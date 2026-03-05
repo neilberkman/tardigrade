@@ -47,11 +47,12 @@ jobs:
             fixed: profiles/mcuboot_pr2100_fixed_discovery.yaml
             extra_args: "--fault-end 10"
           # PR #2109: header reload bug (swap-scratch).
-          # --quick catches it (50% brick rate at 3 sample points).
+          # Use the default heuristic sweep here; --quick's 3-point sampler
+          # can miss the brick window for this profile.
           - name: pr2109
             broken: profiles/mcuboot_pr2109_scratch_broken.yaml
             fixed: profiles/mcuboot_pr2109_scratch_fixed.yaml
-            extra_args: "--quick"
+            extra_args: ""
           # PR #2199: stuck revert (swap-move).
           # 100% failure rate — even control run detects it.
           - name: pr2199

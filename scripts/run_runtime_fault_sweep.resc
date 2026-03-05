@@ -2347,6 +2347,8 @@ if calibration_mode:
             'base_writes': base_writes,
             'calibration_stop_reason': cal_status.get('reason', '?'),
             'calibration_emulated_s': cal_status.get('emulated_s', 0),
+            'calibration_elapsed_s': cal_status.get('elapsed_s', 0),
+            'calibration_pc': cal_status.get('pc', '0x00000000'),
         }
         if trace_file:
             result['trace_file'] = trace_file

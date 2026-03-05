@@ -265,6 +265,10 @@ class CalibrationResult:
     trace_file_bin: Optional[str]
     erase_trace_file_bin: Optional[str]
     calibration_exec_hash: Optional[str] = None
+    stop_reason: Optional[str] = None
+    emulated_s: Optional[float] = None
+    elapsed_s: Optional[float] = None
+    pc: Optional[str] = None
 
 
 def run_calibration(
@@ -319,6 +323,10 @@ def run_calibration(
         trace_file_bin=data.get("trace_file_bin"),
         erase_trace_file_bin=data.get("erase_trace_file_bin"),
         calibration_exec_hash=data.get("calibration_exec_hash"),
+        stop_reason=data.get("calibration_stop_reason"),
+        emulated_s=data.get("calibration_emulated_s"),
+        elapsed_s=data.get("calibration_elapsed_s"),
+        pc=data.get("calibration_pc"),
     )
 
 
@@ -1177,10 +1185,35 @@ def summarize_runtime_sweep(
 
     if control:
         ctrl = control[-1]
-        summary["control"] = {
+        control_summary: Dict[str, Any] = {
             "boot_outcome": ctrl.get("boot_outcome"),
             "boot_slot": ctrl.get("boot_slot"),
         }
+        ctrl_signals = ctrl.get("signals") or {}
+        control_telemetry = {
+            key: ctrl_signals.get(key)
+            for key in (
+                "phase1_stop_reason",
+                "phase1_emulated_s",
+                "phase2_stop_reason",
+                "phase2_emulated_s",
+                "trace_replay_mode",
+                "reload_ms",
+                "replay_ms",
+                "reset_ms",
+                "setup_ms",
+                "emulation_ms",
+                "total_ms",
+                "p2_iters",
+                "vtor",
+                "vtor_final",
+                "pc",
+            )
+            if ctrl_signals.get(key) is not None
+        }
+        if control_telemetry:
+            control_summary["signals"] = control_telemetry
+        summary["control"] = control_summary
 
     # Aggregate per-step timing from signals.
     timing_keys = [
@@ -1708,6 +1741,14 @@ def main() -> int:
                 "workers": args.workers,
             },
             "git": git_metadata(repo_root),
+        }
+        payload["calibration"] = {
+            "writes": cal.total_writes,
+            "erases": total_erases,
+            "stop_reason": cal.stop_reason,
+            "emulated_s": cal.emulated_s,
+            "elapsed_s": cal.elapsed_s,
+            "pc": cal.pc,
         }
         if clean_trace_meta is not None:
             payload["clean_trace"] = clean_trace_meta
