@@ -1332,6 +1332,7 @@ def main() -> int:
         # -------------------------------------------------------------------
         # Calibration
         # -------------------------------------------------------------------
+        cal: Optional[CalibrationResult] = None
         max_writes = profile.fault_sweep.max_writes
         trace_file: Optional[str] = None
         erase_trace_file: Optional[str] = None
@@ -1742,13 +1743,21 @@ def main() -> int:
             },
             "git": git_metadata(repo_root),
         }
+        calibration_source = "executed"
+        if cal is None:
+            if profile.fault_sweep.max_writes == "auto" and eval_mode == "state":
+                calibration_source = "derived"
+            else:
+                calibration_source = "profile"
         payload["calibration"] = {
-            "writes": cal.total_writes,
+            "performed": cal is not None,
+            "source": calibration_source,
+            "writes": max_writes,
             "erases": total_erases,
-            "stop_reason": cal.stop_reason,
-            "emulated_s": cal.emulated_s,
-            "elapsed_s": cal.elapsed_s,
-            "pc": cal.pc,
+            "stop_reason": cal.stop_reason if cal is not None else None,
+            "emulated_s": cal.emulated_s if cal is not None else None,
+            "elapsed_s": cal.elapsed_s if cal is not None else None,
+            "pc": cal.pc if cal is not None else None,
         }
         if clean_trace_meta is not None:
             payload["clean_trace"] = clean_trace_meta
