@@ -1,0 +1,88 @@
+name: full-sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Profile YAML (relative to repo root)
+        required: true
+        default: profiles/mcuboot_pr2100_broken.yaml
+      workers:
+        description: Parallel Renode workers
+        required: false
+        default: "2"
+      exhaustive:
+        description: Run ALL fault points (skip heuristic pruning)
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: full-sweep-${{ github.event.inputs.profile }}
+  cancel-in-progress: true
+
+jobs:
+  sweep:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      RENODE_URL: https://builds.renode.io/renode-latest.linux-portable.tar.gz
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Renode portable
+        run: |
+          set -euxo pipefail
+          tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
+          curl -L "${RENODE_URL}" -o "${tarball}"
+          mkdir -p "${RUNNER_TEMP}/renode"
+          tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
+          python3 -m pip install --user -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+          echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
+
+      - name: Install Python dependencies
+        run: python3 -m pip install --user pyyaml
+
+      - name: Run full sweep
+        run: |
+          args=(
+            --profile "${{ inputs.profile }}"
+            --renode-test "${RUNNER_TEMP}/renode/renode-test"
+            --output results/full_sweep.json
+            --workers "${{ inputs.workers }}"
+          )
+          if [ "${{ inputs.exhaustive }}" = "true" ]; then
+            args+=(--fault-start 0)
+          fi
+          # Don't fail on verdict assertions — this workflow is for data collection.
+          # The summary step prints the verdict for human review.
+          args+=(--no-assert-verdict)
+          python3 scripts/audit_bootloader.py "${args[@]}"
+
+      - name: Print summary
+        if: always()
+        run: |
+          if [ -f results/full_sweep.json ]; then
+            python3 -c "
+          import json
+          r = json.load(open('results/full_sweep.json'))
+          s = r.get('summary', {}).get('runtime_sweep', {})
+          t = s.get('timing', {}).get('averages', {})
+          print('Profile:', r.get('profile'))
+          print('Verdict:', r.get('verdict'))
+          print('Points:', s.get('total_fault_points'))
+          print('Bricks:', s.get('bricks'))
+          print('Brick rate:', s.get('brick_rate'))
+          print('Wall time: {:.1f}s'.format(s.get('wall_time_s', 0)))
+          print('Avg per-point: {}ms (emu={}ms)'.format(t.get('total_ms'), t.get('emulation_ms')))
+          "
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-sweep-results
+          path: results/full_sweep.json

@@ -1,0 +1,104 @@
+name: oss-validation
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mcuboot-guards:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      TOOLCHAIN_VERSION: 13.2.1-1.1
+      TOOLCHAIN_URL: https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v13.2.1-1.1/xpack-arm-none-eabi-gcc-13.2.1-1.1-linux-x64.tar.gz
+      TOOLCHAIN_SHA256: 1252a8cafe9237de27a765376697230368eec21db44dc3f1edeb8d838dabd530
+      RENODE_URL: https://builds.renode.io/renode-latest.linux-portable.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            curl \
+            device-tree-compiler \
+            git \
+            make \
+            ninja-build \
+            python3 \
+            python3-pip \
+            python3-venv \
+            xz-utils
+
+      - name: Install pinned Arm GNU toolchain
+        run: |
+          set -euxo pipefail
+          tarball="${RUNNER_TEMP}/arm-toolchain.tar.gz"
+          curl -L "${TOOLCHAIN_URL}" -o "${tarball}"
+          echo "${TOOLCHAIN_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "${tarball}" -C "${RUNNER_TEMP}"
+          mkdir -p "$HOME/tools"
+          ln -s "${RUNNER_TEMP}/xpack-arm-none-eabi-gcc-${TOOLCHAIN_VERSION}" "$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major"
+          echo "$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major/bin" >> "${GITHUB_PATH}"
+          "$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major/bin/arm-none-eabi-gcc" --version
+
+      - name: Install Renode portable
+        run: |
+          set -euxo pipefail
+          tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
+          curl -L "${RENODE_URL}" -o "${tarball}"
+          mkdir -p "${RUNNER_TEMP}/renode"
+          tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
+          python3 -m pip install --user -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+          echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/renode/renode-test" --help >/dev/null
+
+      - name: Run MCUboot current guard (must pass)
+        run: |
+          set -euxo pipefail
+          export GNUARMEMB_TOOLCHAIN_PATH="$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major"
+          python3 -m pip install --user intelhex cbor2 click cryptography pyyaml
+          ./scripts/bootstrap_mcuboot_matrix_assets.sh
+          python3 scripts/run_oss_validation.py \
+            --manifest docs/oss_validation_profiles.json \
+            --profile mcuboot_swap_current_guard \
+            --renode-test renode-test \
+            --output results/oss_validation/mcuboot_swap_current_guard.json
+
+      - name: Run MCUboot known-bad guard (must fail)
+        run: |
+          set -euxo pipefail
+          export GNUARMEMB_TOOLCHAIN_PATH="$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major"
+          set +e
+          python3 scripts/run_oss_validation.py \
+            --manifest docs/oss_validation_profiles.json \
+            --profile mcuboot_swap_known_bad_guard \
+            --renode-test renode-test \
+            --output results/oss_validation/mcuboot_swap_known_bad_guard.json
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "Known-bad guard unexpectedly passed (regression detector broken)" >&2
+            exit 1
+          fi
+          if [ "$rc" -ne 1 ]; then
+            echo "Known-bad guard failed with unexpected rc=$rc (infrastructure error)" >&2
+            exit "$rc"
+          fi
+          echo "Known-bad guard failed as expected (detector proven)"
+
+      - name: Upload OSS validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oss-validation-artifacts
+          path: |
+            results/oss_validation
+            results/renode_runs

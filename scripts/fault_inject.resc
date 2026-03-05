@@ -1,0 +1,24 @@
+# Usage example:
+# $fault_at=1000
+# i @scripts/fault_inject.resc
+
+$fault_at?=1000
+
+python """
+from Antmicro.Renode.Peripherals.Bus import Access, SysbusAccessWidth
+
+ctrl = monitor.Machine['sysbus.nvm_ctrl']
+bus = monitor.Machine.SystemBus
+counter = {'value': 0, 'fired': False}
+
+def on_write(cpu, addr, width, value):
+    counter['value'] += 1
+    if not counter['fired'] and counter['value'] == int(monitor.GetVariable('fault_at')):
+        counter['fired'] = True
+        cpu.WarningLog('OTA fault injected at write #{0} addr=0x{1:X}'.format(counter['value'], addr))
+        ctrl.InjectPartialWrite(addr)
+        monitor.ExecuteCommand('runMacro $reset')
+
+for width in [SysbusAccessWidth.Byte, SysbusAccessWidth.Word, SysbusAccessWidth.DoubleWord, SysbusAccessWidth.QuadWord]:
+    bus.AddWatchpointHook(0x10000000, width, Access.Write, on_write)
+"""

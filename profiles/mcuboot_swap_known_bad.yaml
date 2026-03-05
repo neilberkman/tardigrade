@@ -1,0 +1,51 @@
+schema_version: 1
+name: mcuboot_swap_known_bad
+description: "MCUboot swap-using-move (commit c50b332, before issues #1966/#2100 fix). nRF52840 flash. Tests the revert path. The fixup_revert vulnerability does not manifest in swap-using-move on nRF52840 — both old and new commits survive all power-loss faults."
+platform: platforms/cortex_m4_flash_fast.repl
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_mcuboot_swap_known_bad_guard.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x76000 }
+    staging: { base: 0x00082000, size: 0x76000 }
+# Revert scenario: image already swapped, upgrade done but not confirmed.
+# - Primary slot (exec): contains the STAGING image (new, unconfirmed)
+# - Secondary slot (staging): contains the EXEC image (old, to revert to)
+# This is the state AFTER a completed upgrade where image_ok was never set.
+images:
+  exec: results/oss_validation/assets/zephyr_slot1_padded.bin
+  staging: results/oss_validation/assets/zephyr_slot0_padded.bin
+# Primary trailer: magic=GOOD, copy_done=SET(0x01), image_ok=UNSET(0xFF).
+# This triggers BOOT_SWAP_TYPE_REVERT in MCUboot's swap table.
+# Primary slot ends at 0x82000, so trailer is at end of primary:
+#   magic at 0x82000 - 16 = 0x81FF0
+#   copy_done at 0x82000 - 16 - 16 = 0x81FE0 (BOOT_MAX_ALIGN=8)
+pre_boot_state:
+  # Primary trailer magic (4 words at 0x81FF0)
+  - { address: 0x00081FF0, u32: 0xF395C277 }
+  - { address: 0x00081FF4, u32: 0x7FEFD260 }
+  - { address: 0x00081FF8, u32: 0x0F505235 }
+  - { address: 0x00081FFC, u32: 0x8079B62C }
+  # Primary copy_done = 0x01 (SET)
+  - { address: 0x00081FE0, u32: 0x00000001 }
+  # Primary image_ok stays 0xFF (erased/UNSET) — don't write it
+success_criteria:
+  # After revert, primary should have the original slot0 image.
+  # Check MCUboot image header version at offset 0x14:
+  #   slot0 = 0x00000001, slot1 = 0x00010001.
+  # If revert succeeded, we should see slot0's value.
+  marker_address: 0x0000C014
+  marker_value: 0x00000001
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 20000000
+  hash_bypass_symbols: ["bootutil_img_validate"]
+expect:
+  should_find_issues: false

@@ -1,0 +1,49 @@
+schema_version: 1
+name: esp_idf_ota_crc_schema_guard
+skip_self_test: true
+description: >
+  ESP-IDF upgrade baseline with control-scope CRC schema assertions.
+  Verifies control-run OtaData CRC words remain consistent with standard
+  ota_seq-only CRC semantics.
+
+platform: platforms/cortex_m4_flash_fast.repl
+bootloader:
+  elf: examples/esp_idf_ota/esp_idf_ota.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x74000 }
+    staging: { base: 0x00080000, size: 0x74000 }
+images:
+  exec: examples/esp_idf_ota/slot0.bin
+  staging: examples/esp_idf_ota/slot1.bin
+pre_boot_state:
+  - { address: 0x000F8000, u32: 0x00000001 }
+  - { address: 0x000F8018, u32: 0x00000002 }
+  - { address: 0x000F801C, u32: 0x4743989A }
+  - { address: 0x000F9000, u32: 0x00000002 }
+  - { address: 0x000F9018, u32: 0x00000000 }
+  - { address: 0x000F901C, u32: 0x55F63774 }
+  - { address: 0x000FC040, u32: 0x55445021 }
+success_criteria:
+  vtor_in_slot: exec
+  otadata_expect_scope: control
+  otadata_expect:
+    otadata_available: true
+    otadata_active_entry: entry1
+    otadata0_state_name: VALID
+    otadata1_state_name: [PENDING_VERIFY, UNDEFINED]
+    otadata0_crc: 0x4743989A
+    otadata1_crc: 0x55F63774
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 0x180000
+  fault_types: [power_loss, interrupted_erase]
+expect:
+  should_find_issues: false

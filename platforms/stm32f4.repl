@@ -1,0 +1,48 @@
+// STM32F4 (Cortex-M4) platform for fault injection testing.
+//
+// Flash architecture:
+//   Single MappedMemory at both 0x00000000 and 0x08000000.
+//   CPU executes from both aliases via MappedMemory's fast IMappedSegment path.
+//   The controller tracks writes via direct interception when
+//   STM32F4FlashInterceptor is wired up, or falls back to multi-locality
+//   shadow diff on PG transitions.
+//
+// The combined RCC+FLASH controller ("nvmc") covers both register
+// blocks and provides NRF52NVMC-compatible tracking properties so
+// the generic sweep script works unmodified.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+
+// Flash: 1 MB at both alias (0x00000000) and canonical (0x08000000) addresses.
+flash: Memory.MappedMemory @ { sysbus 0x00000000; sysbus 0x08000000 }
+    size: 0x100000
+
+// SRAM: 256 KB.
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x40000
+
+// Combined RCC + FLASH controller with write/erase tracking.
+// Base 0x40023800: RCC at offset 0x000, FLASH at offset 0x400.
+// Named "nvmc" for compatibility with run_runtime_fault_sweep.resc.
+nvmc: Miscellaneous.STM32F4FlashController @ sysbus 0x40023800
+    Flash: flash
+    FlashBaseAddress: 0x08000000
+    FlashSize: 0x100000
+    PageSize: 0x20000
+    EraseFill: 0xFF
+
+// Dummy USARTs: always return TXE=1 so firmware UART output doesn't hang.
+uart1: Miscellaneous.STM32DummyUSART @ sysbus 0x40011000
+uart2: Miscellaneous.STM32DummyUSART @ sysbus 0x40004400
+
+sysbus:
+    init:
+        Tag <0x00000000 0x100000> "FLASH_LO"
+        Tag <0x08000000 0x100000> "FLASH_HI"
+        Tag <0x20000000 0x40000> "SRAM"
+        Tag <0x40023800 0x420> "RCC_FLASH_CTRL"

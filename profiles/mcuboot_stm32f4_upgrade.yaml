@@ -1,0 +1,48 @@
+schema_version: 1
+name: mcuboot_stm32f4_upgrade
+description: "MCUboot swap-using-move on STM32F4 (non-uniform flash sectors). Revert scenario: upgrade completed but not confirmed, power loss during revert."
+platform: platforms/stm32f4.repl
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_stm32f4.elf
+  entry: 0x08000000
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x08020000, size: 0x60000 }
+    staging: { base: 0x08080000, size: 0x60000 }
+# Revert scenario: image already swapped, upgrade done but not confirmed.
+# - Primary slot (exec): contains the STAGING image (new v2.0.0, unconfirmed)
+# - Secondary slot (staging): contains the EXEC image (old v1.0.0, to revert to)
+images:
+  exec: results/oss_validation/assets/zephyr_stm32f4_slot1.bin
+  staging: results/oss_validation/assets/zephyr_stm32f4_slot0.bin
+# Primary trailer: magic=GOOD, copy_done=SET(0x01), image_ok=UNSET(0xFF).
+# This triggers BOOT_SWAP_TYPE_REVERT.
+# Primary slot ends at 0x08080000, trailer at end of primary:
+#   magic at 0x08080000 - 16 = 0x0807FFF0
+#   copy_done at magic - 8 - 8 = 0x0807FFE0 (BOOT_MAX_ALIGN=8)
+pre_boot_state:
+  # Primary trailer magic (4 words at 0x0807FFF0)
+  - { address: 0x0807FFF0, u32: 0xF395C277 }
+  - { address: 0x0807FFF4, u32: 0x7FEFD260 }
+  - { address: 0x0807FFF8, u32: 0x0F505235 }
+  - { address: 0x0807FFFC, u32: 0x8079B62C }
+  # Primary copy_done = 0x01 (SET)
+  - { address: 0x0807FFE0, u32: 0x00000001 }
+success_criteria:
+  # After revert, primary should have the original slot0 image (v1.0.0).
+  # MCUboot image header version at offset 0x14: major=1 for v1.0.0.
+  marker_address: 0x08020014
+  marker_value: 0x00000001
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 20000000
+  hash_bypass_symbols: ["bootutil_img_validate"]
+  progress_stall_timeout_s: 120
+expect:
+  should_find_issues: false

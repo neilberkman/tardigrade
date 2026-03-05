@@ -1,0 +1,37 @@
+schema_version: 1
+name: mcuboot_head_revert
+description: "MCUboot HEAD (664093d0) swap-using-move revert scenario. Tests whether tail-of-swap power loss during revert causes silent revert failure."
+platform: platforms/cortex_m4_flash_fast.repl
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_head.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x76000 }
+    staging: { base: 0x00082000, size: 0x76000 }
+# Revert scenario: image already swapped, upgrade done but not confirmed.
+images:
+  exec: results/oss_validation/assets/zephyr_slot1_padded.bin
+  staging: results/oss_validation/assets/zephyr_slot0_padded.bin
+# Primary trailer: magic=GOOD, copy_done=SET(0x01), image_ok=UNSET(0xFF).
+pre_boot_state:
+  - { address: 0x00081FF0, u32: 0xF395C277 }
+  - { address: 0x00081FF4, u32: 0x7FEFD260 }
+  - { address: 0x00081FF8, u32: 0x0F505235 }
+  - { address: 0x00081FFC, u32: 0x8079B62C }
+  - { address: 0x00081FE0, u32: 0x00000001 }
+success_criteria:
+  marker_address: 0x0000C014
+  marker_value: 0x00000001
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 20000000
+  hash_bypass_symbols: ["bootutil_img_validate"]
+expect:
+  should_find_issues: false

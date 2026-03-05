@@ -1,0 +1,33 @@
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m0+"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+
+nvm: Memory.NVMemory @ sysbus 0x10000000
+    Size: 0x80000
+    WordSize: 8
+    EnforceWordWriteSemantics: true
+    WriteLatencyMicros: 0
+
+nvm_boot_alias: Memory.NVMemory @ sysbus 0x00000000
+    AliasTarget: nvm
+
+nvm_read_alias: Memory.NVMemory @ sysbus 0x10080000
+    AliasTarget: nvm
+    ReadOnly: true
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x20000
+
+nvm_ctrl: Memory.GenericNvmController @ sysbus 0x40001000
+    Nvm: nvm
+    NvmBaseAddress: 0x10000000
+    NvReadOffset: 0x80000
+    CommandRegisterOffset: 0x14
+    StatusRegisterOffset: 0x18
+    AddressRegisterOffset: 0x1C
+    DataRegisterOffset: 0x20
+    WriteCommandValue: 0x2
+    SuccessStatusValue: 0x4

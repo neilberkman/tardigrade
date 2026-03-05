@@ -1,0 +1,125 @@
+# Live fault-point run for vulnerable OTA scenario.
+# Required monitor variables:
+#   $fault_at (int)
+#   $total_writes (int)
+#   $result_file (string path)
+# Optional monitor variables:
+#   $evaluation_mode ("execute" or "state")
+
+$fault_at?=0
+$total_writes?=28672
+$evaluation_mode?="execute"
+
+python """
+import json
+
+bus = monitor.Machine.SystemBus
+ctrl = monitor.Machine['sysbus.nvm_ctrl']
+fault_at = int(monitor.GetVariable('fault_at'))
+total_writes = int(monitor.GetVariable('total_writes'))
+result_file = str(monitor.GetVariable('result_file'))
+evaluation_mode = str(monitor.GetVariable('evaluation_mode')).strip().lower()
+if evaluation_mode not in ('execute', 'state'):
+    evaluation_mode = 'execute'
+
+COPY_MARKER_VALUE = 0xC0FEBEEF
+COPY_MARKER_ADDR = 0x10070000
+BOOT_COUNTER_ADDR = 0x10070004
+
+def as_int(value):
+    try:
+        return int(value)
+    except Exception:
+        return int(str(value), 0)
+
+pre_boot_counter = as_int(bus.ReadDoubleWord(BOOT_COUNTER_ADDR))
+fault_injected = False
+
+if evaluation_mode == 'state':
+    for i in range(total_writes):
+        src = 0x10038000 + i * 8
+        dst = 0x10000000 + i * 8
+        if i == fault_at:
+            ctrl.InjectPartialWrite(dst)
+            fault_injected = True
+            break
+        bus.WriteQuadWord(dst, bus.ReadQuadWord(src))
+
+    if not fault_injected:
+        bus.WriteDoubleWord(COPY_MARKER_ADDR, COPY_MARKER_VALUE)
+else:
+    base_writes = int(ctrl.WordWriteCount)
+    ctrl.Nvm.FaultAtWordWrite = base_writes + fault_at + 1
+    monitor.Parse('machine Reset')
+    monitor.Parse('emulation RunFor "0.0001"')
+    fault_injected = bool(ctrl.Nvm.LastFaultInjected)
+    ctrl.Nvm.FaultAtWordWrite = 18446744073709551615
+
+copy_marker = as_int(bus.ReadDoubleWord(COPY_MARKER_ADDR))
+boot_counter = as_int(bus.ReadDoubleWord(BOOT_COUNTER_ADDR))
+sp = as_int(bus.ReadDoubleWord(0x10000000))
+reset_vector = as_int(bus.ReadDoubleWord(0x10000004))
+
+vector_valid = (
+    (0x20000000 <= sp <= 0x20020000)
+    and ((reset_vector & 1) == 1)
+    and (0x10000000 <= (reset_vector & ~1) < 0x10038000)
+)
+copy_done = (copy_marker == COPY_MARKER_VALUE) and (not fault_injected)
+boot_progress = (boot_counter != pre_boot_counter)
+second_boot_progress = False
+
+if evaluation_mode == 'execute':
+    if copy_done and boot_progress:
+        pre_second_counter = boot_counter
+        monitor.Parse('machine Reset')
+        monitor.Parse('emulation RunFor "0.0001"')
+        boot_counter = as_int(bus.ReadDoubleWord(BOOT_COUNTER_ADDR))
+        second_boot_progress = (boot_counter != pre_second_counter)
+
+    if copy_done and boot_progress and second_boot_progress:
+        boot_outcome = 'success'
+        boot_slot = 'A'
+    else:
+        boot_outcome = 'hard_fault'
+        boot_slot = None
+else:
+    # State mode is a structural heuristic: copy must complete and vectors must remain plausible.
+    if copy_done and vector_valid:
+        boot_outcome = 'success'
+        boot_slot = 'A'
+    else:
+        boot_outcome = 'hard_fault'
+        boot_slot = None
+
+# Fault region classification based on write index.
+# Copy is 8-byte words starting at 0x10000000. First 0x100 bytes of the
+# active image = 256 bytes = 32 eight-byte words = vector table region.
+if fault_at < 32:
+    fault_region = 'vector_table'
+else:
+    fault_region = 'image_payload'
+
+result = {
+    'fault_at': fault_at,
+    'boot_outcome': boot_outcome,
+    'boot_slot': boot_slot,
+    'fault_region': fault_region,
+    'nvm_state': {
+        'evaluation_mode': evaluation_mode,
+        'copy_marker': '0x{0:08X}'.format(copy_marker),
+        'boot_counter': boot_counter,
+        'pre_boot_counter': pre_boot_counter,
+        'copy_done': copy_done,
+        'boot_progress': boot_progress,
+        'second_boot_progress': second_boot_progress,
+        'vector_sp': '0x{0:08X}'.format(sp),
+        'vector_reset': '0x{0:08X}'.format(reset_vector),
+        'vector_valid': vector_valid,
+        'fault_injected': fault_injected,
+    },
+}
+
+with open(result_file, 'w') as f:
+    f.write(json.dumps(result, sort_keys=True))
+"""

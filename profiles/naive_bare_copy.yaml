@@ -1,0 +1,26 @@
+schema_version: 1
+name: naive_bare_copy
+description: "Worst-case naive OTA: direct copy from staging to exec with no validation or recovery. Power loss during copy bricks the device."
+platform: platforms/cortex_m0_nvm.repl
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 8
+  slots:
+    exec: { base: 0x10000000, size: 0x38000 }
+    staging: { base: 0x10038000, size: 0x38000 }
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+success_criteria:
+  vtor_in_slot: exec
+  image_hash: true
+  expected_image: staging
+fault_sweep:
+  mode: runtime
+  max_writes: 28672
+  max_writes_cap: 100000
+  run_duration: "0.01"
+expect:
+  should_find_issues: true

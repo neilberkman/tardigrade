@@ -1,0 +1,154 @@
+# Generic copy-in-place OTA fault-point script.
+# Required monitor variables:
+#   $fault_at (int)
+#   $total_writes (int)
+#   $result_file (string path)
+# Optional monitor variables:
+#   $evaluation_mode ("execute" or "state")
+#   $write_granularity (default: 8)
+#   $active_base (default: 0x10000000)
+#   $staging_base (default: 0x10038000)
+#   $nvm_ctrl_path (default: "sysbus.nvm_ctrl")
+
+$fault_at?=0
+$total_writes?=28672
+$result_file?="copy_in_place_fault_result.json"
+$evaluation_mode?="execute"
+$write_granularity?=8
+$active_base?=0x10000000
+$staging_base?=0x10038000
+$nvm_ctrl_path?="sysbus.nvm_ctrl"
+
+python """
+import json
+from System import Array, Byte
+
+bus = monitor.Machine.SystemBus
+
+def as_int(value):
+    try:
+        return int(value) & 0xFFFFFFFF
+    except Exception:
+        return int(str(value), 0) & 0xFFFFFFFF
+
+def as_long(value):
+    try:
+        return int(value)
+    except Exception:
+        return int(str(value), 0)
+
+fault_at = as_long(monitor.GetVariable('fault_at'))
+total_writes = as_long(monitor.GetVariable('total_writes'))
+result_file = str(monitor.GetVariable('result_file'))
+evaluation_mode = str(monitor.GetVariable('evaluation_mode')).strip().lower()
+if evaluation_mode not in ('execute', 'state'):
+    evaluation_mode = 'execute'
+
+active_base = as_long(monitor.GetVariable('active_base'))
+staging_base = as_long(monitor.GetVariable('staging_base'))
+nvm_ctrl_path = str(monitor.GetVariable('nvm_ctrl_path'))
+write_granularity = as_long(monitor.GetVariable('write_granularity'))
+if write_granularity <= 0:
+    write_granularity = 8
+
+ctrl = monitor.Machine[nvm_ctrl_path]
+cpu = monitor.Machine['sysbus.cpu']
+
+state = {'index': 0, 'faulted': False, 'fault_address': 0}
+
+def read_chunk(addr, size):
+    raw = bus.ReadBytes(addr, size)
+    return bytes([(int(b) & 0xFF) for b in raw])
+
+def write_chunk(addr, chunk):
+    array_data = Array[Byte]([int(b) & 0xFF for b in bytearray(chunk)])
+    bus.WriteBytes(addr, array_data, 0, len(array_data))
+
+def maybe_write_chunk(addr, chunk):
+    if state['faulted']:
+        return False
+
+    if state['index'] == fault_at:
+        ctrl.InjectPartialWrite(addr)
+        state['faulted'] = True
+        state['fault_address'] = addr
+        return False
+
+    write_chunk(addr, chunk)
+    state['index'] += 1
+    return True
+
+# Prepare staging image from the current active image.
+for i in range(total_writes):
+    src = active_base + i * write_granularity
+    dst = staging_base + i * write_granularity
+    write_chunk(dst, read_chunk(src, write_granularity))
+
+# Simulate erase of active region before programming.
+erase_chunk = bytes([0xFF] * write_granularity)
+for i in range(total_writes):
+    write_chunk(active_base + i * write_granularity, erase_chunk)
+
+# Copy staging -> active with optional injected partial write.
+for i in range(total_writes):
+    src = staging_base + i * write_granularity
+    dst = active_base + i * write_granularity
+    if not maybe_write_chunk(dst, read_chunk(src, write_granularity)):
+        break
+
+copy_complete = (not state['faulted']) and (state['index'] == total_writes)
+
+sp = as_int(bus.ReadDoubleWord(active_base + 0))
+reset_vector = as_int(bus.ReadDoubleWord(active_base + 4))
+reset_pc = reset_vector & (~1)
+slot_bytes = total_writes * write_granularity
+
+vector_valid = (
+    (0x20000000 <= sp <= 0x20020000)
+    and ((reset_vector & 1) == 1)
+    and (active_base <= reset_pc < (active_base + slot_bytes))
+)
+
+post_pc = None
+pc_in_active = False
+boot_progress = False
+if evaluation_mode == 'execute':
+    monitor.Parse('machine Reset')
+    monitor.Parse('emulation RunFor "0.1"')
+    post_pc = as_int(cpu.PC)
+    pc_in_active = (active_base <= post_pc < (active_base + slot_bytes))
+    boot_progress = pc_in_active and ((post_pc & (~1)) != reset_pc)
+
+if evaluation_mode == 'execute':
+    success = copy_complete and vector_valid and pc_in_active
+else:
+    success = copy_complete and vector_valid
+
+boot_outcome = 'success' if success else 'hard_fault'
+boot_slot = 'A' if success else None
+
+result = {
+    'fault_at': int(fault_at),
+    'boot_outcome': boot_outcome,
+    'boot_slot': boot_slot,
+    'nvm_state': {
+        'evaluation_mode': evaluation_mode,
+        'active_base': '0x{0:08X}'.format(active_base),
+        'staging_base': '0x{0:08X}'.format(staging_base),
+        'write_granularity': int(write_granularity),
+        'write_index': int(state['index']),
+        'copy_complete': bool(copy_complete),
+        'faulted': bool(state['faulted']),
+        'fault_address': '0x{0:08X}'.format(state['fault_address']),
+        'vector_sp': '0x{0:08X}'.format(sp),
+        'vector_reset': '0x{0:08X}'.format(reset_vector),
+        'vector_valid': bool(vector_valid),
+        'post_pc': None if post_pc is None else '0x{0:08X}'.format(post_pc),
+        'pc_in_active': bool(pc_in_active),
+        'boot_progress': bool(boot_progress),
+    },
+}
+
+with open(result_file, 'w') as f:
+    f.write(json.dumps(result, sort_keys=True))
+"""

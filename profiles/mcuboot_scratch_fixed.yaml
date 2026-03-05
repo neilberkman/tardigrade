@@ -1,0 +1,38 @@
+schema_version: 1
+name: mcuboot_scratch_fixed
+description: "MCUboot swap-using-SCRATCH AFTER scratch erase direction fix (commit f76fba70). Backward erase of scratch ensures trailer is erased first, preventing corrupt data from being written back to primary after interrupted erase."
+platform: platforms/cortex_m4_flash_fast.repl
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_scratch_fixed.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x6E000 }
+    staging: { base: 0x0007A000, size: 0x6E000 }
+images:
+  exec: results/oss_validation/assets/zephyr_slot0_padded.bin
+  staging: results/oss_validation/assets/zephyr_slot1_padded.bin
+pre_boot_state:
+  - { address: 0x000E7FF0, u32: 0xF395C277 }
+  - { address: 0x000E7FF4, u32: 0x7FEFD260 }
+  - { address: 0x000E7FF8, u32: 0x0F505235 }
+  - { address: 0x000E7FFC, u32: 0x8079B62C }
+success_criteria:
+  marker_address: 0x0000C014
+  marker_value: 0x00010001
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 20000000
+  fault_types:
+    - power_loss
+    - interrupted_erase
+  hash_bypass_symbols: ["bootutil_img_validate"]
+skip_self_test: true
+expect:
+  should_find_issues: true

@@ -1,0 +1,101 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  renode-tests:
+    runs-on: ubuntu-22.04
+    env:
+      TOOLCHAIN_VERSION: 13.2.1-1.1
+      TOOLCHAIN_URL: https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v13.2.1-1.1/xpack-arm-none-eabi-gcc-13.2.1-1.1-linux-x64.tar.gz
+      TOOLCHAIN_SHA256: 1252a8cafe9237de27a765376697230368eec21db44dc3f1edeb8d838dabd530
+      RENODE_REVISION: d66b0c2aa3d420408eccecfd1d3bab0fd702a6db
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Arm GNU toolchain
+        run: |
+          set -euxo pipefail
+          tarball="${RUNNER_TEMP}/arm-toolchain.tar.gz"
+          curl -L "${TOOLCHAIN_URL}" -o "${tarball}"
+          echo "${TOOLCHAIN_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "${tarball}" -C "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/xpack-arm-none-eabi-gcc-${TOOLCHAIN_VERSION}/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/xpack-arm-none-eabi-gcc-${TOOLCHAIN_VERSION}/bin/arm-none-eabi-gcc" --version
+
+      - name: Build example firmware
+        run: |
+          set -euxo pipefail
+          make -C examples/vulnerable_ota
+          make -C examples/naive_copy
+          make -C examples/nxboot_style
+          make -C examples/esp_idf_ota
+          make -C examples/riotboot_standalone
+          python3 examples/nxboot_style/gen_nxboot_images.py --output-dir examples/nxboot_style
+
+      - name: Run Robot suites in pinned Renode
+        uses: antmicro/renode-test-action@0705567acf04d7b998d7deac1e05d9067d70d901
+        env:
+          RENODE_TEST: renode-test
+        with:
+          renode-revision: ${{ env.RENODE_REVISION }}
+          tests-to-run: |
+            tests/nvm_peripheral.robot
+            tests/ota_fault_point.robot
+          artifacts-path: results/ci_artifacts
+
+      - name: Upload Renode artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renode-artifacts
+          path: results/ci_artifacts
+
+  self-test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      RENODE_URL: https://builds.renode.io/renode-latest.linux-portable.tar.gz
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Renode portable
+        run: |
+          set -euxo pipefail
+          tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
+          curl -L "${RENODE_URL}" -o "${tarball}"
+          mkdir -p "${RUNNER_TEMP}/renode"
+          tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
+          python3 -m pip install --user -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+          echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/renode/renode-test" --help >/dev/null
+
+      - name: Install Python dependencies
+        run: python3 -m pip install --user pyyaml
+
+      - name: Run self-test shard ${{ matrix.shard }}/4
+        run: |
+          python3 scripts/self_test.py --quick \
+            --shard "${{ matrix.shard }}/4" \
+            --renode-test "${RUNNER_TEMP}/renode/renode-test" \
+            --output results/self_test_shard_${{ matrix.shard }}.json
+
+      - name: Upload self-test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: self-test-shard-${{ matrix.shard }}
+          path: results/

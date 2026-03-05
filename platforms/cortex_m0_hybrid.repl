@@ -1,0 +1,27 @@
+// Hybrid platform: CPU boots from MappedMemory (0x00000000, 0x10000000)
+// but NVMemory exists at 0x10100000 (not on instruction fetch path).
+// Tests whether the mere presence of dynamically-compiled NVMemory on the
+// sysbus causes the RunFor hang, or only when instruction fetches hit it.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m0+"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+
+flash: Memory.MappedMemory @ sysbus 0x10000000
+    size: 0x80000
+
+flash_boot_alias: Memory.MappedMemory @ sysbus 0x00000000
+    size: 0x80000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x20000
+
+// NVMemory present but NOT on the boot/fetch path
+nvm_sidecar: Memory.NVMemory @ sysbus 0x10100000
+    Size: 0x1000
+    WordSize: 8
+    EnforceWordWriteSemantics: true
+    WriteLatencyMicros: 0

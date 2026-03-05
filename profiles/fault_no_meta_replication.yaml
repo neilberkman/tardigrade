@@ -1,0 +1,36 @@
+schema_version: 1
+name: fault_no_meta_replication
+description: >-
+  Vulnerable OTA with no metadata replication. A single metadata struct
+  controls which slot is active. If power is lost while updating that
+  struct, the device loses track of which image is valid. Without a second
+  replica to fall back on, a torn metadata write bricks the device. Uses
+  the vulnerable copy-in-place firmware which has no metadata at all.
+
+platform: platforms/cortex_m0_nvm.repl
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 8
+  slots:
+    exec:    { base: 0x10000000, size: 0x38000 }
+    staging: { base: 0x10038000, size: 0x38000 }
+
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+
+
+success_criteria:
+  vtor_in_slot: exec
+
+fault_sweep:
+  mode: runtime
+  max_writes: 28672
+  max_writes_cap: 100000
+  run_duration: "0.01"
+
+expect:
+  should_find_issues: true

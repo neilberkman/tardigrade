@@ -1,0 +1,38 @@
+schema_version: 1
+name: mcuboot_offset_upgrade
+description: >
+  MCUboot upstream/main swap-using-offset upgrade (TEST swap) scenario.
+  Newest swap algorithm — less battle-tested than swap-move/scratch.
+  Secondary has new image with magic GOOD — triggers TEST swap.
+
+platform: platforms/cortex_m4_flash_fast.repl
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_head_offset.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x76000 }
+    staging: { base: 0x00082000, size: 0x76000 }
+images:
+  exec: results/oss_validation/assets/zephyr_slot0_padded.bin
+  staging: results/oss_validation/assets/zephyr_slot1_padded.bin
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: staging
+success_criteria:
+  vtor_in_slot: exec
+  image_hash: true
+  expected_image: staging
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 20000000
+  fault_types: [power_loss, interrupted_erase]
+  hash_bypass_symbols: ["bootutil_img_validate"]
+expect:
+  should_find_issues: false

@@ -1,0 +1,36 @@
+schema_version: 1
+name: fault_staging_overlap
+description: >-
+  Vulnerable OTA where the staging and active regions overlap. The copy
+  overwrites both the source and destination simultaneously, so even a
+  clean (non-faulted) copy can produce a corrupt image. With power-loss
+  faults, the corruption is compounded. Uses the vulnerable copy-in-place
+  firmware as the representative broken implementation.
+
+platform: platforms/cortex_m0_nvm.repl
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 8
+  slots:
+    exec:    { base: 0x10000000, size: 0x38000 }
+    staging: { base: 0x10038000, size: 0x38000 }
+
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+
+
+success_criteria:
+  vtor_in_slot: exec
+
+fault_sweep:
+  mode: runtime
+  max_writes: 28672
+  max_writes_cap: 100000
+  run_duration: "0.01"
+
+expect:
+  should_find_issues: true

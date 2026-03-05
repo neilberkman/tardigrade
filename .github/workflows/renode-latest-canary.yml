@@ -1,0 +1,84 @@
+name: renode-latest-canary
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  canary:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      TOOLCHAIN_VERSION: 13.2.1-1.1
+      TOOLCHAIN_URL: https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v13.2.1-1.1/xpack-arm-none-eabi-gcc-13.2.1-1.1-linux-x64.tar.gz
+      TOOLCHAIN_SHA256: 1252a8cafe9237de27a765376697230368eec21db44dc3f1edeb8d838dabd530
+      RENODE_URL: https://builds.renode.io/renode-latest.linux-portable.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Arm GNU toolchain
+        run: |
+          set -euxo pipefail
+          tarball="${RUNNER_TEMP}/arm-toolchain.tar.gz"
+          curl -L "${TOOLCHAIN_URL}" -o "${tarball}"
+          echo "${TOOLCHAIN_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "${tarball}" -C "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/xpack-arm-none-eabi-gcc-${TOOLCHAIN_VERSION}/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/xpack-arm-none-eabi-gcc-${TOOLCHAIN_VERSION}/bin/arm-none-eabi-gcc" --version
+
+      - name: Build example firmware
+        run: |
+          set -euxo pipefail
+          make -C examples/vulnerable_ota
+          make -C examples/naive_copy
+          make -C examples/nxboot_style
+          make -C examples/esp_idf_ota
+          make -C examples/riotboot_standalone
+          python3 examples/nxboot_style/gen_nxboot_images.py --output-dir examples/nxboot_style
+
+      - name: Install latest Renode portable
+        run: |
+          set -euxo pipefail
+          tarball="${RUNNER_TEMP}/renode-latest.tar.gz"
+          curl -L "${RENODE_URL}" -o "${tarball}"
+          mkdir -p "${RUNNER_TEMP}/renode"
+          tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
+          python3 -m pip install -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+          echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/renode/renode-test" --help >/dev/null
+
+      - name: Install Python dependencies
+        run: python3 -m pip install pyyaml
+
+      - name: Native-AOT RunFor regression test (expected FAIL)
+        continue-on-error: true
+        run: renode-test tests/nativeaot_runfor_bug.robot
+
+      - name: Run latest-Renode canary suites
+        run: |
+          set -euxo pipefail
+          mkdir -p results/renode_latest_canary
+          renode-test tests/nvm_peripheral.robot
+          renode-test tests/ota_fault_point.robot
+          python3 scripts/audit_bootloader.py \
+            --profile profiles/mcuboot_swap_current.yaml \
+            --quick \
+            --renode-test renode-test \
+            --output results/renode_latest_canary/mcuboot_audit.json
+
+      - name: Upload canary artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renode-latest-canary
+          path: |
+            results/renode_latest_canary
+            results/renode_runs
+            output.xml
+            log.html
+            report.html
+            logs/

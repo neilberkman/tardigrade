@@ -1,0 +1,40 @@
+schema_version: 1
+name: esp_idf_ota_upgrade_reset_at_time
+skip_self_test: true
+description: >
+  ESP-IDF upgrade exploratory profile using reset_at_time fault mode.
+  The emulator runs for a deterministic time offset, resets, and then
+  evaluates whether the bootloader recovers from the interrupted flow.
+
+platform: platforms/cortex_m4_flash_fast.repl
+bootloader:
+  elf: examples/esp_idf_ota/esp_idf_ota.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x74000 }
+    staging: { base: 0x00080000, size: 0x74000 }
+images:
+  exec: examples/esp_idf_ota/slot0.bin
+  staging: examples/esp_idf_ota/slot1.bin
+pre_boot_state:
+  - { address: 0x000F8000, u32: 0x00000001 }
+  - { address: 0x000F8018, u32: 0x00000002 }
+  - { address: 0x000F801C, u32: 0x4743989A }
+  - { address: 0x000F9000, u32: 0x00000002 }
+  - { address: 0x000F9018, u32: 0x00000000 }
+  - { address: 0x000F901C, u32: 0x55F63774 }
+  - { address: 0x000FC040, u32: 0x55445021 }
+success_criteria: {}
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 0x180000
+  fault_types: [reset_at_time]
+expect:
+  should_find_issues: false

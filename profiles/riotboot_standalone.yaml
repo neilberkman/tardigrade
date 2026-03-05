@@ -1,0 +1,53 @@
+schema_version: 1
+name: riotboot_standalone
+description: >
+  Standalone riotboot-compatible bootloader (RIOT OS algorithm).
+  Direct-execute (XIP), no swap/copy. Picks highest-version valid slot.
+  Header: magic 0x544F4952 + version + start_addr + Fletcher32 checksum.
+  Execute mode: boots the real bootloader to verify slot selection.
+  Stateless XIP bootloader does 0 NVM writes = inherently safe.
+
+platform: platforms/cortex_m4_flash_fast.repl
+
+bootloader:
+  elf: examples/riotboot_standalone/riotboot.elf
+  entry: 0x00000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x00002000, size: 0x7F000 }
+    staging: { base: 0x00081000, size: 0x7F000 }
+
+# Slot 0 has valid firmware with version 1.
+# Slot 1 has valid firmware with version 2.
+images:
+  exec: examples/riotboot_standalone/slot0.bin
+  staging: examples/riotboot_standalone/slot1.bin
+
+# Declarative trigger: write a valid riotboot header to staging slot.
+# This makes slot 1 bootable with higher version than slot 0.
+update_trigger:
+  type: riotboot_header
+  slot: staging
+  version: 2
+
+# After successful boot, bootloader picks slot 1 (staging) since
+# version 2 > version 1. VTOR should be in staging slot range.
+success_criteria:
+  vtor_in_slot: staging
+
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  # Riotboot is stateless XIP — 0 NVM writes during boot.
+  # Set max_writes=0 to skip calibration and run control-only.
+  max_writes: 0
+  max_writes_cap: 100000
+  run_duration: "0.5"
+  max_step_limit: 5000000
+
+expect:
+  # XIP bootloader does 0 NVM writes = nothing to fault = 0 bricks.
+  should_find_issues: false

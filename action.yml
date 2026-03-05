@@ -1,0 +1,114 @@
+name: Tardigrade OTA Resilience Audit
+description: >
+  Run fault-injection testing against an embedded bootloader.
+  Provide a profile YAML and bootloader ELF; Tardigrade installs Renode,
+  injects faults at every NVM write point, and returns a verdict.
+
+inputs:
+  profile:
+    description: Path to profile YAML (relative to caller's workspace)
+    required: true
+  quick:
+    description: Smoke test only (first/middle/last fault points)
+    required: false
+    default: "true"
+  renode-url:
+    description: Renode portable tarball URL
+    required: false
+    default: https://builds.renode.io/renode-latest.linux-portable.tar.gz
+  workers:
+    description: Number of parallel Renode workers for sweep
+    required: false
+    default: "2"
+
+outputs:
+  verdict:
+    description: PASS or FAIL
+    value: ${{ steps.run.outputs.verdict }}
+  brick-rate:
+    description: Fraction of fault points that bricked the device
+    value: ${{ steps.run.outputs.brick_rate }}
+  report-path:
+    description: Path to JSON report for artifact upload
+    value: ${{ steps.run.outputs.report_path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Renode portable
+      shell: bash
+      run: |
+        set -euo pipefail
+        tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
+        python3 -c "import urllib.request; urllib.request.urlretrieve('${{ inputs.renode-url }}', '${tarball}')"
+        mkdir -p "${RUNNER_TEMP}/renode"
+        tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
+        python3 -m pip install -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+        echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
+
+    - name: Install Python dependencies
+      shell: bash
+      run: python3 -m pip install pyyaml
+
+    - name: Run audit
+      id: run
+      shell: bash
+      run: |
+        set -euo pipefail
+        TARDIGRADE="${{ github.action_path }}"
+        # Fix path inside Docker containers: host /home/runner/work maps to /__w
+        if [ ! -d "${TARDIGRADE}" ] && [ -d "/__w${TARDIGRADE#/home/runner/work}" ]; then
+          TARDIGRADE="/__w${TARDIGRADE#/home/runner/work}"
+        fi
+        REPORT="${RUNNER_TEMP}/tardigrade_report.json"
+        QUICK="${{ inputs.quick }}"
+
+        # Resolve profile to absolute path before cd'ing into the action dir.
+        PROFILE="$(cd "${GITHUB_WORKSPACE}" && realpath "${{ inputs.profile }}")"
+
+        # Remove stale report from prior invocation.
+        rm -f "${REPORT}"
+
+        args=(
+          --profile "${PROFILE}"
+          --output "${REPORT}"
+          --renode-test "${RUNNER_TEMP}/renode/renode-test"
+        )
+        if [ "${QUICK}" = "true" ]; then
+          args+=(--quick)
+        fi
+        WORKERS="${{ inputs.workers }}"
+        if [ -n "${WORKERS}" ] && [ "${WORKERS}" != "1" ]; then
+          args+=(--workers "${WORKERS}")
+        fi
+
+        cd "${TARDIGRADE}"
+        set +e
+        python3 scripts/audit_bootloader.py "${args[@]}"
+        audit_exit=$?
+        set -e
+
+        if [ ! -f "${REPORT}" ]; then
+          echo "verdict=FAIL" >> "${GITHUB_OUTPUT}"
+          echo "brick_rate=-1" >> "${GITHUB_OUTPUT}"
+          echo "report_path=" >> "${GITHUB_OUTPUT}"
+          echo "::error::Audit produced no report (exit ${audit_exit})"
+          exit 1
+        fi
+
+        verdict=$(python3 -c "import json,sys; r=json.load(open('${REPORT}')); print('PASS' if r['verdict']=='PASS' else 'FAIL')")
+        brick_rate=$(python3 -c "import json; r=json.load(open('${REPORT}')); print(r.get('summary',{}).get('runtime_sweep',{}).get('brick_rate',0))")
+
+        echo "verdict=${verdict}" >> "${GITHUB_OUTPUT}"
+        echo "brick_rate=${brick_rate}" >> "${GITHUB_OUTPUT}"
+        echo "report_path=${REPORT}" >> "${GITHUB_OUTPUT}"
+
+        if [ "${verdict}" = "FAIL" ]; then
+          echo "::error::Tardigrade verdict: FAIL (brick rate: ${brick_rate})"
+          exit 1
+        fi
+
+        # Non-zero audit exit with PASS verdict indicates infrastructure issue.
+        if [ "${audit_exit}" -ne 0 ]; then
+          echo "::warning::Audit exited ${audit_exit} but verdict was PASS"
+        fi

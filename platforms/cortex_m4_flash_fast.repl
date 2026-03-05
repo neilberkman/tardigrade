@@ -1,0 +1,86 @@
+// Fast nRF52840 platform for MCUboot execute-mode testing.
+//
+// Uses MappedMemory for the flash data region (0xC000-0xFFFFF) instead of
+// NVMemory. This gives tlib direct pointer access — reads and writes are
+// handled entirely in C without crossing to C#.
+//
+// Write tracking is done through the NVMC peripheral: nRF52 firmware must
+// set NVMC CONFIG=WEN before each flash word write and CONFIG=REN after.
+// NRF52NVMC counts these transitions as TotalWordWrites.
+//
+// Trade-off: no per-byte write tracking in flash, no partial-write fault
+// injection. Fault injection works by counting NVMC CONFIG transitions and
+// signaling via FaultFired. The test harness checks FaultFired to determine
+// if the target write was reached.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+
+// Bootloader code (0x00000-0x0BFFF) — fast MappedMemory for instruction fetch.
+boot_rom: Memory.MappedMemory @ sysbus 0x00000000
+    size: 0xC000
+
+// Writable flash (0x0C000-0xFFFFF) — MappedMemory for fast CPU access.
+// Write tracking is handled by NVMC CONFIG transitions, not by memory hooks.
+nvm: Memory.MappedMemory @ sysbus 0x0000C000
+    size: 0xF4000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x40000
+
+// FICR (Factory Information Configuration Registers) — nRF52840 defaults.
+ficr: Memory.MappedMemory @ sysbus 0x10000000
+    size: 0x1000
+
+// UICR (User Information Configuration Registers).
+uicr: Memory.MappedMemory @ sysbus 0x10001000
+    size: 0x1000
+
+// CLOCK peripheral stub — nRF52840 CLOCK at 0x40000000.
+clock: Memory.MappedMemory @ sysbus 0x40000000
+    size: 0x1000
+
+// UARTE0 — nRF52840 UART at 0x40002000.
+uarte0: UART.NRF52UARTE @ sysbus 0x40002000
+
+// RTC1 — Zephyr's system clock on nRF52840.
+rtc1: Timers.NRF52840_RTC @ sysbus 0x40011000
+    numberOfEvents: 3
+    -> nvic@17
+
+// NVMC — handles write/erase enable, page erase, and write counting.
+// Flash reference for MappedMemory erase operations.
+nvmc: Miscellaneous.NRF52NVMC @ sysbus 0x4001E000
+    Flash: nvm
+    FlashBaseAddress: 0x0000C000
+    FlashSize: 0xF4000
+    EraseFill: 0xFF
+    PageSize: 4096
+
+// Native trace replay helper for high-speed sweep reconstruction.
+trace_replay: Memory.TraceReplayEngine @ sysbus 0x4002F000
+    Target: nvm
+    TargetBaseAddress: 0x0000C000
+
+sysbus:
+    init:
+        Tag <0x00000000 0xC000> "BOOT_ROM"
+        Tag <0x0000C000 0xF4000> "NVM_FLASH"
+        Tag <0x20000000 0x40000> "SRAM"
+        Tag <0x4001E000 0x1000> "NVMC"
+        Tag <0x4002F000 0x100> "TRACE_REPLAY"
+        Tag <0x10000000 0x1000> "FICR"
+        Tag <0x10001000 0x1000> "UICR"
+        Tag <0x40000000 0x1000> "CLOCK"
+        // FICR: nRF52840 factory values.
+        WriteDoubleWord 0x10000010 0x1000
+        WriteDoubleWord 0x10000014 0x100
+        // CLOCK: HFCLKSTARTED event at offset 0x100 = ready.
+        WriteDoubleWord 0x40000100 0x1
+        // HFCLKSTAT — running + source HFXO.
+        WriteDoubleWord 0x40000418 0x10001
+        Tag <0x40002000 0x1000> "UARTE0"

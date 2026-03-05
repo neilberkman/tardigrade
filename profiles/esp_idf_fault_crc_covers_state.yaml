@@ -1,0 +1,48 @@
+schema_version: 1
+name: esp_idf_fault_crc_covers_state
+description: >
+  ESP-IDF OTA model where CRC covers ota_seq+ota_state (8 bytes) instead
+  of just ota_seq (4 bytes). Upgrade scenario: bootloader writes
+  NEW→PENDING_VERIFY, changing ota_state. But the CRC was computed over
+  the OLD state value, so on next boot the entry appears corrupt.
+  Effectively self-corrupts its own otadata on every state transition.
+
+platform: platforms/cortex_m4_flash_fast.repl
+bootloader:
+  elf: examples/esp_idf_ota/esp_idf_fault_crc_covers_state.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x74000 }
+    staging: { base: 0x00080000, size: 0x74000 }
+images:
+  exec: examples/esp_idf_ota/slot0.bin
+  staging: examples/esp_idf_ota/slot1.bin
+pre_boot_state:
+  - { address: 0x000F8000, u32: 0x00000001 }
+  - { address: 0x000F8018, u32: 0x00000002 }
+  # CRC seeded for this defect model: covers ota_seq+ota_state (8 bytes).
+  - { address: 0x000F801C, u32: 0x995C37EA }
+  - { address: 0x000F9000, u32: 0x00000002 }
+  - { address: 0x000F9018, u32: 0x00000000 }
+  # CRC seeded for this defect model: covers ota_seq+ota_state (8 bytes).
+  - { address: 0x000F901C, u32: 0xBDDAF882 }
+  # Trigger one-shot copy-on-boot path (magic at UPDATE_REQ_ADDR).
+  - { address: 0x000FC040, u32: 0x55445021 }
+success_criteria: {}
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 20000000
+  fault_types: [power_loss, interrupted_erase]
+expect:
+  # CRC mismatch makes both entries appear invalid -> bootloader falls back
+  # to slot 0 default. Power-loss tolerant: no bricks, just always
+  # boots slot 0 regardless of otadata content. A correctness bug, not
+  # a power-loss vulnerability.
+  should_find_issues: false

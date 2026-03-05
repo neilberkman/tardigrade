@@ -1,0 +1,12 @@
+# Expects monitor variable $repo_root to point at repository root.
+
+mach create
+
+python """
+repo_root = str(monitor.GetVariable('repo_root'))
+monitor.ExecuteCommand('machine LoadPlatformDescription @' + repo_root + '/platforms/cortex_m0_nvm.repl')
+
+bus = monitor.Machine.SystemBus
+bus.LoadELF(repo_root + '/examples/vulnerable_ota/firmware.elf')
+bus.LoadBinary(repo_root + '/examples/test_image.bin', 0x10038000)
+"""

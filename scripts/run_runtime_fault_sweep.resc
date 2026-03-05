@@ -1,0 +1,2480 @@
+# Runtime fault sweep for profile-driven OTA bootloader auditing.
+#
+# Two evaluation modes:
+#   state   — Python-side simulation: read staging, write to exec word-by-word,
+#             inject partial write at fault_at.  Fast (~seconds).
+#   execute — Full CPU boot: arm FaultAtWordWrite, machine Reset, RunFor.
+#             Slow but truly zero-knowledge.
+#
+# Two platform paths:
+#   slow (NVMemory + NVMemoryController) — per-write tracking via C# callbacks.
+#   fast (MappedMemory + NVMC CONFIG tracking) — write counting via NVMC
+#         CONFIG WEN->REN transitions.  Much faster for bootloaders that do
+#         significant flash reads (SHA-256 etc).
+#
+# The script auto-detects which path based on whether 'sysbus.nvm_ctrl' exists.
+#
+# Batch mode: set $fault_points_csv to a comma-separated list of fault point
+# indices (e.g. "0,100,500,1000").  The script loops over all points in a
+# single Renode session, reloading images between iterations.  Result file
+# contains a JSON array of per-point results.
+#
+# Single mode: leave $fault_points_csv empty and set $fault_at to run one point.
+#
+# Required monitor variables:
+#   $result_file (string)     — where to write JSON result
+#   $repo_root (string)       — repository root path
+#
+# Required from profile (via robot vars):
+#   $bootloader_elf (string)  — path to bootloader ELF
+#   $bootloader_entry (int)   — entry point / VTOR base
+#   $run_duration (string)    — emulation run time in seconds
+#   $max_writes_cap (int)     — safety cap for calibration
+#   $evaluation_mode (string) — "state" or "execute"
+
+$fault_at?=0
+$fault_points_csv?=""
+$calibration_mode?=false
+$evaluation_mode?="state"
+$run_duration?="0.01"
+$max_step_limit?=5000000
+$max_writes_cap?=100000
+$pre_boot_state_bin?=""
+$setup_script?=""
+$success_vtor_slot?="exec"
+$success_pc_slot?=""
+$success_marker_addr?=0
+$success_marker_value?=0
+$write_granularity?=8
+$image_staging_path?=""
+$image_exec_path?=""
+$trace_file?=""
+$erase_trace_file?=""
+$trace_file_bin?=""
+$erase_trace_file_bin?=""
+$fault_types?="write"
+$fault_type_csv?=""
+$success_image_hash?="false"
+$success_image_hash_slot?=""
+$image_exec_sha256?=""
+$image_staging_sha256?=""
+$expected_exec_sha256?=""
+$success_otadata_expect?=""
+$success_otadata_expect_scope?="always"
+$progress_stall_timeout_s?="20"
+$expect_control_outcome?=""
+$no_boot_zero_write_slices?="10"
+$no_boot_min_emulated_s?="0.1"
+$sweep_diff_lookahead?="2147483647"
+$hash_bypass_symbols?=""
+$postmortem_dump_no_boot?="true"
+$postmortem_dump_header_bytes?="4096"
+$resume_trace_no_boot?="true"
+$resume_trace_max_ops?="1024"
+$resume_trace_time_slice?="0.02"
+$resume_trace_wall_timeout_s?="30"
+
+python """
+import json
+import struct
+import sys
+import time as _time
+
+def log(msg):
+    sys.stderr.write('[resc] {}\n'.format(msg))
+    sys.stderr.flush()
+
+bus = monitor.Machine.SystemBus
+
+# ---------------------------------------------------------------------------
+# Auto-detect platform path: slow (NVMemory) vs fast (MappedMemory + NVMC).
+# ---------------------------------------------------------------------------
+try:
+    _nvm_ctrl = monitor.Machine['sysbus.nvm_ctrl']
+    USE_FAST_PATH = False
+except:
+    USE_FAST_PATH = True
+
+_cached_erase_page = None
+_cached_initial_flash = None
+
+if USE_FAST_PATH:
+    nvmc = monitor.Machine['sysbus.nvmc']
+else:
+    ctrl = monitor.Machine['sysbus.nvm_ctrl']
+
+# Read monitor variables.
+result_file = str(monitor.GetVariable('result_file'))
+calibration_mode = str(monitor.GetVariable('calibration_mode')).lower() in ('1', 'true', 'yes')
+evaluation_mode = str(monitor.GetVariable('evaluation_mode')).strip().lower()
+if evaluation_mode not in ('execute', 'state'):
+    evaluation_mode = 'state'
+run_duration = str(monitor.GetVariable('run_duration'))
+max_step_limit = int(monitor.GetVariable('max_step_limit'))
+max_writes_cap = int(monitor.GetVariable('max_writes_cap'))
+progress_stall_timeout_raw = str(monitor.GetVariable('progress_stall_timeout_s')).strip()
+try:
+    progress_stall_timeout_s = float(progress_stall_timeout_raw)
+except Exception:
+    progress_stall_timeout_s = 20.0
+if progress_stall_timeout_s < 0:
+    progress_stall_timeout_s = 0.0
+expect_control_outcome = str(monitor.GetVariable('expect_control_outcome')).strip().lower()
+no_boot_zero_write_slices_raw = str(monitor.GetVariable('no_boot_zero_write_slices')).strip()
+no_boot_min_emulated_s_raw = str(monitor.GetVariable('no_boot_min_emulated_s')).strip()
+try:
+    no_boot_zero_write_slices = int(no_boot_zero_write_slices_raw)
+except Exception:
+    no_boot_zero_write_slices = 10
+if no_boot_zero_write_slices < 1:
+    no_boot_zero_write_slices = 1
+try:
+    no_boot_min_emulated_s = float(no_boot_min_emulated_s_raw)
+except Exception:
+    no_boot_min_emulated_s = 0.1
+if no_boot_min_emulated_s < 0:
+    no_boot_min_emulated_s = 0.0
+sweep_diff_lookahead_raw = str(monitor.GetVariable('sweep_diff_lookahead')).strip()
+try:
+    sweep_diff_lookahead = int(sweep_diff_lookahead_raw, 0)
+except Exception:
+    sweep_diff_lookahead = 2147483647
+if sweep_diff_lookahead < 1:
+    sweep_diff_lookahead = 1
+if sweep_diff_lookahead > 2147483647:
+    sweep_diff_lookahead = 2147483647
+postmortem_dump_no_boot = str(monitor.GetVariable('postmortem_dump_no_boot')).strip().lower() in ('1', 'true', 'yes')
+postmortem_dump_header_bytes_raw = str(monitor.GetVariable('postmortem_dump_header_bytes')).strip()
+try:
+    postmortem_dump_header_bytes = int(postmortem_dump_header_bytes_raw, 0)
+except Exception:
+    postmortem_dump_header_bytes = 4096
+if postmortem_dump_header_bytes < 32:
+    postmortem_dump_header_bytes = 32
+resume_trace_no_boot = str(monitor.GetVariable('resume_trace_no_boot')).strip().lower() in ('1', 'true', 'yes')
+resume_trace_max_ops_raw = str(monitor.GetVariable('resume_trace_max_ops')).strip()
+try:
+    resume_trace_max_ops = int(resume_trace_max_ops_raw, 0)
+except Exception:
+    resume_trace_max_ops = 1024
+if resume_trace_max_ops < 1:
+    resume_trace_max_ops = 1
+resume_trace_time_slice = str(monitor.GetVariable('resume_trace_time_slice')).strip()
+if not resume_trace_time_slice:
+    resume_trace_time_slice = '0.02'
+resume_trace_wall_timeout_raw = str(monitor.GetVariable('resume_trace_wall_timeout_s')).strip()
+try:
+    resume_trace_wall_timeout_s = float(resume_trace_wall_timeout_raw)
+except Exception:
+    resume_trace_wall_timeout_s = 30.0
+if resume_trace_wall_timeout_s <= 0:
+    resume_trace_wall_timeout_s = 30.0
+
+# Batch vs single mode.
+fault_points_csv = str(monitor.GetVariable('fault_points_csv')).strip()
+if fault_points_csv:
+    fault_points = [int(x.strip()) for x in fault_points_csv.split(',') if x.strip()]
+else:
+    fault_points = [int(monitor.GetVariable('fault_at'))]
+batch_mode = len(fault_points) > 1 or bool(fault_points_csv)
+
+# Slot geometry.
+slot_exec_base = int(str(monitor.GetVariable('slot_exec_base')), 0)
+slot_exec_size = int(str(monitor.GetVariable('slot_exec_size')), 0)
+slot_staging_base = int(str(monitor.GetVariable('slot_staging_base')), 0)
+slot_staging_size = int(str(monitor.GetVariable('slot_staging_size')), 0)
+sram_start = int(str(monitor.GetVariable('sram_start')), 0)
+sram_end = int(str(monitor.GetVariable('sram_end')), 0)
+bootloader_entry = int(str(monitor.GetVariable('bootloader_entry')), 0)
+bootloader_elf = str(monitor.GetVariable('bootloader_elf')).strip()
+write_granularity = int(str(monitor.GetVariable('write_granularity')).strip())
+
+# Image paths for reload between batch iterations.
+image_staging_path = str(monitor.GetVariable('image_staging_path')).strip()
+image_exec_path = str(monitor.GetVariable('image_exec_path')).strip()
+
+# Success criteria.
+success_vtor_slot = str(monitor.GetVariable('success_vtor_slot')).strip()
+success_pc_slot_raw = str(monitor.GetVariable('success_pc_slot')).strip()
+success_pc_slot = success_pc_slot_raw if success_pc_slot_raw else None
+
+success_marker_addr_raw = str(monitor.GetVariable('success_marker_addr')).strip()
+success_marker_value_raw = str(monitor.GetVariable('success_marker_value')).strip()
+success_marker_addr = int(success_marker_addr_raw, 0) if success_marker_addr_raw and success_marker_addr_raw != '0' else 0
+success_marker_value = int(success_marker_value_raw, 0) if success_marker_value_raw and success_marker_value_raw != '0' else 0
+
+# Image hash mode.
+success_image_hash = str(monitor.GetVariable('success_image_hash')).strip().lower() in ('1', 'true', 'yes')
+success_image_hash_slot = str(monitor.GetVariable('success_image_hash_slot')).strip()
+image_exec_sha256 = str(monitor.GetVariable('image_exec_sha256')).strip()
+image_staging_sha256 = str(monitor.GetVariable('image_staging_sha256')).strip()
+expected_exec_sha256 = str(monitor.GetVariable('expected_exec_sha256')).strip()
+success_otadata_expect_raw = str(monitor.GetVariable('success_otadata_expect')).strip()
+success_otadata_expect_scope = str(monitor.GetVariable('success_otadata_expect_scope')).strip().lower()
+if success_otadata_expect_scope not in ('always', 'control'):
+    success_otadata_expect_scope = 'always'
+
+# Pre-boot state binary.
+pre_boot_bin = str(monitor.GetVariable('pre_boot_state_bin')).strip()
+
+# Setup script.
+setup_script = str(monitor.GetVariable('setup_script')).strip()
+
+# Fault type support: 'write', 'erase', or 'both'.
+# fault_types controls which operations are tracked during calibration.
+# fault_type_csv provides per-fault-point type:
+#   write-based: 'w' power_loss, 'b' bit_corruption, 's' silent_write_failure,
+#                'd' write_disturb, 'l' wear_leveling_corruption,
+#                'r' write_rejection, 't' reset_at_time
+#   erase-based: 'e' interrupted_erase, 'a' multi_sector_atomicity
+fault_types_raw = str(monitor.GetVariable('fault_types')).strip().lower()
+if fault_types_raw in ('both', 'write_and_erase', 'write,erase'):
+    fault_types_mode = 'both'
+elif fault_types_raw == 'erase':
+    fault_types_mode = 'erase'
+else:
+    fault_types_mode = 'write'
+
+fault_type_csv_raw = str(monitor.GetVariable('fault_type_csv')).strip()
+if fault_type_csv_raw:
+    fault_type_list = [x.strip() for x in fault_type_csv_raw.split(',') if x.strip()]
+else:
+    fault_type_list = []
+
+# Slot lookup table.
+slot_ranges = {
+    'exec': (slot_exec_base, slot_exec_base + slot_exec_size),
+    'staging': (slot_staging_base, slot_staging_base + slot_staging_size),
+}
+
+# Sticky state for VTOR detection during execute runs.
+sticky_vtor = {'value': 0, 'slot': None, 'captured': False}
+
+def on_vtor_write(val):
+    if sticky_vtor['captured']:
+        return
+    v = as_int(val)
+    if v == 0:
+        return
+    for sn, (s_lo, s_hi) in slot_ranges.items():
+        if s_lo <= v < s_hi:
+            sticky_vtor['value'] = v
+            sticky_vtor['slot'] = sn
+            sticky_vtor['captured'] = True
+            log('vtor_sticky: captured {} at {}'.format(sn, fmt_u32(v)))
+            break
+
+def arm_vtor_watchpoint():
+    sticky_vtor['value'] = 0
+    sticky_vtor['slot'] = None
+    sticky_vtor['captured'] = False
+    try:
+        # VTOR is at 0xE000ED08.  Watch for writes.
+        bus.AddWatchpoint(0xE000ED08, 4, 'on_vtor_write(value)')
+    except:
+        pass
+
+def disarm_vtor_watchpoint():
+    try:
+        bus.RemoveWatchpoint(0xE000ED08)
+    except:
+        pass
+
+# ---------------------------------------------------------------------------
+# Hash bypass: skip hash validation functions for faster Phase 2 emulation.
+# Patches flash with Thumb instructions (movs r0,#0; bx lr) so the function
+# returns 0 immediately.  Applied after each reload_images_cached() since the
+# image restore overwrites the patch.
+# ---------------------------------------------------------------------------
+_hash_bypass_symbols_raw = str(monitor.GetVariable('hash_bypass_symbols')).strip()
+_hash_bypass_patches = []
+if _hash_bypass_symbols_raw and USE_FAST_PATH:
+    for sym_name in _hash_bypass_symbols_raw.split(','):
+        sym_name = sym_name.strip()
+        if not sym_name:
+            continue
+        try:
+            addr = int(bus.GetSymbolAddress(sym_name))
+            addr = addr & ~1  # Clear Thumb bit
+            _hash_bypass_patches.append((addr, sym_name))
+            log('hash_bypass: {}={}'.format(sym_name, fmt_u32(addr)))
+        except Exception as e:
+            log('hash_bypass: symbol {} not found ({})'.format(sym_name, e))
+
+def apply_hash_bypass():
+    # ARM Thumb: movs r0, #0 + bx lr = return 0.  Little-endian 32-bit: 0x47702000.
+    # Write via sysbus so it works regardless of which memory region the symbol is in
+    # (boot_rom vs nvm flash).
+    for addr, sym_name in _hash_bypass_patches:
+        bus.WriteDoubleWord(addr, 0x47702000)
+
+_hash_bypass_active = len(_hash_bypass_patches) > 0
+if _hash_bypass_active:
+    log('hash_bypass: {} symbols resolved'.format(len(_hash_bypass_patches)))
+
+# Total words in the copy (for state mode).
+total_copy_writes = slot_exec_size // write_granularity
+
+# ESP-IDF otadata entry bases (used for post-boot state signals).
+OTADATA_ENTRY0_BASE = 0x000F8000
+OTADATA_ENTRY1_BASE = 0x000F9000
+OTADATA_SEQ_OFF = 0x00
+OTADATA_STATE_OFF = 0x18
+OTADATA_CRC_OFF = 0x1C
+
+OTADATA_STATE_NAMES = {
+    0x00000000: 'NEW',
+    0x00000001: 'PENDING_VERIFY',
+    0x00000002: 'VALID',
+    0x00000003: 'INVALID',
+    0x00000004: 'ABORTED',
+    0xFFFFFFFF: 'UNDEFINED',
+}
+
+def as_int(value):
+    try:
+        return int(value)
+    except Exception:
+        try:
+            return int(str(value), 0)
+        except Exception:
+            return 0
+
+def fmt_u32(value):
+    return '0x{0:08X}'.format(as_int(value) & 0xFFFFFFFF)
+
+def fmt_hex32(value):
+    return '{0:08X}'.format(as_int(value) & 0xFFFFFFFF)
+
+def fmt_u8(value):
+    return '0x{0:02X}'.format(as_int(value) & 0xFF)
+
+def normalize_signal_token(value):
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if value is None:
+        return ''
+    text = str(value).strip()
+    if not text:
+        return ''
+    low = text.lower()
+    if low in ('true', 'false'):
+        return low
+    try:
+        parsed = int(text, 0)
+    except ValueError:
+        return text
+    return fmt_u32(parsed)
+
+def to_py_bytes(raw):
+    if raw is None:
+        return None
+    try:
+        return bytes(raw)
+    except Exception:
+        return bytes((int(x) & 0xFF) for x in raw)
+
+def effective_page_size():
+    if USE_FAST_PATH:
+        try:
+            p = int(nvmc.PageSize)
+            if p > 0:
+                return p
+        except Exception:
+            pass
+    return 4096
+
+def flash_geometry():
+    if USE_FAST_PATH:
+        return int(nvmc.FlashBaseAddress), int(nvmc.FlashSize)
+    try:
+        return int(slot_exec_base), int(ctrl.Nvm.Size)
+    except Exception:
+        return int(slot_exec_base), int(slot_exec_size + slot_staging_size)
+
+def read_flash_span(start_addr, size, snapshot_bytes=None):
+    if size <= 0:
+        return b''
+    flash_base, flash_size = flash_geometry()
+    rel = int(start_addr) - int(flash_base)
+    if rel < 0 or rel >= flash_size:
+        return b''
+    max_len = min(int(size), flash_size - rel)
+    if max_len <= 0:
+        return b''
+    if snapshot_bytes is not None:
+        return bytes(snapshot_bytes[rel:rel + max_len])
+    if USE_FAST_PATH:
+        return to_py_bytes(nvmc.Flash.ReadBytes(rel, max_len))
+    return bytes((as_int(bus.ReadByte(start_addr + i)) & 0xFF) for i in range(max_len))
+
+def region_dump(region_bytes, region_addr):
+    import base64
+    import hashlib
+    non_ff = []
+    for i, b in enumerate(region_bytes):
+        if b != 0xFF:
+            non_ff.append({
+                'offset': i,
+                'address': fmt_u32(region_addr + i),
+                'value': fmt_u8(b),
+            })
+    non_ff_preview = non_ff[:512]
+    return {
+        'address': fmt_u32(region_addr),
+        'size': len(region_bytes),
+        'all_ff': len(non_ff) == 0,
+        'non_ff_count': len(non_ff),
+        'non_ff_preview': non_ff_preview,
+        'non_ff_preview_truncated': len(non_ff) > len(non_ff_preview),
+        'sha256': hashlib.sha256(region_bytes).hexdigest(),
+        'raw_base64': base64.b64encode(region_bytes).decode('ascii'),
+    }
+
+def evaluate_slot_header(slot_base, slot_size, header_bytes):
+    if len(header_bytes) < 8:
+        return {
+            'valid': False,
+            'reason': 'header_too_small',
+        }
+    sp = struct.unpack_from('<I', header_bytes, 0)[0]
+    reset_vector = struct.unpack_from('<I', header_bytes, 4)[0]
+    reset_pc = reset_vector & ~1
+    valid = (
+        sram_start <= sp <= sram_end
+        and (reset_vector & 1) == 1
+        and slot_base <= reset_pc < (slot_base + slot_size)
+    )
+    return {
+        'valid': bool(valid),
+        'sp': fmt_u32(sp),
+        'reset_vector': fmt_u32(reset_vector),
+        'reset_pc': fmt_u32(reset_pc),
+    }
+
+def summarize_slot_sectors(slot_bytes, sector_size):
+    sector_size = max(1, int(sector_size))
+    sectors = []
+    erased = []
+    non_erased = []
+    count = (len(slot_bytes) + sector_size - 1) // sector_size
+    for idx in range(count):
+        off = idx * sector_size
+        chunk = slot_bytes[off:off + sector_size]
+        is_erased = all(b == 0xFF for b in chunk)
+        sectors.append({
+            'index': idx,
+            'all_ff': bool(is_erased),
+        })
+        if is_erased:
+            erased.append(idx)
+        else:
+            non_erased.append(idx)
+    return {
+        'count': count,
+        'sector_size': sector_size,
+        'erased_indices': erased,
+        'non_erased_indices': non_erased,
+        'map': sectors,
+    }
+
+def decode_trailer_flags(slot_base, slot_size, trailer_bytes):
+    trailer_len = len(trailer_bytes)
+    if trailer_len < 32:
+        return {'available': False}
+    trailer_base = slot_base + slot_size - trailer_len
+    copy_done = struct.unpack_from('<I', trailer_bytes, trailer_len - 32)[0]
+    image_ok = struct.unpack_from('<I', trailer_bytes, trailer_len - 24)[0]
+    swap_info = struct.unpack_from('<I', trailer_bytes, trailer_len - 20)[0]
+    magic_words = [
+        struct.unpack_from('<I', trailer_bytes, trailer_len - 16 + i * 4)[0]
+        for i in range(4)
+    ]
+    non_ff_status = []
+    status_end = max(0, trailer_len - 32)
+    for i in range(status_end):
+        b = trailer_bytes[i]
+        if b != 0xFF:
+            non_ff_status.append({
+                'offset': i,
+                'address': fmt_u32(trailer_base + i),
+                'value': fmt_u8(b),
+            })
+    status_preview = non_ff_status[:512]
+    return {
+        'available': True,
+        'copy_done': fmt_u32(copy_done),
+        'image_ok': fmt_u32(image_ok),
+        'swap_info': fmt_u32(swap_info),
+        'magic': [fmt_u32(m) for m in magic_words],
+        'status_non_ff_count': len(non_ff_status),
+        'status_non_ff_preview': status_preview,
+        'status_non_ff_preview_truncated': len(non_ff_status) > len(status_preview),
+    }
+
+def build_slot_partition_dump(slot_name, slot_base, slot_size, snapshot_bytes=None):
+    slot_data = read_flash_span(slot_base, slot_size, snapshot_bytes=snapshot_bytes)
+    page_size = effective_page_size()
+    header_len = min(max(32, postmortem_dump_header_bytes), slot_size)
+    trailer_len = min(page_size, slot_size)
+    header = slot_data[:header_len]
+    trailer = slot_data[max(0, slot_size - trailer_len):slot_size]
+    return {
+        'name': slot_name,
+        'base': fmt_u32(slot_base),
+        'size': slot_size,
+        'sector_summary': summarize_slot_sectors(slot_data, page_size),
+        'header': region_dump(header, slot_base),
+        'header_eval': evaluate_slot_header(slot_base, slot_size, header),
+        'trailer': region_dump(trailer, slot_base + slot_size - trailer_len),
+        'trailer_flags': decode_trailer_flags(slot_base, slot_size, trailer),
+    }
+
+def build_postmortem_partition_dump(snapshot_bytes=None, source='live_flash'):
+    return {
+        'source': source,
+        'header_region_bytes': postmortem_dump_header_bytes,
+        'sector_size': effective_page_size(),
+        'slots': {
+            'exec': build_slot_partition_dump('exec', slot_exec_base, slot_exec_size, snapshot_bytes=snapshot_bytes),
+            'staging': build_slot_partition_dump('staging', slot_staging_base, slot_staging_size, snapshot_bytes=snapshot_bytes),
+        },
+    }
+
+def parse_otadata_expect(raw):
+    parsed = {}
+    if not raw:
+        return parsed
+    for pair in raw.split(';'):
+        pair = pair.strip()
+        if not pair or '=' not in pair:
+            continue
+        key, values_raw = pair.split('=', 1)
+        key = key.strip()
+        if not key:
+            continue
+        values = []
+        for item in values_raw.split('|'):
+            token = normalize_signal_token(item)
+            if token:
+                values.append(token)
+        if values:
+            parsed[key] = values
+    return parsed
+
+success_otadata_expect = parse_otadata_expect(success_otadata_expect_raw)
+
+def read_otadata_entry(base_addr):
+    seq = as_int(bus.ReadDoubleWord(base_addr + OTADATA_SEQ_OFF))
+    state_raw = as_int(bus.ReadDoubleWord(base_addr + OTADATA_STATE_OFF))
+    crc_raw = as_int(bus.ReadDoubleWord(base_addr + OTADATA_CRC_OFF))
+    state_name = OTADATA_STATE_NAMES.get(state_raw, 'UNKNOWN')
+    return {
+        'seq_raw': seq & 0xFFFFFFFF,
+        'state_raw': state_raw & 0xFFFFFFFF,
+        'state_name': state_name,
+        'crc_raw': crc_raw & 0xFFFFFFFF,
+    }
+
+def select_otadata_active_entry(entry0, entry1):
+    # Mirrors ESP-IDF's "higher seq wins" behavior for observability.
+    seq0 = entry0['seq_raw']
+    seq1 = entry1['seq_raw']
+    if seq0 == seq1:
+        return 'tie'
+    return 'entry0' if seq0 > seq1 else 'entry1'
+
+def collect_otadata_signals():
+    # Best-effort only; some profiles may not model ESP-IDF otadata.
+    try:
+        e0 = read_otadata_entry(OTADATA_ENTRY0_BASE)
+        e1 = read_otadata_entry(OTADATA_ENTRY1_BASE)
+    except Exception:
+        return {
+            'otadata_available': False,
+        }
+
+    digest = '{0}|{1}'.format(
+        '{}:{}:{}'.format(
+            fmt_hex32(e0['seq_raw']),
+            fmt_hex32(e0['state_raw']),
+            fmt_hex32(e0['crc_raw']),
+        ),
+        '{}:{}:{}'.format(
+            fmt_hex32(e1['seq_raw']),
+            fmt_hex32(e1['state_raw']),
+            fmt_hex32(e1['crc_raw']),
+        ),
+    )
+
+    return {
+        'otadata_available': True,
+        'otadata_active_entry': select_otadata_active_entry(e0, e1),
+        'otadata_digest': digest,
+        'otadata0_seq': fmt_u32(e0['seq_raw']),
+        'otadata0_state': fmt_u32(e0['state_raw']),
+        'otadata0_state_name': e0['state_name'],
+        'otadata0_crc': fmt_u32(e0['crc_raw']),
+        'otadata1_seq': fmt_u32(e1['seq_raw']),
+        'otadata1_state': fmt_u32(e1['state_raw']),
+        'otadata1_state_name': e1['state_name'],
+        'otadata1_crc': fmt_u32(e1['crc_raw']),
+    }
+
+# ---------------------------------------------------------------------------
+# Write tracking abstraction: slow path (NVMemory) vs fast path (NVMC).
+# ---------------------------------------------------------------------------
+def get_total_writes():
+    if USE_FAST_PATH:
+        return int(nvmc.TotalWordWrites)
+    return int(ctrl.Nvm.TotalWordWrites)
+
+def get_total_erases():
+    if USE_FAST_PATH:
+        return int(nvmc.TotalPageErases)
+    return 0  # Slow path doesn't track erases.
+
+def arm_fault(absolute_write_index, write_fault_mode=0):
+    if USE_FAST_PATH:
+        nvmc.WriteFaultMode = write_fault_mode
+        nvmc.FaultAtWordWrite = absolute_write_index
+        nvmc.FaultFired = False
+    else:
+        ctrl.Nvm.WriteFaultMode = write_fault_mode
+        ctrl.Nvm.FaultAtWordWrite = absolute_write_index
+        ctrl.Nvm.FaultEverFired = False
+
+def arm_erase_fault(absolute_erase_index, erase_fault_mode=0):
+    if USE_FAST_PATH:
+        nvmc.EraseFaultMode = erase_fault_mode
+        nvmc.FaultAtPageErase = absolute_erase_index
+        nvmc.EraseFaultFired = False
+
+def disarm_fault():
+    if USE_FAST_PATH:
+        nvmc.FaultAtWordWrite = 18446744073709551615
+        nvmc.FaultAtPageErase = 18446744073709551615
+    else:
+        ctrl.Nvm.FaultAtWordWrite = 18446744073709551615
+
+def disarm_write_fault():
+    if USE_FAST_PATH:
+        nvmc.FaultAtWordWrite = 18446744073709551615
+    else:
+        ctrl.Nvm.FaultAtWordWrite = 18446744073709551615
+
+def disarm_erase_fault():
+    if USE_FAST_PATH:
+        nvmc.FaultAtPageErase = 18446744073709551615
+
+def was_fault_injected():
+    if USE_FAST_PATH:
+        return bool(nvmc.FaultFired) or bool(nvmc.EraseFaultFired)
+    return bool(ctrl.Nvm.FaultEverFired)
+
+def was_write_fault_injected():
+    if USE_FAST_PATH:
+        return bool(nvmc.FaultFired)
+    return bool(ctrl.Nvm.FaultEverFired)
+
+def was_erase_fault_injected():
+    if USE_FAST_PATH:
+        return bool(nvmc.EraseFaultFired)
+    return False
+
+def get_last_write_address():
+    if USE_FAST_PATH:
+        try:
+            return int(nvmc.LastFaultAddress)
+        except Exception:
+            return 0
+    return int(ctrl.Nvm.LastWriteAddress)
+
+def apply_pre_boot_state():
+    if pre_boot_bin:
+        with open(pre_boot_bin, 'rb') as f:
+            pbs_data = f.read()
+        for i in range(0, len(pbs_data), 8):
+            addr, val = struct.unpack_from('<II', pbs_data, i)
+            bus.WriteDoubleWord(addr, val)
+    if setup_script:
+        monitor.Parse('include @' + setup_script)
+
+def restore_hw_init():
+    # Restore hardware init values cleared by machine Reset.
+    # These are nRF52 NVMC/FICR registers needed for correct operation.
+    bus.WriteDoubleWord(0x10000010, 0x1000)
+    bus.WriteDoubleWord(0x10000014, 0x100)
+    bus.WriteDoubleWord(0x40000100, 0x1)
+    bus.WriteDoubleWord(0x40000418, 0x10001)
+
+def reset_nvmc_for_sweep():
+    # Reset NVMC counters and prepare for fault-injected run.
+    if USE_FAST_PATH:
+        # Keep default as full diff for index precision, but allow profile/CLI
+        # overrides for performance experiments.
+        nvmc.DiffLookahead = sweep_diff_lookahead
+        nvmc.TotalWordWrites = 0
+        nvmc.TotalPageErases = 0
+        nvmc.WriteFaultMode = 0
+        nvmc.EraseFaultMode = 0
+        nvmc.FaultFired = False
+        nvmc.EraseFaultFired = False
+        nvmc.LastFaultAddress = 0
+        nvmc.FaultFlashSnapshot = None
+        # Shadow scanning: enable for NRF52-style controllers (WEN batches
+        # multiple writes, needs diff to count them).  Skip for STM32F4-style
+        # controllers where each PG deactivation = exactly 1 word write —
+        # shadow scanning adds 1MB ReadBytes per write with no accuracy benefit.
+        try:
+            if getattr(nvmc, 'PerWriteAccurate', False):
+                nvmc.SkipShadowScan = True
+            else:
+                nvmc.SkipShadowScan = False
+                nvmc.InvalidateShadow()
+        except Exception:
+            pass  # NRF52NVMC doesn't have these
+    else:
+        ctrl.Nvm.TotalWordWrites = 0
+        ctrl.Nvm.FaultEverFired = False
+
+def reset_nvmc_for_recovery():
+    # Reset NVMC for recovery boot: no write counting needed, fast mode.
+    if USE_FAST_PATH:
+        nvmc.DiffLookahead = 32
+        nvmc.TotalWordWrites = 0
+        nvmc.TotalPageErases = 0
+        nvmc.WriteFaultMode = 0
+        nvmc.EraseFaultMode = 0
+        nvmc.FaultFired = False
+        nvmc.EraseFaultFired = False
+        nvmc.LastFaultAddress = 0
+        # Skip shadow scanning during recovery boot — just count PG transitions
+        # for progress tracking. Avoids O(flash_size) ReadBytes per write.
+        try:
+            nvmc.SkipShadowScan = True
+        except Exception:
+            pass  # NRF52NVMC doesn't have this property
+        disarm_fault()
+    else:
+        ctrl.Nvm.TotalWordWrites = 0
+        ctrl.Nvm.FaultEverFired = False
+        disarm_fault()
+
+def restore_flash_and_boot(saved_flash):
+    # Common pattern: reset machine, restore flash snapshot, reload ELF,
+    # restore hw init. Used after Phase 1 fault to set up recovery boot.
+    monitor.Parse('machine Reset')
+    monitor.Parse('machine Pause')
+    flash_ref = nvmc.Flash
+    flash_ref.WriteBytes(0, saved_flash)
+    bus.LoadELF(bootloader_elf)
+    restore_hw_init()
+
+def reload_images():
+    # Restore flash to pre-test state by erasing, then reloading images.
+    # Ensure machine is paused before loading binaries.
+    try:
+        monitor.Parse('machine Pause')
+    except:
+        pass
+    if USE_FAST_PATH:
+        # Fast path: fill MappedMemory with 0xFF (erased state).
+        # Use page-size chunks via NVMC ERASEPAGE for efficient fill.
+        flash_size = int(nvmc.FlashSize)
+        flash_base = int(nvmc.FlashBaseAddress)
+        page_size = int(nvmc.PageSize)
+        flash_ref = nvmc.Flash
+        # Create one page of 0xFF, reuse for all pages.
+        import System
+        global _cached_erase_page
+        if _cached_erase_page is None or len(_cached_erase_page) != page_size:
+            _cached_erase_page = System.Array.CreateInstance(System.Byte, page_size)
+            for i in range(page_size):
+                _cached_erase_page[i] = 0xFF
+        erase_page = _cached_erase_page
+        for offset in range(0, flash_size, page_size):
+            remaining = min(page_size, flash_size - offset)
+            if remaining == page_size:
+                flash_ref.WriteBytes(offset, erase_page)
+            else:
+                partial = System.Array.CreateInstance(System.Byte, remaining)
+                for i in range(remaining):
+                    partial[i] = 0xFF
+                flash_ref.WriteBytes(offset, partial)
+    else:
+        # Slow path: use NVMemory.EraseSector.
+        nvm_size = int(ctrl.Nvm.Size)
+        sector = 4096
+        for offset in range(0, nvm_size, sector):
+            chunk = min(sector, nvm_size - offset)
+            ctrl.Nvm.EraseSector(offset, chunk)
+    bus.LoadELF(bootloader_elf)
+    if image_staging_path:
+        bus.LoadBinary(image_staging_path, slot_staging_base)
+    if image_exec_path:
+        bus.LoadBinary(image_exec_path, slot_exec_base)
+
+def cache_initial_flash():
+    # Snapshot flash after reload_images + apply_pre_boot_state so subsequent
+    # fault points can restore with a single bulk WriteBytes instead of
+    # 244 page erases + 3 binary loads.
+    global _cached_initial_flash
+    if USE_FAST_PATH:
+        flash_ref = nvmc.Flash
+        _cached_initial_flash = flash_ref.ReadBytes(0, int(nvmc.FlashSize))
+
+def reload_images_cached():
+    # Restore flash from cached snapshot if available; otherwise fall back
+    # to full reload_images + apply_pre_boot_state and cache the result.
+    global _cached_initial_flash
+    try:
+        monitor.Parse('machine Pause')
+    except:
+        pass
+    if _cached_initial_flash is not None and USE_FAST_PATH:
+        nvmc.Flash.WriteBytes(0, _cached_initial_flash)
+    else:
+        reload_images()
+        apply_pre_boot_state()
+        cache_initial_flash()
+
+def compute_exec_slot_hash():
+    # Compute SHA-256 of the exec slot image data (excluding trailer page).
+    # Bootloaders modify trailer fields during swap, so the full-slot hash
+    # won't match the original binary. Hashing only the data portion
+    # (everything except the last page) avoids this problem.
+    import hashlib
+    page_size = 4096
+    data_size = slot_exec_size - page_size
+    if data_size <= 0:
+        data_size = slot_exec_size
+    if USE_FAST_PATH:
+        flash_ref = nvmc.Flash
+        flash_base_addr = int(nvmc.FlashBaseAddress)
+        offset = slot_exec_base - flash_base_addr
+        data = bytes(flash_ref.ReadBytes(offset, data_size))
+    else:
+        chunks = []
+        for addr in range(slot_exec_base, slot_exec_base + data_size, 4):
+            chunks.append(struct.pack('<I', as_int(bus.ReadDoubleWord(addr))))
+        data = b''.join(chunks)
+    return hashlib.sha256(data).hexdigest()
+
+def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False):
+    # Shared boot outcome evaluation for all execution modes.
+    # Prioritize 'sticky' VTOR captured by watchpoint during the run.
+    actual_vtor = vtor_value
+    if sticky_vtor['captured']:
+        actual_vtor = sticky_vtor['value']
+
+    # Cortex-M0+ VTOR requires 256-byte alignment (bits [7:0] are ignored).
+    # A misaligned VTOR means the image header size is wrong.
+    vtor_aligned = (actual_vtor % 256 == 0)
+
+    boot_slot = None
+    for sn, (s_lo, s_hi) in slot_ranges.items():
+        if s_lo <= actual_vtor < s_hi:
+            boot_slot = sn
+            break
+
+    vtor_ok = not bool(success_vtor_slot)
+    if success_vtor_slot == 'any':
+        # Any defined slot is acceptable.
+        vtor_ok = any(s_lo <= actual_vtor < s_hi for s_lo, s_hi in slot_ranges.values())
+    elif success_vtor_slot and success_vtor_slot in slot_ranges:
+        s_lo, s_hi = slot_ranges[success_vtor_slot]
+        vtor_ok = (s_lo <= actual_vtor < s_hi)
+
+    pc_ok = True
+    if success_pc_slot and success_pc_slot in slot_ranges:
+        s_lo, s_hi = slot_ranges[success_pc_slot]
+        pc_ok = (s_lo <= (pc_value & ~1) < s_hi)
+        # If VTOR was captured but PC is now 0 (e.g. crash/reset),
+        # treat the VTOR jump as proof of execution attempt.
+        if sticky_vtor['captured'] and pc_value == 0:
+            pc_ok = True
+
+    marker_ok = True
+    hash_result = None
+    actual_marker_val = 0
+    if success_image_hash:
+        enforce_hash = True
+        if success_image_hash_slot and success_image_hash_slot != 'any':
+            enforce_hash = (boot_slot == success_image_hash_slot)
+        if enforce_hash:
+            actual_hash = compute_exec_slot_hash()
+            if actual_hash == image_exec_sha256:
+                hash_result = 'exec_image'
+            elif actual_hash == image_staging_sha256:
+                hash_result = 'staging_image'
+            elif expected_exec_sha256 and actual_hash == expected_exec_sha256:
+                hash_result = 'expected_image'
+            else:
+                hash_result = 'unknown'
+            # Success = exec slot matches the expected post-operation hash.
+            if expected_exec_sha256:
+                marker_ok = (actual_hash == expected_exec_sha256)
+            else:
+                # No expected hash: any known image is success.
+                marker_ok = (hash_result != 'unknown')
+        else:
+            hash_result = 'skipped'
+    elif success_marker_addr != 0:
+        actual_marker_val = as_int(bus.ReadDoubleWord(success_marker_addr))
+        marker_ok = (actual_marker_val == success_marker_value)
+
+    signals = {
+        'vtor': fmt_u32(actual_vtor),
+        'vtor_final': fmt_u32(vtor_value),
+        'vtor_sticky': sticky_vtor['captured'],
+        'vtor_aligned': vtor_aligned,
+        'vtor_ok': vtor_ok,
+        'pc': fmt_u32(pc_value),
+        'pc_ok': pc_ok,
+        'marker_ok': marker_ok,
+        'marker_actual': fmt_u32(actual_marker_val),
+    }
+    if hash_result is not None:
+        signals['image_hash_match'] = hash_result
+    if success_image_hash_slot:
+        signals['image_hash_slot'] = success_image_hash_slot
+    signals.update(collect_otadata_signals())
+
+    otadata_expect_ok = True
+    otadata_mismatches = []
+    enforce_otadata_expect = bool(success_otadata_expect)
+    if success_otadata_expect_scope == 'control':
+        enforce_otadata_expect = not bool(fault_injected)
+
+    if enforce_otadata_expect:
+        for key, expected_values in success_otadata_expect.items():
+            actual = normalize_signal_token(signals.get(key))
+            if actual not in expected_values:
+                otadata_expect_ok = False
+                otadata_mismatches.append(
+                    '{}:{}->{}'.format(
+                        key,
+                        actual if actual else 'missing',
+                        '|'.join(expected_values),
+                    )
+                )
+    signals['otadata_expect_scope'] = success_otadata_expect_scope
+    signals['otadata_expect_enforced'] = enforce_otadata_expect
+    signals['otadata_expect_ok'] = otadata_expect_ok
+    if otadata_mismatches:
+        signals['otadata_expect_mismatches'] = ';'.join(otadata_mismatches)
+
+    criteria_ok = marker_ok and otadata_expect_ok
+    if vtor_ok and vtor_aligned and pc_ok and criteria_ok:
+        boot_outcome = 'success'
+    elif vtor_ok and not vtor_aligned:
+        boot_outcome = 'misaligned_vtor'
+    elif vtor_ok and pc_ok and not criteria_ok:
+        boot_outcome = 'wrong_image'
+    elif vtor_ok and not pc_ok:
+        boot_outcome = 'wrong_pc'
+    else:
+        boot_outcome = 'no_boot'
+
+    return boot_outcome, boot_slot, signals
+
+def run_state_fault(fault_at):
+    # State mode: simulate staging->exec copy, fault at given index.
+    fault_injected = False
+    fault_address = 0
+    actual_writes = 0
+
+    for i in range(total_copy_writes):
+        src = slot_staging_base + i * write_granularity
+        dst = slot_exec_base + i * write_granularity
+
+        if i == fault_at:
+            if not USE_FAST_PATH:
+                ctrl.InjectPartialWrite(dst)
+            fault_injected = True
+            fault_address = dst
+            actual_writes = i
+            break
+
+        if write_granularity == 4:
+            bus.WriteDoubleWord(dst, bus.ReadDoubleWord(src))
+        else:
+            bus.WriteQuadWord(dst, bus.ReadQuadWord(src))
+        actual_writes = i + 1
+
+    copy_completed = not fault_injected
+
+    sp = as_int(bus.ReadDoubleWord(slot_exec_base))
+    reset_vector = as_int(bus.ReadDoubleWord(slot_exec_base + 4))
+    reset_pc = reset_vector & ~1
+
+    vector_valid = (
+        (sram_start <= sp <= sram_end)
+        and ((reset_vector & 1) == 1)
+        and (slot_exec_base <= reset_pc < (slot_exec_base + slot_exec_size))
+    )
+
+    if copy_completed and vector_valid:
+        boot_outcome = 'success'
+    else:
+        boot_outcome = 'hard_fault'
+
+    boot_slot = None
+    if vector_valid:
+        for slot_name, (slot_lo, slot_hi) in slot_ranges.items():
+            if slot_lo <= reset_pc < slot_hi:
+                boot_slot = slot_name
+                break
+
+    if success_marker_addr != 0 and boot_outcome == 'success':
+        actual_marker = as_int(bus.ReadDoubleWord(success_marker_addr))
+        if actual_marker != success_marker_value:
+            boot_outcome = 'hard_fault'
+            boot_slot = None
+    fault_class = classify_fault_result(boot_outcome, boot_slot, {})
+
+    return {
+        'fault_at': fault_at,
+        'fault_requested': fault_at,
+        'fault_type': 'w',
+        'fault_injected': fault_injected,
+        'fault_address': fmt_u32(fault_address),
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'fault_class': fault_class,
+        'actual_writes': actual_writes,
+        'signals': {
+            'vector_sp': fmt_u32(sp),
+            'vector_reset': fmt_u32(reset_vector),
+            'vector_valid': vector_valid,
+            'copy_completed': copy_completed,
+        },
+    }
+
+def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, label='',
+                   expect_writes=True, stop_on_fault=True, op_trace=None, op_trace_limit=0):
+    # Run CPU in continuous mode until it settles or budget exhausted.
+    #
+    # Uses `emulation RunFor` which runs in continuous mode — much faster
+    # than cpu.Step() which uses single-step synchronization (~30x faster).
+    #
+    # Termination conditions (checked after each time slice):
+    #   1. FaultFired set by NVMC (fault injection hit target write)
+    #   2. Write count unchanged for 3+ slices after writes started
+    #   3. Zero writes after 5+ slices when expect_writes=False (bricked)
+    #   4. No forward progress for progress_stall_timeout_s
+    #   5. (no_boot profiles) no writes + no VTOR for N slices/min emulated time
+    #   6. Iteration limit or wall-clock timeout exhausted
+    t0 = _time.time()
+    prev_writes = -1
+    zero_writes_count = 0
+    no_boot_zero_write_count = 0
+    prev_progress_key = None
+    last_progress_t = t0
+    try:
+        slice_s = max(0.001, float(time_slice))
+    except Exception:
+        slice_s = 0.02
+    emulated_s = 0.0
+    reason = 'budget'
+    iters = 0
+    trace_limit_hit = False
+    trace_prev_writes = 0
+    trace_prev_erases = 0
+    if op_trace is not None and op_trace_limit <= 0:
+        op_trace_limit = 1024
+    for iters in range(max_iters):
+        monitor.Parse('emulation RunFor "{}"'.format(time_slice))
+        emulated_s += slice_s
+        if stop_on_fault and was_fault_injected():
+            reason = 'fault_fired'
+            break
+        # Early exit: check if VTOR has been set to a valid slot.
+        # Bus watchpoints don't fire for SCB (CPU-private), so we poll.
+        if not sticky_vtor['captured']:
+            vtor_now = as_int(bus.ReadDoubleWord(0xE000ED08))
+            if vtor_now != 0:
+                for sn, (s_lo, s_hi) in slot_ranges.items():
+                    if s_lo <= vtor_now < s_hi:
+                        sticky_vtor['value'] = vtor_now
+                        sticky_vtor['slot'] = sn
+                        sticky_vtor['captured'] = True
+                        break
+            if sticky_vtor['captured']:
+                # Confirmation: run 5ms more to let app execute / HardFault.
+                monitor.Parse('emulation RunFor "0.005"')
+                cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
+                if cfsr != 0:
+                    reason = 'vtor_captured_hardfault'
+                else:
+                    reason = 'vtor_captured'
+                break
+        cur_writes = get_total_writes()
+        cur_erases = get_total_erases()
+        pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
+        if op_trace is not None:
+            if cur_writes < trace_prev_writes:
+                trace_prev_writes = cur_writes
+            while trace_prev_writes < cur_writes:
+                trace_prev_writes += 1
+                op_trace.append({
+                    'seq': len(op_trace) + 1,
+                    'op': 'write',
+                    'index': trace_prev_writes,
+                    'pc': fmt_u32(pc_now),
+                    'emulated_s': round(emulated_s, 6),
+                })
+                if len(op_trace) >= op_trace_limit:
+                    reason = 'op_trace_limit'
+                    trace_limit_hit = True
+                    break
+            if trace_limit_hit:
+                break
+            if cur_erases < trace_prev_erases:
+                trace_prev_erases = cur_erases
+            while trace_prev_erases < cur_erases:
+                trace_prev_erases += 1
+                op_trace.append({
+                    'seq': len(op_trace) + 1,
+                    'op': 'erase',
+                    'index': trace_prev_erases,
+                    'pc': fmt_u32(pc_now),
+                    'emulated_s': round(emulated_s, 6),
+                })
+                if len(op_trace) >= op_trace_limit:
+                    reason = 'op_trace_limit'
+                    trace_limit_hit = True
+                    break
+            if trace_limit_hit:
+                break
+        progress_key = (
+            cur_writes,
+            cur_erases,
+            bool(sticky_vtor['captured']),
+        )
+        now = _time.time()
+        if prev_progress_key is None or progress_key != prev_progress_key:
+            prev_progress_key = progress_key
+            last_progress_t = now
+        elif progress_stall_timeout_s > 0 and (now - last_progress_t) >= progress_stall_timeout_s:
+            if cur_writes == 0:
+                reason = 'no_boot_stall({:.1f}s)'.format(now - last_progress_t)
+            else:
+                reason = 'no_progress_stall({:.1f}s)'.format(now - last_progress_t)
+            break
+        if cur_writes == 0 and not sticky_vtor['captured']:
+            no_boot_zero_write_count += 1
+        else:
+            no_boot_zero_write_count = 0
+        if (
+            expect_control_outcome == 'no_boot'
+            and no_boot_zero_write_count >= no_boot_zero_write_slices
+            and emulated_s >= no_boot_min_emulated_s
+        ):
+            reason = 'no_boot_no_writes'
+            break
+        # Bricked device detection: no writes at all after several slices.
+        if cur_writes == 0 and not expect_writes:
+            zero_writes_count += 1
+            if zero_writes_count >= 5:
+                reason = 'no_writes_brick'
+                break
+        else:
+            zero_writes_count = 0
+        prev_writes = cur_writes
+        # Wall-clock timeout.
+        elapsed = now - t0
+        if elapsed > wall_timeout:
+            reason = 'wall_timeout({:.0f}s)'.format(elapsed)
+            break
+    elapsed = _time.time() - t0
+    writes_now = get_total_writes()
+    erases_now = get_total_erases()
+    pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
+    log('run_done [{}]: reason={} iters={} writes={} pc={} elapsed={:.1f}s'.format(
+        label, reason, iters + 1, writes_now,
+        fmt_u32(pc_now), elapsed))
+    return {
+        'iters': iters + 1,
+        'reason': reason,
+        'elapsed_s': round(elapsed, 6),
+        'emulated_s': round(emulated_s, 6),
+        'writes': writes_now,
+        'erases': erases_now,
+        'pc': fmt_u32(pc_now),
+        'op_trace_events': len(op_trace) if op_trace is not None else 0,
+        'op_trace_truncated': bool(trace_limit_hit),
+    }
+
+def parse_duration_seconds(default=2.0):
+    try:
+        return max(0.02, float(run_duration))
+    except Exception:
+        return default
+
+def run_timed_reset_fault(fault_at):
+    # reset_at_time: run Phase 1 for a deterministic time offset, then
+    # simulate a power reset regardless of write/erase boundaries.
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    fp_t0 = _time.time()
+    log('fp={} type=t phase1_setup'.format(fault_at))
+
+    monitor.Parse('machine Pause')
+    cpu_ref.IsHalted = False
+    monitor.Parse('machine Reset')
+    reload_images()
+    apply_pre_boot_state()
+    reset_nvmc_for_sweep()
+    disarm_fault()
+
+    duration_s = parse_duration_seconds(default=2.0)
+    max_fp = max(fault_points) if fault_points else max(1, fault_at)
+    frac = 0.0 if max_fp <= 0 else min(1.0, max(0.0, float(fault_at) / float(max_fp)))
+    trigger_s = max(0.005, min(duration_s * 0.95, frac * duration_s))
+    log('fp={} type=t trigger_s={:.3f} frac={:.3f}'.format(fault_at, trigger_s, frac))
+    monitor.Parse('emulation RunFor "{:.3f}"'.format(trigger_s))
+
+    fault_injected = True
+    fault_address = 0
+    actual_writes = get_total_writes() if USE_FAST_PATH else 0
+
+    if USE_FAST_PATH:
+        flash_ref = nvmc.Flash
+        flash_size = int(nvmc.FlashSize)
+        saved_flash = flash_ref.ReadBytes(0, flash_size)
+        fault_snapshot_bytes = to_py_bytes(saved_flash)
+        restore_flash_and_boot(saved_flash)
+        reset_nvmc_for_recovery()
+    else:
+        saved_flash = None
+        fault_snapshot_bytes = None
+        monitor.Parse('machine Reset')
+        monitor.Parse('machine Pause')
+        bus.LoadELF(bootloader_elf)
+        restore_hw_init()
+
+    log('fp={} type=t phase2_step'.format(fault_at))
+    arm_vtor_watchpoint()
+    p2_status = run_until_done(
+        cpu_ref,
+        label='fp{}_t_p2'.format(fault_at),
+        expect_writes=False,
+        wall_timeout=30,
+    )
+    disarm_vtor_watchpoint()
+
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value, pc_value, fault_injected=fault_injected
+    )
+    signals['timed_reset_trigger_s'] = round(trigger_s, 6)
+    signals['timed_reset_fraction'] = round(frac, 6)
+    signals['timed_reset_elapsed_s'] = round(_time.time() - fp_t0, 6)
+    signals['phase2_stop_reason'] = p2_status.get('reason')
+    signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
+
+    result = {
+        'fault_at': fault_at,
+        'fault_requested': fault_at,
+        'fault_type': 't',
+        'fault_injected': fault_injected,
+        'fault_address': fmt_u32(fault_address),
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'fault_class': fault_class,
+        'actual_writes': actual_writes,
+        'signals': signals,
+    }
+    if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
+        dump_source = 'fault_snapshot' if fault_snapshot_bytes is not None else 'live_flash'
+        result['postmortem_partition_dump'] = build_postmortem_partition_dump(
+            snapshot_bytes=fault_snapshot_bytes,
+            source=dump_source,
+        )
+    if boot_outcome == 'no_boot' and resume_trace_no_boot and saved_flash is not None:
+        result['resume_trace'] = run_resume_trace_from_snapshot(saved_flash, fault_at, 't')
+    return result
+
+def classify_fault_result(boot_outcome, boot_slot, signals):
+    if boot_outcome == 'success':
+        return 'recoverable'
+    if boot_outcome == 'wrong_image':
+        hash_match = normalize_signal_token(signals.get('image_hash_match'))
+        expected_slot = None
+        if success_image_hash_slot and success_image_hash_slot != 'any':
+            expected_slot = success_image_hash_slot
+        elif success_vtor_slot and success_vtor_slot in slot_ranges:
+            expected_slot = success_vtor_slot
+        if hash_match == 'unknown' and (expected_slot is None or expected_slot == boot_slot):
+            return 'silent_corruption'
+        return 'wrong_image'
+    if boot_outcome in ('wrong_pc', 'misaligned_vtor', 'hard_fault', 'no_boot'):
+        return 'unrecoverable'
+    return 'unrecoverable'
+
+def parse_write_trace_map(trace_text):
+    flash_base, _ = flash_geometry()
+    mapping = {}
+    for line in trace_text.strip().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(':')
+        if len(parts) < 2:
+            continue
+        write_idx = int(parts[0])
+        flash_off = int(parts[1])
+        value = int(parts[2]) if len(parts) >= 3 else 0
+        mapping[write_idx] = {
+            'flash_offset': flash_off,
+            'address': fmt_u32(flash_base + flash_off),
+            'value': fmt_u32(value),
+        }
+    return mapping
+
+def parse_erase_trace_map(trace_text):
+    flash_base, _ = flash_geometry()
+    mapping = {}
+    for line in trace_text.strip().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(':')
+        if len(parts) < 2:
+            continue
+        erase_idx = int(parts[0])
+        flash_off = int(parts[1])
+        writes_at = int(parts[2]) if len(parts) >= 3 else 0
+        erase_size = int(parts[3]) if len(parts) >= 4 else 0
+        mapping[erase_idx] = {
+            'flash_offset': flash_off,
+            'address': fmt_u32(flash_base + flash_off),
+            'writes_at_this_point': writes_at,
+            'erase_size': erase_size,
+        }
+    return mapping
+
+def run_resume_trace_from_snapshot(snapshot_flash, fault_at, fault_type):
+    if not USE_FAST_PATH:
+        return {
+            'enabled': False,
+            'reason': 'fast_path_required',
+        }
+    if snapshot_flash is None:
+        return {
+            'enabled': False,
+            'reason': 'missing_fault_snapshot',
+        }
+
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    restore_flash_and_boot(snapshot_flash)
+    reset_nvmc_for_recovery()
+    nvmc.DiffLookahead = 2147483647
+    nvmc.WriteTraceClear()
+    nvmc.EraseTraceClear()
+    nvmc.WriteTraceEnabled = True
+    nvmc.EraseTraceEnabled = True
+
+    op_events = []
+    arm_vtor_watchpoint()
+    status = run_until_done(
+        cpu_ref,
+        label='fp{}_resume_trace'.format(fault_at),
+        expect_writes=False,
+        stop_on_fault=False,
+        wall_timeout=resume_trace_wall_timeout_s,
+        time_slice=resume_trace_time_slice,
+        op_trace=op_events,
+        op_trace_limit=resume_trace_max_ops,
+    )
+    disarm_vtor_watchpoint()
+
+    nvmc.WriteTraceEnabled = False
+    nvmc.EraseTraceEnabled = False
+    write_map = parse_write_trace_map(nvmc.WriteTraceToString())
+    erase_map = parse_erase_trace_map(nvmc.EraseTraceToString())
+
+    enriched_ops = []
+    for event in op_events:
+        enriched = dict(event)
+        if event.get('op') == 'write':
+            meta = write_map.get(int(event.get('index', 0)))
+            if meta:
+                enriched.update(meta)
+        elif event.get('op') == 'erase':
+            meta = erase_map.get(int(event.get('index', 0)))
+            if meta:
+                enriched.update(meta)
+        enriched_ops.append(enriched)
+
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, _signals = evaluate_boot_outcome(
+        vtor_value, pc_value, fault_injected=True
+    )
+
+    return {
+        'enabled': True,
+        'fault_at': fault_at,
+        'fault_type': fault_type,
+        'stop_reason': status.get('reason'),
+        'elapsed_s': status.get('elapsed_s'),
+        'emulated_s': status.get('emulated_s'),
+        'iters': status.get('iters'),
+        'op_trace_truncated': status.get('op_trace_truncated', False),
+        'final_pc': fmt_u32(pc_value),
+        'final_vtor': fmt_u32(vtor_value),
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'total_writes': int(nvmc.TotalWordWrites),
+        'total_erases': int(nvmc.TotalPageErases),
+        'operation_count': len(enriched_ops),
+        'nvm_operations': enriched_ops,
+    }
+
+def run_execute_fault(fault_at, fault_type='w'):
+    # Execute mode: full CPU boot with fault injection.
+    #
+    # fault_type:
+    #   write: 'w' power_loss, 'b' bit_corruption, 's' silent_write_failure,
+    #          'r' write_rejection, 'd' write_disturb,
+    #          'l' wear_leveling_corruption
+    #   erase: 'e' interrupted_erase, 'a' multi_sector_atomicity
+    #   timed: 't' reset_at_time
+    #
+    # Fast path (NVMC CONFIG tracking): fault injection works by counting
+    # NVMC CONFIG WEN->REN transitions. When the target write count is
+    # reached, FaultFired is set and run_until_done breaks. The flash
+    # state at this point has writes 1..N completed. We then simulate a
+    # power cycle by resetting the CPU and booting again WITHOUT reloading
+    # images — the flash keeps its interrupted state.
+    #
+    # Erase fault: counts ERASEPAGE operations. At the Nth erase, a
+    # partial erase (first half only) simulates power loss mid-erase.
+    #
+    # Slow path (NVMemory): uses FaultAtWordWrite which corrupts the Nth
+    # word during writing (partial-write fault injection).
+
+    if fault_type == 't':
+        return run_timed_reset_fault(fault_at)
+
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    fp_t0 = _time.time()
+    phase1_ms = 0
+    phase2_ms = 0
+    recovery_writes = None
+    debug_trailer = None
+    phase1_status = None
+    phase2_status = None
+    fault_snapshot_bytes = None
+    saved_flash = None
+    is_erase_fault = fault_type in ('e', 'a')
+    is_power_loss_fault = fault_type in ('w', 'e', 'a')
+    is_non_power_write_fault = fault_type in ('b', 's', 'r', 'd', 'l')
+    log('fp={} type={} phase1_setup'.format(fault_at, fault_type))
+
+    # Phase 1: Reset and set up for the faulted boot.
+    monitor.Parse('machine Pause')
+    cpu_ref.IsHalted = False
+    monitor.Parse('machine Reset')
+    reload_images()
+    apply_pre_boot_state()
+    if _hash_bypass_active:
+        apply_hash_bypass()
+
+    reset_nvmc_for_sweep()
+
+    if is_erase_fault:
+        # Erase faults: arm at the Nth erase operation.
+        # 'e' = interrupted_erase (mode 0), 'a' = multi-sector atomicity (mode 1).
+        erase_mode = 1 if fault_type == 'a' else 0
+        base_erases = get_total_erases()
+        arm_at = base_erases + fault_at + 1
+        log('fp={} phase1_step erase_arm_at={} mode={}'.format(fault_at, arm_at, erase_mode))
+        arm_erase_fault(arm_at, erase_fault_mode=erase_mode)
+        disarm_write_fault()
+    else:
+        # Write faults:
+        #   'w' power_loss (0), 'b' bit_corruption (1),
+        #   's' silent_write_failure (2), 'r' write_rejection (3),
+        #   'd' write_disturb (4),
+        #   'l' wear_leveling_corruption (5).
+        write_mode = {
+            'w': 0,
+            'b': 1,
+            's': 2,
+            'r': 3,
+            'd': 4,
+            'l': 5,
+        }.get(fault_type, 0)
+        base_writes = get_total_writes()
+        arm_at = base_writes + fault_at + 1
+        if arm_at > base_writes + max_writes_cap:
+            arm_at = base_writes + max_writes_cap + 1
+        log('fp={} phase1_step write_arm_at={} mode={}'.format(fault_at, arm_at, write_mode))
+        arm_fault(arm_at, write_fault_mode=write_mode)
+        disarm_erase_fault()
+
+    arm_vtor_watchpoint()
+    p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
+    phase1_status = run_until_done(cpu_ref, label='fp{}_p1'.format(fault_at), stop_on_fault=True, wall_timeout=p1_wall_timeout)
+    disarm_vtor_watchpoint()
+    phase1_ms = int((_time.time() - fp_t0) * 1000)
+
+    fault_injected = was_fault_injected()
+    fault_address = get_last_write_address()
+    if is_erase_fault:
+        phase1_ops = get_total_erases()
+    else:
+        phase1_ops = get_total_writes()
+    if fault_injected and (is_erase_fault or fault_type in ('w', 'b', 's', 'r', 'd', 'l')):
+        # Unified semantics: successful operations before the faulted operation.
+        actual_writes = max(0, phase1_ops - 1)
+    else:
+        actual_writes = phase1_ops
+    log('fp={} type={} phase1_done injected={} ops_total={} ops_before_fault={}'.format(
+        fault_at, fault_type, fault_injected, phase1_ops, actual_writes))
+    disarm_fault()
+
+    if USE_FAST_PATH and fault_injected:
+        # Use the flash snapshot taken by NVMC at the exact fault moment.
+        flash_ref = nvmc.Flash
+        flash_size = int(nvmc.FlashSize)
+        saved_flash = nvmc.FaultFlashSnapshot
+        if saved_flash is None:
+            log('fp={} WARNING: no snapshot, falling back to current flash'.format(fault_at))
+            saved_flash = flash_ref.ReadBytes(0, flash_size)
+        fault_snapshot_bytes = to_py_bytes(saved_flash)
+
+        if is_power_loss_fault:
+            # Power-loss class: simulate a cold reset and recovery boot.
+            if success_marker_addr != 0:
+                flash_base_addr = int(nvmc.FlashBaseAddress)
+                def read_u32_from_snapshot(bus_addr):
+                    offset = bus_addr - flash_base_addr
+                    if 0 <= offset <= len(saved_flash) - 4:
+                        return struct.unpack_from('<I', bytes(saved_flash), offset)[0]
+                    return 0xDEAD
+                pri_end = slot_exec_base + slot_exec_size
+                sec_end = slot_staging_base + slot_staging_size
+                pri_magic = [read_u32_from_snapshot(pri_end - 16 + i*4) for i in range(4)]
+                pri_done  = read_u32_from_snapshot(pri_end - 32)
+                pri_ok    = read_u32_from_snapshot(pri_end - 24)
+                sec_magic = [read_u32_from_snapshot(sec_end - 16 + i*4) for i in range(4)]
+                sec_done  = read_u32_from_snapshot(sec_end - 32)
+                sec_ok    = read_u32_from_snapshot(sec_end - 24)
+                debug_trailer = {
+                    'pri_magic': [fmt_u32(m) for m in pri_magic],
+                    'pri_copy_done': fmt_u32(pri_done),
+                    'pri_image_ok': fmt_u32(pri_ok),
+                    'sec_magic': [fmt_u32(m) for m in sec_magic],
+                    'sec_copy_done': fmt_u32(sec_done),
+                    'sec_image_ok': fmt_u32(sec_ok),
+                }
+
+            phase2_t0 = _time.time()
+            restore_flash_and_boot(saved_flash)
+            if _hash_bypass_active:
+                apply_hash_bypass()
+            reset_nvmc_for_recovery()
+
+            log('fp={} phase2_step'.format(fault_at))
+            arm_vtor_watchpoint()
+            phase2_status = run_until_done(
+                cpu_ref,
+                label='fp{}_p2'.format(fault_at),
+                expect_writes=False,
+                wall_timeout=30,
+                stop_on_fault=False,
+            )
+            disarm_vtor_watchpoint()
+            recovery_writes = get_total_writes()
+            phase2_ms = int((_time.time() - phase2_t0) * 1000)
+            log('fp={} phase2_done rec_writes={}'.format(fault_at, recovery_writes))
+        elif is_non_power_write_fault:
+            # Non-power-loss class: apply the faulted flash state, then continue
+            # executing in the same boot attempt (no simulated reset).
+            phase2_t0 = _time.time()
+            monitor.Parse('machine Pause')
+            flash_ref.WriteBytes(0, saved_flash)
+            nvmc.FaultFired = False
+            nvmc.EraseFaultFired = False
+            disarm_fault()
+            cpu_ref.IsHalted = False
+            log('fp={} phase1_continue_non_power'.format(fault_at))
+            arm_vtor_watchpoint()
+            phase2_status = run_until_done(
+                cpu_ref,
+                label='fp{}_p1c'.format(fault_at),
+                wall_timeout=30,
+                stop_on_fault=False,
+            )
+            disarm_vtor_watchpoint()
+            phase2_ms = int((_time.time() - phase2_t0) * 1000)
+    elif not USE_FAST_PATH and fault_injected and is_power_loss_fault:
+        # Slow path power-loss: NVMemory is non-volatile and retains the
+        # faulted write across machine Reset.  Reset CPU, reload bootloader
+        # ELF and slot images (MappedMemory regions are cleared by reset,
+        # but NVMemory preserves faulted metadata), then run Phase 2.
+        phase2_t0 = _time.time()
+        monitor.Parse('machine Reset')
+        monitor.Parse('machine Pause')
+        bus.LoadELF(bootloader_elf)
+        if image_exec_path:
+            bus.LoadBinary(image_exec_path, slot_exec_base)
+        if image_staging_path:
+            bus.LoadBinary(image_staging_path, slot_staging_base)
+        if _hash_bypass_active:
+            apply_hash_bypass()
+        reset_nvmc_for_recovery()
+
+        log('fp={} phase2_step (slow path)'.format(fault_at))
+        arm_vtor_watchpoint()
+        phase2_status = run_until_done(
+            cpu_ref,
+            label='fp{}_p2'.format(fault_at),
+            expect_writes=False,
+            wall_timeout=30,
+            stop_on_fault=False,
+        )
+        disarm_vtor_watchpoint()
+        recovery_writes = get_total_writes()
+        phase2_ms = int((_time.time() - phase2_t0) * 1000)
+        log('fp={} phase2_done rec_writes={}'.format(fault_at, recovery_writes))
+    elif fault_injected and is_non_power_write_fault:
+        # Slow path non-power-loss: continue in the same boot attempt.
+        phase2_t0 = _time.time()
+        arm_vtor_watchpoint()
+        phase2_status = run_until_done(
+            cpu_ref,
+            label='fp{}_p1c'.format(fault_at),
+            wall_timeout=30,
+            stop_on_fault=False,
+        )
+        disarm_vtor_watchpoint()
+        phase2_ms = int((_time.time() - phase2_t0) * 1000)
+
+    # Read final state.
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value, pc_value, fault_injected=fault_injected
+    )
+    signals['phase1_ms'] = phase1_ms
+    signals['phase2_ms'] = phase2_ms
+    signals['phase1_ops_total'] = phase1_ops
+    signals['trace_replay_mode'] = 'execute'
+    if phase1_status is not None:
+        signals['phase1_stop_reason'] = phase1_status.get('reason')
+        signals['phase1_emulated_s'] = phase1_status.get('emulated_s')
+    if phase2_status is not None:
+        signals['phase2_stop_reason'] = phase2_status.get('reason')
+        signals['phase2_emulated_s'] = phase2_status.get('emulated_s')
+
+    fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
+
+    result = {
+        'fault_at': fault_at,
+        'fault_requested': fault_at,
+        'fault_type': fault_type,
+        'fault_injected': fault_injected,
+        'fault_address': fmt_u32(fault_address),
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'fault_class': fault_class,
+        'actual_writes': actual_writes,
+        'signals': signals,
+    }
+
+    if USE_FAST_PATH and fault_injected and is_power_loss_fault:
+        if debug_trailer is not None:
+            result['debug_trailer'] = debug_trailer
+        result['recovery_writes'] = recovery_writes
+
+    if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
+        dump_source = 'fault_snapshot' if fault_snapshot_bytes is not None else 'live_flash'
+        postmortem_dump = build_postmortem_partition_dump(
+            snapshot_bytes=fault_snapshot_bytes,
+            source=dump_source,
+        )
+        result['postmortem_partition_dump'] = postmortem_dump
+
+    if (
+        boot_outcome == 'no_boot'
+        and resume_trace_no_boot
+        and fault_injected
+        and is_power_loss_fault
+    ):
+        resume_trace = run_resume_trace_from_snapshot(saved_flash, fault_at, fault_type)
+        result['resume_trace'] = resume_trace
+
+    # Release large .NET byte[] to prevent memory exhaustion in batch mode.
+    if USE_FAST_PATH:
+        nvmc.FaultFlashSnapshot = None
+
+    return result
+
+def run_cascading_fault(write_fault_at, erase_fault_at):
+    # Cascading fault: write fault in Phase 1 creates dirty flash state,
+    # erase fault in Phase 2 interrupts recovery.  Phase 3 checks if the
+    # device survives two consecutive power losses.
+    #
+    # This catches bugs where:
+    #   1. First power loss leaves partial swap state (scratch has data)
+    #   2. Recovery boot erases scratch in a vulnerable order
+    #   3. Second power loss mid-erase leaves stale trailer + corrupted data
+    #   4. Third boot reads corrupted state → brick
+    #
+    # General class: any bootloader with "resume interrupted operation"
+    # is potentially vulnerable to faults during the resume itself.
+
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    fp_t0 = _time.time()
+    log('cascade w={} e={} phase1_setup'.format(write_fault_at, erase_fault_at))
+
+    # --- Phase 1: write fault to create dirty state ---
+    monitor.Parse('machine Pause')
+    cpu_ref.IsHalted = False
+    monitor.Parse('machine Reset')
+    reload_images()
+    apply_pre_boot_state()
+
+    reset_nvmc_for_sweep()
+
+    base_writes = get_total_writes()
+    arm_at = base_writes + write_fault_at + 1
+    if arm_at > base_writes + max_writes_cap:
+        arm_at = base_writes + max_writes_cap + 1
+    arm_fault(arm_at)
+    disarm_erase_fault()
+
+    run_until_done(cpu_ref, label='cascade_w{}_p1'.format(write_fault_at))
+    disarm_fault()
+
+    p1_injected = was_write_fault_injected()
+    p1_writes = get_total_writes()
+    p1_erases = get_total_erases()
+    log('cascade w={} phase1_done injected={} writes={} erases={}'.format(
+        write_fault_at, p1_injected, p1_writes, p1_erases))
+
+    if not (USE_FAST_PATH and p1_injected):
+        # Phase 1 didn't fire — return as non-injected.
+        return {
+            'fault_at': write_fault_at,
+            'fault_requested': write_fault_at,
+            'fault_type': 'cascade',
+            'fault_injected': False,
+            'fault_address': '0x00000000',
+            'boot_outcome': 'success',
+            'boot_slot': None,
+            'fault_class': 'recoverable',
+            'actual_writes': p1_writes,
+            'cascade': {
+                'write_fault_at': write_fault_at,
+                'erase_fault_at': erase_fault_at,
+                'p1_injected': False,
+            },
+        }
+
+    # --- Phase 2: recovery boot with erase fault armed ---
+    flash_ref = nvmc.Flash
+    flash_size = int(nvmc.FlashSize)
+    saved_flash = nvmc.FaultFlashSnapshot
+    if saved_flash is None:
+        saved_flash = flash_ref.ReadBytes(0, flash_size)
+
+    restore_flash_and_boot(saved_flash)
+
+    # Reset counters and arm erase fault for recovery boot.
+    reset_nvmc_for_sweep()
+    disarm_write_fault()
+    arm_erase_fault(erase_fault_at + 1)  # 0-indexed → 1-indexed
+
+    log('cascade w={} e={} phase2_step'.format(write_fault_at, erase_fault_at))
+    run_until_done(cpu_ref, label='cascade_w{}_e{}_p2'.format(write_fault_at, erase_fault_at))
+    disarm_fault()
+
+    p2_injected = was_erase_fault_injected()
+    p2_erases = get_total_erases()
+    p2_writes = get_total_writes()
+    log('cascade w={} e={} phase2_done erase_injected={} erases={} writes={}'.format(
+        write_fault_at, erase_fault_at, p2_injected, p2_erases, p2_writes))
+
+    if not p2_injected:
+        # Erase fault didn't fire during recovery (fewer erases than expected).
+        # Read final state from Phase 2 directly.
+        pass
+    else:
+        # --- Phase 3: boot from double-faulted state ---
+        saved_flash2 = nvmc.FaultFlashSnapshot
+        if saved_flash2 is None:
+            saved_flash2 = flash_ref.ReadBytes(0, flash_size)
+
+        restore_flash_and_boot(saved_flash2)
+        reset_nvmc_for_recovery()
+
+        log('cascade w={} e={} phase3_step'.format(write_fault_at, erase_fault_at))
+        arm_vtor_watchpoint()
+        run_until_done(cpu_ref, label='cascade_w{}_e{}_p3'.format(write_fault_at, erase_fault_at),
+                       expect_writes=False, wall_timeout=30)
+        disarm_vtor_watchpoint()
+
+    # Read final state.
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value, pc_value, fault_injected=(p1_injected and p2_injected)
+    )
+    fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
+
+    # Release large .NET byte[] to prevent memory exhaustion in batch mode.
+    if USE_FAST_PATH:
+        nvmc.FaultFlashSnapshot = None
+
+    elapsed = _time.time() - fp_t0
+    result = {
+        'fault_at': write_fault_at,
+        'fault_requested': write_fault_at,
+        'fault_type': 'cascade',
+        'fault_injected': p1_injected and p2_injected,
+        'fault_address': '0x00000000',
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'fault_class': fault_class,
+        'actual_writes': p1_writes,
+        'cascade': {
+            'write_fault_at': write_fault_at,
+            'erase_fault_at': erase_fault_at,
+            'p1_injected': p1_injected,
+            'p2_injected': p2_injected,
+            'p2_erases': p2_erases,
+            'p2_writes': p2_writes,
+            'elapsed_s': round(elapsed, 1),
+        },
+        'signals': signals,
+    }
+    if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
+        snapshot = saved_flash2 if p2_injected else saved_flash
+        result['postmortem_partition_dump'] = build_postmortem_partition_dump(
+            snapshot_bytes=to_py_bytes(snapshot),
+            source='fault_snapshot',
+        )
+    if boot_outcome == 'no_boot' and resume_trace_no_boot and p2_injected:
+        result['resume_trace'] = run_resume_trace_from_snapshot(saved_flash2, write_fault_at, 'cascade')
+    return result
+
+# ---------------------------------------------------------------------------
+# Trace replay mode: reconstruct flash state from calibration trace instead
+# of re-emulating Phase 1.  Eliminates the O(N^2) prefix cost — each fault
+# point costs only O(K) Python writes + ~1s Phase 2 recovery boot.
+# ---------------------------------------------------------------------------
+trace_file_path = str(monitor.GetVariable('trace_file')).strip()
+erase_trace_file_path = str(monitor.GetVariable('erase_trace_file')).strip()
+trace_file_bin_path = str(monitor.GetVariable('trace_file_bin')).strip()
+erase_trace_file_bin_path = str(monitor.GetVariable('erase_trace_file_bin')).strip()
+trace_data_loaded = None
+erase_trace_loaded = None
+trace_replay_engine = None
+trace_replay_engine_attempted = False
+
+def ensure_trace_replay_engine():
+    global trace_replay_engine, trace_replay_engine_attempted
+    if trace_replay_engine is not None:
+        return trace_replay_engine
+    if trace_replay_engine_attempted:
+        return None
+    trace_replay_engine_attempted = True
+    if not USE_FAST_PATH:
+        return None
+    try:
+        trace_replay_engine = monitor.Machine['sysbus.trace_replay']
+        if trace_replay_engine.Target is None:
+            trace_replay_engine.Target = nvmc.Flash
+            trace_replay_engine.TargetBaseAddress = int(nvmc.FlashBaseAddress)
+        log('trace_replay: native engine enabled')
+        return trace_replay_engine
+    except Exception as exc:
+        log('trace_replay: native engine unavailable ({}); using python fallback'.format(exc))
+        return None
+
+def load_trace_data(path):
+    import csv as _csv
+    entries = []
+    with open(path, 'r') as f:
+        reader = _csv.DictReader(f)
+        for row in reader:
+            entries.append((
+                int(row['write_index']),
+                int(row['flash_offset']),
+                int(row['value']),
+            ))
+    return entries
+
+def load_erase_trace_data(path):
+    import csv as _csv
+    entries = []
+    with open(path, 'r') as f:
+        reader = _csv.DictReader(f)
+        for row in reader:
+            entries.append((
+                int(row['flash_offset']),
+                int(row.get('writes_at_this_point', 0)),
+                int(row.get('erase_size', 0)),
+            ))
+    return entries
+
+def run_trace_replay_fault_native(fault_at, fault_type='w'):
+    import os as _os_native
+
+    if not trace_file_bin_path:
+        return None
+    if not _os_native.path.exists(trace_file_bin_path):
+        return None
+    # Preserve correctness for legacy calibrations: if erase CSV exists
+    # but erase BIN is missing, fall back to Python interleaving logic.
+    if erase_trace_file_path and not erase_trace_file_bin_path:
+        return None
+
+    engine = ensure_trace_replay_engine()
+    if engine is None:
+        return None
+
+    fp_t0 = _time.time()
+    cpu_ref = monitor.Machine['sysbus.cpu']
+
+    # Phase 1: restore flash from cache and replay trace to fault point.
+    # No machine Reset needed — reload_images_cached() overwrites full flash,
+    # and trace replay is pure memory writes (no CPU execution).
+    t_reload = _time.time()
+    reload_images_cached()
+    if _hash_bypass_active:
+        apply_hash_bypass()
+    reload_ms = int((_time.time() - t_reload) * 1000)
+
+    t_replay = _time.time()
+    stop_at = int(fault_at) + 1
+    if erase_trace_file_bin_path and _os_native.path.exists(erase_trace_file_bin_path):
+        writes_applied = int(engine.ReplayWithErases(
+            trace_file_bin_path,
+            erase_trace_file_bin_path,
+            stop_at,
+            int(nvmc.PageSize),
+            int(nvmc.EraseFill)
+        ))
+    else:
+        writes_applied = int(engine.Replay(trace_file_bin_path, stop_at))
+
+    fault_injected = bool(engine.LastFaultEncountered)
+    fault_address = int(engine.LastFaultAddress)
+    faulted_flash = nvmc.Flash.ReadBytes(0, int(nvmc.FlashSize))
+    fault_snapshot_bytes = to_py_bytes(faulted_flash)
+    replay_ms = int((_time.time() - t_replay) * 1000)
+    phase1_ms = int((_time.time() - fp_t0) * 1000)
+
+    # Phase 2: reset machine and restore faulted flash for recovery boot.
+    # machine Reset zeroes MappedMemory, so we must write back the faulted
+    # snapshot captured above, then reload the bootloader ELF.
+    t_reset = _time.time()
+    restore_flash_and_boot(faulted_flash)
+    if _hash_bypass_active:
+        apply_hash_bypass()
+    reset_ms = int((_time.time() - t_reset) * 1000)
+
+    t_setup = _time.time()
+    reset_nvmc_for_recovery()
+    setup_ms = int((_time.time() - t_setup) * 1000)
+
+    cpu_ref.IsHalted = False
+    arm_vtor_watchpoint()
+    t_emu = _time.time()
+    p2_status = run_until_done(
+        cpu_ref,
+        label='fp{}_native_replay_p2'.format(fault_at),
+        expect_writes=False,
+        wall_timeout=30,
+        time_slice='0.05',
+    )
+    emulation_ms = int((_time.time() - t_emu) * 1000)
+    disarm_vtor_watchpoint()
+
+    phase2_ms = int((_time.time() - fp_t0) * 1000) - phase1_ms
+    total_ms = int((_time.time() - fp_t0) * 1000)
+
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value, pc_value, fault_injected=fault_injected
+    )
+    signals['phase1_ms'] = phase1_ms
+    signals['phase2_ms'] = phase2_ms
+    signals['reload_ms'] = reload_ms
+    signals['replay_ms'] = replay_ms
+    signals['reset_ms'] = reset_ms
+    signals['setup_ms'] = setup_ms
+    signals['emulation_ms'] = emulation_ms
+    signals['p2_iters'] = p2_status.get('iters')
+    signals['total_ms'] = total_ms
+    signals['trace_replay_mode'] = 'native'
+    signals['phase2_stop_reason'] = p2_status.get('reason')
+    signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
+
+    if fault_at % 50 == 0:
+        log('fp={} native writes={} reload={}ms replay={}ms reset={}ms setup={}ms emu={}ms({}iters) total={}ms outcome={}'.format(
+            fault_at, writes_applied, reload_ms, replay_ms, reset_ms, setup_ms,
+            emulation_ms, p2_status.get('iters'), total_ms, boot_outcome))
+
+    result = {
+        'fault_at': fault_at,
+        'fault_requested': fault_at,
+        'fault_type': fault_type,
+        'fault_injected': fault_injected,
+        'fault_address': fmt_u32(fault_address),
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'fault_class': fault_class,
+        'actual_writes': writes_applied,
+        'signals': signals,
+    }
+    if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
+        result['postmortem_partition_dump'] = build_postmortem_partition_dump(
+            snapshot_bytes=fault_snapshot_bytes,
+            source='fault_snapshot',
+        )
+    if boot_outcome == 'no_boot' and resume_trace_no_boot and fault_injected:
+        result['resume_trace'] = run_resume_trace_from_snapshot(faulted_flash, fault_at, fault_type)
+    return result
+
+def run_trace_replay_fault(fault_at, fault_type='w'):
+    global trace_data_loaded, erase_trace_loaded
+
+    native_result = run_trace_replay_fault_native(fault_at, fault_type=fault_type)
+    if native_result is not None:
+        return native_result
+
+    if trace_data_loaded is None:
+        trace_data_loaded = load_trace_data(trace_file_path)
+        log('trace_replay: loaded {} write entries from {}'.format(
+            len(trace_data_loaded), trace_file_path))
+    if erase_trace_loaded is None and erase_trace_file_path:
+        import os as _os2
+        if _os2.path.exists(erase_trace_file_path):
+            erase_trace_loaded = load_erase_trace_data(erase_trace_file_path)
+            log('trace_replay: loaded {} erase entries from {}'.format(
+                len(erase_trace_loaded), erase_trace_file_path))
+        else:
+            erase_trace_loaded = []
+    if erase_trace_loaded is None:
+        erase_trace_loaded = []
+
+    fp_t0 = _time.time()
+    cpu_ref = monitor.Machine['sysbus.cpu']
+
+    # Phase 1: reconstruct flash state at fault_at from trace.
+    # No machine Reset needed — reload_images_cached() overwrites full flash.
+    t_reload = _time.time()
+    reload_images_cached()
+    if _hash_bypass_active:
+        apply_hash_bypass()
+    reload_ms = int((_time.time() - t_reload) * 1000)
+
+    t_replay = _time.time()
+    import System
+    flash_ref = nvmc.Flash
+    flash_base_addr = int(nvmc.FlashBaseAddress)
+    page_size = int(nvmc.PageSize)
+
+    pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace_loaded]
+    pending_erases.sort()
+    erase_idx = 0
+
+    writes_applied = 0
+    fault_injected = False
+    fault_address = 0
+
+    for write_idx, flash_off, value in trace_data_loaded:
+        if write_idx > fault_at + 1:
+            break
+
+        while erase_idx < len(pending_erases) and pending_erases[erase_idx][0] < write_idx:
+            e_wap, e_off, e_sz = pending_erases[erase_idx]
+            erase_buf = System.Array.CreateInstance(System.Byte, e_sz)
+            for bi in range(e_sz):
+                erase_buf[bi] = 0xFF
+            flash_ref.WriteBytes(int(e_off), erase_buf)
+            erase_idx += 1
+
+        if write_idx <= fault_at:
+            b = System.Array.CreateInstance(System.Byte, 4)
+            b[0] = value & 0xFF
+            b[1] = (value >> 8) & 0xFF
+            b[2] = (value >> 16) & 0xFF
+            b[3] = (value >> 24) & 0xFF
+            flash_ref.WriteBytes(flash_off, b)
+            writes_applied += 1
+        elif write_idx == fault_at + 1:
+            fault_injected = True
+            fault_address = flash_off + flash_base_addr
+            break
+
+    while erase_idx < len(pending_erases) and pending_erases[erase_idx][0] <= fault_at:
+        e_wap, e_off, e_sz = pending_erases[erase_idx]
+        erase_buf = System.Array.CreateInstance(System.Byte, e_sz)
+        for bi in range(e_sz):
+            erase_buf[bi] = 0xFF
+        flash_ref.WriteBytes(int(e_off), erase_buf)
+        erase_idx += 1
+    faulted_flash = flash_ref.ReadBytes(0, int(nvmc.FlashSize))
+    fault_snapshot_bytes = to_py_bytes(faulted_flash)
+
+    replay_ms = int((_time.time() - t_replay) * 1000)
+    phase1_ms = int((_time.time() - fp_t0) * 1000)
+
+    # Phase 2: reset machine and restore faulted flash for recovery boot.
+    # machine Reset zeroes MappedMemory, so we must write back the faulted
+    # snapshot captured above, then reload the bootloader ELF.
+    t_reset = _time.time()
+    restore_flash_and_boot(faulted_flash)
+    if _hash_bypass_active:
+        apply_hash_bypass()
+    reset_ms = int((_time.time() - t_reset) * 1000)
+
+    t_setup = _time.time()
+    reset_nvmc_for_recovery()
+    setup_ms = int((_time.time() - t_setup) * 1000)
+
+    cpu_ref.IsHalted = False
+    arm_vtor_watchpoint()
+    t_emu = _time.time()
+    p2_status = run_until_done(
+        cpu_ref,
+        label='fp{}_replay_p2'.format(fault_at),
+        expect_writes=False,
+        wall_timeout=30,
+        time_slice='0.05',
+    )
+    emulation_ms = int((_time.time() - t_emu) * 1000)
+    disarm_vtor_watchpoint()
+
+    phase2_ms = int((_time.time() - fp_t0) * 1000) - phase1_ms
+    total_ms = int((_time.time() - fp_t0) * 1000)
+
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value, pc_value, fault_injected=fault_injected
+    )
+    signals['phase1_ms'] = phase1_ms
+    signals['phase2_ms'] = phase2_ms
+    signals['reload_ms'] = reload_ms
+    signals['replay_ms'] = replay_ms
+    signals['reset_ms'] = reset_ms
+    signals['setup_ms'] = setup_ms
+    signals['emulation_ms'] = emulation_ms
+    signals['p2_iters'] = p2_status.get('iters')
+    signals['total_ms'] = total_ms
+    signals['trace_replay_mode'] = 'python'
+    signals['phase2_stop_reason'] = p2_status.get('reason')
+    signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
+
+    if fault_at % 50 == 0:
+        log('fp={} py_trace_replay writes={} reload={}ms replay={}ms reset={}ms setup={}ms emu={}ms({}iters) total={}ms outcome={}'.format(
+            fault_at, writes_applied, reload_ms, replay_ms, reset_ms, setup_ms,
+            emulation_ms, p2_status.get('iters'), total_ms, boot_outcome))
+
+    result = {
+        'fault_at': fault_at,
+        'fault_requested': fault_at,
+        'fault_type': fault_type,
+        'fault_injected': fault_injected,
+        'fault_address': fmt_u32(fault_address),
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'fault_class': fault_class,
+        'actual_writes': writes_applied,
+        'signals': signals,
+    }
+    if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
+        result['postmortem_partition_dump'] = build_postmortem_partition_dump(
+            snapshot_bytes=fault_snapshot_bytes,
+            source='fault_snapshot',
+        )
+    if boot_outcome == 'no_boot' and resume_trace_no_boot and fault_injected:
+        result['resume_trace'] = run_resume_trace_from_snapshot(faulted_flash, fault_at, fault_type)
+    return result
+
+# ---------------------------------------------------------------------------
+# Initial flash fill for fast path: MappedMemory starts as 0x00, flash must
+# be 0xFF (erased). Fill AFTER images were loaded by robot suite — only the
+# areas not covered by LoadBinary need the fill. But since LoadBinary already
+# wrote the image data, we reload images after the fill to restore them.
+# ---------------------------------------------------------------------------
+if USE_FAST_PATH:
+    reload_images()
+
+# ---------------------------------------------------------------------------
+# Apply initial pre-boot state
+# ---------------------------------------------------------------------------
+apply_pre_boot_state()
+
+# Cache initial flash state for fast restore during sweep.
+cache_initial_flash()
+
+# ---------------------------------------------------------------------------
+# Calibration mode
+# ---------------------------------------------------------------------------
+if calibration_mode:
+    if evaluation_mode == 'state':
+        result = {
+            'calibration': True,
+            'total_writes': total_copy_writes,
+            'base_writes': get_total_writes(),
+        }
+    else:
+        cpu_ref = monitor.Machine['sysbus.cpu']
+        disarm_fault()
+        monitor.Parse('machine Reset')
+        reload_images()
+        apply_pre_boot_state()
+        if _hash_bypass_active:
+            apply_hash_bypass()
+        # Force word-level diff for calibration so the count matches sweep.
+        # Enable write trace to record (writeIndex, flashOffset) for heuristic.
+        reset_nvmc_for_sweep()
+        if USE_FAST_PATH:
+            nvmc.WriteTraceClear()
+            nvmc.WriteTraceEnabled = True
+            # Always capture erase trace — needed for trace replay correctness.
+            nvmc.EraseTraceClear()
+            nvmc.EraseTraceEnabled = True
+        log('calibration: starting step (fault_types={})'.format(fault_types_mode))
+        base_writes = get_total_writes()
+        base_erases = get_total_erases()
+        # Disable progress-stall for calibration — the full swap must complete.
+        # Long CPU-only phases (hash validation, header parsing) between write
+        # bursts can exceed progress_stall_timeout_s in wall time without any
+        # write/erase progress, causing premature exit.
+        saved_stall = progress_stall_timeout_s
+        progress_stall_timeout_s = 0
+        cal_wall_timeout = max(600, int(float(run_duration) * 300))
+        cal_max_iters = max(500, int(float(run_duration) * 5 / 0.02))
+        cal_status = run_until_done(cpu_ref, label='calibration',
+                                    wall_timeout=cal_wall_timeout,
+                                    max_iters=cal_max_iters)
+        progress_stall_timeout_s = saved_stall
+        log('calibration: stop_reason={}'.format(cal_status.get('reason', '?')))
+        total_writes = get_total_writes() - base_writes
+        total_erases = get_total_erases() - base_erases
+        cpu_ref.IsHalted = True
+
+        # Export write trace if available.
+        trace_file = None
+        trace_file_bin = None
+        if USE_FAST_PATH and nvmc.WriteTraceEnabled:
+            nvmc.WriteTraceEnabled = False
+            trace_count = nvmc.WriteTraceCount
+            if trace_count > 0:
+                trace_file = result_file.replace('.json', '_trace.csv')
+                trace_file_bin = result_file.replace('.json', '_trace.bin')
+                trace_data = nvmc.WriteTraceToString()
+                with open(trace_file, 'w') as tf:
+                    tf.write('write_index,flash_offset,value\n')
+                    with open(trace_file_bin, 'wb') as tfb:
+                        trace_bin_count = 0
+                        for line in trace_data.strip().split('\n'):
+                            parts = line.split(':')
+                            if len(parts) == 3:
+                                write_idx = int(parts[0]) & 0xFFFFFFFF
+                                flash_off = int(parts[1]) & 0xFFFFFFFF
+                                value = int(parts[2]) & 0xFFFFFFFF
+                                tf.write('{},{},{}\n'.format(write_idx, flash_off, value))
+                                tfb.write(struct.pack('<III', write_idx, flash_off, value))
+                                trace_bin_count += 1
+                            elif len(parts) == 2:
+                                write_idx = int(parts[0]) & 0xFFFFFFFF
+                                flash_off = int(parts[1]) & 0xFFFFFFFF
+                                tf.write('{},{},0\n'.format(write_idx, flash_off))
+                                tfb.write(struct.pack('<III', write_idx, flash_off, 0))
+                                trace_bin_count += 1
+                log('calibration: wrote {} trace entries to {}'.format(trace_count, trace_file))
+                log('calibration: wrote {} binary trace entries to {}'.format(trace_bin_count, trace_file_bin))
+
+        # Export erase trace — always captured for trace replay correctness.
+        erase_trace_file = None
+        erase_trace_file_bin = None
+        if USE_FAST_PATH:
+            nvmc.EraseTraceEnabled = False
+            erase_count = nvmc.EraseTraceCount
+            if erase_count > 0:
+                erase_trace_file = result_file.replace('.json', '_erase_trace.csv')
+                erase_trace_file_bin = result_file.replace('.json', '_erase_trace.bin')
+                erase_data = nvmc.EraseTraceToString()
+                with open(erase_trace_file, 'w') as ef:
+                    ef.write('erase_index,flash_offset,writes_at_this_point,erase_size\n')
+                    with open(erase_trace_file_bin, 'wb') as efb:
+                        erase_bin_count = 0
+                        for line in erase_data.strip().split('\n'):
+                            parts = line.split(':')
+                            if len(parts) >= 4:
+                                erase_idx = int(parts[0]) & 0xFFFFFFFF
+                                flash_off = int(parts[1]) & 0xFFFFFFFF
+                                writes_at = int(parts[2]) & 0xFFFFFFFF
+                                erase_sz = int(parts[3]) & 0xFFFFFFFF
+                                ef.write('{},{},{},{}\n'.format(erase_idx, flash_off, writes_at, erase_sz))
+                                efb.write(struct.pack('<III', writes_at, flash_off, erase_sz))
+                                erase_bin_count += 1
+                            elif len(parts) >= 3:
+                                # Legacy format without erase_size — use PageSize.
+                                erase_idx = int(parts[0]) & 0xFFFFFFFF
+                                flash_off = int(parts[1]) & 0xFFFFFFFF
+                                writes_at = int(parts[2]) & 0xFFFFFFFF
+                                fallback_sz = int(nvmc.PageSize) & 0xFFFFFFFF
+                                ef.write('{},{},{},{}\n'.format(erase_idx, flash_off, writes_at, fallback_sz))
+                                efb.write(struct.pack('<III', writes_at, flash_off, fallback_sz))
+                                erase_bin_count += 1
+                log('calibration: wrote {} erase trace entries to {}'.format(erase_count, erase_trace_file))
+                log('calibration: wrote {} binary erase entries to {}'.format(erase_bin_count, erase_trace_file_bin))
+                log('calibration: {} total erases'.format(total_erases))
+
+        result = {
+            'calibration': True,
+            'total_writes': total_writes,
+            'total_erases': total_erases,
+            'base_writes': base_writes,
+            'calibration_stop_reason': cal_status.get('reason', '?'),
+            'calibration_emulated_s': cal_status.get('emulated_s', 0),
+        }
+        if trace_file:
+            result['trace_file'] = trace_file
+        if trace_file_bin:
+            result['trace_file_bin'] = trace_file_bin
+        if erase_trace_file:
+            result['erase_trace_file'] = erase_trace_file
+        if erase_trace_file_bin:
+            result['erase_trace_file_bin'] = erase_trace_file_bin
+        # In image_hash mode, compute the exec slot hash after the unfaulted
+        # calibration run.  This is the ground-truth hash of what a successful
+        # operation produces (bootloaders modify headers/trailers during swap,
+        # so the result won't match the original binary file).
+        if success_image_hash:
+            cal_exec_hash = compute_exec_slot_hash()
+            result['calibration_exec_hash'] = cal_exec_hash
+            log('calibration: exec slot hash = {}'.format(cal_exec_hash[:16]))
+    with open(result_file, 'w') as f:
+        f.write(json.dumps(result, sort_keys=True))
+    log('calibration done: total_writes={}'.format(result.get('total_writes', '?')))
+
+else:
+    # -------------------------------------------------------------------
+    # Fault sweep (batch or single)
+    # -------------------------------------------------------------------
+    results = []
+
+    # Select run function: trace replay eliminates Phase 1 emulation.
+    import os as _os
+    trace_source_exists = (
+        (trace_file_bin_path and _os.path.exists(trace_file_bin_path))
+        or (trace_file_path and _os.path.exists(trace_file_path))
+    )
+    use_trace_replay = (
+        USE_FAST_PATH
+        and evaluation_mode == 'execute'
+        and trace_source_exists
+    )
+
+    if use_trace_replay:
+        run_fn = run_trace_replay_fault
+        if trace_file_bin_path and _os.path.exists(trace_file_bin_path):
+            log('sweep: using native trace replay mode ({})'.format(trace_file_bin_path))
+        else:
+            log('sweep: using python trace replay mode ({})'.format(trace_file_path))
+    elif evaluation_mode == 'state':
+        run_fn = run_state_fault
+    else:
+        run_fn = run_execute_fault
+
+    for idx, fp in enumerate(fault_points):
+        if idx > 0 and evaluation_mode == 'state' and not use_trace_replay:
+            reload_images()
+            apply_pre_boot_state()
+        # Determine fault type for this point.
+        ft = 'w'
+        if idx < len(fault_type_list):
+            ft = fault_type_list[idx]
+        # Cascade faults: 'c:W:E' where W=write_fault_at, E=erase_fault_at.
+        if ft.startswith('c:'):
+            parts = ft.split(':')
+            w_at = int(parts[1])
+            e_at = int(parts[2])
+            results.append(run_cascading_fault(w_at, e_at))
+        # Synthetic/non-default faults always use full execute mode
+        # (not trace replay — they depend on NVMC peripheral state/PRNG).
+        elif ft in ('e', 'a', 'b', 's', 'd', 'l', 'r', 't'):
+            results.append(run_execute_fault(fp, fault_type=ft))
+        elif run_fn == run_trace_replay_fault:
+            results.append(run_fn(fp, fault_type=ft))
+        elif run_fn == run_execute_fault:
+            results.append(run_fn(fp, fault_type=ft))
+        else:
+            results.append(run_fn(fp))
+
+        # Force .NET GC periodically to prevent memory exhaustion.
+        # Every-iteration GC is wasteful; every 10th iteration is sufficient
+        # since the main allocations (flash snapshots) are reused via cache.
+        if USE_FAST_PATH and idx % 10 == 9:
+            import System
+            System.GC.Collect()
+
+    # Aggregate timing summary for batch runs.
+    if batch_mode and results:
+        timing_keys = ['reload_ms', 'replay_ms', 'reset_ms', 'setup_ms', 'emulation_ms', 'total_ms', 'p2_iters']
+        sums = {}
+        maxes = {}
+        count = 0
+        for r in results:
+            s = r.get('signals', {})
+            if 'total_ms' not in s:
+                continue
+            count += 1
+            for k in timing_keys:
+                v = s.get(k, 0)
+                sums[k] = sums.get(k, 0) + v
+                maxes[k] = max(maxes.get(k, 0), v)
+        if count > 0:
+            log('=== TIMING SUMMARY ({} points) ==='.format(count))
+            log('  total:     sum={}ms  avg={}ms  max={}ms'.format(
+                sums.get('total_ms', 0), sums.get('total_ms', 0) // count, maxes.get('total_ms', 0)))
+            log('  reload:    sum={}ms  avg={}ms  max={}ms'.format(
+                sums.get('reload_ms', 0), sums.get('reload_ms', 0) // count, maxes.get('reload_ms', 0)))
+            log('  replay:    sum={}ms  avg={}ms  max={}ms'.format(
+                sums.get('replay_ms', 0), sums.get('replay_ms', 0) // count, maxes.get('replay_ms', 0)))
+            log('  reset:     sum={}ms  avg={}ms  max={}ms'.format(
+                sums.get('reset_ms', 0), sums.get('reset_ms', 0) // count, maxes.get('reset_ms', 0)))
+            log('  setup:     sum={}ms  avg={}ms  max={}ms'.format(
+                sums.get('setup_ms', 0), sums.get('setup_ms', 0) // count, maxes.get('setup_ms', 0)))
+            log('  emulation: sum={}ms  avg={}ms  max={}ms'.format(
+                sums.get('emulation_ms', 0), sums.get('emulation_ms', 0) // count, maxes.get('emulation_ms', 0)))
+            log('  p2_iters:  sum={}    avg={}    max={}'.format(
+                sums.get('p2_iters', 0), sums.get('p2_iters', 0) // count, maxes.get('p2_iters', 0)))
+
+    # Write results.
+    if batch_mode:
+        with open(result_file, 'w') as f:
+            f.write(json.dumps(results, sort_keys=True))
+    else:
+        with open(result_file, 'w') as f:
+            f.write(json.dumps(results[0], sort_keys=True))
+
+    log('sweep done: {} fault points'.format(len(results)))
+
+# Halt CPU so Renode exits promptly.
+try:
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = True
+except:
+    pass
+"""

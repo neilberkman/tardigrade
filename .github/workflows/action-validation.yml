@@ -1,0 +1,102 @@
+name: action-validation
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Prove the action plumbing works end-to-end.
+  action-smoke:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run action against public MCUboot profile (expect PASS)
+        uses: ./
+        id: mcuboot
+        with:
+          profile: profiles/mcuboot_swap_current.yaml
+          quick: "true"
+
+      - name: Verify outputs
+        run: |
+          echo "verdict=${{ steps.mcuboot.outputs.verdict }}"
+          echo "brick_rate=${{ steps.mcuboot.outputs.brick-rate }}"
+          echo "report=${{ steps.mcuboot.outputs.report-path }}"
+          test "${{ steps.mcuboot.outputs.verdict }}" = "PASS"
+
+  # Prove tardigrade catches the three MCUboot bugs we claim it catches.
+  # Each differential: broken ELF finds bricks, fixed ELF is clean.
+  pr-differentials:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # PR #2100: revert magic bug (swap-move).
+          # Vulnerability at fault points 2-4 out of ~15K.
+          # Target first 10 points instead of full sweep.
+          - name: pr2100
+            broken: profiles/mcuboot_pr2100_broken_discovery.yaml
+            fixed: profiles/mcuboot_pr2100_fixed_discovery.yaml
+            extra_args: "--fault-end 10"
+          # PR #2109: header reload bug (swap-scratch).
+          # --quick catches it (50% brick rate at 3 sample points).
+          - name: pr2109
+            broken: profiles/mcuboot_pr2109_scratch_broken.yaml
+            fixed: profiles/mcuboot_pr2109_scratch_fixed.yaml
+            extra_args: "--quick"
+          # PR #2199: stuck revert (swap-move).
+          # 100% failure rate — even control run detects it.
+          - name: pr2199
+            broken: profiles/mcuboot_pr2199_move_broken.yaml
+            fixed: profiles/mcuboot_pr2199_move_fixed.yaml
+            extra_args: "--quick"
+    env:
+      RENODE_URL: https://builds.renode.io/renode-latest.linux-portable.tar.gz
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Renode portable
+        run: |
+          set -euxo pipefail
+          tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
+          curl -L "${RENODE_URL}" -o "${tarball}"
+          mkdir -p "${RUNNER_TEMP}/renode"
+          tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
+          python3 -m pip install --user -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+          echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
+
+      - name: Install Python dependencies
+        run: python3 -m pip install --user pyyaml
+
+      - name: "Broken ELF: must detect bricks"
+        run: |
+          python3 scripts/audit_bootloader.py \
+            --profile "${{ matrix.broken }}" \
+            --output "${RUNNER_TEMP}/${{ matrix.name }}_broken.json" \
+            --renode-test "${RUNNER_TEMP}/renode/renode-test" \
+            ${{ matrix.extra_args }}
+
+      - name: "Fixed ELF: must be clean"
+        run: |
+          python3 scripts/audit_bootloader.py \
+            --profile "${{ matrix.fixed }}" \
+            --output "${RUNNER_TEMP}/${{ matrix.name }}_fixed.json" \
+            --renode-test "${RUNNER_TEMP}/renode/renode-test" \
+            ${{ matrix.extra_args }}
+
+      - name: Upload differential reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: differential-${{ matrix.name }}
+          path: ${{ runner.temp }}/${{ matrix.name }}_*.json

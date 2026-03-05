@@ -1,0 +1,45 @@
+schema_version: 1
+name: esp_idf_fault_single_sector
+description: >
+  ESP-IDF OTA model reading only otadata sector 0 (no redundancy).
+  Rollback scenario: entry 0 is PENDING_VERIFY and must be ABORTED, while
+  entry 1 is VALID. Correct bootloader reads both sectors and rolls back to
+  entry 1. Defect only reads sector 0, so it loses the valid fallback entry.
+
+platform: platforms/cortex_m4_flash_fast.repl
+bootloader:
+  elf: examples/esp_idf_ota/esp_idf_fault_single_sector.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x74000 }
+    staging: { base: 0x00080000, size: 0x74000 }
+images:
+  exec: examples/esp_idf_ota/slot0.bin
+  staging: examples/esp_idf_ota/slot1.bin
+# Rollback scenario: entry 0 = seq 2/PENDING_VERIFY, entry 1 = seq 1/VALID
+pre_boot_state:
+  - { address: 0x000F8000, u32: 0x00000002 }
+  - { address: 0x000F8018, u32: 0x00000001 }
+  - { address: 0x000F801C, u32: 0x55F63774 }
+  - { address: 0x000F9000, u32: 0x00000001 }
+  - { address: 0x000F9018, u32: 0x00000002 }
+  - { address: 0x000F901C, u32: 0x4743989A }
+success_criteria:
+  # Expected correct behavior: rollback to entry 1 (slot 0 / exec) after
+  # aborting entry 0.
+  vtor_in_slot: exec
+  marker_address: 0x000FC000
+  marker_value: 0x00000000
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 20000000
+  fault_types: [power_loss, interrupted_erase]
+expect:
+  should_find_issues: false

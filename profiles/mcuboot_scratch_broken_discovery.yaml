@@ -1,0 +1,51 @@
+schema_version: 1
+name: mcuboot_scratch_broken_discovery
+description: >
+  MCUboot swap-using-SCRATCH BEFORE scratch erase direction fix (commit 7253f01c).
+  Discovery mode with image hash validation and declarative update trigger.
+
+platform: platforms/cortex_m4_flash_fast.repl
+
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_scratch_broken.elf
+  entry: 0x00000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x6E000 }
+    staging: { base: 0x0007A000, size: 0x6E000 }
+
+# Upgrade scenario: new image in secondary, trigger swap.
+images:
+  exec: results/oss_validation/assets/zephyr_slot0_padded.bin
+  staging: results/oss_validation/assets/zephyr_slot1_padded.bin
+
+# Declarative trigger: write GOOD magic to staging slot trailer.
+# MCUboot reads the secondary trailer to decide whether to swap.
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: staging
+
+# Image hash mode: after upgrade, exec slot should contain the staging image.
+success_criteria:
+  vtor_in_slot: exec
+  image_hash: true
+  expected_image: staging
+
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 20000000
+  fault_types:
+    - power_loss
+    - interrupted_erase
+  hash_bypass_symbols: ["bootutil_img_validate"]
+
+skip_self_test: true
+expect:
+  should_find_issues: true

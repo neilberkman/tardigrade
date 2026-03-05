@@ -1,0 +1,54 @@
+schema_version: 1
+name: mcuboot_pr2100_broken_discovery
+description: >
+  MCUboot swap-using-move BEFORE PR #2100 fix (commit 2ac79767).
+  Discovery mode: uses image hash validation and update_trigger instead
+  of hand-computed pre_boot_state and marker_address.
+
+platform: platforms/cortex_m4_flash_fast.repl
+
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_pr2100_broken.elf
+  entry: 0x00000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x76000 }
+    staging: { base: 0x00082000, size: 0x76000 }
+
+# Revert scenario: after a completed upgrade that was not confirmed.
+images:
+  exec: results/oss_validation/assets/zephyr_slot1_padded.bin
+  staging: results/oss_validation/assets/zephyr_slot0_padded.bin
+
+# Declarative trigger instead of hand-computed trailer bytes.
+# mcuboot_trailer_magic writes GOOD magic at slot_end - 16.
+# copy_done: 1 triggers REVERT (upgrade completed but not confirmed).
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: exec
+  copy_done: 1
+
+# Image hash mode: after recovery, hash exec slot and compare against
+# both known images. No need to know MCUboot header offsets.
+# expected_image: which image should end up in exec after successful revert.
+# For revert, MCUboot swaps staging (old image) back into exec.
+success_criteria:
+  vtor_in_slot: exec
+  image_hash: true
+  expected_image: staging
+
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 20000000
+  hash_bypass_symbols: ["bootutil_img_validate"]
+
+skip_self_test: true
+expect:
+  should_find_issues: true

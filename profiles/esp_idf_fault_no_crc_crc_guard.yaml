@@ -1,0 +1,43 @@
+schema_version: 1
+name: esp_idf_fault_no_crc_crc_guard
+skip_self_test: true
+description: >
+  ESP-IDF no_crc defect counterpart for esp_idf_ota_crc_guard. With CRC
+  checks disabled, the corrupted higher-seq entry can be selected, driving
+  wrong-slot/no-boot outcomes that the baseline avoids.
+
+platform: platforms/cortex_m4_flash_fast.repl
+bootloader:
+  elf: examples/esp_idf_ota/esp_idf_fault_no_crc.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x74000 }
+    staging: { base: 0x00080000, size: 0x74000 }
+images:
+  exec: examples/esp_idf_ota/slot0.bin
+  staging: examples/esp_idf_ota/slot1.bin
+pre_boot_state:
+  # Entry 0: seq=1, NEW, valid CRC.
+  - { address: 0x000F8000, u32: 0x00000001 }
+  - { address: 0x000F8018, u32: 0x00000000 }
+  - { address: 0x000F801C, u32: 0x4743989A }
+  # Entry 1: seq=2, NEW, CRC intentionally corrupted (should be 0x55F63774).
+  - { address: 0x000F9000, u32: 0x00000002 }
+  - { address: 0x000F9018, u32: 0x00000000 }
+  - { address: 0x000F901C, u32: 0x55F63775 }
+success_criteria:
+  vtor_in_slot: exec
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  sweep_strategy: exhaustive
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 0x180000
+  fault_types: [power_loss, interrupted_erase]
+expect:
+  should_find_issues: true

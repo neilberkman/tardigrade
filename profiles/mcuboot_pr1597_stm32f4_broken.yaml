@@ -1,0 +1,49 @@
+schema_version: 1
+name: mcuboot_pr1597_stm32f4_broken
+description: >
+  MCUboot swap-move BEFORE g_last_idx fix (PR #1597, commit bfdf934e).
+  Static g_last_idx resets to UINT32_MAX on power cycle. After interrupted
+  swap-move resumes, boot_read_image_header reads from wrong offset,
+  causing permanent brick.
+
+platform: platforms/stm32f4.repl
+
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_pr1597_stm32f4_broken.elf
+  entry: 0x08000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x08020000, size: 0x60000 }
+    staging: { base: 0x08080000, size: 0x60000 }
+
+images:
+  exec: results/oss_validation/assets/zephyr_stm32f4_slot0.bin
+  staging: results/oss_validation/assets/zephyr_stm32f4_slot1.bin
+
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: staging
+
+success_criteria:
+  vtor_in_slot: exec
+  image_hash: true
+  expected_image: staging
+
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 20000000
+  fault_types:
+    - power_loss
+  hash_bypass_symbols: ["bootutil_img_validate"]
+  progress_stall_timeout_s: 120
+
+skip_self_test: true
+expect:
+  should_find_issues: true
