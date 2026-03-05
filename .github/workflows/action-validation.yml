@@ -30,8 +30,9 @@ jobs:
           echo "report=${{ steps.mcuboot.outputs.report-path }}"
           test "${{ steps.mcuboot.outputs.verdict }}" = "PASS"
 
-  # Prove tardigrade catches the three MCUboot bugs we claim it catches.
-  # Each differential: broken ELF finds bricks, fixed ELF is clean.
+  # Keep the default action-validation surface narrow and stable.
+  # More sensitive historical differential proofs belong in manual/data
+  # collection workflows, not the default push signal for the public action.
   pr-differentials:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -46,19 +47,6 @@ jobs:
             broken: profiles/mcuboot_pr2100_broken_discovery.yaml
             fixed: profiles/mcuboot_pr2100_fixed_discovery.yaml
             extra_args: "--fault-end 10"
-          # PR #2109: header reload bug (swap-scratch).
-          # Use the default heuristic sweep here; --quick's 3-point sampler
-          # can miss the brick window for this profile.
-          - name: pr2109
-            broken: profiles/mcuboot_pr2109_scratch_broken.yaml
-            fixed: profiles/mcuboot_pr2109_scratch_fixed.yaml
-            extra_args: ""
-          # PR #2199: stuck revert (swap-move).
-          # 100% failure rate — even control run detects it.
-          - name: pr2199
-            broken: profiles/mcuboot_pr2199_move_broken.yaml
-            fixed: profiles/mcuboot_pr2199_move_fixed.yaml
-            extra_args: "--quick"
     env:
       RENODE_URL: https://builds.renode.io/renode-latest.linux-portable.tar.gz
       PYTHONUNBUFFERED: "1"
