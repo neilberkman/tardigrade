@@ -1,6 +1,19 @@
 name: oss-validation
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/oss-validation.yml
+      - action.yml
+      - docs/oss_validation_profiles.json
+      - platforms/**
+      - profiles/**
+      - scripts/**
+      - tests/**
+  schedule:
+    - cron: '0 9 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -8,7 +21,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  recent-activity:
+    runs-on: ubuntu-22.04
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: decide
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "should_run=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          changed="$(
+            git log \
+              --since='24 hours ago' \
+              --name-only \
+              --pretty=format: \
+              -- \
+              .github/workflows/oss-validation.yml \
+              action.yml \
+              docs/oss_validation_profiles.json \
+              platforms \
+              profiles \
+              scripts \
+              tests \
+            | sed '/^$/d' \
+            | sort -u
+          )"
+
+          if [ -n "${changed}" ]; then
+            echo "Recent relevant activity detected:"
+            echo "${changed}"
+            echo "should_run=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "No relevant activity in the last 24 hours; skipping scheduled OSS validation."
+            echo "should_run=false" >> "${GITHUB_OUTPUT}"
+          fi
+
   mcuboot-guards:
+    needs: recent-activity
+    if: needs.recent-activity.outputs.should_run == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:
