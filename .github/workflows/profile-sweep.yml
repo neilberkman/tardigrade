@@ -1,24 +1,24 @@
-name: full-sweep
+name: profile-sweep
 
 on:
   workflow_dispatch:
     inputs:
       profile:
-        description: Profile YAML (relative to repo root)
+        description: Profile YAML to sweep (relative to repo root)
         required: true
-        default: profiles/mcuboot_pr2100_broken.yaml
+        default: profiles/mcuboot_swap_current.yaml
       workers:
         description: Parallel Renode workers
         required: false
         default: "2"
       exhaustive:
-        description: Run ALL fault points (skip heuristic pruning)
+        description: Sweep all fault points for the selected profile
         type: boolean
         required: false
-        default: true
+        default: false
 
 concurrency:
-  group: full-sweep-${{ github.event.inputs.profile }}
+  group: profile-sweep-${{ github.event.inputs.profile }}-${{ github.event.inputs.exhaustive }}
   cancel-in-progress: true
 
 jobs:
@@ -45,12 +45,12 @@ jobs:
       - name: Install Python dependencies
         run: python3 -m pip install --user pyyaml
 
-      - name: Run full sweep
+      - name: Run profile sweep
         run: |
           args=(
             --profile "${{ inputs.profile }}"
             --renode-test "${RUNNER_TEMP}/renode/renode-test"
-            --output results/full_sweep.json
+            --output results/profile_sweep.json
             --workers "${{ inputs.workers }}"
           )
           if [ "${{ inputs.exhaustive }}" = "true" ]; then
@@ -64,10 +64,10 @@ jobs:
       - name: Print summary
         if: always()
         run: |
-          if [ -f results/full_sweep.json ]; then
+          if [ -f results/profile_sweep.json ]; then
             python3 -c "
           import json
-          r = json.load(open('results/full_sweep.json'))
+          r = json.load(open('results/profile_sweep.json'))
           s = r.get('summary', {}).get('runtime_sweep', {})
           t = s.get('timing', {}).get('averages', {})
           print('Profile:', r.get('profile'))
@@ -84,5 +84,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: full-sweep-results
-          path: results/full_sweep.json
+          name: profile-sweep-results
+          path: results/profile_sweep.json

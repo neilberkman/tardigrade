@@ -193,7 +193,7 @@ Key fields: `platform`, `bootloader`, `memory`, `images`, `success_criteria`, `f
 
 ## Performance
 
-Optimizations that make full sweeps feasible on CI runners:
+Optimizations that make profile sweeps feasible on CI runners:
 
 - **Trace replay** -- calibration records every write address+value; sweep replays from trace (~20ms) instead of re-emulating Phase 1, eliminating O(N^2) prefix cost
 - **Cached flash restore** -- single `WriteBytes` call per fault point instead of per-page erase+load
@@ -232,7 +232,7 @@ Per-point diagnostics are attached only when relevant:
 | Workflow                   | Trigger           | What it does                                              |
 | -------------------------- | ----------------- | --------------------------------------------------------- |
 | `ci.yml`                   | push, PR          | Robot suites + sharded self-test                           |
-| `full-sweep.yml`           | workflow_dispatch | On-demand exhaustive sweep                                |
+| `profile-sweep.yml`        | workflow_dispatch | On-demand single-profile sweep with optional exhaustive mode |
 | `action-validation.yml`    | push, PR          | Validates the reusable GitHub Action                      |
 | `oss-validation.yml`       | workflow_dispatch | Runs OSS bootloader profiles                              |
 | `renode-latest-canary.yml` | workflow_dispatch | Tests against latest Renode build                         |
