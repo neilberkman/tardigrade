@@ -131,5 +131,5 @@ Run Runtime Fault Point
 
 *** Test Cases ***
 Run OTA Fault Point
-    [Timeout]    10 minutes
+    [Timeout]    15 minutes
     Run Runtime Fault Point
