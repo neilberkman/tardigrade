@@ -6,6 +6,8 @@ from __future__ import annotations
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +24,7 @@ from run_scenario import (  # noqa: E402
     apply_replay_to_profile,
     evaluate_assertions,
     load_replay_spec,
+    run_audit_step,
 )
 
 
@@ -292,6 +295,84 @@ class GenericFrameworkTest(unittest.TestCase):
         )
         self.assertEqual(merged["expect"]["control_outcome"], "success")
         self.assertEqual(merged["expect"]["required_issue_reasons"], ["boot_outcome"])
+
+    def test_run_audit_step_honors_step_base_profile_override(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            base1 = tempdir / "base1.yaml"
+            base2 = tempdir / "base2.yaml"
+            base1.write_text(
+                textwrap.dedent(
+                    """
+                    schema_version: 1
+                    name: base_one
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    bootloader: { elf: examples/vulnerable_ota/firmware.elf, entry: 0x10000000 }
+                    memory:
+                      sram: { start: 0x20000000, end: 0x20020000 }
+                      write_granularity: 4
+                      slots:
+                        exec: { base: 0x10000000, size: 0x1000 }
+                        staging: { base: 0x10001000, size: 0x1000 }
+                    images: { staging: examples/vulnerable_ota/firmware.bin }
+                    success_criteria: { vtor_in_slot: exec }
+                    expect: { should_find_issues: false }
+                    """
+                ),
+                encoding="utf-8",
+            )
+            base2.write_text(
+                textwrap.dedent(
+                    """
+                    schema_version: 1
+                    name: base_two
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    bootloader: { elf: examples/vulnerable_ota/firmware.elf, entry: 0x10000000 }
+                    memory:
+                      sram: { start: 0x20000000, end: 0x20020000 }
+                      write_granularity: 4
+                      slots:
+                        exec: { base: 0x20000000, size: 0x1000 }
+                        staging: { base: 0x20001000, size: 0x1000 }
+                    images: { staging: examples/vulnerable_ota/firmware.bin }
+                    success_criteria: { vtor_in_slot: exec }
+                    expect: { should_find_issues: false }
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_run(cmd, cwd, capture_output, text, check):
+                profile_path = Path(cmd[cmd.index("--profile") + 1])
+                output_path = Path(cmd[cmd.index("--output") + 1])
+                rendered = profile_path.read_text(encoding="utf-8")
+                self.assertIn("name: base_two", rendered)
+                output_path.write_text(
+                    '{"summary": {"runtime_sweep": {"issue_points": 0}}}',
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch("run_scenario.subprocess.run", side_effect=fake_run):
+                step_result = run_audit_step(
+                    repo_root=ROOT,
+                    scenario_dir=tempdir,
+                    default_base_profile_path=base1,
+                    step={
+                        "id": "override_case",
+                        "kind": "audit",
+                        "base_profile": base2.name,
+                        "profile_overrides": {"expect": {"required_issue_reasons": ["boot_outcome"]}},
+                    },
+                    tempdir=tempdir,
+                    args=SimpleNamespace(
+                        renode_test="",
+                        renode_remote_server_dir="",
+                        robot_var=[],
+                        keep_run_artifacts=False,
+                    ),
+                )
+            self.assertEqual(step_result["base_profile"], str(base2.resolve()))
 
 
 if __name__ == "__main__":

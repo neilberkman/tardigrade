@@ -239,6 +239,8 @@ Key fields: `platform`, `bootloader`, `memory`, `images`, `success_criteria`, `f
 
 Use [`scripts/run_scenario.py`](scripts/run_scenario.py) to orchestrate multi-step discovery runs without baking target semantics into the core. A scenario references a base profile and then runs `audit` or `replay` steps by applying generic profile overrides.
 
+Public example: [`scenarios/mcuboot_head_exploratory.yaml`](scenarios/mcuboot_head_exploratory.yaml) attaches a target-side probe and invariant provider to the public `mcuboot_head_upgrade` and `mcuboot_head_revert` profiles, then checks both paths through the generic scenario runner.
+
 Replay specs are generic override bundles, suitable for counterexamples from CBMC or any other model checker:
 
 ```yaml
@@ -302,6 +304,7 @@ Per-point diagnostics are attached only when relevant:
 | `profile-sweep.yml`        | workflow_dispatch | On-demand single-profile sweep with optional exhaustive mode |
 | `action-validation.yml`    | push, PR          | Validates the reusable GitHub Action                      |
 | `oss-validation.yml`       | workflow_dispatch | Runs OSS bootloader profiles                              |
+| `mcuboot-head-exploratory.yml` | workflow_dispatch | Runs the public MCUboot exploratory scenario via `run_scenario.py` |
 | `renode-latest-canary.yml` | workflow_dispatch | Tests against latest Renode build                         |
 
 ## Repository layout
@@ -331,7 +334,11 @@ tardigrade/
 │   └── cbmc_to_profile.py                       # CBMC counterexample → profile converter
 ├── targets/
 │   └── mcuboot/
+│       ├── probe.py                              # MCUboot trailer-state semantic probe
+│       ├── invariants.py                         # MCUboot-specific invariant provider
 │       └── state_fuzzer.py                      # MCUboot-specific trailer state exploration
+├── scenarios/
+│   └── mcuboot_head_exploratory.yaml            # Public multi-step scenario example
 ├── examples/                                    # Built-in bootloader firmware
 │   ├── naive_copy/
 │   ├── vulnerable_ota/

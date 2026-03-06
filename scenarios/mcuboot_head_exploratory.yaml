@@ -1,0 +1,71 @@
+schema_version: 1
+name: mcuboot_head_exploratory
+base_profile: profiles/mcuboot_head_upgrade.yaml
+
+shared_profile_overrides: &mcuboot_target_overrides
+  fault_sweep:
+    boot_cycles: 3
+  state_probe:
+    script: targets/mcuboot/probe.py
+    format: tardigrade.semantic-state/v1
+    contract_version: 1
+    required_paths:
+      - semantic_state.slots.exec.magic_state
+      - semantic_state.slots.staging.magic_state
+      - semantic_state.flags.any_partial_magic
+  invariant_providers:
+    - targets/mcuboot/invariants.py
+  invariants:
+    - multi_boot_converges
+    - mcuboot_no_partial_magic
+
+steps:
+  - id: upgrade_head
+    kind: audit
+    audit:
+      workers: 2
+    profile_overrides:
+      <<: *mcuboot_target_overrides
+      semantic_assertions:
+        control:
+          multi_boot_analysis.status: converged
+
+  - id: revert_head
+    kind: audit
+    base_profile: profiles/mcuboot_head_revert.yaml
+    audit:
+      workers: 2
+    profile_overrides:
+      <<: *mcuboot_target_overrides
+      semantic_assertions:
+        control:
+          multi_boot_analysis.status: converged
+
+  - id: upgrade_assert
+    kind: assert
+    assertions:
+      - path: steps.upgrade_head.report.summary.runtime_sweep.control.boot_outcome
+        op: equals
+        value: success
+      - path: steps.upgrade_head.report.summary.runtime_sweep.control.issue_count
+        op: equals
+        value: 0
+      - path: steps.upgrade_head.report.summary.runtime_sweep.control.multi_boot_analysis.status
+        op: equals
+        value: converged
+
+  - id: revert_assert
+    kind: assert
+    assertions:
+      - path: steps.revert_head.report.summary.runtime_sweep.control.boot_outcome
+        op: equals
+        value: success
+      - path: steps.revert_head.report.summary.runtime_sweep.control.issue_count
+        op: equals
+        value: 0
+      - path: steps.revert_head.report.summary.runtime_sweep.control.multi_boot_analysis.status
+        op: equals
+        value: converged
+      - path: steps.revert_head.report.summary.runtime_sweep.control.multi_boot_analysis.final_slot
+        op: equals
+        value: exec

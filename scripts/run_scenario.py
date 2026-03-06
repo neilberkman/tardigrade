@@ -266,7 +266,7 @@ def build_audit_command(
 def run_audit_step(
     repo_root: Path,
     scenario_dir: Path,
-    base_profile_raw: Dict[str, Any],
+    default_base_profile_path: Path,
     step: Dict[str, Any],
     tempdir: Path,
     args: argparse.Namespace,
@@ -284,7 +284,14 @@ def run_audit_step(
     if not isinstance(inline_overrides, dict):
         raise ScenarioError("step {} profile_overrides: expected mapping".format(step_id))
 
-    profile_raw = dict(base_profile_raw)
+    step_base_profile_raw = step.get("base_profile")
+    if step_base_profile_raw:
+        base_profile_path = Path(
+            _resolve_path(scenario_dir, str(step_base_profile_raw))
+        )
+    else:
+        base_profile_path = default_base_profile_path
+    profile_raw = dict(_load_data(base_profile_path))
     replay_meta: Optional[Dict[str, Any]] = None
     if step_kind == "replay":
         replay_file = step.get("replay_file")
@@ -331,6 +338,7 @@ def run_audit_step(
     return {
         "id": step_id,
         "kind": step_kind,
+        "base_profile": str(base_profile_path),
         "exit_code": proc.returncode,
         "status": "PASS" if proc.returncode == 0 else "FAIL",
         "command": cmd,
@@ -377,7 +385,6 @@ def main() -> int:
     scenario_dir = scenario_path.parent
     scenario = load_scenario(scenario_path)
     base_profile_path = Path(_resolve_path(scenario_dir, str(scenario["base_profile"])))
-    base_profile_raw = _load_data(base_profile_path)
 
     results: Dict[str, Any] = {
         "scenario": {
@@ -398,7 +405,7 @@ def main() -> int:
                 step_result = run_audit_step(
                     repo_root=repo_root,
                     scenario_dir=scenario_dir,
-                    base_profile_raw=base_profile_raw,
+                    default_base_profile_path=base_profile_path,
                     step=step,
                     tempdir=tempdir,
                     args=args,
