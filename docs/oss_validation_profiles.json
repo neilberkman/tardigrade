@@ -24,7 +24,7 @@
       },
       "setup_commands": [
         "\"{repo_root}/scripts/bootstrap_mcuboot_matrix_assets.sh\"",
-        "cd \"{repo_root}/third_party/zephyr_ws\" && ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb GNUARMEMB_TOOLCHAIN_PATH=\"$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major\" \"{repo_root}/third_party/zephyr-venv/bin/west\" build -d \"{repo_root}/results/oss_validation/build/oss_mcuboot_{variant_name}\" -p always -b nrf52840dk/nrf52840 \"{source_worktree}/boot/zephyr\" -- -DCONFIG_BOOT_SWAP_USING_MOVE=y -DCONFIG_BOOT_SIGNATURE_TYPE_NONE=y -DCONFIG_BOOT_SIGNATURE_TYPE_RSA=n -DCMAKE_GDB:FILEPATH=\"$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major/bin/arm-none-eabi-gdb\" -DPython3_EXECUTABLE:FILEPATH=\"{repo_root}/third_party/zephyr-venv/bin/python3\"",
+        "cd \"{repo_root}/third_party/zephyr_ws\" && ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb GNUARMEMB_TOOLCHAIN_PATH=\"$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major\" \"{repo_root}/third_party/zephyr-venv/bin/west\" build -d \"{repo_root}/results/oss_validation/build/oss_mcuboot_{variant_name}\" -p always -b nrf52840dk_nrf52840 \"{source_worktree}/boot/zephyr\" -- -DCONFIG_BOOT_SWAP_USING_MOVE=y -DCONFIG_BOOT_SIGNATURE_TYPE_NONE=y -DCONFIG_BOOT_SIGNATURE_TYPE_RSA=n -DCMAKE_GDB:FILEPATH=\"$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major/bin/arm-none-eabi-gdb\" -DPython3_EXECUTABLE:FILEPATH=\"{repo_root}/third_party/zephyr-venv/bin/python3\"",
         "cp \"{repo_root}/results/oss_validation/build/oss_mcuboot_{variant_name}/zephyr/zephyr.elf\" \"{repo_root}/results/oss_validation/assets/oss_mcuboot_{variant_name}.elf\""
       ],
       "robot_vars": [
@@ -67,7 +67,7 @@
       },
       "setup_commands": [
         "\"{repo_root}/scripts/bootstrap_mcuboot_matrix_assets.sh\"",
-        "cd \"{repo_root}/third_party/zephyr_ws\" && ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb GNUARMEMB_TOOLCHAIN_PATH=\"$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major\" \"{repo_root}/third_party/zephyr-venv/bin/west\" build -d \"{repo_root}/results/oss_validation/build/oss_mcuboot_{variant_name}\" -p always -b nrf52840dk/nrf52840 \"{source_worktree}/boot/zephyr\" -- -DCONFIG_BOOT_SWAP_USING_MOVE=y -DCONFIG_BOOT_SIGNATURE_TYPE_NONE=y -DCONFIG_BOOT_SIGNATURE_TYPE_RSA=n -DCMAKE_GDB:FILEPATH=\"$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major/bin/arm-none-eabi-gdb\" -DPython3_EXECUTABLE:FILEPATH=\"{repo_root}/third_party/zephyr-venv/bin/python3\"",
+        "cd \"{repo_root}/third_party/zephyr_ws\" && ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb GNUARMEMB_TOOLCHAIN_PATH=\"$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major\" \"{repo_root}/third_party/zephyr-venv/bin/west\" build -d \"{repo_root}/results/oss_validation/build/oss_mcuboot_{variant_name}\" -p always -b nrf52840dk_nrf52840 \"{source_worktree}/boot/zephyr\" -- -DCONFIG_BOOT_SWAP_USING_MOVE=y -DCONFIG_BOOT_SIGNATURE_TYPE_NONE=y -DCONFIG_BOOT_SIGNATURE_TYPE_RSA=n -DCMAKE_GDB:FILEPATH=\"$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major/bin/arm-none-eabi-gdb\" -DPython3_EXECUTABLE:FILEPATH=\"{repo_root}/third_party/zephyr-venv/bin/python3\"",
         "cp \"{repo_root}/results/oss_validation/build/oss_mcuboot_{variant_name}/zephyr/zephyr.elf\" \"{repo_root}/results/oss_validation/assets/oss_mcuboot_{variant_name}.elf\""
       ],
       "robot_vars": [

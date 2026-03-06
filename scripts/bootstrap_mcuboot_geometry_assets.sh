@@ -66,7 +66,7 @@ build_pr2206_variant() {
         "${WEST}" build \
           -d "${out_build}" \
           -p always \
-          -b nrf52840dk/nrf52840 \
+          -b nrf52840dk_nrf52840 \
           "${src}/boot/zephyr" \
           -- \
           -DDTC_OVERLAY_FILE="${BUILD_DIR}/scratch_with_code_partition.dts" \
