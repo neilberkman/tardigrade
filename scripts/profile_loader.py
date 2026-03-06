@@ -164,15 +164,19 @@ class StateFuzzerConfig:
 
 
 class ExpectConfig:
-    __slots__ = ("should_find_issues", "control_outcome")
+    __slots__ = ("should_find_issues", "control_outcome", "allow_semantic_only_issues", "required_issue_reasons")
 
     def __init__(
         self,
         should_find_issues: bool = True,
         control_outcome: str = "success",
+        allow_semantic_only_issues: bool = False,
+        required_issue_reasons: Optional[List[str]] = None,
     ) -> None:
         self.should_find_issues = should_find_issues
         self.control_outcome = control_outcome
+        self.allow_semantic_only_issues = allow_semantic_only_issues
+        self.required_issue_reasons = required_issue_reasons or []
 
 
 class PreBootWrite:
@@ -642,9 +646,16 @@ def _parse_state_fuzzer(raw: Optional[Dict[str, Any]]) -> StateFuzzerConfig:
 def _parse_expect(raw: Optional[Dict[str, Any]]) -> ExpectConfig:
     if raw is None:
         return ExpectConfig()
+    required_issue_reasons = [
+        str(reason).strip()
+        for reason in raw.get("required_issue_reasons", [])
+        if str(reason).strip()
+    ]
     return ExpectConfig(
         should_find_issues=bool(raw.get("should_find_issues", True)),
         control_outcome=str(raw.get("control_outcome", "success")),
+        allow_semantic_only_issues=bool(raw.get("allow_semantic_only_issues", False)),
+        required_issue_reasons=required_issue_reasons,
     )
 
 
@@ -887,6 +898,9 @@ def main() -> int:
         "boot_cycles": profile.fault_sweep.boot_cycles,
         "state_fuzzer_enabled": profile.state_fuzzer.enabled,
         "expect_should_find_issues": profile.expect.should_find_issues,
+        "expect_control_outcome": profile.expect.control_outcome,
+        "expect_allow_semantic_only_issues": profile.expect.allow_semantic_only_issues,
+        "expect_required_issue_reasons": profile.expect.required_issue_reasons,
         "image_hash": profile.success_criteria.image_hash,
         "image_hash_slot": profile.success_criteria.image_hash_slot,
         "otadata_expect": profile.success_criteria.otadata_expect,

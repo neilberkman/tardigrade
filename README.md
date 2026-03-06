@@ -208,6 +208,9 @@ invariants:
 
 expect:
   should_find_issues: true # Self-test: tool must find bricks
+  # Optional for semantic-only discovery profiles:
+  allow_semantic_only_issues: false
+  required_issue_reasons: ["boot_outcome"]
 ```
 
 Key fields: `platform`, `bootloader`, `memory`, `images`, `success_criteria`, `fault_sweep`, `expect`. See [`scripts/profile_loader.py`](scripts/profile_loader.py) for the full schema.
@@ -216,8 +219,10 @@ Key fields: `platform`, `bootloader`, `memory`, `images`, `success_criteria`, `f
 
 - `state_probe_script`: profile-supplied Python hook that exports target-specific semantic state into the report after each boot.
 - `semantic_assertions`: path-based expectations over the runtime result (`semantic_state.*`, `multi_boot_analysis.*`, etc.). A point can fail even when the device still boots.
+- Missing semantic observations are reported separately from assertion failures so incomplete probes do not automatically look like discovered bugs.
 - `invariants`: named postconditions such as `multi_boot_converges` that run against the normalized result payload.
 - `fault_sweep.boot_cycles`: repeat clean boots after the initial control or faulted boot to catch stuck-revert or oscillation bugs that require more than one reboot.
+- `expect.allow_semantic_only_issues` and `expect.required_issue_reasons`: self-test controls for profiles that intentionally expect semantic-only discoveries instead of boot-visible failures.
 
 ## Performance
 
@@ -247,6 +252,7 @@ Primary report fields:
 
 - `summary.runtime_sweep`: aggregate outcomes (`failure_outcomes`), aggregate failure classes (`failure_classes`), brick rate, control result, and timing.
 - `runtime_sweep_results[]`: per-point records with `fault_type`, `boot_outcome`, `fault_class`, `signals`, and optional diagnostics such as `semantic_state`, `boot_cycles`, `multi_boot_analysis`, `semantic_assertion_failures`, and `invariant_violations`.
+- `semantic_observation_failures`: reported when a probe did not export a requested semantic field; these are observation gaps, not verdict-driving failures by default.
 - `clean_trace`: calibration-trace metadata when available (write/erase counts and how many points were window-annotated).
 
 Per-point diagnostics are attached only when relevant:

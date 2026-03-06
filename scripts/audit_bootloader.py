@@ -43,6 +43,12 @@ DEFAULT_ROBOT_SUITE = "tests/ota_fault_point.robot"
 EXIT_ASSERTION_FAILURE = 1
 EXIT_INFRA_FAILURE = 2
 DOCKER_RENODE_PREFIX = "docker://"
+CALIBRATION_INCOMPLETE_PREFIXES = (
+    "wall_timeout(",
+    "no_progress_stall(",
+    "no_boot_stall(",
+    "op_trace_limit",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -374,6 +380,22 @@ class CalibrationResult:
     pc: Optional[str] = None
 
 
+def calibration_completed(
+    stop_reason: Optional[str],
+    expected_control_outcome: str = "success",
+) -> bool:
+    """Return whether a calibration stop reason represents a complete pass."""
+    if not stop_reason:
+        return False
+    if stop_reason == "budget":
+        return False
+    if any(stop_reason.startswith(prefix) for prefix in CALIBRATION_INCOMPLETE_PREFIXES):
+        return False
+    if stop_reason in {"no_boot_no_writes", "no_writes_brick", "vtor_captured_hardfault"}:
+        return expected_control_outcome == "no_boot"
+    return True
+
+
 def run_calibration(
     repo_root: Path,
     renode_test: str,
@@ -397,6 +419,14 @@ def run_calibration(
     )
     total_writes = int(data.get("total_writes", 0))
     total_erases = int(data.get("total_erases", 0))
+    stop_reason = data.get("calibration_stop_reason")
+    if not calibration_completed(stop_reason, profile.expect.control_outcome):
+        raise RuntimeError(
+            "Calibration did not complete cleanly (reason={!r}, writes={}, erases={}). "
+            "Refusing to run a partial sweep.".format(
+                stop_reason, total_writes, total_erases
+            )
+        )
     if total_writes <= 0 and total_erases <= 0:
         if profile.expect.control_outcome == "no_boot":
             print(
@@ -426,7 +456,7 @@ def run_calibration(
         trace_file_bin=data.get("trace_file_bin"),
         erase_trace_file_bin=data.get("erase_trace_file_bin"),
         calibration_exec_hash=data.get("calibration_exec_hash"),
-        stop_reason=data.get("calibration_stop_reason"),
+        stop_reason=stop_reason,
         emulated_s=data.get("calibration_emulated_s"),
         elapsed_s=data.get("calibration_elapsed_s"),
         pc=data.get("calibration_pc"),
@@ -795,13 +825,24 @@ def _profile_partition_ranges(profile: ProfileConfig) -> List[Tuple[int, int]]:
 def _evaluate_semantic_assertions(
     result: Dict[str, Any],
     profile: ProfileConfig,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     failures: List[Dict[str, Any]] = []
+    observation_failures: List[Dict[str, Any]] = []
     scopes = ["always", "control" if result.get("is_control") else "faulted"]
     for scope in scopes:
         expectations = profile.semantic_assertions.get(scope, {})
         for path, expected in expectations.items():
             actual = _lookup_path(result, path)
+            if actual is _MISSING:
+                observation_failures.append(
+                    {
+                        "scope": scope,
+                        "path": path,
+                        "expected": _serialize_value(expected),
+                        "actual": "<missing>",
+                    }
+                )
+                continue
             if not _value_matches(actual, expected):
                 failures.append(
                     {
@@ -811,12 +852,45 @@ def _evaluate_semantic_assertions(
                         "actual": _serialize_value(actual),
                     }
                 )
-    return failures
+    return failures, observation_failures
+
+
+def _slot_validity_from_boot_slot(boot_slot: Optional[str]) -> Dict[str, bool]:
+    token = str(boot_slot or "").strip().lower()
+    slot_a_names = {"exec", "primary", "slot_a", "slot0", "a"}
+    slot_b_names = {"staging", "secondary", "slot_b", "slot1", "b"}
+    return {
+        "slot_a_valid": token in slot_a_names,
+        "slot_b_valid": token in slot_b_names,
+    }
+
+
+def _derive_runtime_pre_state(
+    result: Dict[str, Any],
+    control_result: Optional[Dict[str, Any]],
+    profile: ProfileConfig,
+) -> Optional[Dict[str, Any]]:
+    explicit = result.get("pre_state")
+    if isinstance(explicit, dict):
+        return explicit
+    if not isinstance(control_result, dict):
+        return None
+    expected_outcome = getattr(profile.expect, "control_outcome", "success") or "success"
+    if control_result.get("boot_outcome") != expected_outcome:
+        return None
+    derived = _slot_validity_from_boot_slot(control_result.get("boot_slot"))
+    if not any(derived.values()):
+        derived["slot_a_valid"] = True
+    derived["derived_from"] = "control_result"
+    derived["control_boot_slot"] = control_result.get("boot_slot")
+    derived["control_boot_outcome"] = control_result.get("boot_outcome")
+    return derived
 
 
 def _evaluate_invariants(
     result: Dict[str, Any],
     profile: ProfileConfig,
+    pre_state: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     if not profile.invariants:
         return []
@@ -832,7 +906,7 @@ def _evaluate_invariants(
     violations = run_invariants(
         fault_result,
         invariant_fns,
-        pre_state=result.get("pre_state"),
+        pre_state=pre_state,
         write_log=result.get("write_log"),
         partition_ranges=_profile_partition_ranges(profile),
         multi_boot_analysis=result.get("multi_boot_analysis"),
@@ -852,11 +926,22 @@ def annotate_result_checks(
     results: List[Dict[str, Any]],
     profile: ProfileConfig,
 ) -> None:
+    control_result: Optional[Dict[str, Any]] = None
+    for candidate in results:
+        if candidate.get("is_control"):
+            control_result = candidate
     for result in results:
-        semantic_failures = _evaluate_semantic_assertions(result, profile)
+        semantic_failures, observation_failures = _evaluate_semantic_assertions(
+            result, profile
+        )
         if semantic_failures:
             result["semantic_assertion_failures"] = semantic_failures
-        invariant_failures = _evaluate_invariants(result, profile)
+        if observation_failures:
+            result["semantic_observation_failures"] = observation_failures
+        pre_state = _derive_runtime_pre_state(result, control_result, profile)
+        if pre_state is not None:
+            result["pre_state"] = pre_state
+        invariant_failures = _evaluate_invariants(result, profile, pre_state=pre_state)
         if invariant_failures:
             result["invariant_violations"] = invariant_failures
 
@@ -1299,12 +1384,13 @@ def _compact_operation(op: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
 def annotate_fault_windows(
     results: List[Dict[str, Any]],
     clean_operations: List[Dict[str, Any]],
-) -> int:
+) -> Dict[str, int]:
     """Attach clean-trace window annotations to injected results."""
     if not clean_operations:
-        return 0
+        return {"annotated": 0, "skipped_unknown_interleaving": 0}
 
     annotated = 0
+    skipped_unknown_interleaving = 0
     write_pos = {int(op["write_index"]): i for i, op in enumerate(clean_operations) if op.get("kind") == "write"}
     erase_pos = {int(op["erase_index"]): i for i, op in enumerate(clean_operations) if op.get("kind") == "erase"}
 
@@ -1326,8 +1412,13 @@ def annotate_fault_windows(
         if target_pos is None:
             continue
 
-        before_op = clean_operations[target_pos - 1] if target_pos > 0 else None
         target_op = clean_operations[target_pos]
+        if target_op.get("kind") == "erase" and not target_op.get("writes_at_known", True):
+            r["fault_window_unavailable_reason"] = "erase_interleaving_unknown"
+            skipped_unknown_interleaving += 1
+            continue
+
+        before_op = clean_operations[target_pos - 1] if target_pos > 0 else None
         next_op = clean_operations[target_pos + 1] if target_pos + 1 < len(clean_operations) else None
 
         r["fault_window"] = {
@@ -1339,7 +1430,10 @@ def annotate_fault_windows(
         }
         annotated += 1
 
-    return annotated
+    return {
+        "annotated": annotated,
+        "skipped_unknown_interleaving": skipped_unknown_interleaving,
+    }
 
 
 def categorize_failure(
@@ -1401,6 +1495,10 @@ def categorize_failure(
         payload["issue_reasons"] = issue_reasons
     if result.get("semantic_assertion_failures"):
         payload["semantic_assertion_failures"] = result.get("semantic_assertion_failures")
+    if result.get("semantic_observation_failures"):
+        payload["semantic_observation_failures"] = result.get(
+            "semantic_observation_failures"
+        )
     if result.get("invariant_violations"):
         payload["invariant_violations"] = result.get("invariant_violations")
     window = result.get("fault_window")
@@ -1433,6 +1531,9 @@ def summarize_runtime_sweep(
     failures = [r for r in injected if result_has_issues(r, expected_outcome)]
     recoveries = sum(1 for r in injected if not result_has_issues(r, expected_outcome))
     semantic_issue_points = sum(1 for r in injected if r.get("semantic_assertion_failures"))
+    semantic_observation_points = sum(
+        1 for r in injected if r.get("semantic_observation_failures")
+    )
     invariant_issue_points = sum(1 for r in injected if r.get("invariant_violations"))
 
     # Categorize failures by outcome type.
@@ -1458,6 +1559,7 @@ def summarize_runtime_sweep(
         "bricks": len(boot_failures),
         "issue_points": len(failures),
         "semantic_issue_points": semantic_issue_points,
+        "semantic_observation_points": semantic_observation_points,
         "invariant_issue_points": invariant_issue_points,
         "recoveries": recoveries,
         "brick_rate": (float(len(boot_failures)) / float(total)) if total else 0.0,
@@ -1506,6 +1608,10 @@ def summarize_runtime_sweep(
         if ctrl.get("semantic_assertion_failures"):
             control_summary["semantic_assertion_failures"] = ctrl.get(
                 "semantic_assertion_failures"
+            )
+        if ctrl.get("semantic_observation_failures"):
+            control_summary["semantic_observation_failures"] = ctrl.get(
+                "semantic_observation_failures"
             )
         if ctrl.get("invariant_violations"):
             control_summary["invariant_violations"] = ctrl.get("invariant_violations")
@@ -1948,7 +2054,7 @@ def main() -> int:
                 for e in clean_erase_trace
                 if e.get("writes_at_this_point") is None
             )
-            annotated_windows = annotate_fault_windows(sweep_results, clean_ops)
+            window_stats = annotate_fault_windows(sweep_results, clean_ops)
             clean_trace_meta = {
                 "trace_file": trace_file,
                 "erase_trace_file": erase_trace_file,
@@ -1956,19 +2062,23 @@ def main() -> int:
                 "erases": len(clean_erase_trace),
                 "erases_missing_writes_at": erase_missing_writes_at,
                 "operations": len(clean_ops),
-                "fault_windows_annotated": annotated_windows,
+                "fault_windows_annotated": window_stats["annotated"],
+                "fault_windows_skipped_unknown_interleaving": window_stats[
+                    "skipped_unknown_interleaving"
+                ],
             }
             print(
                 "Fault-window annotation: {} points mapped to clean trace.".format(
-                    annotated_windows
+                    window_stats["annotated"]
                 ),
                 file=sys.stderr,
             )
             if erase_missing_writes_at > 0:
                 print(
                     "Clean erase trace: {} entries missing writes_at; "
-                    "using deterministic fallback ordering.".format(
-                        erase_missing_writes_at
+                    "{} fault windows skipped because precise erase ordering is unknown.".format(
+                        erase_missing_writes_at,
+                        window_stats["skipped_unknown_interleaving"],
                     ),
                     file=sys.stderr,
                 )

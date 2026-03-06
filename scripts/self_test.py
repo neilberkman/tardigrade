@@ -92,6 +92,12 @@ def check_verdict(
     expect = profile_raw.get("expect", {})
     should_find_issues = expect.get("should_find_issues", True)
     brick_rate_min = float(expect.get("brick_rate_min", 0.0))
+    allow_semantic_only_issues = bool(expect.get("allow_semantic_only_issues", False))
+    required_issue_reasons = {
+        str(reason).strip()
+        for reason in expect.get("required_issue_reasons", [])
+        if str(reason).strip()
+    }
 
     verdict = report.get("verdict", "")
     summary = report.get("summary", {})
@@ -99,6 +105,7 @@ def check_verdict(
     brick_rate = float(sweep.get("brick_rate", 0.0))
     bricks = int(sweep.get("bricks", 0))
     issue_points = int(sweep.get("issue_points", bricks))
+    issue_reasons = sweep.get("issue_reasons", {}) if isinstance(sweep.get("issue_reasons"), dict) else {}
 
     if should_find_issues:
         if issue_points == 0:
@@ -107,8 +114,19 @@ def check_verdict(
             return False, "Brick rate {:.1%} below minimum {:.1%}".format(
                 brick_rate, brick_rate_min
             )
+        if required_issue_reasons:
+            missing = sorted(
+                reason for reason in required_issue_reasons if int(issue_reasons.get(reason, 0)) <= 0
+            )
+            if missing:
+                return False, "Missing expected issue reason(s): {}".format(", ".join(missing))
         if bricks > 0:
             return True, "Found {} bricks ({:.1%}), as expected".format(bricks, brick_rate)
+        if not allow_semantic_only_issues:
+            return False, (
+                "Expected boot-visible issues but only found semantic/invariant issue points; "
+                "set expect.allow_semantic_only_issues=true if that is intentional"
+            )
         return True, "Found {} semantic/invariant issue points, as expected".format(
             issue_points
         )
