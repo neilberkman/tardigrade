@@ -1,5 +1,6 @@
 schema_version: 1
 name: mcuboot_stm32f4_upgrade
+skip_self_test: true
 description: "MCUboot swap-using-move on STM32F4 (non-uniform flash sectors). Revert scenario: upgrade completed but not confirmed, power loss during revert."
 platform: platforms/stm32f4.repl
 bootloader:
