@@ -12,7 +12,7 @@ concurrency:
 jobs:
   canary:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 60
     env:
       TOOLCHAIN_VERSION: 13.2.1-1.1
       TOOLCHAIN_URL: https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v13.2.1-1.1/xpack-arm-none-eabi-gcc-13.2.1-1.1-linux-x64.tar.gz
@@ -61,11 +61,12 @@ jobs:
         run: renode-test tests/nativeaot_runfor_bug.robot
 
       - name: Run latest-Renode canary suites
+        timeout-minutes: 35
         run: |
           set -euxo pipefail
           mkdir -p results/renode_latest_canary
-          renode-test tests/nvm_peripheral.robot
-          renode-test tests/ota_fault_point.robot
+          renode-test --test-timeout "10 minutes" --kill-stale-renode-instances --save-logs always --keep-renode-output tests/nvm_peripheral.robot
+          renode-test --test-timeout "10 minutes" --kill-stale-renode-instances --save-logs always --keep-renode-output tests/ota_fault_point.robot
           python3 scripts/audit_bootloader.py \
             --profile profiles/mcuboot_swap_current.yaml \
             --quick \
