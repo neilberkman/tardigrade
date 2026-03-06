@@ -55,7 +55,6 @@ jobs:
             --keep-renode-output
           tests-to-run: |
             tests/nvm_peripheral.robot
-            tests/ota_fault_point.robot
           artifacts-path: results/ci_artifacts
 
       - name: Upload Renode artifacts

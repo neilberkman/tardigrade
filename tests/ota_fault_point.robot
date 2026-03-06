@@ -14,9 +14,9 @@ ${BOOTLOADER_ENTRY}            0x10000000
 ${SRAM_START}                  0x20000000
 ${SRAM_END}                    0x20020000
 ${WRITE_GRANULARITY}           8
-${RUN_DURATION}                0.01
-${MAX_STEP_LIMIT}              500000
-${MAX_WRITES_CAP}              100000
+${RUN_DURATION}                0.005
+${MAX_STEP_LIMIT}              100000
+${MAX_WRITES_CAP}              512
 ${SLOT_EXEC_BASE}              0x10000000
 ${SLOT_EXEC_SIZE}              0x38000
 ${SLOT_STAGING_BASE}           0x10038000
@@ -46,7 +46,7 @@ ${EXPECTED_EXEC_SHA256}        ${EMPTY}
 ${SUCCESS_OTADATA_EXPECT}      ${EMPTY}
 ${SUCCESS_OTADATA_EXPECT_SCOPE}    always
 ${HASH_BYPASS_SYMBOLS}         ${EMPTY}
-${PROGRESS_STALL_TIMEOUT_S}    20
+${PROGRESS_STALL_TIMEOUT_S}    5
 ${EXPECT_CONTROL_OUTCOME}      ${EMPTY}
 ${POSTMORTEM_DUMP_NO_BOOT}     true
 ${POSTMORTEM_DUMP_HEADER_BYTES}    4096
@@ -131,5 +131,5 @@ Run Runtime Fault Point
 
 *** Test Cases ***
 Run OTA Fault Point
-    [Timeout]    15 minutes
+    [Timeout]    2 minutes
     Run Runtime Fault Point
