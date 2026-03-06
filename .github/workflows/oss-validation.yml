@@ -119,11 +119,13 @@ jobs:
           echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
           "${RUNNER_TEMP}/renode/renode-test" --help >/dev/null
 
+      - name: Install Python dependencies
+        run: python3 -m pip install --user pyyaml intelhex cbor2 click cryptography
+
       - name: Run MCUboot current guard (must pass)
         run: |
           set -euxo pipefail
           export GNUARMEMB_TOOLCHAIN_PATH="$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major"
-          python3 -m pip install --user intelhex cbor2 click cryptography pyyaml
           ./scripts/bootstrap_mcuboot_matrix_assets.sh
           python3 scripts/run_oss_validation.py \
             --manifest docs/oss_validation_profiles.json \
@@ -131,27 +133,23 @@ jobs:
             --renode-test renode-test \
             --output results/oss_validation/mcuboot_swap_current_guard.json
 
-      - name: Run MCUboot known-bad guard (must fail)
+      - name: Run MCUboot PR2100 broken guard (must detect issues)
         run: |
           set -euxo pipefail
-          export GNUARMEMB_TOOLCHAIN_PATH="$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major"
-          set +e
-          python3 scripts/run_oss_validation.py \
-            --manifest docs/oss_validation_profiles.json \
-            --profile mcuboot_swap_known_bad_guard \
+          python3 scripts/audit_bootloader.py \
+            --profile profiles/mcuboot_pr2100_broken_discovery.yaml \
+            --output results/oss_validation/mcuboot_pr2100_broken_discovery.json \
             --renode-test renode-test \
-            --output results/oss_validation/mcuboot_swap_known_bad_guard.json
-          rc=$?
-          set -e
-          if [ "$rc" -eq 0 ]; then
-            echo "Known-bad guard unexpectedly passed (regression detector broken)" >&2
-            exit 1
-          fi
-          if [ "$rc" -ne 1 ]; then
-            echo "Known-bad guard failed with unexpected rc=$rc (infrastructure error)" >&2
-            exit "$rc"
-          fi
-          echo "Known-bad guard failed as expected (detector proven)"
+            --fault-end 10
+
+      - name: Run MCUboot PR2100 fixed control (must pass)
+        run: |
+          set -euxo pipefail
+          python3 scripts/audit_bootloader.py \
+            --profile profiles/mcuboot_pr2100_fixed_discovery.yaml \
+            --output results/oss_validation/mcuboot_pr2100_fixed_discovery.json \
+            --renode-test renode-test \
+            --fault-end 10
 
       - name: Upload OSS validation artifacts
         if: always()

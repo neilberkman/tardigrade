@@ -44,49 +44,6 @@
       ]
     },
     {
-      "name": "mcuboot_swap_known_bad_guard",
-      "license": "Apache-2.0",
-      "description": "Negative control: known-bad MCUboot commit expected to fail no-bricks guard.",
-      "robot_suite": "tests/generic_fault_point.robot",
-      "evaluation_mode": "execute",
-      "boot_mode": "swap",
-      "fault_range": "0:1888",
-      "fault_step": 400,
-      "total_writes": 1888,
-      "expect": {
-        "bricks_max": 0,
-        "require_control_success": true
-      },
-      "slot_a_image_file": "{repo_root}/results/oss_validation/assets/zephyr_slot0_padded.bin",
-      "slot_b_image_file": "{repo_root}/results/oss_validation/assets/zephyr_slot1_padded.bin",
-      "ota_header_size": 512,
-      "source_checkout": {
-        "repo": "third_party/zephyr_ws/bootloader/mcuboot",
-        "ref": "c50b332ba794bd35c1915fdf5342fb5ce10e7ab6",
-        "fetch_remote": "upstream"
-      },
-      "setup_commands": [
-        "\"{repo_root}/scripts/bootstrap_mcuboot_matrix_assets.sh\"",
-        "cd \"{repo_root}/third_party/zephyr_ws\" && ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb GNUARMEMB_TOOLCHAIN_PATH=\"$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major\" \"{repo_root}/third_party/zephyr-venv/bin/west\" build -d \"{repo_root}/results/oss_validation/build/oss_mcuboot_{variant_name}\" -p always -b nrf52840dk_nrf52840 \"{source_worktree}/boot/zephyr\" -- -DCONFIG_BOOT_SWAP_USING_MOVE=y -DCONFIG_BOOT_SIGNATURE_TYPE_NONE=y -DCONFIG_BOOT_SIGNATURE_TYPE_RSA=n -DCMAKE_GDB:FILEPATH=\"$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major/bin/arm-none-eabi-gdb\" -DPython3_EXECUTABLE:FILEPATH=\"{repo_root}/third_party/zephyr-venv/bin/python3\"",
-        "cp \"{repo_root}/results/oss_validation/build/oss_mcuboot_{variant_name}/zephyr/zephyr.elf\" \"{repo_root}/results/oss_validation/assets/oss_mcuboot_{variant_name}.elf\""
-      ],
-      "robot_vars": [
-        "PLATFORM_REPL:{repo_root}/platforms/nrf52840_nvmc_psel.repl",
-        "BOOTLOADER_ELF:{repo_root}/results/oss_validation/assets/oss_mcuboot_{variant_name}.elf",
-        "BOOT_META_BIN:{repo_root}/results/oss_validation/assets/zephyr_slot0_padded.bin",
-        "FAULT_POINT_SCRIPT:scripts/run_bootloader_ab_fault_point.resc",
-        "WRITE_GRANULARITY:256",
-        "SLOT_A_BASE:0x0000C000",
-        "SLOT_B_BASE:0x00082000",
-        "SLOT_SIZE:0x76000",
-        "META_BASE_0:0x000F8000",
-        "META_BASE_1:0x000F8100",
-        "META_SIZE:0",
-        "BOOTLOADER_ENTRY:0x00000000",
-        "RUN_DURATION:0.5"
-      ]
-    },
-    {
       "name": "nxboot_style_correct",
       "license": "Apache-2.0",
       "description": "NuttX nxboot-style three-partition bootloader (correct). Must pass (no bricks).",
