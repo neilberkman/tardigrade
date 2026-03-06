@@ -65,8 +65,8 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p results/renode_latest_canary
-          renode-test --test-timeout "10 minutes" --kill-stale-renode-instances --save-logs always --keep-renode-output tests/nvm_peripheral.robot
-          renode-test --test-timeout "10 minutes" --kill-stale-renode-instances --save-logs always --keep-renode-output tests/ota_fault_point.robot
+          renode-test --test-timeout 600s --kill-stale-renode-instances --save-logs always --keep-renode-output tests/nvm_peripheral.robot
+          renode-test --test-timeout 600s --kill-stale-renode-instances --save-logs always --keep-renode-output tests/ota_fault_point.robot
           python3 scripts/audit_bootloader.py \
             --profile profiles/mcuboot_swap_current.yaml \
             --quick \

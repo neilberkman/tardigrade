@@ -49,7 +49,7 @@ jobs:
         with:
           renode-revision: ${{ env.RENODE_REVISION }}
           renode-arguments: >-
-            --test-timeout 10 minutes
+            --test-timeout 600s
             --kill-stale-renode-instances
             --save-logs always
             --keep-renode-output
