@@ -10,11 +10,7 @@ __pycache__/
 # Keep prebuilt examples for out-of-the-box runnable OSS usage.
 !examples/vulnerable_ota/*.elf
 !examples/vulnerable_ota/*.bin
-!examples/resilient_ota/*.elf
-!examples/resilient_ota/*.bin
 !examples/test_image.bin
-!examples/fault_variants/*.elf
-!examples/fault_variants/*.bin
 !examples/naive_copy/*.elf
 !examples/naive_copy/*.bin
 !examples/nxboot_style/*.elf
@@ -37,8 +33,6 @@ snapshots/
 
 # Campaign scratch outputs
 results/full_campaign.json
-results/resilient_campaign.json
-results/resilient_meta_campaign.json
 results/vulnerable_campaign.json
 
 # Audit run artifacts and result JSONs (generated, not committed)
@@ -47,10 +41,7 @@ results/*.json
 
 # Build outputs
 results/oss_validation/build/
+results/oss_validation/worktrees/
 
 # Third-party source checkouts
 third_party/
-
-# CBMC generated outputs (keep harness/source, ignore solver result dumps)
-examples/resilient_ota/cbmc/cbmc_*.json
-examples/resilient_ota/cbmc/*_output.json

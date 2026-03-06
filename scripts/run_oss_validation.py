@@ -31,6 +31,80 @@ def render(value: Any, variables: Dict[str, str]) -> Any:
     return value
 
 
+def git_ref_exists(repo: Path, ref: str) -> bool:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "{}^{{commit}}".format(ref)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def ensure_source_worktree(
+    repo_root: Path,
+    profile_name: str,
+    source_checkout: Dict[str, Any],
+    source_worktree: Path,
+) -> None:
+    source_repo = repo_root / str(source_checkout["repo"])
+    ref = str(source_checkout["ref"])
+    fetch_remote = str(source_checkout.get("fetch_remote", "")).strip()
+
+    if not source_repo.is_dir():
+        raise RuntimeError("source checkout repo not found: {}".format(source_repo))
+
+    if not git_ref_exists(source_repo, ref):
+        if not fetch_remote:
+            raise RuntimeError(
+                "ref '{}' missing in {} and no fetch_remote configured".format(ref, source_repo)
+            )
+        proc = subprocess.run(
+            ["git", "-C", str(source_repo), "fetch", "--quiet", fetch_remote, ref],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "git fetch failed for {} {}:\nSTDOUT:\n{}\nSTDERR:\n{}".format(
+                    fetch_remote, ref, proc.stdout, proc.stderr
+                )
+            )
+        if not git_ref_exists(source_repo, ref):
+            raise RuntimeError(
+                "ref '{}' still missing after fetch from {}".format(ref, fetch_remote)
+            )
+
+    source_worktree.parent.mkdir(parents=True, exist_ok=True)
+
+    if source_worktree.exists():
+        proc = subprocess.run(
+            ["git", "-C", str(source_repo), "worktree", "remove", "--force", str(source_worktree)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0 and source_worktree.exists():
+            shutil.rmtree(source_worktree)
+
+    proc = subprocess.run(
+        [
+            "git", "-C", str(source_repo), "worktree", "add", "--detach", "--force",
+            str(source_worktree), ref,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "git worktree add failed for {} at {}:\nSTDOUT:\n{}\nSTDERR:\n{}".format(
+                profile_name, ref, proc.stdout, proc.stderr
+            )
+        )
+
+
 def run_single_fault_point(
     repo_root: Path, renode_test: str, robot_suite: str,
     fault_at: int, robot_vars: List[str], work_dir: Path,
@@ -83,6 +157,14 @@ def run_profile(
     variables: Dict[str, str], workers: int, skip_setup: bool,
 ) -> Dict[str, Any]:
     name = profile["name"]
+    variables = dict(variables)
+    source_checkout = render(profile.get("source_checkout"), variables)
+    source_worktree: Path | None = None
+    if source_checkout:
+        source_worktree = (
+            repo_root / "results" / "oss_validation" / "worktrees" / name
+        ).resolve()
+        variables["source_worktree"] = str(source_worktree)
     rendered = render(profile, variables)
     robot_suite = str(rendered.get("robot_suite", "tests/generic_fault_point.robot"))
     robot_vars = [str(rv) for rv in rendered.get("robot_vars", [])]
@@ -94,15 +176,24 @@ def run_profile(
         if val is not None:
             robot_vars.append("{}:{}".format(key.upper(), val))
 
+    source_worktree_ready = False
     if not skip_setup:
         for raw_cmd in (rendered.get("setup_commands") or []):
             cmd = str(render(raw_cmd, variables))
+            if (
+                source_checkout
+                and source_worktree is not None
+                and not source_worktree_ready
+                and str(source_worktree) in cmd
+            ):
+                ensure_source_worktree(repo_root, name, source_checkout, source_worktree)
+                source_worktree_ready = True
             print("  setup>> {}".format(cmd), file=sys.stderr)
             proc = subprocess.run(["/bin/bash", "-lc", cmd], cwd=str(repo_root), check=False)
             if proc.returncode != 0:
                 raise RuntimeError("setup failed (rc={}): {}".format(proc.returncode, cmd))
-
-    # TODO: source_checkout worktree management (pre-built ELFs are committed for now).
+    elif source_checkout and source_worktree is not None:
+        ensure_source_worktree(repo_root, name, source_checkout, source_worktree)
 
     # Build fault point list from profile range/step.
     fault_range = str(rendered.get("fault_range", "0:28672"))
