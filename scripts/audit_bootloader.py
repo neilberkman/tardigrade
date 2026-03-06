@@ -35,12 +35,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fault_inject import FaultResult
+from invariants import resolve_invariants, run_invariants
 from profile_loader import ProfileConfig, load_profile
 
 DEFAULT_RENODE_TEST = os.environ.get("RENODE_TEST", "renode-test")
 DEFAULT_ROBOT_SUITE = "tests/ota_fault_point.robot"
 EXIT_ASSERTION_FAILURE = 1
 EXIT_INFRA_FAILURE = 2
+DOCKER_RENODE_PREFIX = "docker://"
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,7 +60,11 @@ def parse_args() -> argparse.Namespace:
         default="state",
         help="Fault evaluation: state (fast Python simulation) or execute (CPU boot). Default: state.",
     )
-    parser.add_argument("--renode-test", default=DEFAULT_RENODE_TEST)
+    parser.add_argument(
+        "--renode-test",
+        default=DEFAULT_RENODE_TEST,
+        help="renode-test executable path, or docker://IMAGE to run inside Docker.",
+    )
     parser.add_argument(
         "--renode-remote-server-dir", default="",
         help="Optional directory containing the renode remote-server binary.",
@@ -131,6 +137,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def ensure_tool(path: str) -> str:
+    if path.startswith(DOCKER_RENODE_PREFIX):
+        image = path[len(DOCKER_RENODE_PREFIX):].strip()
+        if not image:
+            raise ValueError(
+                "docker renode-test spec must use docker://IMAGE, got {!r}".format(path)
+            )
+        if shutil.which("docker") is None:
+            raise FileNotFoundError(
+                "docker is required for dockerized renode-test spec '{}'".format(path)
+            )
+        return path
     if os.path.isabs(path):
         if not os.path.exists(path):
             raise FileNotFoundError("renode-test not found at {}".format(path))
@@ -141,6 +158,91 @@ def ensure_tool(path: str) -> str:
             "renode-test executable '{}' not found in PATH".format(path)
         )
     return resolved
+
+
+def prepare_renode_command(
+    renode_test: str,
+    base_cmd: List[str],
+    cwd: Path,
+    env: Dict[str, str],
+) -> List[str]:
+    """Expand docker://IMAGE renode-test specs into a concrete docker run command."""
+    if not renode_test.startswith(DOCKER_RENODE_PREFIX):
+        return base_cmd
+
+    image = renode_test[len(DOCKER_RENODE_PREFIX):].strip()
+    platform = os.environ.get("OTA_RENODE_DOCKER_PLATFORM", "linux/amd64")
+    mount_dirs: Dict[str, None] = {}
+
+    def add_mount(raw_path: str) -> None:
+        if not raw_path or not os.path.isabs(raw_path):
+            return
+        p = Path(raw_path)
+        target = p if p.is_dir() else p.parent
+        mount_dirs[str(target)] = None
+        try:
+            resolved = str(target.resolve())
+        except FileNotFoundError:
+            resolved = None
+        if resolved and resolved != str(target):
+            mount_dirs[resolved] = None
+
+    def normalize_container_path(raw_path: str) -> str:
+        if not raw_path or not os.path.isabs(raw_path):
+            return raw_path
+        p = Path(raw_path)
+        target = p if p.is_dir() else p.parent
+        try:
+            resolved_target = target.resolve()
+        except FileNotFoundError:
+            return raw_path
+        if p.is_dir():
+            return str(resolved_target)
+        return str(resolved_target / p.name)
+
+    add_mount(str(cwd))
+    container_args: List[str] = []
+    for arg in base_cmd[1:]:
+        if os.path.isabs(arg):
+            add_mount(arg)
+            container_args.append(normalize_container_path(arg))
+            continue
+        key, sep, value = arg.partition(":")
+        if sep and os.path.isabs(value):
+            add_mount(value)
+            container_args.append("{}:{}".format(key, normalize_container_path(value)))
+            continue
+        container_args.append(arg)
+
+    container_config_path = "/tmp/renode.config"
+    if "--renode-config" in container_args:
+        idx = container_args.index("--renode-config")
+        if idx + 1 < len(container_args):
+            container_args[idx + 1] = container_config_path
+
+    cmd: List[str] = [
+        "docker",
+        "run",
+        "--rm",
+        "--platform",
+        platform,
+    ]
+    for mount_dir in sorted(mount_dirs.keys()):
+        cmd.extend(["-v", "{}:{}".format(mount_dir, mount_dir)])
+    cmd.extend(
+        [
+            "-w",
+            str(cwd),
+            "-e",
+            "DOTNET_BUNDLE_EXTRACT_BASE_DIR={}".format(
+                env.get("DOTNET_BUNDLE_EXTRACT_BASE_DIR", "/tmp/dotnet_bundle")
+            ),
+            image,
+            "renode-test",
+        ]
+    )
+    cmd.extend(container_args)
+    return cmd
 
 
 def parse_robot_vars(raw_vars: List[str]) -> List[str]:
@@ -219,6 +321,7 @@ def run_single_point(
 
     env = os.environ.copy()
     env.setdefault("DOTNET_BUNDLE_EXTRACT_BASE_DIR", str(bundle_dir))
+    cmd = prepare_renode_command(renode_test, cmd, repo_root, env)
     timeout_s = parse_renode_point_timeout(env)
     if calibration and timeout_s is not None:
         timeout_s = max(timeout_s, 900.0)
@@ -397,6 +500,7 @@ def run_batch(
 
     env = os.environ.copy()
     env.setdefault("DOTNET_BUNDLE_EXTRACT_BASE_DIR", str(bundle_dir))
+    cmd = prepare_renode_command(renode_test, cmd, repo_root, env)
     per_point_timeout = parse_renode_point_timeout(env)
     # Scale batch timeout by number of fault points.  Each point typically
     # takes 0.5-3s on CI runners; add 120s startup overhead.
@@ -608,6 +712,168 @@ def normalize_classic_result(data: Dict[str, Any], fault_at: int) -> Dict[str, A
             "replica1_valid": nvm.get("replica1_valid"),
         },
     }
+
+
+_MISSING = object()
+
+
+def _tokenize_path(path: str) -> List[Any]:
+    tokens: List[Any] = []
+    current = ""
+    i = 0
+    while i < len(path):
+        ch = path[i]
+        if ch == ".":
+            if current:
+                tokens.append(current)
+                current = ""
+            i += 1
+            continue
+        if ch == "[":
+            if current:
+                tokens.append(current)
+                current = ""
+            end = path.find("]", i)
+            if end == -1:
+                raise ValueError("unterminated path index in {!r}".format(path))
+            index_text = path[i + 1:end].strip()
+            if not index_text:
+                raise ValueError("empty path index in {!r}".format(path))
+            tokens.append(int(index_text))
+            i = end + 1
+            continue
+        current += ch
+        i += 1
+    if current:
+        tokens.append(current)
+    return tokens
+
+
+def _lookup_path(data: Any, path: str) -> Any:
+    current = data
+    for token in _tokenize_path(path):
+        if isinstance(token, int):
+            if not isinstance(current, list) or token < 0 or token >= len(current):
+                return _MISSING
+            current = current[token]
+            continue
+        if not isinstance(current, dict) or token not in current:
+            return _MISSING
+        current = current[token]
+    return current
+
+
+def _value_matches(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, list):
+        return actual in expected
+    return actual == expected
+
+
+def _serialize_value(value: Any) -> Any:
+    if value is _MISSING:
+        return "<missing>"
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return value
+
+
+def _result_state_payload(result: Dict[str, Any]) -> Any:
+    if isinstance(result.get("nvm_state"), dict):
+        return result.get("nvm_state")
+    if isinstance(result.get("semantic_state"), dict):
+        return result.get("semantic_state")
+    return result.get("nvm_state") or result.get("semantic_state")
+
+
+def _profile_partition_ranges(profile: ProfileConfig) -> List[Tuple[int, int]]:
+    return [
+        (slot.base, slot.base + slot.size)
+        for slot in profile.memory.slots.values()
+    ]
+
+
+def _evaluate_semantic_assertions(
+    result: Dict[str, Any],
+    profile: ProfileConfig,
+) -> List[Dict[str, Any]]:
+    failures: List[Dict[str, Any]] = []
+    scopes = ["always", "control" if result.get("is_control") else "faulted"]
+    for scope in scopes:
+        expectations = profile.semantic_assertions.get(scope, {})
+        for path, expected in expectations.items():
+            actual = _lookup_path(result, path)
+            if not _value_matches(actual, expected):
+                failures.append(
+                    {
+                        "scope": scope,
+                        "path": path,
+                        "expected": _serialize_value(expected),
+                        "actual": _serialize_value(actual),
+                    }
+                )
+    return failures
+
+
+def _evaluate_invariants(
+    result: Dict[str, Any],
+    profile: ProfileConfig,
+) -> List[Dict[str, Any]]:
+    if not profile.invariants:
+        return []
+    invariant_fns = resolve_invariants(profile.invariants)
+    fault_result = FaultResult(
+        fault_at=int(result.get("fault_at", 0)),
+        boot_outcome=str(result.get("boot_outcome", "unknown")),
+        boot_slot=result.get("boot_slot"),
+        nvm_state=_result_state_payload(result),
+        raw_log="",
+        is_control=bool(result.get("is_control", False)),
+    )
+    violations = run_invariants(
+        fault_result,
+        invariant_fns,
+        pre_state=result.get("pre_state"),
+        write_log=result.get("write_log"),
+        partition_ranges=_profile_partition_ranges(profile),
+        multi_boot_analysis=result.get("multi_boot_analysis"),
+        boot_cycles=result.get("boot_cycles"),
+    )
+    return [
+        {
+            "name": v.invariant_name,
+            "description": v.description,
+            "details": v.details,
+        }
+        for v in violations
+    ]
+
+
+def annotate_result_checks(
+    results: List[Dict[str, Any]],
+    profile: ProfileConfig,
+) -> None:
+    for result in results:
+        semantic_failures = _evaluate_semantic_assertions(result, profile)
+        if semantic_failures:
+            result["semantic_assertion_failures"] = semantic_failures
+        invariant_failures = _evaluate_invariants(result, profile)
+        if invariant_failures:
+            result["invariant_violations"] = invariant_failures
+
+
+def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[str]:
+    reasons: List[str] = []
+    if result.get("boot_outcome") != expected_outcome:
+        reasons.append("boot_outcome")
+    if result.get("semantic_assertion_failures"):
+        reasons.append("semantic_assertion")
+    if result.get("invariant_violations"):
+        reasons.append("invariant")
+    return reasons
+
+
+def result_has_issues(result: Dict[str, Any], expected_outcome: str) -> bool:
+    return bool(result_issue_reasons(result, expected_outcome))
 
 
 def _run_batch_worker(
@@ -1127,6 +1393,16 @@ def categorize_failure(
         "phase": phase,
         "position_pct": round(pct * 100, 2),
     }
+    issue_reasons = result_issue_reasons(
+        result,
+        getattr(profile.expect, "control_outcome", "success") if profile else "success",
+    )
+    if issue_reasons:
+        payload["issue_reasons"] = issue_reasons
+    if result.get("semantic_assertion_failures"):
+        payload["semantic_assertion_failures"] = result.get("semantic_assertion_failures")
+    if result.get("invariant_violations"):
+        payload["invariant_violations"] = result.get("invariant_violations")
     window = result.get("fault_window")
     if isinstance(window, dict):
         payload["fault_window"] = window
@@ -1153,18 +1429,25 @@ def summarize_runtime_sweep(
         expected_outcome = (
             getattr(profile.expect, "control_outcome", "success") or "success"
         )
-    failures = [r for r in injected if r.get("boot_outcome") != expected_outcome]
-    recoveries = sum(1 for r in injected if r.get("boot_outcome") == expected_outcome)
+    boot_failures = [r for r in injected if r.get("boot_outcome") != expected_outcome]
+    failures = [r for r in injected if result_has_issues(r, expected_outcome)]
+    recoveries = sum(1 for r in injected if not result_has_issues(r, expected_outcome))
+    semantic_issue_points = sum(1 for r in injected if r.get("semantic_assertion_failures"))
+    invariant_issue_points = sum(1 for r in injected if r.get("invariant_violations"))
 
     # Categorize failures by outcome type.
     outcome_counts: Dict[str, int] = {}
     class_counts: Dict[str, int] = {}
+    issue_reason_counts: Dict[str, int] = {}
     categorized_failures: List[Dict[str, Any]] = []
     for r in failures:
-        outcome = r.get("boot_outcome", "unknown")
-        outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+        if r.get("boot_outcome") != expected_outcome:
+            outcome = r.get("boot_outcome", "unknown")
+            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
         fclass = classify_failure_class(r)
         class_counts[fclass] = class_counts.get(fclass, 0) + 1
+        for reason in result_issue_reasons(r, expected_outcome):
+            issue_reason_counts[reason] = issue_reason_counts.get(reason, 0) + 1
         if profile:
             categorized_failures.append(
                 categorize_failure(r, total_writes, profile)
@@ -1172,13 +1455,19 @@ def summarize_runtime_sweep(
 
     summary: Dict[str, Any] = {
         "total_fault_points": total,
-        "bricks": len(failures),
+        "bricks": len(boot_failures),
+        "issue_points": len(failures),
+        "semantic_issue_points": semantic_issue_points,
+        "invariant_issue_points": invariant_issue_points,
         "recoveries": recoveries,
-        "brick_rate": (float(len(failures)) / float(total)) if total else 0.0,
+        "brick_rate": (float(len(boot_failures)) / float(total)) if total else 0.0,
+        "issue_rate": (float(len(failures)) / float(total)) if total else 0.0,
         "discarded_no_fault_fired": len(not_injected),
         "failure_outcomes": outcome_counts,
         "failure_classes": class_counts,
     }
+    if issue_reason_counts:
+        summary["issue_reasons"] = issue_reason_counts
 
     if categorized_failures:
         summary["failures"] = categorized_failures
@@ -1213,6 +1502,15 @@ def summarize_runtime_sweep(
         }
         if control_telemetry:
             control_summary["signals"] = control_telemetry
+        control_summary["issue_count"] = len(result_issue_reasons(ctrl, expected_outcome))
+        if ctrl.get("semantic_assertion_failures"):
+            control_summary["semantic_assertion_failures"] = ctrl.get(
+                "semantic_assertion_failures"
+            )
+        if ctrl.get("invariant_violations"):
+            control_summary["invariant_violations"] = ctrl.get("invariant_violations")
+        if ctrl.get("multi_boot_analysis"):
+            control_summary["multi_boot_analysis"] = ctrl.get("multi_boot_analysis")
         summary["control"] = control_summary
 
     # Aggregate per-step timing from signals.
@@ -1675,6 +1973,7 @@ def main() -> int:
                     file=sys.stderr,
                 )
 
+        annotate_result_checks(sweep_results, profile)
         sweep_summary = summarize_runtime_sweep(
             sweep_results, total_writes=max_writes, profile=profile
         )
@@ -1699,14 +1998,22 @@ def main() -> int:
         # -------------------------------------------------------------------
         # Verdict
         # -------------------------------------------------------------------
-        found_issues = sweep_summary["bricks"] > 0
+        found_issues = int(sweep_summary.get("issue_points", sweep_summary["bricks"])) > 0
+        control_issue_count = int(
+            (sweep_summary.get("control") or {}).get("issue_count", 0)
+        )
 
         verdict = "PASS"
-        if profile.expect.should_find_issues and not found_issues:
-            verdict = "FAIL — expected to find bricks but found none"
+        if control_issue_count:
+            verdict = "FAIL — control checks failed"
+        elif profile.expect.should_find_issues and not found_issues:
+            verdict = "FAIL — expected to find issues but found none"
         elif not profile.expect.should_find_issues and found_issues:
-            verdict = "FAIL — found {} bricks (expected none)".format(
-                sweep_summary["bricks"]
+            verdict = "FAIL — found {} issue points ({} boot mismatches, {} semantic, {} invariant)".format(
+                sweep_summary.get("issue_points", 0),
+                sweep_summary.get("bricks", 0),
+                sweep_summary.get("semantic_issue_points", 0),
+                sweep_summary.get("invariant_issue_points", 0),
             )
 
         # -------------------------------------------------------------------
@@ -1788,6 +2095,14 @@ def main() -> int:
                 print(
                     "ASSERTION FAILED: control point outcome '{}' != expected '{}'".format(
                         ctrl.get("boot_outcome"), expected_control
+                    ),
+                    file=sys.stderr,
+                )
+                return EXIT_ASSERTION_FAILURE
+            if ctrl.get("issue_count", 0):
+                print(
+                    "ASSERTION FAILED: control checks reported {} issue(s)".format(
+                        ctrl.get("issue_count", 0)
                     ),
                     file=sys.stderr,
                 )

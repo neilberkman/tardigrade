@@ -73,6 +73,8 @@ $resume_trace_no_boot?="true"
 $resume_trace_max_ops?="1024"
 $resume_trace_time_slice?="0.02"
 $resume_trace_wall_timeout_s?="30"
+$boot_cycles?="1"
+$state_probe_script?=""
 
 python """
 import json
@@ -169,6 +171,13 @@ except Exception:
     resume_trace_wall_timeout_s = 30.0
 if resume_trace_wall_timeout_s <= 0:
     resume_trace_wall_timeout_s = 30.0
+boot_cycles_raw = str(monitor.GetVariable('boot_cycles')).strip()
+try:
+    boot_cycles = int(boot_cycles_raw, 0) if boot_cycles_raw else 1
+except Exception:
+    boot_cycles = 1
+if boot_cycles < 1:
+    boot_cycles = 1
 
 # Batch vs single mode.
 fault_points_csv = str(monitor.GetVariable('fault_points_csv')).strip()
@@ -219,6 +228,7 @@ pre_boot_bin = str(monitor.GetVariable('pre_boot_state_bin')).strip()
 
 # Setup script.
 setup_script = str(monitor.GetVariable('setup_script')).strip()
+state_probe_script = str(monitor.GetVariable('state_probe_script')).strip()
 
 # Fault type support: 'write', 'erase', or 'both'.
 # fault_types controls which operations are tracked during calibration.
@@ -373,6 +383,168 @@ def to_py_bytes(raw):
         return bytes(raw)
     except Exception:
         return bytes((int(x) & 0xFF) for x in raw)
+
+
+_state_probe_collect = None
+
+
+def load_state_probe():
+    global _state_probe_collect
+    if _state_probe_collect is not None or not state_probe_script:
+        return _state_probe_collect
+    with open(state_probe_script, 'r') as f:
+        code = compile(f.read(), state_probe_script, 'exec')
+    probe_ns = {'__builtins__': __builtins__}
+    exec(code, probe_ns)
+    collect_fn = probe_ns.get('collect_state')
+    if not callable(collect_fn):
+        raise RuntimeError(
+            'state_probe_script must define callable collect_state(bus, monitor, context)'
+        )
+    _state_probe_collect = collect_fn
+    log('state_probe: loaded {}'.format(state_probe_script))
+    return _state_probe_collect
+
+
+def collect_semantic_state(context):
+    collect_fn = load_state_probe()
+    if collect_fn is None:
+        return None
+    try:
+        state = collect_fn(bus=bus, monitor=monitor, context=context)
+    except TypeError:
+        state = collect_fn(bus, monitor, context)
+    if state is None:
+        return None
+    if not isinstance(state, dict):
+        raise RuntimeError('state_probe_script collect_state must return dict or None')
+    return state
+
+
+def build_cycle_record(cycle_index, boot_outcome, boot_slot, signals, stop_status=None,
+                       fault_injected=False):
+    record = {
+        'cycle': int(cycle_index),
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'signals': dict(signals) if isinstance(signals, dict) else {},
+    }
+    if stop_status is not None:
+        record['stop_reason'] = stop_status.get('reason')
+        record['emulated_s'] = stop_status.get('emulated_s')
+        record['elapsed_s'] = stop_status.get('elapsed_s')
+        record['iters'] = stop_status.get('iters')
+    semantic_state = collect_semantic_state({
+        'cycle': int(cycle_index),
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'signals': record['signals'],
+        'fault_injected': bool(fault_injected),
+        'stage': 'boot_cycle',
+    })
+    if semantic_state is not None:
+        record['semantic_state'] = semantic_state
+    return record
+
+
+def analyze_boot_cycles(cycle_records):
+    if not cycle_records:
+        return {'status': 'not_run', 'requested_cycles': int(boot_cycles), 'completed_cycles': 0}
+
+    pairs = [
+        (rec.get('boot_slot'), rec.get('boot_outcome'))
+        for rec in cycle_records
+    ]
+    analysis = {
+        'requested_cycles': int(boot_cycles),
+        'completed_cycles': len(cycle_records),
+        'final_slot': cycle_records[-1].get('boot_slot'),
+        'final_outcome': cycle_records[-1].get('boot_outcome'),
+        'slots_observed': [rec.get('boot_slot') for rec in cycle_records],
+        'outcomes_observed': [rec.get('boot_outcome') for rec in cycle_records],
+    }
+    if len(cycle_records) == 1:
+        analysis['status'] = 'single_boot'
+        return analysis
+    if all(pair == pairs[0] for pair in pairs):
+        analysis['status'] = 'converged'
+        analysis['converged_at_cycle'] = 0
+        return analysis
+    if len(pairs) >= 2 and pairs[-1] == pairs[-2]:
+        analysis['status'] = 'converged'
+        converged_at = len(pairs) - 2
+        final_pair = pairs[-1]
+        for idx in range(len(pairs) - 2, -1, -1):
+            if pairs[idx] == final_pair:
+                converged_at = idx
+            else:
+                break
+        analysis['converged_at_cycle'] = converged_at
+        return analysis
+    analysis['status'] = 'oscillating'
+    return analysis
+
+
+def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_signals,
+                             initial_status=None, fault_injected=False, label='followup'):
+    cycle_records = [
+        build_cycle_record(
+            0,
+            initial_boot_outcome,
+            initial_boot_slot,
+            initial_signals,
+            stop_status=initial_status,
+            fault_injected=fault_injected,
+        )
+    ]
+
+    if boot_cycles <= 1:
+        return None, None
+
+    if not USE_FAST_PATH:
+        return cycle_records, {
+            'status': 'unsupported_fast_path_required',
+            'requested_cycles': int(boot_cycles),
+            'completed_cycles': len(cycle_records),
+        }
+
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    flash_size = int(nvmc.FlashSize)
+    for cycle_index in range(1, int(boot_cycles)):
+        current_flash = nvmc.Flash.ReadBytes(0, flash_size)
+        restore_flash_and_boot(current_flash)
+        if _hash_bypass_active:
+            apply_hash_bypass()
+        reset_nvmc_for_recovery()
+        arm_vtor_watchpoint()
+        status = run_until_done(
+            cpu_ref,
+            label='{}_{}'.format(label, cycle_index),
+            expect_writes=False,
+            wall_timeout=30,
+            stop_on_fault=False,
+        )
+        disarm_vtor_watchpoint()
+        vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+        pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+        boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+            vtor_value, pc_value, fault_injected=fault_injected
+        )
+        signals['followup_cycle'] = int(cycle_index)
+        signals['phase_followup_stop_reason'] = status.get('reason')
+        signals['phase_followup_emulated_s'] = status.get('emulated_s')
+        cycle_records.append(
+            build_cycle_record(
+                cycle_index,
+                boot_outcome,
+                boot_slot,
+                signals,
+                stop_status=status,
+                fault_injected=fault_injected,
+            )
+        )
+
+    return cycle_records, analyze_boot_cycles(cycle_records)
 
 def effective_page_size():
     if USE_FAST_PATH:
@@ -1032,9 +1204,23 @@ def run_state_fault(fault_at):
         if actual_marker != success_marker_value:
             boot_outcome = 'hard_fault'
             boot_slot = None
-    fault_class = classify_fault_result(boot_outcome, boot_slot, {})
+    signals = {
+        'vector_sp': fmt_u32(sp),
+        'vector_reset': fmt_u32(reset_vector),
+        'vector_valid': vector_valid,
+        'copy_completed': copy_completed,
+    }
+    semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'signals': signals,
+        'fault_injected': bool(fault_injected),
+        'stage': 'state_mode',
+    })
+    fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
 
-    return {
+    result = {
         'fault_at': fault_at,
         'fault_requested': fault_at,
         'fault_type': 'w',
@@ -1044,13 +1230,11 @@ def run_state_fault(fault_at):
         'boot_slot': boot_slot,
         'fault_class': fault_class,
         'actual_writes': actual_writes,
-        'signals': {
-            'vector_sp': fmt_u32(sp),
-            'vector_reset': fmt_u32(reset_vector),
-            'vector_valid': vector_valid,
-            'copy_completed': copy_completed,
-        },
+        'signals': signals,
     }
+    if semantic_state is not None:
+        result['semantic_state'] = semantic_state
+    return result
 
 def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, label='',
                    expect_writes=True, stop_on_fault=True, op_trace=None, op_trace_limit=0):
@@ -1274,7 +1458,23 @@ def run_timed_reset_fault(fault_at):
     signals['timed_reset_elapsed_s'] = round(_time.time() - fp_t0, 6)
     signals['phase2_stop_reason'] = p2_status.get('reason')
     signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'signals': signals,
+        'fault_injected': bool(fault_injected),
+        'stage': 'post_boot',
+    })
     fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
+    boot_cycle_records, multi_boot_analysis = run_followup_boot_cycles(
+        boot_outcome,
+        boot_slot,
+        signals,
+        initial_status=p2_status,
+        fault_injected=fault_injected,
+        label='fp{}_timed_followup'.format(fault_at),
+    )
 
     result = {
         'fault_at': fault_at,
@@ -1288,6 +1488,11 @@ def run_timed_reset_fault(fault_at):
         'actual_writes': actual_writes,
         'signals': signals,
     }
+    if semantic_state is not None:
+        result['semantic_state'] = semantic_state
+    if boot_cycle_records is not None:
+        result['boot_cycles'] = boot_cycle_records
+        result['multi_boot_analysis'] = multi_boot_analysis
     if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
         dump_source = 'fault_snapshot' if fault_snapshot_bytes is not None else 'live_flash'
         result['postmortem_partition_dump'] = build_postmortem_partition_dump(
@@ -1674,7 +1879,23 @@ def run_execute_fault(fault_at, fault_type='w'):
         signals['phase2_stop_reason'] = phase2_status.get('reason')
         signals['phase2_emulated_s'] = phase2_status.get('emulated_s')
 
+    semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'signals': signals,
+        'fault_injected': bool(fault_injected),
+        'stage': 'post_boot',
+    })
     fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
+    boot_cycle_records, multi_boot_analysis = run_followup_boot_cycles(
+        boot_outcome,
+        boot_slot,
+        signals,
+        initial_status=phase2_status,
+        fault_injected=fault_injected,
+        label='fp{}_followup'.format(fault_at),
+    )
 
     result = {
         'fault_at': fault_at,
@@ -1688,6 +1909,11 @@ def run_execute_fault(fault_at, fault_type='w'):
         'actual_writes': actual_writes,
         'signals': signals,
     }
+    if semantic_state is not None:
+        result['semantic_state'] = semantic_state
+    if boot_cycle_records is not None:
+        result['boot_cycles'] = boot_cycle_records
+        result['multi_boot_analysis'] = multi_boot_analysis
 
     if USE_FAST_PATH and fault_injected and is_power_loss_fault:
         if debug_trailer is not None:
@@ -2020,7 +2246,23 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     signals['trace_replay_mode'] = 'native'
     signals['phase2_stop_reason'] = p2_status.get('reason')
     signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'signals': signals,
+        'fault_injected': bool(fault_injected),
+        'stage': 'post_boot',
+    })
     fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
+    boot_cycle_records, multi_boot_analysis = run_followup_boot_cycles(
+        boot_outcome,
+        boot_slot,
+        signals,
+        initial_status=p2_status,
+        fault_injected=fault_injected,
+        label='fp{}_native_followup'.format(fault_at),
+    )
 
     if fault_at % 50 == 0:
         log('fp={} native writes={} reload={}ms replay={}ms reset={}ms setup={}ms emu={}ms({}iters) total={}ms outcome={}'.format(
@@ -2039,6 +2281,11 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         'actual_writes': writes_applied,
         'signals': signals,
     }
+    if semantic_state is not None:
+        result['semantic_state'] = semantic_state
+    if boot_cycle_records is not None:
+        result['boot_cycles'] = boot_cycle_records
+        result['multi_boot_analysis'] = multi_boot_analysis
     if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
         result['postmortem_partition_dump'] = build_postmortem_partition_dump(
             snapshot_bytes=fault_snapshot_bytes,
@@ -2179,7 +2426,23 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     signals['trace_replay_mode'] = 'python'
     signals['phase2_stop_reason'] = p2_status.get('reason')
     signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'signals': signals,
+        'fault_injected': bool(fault_injected),
+        'stage': 'post_boot',
+    })
     fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
+    boot_cycle_records, multi_boot_analysis = run_followup_boot_cycles(
+        boot_outcome,
+        boot_slot,
+        signals,
+        initial_status=p2_status,
+        fault_injected=fault_injected,
+        label='fp{}_python_followup'.format(fault_at),
+    )
 
     if fault_at % 50 == 0:
         log('fp={} py_trace_replay writes={} reload={}ms replay={}ms reset={}ms setup={}ms emu={}ms({}iters) total={}ms outcome={}'.format(
@@ -2198,6 +2461,11 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         'actual_writes': writes_applied,
         'signals': signals,
     }
+    if semantic_state is not None:
+        result['semantic_state'] = semantic_state
+    if boot_cycle_records is not None:
+        result['boot_cycles'] = boot_cycle_records
+        result['multi_boot_analysis'] = multi_boot_analysis
     if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
         result['postmortem_partition_dump'] = build_postmortem_partition_dump(
             snapshot_bytes=fault_snapshot_bytes,

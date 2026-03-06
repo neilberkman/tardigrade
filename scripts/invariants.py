@@ -314,6 +314,40 @@ def check_slot_integrity(result: FaultResult, **_: Any) -> None:
         )
 
 
+def check_multi_boot_converges(
+    result: FaultResult,
+    multi_boot_analysis: Optional[Dict[str, Any]] = None,
+    **_: Any,
+) -> None:
+    """When multi-boot analysis is present, the boot path should converge.
+
+    This catches stuck revert / oscillation bugs that only become visible
+    across repeated clean boots after the initial recovery boot.
+    """
+    if not isinstance(multi_boot_analysis, dict):
+        return
+
+    status = multi_boot_analysis.get("status")
+    if status in (None, "not_run", "single_boot"):
+        return
+    if status == "unsupported_fast_path_required":
+        return
+    if status != "converged":
+        raise InvariantViolation(
+            invariant_name="multi_boot_converges",
+            description=(
+                "Boot path did not converge across follow-up boots "
+                "(status={!r}, final_slot={!r}, final_outcome={!r}).".format(
+                    status,
+                    multi_boot_analysis.get("final_slot"),
+                    multi_boot_analysis.get("final_outcome"),
+                )
+            ),
+            result=result,
+            details=dict(multi_boot_analysis),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -324,7 +358,17 @@ _ALL_INVARIANTS: List[InvariantFn] = [
     check_metadata_single_fault_consistency,
     check_no_oob_writes,
     check_slot_integrity,
+    check_multi_boot_converges,
 ]
+
+_INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
+    "at_least_one_bootable": check_at_least_one_bootable,
+    "boot_matches_metadata": check_boot_matches_metadata,
+    "metadata_single_fault_consistency": check_metadata_single_fault_consistency,
+    "no_oob_writes": check_no_oob_writes,
+    "slot_integrity": check_slot_integrity,
+    "multi_boot_converges": check_multi_boot_converges,
+}
 
 
 def run_invariants(
@@ -378,3 +422,28 @@ def default_invariants(scenario: str) -> List[InvariantFn]:
     if scenario == "vulnerable":
         return [check_slot_integrity]
     return [check_at_least_one_bootable, check_slot_integrity]
+
+
+def resolve_invariants(spec: Sequence[str]) -> List[InvariantFn]:
+    """Resolve invariant names/presets into callable checks."""
+    resolved: List[InvariantFn] = []
+    seen: set[str] = set()
+    for entry in spec:
+        name = str(entry).strip()
+        if not name:
+            continue
+        if name in ("strict", "vulnerable", "default"):
+            preset = default_invariants(name)
+            for fn in preset:
+                fn_name = fn.__name__
+                if fn_name not in seen:
+                    resolved.append(fn)
+                    seen.add(fn_name)
+            continue
+        fn = _INVARIANT_REGISTRY.get(name)
+        if fn is None:
+            raise ValueError("unknown invariant '{}'".format(name))
+        if fn.__name__ not in seen:
+            resolved.append(fn)
+            seen.add(fn.__name__)
+    return resolved

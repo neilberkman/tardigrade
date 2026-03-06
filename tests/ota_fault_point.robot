@@ -38,6 +38,7 @@ ${TRACE_FILE_BIN}              ${EMPTY}
 ${ERASE_TRACE_FILE_BIN}        ${EMPTY}
 ${FAULT_TYPES}                 write
 ${FAULT_TYPE_CSV}              ${EMPTY}
+${BOOT_CYCLES}                 1
 ${SUCCESS_IMAGE_HASH}          false
 ${SUCCESS_IMAGE_HASH_SLOT}     ${EMPTY}
 ${IMAGE_EXEC_SHA256}           ${EMPTY}
@@ -45,6 +46,7 @@ ${IMAGE_STAGING_SHA256}        ${EMPTY}
 ${EXPECTED_EXEC_SHA256}        ${EMPTY}
 ${SUCCESS_OTADATA_EXPECT}      ${EMPTY}
 ${SUCCESS_OTADATA_EXPECT_SCOPE}    always
+${STATE_PROBE_SCRIPT}          ${EMPTY}
 ${HASH_BYPASS_SYMBOLS}         ${EMPTY}
 ${PROGRESS_STALL_TIMEOUT_S}    5
 ${EXPECT_CONTROL_OUTCOME}      ${EMPTY}
@@ -108,6 +110,7 @@ Run Runtime Fault Point
     Execute Command    $erase_trace_file_bin="${ERASE_TRACE_FILE_BIN}"
     Execute Command    $fault_types="${FAULT_TYPES}"
     Execute Command    $fault_type_csv="${FAULT_TYPE_CSV}"
+    Execute Command    $boot_cycles="${BOOT_CYCLES}"
     Execute Command    $success_image_hash="${SUCCESS_IMAGE_HASH}"
     Execute Command    $success_image_hash_slot="${SUCCESS_IMAGE_HASH_SLOT}"
     Execute Command    $image_exec_sha256="${IMAGE_EXEC_SHA256}"
@@ -115,6 +118,7 @@ Run Runtime Fault Point
     Execute Command    $expected_exec_sha256="${EXPECTED_EXEC_SHA256}"
     Execute Command    $success_otadata_expect="${SUCCESS_OTADATA_EXPECT}"
     Execute Command    $success_otadata_expect_scope="${SUCCESS_OTADATA_EXPECT_SCOPE}"
+    Execute Command    $state_probe_script="${STATE_PROBE_SCRIPT}"
     Execute Command    $hash_bypass_symbols="${HASH_BYPASS_SYMBOLS}"
     Execute Command    $progress_stall_timeout_s="${PROGRESS_STALL_TIMEOUT_S}"
     Execute Command    $expect_control_outcome="${EXPECT_CONTROL_OUTCOME}"

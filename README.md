@@ -38,7 +38,7 @@ See [`action.yml`](action.yml) for all inputs and outputs.
 
 ## Quick start: local
 
-Prerequisites: `python3`, `pyyaml`, `renode-test` on PATH.
+Prerequisites: `python3`, `pyyaml`, and either `renode-test` on PATH or Docker access for `docker://IMAGE` runs.
 
 ```bash
 python3 scripts/audit_bootloader.py \
@@ -48,6 +48,15 @@ python3 scripts/audit_bootloader.py \
 ```
 
 Add `--quick` for a smoke test (3 fault points, seconds). Add `--workers 4` for parallel sweep.
+
+If native Renode is unavailable locally, you can run the same audit through Docker:
+
+```bash
+python3 scripts/audit_bootloader.py \
+  --profile profiles/mcuboot_pr2100_broken.yaml \
+  --renode-test docker://renode-patched:test \
+  --output results/report.json
+```
 
 ## Run modes
 
@@ -131,7 +140,7 @@ Six architectures, from worst-case patterns to hardened OSS boot flows:
 | `mcuboot`      | Swap-move / swap-scratch on nRF52   | varies     | Real MCUboot ELFs from upstream CI           |
 | `riotboot`     | Slot selection via header metadata  | varies     | Standalone RIOTboot model                    |
 
-68 profiles total, including intentional-defect variants for self-testing.
+67 profiles total, including intentional-defect variants for self-testing.
 
 ## OSS validation
 
@@ -183,13 +192,32 @@ fault_sweep:
   mode: runtime
   evaluation_mode: execute
   max_writes: auto
+  boot_cycles: 3
   hash_bypass_symbols: ["bootutil_img_validate"] # Patch out crypto in emulation
+
+state_probe_script: scripts/probes/my_target_probe.py # Optional semantic-state hook
+
+semantic_assertions:
+  control:
+    multi_boot_analysis.status: converged
+  faulted:
+    semantic_state.confirmed: false
+
+invariants:
+  - multi_boot_converges
 
 expect:
   should_find_issues: true # Self-test: tool must find bricks
 ```
 
 Key fields: `platform`, `bootloader`, `memory`, `images`, `success_criteria`, `fault_sweep`, `expect`. See [`scripts/profile_loader.py`](scripts/profile_loader.py) for the full schema.
+
+### Discovery-oriented profile hooks
+
+- `state_probe_script`: profile-supplied Python hook that exports target-specific semantic state into the report after each boot.
+- `semantic_assertions`: path-based expectations over the runtime result (`semantic_state.*`, `multi_boot_analysis.*`, etc.). A point can fail even when the device still boots.
+- `invariants`: named postconditions such as `multi_boot_converges` that run against the normalized result payload.
+- `fault_sweep.boot_cycles`: repeat clean boots after the initial control or faulted boot to catch stuck-revert or oscillation bugs that require more than one reboot.
 
 ## Performance
 
@@ -218,7 +246,7 @@ In `execute` mode, Phase 2 performs a full CPU recovery boot from faulted flash:
 Primary report fields:
 
 - `summary.runtime_sweep`: aggregate outcomes (`failure_outcomes`), aggregate failure classes (`failure_classes`), brick rate, control result, and timing.
-- `runtime_sweep_results[]`: per-point records with `fault_type`, `boot_outcome`, `fault_class`, `signals`, and optional diagnostics.
+- `runtime_sweep_results[]`: per-point records with `fault_type`, `boot_outcome`, `fault_class`, `signals`, and optional diagnostics such as `semantic_state`, `boot_cycles`, `multi_boot_analysis`, `semantic_assertion_failures`, and `invariant_violations`.
 - `clean_trace`: calibration-trace metadata when available (write/erase counts and how many points were window-annotated).
 
 Per-point diagnostics are attached only when relevant:
@@ -286,7 +314,7 @@ python3 scripts/audit_bootloader.py \
   --output results/your_report.json
 ```
 
-See the 74 included profiles for examples covering NVMemory, NVMC, and hybrid platforms.
+See the 67 included profiles for examples covering NVMemory, NVMC, and hybrid platforms.
 
 ## Beyond the primary audit
 

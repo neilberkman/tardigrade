@@ -126,7 +126,7 @@ class SuccessCriteria:
 
 
 class FaultSweepConfig:
-    __slots__ = ("mode", "max_writes", "max_writes_cap", "max_step_limit", "run_duration", "fault_types", "evaluation_mode", "sweep_strategy", "hash_bypass_symbols", "progress_stall_timeout_s")
+    __slots__ = ("mode", "max_writes", "max_writes_cap", "max_step_limit", "run_duration", "fault_types", "evaluation_mode", "sweep_strategy", "hash_bypass_symbols", "progress_stall_timeout_s", "boot_cycles")
 
     def __init__(
         self,
@@ -140,6 +140,7 @@ class FaultSweepConfig:
         sweep_strategy: str = "heuristic",
         hash_bypass_symbols: Optional[List[str]] = None,
         progress_stall_timeout_s: Optional[float] = None,
+        boot_cycles: int = 1,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -151,6 +152,7 @@ class FaultSweepConfig:
         self.sweep_strategy = sweep_strategy
         self.hash_bypass_symbols = hash_bypass_symbols or []
         self.progress_stall_timeout_s = progress_stall_timeout_s
+        self.boot_cycles = max(1, int(boot_cycles))
 
 
 class StateFuzzerConfig:
@@ -239,6 +241,9 @@ class ProfileConfig:
         profile_path: Optional[Path] = None,
         scenario: str = "runtime",
         update_trigger: Optional[UpdateTrigger] = None,
+        state_probe_script: Optional[str] = None,
+        semantic_assertions: Optional[Dict[str, Dict[str, Any]]] = None,
+        invariants: Optional[List[str]] = None,
     ) -> None:
         self.schema_version = schema_version
         self.name = name
@@ -257,6 +262,9 @@ class ProfileConfig:
         self.profile_path = profile_path
         self.scenario = scenario
         self.update_trigger = update_trigger
+        self.state_probe_script = state_probe_script
+        self.semantic_assertions = semantic_assertions or {}
+        self.invariants = invariants or []
 
     def resolve_path(self, repo_root: Path, value: str) -> str:
         """Resolve a path relative to the repo root."""
@@ -358,6 +366,7 @@ class ProfileConfig:
             "RUN_DURATION:{}".format(fs.run_duration),
             "MAX_STEP_LIMIT:{}".format(fs.max_step_limit),
             "MAX_WRITES_CAP:{}".format(fs.max_writes_cap),
+            "BOOT_CYCLES:{}".format(fs.boot_cycles),
             "RUNTIME_MODE:true",
         ]
 
@@ -443,6 +452,12 @@ class ProfileConfig:
         if self.setup_script:
             vars_list.append(
                 "SETUP_SCRIPT:{}".format(self.resolve_path(repo_root, self.setup_script))
+            )
+        if self.state_probe_script:
+            vars_list.append(
+                "STATE_PROBE_SCRIPT:{}".format(
+                    self.resolve_path(repo_root, self.state_probe_script)
+                )
             )
 
         # Hash bypass: comma-separated list of function symbols to short-circuit.
@@ -597,6 +612,9 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
     stall_timeout = raw.get("progress_stall_timeout_s")
     if stall_timeout is not None:
         stall_timeout = float(stall_timeout)
+    boot_cycles = int(raw.get("boot_cycles", 1))
+    if boot_cycles < 1:
+        raise ProfileError("fault_sweep.boot_cycles: expected integer >= 1")
     return FaultSweepConfig(
         mode=raw.get("mode", "runtime"),
         max_writes=raw.get("max_writes", "auto"),
@@ -608,6 +626,7 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         sweep_strategy=str(raw.get("sweep_strategy", "heuristic")),
         hash_bypass_symbols=hash_bypass,
         progress_stall_timeout_s=stall_timeout,
+        boot_cycles=boot_cycles,
     )
 
 
@@ -650,6 +669,59 @@ def _parse_pre_boot_state(raw: Optional[list]) -> List[PreBootWrite]:
         val = _parse_int(_require(entry, "u32", "pre_boot_state[{}]".format(i)), "pre_boot_state[{}].u32".format(i))
         writes.append(PreBootWrite(address=addr, u32=val))
     return writes
+
+
+def _parse_semantic_assertions(raw: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ProfileError("semantic_assertions: expected mapping")
+    parsed: Dict[str, Dict[str, Any]] = {}
+    for scope in ("always", "control", "faulted"):
+        scope_raw = raw.get(scope)
+        if scope_raw is None:
+            continue
+        if not isinstance(scope_raw, dict):
+            raise ProfileError(
+                "semantic_assertions.{}: expected mapping of path -> expected value".format(
+                    scope
+                )
+            )
+        parsed_scope: Dict[str, Any] = {}
+        for key, value in scope_raw.items():
+            path = str(key).strip()
+            if not path:
+                raise ProfileError(
+                    "semantic_assertions.{}: expected non-empty assertion path".format(
+                        scope
+                    )
+                )
+            parsed_scope[path] = value
+        if parsed_scope:
+            parsed[scope] = parsed_scope
+    unknown_scopes = sorted(set(raw.keys()) - {"always", "control", "faulted"})
+    if unknown_scopes:
+        raise ProfileError(
+            "semantic_assertions: unknown scope(s): {}".format(", ".join(unknown_scopes))
+        )
+    return parsed
+
+
+def _parse_invariants(raw: Optional[Any]) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        value = raw.strip()
+        return [value] if value else []
+    if isinstance(raw, list):
+        parsed: List[str] = []
+        for i, entry in enumerate(raw):
+            value = str(entry).strip()
+            if not value:
+                raise ProfileError("invariants[{}]: expected non-empty string".format(i))
+            parsed.append(value)
+        return parsed
+    raise ProfileError("invariants: expected string or list of strings")
 
 
 # ---------------------------------------------------------------------------
@@ -717,11 +789,16 @@ def load_profile(path: str | Path) -> ProfileConfig:
     setup_script = data.get("setup_script")
     if setup_script is not None:
         setup_script = str(setup_script)
+    state_probe_script = data.get("state_probe_script")
+    if state_probe_script is not None:
+        state_probe_script = str(state_probe_script)
 
     success_criteria = _parse_success_criteria(data.get("success_criteria"))
     fault_sweep = _parse_fault_sweep(data.get("fault_sweep"))
     state_fuzzer = _parse_state_fuzzer(data.get("state_fuzzer"))
     expect = _parse_expect(data.get("expect"))
+    semantic_assertions = _parse_semantic_assertions(data.get("semantic_assertions"))
+    invariants = _parse_invariants(data.get("invariants"))
 
     scenario = str(data.get("scenario", "runtime"))
     if scenario not in VALID_SCENARIOS:
@@ -763,6 +840,9 @@ def load_profile(path: str | Path) -> ProfileConfig:
         profile_path=path,
         scenario=scenario,
         update_trigger=update_trigger,
+        state_probe_script=state_probe_script,
+        semantic_assertions=semantic_assertions,
+        invariants=invariants,
     )
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.
@@ -804,12 +884,16 @@ def main() -> int:
         "images": profile.images,
         "fault_sweep_mode": profile.fault_sweep.mode,
         "max_writes": profile.fault_sweep.max_writes,
+        "boot_cycles": profile.fault_sweep.boot_cycles,
         "state_fuzzer_enabled": profile.state_fuzzer.enabled,
         "expect_should_find_issues": profile.expect.should_find_issues,
         "image_hash": profile.success_criteria.image_hash,
         "image_hash_slot": profile.success_criteria.image_hash_slot,
         "otadata_expect": profile.success_criteria.otadata_expect,
         "otadata_expect_scope": profile.success_criteria.otadata_expect_scope,
+        "state_probe_script": profile.state_probe_script,
+        "semantic_assertions": profile.semantic_assertions,
+        "invariants": profile.invariants,
         "update_trigger": profile.update_trigger.type if profile.update_trigger else None,
         "pre_boot_state_count": len(profile.pre_boot_state),
     }

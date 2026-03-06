@@ -92,6 +92,9 @@ jobs:
       - name: Install Python dependencies
         run: python3 -m pip install --user pyyaml
 
+      - name: Run discovery feature unit tests
+        run: python3 tests/test_discovery_features.py
+
       - name: Run self-test shard ${{ matrix.shard }}/4
         run: |
           python3 scripts/self_test.py --quick \

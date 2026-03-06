@@ -98,21 +98,24 @@ def check_verdict(
     sweep = summary.get("runtime_sweep", {})
     brick_rate = float(sweep.get("brick_rate", 0.0))
     bricks = int(sweep.get("bricks", 0))
+    issue_points = int(sweep.get("issue_points", bricks))
 
     if should_find_issues:
-        if bricks == 0:
-            return False, "Expected bricks but found none"
+        if issue_points == 0:
+            return False, "Expected issues but found none"
         if brick_rate_min > 0 and brick_rate < brick_rate_min:
             return False, "Brick rate {:.1%} below minimum {:.1%}".format(
                 brick_rate, brick_rate_min
             )
-        return True, "Found {} bricks ({:.1%}), as expected".format(bricks, brick_rate)
-    else:
         if bricks > 0:
-            return False, "Expected no bricks but found {} ({:.1%})".format(
-                bricks, brick_rate
-            )
-        return True, "No bricks found, as expected"
+            return True, "Found {} bricks ({:.1%}), as expected".format(bricks, brick_rate)
+        return True, "Found {} semantic/invariant issue points, as expected".format(
+            issue_points
+        )
+    else:
+        if issue_points > 0:
+            return False, "Expected no issues but found {} point(s)".format(issue_points)
+        return True, "No issues found, as expected"
 
 
 def main() -> int:
