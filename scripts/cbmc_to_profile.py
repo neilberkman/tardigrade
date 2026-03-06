@@ -31,6 +31,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--template", required=True, help="Template profile YAML to copy.")
     parser.add_argument("--output", required=True, help="Output profile path.")
     parser.add_argument(
+        "--replay-output",
+        default="",
+        help="Optional output path for generic replay spec(s).",
+    )
+    parser.add_argument(
         "--meta-size",
         type=int,
         default=DEFAULT_META_SIZE,
@@ -274,11 +279,41 @@ def _property_name(trace_entry: Dict[str, Any], index: int) -> str:
     return "cbmc_counterexample_{}".format(index)
 
 
+def _build_replay_spec(
+    profile: Dict[str, Any],
+    failure: Dict[str, Any],
+    index: int,
+    normalized: Dict[int, int],
+    array_name: str,
+    meta_base: int,
+) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "kind": "replay",
+        "name": profile.get("name"),
+        "description": profile.get("description"),
+        "source": {
+            "type": "cbmc",
+            "property": _property_name(failure, index),
+            "array": array_name,
+            "meta_base": "0x{:08X}".format(meta_base),
+            "byte_count": len(normalized),
+        },
+        "profile_overrides": {
+            "pre_boot_state": _bytes_to_pre_boot_state(meta_base, normalized),
+            "expect": {
+                "should_find_issues": True,
+            },
+        },
+    }
+
+
 def main() -> int:
     args = parse_args()
     cbmc_path = Path(args.cbmc_output)
     template_path = Path(args.template)
     output_path = Path(args.output)
+    replay_output_path = Path(args.replay_output).resolve() if args.replay_output else None
 
     cbmc_data = json.loads(cbmc_path.read_text(encoding="utf-8"))
     template_data = yaml.safe_load(template_path.read_text(encoding="utf-8"))
@@ -304,6 +339,7 @@ def main() -> int:
 
     meta_base = _derive_meta_base(template_data, args.meta_base)
     generated_paths: List[Path] = []
+    generated_replays: List[Path] = []
 
     for idx, failure in enumerate(failures, start=1):
         trace = failure.get("trace")
@@ -356,6 +392,31 @@ def main() -> int:
                 array_name,
             )
         )
+        if replay_output_path is not None:
+            replay_spec = _build_replay_spec(
+                profile=profile,
+                failure=failure,
+                index=idx,
+                normalized=normalized,
+                array_name=array_name,
+                meta_base=meta_base,
+            )
+            if len(failures) == 1:
+                replay_dest = replay_output_path
+            else:
+                replay_dest = _suffix_path(replay_output_path, idx)
+            replay_dest.parent.mkdir(parents=True, exist_ok=True)
+            replay_dest.write_text(
+                yaml.safe_dump(replay_spec, sort_keys=False),
+                encoding="utf-8",
+            )
+            generated_replays.append(replay_dest)
+            print(
+                "Generated replay spec {} for property '{}'.".format(
+                    replay_dest,
+                    _property_name(failure, idx),
+                )
+            )
 
     if not generated_paths:
         raise RuntimeError("No profiles were generated from the failing traces.")

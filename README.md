@@ -6,6 +6,8 @@ Fault-injection resilience auditing for embedded bootloaders under [Renode](http
 
 Profile-driven fault injection that exercises NVM write points during a firmware update, injects faults (power loss, bit corruption, interrupted erase), and checks whether the bootloader reaches the expected boot outcome. Designed for Cortex-M firmware under Renode. You bring your ELF and binary images, define success criteria or target-specific state checks in a YAML profile, and tardigrade tells you whether your OTA path survives the exercised faults.
 
+The core engine stays generic: fault injection, replay, semantic-state collection, assertions, invariants, and scenario orchestration live here. Bootloader-specific state probes, invariant providers, formal models, and exploratory generators should live in target-side adapters.
+
 ## Quick start: GitHub Action
 
 The fastest integration path is the reusable GitHub Action:
@@ -195,16 +197,23 @@ fault_sweep:
   boot_cycles: 3
   hash_bypass_symbols: ["bootutil_img_validate"] # Patch out crypto in emulation
 
-state_probe_script: scripts/probes/my_target_probe.py # Optional semantic-state hook
-
 semantic_assertions:
   control:
     multi_boot_analysis.status: converged
   faulted:
     semantic_state.confirmed: false
 
+state_probe:
+  script: scripts/probes/my_target_probe.py
+  format: tardigrade.semantic-state/v1
+  contract_version: 1
+  required_paths:
+    - semantic_state.confirmed
+
 invariants:
   - multi_boot_converges
+invariant_providers:
+  - targets/my_bootloader/invariants.py
 
 expect:
   should_find_issues: true # Self-test: tool must find bricks
@@ -217,12 +226,36 @@ Key fields: `platform`, `bootloader`, `memory`, `images`, `success_criteria`, `f
 
 ### Discovery-oriented profile hooks
 
-- `state_probe_script`: profile-supplied Python hook that exports target-specific semantic state into the report after each boot.
+- `state_probe`: profile-supplied semantic-state contract. `script` is the probe implementation; `format` and `contract_version` document the JSON shape; `required_paths` marks fields that must be observed for the probe contract to count as satisfied.
+- `state_probe_script`: legacy shorthand for `state_probe.script`; still supported for compatibility.
 - `semantic_assertions`: path-based expectations over the runtime result (`semantic_state.*`, `multi_boot_analysis.*`, etc.). A point can fail even when the device still boots.
 - Missing semantic observations are reported separately from assertion failures so incomplete probes do not automatically look like discovered bugs.
 - `invariants`: named postconditions such as `multi_boot_converges` that run against the normalized result payload.
+- `invariant_providers`: external Python modules that register additional invariant checks without extending the core registry.
 - `fault_sweep.boot_cycles`: repeat clean boots after the initial control or faulted boot to catch stuck-revert or oscillation bugs that require more than one reboot.
 - `expect.allow_semantic_only_issues` and `expect.required_issue_reasons`: self-test controls for profiles that intentionally expect semantic-only discoveries instead of boot-visible failures.
+
+## Generic scenarios and replay
+
+Use [`scripts/run_scenario.py`](scripts/run_scenario.py) to orchestrate multi-step discovery runs without baking target semantics into the core. A scenario references a base profile and then runs `audit` or `replay` steps by applying generic profile overrides.
+
+Replay specs are generic override bundles, suitable for counterexamples from CBMC or any other model checker:
+
+```yaml
+schema_version: 1
+kind: replay
+name: example_counterexample
+source:
+  type: cbmc
+  property: boot_target_never_null
+profile_overrides:
+  pre_boot_state:
+    - { address: 0x10070000, u32: 0x00000001 }
+  expect:
+    should_find_issues: true
+```
+
+`scripts/cbmc_to_profile.py` can now emit these replay specs directly via `--replay-output`.
 
 ## Performance
 
@@ -293,9 +326,12 @@ tardigrade/
 │   ├── write_trace_heuristic.py                 # Write-trace classification for pruning
 │   ├── render_results_html.py                   # HTML report renderer
 │   ├── run_oss_validation.py                    # OSS profile orchestrator
-│   ├── mcuboot_state_fuzzer.py                  # MCUboot trailer state exploration
+│   ├── mcuboot_state_fuzzer.py                  # Compatibility wrapper to targets/mcuboot/state_fuzzer.py
 │   ├── geometry_matrix.py                       # Parametric slot-layout generator
 │   └── cbmc_to_profile.py                       # CBMC counterexample → profile converter
+├── targets/
+│   └── mcuboot/
+│       └── state_fuzzer.py                      # MCUboot-specific trailer state exploration
 ├── examples/                                    # Built-in bootloader firmware
 │   ├── naive_copy/
 │   ├── vulnerable_ota/
@@ -327,7 +363,7 @@ See the 67 included profiles for examples covering NVMemory, NVMC, and hybrid pl
 The main workflow is `audit_bootloader.py --profile`, but the repo includes deeper analysis tools for bootloader authors:
 
 - **Geometry matrix** (`scripts/geometry_matrix.py`) -- generates parametric slot-layout permutations (alignment, sector size, slot count) to catch geometry-dependent bugs. This is how PR [#2206](https://github.com/mcu-tools/mcuboot/pull/2206) was validated across layout variants.
-- **State fuzzer** (`scripts/mcuboot_state_fuzzer.py`) -- property-based exploration of MCUboot trailer states. Seeds arbitrary metadata combinations and checks boot decisions against an oracle. Useful for any swap-based bootloader.
+- **State fuzzer** (`targets/mcuboot/state_fuzzer.py`) -- MCUboot-specific trailer-state exploration. Kept outside the core namespace so target logic stays separate from generic discovery plumbing.
 - **CBMC bridge** (`scripts/cbmc_to_profile.py`) -- converts CBMC counterexamples over modeled metadata/state into tardigrade profiles for dynamic replay. Bridges static and dynamic analysis when the counterexample can be projected into a concrete pre-boot state.
 
 ## Limitations

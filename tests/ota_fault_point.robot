@@ -56,6 +56,7 @@ ${RESUME_TRACE_NO_BOOT}        true
 ${RESUME_TRACE_MAX_OPS}        1024
 ${RESUME_TRACE_TIME_SLICE}     0.02
 ${RESUME_TRACE_WALL_TIMEOUT_S}    30
+${EXTRA_PERIPHERALS}           ${EMPTY}
 
 *** Keywords ***
 Load Runtime Scenario
@@ -68,12 +69,20 @@ Load Runtime Scenario
     Execute Command    include "${ROOT}/peripherals/TraceReplayEngine.cs"
     Execute Command    include "${ROOT}/peripherals/STM32F4FlashController.cs"
     Execute Command    include "${ROOT}/peripherals/STM32DummyUSART.cs"
+    Run Keyword If    '${EXTRA_PERIPHERALS}' != ''    Load Extra Peripherals
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${PLATFORM_REPL}
     ${load_cmds}=    Set Variable    bus=monitor.Machine.SystemBus; bus.LoadELF(r'${BOOTLOADER_ELF}')
     Run Keyword If    '${IMAGE_EXEC}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_EXEC}', ${SLOT_EXEC_BASE})"
     Run Keyword If    '${IMAGE_STAGING}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_STAGING}', ${SLOT_STAGING_BASE})"
     Execute Command    python "${load_cmds}"
+
+Load Extra Peripherals
+    [Documentation]    Compile additional C# peripherals specified as comma-separated paths.
+    @{paths}=    Split String    ${EXTRA_PERIPHERALS}    ,
+    FOR    ${path}    IN    @{paths}
+        Execute Command    include "${path}"
+    END
 
 Run Runtime Fault Point
     [Documentation]    Profile-driven runtime fault sweep. Uses run_runtime_fault_sweep.resc.

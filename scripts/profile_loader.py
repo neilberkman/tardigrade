@@ -163,6 +163,22 @@ class StateFuzzerConfig:
         self.metadata_model = metadata_model
 
 
+class StateProbeConfig:
+    __slots__ = ("script", "format", "contract_version", "required_paths")
+
+    def __init__(
+        self,
+        script: str,
+        format: str = "tardigrade.semantic-state/v1",
+        contract_version: int = 1,
+        required_paths: Optional[List[str]] = None,
+    ) -> None:
+        self.script = script
+        self.format = format
+        self.contract_version = max(1, int(contract_version))
+        self.required_paths = required_paths or []
+
+
 class ExpectConfig:
     __slots__ = ("should_find_issues", "control_outcome", "allow_semantic_only_issues", "required_issue_reasons")
 
@@ -238,6 +254,7 @@ class ProfileConfig:
         images: Dict[str, str],
         pre_boot_state: List[PreBootWrite],
         setup_script: Optional[str],
+        extra_peripherals: Optional[List[str]],
         success_criteria: SuccessCriteria,
         fault_sweep: FaultSweepConfig,
         state_fuzzer: StateFuzzerConfig,
@@ -245,9 +262,11 @@ class ProfileConfig:
         profile_path: Optional[Path] = None,
         scenario: str = "runtime",
         update_trigger: Optional[UpdateTrigger] = None,
+        state_probe: Optional[StateProbeConfig] = None,
         state_probe_script: Optional[str] = None,
         semantic_assertions: Optional[Dict[str, Dict[str, Any]]] = None,
         invariants: Optional[List[str]] = None,
+        invariant_providers: Optional[List[str]] = None,
     ) -> None:
         self.schema_version = schema_version
         self.name = name
@@ -259,6 +278,7 @@ class ProfileConfig:
         self.images = images
         self.pre_boot_state = pre_boot_state
         self.setup_script = setup_script
+        self.extra_peripherals = extra_peripherals or []
         self.success_criteria = success_criteria
         self.fault_sweep = fault_sweep
         self.state_fuzzer = state_fuzzer
@@ -266,9 +286,13 @@ class ProfileConfig:
         self.profile_path = profile_path
         self.scenario = scenario
         self.update_trigger = update_trigger
-        self.state_probe_script = state_probe_script
+        self.state_probe = state_probe
+        self.state_probe_script = (
+            state_probe.script if state_probe is not None else state_probe_script
+        )
         self.semantic_assertions = semantic_assertions or {}
         self.invariants = invariants or []
+        self.invariant_providers = invariant_providers or []
 
     def resolve_path(self, repo_root: Path, value: str) -> str:
         """Resolve a path relative to the repo root."""
@@ -464,6 +488,14 @@ class ProfileConfig:
                 )
             )
 
+        # Extra peripherals: comma-separated list of .cs files to compile
+        # before platform loading (e.g. controller stubs for custom SoCs).
+        if self.extra_peripherals:
+            resolved = [
+                self.resolve_path(repo_root, p) for p in self.extra_peripherals
+            ]
+            vars_list.append("EXTRA_PERIPHERALS:{}".format(",".join(resolved)))
+
         # Hash bypass: comma-separated list of function symbols to short-circuit.
         if fs.hash_bypass_symbols:
             vars_list.append(
@@ -643,6 +675,52 @@ def _parse_state_fuzzer(raw: Optional[Dict[str, Any]]) -> StateFuzzerConfig:
     )
 
 
+def _parse_state_probe(
+    raw: Optional[Any],
+    legacy_script: Optional[str],
+) -> Optional[StateProbeConfig]:
+    if raw is None:
+        return StateProbeConfig(script=str(legacy_script)) if legacy_script else None
+    if legacy_script:
+        raise ProfileError(
+            "state_probe and state_probe_script are mutually exclusive; use state_probe.script"
+        )
+    if isinstance(raw, str):
+        text = raw.strip()
+        return StateProbeConfig(script=text) if text else None
+    if not isinstance(raw, dict):
+        raise ProfileError("state_probe: expected mapping or string path")
+    script = str(_require(raw, "script", "state_probe")).strip()
+    if not script:
+        raise ProfileError("state_probe.script: expected non-empty path")
+    required_paths_raw = raw.get("required_paths", [])
+    if isinstance(required_paths_raw, str):
+        required_paths = [required_paths_raw.strip()] if required_paths_raw.strip() else []
+    elif isinstance(required_paths_raw, list):
+        required_paths = []
+        for i, entry in enumerate(required_paths_raw):
+            value = str(entry).strip()
+            if not value:
+                raise ProfileError(
+                    "state_probe.required_paths[{}]: expected non-empty string".format(i)
+                )
+            required_paths.append(value)
+    else:
+        raise ProfileError("state_probe.required_paths: expected string or list of strings")
+    contract_version = int(raw.get("contract_version", 1))
+    if contract_version < 1:
+        raise ProfileError("state_probe.contract_version: expected integer >= 1")
+    format_name = str(raw.get("format", "tardigrade.semantic-state/v1")).strip()
+    if not format_name:
+        raise ProfileError("state_probe.format: expected non-empty string")
+    return StateProbeConfig(
+        script=script,
+        format=format_name,
+        contract_version=contract_version,
+        required_paths=required_paths,
+    )
+
+
 def _parse_expect(raw: Optional[Dict[str, Any]]) -> ExpectConfig:
     if raw is None:
         return ExpectConfig()
@@ -735,6 +813,25 @@ def _parse_invariants(raw: Optional[Any]) -> List[str]:
     raise ProfileError("invariants: expected string or list of strings")
 
 
+def _parse_invariant_providers(raw: Optional[Any]) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        value = raw.strip()
+        return [value] if value else []
+    if isinstance(raw, list):
+        parsed: List[str] = []
+        for i, entry in enumerate(raw):
+            value = str(entry).strip()
+            if not value:
+                raise ProfileError(
+                    "invariant_providers[{}]: expected non-empty string".format(i)
+                )
+            parsed.append(value)
+        return parsed
+    raise ProfileError("invariant_providers: expected string or list of strings")
+
+
 # ---------------------------------------------------------------------------
 # Main loader
 # ---------------------------------------------------------------------------
@@ -800,9 +897,17 @@ def load_profile(path: str | Path) -> ProfileConfig:
     setup_script = data.get("setup_script")
     if setup_script is not None:
         setup_script = str(setup_script)
-    state_probe_script = data.get("state_probe_script")
-    if state_probe_script is not None:
-        state_probe_script = str(state_probe_script)
+    extra_peripherals_raw = data.get("extra_peripherals")
+    extra_peripherals: Optional[List[str]] = None
+    if extra_peripherals_raw is not None:
+        if isinstance(extra_peripherals_raw, list):
+            extra_peripherals = [str(p) for p in extra_peripherals_raw]
+        else:
+            extra_peripherals = [str(extra_peripherals_raw)]
+    legacy_state_probe_script = data.get("state_probe_script")
+    if legacy_state_probe_script is not None:
+        legacy_state_probe_script = str(legacy_state_probe_script)
+    state_probe = _parse_state_probe(data.get("state_probe"), legacy_state_probe_script)
 
     success_criteria = _parse_success_criteria(data.get("success_criteria"))
     fault_sweep = _parse_fault_sweep(data.get("fault_sweep"))
@@ -810,6 +915,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
     expect = _parse_expect(data.get("expect"))
     semantic_assertions = _parse_semantic_assertions(data.get("semantic_assertions"))
     invariants = _parse_invariants(data.get("invariants"))
+    invariant_providers = _parse_invariant_providers(data.get("invariant_providers"))
 
     scenario = str(data.get("scenario", "runtime"))
     if scenario not in VALID_SCENARIOS:
@@ -844,6 +950,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         images=images,
         pre_boot_state=pre_boot_state,
         setup_script=setup_script,
+        extra_peripherals=extra_peripherals,
         success_criteria=success_criteria,
         fault_sweep=fault_sweep,
         state_fuzzer=state_fuzzer,
@@ -851,9 +958,11 @@ def load_profile(path: str | Path) -> ProfileConfig:
         profile_path=path,
         scenario=scenario,
         update_trigger=update_trigger,
-        state_probe_script=state_probe_script,
+        state_probe=state_probe,
+        state_probe_script=legacy_state_probe_script,
         semantic_assertions=semantic_assertions,
         invariants=invariants,
+        invariant_providers=invariant_providers,
     )
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.
@@ -905,9 +1014,20 @@ def main() -> int:
         "image_hash_slot": profile.success_criteria.image_hash_slot,
         "otadata_expect": profile.success_criteria.otadata_expect,
         "otadata_expect_scope": profile.success_criteria.otadata_expect_scope,
+        "state_probe": (
+            {
+                "script": profile.state_probe_script,
+                "format": profile.state_probe.format,
+                "contract_version": profile.state_probe.contract_version,
+                "required_paths": profile.state_probe.required_paths,
+            }
+            if profile.state_probe is not None
+            else None
+        ),
         "state_probe_script": profile.state_probe_script,
         "semantic_assertions": profile.semantic_assertions,
         "invariants": profile.invariants,
+        "invariant_providers": profile.invariant_providers,
         "update_trigger": profile.update_trigger.type if profile.update_trigger else None,
         "pre_boot_state_count": len(profile.pre_boot_state),
     }

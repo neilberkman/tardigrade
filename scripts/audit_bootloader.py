@@ -38,6 +38,7 @@ from fault_inject import FaultResult
 from invariants import resolve_invariants, run_invariants
 from profile_loader import ProfileConfig, load_profile
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RENODE_TEST = os.environ.get("RENODE_TEST", "renode-test")
 DEFAULT_ROBOT_SUITE = "tests/ota_fault_point.robot"
 EXIT_ASSERTION_FAILURE = 1
@@ -214,10 +215,23 @@ def prepare_renode_command(
             container_args.append(normalize_container_path(arg))
             continue
         key, sep, value = arg.partition(":")
-        if sep and os.path.isabs(value):
-            add_mount(value)
-            container_args.append("{}:{}".format(key, normalize_container_path(value)))
-            continue
+        if sep and value:
+            # Handle comma-separated paths (e.g. EXTRA_PERIPHERALS:/a.cs,/b.cs).
+            sub_values = value.split(",") if "," in value else [value]
+            any_abs = False
+            normalized_subs = []
+            for sv in sub_values:
+                if os.path.isabs(sv):
+                    add_mount(sv)
+                    normalized_subs.append(normalize_container_path(sv))
+                    any_abs = True
+                else:
+                    normalized_subs.append(sv)
+            if any_abs:
+                container_args.append(
+                    "{}:{}".format(key, ",".join(normalized_subs))
+                )
+                continue
         container_args.append(arg)
 
     container_config_path = "/tmp/renode.config"
@@ -855,6 +869,31 @@ def _evaluate_semantic_assertions(
     return failures, observation_failures
 
 
+def _evaluate_state_probe_contract(
+    result: Dict[str, Any],
+    profile: ProfileConfig,
+) -> List[Dict[str, Any]]:
+    if getattr(profile, "state_probe", None) is None:
+        return []
+    required_paths = list(getattr(profile.state_probe, "required_paths", []) or [])
+    if not required_paths:
+        return []
+    failures: List[Dict[str, Any]] = []
+    for path in required_paths:
+        actual = _lookup_path(result, path)
+        if actual is _MISSING:
+            failures.append(
+                {
+                    "scope": "contract",
+                    "contract": "state_probe.required_paths",
+                    "path": path,
+                    "expected": "present",
+                    "actual": "<missing>",
+                }
+            )
+    return failures
+
+
 def _slot_validity_from_boot_slot(boot_slot: Optional[str]) -> Dict[str, bool]:
     token = str(boot_slot or "").strip().lower()
     slot_a_names = {"exec", "primary", "slot_a", "slot0", "a"}
@@ -894,7 +933,14 @@ def _evaluate_invariants(
 ) -> List[Dict[str, Any]]:
     if not profile.invariants:
         return []
-    invariant_fns = resolve_invariants(profile.invariants)
+    provider_paths = [
+        profile.resolve_path(REPO_ROOT, provider_path)
+        for provider_path in getattr(profile, "invariant_providers", []) or []
+    ]
+    invariant_fns = resolve_invariants(
+        profile.invariants,
+        provider_paths=provider_paths,
+    )
     fault_result = FaultResult(
         fault_at=int(result.get("fault_at", 0)),
         boot_outcome=str(result.get("boot_outcome", "unknown")),
@@ -931,13 +977,15 @@ def annotate_result_checks(
         if candidate.get("is_control"):
             control_result = candidate
     for result in results:
+        contract_observation_failures = _evaluate_state_probe_contract(result, profile)
         semantic_failures, observation_failures = _evaluate_semantic_assertions(
             result, profile
         )
         if semantic_failures:
             result["semantic_assertion_failures"] = semantic_failures
-        if observation_failures:
-            result["semantic_observation_failures"] = observation_failures
+        combined_observation_failures = contract_observation_failures + observation_failures
+        if combined_observation_failures:
+            result["semantic_observation_failures"] = combined_observation_failures
         pre_state = _derive_runtime_pre_state(result, control_result, profile)
         if pre_state is not None:
             result["pre_state"] = pre_state
@@ -1671,7 +1719,7 @@ def git_metadata(repo_root: Path) -> Dict[str, str]:
 
 def main() -> int:
     args = parse_args()
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = REPO_ROOT
     temp_ctx: Optional[tempfile.TemporaryDirectory[str]] = None
 
     try:
@@ -2159,6 +2207,19 @@ def main() -> int:
                 "workers": args.workers,
             },
             "git": git_metadata(repo_root),
+        }
+        payload["contracts"] = {
+            "state_probe": (
+                {
+                    "script": profile.state_probe_script,
+                    "format": profile.state_probe.format,
+                    "contract_version": profile.state_probe.contract_version,
+                    "required_paths": profile.state_probe.required_paths,
+                }
+                if getattr(profile, "state_probe", None) is not None
+                else None
+            ),
+            "invariant_providers": list(getattr(profile, "invariant_providers", []) or []),
         }
         calibration_source = "executed"
         if cal is None:

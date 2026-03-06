@@ -19,6 +19,9 @@ Usage from a campaign runner::
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+import sys
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from fault_inject import FaultResult
@@ -369,6 +372,7 @@ _INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
     "slot_integrity": check_slot_integrity,
     "multi_boot_converges": check_multi_boot_converges,
 }
+_PROVIDER_CACHE: Dict[str, Dict[str, InvariantFn]] = {}
 
 
 def run_invariants(
@@ -424,8 +428,87 @@ def default_invariants(scenario: str) -> List[InvariantFn]:
     return [check_at_least_one_bootable, check_slot_integrity]
 
 
-def resolve_invariants(spec: Sequence[str]) -> List[InvariantFn]:
+def _load_provider_module(provider_path: str) -> Dict[str, InvariantFn]:
+    resolved = str(Path(provider_path).resolve())
+    cached = _PROVIDER_CACHE.get(resolved)
+    if cached is not None:
+        return cached
+
+    module_name = "tardigrade_invariant_provider_{}".format(
+        abs(hash(resolved))
+    )
+    spec = importlib.util.spec_from_file_location(module_name, resolved)
+    if spec is None or spec.loader is None:
+        raise ValueError(
+            "failed to load invariant provider module '{}'".format(provider_path)
+        )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    mapping: Any = None
+    if hasattr(module, "register_invariants"):
+        mapping = module.register_invariants()
+    elif hasattr(module, "INVARIANTS"):
+        mapping = getattr(module, "INVARIANTS")
+    else:
+        raise ValueError(
+            "invariant provider '{}' must define register_invariants() or INVARIANTS".format(
+                provider_path
+            )
+        )
+
+    if not isinstance(mapping, dict):
+        raise ValueError(
+            "invariant provider '{}' must return a name -> callable mapping".format(
+                provider_path
+            )
+        )
+
+    parsed: Dict[str, InvariantFn] = {}
+    for raw_name, fn in mapping.items():
+        name = str(raw_name).strip()
+        if not name:
+            raise ValueError(
+                "invariant provider '{}' returned an empty invariant name".format(
+                    provider_path
+                )
+            )
+        if not callable(fn):
+            raise ValueError(
+                "invariant provider '{}' entry '{}' is not callable".format(
+                    provider_path, name
+                )
+            )
+        parsed[name] = fn
+
+    _PROVIDER_CACHE[resolved] = parsed
+    return parsed
+
+
+def build_invariant_registry(
+    provider_paths: Optional[Sequence[str]] = None,
+) -> Dict[str, InvariantFn]:
+    registry = dict(_INVARIANT_REGISTRY)
+    for provider_path in provider_paths or []:
+        provided = _load_provider_module(provider_path)
+        for name, fn in provided.items():
+            if name in registry:
+                raise ValueError(
+                    "duplicate invariant name '{}' from provider '{}'".format(
+                        name, provider_path
+                    )
+                )
+            registry[name] = fn
+    return registry
+
+
+def resolve_invariants(
+    spec: Sequence[str],
+    provider_paths: Optional[Sequence[str]] = None,
+) -> List[InvariantFn]:
     """Resolve invariant names/presets into callable checks."""
+    registry = build_invariant_registry(provider_paths)
     resolved: List[InvariantFn] = []
     seen: set[str] = set()
     for entry in spec:
@@ -440,7 +523,7 @@ def resolve_invariants(spec: Sequence[str]) -> List[InvariantFn]:
                     resolved.append(fn)
                     seen.add(fn_name)
             continue
-        fn = _INVARIANT_REGISTRY.get(name)
+        fn = registry.get(name)
         if fn is None:
             raise ValueError("unknown invariant '{}'".format(name))
         if fn.__name__ not in seen:
