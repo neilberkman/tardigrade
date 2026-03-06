@@ -4,7 +4,7 @@ Fault-injection resilience auditing for embedded bootloaders under [Renode](http
 
 ## What it does
 
-Profile-driven fault injection that sweeps every NVM write point during a firmware update, injects faults (power loss, bit corruption, interrupted erase), and verifies the bootloader recovers correctly. Works with any Cortex-M firmware under Renode. You bring your ELF and binary images, define success criteria in a YAML profile, and tardigrade tells you whether your OTA path survives.
+Profile-driven fault injection that exercises NVM write points during a firmware update, injects faults (power loss, bit corruption, interrupted erase), and checks whether the bootloader reaches the expected boot outcome. Designed for Cortex-M firmware under Renode. You bring your ELF and binary images, define success criteria or target-specific state checks in a YAML profile, and tardigrade tells you whether your OTA path survives the exercised faults.
 
 ## Quick start: GitHub Action
 
@@ -57,7 +57,7 @@ Add `--quick` for a smoke test (3 fault points, seconds). Add `--workers 4` for 
 | Heuristic  | _(default)_       | ~1K    | 2-4 min | CI gate         |
 | Exhaustive | `--fault-start 0` | ~15K   | 15 min  | full validation |
 
-Heuristic mode uses write-trace analysis to prune the ~15K write points down to ~1K high-value targets (trailer boundaries, slot transitions) with no loss of defect coverage.
+Heuristic mode uses write-trace analysis to prune the ~15K write points down to ~1K high-value targets (trailer boundaries, slot transitions). This is the default CI tradeoff, not a proof of equivalence to an exhaustive sweep.
 
 ## Fault injection model
 
@@ -135,7 +135,7 @@ Six architectures, from worst-case patterns to hardened OSS boot flows:
 
 ## OSS validation
 
-Retroactive validation against known MCUboot bugs, proving the tool catches these bug classes:
+Retroactive validation against known MCUboot bugs shows the tool catches these observed regression classes:
 
 | PR                                                      | Bug                                                  | Algorithm    | Broken               | Fixed      |
 | ------------------------------------------------------- | ---------------------------------------------------- | ------------ | -------------------- | ---------- |
@@ -254,7 +254,7 @@ tardigrade/
 ├── scripts/
 │   ├── audit_bootloader.py                      # Profile-driven audit runner (primary CLI)
 │   ├── profile_loader.py                        # YAML profile parser + validation
-│   ├── self_test.py                             # Meta-test: audit catches all known defects
+│   ├── self_test.py                             # Meta-test: audit catches the repo's known defect corpus
 │   ├── run_runtime_fault_sweep.resc             # Renode runtime fault sweep engine
 │   ├── write_trace_heuristic.py                 # Write-trace classification for pruning
 │   ├── render_results_html.py                   # HTML report renderer
@@ -294,13 +294,14 @@ The main workflow is `audit_bootloader.py --profile`, but the repo includes deep
 
 - **Geometry matrix** (`scripts/geometry_matrix.py`) -- generates parametric slot-layout permutations (alignment, sector size, slot count) to catch geometry-dependent bugs. This is how PR [#2206](https://github.com/mcu-tools/mcuboot/pull/2206) was validated across layout variants.
 - **State fuzzer** (`scripts/mcuboot_state_fuzzer.py`) -- property-based exploration of MCUboot trailer states. Seeds arbitrary metadata combinations and checks boot decisions against an oracle. Useful for any swap-based bootloader.
-- **CBMC bridge** (`scripts/cbmc_to_profile.py`) -- converts formal verification counterexamples (from CBMC model checking) into tardigrade profiles for dynamic replay. Bridges static and dynamic analysis.
+- **CBMC bridge** (`scripts/cbmc_to_profile.py`) -- converts CBMC counterexamples over modeled metadata/state into tardigrade profiles for dynamic replay. Bridges static and dynamic analysis when the counterexample can be projected into a concrete pre-boot state.
 
 ## Limitations
 
 - Fault model operates at write-operation granularity, not analog brownout simulation.
 - Cortex-M targets currently; non-Cortex architectures are not first-class.
-- Full exhaustive sweeps take ~15 min on a 2-core CI runner; heuristic mode covers this in 2-4 min.
+- Semantic/state-only bugs that do not change boot outcome require explicit instrumentation or stronger target-specific oracles.
+- Full exhaustive sweeps take ~15 min on a 2-core CI runner; heuristic mode usually reduces this to 2-4 min, but it remains a coverage/performance tradeoff.
 
 ## Why "tardigrade"
 
