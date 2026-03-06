@@ -578,12 +578,12 @@ def effective_page_size():
 
 def flash_geometry():
     if USE_MRAM_PATH:
-        # MRAMMemory may be multi-registered; use first registration base.
-        try:
-            base = int(bus.GetRegistrationPoint(mram).Range.StartAddress)
-        except Exception:
-            base = int(slot_exec_base)
-        return base, int(mram.Size)
+        # Derive MRAM bus base by aligning lowest slot address down to
+        # MRAM size boundary (MRAM size is always a power of two).
+        mram_size = int(mram.Size)
+        lowest_slot = min(int(slot_exec_base), int(slot_staging_base))
+        base = lowest_slot & ~(mram_size - 1)
+        return base, mram_size
     if USE_FAST_PATH:
         return int(nvmc.FlashBaseAddress), int(nvmc.FlashSize)
     try:
@@ -885,14 +885,18 @@ def disarm_erase_fault():
 
 def was_fault_injected():
     if USE_MRAM_PATH:
-        return bool(mram.LastFaultInjected)
+        # LastFaultInjected is cleared on every subsequent write (line 188
+        # of MRAMMemory.cs), so it's only true if the fault was the LAST
+        # write.  Use TotalWordWrites >= FaultAtWordWrite as a sticky check:
+        # if we reached or passed the armed index, the fault fired.
+        return int(mram.TotalWordWrites) >= int(mram.FaultAtWordWrite)
     if USE_FAST_PATH:
         return bool(nvmc.FaultFired) or bool(nvmc.EraseFaultFired)
     return bool(ctrl.Nvm.FaultEverFired)
 
 def was_write_fault_injected():
     if USE_MRAM_PATH:
-        return bool(mram.LastFaultInjected)
+        return int(mram.TotalWordWrites) >= int(mram.FaultAtWordWrite)
     if USE_FAST_PATH:
         return bool(nvmc.FaultFired)
     return bool(ctrl.Nvm.FaultEverFired)
@@ -1108,8 +1112,7 @@ def compute_exec_slot_hash():
     if data_size <= 0:
         data_size = slot_exec_size
     if USE_MRAM_PATH:
-        # MRAMMemory is mapped directly at slot addresses.
-        mram_base = int(bus.GetRegistrationPoint(mram).Range.StartAddress)
+        mram_base, _ = flash_geometry()
         offset = slot_exec_base - mram_base
         data = bytes(mram.ReadBytes(offset, data_size))
     elif USE_FAST_PATH:
@@ -1141,10 +1144,12 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False):
             boot_slot = sn
             break
 
+    vtor_in_known_slot = boot_slot is not None
+
     vtor_ok = not bool(success_vtor_slot)
     if success_vtor_slot == 'any':
         # Any defined slot is acceptable.
-        vtor_ok = any(s_lo <= actual_vtor < s_hi for s_lo, s_hi in slot_ranges.values())
+        vtor_ok = vtor_in_known_slot
     elif success_vtor_slot and success_vtor_slot in slot_ranges:
         s_lo, s_hi = slot_ranges[success_vtor_slot]
         vtor_ok = (s_lo <= actual_vtor < s_hi)
@@ -1191,6 +1196,7 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False):
         'vtor': fmt_u32(actual_vtor),
         'vtor_final': fmt_u32(vtor_value),
         'vtor_sticky': sticky_vtor['captured'],
+        'execution_observed': vtor_in_known_slot,
         'vtor_aligned': vtor_aligned,
         'vtor_ok': vtor_ok,
         'pc': fmt_u32(pc_value),
@@ -1229,16 +1235,21 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False):
         signals['otadata_expect_mismatches'] = ';'.join(otadata_mismatches)
 
     criteria_ok = marker_ok and otadata_expect_ok
-    if vtor_ok and vtor_aligned and pc_ok and criteria_ok:
-        boot_outcome = 'success'
-    elif vtor_ok and not vtor_aligned:
-        boot_outcome = 'misaligned_vtor'
-    elif vtor_ok and pc_ok and not criteria_ok:
-        boot_outcome = 'wrong_image'
-    elif vtor_ok and not pc_ok:
-        boot_outcome = 'wrong_pc'
-    else:
+    expectations_met = vtor_ok and vtor_aligned and pc_ok and criteria_ok
+    signals['expectations_met'] = expectations_met
+
+    # Keep execution failures separate from expectation mismatches:
+    # a boot into a real slot with the "wrong" image/slot is not "no_boot".
+    if not vtor_in_known_slot:
         boot_outcome = 'no_boot'
+    elif not vtor_aligned:
+        boot_outcome = 'misaligned_vtor'
+    elif not pc_ok:
+        boot_outcome = 'wrong_pc'
+    elif not vtor_ok or not criteria_ok:
+        boot_outcome = 'wrong_image'
+    else:
+        boot_outcome = 'success'
 
     return boot_outcome, boot_slot, signals
 

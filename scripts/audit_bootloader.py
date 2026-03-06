@@ -1009,6 +1009,11 @@ def result_has_issues(result: Dict[str, Any], expected_outcome: str) -> bool:
     return bool(result_issue_reasons(result, expected_outcome))
 
 
+def result_is_brick(result: Dict[str, Any]) -> bool:
+    outcome = str(result.get("boot_outcome", "unknown") or "unknown").strip().lower()
+    return outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}
+
+
 def _run_batch_worker(
     repo_root_str: str,
     renode_test: str,
@@ -1575,7 +1580,7 @@ def summarize_runtime_sweep(
         expected_outcome = (
             getattr(profile.expect, "control_outcome", "success") or "success"
         )
-    boot_failures = [r for r in injected if r.get("boot_outcome") != expected_outcome]
+    boot_failures = [r for r in injected if result_is_brick(r)]
     failures = [r for r in injected if result_has_issues(r, expected_outcome)]
     recoveries = sum(1 for r in injected if not result_has_issues(r, expected_outcome))
     semantic_issue_points = sum(1 for r in injected if r.get("semantic_assertion_failures"))

@@ -192,6 +192,51 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertEqual(summary["issue_points"], 0)
             self.assertEqual(summary["semantic_observation_points"], 1)
 
+    def test_wrong_image_is_issue_but_not_brick(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: wrong_image_profile
+                description: discovery
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            results = [
+                {
+                    "fault_at": 11,
+                    "fault_injected": True,
+                    "boot_outcome": "wrong_image",
+                    "boot_slot": "staging",
+                    "signals": {"execution_observed": True, "vtor_ok": False},
+                    "is_control": False,
+                }
+            ]
+
+            summary = summarize_runtime_sweep(results, total_writes=10, profile=profile)
+            self.assertEqual(summary["bricks"], 0)
+            self.assertEqual(summary["issue_points"], 1)
+            self.assertEqual(summary["failure_outcomes"], {"wrong_image": 1})
+            self.assertEqual(summary["failure_classes"], {"wrong_image": 1})
+
     def test_control_result_derives_pre_state_for_bootable_invariant(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
