@@ -1,0 +1,70 @@
+schema_version: 1
+name: nxboot_style_exploratory
+base_profile: profiles/nxboot_style_update.yaml
+
+shared_profile_overrides: &nxboot_target_overrides
+  fault_sweep:
+    boot_cycles: 3
+  state_probe:
+    script: targets/nxboot/probe.py
+    format: tardigrade.semantic-state/v1
+    contract_version: 1
+    required_paths:
+      - semantic_state.roles.next_boot
+      - semantic_state.roles.update_slot
+      - semantic_state.roles.recovery_slot
+      - semantic_state.slots.primary.magic_kind
+      - semantic_state.slots.tertiary.crc_valid
+  invariant_providers:
+    - targets/nxboot/invariants.py
+  invariants:
+    - multi_boot_converges
+    - nxboot_roles_distinct
+    - nxboot_confirmed_has_recovery
+    - nxboot_duplicate_update_consumed
+
+steps:
+  - id: update_correct
+    kind: audit
+    audit:
+      workers: 2
+    profile_overrides:
+      <<: *nxboot_target_overrides
+      semantic_assertions:
+        control:
+          multi_boot_analysis.status: converged
+          semantic_state.roles.next_boot: none
+
+  - id: no_recovery_defect
+    kind: audit
+    base_profile: profiles/nxboot_style_no_recovery.yaml
+    audit:
+      workers: 2
+    profile_overrides:
+      <<: *nxboot_target_overrides
+
+  - id: update_correct_assert
+    kind: assert
+    assertions:
+      - path: steps.update_correct.report.summary.runtime_sweep.control.boot_outcome
+        op: equals
+        value: success
+      - path: steps.update_correct.report.summary.runtime_sweep.control.issue_count
+        op: equals
+        value: 0
+      - path: steps.update_correct.report.summary.runtime_sweep.control.multi_boot_analysis.status
+        op: equals
+        value: converged
+      - path: steps.update_correct.report.summary.runtime_sweep.control.semantic_state.roles.next_boot
+        op: equals
+        value: none
+
+  - id: no_recovery_assert
+    kind: assert
+    assertions:
+      - path: steps.no_recovery_defect.report.summary.runtime_sweep.control.boot_outcome
+        op: equals
+        value: success
+      - path: steps.no_recovery_defect.report.summary.runtime_sweep.issue_points
+        op: gt
+        value: 0

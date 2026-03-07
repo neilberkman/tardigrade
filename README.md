@@ -335,12 +335,16 @@ tardigrade/
 │   ├── geometry_matrix.py                       # Parametric slot-layout generator
 │   └── cbmc_to_profile.py                       # CBMC counterexample → profile converter
 ├── targets/
-│   └── mcuboot/
+│   ├── mcuboot/
 │       ├── probe.py                              # MCUboot trailer-state semantic probe
 │       ├── invariants.py                         # MCUboot-specific invariant provider
 │       └── state_fuzzer.py                      # MCUboot-specific trailer state exploration
+│   └── nxboot/
+│       ├── probe.py                              # nxboot-style semantic probe
+│       └── invariants.py                         # nxboot-style invariant provider
 ├── scenarios/
-│   └── mcuboot_head_exploratory.yaml            # Public multi-step scenario example
+│   ├── mcuboot_head_exploratory.yaml            # Public MCUboot multi-step scenario
+│   └── nxboot_style_exploratory.yaml            # Public nxboot-style scenario
 ├── examples/                                    # Built-in bootloader firmware
 │   ├── naive_copy/
 │   ├── vulnerable_ota/

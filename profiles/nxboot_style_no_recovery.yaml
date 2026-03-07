@@ -1,0 +1,29 @@
+schema_version: 1
+name: nxboot_style_no_recovery
+description: >
+  Standalone nxboot-style bootloader with recovery creation disabled before
+  update. This is the real nxboot-style negative control and should expose
+  issue points under interrupted update faults.
+platform: platforms/cortex_m0_nvm.repl
+bootloader:
+  elf: examples/nxboot_style/bootloader_nxboot_no_recovery.elf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x10002000, size: 0x23000 }
+    staging: { base: 0x10025000, size: 0x23000 }
+images:
+  exec: examples/nxboot_style/nxboot_primary.bin
+  staging: examples/nxboot_style/nxboot_update.bin
+success_criteria:
+  vtor_in_slot: exec
+  image_hash: true
+  image_hash_slot: exec
+  expected_image: staging
+fault_sweep:
+  mode: runtime
+  run_duration: "0.5"
+expect:
+  should_find_issues: true
