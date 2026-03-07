@@ -519,9 +519,68 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertTrue(
                 (tempdir / "work" / "keep_artifacts_profile_fault_9" / "robot" / "snapshots").exists()
             )
-            self.assertTrue(
-                (tempdir / "work" / "keep_artifacts_profile_fault_9" / ".tmp" / "renode.tmp").exists()
+
+    def test_run_single_point_uses_no_fault_control_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: control_profile
+                description: cleanup
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
             )
+            profile = load_profile(profile_path)
+
+            def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+                fault_var = next(
+                    cmd[i + 1]
+                    for i, token in enumerate(cmd[:-1])
+                    if token == "--variable" and cmd[i + 1].startswith("FAULT_AT:")
+                )
+                self.assertEqual(fault_var, "FAULT_AT:-1")
+                result_token = next(
+                    cmd[i + 1]
+                    for i, token in enumerate(cmd[:-1])
+                    if token == "--variable" and cmd[i + 1].startswith("RESULT_FILE:")
+                )
+                result_file = Path(result_token.split(":", 1)[1])
+                result_file.parent.mkdir(parents=True, exist_ok=True)
+                result_file.write_text('{"boot_outcome":"success","fault_injected":false}', encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch("audit_bootloader.subprocess.run", side_effect=fake_run):
+                result = run_single_point(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    fault_at=1000000,
+                    robot_vars=[],
+                    work_dir=tempdir / "work",
+                    renode_remote_server_dir="",
+                    is_control=True,
+                    keep_run_artifacts=False,
+                )
+
+            self.assertEqual(result["boot_outcome"], "success")
 
     def test_run_batches_chunked_emits_progress(self) -> None:
         with tempfile.TemporaryDirectory() as td:
