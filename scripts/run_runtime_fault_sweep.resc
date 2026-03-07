@@ -79,6 +79,7 @@ $resume_trace_wall_timeout_s?="30"
 $boot_cycles?="1"
 $state_probe_script?=""
 $flash_backend?=""
+$enable_machine_snapshots?="false"
 
 python """
 import json
@@ -243,6 +244,7 @@ except Exception:
 if resume_trace_wall_timeout_s <= 0:
     resume_trace_wall_timeout_s = 30.0
 boot_cycles_raw = str(monitor.GetVariable('boot_cycles')).strip()
+enable_machine_snapshots = str(monitor.GetVariable('enable_machine_snapshots')).strip().lower() in ('1', 'true', 'yes')
 try:
     boot_cycles = int(boot_cycles_raw, 0) if boot_cycles_raw else 1
 except Exception:
@@ -1188,6 +1190,9 @@ def prepare_clean_phase1_state():
 
 def restore_phase1_baseline():
     global _cached_phase1_snapshot_path
+    if not enable_machine_snapshots:
+        prepare_clean_phase1_state()
+        return
     if _cached_phase1_snapshot_path is None:
         _cached_phase1_snapshot_path = get_machine_snapshot_path('phase1_baseline')
         prepare_clean_phase1_state()
@@ -1208,12 +1213,15 @@ def restore_flash_and_boot(saved_flash):
     # the faulted flash snapshot.  This preserves semantics while avoiding
     # repeated full reset/ELF reload work on every point.
     global _cached_recovery_snapshot_path
-    if _cached_recovery_snapshot_path is None:
-        _cached_recovery_snapshot_path = get_machine_snapshot_path('recovery_shell')
+    if not enable_machine_snapshots:
         prepare_recovery_shell_state()
-        save_machine_snapshot(_cached_recovery_snapshot_path)
     else:
-        load_machine_snapshot(_cached_recovery_snapshot_path)
+        if _cached_recovery_snapshot_path is None:
+            _cached_recovery_snapshot_path = get_machine_snapshot_path('recovery_shell')
+            prepare_recovery_shell_state()
+            save_machine_snapshot(_cached_recovery_snapshot_path)
+        else:
+            load_machine_snapshot(_cached_recovery_snapshot_path)
     if USE_MRAM_PATH:
         # MRAMMemory may or may not survive machine Reset depending on
         # vtable dispatch.  Always restore to be safe.
