@@ -319,7 +319,7 @@ if _hash_bypass_symbols_raw and (USE_FAST_PATH or USE_MRAM_PATH):
             addr = int(bus.GetSymbolAddress(sym_name))
             addr = addr & ~1  # Clear Thumb bit
             _hash_bypass_patches.append((addr, sym_name))
-            log('hash_bypass: {}={}'.format(sym_name, fmt_u32(addr)))
+            log('hash_bypass: {}=0x{:08X}'.format(sym_name, addr & 0xFFFFFFFF))
         except Exception as e:
             log('hash_bypass: symbol {} not found ({})'.format(sym_name, e))
 

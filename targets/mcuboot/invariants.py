@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """MCUboot-specific invariants for tardigrade replay and audit runs."""
 
-from __future__ import annotations
-
-from typing import Any, Dict
-
 from invariants import InvariantViolation
 
 
-def _semantic_slot(result: Any, slot_name: str) -> Dict[str, Any]:
+def _semantic_slot(result, slot_name):
     state = result.nvm_state or {}
     if not isinstance(state, dict):
         return {}
@@ -19,7 +15,7 @@ def _semantic_slot(result: Any, slot_name: str) -> Dict[str, Any]:
     return slot if isinstance(slot, dict) else {}
 
 
-def check_mcuboot_no_partial_magic(result: Any, **_: Any) -> None:
+def check_mcuboot_no_partial_magic(result, **_):
     exec_slot = _semantic_slot(result, "exec")
     staging_slot = _semantic_slot(result, "staging")
     partial_slots = []

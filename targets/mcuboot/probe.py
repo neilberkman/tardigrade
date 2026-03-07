@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """MCUboot trailer-state probe for tardigrade semantic-state collection."""
 
-from __future__ import annotations
-
 import struct
-from typing import Any, Dict
 
 
 MCUBOOT_GOOD_MAGIC = struct.pack(
@@ -16,22 +13,22 @@ MCUBOOT_GOOD_MAGIC = struct.pack(
 )
 
 
-def _as_int(value: Any, default: int = 0) -> int:
+def _as_int(value, default=0):
     try:
         return int(str(value), 0)
     except Exception:
         return int(default)
 
 
-def _read_byte(bus: Any, addr: int) -> int:
+def _read_byte(bus, addr):
     return int(bus.ReadByte(addr)) & 0xFF
 
 
-def _read_bytes(bus: Any, addr: int, size: int) -> bytes:
+def _read_bytes(bus, addr, size):
     return bytes(_read_byte(bus, addr + i) for i in range(size))
 
 
-def _read_flag(bus: Any, addr: int) -> Dict[str, Any]:
+def _read_flag(bus, addr):
     raw = _read_byte(bus, addr)
     if raw == 0xFF:
         state = "unset"
@@ -45,7 +42,7 @@ def _read_flag(bus: Any, addr: int) -> Dict[str, Any]:
     }
 
 
-def _magic_state(raw: bytes) -> str:
+def _magic_state(raw):
     if raw == MCUBOOT_GOOD_MAGIC:
         return "good"
     if raw == (b"\xFF" * 16):
@@ -55,7 +52,11 @@ def _magic_state(raw: bytes) -> str:
     return "other"
 
 
-def _slot_probe(bus: Any, base: int, size: int, align: int) -> Dict[str, Any]:
+def _hex_bytes(raw):
+    return "".join("{:02x}".format(b) for b in raw)
+
+
+def _slot_probe(bus, base, size, align):
     slot_end = base + size
     magic_addr = slot_end - 16
     image_ok_addr = slot_end - 16 - align
@@ -67,14 +68,14 @@ def _slot_probe(bus: Any, base: int, size: int, align: int) -> Dict[str, Any]:
         "magic_addr": "0x{:08X}".format(magic_addr),
         "image_ok_addr": "0x{:08X}".format(image_ok_addr),
         "copy_done_addr": "0x{:08X}".format(copy_done_addr),
-        "magic": magic.hex(),
+        "magic": _hex_bytes(magic),
         "magic_state": _magic_state(magic),
         "image_ok": _read_flag(bus, image_ok_addr),
         "copy_done": _read_flag(bus, copy_done_addr),
     }
 
 
-def collect_state(bus: Any = None, monitor: Any = None, context: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def collect_state(bus=None, monitor=None, context=None):
     if bus is None or monitor is None:
         return {}
     context = context or {}
