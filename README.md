@@ -250,6 +250,7 @@ Public examples:
 
 - [`scenarios/mcuboot_head_exploratory.yaml`](scenarios/mcuboot_head_exploratory.yaml) attaches a target-side probe and invariant provider to the public `mcuboot_head_upgrade` and `mcuboot_head_revert` profiles, then checks both paths through the generic scenario runner.
 - [`scenarios/nxboot_style_exploratory.yaml`](scenarios/nxboot_style_exploratory.yaml) is a standalone modeled-family exercise for the generic scenario/probe/invariant surfaces. It is useful as a public adapter example, but it should not be read as a validated upstream `nxboot`/NuttX canary yet.
+- [`targets/nuttx_nxboot/`](targets/nuttx_nxboot) is the start of the real upstream NuttX `nxboot` adapter. It is scaffolded and unit-tested, with the next steps captured in [`docs/nuttx_nxboot_plan.md`](docs/nuttx_nxboot_plan.md), but it is not wired to a public workflow yet.
 
 Replay specs are generic override bundles, suitable for counterexamples from CBMC or any other model checker:
 
@@ -347,15 +348,20 @@ tardigrade/
 │   └── cbmc_to_profile.py                       # CBMC counterexample → profile converter
 ├── targets/
 │   ├── mcuboot/
-│       ├── probe.py                              # MCUboot trailer-state semantic probe
-│       ├── invariants.py                         # MCUboot-specific invariant provider
-│       └── state_fuzzer.py                      # MCUboot-specific trailer state exploration
-│   └── nxboot/
-│       ├── probe.py                              # nxboot-style semantic probe
-│       └── invariants.py                         # nxboot-style invariant provider
+│   │   ├── probe.py                              # MCUboot trailer-state semantic probe
+│   │   ├── invariants.py                         # MCUboot-specific invariant provider
+│   │   └── state_fuzzer.py                       # MCUboot-specific trailer state exploration
+│   ├── nxboot/
+│   │   ├── probe.py                              # nxboot-style semantic probe
+│   │   └── invariants.py                         # nxboot-style invariant provider
+│   └── nuttx_nxboot/
+│       ├── probe.py                              # Real NuttX nxboot adapter scaffold
+│       └── invariants.py                         # Real NuttX nxboot invariants
 ├── scenarios/
 │   ├── mcuboot_head_exploratory.yaml            # Public MCUboot multi-step scenario
 │   └── nxboot_style_exploratory.yaml            # Experimental standalone nxboot-style scenario
+├── docs/
+│   └── nuttx_nxboot_plan.md                     # Real NuttX nxboot target plan
 ├── examples/                                    # Built-in bootloader firmware
 │   ├── naive_copy/
 │   ├── vulnerable_ota/
