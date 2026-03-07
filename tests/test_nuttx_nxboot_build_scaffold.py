@@ -10,7 +10,9 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(SCRIPTS))
 
 from examples.nxboot_style.gen_nxboot_images import wrap_nxboot_image  # noqa: E402
 from targets.nuttx_nxboot.build_public_target import (  # noqa: E402
@@ -21,6 +23,10 @@ from targets.nuttx_nxboot.build_public_target import (  # noqa: E402
     patch_progmem,
     patch_stm32h7_kconfig,
 )
+from targets.nuttx_nxboot.generate_runtime_profile import (  # noqa: E402
+    render_runtime_profile,
+)
+from profile_loader import load_profile  # noqa: E402
 
 
 class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
@@ -135,6 +141,44 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
                 config, "../../../nuttx-apps", "nucleo-h743zi:nxboot-loader"
             )
             self.assertFalse(changed_again)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_render_runtime_profile_builds_real_nuttx_shape(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_profile_"))
+        try:
+            build_dir = temp_dir / "build"
+            images_dir = build_dir / "images"
+            images_dir.mkdir(parents=True)
+            (build_dir / "nxboot-loader.elf").write_bytes(b"ELF")
+            (images_dir / "nxboot-primary-v1-h400.img").write_bytes(b"P")
+            (images_dir / "nxboot-update-v2-h400.img").write_bytes(b"U")
+
+            rendered = render_runtime_profile(build_dir, fault_max_writes=64, boot_cycles=3)
+            profile_path = temp_dir / "profile.yaml"
+            profile_path.write_text(rendered)
+            profile = load_profile(profile_path)
+
+            self.assertEqual(profile.platform, "platforms/nucleo_h753zi_tardigrade.repl")
+            self.assertEqual(profile.bootloader_entry, 0x08000000)
+            self.assertEqual(profile.success_criteria.vtor_in_slot, "exec")
+            self.assertEqual(profile.success_criteria.vector_table_offset, 0x400)
+            self.assertFalse(profile.success_criteria.image_hash)
+            self.assertEqual(profile.fault_sweep.max_writes, 64)
+            self.assertEqual(profile.fault_sweep.boot_cycles, 3)
+            self.assertEqual(
+                profile.semantic_assertions["control"]["semantic_state.roles.next_boot"],
+                "revert",
+            )
+            robot_vars = profile.robot_vars(ROOT)
+            self.assertIn(
+                "PLATFORM_REPL:{}".format((ROOT / "platforms/nucleo_h753zi_tardigrade.repl").resolve()),
+                robot_vars,
+            )
+            self.assertIn(
+                "EXTRA_PERIPHERALS:{}".format((ROOT / "peripherals/STM32H7FlashController.cs").resolve()),
+                robot_vars,
+            )
         finally:
             shutil.rmtree(temp_dir)
 
