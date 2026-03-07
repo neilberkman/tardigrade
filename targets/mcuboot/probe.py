@@ -44,6 +44,17 @@ def _read_flag(bus, addr):
     }
 
 
+def _byte_value(value):
+    try:
+        return int(value) & 0xFF
+    except Exception:
+        pass
+    text = str(value)
+    if len(text) == 1:
+        return ord(text)
+    return _as_int(value) & 0xFF
+
+
 def _magic_state(raw):
     if raw == MCUBOOT_GOOD_MAGIC:
         return "good"
@@ -55,7 +66,10 @@ def _magic_state(raw):
 
 
 def _hex_bytes(raw):
-    return "".join(["{:02x}".format(b) for b in raw])
+    parts = []
+    for item in raw:
+        parts.append("{:02x}".format(_byte_value(item)))
+    return "".join(parts)
 
 
 def _slot_probe(bus, base, size, align):

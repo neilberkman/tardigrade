@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from invariants import InvariantViolation  # noqa: E402
 from targets.mcuboot.invariants import check_mcuboot_no_partial_magic  # noqa: E402
-from targets.mcuboot.probe import collect_state  # noqa: E402
+from targets.mcuboot.probe import _hex_bytes, collect_state  # noqa: E402
 
 
 GOOD_MAGIC = struct.pack(
@@ -50,6 +50,9 @@ class _FakeMonitor:
 
 
 class McubootTargetPackageTest(unittest.TestCase):
+    def test_hex_bytes_accepts_python2_style_byte_iteration(self) -> None:
+        self.assertEqual(_hex_bytes(["\x00", "\xFF"]), "00ff")
+
     def test_probe_reads_trailer_flags(self) -> None:
         exec_base = 0x0000C000
         exec_size = 0x1000
