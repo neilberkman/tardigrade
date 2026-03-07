@@ -103,14 +103,17 @@ jobs:
           if [ -f results/nuttx_nxboot_real_exploratory.json ]; then
             python3 - <<'PY'
           import json
+          import os
           payload = json.load(open("results/nuttx_nxboot_real_exploratory.json"))
           summary = payload.get("summary", {}).get("runtime_sweep", {})
           control = summary.get("control", {})
+          issues = int(summary.get("issue_points") or 0)
+          bricks = int(summary.get("bricks") or 0)
           print("Profile:", payload.get("profile"))
           print("Verdict:", payload.get("verdict"))
           print("Points:", summary.get("total_fault_points"))
-          print("Issues:", summary.get("issue_points"))
-          print("Bricks:", summary.get("bricks"))
+          print("Issues:", issues)
+          print("Bricks:", bricks)
           print("Control outcome:", control.get("boot_outcome"))
           mba = control.get("multi_boot_analysis") or {}
           if mba:
@@ -120,6 +123,20 @@ jobs:
               print("Representative failures:")
               for failure in failures[:10]:
                   print(json.dumps(failure, sort_keys=True))
+          if issues or bricks:
+              print(f"::warning::Real NuttX exploratory audit found {issues} issue points and {bricks} bricks.")
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a") as fh:
+                  fh.write("## Real NuttX nxboot exploratory summary\n")
+                  fh.write(f"- Profile: `{payload.get('profile')}`\n")
+                  fh.write(f"- Verdict: `{payload.get('verdict')}`\n")
+                  fh.write(f"- Fault points: `{summary.get('total_fault_points')}`\n")
+                  fh.write(f"- Issues: `{issues}`\n")
+                  fh.write(f"- Bricks: `{bricks}`\n")
+                  fh.write(f"- Control outcome: `{control.get('boot_outcome')}`\n")
+                  if mba:
+                      fh.write(f"- Control multi-boot: `{mba.get('status')}` / `{mba.get('final_slot')}`\n")
           PY
           fi
 
