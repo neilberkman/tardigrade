@@ -95,6 +95,7 @@ jobs:
             --profile "${RUNNER_TEMP}/nuttx-runtime-profile.yaml" \
             --renode-test "${RUNNER_TEMP}/renode/renode-test" \
             --workers 2 \
+            --robot-var "TEST_TIMEOUT:10 minutes" \
             --output results/nuttx_nxboot_real_exploratory.json \
             --no-assert-verdict
 
