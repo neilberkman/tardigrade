@@ -92,8 +92,35 @@ def check_nuttx_nxboot_duplicate_update_consumed(result, **_):
     )
 
 
+def check_nuttx_nxboot_unconfirmed_internal_requires_revert(result, **_):
+    root = _semantic_root(result)
+    roles = _roles(root)
+    primary = _slot(root, "primary")
+    if primary.get("magic_kind") != "internal":
+        return
+    if roles.get("primary_confirmed") or not roles.get("recovery_valid"):
+        return
+    if roles.get("next_boot") == "revert":
+        return
+    raise InvariantViolation(
+        invariant_name="nuttx_nxboot_unconfirmed_internal_requires_revert",
+        description=(
+            "Internal unconfirmed primary image did not schedule a revert despite a valid recovery."
+        ),
+        result=result,
+        details={
+            "primary_confirmed": roles.get("primary_confirmed"),
+            "recovery_valid": roles.get("recovery_valid"),
+            "next_boot": roles.get("next_boot"),
+        },
+    )
+
+
 INVARIANTS = {
     "nuttx_nxboot_roles_distinct": check_nuttx_nxboot_roles_distinct,
     "nuttx_nxboot_confirmed_has_recovery": check_nuttx_nxboot_confirmed_has_recovery,
     "nuttx_nxboot_duplicate_update_consumed": check_nuttx_nxboot_duplicate_update_consumed,
+    "nuttx_nxboot_unconfirmed_internal_requires_revert": (
+        check_nuttx_nxboot_unconfirmed_internal_requires_revert
+    ),
 }

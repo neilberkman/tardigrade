@@ -19,6 +19,7 @@ from targets.nuttx_nxboot.invariants import (  # noqa: E402
     check_nuttx_nxboot_confirmed_has_recovery,
     check_nuttx_nxboot_duplicate_update_consumed,
     check_nuttx_nxboot_roles_distinct,
+    check_nuttx_nxboot_unconfirmed_internal_requires_revert,
 )
 from targets.nuttx_nxboot.probe import (  # noqa: E402
     NXBOOT_HEADER_MAGIC_INT,
@@ -300,6 +301,22 @@ class NuttxNxbootTargetPackageTest(unittest.TestCase):
         )
         with self.assertRaises(InvariantViolation):
             check_nuttx_nxboot_roles_distinct(result)
+
+    def test_invariant_requires_revert_for_unconfirmed_internal_primary(self) -> None:
+        result = SimpleNamespace(
+            nvm_state={
+                "slots": {
+                    "primary": {"magic_kind": "internal"},
+                },
+                "roles": {
+                    "primary_confirmed": False,
+                    "recovery_valid": True,
+                    "next_boot": "none",
+                },
+            }
+        )
+        with self.assertRaises(InvariantViolation):
+            check_nuttx_nxboot_unconfirmed_internal_requires_revert(result)
 
 
 if __name__ == "__main__":
