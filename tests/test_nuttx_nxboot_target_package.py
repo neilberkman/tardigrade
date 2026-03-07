@@ -95,6 +95,55 @@ class NuttxNxbootTargetPackageTest(unittest.TestCase):
         self.assertEqual(state["roles"]["next_boot"], "update")
         self.assertEqual(state["slots"]["tertiary"]["magic_kind"], "erased")
 
+    def test_probe_models_pending_update_roles_with_h400_headers(self) -> None:
+        slot_size = 0x23000
+        primary_base = 0x08040000
+        secondary_base = 0x08080000
+        tertiary_base = 0x080C0000
+
+        bus = _FakeBus()
+        monitor = _FakeMonitor(
+            {
+                "slot_exec_base": hex(primary_base),
+                "slot_exec_size": hex(slot_size),
+                "slot_staging_base": hex(secondary_base),
+                "slot_staging_size": hex(slot_size),
+                "slot_tertiary_base": hex(tertiary_base),
+                "slot_tertiary_size": hex(slot_size),
+            }
+        )
+
+        primary = make_nxboot_image(
+            primary_base,
+            0x6000,
+            (1, 0, 0),
+            header_size=0x400,
+            platform_id=0x100000042,
+        )
+        update = make_nxboot_image(
+            primary_base,
+            0x6000,
+            (2, 0, 0),
+            header_size=0x400,
+            platform_id=0x100000042,
+        )
+        bus.write_bytes(primary_base, primary)
+        bus.write_bytes(secondary_base, update)
+
+        state = collect_state(
+            bus=bus,
+            monitor=monitor,
+            context={"stage": "post_boot", "boot_slot": "exec", "fault_injected": False},
+        )
+        self.assertEqual(state["slots"]["primary"]["header_size"], 0x400)
+        self.assertEqual(state["slots"]["secondary"]["header_size"], 0x400)
+        self.assertEqual(state["slots"]["primary"]["identifier"], "0x0000000100000042")
+        self.assertTrue(state["slots"]["primary"]["vector_valid"])
+        self.assertTrue(state["roles"]["primary_valid"])
+        self.assertEqual(state["roles"]["update_slot"], "secondary")
+        self.assertEqual(state["roles"]["recovery_slot"], "tertiary")
+        self.assertEqual(state["roles"]["next_boot"], "update")
+
     def test_probe_models_internal_primary_confirmed_via_secondary_recovery(self) -> None:
         slot_size = 0x23000
         primary_base = 0x10002000

@@ -89,6 +89,10 @@ def _hex_u32(value):
     return "0x{:08X}".format(int(value) & 0xFFFFFFFF)
 
 
+def _hex_u64(value):
+    return "0x{:016X}".format(int(value) & 0xFFFFFFFFFFFFFFFF)
+
+
 def _slot_probe(bus, base, slot_size):
     header = _read_bytes(bus, base, 40)
     magic = struct.unpack_from("<I", header, 0)[0]
@@ -123,7 +127,7 @@ def _slot_probe(bus, base, slot_size):
         "header_size": int(header_size),
         "image_size": int(image_size),
         "image_crc": _hex_u32(image_crc),
-        "identifier": _hex_u32(identifier),
+        "identifier": _hex_u64(identifier),
         "version": "{}.{}.{}".format(version[0], version[1], version[2]),
         "crc_valid": bool(crc_valid),
         "image_valid": image_valid,

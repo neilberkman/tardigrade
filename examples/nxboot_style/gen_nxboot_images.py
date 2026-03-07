@@ -133,6 +133,18 @@ def main() -> None:
         default=0x4000,
         help="Firmware payload size in bytes (default: 16KB)",
     )
+    parser.add_argument(
+        "--header-size",
+        type=lambda x: int(x, 0),
+        default=NXBOOT_HEADER_SIZE,
+        help="nxboot header size in bytes (default: 0x200)",
+    )
+    parser.add_argument(
+        "--platform-id",
+        type=lambda x: int(x, 0),
+        default=PLATFORM_ID,
+        help="Platform identifier written into the nxboot header (default: 0x0)",
+    )
     args = parser.parse_args()
 
     out = Path(args.output_dir)
@@ -144,16 +156,32 @@ def main() -> None:
     primary_base = 0x10002000
 
     # Primary image (v1.0.0) — goes into primary slot
-    primary = make_nxboot_image(primary_base, args.payload_size, (1, 0, 0))
+    primary = make_nxboot_image(
+        primary_base,
+        args.payload_size,
+        (1, 0, 0),
+        header_size=args.header_size,
+        platform_id=args.platform_id,
+    )
     (out / "nxboot_primary.bin").write_bytes(primary)
 
     # Update image (v2.0.0) — goes into secondary, copied to primary to run
-    update = make_nxboot_image(primary_base, args.payload_size, (2, 0, 0))
+    update = make_nxboot_image(
+        primary_base,
+        args.payload_size,
+        (2, 0, 0),
+        header_size=args.header_size,
+        platform_id=args.platform_id,
+    )
     (out / "nxboot_update.bin").write_bytes(update)
 
     print(f"Generated images in {out}:")
-    print(f"  nxboot_primary.bin  ({len(primary)} bytes, v1.0.0)")
-    print(f"  nxboot_update.bin   ({len(update)} bytes, v2.0.0)")
+    print(
+        f"  nxboot_primary.bin  ({len(primary)} bytes, v1.0.0, header=0x{args.header_size:X})"
+    )
+    print(
+        f"  nxboot_update.bin   ({len(update)} bytes, v2.0.0, header=0x{args.header_size:X})"
+    )
 
 
 if __name__ == "__main__":
