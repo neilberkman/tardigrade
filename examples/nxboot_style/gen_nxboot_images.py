@@ -69,6 +69,38 @@ def make_firmware_payload(slot_base: int, header_size: int, size: int) -> bytes:
     return payload[:size]
 
 
+def wrap_nxboot_image(
+    payload: bytes,
+    version: tuple[int, int, int],
+    header_size: int = NXBOOT_HEADER_SIZE,
+    magic: int = NXBOOT_HEADER_MAGIC,
+    platform_id: int = PLATFORM_ID,
+) -> bytes:
+    """Wrap an existing firmware payload with a nxboot header."""
+    payload = bytes(payload)
+
+    hdr = bytearray(header_size)
+    for i in range(header_size):
+        hdr[i] = 0xFF
+
+    struct.pack_into("<I", hdr, 0, magic)
+    hdr[4] = 1
+    hdr[5] = 0
+    struct.pack_into("<H", hdr, 6, header_size)
+    struct.pack_into("<I", hdr, 8, 0)
+    struct.pack_into("<I", hdr, 12, len(payload))
+    struct.pack_into("<Q", hdr, 16, platform_id)
+    struct.pack_into("<I", hdr, 24, 0)
+    struct.pack_into("<HHH", hdr, 28, version[0], version[1], version[2])
+
+    full_image = bytes(hdr) + payload
+    crc_data = full_image[12:]
+    crc = zlib.crc32(crc_data) & 0xFFFFFFFF
+    struct.pack_into("<I", hdr, 8, crc)
+
+    return bytes(hdr) + payload
+
+
 def make_nxboot_image(
     slot_base: int,
     payload_size: int,
@@ -84,40 +116,13 @@ def make_nxboot_image(
     """
     payload = make_firmware_payload(slot_base, header_size, payload_size)
 
-    # Build header (128 bytes of meaningful data)
-    hdr = bytearray(header_size)
-    # Fill with 0xFF (like erased flash)
-    for i in range(header_size):
-        hdr[i] = 0xFF
-
-    # magic (4 bytes)
-    struct.pack_into("<I", hdr, 0, magic)
-    # hdr_version (2 bytes: major=1, minor=0)
-    hdr[4] = 1
-    hdr[5] = 0
-    # header_size (2 bytes)
-    struct.pack_into("<H", hdr, 6, header_size)
-    # crc placeholder (4 bytes at offset 8) — computed below
-    struct.pack_into("<I", hdr, 8, 0)
-    # size (4 bytes at offset 12)
-    struct.pack_into("<I", hdr, 12, payload_size)
-    # identifier (8 bytes at offset 16)
-    struct.pack_into("<Q", hdr, 16, platform_id)
-    # extd_hdr_ptr (4 bytes at offset 24)
-    struct.pack_into("<I", hdr, 24, 0)
-    # img_version (6 bytes at offset 28)
-    struct.pack_into("<HHH", hdr, 28, version[0], version[1], version[2])
-    # pre_release string (94 bytes at offset 34) — leave as 0xFF
-
-    # Compute CRC-32 over everything from offset 12 to end
-    full_image = bytes(hdr) + payload
-    crc_data = full_image[12:]
-    crc = zlib.crc32(crc_data) & 0xFFFFFFFF
-
-    # Write CRC back into header
-    struct.pack_into("<I", hdr, 8, crc)
-
-    return bytes(hdr) + payload
+    return wrap_nxboot_image(
+        payload,
+        version,
+        header_size=header_size,
+        magic=magic,
+        platform_id=platform_id,
+    )
 
 
 def main() -> None:
@@ -145,34 +150,51 @@ def main() -> None:
         default=PLATFORM_ID,
         help="Platform identifier written into the nxboot header (default: 0x0)",
     )
+    parser.add_argument(
+        "--payload-file",
+        default="",
+        help="Wrap an existing raw firmware payload instead of generating a synthetic one",
+    )
     args = parser.parse_args()
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Both images target the primary slot execution address since the
-    # bootloader copies update -> primary before jumping.  The vector
-    # table must be valid at the primary slot base, not the staging slot.
-    primary_base = 0x10002000
-
-    # Primary image (v1.0.0) — goes into primary slot
-    primary = make_nxboot_image(
-        primary_base,
-        args.payload_size,
-        (1, 0, 0),
-        header_size=args.header_size,
-        platform_id=args.platform_id,
-    )
+    payload_file = Path(args.payload_file) if args.payload_file else None
+    if payload_file:
+        payload = payload_file.read_bytes()
+        primary = wrap_nxboot_image(
+            payload,
+            (1, 0, 0),
+            header_size=args.header_size,
+            platform_id=args.platform_id,
+        )
+        update = wrap_nxboot_image(
+            payload,
+            (2, 0, 0),
+            header_size=args.header_size,
+            platform_id=args.platform_id,
+        )
+    else:
+        # Both images target the primary slot execution address since the
+        # bootloader copies update -> primary before jumping. The vector
+        # table must be valid at the primary slot base, not the staging slot.
+        primary_base = 0x10002000
+        primary = make_nxboot_image(
+            primary_base,
+            args.payload_size,
+            (1, 0, 0),
+            header_size=args.header_size,
+            platform_id=args.platform_id,
+        )
+        update = make_nxboot_image(
+            primary_base,
+            args.payload_size,
+            (2, 0, 0),
+            header_size=args.header_size,
+            platform_id=args.platform_id,
+        )
     (out / "nxboot_primary.bin").write_bytes(primary)
-
-    # Update image (v2.0.0) — goes into secondary, copied to primary to run
-    update = make_nxboot_image(
-        primary_base,
-        args.payload_size,
-        (2, 0, 0),
-        header_size=args.header_size,
-        platform_id=args.platform_id,
-    )
     (out / "nxboot_update.bin").write_bytes(update)
 
     print(f"Generated images in {out}:")
