@@ -10,18 +10,20 @@ The core engine stays generic: fault injection, replay, semantic-state collectio
 
 ## Quick start: GitHub Action
 
-The fastest integration path is the reusable GitHub Action:
+The narrow CI/canary path is the reusable GitHub Action:
 
 ```yaml
 - id: tardigrade
   uses: neilberkman/tardigrade@v1
   with:
     profile: profiles/mcuboot_swap_current.yaml
-    quick: true # smoke test; set false for full heuristic sweep
+    quick: false # prefer heuristic sweep for real CI signal
     workers: 2
 ```
 
 Outputs: `verdict` (PASS/FAIL), `brick-rate`, `report-path`. `brick-rate` counts unrecoverable execution failures only; broader slot/hash/invariant issues live in the JSON report.
+
+`quick` remains available for compatibility smoke runs, but it is intentionally shallow. Prefer heuristic mode (`quick: false`) for anything you want to treat as a meaningful gate or canary.
 
 In CI, upload `report-path` as an artifact so failures include the full per-point diagnostics:
 
@@ -49,7 +51,7 @@ python3 scripts/audit_bootloader.py \
   --output results/report.json
 ```
 
-Add `--quick` for a smoke test (3 fault points, seconds). It can miss narrow windows. Add `--workers 4` for parallel sweep.
+Add `--quick` only for a smoke test (3 fault points, seconds). It can miss narrow windows. For meaningful local validation, keep the default heuristic sweep and add `--workers 4` for parallelism.
 
 If native Renode is unavailable locally, you can run the same audit through Docker:
 
@@ -238,6 +240,11 @@ Key fields: `platform`, `bootloader`, `memory`, `images`, `success_criteria`, `f
 ## Generic scenarios and replay
 
 Use [`scripts/run_scenario.py`](scripts/run_scenario.py) to orchestrate multi-step discovery runs without baking target semantics into the core. A scenario references a base profile and then runs `audit` or `replay` steps by applying generic profile overrides.
+
+In practice, the repo exposes two complementary public surfaces:
+
+- `audit_bootloader.py --profile ...` or the reusable GitHub Action for narrow CI/canary use
+- `run_scenario.py` plus target-side adapters under `targets/*` for exploratory validation
 
 Public examples:
 

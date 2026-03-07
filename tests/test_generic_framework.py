@@ -342,7 +342,7 @@ class GenericFrameworkTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            def fake_run(cmd, cwd, capture_output, text, check):
+            def fake_run(cmd, cwd):
                 profile_path = Path(cmd[cmd.index("--profile") + 1])
                 output_path = Path(cmd[cmd.index("--output") + 1])
                 rendered = profile_path.read_text(encoding="utf-8")
@@ -351,9 +351,9 @@ class GenericFrameworkTest(unittest.TestCase):
                     '{"summary": {"runtime_sweep": {"issue_points": 0}}}',
                     encoding="utf-8",
                 )
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
+                return 0, "", ""
 
-            with mock.patch("run_scenario.subprocess.run", side_effect=fake_run):
+            with mock.patch("run_scenario._run_command_streamed", side_effect=fake_run):
                 step_result = run_audit_step(
                     repo_root=ROOT,
                     scenario_dir=tempdir,
@@ -424,7 +424,7 @@ class GenericFrameworkTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            def fake_run(cmd, cwd, capture_output, text, check):
+            def fake_run(cmd, cwd):
                 profile_path = Path(cmd[cmd.index("--profile") + 1])
                 output_path = Path(cmd[cmd.index("--output") + 1])
                 rendered = profile_path.read_text(encoding="utf-8")
@@ -433,9 +433,9 @@ class GenericFrameworkTest(unittest.TestCase):
                     '{"summary": {"runtime_sweep": {"issue_points": 0}}}',
                     encoding="utf-8",
                 )
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
+                return 0, "", ""
 
-            with mock.patch("run_scenario.subprocess.run", side_effect=fake_run):
+            with mock.patch("run_scenario._run_command_streamed", side_effect=fake_run):
                 step_result = run_audit_step(
                     repo_root=tempdir,
                     scenario_dir=scenarios_dir,

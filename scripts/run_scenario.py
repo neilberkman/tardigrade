@@ -31,6 +31,59 @@ class ScenarioError(Exception):
     """Raised when a scenario or replay spec is invalid."""
 
 
+def _progress(message: str) -> None:
+    print("[scenario] {}".format(message), flush=True)
+
+
+def _run_command_streamed(cmd: List[str], cwd: Path) -> Tuple[int, str, str]:
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    lines: List[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        lines.append(line)
+        print(line, end="", flush=True)
+    proc.stdout.close()
+    return_code = proc.wait()
+    combined = "".join(lines)
+    return return_code, combined, ""
+
+
+def _summarize_step_report(step_id: str, report: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(report, dict):
+        return
+    verdict = report.get("verdict")
+    runtime = ((report.get("summary") or {}).get("runtime_sweep") or {})
+    if not isinstance(runtime, dict):
+        if verdict:
+            _progress("step {} verdict={}".format(step_id, verdict))
+        return
+    control = runtime.get("control") or {}
+    total_points = runtime.get("total_fault_points")
+    issue_points = runtime.get("issue_points")
+    bricks = runtime.get("bricks")
+    control_outcome = control.get("boot_outcome")
+    details: List[str] = []
+    if verdict is not None:
+        details.append("verdict={}".format(verdict))
+    if total_points is not None:
+        details.append("points={}".format(total_points))
+    if issue_points is not None:
+        details.append("issues={}".format(issue_points))
+    if bricks is not None:
+        details.append("bricks={}".format(bricks))
+    if control_outcome is not None:
+        details.append("control={}".format(control_outcome))
+    if details:
+        _progress("step {} {}".format(step_id, " ".join(details)))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a generic multi-step tardigrade scenario."
@@ -333,33 +386,37 @@ def run_audit_step(
     step_profile.write_text(yaml.safe_dump(profile_raw, sort_keys=False), encoding="utf-8")
 
     cmd = build_audit_command(repo_root, step_profile, step_output, step_audit, args)
-    proc = subprocess.run(
-        cmd,
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    _progress("starting step {} ({})".format(step_id, step_kind))
+    _progress("profile {}".format(step_profile))
+    proc_returncode, proc_stdout, proc_stderr = _run_command_streamed(cmd, repo_root)
     report: Optional[Dict[str, Any]] = None
     if step_output.exists():
         report = json.loads(step_output.read_text(encoding="utf-8"))
-    if proc.returncode != 0 and report is None:
+    if proc_returncode != 0 and report is None:
         raise RuntimeError(
             "audit step '{}' failed with exit {} and no report\nSTDOUT:\n{}\nSTDERR:\n{}".format(
-                step_id, proc.returncode, proc.stdout, proc.stderr
+                step_id, proc_returncode, proc_stdout, proc_stderr
             )
         )
+    _summarize_step_report(step_id, report)
+    _progress(
+        "completed step {} status={} exit={}".format(
+            step_id,
+            "PASS" if proc_returncode == 0 else "FAIL",
+            proc_returncode,
+        )
+    )
 
     return {
         "id": step_id,
         "kind": step_kind,
         "base_profile": str(base_profile_path),
-        "exit_code": proc.returncode,
-        "status": "PASS" if proc.returncode == 0 else "FAIL",
+        "exit_code": proc_returncode,
+        "status": "PASS" if proc_returncode == 0 else "FAIL",
         "command": cmd,
         "report": report,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
+        "stdout": proc_stdout,
+        "stderr": proc_stderr,
         "replay": replay_meta,
     }
 
@@ -415,6 +472,7 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="tardigrade_scenario_") as td:
         tempdir = Path(td)
+        _progress("running scenario {}".format(scenario.get("name") or scenario_path.name))
         for step in scenario["steps"]:
             step_id = str(step["id"])
             kind = str(step.get("kind", "audit")).strip().lower()
@@ -441,6 +499,13 @@ def main() -> int:
                 "failures": failures,
                 "status": "PASS" if not failures else "FAIL",
             }
+            _progress(
+                "completed step {} status={} failures={}".format(
+                    step_id,
+                    step_result["status"],
+                    len(failures),
+                )
+            )
             if failures:
                 results["status"] = "FAIL"
             results["steps"][step_id] = step_result
