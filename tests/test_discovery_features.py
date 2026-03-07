@@ -6,6 +6,8 @@ from __future__ import annotations
 import tempfile
 import textwrap
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +21,8 @@ from audit_bootloader import (  # noqa: E402
     annotate_result_checks,
     calibration_completed,
     prepare_renode_command,
+    run_batch,
+    run_single_point,
     summarize_runtime_sweep,
 )
 from profile_loader import load_profile  # noqa: E402
@@ -364,6 +368,178 @@ class DiscoveryFeaturesTest(unittest.TestCase):
         self.assertIn(str(ROOT), cmd)
         self.assertIn("DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp/dotnet_bundle", cmd)
         self.assertNotIn("docker://renode-patched:test", cmd[1:])
+
+    def test_run_single_point_prunes_robot_artifacts_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: cleanup_profile
+                description: cleanup
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+
+            def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+                rf_results = Path(cmd[cmd.index("--results-dir") + 1])
+                rf_results.mkdir(parents=True, exist_ok=True)
+                (rf_results / "snapshots").mkdir(parents=True, exist_ok=True)
+                (rf_results / "snapshots" / "dummy.bin").write_text("x", encoding="utf-8")
+                result_token = next(
+                    cmd[i + 1]
+                    for i, token in enumerate(cmd[:-1])
+                    if token == "--variable" and cmd[i + 1].startswith("RESULT_FILE:")
+                )
+                result_file = Path(result_token.split(":", 1)[1])
+                result_file.parent.mkdir(parents=True, exist_ok=True)
+                result_file.write_text('{"boot_outcome":"success"}', encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch("audit_bootloader.subprocess.run", side_effect=fake_run):
+                result = run_single_point(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    fault_at=7,
+                    robot_vars=[],
+                    work_dir=tempdir / "work",
+                    renode_remote_server_dir="",
+                    keep_run_artifacts=False,
+                )
+
+            self.assertEqual(result["boot_outcome"], "success")
+            self.assertFalse((tempdir / "work" / "cleanup_profile_fault_7" / "robot").exists())
+
+    def test_run_single_point_keeps_robot_artifacts_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: keep_artifacts_profile
+                description: cleanup
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+
+            def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+                rf_results = Path(cmd[cmd.index("--results-dir") + 1])
+                rf_results.mkdir(parents=True, exist_ok=True)
+                (rf_results / "snapshots").mkdir(parents=True, exist_ok=True)
+                result_token = next(
+                    cmd[i + 1]
+                    for i, token in enumerate(cmd[:-1])
+                    if token == "--variable" and cmd[i + 1].startswith("RESULT_FILE:")
+                )
+                result_file = Path(result_token.split(":", 1)[1])
+                result_file.parent.mkdir(parents=True, exist_ok=True)
+                result_file.write_text('{"boot_outcome":"success"}', encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch("audit_bootloader.subprocess.run", side_effect=fake_run):
+                run_single_point(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    fault_at=9,
+                    robot_vars=[],
+                    work_dir=tempdir / "work",
+                    renode_remote_server_dir="",
+                    keep_run_artifacts=True,
+                )
+
+            self.assertTrue(
+                (tempdir / "work" / "keep_artifacts_profile_fault_9" / "robot" / "snapshots").exists()
+            )
+
+    def test_run_batch_prunes_robot_artifacts_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: cleanup_batch_profile
+                description: cleanup
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+
+            def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+                rf_results = Path(cmd[cmd.index("--results-dir") + 1])
+                rf_results.mkdir(parents=True, exist_ok=True)
+                (rf_results / "snapshots").mkdir(parents=True, exist_ok=True)
+                (rf_results / "snapshots" / "dummy.bin").write_text("x", encoding="utf-8")
+                return SimpleNamespace(returncode=1, stdout="boom", stderr="bad")
+
+            with mock.patch("audit_bootloader.subprocess.run", side_effect=fake_run):
+                with self.assertRaises(RuntimeError):
+                    run_batch(
+                        repo_root=ROOT,
+                        renode_test="renode-test",
+                        robot_suite="tests/ota_fault_point.robot",
+                        profile=profile,
+                        fault_points=[1, 2],
+                        robot_vars=[],
+                        work_dir=tempdir / "work",
+                        renode_remote_server_dir="",
+                        keep_run_artifacts=False,
+                    )
+
+            self.assertFalse((tempdir / "work" / "cleanup_batch_profile_batch" / "robot").exists())
 
 
 if __name__ == "__main__":

@@ -312,6 +312,7 @@ def run_single_point(
     renode_remote_server_dir: str,
     is_control: bool = False,
     calibration: bool = False,
+    keep_run_artifacts: bool = False,
 ) -> Dict[str, Any]:
     """Run a single fault point (or calibration) via renode-test."""
     label = "calibration" if calibration else ("control" if is_control else "fault_{}".format(fault_at))
@@ -347,36 +348,40 @@ def run_single_point(
         timeout_s = max(timeout_s, 900.0)
 
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-            timeout=timeout_s,
-        )
-    except subprocess.TimeoutExpired as exc:
-        out = exc.stdout or ""
-        err = exc.stderr or ""
-        raise RuntimeError(
-            "renode-test timed out for {} fault_at={} after {}s\nSTDOUT:\n{}\nSTDERR:\n{}\n"
-            "Adjust with OTA_RENODE_POINT_TIMEOUT_S (seconds; <=0 disables timeout).".format(
-                label, fault_at, timeout_s, out, err
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+                timeout=timeout_s,
             )
-        )
-
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "renode-test failed for {} fault_at={}\nSTDOUT:\n{}\nSTDERR:\n{}".format(
-                label, fault_at, proc.stdout, proc.stderr,
+        except subprocess.TimeoutExpired as exc:
+            out = exc.stdout or ""
+            err = exc.stderr or ""
+            raise RuntimeError(
+                "renode-test timed out for {} fault_at={} after {}s\nSTDOUT:\n{}\nSTDERR:\n{}\n"
+                "Adjust with OTA_RENODE_POINT_TIMEOUT_S (seconds; <=0 disables timeout).".format(
+                    label, fault_at, timeout_s, out, err
+                )
             )
-        )
 
-    if not result_file.exists():
-        raise RuntimeError("Run did not produce {}".format(result_file))
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "renode-test failed for {} fault_at={}\nSTDOUT:\n{}\nSTDERR:\n{}".format(
+                    label, fault_at, proc.stdout, proc.stderr,
+                )
+            )
 
-    return json.loads(result_file.read_text(encoding="utf-8"))
+        if not result_file.exists():
+            raise RuntimeError("Run did not produce {}".format(result_file))
+
+        return json.loads(result_file.read_text(encoding="utf-8"))
+    finally:
+        if not keep_run_artifacts and rf_results.exists():
+            shutil.rmtree(rf_results, ignore_errors=True)
 
 
 @dataclasses.dataclass
@@ -418,6 +423,7 @@ def run_calibration(
     robot_vars: List[str],
     work_dir: Path,
     renode_remote_server_dir: str,
+    keep_run_artifacts: bool = False,
 ) -> CalibrationResult:
     """Run calibration to discover total NVM writes and erases during a clean update."""
     data = run_single_point(
@@ -430,6 +436,7 @@ def run_calibration(
         work_dir=work_dir,
         renode_remote_server_dir=renode_remote_server_dir,
         calibration=True,
+        keep_run_artifacts=keep_run_artifacts,
     )
     total_writes = int(data.get("total_writes", 0))
     total_erases = int(data.get("total_erases", 0))
@@ -491,6 +498,7 @@ def run_batch(
     trace_file_bin: Optional[str] = None,
     erase_trace_file_bin: Optional[str] = None,
     fault_types_list: Optional[List[str]] = None,
+    keep_run_artifacts: bool = False,
 ) -> List[Dict[str, Any]]:
     """Run multiple fault points in a single Renode session (batch mode).
 
@@ -557,39 +565,43 @@ def run_batch(
         timeout_s = None
 
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-            timeout=timeout_s,
-        )
-    except subprocess.TimeoutExpired as exc:
-        out = exc.stdout or ""
-        err = exc.stderr or ""
-        raise RuntimeError(
-            "renode-test batch timed out after {}s ({} points)\nSTDOUT:\n{}\nSTDERR:\n{}\n"
-            "Adjust with OTA_RENODE_POINT_TIMEOUT_S (seconds; <=0 disables timeout).".format(
-                timeout_s, len(fault_points), out, err
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+                timeout=timeout_s,
             )
-        )
-
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "renode-test batch failed\nSTDOUT:\n{}\nSTDERR:\n{}".format(
-                proc.stdout, proc.stderr,
+        except subprocess.TimeoutExpired as exc:
+            out = exc.stdout or ""
+            err = exc.stderr or ""
+            raise RuntimeError(
+                "renode-test batch timed out after {}s ({} points)\nSTDOUT:\n{}\nSTDERR:\n{}\n"
+                "Adjust with OTA_RENODE_POINT_TIMEOUT_S (seconds; <=0 disables timeout).".format(
+                    timeout_s, len(fault_points), out, err
+                )
             )
-        )
 
-    if not result_file.exists():
-        raise RuntimeError("Batch run did not produce {}".format(result_file))
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "renode-test batch failed\nSTDOUT:\n{}\nSTDERR:\n{}".format(
+                    proc.stdout, proc.stderr,
+                )
+            )
 
-    data = json.loads(result_file.read_text(encoding="utf-8"))
-    if isinstance(data, list):
-        return data
-    return [data]
+        if not result_file.exists():
+            raise RuntimeError("Batch run did not produce {}".format(result_file))
+
+        data = json.loads(result_file.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+        return [data]
+    finally:
+        if not keep_run_artifacts and rf_results.exists():
+            shutil.rmtree(rf_results, ignore_errors=True)
 
 
 def _split_batch_plan(
@@ -627,6 +639,7 @@ def _run_batch_with_fallback(
     trace_file_bin: Optional[str] = None,
     erase_trace_file_bin: Optional[str] = None,
     fault_types_list: Optional[List[str]] = None,
+    keep_run_artifacts: bool = False,
 ) -> List[Dict[str, Any]]:
     """Run one batch; on failure retry each point in separate Renode sessions."""
     try:
@@ -644,6 +657,7 @@ def _run_batch_with_fallback(
             trace_file_bin=trace_file_bin,
             erase_trace_file_bin=erase_trace_file_bin,
             fault_types_list=fault_types_list,
+            keep_run_artifacts=keep_run_artifacts,
         )
     except Exception as exc:
         print(
@@ -671,6 +685,7 @@ def _run_batch_with_fallback(
                 trace_file_bin=trace_file_bin,
                 erase_trace_file_bin=erase_trace_file_bin,
                 fault_types_list=point_fault_types,
+                keep_run_artifacts=keep_run_artifacts,
             )
             results.extend(point_results)
             print(
@@ -697,6 +712,7 @@ def _run_batches_chunked(
     erase_trace_file_bin: Optional[str] = None,
     fault_types_list: Optional[List[str]] = None,
     max_batch_points: int = 0,
+    keep_run_artifacts: bool = False,
 ) -> List[Dict[str, Any]]:
     """Run one or more fault batches with optional fixed-size chunking."""
     plan = _split_batch_plan(
@@ -732,6 +748,7 @@ def _run_batches_chunked(
                 trace_file_bin=trace_file_bin,
                 erase_trace_file_bin=erase_trace_file_bin,
                 fault_types_list=chunk_types,
+                keep_run_artifacts=keep_run_artifacts,
             )
         )
     return combined
@@ -1030,6 +1047,7 @@ def _run_batch_worker(
     erase_trace_file_bin: Optional[str] = None,
     fault_types_list: Optional[List[str]] = None,
     max_batch_points: int = 0,
+    keep_run_artifacts: bool = False,
 ) -> List[Dict[str, Any]]:
     """Worker function for parallel batch execution.
 
@@ -1082,6 +1100,7 @@ def _run_batch_worker(
         erase_trace_file_bin=erase_trace_file_bin,
         fault_types_list=fault_types_list,
         max_batch_points=max_batch_points,
+        keep_run_artifacts=keep_run_artifacts,
     )
 
 
@@ -1103,6 +1122,7 @@ def run_runtime_sweep(
     trace_file_bin: Optional[str] = None,
     erase_trace_file_bin: Optional[str] = None,
     fault_types_list: Optional[List[str]] = None,
+    keep_run_artifacts: bool = False,
 ) -> List[Dict[str, Any]]:
     """Run the full runtime fault sweep.
 
@@ -1171,6 +1191,7 @@ def run_runtime_sweep(
                     erase_trace_file_bin=erase_trace_file_bin,
                     fault_types_list=ft_chunks[wid] if wid < len(ft_chunks) else None,
                     max_batch_points=max_batch_points,
+                    keep_run_artifacts=keep_run_artifacts,
                 )
                 futures[f] = wid
 
@@ -1205,6 +1226,7 @@ def run_runtime_sweep(
             erase_trace_file_bin=erase_trace_file_bin,
             fault_types_list=fault_types_list,
             max_batch_points=max_batch_points,
+            keep_run_artifacts=keep_run_artifacts,
         )
     else:
         batch_results = []
@@ -1228,6 +1250,7 @@ def run_runtime_sweep(
             work_dir=work_dir,
             renode_remote_server_dir=renode_remote_server_dir,
             is_control=True,
+            keep_run_artifacts=keep_run_artifacts,
         )
         data["is_control"] = True
         results.append(data)
@@ -1831,6 +1854,7 @@ def main() -> int:
                     robot_vars=robot_vars,
                     work_dir=work_dir,
                     renode_remote_server_dir=args.renode_remote_server_dir,
+                    keep_run_artifacts=args.keep_run_artifacts,
                 )
                 max_writes = cal.total_writes
                 total_erases = cal.total_erases
@@ -2079,6 +2103,7 @@ def main() -> int:
             trace_file_bin=trace_file_bin if not args.no_trace_replay else None,
             erase_trace_file_bin=erase_trace_file_bin if not args.no_trace_replay else None,
             fault_types_list=fault_types_list,
+            keep_run_artifacts=args.keep_run_artifacts,
         )
 
         sweep_wall_s = _time_mod.time() - sweep_wall_t0
