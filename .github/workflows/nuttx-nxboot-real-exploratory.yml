@@ -1,0 +1,123 @@
+name: nuttx-nxboot-real-exploratory
+
+on:
+  workflow_dispatch:
+    inputs:
+      nuttx_ref:
+        description: apache/nuttx ref to build
+        required: true
+        default: master
+      nuttx_apps_ref:
+        description: apache/nuttx-apps ref to build
+        required: true
+        default: master
+      fault_max_writes:
+        description: Representative fault-point budget
+        required: true
+        default: "2"
+
+concurrency:
+  group: nuttx-nxboot-real-exploratory-${{ github.event.inputs.nuttx_ref }}-${{ github.event.inputs.nuttx_apps_ref }}-${{ github.event.inputs.fault_max_writes }}
+  cancel-in-progress: true
+
+jobs:
+  exploratory:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      TOOLCHAIN_VERSION: 13.2.1-1.1
+      TOOLCHAIN_URL: https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v13.2.1-1.1/xpack-arm-none-eabi-gcc-13.2.1-1.1-linux-x64.tar.gz
+      TOOLCHAIN_SHA256: 1252a8cafe9237de27a765376697230368eec21db44dc3f1edeb8d838dabd530
+      RENODE_URL: https://builds.renode.io/renode-latest.linux-portable.tar.gz
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Arm GNU toolchain
+        run: |
+          set -euxo pipefail
+          tarball="${RUNNER_TEMP}/arm-toolchain.tar.gz"
+          curl -L "${TOOLCHAIN_URL}" -o "${tarball}"
+          echo "${TOOLCHAIN_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "${tarball}" -C "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/xpack-arm-none-eabi-gcc-${TOOLCHAIN_VERSION}/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/xpack-arm-none-eabi-gcc-${TOOLCHAIN_VERSION}/bin/arm-none-eabi-gcc" --version
+
+      - name: Clone upstream NuttX sources
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch "${{ inputs.nuttx_ref }}" https://github.com/apache/nuttx.git "${RUNNER_TEMP}/nuttx"
+          git clone --depth 1 --branch "${{ inputs.nuttx_apps_ref }}" https://github.com/apache/nuttx-apps.git "${RUNNER_TEMP}/nuttx-apps"
+
+      - name: Build real NuttX nxboot target
+        run: |
+          python3 targets/nuttx_nxboot/build_public_target.py \
+            --nuttx-root "${RUNNER_TEMP}/nuttx" \
+            --apps-root "${RUNNER_TEMP}/nuttx-apps" \
+            --output-dir "${RUNNER_TEMP}/nuttx-build" \
+            --jobs 8
+
+      - name: Generate runtime profile
+        run: |
+          python3 targets/nuttx_nxboot/generate_runtime_profile.py \
+            --build-dir "${RUNNER_TEMP}/nuttx-build" \
+            --output-profile "${RUNNER_TEMP}/nuttx-runtime-profile.yaml" \
+            --fault-max-writes "${{ inputs.fault_max_writes }}" \
+            --boot-cycles 2
+
+      - name: Install Renode portable
+        run: |
+          set -euxo pipefail
+          tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
+          curl -L "${RENODE_URL}" -o "${tarball}"
+          mkdir -p "${RUNNER_TEMP}/renode"
+          tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
+          python3 -m pip install --user -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+          echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
+
+      - name: Install Python dependencies
+        run: python3 -m pip install --user pyyaml
+
+      - name: Run exploratory audit
+        run: |
+          python3 scripts/audit_bootloader.py \
+            --profile "${RUNNER_TEMP}/nuttx-runtime-profile.yaml" \
+            --renode-test "${RUNNER_TEMP}/renode/renode-test" \
+            --output results/nuttx_nxboot_real_exploratory.json \
+            --no-assert-verdict
+
+      - name: Print summary
+        if: always()
+        run: |
+          if [ -f results/nuttx_nxboot_real_exploratory.json ]; then
+            python3 - <<'PY'
+          import json
+          payload = json.load(open("results/nuttx_nxboot_real_exploratory.json"))
+          summary = payload.get("summary", {}).get("runtime_sweep", {})
+          control = summary.get("control", {})
+          print("Profile:", payload.get("profile"))
+          print("Verdict:", payload.get("verdict"))
+          print("Points:", summary.get("total_fault_points"))
+          print("Issues:", summary.get("issue_points"))
+          print("Bricks:", summary.get("bricks"))
+          print("Control outcome:", control.get("boot_outcome"))
+          mba = control.get("multi_boot_analysis") or {}
+          if mba:
+              print("Control multi-boot:", mba.get("status"), mba.get("final_slot"))
+          failures = summary.get("failures") or []
+          if failures:
+              print("Representative failures:")
+              for failure in failures[:10]:
+                  print(json.dumps(failure, sort_keys=True))
+          PY
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuttx-nxboot-real-exploratory-results
+          path: |
+            results/nuttx_nxboot_real_exploratory.json
+            ${{ runner.temp }}/nuttx-runtime-profile.yaml
