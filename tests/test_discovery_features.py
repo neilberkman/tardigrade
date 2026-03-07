@@ -6,6 +6,8 @@ from __future__ import annotations
 import tempfile
 import textwrap
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
@@ -20,6 +22,7 @@ sys.path.insert(0, str(SCRIPTS))
 from audit_bootloader import (  # noqa: E402
     annotate_result_checks,
     calibration_completed,
+    _run_batches_chunked,
     prepare_renode_command,
     run_batch,
     run_single_point,
@@ -519,6 +522,65 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertTrue(
                 (tempdir / "work" / "keep_artifacts_profile_fault_9" / ".tmp" / "renode.tmp").exists()
             )
+
+    def test_run_batches_chunked_emits_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: progress_profile
+                description: progress
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            stderr = StringIO()
+
+            def fake_batch(*args, **kwargs):
+                points = kwargs["fault_points"]
+                return [{"fault_at": fp, "boot_outcome": "success"} for fp in points]
+
+            with mock.patch(
+                "audit_bootloader._run_batch_with_fallback",
+                side_effect=fake_batch,
+            ):
+                with redirect_stderr(stderr):
+                    results = _run_batches_chunked(
+                        repo_root=ROOT,
+                        renode_test="renode-test",
+                        robot_suite="tests/ota_fault_point.robot",
+                        profile=profile,
+                        fault_points=[1, 2, 3, 4, 5],
+                        robot_vars=[],
+                        work_dir=tempdir / "work",
+                        renode_remote_server_dir="",
+                        max_batch_points=2,
+                        progress_label="worker 0",
+                    )
+
+            output = stderr.getvalue()
+            self.assertEqual(len(results), 5)
+            self.assertIn("[audit ", output)
+            self.assertIn("worker 0 sub-batching 5 points into 3 chunks", output)
+            self.assertIn("worker 0 chunk 1/3 start: 2 points (faults 1..2)", output)
+            self.assertIn("worker 0 chunk 3/3 complete: 1 results", output)
 
     def test_run_batch_prunes_robot_artifacts_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:

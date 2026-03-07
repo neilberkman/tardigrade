@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -50,6 +51,11 @@ CALIBRATION_INCOMPLETE_PREFIXES = (
     "no_boot_stall(",
     "op_trace_limit",
 )
+
+
+def _progress(message: str) -> None:
+    stamp = dt.datetime.now().strftime("%H:%M:%S")
+    print("[audit {}] {}".format(stamp, message), file=sys.stderr, flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -688,10 +694,7 @@ def _run_batch_with_fallback(
             keep_run_artifacts=keep_run_artifacts,
         )
     except Exception as exc:
-        print(
-            "Batch run failed; retrying per-point Renode sessions. {}".format(exc),
-            file=sys.stderr,
-        )
+        _progress("Batch run failed; retrying per-point Renode sessions. {}".format(exc))
         results: List[Dict[str, Any]] = []
         fallback_root = work_dir / "batch_fallback"
         fallback_root.mkdir(parents=True, exist_ok=True)
@@ -716,11 +719,10 @@ def _run_batch_with_fallback(
                 keep_run_artifacts=keep_run_artifacts,
             )
             results.extend(point_results)
-            print(
+            _progress(
                 "Fallback point {} complete ({}/{})".format(
                     fp, idx + 1, len(fault_points)
-                ),
-                file=sys.stderr,
+                )
             )
         return results
 
@@ -741,6 +743,7 @@ def _run_batches_chunked(
     fault_types_list: Optional[List[str]] = None,
     max_batch_points: int = 0,
     keep_run_artifacts: bool = False,
+    progress_label: str = "",
 ) -> List[Dict[str, Any]]:
     """Run one or more fault batches with optional fixed-size chunking."""
     plan = _split_batch_plan(
@@ -749,34 +752,50 @@ def _run_batches_chunked(
         max_batch_points=max_batch_points,
     )
 
+    label_prefix = "{} ".format(progress_label) if progress_label else ""
+
     if len(plan) > 1:
-        print(
-            "Sub-batching {} points into {} chunks (max {} points/chunk).".format(
-                len(fault_points), len(plan), max_batch_points
-            ),
-            file=sys.stderr,
+        _progress(
+            "{}sub-batching {} points into {} chunks (max {} points/chunk).".format(
+                label_prefix, len(fault_points), len(plan), max_batch_points
+            )
         )
 
     combined: List[Dict[str, Any]] = []
     for i, (chunk_points, chunk_types) in enumerate(plan):
         chunk_dir = work_dir / "chunk_{:04d}".format(i)
         chunk_dir.mkdir(parents=True, exist_ok=True)
-        combined.extend(
-            _run_batch_with_fallback(
-                repo_root=repo_root,
-                renode_test=renode_test,
-                robot_suite=robot_suite,
-                profile=profile,
-                fault_points=chunk_points,
-                robot_vars=robot_vars,
-                work_dir=chunk_dir,
-                renode_remote_server_dir=renode_remote_server_dir,
-                trace_file=trace_file,
-                erase_trace_file=erase_trace_file,
-                trace_file_bin=trace_file_bin,
-                erase_trace_file_bin=erase_trace_file_bin,
-                fault_types_list=chunk_types,
-                keep_run_artifacts=keep_run_artifacts,
+        chunk_start = time.monotonic()
+        span = "{}..{}".format(chunk_points[0], chunk_points[-1]) if chunk_points else "empty"
+        _progress(
+            "{}chunk {}/{} start: {} points (faults {}).".format(
+                label_prefix, i + 1, len(plan), len(chunk_points), span
+            )
+        )
+        chunk_results = _run_batch_with_fallback(
+            repo_root=repo_root,
+            renode_test=renode_test,
+            robot_suite=robot_suite,
+            profile=profile,
+            fault_points=chunk_points,
+            robot_vars=robot_vars,
+            work_dir=chunk_dir,
+            renode_remote_server_dir=renode_remote_server_dir,
+            trace_file=trace_file,
+            erase_trace_file=erase_trace_file,
+            trace_file_bin=trace_file_bin,
+            erase_trace_file_bin=erase_trace_file_bin,
+            fault_types_list=chunk_types,
+            keep_run_artifacts=keep_run_artifacts,
+        )
+        combined.extend(chunk_results)
+        _progress(
+            "{}chunk {}/{} complete: {} results in {:.1f}s.".format(
+                label_prefix,
+                i + 1,
+                len(plan),
+                len(chunk_results),
+                time.monotonic() - chunk_start,
             )
         )
     return combined
@@ -1086,6 +1105,7 @@ def _run_batch_worker(
     work_dir = Path(work_dir_str)
     worker_dir = work_dir / "worker_{}".format(worker_id)
     worker_dir.mkdir(parents=True, exist_ok=True)
+    _progress("worker {} starting: {} fault points.".format(worker_id, len(fault_points)))
 
     # Re-create the renode config for this worker's directory.
     renode_config = worker_dir / "renode.config"
@@ -1113,7 +1133,7 @@ def _run_batch_worker(
 
     profile = load_profile(profile_path)
 
-    return _run_batches_chunked(
+    results = _run_batches_chunked(
         repo_root=repo_root,
         renode_test=renode_test,
         robot_suite=robot_suite,
@@ -1129,7 +1149,10 @@ def _run_batch_worker(
         fault_types_list=fault_types_list,
         max_batch_points=max_batch_points,
         keep_run_artifacts=keep_run_artifacts,
+        progress_label="worker {}".format(worker_id),
     )
+    _progress("worker {} complete: {} results.".format(worker_id, len(results)))
+    return results
 
 
 def run_runtime_sweep(
@@ -1191,11 +1214,10 @@ def run_runtime_sweep(
         else:
             ft_chunks = [None] * len(chunks)
 
-        print(
+        _progress(
             "Parallel sweep: {} workers, ~{} points each (interleaved)".format(
                 len(chunks), len(chunks[0])
-            ),
-            file=sys.stderr,
+            )
         )
 
         batch_results: List[Dict[str, Any]] = []
@@ -1228,15 +1250,13 @@ def run_runtime_sweep(
                 try:
                     worker_results = f.result()
                     batch_results.extend(worker_results)
-                    print(
-                        "Worker {} finished: {} results".format(wid, len(worker_results)),
-                        file=sys.stderr,
+                    _progress(
+                        "Worker {} finished: {} results".format(
+                            wid, len(worker_results)
+                        )
                     )
                 except Exception as exc:
-                    print(
-                        "Worker {} FAILED: {}".format(wid, exc),
-                        file=sys.stderr,
-                    )
+                    _progress("Worker {} FAILED: {}".format(wid, exc))
                     raise
     elif fault_points:
         batch_results = _run_batches_chunked(
