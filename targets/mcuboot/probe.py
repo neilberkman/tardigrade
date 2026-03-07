@@ -44,17 +44,6 @@ def _read_flag(bus, addr):
     }
 
 
-def _byte_value(value):
-    try:
-        return int(value) & 0xFF
-    except Exception:
-        pass
-    text = str(value)
-    if len(text) == 1:
-        return ord(text)
-    return _as_int(value) & 0xFF
-
-
 def _magic_state(raw):
     if raw == MCUBOOT_GOOD_MAGIC:
         return "good"
@@ -65,13 +54,6 @@ def _magic_state(raw):
     return "other"
 
 
-def _hex_bytes(raw):
-    parts = []
-    for item in raw:
-        parts.append("{:02x}".format(_byte_value(item)))
-    return "".join(parts)
-
-
 def _slot_probe(bus, base, size, align):
     slot_end = base + size
     magic_addr = slot_end - 16
@@ -79,12 +61,6 @@ def _slot_probe(bus, base, size, align):
     copy_done_addr = slot_end - 16 - (2 * align)
     magic = _read_bytes(bus, magic_addr, 16)
     return {
-        "base": "0x{:08X}".format(base),
-        "size": "0x{:08X}".format(size),
-        "magic_addr": "0x{:08X}".format(magic_addr),
-        "image_ok_addr": "0x{:08X}".format(image_ok_addr),
-        "copy_done_addr": "0x{:08X}".format(copy_done_addr),
-        "magic": _hex_bytes(magic),
         "magic_state": _magic_state(magic),
         "image_ok": _read_flag(bus, image_ok_addr),
         "copy_done": _read_flag(bus, copy_done_addr),
