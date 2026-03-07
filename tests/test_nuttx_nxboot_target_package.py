@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -161,6 +162,50 @@ class NuttxNxbootTargetPackageTest(unittest.TestCase):
         self.assertEqual(state["roles"]["update_slot"], "secondary")
         self.assertEqual(state["roles"]["recovery_slot"], "tertiary")
         self.assertEqual(state["roles"]["next_boot"], "update")
+
+    def test_probe_uses_monitor_sram_bounds_for_real_h743_vectors(self) -> None:
+        slot_size = 0x80000
+        primary_base = 0x08040000
+        secondary_base = 0x080C0000
+        tertiary_base = 0x08140000
+
+        bus = _FakeBus()
+        monitor = _FakeMonitor(
+            {
+                "slot_exec_base": hex(primary_base),
+                "slot_exec_size": hex(slot_size),
+                "slot_staging_base": hex(secondary_base),
+                "slot_staging_size": hex(slot_size),
+                "slot_tertiary_base": hex(tertiary_base),
+                "slot_tertiary_size": hex(slot_size),
+                "sram_start": hex(0x20000000),
+                "sram_end": hex(0x240A0000),
+            }
+        )
+
+        primary = bytearray(
+            make_nxboot_image(
+                primary_base,
+                0x6000,
+                (1, 0, 0),
+                header_size=0x400,
+                platform_id=0x100000042,
+            )
+        )
+        primary[0x400:0x408] = b"\xC4\x9D\x00\x24\x6B\x18\x04\x08"
+        crc = zlib.crc32(bytes(primary[12:])) & 0xFFFFFFFF
+        primary[8:12] = crc.to_bytes(4, "little")
+        bus.write_bytes(primary_base, bytes(primary))
+
+        state = collect_state(
+            bus=bus,
+            monitor=monitor,
+            context={"stage": "post_boot", "boot_slot": "exec", "fault_injected": False},
+        )
+
+        self.assertTrue(state["slots"]["primary"]["crc_valid"])
+        self.assertTrue(state["slots"]["primary"]["vector_valid"])
+        self.assertTrue(state["slots"]["primary"]["bootable"])
 
     def test_probe_models_internal_primary_confirmed_via_secondary_recovery(self) -> None:
         slot_size = 0x23000
