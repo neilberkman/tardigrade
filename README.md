@@ -133,14 +133,14 @@ For `no_boot` outcomes in runtime execute mode, the result also includes:
 
 Six architectures, from worst-case patterns to hardened OSS boot flows:
 
-| Family         | Architecture                        | Brick rate | Why                                          |
-| -------------- | ----------------------------------- | ---------- | -------------------------------------------- |
-| `naive_copy`   | Copy staging to exec, no fallback   | ~100%      | Any mid-copy fault bricks; no recovery path  |
-| `vulnerable`   | Copy-in-place with pending flag     | ~88%       | Overwrites only image; mid-copy fault bricks |
-| `nxboot_style` | Three-partition copy, CRC, recovery | ~0%        | Recovery slot enables revert on corruption   |
-| `esp_idf`      | Dual otadata CRC + rollback FSM     | varies     | Clean-room model of ESP-IDF OTA selection    |
-| `mcuboot`      | Swap-move / swap-scratch on nRF52   | varies     | Real MCUboot ELFs from upstream CI           |
-| `riotboot`     | Slot selection via header metadata  | varies     | Standalone RIOTboot model                    |
+| Family         | Architecture                        | Representative signal                         | Why                                          |
+| -------------- | ----------------------------------- | --------------------------------------------- | -------------------------------------------- |
+| `naive_copy`   | Copy staging to exec, no fallback   | catastrophic boot-visible failures            | Any mid-copy fault bricks; no recovery path  |
+| `vulnerable`   | Copy-in-place with pending flag     | frequent boot-visible failures                | Overwrites only image; mid-copy fault bricks |
+| `nxboot_style` | Three-partition copy, CRC, recovery | mostly semantic/invariant issues when broken  | Recovery slot enables revert on corruption   |
+| `esp_idf`      | Dual otadata CRC + rollback FSM     | platform/profile dependent                    | Clean-room model of ESP-IDF OTA selection    |
+| `mcuboot`      | Swap-move / swap-scratch on nRF52   | profile dependent, good public validation set | Real MCUboot ELFs from upstream CI           |
+| `riotboot`     | Slot selection via header metadata  | profile dependent                             | Standalone RIOTboot model                    |
 
 The repo includes dozens of profiles, including intentional-defect variants for self-testing.
 
