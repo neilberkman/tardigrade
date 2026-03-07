@@ -25,7 +25,9 @@ def _read_byte(bus, addr):
 
 
 def _read_bytes(bus, addr, size):
-    return bytes(_read_byte(bus, addr + i) for i in range(size))
+    # Renode's embedded Python/.NET bridge is unhappy when a generator is passed
+    # through byte-oriented helpers; force eager materialization.
+    return bytes([_read_byte(bus, addr + i) for i in range(size)])
 
 
 def _read_flag(bus, addr):
