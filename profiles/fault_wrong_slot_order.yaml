@@ -9,6 +9,7 @@ description: >-
   firmware which has no metadata ordering at all.
 
 platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
 bootloader:
   elf: examples/vulnerable_ota/firmware.elf
   entry: 0x10000000

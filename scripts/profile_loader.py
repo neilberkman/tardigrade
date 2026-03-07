@@ -270,6 +270,7 @@ class ProfileConfig:
         semantic_assertions: Optional[Dict[str, Dict[str, Any]]] = None,
         invariants: Optional[List[str]] = None,
         invariant_providers: Optional[List[str]] = None,
+        flash_backend: Optional[str] = None,
     ) -> None:
         self.schema_version = schema_version
         self.name = name
@@ -296,6 +297,7 @@ class ProfileConfig:
         self.semantic_assertions = semantic_assertions or {}
         self.invariants = invariants or []
         self.invariant_providers = invariant_providers or []
+        self.flash_backend = flash_backend
 
     def resolve_path(self, repo_root: Path, value: str) -> str:
         """Resolve a path relative to the repo root."""
@@ -493,6 +495,10 @@ class ProfileConfig:
                     self.resolve_path(repo_root, self.state_probe_script)
                 )
             )
+
+        # Flash backend: explicit sysbus name for the fault-injectable controller.
+        if self.flash_backend:
+            vars_list.append("FLASH_BACKEND:{}".format(self.flash_backend))
 
         # Extra peripherals: comma-separated list of .cs files to compile
         # before platform loading (e.g. controller stubs for custom SoCs).
@@ -904,6 +910,9 @@ def load_profile(path: str | Path) -> ProfileConfig:
     setup_script = data.get("setup_script")
     if setup_script is not None:
         setup_script = str(setup_script)
+    flash_backend_raw = data.get("flash_backend")
+    flash_backend: Optional[str] = str(flash_backend_raw) if flash_backend_raw is not None else None
+
     extra_peripherals_raw = data.get("extra_peripherals")
     extra_peripherals: Optional[List[str]] = None
     if extra_peripherals_raw is not None:
@@ -970,6 +979,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         semantic_assertions=semantic_assertions,
         invariants=invariants,
         invariant_providers=invariant_providers,
+        flash_backend=flash_backend,
     )
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.

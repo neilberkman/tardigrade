@@ -2,6 +2,7 @@ schema_version: 1
 name: mcuboot_scratch_fixed
 description: "MCUboot swap-using-SCRATCH AFTER scratch erase direction fix (commit f76fba70). Backward erase of scratch ensures trailer is erased first, preventing corrupt data from being written back to primary after interrupted erase."
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_scratch_fixed.elf
   entry: 0x00000000

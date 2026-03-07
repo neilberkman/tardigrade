@@ -5,6 +5,7 @@ description: >
   Discovery mode with image hash validation and declarative update trigger.
 
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_scratch_fixed.elf

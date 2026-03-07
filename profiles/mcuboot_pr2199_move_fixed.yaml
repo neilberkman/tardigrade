@@ -7,6 +7,7 @@ description: >
   AND primary trailer — clears REVERT state, boots primary cleanly.
 
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_pr2199_move_fixed.elf
   entry: 0x00000000

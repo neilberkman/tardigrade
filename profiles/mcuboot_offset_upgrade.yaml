@@ -6,6 +6,7 @@ description: >
   Secondary has new image with magic GOOD — triggers TEST swap.
 
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_head_offset.elf
   entry: 0x00000000

@@ -61,7 +61,7 @@ sdramBank2: Memory.MappedMemory @ sysbus 0xD0000000
 sdramBank1: Memory.MappedMemory @ sysbus 0xC0000000
     size: 0x10000000
 
-flashController: Miscellaneous.STM32H7FlashController @ sysbus 0x52002000
+faultFlash: Miscellaneous.STM32H7FlashController @ sysbus 0x52002000
     flash1: flashBank1
     flash2: flashBank2
     -> nvic@4

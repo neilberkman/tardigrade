@@ -6,6 +6,7 @@ description: >
   of hand-computed pre_boot_state and marker_address.
 
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_pr2100_broken.elf

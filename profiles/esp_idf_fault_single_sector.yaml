@@ -7,6 +7,7 @@ description: >
   entry 1. Defect only reads sector 0, so it loses the valid fallback entry.
 
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 bootloader:
   elf: examples/esp_idf_ota/esp_idf_fault_single_sector.elf
   entry: 0x00000000

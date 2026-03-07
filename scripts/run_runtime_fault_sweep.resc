@@ -78,6 +78,7 @@ $resume_trace_time_slice?="0.02"
 $resume_trace_wall_timeout_s?="30"
 $boot_cycles?="1"
 $state_probe_script?=""
+$flash_backend?=""
 
 python """
 import json
@@ -115,64 +116,49 @@ def get_optional_int_var(names, default=None):
     return default
 
 # ---------------------------------------------------------------------------
-# Flash backend discovery.
-#   nvm_ctrl = GenericNvmController (sysbus.nvm_ctrl) — slow path
-#   mram     = MRAMMemory (sysbus.mram) — non-volatile with built-in fault injection
-#   fast     = ITardigradeFaultInjectable (sysbus.faultFlash)
+# Flash backend selection.
+#
+# $flash_backend must name the sysbus peripheral (e.g. faultFlash, nvm_ctrl,
+# mram).  The profile YAML declares this; the resc looks it up and fails if
+# it is missing or incompatible.
 # ---------------------------------------------------------------------------
+
 USE_FAST_PATH = False
 USE_MRAM_PATH = False
-_fast_backend_name = None
-_mram_backend_name = None
-_slow_backend_name = None
 
-def _lookup_machine_peripheral(candidates):
-    for name in candidates:
-        try:
-            return name, monitor.Machine[name]
-        except:
-            pass
-    return None, None
+_flash_backend_var = str(monitor.GetVariable('flash_backend')).strip()
+if not _flash_backend_var:
+    raise Exception(
+        'flash_backend not set.  Every profile must declare '
+        'flash_backend: <sysbus-name> (e.g. faultFlash, nvm_ctrl, mram).'
+    )
 
+_backend_name = 'sysbus.' + _flash_backend_var if not _flash_backend_var.startswith('sysbus.') else _flash_backend_var
 try:
-    _slow_backend_name, _nvm_ctrl = _lookup_machine_peripheral(['sysbus.nvm_ctrl', 'nvm_ctrl'])
-    if _nvm_ctrl is None:
-        raise Exception('nvm controller not present')
+    _backend_obj = monitor.Machine[_backend_name]
 except:
-    try:
-        _mram_backend_name, _mram_obj = _lookup_machine_peripheral(['sysbus.mram', 'mram'])
-        if _mram_obj is None:
-            raise Exception('mram controller not present')
-        _test = _mram_obj.TotalWordWrites
-        USE_MRAM_PATH = True
-    except:
-        try:
-            _fast_backend_name, _ff_obj = _lookup_machine_peripheral([
-                'sysbus.faultFlash',
-                'faultFlash',
-                'sysbus.flashController',
-                'flashController',
-            ])
-            if _ff_obj is None:
-                raise Exception('fault-injectable flash controller not present')
-            _test = _ff_obj.TotalWordWrites
-            USE_FAST_PATH = True
-        except:
-            raise Exception(
-                'No supported flash backend found. '
-                'Expected sysbus.faultFlash/faultFlash, sysbus.flashController/flashController, '
-                'sysbus.mram/mram, or sysbus.nvm_ctrl/nvm_ctrl.'
-            )
+    raise Exception(
+        'flash_backend "{}" not found on sysbus. '
+        'Check that the platform .repl registers this peripheral.'.format(_flash_backend_var)
+    )
+
+# Classify the backend path.
+if 'mram' in _backend_name.lower():
+    USE_MRAM_PATH = True
+elif 'nvm_ctrl' in _backend_name.lower():
+    pass  # slow path (default)
+else:
+    USE_FAST_PATH = True
 
 _cached_erase_page = None
 _cached_initial_flash = None
 
 if USE_MRAM_PATH:
-    mram = monitor.Machine[_mram_backend_name]
+    mram = _backend_obj
 elif USE_FAST_PATH:
-    faultFlash = monitor.Machine[_fast_backend_name]
+    faultFlash = _backend_obj
 else:
-    ctrl = monitor.Machine[_slow_backend_name]
+    ctrl = _backend_obj
 
 # Read monitor variables.
 result_file = str(monitor.GetVariable('result_file'))
@@ -1153,9 +1139,9 @@ def restore_flash_and_boot(saved_flash):
         flash_ref.WriteBytes(0, saved_flash)
     bus.LoadELF(bootloader_elf)
     restore_hw_init()
-    # Re-run setup script after machine Reset (e.g. boot_rom mirror).
-    if setup_script:
-        monitor.Parse('include @' + setup_script)
+    # Do NOT re-run setup_script here.  The faulted snapshot is the
+    # ground-truth state for the recovery boot — re-running setup would
+    # overwrite it with clean data and mask the fault.
     prime_bootloader_entry()
 
 def reload_images():
@@ -1665,7 +1651,7 @@ def run_timed_reset_fault(fault_at):
     monitor.Parse('machine Pause')
     cpu_ref.IsHalted = False
     monitor.Parse('machine Reset')
-    reload_images()
+    reload_images_cached()
     apply_pre_boot_state()
     reset_nvmc_for_sweep()
     disarm_fault()
@@ -2034,7 +2020,7 @@ def run_execute_fault(fault_at, fault_type='w'):
     monitor.Parse('machine Pause')
     cpu_ref.IsHalted = False
     monitor.Parse('machine Reset')
-    reload_images()
+    reload_images_cached()
     apply_pre_boot_state()
     if _hash_bypass_active:
         apply_hash_bypass()
@@ -2330,7 +2316,7 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
     monitor.Parse('machine Pause')
     cpu_ref.IsHalted = False
     monitor.Parse('machine Reset')
-    reload_images()
+    reload_images_cached()
     apply_pre_boot_state()
 
     reset_nvmc_for_sweep()

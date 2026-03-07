@@ -3,6 +3,7 @@ name: mcuboot_stm32f4_upgrade
 skip_self_test: true
 description: "MCUboot swap-using-move on STM32F4 (non-uniform flash sectors). Revert scenario: upgrade completed but not confirmed, power loss during revert."
 platform: platforms/stm32f4.repl
+flash_backend: faultFlash
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_stm32f4.elf
   entry: 0x08000000

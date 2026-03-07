@@ -34,8 +34,10 @@ using Antmicro.Renode.Peripherals.MTD;
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
-    public class STM32H7FlashController : STM32_FlashController, IKnownSize
+    public class STM32H7FlashController : STM32_FlashController, IKnownSize, ITardigradeFaultInjectable
     {
+        private readonly FaultTracker tracker = new FaultTracker();
+
         public STM32H7FlashController(IMachine machine, MappedMemory flash1, MappedMemory flash2) : base(machine)
         {
             this.flash1 = flash1;
@@ -69,15 +71,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             optionControlLock.Reset();
             optionStatusCurrentValue = 0;
-            writeTrace.Clear();
-            eraseTrace.Clear();
+            tracker.Reset();
             flashShadow = null;
-            TotalWordWrites = 0;
-            TotalPageErases = 0;
-            FaultFired = false;
-            EraseFaultFired = false;
-            LastFaultAddress = 0;
-            FaultFlashSnapshot = null;
             ProgramCurrentValues();
         }
 
@@ -97,6 +92,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public DualBankFlashView Flash { get; }
 
+        IMemory ITardigradeFaultInjectable.Flash => Flash;
+
         public long FlashBaseAddress { get; set; }
 
         public long FlashSize { get; set; }
@@ -105,23 +102,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public byte EraseFill { get; set; }
 
-        public ulong TotalWordWrites { get; set; }
+        public ulong TotalWordWrites { get => tracker.TotalWordWrites; set => tracker.TotalWordWrites = value; }
 
-        public ulong FaultAtWordWrite { get; set; } = ulong.MaxValue;
+        public ulong FaultAtWordWrite { get => tracker.FaultAtWordWrite; set => tracker.FaultAtWordWrite = value; }
 
-        public bool FaultFired { get; set; }
+        public bool FaultFired { get => tracker.FaultFired; set => tracker.FaultFired = value; }
 
-        public ulong TotalPageErases { get; set; }
+        public ulong TotalPageErases { get => tracker.TotalPageErases; set => tracker.TotalPageErases = value; }
 
-        public ulong FaultAtPageErase { get; set; } = ulong.MaxValue;
+        public ulong FaultAtPageErase { get => tracker.FaultAtPageErase; set => tracker.FaultAtPageErase = value; }
 
-        public bool EraseFaultFired { get; set; }
+        public bool EraseFaultFired { get => tracker.EraseFaultFired; set => tracker.EraseFaultFired = value; }
 
-        public bool AnyFaultFired => FaultFired || EraseFaultFired;
+        public bool AnyFaultFired => tracker.AnyFaultFired;
 
-        public uint LastFaultAddress { get; set; }
+        public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
 
-        public byte[] FaultFlashSnapshot { get; set; }
+        public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
 
         public int DiffLookahead { get; set; } = 32;
 
@@ -129,61 +126,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public bool SkipShadowScan { get; set; }
 
-        public int WriteFaultMode { get; set; } = 0;
+        public int WriteFaultMode { get => tracker.WriteFaultMode; set => tracker.WriteFaultMode = value; }
 
-        public int EraseFaultMode { get; set; } = 0;
+        public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
 
-        public uint CorruptionSeed { get; set; } = 0;
+        public uint CorruptionSeed { get => tracker.CorruptionSeed; set => tracker.CorruptionSeed = value; }
 
-        public bool WriteTraceEnabled { get; set; }
+        public bool WriteTraceEnabled { get => tracker.WriteTraceEnabled; set => tracker.WriteTraceEnabled = value; }
 
-        public int WriteTraceCount => writeTrace.Count;
+        public int WriteTraceCount => tracker.WriteTraceCount;
 
-        public string WriteTraceToString()
-        {
-            var sb = new StringBuilder(writeTrace.Count * 24);
-            foreach(var entry in writeTrace)
-            {
-                sb.Append(entry.Item1);
-                sb.Append(':');
-                sb.Append(entry.Item2);
-                sb.Append(':');
-                sb.Append(entry.Item3);
-                sb.Append('\n');
-            }
-            return sb.ToString();
-        }
+        public string WriteTraceToString() => tracker.WriteTraceToString();
 
-        public void WriteTraceClear()
-        {
-            writeTrace.Clear();
-        }
+        public void WriteTraceClear() => tracker.WriteTraceClear();
 
-        public bool EraseTraceEnabled { get; set; }
+        public bool EraseTraceEnabled { get => tracker.EraseTraceEnabled; set => tracker.EraseTraceEnabled = value; }
 
-        public int EraseTraceCount => eraseTrace.Count;
+        public int EraseTraceCount => tracker.EraseTraceCount;
 
-        public string EraseTraceToString()
-        {
-            var sb = new StringBuilder(eraseTrace.Count * 32);
-            foreach(var entry in eraseTrace)
-            {
-                sb.Append(entry.Item1);
-                sb.Append(':');
-                sb.Append(entry.Item2);
-                sb.Append(':');
-                sb.Append(entry.Item3);
-                sb.Append(':');
-                sb.Append(entry.Item4);
-                sb.Append('\n');
-            }
-            return sb.ToString();
-        }
+        public string EraseTraceToString() => tracker.EraseTraceToString();
 
-        public void EraseTraceClear()
-        {
-            eraseTrace.Clear();
-        }
+        public void EraseTraceClear() => tracker.EraseTraceClear();
 
         public void InvalidateShadow()
         {
@@ -351,13 +314,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         | ((uint)valueBytes[cursor + i] << shift);
                 }
 
-                TotalWordWrites++;
-                if(WriteTraceEnabled)
-                {
-                    writeTrace.Add(Tuple.Create(TotalWordWrites, (int)alignedOffset, newWord));
-                }
-
-                if(TotalWordWrites == FaultAtWordWrite)
+                if(tracker.RecordWriteAndCheckFault((int)alignedOffset, newWord))
                 {
                     FaultFired = true;
                     LastFaultAddress = (uint)(FlashBaseAddress + alignedOffset);
@@ -385,13 +342,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             EnsureShadow();
 
-            TotalPageErases++;
-            if(EraseTraceEnabled)
-            {
-                eraseTrace.Add(Tuple.Create(TotalPageErases, bank.CombinedBaseOffset + sectorOffset, TotalWordWrites, eraseSize));
-            }
-
-            if(TotalPageErases == FaultAtPageErase)
+            if(tracker.RecordEraseAndCheckFault(bank.CombinedBaseOffset + sectorOffset, eraseSize))
             {
                 EraseFaultFired = true;
                 LastFaultAddress = (uint)(FlashBaseAddress + bank.CombinedBaseOffset + sectorOffset);
@@ -448,7 +399,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void WriteWordFault(long alignedOffset, uint shadowOldWord, uint value)
         {
-            var bytes = WordToBytes(value);
+            var bytes = FaultTracker.WordToBytes(value);
             Flash.WriteBytes(alignedOffset, bytes, 0, bytes.Length, this);
             WriteSnapshotBytes(alignedOffset, bytes);
             WriteShadowBytes(alignedOffset, bytes);
@@ -464,7 +415,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 var oldWord = ReadWordFromShadow(offset);
                 var disturbed = oldWord & 0xEEEEEEEEU;
-                var bytes = WordToBytes(disturbed);
+                var bytes = FaultTracker.WordToBytes(disturbed);
                 Flash.WriteBytes(offset, bytes, 0, bytes.Length, this);
                 WriteSnapshotBytes(offset, bytes);
                 WriteShadowBytes(offset, bytes);
@@ -474,17 +425,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private void ApplyWearCorruption(long alignedOffset)
         {
             var pageStart = (alignedOffset / PageSize) * PageSize;
-            var seed = BuildFaultSeed((int)alignedOffset);
+            var seed = tracker.BuildFaultSeed((int)alignedOffset);
             for(var i = 0; i < 4; i++)
             {
-                var candidate = pageStart + ((long)(NextLcg(ref seed) % (uint)PageSize) & ~3L);
+                var candidate = pageStart + ((long)(FaultTracker.NextLcg(ref seed) % (uint)PageSize) & ~3L);
                 if(candidate < 0 || candidate + 4 > FlashSize)
                 {
                     continue;
                 }
                 var oldWord = ReadWordFromShadow(candidate);
-                var corrupted = oldWord & ~(1u << (int)(NextLcg(ref seed) % 31));
-                var bytes = WordToBytes(corrupted);
+                var corrupted = oldWord & ~(1u << (int)(FaultTracker.NextLcg(ref seed) % 31));
+                var bytes = FaultTracker.WordToBytes(corrupted);
                 Flash.WriteBytes(candidate, bytes, 0, bytes.Length, this);
                 WriteSnapshotBytes(candidate, bytes);
                 WriteShadowBytes(candidate, bytes);
@@ -493,8 +444,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private uint ApplyBitCorruption(long alignedOffset, uint oldWord, uint newWord)
         {
-            var seed = BuildFaultSeed((int)alignedOffset);
-            var keepMask = NextLcg(ref seed);
+            var seed = tracker.BuildFaultSeed((int)alignedOffset);
+            var keepMask = FaultTracker.NextLcg(ref seed);
             var bitsToFlip = oldWord & ~newWord;
             var actuallyFlipped = bitsToFlip & keepMask;
             return oldWord & ~actuallyFlipped;
@@ -536,7 +487,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private void RestoreWordFromShadow(long alignedOffset)
         {
             var oldWord = ReadWordFromShadow(alignedOffset);
-            var bytes = WordToBytes(oldWord);
+            var bytes = FaultTracker.WordToBytes(oldWord);
             Flash.WriteBytes(alignedOffset, bytes, 0, bytes.Length, this);
         }
 
@@ -590,31 +541,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             Array.Copy(bytes, 0, FaultFlashSnapshot, (int)offset, bytes.Length);
         }
 
-        private static byte[] WordToBytes(uint value)
-        {
-            return new[]
-            {
-                (byte)(value & 0xFF),
-                (byte)((value >> 8) & 0xFF),
-                (byte)((value >> 16) & 0xFF),
-                (byte)((value >> 24) & 0xFF),
-            };
-        }
-
-        private uint NextLcg(ref uint seed)
-        {
-            seed = seed * 1103515245 + 12345;
-            return seed;
-        }
-
-        private uint BuildFaultSeed(int offset)
-        {
-            var seed = CorruptionSeed != 0 ? CorruptionSeed : (uint)TotalWordWrites;
-            seed ^= (uint)offset;
-            seed ^= (uint)(TotalPageErases * 2654435761UL);
-            return seed;
-        }
-
         private uint optionStatusCurrentValue;
         private IValueRegisterField optionStatusProgramRegister;
         private readonly LockRegister optionControlLock;
@@ -623,8 +549,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly MappedMemory flash2;
         private readonly long flash1Size;
         private byte[] flashShadow;
-        private readonly List<Tuple<ulong, int, uint>> writeTrace = new List<Tuple<ulong, int, uint>>();
-        private readonly List<Tuple<ulong, long, ulong, int>> eraseTrace = new List<Tuple<ulong, long, ulong, int>>();
 
         private static readonly uint[] ControlBankKey = { 0x45670123, 0xCDEF89AB };
         private static readonly uint[] OptionControlKey = { 0x08192A3B, 0x4C5D6E7F };

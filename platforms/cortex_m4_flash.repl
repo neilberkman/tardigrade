@@ -49,7 +49,7 @@ nvm_ctrl: NVMemoryController @ sysbus 0x40001000
     NvmBaseAddress: 0x0000C000
     FullMode: true
 
-nvmc: Miscellaneous.NRF52NVMC @ sysbus 0x4001E000
+faultFlash: Miscellaneous.NRF52NVMC @ sysbus 0x4001E000
     Nvm: nvm
     NvmBaseAddress: 0x0000C000
     PageSize: 4096

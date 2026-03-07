@@ -444,6 +444,7 @@ class GenericFrameworkTest(unittest.TestCase):
                         renode_remote_server_dir="",
                         robot_var=[],
                         keep_run_artifacts=False,
+                        workers=0,
                     ),
                 )
             self.assertEqual(step_result["base_profile"], str(base2.resolve()))
@@ -525,6 +526,7 @@ class GenericFrameworkTest(unittest.TestCase):
                         renode_remote_server_dir="",
                         robot_var=[],
                         keep_run_artifacts=False,
+                        workers=0,
                     ),
                 )
             self.assertEqual(step_result["base_profile"], str(base2.resolve()))

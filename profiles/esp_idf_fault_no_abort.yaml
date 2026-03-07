@@ -8,6 +8,7 @@ description: >
   (higher seq), boots the unconfirmed image forever. No rollback.
 
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 bootloader:
   elf: examples/esp_idf_ota/esp_idf_fault_no_abort.elf
   entry: 0x00000000

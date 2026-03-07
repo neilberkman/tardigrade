@@ -6,6 +6,7 @@ description: >
   Loads a confirmed primary image plus a newer external-magic update image and
   expects the update to copy into the primary slot.
 platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
 bootloader:
   elf: examples/nxboot_style/bootloader_nxboot_none.elf
   entry: 0x10000000

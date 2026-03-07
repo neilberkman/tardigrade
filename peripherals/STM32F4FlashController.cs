@@ -3,7 +3,7 @@
 //
 // STM32F4 RCC + FLASH peripheral with word-level write tracking and fault
 // injection.  API-compatible with NRF52NVMC so the generic sweep script
-// (run_runtime_fault_sweep.resc) can use it via `sysbus.nvmc`.
+// (run_runtime_fault_sweep.resc) can use it via `sysbus.faultFlash`.
 //
 // Covers two STM32F4 register blocks in one peripheral:
 //   RCC   (base + 0x000): clock control with auto-ready bits
@@ -43,8 +43,10 @@ using Antmicro.Renode.Peripherals.Memory;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
-    public class STM32F4FlashController : BasicDoubleWordPeripheral, IKnownSize
+    public class STM32F4FlashController : BasicDoubleWordPeripheral, IKnownSize, ITardigradeFaultInjectable
     {
+        private readonly FaultTracker tracker = new FaultTracker();
+
         public STM32F4FlashController(IMachine machine) : base(machine)
         {
             DefineRegisters();
@@ -55,7 +57,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         // --- MappedMemory references (NRF52NVMC-compatible) ---
 
-        public MappedMemory Flash { get; set; }
+        public IMemory Flash { get; set; }
         public long FlashBaseAddress { get; set; } = 0x00000000;
         public long FlashSize { get; set; } = 0;
         public int PageSize { get; set; } = 0x20000;
@@ -63,21 +65,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         // --- Write tracking ---
 
-        public ulong TotalWordWrites { get; set; }
-        public ulong FaultAtWordWrite { get; set; } = ulong.MaxValue;
-        public bool FaultFired { get; set; }
-        public uint LastFaultAddress { get; set; }
-        public byte[] FaultFlashSnapshot { get; set; }
+        public ulong TotalWordWrites { get => tracker.TotalWordWrites; set => tracker.TotalWordWrites = value; }
+        public ulong FaultAtWordWrite { get => tracker.FaultAtWordWrite; set => tracker.FaultAtWordWrite = value; }
+        public bool FaultFired { get => tracker.FaultFired; set => tracker.FaultFired = value; }
+        public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
+        public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
 
         // Kept for backward compatibility with .resc scripts (no-op).
         public int DiffLookahead { get; set; } = 32;
 
-        // Each PG deactivation = exactly 1 word write, so shadow scanning
-        // is unnecessary overhead.  Checked by run_runtime_fault_sweep.resc.
         public bool PerWriteAccurate => true;
 
-        // Skip expensive shadow scanning; just count PG transitions.
-        // Used during Phase 2 recovery boots where only write progress matters.
         public bool SkipShadowScan { get; set; }
 
         // --- PG state ---
@@ -86,46 +84,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         // --- Erase tracking ---
 
-        public ulong TotalPageErases { get; set; }
-        public ulong FaultAtPageErase { get; set; } = ulong.MaxValue;
-        public bool EraseFaultFired { get; set; }
+        public ulong TotalPageErases { get => tracker.TotalPageErases; set => tracker.TotalPageErases = value; }
+        public ulong FaultAtPageErase { get => tracker.FaultAtPageErase; set => tracker.FaultAtPageErase = value; }
+        public bool EraseFaultFired { get => tracker.EraseFaultFired; set => tracker.EraseFaultFired = value; }
 
         // --- Fault modes ---
 
-        // Write: 0=power_loss, 1=bit_corruption, 2=silent_write_failure,
-        //        3=write_rejection, 4=write_disturb, 5=wear_leveling_corruption.
-        public int WriteFaultMode { get; set; } = 0;
-        public uint CorruptionSeed { get; set; } = 0;
+        public int WriteFaultMode { get => tracker.WriteFaultMode; set => tracker.WriteFaultMode = value; }
+        public uint CorruptionSeed { get => tracker.CorruptionSeed; set => tracker.CorruptionSeed = value; }
 
-        // Erase: 0=interrupted_erase, 1=multi_sector_atomicity.
-        public int EraseFaultMode { get; set; } = 0;
+        public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
 
-        public bool AnyFaultFired => FaultFired || EraseFaultFired;
+        public bool AnyFaultFired => tracker.AnyFaultFired;
 
         // --- Write trace ---
 
-        public bool WriteTraceEnabled { get; set; }
-        public int WriteTraceCount => writeTrace.Count;
+        public bool WriteTraceEnabled { get => tracker.WriteTraceEnabled; set => tracker.WriteTraceEnabled = value; }
+        public int WriteTraceCount => tracker.WriteTraceCount;
 
-        public string WriteTraceToString()
-        {
-            var sb = new StringBuilder(writeTrace.Count * 24);
-            foreach(var entry in writeTrace)
-            {
-                sb.Append(entry.Item1);
-                sb.Append(':');
-                sb.Append(entry.Item2);
-                sb.Append(':');
-                sb.Append(entry.Item3);
-                sb.Append('\n');
-            }
-            return sb.ToString();
-        }
+        public string WriteTraceToString() => tracker.WriteTraceToString();
 
-        public void WriteTraceClear()
-        {
-            writeTrace.Clear();
-        }
+        public void WriteTraceClear() => tracker.WriteTraceClear();
 
         public void InvalidateShadow()
         {
@@ -164,35 +143,28 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return true;
             }
 
-            TotalWordWrites++;
-
             // Word-align for trace and fault tracking.
             int aligned = (int)(offset & ~3L);
 
-            if(WriteTraceEnabled)
+            // Compute the full word value for trace recording.
+            var pre = Flash.ReadBytes(aligned, 4);
+            uint wordValue = FaultTracker.ReadU32(pre, 0);
+            if(width == 4)
             {
-                // Read the full word (pre-write — interceptor hasn't written yet).
-                var pre = Flash.ReadBytes(aligned, 4);
-                // Apply our write into the pre-read to get the post-write word.
-                uint wordValue = ReadU32(pre, 0);
-                if(width == 4)
-                {
-                    wordValue = value;
-                }
-                else if(width == 2)
-                {
-                    int shift = (int)((offset & 2) * 8);
-                    wordValue = (wordValue & ~(0xFFFFU << shift)) | ((value & 0xFFFF) << shift);
-                }
-                else
-                {
-                    int shift = (int)((offset & 3) * 8);
-                    wordValue = (wordValue & ~(0xFFU << shift)) | ((value & 0xFF) << shift);
-                }
-                writeTrace.Add(Tuple.Create(TotalWordWrites, aligned, wordValue));
+                wordValue = value;
+            }
+            else if(width == 2)
+            {
+                int shift = (int)((offset & 2) * 8);
+                wordValue = (wordValue & ~(0xFFFFU << shift)) | ((value & 0xFFFF) << shift);
+            }
+            else
+            {
+                int shift = (int)((offset & 3) * 8);
+                wordValue = (wordValue & ~(0xFFU << shift)) | ((value & 0xFF) << shift);
             }
 
-            if(TotalWordWrites == FaultAtWordWrite)
+            if(tracker.RecordWriteAndCheckFault(aligned, wordValue))
             {
                 FaultFired = true;
                 LastFaultAddress = (uint)(FlashBaseAddress + offset);
@@ -209,13 +181,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 else if(WriteFaultMode == 1)
                 {
                     // Bit corruption: partial write (NOR flash physics).
-                    uint seed = BuildFaultSeed((int)offset);
+                    uint seed = tracker.BuildFaultSeed((int)offset);
                     for(int i = 0; i < width; i++)
                     {
                         int byteOff = (int)offset + i;
                         byte oldByte = Flash.ReadBytes(byteOff, 1)[0];
                         byte newByte = (byte)((value >> (i * 8)) & 0xFF);
-                        byte keepMask = (byte)(NextLcg(ref seed) & 0xFF);
+                        byte keepMask = (byte)(FaultTracker.NextLcg(ref seed) & 0xFF);
                         byte bitsToFlip = (byte)(oldByte & ~newByte);
                         byte actuallyFlipped = (byte)(bitsToFlip & keepMask);
                         byte corrupted = (byte)(oldByte & ~actuallyFlipped);
@@ -233,30 +205,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         // --- Erase trace ---
 
-        public bool EraseTraceEnabled { get; set; }
-        public int EraseTraceCount => eraseTrace.Count;
+        public bool EraseTraceEnabled { get => tracker.EraseTraceEnabled; set => tracker.EraseTraceEnabled = value; }
+        public int EraseTraceCount => tracker.EraseTraceCount;
 
-        public string EraseTraceToString()
-        {
-            var sb = new StringBuilder(eraseTrace.Count * 32);
-            foreach(var entry in eraseTrace)
-            {
-                sb.Append(entry.Item1);
-                sb.Append(':');
-                sb.Append(entry.Item2);
-                sb.Append(':');
-                sb.Append(entry.Item3);
-                sb.Append(':');
-                sb.Append(entry.Item4);
-                sb.Append('\n');
-            }
-            return sb.ToString();
-        }
+        public string EraseTraceToString() => tracker.EraseTraceToString();
 
-        public void EraseTraceClear()
-        {
-            eraseTrace.Clear();
-        }
+        public void EraseTraceClear() => tracker.EraseTraceClear();
 
         // ---------------------------------------------------------------
         // Internals.
@@ -274,10 +228,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         // Generic register storage for unhandled offsets.
         private readonly Dictionary<long, uint> genericStorage = new Dictionary<long, uint>();
-
-        // Trace storage.
-        private readonly List<Tuple<ulong, int, uint>> writeTrace = new List<Tuple<ulong, int, uint>>();
-        private readonly List<Tuple<ulong, long, ulong, int>> eraseTrace = new List<Tuple<ulong, long, ulong, int>>();
 
         // Shadow copy for locality-based write detection.
         private byte[] flashShadow;
@@ -535,9 +485,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // Each PG deactivation = exactly 1 word write on STM32F4.
             if(SkipShadowScan)
             {
-                TotalWordWrites++;
-
-                if(TotalWordWrites == FaultAtWordWrite)
+                if(tracker.IncrementWriteCount())
                 {
                     FaultFired = true;
                     HandleSkipScanFault();
@@ -563,22 +511,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             byte newValue = Flash.ReadBytes(changedOffset, 1)[0];
             byte oldValue = flashShadow[changedOffset];
 
-            TotalWordWrites++;
-
-            if(WriteTraceEnabled)
-            {
-                // Promote to word-aligned entry for trace replay compatibility.
-                int aligned = changedOffset & ~3;
-                // Read the full word from flash (already has the new byte).
-                var wordBytes = Flash.ReadBytes(aligned, 4);
-                uint wordValue = ReadU32(wordBytes, 0);
-                writeTrace.Add(Tuple.Create(TotalWordWrites, aligned, wordValue));
-            }
+            // Promote to word-aligned for trace recording.
+            int aligned = changedOffset & ~3;
+            var wordBytes = Flash.ReadBytes(aligned, 4);
+            uint wordValue = FaultTracker.ReadU32(wordBytes, 0);
 
             // Update shadow to reflect the write.
             flashShadow[changedOffset] = newValue;
 
-            if(TotalWordWrites == FaultAtWordWrite)
+            if(tracker.RecordWriteAndCheckFault(aligned, wordValue))
             {
                 FaultFired = true;
                 LastFaultAddress = (uint)(FlashBaseAddress + changedOffset);
@@ -691,8 +632,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 case 1: // Bit corruption: partial write.
                 {
-                    uint seed = BuildFaultSeed(offset);
-                    byte keepMask = (byte)(NextLcg(ref seed) & 0xFF);
+                    uint seed = tracker.BuildFaultSeed(offset);
+                    byte keepMask = (byte)(FaultTracker.NextLcg(ref seed) & 0xFF);
                     byte bitsToFlip = (byte)(oldValue & ~newValue);
                     byte actuallyFlipped = (byte)(bitsToFlip & keepMask);
                     byte corrupted = (byte)(oldValue & ~actuallyFlipped);
@@ -718,7 +659,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 case 4: // Write-disturb: keep write, corrupt neighbors.
                 {
-                    uint seed = BuildFaultSeed(offset);
+                    uint seed = tracker.BuildFaultSeed(offset);
                     foreach(int nOff in new[] { offset - 1, offset + 1 })
                     {
                         if(nOff < 0 || nOff >= FaultFlashSnapshot.Length)
@@ -726,7 +667,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                             continue;
                         }
                         byte nb = FaultFlashSnapshot[nOff];
-                        byte disturbMask = (byte)(NextLcg(ref seed) & 0x11);
+                        byte disturbMask = (byte)(FaultTracker.NextLcg(ref seed) & 0x11);
                         byte disturbed = (byte)(nb & ~disturbMask);
                         Flash.WriteByte(nOff, disturbed);
                         flashShadow[nOff] = disturbed;
@@ -766,13 +707,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
-            TotalPageErases++;
-            if(EraseTraceEnabled)
-            {
-                eraseTrace.Add(Tuple.Create(TotalPageErases, offset, TotalWordWrites, size));
-            }
-
-            if(TotalPageErases == FaultAtPageErase)
+            if(tracker.RecordEraseAndCheckFault(offset, size))
             {
                 EraseFaultFired = true;
                 LastFaultAddress = (uint)(FlashBaseAddress + offset);
@@ -819,7 +754,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // Helpers.
         // ---------------------------------------------------------------
 
-        private void EraseWithFill(MappedMemory flash, long offset, int size)
+        private void EraseWithFill(IMemory flash, long offset, int size)
         {
             if(size <= 0)
             {
@@ -830,30 +765,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 fillData[i] = EraseFill;
             }
-            flash.WriteBytes(offset, fillData);
+            flash.WriteBytes(offset, fillData, 0, fillData.Length);
         }
 
-        private static uint ReadU32(byte[] data, int offset)
-        {
-            return (uint)(data[offset]
-                | (data[offset + 1] << 8)
-                | (data[offset + 2] << 16)
-                | (data[offset + 3] << 24));
-        }
-
-        private uint NextLcg(ref uint seed)
-        {
-            seed = seed * 1103515245 + 12345;
-            return seed;
-        }
-
-        private uint BuildFaultSeed(int offset)
-        {
-            uint seed = CorruptionSeed != 0 ? CorruptionSeed : (uint)TotalWordWrites;
-            seed ^= (uint)offset;
-            seed ^= (uint)(TotalPageErases * 2654435761UL);
-            return seed;
-        }
 
         // ---------------------------------------------------------------
         // Register definitions.

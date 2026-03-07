@@ -8,6 +8,7 @@ description: >
   Stateless XIP bootloader does 0 NVM writes = inherently safe.
 
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 
 bootloader:
   elf: examples/riotboot_standalone/riotboot.elf

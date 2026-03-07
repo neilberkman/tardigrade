@@ -2,6 +2,7 @@ schema_version: 1
 name: naive_bare_copy
 description: "Worst-case naive OTA: direct copy from staging to exec with no validation or recovery. Power loss during copy bricks the device."
 platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
 bootloader:
   elf: examples/vulnerable_ota/firmware.elf
   entry: 0x10000000

@@ -66,12 +66,16 @@ ${RESUME_TRACE_MAX_OPS}        1024
 ${RESUME_TRACE_TIME_SLICE}     0.02
 ${RESUME_TRACE_WALL_TIMEOUT_S}    30
 ${EXTRA_PERIPHERALS}           ${EMPTY}
+${FLASH_BACKEND}               ${EMPTY}
+${TEST_TIMEOUT}                2 minutes
 
 *** Keywords ***
 Load Runtime Scenario
     [Documentation]    Profile-driven runtime scenario: load peripheral, platform, ELF, and seed images.
     Execute Command    include "${ROOT}/peripherals/NVMemoryController.cs"
     Execute Command    include "${ROOT}/peripherals/GenericNvmController.cs"
+    Execute Command    include "${ROOT}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${ROOT}/peripherals/FaultTracker.cs"
     Execute Command    include "${ROOT}/peripherals/NRF52NVMC.cs"
     Execute Command    include "${ROOT}/peripherals/NRF52UARTE.cs"
     Execute Command    include "${ROOT}/peripherals/SimpleCacheController.cs"
@@ -121,6 +125,7 @@ Run Runtime Fault Point
     Run Keyword If    '${SLOT_RECOVERY_SIZE}' != ''    Execute Command    $slot_recovery_size=${SLOT_RECOVERY_SIZE}
     Execute Command    $pre_boot_state_bin="${PRE_BOOT_STATE_BIN}"
     Execute Command    $setup_script="${SETUP_SCRIPT}"
+    Execute Command    $flash_backend="${FLASH_BACKEND}"
     Execute Command    $success_vtor_slot="${SUCCESS_VTOR_SLOT}"
     Execute Command    $success_vector_offset=${SUCCESS_VECTOR_OFFSET}
     Execute Command    $success_pc_slot="${SUCCESS_PC_SLOT}"
@@ -162,5 +167,5 @@ Run Runtime Fault Point
 
 *** Test Cases ***
 Run OTA Fault Point
-    [Timeout]    2 minutes
+    [Timeout]    ${TEST_TIMEOUT}
     Run Runtime Fault Point

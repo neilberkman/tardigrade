@@ -2,6 +2,7 @@ schema_version: 1
 name: naive_copy_small_image
 description: "Naive OTA with reduced fault sweep cap for faster testing. Same vulnerable copy-to-exec behavior, but max_writes_cap is 1000 so campaigns complete quickly."
 platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
 bootloader:
   elf: examples/vulnerable_ota/firmware.elf
   entry: 0x10000000

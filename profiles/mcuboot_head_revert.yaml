@@ -2,6 +2,7 @@ schema_version: 1
 name: mcuboot_head_revert
 description: "MCUboot HEAD (664093d0) swap-using-move revert scenario. Tests whether tail-of-swap power loss during revert causes silent revert failure."
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_head.elf
   entry: 0x00000000

@@ -5,6 +5,7 @@ description: >
   update. This is the real nxboot-style negative control and should expose
   issue points under interrupted update faults.
 platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
 bootloader:
   elf: examples/nxboot_style/bootloader_nxboot_no_recovery.elf
   entry: 0x10000000
