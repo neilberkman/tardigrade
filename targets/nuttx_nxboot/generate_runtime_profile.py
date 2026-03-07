@@ -65,6 +65,7 @@ fault_sweep:
   evaluation_mode: execute
   run_duration: "{run_duration}"
   boot_cycles: {boot_cycles}
+  expected_rollback_at_cycle: 1
 state_probe:
   script: targets/nuttx_nxboot/probe.py
 semantic_assertions:
@@ -82,6 +83,7 @@ invariants:
   - nuttx_nxboot_confirmed_has_recovery
   - nuttx_nxboot_duplicate_update_consumed
   - nuttx_nxboot_unconfirmed_internal_requires_revert
+  - successful_rollback
 expect:
   should_find_issues: false
 """.format(

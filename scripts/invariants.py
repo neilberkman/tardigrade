@@ -335,7 +335,7 @@ def check_multi_boot_converges(
         return
     if status == "unsupported_fast_path_required":
         return
-    if status != "converged":
+    if status not in ("converged", "rollback_converged", "rollback_not_applicable"):
         raise InvariantViolation(
             invariant_name="multi_boot_converges",
             description=(
@@ -351,6 +351,36 @@ def check_multi_boot_converges(
         )
 
 
+def check_successful_rollback(
+    result: FaultResult,
+    multi_boot_analysis: Optional[Dict[str, Any]] = None,
+    **_: Any,
+) -> None:
+    """When rollback is expected, the boot path should reach it in time."""
+    if not isinstance(multi_boot_analysis, dict):
+        return
+    expected_cycle = multi_boot_analysis.get("expected_rollback_at_cycle")
+    if expected_cycle in (None, ""):
+        return
+    if multi_boot_analysis.get("status") == "rollback_converged":
+        return
+    raise InvariantViolation(
+        invariant_name="successful_rollback",
+        description=(
+            "Expected rollback by cycle {!r}, but multi-boot analysis reported "
+            "status={!r} (rollback_cycle={!r}, final_slot={!r}, final_outcome={!r}).".format(
+                expected_cycle,
+                multi_boot_analysis.get("status"),
+                multi_boot_analysis.get("rollback_cycle"),
+                multi_boot_analysis.get("final_slot"),
+                multi_boot_analysis.get("final_outcome"),
+            )
+        ),
+        result=result,
+        details=dict(multi_boot_analysis),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -362,6 +392,7 @@ _ALL_INVARIANTS: List[InvariantFn] = [
     check_no_oob_writes,
     check_slot_integrity,
     check_multi_boot_converges,
+    check_successful_rollback,
 ]
 
 _INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
@@ -371,6 +402,7 @@ _INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
     "no_oob_writes": check_no_oob_writes,
     "slot_integrity": check_slot_integrity,
     "multi_boot_converges": check_multi_boot_converges,
+    "successful_rollback": check_successful_rollback,
 }
 _PROVIDER_CACHE: Dict[str, Dict[str, InvariantFn]] = {}
 

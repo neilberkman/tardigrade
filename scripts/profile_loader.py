@@ -129,7 +129,21 @@ class SuccessCriteria:
 
 
 class FaultSweepConfig:
-    __slots__ = ("mode", "max_writes", "max_writes_cap", "max_step_limit", "run_duration", "fault_types", "evaluation_mode", "sweep_strategy", "hash_bypass_symbols", "progress_stall_timeout_s", "boot_cycles")
+    __slots__ = (
+        "mode",
+        "max_writes",
+        "max_writes_cap",
+        "max_step_limit",
+        "run_duration",
+        "fault_types",
+        "evaluation_mode",
+        "sweep_strategy",
+        "hash_bypass_symbols",
+        "progress_stall_timeout_s",
+        "boot_cycles",
+        "boot_cycle_hook",
+        "expected_rollback_at_cycle",
+    )
 
     def __init__(
         self,
@@ -144,6 +158,8 @@ class FaultSweepConfig:
         hash_bypass_symbols: Optional[List[str]] = None,
         progress_stall_timeout_s: Optional[float] = None,
         boot_cycles: int = 1,
+        boot_cycle_hook: Optional[str] = None,
+        expected_rollback_at_cycle: Optional[int] = None,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -156,6 +172,12 @@ class FaultSweepConfig:
         self.hash_bypass_symbols = hash_bypass_symbols or []
         self.progress_stall_timeout_s = progress_stall_timeout_s
         self.boot_cycles = max(1, int(boot_cycles))
+        self.boot_cycle_hook = str(boot_cycle_hook).strip() if boot_cycle_hook else None
+        self.expected_rollback_at_cycle = (
+            None
+            if expected_rollback_at_cycle is None
+            else max(1, int(expected_rollback_at_cycle))
+        )
 
 
 class StateFuzzerConfig:
@@ -402,6 +424,18 @@ class ProfileConfig:
             "BOOT_CYCLES:{}".format(fs.boot_cycles),
             "RUNTIME_MODE:true",
         ]
+        if fs.boot_cycle_hook:
+            vars_list.append(
+                "BOOT_CYCLE_HOOK:{}".format(
+                    self.resolve_path(repo_root, fs.boot_cycle_hook)
+                )
+            )
+        if fs.expected_rollback_at_cycle is not None:
+            vars_list.append(
+                "EXPECTED_ROLLBACK_AT_CYCLE:{}".format(
+                    fs.expected_rollback_at_cycle
+                )
+            )
 
         # Slot info.
         for slot_name, slot_cfg in mem.slots.items():
@@ -664,6 +698,18 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
     boot_cycles = int(raw.get("boot_cycles", 1))
     if boot_cycles < 1:
         raise ProfileError("fault_sweep.boot_cycles: expected integer >= 1")
+    boot_cycle_hook = raw.get("boot_cycle_hook")
+    if boot_cycle_hook is not None:
+        boot_cycle_hook = str(boot_cycle_hook).strip()
+        if not boot_cycle_hook:
+            raise ProfileError("fault_sweep.boot_cycle_hook: expected non-empty path")
+    expected_rollback_at_cycle = raw.get("expected_rollback_at_cycle")
+    if expected_rollback_at_cycle is not None:
+        expected_rollback_at_cycle = int(expected_rollback_at_cycle)
+        if expected_rollback_at_cycle < 1:
+            raise ProfileError(
+                "fault_sweep.expected_rollback_at_cycle: expected integer >= 1"
+            )
     return FaultSweepConfig(
         mode=raw.get("mode", "runtime"),
         max_writes=raw.get("max_writes", "auto"),
@@ -676,6 +722,8 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         hash_bypass_symbols=hash_bypass,
         progress_stall_timeout_s=stall_timeout,
         boot_cycles=boot_cycles,
+        boot_cycle_hook=boot_cycle_hook,
+        expected_rollback_at_cycle=expected_rollback_at_cycle,
     )
 
 
@@ -1022,6 +1070,8 @@ def main() -> int:
         "fault_sweep_mode": profile.fault_sweep.mode,
         "max_writes": profile.fault_sweep.max_writes,
         "boot_cycles": profile.fault_sweep.boot_cycles,
+        "boot_cycle_hook": profile.fault_sweep.boot_cycle_hook,
+        "expected_rollback_at_cycle": profile.fault_sweep.expected_rollback_at_cycle,
         "state_fuzzer_enabled": profile.state_fuzzer.enabled,
         "expect_should_find_issues": profile.expect.should_find_issues,
         "expect_control_outcome": profile.expect.control_outcome,
