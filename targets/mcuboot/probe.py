@@ -55,7 +55,7 @@ def _magic_state(raw):
 
 
 def _hex_bytes(raw):
-    return "".join("{:02x}".format(b) for b in raw)
+    return "".join(["{:02x}".format(b) for b in raw])
 
 
 def _slot_probe(bus, base, size, align):

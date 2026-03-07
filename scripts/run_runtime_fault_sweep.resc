@@ -394,7 +394,7 @@ def to_py_bytes(raw):
     try:
         return bytes(raw)
     except Exception:
-        return bytes((int(x) & 0xFF) for x in raw)
+        return bytes([int(x) & 0xFF for x in raw])
 
 
 _state_probe_collect = None
@@ -607,7 +607,7 @@ def read_flash_span(start_addr, size, snapshot_bytes=None):
         return to_py_bytes(mram.ReadBytes(rel, max_len))
     if USE_FAST_PATH:
         return to_py_bytes(nvmc.Flash.ReadBytes(rel, max_len))
-    return bytes((as_int(bus.ReadByte(start_addr + i)) & 0xFF) for i in range(max_len))
+    return bytes([as_int(bus.ReadByte(start_addr + i)) & 0xFF for i in range(max_len)])
 
 def region_dump(region_bytes, region_addr):
     import base64
