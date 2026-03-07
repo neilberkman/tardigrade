@@ -1875,6 +1875,7 @@ def run_timed_reset_fault(fault_at):
         cpu_ref,
         label='fp{}_t_p2'.format(fault_at),
         expect_writes=False,
+        zero_writes_is_brick=False,
         wall_timeout=30,
     )
     disarm_vtor_watchpoint()
@@ -2020,6 +2021,7 @@ def run_resume_trace_from_snapshot(snapshot_flash, fault_at, fault_type):
         cpu_ref,
         label='fp{}_resume_trace'.format(fault_at),
         expect_writes=False,
+        zero_writes_is_brick=False,
         stop_on_fault=False,
         wall_timeout=resume_trace_wall_timeout_s,
         time_slice=resume_trace_time_slice,
@@ -2312,6 +2314,7 @@ def run_execute_fault(fault_at, fault_type='w'):
                 cpu_ref,
                 label='fp{}_p2'.format(fault_at),
                 expect_writes=False,
+                zero_writes_is_brick=False,
                 wall_timeout=30,
                 stop_on_fault=False,
             )
@@ -2362,13 +2365,14 @@ def run_execute_fault(fault_at, fault_type='w'):
 
         log('fp={} phase2_step (slow path)'.format(fault_at))
         arm_vtor_watchpoint()
-        phase2_status = run_until_done(
-            cpu_ref,
-            label='fp{}_p2'.format(fault_at),
-            expect_writes=False,
-            wall_timeout=30,
-            stop_on_fault=False,
-        )
+            phase2_status = run_until_done(
+                cpu_ref,
+                label='fp{}_p2'.format(fault_at),
+                expect_writes=False,
+                zero_writes_is_brick=False,
+                wall_timeout=30,
+                stop_on_fault=False,
+            )
         disarm_vtor_watchpoint()
         recovery_writes = get_total_writes()
         phase2_ms = int((_time.time() - phase2_t0) * 1000)
@@ -2568,8 +2572,8 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
 
         log('cascade w={} e={} phase3_step'.format(write_fault_at, erase_fault_at))
         arm_vtor_watchpoint()
-        run_until_done(cpu_ref, label='cascade_w{}_e{}_p3'.format(write_fault_at, erase_fault_at),
-                       expect_writes=False, wall_timeout=30)
+    run_until_done(cpu_ref, label='cascade_w{}_e{}_p3'.format(write_fault_at, erase_fault_at),
+                       expect_writes=False, zero_writes_is_brick=False, wall_timeout=30)
         disarm_vtor_watchpoint()
 
     # Read final state.
@@ -2744,6 +2748,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         cpu_ref,
         label='fp{}_native_replay_p2'.format(fault_at),
         expect_writes=False,
+        zero_writes_is_brick=False,
         wall_timeout=30,
         time_slice='0.05',
     )
@@ -2924,6 +2929,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         cpu_ref,
         label='fp{}_replay_p2'.format(fault_at),
         expect_writes=False,
+        zero_writes_is_brick=False,
         wall_timeout=30,
         time_slice='0.05',
     )

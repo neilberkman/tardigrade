@@ -11,17 +11,17 @@ on:
         description: apache/nuttx-apps ref to build
         required: true
         default: master
-      fault_max_writes:
-        description: Representative fault-point budget
+      fault_budget:
+        description: Target number of fault points to test across the full write range
         required: true
-        default: "2"
+        default: "16"
       renode_url:
         description: Renode archive URL
         required: true
         default: https://builds.renode.io/renode-1.16.1.linux-dotnet.tar.gz
 
 concurrency:
-  group: nuttx-nxboot-real-exploratory-${{ github.event.inputs.nuttx_ref }}-${{ github.event.inputs.nuttx_apps_ref }}-${{ github.event.inputs.fault_max_writes }}-${{ github.event.inputs.renode_url }}
+  group: nuttx-nxboot-real-exploratory-${{ github.event.inputs.nuttx_ref }}-${{ github.event.inputs.nuttx_apps_ref }}-${{ github.event.inputs.fault_budget }}-${{ github.event.inputs.renode_url }}
   cancel-in-progress: true
 
 jobs:
@@ -83,7 +83,7 @@ jobs:
           python3 targets/nuttx_nxboot/generate_runtime_profile.py \
             --build-dir "${RUNNER_TEMP}/nuttx-build" \
             --output-profile "${RUNNER_TEMP}/nuttx-runtime-profile.yaml" \
-            --fault-max-writes "${{ inputs.fault_max_writes }}" \
+            --fault-max-writes auto \
             --boot-cycles 2
 
       - name: Install Renode portable
@@ -100,12 +100,24 @@ jobs:
         run: python3 -m pip install --user pyyaml
 
       - name: Run exploratory audit
+        env:
+          FAULT_BUDGET: ${{ inputs.fault_budget }}
         run: |
+          budget="${FAULT_BUDGET:-16}"
+          step_flag=""
+          if [ "$budget" -gt 0 ] 2>/dev/null; then
+            estimated_writes=196608
+            step=$(( (estimated_writes + budget - 1) / budget ))
+            if [ "$step" -gt 1 ]; then
+              step_flag="--fault-step $step"
+            fi
+          fi
           python3 scripts/audit_bootloader.py \
             --profile "${RUNNER_TEMP}/nuttx-runtime-profile.yaml" \
             --renode-test "${RUNNER_TEMP}/renode/renode-test" \
             --workers 2 \
             --robot-var "TEST_TIMEOUT:10 minutes" \
+            $step_flag \
             --output results/nuttx_nxboot_real_exploratory.json \
             --no-assert-verdict
 
@@ -121,11 +133,14 @@ jobs:
           control = summary.get("control", {})
           issues = int(summary.get("issue_points") or 0)
           bricks = int(summary.get("bricks") or 0)
+          cal = payload.get("calibration", {})
           print("Profile:", payload.get("profile"))
           print("Verdict:", payload.get("verdict"))
+          print("Calibrated writes:", cal.get("writes"))
           print("Points:", summary.get("total_fault_points"))
           print("Issues:", issues)
           print("Bricks:", bricks)
+          print("Brick rate:", summary.get("brick_rate"))
           print("Control outcome:", control.get("boot_outcome"))
           mba = control.get("multi_boot_analysis") or {}
           if mba:
@@ -143,9 +158,11 @@ jobs:
                   fh.write("## Real NuttX nxboot exploratory summary\n")
                   fh.write(f"- Profile: `{payload.get('profile')}`\n")
                   fh.write(f"- Verdict: `{payload.get('verdict')}`\n")
+                  fh.write(f"- Calibrated writes: `{cal.get('writes')}`\n")
                   fh.write(f"- Fault points: `{summary.get('total_fault_points')}`\n")
                   fh.write(f"- Issues: `{issues}`\n")
                   fh.write(f"- Bricks: `{bricks}`\n")
+                  fh.write(f"- Brick rate: `{summary.get('brick_rate')}`\n")
                   fh.write(f"- Control outcome: `{control.get('boot_outcome')}`\n")
                   if mba:
                       fh.write(f"- Control multi-boot: `{mba.get('status')}` / `{mba.get('final_slot')}`\n")
