@@ -444,7 +444,16 @@ def _load_provider_module(provider_path: str) -> Dict[str, InvariantFn]:
         )
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    # Ensure provider modules can resolve `from invariants import ...`
+    scripts_dir = str(Path(__file__).resolve().parent)
+    path_added = scripts_dir not in sys.path
+    if path_added:
+        sys.path.insert(0, scripts_dir)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if path_added and scripts_dir in sys.path:
+            sys.path.remove(scripts_dir)
 
     mapping: Any = None
     if hasattr(module, "register_invariants"):

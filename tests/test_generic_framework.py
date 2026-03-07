@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 from types import SimpleNamespace
 from pathlib import Path
+import sys as pysys
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -19,6 +20,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from audit_bootloader import annotate_result_checks  # noqa: E402
 from profile_loader import load_profile  # noqa: E402
+from invariants import resolve_invariants  # noqa: E402
 from run_scenario import (  # noqa: E402
     _deep_merge,
     apply_replay_to_profile,
@@ -166,6 +168,36 @@ class GenericFrameworkTest(unittest.TestCase):
                 results[0]["invariant_violations"][0]["name"],
                 "external_probe_ok",
             )
+
+    def test_external_invariant_provider_loads_without_scripts_dir_on_sys_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            provider = tempdir / "provider.py"
+            provider.write_text(
+                textwrap.dedent(
+                    """
+                    from invariants import InvariantViolation
+
+                    def check_external_probe(result, **_):
+                        return None
+
+                    INVARIANTS = {"external_probe_ok": check_external_probe}
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            original_path = list(pysys.path)
+            try:
+                pysys.path[:] = [entry for entry in pysys.path if entry != str(SCRIPTS)]
+                resolved = resolve_invariants(
+                    ["external_probe_ok"],
+                    provider_paths=[str(provider)],
+                )
+            finally:
+                pysys.path[:] = original_path
+
+            self.assertEqual(len(resolved), 1)
 
     def test_state_probe_required_paths_become_observation_failures(self) -> None:
         with tempfile.TemporaryDirectory() as td:
