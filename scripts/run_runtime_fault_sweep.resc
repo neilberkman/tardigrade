@@ -546,7 +546,10 @@ def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_si
         vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
         pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
         boot_outcome, boot_slot, signals = evaluate_boot_outcome(
-            vtor_value, pc_value, fault_injected=fault_injected
+            vtor_value,
+            pc_value,
+            fault_injected=fault_injected,
+            enforce_content_criteria=False,
         )
         signals['followup_cycle'] = int(cycle_index)
         signals['phase_followup_stop_reason'] = status.get('reason')
@@ -1127,7 +1130,7 @@ def compute_exec_slot_hash():
         data = b''.join(chunks)
     return hashlib.sha256(data).hexdigest()
 
-def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False):
+def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_content_criteria=True):
     # Shared boot outcome evaluation for all execution modes.
     # Prioritize 'sticky' VTOR captured by watchpoint during the run.
     actual_vtor = vtor_value
@@ -1166,31 +1169,32 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False):
     marker_ok = True
     hash_result = None
     actual_marker_val = 0
-    if success_image_hash:
-        enforce_hash = True
-        if success_image_hash_slot and success_image_hash_slot != 'any':
-            enforce_hash = (boot_slot == success_image_hash_slot)
-        if enforce_hash:
-            actual_hash = compute_exec_slot_hash()
-            if actual_hash == image_exec_sha256:
-                hash_result = 'exec_image'
-            elif actual_hash == image_staging_sha256:
-                hash_result = 'staging_image'
-            elif expected_exec_sha256 and actual_hash == expected_exec_sha256:
-                hash_result = 'expected_image'
+    if enforce_content_criteria:
+        if success_image_hash:
+            enforce_hash = True
+            if success_image_hash_slot and success_image_hash_slot != 'any':
+                enforce_hash = (boot_slot == success_image_hash_slot)
+            if enforce_hash:
+                actual_hash = compute_exec_slot_hash()
+                if actual_hash == image_exec_sha256:
+                    hash_result = 'exec_image'
+                elif actual_hash == image_staging_sha256:
+                    hash_result = 'staging_image'
+                elif expected_exec_sha256 and actual_hash == expected_exec_sha256:
+                    hash_result = 'expected_image'
+                else:
+                    hash_result = 'unknown'
+                # Success = exec slot matches the expected post-operation hash.
+                if expected_exec_sha256:
+                    marker_ok = (actual_hash == expected_exec_sha256)
+                else:
+                    # No expected hash: any known image is success.
+                    marker_ok = (hash_result != 'unknown')
             else:
-                hash_result = 'unknown'
-            # Success = exec slot matches the expected post-operation hash.
-            if expected_exec_sha256:
-                marker_ok = (actual_hash == expected_exec_sha256)
-            else:
-                # No expected hash: any known image is success.
-                marker_ok = (hash_result != 'unknown')
-        else:
-            hash_result = 'skipped'
-    elif success_marker_addr != 0:
-        actual_marker_val = as_int(bus.ReadDoubleWord(success_marker_addr))
-        marker_ok = (actual_marker_val == success_marker_value)
+                hash_result = 'skipped'
+        elif success_marker_addr != 0:
+            actual_marker_val = as_int(bus.ReadDoubleWord(success_marker_addr))
+            marker_ok = (actual_marker_val == success_marker_value)
 
     signals = {
         'vtor': fmt_u32(actual_vtor),
@@ -1212,9 +1216,11 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False):
 
     otadata_expect_ok = True
     otadata_mismatches = []
-    enforce_otadata_expect = bool(success_otadata_expect)
-    if success_otadata_expect_scope == 'control':
-        enforce_otadata_expect = not bool(fault_injected)
+    enforce_otadata_expect = False
+    if enforce_content_criteria:
+        enforce_otadata_expect = bool(success_otadata_expect)
+        if success_otadata_expect_scope == 'control':
+            enforce_otadata_expect = not bool(fault_injected)
 
     if enforce_otadata_expect:
         for key, expected_values in success_otadata_expect.items():
