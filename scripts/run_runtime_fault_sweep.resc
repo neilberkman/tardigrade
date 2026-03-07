@@ -122,6 +122,7 @@ def get_optional_int_var(names, default=None):
 # ---------------------------------------------------------------------------
 USE_FAST_PATH = False
 USE_MRAM_PATH = False
+unsupported_flash_backend = None
 
 try:
     _nvm_ctrl = monitor.Machine['sysbus.nvm_ctrl']
@@ -131,7 +132,16 @@ except:
         _test = _mram_obj.TotalWordWrites  # verify it's a MRAMMemory
         USE_MRAM_PATH = True
     except:
-        USE_FAST_PATH = True
+        try:
+            _nvmc_obj = monitor.Machine['sysbus.nvmc']
+            _test = _nvmc_obj.TotalWordWrites
+            USE_FAST_PATH = True
+        except:
+            try:
+                monitor.Machine['sysbus.flashController']
+                unsupported_flash_backend = 'sysbus.flashController'
+            except:
+                unsupported_flash_backend = 'unknown'
 
 _cached_erase_page = None
 _cached_initial_flash = None
@@ -141,6 +151,12 @@ if USE_MRAM_PATH:
 elif USE_FAST_PATH:
     nvmc = monitor.Machine['sysbus.nvmc']
 else:
+    if unsupported_flash_backend is not None:
+        raise Exception(
+            'Unsupported flash backend: {}. '
+            'This platform does not expose a nvm_ctrl, mram, or nvmc-compatible '
+            'fault-injection peripheral yet.'.format(unsupported_flash_backend)
+        )
     ctrl = monitor.Machine['sysbus.nvm_ctrl']
 
 # Read monitor variables.

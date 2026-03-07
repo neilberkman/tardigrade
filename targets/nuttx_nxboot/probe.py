@@ -71,14 +71,14 @@ def _magic_kind(magic):
     return "other"
 
 
-def _vector_valid(bus, base, header_size, slot_size):
+def _vector_valid(bus, base, header_size, slot_size, sram_start, sram_end):
     img_base = int(base) + int(header_size)
     sp = _read_u32(bus, img_base)
     rv = _read_u32(bus, img_base + 4)
     pc = rv & (~1)
     return (
-        sp >= SRAM_START
-        and sp <= SRAM_END
+        sp >= int(sram_start)
+        and sp <= int(sram_end)
         and (rv & 1) == 1
         and pc >= img_base
         and pc < (int(base) + int(slot_size))
@@ -93,7 +93,7 @@ def _hex_u64(value):
     return "0x{:016X}".format(int(value) & 0xFFFFFFFFFFFFFFFF)
 
 
-def _slot_probe(bus, base, slot_size):
+def _slot_probe(bus, base, slot_size, sram_start, sram_end):
     header = _read_bytes(bus, base, 40)
     magic = struct.unpack_from("<I", header, 0)[0]
     header_size = struct.unpack_from("<H", header, 6)[0]
@@ -117,7 +117,9 @@ def _slot_probe(bus, base, slot_size):
     image_valid = bool(magic_kind in ("external", "internal") and crc_valid)
     vector_valid = False
     if total_image_size <= int(slot_size) and header_size <= int(slot_size):
-        vector_valid = _vector_valid(bus, base, header_size, slot_size)
+        vector_valid = _vector_valid(
+            bus, base, header_size, slot_size, sram_start, sram_end
+        )
     return {
         "base": _hex_u32(base),
         "size": _hex_u32(slot_size),
@@ -182,10 +184,12 @@ def collect_state(bus=None, monitor=None, context=None):
         ("slot_tertiary_size", "slot_recovery_size"),
         secondary_size,
     )
+    sram_start = _get_monitor_int(monitor, ("sram_start",), SRAM_START)
+    sram_end = _get_monitor_int(monitor, ("sram_end",), SRAM_END)
 
-    primary = _slot_probe(bus, primary_base, primary_size)
-    secondary = _slot_probe(bus, secondary_base, secondary_size)
-    tertiary = _slot_probe(bus, tertiary_base, tertiary_size)
+    primary = _slot_probe(bus, primary_base, primary_size, sram_start, sram_end)
+    secondary = _slot_probe(bus, secondary_base, secondary_size, sram_start, sram_end)
+    tertiary = _slot_probe(bus, tertiary_base, tertiary_size, sram_start, sram_end)
 
     update_slot, recovery_slot = _determine_roles(primary, secondary, tertiary)
     update = secondary if update_slot == "secondary" else tertiary
