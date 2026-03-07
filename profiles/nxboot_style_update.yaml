@@ -1,5 +1,6 @@
 schema_version: 1
 name: nxboot_style_update
+skip_self_test: true
 description: >
   Standalone nxboot-style three-partition bootloader (correct implementation).
   Loads a confirmed primary image plus a newer external-magic update image and

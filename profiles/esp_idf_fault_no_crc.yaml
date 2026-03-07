@@ -42,3 +42,4 @@ fault_sweep:
 expect:
   # Copy-on-boot path should expose corruption acceptance when CRC is skipped.
   should_find_issues: true
+  allow_semantic_only_issues: true

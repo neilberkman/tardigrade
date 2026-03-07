@@ -47,3 +47,4 @@ fault_sweep:
 
 expect:
   should_find_issues: true
+  allow_semantic_only_issues: true

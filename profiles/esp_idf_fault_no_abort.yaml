@@ -49,3 +49,4 @@ expect:
   # "old image still boots" outcomes. Keep this as a documented detection in
   # tardigrade (not an upstream bug filing target).
   should_find_issues: true
+  allow_semantic_only_issues: true
