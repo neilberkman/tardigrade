@@ -22,6 +22,7 @@ sys.path.insert(0, str(SCRIPTS))
 from audit_bootloader import (  # noqa: E402
     annotate_result_checks,
     calibration_completed,
+    _run_batch_with_fallback,
     _run_batches_chunked,
     prepare_renode_command,
     run_batch,
@@ -640,6 +641,113 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertIn("worker 0 sub-batching 5 points into 3 chunks", output)
             self.assertIn("worker 0 chunk 1/3 start: 2 points (faults 1..2)", output)
             self.assertIn("worker 0 chunk 3/3 complete: 1 results", output)
+
+    def test_run_batch_with_fallback_splits_before_singles(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: split_fallback_profile
+                description: progress
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            calls = []
+
+            def fake_run_batch(**kwargs):
+                points = kwargs["fault_points"]
+                calls.append(list(points))
+                if len(points) > 2:
+                    raise RuntimeError("batch timeout")
+                return [{"fault_at": fp, "boot_outcome": "success"} for fp in points]
+
+            with mock.patch("audit_bootloader.run_batch", side_effect=fake_run_batch):
+                results = _run_batch_with_fallback(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    fault_points=[1, 2, 3, 4],
+                    robot_vars=[],
+                    work_dir=tempdir / "work",
+                    renode_remote_server_dir="",
+                    keep_run_artifacts=False,
+                )
+
+            self.assertEqual([1, 2, 3, 4], calls[0])
+            self.assertEqual(calls[1:], [[1, 2], [3, 4]])
+            self.assertEqual(len(results), 4)
+
+    def test_run_batch_with_fallback_reaches_single_points_only_if_needed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: split_to_single_profile
+                description: progress
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            calls = []
+
+            def fake_run_batch(**kwargs):
+                points = kwargs["fault_points"]
+                calls.append(list(points))
+                if len(points) > 1:
+                    raise RuntimeError("batch timeout")
+                return [{"fault_at": points[0], "boot_outcome": "success"}]
+
+            with mock.patch("audit_bootloader.run_batch", side_effect=fake_run_batch):
+                results = _run_batch_with_fallback(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    fault_points=[7, 8],
+                    robot_vars=[],
+                    work_dir=tempdir / "work",
+                    renode_remote_server_dir="",
+                    keep_run_artifacts=False,
+                )
+
+            self.assertEqual(calls, [[7, 8], [7], [8]])
+            self.assertEqual(len(results), 2)
 
     def test_run_batch_prunes_robot_artifacts_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -677,9 +677,9 @@ def _run_batch_with_fallback(
     fault_types_list: Optional[List[str]] = None,
     keep_run_artifacts: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Run one batch; on failure retry each point in separate Renode sessions."""
+    """Run one batch; on failure recursively retry smaller sub-batches."""
     try:
-        return run_batch(
+        results = run_batch(
             repo_root=repo_root,
             renode_test=renode_test,
             robot_suite=robot_suite,
@@ -695,35 +695,65 @@ def _run_batch_with_fallback(
             fault_types_list=fault_types_list,
             keep_run_artifacts=keep_run_artifacts,
         )
+        if len(fault_points) == 1:
+            _progress("Fallback point {} complete.".format(fault_points[0]))
+        return results
     except Exception as exc:
-        _progress("Batch run failed; retrying per-point Renode sessions. {}".format(exc))
+        if len(fault_points) <= 1:
+            raise
+        mid = max(1, len(fault_points) // 2)
+        left_points = fault_points[:mid]
+        right_points = fault_points[mid:]
+        left_types = fault_types_list[:mid] if fault_types_list else None
+        right_types = fault_types_list[mid:] if fault_types_list else None
+        _progress(
+            "Batch run failed; retrying smaller sub-batches ({} -> {} + {}). {}".format(
+                len(fault_points), len(left_points), len(right_points), exc
+            )
+        )
         results: List[Dict[str, Any]] = []
         fallback_root = work_dir / "batch_fallback"
         fallback_root.mkdir(parents=True, exist_ok=True)
-        for idx, fp in enumerate(fault_points):
-            point_fault_types: Optional[List[str]] = None
-            if fault_types_list and idx < len(fault_types_list):
-                point_fault_types = [fault_types_list[idx]]
-            point_results = run_batch(
-                repo_root=repo_root,
-                renode_test=renode_test,
-                robot_suite=robot_suite,
-                profile=profile,
-                fault_points=[fp],
-                robot_vars=robot_vars,
-                work_dir=fallback_root / "fp_{:07d}".format(fp),
-                renode_remote_server_dir=renode_remote_server_dir,
-                trace_file=trace_file,
-                erase_trace_file=erase_trace_file,
-                trace_file_bin=trace_file_bin,
-                erase_trace_file_bin=erase_trace_file_bin,
-                fault_types_list=point_fault_types,
-                keep_run_artifacts=keep_run_artifacts,
+        if left_points:
+            results.extend(
+                _run_batch_with_fallback(
+                    repo_root=repo_root,
+                    renode_test=renode_test,
+                    robot_suite=robot_suite,
+                    profile=profile,
+                    fault_points=left_points,
+                    robot_vars=robot_vars,
+                    work_dir=fallback_root / "chunk_{:07d}_{:07d}".format(
+                        left_points[0], left_points[-1]
+                    ),
+                    renode_remote_server_dir=renode_remote_server_dir,
+                    trace_file=trace_file,
+                    erase_trace_file=erase_trace_file,
+                    trace_file_bin=trace_file_bin,
+                    erase_trace_file_bin=erase_trace_file_bin,
+                    fault_types_list=left_types,
+                    keep_run_artifacts=keep_run_artifacts,
+                )
             )
-            results.extend(point_results)
-            _progress(
-                "Fallback point {} complete ({}/{})".format(
-                    fp, idx + 1, len(fault_points)
+        if right_points:
+            results.extend(
+                _run_batch_with_fallback(
+                    repo_root=repo_root,
+                    renode_test=renode_test,
+                    robot_suite=robot_suite,
+                    profile=profile,
+                    fault_points=right_points,
+                    robot_vars=robot_vars,
+                    work_dir=fallback_root / "chunk_{:07d}_{:07d}".format(
+                        right_points[0], right_points[-1]
+                    ),
+                    renode_remote_server_dir=renode_remote_server_dir,
+                    trace_file=trace_file,
+                    erase_trace_file=erase_trace_file,
+                    trace_file_bin=trace_file_bin,
+                    erase_trace_file_bin=erase_trace_file_bin,
+                    fault_types_list=right_types,
+                    keep_run_artifacts=keep_run_artifacts,
                 )
             )
         return results
