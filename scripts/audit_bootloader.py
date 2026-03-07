@@ -356,12 +356,14 @@ def run_single_point(
     renode_config = work_dir / "renode.config"
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
+    point_fault_at = -1 if is_control else fault_at
+
     cmd = [
         renode_test,
         "--renode-config", str(renode_config),
         robot_suite,
         "--results-dir", str(rf_results),
-        "--variable", "FAULT_AT:{}".format(fault_at),
+        "--variable", "FAULT_AT:{}".format(point_fault_at),
         "--variable", "RESULT_FILE:{}".format(result_file),
         "--variable", "CALIBRATION_MODE:{}".format("true" if calibration else "false"),
     ]

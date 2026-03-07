@@ -118,7 +118,8 @@ def get_optional_int_var(names, default=None):
 # Auto-detect platform path:
 #   slow  = NVMemory (sysbus.nvm_ctrl)
 #   mram  = MRAMMemory (sysbus.mram) — non-volatile with built-in fault injection
-#   fast  = MappedMemory + NVMC (sysbus.nvmc)
+#   fast  = controller exposing the tardigrade fast-path API
+#           (sysbus.nvmc or sysbus.flashController)
 # ---------------------------------------------------------------------------
 USE_FAST_PATH = False
 USE_MRAM_PATH = False
@@ -138,10 +139,15 @@ except:
             USE_FAST_PATH = True
         except:
             try:
-                monitor.Machine['sysbus.flashController']
-                unsupported_flash_backend = 'sysbus.flashController'
+                _flash_ctrl_obj = monitor.Machine['sysbus.flashController']
+                _test = _flash_ctrl_obj.TotalWordWrites
+                USE_FAST_PATH = True
             except:
-                unsupported_flash_backend = 'unknown'
+                try:
+                    monitor.Machine['sysbus.flashController']
+                    unsupported_flash_backend = 'sysbus.flashController'
+                except:
+                    unsupported_flash_backend = 'unknown'
 
 _cached_erase_page = None
 _cached_initial_flash = None
@@ -149,7 +155,10 @@ _cached_initial_flash = None
 if USE_MRAM_PATH:
     mram = monitor.Machine['sysbus.mram']
 elif USE_FAST_PATH:
-    nvmc = monitor.Machine['sysbus.nvmc']
+    try:
+        nvmc = monitor.Machine['sysbus.nvmc']
+    except:
+        nvmc = monitor.Machine['sysbus.flashController']
 else:
     if unsupported_flash_backend is not None:
         raise Exception(
@@ -1013,6 +1022,39 @@ def apply_pre_boot_state():
             bus.WriteDoubleWord(addr, val)
     if setup_script:
         monitor.Parse('include @' + setup_script)
+    # Some Cortex-M platforms do not reliably restore SP/PC from the loaded
+    # bootloader image after machine Reset. Re-prime the core from the vector
+    # table so execution starts from the bootloader entry on the next RunFor.
+    try:
+        initial_sp = as_int(bus.ReadDoubleWord(int(bootloader_entry)))
+        initial_pc = as_int(bus.ReadDoubleWord(int(bootloader_entry) + 4))
+        cpu_ref = monitor.Machine['sysbus.cpu']
+        for cpu_name in ('cpu', 'sysbus.cpu'):
+            try:
+                monitor.Parse('{} VectorTableOffset 0x{:08X}'.format(cpu_name, int(bootloader_entry)))
+                if initial_sp != 0:
+                    monitor.Parse('{} SP 0x{:08X}'.format(cpu_name, initial_sp))
+                if initial_pc != 0:
+                    monitor.Parse('{} PC 0x{:08X}'.format(cpu_name, initial_pc))
+                break
+            except Exception:
+                continue
+        try:
+            cpu_ref.IsHalted = False
+        except Exception:
+            pass
+        try:
+            log('prime_boot: entry={} sp={} pc={} cpu_pc={} vtor={}'.format(
+                fmt_u32(int(bootloader_entry)),
+                fmt_u32(initial_sp),
+                fmt_u32(initial_pc),
+                fmt_u32(as_int(cpu_ref.GetRegisterUnsafe(15))),
+                fmt_u32(as_int(bus.ReadDoubleWord(0xE000ED08))),
+            ))
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 def restore_hw_init():
     # Restore hardware init values cleared by machine Reset.
@@ -1870,6 +1912,89 @@ def run_execute_fault(fault_at, fault_type='w'):
         return run_timed_reset_fault(fault_at)
 
     cpu_ref = monitor.Machine['sysbus.cpu']
+    if int(fault_at) < 0:
+        fp_t0 = _time.time()
+        phase1_ms = 0
+        phase1_status = None
+
+        log('control phase1_setup')
+        monitor.Parse('machine Pause')
+        cpu_ref.IsHalted = False
+        monitor.Parse('machine Reset')
+        reload_images()
+        apply_pre_boot_state()
+        if _hash_bypass_active:
+            apply_hash_bypass()
+
+        reset_nvmc_for_recovery()
+        disarm_fault()
+
+        arm_vtor_watchpoint()
+        p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
+        phase1_status = run_until_done(
+            cpu_ref,
+            label='control_p1',
+            stop_on_fault=False,
+            wall_timeout=p1_wall_timeout,
+        )
+        disarm_vtor_watchpoint()
+        phase1_ms = int((_time.time() - fp_t0) * 1000)
+
+        actual_writes = get_total_writes()
+        vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+        pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+        boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+            vtor_value, pc_value, fault_injected=False
+        )
+        signals['phase1_ms'] = phase1_ms
+        signals['phase2_ms'] = 0
+        signals['phase1_ops_total'] = actual_writes
+        signals['trace_replay_mode'] = 'execute'
+        if phase1_status is not None:
+            signals['phase1_stop_reason'] = phase1_status.get('reason')
+            signals['phase1_emulated_s'] = phase1_status.get('emulated_s')
+
+        semantic_state = collect_semantic_state({
+            'cycle': 0,
+            'boot_outcome': boot_outcome,
+            'boot_slot': boot_slot,
+            'signals': signals,
+            'fault_injected': False,
+            'stage': 'post_boot',
+        })
+        fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
+        boot_cycle_records, multi_boot_analysis = run_followup_boot_cycles(
+            boot_outcome,
+            boot_slot,
+            signals,
+            initial_status=phase1_status,
+            fault_injected=False,
+            label='control_followup',
+        )
+
+        result = {
+            'fault_at': fault_at,
+            'fault_requested': fault_at,
+            'fault_type': 'control',
+            'fault_injected': False,
+            'fault_address': '0x00000000',
+            'boot_outcome': boot_outcome,
+            'boot_slot': boot_slot,
+            'fault_class': fault_class,
+            'actual_writes': actual_writes,
+            'signals': signals,
+        }
+        if semantic_state is not None:
+            result['semantic_state'] = semantic_state
+        if boot_cycle_records is not None:
+            result['boot_cycles'] = boot_cycle_records
+            result['multi_boot_analysis'] = multi_boot_analysis
+        if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
+            result['postmortem_partition_dump'] = build_postmortem_partition_dump(
+                source='live_flash',
+            )
+        return result
+
     fp_t0 = _time.time()
     phase1_ms = 0
     phase2_ms = 0
