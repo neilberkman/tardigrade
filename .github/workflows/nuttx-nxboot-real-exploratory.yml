@@ -33,6 +33,7 @@ jobs:
       TOOLCHAIN_URL: https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v13.2.1-1.1/xpack-arm-none-eabi-gcc-13.2.1-1.1-linux-x64.tar.gz
       TOOLCHAIN_SHA256: 1252a8cafe9237de27a765376697230368eec21db44dc3f1edeb8d838dabd530
       RENODE_URL: ${{ inputs.renode_url }}
+      OTA_RENODE_POINT_TIMEOUT_S: "900"
       PYTHONUNBUFFERED: "1"
 
     steps:
