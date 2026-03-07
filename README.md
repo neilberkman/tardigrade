@@ -252,6 +252,8 @@ Public examples:
 - [`scenarios/nxboot_style_exploratory.yaml`](scenarios/nxboot_style_exploratory.yaml) is a standalone modeled-family exercise for the generic scenario/probe/invariant surfaces. It is useful as a public adapter example, but it should not be read as a validated upstream `nxboot`/NuttX canary yet.
 - [`targets/nuttx_nxboot/`](targets/nuttx_nxboot) is the start of the real upstream NuttX `nxboot` adapter. It is scaffolded and unit-tested, with the next steps captured in [`docs/nuttx_nxboot_plan.md`](docs/nuttx_nxboot_plan.md), but it is not wired to a public workflow yet.
 
+Current public direction and backlog are tracked in [`docs/public_roadmap.md`](docs/public_roadmap.md).
+
 Replay specs are generic override bundles, suitable for counterexamples from CBMC or any other model checker:
 
 ```yaml
