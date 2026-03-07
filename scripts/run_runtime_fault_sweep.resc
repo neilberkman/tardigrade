@@ -49,6 +49,8 @@ $success_marker_value?=0
 $write_granularity?=8
 $image_staging_path?=""
 $image_exec_path?=""
+$image_tertiary_path?=""
+$image_recovery_path?=""
 $trace_file?=""
 $erase_trace_file?=""
 $trace_file_bin?=""
@@ -88,6 +90,29 @@ def log(msg):
     sys.stderr.flush()
 
 bus = monitor.Machine.SystemBus
+
+def get_optional_var(name, default=''):
+    try:
+        value = monitor.GetVariable(name)
+    except Exception:
+        return default
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+def get_optional_int_var(names, default=None):
+    if not isinstance(names, (list, tuple)):
+        names = (names,)
+    for name in names:
+        raw = get_optional_var(name, '')
+        if not raw:
+            continue
+        try:
+            return int(raw, 0)
+        except Exception:
+            continue
+    return default
 
 # ---------------------------------------------------------------------------
 # Auto-detect platform path:
@@ -205,6 +230,10 @@ slot_exec_base = int(str(monitor.GetVariable('slot_exec_base')), 0)
 slot_exec_size = int(str(monitor.GetVariable('slot_exec_size')), 0)
 slot_staging_base = int(str(monitor.GetVariable('slot_staging_base')), 0)
 slot_staging_size = int(str(monitor.GetVariable('slot_staging_size')), 0)
+slot_tertiary_base = get_optional_int_var('slot_tertiary_base', None)
+slot_tertiary_size = get_optional_int_var('slot_tertiary_size', None)
+slot_recovery_base = get_optional_int_var('slot_recovery_base', None)
+slot_recovery_size = get_optional_int_var('slot_recovery_size', None)
 sram_start = int(str(monitor.GetVariable('sram_start')), 0)
 sram_end = int(str(monitor.GetVariable('sram_end')), 0)
 bootloader_entry = int(str(monitor.GetVariable('bootloader_entry')), 0)
@@ -214,6 +243,8 @@ write_granularity = int(str(monitor.GetVariable('write_granularity')).strip())
 # Image paths for reload between batch iterations.
 image_staging_path = str(monitor.GetVariable('image_staging_path')).strip()
 image_exec_path = str(monitor.GetVariable('image_exec_path')).strip()
+image_tertiary_path = get_optional_var('image_tertiary_path', '')
+image_recovery_path = get_optional_var('image_recovery_path', '')
 
 # Success criteria.
 success_vtor_slot = str(monitor.GetVariable('success_vtor_slot')).strip()
@@ -276,6 +307,16 @@ slot_ranges = {
     'exec': (slot_exec_base, slot_exec_base + slot_exec_size),
     'staging': (slot_staging_base, slot_staging_base + slot_staging_size),
 }
+if slot_tertiary_base is not None and slot_tertiary_size is not None:
+    slot_ranges['tertiary'] = (
+        slot_tertiary_base,
+        slot_tertiary_base + slot_tertiary_size,
+    )
+if slot_recovery_base is not None and slot_recovery_size is not None:
+    slot_ranges['recovery'] = (
+        slot_recovery_base,
+        slot_recovery_base + slot_recovery_size,
+    )
 
 # Sticky state for VTOR detection during execute runs.
 sticky_vtor = {'value': 0, 'slot': None, 'captured': False}
@@ -588,11 +629,22 @@ def effective_page_size():
     return 4096
 
 def flash_geometry():
+    slot_bases = [int(slot_exec_base), int(slot_staging_base)]
+    slot_ends = [
+        int(slot_exec_base) + int(slot_exec_size),
+        int(slot_staging_base) + int(slot_staging_size),
+    ]
+    if slot_tertiary_base is not None and slot_tertiary_size is not None:
+        slot_bases.append(int(slot_tertiary_base))
+        slot_ends.append(int(slot_tertiary_base) + int(slot_tertiary_size))
+    if slot_recovery_base is not None and slot_recovery_size is not None:
+        slot_bases.append(int(slot_recovery_base))
+        slot_ends.append(int(slot_recovery_base) + int(slot_recovery_size))
     if USE_MRAM_PATH:
         # Derive MRAM bus base by aligning lowest slot address down to
         # MRAM size boundary (MRAM size is always a power of two).
         mram_size = int(mram.Size)
-        lowest_slot = min(int(slot_exec_base), int(slot_staging_base))
+        lowest_slot = min(slot_bases)
         base = lowest_slot & ~(mram_size - 1)
         return base, mram_size
     if USE_FAST_PATH:
@@ -600,7 +652,9 @@ def flash_geometry():
     try:
         return int(slot_exec_base), int(ctrl.Nvm.Size)
     except Exception:
-        return int(slot_exec_base), int(slot_exec_size + slot_staging_size)
+        flash_base = min(slot_bases)
+        flash_end = max(slot_ends)
+        return flash_base, flash_end - flash_base
 
 def read_flash_span(start_addr, size, snapshot_bytes=None):
     if size <= 0:
@@ -743,14 +797,19 @@ def build_slot_partition_dump(slot_name, slot_base, slot_size, snapshot_bytes=No
     }
 
 def build_postmortem_partition_dump(snapshot_bytes=None, source='live_flash'):
+    slots_dump = {}
+    for slot_name, (slot_base, slot_end) in slot_ranges.items():
+        slots_dump[slot_name] = build_slot_partition_dump(
+            slot_name,
+            slot_base,
+            slot_end - slot_base,
+            snapshot_bytes=snapshot_bytes,
+        )
     return {
         'source': source,
         'header_region_bytes': postmortem_dump_header_bytes,
         'sector_size': effective_page_size(),
-        'slots': {
-            'exec': build_slot_partition_dump('exec', slot_exec_base, slot_exec_size, snapshot_bytes=snapshot_bytes),
-            'staging': build_slot_partition_dump('staging', slot_staging_base, slot_staging_size, snapshot_bytes=snapshot_bytes),
-        },
+        'slots': slots_dump,
     }
 
 def parse_otadata_expect(raw):
@@ -1083,6 +1142,10 @@ def reload_images():
         bus.LoadBinary(image_staging_path, slot_staging_base)
     if image_exec_path:
         bus.LoadBinary(image_exec_path, slot_exec_base)
+    if image_tertiary_path and slot_tertiary_base is not None:
+        bus.LoadBinary(image_tertiary_path, slot_tertiary_base)
+    if image_recovery_path and slot_recovery_base is not None:
+        bus.LoadBinary(image_recovery_path, slot_recovery_base)
 
 def cache_initial_flash():
     # Snapshot flash after reload_images + apply_pre_boot_state so subsequent
