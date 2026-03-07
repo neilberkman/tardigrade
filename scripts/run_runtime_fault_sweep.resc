@@ -167,6 +167,7 @@ _cached_erase_page = None
 _cached_initial_flash = None
 _cached_phase1_snapshot_path = None
 _cached_recovery_snapshot_path = None
+_machine_selector = '0'
 
 if USE_MRAM_PATH:
     mram = _backend_obj
@@ -1154,6 +1155,7 @@ def save_machine_snapshot(path):
 
 def load_machine_snapshot(path):
     monitor.Parse('Load @{}'.format(path))
+    monitor.Parse('mach set {}'.format(_machine_selector))
     refresh_runtime_handles()
 
 
