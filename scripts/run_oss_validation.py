@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Run OSS validation profiles: read manifest, iterate fault points, check expectations."""
+"""Run OSS validation profiles: read manifest, iterate fault points, check expectations.
+
+Internal orchestrator for the oss-validation.yml GitHub workflow.
+Not intended as a user-facing CLI -- use audit_bootloader.py for direct profile runs.
+"""
 
 from __future__ import annotations
 
