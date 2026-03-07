@@ -7,6 +7,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +18,7 @@ sys.path.insert(0, str(SCRIPTS))
 from examples.nxboot_style.gen_nxboot_images import wrap_nxboot_image  # noqa: E402
 from targets.nuttx_nxboot.build_public_target import (  # noqa: E402
     build_env,
+    ensure_host_tools,
     normalize_generated_config,
     package_images,
     patch_cmakelists,
@@ -155,6 +157,11 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             self.assertEqual(Path(env["PATH"].split(":")[0]), tools_dir.resolve())
         finally:
             shutil.rmtree(temp_dir)
+
+    def test_ensure_host_tools_requires_kconfig_tweak(self) -> None:
+        with mock.patch("targets.nuttx_nxboot.build_public_target.shutil.which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "kconfig-tweak"):
+                ensure_host_tools()
 
     def test_render_runtime_profile_builds_real_nuttx_shape(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_profile_"))

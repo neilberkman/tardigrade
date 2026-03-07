@@ -309,12 +309,21 @@ def build_env(nuttx_root: Path) -> dict[str, str]:
     return env
 
 
+def ensure_host_tools() -> None:
+    if shutil.which("kconfig-tweak") is None:
+        raise RuntimeError(
+            "kconfig-tweak not found on PATH; install kconfig-frontends or provide "
+            "kconfig-tweak before building NuttX."
+        )
+
+
 def _run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
     subprocess.run(cmd, cwd=cwd, check=True, env=env)
 
 
 def build_variant(nuttx_root: Path, apps_root: Path, variant: str, jobs: int) -> None:
     apps_arg = os.path.relpath(apps_root, nuttx_root)
+    ensure_host_tools()
     env = build_env(nuttx_root)
     _run(
         [
