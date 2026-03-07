@@ -122,34 +122,57 @@ def get_optional_int_var(names, default=None):
 # ---------------------------------------------------------------------------
 USE_FAST_PATH = False
 USE_MRAM_PATH = False
+_fast_backend_name = None
+_mram_backend_name = None
+_slow_backend_name = None
+
+def _lookup_machine_peripheral(candidates):
+    for name in candidates:
+        try:
+            return name, monitor.Machine[name]
+        except:
+            pass
+    return None, None
 
 try:
-    _nvm_ctrl = monitor.Machine['sysbus.nvm_ctrl']
+    _slow_backend_name, _nvm_ctrl = _lookup_machine_peripheral(['sysbus.nvm_ctrl', 'nvm_ctrl'])
+    if _nvm_ctrl is None:
+        raise Exception('nvm controller not present')
 except:
     try:
-        _mram_obj = monitor.Machine['sysbus.mram']
+        _mram_backend_name, _mram_obj = _lookup_machine_peripheral(['sysbus.mram', 'mram'])
+        if _mram_obj is None:
+            raise Exception('mram controller not present')
         _test = _mram_obj.TotalWordWrites
         USE_MRAM_PATH = True
     except:
         try:
-            _ff_obj = monitor.Machine['sysbus.faultFlash']
+            _fast_backend_name, _ff_obj = _lookup_machine_peripheral([
+                'sysbus.faultFlash',
+                'faultFlash',
+                'sysbus.flashController',
+                'flashController',
+            ])
+            if _ff_obj is None:
+                raise Exception('fault-injectable flash controller not present')
             _test = _ff_obj.TotalWordWrites
             USE_FAST_PATH = True
         except:
             raise Exception(
                 'No supported flash backend found. '
-                'Expected sysbus.faultFlash, sysbus.mram, or sysbus.nvm_ctrl.'
+                'Expected sysbus.faultFlash/faultFlash, sysbus.flashController/flashController, '
+                'sysbus.mram/mram, or sysbus.nvm_ctrl/nvm_ctrl.'
             )
 
 _cached_erase_page = None
 _cached_initial_flash = None
 
 if USE_MRAM_PATH:
-    mram = monitor.Machine['sysbus.mram']
+    mram = monitor.Machine[_mram_backend_name]
 elif USE_FAST_PATH:
-    faultFlash = monitor.Machine['sysbus.faultFlash']
+    faultFlash = monitor.Machine[_fast_backend_name]
 else:
-    ctrl = monitor.Machine['sysbus.nvm_ctrl']
+    ctrl = monitor.Machine[_slow_backend_name]
 
 # Read monitor variables.
 result_file = str(monitor.GetVariable('result_file'))
