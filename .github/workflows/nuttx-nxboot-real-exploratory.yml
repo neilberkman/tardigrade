@@ -63,11 +63,20 @@ jobs:
 
       - name: Build real NuttX nxboot target
         run: |
-          python3 targets/nuttx_nxboot/build_public_target.py \
+          set -euo pipefail
+          build_log="${RUNNER_TEMP}/nuttx-build.log"
+          if python3 targets/nuttx_nxboot/build_public_target.py \
             --nuttx-root "${RUNNER_TEMP}/nuttx" \
             --apps-root "${RUNNER_TEMP}/nuttx-apps" \
             --output-dir "${RUNNER_TEMP}/nuttx-build" \
-            --jobs 8
+            --jobs 8 >"${build_log}" 2>&1; then
+            echo "NuttX build completed. Showing final log tail:"
+            tail -40 "${build_log}"
+          else
+            echo "::error::NuttX build failed. Showing final log tail:"
+            tail -200 "${build_log}"
+            exit 1
+          fi
 
       - name: Generate runtime profile
         run: |
@@ -151,3 +160,4 @@ jobs:
           path: |
             results/nuttx_nxboot_real_exploratory.json
             ${{ runner.temp }}/nuttx-runtime-profile.yaml
+            ${{ runner.temp }}/nuttx-build.log
