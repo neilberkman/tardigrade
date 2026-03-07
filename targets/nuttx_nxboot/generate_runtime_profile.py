@@ -23,6 +23,7 @@ def render_runtime_profile(
     header_size: int = 0x400,
     fault_max_writes: int = 2048,
     boot_cycles: int = 2,
+    run_duration: str = "8.0",
     name: str = "nuttx_nxboot_real_update",
 ) -> str:
     build_dir = build_dir.resolve()
@@ -61,6 +62,7 @@ fault_sweep:
   mode: runtime
   max_writes: {fault_max_writes}
   evaluation_mode: execute
+  run_duration: "{run_duration}"
   boot_cycles: {boot_cycles}
 state_probe:
   script: targets/nuttx_nxboot/probe.py
@@ -97,6 +99,7 @@ expect:
         header_size=int(header_size),
         fault_max_writes=int(fault_max_writes),
         boot_cycles=max(1, int(boot_cycles)),
+        run_duration=str(run_duration),
     )
 
 
@@ -107,6 +110,7 @@ def main() -> int:
     parser.add_argument("--header-size", type=lambda x: int(x, 0), default=0x400)
     parser.add_argument("--fault-max-writes", type=int, default=2048)
     parser.add_argument("--boot-cycles", type=int, default=2)
+    parser.add_argument("--run-duration", default="8.0")
     parser.add_argument("--name", default="nuttx_nxboot_real_update")
     args = parser.parse_args()
 
@@ -115,6 +119,7 @@ def main() -> int:
         header_size=args.header_size,
         fault_max_writes=args.fault_max_writes,
         boot_cycles=args.boot_cycles,
+        run_duration=args.run_duration,
         name=args.name,
     )
     args.output_profile.parent.mkdir(parents=True, exist_ok=True)
