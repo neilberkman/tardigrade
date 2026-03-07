@@ -50,6 +50,12 @@ steps:
       - path: steps.update_correct.report.summary.runtime_sweep.control.issue_count
         op: equals
         value: 0
+      - path: steps.update_correct.report.summary.runtime_sweep.issue_points
+        op: equals
+        value: 0
+      - path: steps.update_correct.report.summary.runtime_sweep.bricks
+        op: equals
+        value: 0
       - path: steps.update_correct.report.summary.runtime_sweep.control.semantic_state.roles.next_boot
         op: equals
         value: none

@@ -139,7 +139,7 @@ Six architectures, from worst-case patterns to hardened OSS boot flows:
 | -------------- | ----------------------------------- | --------------------------------------------- | -------------------------------------------- |
 | `naive_copy`   | Copy staging to exec, no fallback   | catastrophic boot-visible failures            | Any mid-copy fault bricks; no recovery path  |
 | `vulnerable`   | Copy-in-place with pending flag     | frequent boot-visible failures                | Overwrites only image; mid-copy fault bricks |
-| `nxboot_style` | Three-partition copy, CRC, recovery | mostly semantic/invariant issues when broken  | Recovery slot enables revert on corruption   |
+| `nxboot_style` | Three-partition copy, CRC, recovery | standalone modeled family; still experimental | Useful target-adapter exercise, not upstream validation yet |
 | `esp_idf`      | Dual otadata CRC + rollback FSM     | platform/profile dependent                    | Clean-room model of ESP-IDF OTA selection    |
 | `mcuboot`      | Swap-move / swap-scratch on nRF52   | profile dependent, good public validation set | Real MCUboot ELFs from upstream CI           |
 | `riotboot`     | Slot selection via header metadata  | profile dependent                             | Standalone RIOTboot model                    |
@@ -249,7 +249,7 @@ In practice, the repo exposes two complementary public surfaces:
 Public examples:
 
 - [`scenarios/mcuboot_head_exploratory.yaml`](scenarios/mcuboot_head_exploratory.yaml) attaches a target-side probe and invariant provider to the public `mcuboot_head_upgrade` and `mcuboot_head_revert` profiles, then checks both paths through the generic scenario runner.
-- [`scenarios/nxboot_style_exploratory.yaml`](scenarios/nxboot_style_exploratory.yaml) does the same for the public `nxboot_style_update` and `nxboot_style_no_recovery` profiles, giving a second OSS target-side adapter example without changing the core engine.
+- [`scenarios/nxboot_style_exploratory.yaml`](scenarios/nxboot_style_exploratory.yaml) is a standalone modeled-family exercise for the generic scenario/probe/invariant surfaces. It is useful as a public adapter example, but it should not be read as a validated upstream `nxboot`/NuttX canary yet.
 
 Replay specs are generic override bundles, suitable for counterexamples from CBMC or any other model checker:
 
@@ -317,7 +317,7 @@ Per-point diagnostics are attached only when relevant:
 | `action-validation.yml`    | push, PR                       | Validates the reusable GitHub Action                        |
 | `oss-validation.yml`       | push to `main`, schedule, manual | Runs selected OSS validation guards                         |
 | `mcuboot-head-exploratory.yml` | workflow_dispatch          | Runs the public MCUboot exploratory scenario via `run_scenario.py` |
-| `nxboot-style-exploratory.yml` | workflow_dispatch         | Builds the nxboot-style example and runs the public exploratory scenario |
+| `nxboot-style-exploratory.yml` | workflow_dispatch         | Builds the standalone `nxboot_style` model and runs its experimental exploratory scenario |
 | `renode-latest-canary.yml` | schedule, workflow_dispatch    | Tests against latest Renode build                           |
 
 ## Repository layout
@@ -355,7 +355,7 @@ tardigrade/
 │       └── invariants.py                         # nxboot-style invariant provider
 ├── scenarios/
 │   ├── mcuboot_head_exploratory.yaml            # Public MCUboot multi-step scenario
-│   └── nxboot_style_exploratory.yaml            # Public nxboot-style scenario
+│   └── nxboot_style_exploratory.yaml            # Experimental standalone nxboot-style scenario
 ├── examples/                                    # Built-in bootloader firmware
 │   ├── naive_copy/
 │   ├── vulnerable_ota/
