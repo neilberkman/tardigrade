@@ -60,6 +60,24 @@ class NuttxNxbootTargetPackageTest(unittest.TestCase):
             }
         )
 
+    @staticmethod
+    def _monitor_with_tertiary(
+        primary_base: int,
+        secondary_base: int,
+        tertiary_base: int,
+        slot_size: int,
+    ) -> _FakeMonitor:
+        return _FakeMonitor(
+            {
+                "slot_exec_base": hex(primary_base),
+                "slot_exec_size": hex(slot_size),
+                "slot_staging_base": hex(secondary_base),
+                "slot_staging_size": hex(slot_size),
+                "slot_tertiary_base": hex(tertiary_base),
+                "slot_tertiary_size": hex(slot_size),
+            }
+        )
+
     def test_crc_helper_accepts_legacy_char_iteration(self) -> None:
         expected = _crc32_update(0xFFFFFFFF, b"ABC") ^ 0xFFFFFFFF
         legacy = _crc32_update(0xFFFFFFFF, "ABC") ^ 0xFFFFFFFF
@@ -323,6 +341,98 @@ class NuttxNxbootTargetPackageTest(unittest.TestCase):
         self.assertFalse(state["roles"]["primary_confirmed"])
         self.assertTrue(state["roles"]["recovery_valid"])
         self.assertEqual(state["roles"]["next_boot"], "revert")
+
+    def test_probe_models_real_h743_post_update_state(self) -> None:
+        slot_size = 0x80000
+        primary_base = 0x08040000
+        secondary_base = 0x080C0000
+        tertiary_base = 0x08140000
+
+        bus = _FakeBus()
+        monitor = self._monitor_with_tertiary(
+            primary_base, secondary_base, tertiary_base, slot_size
+        )
+
+        updated_primary = make_nxboot_image(
+            primary_base,
+            0x6000,
+            (2, 0, 0),
+            header_size=0x400,
+            magic=NXBOOT_HEADER_MAGIC_INT | 0x1,
+        )
+        recovery = make_nxboot_image(
+            primary_base,
+            0x6000,
+            (1, 0, 0),
+            header_size=0x400,
+            magic=NXBOOT_HEADER_MAGIC_INT,
+        )
+        bus.write_bytes(primary_base, updated_primary)
+        bus.write_bytes(tertiary_base, recovery)
+
+        state = collect_state(
+            bus=bus,
+            monitor=monitor,
+            context={"stage": "post_boot", "boot_slot": "exec", "fault_injected": False},
+        )
+
+        self.assertEqual(state["slots"]["primary"]["magic_kind"], "internal")
+        self.assertEqual(state["slots"]["primary"]["internal_recovery_ptr"], 1)
+        self.assertEqual(state["slots"]["primary"]["version"], "2.0.0")
+        self.assertEqual(state["slots"]["secondary"]["magic_kind"], "erased")
+        self.assertEqual(state["slots"]["tertiary"]["magic_kind"], "internal")
+        self.assertEqual(state["slots"]["tertiary"]["version"], "1.0.0")
+        self.assertEqual(state["roles"]["update_slot"], "secondary")
+        self.assertEqual(state["roles"]["recovery_slot"], "tertiary")
+        self.assertFalse(state["roles"]["primary_confirmed"])
+        self.assertTrue(state["roles"]["recovery_valid"])
+        self.assertFalse(state["roles"]["recovery_present"])
+        self.assertEqual(state["roles"]["next_boot"], "revert")
+
+    def test_probe_models_real_h743_post_revert_state(self) -> None:
+        slot_size = 0x80000
+        primary_base = 0x08040000
+        secondary_base = 0x080C0000
+        tertiary_base = 0x08140000
+
+        bus = _FakeBus()
+        monitor = self._monitor_with_tertiary(
+            primary_base, secondary_base, tertiary_base, slot_size
+        )
+
+        primary = make_nxboot_image(
+            primary_base,
+            0x6000,
+            (1, 0, 0),
+            header_size=0x400,
+        )
+        recovery = make_nxboot_image(
+            primary_base,
+            0x6000,
+            (1, 0, 0),
+            header_size=0x400,
+            magic=NXBOOT_HEADER_MAGIC_INT,
+        )
+        bus.write_bytes(primary_base, primary)
+        bus.write_bytes(tertiary_base, recovery)
+
+        state = collect_state(
+            bus=bus,
+            monitor=monitor,
+            context={"stage": "post_boot", "boot_slot": "exec", "fault_injected": False},
+        )
+
+        self.assertEqual(state["slots"]["primary"]["magic_kind"], "external")
+        self.assertEqual(state["slots"]["primary"]["version"], "1.0.0")
+        self.assertEqual(state["slots"]["secondary"]["magic_kind"], "erased")
+        self.assertEqual(state["slots"]["tertiary"]["magic_kind"], "internal")
+        self.assertEqual(state["slots"]["tertiary"]["version"], "1.0.0")
+        self.assertEqual(state["roles"]["update_slot"], "secondary")
+        self.assertEqual(state["roles"]["recovery_slot"], "tertiary")
+        self.assertTrue(state["roles"]["primary_confirmed"])
+        self.assertTrue(state["roles"]["recovery_valid"])
+        self.assertTrue(state["roles"]["recovery_present"])
+        self.assertEqual(state["roles"]["next_boot"], "none")
 
     def test_probe_consumes_duplicate_update(self) -> None:
         slot_size = 0x23000
