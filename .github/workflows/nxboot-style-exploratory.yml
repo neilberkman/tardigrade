@@ -60,6 +60,7 @@ jobs:
           python3 scripts/run_scenario.py \
             --scenario "${{ inputs.scenario }}" \
             --renode-test "${RUNNER_TEMP}/renode/renode-test" \
+            --workers 2 \
             --output results/nxboot_style_exploratory.json
 
       - name: Print summary
