@@ -34,6 +34,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install NuttX host dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y kconfig-frontends || sudo apt-get install -y kconfig-frontends-nox
+
       - name: Install pinned Arm GNU toolchain
         run: |
           set -euxo pipefail
