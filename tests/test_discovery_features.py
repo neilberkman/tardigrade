@@ -64,6 +64,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                   staging: examples/vulnerable_ota/firmware.bin
                 success_criteria:
                   vtor_in_slot: exec
+                  vector_table_offset: 0x200
                 fault_sweep:
                   mode: runtime
                   evaluation_mode: execute
@@ -87,9 +88,11 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 profile.semantic_assertions["control"]["multi_boot_analysis.status"],
                 "converged",
             )
+            self.assertEqual(profile.success_criteria.vector_table_offset, 0x200)
             robot_vars = profile.robot_vars(ROOT)
             self.assertIn("BOOT_CYCLES:3", robot_vars)
             self.assertIn("STATE_PROBE_SCRIPT:{}".format(probe), robot_vars)
+            self.assertIn("SUCCESS_VECTOR_OFFSET:0x00000200", robot_vars)
 
     def test_semantic_assertions_and_invariants_annotate_results(self) -> None:
         with tempfile.TemporaryDirectory() as td:

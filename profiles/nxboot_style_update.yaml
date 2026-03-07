@@ -20,11 +20,13 @@ images:
   staging: examples/nxboot_style/nxboot_update.bin
 success_criteria:
   vtor_in_slot: exec
+  vector_table_offset: 0x200
   image_hash: true
   image_hash_slot: exec
   expected_image: staging
 fault_sweep:
   mode: runtime
   run_duration: "0.5"
+  max_writes: 2048
 expect:
   should_find_issues: false

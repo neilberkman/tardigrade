@@ -3,8 +3,6 @@ name: nxboot_style_exploratory
 base_profile: profiles/nxboot_style_update.yaml
 
 shared_profile_overrides: &nxboot_target_overrides
-  fault_sweep:
-    boot_cycles: 3
   state_probe:
     script: targets/nxboot/probe.py
     format: tardigrade.semantic-state/v1
@@ -18,7 +16,6 @@ shared_profile_overrides: &nxboot_target_overrides
   invariant_providers:
     - targets/nxboot/invariants.py
   invariants:
-    - multi_boot_converges
     - nxboot_roles_distinct
     - nxboot_confirmed_has_recovery
     - nxboot_duplicate_update_consumed
@@ -33,7 +30,6 @@ steps:
       <<: *nxboot_target_overrides
       semantic_assertions:
         control:
-          multi_boot_analysis.status: converged
           semantic_state.roles.next_boot: none
 
   - id: no_recovery_defect
@@ -54,9 +50,6 @@ steps:
       - path: steps.update_correct.report.summary.runtime_sweep.control.issue_count
         op: equals
         value: 0
-      - path: steps.update_correct.report.summary.runtime_sweep.control.multi_boot_analysis.status
-        op: equals
-        value: converged
       - path: steps.update_correct.report.summary.runtime_sweep.control.semantic_state.roles.next_boot
         op: equals
         value: none

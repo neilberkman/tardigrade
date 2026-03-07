@@ -92,6 +92,7 @@ class MemoryConfig:
 class SuccessCriteria:
     __slots__ = (
         "vtor_in_slot",
+        "vector_table_offset",
         "pc_in_slot",
         "marker_address",
         "marker_value",
@@ -105,6 +106,7 @@ class SuccessCriteria:
     def __init__(
         self,
         vtor_in_slot: Optional[str] = None,
+        vector_table_offset: int = 0,
         pc_in_slot: Optional[str] = None,
         marker_address: Optional[int] = None,
         marker_value: Optional[int] = None,
@@ -115,6 +117,7 @@ class SuccessCriteria:
         otadata_expect_scope: str = "always",
     ) -> None:
         self.vtor_in_slot = vtor_in_slot
+        self.vector_table_offset = max(0, int(vector_table_offset))
         self.pc_in_slot = pc_in_slot
         self.marker_address = marker_address
         self.marker_value = marker_value
@@ -415,6 +418,9 @@ class ProfileConfig:
             vars_list.append("SUCCESS_VTOR_SLOT:{}".format(sc.vtor_in_slot))
         else:
             vars_list.append("SUCCESS_VTOR_SLOT:")
+        vars_list.append(
+            "SUCCESS_VECTOR_OFFSET:0x{:08X}".format(sc.vector_table_offset)
+        )
         if sc.pc_in_slot:
             vars_list.append("SUCCESS_PC_SLOT:{}".format(sc.pc_in_slot))
         if sc.marker_address is not None:
@@ -617,6 +623,7 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         )
     return SuccessCriteria(
         vtor_in_slot=raw.get("vtor_in_slot"),
+        vector_table_offset=_parse_int(raw.get("vector_table_offset", 0), "success_criteria.vector_table_offset"),
         pc_in_slot=raw.get("pc_in_slot"),
         marker_address=_parse_int(raw["marker_address"], "success_criteria.marker_address") if "marker_address" in raw else None,
         marker_value=_parse_int(raw["marker_value"], "success_criteria.marker_value") if "marker_value" in raw else None,

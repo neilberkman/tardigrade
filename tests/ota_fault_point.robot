@@ -26,6 +26,7 @@ ${IMAGE_STAGING}               ${ROOT}/examples/vulnerable_ota/firmware.bin
 ${PRE_BOOT_STATE_BIN}          ${EMPTY}
 ${SETUP_SCRIPT}                ${EMPTY}
 ${SUCCESS_VTOR_SLOT}           exec
+${SUCCESS_VECTOR_OFFSET}       0
 ${SUCCESS_PC_SLOT}             ${EMPTY}
 ${SUCCESS_MARKER_ADDR}         0
 ${SUCCESS_MARKER_VALUE}        0
@@ -107,6 +108,7 @@ Run Runtime Fault Point
     Execute Command    $pre_boot_state_bin="${PRE_BOOT_STATE_BIN}"
     Execute Command    $setup_script="${SETUP_SCRIPT}"
     Execute Command    $success_vtor_slot="${SUCCESS_VTOR_SLOT}"
+    Execute Command    $success_vector_offset=${SUCCESS_VECTOR_OFFSET}
     Execute Command    $success_pc_slot="${SUCCESS_PC_SLOT}"
     Execute Command    $success_marker_addr=${SUCCESS_MARKER_ADDR}
     Execute Command    $success_marker_value=${SUCCESS_MARKER_VALUE}
