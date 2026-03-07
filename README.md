@@ -318,7 +318,6 @@ Per-point diagnostics are attached only when relevant:
 | `action-validation.yml`    | push, PR                       | Validates the reusable GitHub Action                        |
 | `oss-validation.yml`       | push to `main`, schedule, manual | Runs selected OSS validation guards                         |
 | `mcuboot-head-exploratory.yml` | workflow_dispatch          | Runs the public MCUboot exploratory scenario via `run_scenario.py` |
-| `nxboot-style-exploratory.yml` | workflow_dispatch         | Builds the standalone `nxboot_style` model and runs its experimental exploratory scenario |
 | `renode-latest-canary.yml` | schedule, workflow_dispatch    | Tests against latest Renode build                           |
 
 ## Repository layout
@@ -343,7 +342,6 @@ tardigrade/
 │   ├── write_trace_heuristic.py                 # Write-trace classification for pruning
 │   ├── render_results_html.py                   # HTML report renderer
 │   ├── run_oss_validation.py                    # OSS profile orchestrator
-│   ├── mcuboot_state_fuzzer.py                  # Compatibility wrapper to targets/mcuboot/state_fuzzer.py
 │   ├── geometry_matrix.py                       # Parametric slot-layout generator
 │   └── cbmc_to_profile.py                       # CBMC counterexample → profile converter
 ├── targets/
@@ -361,7 +359,7 @@ tardigrade/
 │   ├── mcuboot_head_exploratory.yaml            # Public MCUboot multi-step scenario
 │   └── nxboot_style_exploratory.yaml            # Experimental standalone nxboot-style scenario
 ├── docs/
-│   └── nuttx_nxboot_plan.md                     # Real NuttX nxboot target plan
+│   └── oss_validation_profiles.json             # Manifest for OSS validation workflow
 ├── examples/                                    # Built-in bootloader firmware
 │   ├── naive_copy/
 │   ├── vulnerable_ota/

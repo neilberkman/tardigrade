@@ -14,7 +14,7 @@ Usage as library::
 
 Usage as CLI::
 
-    python3 scripts/mcuboot_state_fuzzer.py --count 100 --seed 42 --output /tmp/states.json
+    python3 targets/mcuboot/state_fuzzer.py --count 100 --seed 42 --output /tmp/states.json
 """
 from __future__ import annotations
 
