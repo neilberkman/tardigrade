@@ -19,7 +19,7 @@ from targets.nxboot.invariants import (  # noqa: E402
     check_nxboot_confirmed_has_recovery,
     check_nxboot_duplicate_update_consumed,
 )
-from targets.nxboot.probe import collect_state  # noqa: E402
+from targets.nxboot.probe import _crc32_update, collect_state  # noqa: E402
 
 
 class _FakeBus:
@@ -43,6 +43,11 @@ class _FakeMonitor:
 
 
 class NxbootTargetPackageTest(unittest.TestCase):
+    def test_crc_helper_accepts_legacy_char_iteration(self) -> None:
+        expected = _crc32_update(0xFFFFFFFF, b"ABC") ^ 0xFFFFFFFF
+        legacy = _crc32_update(0xFFFFFFFF, "ABC") ^ 0xFFFFFFFF
+        self.assertEqual(legacy, expected)
+
     def test_probe_models_pending_update_roles(self) -> None:
         slot_size = 0x23000
         primary_base = 0x10002000

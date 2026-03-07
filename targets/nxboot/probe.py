@@ -26,7 +26,7 @@ def _read_bytes(bus, addr, size):
     raw = []
     for offset in range(int(size)):
         raw.append(_read_byte(bus, addr + offset))
-    return bytes(raw)
+    return struct.pack("{}B".format(len(raw)), *raw)
 
 
 def _read_u32(bus, addr):
@@ -35,6 +35,8 @@ def _read_u32(bus, addr):
 
 def _crc32_update(crc, raw):
     for byte in raw:
+        if not isinstance(byte, int):
+            byte = ord(byte)
         crc ^= int(byte) & 0xFF
         for _ in range(8):
             if crc & 1:
