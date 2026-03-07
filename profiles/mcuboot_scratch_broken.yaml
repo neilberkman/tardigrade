@@ -2,6 +2,7 @@ schema_version: 1
 name: mcuboot_scratch_broken
 description: "MCUboot swap-using-SCRATCH BEFORE scratch erase direction fix (commit 7253f01c). Forward erase of scratch area means partial erase + reboot writes corrupted scratch data back to primary slot, bricking device."
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_scratch_broken.elf
   entry: 0x00000000

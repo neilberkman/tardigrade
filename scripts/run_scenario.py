@@ -112,6 +112,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Preserve per-step audit artifacts under results/scenario_runs.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Override worker count for all audit steps (0 = use per-step YAML value).",
+    )
     return parser.parse_args()
 
 
@@ -318,7 +324,10 @@ def build_audit_command(
     if step_audit.get("keep_run_artifacts") or args.keep_run_artifacts:
         cmd.append("--keep-run-artifacts")
     for key in ("fault_start", "fault_end", "fault_step", "workers", "max_batch_points"):
-        value = step_audit.get(key)
+        if key == "workers" and args.workers > 0:
+            value = args.workers
+        else:
+            value = step_audit.get(key)
         if value is not None:
             cmd.extend(["--{}".format(key.replace("_", "-")), str(value)])
     evaluation_mode = step_audit.get("evaluation_mode")

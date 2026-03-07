@@ -28,8 +28,7 @@ sram: Memory.MappedMemory @ sysbus 0x20000000
 
 // Combined RCC + FLASH controller with write/erase tracking.
 // Base 0x40023800: RCC at offset 0x000, FLASH at offset 0x400.
-// Named "nvmc" for compatibility with run_runtime_fault_sweep.resc.
-nvmc: Miscellaneous.STM32F4FlashController @ sysbus 0x40023800
+faultFlash: Miscellaneous.STM32F4FlashController @ sysbus 0x40023800
     Flash: flash
     FlashBaseAddress: 0x08000000
     FlashSize: 0x100000

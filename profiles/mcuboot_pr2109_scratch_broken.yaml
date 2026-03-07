@@ -9,6 +9,7 @@ description: >
   Different-sized images (slot0=19KB, slot1=36KB) are required to trigger.
 
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_pr2109_scratch_broken.elf

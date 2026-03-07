@@ -2,6 +2,7 @@ schema_version: 1
 name: naive_copy_with_marker
 description: "Naive OTA with completion marker: copies staging to exec, then writes a marker word. Marker check on boot detects incomplete copies, but cannot recover from them."
 platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
 bootloader:
   elf: examples/vulnerable_ota/firmware.elf
   entry: 0x10000000

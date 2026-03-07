@@ -2,6 +2,7 @@ schema_version: 1
 name: mcuboot_swap_current
 description: "MCUboot swap-using-move (fixed commit 664093d). nRF52840 flash. Tests the revert path — should survive all power-loss faults."
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_mcuboot_swap_current_guard.elf
   entry: 0x00000000
