@@ -82,6 +82,7 @@ $flash_backend?=""
 
 python """
 import json
+import os
 import struct
 import sys
 import time as _time
@@ -114,6 +115,18 @@ def get_optional_int_var(names, default=None):
         except Exception:
             continue
     return default
+
+
+def refresh_runtime_handles():
+    global bus, _backend_obj, mram, faultFlash, ctrl
+    bus = monitor.Machine.SystemBus
+    _backend_obj = monitor.Machine[_backend_name]
+    if USE_MRAM_PATH:
+        mram = _backend_obj
+    elif USE_FAST_PATH:
+        faultFlash = _backend_obj
+    else:
+        ctrl = _backend_obj
 
 # ---------------------------------------------------------------------------
 # Flash backend selection.
@@ -152,6 +165,8 @@ else:
 
 _cached_erase_page = None
 _cached_initial_flash = None
+_cached_phase1_snapshot_path = None
+_cached_recovery_snapshot_path = None
 
 if USE_MRAM_PATH:
     mram = _backend_obj
@@ -1125,11 +1140,78 @@ def reset_nvmc_for_recovery():
         ctrl.Nvm.FaultEverFired = False
         disarm_fault()
 
-def restore_flash_and_boot(saved_flash):
-    # Common pattern: reset machine, restore flash snapshot, reload ELF,
-    # restore hw init. Used after Phase 1 fault to set up recovery boot.
+
+def get_machine_snapshot_path(kind):
+    cache_dir = os.path.join(os.path.dirname(result_file), '.machine_snapshots')
+    if not os.path.isdir(cache_dir):
+        os.makedirs(cache_dir)
+    return os.path.join(cache_dir, '{}.save'.format(kind))
+
+
+def save_machine_snapshot(path):
+    monitor.Parse('Save @{}'.format(path))
+
+
+def load_machine_snapshot(path):
+    monitor.Parse('Load @{}'.format(path))
+    refresh_runtime_handles()
+
+
+def restore_initial_flash_cache():
+    try:
+        monitor.Parse('machine Pause')
+    except:
+        pass
+    if _cached_initial_flash is not None and USE_MRAM_PATH:
+        mram.WriteBytes(0, _cached_initial_flash, 0, len(_cached_initial_flash))
+        return True
+    if _cached_initial_flash is not None and USE_FAST_PATH:
+        faultFlash.Flash.WriteBytes(0, _cached_initial_flash)
+        return True
+    reload_images()
+    apply_pre_boot_state()
+    cache_initial_flash()
+    return False
+
+
+def prepare_clean_phase1_state():
     monitor.Parse('machine Reset')
     monitor.Parse('machine Pause')
+    needs_pre_boot = restore_initial_flash_cache()
+    if needs_pre_boot:
+        apply_pre_boot_state()
+    if _hash_bypass_active:
+        apply_hash_bypass()
+
+
+def restore_phase1_baseline():
+    global _cached_phase1_snapshot_path
+    if _cached_phase1_snapshot_path is None:
+        _cached_phase1_snapshot_path = get_machine_snapshot_path('phase1_baseline')
+        prepare_clean_phase1_state()
+        save_machine_snapshot(_cached_phase1_snapshot_path)
+        return
+    load_machine_snapshot(_cached_phase1_snapshot_path)
+
+
+def prepare_recovery_shell_state():
+    monitor.Parse('machine Reset')
+    monitor.Parse('machine Pause')
+    bus.LoadELF(bootloader_elf)
+    restore_hw_init()
+    prime_bootloader_entry()
+
+def restore_flash_and_boot(saved_flash):
+    # Common pattern: restore a cached post-reset machine shell, then overlay
+    # the faulted flash snapshot.  This preserves semantics while avoiding
+    # repeated full reset/ELF reload work on every point.
+    global _cached_recovery_snapshot_path
+    if _cached_recovery_snapshot_path is None:
+        _cached_recovery_snapshot_path = get_machine_snapshot_path('recovery_shell')
+        prepare_recovery_shell_state()
+        save_machine_snapshot(_cached_recovery_snapshot_path)
+    else:
+        load_machine_snapshot(_cached_recovery_snapshot_path)
     if USE_MRAM_PATH:
         # MRAMMemory may or may not survive machine Reset depending on
         # vtable dispatch.  Always restore to be safe.
@@ -1137,12 +1219,9 @@ def restore_flash_and_boot(saved_flash):
     else:
         flash_ref = faultFlash.Flash
         flash_ref.WriteBytes(0, saved_flash)
-    bus.LoadELF(bootloader_elf)
-    restore_hw_init()
     # Do NOT re-run setup_script here.  The faulted snapshot is the
     # ground-truth state for the recovery boot — re-running setup would
     # overwrite it with clean data and mask the fault.
-    prime_bootloader_entry()
 
 def reload_images():
     # Restore flash/NVM to pre-test state by erasing, then reloading images.
@@ -1648,11 +1727,9 @@ def run_timed_reset_fault(fault_at):
     fp_t0 = _time.time()
     log('fp={} type=t phase1_setup'.format(fault_at))
 
-    monitor.Parse('machine Pause')
+    restore_phase1_baseline()
+    cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
-    monitor.Parse('machine Reset')
-    reload_images_cached()
-    apply_pre_boot_state()
     reset_nvmc_for_sweep()
     disarm_fault()
 
@@ -1923,13 +2000,9 @@ def run_execute_fault(fault_at, fault_type='w'):
         phase1_status = None
 
         log('control phase1_setup')
-        monitor.Parse('machine Pause')
+        restore_phase1_baseline()
+        cpu_ref = monitor.Machine['sysbus.cpu']
         cpu_ref.IsHalted = False
-        monitor.Parse('machine Reset')
-        reload_images()
-        apply_pre_boot_state()
-        if _hash_bypass_active:
-            apply_hash_bypass()
 
         reset_nvmc_for_recovery()
         disarm_fault()
@@ -2017,13 +2090,9 @@ def run_execute_fault(fault_at, fault_type='w'):
     log('fp={} type={} phase1_setup'.format(fault_at, fault_type))
 
     # Phase 1: Reset and set up for the faulted boot.
-    monitor.Parse('machine Pause')
+    restore_phase1_baseline()
+    cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
-    monitor.Parse('machine Reset')
-    reload_images_cached()
-    apply_pre_boot_state()
-    if _hash_bypass_active:
-        apply_hash_bypass()
 
     reset_nvmc_for_sweep()
 
