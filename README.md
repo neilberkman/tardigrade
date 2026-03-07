@@ -239,7 +239,10 @@ Key fields: `platform`, `bootloader`, `memory`, `images`, `success_criteria`, `f
 
 Use [`scripts/run_scenario.py`](scripts/run_scenario.py) to orchestrate multi-step discovery runs without baking target semantics into the core. A scenario references a base profile and then runs `audit` or `replay` steps by applying generic profile overrides.
 
-Public example: [`scenarios/mcuboot_head_exploratory.yaml`](scenarios/mcuboot_head_exploratory.yaml) attaches a target-side probe and invariant provider to the public `mcuboot_head_upgrade` and `mcuboot_head_revert` profiles, then checks both paths through the generic scenario runner.
+Public examples:
+
+- [`scenarios/mcuboot_head_exploratory.yaml`](scenarios/mcuboot_head_exploratory.yaml) attaches a target-side probe and invariant provider to the public `mcuboot_head_upgrade` and `mcuboot_head_revert` profiles, then checks both paths through the generic scenario runner.
+- [`scenarios/nxboot_style_exploratory.yaml`](scenarios/nxboot_style_exploratory.yaml) does the same for the public `nxboot_style_update` and `nxboot_style_no_recovery` profiles, giving a second OSS target-side adapter example without changing the core engine.
 
 Replay specs are generic override bundles, suitable for counterexamples from CBMC or any other model checker:
 
@@ -307,6 +310,7 @@ Per-point diagnostics are attached only when relevant:
 | `action-validation.yml`    | push, PR                       | Validates the reusable GitHub Action                        |
 | `oss-validation.yml`       | push to `main`, schedule, manual | Runs selected OSS validation guards                         |
 | `mcuboot-head-exploratory.yml` | workflow_dispatch          | Runs the public MCUboot exploratory scenario via `run_scenario.py` |
+| `nxboot-style-exploratory.yml` | workflow_dispatch         | Builds the nxboot-style example and runs the public exploratory scenario |
 | `renode-latest-canary.yml` | schedule, workflow_dispatch    | Tests against latest Renode build                           |
 
 ## Repository layout

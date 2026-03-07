@@ -28,6 +28,7 @@ steps:
     kind: audit
     audit:
       workers: 2
+      max_batch_points: 128
     profile_overrides:
       <<: *nxboot_target_overrides
       semantic_assertions:
@@ -40,6 +41,7 @@ steps:
     base_profile: profiles/nxboot_style_no_recovery.yaml
     audit:
       workers: 2
+      max_batch_points: 128
     profile_overrides:
       <<: *nxboot_target_overrides
 
