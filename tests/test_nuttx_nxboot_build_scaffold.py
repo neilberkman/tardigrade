@@ -173,7 +173,12 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             (images_dir / "nxboot-primary-v1-h400.img").write_bytes(b"P")
             (images_dir / "nxboot-update-v2-h400.img").write_bytes(b"U")
 
-            rendered = render_runtime_profile(build_dir, fault_max_writes=64, boot_cycles=3)
+            rendered = render_runtime_profile(
+                build_dir,
+                fault_max_writes=64,
+                boot_cycles=3,
+                run_duration="8.0",
+            )
             profile_path = temp_dir / "profile.yaml"
             profile_path.write_text(rendered)
             profile = load_profile(profile_path)
@@ -185,6 +190,7 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             self.assertFalse(profile.success_criteria.image_hash)
             self.assertEqual(profile.fault_sweep.max_writes, 64)
             self.assertEqual(profile.fault_sweep.boot_cycles, 3)
+            self.assertEqual(profile.fault_sweep.run_duration, "8.0")
             self.assertEqual(
                 profile.semantic_assertions["control"]["semantic_state.roles.next_boot"],
                 "revert",

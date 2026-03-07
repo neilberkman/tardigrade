@@ -115,39 +115,31 @@ def get_optional_int_var(names, default=None):
     return default
 
 # ---------------------------------------------------------------------------
-# Auto-detect platform path:
-#   slow  = NVMemory (sysbus.nvm_ctrl)
-#   mram  = MRAMMemory (sysbus.mram) — non-volatile with built-in fault injection
-#   fast  = controller exposing the tardigrade fast-path API
-#           (sysbus.nvmc or sysbus.flashController)
+# Flash backend discovery.
+#   nvm_ctrl = GenericNvmController (sysbus.nvm_ctrl) — slow path
+#   mram     = MRAMMemory (sysbus.mram) — non-volatile with built-in fault injection
+#   fast     = ITardigradeFaultInjectable (sysbus.faultFlash)
 # ---------------------------------------------------------------------------
 USE_FAST_PATH = False
 USE_MRAM_PATH = False
-unsupported_flash_backend = None
 
 try:
     _nvm_ctrl = monitor.Machine['sysbus.nvm_ctrl']
 except:
     try:
         _mram_obj = monitor.Machine['sysbus.mram']
-        _test = _mram_obj.TotalWordWrites  # verify it's a MRAMMemory
+        _test = _mram_obj.TotalWordWrites
         USE_MRAM_PATH = True
     except:
         try:
-            _nvmc_obj = monitor.Machine['sysbus.nvmc']
-            _test = _nvmc_obj.TotalWordWrites
+            _ff_obj = monitor.Machine['sysbus.faultFlash']
+            _test = _ff_obj.TotalWordWrites
             USE_FAST_PATH = True
         except:
-            try:
-                _flash_ctrl_obj = monitor.Machine['sysbus.flashController']
-                _test = _flash_ctrl_obj.TotalWordWrites
-                USE_FAST_PATH = True
-            except:
-                try:
-                    monitor.Machine['sysbus.flashController']
-                    unsupported_flash_backend = 'sysbus.flashController'
-                except:
-                    unsupported_flash_backend = 'unknown'
+            raise Exception(
+                'No supported flash backend found. '
+                'Expected sysbus.faultFlash, sysbus.mram, or sysbus.nvm_ctrl.'
+            )
 
 _cached_erase_page = None
 _cached_initial_flash = None
@@ -155,17 +147,8 @@ _cached_initial_flash = None
 if USE_MRAM_PATH:
     mram = monitor.Machine['sysbus.mram']
 elif USE_FAST_PATH:
-    try:
-        nvmc = monitor.Machine['sysbus.nvmc']
-    except:
-        nvmc = monitor.Machine['sysbus.flashController']
+    faultFlash = monitor.Machine['sysbus.faultFlash']
 else:
-    if unsupported_flash_backend is not None:
-        raise Exception(
-            'Unsupported flash backend: {}. '
-            'This platform does not expose a nvm_ctrl, mram, or nvmc-compatible '
-            'fault-injection peripheral yet.'.format(unsupported_flash_backend)
-        )
     ctrl = monitor.Machine['sysbus.nvm_ctrl']
 
 # Read monitor variables.
@@ -598,12 +581,12 @@ def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_si
     if USE_MRAM_PATH:
         flash_size = int(mram.Size)
     else:
-        flash_size = int(nvmc.FlashSize)
+        flash_size = int(faultFlash.FlashSize)
     for cycle_index in range(1, int(boot_cycles)):
         if USE_MRAM_PATH:
             current_flash = mram.ReadBytes(0, flash_size)
         else:
-            current_flash = nvmc.Flash.ReadBytes(0, flash_size)
+            current_flash = faultFlash.Flash.ReadBytes(0, flash_size)
         restore_flash_and_boot(current_flash)
         if _hash_bypass_active:
             apply_hash_bypass()
@@ -647,7 +630,7 @@ def effective_page_size():
         return int(mram.WordSize)
     if USE_FAST_PATH:
         try:
-            p = int(nvmc.PageSize)
+            p = int(faultFlash.PageSize)
             if p > 0:
                 return p
         except Exception:
@@ -674,7 +657,7 @@ def flash_geometry():
         base = lowest_slot & ~(mram_size - 1)
         return base, mram_size
     if USE_FAST_PATH:
-        return int(nvmc.FlashBaseAddress), int(nvmc.FlashSize)
+        return int(faultFlash.FlashBaseAddress), int(faultFlash.FlashSize)
     try:
         return int(slot_exec_base), int(ctrl.Nvm.Size)
     except Exception:
@@ -697,7 +680,7 @@ def read_flash_span(start_addr, size, snapshot_bytes=None):
     if USE_MRAM_PATH:
         return to_py_bytes(mram.ReadBytes(rel, max_len))
     if USE_FAST_PATH:
-        return to_py_bytes(nvmc.Flash.ReadBytes(rel, max_len))
+        return to_py_bytes(faultFlash.Flash.ReadBytes(rel, max_len))
     return bytes([as_int(bus.ReadByte(start_addr + i)) & 0xFF for i in range(max_len)])
 
 def region_dump(region_bytes, region_addr):
@@ -925,14 +908,14 @@ def get_total_writes():
     if USE_MRAM_PATH:
         return int(mram.TotalWordWrites)
     if USE_FAST_PATH:
-        return int(nvmc.TotalWordWrites)
+        return int(faultFlash.TotalWordWrites)
     return int(ctrl.Nvm.TotalWordWrites)
 
 def get_total_erases():
     if USE_MRAM_PATH:
         return 0  # MRAM has no page erases.
     if USE_FAST_PATH:
-        return int(nvmc.TotalPageErases)
+        return int(faultFlash.TotalPageErases)
     return 0  # Slow path doesn't track erases.
 
 def arm_fault(absolute_write_index, write_fault_mode=0):
@@ -940,9 +923,9 @@ def arm_fault(absolute_write_index, write_fault_mode=0):
         mram.FaultAtWordWrite = absolute_write_index
         mram.LastFaultInjected = False
     elif USE_FAST_PATH:
-        nvmc.WriteFaultMode = write_fault_mode
-        nvmc.FaultAtWordWrite = absolute_write_index
-        nvmc.FaultFired = False
+        faultFlash.WriteFaultMode = write_fault_mode
+        faultFlash.FaultAtWordWrite = absolute_write_index
+        faultFlash.FaultFired = False
     else:
         ctrl.Nvm.WriteFaultMode = write_fault_mode
         ctrl.Nvm.FaultAtWordWrite = absolute_write_index
@@ -952,16 +935,16 @@ def arm_erase_fault(absolute_erase_index, erase_fault_mode=0):
     if USE_MRAM_PATH:
         pass  # MRAM has no page erases.
     elif USE_FAST_PATH:
-        nvmc.EraseFaultMode = erase_fault_mode
-        nvmc.FaultAtPageErase = absolute_erase_index
-        nvmc.EraseFaultFired = False
+        faultFlash.EraseFaultMode = erase_fault_mode
+        faultFlash.FaultAtPageErase = absolute_erase_index
+        faultFlash.EraseFaultFired = False
 
 def disarm_fault():
     if USE_MRAM_PATH:
         mram.FaultAtWordWrite = 18446744073709551615
     elif USE_FAST_PATH:
-        nvmc.FaultAtWordWrite = 18446744073709551615
-        nvmc.FaultAtPageErase = 18446744073709551615
+        faultFlash.FaultAtWordWrite = 18446744073709551615
+        faultFlash.FaultAtPageErase = 18446744073709551615
     else:
         ctrl.Nvm.FaultAtWordWrite = 18446744073709551615
 
@@ -969,7 +952,7 @@ def disarm_write_fault():
     if USE_MRAM_PATH:
         mram.FaultAtWordWrite = 18446744073709551615
     elif USE_FAST_PATH:
-        nvmc.FaultAtWordWrite = 18446744073709551615
+        faultFlash.FaultAtWordWrite = 18446744073709551615
     else:
         ctrl.Nvm.FaultAtWordWrite = 18446744073709551615
 
@@ -977,7 +960,7 @@ def disarm_erase_fault():
     if USE_MRAM_PATH:
         pass  # MRAM has no page erases.
     elif USE_FAST_PATH:
-        nvmc.FaultAtPageErase = 18446744073709551615
+        faultFlash.FaultAtPageErase = 18446744073709551615
 
 def was_fault_injected():
     if USE_MRAM_PATH:
@@ -987,21 +970,21 @@ def was_fault_injected():
         # if we reached or passed the armed index, the fault fired.
         return int(mram.TotalWordWrites) >= int(mram.FaultAtWordWrite)
     if USE_FAST_PATH:
-        return bool(nvmc.FaultFired) or bool(nvmc.EraseFaultFired)
+        return bool(faultFlash.FaultFired) or bool(faultFlash.EraseFaultFired)
     return bool(ctrl.Nvm.FaultEverFired)
 
 def was_write_fault_injected():
     if USE_MRAM_PATH:
         return int(mram.TotalWordWrites) >= int(mram.FaultAtWordWrite)
     if USE_FAST_PATH:
-        return bool(nvmc.FaultFired)
+        return bool(faultFlash.FaultFired)
     return bool(ctrl.Nvm.FaultEverFired)
 
 def was_erase_fault_injected():
     if USE_MRAM_PATH:
         return False  # MRAM has no page erases.
     if USE_FAST_PATH:
-        return bool(nvmc.EraseFaultFired)
+        return bool(faultFlash.EraseFaultFired)
     return False
 
 def get_last_write_address():
@@ -1009,7 +992,7 @@ def get_last_write_address():
         return 0  # MRAMMemory does not track fault address.
     if USE_FAST_PATH:
         try:
-            return int(nvmc.LastFaultAddress)
+            return int(faultFlash.LastFaultAddress)
         except Exception:
             return 0
     return int(ctrl.Nvm.LastWriteAddress)
@@ -1080,25 +1063,25 @@ def reset_nvmc_for_sweep():
     if USE_FAST_PATH:
         # Keep default as full diff for index precision, but allow profile/CLI
         # overrides for performance experiments.
-        nvmc.DiffLookahead = sweep_diff_lookahead
-        nvmc.TotalWordWrites = 0
-        nvmc.TotalPageErases = 0
-        nvmc.WriteFaultMode = 0
-        nvmc.EraseFaultMode = 0
-        nvmc.FaultFired = False
-        nvmc.EraseFaultFired = False
-        nvmc.LastFaultAddress = 0
-        nvmc.FaultFlashSnapshot = None
+        faultFlash.DiffLookahead = sweep_diff_lookahead
+        faultFlash.TotalWordWrites = 0
+        faultFlash.TotalPageErases = 0
+        faultFlash.WriteFaultMode = 0
+        faultFlash.EraseFaultMode = 0
+        faultFlash.FaultFired = False
+        faultFlash.EraseFaultFired = False
+        faultFlash.LastFaultAddress = 0
+        faultFlash.FaultFlashSnapshot = None
         # Shadow scanning: enable for NRF52-style controllers (WEN batches
         # multiple writes, needs diff to count them).  Skip for STM32F4-style
         # controllers where each PG deactivation = exactly 1 word write —
         # shadow scanning adds 1MB ReadBytes per write with no accuracy benefit.
         try:
-            if getattr(nvmc, 'PerWriteAccurate', False):
-                nvmc.SkipShadowScan = True
+            if getattr(faultFlash, 'PerWriteAccurate', False):
+                faultFlash.SkipShadowScan = True
             else:
-                nvmc.SkipShadowScan = False
-                nvmc.InvalidateShadow()
+                faultFlash.SkipShadowScan = False
+                faultFlash.InvalidateShadow()
         except Exception:
             pass  # NRF52NVMC doesn't have these
     else:
@@ -1113,18 +1096,18 @@ def reset_nvmc_for_recovery():
         disarm_fault()
         return
     if USE_FAST_PATH:
-        nvmc.DiffLookahead = 32
-        nvmc.TotalWordWrites = 0
-        nvmc.TotalPageErases = 0
-        nvmc.WriteFaultMode = 0
-        nvmc.EraseFaultMode = 0
-        nvmc.FaultFired = False
-        nvmc.EraseFaultFired = False
-        nvmc.LastFaultAddress = 0
+        faultFlash.DiffLookahead = 32
+        faultFlash.TotalWordWrites = 0
+        faultFlash.TotalPageErases = 0
+        faultFlash.WriteFaultMode = 0
+        faultFlash.EraseFaultMode = 0
+        faultFlash.FaultFired = False
+        faultFlash.EraseFaultFired = False
+        faultFlash.LastFaultAddress = 0
         # Skip shadow scanning during recovery boot — just count PG transitions
         # for progress tracking. Avoids O(flash_size) ReadBytes per write.
         try:
-            nvmc.SkipShadowScan = True
+            faultFlash.SkipShadowScan = True
         except Exception:
             pass  # NRF52NVMC doesn't have this property
         disarm_fault()
@@ -1143,7 +1126,7 @@ def restore_flash_and_boot(saved_flash):
         # vtable dispatch.  Always restore to be safe.
         mram.WriteBytes(0, saved_flash, 0, len(saved_flash))
     else:
-        flash_ref = nvmc.Flash
+        flash_ref = faultFlash.Flash
         flash_ref.WriteBytes(0, saved_flash)
     bus.LoadELF(bootloader_elf)
     restore_hw_init()
@@ -1172,10 +1155,10 @@ def reload_images():
     elif USE_FAST_PATH:
         # Fast path: fill MappedMemory with 0xFF (erased state).
         # Use page-size chunks via NVMC ERASEPAGE for efficient fill.
-        flash_size = int(nvmc.FlashSize)
-        flash_base = int(nvmc.FlashBaseAddress)
-        page_size = int(nvmc.PageSize)
-        flash_ref = nvmc.Flash
+        flash_size = int(faultFlash.FlashSize)
+        flash_base = int(faultFlash.FlashBaseAddress)
+        page_size = int(faultFlash.PageSize)
+        flash_ref = faultFlash.Flash
         # Create one page of 0xFF, reuse for all pages.
         import System
         global _cached_erase_page
@@ -1218,8 +1201,8 @@ def cache_initial_flash():
     if USE_MRAM_PATH:
         _cached_initial_flash = mram.ReadBytes(0, int(mram.Size))
     elif USE_FAST_PATH:
-        flash_ref = nvmc.Flash
-        _cached_initial_flash = flash_ref.ReadBytes(0, int(nvmc.FlashSize))
+        flash_ref = faultFlash.Flash
+        _cached_initial_flash = flash_ref.ReadBytes(0, int(faultFlash.FlashSize))
 
 def reload_images_cached():
     # Restore flash from cached snapshot if available; otherwise fall back
@@ -1232,7 +1215,7 @@ def reload_images_cached():
     if _cached_initial_flash is not None and USE_MRAM_PATH:
         mram.WriteBytes(0, _cached_initial_flash, 0, len(_cached_initial_flash))
     elif _cached_initial_flash is not None and USE_FAST_PATH:
-        nvmc.Flash.WriteBytes(0, _cached_initial_flash)
+        faultFlash.Flash.WriteBytes(0, _cached_initial_flash)
     else:
         reload_images()
         apply_pre_boot_state()
@@ -1253,8 +1236,8 @@ def compute_exec_slot_hash():
         offset = slot_exec_base - mram_base
         data = bytes(mram.ReadBytes(offset, data_size))
     elif USE_FAST_PATH:
-        flash_ref = nvmc.Flash
-        flash_base_addr = int(nvmc.FlashBaseAddress)
+        flash_ref = faultFlash.Flash
+        flash_base_addr = int(faultFlash.FlashBaseAddress)
         offset = slot_exec_base - flash_base_addr
         data = bytes(flash_ref.ReadBytes(offset, data_size))
     else:
@@ -1644,6 +1627,11 @@ def parse_duration_seconds(default=2.0):
     except Exception:
         return default
 
+def phase1_max_iters(default_s=4.0, time_slice_s=0.02):
+    duration_s = max(float(default_s), parse_duration_seconds(default=default_s))
+    slice_s = max(0.001, float(time_slice_s))
+    return max(200, int((duration_s / slice_s) + 0.999))
+
 def run_timed_reset_fault(fault_at):
     # reset_at_time: run Phase 1 for a deterministic time offset, then
     # simulate a power reset regardless of write/erase boundaries.
@@ -1677,8 +1665,8 @@ def run_timed_reset_fault(fault_at):
         restore_flash_and_boot(saved_flash)
         reset_nvmc_for_recovery()
     elif USE_FAST_PATH:
-        flash_ref = nvmc.Flash
-        flash_size = int(nvmc.FlashSize)
+        flash_ref = faultFlash.Flash
+        flash_size = int(faultFlash.FlashSize)
         saved_flash = flash_ref.ReadBytes(0, flash_size)
         fault_snapshot_bytes = to_py_bytes(saved_flash)
         restore_flash_and_boot(saved_flash)
@@ -1830,11 +1818,11 @@ def run_resume_trace_from_snapshot(snapshot_flash, fault_at, fault_type):
     cpu_ref = monitor.Machine['sysbus.cpu']
     restore_flash_and_boot(snapshot_flash)
     reset_nvmc_for_recovery()
-    nvmc.DiffLookahead = 2147483647
-    nvmc.WriteTraceClear()
-    nvmc.EraseTraceClear()
-    nvmc.WriteTraceEnabled = True
-    nvmc.EraseTraceEnabled = True
+    faultFlash.DiffLookahead = 2147483647
+    faultFlash.WriteTraceClear()
+    faultFlash.EraseTraceClear()
+    faultFlash.WriteTraceEnabled = True
+    faultFlash.EraseTraceEnabled = True
 
     op_events = []
     arm_vtor_watchpoint()
@@ -1850,10 +1838,10 @@ def run_resume_trace_from_snapshot(snapshot_flash, fault_at, fault_type):
     )
     disarm_vtor_watchpoint()
 
-    nvmc.WriteTraceEnabled = False
-    nvmc.EraseTraceEnabled = False
-    write_map = parse_write_trace_map(nvmc.WriteTraceToString())
-    erase_map = parse_erase_trace_map(nvmc.EraseTraceToString())
+    faultFlash.WriteTraceEnabled = False
+    faultFlash.EraseTraceEnabled = False
+    write_map = parse_write_trace_map(faultFlash.WriteTraceToString())
+    erase_map = parse_erase_trace_map(faultFlash.EraseTraceToString())
 
     enriched_ops = []
     for event in op_events:
@@ -1887,8 +1875,8 @@ def run_resume_trace_from_snapshot(snapshot_flash, fault_at, fault_type):
         'final_vtor': fmt_u32(vtor_value),
         'boot_outcome': boot_outcome,
         'boot_slot': boot_slot,
-        'total_writes': int(nvmc.TotalWordWrites),
-        'total_erases': int(nvmc.TotalPageErases),
+        'total_writes': int(faultFlash.TotalWordWrites),
+        'total_erases': int(faultFlash.TotalPageErases),
         'operation_count': len(enriched_ops),
         'nvm_operations': enriched_ops,
     }
@@ -1939,10 +1927,12 @@ def run_execute_fault(fault_at, fault_type='w'):
 
         arm_vtor_watchpoint()
         p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
+        p1_max_iters = phase1_max_iters(default_s=4.0)
         phase1_status = run_until_done(
             cpu_ref,
             label='control_p1',
             stop_on_fault=False,
+            max_iters=p1_max_iters,
             wall_timeout=p1_wall_timeout,
         )
         disarm_vtor_watchpoint()
@@ -2061,7 +2051,14 @@ def run_execute_fault(fault_at, fault_type='w'):
 
     arm_vtor_watchpoint()
     p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
-    phase1_status = run_until_done(cpu_ref, label='fp{}_p1'.format(fault_at), stop_on_fault=True, wall_timeout=p1_wall_timeout)
+    p1_max_iters = phase1_max_iters(default_s=4.0)
+    phase1_status = run_until_done(
+        cpu_ref,
+        label='fp{}_p1'.format(fault_at),
+        stop_on_fault=True,
+        max_iters=p1_max_iters,
+        wall_timeout=p1_wall_timeout,
+    )
     disarm_vtor_watchpoint()
     phase1_ms = int((_time.time() - fp_t0) * 1000)
 
@@ -2087,9 +2084,9 @@ def run_execute_fault(fault_at, fault_type='w'):
             saved_flash = mram.ReadBytes(0, mram_size)
             fault_snapshot_bytes = to_py_bytes(saved_flash)
         else:
-            flash_ref = nvmc.Flash
-            flash_size = int(nvmc.FlashSize)
-            saved_flash = nvmc.FaultFlashSnapshot
+            flash_ref = faultFlash.Flash
+            flash_size = int(faultFlash.FlashSize)
+            saved_flash = faultFlash.FaultFlashSnapshot
             if saved_flash is None:
                 log('fp={} WARNING: no snapshot, falling back to current flash'.format(fault_at))
                 saved_flash = flash_ref.ReadBytes(0, flash_size)
@@ -2150,8 +2147,8 @@ def run_execute_fault(fault_at, fault_type='w'):
                 mram.LastFaultInjected = False
             else:
                 flash_ref.WriteBytes(0, saved_flash)
-                nvmc.FaultFired = False
-                nvmc.EraseFaultFired = False
+                faultFlash.FaultFired = False
+                faultFlash.EraseFaultFired = False
             disarm_fault()
             cpu_ref.IsHalted = False
             log('fp={} phase1_continue_non_power'.format(fault_at))
@@ -2284,7 +2281,7 @@ def run_execute_fault(fault_at, fault_type='w'):
 
     # Release large .NET byte[] to prevent memory exhaustion in batch mode.
     if USE_FAST_PATH:
-        nvmc.FaultFlashSnapshot = None
+        faultFlash.FaultFlashSnapshot = None
 
     return result
 
@@ -2351,9 +2348,9 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
         }
 
     # --- Phase 2: recovery boot with erase fault armed ---
-    flash_ref = nvmc.Flash
-    flash_size = int(nvmc.FlashSize)
-    saved_flash = nvmc.FaultFlashSnapshot
+    flash_ref = faultFlash.Flash
+    flash_size = int(faultFlash.FlashSize)
+    saved_flash = faultFlash.FaultFlashSnapshot
     if saved_flash is None:
         saved_flash = flash_ref.ReadBytes(0, flash_size)
 
@@ -2380,7 +2377,7 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
         pass
     else:
         # --- Phase 3: boot from double-faulted state ---
-        saved_flash2 = nvmc.FaultFlashSnapshot
+        saved_flash2 = faultFlash.FaultFlashSnapshot
         if saved_flash2 is None:
             saved_flash2 = flash_ref.ReadBytes(0, flash_size)
 
@@ -2403,7 +2400,7 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
 
     # Release large .NET byte[] to prevent memory exhaustion in batch mode.
     if USE_FAST_PATH:
-        nvmc.FaultFlashSnapshot = None
+        faultFlash.FaultFlashSnapshot = None
 
     elapsed = _time.time() - fp_t0
     result = {
@@ -2463,8 +2460,8 @@ def ensure_trace_replay_engine():
     try:
         trace_replay_engine = monitor.Machine['sysbus.trace_replay']
         if trace_replay_engine.Target is None:
-            trace_replay_engine.Target = nvmc.Flash
-            trace_replay_engine.TargetBaseAddress = int(nvmc.FlashBaseAddress)
+            trace_replay_engine.Target = faultFlash.Flash
+            trace_replay_engine.TargetBaseAddress = int(faultFlash.FlashBaseAddress)
         log('trace_replay: native engine enabled')
         return trace_replay_engine
     except Exception as exc:
@@ -2532,15 +2529,15 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
             trace_file_bin_path,
             erase_trace_file_bin_path,
             stop_at,
-            int(nvmc.PageSize),
-            int(nvmc.EraseFill)
+            int(faultFlash.PageSize),
+            int(faultFlash.EraseFill)
         ))
     else:
         writes_applied = int(engine.Replay(trace_file_bin_path, stop_at))
 
     fault_injected = bool(engine.LastFaultEncountered)
     fault_address = int(engine.LastFaultAddress)
-    faulted_flash = nvmc.Flash.ReadBytes(0, int(nvmc.FlashSize))
+    faulted_flash = faultFlash.Flash.ReadBytes(0, int(faultFlash.FlashSize))
     fault_snapshot_bytes = to_py_bytes(faulted_flash)
     replay_ms = int((_time.time() - t_replay) * 1000)
     phase1_ms = int((_time.time() - fp_t0) * 1000)
@@ -2675,9 +2672,9 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 
     t_replay = _time.time()
     import System
-    flash_ref = nvmc.Flash
-    flash_base_addr = int(nvmc.FlashBaseAddress)
-    page_size = int(nvmc.PageSize)
+    flash_ref = faultFlash.Flash
+    flash_base_addr = int(faultFlash.FlashBaseAddress)
+    page_size = int(faultFlash.PageSize)
 
     pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace_loaded]
     pending_erases.sort()
@@ -2719,7 +2716,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
             erase_buf[bi] = 0xFF
         flash_ref.WriteBytes(int(e_off), erase_buf)
         erase_idx += 1
-    faulted_flash = flash_ref.ReadBytes(0, int(nvmc.FlashSize))
+    faulted_flash = flash_ref.ReadBytes(0, int(faultFlash.FlashSize))
     fault_snapshot_bytes = to_py_bytes(faulted_flash)
 
     replay_ms = int((_time.time() - t_replay) * 1000)
@@ -2859,11 +2856,11 @@ if calibration_mode:
         # Enable write trace to record (writeIndex, flashOffset) for heuristic.
         reset_nvmc_for_sweep()
         if USE_FAST_PATH:
-            nvmc.WriteTraceClear()
-            nvmc.WriteTraceEnabled = True
+            faultFlash.WriteTraceClear()
+            faultFlash.WriteTraceEnabled = True
             # Always capture erase trace — needed for trace replay correctness.
-            nvmc.EraseTraceClear()
-            nvmc.EraseTraceEnabled = True
+            faultFlash.EraseTraceClear()
+            faultFlash.EraseTraceEnabled = True
         log('calibration: starting step (fault_types={})'.format(fault_types_mode))
         base_writes = get_total_writes()
         base_erases = get_total_erases()
@@ -2887,13 +2884,13 @@ if calibration_mode:
         # Export write trace if available.
         trace_file = None
         trace_file_bin = None
-        if USE_FAST_PATH and nvmc.WriteTraceEnabled:
-            nvmc.WriteTraceEnabled = False
-            trace_count = nvmc.WriteTraceCount
+        if USE_FAST_PATH and faultFlash.WriteTraceEnabled:
+            faultFlash.WriteTraceEnabled = False
+            trace_count = faultFlash.WriteTraceCount
             if trace_count > 0:
                 trace_file = result_file.replace('.json', '_trace.csv')
                 trace_file_bin = result_file.replace('.json', '_trace.bin')
-                trace_data = nvmc.WriteTraceToString()
+                trace_data = faultFlash.WriteTraceToString()
                 with open(trace_file, 'w') as tf:
                     tf.write('write_index,flash_offset,value\n')
                     with open(trace_file_bin, 'wb') as tfb:
@@ -2920,12 +2917,12 @@ if calibration_mode:
         erase_trace_file = None
         erase_trace_file_bin = None
         if USE_FAST_PATH:
-            nvmc.EraseTraceEnabled = False
-            erase_count = nvmc.EraseTraceCount
+            faultFlash.EraseTraceEnabled = False
+            erase_count = faultFlash.EraseTraceCount
             if erase_count > 0:
                 erase_trace_file = result_file.replace('.json', '_erase_trace.csv')
                 erase_trace_file_bin = result_file.replace('.json', '_erase_trace.bin')
-                erase_data = nvmc.EraseTraceToString()
+                erase_data = faultFlash.EraseTraceToString()
                 with open(erase_trace_file, 'w') as ef:
                     ef.write('erase_index,flash_offset,writes_at_this_point,erase_size\n')
                     with open(erase_trace_file_bin, 'wb') as efb:
@@ -2945,7 +2942,7 @@ if calibration_mode:
                                 erase_idx = int(parts[0]) & 0xFFFFFFFF
                                 flash_off = int(parts[1]) & 0xFFFFFFFF
                                 writes_at = int(parts[2]) & 0xFFFFFFFF
-                                fallback_sz = int(nvmc.PageSize) & 0xFFFFFFFF
+                                fallback_sz = int(faultFlash.PageSize) & 0xFFFFFFFF
                                 ef.write('{},{},{},{}\n'.format(erase_idx, flash_off, writes_at, fallback_sz))
                                 efb.write(struct.pack('<III', writes_at, flash_off, fallback_sz))
                                 erase_bin_count += 1
