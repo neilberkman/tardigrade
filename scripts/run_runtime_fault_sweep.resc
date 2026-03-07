@@ -613,6 +613,7 @@ def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_si
             cpu_ref,
             label='{}_{}'.format(label, cycle_index),
             expect_writes=False,
+            zero_writes_is_brick=False,
             wall_timeout=30,
             stop_on_fault=False,
         )
@@ -1013,15 +1014,7 @@ def get_last_write_address():
             return 0
     return int(ctrl.Nvm.LastWriteAddress)
 
-def apply_pre_boot_state():
-    if pre_boot_bin:
-        with open(pre_boot_bin, 'rb') as f:
-            pbs_data = f.read()
-        for i in range(0, len(pbs_data), 8):
-            addr, val = struct.unpack_from('<II', pbs_data, i)
-            bus.WriteDoubleWord(addr, val)
-    if setup_script:
-        monitor.Parse('include @' + setup_script)
+def prime_bootloader_entry():
     # Some Cortex-M platforms do not reliably restore SP/PC from the loaded
     # bootloader image after machine Reset. Re-prime the core from the vector
     # table so execution starts from the bootloader entry on the next RunFor.
@@ -1055,6 +1048,17 @@ def apply_pre_boot_state():
             pass
     except Exception:
         pass
+
+def apply_pre_boot_state():
+    if pre_boot_bin:
+        with open(pre_boot_bin, 'rb') as f:
+            pbs_data = f.read()
+        for i in range(0, len(pbs_data), 8):
+            addr, val = struct.unpack_from('<II', pbs_data, i)
+            bus.WriteDoubleWord(addr, val)
+    if setup_script:
+        monitor.Parse('include @' + setup_script)
+    prime_bootloader_entry()
 
 def restore_hw_init():
     # Restore hardware init values cleared by machine Reset.
@@ -1146,6 +1150,7 @@ def restore_flash_and_boot(saved_flash):
     # Re-run setup script after machine Reset (e.g. boot_rom mirror).
     if setup_script:
         monitor.Parse('include @' + setup_script)
+    prime_bootloader_entry()
 
 def reload_images():
     # Restore flash/NVM to pre-test state by erasing, then reloading images.
@@ -1476,7 +1481,8 @@ def run_state_fault(fault_at):
     return result
 
 def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, label='',
-                   expect_writes=True, stop_on_fault=True, op_trace=None, op_trace_limit=0):
+                   expect_writes=True, stop_on_fault=True, op_trace=None, op_trace_limit=0,
+                   zero_writes_is_brick=True):
     # Run CPU in continuous mode until it settles or budget exhausted.
     #
     # Uses `emulation RunFor` which runs in continuous mode — much faster
@@ -1598,7 +1604,9 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
             reason = 'no_boot_no_writes'
             break
         # Bricked device detection: no writes at all after several slices.
-        if cur_writes == 0 and not expect_writes:
+        # Some clean follow-up boots are legitimately read-only and should not
+        # be cut off by this heuristic.
+        if zero_writes_is_brick and cur_writes == 0 and not expect_writes:
             zero_writes_count += 1
             if zero_writes_count >= 5:
                 reason = 'no_writes_brick'
