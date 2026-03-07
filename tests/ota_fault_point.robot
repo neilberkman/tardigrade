@@ -21,8 +21,14 @@ ${SLOT_EXEC_BASE}              0x10000000
 ${SLOT_EXEC_SIZE}              0x38000
 ${SLOT_STAGING_BASE}           0x10038000
 ${SLOT_STAGING_SIZE}           0x38000
+${SLOT_TERTIARY_BASE}          ${EMPTY}
+${SLOT_TERTIARY_SIZE}          ${EMPTY}
+${SLOT_RECOVERY_BASE}          ${EMPTY}
+${SLOT_RECOVERY_SIZE}          ${EMPTY}
 ${IMAGE_EXEC}                  ${EMPTY}
 ${IMAGE_STAGING}               ${ROOT}/examples/vulnerable_ota/firmware.bin
+${IMAGE_TERTIARY}              ${EMPTY}
+${IMAGE_RECOVERY}              ${EMPTY}
 ${PRE_BOOT_STATE_BIN}          ${EMPTY}
 ${SETUP_SCRIPT}                ${EMPTY}
 ${SUCCESS_VTOR_SLOT}           exec
@@ -33,6 +39,8 @@ ${SUCCESS_MARKER_VALUE}        0
 ${FAULT_POINTS_CSV}            ${EMPTY}
 ${IMAGE_STAGING_PATH}          ${ROOT}/examples/vulnerable_ota/firmware.bin
 ${IMAGE_EXEC_PATH}             ${EMPTY}
+${IMAGE_TERTIARY_PATH}         ${EMPTY}
+${IMAGE_RECOVERY_PATH}         ${EMPTY}
 ${TRACE_FILE}                  ${EMPTY}
 ${ERASE_TRACE_FILE}            ${EMPTY}
 ${TRACE_FILE_BIN}              ${EMPTY}
@@ -76,6 +84,8 @@ Load Runtime Scenario
     ${load_cmds}=    Set Variable    bus=monitor.Machine.SystemBus; bus.LoadELF(r'${BOOTLOADER_ELF}')
     Run Keyword If    '${IMAGE_EXEC}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_EXEC}', ${SLOT_EXEC_BASE})"
     Run Keyword If    '${IMAGE_STAGING}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_STAGING}', ${SLOT_STAGING_BASE})"
+    Run Keyword If    '${IMAGE_TERTIARY}' != '' and '${SLOT_TERTIARY_BASE}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_TERTIARY}', ${SLOT_TERTIARY_BASE})"
+    Run Keyword If    '${IMAGE_RECOVERY}' != '' and '${SLOT_RECOVERY_BASE}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_RECOVERY}', ${SLOT_RECOVERY_BASE})"
     Execute Command    python "${load_cmds}"
 
 Load Extra Peripherals
@@ -105,6 +115,10 @@ Run Runtime Fault Point
     Execute Command    $slot_exec_size=${SLOT_EXEC_SIZE}
     Execute Command    $slot_staging_base=${SLOT_STAGING_BASE}
     Execute Command    $slot_staging_size=${SLOT_STAGING_SIZE}
+    Run Keyword If    '${SLOT_TERTIARY_BASE}' != ''    Execute Command    $slot_tertiary_base=${SLOT_TERTIARY_BASE}
+    Run Keyword If    '${SLOT_TERTIARY_SIZE}' != ''    Execute Command    $slot_tertiary_size=${SLOT_TERTIARY_SIZE}
+    Run Keyword If    '${SLOT_RECOVERY_BASE}' != ''    Execute Command    $slot_recovery_base=${SLOT_RECOVERY_BASE}
+    Run Keyword If    '${SLOT_RECOVERY_SIZE}' != ''    Execute Command    $slot_recovery_size=${SLOT_RECOVERY_SIZE}
     Execute Command    $pre_boot_state_bin="${PRE_BOOT_STATE_BIN}"
     Execute Command    $setup_script="${SETUP_SCRIPT}"
     Execute Command    $success_vtor_slot="${SUCCESS_VTOR_SLOT}"
@@ -115,6 +129,8 @@ Run Runtime Fault Point
     Execute Command    $fault_points_csv="${FAULT_POINTS_CSV}"
     Execute Command    $image_staging_path="${IMAGE_STAGING_PATH}"
     Execute Command    $image_exec_path="${IMAGE_EXEC_PATH}"
+    Run Keyword If    '${IMAGE_TERTIARY_PATH}' != ''    Execute Command    $image_tertiary_path="${IMAGE_TERTIARY_PATH}"
+    Run Keyword If    '${IMAGE_RECOVERY_PATH}' != ''    Execute Command    $image_recovery_path="${IMAGE_RECOVERY_PATH}"
     Execute Command    $trace_file="${TRACE_FILE}"
     Execute Command    $erase_trace_file="${ERASE_TRACE_FILE}"
     Execute Command    $trace_file_bin="${TRACE_FILE_BIN}"

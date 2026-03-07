@@ -99,6 +99,48 @@ class GenericFrameworkTest(unittest.TestCase):
             robot_vars = profile.robot_vars(ROOT)
             self.assertIn("STATE_PROBE_SCRIPT:{}".format(probe), robot_vars)
 
+    def test_profile_loader_emits_optional_slot_and_image_vars(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            tertiary = tempdir / "tertiary.bin"
+            recovery = tempdir / "recovery.bin"
+            tertiary.write_bytes(b"\xAA" * 32)
+            recovery.write_bytes(b"\xBB" * 32)
+            profile_path = self._write_profile(
+                tempdir,
+                f"""
+                schema_version: 1
+                name: optional_slot_profile
+                description: generic
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: {{ start: 0x20000000, end: 0x20020000 }}
+                  write_granularity: 4
+                  slots:
+                    exec: {{ base: 0x10000000, size: 0x1000 }}
+                    staging: {{ base: 0x10001000, size: 0x1000 }}
+                    tertiary: {{ base: 0x10010000, size: 0x1000 }}
+                    recovery: {{ base: 0x10011000, size: 0x1000 }}
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                  tertiary: {tertiary.as_posix()}
+                  recovery: {recovery.as_posix()}
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            robot_vars = profile.robot_vars(ROOT)
+            self.assertIn("SLOT_TERTIARY_BASE:0x10010000", robot_vars)
+            self.assertIn("SLOT_RECOVERY_BASE:0x10011000", robot_vars)
+            self.assertIn("IMAGE_TERTIARY:{}".format(tertiary), robot_vars)
+            self.assertIn("IMAGE_RECOVERY:{}".format(recovery), robot_vars)
+
     def test_external_invariant_provider_participates_in_annotation(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
