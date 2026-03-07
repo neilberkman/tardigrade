@@ -77,6 +77,8 @@ $resume_trace_max_ops?="1024"
 $resume_trace_time_slice?="0.02"
 $resume_trace_wall_timeout_s?="30"
 $boot_cycles?="1"
+$boot_cycle_hook?=""
+$expected_rollback_at_cycle?=""
 $state_probe_script?=""
 $flash_backend?=""
 $enable_machine_snapshots?="false"
@@ -245,6 +247,8 @@ if resume_trace_wall_timeout_s <= 0:
     resume_trace_wall_timeout_s = 30.0
 boot_cycles_raw = str(monitor.GetVariable('boot_cycles')).strip()
 enable_machine_snapshots = str(monitor.GetVariable('enable_machine_snapshots')).strip().lower() in ('1', 'true', 'yes')
+boot_cycle_hook = get_optional_var('boot_cycle_hook', '')
+expected_rollback_at_cycle = get_optional_int_var('expected_rollback_at_cycle')
 try:
     boot_cycles = int(boot_cycles_raw, 0) if boot_cycles_raw else 1
 except Exception:
@@ -543,6 +547,53 @@ def build_cycle_record(cycle_index, boot_outcome, boot_slot, signals, stop_statu
     return record
 
 
+def _set_monitor_hook_var(name, value):
+    if value is None:
+        monitor.Parse('${}=""'.format(name))
+        return
+    if isinstance(value, bool):
+        monitor.Parse('${}={}'.format(name, 'true' if value else 'false'))
+        return
+    try:
+        integer_types = (int, long)
+    except NameError:
+        integer_types = (int,)
+    if isinstance(value, integer_types):
+        monitor.Parse('${}={}'.format(name, int(value)))
+        return
+    monitor.Parse('${}={}'.format(name, json.dumps(str(value))))
+
+
+def run_boot_cycle_hook(next_cycle_index, cycle_records):
+    if not boot_cycle_hook:
+        return
+    previous_record = cycle_records[-1] if cycle_records else {}
+    hook_path = str(boot_cycle_hook).strip()
+    if not hook_path:
+        return
+    _set_monitor_hook_var('boot_cycle_index', int(next_cycle_index))
+    _set_monitor_hook_var('boot_cycle_previous_index', int(next_cycle_index) - 1)
+    _set_monitor_hook_var('boot_cycle_previous_slot', previous_record.get('boot_slot'))
+    _set_monitor_hook_var('boot_cycle_previous_outcome', previous_record.get('boot_outcome'))
+    if hook_path.lower().endswith('.py'):
+        hook_globals = {
+            '__name__': '__tardigrade_boot_cycle_hook__',
+            'monitor': monitor,
+            'bus': bus,
+            'cycle_records': cycle_records,
+            'previous_record': previous_record,
+            'next_cycle_index': int(next_cycle_index),
+            'success_vtor_slot': success_vtor_slot,
+        }
+        with open(hook_path, 'r') as hook_file:
+            source = hook_file.read()
+        exec(compile(source, hook_path, 'exec'), hook_globals, hook_globals)
+        log('boot_cycle_hook: ran {} before cycle {}'.format(hook_path, next_cycle_index))
+        return
+    monitor.Parse('include @{}'.format(hook_path))
+    log('boot_cycle_hook: included {} before cycle {}'.format(hook_path, next_cycle_index))
+
+
 def analyze_boot_cycles(cycle_records):
     if not cycle_records:
         return {'status': 'not_run', 'requested_cycles': int(boot_cycles), 'completed_cycles': 0}
@@ -554,20 +605,28 @@ def analyze_boot_cycles(cycle_records):
     analysis = {
         'requested_cycles': int(boot_cycles),
         'completed_cycles': len(cycle_records),
+        'initial_slot': cycle_records[0].get('boot_slot'),
+        'initial_outcome': cycle_records[0].get('boot_outcome'),
         'final_slot': cycle_records[-1].get('boot_slot'),
         'final_outcome': cycle_records[-1].get('boot_outcome'),
         'slots_observed': [rec.get('boot_slot') for rec in cycle_records],
         'outcomes_observed': [rec.get('boot_outcome') for rec in cycle_records],
     }
+    target_slot = success_vtor_slot if success_vtor_slot not in ('', 'any') else None
+    if expected_rollback_at_cycle is not None:
+        analysis['expected_rollback_at_cycle'] = int(expected_rollback_at_cycle)
+        if target_slot is not None:
+            analysis['rollback_target_slot'] = target_slot
     if len(cycle_records) == 1:
         analysis['status'] = 'single_boot'
         return analysis
+    generic_status = 'oscillating'
+    converged_at_cycle = None
     if all(pair == pairs[0] for pair in pairs):
-        analysis['status'] = 'converged'
-        analysis['converged_at_cycle'] = 0
-        return analysis
-    if len(pairs) >= 2 and pairs[-1] == pairs[-2]:
-        analysis['status'] = 'converged'
+        generic_status = 'converged'
+        converged_at_cycle = 0
+    elif len(pairs) >= 2 and pairs[-1] == pairs[-2]:
+        generic_status = 'converged'
         converged_at = len(pairs) - 2
         final_pair = pairs[-1]
         for idx in range(len(pairs) - 2, -1, -1):
@@ -575,9 +634,43 @@ def analyze_boot_cycles(cycle_records):
                 converged_at = idx
             else:
                 break
-        analysis['converged_at_cycle'] = converged_at
+        converged_at_cycle = converged_at
+    if converged_at_cycle is not None:
+        analysis['converged_at_cycle'] = converged_at_cycle
+
+    if expected_rollback_at_cycle is not None:
+        rollback_cycle = None
+        initial_slot = analysis.get('initial_slot')
+        if target_slot is None:
+            target_slot = initial_slot
+        if target_slot == initial_slot:
+            analysis['status'] = generic_status
+            analysis['rollback_not_applicable'] = True
+            return analysis
+        for rec in cycle_records[1:]:
+            if rec.get('boot_outcome') != 'success':
+                continue
+            if rec.get('boot_slot') == target_slot:
+                rollback_cycle = int(rec.get('cycle', 0))
+                break
+        if rollback_cycle is None:
+            analysis['status'] = 'rollback_missing'
+            return analysis
+        analysis['rollback_cycle'] = rollback_cycle
+        if rollback_cycle > int(expected_rollback_at_cycle):
+            analysis['status'] = 'rollback_late'
+            return analysis
+        if (
+            generic_status == 'converged'
+            and analysis.get('final_outcome') == 'success'
+            and analysis.get('final_slot') == target_slot
+        ):
+            analysis['status'] = 'rollback_converged'
+            return analysis
+        analysis['status'] = 'rollback_observed_oscillating'
         return analysis
-    analysis['status'] = 'oscillating'
+
+    analysis['status'] = generic_status
     return analysis
 
 
@@ -610,6 +703,7 @@ def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_si
     else:
         flash_size = int(faultFlash.FlashSize)
     for cycle_index in range(1, int(boot_cycles)):
+        run_boot_cycle_hook(cycle_index, cycle_records)
         if USE_MRAM_PATH:
             current_flash = mram.ReadBytes(0, flash_size)
         else:

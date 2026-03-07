@@ -191,6 +191,7 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             self.assertFalse(profile.success_criteria.image_hash)
             self.assertEqual(profile.fault_sweep.max_writes, 64)
             self.assertEqual(profile.fault_sweep.boot_cycles, 3)
+            self.assertEqual(profile.fault_sweep.expected_rollback_at_cycle, 1)
             self.assertEqual(profile.fault_sweep.run_duration, "8.0")
             self.assertEqual(
                 profile.semantic_assertions["control"]["semantic_state.roles.next_boot"],
@@ -205,6 +206,8 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
                 "EXTRA_PERIPHERALS:{}".format((ROOT / "peripherals/STM32H7FlashController.cs").resolve()),
                 robot_vars,
             )
+            self.assertIn("EXPECTED_ROLLBACK_AT_CYCLE:1", robot_vars)
+            self.assertIn("successful_rollback", profile.invariants)
         finally:
             shutil.rmtree(temp_dir)
 

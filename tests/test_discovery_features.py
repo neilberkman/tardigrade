@@ -73,6 +73,8 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                   mode: runtime
                   evaluation_mode: execute
                   boot_cycles: 3
+                  boot_cycle_hook: {probe.as_posix()}
+                  expected_rollback_at_cycle: 2
                 state_probe_script: {probe.as_posix()}
                 semantic_assertions:
                   control:
@@ -87,6 +89,8 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             )
             profile = load_profile(profile_path)
             self.assertEqual(profile.fault_sweep.boot_cycles, 3)
+            self.assertEqual(profile.fault_sweep.boot_cycle_hook, str(probe))
+            self.assertEqual(profile.fault_sweep.expected_rollback_at_cycle, 2)
             self.assertEqual(profile.invariants, ["multi_boot_converges"])
             self.assertEqual(
                 profile.semantic_assertions["control"]["multi_boot_analysis.status"],
@@ -95,6 +99,8 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertEqual(profile.success_criteria.vector_table_offset, 0x200)
             robot_vars = profile.robot_vars(ROOT)
             self.assertIn("BOOT_CYCLES:3", robot_vars)
+            self.assertIn("BOOT_CYCLE_HOOK:{}".format(probe), robot_vars)
+            self.assertIn("EXPECTED_ROLLBACK_AT_CYCLE:2", robot_vars)
             self.assertIn("STATE_PROBE_SCRIPT:{}".format(probe), robot_vars)
             self.assertIn("SUCCESS_VECTOR_OFFSET:0x00000200", robot_vars)
 
@@ -247,6 +253,114 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertEqual(summary["issue_points"], 1)
             self.assertEqual(summary["failure_outcomes"], {"wrong_image": 1})
             self.assertEqual(summary["failure_classes"], {"wrong_image": 1})
+
+    def test_rollback_converged_satisfies_generic_invariants(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: rollback_profile
+                description: discovery
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  boot_cycles: 2
+                  expected_rollback_at_cycle: 1
+                invariants:
+                  - multi_boot_converges
+                  - successful_rollback
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            results = [
+                {
+                    "fault_at": 1,
+                    "fault_injected": True,
+                    "boot_outcome": "success",
+                    "boot_slot": "staging",
+                    "is_control": False,
+                    "multi_boot_analysis": {
+                        "status": "rollback_converged",
+                        "expected_rollback_at_cycle": 1,
+                        "rollback_cycle": 1,
+                        "final_slot": "exec",
+                        "final_outcome": "success",
+                    },
+                }
+            ]
+            annotate_result_checks(results, profile)
+            self.assertEqual(results[0].get("invariant_violations", []), [])
+
+    def test_successful_rollback_flags_missing_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: rollback_missing_profile
+                description: discovery
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  boot_cycles: 2
+                  expected_rollback_at_cycle: 1
+                invariants:
+                  - successful_rollback
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            results = [
+                {
+                    "fault_at": 1,
+                    "fault_injected": True,
+                    "boot_outcome": "success",
+                    "boot_slot": "staging",
+                    "is_control": False,
+                    "multi_boot_analysis": {
+                        "status": "rollback_missing",
+                        "expected_rollback_at_cycle": 1,
+                        "final_slot": "staging",
+                        "final_outcome": "success",
+                    },
+                }
+            ]
+            annotate_result_checks(results, profile)
+            self.assertEqual(len(results[0].get("invariant_violations", [])), 1)
+            self.assertEqual(
+                results[0]["invariant_violations"][0]["name"],
+                "successful_rollback",
+            )
 
     def test_control_result_derives_pre_state_for_bootable_invariant(self) -> None:
         with tempfile.TemporaryDirectory() as td:
