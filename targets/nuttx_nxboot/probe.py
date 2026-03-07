@@ -101,6 +101,7 @@ def _slot_probe(bus, base, slot_size):
         crc_data = _read_bytes(bus, int(base) + 12, total_image_size - 12)
         computed_crc = _crc32_update(0xFFFFFFFF, crc_data) ^ 0xFFFFFFFF
         crc_valid = computed_crc == image_crc
+    image_valid = bool(magic_kind in ("external", "internal") and crc_valid)
     vector_valid = False
     if total_image_size <= int(slot_size) and header_size <= int(slot_size):
         vector_valid = _vector_valid(bus, base, header_size, slot_size)
@@ -116,10 +117,9 @@ def _slot_probe(bus, base, slot_size):
         "identifier": _hex_u32(identifier),
         "version": "{}.{}.{}".format(version[0], version[1], version[2]),
         "crc_valid": bool(crc_valid),
+        "image_valid": image_valid,
         "vector_valid": bool(vector_valid),
-        "bootable": bool(
-            magic_kind in ("external", "internal") and crc_valid and vector_valid
-        ),
+        "bootable": bool(image_valid and vector_valid),
     }
 
 
@@ -168,8 +168,8 @@ def collect_state(bus=None, monitor=None, context=None):
     update = secondary if update_slot == "secondary" else tertiary
     recovery = secondary if recovery_slot == "secondary" else tertiary
 
-    primary_valid = bool(primary.get("crc_valid") and primary.get("vector_valid"))
-    recovery_valid = bool(recovery.get("crc_valid") and recovery.get("vector_valid"))
+    primary_valid = bool(primary.get("image_valid"))
+    recovery_valid = bool(recovery.get("image_valid"))
     recovery_present = primary.get("image_crc") == recovery.get("image_crc")
 
     primary_confirmed = False

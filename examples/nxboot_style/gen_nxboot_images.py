@@ -74,6 +74,8 @@ def make_nxboot_image(
     payload_size: int,
     version: tuple[int, int, int],
     header_size: int = NXBOOT_HEADER_SIZE,
+    magic: int = NXBOOT_HEADER_MAGIC,
+    platform_id: int = PLATFORM_ID,
 ) -> bytes:
     """Build a complete nxboot image (header + payload).
 
@@ -89,7 +91,7 @@ def make_nxboot_image(
         hdr[i] = 0xFF
 
     # magic (4 bytes)
-    struct.pack_into("<I", hdr, 0, NXBOOT_HEADER_MAGIC)
+    struct.pack_into("<I", hdr, 0, magic)
     # hdr_version (2 bytes: major=1, minor=0)
     hdr[4] = 1
     hdr[5] = 0
@@ -100,7 +102,7 @@ def make_nxboot_image(
     # size (4 bytes at offset 12)
     struct.pack_into("<I", hdr, 12, payload_size)
     # identifier (8 bytes at offset 16)
-    struct.pack_into("<Q", hdr, 16, PLATFORM_ID)
+    struct.pack_into("<Q", hdr, 16, platform_id)
     # extd_hdr_ptr (4 bytes at offset 24)
     struct.pack_into("<I", hdr, 24, 0)
     # img_version (6 bytes at offset 28)
