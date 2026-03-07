@@ -49,7 +49,7 @@ ${FAULT_TYPES}                 write
 ${FAULT_TYPE_CSV}              ${EMPTY}
 ${BOOT_CYCLES}                 1
 ${BOOT_CYCLE_HOOK}            ${EMPTY}
-${EXPECTED_ROLLBACK_AT_CYCLE} ${EMPTY}
+${EXPECTED_ROLLBACK_AT_CYCLE}    ${EMPTY}
 ${SUCCESS_IMAGE_HASH}          false
 ${SUCCESS_IMAGE_HASH_SLOT}     ${EMPTY}
 ${IMAGE_EXEC_SHA256}           ${EMPTY}
