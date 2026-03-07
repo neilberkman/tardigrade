@@ -184,6 +184,7 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             profile = load_profile(profile_path)
 
             self.assertEqual(profile.platform, "platforms/nucleo_h753zi_tardigrade.repl")
+            self.assertEqual(profile.flash_backend, "faultFlash")
             self.assertEqual(profile.bootloader_entry, 0x08000000)
             self.assertEqual(profile.success_criteria.vtor_in_slot, "exec")
             self.assertEqual(profile.success_criteria.vector_table_offset, 0x400)

@@ -39,6 +39,7 @@ def render_runtime_profile(
 name: {name}
 description: Real NuttX nxboot STM32H7 update profile generated from public build outputs
 platform: platforms/nucleo_h753zi_tardigrade.repl
+flash_backend: faultFlash
 bootloader:
   elf: {loader_elf}
   entry: 0x{bootloader_entry:08X}
