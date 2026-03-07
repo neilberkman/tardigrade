@@ -15,9 +15,13 @@ on:
         description: Representative fault-point budget
         required: true
         default: "2"
+      renode_url:
+        description: Renode archive URL
+        required: true
+        default: https://builds.renode.io/renode-1.16.1.linux-dotnet.tar.gz
 
 concurrency:
-  group: nuttx-nxboot-real-exploratory-${{ github.event.inputs.nuttx_ref }}-${{ github.event.inputs.nuttx_apps_ref }}-${{ github.event.inputs.fault_max_writes }}
+  group: nuttx-nxboot-real-exploratory-${{ github.event.inputs.nuttx_ref }}-${{ github.event.inputs.nuttx_apps_ref }}-${{ github.event.inputs.fault_max_writes }}-${{ github.event.inputs.renode_url }}
   cancel-in-progress: true
 
 jobs:
@@ -28,7 +32,7 @@ jobs:
       TOOLCHAIN_VERSION: 13.2.1-1.1
       TOOLCHAIN_URL: https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v13.2.1-1.1/xpack-arm-none-eabi-gcc-13.2.1-1.1-linux-x64.tar.gz
       TOOLCHAIN_SHA256: 1252a8cafe9237de27a765376697230368eec21db44dc3f1edeb8d838dabd530
-      RENODE_URL: https://builds.renode.io/renode-latest.linux-portable.tar.gz
+      RENODE_URL: ${{ inputs.renode_url }}
       PYTHONUNBUFFERED: "1"
 
     steps:
