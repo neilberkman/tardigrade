@@ -208,6 +208,16 @@ def prepare_renode_command(
         return str(resolved_target / p.name)
 
     add_mount(str(cwd))
+    forwarded_env: List[Tuple[str, str]] = []
+    for key in ("DOTNET_BUNDLE_EXTRACT_BASE_DIR", "TMPDIR", "TMP", "TEMP"):
+        value = env.get(key)
+        if not value:
+            continue
+        if os.path.isabs(value):
+            add_mount(value)
+            value = normalize_container_path(value)
+        forwarded_env.append((key, value))
+
     container_args: List[str] = []
     for arg in base_cmd[1:]:
         if os.path.isabs(arg):
@@ -249,14 +259,12 @@ def prepare_renode_command(
     ]
     for mount_dir in sorted(mount_dirs.keys()):
         cmd.extend(["-v", "{}:{}".format(mount_dir, mount_dir)])
+    for key, value in forwarded_env:
+        cmd.extend(["-e", "{}={}".format(key, value)])
     cmd.extend(
         [
             "-w",
             str(cwd),
-            "-e",
-            "DOTNET_BUNDLE_EXTRACT_BASE_DIR={}".format(
-                env.get("DOTNET_BUNDLE_EXTRACT_BASE_DIR", "/tmp/dotnet_bundle")
-            ),
             image,
             "renode-test",
         ]
@@ -294,6 +302,22 @@ def parse_renode_point_timeout(env: Dict[str, str]) -> Optional[float]:
     return value
 
 
+def prepare_run_environment(
+    base_env: Dict[str, str],
+    bundle_dir: Path,
+    temp_root: Path,
+) -> Dict[str, str]:
+    """Prepare a subprocess environment with isolated temp directories."""
+    env = dict(base_env)
+    env.setdefault("DOTNET_BUNDLE_EXTRACT_BASE_DIR", str(bundle_dir))
+    temp_root.mkdir(parents=True, exist_ok=True)
+    temp_root_str = str(temp_root)
+    env["TMPDIR"] = temp_root_str
+    env["TMP"] = temp_root_str
+    env["TEMP"] = temp_root_str
+    return env
+
+
 def quick_subset(points: List[int]) -> List[int]:
     if len(points) <= 3:
         return points
@@ -321,6 +345,7 @@ def run_single_point(
 
     result_file = point_dir / "result.json"
     rf_results = point_dir / "robot"
+    temp_root = point_dir / ".tmp"
     bundle_dir = work_dir / ".dotnet_bundle"
     renode_config = work_dir / "renode.config"
     bundle_dir.mkdir(parents=True, exist_ok=True)
@@ -340,8 +365,7 @@ def run_single_point(
     for rv in robot_vars:
         cmd.extend(["--variable", rv])
 
-    env = os.environ.copy()
-    env.setdefault("DOTNET_BUNDLE_EXTRACT_BASE_DIR", str(bundle_dir))
+    env = prepare_run_environment(os.environ.copy(), bundle_dir, temp_root)
     cmd = prepare_renode_command(renode_test, cmd, repo_root, env)
     timeout_s = parse_renode_point_timeout(env)
     if calibration and timeout_s is not None:
@@ -382,6 +406,8 @@ def run_single_point(
     finally:
         if not keep_run_artifacts and rf_results.exists():
             shutil.rmtree(rf_results, ignore_errors=True)
+        if not keep_run_artifacts and temp_root.exists():
+            shutil.rmtree(temp_root, ignore_errors=True)
 
 
 @dataclasses.dataclass
@@ -509,6 +535,7 @@ def run_batch(
 
     result_file = batch_dir / "result.json"
     rf_results = batch_dir / "robot"
+    temp_root = batch_dir / ".tmp"
     bundle_dir = work_dir / ".dotnet_bundle"
     renode_config = work_dir / "renode.config"
     bundle_dir.mkdir(parents=True, exist_ok=True)
@@ -550,8 +577,7 @@ def run_batch(
     for rv in robot_vars:
         cmd.extend(["--variable", rv])
 
-    env = os.environ.copy()
-    env.setdefault("DOTNET_BUNDLE_EXTRACT_BASE_DIR", str(bundle_dir))
+    env = prepare_run_environment(os.environ.copy(), bundle_dir, temp_root)
     cmd = prepare_renode_command(renode_test, cmd, repo_root, env)
     per_point_timeout = parse_renode_point_timeout(env)
     # Scale batch timeout by number of fault points.  Each point typically
@@ -602,6 +628,8 @@ def run_batch(
     finally:
         if not keep_run_artifacts and rf_results.exists():
             shutil.rmtree(rf_results, ignore_errors=True)
+        if not keep_run_artifacts and temp_root.exists():
+            shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def _split_batch_plan(

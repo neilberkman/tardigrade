@@ -24,6 +24,7 @@ steps:
     kind: audit
     audit:
       workers: 2
+      max_batch_points: 128
     profile_overrides:
       <<: *mcuboot_target_overrides
       semantic_assertions:
@@ -35,6 +36,7 @@ steps:
     base_profile: profiles/mcuboot_head_revert.yaml
     audit:
       workers: 2
+      max_batch_points: 128
     profile_overrides:
       <<: *mcuboot_target_overrides
       semantic_assertions:

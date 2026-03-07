@@ -342,7 +342,12 @@ class DiscoveryFeaturesTest(unittest.TestCase):
         self.assertIn("semantic/invariant", reason)
 
     def test_docker_renode_spec_expands_to_direct_docker_command(self) -> None:
-        env = {"DOTNET_BUNDLE_EXTRACT_BASE_DIR": "/tmp/dotnet_bundle"}
+        env = {
+            "DOTNET_BUNDLE_EXTRACT_BASE_DIR": "/tmp/dotnet_bundle",
+            "TMPDIR": "/tmp/renode_tmp",
+            "TMP": "/tmp/renode_tmp",
+            "TEMP": "/tmp/renode_tmp",
+        }
         platform_repl = ROOT / "platforms" / "cortex_m4_flash_fast.repl"
         cmd = prepare_renode_command(
             "docker://renode-patched:test",
@@ -366,7 +371,12 @@ class DiscoveryFeaturesTest(unittest.TestCase):
         self.assertTrue(any("renode-test" in part for part in cmd))
         self.assertIn("-w", cmd)
         self.assertIn(str(ROOT), cmd)
-        self.assertIn("DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp/dotnet_bundle", cmd)
+        self.assertTrue(
+            any(part.startswith("DOTNET_BUNDLE_EXTRACT_BASE_DIR=") for part in cmd)
+        )
+        self.assertTrue(any(part.startswith("TMPDIR=") for part in cmd))
+        self.assertTrue(any(part.startswith("TMP=") for part in cmd))
+        self.assertTrue(any(part.startswith("TEMP=") for part in cmd))
         self.assertNotIn("docker://renode-patched:test", cmd[1:])
 
     def test_run_single_point_prunes_robot_artifacts_by_default(self) -> None:
@@ -399,6 +409,14 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             profile = load_profile(profile_path)
 
             def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+                self.assertEqual(
+                    env["TMPDIR"],
+                    str(tempdir / "work" / "cleanup_profile_fault_7" / ".tmp"),
+                )
+                self.assertEqual(env["TMP"], env["TMPDIR"])
+                self.assertEqual(env["TEMP"], env["TMPDIR"])
+                Path(env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+                (Path(env["TMPDIR"]) / "renode.tmp").write_text("x", encoding="utf-8")
                 rf_results = Path(cmd[cmd.index("--results-dir") + 1])
                 rf_results.mkdir(parents=True, exist_ok=True)
                 (rf_results / "snapshots").mkdir(parents=True, exist_ok=True)
@@ -428,6 +446,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
 
             self.assertEqual(result["boot_outcome"], "success")
             self.assertFalse((tempdir / "work" / "cleanup_profile_fault_7" / "robot").exists())
+            self.assertFalse((tempdir / "work" / "cleanup_profile_fault_7" / ".tmp").exists())
 
     def test_run_single_point_keeps_robot_artifacts_when_requested(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -459,6 +478,12 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             profile = load_profile(profile_path)
 
             def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+                self.assertEqual(
+                    env["TMPDIR"],
+                    str(tempdir / "work" / "keep_artifacts_profile_fault_9" / ".tmp"),
+                )
+                Path(env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+                (Path(env["TMPDIR"]) / "renode.tmp").write_text("x", encoding="utf-8")
                 rf_results = Path(cmd[cmd.index("--results-dir") + 1])
                 rf_results.mkdir(parents=True, exist_ok=True)
                 (rf_results / "snapshots").mkdir(parents=True, exist_ok=True)
@@ -487,6 +512,9 @@ class DiscoveryFeaturesTest(unittest.TestCase):
 
             self.assertTrue(
                 (tempdir / "work" / "keep_artifacts_profile_fault_9" / "robot" / "snapshots").exists()
+            )
+            self.assertTrue(
+                (tempdir / "work" / "keep_artifacts_profile_fault_9" / ".tmp" / "renode.tmp").exists()
             )
 
     def test_run_batch_prunes_robot_artifacts_on_failure(self) -> None:
@@ -519,6 +547,12 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             profile = load_profile(profile_path)
 
             def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+                self.assertEqual(
+                    env["TMPDIR"],
+                    str(tempdir / "work" / "cleanup_batch_profile_batch" / ".tmp"),
+                )
+                Path(env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+                (Path(env["TMPDIR"]) / "renode.tmp").write_text("x", encoding="utf-8")
                 rf_results = Path(cmd[cmd.index("--results-dir") + 1])
                 rf_results.mkdir(parents=True, exist_ok=True)
                 (rf_results / "snapshots").mkdir(parents=True, exist_ok=True)
@@ -540,6 +574,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                     )
 
             self.assertFalse((tempdir / "work" / "cleanup_batch_profile_batch" / "robot").exists())
+            self.assertFalse((tempdir / "work" / "cleanup_batch_profile_batch" / ".tmp").exists())
 
 
 if __name__ == "__main__":
