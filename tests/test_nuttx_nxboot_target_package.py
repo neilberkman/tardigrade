@@ -162,6 +162,100 @@ class NuttxNxbootTargetPackageTest(unittest.TestCase):
         self.assertTrue(state["roles"]["recovery_valid"])
         self.assertTrue(state["flags"]["same_primary_recovery_crc"])
 
+    def test_probe_honors_explicit_tertiary_layout(self) -> None:
+        slot_size = 0x23000
+        primary_base = 0x10002000
+        secondary_base = 0x10025000
+        tertiary_base = 0x10100000
+
+        bus = _FakeBus()
+        monitor = _FakeMonitor(
+            {
+                "slot_exec_base": hex(primary_base),
+                "slot_exec_size": hex(slot_size),
+                "slot_staging_base": hex(secondary_base),
+                "slot_staging_size": hex(slot_size),
+                "slot_tertiary_base": hex(tertiary_base),
+                "slot_tertiary_size": hex(slot_size),
+            }
+        )
+
+        primary = make_nxboot_image(primary_base, 0x4000, (1, 0, 0))
+        recovery = make_nxboot_image(
+            primary_base,
+            0x4000,
+            (1, 0, 0),
+            magic=NXBOOT_HEADER_MAGIC_INT,
+        )
+        update = make_nxboot_image(primary_base, 0x4000, (3, 0, 0))
+        bus.write_bytes(primary_base, primary)
+        bus.write_bytes(secondary_base, recovery)
+        bus.write_bytes(tertiary_base, update)
+
+        state = collect_state(
+            bus=bus,
+            monitor=monitor,
+            context={"stage": "post_boot", "boot_slot": "exec", "fault_injected": False},
+        )
+        self.assertEqual(state["slots"]["tertiary"]["base"], "0x10100000")
+        self.assertEqual(state["roles"]["update_slot"], "tertiary")
+        self.assertEqual(state["roles"]["recovery_slot"], "secondary")
+        self.assertEqual(state["roles"]["next_boot"], "update")
+
+    def test_probe_models_revert_for_unconfirmed_internal_primary(self) -> None:
+        slot_size = 0x23000
+        primary_base = 0x10002000
+        secondary_base = 0x10025000
+
+        bus = _FakeBus()
+        monitor = self._monitor(primary_base, secondary_base, slot_size)
+
+        primary = make_nxboot_image(
+            primary_base,
+            0x4000,
+            (2, 0, 0),
+            magic=NXBOOT_HEADER_MAGIC_INT | 0x1,
+        )
+        recovery = make_nxboot_image(
+            primary_base,
+            0x4000,
+            (1, 0, 0),
+            magic=NXBOOT_HEADER_MAGIC_INT,
+        )
+        bus.write_bytes(primary_base, primary)
+        bus.write_bytes(secondary_base, recovery)
+
+        state = collect_state(
+            bus=bus,
+            monitor=monitor,
+            context={"stage": "post_boot", "boot_slot": "exec", "fault_injected": False},
+        )
+        self.assertFalse(state["roles"]["primary_confirmed"])
+        self.assertTrue(state["roles"]["recovery_valid"])
+        self.assertEqual(state["roles"]["next_boot"], "revert")
+
+    def test_probe_consumes_duplicate_update(self) -> None:
+        slot_size = 0x23000
+        primary_base = 0x10002000
+        secondary_base = 0x10025000
+
+        bus = _FakeBus()
+        monitor = self._monitor(primary_base, secondary_base, slot_size)
+
+        primary = make_nxboot_image(primary_base, 0x4000, (1, 0, 0))
+        duplicate = make_nxboot_image(primary_base, 0x4000, (1, 0, 0))
+        bus.write_bytes(primary_base, primary)
+        bus.write_bytes(secondary_base, duplicate)
+
+        state = collect_state(
+            bus=bus,
+            monitor=monitor,
+            context={"stage": "post_boot", "boot_slot": "exec", "fault_injected": False},
+        )
+        self.assertEqual(state["roles"]["update_slot"], "secondary")
+        self.assertTrue(state["flags"]["same_primary_update_crc"])
+        self.assertEqual(state["roles"]["next_boot"], "none")
+
     def test_invariant_rejects_confirmed_internal_without_recovery(self) -> None:
         result = SimpleNamespace(
             nvm_state={

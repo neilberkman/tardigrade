@@ -23,6 +23,15 @@ def _as_int(value, default=0):
         return int(default)
 
 
+def _get_monitor_int(monitor, names, default=None):
+    for name in names:
+        try:
+            return _as_int(monitor.GetVariable(name))
+        except Exception:
+            continue
+    return default
+
+
 def _read_byte(bus, addr):
     return int(bus.ReadByte(addr)) & 0xFF
 
@@ -156,13 +165,23 @@ def collect_state(bus=None, monitor=None, context=None):
 
     context = context or {}
     primary_base = _as_int(monitor.GetVariable("slot_exec_base"))
-    slot_size = _as_int(monitor.GetVariable("slot_exec_size"))
+    primary_size = _as_int(monitor.GetVariable("slot_exec_size"))
     secondary_base = _as_int(monitor.GetVariable("slot_staging_base"))
-    tertiary_base = secondary_base + slot_size
+    secondary_size = _as_int(monitor.GetVariable("slot_staging_size"), primary_size)
+    tertiary_base = _get_monitor_int(
+        monitor,
+        ("slot_tertiary_base", "slot_recovery_base"),
+        secondary_base + secondary_size,
+    )
+    tertiary_size = _get_monitor_int(
+        monitor,
+        ("slot_tertiary_size", "slot_recovery_size"),
+        secondary_size,
+    )
 
-    primary = _slot_probe(bus, primary_base, slot_size)
-    secondary = _slot_probe(bus, secondary_base, slot_size)
-    tertiary = _slot_probe(bus, tertiary_base, slot_size)
+    primary = _slot_probe(bus, primary_base, primary_size)
+    secondary = _slot_probe(bus, secondary_base, secondary_size)
+    tertiary = _slot_probe(bus, tertiary_base, tertiary_size)
 
     update_slot, recovery_slot = _determine_roles(primary, secondary, tertiary)
     update = secondary if update_slot == "secondary" else tertiary
