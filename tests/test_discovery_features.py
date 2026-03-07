@@ -362,6 +362,297 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 "successful_rollback",
             )
 
+    def test_boot_cycle_hook_with_rollback_full_pipeline(self) -> None:
+        """End-to-end: profile with hook -> result with rollback cycle records -> correct invariant verdict.
+
+        Simulates the scenario where a boot_cycle_hook acts as an
+        "app confirms OTA" step. The hook writes a confirmation marker
+        between cycles. Without the hook, the bootloader would roll back
+        to the safe slot. With the hook confirming, the new slot sticks.
+
+        This test proves the full pipeline:
+          1. Profile parsing of boot_cycle_hook + expected_rollback_at_cycle
+          2. Robot variable emission (BOOT_CYCLE_HOOK, EXPECTED_ROLLBACK_AT_CYCLE)
+          3. Invariant evaluation of rollback_converged status
+          4. Summary verdict (no issues when rollback succeeds)
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            # Create a real hook script file (the file must exist for
+            # path resolution even though we won't execute it in Renode).
+            hook_script = tempdir / "confirm_ota_hook.py"
+            hook_script.write_text(
+                "# Boot cycle hook: simulate OTA confirmation.\n"
+                "# In a real Renode run, this would write a marker to NVM:\n"
+                "#   bus.WriteDoubleWord(CONFIRM_ADDR, 0xC0FFEE01)\n"
+                "# Here we just need to exist for profile/path resolution.\n",
+                encoding="utf-8",
+            )
+            profile_path = self._write_profile(
+                tempdir,
+                f"""
+                schema_version: 1
+                name: hook_rollback_pipeline
+                description: Hook-driven rollback integration test
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: {{ start: 0x20000000, end: 0x20020000 }}
+                  write_granularity: 4
+                  slots:
+                    exec: {{ base: 0x10000000, size: 0x1000 }}
+                    staging: {{ base: 0x10001000, size: 0x1000 }}
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  boot_cycles: 3
+                  boot_cycle_hook: {hook_script.as_posix()}
+                  expected_rollback_at_cycle: 2
+                invariants:
+                  - multi_boot_converges
+                  - successful_rollback
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+
+            # Verify profile fields parsed correctly.
+            self.assertEqual(profile.fault_sweep.boot_cycles, 3)
+            self.assertEqual(profile.fault_sweep.boot_cycle_hook, str(hook_script))
+            self.assertEqual(profile.fault_sweep.expected_rollback_at_cycle, 2)
+
+            # Verify robot variables emitted correctly.
+            robot_vars = profile.robot_vars(ROOT)
+            self.assertIn("BOOT_CYCLES:3", robot_vars)
+            self.assertIn(f"BOOT_CYCLE_HOOK:{hook_script}", robot_vars)
+            self.assertIn("EXPECTED_ROLLBACK_AT_CYCLE:2", robot_vars)
+
+            # Simulate a SUCCESSFUL rollback scenario:
+            # Cycle 0: fault during OTA, boots to staging (wrong slot)
+            # Cycle 1: hook runs, simulates "app does NOT confirm" -> boots staging again
+            # Cycle 2: hook runs, bootloader rolls back -> boots exec (target slot)
+            results_rollback_ok = [
+                {
+                    "fault_at": 5,
+                    "fault_injected": True,
+                    "boot_outcome": "success",
+                    "boot_slot": "staging",
+                    "is_control": False,
+                    "multi_boot_analysis": {
+                        "status": "rollback_converged",
+                        "requested_cycles": 3,
+                        "completed_cycles": 3,
+                        "expected_rollback_at_cycle": 2,
+                        "rollback_cycle": 2,
+                        "initial_slot": "staging",
+                        "initial_outcome": "success",
+                        "final_slot": "exec",
+                        "final_outcome": "success",
+                        "slots_observed": ["staging", "staging", "exec"],
+                        "outcomes_observed": ["success", "success", "success"],
+                        "converged_at_cycle": 2,
+                    },
+                    "boot_cycles": [
+                        {"cycle": 0, "boot_outcome": "success", "boot_slot": "staging"},
+                        {"cycle": 1, "boot_outcome": "success", "boot_slot": "staging"},
+                        {"cycle": 2, "boot_outcome": "success", "boot_slot": "exec"},
+                    ],
+                }
+            ]
+            annotate_result_checks(results_rollback_ok, profile)
+            # Both invariants should pass when rollback converged.
+            self.assertEqual(results_rollback_ok[0].get("invariant_violations", []), [])
+
+            # Now simulate a FAILED rollback scenario (hook never causes rollback):
+            # All 3 cycles boot to staging -- rollback never happened.
+            results_rollback_missing = [
+                {
+                    "fault_at": 5,
+                    "fault_injected": True,
+                    "boot_outcome": "success",
+                    "boot_slot": "staging",
+                    "is_control": False,
+                    "multi_boot_analysis": {
+                        "status": "rollback_missing",
+                        "requested_cycles": 3,
+                        "completed_cycles": 3,
+                        "expected_rollback_at_cycle": 2,
+                        "initial_slot": "staging",
+                        "initial_outcome": "success",
+                        "final_slot": "staging",
+                        "final_outcome": "success",
+                        "slots_observed": ["staging", "staging", "staging"],
+                        "outcomes_observed": ["success", "success", "success"],
+                    },
+                    "boot_cycles": [
+                        {"cycle": 0, "boot_outcome": "success", "boot_slot": "staging"},
+                        {"cycle": 1, "boot_outcome": "success", "boot_slot": "staging"},
+                        {"cycle": 2, "boot_outcome": "success", "boot_slot": "staging"},
+                    ],
+                }
+            ]
+            annotate_result_checks(results_rollback_missing, profile)
+            # successful_rollback invariant must fire.
+            violations = results_rollback_missing[0].get("invariant_violations", [])
+            violation_names = [v["name"] for v in violations]
+            self.assertIn("successful_rollback", violation_names)
+
+            # Verify summary correctly counts issues for the failed case.
+            summary = summarize_runtime_sweep(
+                results_rollback_missing, total_writes=10, profile=profile
+            )
+            self.assertGreater(summary["invariant_issue_points"], 0)
+
+    def test_boot_cycle_hook_oscillating_triggers_multi_boot_invariant(self) -> None:
+        """Boot path that oscillates between slots should trigger multi_boot_converges."""
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            hook_script = tempdir / "noop_hook.py"
+            hook_script.write_text("# no-op hook\n", encoding="utf-8")
+            profile_path = self._write_profile(
+                tempdir,
+                f"""
+                schema_version: 1
+                name: hook_oscillation_test
+                description: Hook with oscillating boots
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: {{ start: 0x20000000, end: 0x20020000 }}
+                  write_granularity: 4
+                  slots:
+                    exec: {{ base: 0x10000000, size: 0x1000 }}
+                    staging: {{ base: 0x10001000, size: 0x1000 }}
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  boot_cycles: 4
+                  boot_cycle_hook: {hook_script.as_posix()}
+                invariants:
+                  - multi_boot_converges
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+
+            # Oscillating: exec -> staging -> exec -> staging
+            results = [
+                {
+                    "fault_at": 3,
+                    "fault_injected": True,
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "is_control": False,
+                    "multi_boot_analysis": {
+                        "status": "oscillating",
+                        "requested_cycles": 4,
+                        "completed_cycles": 4,
+                        "initial_slot": "exec",
+                        "initial_outcome": "success",
+                        "final_slot": "staging",
+                        "final_outcome": "success",
+                        "slots_observed": ["exec", "staging", "exec", "staging"],
+                        "outcomes_observed": ["success", "success", "success", "success"],
+                    },
+                    "boot_cycles": [
+                        {"cycle": 0, "boot_outcome": "success", "boot_slot": "exec"},
+                        {"cycle": 1, "boot_outcome": "success", "boot_slot": "staging"},
+                        {"cycle": 2, "boot_outcome": "success", "boot_slot": "exec"},
+                        {"cycle": 3, "boot_outcome": "success", "boot_slot": "staging"},
+                    ],
+                }
+            ]
+            annotate_result_checks(results, profile)
+            violations = results[0].get("invariant_violations", [])
+            violation_names = [v["name"] for v in violations]
+            self.assertIn("multi_boot_converges", violation_names)
+
+    def test_rollback_not_applicable_when_already_in_target_slot(self) -> None:
+        """When initial boot is already in the target slot, rollback is N/A."""
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: rollback_na_profile
+                description: discovery
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  boot_cycles: 3
+                  expected_rollback_at_cycle: 2
+                invariants:
+                  - multi_boot_converges
+                  - successful_rollback
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+
+            # Already in exec (target slot) -- rollback is not applicable.
+            # analyze_boot_cycles sets rollback_not_applicable=True and
+            # status = converged (since all cycles are the same).
+            results = [
+                {
+                    "fault_at": 2,
+                    "fault_injected": True,
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "is_control": False,
+                    "multi_boot_analysis": {
+                        "status": "converged",
+                        "requested_cycles": 3,
+                        "completed_cycles": 3,
+                        "expected_rollback_at_cycle": 2,
+                        "rollback_not_applicable": True,
+                        "initial_slot": "exec",
+                        "initial_outcome": "success",
+                        "final_slot": "exec",
+                        "final_outcome": "success",
+                        "converged_at_cycle": 0,
+                        "slots_observed": ["exec", "exec", "exec"],
+                        "outcomes_observed": ["success", "success", "success"],
+                    },
+                    "boot_cycles": [
+                        {"cycle": 0, "boot_outcome": "success", "boot_slot": "exec"},
+                        {"cycle": 1, "boot_outcome": "success", "boot_slot": "exec"},
+                        {"cycle": 2, "boot_outcome": "success", "boot_slot": "exec"},
+                    ],
+                }
+            ]
+            annotate_result_checks(results, profile)
+            # multi_boot_converges should pass (status = converged).
+            # successful_rollback should also pass: the device already
+            # booted into the target slot, so rollback was not needed.
+            violations = results[0].get("invariant_violations", [])
+            violation_names = [v["name"] for v in violations]
+            self.assertNotIn("multi_boot_converges", violation_names)
+            self.assertNotIn("successful_rollback", violation_names)
+
     def test_control_result_derives_pre_state_for_bootable_invariant(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)

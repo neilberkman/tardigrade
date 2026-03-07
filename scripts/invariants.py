@@ -364,6 +364,10 @@ def check_successful_rollback(
         return
     if multi_boot_analysis.get("status") == "rollback_converged":
         return
+    # If the device already booted into the target slot (no rollback
+    # needed), this is not a failure -- rollback is simply N/A.
+    if multi_boot_analysis.get("rollback_not_applicable"):
+        return
     raise InvariantViolation(
         invariant_name="successful_rollback",
         description=(
