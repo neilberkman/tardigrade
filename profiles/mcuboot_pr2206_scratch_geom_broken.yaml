@@ -6,6 +6,7 @@ description: >
   Uses a near-max staging image for slot size 0x6E000.
 
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_pr2206_scratch_geom_broken.elf

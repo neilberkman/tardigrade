@@ -6,6 +6,7 @@ description: >
   flash metadata on every boot. No brick on power-cycle mid swap-move.
 
 platform: platforms/stm32f4.repl
+flash_backend: faultFlash
 
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_pr1597_stm32f4_fixed.elf

@@ -2,6 +2,7 @@ schema_version: 1
 name: mcuboot_pr2100_fixed
 description: "MCUboot swap-using-move AFTER PR #2100 fix (commit 4f393563). REVERT row accepts BOOT_MAGIC_ANY — tolerates partial magic from interrupted fixup_revert."
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_pr2100_fixed.elf
   entry: 0x00000000

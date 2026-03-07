@@ -54,7 +54,7 @@ rtc1: Timers.NRF52840_RTC @ sysbus 0x40011000
 
 // NVMC — handles write/erase enable, page erase, and write counting.
 // Flash reference for MappedMemory erase operations.
-nvmc: Miscellaneous.NRF52NVMC @ sysbus 0x4001E000
+faultFlash: Miscellaneous.NRF52NVMC @ sysbus 0x4001E000
     Flash: nvm
     FlashBaseAddress: 0x0000C000
     FlashSize: 0xF4000

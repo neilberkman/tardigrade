@@ -1198,9 +1198,9 @@ def run_runtime_sweep(
         and not trace_file_bin
         and fault_points
     ):
-        max_batch_points = 4
+        max_batch_points = 32
         print(
-            "Execute mode without trace replay: enforcing sub-batches of 4 points.",
+            "Execute mode without trace replay: enforcing sub-batches of 32 points.",
             file=sys.stderr,
         )
 

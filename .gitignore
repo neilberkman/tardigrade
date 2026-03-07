@@ -45,3 +45,4 @@ results/oss_validation/worktrees/
 
 # Third-party source checkouts
 third_party/
+.worktrees/

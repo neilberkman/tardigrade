@@ -8,6 +8,7 @@ description: >-
   the vulnerable copy-in-place firmware which has no metadata at all.
 
 platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
 bootloader:
   elf: examples/vulnerable_ota/firmware.elf
   entry: 0x10000000

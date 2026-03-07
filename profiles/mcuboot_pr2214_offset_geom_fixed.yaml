@@ -5,6 +5,7 @@ description: >
   Companion profile to compare against the broken geometry-trigger variant.
 
 platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
 
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_pr2214_offset_fixed.elf
