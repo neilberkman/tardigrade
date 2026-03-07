@@ -31,6 +31,11 @@ def render(value: Any, variables: Dict[str, str]) -> Any:
     return value
 
 
+def is_brick(result: Dict[str, Any]) -> bool:
+    outcome = str(result.get("boot_outcome", "unknown") or "unknown").strip().lower()
+    return outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}
+
+
 def git_ref_exists(repo: Path, ref: str) -> bool:
     proc = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "--verify", "{}^{{commit}}".format(ref)],
@@ -242,14 +247,26 @@ def run_profile(
     expect = profile.get("expect") or {}
     control = [r for r in results if r.get("is_control")]
     faulted = [r for r in results if not r.get("is_control")]
-    bricks = sum(1 for r in faulted if r.get("boot_outcome") != "success")
+    bricks = sum(1 for r in faulted if is_brick(r))
+    issues = sum(1 for r in faulted if r.get("boot_outcome") != "success")
     errors = sum(1 for r in results if r.get("boot_outcome") == "infra_error")
     brick_rate = (float(bricks) / len(faulted)) if faulted else 0.0
+    issue_rate = (float(issues) / len(faulted)) if faulted else 0.0
     failures: List[str] = []
 
     bricks_max = expect.get("bricks_max")
     if bricks_max is not None and bricks > int(bricks_max):
         failures.append("bricks={} exceeds max {}".format(bricks, bricks_max))
+    bricks_min = expect.get("bricks_min")
+    if bricks_min is not None and bricks < int(bricks_min):
+        failures.append("bricks={} below min {}".format(bricks, bricks_min))
+
+    issues_max = expect.get("issues_max")
+    if issues_max is not None and issues > int(issues_max):
+        failures.append("issues={} exceeds max {}".format(issues, issues_max))
+    issues_min = expect.get("issues_min")
+    if issues_min is not None and issues < int(issues_min):
+        failures.append("issues={} below min {}".format(issues, issues_min))
 
     if expect.get("require_control_success"):
         bad = [r for r in control if r.get("boot_outcome") != "success"]
@@ -261,7 +278,8 @@ def run_profile(
     return {
         "profile": name, "passed": len(failures) == 0,
         "faulted_runs": len(faulted), "bricks": bricks,
-        "brick_rate": round(brick_rate, 4), "infra_errors": errors,
+        "brick_rate": round(brick_rate, 4), "issues": issues,
+        "issue_rate": round(issue_rate, 4), "infra_errors": errors,
         "failures": failures, "results": results,
     }
 
@@ -313,8 +331,9 @@ def main() -> int:
         entry = run_profile(repo_root, renode_test, profile, variables, args.workers, args.skip_setup)
         all_results.append(entry)
         status = "PASS" if entry["passed"] else "FAIL"
-        print("  {} bricks={}/{} {}".format(
+        print("  {} bricks={}/{} issues={}/{} {}".format(
             status, entry["bricks"], entry["faulted_runs"],
+            entry["issues"], entry["faulted_runs"],
             " ".join(entry["failures"])), file=sys.stderr)
 
     all_passed = all(r["passed"] for r in all_results)

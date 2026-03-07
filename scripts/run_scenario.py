@@ -137,6 +137,19 @@ def _resolve_path(base_dir: Path, value: str) -> str:
     return str((base_dir / path).resolve())
 
 
+def _resolve_repo_or_scenario_path(repo_root: Path, scenario_dir: Path, value: str) -> str:
+    path = Path(value)
+    if path.is_absolute():
+        return str(path)
+    scenario_candidate = (scenario_dir / path).resolve()
+    if scenario_candidate.exists():
+        return str(scenario_candidate)
+    repo_candidate = (repo_root / path).resolve()
+    if repo_candidate.exists():
+        return str(repo_candidate)
+    return str(scenario_candidate)
+
+
 def _parse_step_assertions(raw: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     parsed: List[Dict[str, Any]] = []
     for idx, entry in enumerate(raw):
@@ -287,7 +300,7 @@ def run_audit_step(
     step_base_profile_raw = step.get("base_profile")
     if step_base_profile_raw:
         base_profile_path = Path(
-            _resolve_path(scenario_dir, str(step_base_profile_raw))
+            _resolve_repo_or_scenario_path(repo_root, scenario_dir, str(step_base_profile_raw))
         )
     else:
         base_profile_path = default_base_profile_path
@@ -296,7 +309,9 @@ def run_audit_step(
     if step_kind == "replay":
         replay_file = step.get("replay_file")
         if replay_file:
-            replay_raw = load_replay_spec(Path(_resolve_path(scenario_dir, str(replay_file))))
+            replay_raw = load_replay_spec(
+                Path(_resolve_repo_or_scenario_path(repo_root, scenario_dir, str(replay_file)))
+            )
         else:
             replay_inline = step.get("replay")
             if not isinstance(replay_inline, dict):
@@ -384,7 +399,9 @@ def main() -> int:
     scenario_path = Path(args.scenario).resolve()
     scenario_dir = scenario_path.parent
     scenario = load_scenario(scenario_path)
-    base_profile_path = Path(_resolve_path(scenario_dir, str(scenario["base_profile"])))
+    base_profile_path = Path(
+        _resolve_repo_or_scenario_path(repo_root, scenario_dir, str(scenario["base_profile"]))
+    )
 
     results: Dict[str, Any] = {
         "scenario": {

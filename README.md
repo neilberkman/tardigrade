@@ -21,7 +21,7 @@ The fastest integration path is the reusable GitHub Action:
     workers: 2
 ```
 
-Outputs: `verdict` (PASS/FAIL), `brick-rate`, `report-path`.
+Outputs: `verdict` (PASS/FAIL), `brick-rate`, `report-path`. `brick-rate` counts unrecoverable execution failures only; broader slot/hash/invariant issues live in the JSON report.
 
 In CI, upload `report-path` as an artifact so failures include the full per-point diagnostics:
 
@@ -49,7 +49,7 @@ python3 scripts/audit_bootloader.py \
   --output results/report.json
 ```
 
-Add `--quick` for a smoke test (3 fault points, seconds). Add `--workers 4` for parallel sweep.
+Add `--quick` for a smoke test (3 fault points, seconds). It can miss narrow windows. Add `--workers 4` for parallel sweep.
 
 If native Renode is unavailable locally, you can run the same audit through Docker:
 
@@ -118,7 +118,7 @@ flowchart TD
 2. Heuristic pruning classifies writes into tiers (trailer=exhaustive, boundary=dense, bulk=sparse) to reduce sweep points ~10x.
 3. For each fault point, Phase 1 replays the write trace up to write N and injects the fault. Trace replay eliminates O(N^2) prefix re-emulation.
 4. In `state` mode, boot outcome is inferred from NVM contents. In `execute` mode, Phase 2 resets the CPU and performs a recovery boot.
-5. Results are classified (`success`, `wrong_image`, `no_boot`, `wrong_pc`) plus a failure class (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`) and aggregated into the final verdict.
+5. Results are classified into observed boot outcomes (`success`, `wrong_image`, `no_boot`, `wrong_pc`) plus a failure class (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`) and aggregated into the final verdict.
 
 For `no_boot` outcomes in runtime execute mode, the result also includes:
 
@@ -142,17 +142,17 @@ Six architectures, from worst-case patterns to hardened OSS boot flows:
 | `mcuboot`      | Swap-move / swap-scratch on nRF52   | varies     | Real MCUboot ELFs from upstream CI           |
 | `riotboot`     | Slot selection via header metadata  | varies     | Standalone RIOTboot model                    |
 
-67 profiles total, including intentional-defect variants for self-testing.
+The repo includes dozens of profiles, including intentional-defect variants for self-testing.
 
 ## OSS validation
 
 Retroactive validation against known MCUboot bugs shows the tool catches these observed regression classes:
 
-| PR                                                      | Bug                                                  | Algorithm    | Broken               | Fixed      |
-| ------------------------------------------------------- | ---------------------------------------------------- | ------------ | -------------------- | ---------- |
-| [#2100](https://github.com/mcu-tools/mcuboot/pull/2100) | Revert magic: `BOOT_MAGIC_BAD` left in REVERT row    | swap-move    | 3 bricks (9.7%)      | 0 bricks   |
-| [#2109](https://github.com/mcu-tools/mcuboot/pull/2109) | Header reload from wrong slot after interrupted swap | swap-scratch | 19 bricks (33.3%)    | 0 bricks   |
-| [#2199](https://github.com/mcu-tools/mcuboot/pull/2199) | Stuck revert: primary REVERT trailer never cleared   | swap-move    | 1 wrong_image (100%) | 0 failures |
+| PR                                                      | Bug                                                  | Algorithm    | Broken signal        | Fixed signal |
+| ------------------------------------------------------- | ---------------------------------------------------- | ------------ | -------------------- | ------------ |
+| [#2100](https://github.com/mcu-tools/mcuboot/pull/2100) | Revert magic: `BOOT_MAGIC_BAD` left in REVERT row    | swap-move    | 3 bricks (9.7%)      | 0 issues     |
+| [#2109](https://github.com/mcu-tools/mcuboot/pull/2109) | Header reload from wrong slot after interrupted swap | swap-scratch | 19 bricks (33.3%)    | 0 issues     |
+| [#2199](https://github.com/mcu-tools/mcuboot/pull/2199) | Stuck revert: primary REVERT trailer never cleared   | swap-move    | 1 wrong_image (100%) | 0 issues     |
 
 Additional differential pairs for PRs [#2205](https://github.com/mcu-tools/mcuboot/pull/2205), [#2206](https://github.com/mcu-tools/mcuboot/pull/2206), and [#2214](https://github.com/mcu-tools/mcuboot/pull/2214) are included as profiles.
 
@@ -216,7 +216,7 @@ invariant_providers:
   - targets/my_bootloader/invariants.py
 
 expect:
-  should_find_issues: true # Self-test: tool must find bricks
+  should_find_issues: true # Self-test: tool must find issue points
   # Optional for semantic-only discovery profiles:
   allow_semantic_only_issues: false
   required_issue_reasons: ["boot_outcome"]
@@ -268,7 +268,7 @@ Optimizations that make profile sweeps feasible on CI runners:
 - **VTOR early exit** -- polling detects boot slot quickly; HardFault confirmation avoids false negatives
 - **Hash bypass** -- patches out crypto validation in emulation (`hash_bypass_symbols` in profile)
 - **Parallel workers** -- `--workers N` splits fault points across N Renode instances
-- **Heuristic pruning** -- write-trace classification reduces ~15K points to ~1K with no coverage loss
+- **Heuristic pruning** -- write-trace classification reduces ~15K points to ~1K for routine CI sweeps; exhaustive runs remain the higher-confidence mode
 - **Interleaved distribution** -- round-robin point assignment balances load across workers
 
 ## Execute-mode hardening
@@ -285,10 +285,12 @@ In `execute` mode, Phase 2 performs a full CPU recovery boot from faulted flash:
 
 Primary report fields:
 
-- `summary.runtime_sweep`: aggregate outcomes (`failure_outcomes`), aggregate failure classes (`failure_classes`), brick rate, control result, and timing.
+- `summary.runtime_sweep`: aggregate outcomes (`failure_outcomes`), aggregate failure classes (`failure_classes`), brick rate, issue rate, control result, and timing.
 - `runtime_sweep_results[]`: per-point records with `fault_type`, `boot_outcome`, `fault_class`, `signals`, and optional diagnostics such as `semantic_state`, `boot_cycles`, `multi_boot_analysis`, `semantic_assertion_failures`, and `invariant_violations`.
 - `semantic_observation_failures`: reported when a probe did not export a requested semantic field; these are observation gaps, not verdict-driving failures by default.
 - `clean_trace`: calibration-trace metadata when available (write/erase counts and how many points were window-annotated).
+
+`bricks` counts unrecoverable observed execution failures. Use `issue_points` when you care about broader expectation mismatches such as wrong slot/image, semantic assertions, or invariant violations.
 
 Per-point diagnostics are attached only when relevant:
 
@@ -298,14 +300,14 @@ Per-point diagnostics are attached only when relevant:
 
 ## CI workflows
 
-| Workflow                   | Trigger           | What it does                                              |
-| -------------------------- | ----------------- | --------------------------------------------------------- |
-| `ci.yml`                   | push, PR          | Robot suites + sharded self-test                           |
-| `profile-sweep.yml`        | workflow_dispatch | On-demand single-profile sweep with optional exhaustive mode |
-| `action-validation.yml`    | push, PR          | Validates the reusable GitHub Action                      |
-| `oss-validation.yml`       | workflow_dispatch | Runs OSS bootloader profiles                              |
-| `mcuboot-head-exploratory.yml` | workflow_dispatch | Runs the public MCUboot exploratory scenario via `run_scenario.py` |
-| `renode-latest-canary.yml` | workflow_dispatch | Tests against latest Renode build                         |
+| Workflow                   | Trigger                        | What it does                                                |
+| -------------------------- | ------------------------------ | ----------------------------------------------------------- |
+| `ci.yml`                   | push, PR                       | Robot suites + sharded self-test                            |
+| `profile-sweep.yml`        | workflow_dispatch              | On-demand single-profile sweep with optional exhaustive mode |
+| `action-validation.yml`    | push, PR                       | Validates the reusable GitHub Action                        |
+| `oss-validation.yml`       | push to `main`, schedule, manual | Runs selected OSS validation guards                         |
+| `mcuboot-head-exploratory.yml` | workflow_dispatch          | Runs the public MCUboot exploratory scenario via `run_scenario.py` |
+| `renode-latest-canary.yml` | schedule, workflow_dispatch    | Tests against latest Renode build                           |
 
 ## Repository layout
 
@@ -363,7 +365,7 @@ python3 scripts/audit_bootloader.py \
   --output results/your_report.json
 ```
 
-See the 67 included profiles for examples covering NVMemory, NVMC, and hybrid platforms.
+See the included profiles for examples covering NVMemory, NVMC, and hybrid platforms.
 
 ## Beyond the primary audit
 

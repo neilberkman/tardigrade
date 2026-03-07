@@ -3,7 +3,7 @@
     {
       "name": "mcuboot_swap_current_guard",
       "license": "Apache-2.0",
-      "description": "Current validated MCUboot guard (fixed commit). Must pass (no bricks).",
+      "description": "Current validated MCUboot guard (fixed commit). Must pass with no issues.",
       "robot_suite": "tests/generic_fault_point.robot",
       "evaluation_mode": "execute",
       "boot_mode": "swap",
@@ -12,6 +12,7 @@
       "total_writes": 1888,
       "expect": {
         "bricks_max": 0,
+        "issues_max": 0,
         "require_control_success": true
       },
       "slot_a_image_file": "{repo_root}/results/oss_validation/assets/zephyr_slot0_padded.bin",
@@ -46,12 +47,13 @@
     {
       "name": "nxboot_style_correct",
       "license": "Apache-2.0",
-      "description": "NuttX nxboot-style three-partition bootloader (correct). Must pass (no bricks).",
+      "description": "NuttX nxboot-style three-partition bootloader (correct). Must pass with no issues.",
       "robot_suite": "tests/generic_fault_point.robot",
       "evaluation_mode": "execute",
       "boot_mode": "copy",
       "expect": {
         "bricks_max": 0,
+        "issues_max": 0,
         "require_control_success": true
       },
       "slot_a_image_file": "{repo_root}/examples/nxboot_style/nxboot_primary.bin",
@@ -83,7 +85,7 @@
       "evaluation_mode": "execute",
       "boot_mode": "copy",
       "expect": {
-        "bricks_max": 0,
+        "bricks_min": 1,
         "require_control_success": true
       },
       "slot_a_image_file": "{repo_root}/examples/nxboot_style/nxboot_primary.bin",
@@ -115,7 +117,7 @@
       "evaluation_mode": "execute",
       "boot_mode": "copy",
       "expect": {
-        "bricks_max": 0,
+        "bricks_min": 1,
         "require_control_success": true
       },
       "setup_commands": ["make -C \"{repo_root}/examples/naive_copy\""],

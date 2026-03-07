@@ -374,6 +374,87 @@ class GenericFrameworkTest(unittest.TestCase):
                 )
             self.assertEqual(step_result["base_profile"], str(base2.resolve()))
 
+    def test_run_audit_step_resolves_repo_root_relative_base_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profiles_dir = tempdir / "profiles"
+            scenarios_dir = tempdir / "scenarios"
+            profiles_dir.mkdir()
+            scenarios_dir.mkdir()
+            base1 = profiles_dir / "base1.yaml"
+            base2 = profiles_dir / "base2.yaml"
+            base1.write_text(
+                textwrap.dedent(
+                    """
+                    schema_version: 1
+                    name: base_one
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    bootloader: { elf: examples/vulnerable_ota/firmware.elf, entry: 0x10000000 }
+                    memory:
+                      sram: { start: 0x20000000, end: 0x20020000 }
+                      write_granularity: 4
+                      slots:
+                        exec: { base: 0x10000000, size: 0x1000 }
+                        staging: { base: 0x10001000, size: 0x1000 }
+                    images: { staging: examples/vulnerable_ota/firmware.bin }
+                    success_criteria: { vtor_in_slot: exec }
+                    expect: { should_find_issues: false }
+                    """
+                ),
+                encoding="utf-8",
+            )
+            base2.write_text(
+                textwrap.dedent(
+                    """
+                    schema_version: 1
+                    name: base_two
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    bootloader: { elf: examples/vulnerable_ota/firmware.elf, entry: 0x10000000 }
+                    memory:
+                      sram: { start: 0x20000000, end: 0x20020000 }
+                      write_granularity: 4
+                      slots:
+                        exec: { base: 0x20000000, size: 0x1000 }
+                        staging: { base: 0x20001000, size: 0x1000 }
+                    images: { staging: examples/vulnerable_ota/firmware.bin }
+                    success_criteria: { vtor_in_slot: exec }
+                    expect: { should_find_issues: false }
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_run(cmd, cwd, capture_output, text, check):
+                profile_path = Path(cmd[cmd.index("--profile") + 1])
+                output_path = Path(cmd[cmd.index("--output") + 1])
+                rendered = profile_path.read_text(encoding="utf-8")
+                self.assertIn("name: base_two", rendered)
+                output_path.write_text(
+                    '{"summary": {"runtime_sweep": {"issue_points": 0}}}',
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch("run_scenario.subprocess.run", side_effect=fake_run):
+                step_result = run_audit_step(
+                    repo_root=tempdir,
+                    scenario_dir=scenarios_dir,
+                    default_base_profile_path=base1,
+                    step={
+                        "id": "repo_root_override",
+                        "kind": "audit",
+                        "base_profile": "profiles/base2.yaml",
+                    },
+                    tempdir=tempdir,
+                    args=SimpleNamespace(
+                        renode_test="",
+                        renode_remote_server_dir="",
+                        robot_var=[],
+                        keep_run_artifacts=False,
+                    ),
+                )
+            self.assertEqual(step_result["base_profile"], str(base2.resolve()))
+
 
 if __name__ == "__main__":
     unittest.main()
