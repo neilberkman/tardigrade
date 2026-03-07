@@ -16,6 +16,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from examples.nxboot_style.gen_nxboot_images import wrap_nxboot_image  # noqa: E402
 from targets.nuttx_nxboot.build_public_target import (  # noqa: E402
+    build_env,
     normalize_generated_config,
     package_images,
     patch_cmakelists,
@@ -141,6 +142,17 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
                 config, "../../../nuttx-apps", "nucleo-h743zi:nxboot-loader"
             )
             self.assertFalse(changed_again)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_build_env_prefixes_nuttx_tools(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_env_"))
+        try:
+            tools_dir = temp_dir / "tools"
+            tools_dir.mkdir(parents=True)
+            env = build_env(temp_dir)
+            self.assertTrue(env["PATH"].split(":")[0].endswith("/tools"))
+            self.assertEqual(Path(env["PATH"].split(":")[0]), tools_dir.resolve())
         finally:
             shutil.rmtree(temp_dir)
 
