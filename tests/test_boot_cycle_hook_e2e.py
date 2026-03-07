@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -50,12 +51,17 @@ class BootCycleHookE2ETests(unittest.TestCase):
                 "1",
                 "--fault-end",
                 "1",
+                "--robot-var",
+                "TEST_TIMEOUT:10 minutes",
                 "--no-assert-control-boots",
                 "--no-assert-verdict",
             ]
+            env = dict(os.environ)
+            env["OTA_RENODE_POINT_TIMEOUT_S"] = "900"
             result = subprocess.run(
                 cmd,
                 cwd=ROOT,
+                env=env,
                 text=True,
                 capture_output=True,
                 timeout=900,
