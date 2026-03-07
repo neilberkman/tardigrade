@@ -250,9 +250,7 @@ Public examples:
 
 - [`scenarios/mcuboot_head_exploratory.yaml`](scenarios/mcuboot_head_exploratory.yaml) attaches a target-side probe and invariant provider to the public `mcuboot_head_upgrade` and `mcuboot_head_revert` profiles, then checks both paths through the generic scenario runner.
 - [`scenarios/nxboot_style_exploratory.yaml`](scenarios/nxboot_style_exploratory.yaml) is a standalone modeled-family exercise for the generic scenario/probe/invariant surfaces. It is useful as a public adapter example, but it should not be read as a validated upstream `nxboot`/NuttX canary yet.
-- [`targets/nuttx_nxboot/`](targets/nuttx_nxboot) is the start of the real upstream NuttX `nxboot` adapter. It is scaffolded and unit-tested, with the next steps captured in [`docs/nuttx_nxboot_plan.md`](docs/nuttx_nxboot_plan.md), but it is not wired to a public workflow yet.
-
-Current public direction and backlog are tracked in [`docs/public_roadmap.md`](docs/public_roadmap.md).
+- [`targets/nuttx_nxboot/`](targets/nuttx_nxboot) is the start of the real upstream NuttX `nxboot` adapter. It is scaffolded and unit-tested, but it is not wired to a public workflow yet.
 
 Replay specs are generic override bundles, suitable for counterexamples from CBMC or any other model checker:
 
