@@ -298,12 +298,24 @@ def package_images(app_bin: Path, output_dir: Path, header_size: int, platform_i
     return [primary, update]
 
 
-def _run(cmd: list[str], cwd: Path) -> None:
-    subprocess.run(cmd, cwd=cwd, check=True)
+def build_env(nuttx_root: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    tools_dir = str((nuttx_root / "tools").resolve())
+    existing_path = env.get("PATH", "")
+    if existing_path:
+        env["PATH"] = tools_dir + os.pathsep + existing_path
+    else:
+        env["PATH"] = tools_dir
+    return env
+
+
+def _run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
+    subprocess.run(cmd, cwd=cwd, check=True, env=env)
 
 
 def build_variant(nuttx_root: Path, apps_root: Path, variant: str, jobs: int) -> None:
     apps_arg = os.path.relpath(apps_root, nuttx_root)
+    env = build_env(nuttx_root)
     _run(
         [
             str(nuttx_root / "tools" / "configure.sh"),
@@ -313,10 +325,11 @@ def build_variant(nuttx_root: Path, apps_root: Path, variant: str, jobs: int) ->
             f"nucleo-h743zi:{variant}",
         ],
         cwd=nuttx_root,
+        env=env,
     )
     normalize_generated_config(nuttx_root / ".config", apps_arg, f"nucleo-h743zi:{variant}")
-    _run(["make", "olddefconfig"], cwd=nuttx_root)
-    _run(["make", f"-j{jobs}"], cwd=nuttx_root)
+    _run(["make", "olddefconfig"], cwd=nuttx_root, env=env)
+    _run(["make", f"-j{jobs}"], cwd=nuttx_root, env=env)
 
 
 def main() -> int:
