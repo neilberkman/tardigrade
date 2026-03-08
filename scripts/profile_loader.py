@@ -967,6 +967,37 @@ def _parse_multi_fault(raw):
     )
 
 
+def _parse_read_fault_config(raw: Optional[Dict[str, Any]]) -> Optional[ReadFaultConfig]:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ProfileError("read_fault_config: expected mapping")
+    target_regions_raw = raw.get("target_regions", [])
+    if not isinstance(target_regions_raw, list):
+        raise ProfileError("read_fault_config.target_regions: expected list")
+    target_regions: List[Tuple[int, int]] = []
+    for i, region in enumerate(target_regions_raw):
+        ctx = "read_fault_config.target_regions[{}]".format(i)
+        if not isinstance(region, dict):
+            raise ProfileError("{}: expected mapping with start/end".format(ctx))
+        start = _parse_int(_require(region, "start", ctx), "{}.start".format(ctx))
+        end = _parse_int(_require(region, "end", ctx), "{}.end".format(ctx))
+        target_regions.append((start, end))
+    bit_flip_count = int(raw.get("bit_flip_count", 1))
+    if bit_flip_count < 1:
+        raise ProfileError(
+            "read_fault_config.bit_flip_count: expected integer >= 1"
+        )
+    fault_probability = float(raw.get("fault_probability", 1.0))
+    seed = int(raw.get("seed", 0))
+    return ReadFaultConfig(
+        target_regions=target_regions,
+        bit_flip_count=bit_flip_count,
+        fault_probability=fault_probability,
+        seed=seed,
+    )
+
+
 def _parse_state_fuzzer(raw: Optional[Dict[str, Any]]) -> StateFuzzerConfig:
     if raw is None:
         return StateFuzzerConfig()
