@@ -1757,6 +1757,8 @@ def summarize_runtime_sweep(
                 "phase1_emulated_s",
                 "phase2_stop_reason",
                 "phase2_emulated_s",
+                "phase3_stop_reason",
+                "phase3_ms",
                 "trace_replay_mode",
                 "reload_ms",
                 "replay_ms",
