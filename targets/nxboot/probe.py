@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""nxboot-style state probe for tardigrade semantic-state collection."""
+"""nxboot-style state probe for tardigrade semantic-state collection.
+
+This is the shared implementation for all nxboot-style bootloaders.
+Platform-specific adapters (e.g. nuttx_nxboot) delegate here rather than
+duplicating the slot-probing and role-determination logic.
+"""
 
 import struct
 
@@ -16,6 +21,16 @@ def _as_int(value, default=0):
         return int(str(value), 0)
     except Exception:
         return int(default)
+
+
+def _get_monitor_int(monitor, names, default=None):
+    """Try multiple monitor variable names, return first valid int or default."""
+    for name in names:
+        try:
+            return _as_int(monitor.GetVariable(name))
+        except Exception:
+            continue
+    return default
 
 
 def _read_byte(bus, addr):
@@ -57,14 +72,14 @@ def _magic_kind(magic):
     return "other"
 
 
-def _vector_valid(bus, base, header_size, slot_size):
+def _vector_valid(bus, base, header_size, slot_size, sram_start=SRAM_START, sram_end=SRAM_END):
     img_base = int(base) + int(header_size)
     sp = _read_u32(bus, img_base)
     rv = _read_u32(bus, img_base + 4)
     pc = rv & (~1)
     return (
-        sp >= SRAM_START
-        and sp <= SRAM_END
+        sp >= int(sram_start)
+        and sp <= int(sram_end)
         and (rv & 1) == 1
         and pc >= img_base
         and pc < (int(base) + int(slot_size))
@@ -75,7 +90,11 @@ def _hex_u32(value):
     return "0x{:08X}".format(int(value) & 0xFFFFFFFF)
 
 
-def _slot_probe(bus, base, slot_size):
+def _hex_u64(value):
+    return "0x{:016X}".format(int(value) & 0xFFFFFFFFFFFFFFFF)
+
+
+def _slot_probe(bus, base, slot_size, sram_start=SRAM_START, sram_end=SRAM_END):
     header = _read_bytes(bus, base, 40)
     magic = struct.unpack_from("<I", header, 0)[0]
     header_size = struct.unpack_from("<H", header, 6)[0]
@@ -96,9 +115,12 @@ def _slot_probe(bus, base, slot_size):
         crc_data = _read_bytes(bus, int(base) + 12, total_image_size - 12)
         computed_crc = _crc32_update(0xFFFFFFFF, crc_data) ^ 0xFFFFFFFF
         crc_valid = computed_crc == image_crc
+    image_valid = bool(magic_kind in ("external", "internal") and crc_valid)
     vector_valid = False
     if total_image_size <= int(slot_size) and header_size <= int(slot_size):
-        vector_valid = _vector_valid(bus, base, header_size, slot_size)
+        vector_valid = _vector_valid(
+            bus, base, header_size, slot_size, sram_start, sram_end
+        )
     return {
         "base": _hex_u32(base),
         "size": _hex_u32(slot_size),
@@ -108,13 +130,12 @@ def _slot_probe(bus, base, slot_size):
         "header_size": int(header_size),
         "image_size": int(image_size),
         "image_crc": _hex_u32(image_crc),
-        "identifier": _hex_u32(identifier),
+        "identifier": _hex_u64(identifier),
         "version": "{}.{}.{}".format(version[0], version[1], version[2]),
         "crc_valid": bool(crc_valid),
+        "image_valid": image_valid,
         "vector_valid": bool(vector_valid),
-        "bootable": bool(
-            magic_kind in ("external", "internal") and crc_valid and vector_valid
-        ),
+        "bootable": bool(image_valid and vector_valid),
     }
 
 
@@ -145,26 +166,14 @@ def _determine_roles(primary, secondary, tertiary):
     return update_slot, recovery_slot
 
 
-def collect_state(bus=None, monitor=None, context=None):
-    if bus is None or monitor is None:
-        return {}
-
-    context = context or {}
-    primary_base = _as_int(monitor.GetVariable("slot_exec_base"))
-    slot_size = _as_int(monitor.GetVariable("slot_exec_size"))
-    secondary_base = _as_int(monitor.GetVariable("slot_staging_base"))
-    tertiary_base = secondary_base + slot_size
-
-    primary = _slot_probe(bus, primary_base, slot_size)
-    secondary = _slot_probe(bus, secondary_base, slot_size)
-    tertiary = _slot_probe(bus, tertiary_base, slot_size)
-
+def _compute_roles_and_flags(primary, secondary, tertiary):
+    """Shared role/flag computation used by all nxboot-style collect_state variants."""
     update_slot, recovery_slot = _determine_roles(primary, secondary, tertiary)
     update = secondary if update_slot == "secondary" else tertiary
     recovery = secondary if recovery_slot == "secondary" else tertiary
 
-    primary_valid = bool(primary.get("crc_valid") and primary.get("vector_valid"))
-    recovery_valid = bool(recovery.get("crc_valid") and recovery.get("vector_valid"))
+    primary_valid = bool(primary.get("image_valid"))
+    recovery_valid = bool(recovery.get("image_valid"))
     recovery_present = primary.get("image_crc") == recovery.get("image_crc")
 
     primary_confirmed = False
@@ -190,8 +199,63 @@ def collect_state(bus=None, monitor=None, context=None):
     ):
         next_boot = "revert"
 
+    roles = {
+        "update_slot": update_slot,
+        "recovery_slot": recovery_slot,
+        "primary_valid": primary_valid,
+        "primary_confirmed": primary_confirmed,
+        "recovery_valid": recovery_valid,
+        "recovery_present": recovery_present,
+        "next_boot": next_boot,
+    }
+    flags = {
+        "same_primary_update_crc": primary.get("image_crc") == update.get("image_crc"),
+        "same_primary_recovery_crc": recovery_present,
+    }
+    return roles, flags
+
+
+def collect_state(bus=None, monitor=None, context=None, target_name="nxboot_style"):
+    """Collect nxboot-style semantic state from emulated memory.
+
+    Parameters
+    ----------
+    target_name : str
+        Value for the ``target`` field in the returned dict.  Callers may
+        override this to tag output for a specific adapter (e.g.
+        ``nuttx_nxboot``).
+    """
+    if bus is None or monitor is None:
+        return {}
+
+    context = context or {}
+    primary_base = _as_int(monitor.GetVariable("slot_exec_base"))
+    primary_size = _as_int(monitor.GetVariable("slot_exec_size"))
+    secondary_base = _as_int(monitor.GetVariable("slot_staging_base"))
+    secondary_size = _get_monitor_int(
+        monitor, ("slot_staging_size",), primary_size
+    )
+    tertiary_base = _get_monitor_int(
+        monitor,
+        ("slot_tertiary_base", "slot_recovery_base"),
+        secondary_base + secondary_size,
+    )
+    tertiary_size = _get_monitor_int(
+        monitor,
+        ("slot_tertiary_size", "slot_recovery_size"),
+        secondary_size,
+    )
+    sram_start = _get_monitor_int(monitor, ("sram_start",), SRAM_START)
+    sram_end = _get_monitor_int(monitor, ("sram_end",), SRAM_END)
+
+    primary = _slot_probe(bus, primary_base, primary_size, sram_start, sram_end)
+    secondary = _slot_probe(bus, secondary_base, secondary_size, sram_start, sram_end)
+    tertiary = _slot_probe(bus, tertiary_base, tertiary_size, sram_start, sram_end)
+
+    roles, flags = _compute_roles_and_flags(primary, secondary, tertiary)
+
     return {
-        "target": "nxboot_style",
+        "target": target_name,
         "stage": context.get("stage"),
         "boot_slot": context.get("boot_slot"),
         "fault_injected": bool(context.get("fault_injected", False)),
@@ -200,17 +264,6 @@ def collect_state(bus=None, monitor=None, context=None):
             "secondary": secondary,
             "tertiary": tertiary,
         },
-        "roles": {
-            "update_slot": update_slot,
-            "recovery_slot": recovery_slot,
-            "primary_valid": primary_valid,
-            "primary_confirmed": primary_confirmed,
-            "recovery_valid": recovery_valid,
-            "recovery_present": recovery_present,
-            "next_boot": next_boot,
-        },
-        "flags": {
-            "same_primary_update_crc": primary.get("image_crc") == update.get("image_crc"),
-            "same_primary_recovery_crc": recovery_present,
-        },
+        "roles": roles,
+        "flags": flags,
     }

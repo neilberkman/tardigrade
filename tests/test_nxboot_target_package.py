@@ -18,6 +18,7 @@ from examples.nxboot_style.gen_nxboot_images import make_nxboot_image  # noqa: E
 from targets.nxboot.invariants import (  # noqa: E402
     check_nxboot_confirmed_has_recovery,
     check_nxboot_duplicate_update_consumed,
+    check_nxboot_unconfirmed_internal_requires_revert,
 )
 from targets.nxboot.probe import _crc32_update, collect_state  # noqa: E402
 
@@ -76,6 +77,7 @@ class NxbootTargetPackageTest(unittest.TestCase):
         )
         self.assertEqual(state["slots"]["primary"]["magic_kind"], "external")
         self.assertTrue(state["slots"]["primary"]["crc_valid"])
+        self.assertTrue(state["slots"]["primary"]["image_valid"])
         self.assertEqual(state["slots"]["secondary"]["magic_kind"], "external")
         self.assertEqual(state["roles"]["update_slot"], "secondary")
         self.assertEqual(state["roles"]["recovery_slot"], "tertiary")
@@ -116,6 +118,22 @@ class NxbootTargetPackageTest(unittest.TestCase):
         )
         with self.assertRaises(InvariantViolation):
             check_nxboot_duplicate_update_consumed(result)
+
+    def test_invariant_requires_revert_for_unconfirmed_internal_primary(self) -> None:
+        result = SimpleNamespace(
+            nvm_state={
+                "slots": {
+                    "primary": {"magic_kind": "internal"},
+                },
+                "roles": {
+                    "primary_confirmed": False,
+                    "recovery_valid": True,
+                    "next_boot": "none",
+                },
+            }
+        )
+        with self.assertRaises(InvariantViolation):
+            check_nxboot_unconfirmed_internal_requires_revert(result)
 
 
 if __name__ == "__main__":
