@@ -76,7 +76,8 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                   phase2_time_slice: "0.07"
                   boot_cycle_hook: {probe.as_posix()}
                   expected_rollback_at_cycle: 2
-                state_probe_script: {probe.as_posix()}
+                state_probe:
+                  script: {probe.as_posix()}
                 semantic_assertions:
                   control:
                     multi_boot_analysis.status: converged
@@ -104,7 +105,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertIn("PHASE2_TIME_SLICE:0.07", robot_vars)
             self.assertIn("BOOT_CYCLE_HOOK:{}".format(probe), robot_vars)
             self.assertIn("EXPECTED_ROLLBACK_AT_CYCLE:2", robot_vars)
-            self.assertIn("STATE_PROBE_SCRIPT:{}".format(probe), robot_vars)
+            self.assertIn("STATE_PROBE:{}".format(probe), robot_vars)
             self.assertIn("SUCCESS_VECTOR_OFFSET:0x00000200", robot_vars)
 
     def test_semantic_assertions_and_invariants_annotate_results(self) -> None:

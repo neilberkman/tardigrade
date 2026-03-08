@@ -77,12 +77,12 @@ semantic_assertions:
     multi_boot_analysis.final_outcome: success
     multi_boot_analysis.final_slot: exec
 invariant_providers:
-  - targets/nuttx_nxboot/invariants.py
+  - targets/nxboot/invariants.py
 invariants:
-  - nuttx_nxboot_roles_distinct
-  - nuttx_nxboot_confirmed_has_recovery
-  - nuttx_nxboot_duplicate_update_consumed
-  - nuttx_nxboot_unconfirmed_internal_requires_revert
+  - nxboot_roles_distinct
+  - nxboot_confirmed_has_recovery
+  - nxboot_duplicate_update_consumed
+  - nxboot_unconfirmed_internal_requires_revert
   - successful_rollback
 expect:
   should_find_issues: false
