@@ -1,0 +1,50 @@
+schema_version: 1
+name: mcuboot_partial_staging
+description: >
+  Test MCUboot swap-using-move against partially downloaded staging images.
+  MCUboot validates image headers and TLV signatures before attempting a
+  swap, so truncated images should be rejected and the bootloader should
+  boot the primary (exec) slot. This profile verifies that behavior across
+  a range of truncation points including mid-header, mid-TLV, and
+  various body offsets.
+
+platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_head.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x76000 }
+    staging: { base: 0x00082000, size: 0x76000 }
+images:
+  exec: results/oss_validation/assets/zephyr_slot0_padded.bin
+  staging: results/oss_validation/assets/zephyr_slot1_padded.bin
+# Staging trailer triggers TEST swap (if image validates).
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: staging
+success_criteria:
+  vtor_in_slot: exec
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 20000000
+  hash_bypass_symbols: ["bootutil_img_validate"]
+  partial_staging:
+    staging_slot: staging
+    truncation_points: heuristic
+    fill_pattern: 0xFF
+    # MCUboot image header is 32 bytes.
+    header_size: 32
+    sector_size: 4096
+    # MCUboot TLV area at end of image (varies, ~256 bytes typical).
+    trailer_size: 256
+expect:
+  # MCUboot should correctly reject all partial images — no issues expected.
+  should_find_issues: false
