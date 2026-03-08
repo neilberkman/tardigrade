@@ -2390,6 +2390,56 @@ def main() -> int:
         sweep_summary["wall_time_s"] = round(sweep_wall_s, 1)
 
         # -------------------------------------------------------------------
+        # Multi-fault plan (opt-in)
+        # -------------------------------------------------------------------
+        multi_fault_plan_data = None
+        mf_config = profile.fault_sweep.multi_fault
+
+        if mf_config.enabled:
+            # Identify "interesting" fault points from single-fault results:
+            # those that bricked or produced wrong_image outcomes.
+            expected_outcome = "success"
+            if getattr(profile.expect, "control_outcome", None):
+                expected_outcome = profile.expect.control_outcome
+            interesting_fps = []
+            for r in sweep_results:
+                if r.get("is_control", False):
+                    continue
+                if not r.get("fault_injected", False):
+                    continue
+                if result_is_brick(r) or result_has_issues(r, expected_outcome):
+                    fp = r.get("fault_at")
+                    if fp is not None:
+                        interesting_fps.append(int(fp))
+
+            interesting_fps = sorted(set(interesting_fps))
+            print(
+                "Multi-fault: {} interesting points from single-fault sweep "
+                "(strategy={}, max_pairs={}).".format(
+                    len(interesting_fps),
+                    mf_config.strategy,
+                    mf_config.max_pairs,
+                ),
+                file=sys.stderr,
+            )
+
+            mf_plan = generate_multi_fault_sequences(
+                strategy=mf_config.strategy,
+                interesting_points=interesting_fps,
+                max_faults_per_run=mf_config.max_faults_per_run,
+                max_pairs=mf_config.max_pairs,
+                explicit_sequences=mf_config.sequences or None,
+                seed=mf_config.seed,
+            )
+            multi_fault_plan_data = multi_fault_plan_summary(mf_plan)
+            print(
+                "Multi-fault plan: {} sequences generated.".format(
+                    len(mf_plan.sequences)
+                ),
+                file=sys.stderr,
+            )
+
+        # -------------------------------------------------------------------
         # State fuzzer (opt-in)
         # -------------------------------------------------------------------
         state_fuzz_results: Optional[List[Dict[str, Any]]] = None
@@ -2496,6 +2546,9 @@ def main() -> int:
         if state_fuzz_results is not None:
             payload["state_fuzz_results"] = state_fuzz_results
             payload["summary"]["state_fuzz"] = state_fuzz_summary
+
+        if multi_fault_plan_data is not None:
+            payload["summary"]["multi_fault_plan"] = multi_fault_plan_data
 
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
