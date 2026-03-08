@@ -806,6 +806,23 @@ class TestMaxPointsCap(unittest.TestCase):
         config = parse_partial_staging_config(raw, images, slots)
         self.assertEqual(config.max_points, 20)
 
+    def test_yaml_sector_size_overrides_caller_default(self):
+        """YAML sector_size must override caller-supplied default."""
+        raw = {
+            "staging_slot": "staging",
+            "sector_size": 4096,
+        }
+        images = {"staging": "staging.bin"}
+
+        class MockSlot:
+            base = 0x10000
+            size = 0x38000
+
+        slots = {"staging": MockSlot()}
+        # Caller passes sector_size=8, but YAML says 4096 — YAML wins.
+        config = parse_partial_staging_config(raw, images, slots, sector_size=8)
+        self.assertEqual(config.sector_size, 4096)
+
     def test_parse_config_no_max_points(self):
         """Omitted max_points should parse as None."""
         raw = {

@@ -324,25 +324,54 @@ def _evenly_sample(
 ) -> List[TruncationPoint]:
     """Evenly sample from a sorted list of truncation points.
 
-    Always keeps the first and last points, then selects evenly spaced
-    points from the interior to fill the budget.
+    Always preserves structurally important anchor points (heuristic
+    points like header, trailer, midpoints).  Only sector boundary
+    points are subject to sampling.  This prevents the cap from
+    discarding the most semantically valuable truncation points.
     """
     if max_points < 1:
         return []
     if max_points >= len(points):
         return points
-    if max_points == 1:
-        return [points[0]]
 
-    # Always include first and last.
-    indices = {0, len(points) - 1}
-    interior_budget = max_points - 2
-    if interior_budget > 0:
-        step = (len(points) - 1) / (interior_budget + 1)
-        for i in range(1, interior_budget + 1):
-            indices.add(round(i * step))
+    # Separate anchors (heuristic structural points) from sector fills.
+    anchors = []
+    sector_pts = []
+    for p in points:
+        if p.label.startswith("sector_"):
+            sector_pts.append(p)
+        else:
+            anchors.append(p)
 
-    return [points[i] for i in sorted(indices)]
+    # If anchors alone exceed budget, keep first/last + evenly sample anchors.
+    if len(anchors) >= max_points:
+        if max_points == 1:
+            return [anchors[0]]
+        indices = {0, len(anchors) - 1}
+        interior = max_points - 2
+        if interior > 0:
+            step = (len(anchors) - 1) / (interior + 1)
+            for i in range(1, interior + 1):
+                indices.add(round(i * step))
+        return [anchors[i] for i in sorted(indices)]
+
+    # All anchors kept; fill remaining budget from sector boundaries.
+    remaining = max_points - len(anchors)
+    if remaining <= 0 or not sector_pts:
+        return sorted(anchors, key=lambda p: p.offset)
+
+    if remaining >= len(sector_pts):
+        sampled_sectors = sector_pts
+    else:
+        indices = set()
+        step = (len(sector_pts) - 1) / (remaining - 1) if remaining > 1 else 0
+        for i in range(remaining):
+            indices.add(min(round(i * step), len(sector_pts) - 1))
+        sampled_sectors = [sector_pts[i] for i in sorted(indices)]
+
+    merged = anchors + sampled_sectors
+    merged.sort(key=lambda p: p.offset)
+    return merged
 
 
 def _deduplicate_and_sort(points: List[TruncationPoint]) -> List[TruncationPoint]:
