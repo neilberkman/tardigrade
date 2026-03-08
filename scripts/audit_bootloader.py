@@ -3069,20 +3069,23 @@ def main() -> int:
                 heuristic_kwargs["tier2_step"] = hc.tier2_step
                 heuristic_kwargs["tier3_step"] = hc.tier3_step
                 heuristic_kwargs["discontinuity_window"] = hc.discontinuity_window
-            fault_points = classify_trace(
+            classification = classify_trace(
                 trace=trace,
                 slot_ranges=slot_ranges_for_heuristic,
                 flash_base=flash_base,
                 page_size=getattr(profile.memory, "page_size", 4096),
                 bootloader_region=bl_region_for_heuristic,
+                return_details=True,
                 **heuristic_kwargs,
             )
+            fault_points = classification["fault_points"]
             heuristic_summary = summarize_classification(
                 trace=trace,
                 fault_points=fault_points,
                 slot_ranges=slot_ranges_for_heuristic,
                 flash_base=flash_base,
                 bootloader_region=bl_region_for_heuristic,
+                tier_details=classification,
             )
             print(
                 "Heuristic: {} fault points from {} writes (reduction {:.1f}x). "
