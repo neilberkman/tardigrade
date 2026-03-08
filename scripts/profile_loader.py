@@ -238,6 +238,24 @@ class UpdateTrigger:
         self.fields = fields or {}
 
 
+class InitialStateConfig:
+    """A named initial-state seed for sweep matrix expansion."""
+    __slots__ = ("name", "description", "pre_boot_state", "setup_script",
+                 "update_trigger", "expect_overrides")
+
+    def __init__(self, name: str, description: str = "",
+                 pre_boot_state: Optional[List[PreBootWrite]] = None,
+                 setup_script: Optional[str] = None,
+                 update_trigger: Optional[UpdateTrigger] = None,
+                 expect_overrides: Optional[Dict[str, Any]] = None) -> None:
+        self.name = name
+        self.description = description
+        self.pre_boot_state = pre_boot_state
+        self.setup_script = setup_script
+        self.update_trigger = update_trigger
+        self.expect_overrides = expect_overrides or {}
+
+
 # MCUboot trailer magic: 4 words written at (slot_end - 16).
 MCUBOOT_GOOD_MAGIC = [0xF395C277, 0x7FEFD260, 0x0F505235, 0x8079B62C]
 
@@ -293,6 +311,7 @@ class ProfileConfig:
         invariants: Optional[List[str]] = None,
         invariant_providers: Optional[List[str]] = None,
         flash_backend: Optional[str] = None,
+        initial_states: Optional[List["InitialStateConfig"]] = None,
     ) -> None:
         self.schema_version = schema_version
         self.name = name
@@ -320,6 +339,39 @@ class ProfileConfig:
         self.invariants = invariants or []
         self.invariant_providers = invariant_providers or []
         self.flash_backend = flash_backend
+        self.initial_states: List[InitialStateConfig] = initial_states or []
+
+    def resolve_initial_state(self, state: "InitialStateConfig") -> "ProfileConfig":
+        """Return a new ProfileConfig with the given initial state applied."""
+        new_pre_boot = (list(state.pre_boot_state) if state.pre_boot_state is not None
+                        else list(self.pre_boot_state))
+        new_setup = state.setup_script if state.setup_script is not None else self.setup_script
+        new_trigger = state.update_trigger if state.update_trigger is not None else self.update_trigger
+        new_expect = self.expect
+        if state.expect_overrides:
+            eo = state.expect_overrides
+            new_expect = ExpectConfig(
+                should_find_issues=eo.get("should_find_issues", self.expect.should_find_issues),
+                control_outcome=eo.get("control_outcome", self.expect.control_outcome),
+                allow_semantic_only_issues=eo.get("allow_semantic_only_issues", self.expect.allow_semantic_only_issues),
+                required_issue_reasons=eo.get("required_issue_reasons", self.expect.required_issue_reasons),
+            )
+        resolved = ProfileConfig(
+            schema_version=self.schema_version, name="{}/{}".format(self.name, state.name),
+            description=state.description or self.description, platform=self.platform,
+            bootloader_elf=self.bootloader_elf, bootloader_entry=self.bootloader_entry,
+            memory=self.memory, images=self.images, pre_boot_state=new_pre_boot,
+            setup_script=new_setup, extra_peripherals=self.extra_peripherals,
+            success_criteria=self.success_criteria, fault_sweep=self.fault_sweep,
+            state_fuzzer=self.state_fuzzer, expect=new_expect, profile_path=self.profile_path,
+            scenario=self.scenario, update_trigger=new_trigger, state_probe=self.state_probe,
+            state_probe_script=self.state_probe_script, semantic_assertions=self.semantic_assertions,
+            invariants=self.invariants, invariant_providers=self.invariant_providers,
+            flash_backend=self.flash_backend, initial_states=[],
+        )
+        if state.update_trigger is not None and state.pre_boot_state is None:
+            resolved.pre_boot_state = resolved.expand_update_trigger()
+        return resolved
 
     def resolve_path(self, repo_root: Path, value: str) -> str:
         """Resolve a path relative to the repo root."""
@@ -874,6 +926,41 @@ def _parse_invariants(raw: Optional[Any]) -> List[str]:
     raise ProfileError("invariants: expected string or list of strings")
 
 
+def _parse_initial_states(raw: Optional[List[Any]]) -> List[InitialStateConfig]:
+    """Parse the initial_states list from a profile YAML."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("initial_states: expected list of state definitions")
+    states: List[InitialStateConfig] = []
+    seen_names: set = set()
+    for idx, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ProfileError("initial_states[{}]: expected mapping".format(idx))
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            raise ProfileError("initial_states[{}].name: expected non-empty string".format(idx))
+        if name in seen_names:
+            raise ProfileError("initial_states: duplicate name '{}'".format(name))
+        seen_names.add(name)
+        description = str(entry.get("description", ""))
+        pre_boot = _parse_pre_boot_state(entry.get("pre_boot_state"))
+        setup_script = entry.get("setup_script")
+        if setup_script is not None:
+            setup_script = str(setup_script)
+        trigger = _parse_update_trigger(entry.get("update_trigger"))
+        expect_overrides = entry.get("expect")
+        if expect_overrides is not None and not isinstance(expect_overrides, dict):
+            raise ProfileError("initial_states[{}].expect: expected mapping".format(idx))
+        parsed_pre_boot: Optional[List[PreBootWrite]] = None
+        if "pre_boot_state" in entry:
+            parsed_pre_boot = pre_boot
+        states.append(InitialStateConfig(name=name, description=description,
+            pre_boot_state=parsed_pre_boot, setup_script=setup_script,
+            update_trigger=trigger, expect_overrides=expect_overrides or {}))
+    return states
+
+
 def _parse_invariant_providers(raw: Optional[Any]) -> List[str]:
     if raw is None:
         return []
@@ -980,6 +1067,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
     semantic_assertions = _parse_semantic_assertions(data.get("semantic_assertions"))
     invariants = _parse_invariants(data.get("invariants"))
     invariant_providers = _parse_invariant_providers(data.get("invariant_providers"))
+    initial_states = _parse_initial_states(data.get("initial_states"))
 
     scenario = str(data.get("scenario", "runtime"))
     if scenario not in VALID_SCENARIOS:
@@ -1028,6 +1116,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         invariants=invariants,
         invariant_providers=invariant_providers,
         flash_backend=flash_backend,
+        initial_states=initial_states,
     )
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.
@@ -1035,6 +1124,13 @@ def load_profile(path: str | Path) -> ProfileConfig:
         profile.pre_boot_state = profile.expand_update_trigger()
 
     return profile
+
+
+def expand_initial_states(profile: ProfileConfig) -> List[ProfileConfig]:
+    """Expand a profile into per-state profiles for sweep matrix."""
+    if not profile.initial_states:
+        return [profile]
+    return [profile.resolve_initial_state(s) for s in profile.initial_states]
 
 
 def load_profile_raw(path: str | Path) -> Dict[str, Any]:
@@ -1097,6 +1193,8 @@ def main() -> int:
         "invariant_providers": profile.invariant_providers,
         "update_trigger": profile.update_trigger.type if profile.update_trigger else None,
         "pre_boot_state_count": len(profile.pre_boot_state),
+        "initial_states": [{"name": s.name, "description": s.description}
+                           for s in profile.initial_states],
     }
     print(json.dumps(info, indent=2, sort_keys=True))
     return 0
