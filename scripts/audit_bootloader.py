@@ -1542,7 +1542,7 @@ def enrich_results_with_fault_regions(
         r["fault_region"] = classify_fault_region(
             addr, metadata_regions, bootloader_region=bootloader_region
         )
-<<<<<<< HEAD
+
 def compute_region_breakdown(
     results,  # type: List[Dict[str, Any]]
     expected_outcome,  # type: str
