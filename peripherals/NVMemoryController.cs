@@ -422,8 +422,18 @@ namespace Antmicro.Renode.Peripherals.Memory
 
             // Fire the fault: flip deterministic bits. NVM is NOT modified.
             ReadFaultFired = true;
+            ReadFaultEnabled = false;  // one-shot semantics
             var seed = ReadFaultSeed != 0 ? ReadFaultSeed : (uint)(ReadFaultAddress ^ 0xDEAD);
-            return Antmicro.Renode.Peripherals.Miscellaneous.FaultTracker.ApplyReadBitFlip(value, seed);
+            // Deterministic bit-flip: LCG PRNG selects bit positions.
+            if(seed == 0) seed = 0xDEAD;
+            var flipCount = 1 + (seed % 3);
+            for(var i = 0u; i < flipCount; i++)
+            {
+                seed = (uint)((seed * 1103515245u + 12345u) & 0xFFFFFFFF);
+                var bitPos = (int)(seed % 32);
+                value ^= (uint)(1 << bitPos);
+            }
+            return value;
         }
 
         private void WriteBytesInternal(long offset, byte[] data)
