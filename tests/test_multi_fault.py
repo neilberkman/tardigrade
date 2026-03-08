@@ -627,6 +627,93 @@ class TestMultiFaultValidation(unittest.TestCase):
             )
 
 
+class TestLargeCandidateSets(unittest.TestCase):
+    """Verify planner handles large candidate sets without blowing up memory."""
+
+    def test_pairwise_interesting_large_input_capped(self) -> None:
+        """1000 candidates -> C(1000,2)=499500, but max_pairs=50 caps it."""
+        pts = list(range(1000))
+        plan = generate_multi_fault_sequences(
+            strategy="pairwise_interesting",
+            interesting_points=pts,
+            max_pairs=50,
+        )
+        self.assertEqual(len(plan.sequences), 50)
+        self.assertFalse(plan.diagnostics["exhaustive"])
+        self.assertEqual(plan.diagnostics["theoretical_combinations"], 499500)
+        self.assertEqual(plan.diagnostics["capped_at"], 50)
+        # First combination should be the lexicographically first pair
+        self.assertEqual(plan.sequences[0], [0, 1])
+
+    def test_random_sample_large_input_capped(self) -> None:
+        """1000 candidates -> C(1000,2)=499500, sample 100."""
+        pts = list(range(1000))
+        plan = generate_multi_fault_sequences(
+            strategy="random_sample",
+            interesting_points=pts,
+            max_pairs=100,
+            seed=42,
+        )
+        self.assertEqual(len(plan.sequences), 100)
+        self.assertFalse(plan.diagnostics["exhaustive"])
+        self.assertEqual(plan.diagnostics["theoretical_combinations"], 499500)
+        self.assertEqual(plan.diagnostics["sampled"], 100)
+        # No duplicates
+        tuples = [tuple(s) for s in plan.sequences]
+        self.assertEqual(len(tuples), len(set(tuples)))
+
+    def test_random_sample_large_deterministic(self) -> None:
+        """Same seed on large input produces identical results."""
+        pts = list(range(1000))
+        plan1 = generate_multi_fault_sequences(
+            strategy="random_sample",
+            interesting_points=pts,
+            max_pairs=100,
+            seed=7,
+        )
+        plan2 = generate_multi_fault_sequences(
+            strategy="random_sample",
+            interesting_points=pts,
+            max_pairs=100,
+            seed=7,
+        )
+        self.assertEqual(plan1.sequences, plan2.sequences)
+
+    def test_pairwise_large_runs_quickly(self) -> None:
+        """5000 candidates with low cap should return near-instantly."""
+        import time
+
+        pts = list(range(5000))
+        t0 = time.monotonic()
+        plan = generate_multi_fault_sequences(
+            strategy="pairwise_interesting",
+            interesting_points=pts,
+            max_pairs=20,
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(len(plan.sequences), 20)
+        # C(5000,2) = 12497500 -- must not materialize all of them
+        self.assertEqual(plan.diagnostics["theoretical_combinations"], 12497500)
+        self.assertLess(elapsed, 2.0, "should complete in under 2 seconds")
+
+    def test_random_sample_large_runs_quickly(self) -> None:
+        """5000 candidates sampled down to 50 should return quickly."""
+        import time
+
+        pts = list(range(5000))
+        t0 = time.monotonic()
+        plan = generate_multi_fault_sequences(
+            strategy="random_sample",
+            interesting_points=pts,
+            max_pairs=50,
+            seed=1,
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(len(plan.sequences), 50)
+        self.assertEqual(plan.diagnostics["theoretical_combinations"], 12497500)
+        self.assertLess(elapsed, 2.0, "should complete in under 2 seconds")
+
+
 class TestMultiFaultResult(unittest.TestCase):
     """Test MultiFaultResult data structure."""
 

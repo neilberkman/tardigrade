@@ -568,15 +568,14 @@ def generate_pairwise_interesting(
         )
 
     k = min(max_faults_per_run, len(pts))
-    all_combos = list(itertools.combinations(pts, k))
-    theoretical = len(all_combos)
+    theoretical = math.comb(len(pts), k)
     exhaustive = theoretical <= max_pairs
 
     if exhaustive:
-        seqs = [list(c) for c in all_combos]
+        seqs = [list(c) for c in itertools.combinations(pts, k)]
     else:
-        # Deterministic truncation (stable order from sorted input).
-        seqs = [list(c) for c in all_combos[:max_pairs]]
+        # Deterministic truncation: lazily iterate and stop at cap.
+        seqs = [list(c) for c in itertools.islice(itertools.combinations(pts, k), max_pairs)]
 
     return MultiFaultPlan(
         sequences=seqs,
@@ -590,6 +589,29 @@ def generate_pairwise_interesting(
             "capped_at": max_pairs if not exhaustive else None,
         },
     )
+
+
+def _unrank_combination(rank: int, n: int, k: int) -> Tuple[int, ...]:
+    """Map a combinatorial rank to the corresponding combination (indices).
+
+    Uses the combinatorial number system: given a rank in [0, C(n,k)),
+    return the unique k-element subset of range(n) in sorted order.
+    This avoids materializing all C(n,k) combinations.
+    """
+    result = []
+    remaining = rank
+    start = 0
+    for i in range(k, 0, -1):
+        # Find the largest element c such that C(c - start, i) <= remaining
+        # by scanning from start upward.
+        for c in range(start, n):
+            count = math.comb(n - 1 - c, i - 1)
+            if remaining < count:
+                result.append(c)
+                start = c + 1
+                break
+            remaining -= count
+    return tuple(result)
 
 
 def generate_random_sample(
@@ -611,14 +633,13 @@ def generate_random_sample(
         )
 
     k = min(max_faults_per_run, len(pts))
-    all_combos = list(itertools.combinations(pts, k))
-    theoretical = len(all_combos)
+    theoretical = math.comb(len(pts), k)
 
     rng = random.Random(seed)
 
     if theoretical <= max_pairs:
         # All fit; shuffle for variety but return all.
-        seqs = [list(c) for c in all_combos]
+        seqs = [list(c) for c in itertools.combinations(pts, k)]
         rng.shuffle(seqs)
         return MultiFaultPlan(
             sequences=seqs,
@@ -629,9 +650,13 @@ def generate_random_sample(
             diagnostics={"exhaustive": True, "theoretical_combinations": theoretical},
         )
 
-    # Sample without replacement.
+    # Sample without replacement using index unranking.
     sampled_indices = rng.sample(range(theoretical), max_pairs)
-    seqs = [list(all_combos[i]) for i in sorted(sampled_indices)]
+    n = len(pts)
+    seqs = [
+        [pts[i] for i in _unrank_combination(rank, n, k)]
+        for rank in sorted(sampled_indices)
+    ]
 
     return MultiFaultPlan(
         sequences=seqs,
