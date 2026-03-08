@@ -15,12 +15,18 @@ Tier 1 (EXHAUSTIVE): test every write
   - Writes to trailer regions (last page of each slot)
   - Writes where address jumps discontinuously (region transitions)
   - First/last N writes surrounding any address discontinuity
+  - First write to each new page (page entry)
+  - Last write before leaving a page (page exit)
+  - Overwrites (same word address as previous write)
 
 Tier 2 (DENSE): test every Kth write
   - Writes in the first and last sectors of each slot (boundary sectors)
 
-Tier 3 (SPARSE): test every Kth write
-  - Bulk sequential image data copy (same sector, sequential addresses)
+Tier 3 (SPARSE): stratified sampling of bulk sequential copies
+  - Short runs (<=20 writes): sampled at tier2_step density
+  - Medium runs (21-100 writes): start/mid/end anchors + every tier3_step-th
+  - Long runs (>100 writes): structural anchors at 0/10/25/50/75/90/100%
+    plus evenly spaced fill points
 """
 
 import csv
@@ -37,6 +43,124 @@ def load_trace(trace_path: str) -> List[Tuple[int, int]]:
         for row in reader:
             entries.append((int(row["write_index"]), int(row["flash_offset"])))
     return entries
+
+
+def _segment_runs(
+    tier3_indices: List[int],
+    trace: List[Tuple[int, int]],
+    page_size: int = 4096,
+) -> List[Tuple[int, int, int]]:
+    """
+    Segment tier3 writes into contiguous runs of sequential/nearby addresses.
+
+    A run breaks when there's a gap > 1 page between consecutive tier3 writes,
+    or when the next tier3 write is not adjacent in trace index (meaning a
+    non-tier3 write intervened).
+
+    Args:
+        tier3_indices: Sorted list of trace indices (0-based into trace list)
+            that were classified as tier3.
+        trace: The full write trace.
+        page_size: Flash page size in bytes.
+
+    Returns:
+        List of (run_start_trace_idx, run_end_trace_idx, run_length) tuples.
+        run_start and run_end are inclusive trace indices from tier3_indices.
+    """
+    if not tier3_indices:
+        return []
+
+    runs: List[Tuple[int, int, int]] = []
+    run_start = tier3_indices[0]
+    prev_idx = tier3_indices[0]
+
+    for k in range(1, len(tier3_indices)):
+        cur_idx = tier3_indices[k]
+        prev_off = trace[prev_idx][1]
+        cur_off = trace[cur_idx][1]
+
+        # Break run if: non-contiguous trace indices OR address gap > 1 page.
+        if cur_idx != prev_idx + 1 or abs(cur_off - prev_off) > page_size:
+            run_len = prev_idx - run_start + 1
+            runs.append((run_start, prev_idx, run_len))
+            run_start = cur_idx
+
+        prev_idx = cur_idx
+
+    # Close the final run.
+    run_len = prev_idx - run_start + 1
+    runs.append((run_start, prev_idx, run_len))
+
+    return runs
+
+
+def _sample_bulk_run(
+    run_start: int,
+    run_end: int,
+    run_length: int,
+    tier3_step: int,
+    tier2_step: int,
+) -> List[int]:
+    """
+    Return selected trace indices from a single bulk (tier3) run using
+    stratified sampling.
+
+    - Short runs (<=20): every tier2_step-th index (denser).
+    - Medium runs (21-100): start, midpoint, end, plus every tier3_step-th.
+    - Long runs (>100): structural anchors at 0/10/25/50/75/90/100% plus
+      evenly spaced fill to reach a budget of max(7, run_length // tier3_step).
+
+    Args:
+        run_start: First trace index in the run (inclusive).
+        run_end: Last trace index in the run (inclusive).
+        run_length: Number of writes in the run.
+        tier3_step: Base sparse sampling step.
+        tier2_step: Denser sampling step for short runs.
+
+    Returns:
+        Sorted list of trace indices selected from this run.
+    """
+    selected: Set[int] = set()
+
+    if run_length <= 20:
+        # Short run: dense sampling.
+        for i, idx in enumerate(range(run_start, run_end + 1)):
+            if i % tier2_step == 0:
+                selected.add(idx)
+        # Always include endpoints.
+        selected.add(run_start)
+        selected.add(run_end)
+
+    elif run_length <= 100:
+        # Medium run: structural anchors + periodic.
+        selected.add(run_start)
+        selected.add(run_end)
+        midpoint = run_start + run_length // 2
+        selected.add(midpoint)
+        # Fill with periodic sampling.
+        for i, idx in enumerate(range(run_start, run_end + 1)):
+            if i % tier3_step == 0:
+                selected.add(idx)
+
+    else:
+        # Long run: percentage-based structural anchors + fill.
+        anchors = [0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 1.0]
+        for pct in anchors:
+            offset = int(pct * (run_length - 1))
+            selected.add(run_start + offset)
+
+        # Fill budget: enough points to match roughly the old tier3_step density.
+        budget = max(7, run_length // tier3_step)
+        if len(selected) < budget:
+            remaining = budget - len(selected)
+            # Evenly space the fill points across the run.
+            step = max(1, run_length // (remaining + 1))
+            for i in range(1, remaining + 1):
+                candidate = run_start + i * step
+                if candidate <= run_end:
+                    selected.add(candidate)
+
+    return sorted(selected)
 
 
 def classify_trace(
@@ -145,11 +269,34 @@ def classify_trace(
             ):
                 discontinuity_indices.add(j)
 
-    # Pass 2: classify each write.
+    # Pass 2: structural signal detection for tier1 promotion.
+    # These are cheap single-pass detections run over the full trace.
+    page_entry_indices: Set[int] = set()   # first write to a new page
+    page_exit_indices: Set[int] = set()    # last write before page change
+    overwrite_indices: Set[int] = set()    # same word address as previous write
+
+    prev_page: Optional[int] = None
+    for i, (write_idx, flash_off) in enumerate(trace):
+        cur_page = flash_off // page_size
+
+        # Page entry: first write to a page we haven't just been writing to.
+        if cur_page != prev_page:
+            page_entry_indices.add(i)
+            # The previous write was a page exit (if it exists).
+            if i > 0:
+                page_exit_indices.add(i - 1)
+
+        # Overwrite: same word address as the immediately preceding write.
+        if i > 0 and flash_off == trace[i - 1][1]:
+            overwrite_indices.add(i)
+
+        prev_page = cur_page
+
+    # Pass 3: classify each write into tiers.
     tier0: Set[int] = set()  # bootloader region (critical)
     tier1: Set[int] = set()
     tier2: Set[int] = set()
-    tier3: Set[int] = set()
+    tier3_trace_indices: List[int] = []  # trace indices (not fault points)
 
     for i, (write_idx, flash_off) in enumerate(trace):
         # Fault point is 0-based: write_idx is 1-based from NVMC.
@@ -161,10 +308,18 @@ def classify_trace(
             tier1.add(fault_point)
         elif i in discontinuity_indices:
             tier1.add(fault_point)
+        elif (
+            i in page_entry_indices
+            or i in page_exit_indices
+            or i in overwrite_indices
+        ):
+            # Structural signal promotion: these patterns indicate
+            # high-risk transition points even in non-trailer regions.
+            tier1.add(fault_point)
         elif in_any_region(flash_off, boundary_regions):
             tier2.add(fault_point)
         else:
-            tier3.add(fault_point)
+            tier3_trace_indices.append(i)
 
     # Build final fault point list.
     selected: Set[int] = set()
@@ -183,12 +338,17 @@ def classify_trace(
             tier2_selected.add(fp)
     selected.update(tier2_selected)
 
-    # Tier 3: every Kth.
+    # Tier 3: stratified bulk sampling via run segmentation.
     tier3_selected: Set[int] = set()
-    tier3_sorted = sorted(tier3 - tier1 - tier2)
-    for i, fp in enumerate(tier3_sorted):
-        if i % tier3_step == 0:
-            tier3_selected.add(fp)
+    runs = _segment_runs(tier3_trace_indices, trace, page_size)
+
+    for run_start, run_end, run_length in runs:
+        sampled_trace_indices = _sample_bulk_run(
+            run_start, run_end, run_length, tier3_step, tier2_step
+        )
+        for trace_idx in sampled_trace_indices:
+            fault_point = trace[trace_idx][0] - 1
+            tier3_selected.add(fault_point)
     selected.update(tier3_selected)
 
     # Always include first and last fault points.
@@ -207,7 +367,7 @@ def classify_trace(
             "tier2_selected": tier2_selected,
             "tier3_selected": tier3_selected,
             "tier2_total": len(tier2),
-            "tier3_total": len(tier3),
+            "tier3_total": len(tier3_trace_indices),
             "discontinuity_count": discontinuity_count,
             "heuristic_config": {
                 "tier2_step": tier2_step,
