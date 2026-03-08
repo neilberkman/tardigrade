@@ -43,6 +43,7 @@ KNOWN_FAULT_TYPES = {
     "wear_leveling_corruption",
     "write_rejection",
     "reset_at_time",
+    "read_bit_flip",
 }
 IMPLEMENTED_FAULT_TYPES = {
     "power_loss",
@@ -54,6 +55,7 @@ IMPLEMENTED_FAULT_TYPES = {
     "wear_leveling_corruption",
     "write_rejection",
     "reset_at_time",
+    "read_bit_flip",
 }
 
 
@@ -167,6 +169,37 @@ class Phase2FaultConfig:
         self.max_points = max(0, int(max_points))
 
 
+class ReadFaultConfig:
+    """Configuration for read-time bit-flip fault injection."""
+
+    __slots__ = ("target_regions", "bit_flip_count", "fault_probability", "seed")
+
+    def __init__(
+        self,
+        target_regions: Optional[List[Tuple[int, int]]] = None,
+        bit_flip_count: int = 1,
+        fault_probability: float = 1.0,
+        seed: int = 0,
+    ) -> None:
+        self.target_regions: List[Tuple[int, int]] = target_regions or []
+        self.bit_flip_count = max(1, int(bit_flip_count))
+        if not (0.0 <= fault_probability <= 1.0):
+            raise ProfileError(
+                "read_fault_config.fault_probability must be in [0.0, 1.0], got {}".format(
+                    fault_probability
+                )
+            )
+        self.fault_probability = float(fault_probability)
+        self.seed = int(seed)
+        for i, (start, end) in enumerate(self.target_regions):
+            if end <= start:
+                raise ProfileError(
+                    "read_fault_config.target_regions[{}]: end (0x{:X}) must be > start (0x{:X})".format(
+                        i, end, start
+                    )
+                )
+
+
 class FaultSweepConfig:
     __slots__ = (
         "mode",
@@ -185,6 +218,7 @@ class FaultSweepConfig:
         "expected_rollback_at_cycle",
         "phase2_fault",
         "multi_fault",
+        "read_fault_config",
     )
 
     def __init__(
@@ -205,6 +239,7 @@ class FaultSweepConfig:
         expected_rollback_at_cycle: Optional[int] = None,
         phase2_fault: Optional["Phase2FaultConfig"] = None,
         multi_fault=None,
+        read_fault_config: Optional["ReadFaultConfig"] = None,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -228,6 +263,7 @@ class FaultSweepConfig:
         )
         self.phase2_fault = phase2_fault or Phase2FaultConfig()
         self.multi_fault = multi_fault or MultiFaultConfig()
+        self.read_fault_config = read_fault_config
 
 
 class StateFuzzerConfig:
@@ -654,6 +690,24 @@ class ProfileConfig:
                 "HASH_BYPASS_SYMBOLS:{}".format(",".join(fs.hash_bypass_symbols))
             )
 
+        # Read fault config: emit when read_bit_flip is an active fault type.
+        if "read_bit_flip" in fs.fault_types and fs.read_fault_config is not None:
+            rfc = fs.read_fault_config
+            if rfc.target_regions:
+                region_strs = [
+                    "0x{:08X}-0x{:08X}".format(s, e) for s, e in rfc.target_regions
+                ]
+                vars_list.append(
+                    "READ_FAULT_REGIONS:{}".format(",".join(region_strs))
+                )
+            vars_list.append(
+                "READ_FAULT_BIT_FLIPS:{}".format(rfc.bit_flip_count)
+            )
+            vars_list.append(
+                "READ_FAULT_PROBABILITY:{}".format(rfc.fault_probability)
+            )
+            vars_list.append("READ_FAULT_SEED:{}".format(rfc.seed))
+
         # Per-profile stall timeout override.
         if fs.progress_stall_timeout_s is not None:
             vars_list.append(
@@ -833,6 +887,7 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         expected_rollback_at_cycle=expected_rollback_at_cycle,
         phase2_fault=_parse_phase2_fault(raw.get("phase2_fault")),
         multi_fault=_parse_multi_fault(raw.get("multi_fault")),
+        read_fault_config=_parse_read_fault_config(raw.get("read_fault_config")),
     )
 
 
@@ -860,8 +915,6 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
         fault_types=fault_types,
         max_points=max_points,
     )
-
-
 
 def _parse_multi_fault(raw):
     """Parse multi_fault configuration from profile YAML."""
@@ -1334,6 +1387,19 @@ def main() -> int:
             "seed": profile.fault_sweep.multi_fault.seed,
             "sequences_count": len(profile.fault_sweep.multi_fault.sequences),
         },
+        "read_fault_config": (
+            {
+                "target_regions": [
+                    {"start": "0x{:08X}".format(s), "end": "0x{:08X}".format(e)}
+                    for s, e in profile.fault_sweep.read_fault_config.target_regions
+                ],
+                "bit_flip_count": profile.fault_sweep.read_fault_config.bit_flip_count,
+                "fault_probability": profile.fault_sweep.read_fault_config.fault_probability,
+                "seed": profile.fault_sweep.read_fault_config.seed,
+            }
+            if profile.fault_sweep.read_fault_config is not None
+            else None
+        ),
     }
     print(json.dumps(info, indent=2, sort_keys=True))
     return 0
