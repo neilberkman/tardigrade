@@ -2999,7 +2999,11 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     cpu_ref = monitor.Machine['sysbus.cpu']
     fp_t0 = _time.time()
     is_p1_erase = p1_fault_type in ('e', 'a')
+    is_p1_timed = p1_fault_type == 't'
     is_p2_erase = p2_fault_type in ('e', 'a')
+    is_p2_timed = p2_fault_type == 't'
+    p1_status = None
+    p2_status = None
     log('p2fault p1={}/{} p2={}/{} phase1_setup'.format(
         p1_fault_at, p1_fault_type, p2_fault_at, p2_fault_type))
 
@@ -3009,12 +3013,36 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     cpu_ref.IsHalted = False
     reset_nvmc_for_sweep()
 
-    if is_p1_erase:
+    if is_p1_timed:
+        # Timed reset Phase 1: run for a fractional duration then interrupt.
+        disarm_fault()
+        duration_s = parse_duration_seconds(default=2.0)
+        max_fp = max(fault_points) if fault_points else max(1, p1_fault_at)
+        frac = 0.0 if max_fp <= 0 else min(1.0, max(0.0, float(p1_fault_at) / float(max_fp)))
+        trigger_s = max(0.005, min(duration_s * 0.95, frac * duration_s))
+        log('p2fault p1={} type=t trigger_s={:.3f}'.format(p1_fault_at, trigger_s))
+        monitor.Parse('emulation RunFor "{:.3f}"'.format(trigger_s))
+        p1_injected = True  # Timed resets always "inject".
+        p1_ops = get_total_writes() if (USE_FAST_PATH or USE_MRAM_PATH) else 0
+    elif is_p1_erase:
         erase_mode = 1 if p1_fault_type == 'a' else 0
         base_erases = get_total_erases()
         arm_at = base_erases + p1_fault_at + 1
         arm_erase_fault(arm_at, erase_fault_mode=erase_mode)
         disarm_write_fault()
+
+        p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
+        p1_max_iters = phase1_max_iters(default_s=4.0)
+        p1_status = run_until_done(
+            cpu_ref,
+            label='p2fault_p1_{}'.format(p1_fault_at),
+            stop_on_fault=True,
+            max_iters=p1_max_iters,
+            wall_timeout=p1_wall_timeout,
+        )
+        disarm_fault()
+        p1_injected = was_fault_injected()
+        p1_ops = get_total_erases()
     else:
         write_mode = {'w': 0, 'b': 1, 's': 2, 'r': 3, 'd': 4, 'l': 5}.get(
             p1_fault_type, 0
@@ -3026,22 +3054,19 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         arm_fault(arm_at, write_fault_mode=write_mode)
         disarm_erase_fault()
 
-    p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
-    p1_max_iters = phase1_max_iters(default_s=4.0)
-    p1_status = run_until_done(
-        cpu_ref,
-        label='p2fault_p1_{}'.format(p1_fault_at),
-        stop_on_fault=True,
-        max_iters=p1_max_iters,
-        wall_timeout=p1_wall_timeout,
-    )
-    disarm_fault()
-
-    p1_injected = was_fault_injected()
-    if is_p1_erase:
-        p1_ops = get_total_erases()
-    else:
+        p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
+        p1_max_iters = phase1_max_iters(default_s=4.0)
+        p1_status = run_until_done(
+            cpu_ref,
+            label='p2fault_p1_{}'.format(p1_fault_at),
+            stop_on_fault=True,
+            max_iters=p1_max_iters,
+            wall_timeout=p1_wall_timeout,
+        )
+        disarm_fault()
+        p1_injected = was_fault_injected()
         p1_ops = get_total_writes()
+
     phase1_ms = int((_time.time() - fp_t0) * 1000)
 
     log('p2fault p1={}/{} phase1_done injected={} ops={}'.format(
@@ -3098,10 +3123,36 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
 
     reset_nvmc_for_sweep()
 
-    if is_p2_erase:
+    if is_p2_timed:
+        # Timed reset during recovery: run for a fractional duration of
+        # the recovery boot, simulating a second power loss mid-recovery.
+        disarm_fault()
+        duration_s = parse_duration_seconds(default=2.0)
+        p2_max_idx = max(fault_points) if fault_points else max(1, p2_fault_at)
+        p2_frac = 0.0 if p2_max_idx <= 0 else min(1.0, max(0.0, float(p2_fault_at) / float(p2_max_idx)))
+        p2_trigger_s = max(0.005, min(duration_s * 0.95, p2_frac * duration_s))
+        log('p2fault p1={} p2={} type=t trigger_s={:.3f}'.format(
+            p1_fault_at, p2_fault_at, p2_trigger_s))
+        monitor.Parse('emulation RunFor "{:.3f}"'.format(p2_trigger_s))
+        p2_injected = True  # Timed resets always "inject".
+        p2_ops = get_total_writes() if (USE_FAST_PATH or USE_MRAM_PATH) else 0
+    elif is_p2_erase:
         erase_mode = 1 if p2_fault_type == 'a' else 0
         arm_erase_fault(p2_fault_at + 1, erase_fault_mode=erase_mode)
         disarm_write_fault()
+
+        log('p2fault p1={} p2={}/{} phase2_step'.format(
+            p1_fault_at, p2_fault_at, p2_fault_type))
+        p2_status = run_until_done(
+            cpu_ref,
+            label='p2fault_p2_{}_{}'.format(p1_fault_at, p2_fault_at),
+            stop_on_fault=True,
+            time_slice=phase2_time_slice,
+            wall_timeout=60,
+        )
+        disarm_fault()
+        p2_injected = was_fault_injected()
+        p2_ops = get_total_erases()
     else:
         write_mode = {'w': 0, 'b': 1, 's': 2, 'r': 3, 'd': 4, 'l': 5}.get(
             p2_fault_type, 0
@@ -3111,22 +3162,19 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         arm_fault(arm_at, write_fault_mode=write_mode)
         disarm_erase_fault()
 
-    log('p2fault p1={} p2={}/{} phase2_step'.format(
-        p1_fault_at, p2_fault_at, p2_fault_type))
-    p2_status = run_until_done(
-        cpu_ref,
-        label='p2fault_p2_{}_{}'.format(p1_fault_at, p2_fault_at),
-        stop_on_fault=True,
-        time_slice=phase2_time_slice,
-        wall_timeout=60,
-    )
-    disarm_fault()
-
-    p2_injected = was_fault_injected()
-    if is_p2_erase:
-        p2_ops = get_total_erases()
-    else:
+        log('p2fault p1={} p2={}/{} phase2_step'.format(
+            p1_fault_at, p2_fault_at, p2_fault_type))
+        p2_status = run_until_done(
+            cpu_ref,
+            label='p2fault_p2_{}_{}'.format(p1_fault_at, p2_fault_at),
+            stop_on_fault=True,
+            time_slice=phase2_time_slice,
+            wall_timeout=60,
+        )
+        disarm_fault()
+        p2_injected = was_fault_injected()
         p2_ops = get_total_writes()
+
     phase2_ms = int((_time.time() - phase2_t0) * 1000)
 
     log('p2fault p1={} p2={}/{} phase2_done injected={} ops={}'.format(
@@ -4037,6 +4085,22 @@ else:
             w_at = int(parts[1])
             e_at = int(parts[2])
             results.append(run_cascading_fault(w_at, e_at))
+        # Clustered bit-corruption: 'b:<seed>' sets CorruptionSeed before
+        # running a standard bit_corruption fault.
+        elif ft.startswith('b:') and ft[2:].isdigit():
+            cseed = int(ft[2:])
+            if USE_FAST_PATH:
+                faultFlash.CorruptionSeed = cseed
+            elif USE_MRAM_PATH:
+                pass  # MRAM uses built-in fault model.
+            else:
+                ctrl.Nvm.CorruptionSeed = cseed
+            results.append(run_execute_fault(fp, fault_type='b'))
+            # Reset seed for subsequent points.
+            if USE_FAST_PATH:
+                faultFlash.CorruptionSeed = 0
+            elif not USE_MRAM_PATH:
+                ctrl.Nvm.CorruptionSeed = 0
         # Synthetic/non-default faults always use full execute mode
         # (not trace replay — they depend on NVMC peripheral state/PRNG).
         elif ft in ('e', 'a', 'b', 's', 'd', 'l', 'r', 't', 'f'):

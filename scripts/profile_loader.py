@@ -25,7 +25,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fault_inject import BootloaderRegionConfig, MetadataFaultRegion
+from fault_inject import MetadataFaultRegion, NvsRegion, ConfigCheck
+from fault_inject import FaultDistributionConfig, MetadataFaultRegion
 
 try:
     import yaml
@@ -46,6 +47,7 @@ KNOWN_FAULT_TYPES = {
     "write_rejection",
     "reset_at_time",
     "read_bit_flip",
+    "bootloader_region_write",
     "nvs_corruption",
 }
 IMPLEMENTED_FAULT_TYPES = {
@@ -59,61 +61,13 @@ IMPLEMENTED_FAULT_TYPES = {
     "write_rejection",
     "reset_at_time",
     "read_bit_flip",
+    "bootloader_region_write",
     "nvs_corruption",
 }
 
 
 class ProfileError(Exception):
     """Raised when a profile is invalid or unsupported."""
-
-
-
-class NvsRegionConfig:
-    """Configuration for an NVS/config memory region subject to corruption testing."""
-    __slots__ = ("address", "size", "snapshot")
-    def __init__(self, address: int, size: int, snapshot: Optional[str] = None) -> None:
-        self.address = address
-        self.size = size
-        self.snapshot = snapshot
-
-
-class ConfigCheck:
-    """A single post-boot config check: verify memory at an address."""
-    __slots__ = ("address", "expected", "nonzero", "range_min", "range_max")
-    def __init__(self, address: int, expected: Optional[int] = None, nonzero: bool = False,
-                 range_min: Optional[int] = None, range_max: Optional[int] = None) -> None:
-        self.address = address
-        self.expected = expected
-        self.nonzero = nonzero
-        self.range_min = range_min
-        self.range_max = range_max
-
-    def evaluate(self, actual_value: int) -> bool:
-        """Evaluate this check against an actual memory value."""
-        if self.expected is not None and actual_value != self.expected:
-            return False
-        if self.nonzero and actual_value == 0:
-            return False
-        if self.range_min is not None and actual_value < self.range_min:
-            return False
-        if self.range_max is not None and actual_value > self.range_max:
-            return False
-        return True
-
-    def describe_failure(self, actual_value: int) -> str:
-        """Return a human-readable failure description."""
-        parts = ["config check at 0x{:X} failed:".format(self.address)]
-        parts.append("actual=0x{:X}".format(actual_value))
-        if self.expected is not None:
-            parts.append("expected=0x{:X}".format(self.expected))
-        if self.nonzero:
-            parts.append("expected nonzero")
-        if self.range_min is not None or self.range_max is not None:
-            parts.append("expected range [{}, {}]".format(
-                "0x{:X}".format(self.range_min) if self.range_min is not None else "-inf",
-                "0x{:X}".format(self.range_max) if self.range_max is not None else "+inf"))
-        return " ".join(parts)
-
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +82,22 @@ class SlotConfig:
         self.size = size
 
 
+class BootloaderRegion:
+    """Address range of the bootloader's own code in NVM."""
+
+    __slots__ = ("base", "size")
+
+    def __init__(self, base: int, size: int) -> None:
+        self.base = base
+        self.size = size
+
+    @property
+    def end(self) -> int:
+        return self.base + self.size
+
+
 class MemoryConfig:
-    __slots__ = ("sram_start", "sram_end", "write_granularity", "slots")
+    __slots__ = ("sram_start", "sram_end", "write_granularity", "slots", "bootloader_region")
 
     def __init__(
         self,
@@ -137,11 +105,13 @@ class MemoryConfig:
         sram_end: int,
         write_granularity: int,
         slots: Dict[str, SlotConfig],
+        bootloader_region: Optional["BootloaderRegion"] = None,
     ) -> None:
         self.sram_start = sram_start
         self.sram_end = sram_end
         self.write_granularity = write_granularity
         self.slots = slots
+        self.bootloader_region = bootloader_region
 
 
 class SuccessCriteria:
@@ -173,7 +143,7 @@ class SuccessCriteria:
         otadata_expect: Optional[Dict[str, List[str]]] = None,
         otadata_expect_scope: str = "always",
         bootloader_integrity: bool = False,
-        config_checks: Optional[List["ConfigCheck"]] = None,
+        config_checks: Optional[List[ConfigCheck]] = None,
     ) -> None:
         self.vtor_in_slot = vtor_in_slot
         self.vector_table_offset = max(0, int(vector_table_offset))
@@ -186,7 +156,8 @@ class SuccessCriteria:
         self.otadata_expect = otadata_expect or {}
         self.otadata_expect_scope = otadata_expect_scope
         self.bootloader_integrity = bootloader_integrity
-        self.config_checks: List["ConfigCheck"] = config_checks or []
+        self.config_checks = config_checks or []
+
 
 
 class MultiFaultConfig:
@@ -375,6 +346,47 @@ class MultiComponentConfig:
     ) -> None:
         self.components = components
         self.fault_matrix = fault_matrix
+class NvsRegionConfig:
+    """Configuration for an NVS (non-volatile storage) region on flash."""
+    __slots__ = ("address", "size", "snapshot")
+
+    def __init__(
+        self,
+        address: int,
+        size: int,
+        snapshot: Optional[str] = None,
+    ) -> None:
+        self.address = address
+        self.size = size
+        self.snapshot = snapshot
+
+
+class NvsCorruptionConfig:
+    """Configuration for NVS corruption fault injection."""
+    __slots__ = (
+        "enabled",
+        "modes",
+        "bit_flip_counts",
+        "erase_fractions",
+        "truncate_offsets",
+        "seed",
+    )
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        modes: Optional[List[str]] = None,
+        bit_flip_counts: Optional[List[int]] = None,
+        erase_fractions: Optional[List[float]] = None,
+        truncate_offsets: Optional[List[Optional[int]]] = None,
+        seed: int = 0,
+    ) -> None:
+        self.enabled = enabled
+        self.modes = modes or ["bit_flip", "partial_erase", "truncation"]
+        self.bit_flip_counts = bit_flip_counts or [1, 4, 16]
+        self.erase_fractions = erase_fractions or [0.25, 0.5, 1.0]
+        self.truncate_offsets = truncate_offsets
+        self.seed = seed
 
 
 class FaultSweepConfig:
@@ -398,6 +410,8 @@ class FaultSweepConfig:
         "read_fault_config",
         "metadata_fault",
         "partial_staging",
+        "nvs_corruption",
+        "fault_distribution",
     )
 
     def __init__(
@@ -421,6 +435,8 @@ class FaultSweepConfig:
         read_fault_config: Optional["ReadFaultConfig"] = None,
         metadata_fault: Optional["MetadataFaultConfig"] = None,
         partial_staging: Optional[Any] = None,
+        nvs_corruption: Optional["NvsCorruptionConfig"] = None,
+        fault_distribution: Optional["FaultDistributionConfig"] = None,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -447,6 +463,8 @@ class FaultSweepConfig:
         self.read_fault_config = read_fault_config
         self.metadata_fault = metadata_fault or MetadataFaultConfig()
         self.partial_staging = partial_staging
+        self.nvs_corruption = nvs_corruption or NvsCorruptionConfig()
+        self.fault_distribution = fault_distribution or FaultDistributionConfig()
 
 
 class StateFuzzerConfig:
@@ -601,10 +619,9 @@ class ProfileConfig:
         invariant_config: Optional[Dict[str, Any]] = None,
         flash_backend: Optional[str] = None,
         initial_states: Optional[List["InitialStateConfig"]] = None,
-        nvs_region: Optional["NvsRegionConfig"] = None,
         metadata_fault_regions: Optional[List[MetadataFaultRegion]] = None,
-        bootloader_region: Optional[BootloaderRegionConfig] = None,
         multi_component: Optional["MultiComponentConfig"] = None,
+        nvs_region: Optional[NvsRegionConfig] = None,
         security_policy: Optional["SecurityPolicyConfig"] = None,
     ) -> None:
         self.schema_version = schema_version
@@ -633,11 +650,9 @@ class ProfileConfig:
         self.flash_backend = flash_backend
         self.security_policy = security_policy or SecurityPolicyConfig()
         self.initial_states: List[InitialStateConfig] = initial_states or []
-        self.nvs_region: Optional[NvsRegionConfig] = nvs_region
         self.metadata_fault_regions: List[MetadataFaultRegion] = metadata_fault_regions or []
-        self.bootloader_region: Optional[BootloaderRegionConfig] = bootloader_region
-        self.bootloader_region: Optional[BootloaderRegionConfig] = bootloader_region
         self.multi_component: Optional[MultiComponentConfig] = multi_component
+        self.nvs_region = nvs_region
 
     @property
     def is_multi_component(self) -> bool:
@@ -689,9 +704,8 @@ class ProfileConfig:
             invariants=self.invariants, invariant_providers=self.invariant_providers,
             invariant_config=self.invariant_config,
             flash_backend=self.flash_backend, initial_states=[],
-            nvs_region=self.nvs_region,
             metadata_fault_regions=self.metadata_fault_regions,
-            bootloader_region=self.bootloader_region,
+            nvs_region=self.nvs_region,
             security_policy=self.security_policy,
         )
         if state.update_trigger is not None and state.pre_boot_state is None:
@@ -915,6 +929,19 @@ class ProfileConfig:
                 )
             )
 
+        # Bootloader integrity check.
+        if sc.bootloader_integrity:
+            vars_list.append("SUCCESS_BOOTLOADER_INTEGRITY:true")
+
+        # Bootloader region.
+        if mem.bootloader_region is not None:
+            vars_list.append(
+                "BOOTLOADER_REGION_BASE:0x{:08X}".format(mem.bootloader_region.base)
+            )
+            vars_list.append(
+                "BOOTLOADER_REGION_SIZE:0x{:08X}".format(mem.bootloader_region.size)
+            )
+
         # Flash backend: explicit sysbus name for the fault-injectable controller.
         if self.flash_backend:
             vars_list.append("FLASH_BACKEND:{}".format(self.flash_backend))
@@ -965,6 +992,42 @@ class ProfileConfig:
             )
             vars_list.append("METADATA_FAULT_REGIONS:{}".format(encoded))
 
+        # NVS region config.
+        if self.nvs_region:
+            vars_list.append(
+                "NVS_REGION_ADDR:0x{:08X}".format(self.nvs_region.address)
+            )
+            vars_list.append(
+                "NVS_REGION_SIZE:0x{:08X}".format(self.nvs_region.size)
+            )
+            if self.nvs_region.snapshot:
+                vars_list.append(
+                    "NVS_REGION_SNAPSHOT:{}".format(
+                        self.resolve_path(repo_root, self.nvs_region.snapshot)
+                    )
+                )
+
+        # Config checks: semicolon-separated list of check specs.
+        if sc.config_checks:
+            check_parts: List[str] = []
+            for chk in sc.config_checks:
+                parts: List[str] = ["addr=0x{:X}".format(chk.address)]
+                if chk.expected is not None:
+                    parts.append("expected=0x{:02X}".format(chk.expected & 0xFF))
+                if chk.nonzero:
+                    parts.append("nonzero=true")
+                if chk.mask is not None:
+                    parts.append("mask=0x{:02X}".format(chk.mask & 0xFF))
+                if chk.expected_masked is not None:
+                    parts.append(
+                        "expected_masked=0x{:02X}".format(
+                            chk.expected_masked & 0xFF
+                        )
+                    )
+                check_parts.append(",".join(parts))
+            vars_list.append(
+                "CONFIG_CHECKS:{}".format(";".join(check_parts))
+            )
         # Security policy: advisory fields for adversarial fault classification.
         sp = self.security_policy
         if sp.anti_rollback:
@@ -1061,17 +1124,31 @@ def _parse_slots(raw: Dict[str, Any]) -> Dict[str, SlotConfig]:
     return slots
 
 
+def _parse_bootloader_region(raw: Optional[Dict[str, Any]]) -> Optional[BootloaderRegion]:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ProfileError("memory.bootloader_region: expected mapping with base and size")
+    base = _parse_int(_require(raw, "base", "memory.bootloader_region"), "memory.bootloader_region.base")
+    size = _parse_int(_require(raw, "size", "memory.bootloader_region"), "memory.bootloader_region.size")
+    if size <= 0:
+        raise ProfileError("memory.bootloader_region.size: must be positive, got {}".format(size))
+    return BootloaderRegion(base=base, size=size)
+
+
 def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
     sram = _require(raw, "sram", "memory")
     sram_start = _parse_int(_require(sram, "start", "memory.sram"), "memory.sram.start")
     sram_end = _parse_int(_require(sram, "end", "memory.sram"), "memory.sram.end")
     write_granularity = _parse_int(raw.get("write_granularity", 8), "memory.write_granularity")
     slots = _parse_slots(_require(raw, "slots", "memory"))
+    bootloader_region = _parse_bootloader_region(raw.get("bootloader_region"))
     return MemoryConfig(
         sram_start=sram_start,
         sram_end=sram_end,
         write_granularity=write_granularity,
         slots=slots,
+        bootloader_region=bootloader_region,
     )
 
 
@@ -1154,6 +1231,8 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         read_fault_config=_parse_read_fault_config(raw.get("read_fault_config")),
         metadata_fault=_parse_metadata_fault(raw.get("metadata_fault")),
         partial_staging=raw.get("partial_staging"),
+        nvs_corruption=_parse_nvs_corruption(raw.get("nvs_corruption")),
+        fault_distribution=_parse_fault_distribution(raw.get("fault_distribution")),
     )
 
 
@@ -1305,53 +1384,133 @@ def _parse_metadata_fault(raw):
     return MetadataFaultConfig(enabled=enabled, fault_types=fault_types)
 
 
+def _parse_config_checks(raw: Optional[List[Any]]) -> List[ConfigCheck]:
+    """Parse config_checks from success_criteria YAML block."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("success_criteria.config_checks: expected list")
+    checks: List[ConfigCheck] = []
+    for i, entry in enumerate(raw):
+        ctx = "success_criteria.config_checks[{}]".format(i)
+        if not isinstance(entry, dict):
+            raise ProfileError("{}: expected mapping".format(ctx))
+        address = _parse_int(
+            _require(entry, "address", ctx), "{}.address".format(ctx)
+        )
+        expected: Optional[int] = None
+        if "expected" in entry:
+            expected = _parse_int(entry["expected"], "{}.expected".format(ctx))
+        nonzero = bool(entry.get("nonzero", False))
+        mask: Optional[int] = None
+        if "mask" in entry:
+            mask = _parse_int(entry["mask"], "{}.mask".format(ctx))
+        expected_masked: Optional[int] = None
+        if "expected_masked" in entry:
+            expected_masked = _parse_int(
+                entry["expected_masked"], "{}.expected_masked".format(ctx)
+            )
+        if expected is None and not nonzero and mask is None:
+            raise ProfileError(
+                "{}: must specify at least one of expected, nonzero, or mask+expected_masked".format(
+                    ctx
+                )
+            )
+        checks.append(ConfigCheck(
+            address=address,
+            expected=expected,
+            nonzero=nonzero,
+            mask=mask,
+            expected_masked=expected_masked,
+        ))
+    return checks
 
-def _parse_nvs_region(raw: Optional[Dict[str, Any]]) -> Optional["NvsRegionConfig"]:
+
+def _parse_nvs_region(raw: Optional[Dict[str, Any]]) -> Optional[NvsRegionConfig]:
     """Parse nvs_region from profile YAML."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise ProfileError("nvs_region: expected mapping")
-    address = _parse_int(_require(raw, "address", "nvs_region"), "nvs_region.address")
-    size = _parse_int(_require(raw, "size", "nvs_region"), "nvs_region.size")
+    address = _parse_int(
+        _require(raw, "address", "nvs_region"), "nvs_region.address"
+    )
+    size = _parse_int(
+        _require(raw, "size", "nvs_region"), "nvs_region.size"
+    )
     if size <= 0:
-        raise ProfileError("nvs_region.size: expected positive integer")
+        raise ProfileError("nvs_region.size: must be > 0, got {}".format(size))
     snapshot = raw.get("snapshot")
     if snapshot is not None:
-        snapshot = str(snapshot).strip()
-        if not snapshot:
-            raise ProfileError("nvs_region.snapshot: expected non-empty path")
+        snapshot = str(snapshot)
     return NvsRegionConfig(address=address, size=size, snapshot=snapshot)
 
 
-def _parse_config_checks(raw: Optional[list]) -> List["ConfigCheck"]:
-    """Parse success_criteria.config_checks from profile YAML."""
+def _parse_nvs_corruption(raw: Optional[Dict[str, Any]]) -> NvsCorruptionConfig:
+    """Parse nvs_corruption config from fault_sweep YAML block."""
     if raw is None:
-        return []
-    if not isinstance(raw, list):
-        raise ProfileError("success_criteria.config_checks: expected list")
-    checks: List["ConfigCheck"] = []
-    for i, entry in enumerate(raw):
-        ctx = "success_criteria.config_checks[{}]".format(i)
-        if not isinstance(entry, dict):
-            raise ProfileError("{}: expected mapping".format(ctx))
-        address = _parse_int(_require(entry, "address", ctx), "{}.address".format(ctx))
-        expected = None
-        if "expected" in entry:
-            expected = _parse_int(entry["expected"], "{}.expected".format(ctx))
-        nonzero = bool(entry.get("nonzero", False))
-        range_min = None
-        range_max = None
-        if "range" in entry:
-            range_raw = entry["range"]
-            if not isinstance(range_raw, dict):
-                raise ProfileError("{}.range: expected mapping with min/max".format(ctx))
-            if "min" in range_raw:
-                range_min = _parse_int(range_raw["min"], "{}.range.min".format(ctx))
-            if "max" in range_raw:
-                range_max = _parse_int(range_raw["max"], "{}.range.max".format(ctx))
-        checks.append(ConfigCheck(address=address, expected=expected, nonzero=nonzero, range_min=range_min, range_max=range_max))
-    return checks
+        return NvsCorruptionConfig()
+    if isinstance(raw, bool):
+        return NvsCorruptionConfig(enabled=raw)
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep.nvs_corruption: expected mapping or bool")
+    enabled = bool(raw.get("enabled", False))
+    modes = raw.get("modes")
+    if modes is not None:
+        if isinstance(modes, str):
+            modes = [modes]
+        if not isinstance(modes, list):
+            raise ProfileError("nvs_corruption.modes: expected list of strings")
+        valid_modes = {"bit_flip", "partial_erase", "truncation"}
+        for m in modes:
+            if m not in valid_modes:
+                raise ProfileError(
+                    "nvs_corruption.modes: unknown mode '{}', expected one of {}".format(
+                        m, sorted(valid_modes)
+                    )
+                )
+    bit_flip_counts = raw.get("bit_flip_counts")
+    if bit_flip_counts is not None:
+        if not isinstance(bit_flip_counts, list):
+            raise ProfileError(
+                "nvs_corruption.bit_flip_counts: expected list of integers"
+            )
+        bit_flip_counts = [int(x) for x in bit_flip_counts]
+        for c in bit_flip_counts:
+            if c < 1:
+                raise ProfileError(
+                    "nvs_corruption.bit_flip_counts: values must be >= 1"
+                )
+    erase_fractions = raw.get("erase_fractions")
+    if erase_fractions is not None:
+        if not isinstance(erase_fractions, list):
+            raise ProfileError(
+                "nvs_corruption.erase_fractions: expected list of floats"
+            )
+        erase_fractions = [float(x) for x in erase_fractions]
+        for f in erase_fractions:
+            if not (0.0 < f <= 1.0):
+                raise ProfileError(
+                    "nvs_corruption.erase_fractions: values must be in (0.0, 1.0]"
+                )
+    truncate_offsets = raw.get("truncate_offsets")
+    if truncate_offsets is not None:
+        if not isinstance(truncate_offsets, list):
+            raise ProfileError(
+                "nvs_corruption.truncate_offsets: expected list of integers or null"
+            )
+        truncate_offsets = [
+            int(x) if x is not None else None for x in truncate_offsets
+        ]
+    seed = int(raw.get("seed", 0))
+    return NvsCorruptionConfig(
+        enabled=enabled,
+        modes=modes,
+        bit_flip_counts=bit_flip_counts,
+        erase_fractions=erase_fractions,
+        truncate_offsets=truncate_offsets,
+        seed=seed,
+    )
 
 
 def _parse_security_policy(raw: Optional[Dict[str, Any]]) -> SecurityPolicyConfig:
@@ -1375,6 +1534,55 @@ def _parse_security_policy(raw: Optional[Dict[str, Any]]) -> SecurityPolicyConfi
         anti_rollback=anti_rollback,
         minimum_version=minimum_version,
         toctou_protection=toctou_protection,
+    )
+
+def _parse_fault_distribution(raw: Optional[Dict[str, Any]]) -> Optional[FaultDistributionConfig]:
+    """Parse fault_distribution config from fault_sweep YAML block."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep.fault_distribution: expected mapping")
+    mode = str(raw.get("mode", "uniform")).strip().lower()
+    if mode not in ("uniform", "clustered"):
+        raise ProfileError(
+            "fault_sweep.fault_distribution.mode: must be 'uniform' or 'clustered', got {!r}".format(
+                mode
+            )
+        )
+    cluster_start = 0
+    cluster_end = 0
+    if mode == "clustered":
+        cluster_sectors = raw.get("cluster_sectors")
+        if cluster_sectors is not None:
+            if not isinstance(cluster_sectors, list) or len(cluster_sectors) != 2:
+                raise ProfileError(
+                    "fault_sweep.fault_distribution.cluster_sectors: expected [start, end] pair"
+                )
+            cluster_start = _parse_int(cluster_sectors[0], "fault_distribution.cluster_sectors[0]")
+            cluster_end = _parse_int(cluster_sectors[1], "fault_distribution.cluster_sectors[1]")
+        else:
+            cluster_start = _parse_int(
+                raw.get("cluster_start", 0), "fault_distribution.cluster_start"
+            )
+            cluster_end = _parse_int(
+                raw.get("cluster_end", 0), "fault_distribution.cluster_end"
+            )
+        if cluster_end <= cluster_start:
+            raise ProfileError(
+                "fault_sweep.fault_distribution: cluster_end (0x{:X}) must be > cluster_start (0x{:X})".format(
+                    cluster_end, cluster_start
+                )
+            )
+    flip_in = float(raw.get("flip_probability_in_cluster", 0.1))
+    flip_out = float(raw.get("flip_probability_outside", 0.001))
+    seed = int(raw.get("seed", 0))
+    return FaultDistributionConfig(
+        mode=mode,
+        cluster_start=cluster_start,
+        cluster_end=cluster_end,
+        flip_probability_in_cluster=flip_in,
+        flip_probability_outside=flip_out,
+        seed=seed,
     )
 
 
@@ -1768,19 +1976,6 @@ def _parse_metadata_fault_regions(raw, slots=None):
     return regions
 
 
-def _parse_bootloader_region(raw: Optional[Dict[str, Any]]) -> Optional[BootloaderRegionConfig]:
-    """Parse bootloader_region from profile YAML."""
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        raise ProfileError("bootloader_region: expected mapping with base and size")
-    base = _parse_int(_require(raw, "base", "bootloader_region"), "bootloader_region.base")
-    size = _parse_int(_require(raw, "size", "bootloader_region"), "bootloader_region.size")
-    if size <= 0:
-        raise ProfileError("bootloader_region.size must be > 0, got 0x{:X}".format(size))
-    return BootloaderRegionConfig(base=base, size=size)
-
-
 # ---------------------------------------------------------------------------
 # Main loader
 # ---------------------------------------------------------------------------
@@ -1872,12 +2067,11 @@ def load_profile(path: str | Path) -> ProfileConfig:
     invariant_providers = _parse_invariant_providers(data.get("invariant_providers"))
     invariant_config = _parse_invariant_config(data.get("invariant_config"))
     initial_states = _parse_initial_states(data.get("initial_states"))
-    nvs_region = _parse_nvs_region(data.get("nvs_region"))
     metadata_fault_regions = _parse_metadata_fault_regions(
         data.get("metadata_fault_regions"), slots=memory.slots
     )
-    bootloader_region = _parse_bootloader_region(data.get("bootloader_region"))
     multi_component = _parse_components(data.get("multi_component"))
+    nvs_region = _parse_nvs_region(data.get("nvs_region"))
 
     scenario = str(data.get("scenario", "runtime"))
     if scenario not in VALID_SCENARIOS:
@@ -1927,10 +2121,9 @@ def load_profile(path: str | Path) -> ProfileConfig:
         invariant_config=invariant_config,
         flash_backend=flash_backend,
         initial_states=initial_states,
-        nvs_region=nvs_region,
         metadata_fault_regions=metadata_fault_regions,
-        bootloader_region=bootloader_region,
         multi_component=multi_component,
+        nvs_region=nvs_region,
         security_policy=security_policy,
     )
 
