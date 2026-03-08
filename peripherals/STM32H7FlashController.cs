@@ -278,10 +278,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
-            var writeTarget = machine.GetSystemBus(this).WhatIsAt(physicalAddress)?.Peripheral;
+            var registration = machine.GetSystemBus(this).WhatIsAt(physicalAddress);
+            if(registration == null)
+            {
+                return;
+            }
+
+            var writeTarget = registration.Peripheral;
+            var localOffset = (long)(physicalAddress - registration.RegistrationPoint.Range.StartAddress);
             foreach(var bank in banks)
             {
-                bank.HandleMemoryProgramWrite(writeTarget, physicalAddress, width, value);
+                bank.HandleMemoryProgramWrite(writeTarget, localOffset, width, value);
             }
         }
 
@@ -652,7 +659,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 parent.UpdateInterrupts();
             }
 
-            public void HandleMemoryProgramWrite(IPeripheral writeTarget, ulong address, uint width, ulong value)
+            public void HandleMemoryProgramWrite(IPeripheral writeTarget, long localOffset, uint width, ulong value)
             {
                 if(writeTarget != memory)
                 {
@@ -666,19 +673,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     return;
                 }
 
-                var registration = parent.machine.GetSystemBus(parent).WhatIsAt(address);
-                if(registration == null)
-                {
-                    return;
-                }
-
-                var localOffset = (long)(address - registration.RegistrationPoint.Range.StartAddress);
-
                 if(bankWriteBufferCounter == 0)
                 {
-                    bankWriteBufferAddress = address;
+                    bankWriteBufferAddress = (ulong)localOffset;
                 }
-                else if(bankWriteBufferAddress + (ulong)bankWriteBufferCounter != address)
+                else if(bankWriteBufferAddress + (ulong)bankWriteBufferCounter != (ulong)localOffset)
                 {
                     bankInconsistencyErrorStatus.Value = true;
                     parent.UpdateInterrupts();
