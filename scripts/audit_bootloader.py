@@ -2063,6 +2063,7 @@ def main() -> int:
             or include_wear_leveling
             or include_write_rejection
             or include_reset_at_time
+            or profile.fault_sweep.phase2_fault.enabled
         )
         if has_mixed_types:
             write_fps: List[Tuple[int, str]] = []
@@ -2139,6 +2140,40 @@ def main() -> int:
                 combined += [(tp, 't') for tp in timed_reset_fps]
                 timed_reset_count = len(timed_reset_fps)
 
+            # Phase 2 recovery fault injection: for selected Phase 1 fault
+            # points, also sweep faults during the recovery boot.
+            p2_config = profile.fault_sweep.phase2_fault
+            phase2_count = 0
+            if p2_config.enabled and write_fps:
+                p2_max = p2_config.max_points if p2_config.max_points > 0 else min(50, max_writes)
+                # Map profile fault type names to single-char codes.
+                p2_type_map = {
+                    "power_loss": "w",
+                    "interrupted_erase": "e",
+                    "bit_corruption": "b",
+                    "silent_write_failure": "s",
+                    "write_disturb": "d",
+                    "wear_leveling_corruption": "l",
+                    "write_rejection": "r",
+                    "multi_sector_atomicity": "a",
+                }
+                p2_type_codes = [
+                    p2_type_map.get(ft, "w") for ft in p2_config.fault_types
+                ]
+                if not p2_type_codes:
+                    p2_type_codes = ["w"]
+                # Select representative Phase 1 points: quick subset of write fps.
+                p1_representatives = quick_subset([fp for fp, _ in write_fps])
+                p2_range = list(range(0, p2_max))
+                if args.quick:
+                    p2_range = quick_subset(p2_range)
+                for p1_fp in p1_representatives:
+                    for p2_fp in p2_range:
+                        for p2_code in p2_type_codes:
+                            enc = "p2:{}:{}:w:{}".format(p1_fp, p2_fp, p2_code)
+                            combined.append((p1_fp, enc))
+                            phase2_count += 1
+
             fault_points = [fp for fp, _ in combined]
             fault_types_list = [ft for _, ft in combined]
             parts = ["{} writes".format(len(write_fps))]
@@ -2158,6 +2193,8 @@ def main() -> int:
                 parts.append("{} write-reject".format(rejection_count))
             if timed_reset_count:
                 parts.append("{} timed-reset".format(timed_reset_count))
+            if phase2_count:
+                parts.append("{} phase2-recovery".format(phase2_count))
             print(
                 "Running {} fault points ({}) for '{}'...".format(
                     len(fault_points),
