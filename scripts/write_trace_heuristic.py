@@ -26,7 +26,7 @@ Tier 3 (SPARSE): test every Kth write
 import csv
 import json
 import os
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 
 def load_trace(trace_path: str) -> List[Tuple[int, int]]:
@@ -48,7 +48,8 @@ def classify_trace(
     tier3_step: int = 100,
     discontinuity_window: int = 3,
     bootloader_region: Optional[Tuple[int, int]] = None,
-) -> List[int]:
+    return_details: bool = False,
+) -> Union[List[int], Dict[str, Any]]:
     """
     Classify trace entries into priority tiers and return a sorted list of
     fault points to test.
@@ -65,11 +66,32 @@ def classify_trace(
             to include as tier 1.
         bootloader_region: Optional (bus_start, bus_end) of bootloader code
             region.  Writes here are Tier 0 (always tested).
+        return_details: If True, return a dict with fault_points and per-tier
+            membership info instead of a plain list.
 
     Returns:
-        Sorted list of fault point indices (0-based write numbers to test).
+        If return_details is False: sorted list of fault point indices.
+        If return_details is True: dict with keys fault_points, tier0, tier1,
+            tier2_selected, tier3_selected, tier2_total, tier3_total,
+            discontinuity_count, and heuristic_config.
     """
     if not trace:
+        if return_details:
+            return {
+                "fault_points": [],
+                "tier0": set(),
+                "tier1": set(),
+                "tier2_selected": set(),
+                "tier3_selected": set(),
+                "tier2_total": 0,
+                "tier3_total": 0,
+                "discontinuity_count": 0,
+                "heuristic_config": {
+                    "tier2_step": tier2_step,
+                    "tier3_step": tier3_step,
+                    "discontinuity_window": discontinuity_window,
+                },
+            }
         return []
 
     # Tier 0: bootloader self-update region, if configured.
@@ -109,11 +131,13 @@ def classify_trace(
 
     # Pass 1: find discontinuities (address jumps > 1 page between consecutive writes).
     discontinuity_indices: Set[int] = set()
+    discontinuity_count = 0
     for i in range(1, len(trace)):
         prev_off = trace[i - 1][1]
         cur_off = trace[i][1]
         # A discontinuity is a jump larger than one page or a direction reversal.
         if abs(cur_off - prev_off) > page_size:
+            discontinuity_count += 1
             # Mark writes in the window around the discontinuity.
             for j in range(
                 max(0, i - discontinuity_window),
@@ -122,7 +146,6 @@ def classify_trace(
                 discontinuity_indices.add(j)
 
     # Pass 2: classify each write.
-    tier0: Set[int] = set()
     tier0: Set[int] = set()  # bootloader region (critical)
     tier1: Set[int] = set()
     tier2: Set[int] = set()
@@ -146,7 +169,6 @@ def classify_trace(
     # Build final fault point list.
     selected: Set[int] = set()
 
-    # Tier 0: all.
     # Tier 0: all (bootloader region -- critical).
     selected.update(tier0)
 
@@ -154,16 +176,20 @@ def classify_trace(
     selected.update(tier1)
 
     # Tier 2: every Kth.
+    tier2_selected: Set[int] = set()
     tier2_sorted = sorted(tier2 - tier1)
     for i, fp in enumerate(tier2_sorted):
         if i % tier2_step == 0:
-            selected.add(fp)
+            tier2_selected.add(fp)
+    selected.update(tier2_selected)
 
     # Tier 3: every Kth.
+    tier3_selected: Set[int] = set()
     tier3_sorted = sorted(tier3 - tier1 - tier2)
     for i, fp in enumerate(tier3_sorted):
         if i % tier3_step == 0:
-            selected.add(fp)
+            tier3_selected.add(fp)
+    selected.update(tier3_selected)
 
     # Always include first and last fault points.
     all_fps = [w - 1 for w, _ in trace]
@@ -172,6 +198,24 @@ def classify_trace(
         selected.add(max(all_fps))
 
     result = sorted(selected)
+
+    if return_details:
+        return {
+            "fault_points": result,
+            "tier0": tier0,
+            "tier1": tier1,
+            "tier2_selected": tier2_selected,
+            "tier3_selected": tier3_selected,
+            "tier2_total": len(tier2),
+            "tier3_total": len(tier3),
+            "discontinuity_count": discontinuity_count,
+            "heuristic_config": {
+                "tier2_step": tier2_step,
+                "tier3_step": tier3_step,
+                "discontinuity_window": discontinuity_window,
+            },
+        }
+
     return result
 
 
@@ -182,8 +226,15 @@ def summarize_classification(
     flash_base: int = 0,
     page_size: int = 4096,
     bootloader_region: Optional[Tuple[int, int]] = None,
+    tier_details: Optional[Dict[str, Any]] = None,
 ) -> Dict:
-    """Return a summary dict for logging/JSON output."""
+    """Return a summary dict for logging/JSON output.
+
+    Args:
+        tier_details: Optional dict from classify_trace(return_details=True).
+            When provided, per-tier counts and heuristic config are included
+            in the output.
+    """
     trailer_regions: List[Tuple[int, int]] = []
     for _name, (bus_start, bus_end) in slot_ranges.items():
         t_start = bus_end - page_size - flash_base
@@ -205,7 +256,7 @@ def summarize_classification(
             for _, off in trace
             if bl_start <= off < bl_end
         )
-    result = {
+    result: Dict[str, Any] = {
         "total_writes": len(trace),
         "trailer_writes": trailer_writes,
         "bulk_writes": len(trace) - trailer_writes - bl_writes,
@@ -215,4 +266,15 @@ def summarize_classification(
     if bl_writes > 0:
         result["bootloader_region_writes"] = bl_writes
         result["bulk_writes"] = max(0, result["bulk_writes"] - bl_writes)
+
+    if tier_details is not None:
+        result["tier0_count"] = len(tier_details["tier0"])
+        result["tier1_count"] = len(tier_details["tier1"])
+        result["tier2_count"] = len(tier_details["tier2_selected"])
+        result["tier3_count"] = len(tier_details["tier3_selected"])
+        result["tier2_total"] = tier_details["tier2_total"]
+        result["tier3_total"] = tier_details["tier3_total"]
+        result["discontinuity_count"] = tier_details["discontinuity_count"]
+        result["heuristic_config"] = tier_details["heuristic_config"]
+
     return result
