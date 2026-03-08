@@ -55,6 +55,67 @@ class ReadFaultResult:
 
 
 @dataclasses.dataclass
+class BootloaderRegionConfig:
+    """Address range of the bootloader's own code region."""
+
+    base: int
+    size: int
+
+    @property
+    def end(self) -> int:
+        return self.base + self.size
+
+    def contains(self, address: int) -> bool:
+        return self.base <= address < self.end
+
+
+def validate_bootloader_vector_table(
+    memory_bytes: bytes,
+    region_base: int,
+    region_size: int,
+    sram_start: int = 0x20000000,
+    sram_end: int = 0x30000000,
+) -> Tuple[bool, str]:
+    """Check that the bootloader region contains a valid ARM vector table.
+
+    Validates:
+      - Initial stack pointer (first 4 bytes) points into SRAM range.
+      - Reset vector (bytes 4-7) points into the bootloader region.
+
+    Args:
+        memory_bytes: Raw bytes of the bootloader region (must be >= 8 bytes).
+        region_base: Bus address of the start of the bootloader region.
+        region_size: Size of the bootloader region in bytes.
+        sram_start: Start of valid SRAM range (inclusive).
+        sram_end: End of valid SRAM range (exclusive).
+
+    Returns:
+        (valid, reason) tuple.  valid is True if the vector table looks good.
+    """
+    import struct as _struct
+
+    if len(memory_bytes) < 8:
+        return False, "region too small ({} bytes, need >= 8)".format(len(memory_bytes))
+
+    sp = _struct.unpack_from("<I", memory_bytes, 0)[0]
+    reset_vector = _struct.unpack_from("<I", memory_bytes, 4)[0]
+
+    region_end = region_base + region_size
+
+    if not (sram_start <= sp < sram_end):
+        return False, "initial SP 0x{:08X} not in SRAM range 0x{:08X}-0x{:08X}".format(
+            sp, sram_start, sram_end
+        )
+
+    if not (region_base <= reset_vector < region_end):
+        return False, "reset vector 0x{:08X} not in bootloader region 0x{:08X}-0x{:08X}".format(
+            reset_vector, region_base, region_end
+        )
+
+    return True, "ok"
+
+
+@dataclasses.dataclass
 class MetadataFaultRegion:
     """A named address range for metadata fault classification."""
 
@@ -69,16 +130,22 @@ class MetadataFaultRegion:
 def classify_fault_region(
     fault_address: int,
     metadata_regions: List[MetadataFaultRegion],
+    bootloader_region: Optional[BootloaderRegionConfig] = None,
 ) -> Optional[str]:
-    """Classify a fault address as metadata or data.
+    """Classify a fault address into a region category.
 
     Returns:
-        "metadata:<name>" if the address falls within a metadata region,
-        "data" if metadata_regions are defined but the address doesn't match any,
-        None if no metadata_regions are defined.
+        "bootloader_region" if bootloader_region is defined and the address
+            falls within it (highest priority).
+        "metadata:<name>" if the address falls within a metadata region.
+        "data" if metadata_regions or bootloader_region are defined but the
+            address doesn't match any named region.
+        None if no metadata_regions and no bootloader_region are defined.
     """
-    if not metadata_regions:
+    if not metadata_regions and bootloader_region is None:
         return None
+    if bootloader_region is not None and bootloader_region.contains(fault_address):
+        return "bootloader_region"
     for region in metadata_regions:
         if region.contains(fault_address):
             return "metadata:{}".format(region.name)
