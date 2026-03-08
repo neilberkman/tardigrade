@@ -1,0 +1,65 @@
+# Example profile demonstrating NVS/config region fault injection.
+#
+# Tests what happens when new firmware encounters old or corrupted
+# persistent configuration data in the NVS region.  The nvs_region
+# block identifies the config storage area, and config_checks in
+# success_criteria verify that firmware reads sane config values
+# after boot.
+#
+# This is a SCHEMA EXAMPLE -- it references placeholder binaries.
+# To run a real audit, replace bootloader.elf, images, and
+# nvs_region.snapshot with actual firmware artifacts.
+
+schema_version: 1
+name: nvs_config_migration_example
+description: >
+  Demonstrates NVS config region corruption testing.  Injects
+  bit flips, partial erases, truncation, and scramble faults
+  into the NVS region, then checks whether the bootloader and
+  application handle corrupted config gracefully.
+
+platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
+
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x00000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec:    { base: 0x0000C000, size: 0x74000 }
+    staging: { base: 0x00080000, size: 0x74000 }
+
+images:
+  exec:    examples/test_image.bin
+  staging: examples/test_image.bin
+
+# NVS region: the persistent config storage area.
+# 'snapshot' (optional) is a binary dump of the NVS contents from
+# the previous firmware version -- used as the baseline that gets
+# corrupted during fault injection.
+nvs_region:
+  address: 0x000F4000
+  size: 0x2000
+  # snapshot: old_firmware_nvs_dump.bin
+
+success_criteria:
+  vtor_in_slot: exec
+  # Config checks run after every boot.  If a check fails on a
+  # faulted run, the result is classified as 'config_lost'.
+  config_checks:
+    - { address: 0x000F4010, expected: 0x01 }
+    - { address: 0x000F4100, nonzero: true }
+    - address: 0x000F4200
+      range: { min: 0, max: 255 }
+
+fault_sweep:
+  mode: runtime
+  fault_types: [power_loss, nvs_corruption]
+  max_writes: auto
+  run_duration: "1.0"
+
+expect:
+  should_find_issues: true
