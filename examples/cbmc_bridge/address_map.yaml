@@ -1,0 +1,6 @@
+# Address map: CBMC variable names -> absolute flash addresses.
+#
+# When cbmc_to_profile.py encounters array assignments for one of these
+# names, it uses the corresponding address as the base for pre_boot_state
+# writes instead of inferring from the template's slot layout.
+meta_bytes: 0x10070000

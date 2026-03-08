@@ -1,0 +1,8 @@
+# Address map for fuzz_to_profile.py.
+#
+# Describes how to partition sequential crash input bytes into flash
+# memory regions for pre_boot_state writes.
+regions:
+  - name: metadata
+    address: 0x10070000
+    size: 16    # boot_meta struct is 16 bytes
