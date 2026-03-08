@@ -286,6 +286,84 @@ class GenericFrameworkTest(unittest.TestCase):
             annotate_result_checks(results, profile)
             self.assertEqual(results[0].get("invariant_violations", []), [])
 
+    def test_invariant_provider_sees_elapsed_virtual_time(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            provider = tempdir / "provider.py"
+            provider.write_text(
+                textwrap.dedent(
+                    """
+                    from invariants import InvariantViolation
+
+                    def check_boot_timing(result, **context):
+                        cfg = context.get("invariant_config") or {}
+                        limit = cfg.get("max_boot_seconds")
+                        if limit is None:
+                            return
+                        elapsed = getattr(result, "elapsed_virtual_time_s", None)
+                        if elapsed is None:
+                            raise InvariantViolation(
+                                invariant_name="boot_timing",
+                                description="missing elapsed virtual time",
+                                result=result,
+                            )
+                        if elapsed > limit:
+                            raise InvariantViolation(
+                                invariant_name="boot_timing",
+                                description="boot exceeded configured limit",
+                                result=result,
+                                details={"elapsed": elapsed, "limit": limit},
+                            )
+
+                    INVARIANTS = {"boot_timing": check_boot_timing}
+                    """
+                ),
+                encoding="utf-8",
+            )
+            profile_path = self._write_profile(
+                tempdir,
+                f"""
+                schema_version: 1
+                name: provider_profile
+                description: provider
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: {{ start: 0x20000000, end: 0x20020000 }}
+                  write_granularity: 4
+                  slots:
+                    exec: {{ base: 0x10000000, size: 0x1000 }}
+                    staging: {{ base: 0x10001000, size: 0x1000 }}
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                invariant_providers:
+                  - {provider.as_posix()}
+                invariant_config:
+                  max_boot_seconds: 1.0
+                invariants:
+                  - boot_timing
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            results = [
+                {
+                    "fault_at": 1,
+                    "fault_injected": True,
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "signals": {"phase2_emulated_s": 0.75},
+                    "is_control": False,
+                }
+            ]
+            annotate_result_checks(results, profile)
+            self.assertEqual(results[0].get("invariant_violations", []), [])
+
     def test_external_invariant_provider_loads_without_scripts_dir_on_sys_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)

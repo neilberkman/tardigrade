@@ -94,6 +94,7 @@ class FaultResult:
     raw_log: str
     is_control: bool = False
     fault_region: Optional[str] = None
+    elapsed_virtual_time_s: Optional[float] = None
 
 
 @dataclasses.dataclass
