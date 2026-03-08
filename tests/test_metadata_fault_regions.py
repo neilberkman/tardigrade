@@ -458,5 +458,48 @@ class TestSummarizeWithRegions(unittest.TestCase):
         )
 
 
+class TestSummarySkipReasons(unittest.TestCase):
+    """Test that summarize_runtime_sweep surfaces skip_reason counts."""
+
+    def test_skip_reasons_populated(self):
+        results = [
+            {"fault_at": 1, "fault_injected": True,
+             "boot_outcome": "success", "boot_slot": "exec"},
+            {"fault_at": 2, "fault_injected": False,
+             "boot_outcome": "skipped", "boot_slot": None,
+             "skip_reason": "fast_path_no_read_intercept"},
+            {"fault_at": 3, "fault_injected": False,
+             "boot_outcome": "skipped", "boot_slot": None,
+             "skip_reason": "fast_path_no_read_intercept"},
+            {"fault_at": 4, "fault_injected": False,
+             "boot_outcome": "skipped", "boot_slot": None,
+             "skip_reason": "probability_gate"},
+        ]
+        summary = summarize_runtime_sweep(results, total_writes=100)
+        self.assertEqual(summary["discarded_no_fault_fired"], 3)
+        self.assertIn("skip_reasons", summary)
+        self.assertEqual(
+            summary["skip_reasons"]["fast_path_no_read_intercept"], 2
+        )
+        self.assertEqual(summary["skip_reasons"]["probability_gate"], 1)
+
+    def test_skip_reasons_absent_when_all_injected(self):
+        results = [
+            {"fault_at": 1, "fault_injected": True,
+             "boot_outcome": "success", "boot_slot": "exec"},
+        ]
+        summary = summarize_runtime_sweep(results, total_writes=100)
+        self.assertNotIn("skip_reasons", summary)
+
+    def test_skip_reasons_unknown_when_no_reason_field(self):
+        results = [
+            {"fault_at": 1, "fault_injected": False,
+             "boot_outcome": "skipped", "boot_slot": None},
+        ]
+        summary = summarize_runtime_sweep(results, total_writes=100)
+        self.assertIn("skip_reasons", summary)
+        self.assertEqual(summary["skip_reasons"]["unknown"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1873,6 +1873,12 @@ def summarize_runtime_sweep(
                 categorize_failure(r, total_writes, profile)
             )
 
+    # Break down skip reasons for discarded (non-injected) results.
+    skip_reason_counts: Dict[str, int] = {}
+    for r in not_injected:
+        reason = r.get("skip_reason", "unknown")
+        skip_reason_counts[reason] = skip_reason_counts.get(reason, 0) + 1
+
     summary: Dict[str, Any] = {
         "total_fault_points": total,
         "bricks": len(boot_failures),
@@ -1890,6 +1896,8 @@ def summarize_runtime_sweep(
         "fault_type_issue_points": fault_type_issue_counts,
         "fault_type_bricks": fault_type_brick_counts,
     }
+    if skip_reason_counts:
+        summary["skip_reasons"] = skip_reason_counts
     if issue_reason_counts:
         summary["issue_reasons"] = issue_reason_counts
 
@@ -2504,6 +2512,20 @@ def main() -> int:
             sweep_results, total_writes=max_writes, profile=profile
         )
         sweep_summary["wall_time_s"] = round(sweep_wall_s, 1)
+
+        # Report skip reasons so operators know why points were discarded.
+        skip_reasons = sweep_summary.get("skip_reasons")
+        if skip_reasons:
+            parts = [
+                "{} {}".format(count, reason)
+                for reason, count in sorted(skip_reasons.items())
+            ]
+            _progress(
+                "Skipped {} fault points (not injected): {}".format(
+                    sweep_summary.get("discarded_no_fault_fired", 0),
+                    ", ".join(parts),
+                )
+            )
 
         # -------------------------------------------------------------------
         # Multi-fault plan (opt-in)
