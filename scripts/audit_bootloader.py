@@ -1003,6 +1003,40 @@ def _evaluate_state_probe_contract(
     return failures
 
 
+# Multi-boot statuses that represent a successful final state.
+_MULTI_BOOT_SUCCESS_STATUSES = frozenset({"converged", "rollback_converged"})
+
+
+def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    """Return (effective_outcome, effective_slot) accounting for multi-boot.
+
+    If the result has a ``multi_boot_analysis`` whose status indicates the
+    device converged (or rolled back successfully) to a final slot with a
+    successful outcome, use those final values instead of the raw cycle-0
+    ``boot_outcome`` / ``boot_slot``.
+
+    Statuses that are NOT promoted:
+      - rollback_missing
+      - rollback_late
+      - rollback_observed_oscillating
+      - stuck_revert
+      - oscillating
+    """
+    raw_outcome = result.get("boot_outcome", "unknown")
+    raw_slot = result.get("boot_slot")
+    mba = result.get("multi_boot_analysis")
+    if not isinstance(mba, dict):
+        return (raw_outcome, raw_slot)
+    status = mba.get("status")
+    if status not in _MULTI_BOOT_SUCCESS_STATUSES:
+        return (raw_outcome, raw_slot)
+    final_outcome = mba.get("final_outcome")
+    final_slot = mba.get("final_slot")
+    if final_outcome is None:
+        return (raw_outcome, raw_slot)
+    return (final_outcome, final_slot)
+
+
 def _slot_validity_from_boot_slot(boot_slot: Optional[str]) -> Dict[str, bool]:
     token = str(boot_slot or "").strip().lower()
     slot_a_names = {"exec", "primary", "slot_a", "slot0", "a"}
@@ -1612,7 +1646,8 @@ def categorize_failure(
 ) -> Dict[str, Any]:
     """Classify a single failure by outcome type and fault region."""
     fp = result.get("fault_at", 0)
-    outcome = result.get("boot_outcome", "unknown")
+    eff_outcome, _ = _effective_boot_result(result)
+    outcome = eff_outcome if eff_outcome is not None else "unknown"
     fault_addr = result.get("fault_address", "0x00000000")
 
     # Parse fault address.
@@ -1711,9 +1746,9 @@ def summarize_runtime_sweep(
     issue_reason_counts: Dict[str, int] = {}
     categorized_failures: List[Dict[str, Any]] = []
     for r in failures:
-        if r.get("boot_outcome") != expected_outcome:
-            outcome = r.get("boot_outcome", "unknown")
-            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+        eff_out, _ = _effective_boot_result(r)
+        if eff_out != expected_outcome:
+            outcome_counts[eff_out] = outcome_counts.get(eff_out, 0) + 1
         fclass = classify_failure_class(r)
         class_counts[fclass] = class_counts.get(fclass, 0) + 1
         for reason in result_issue_reasons(r, expected_outcome):
@@ -1745,9 +1780,12 @@ def summarize_runtime_sweep(
 
     if control:
         ctrl = control[-1]
+        ctrl_eff_outcome, ctrl_eff_slot = _effective_boot_result(ctrl)
         control_summary: Dict[str, Any] = {
             "boot_outcome": ctrl.get("boot_outcome"),
             "boot_slot": ctrl.get("boot_slot"),
+            "effective_outcome": ctrl_eff_outcome,
+            "effective_slot": ctrl_eff_slot,
         }
         ctrl_signals = ctrl.get("signals") or {}
         control_telemetry = {
@@ -2424,10 +2462,12 @@ def main() -> int:
         expected_control = profile.expect.control_outcome
         if control_assert and "control" in sweep_summary:
             ctrl = sweep_summary["control"]
-            if ctrl.get("boot_outcome") != expected_control:
+            ctrl_effective = ctrl.get("effective_outcome", ctrl.get("boot_outcome"))
+            if ctrl_effective != expected_control:
                 print(
-                    "ASSERTION FAILED: control point outcome '{}' != expected '{}'".format(
-                        ctrl.get("boot_outcome"), expected_control
+                    "ASSERTION FAILED: control point outcome '{}' != expected '{}'"
+                    " (raw boot_outcome='{}')".format(
+                        ctrl_effective, expected_control, ctrl.get("boot_outcome")
                     ),
                     file=sys.stderr,
                 )
