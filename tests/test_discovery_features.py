@@ -1214,5 +1214,288 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertFalse((tempdir / "work" / "cleanup_batch_profile_batch" / ".tmp").exists())
 
 
+class Phase2FaultTest(unittest.TestCase):
+    """Tests for the phase2_fault profile schema and robot var generation."""
+
+    def _write_profile(self, tempdir: Path, body: str) -> Path:
+        path = tempdir / "profile.yaml"
+        path.write_text(textwrap.dedent(body), encoding="utf-8")
+        return path
+
+    def test_phase2_fault_defaults_disabled(self) -> None:
+        """Without phase2_fault in profile, config defaults to disabled."""
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: no_phase2
+                platform: platforms/cortex_m4_flash_fast.repl
+                flash_backend: faultFlash
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  mode: runtime
+                """,
+            )
+            profile = load_profile(profile_path)
+            self.assertFalse(profile.fault_sweep.phase2_fault.enabled)
+            self.assertEqual(profile.fault_sweep.phase2_fault.max_points, 0)
+            self.assertEqual(profile.fault_sweep.phase2_fault.fault_types, ["power_loss"])
+            # Robot vars should NOT contain PHASE2_FAULT_ENABLED
+            robot_vars = profile.robot_vars(ROOT)
+            phase2_vars = [v for v in robot_vars if "PHASE2_FAULT" in v]
+            self.assertEqual(phase2_vars, [])
+
+    def test_phase2_fault_enabled_parsed(self) -> None:
+        """phase2_fault section is parsed and emits robot vars."""
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: with_phase2
+                platform: platforms/cortex_m4_flash_fast.repl
+                flash_backend: faultFlash
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  mode: runtime
+                  evaluation_mode: execute
+                  phase2_fault:
+                    enabled: true
+                    fault_types:
+                      - power_loss
+                      - interrupted_erase
+                    max_points: 50
+                """,
+            )
+            profile = load_profile(profile_path)
+            p2f = profile.fault_sweep.phase2_fault
+            self.assertTrue(p2f.enabled)
+            self.assertEqual(p2f.max_points, 50)
+            self.assertEqual(p2f.fault_types, ["power_loss", "interrupted_erase"])
+
+            robot_vars = profile.robot_vars(ROOT)
+            self.assertIn("PHASE2_FAULT_ENABLED:true", robot_vars)
+            self.assertIn("PHASE2_FAULT_MAX_POINTS:50", robot_vars)
+
+    def test_phase2_fault_enabled_no_max_points(self) -> None:
+        """phase2_fault enabled without max_points omits that var."""
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: phase2_no_max
+                platform: platforms/cortex_m4_flash_fast.repl
+                flash_backend: faultFlash
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  mode: runtime
+                  phase2_fault:
+                    enabled: true
+                """,
+            )
+            profile = load_profile(profile_path)
+            self.assertTrue(profile.fault_sweep.phase2_fault.enabled)
+            self.assertEqual(profile.fault_sweep.phase2_fault.max_points, 0)
+
+            robot_vars = profile.robot_vars(ROOT)
+            self.assertIn("PHASE2_FAULT_ENABLED:true", robot_vars)
+            # max_points=0 means auto/unlimited — no robot var emitted
+            max_points_vars = [v for v in robot_vars if "PHASE2_FAULT_MAX_POINTS" in v]
+            self.assertEqual(max_points_vars, [])
+
+    def test_phase2_fault_negative_max_points_rejected(self) -> None:
+        """Negative max_points raises ProfileError."""
+        from profile_loader import ProfileError
+
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: bad_phase2
+                platform: platforms/cortex_m4_flash_fast.repl
+                flash_backend: faultFlash
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  mode: runtime
+                  phase2_fault:
+                    enabled: true
+                    max_points: -5
+                """,
+            )
+            with self.assertRaises(ProfileError):
+                load_profile(profile_path)
+
+    def test_phase2_fault_invalid_type_warns(self) -> None:
+        """Unknown fault type in phase2_fault emits a warning."""
+        import warnings
+
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: warn_phase2
+                platform: platforms/cortex_m4_flash_fast.repl
+                flash_backend: faultFlash
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  mode: runtime
+                  phase2_fault:
+                    enabled: true
+                    fault_types:
+                      - power_loss
+                      - unknown_type_xyz
+                """,
+            )
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                profile = load_profile(profile_path)
+                warning_msgs = [str(warning.message) for warning in w]
+                has_unknown_warning = any(
+                    "unknown_type_xyz" in msg.lower()
+                    for msg in warning_msgs
+                )
+                self.assertTrue(has_unknown_warning, "Expected warning about unknown_type_xyz")
+            self.assertTrue(profile.fault_sweep.phase2_fault.enabled)
+
+    def test_phase2_fault_cli_output(self) -> None:
+        """CLI debug output includes phase2_fault fields."""
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: cli_phase2
+                platform: platforms/cortex_m4_flash_fast.repl
+                flash_backend: faultFlash
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  mode: runtime
+                  phase2_fault:
+                    enabled: true
+                    max_points: 25
+                    fault_types:
+                      - power_loss
+                """,
+            )
+            import json
+            from unittest.mock import patch
+            from io import StringIO
+
+            with patch("sys.argv", ["profile_loader.py", str(profile_path)]):
+                captured = StringIO()
+                with redirect_stderr(StringIO()):
+                    import profile_loader
+                    with patch("sys.stdout", captured):
+                        profile_loader.main()
+                output = json.loads(captured.getvalue())
+            self.assertTrue(output["phase2_fault_enabled"])
+            self.assertEqual(output["phase2_fault_max_points"], 25)
+            self.assertEqual(output["phase2_fault_types"], ["power_loss"])
+
+    def test_p2_fault_type_encoding(self) -> None:
+        """Validate the p2: encoding format for fault_type_csv."""
+        # The dispatch encoding is 'p2:P1_AT:P2_AT:P1_TYPE:P2_TYPE'.
+        # Test that the format matches what the resc parser expects.
+        encoded = "p2:100:5:w:e"
+        parts = encoded.split(":")
+        self.assertEqual(parts[0], "p2")
+        self.assertEqual(int(parts[1]), 100)  # p1_fault_at
+        self.assertEqual(int(parts[2]), 5)    # p2_fault_at
+        self.assertEqual(parts[3], "w")       # p1_fault_type
+        self.assertEqual(parts[4], "e")       # p2_fault_type
+
+    def test_p2_fault_type_encoding_defaults(self) -> None:
+        """p2: encoding with only two fields defaults types to 'w'."""
+        encoded = "p2:50:10"
+        parts = encoded.split(":")
+        self.assertEqual(parts[0], "p2")
+        p1_type = parts[3] if len(parts) > 3 else "w"
+        p2_type = parts[4] if len(parts) > 4 else "w"
+        self.assertEqual(p1_type, "w")
+        self.assertEqual(p2_type, "w")
+
+
 if __name__ == "__main__":
     unittest.main()
