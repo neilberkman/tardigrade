@@ -154,6 +154,14 @@ def parse_args() -> argparse.Namespace:
             "Set <=0 to disable. Default from OTA_PROGRESS_STALL_TIMEOUT_S or 20."
         ),
     )
+    parser.add_argument(
+        "--explain-multi-fault-plan",
+        action="store_true",
+        help=(
+            "Explain the generated multi-fault plan and skip executing the "
+            "multi-fault sweep."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -2582,7 +2590,17 @@ def main() -> int:
                 ),
                 file=sys.stderr,
             )
-            if mf_plan.sequences:
+            if args.explain_multi_fault_plan and multi_fault_plan_data is not None:
+                multi_fault_plan_data["execution_skipped"] = True
+                print(
+                    json.dumps(
+                        {"multi_fault_plan": multi_fault_plan_data},
+                        indent=2,
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+            if mf_plan.sequences and not args.explain_multi_fault_plan:
                 multi_fault_points = [seq[0] for seq in mf_plan.sequences]
                 multi_fault_types = [
                     encode_multi_fault_sequence(seq) for seq in mf_plan.sequences

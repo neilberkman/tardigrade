@@ -475,11 +475,15 @@ def multi_fault_plan_summary(plan: Optional[MultiFaultPlan]) -> Optional[Dict[st
     """Return a JSON-serializable summary of a multi-fault plan."""
     if plan is None:
         return None
+    preview_limit = 10
+    preview = [list(seq) for seq in plan.sequences[:preview_limit]]
     return {
         "strategy": plan.strategy,
         "sequences": len(plan.sequences),
         "interesting_points": plan.interesting_point_count,
         "max_faults_per_run": plan.max_faults_per_run,
         "seed": plan.seed,
+        "sample_sequences": preview,
+        "sample_truncated": len(plan.sequences) > preview_limit,
         "diagnostics": plan.diagnostics,
     }
