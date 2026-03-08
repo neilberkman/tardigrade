@@ -35,9 +35,12 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+<<<<<<< HEAD
 from fault_inject import (
     FaultResult,
+    MetadataFaultRegion,
     MultiFaultPlan,
+    classify_fault_region,
     encode_multi_fault_sequence,
     generate_multi_fault_sequences,
     multi_fault_plan_summary,
@@ -1439,6 +1442,53 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
     return "unrecoverable"
 
 
+def enrich_results_with_fault_regions(
+    results,  # type: List[Dict[str, Any]]
+    metadata_regions,  # type: List[MetadataFaultRegion]
+):
+    # type: (...) -> None
+    """Annotate each result dict with a 'fault_region' classification."""
+    if not metadata_regions:
+        return
+    for r in results:
+        if r.get("is_control", False):
+            continue
+        fault_addr = r.get("fault_address", "0x00000000")
+        if isinstance(fault_addr, str):
+            addr = int(fault_addr, 16)
+        else:
+            addr = int(fault_addr)
+        r["fault_region"] = classify_fault_region(addr, metadata_regions)
+
+
+def compute_region_breakdown(
+    results,  # type: List[Dict[str, Any]]
+    expected_outcome,  # type: str
+):
+    # type: (...) -> Dict[str, Dict[str, int]]
+    """Compute per-region brick/issue/total counts from enriched results."""
+    breakdown = {}  # type: Dict[str, Dict[str, int]]
+    for r in results:
+        if r.get("is_control", False):
+            continue
+        if not r.get("fault_injected", False):
+            continue
+        region = r.get("fault_region")
+        if region is None:
+            continue
+        if region not in breakdown:
+            breakdown[region] = {"total": 0, "bricks": 0, "issues": 0, "recoveries": 0}
+        bucket = breakdown[region]
+        bucket["total"] += 1
+        if result_is_brick(r):
+            bucket["bricks"] += 1
+        if result_has_issues(r, expected_outcome):
+            bucket["issues"] += 1
+        else:
+            bucket["recoveries"] += 1
+    return breakdown
+
+
 def load_clean_write_trace(trace_file: Optional[str]) -> List[Dict[str, int]]:
     """Load calibration write trace CSV."""
     if not trace_file or not os.path.exists(trace_file):
@@ -1743,6 +1793,7 @@ def summarize_runtime_sweep(
     results: List[Dict[str, Any]],
     total_writes: int = 0,
     profile: Optional["ProfileConfig"] = None,
+    metadata_regions: Optional[List[MetadataFaultRegion]] = None,
 ) -> Dict[str, Any]:
     """Compute summary statistics from runtime sweep results."""
     non_control = [r for r in results if not r.get("is_control", False)]
@@ -1881,6 +1932,16 @@ def summarize_runtime_sweep(
             "averages": {k: timing_sums.get(k, 0) // timing_count for k in timing_keys},
             "maximums": {k: timing_maxes.get(k, 0) for k in timing_keys},
         }
+
+    # Metadata fault region breakdown.
+    regions = metadata_regions or []
+    if not regions and profile is not None:
+        regions = getattr(profile, "metadata_fault_regions", []) or []
+    if regions:
+        enrich_results_with_fault_regions(results, regions)
+        region_breakdown = compute_region_breakdown(results, expected_outcome)
+        if region_breakdown:
+            summary["region_breakdown"] = region_breakdown
 
     return summary
 
