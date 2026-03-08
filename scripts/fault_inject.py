@@ -55,6 +55,37 @@ class ReadFaultResult:
 
 
 @dataclasses.dataclass
+class MetadataFaultRegion:
+    """A named address range for metadata fault classification."""
+
+    name: str
+    start: int
+    end: int
+
+    def contains(self, address: int) -> bool:
+        return self.start <= address < self.end
+
+
+def classify_fault_region(
+    fault_address: int,
+    metadata_regions: List[MetadataFaultRegion],
+) -> Optional[str]:
+    """Classify a fault address as metadata or data.
+
+    Returns:
+        "metadata:<name>" if the address falls within a metadata region,
+        "data" if metadata_regions are defined but the address doesn't match any,
+        None if no metadata_regions are defined.
+    """
+    if not metadata_regions:
+        return None
+    for region in metadata_regions:
+        if region.contains(fault_address):
+            return "metadata:{}".format(region.name)
+    return "data"
+
+
+@dataclasses.dataclass
 class FaultResult:
     fault_at: int
     boot_outcome: str
@@ -62,6 +93,7 @@ class FaultResult:
     nvm_state: Any
     raw_log: str
     is_control: bool = False
+    fault_region: Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -75,6 +107,7 @@ class MultiFaultResult:
     per_fault_states: List[Dict[str, Any]]  # nvm_state snapshot after each fault
     raw_log: str
     is_control: bool = False
+    fault_region: Optional[str] = None
 
 
 @dataclasses.dataclass
