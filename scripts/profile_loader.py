@@ -421,6 +421,93 @@ class NvsCorruptionConfig:
         self.seed = seed
 
 
+class HeuristicConfig:
+    """Configuration knobs for the heuristic write-trace classifier."""
+
+    __slots__ = (
+        "tier2_step",
+        "tier3_step",
+        "discontinuity_window",
+        "target_points",
+        "preserve_critical_tiers",
+        "shard_count",
+        "shard_index",
+        "random_tail_budget",
+    )
+
+    def __init__(
+        self,
+        tier2_step: int = 3,
+        tier3_step: int = 100,
+        discontinuity_window: int = 3,
+        target_points: Optional[int] = None,
+        preserve_critical_tiers: bool = True,
+        shard_count: int = 1,
+        shard_index: int = 0,
+        random_tail_budget: int = 0,
+    ) -> None:
+        self.tier2_step = int(tier2_step)
+        self.tier3_step = int(tier3_step)
+        self.discontinuity_window = int(discontinuity_window)
+        self.target_points = None if target_points is None else int(target_points)
+        self.preserve_critical_tiers = bool(preserve_critical_tiers)
+        self.shard_count = int(shard_count)
+        self.shard_index = int(shard_index)
+        self.random_tail_budget = int(random_tail_budget)
+        self._validate()
+
+    def _validate(self) -> None:
+        if self.tier2_step < 1:
+            raise ValueError(
+                "heuristic.tier2_step must be >= 1, got {}".format(self.tier2_step)
+            )
+        if self.tier3_step < 1:
+            raise ValueError(
+                "heuristic.tier3_step must be >= 1, got {}".format(self.tier3_step)
+            )
+        if self.discontinuity_window < 0:
+            raise ValueError(
+                "heuristic.discontinuity_window must be >= 0, got {}".format(
+                    self.discontinuity_window
+                )
+            )
+        if self.target_points is not None and self.target_points < 1:
+            raise ValueError(
+                "heuristic.target_points must be >= 1 or None, got {}".format(
+                    self.target_points
+                )
+            )
+        if self.shard_count < 1:
+            raise ValueError(
+                "heuristic.shard_count must be >= 1, got {}".format(self.shard_count)
+            )
+        if not (0 <= self.shard_index < self.shard_count):
+            raise ValueError(
+                "heuristic.shard_index must be in [0, shard_count), got {} with shard_count={}".format(
+                    self.shard_index, self.shard_count
+                )
+            )
+        if self.random_tail_budget < 0:
+            raise ValueError(
+                "heuristic.random_tail_budget must be >= 0, got {}".format(
+                    self.random_tail_budget
+                )
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to a JSON-compatible dict."""
+        return {
+            "tier2_step": self.tier2_step,
+            "tier3_step": self.tier3_step,
+            "discontinuity_window": self.discontinuity_window,
+            "target_points": self.target_points,
+            "preserve_critical_tiers": self.preserve_critical_tiers,
+            "shard_count": self.shard_count,
+            "shard_index": self.shard_index,
+            "random_tail_budget": self.random_tail_budget,
+        }
+
+
 class FaultSweepConfig:
     __slots__ = (
         "mode",
@@ -444,6 +531,7 @@ class FaultSweepConfig:
         "partial_staging",
         "nvs_corruption",
         "fault_distribution",
+        "heuristic_config",
     )
 
     def __init__(
@@ -469,6 +557,7 @@ class FaultSweepConfig:
         partial_staging: Optional[Any] = None,
         nvs_corruption: Optional["NvsCorruptionConfig"] = None,
         fault_distribution: Optional["FaultDistributionConfig"] = None,
+        heuristic_config: Optional["HeuristicConfig"] = None,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -497,6 +586,7 @@ class FaultSweepConfig:
         self.partial_staging = partial_staging
         self.nvs_corruption = nvs_corruption or NvsCorruptionConfig()
         self.fault_distribution = fault_distribution or FaultDistributionConfig()
+        self.heuristic_config = heuristic_config
 
 
 class StateFuzzerConfig:
@@ -1210,6 +1300,24 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
     )
 
 
+def _parse_heuristic_config(raw: Optional[Dict[str, Any]]) -> Optional[HeuristicConfig]:
+    """Parse the optional heuristic sub-config from fault_sweep."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep.heuristic: expected mapping")
+    return HeuristicConfig(
+        tier2_step=int(raw.get("tier2_step", 3)),
+        tier3_step=int(raw.get("tier3_step", 100)),
+        discontinuity_window=int(raw.get("discontinuity_window", 3)),
+        target_points=int(raw["target_points"]) if "target_points" in raw else None,
+        preserve_critical_tiers=bool(raw.get("preserve_critical_tiers", True)),
+        shard_count=int(raw.get("shard_count", 1)),
+        shard_index=int(raw.get("shard_index", 0)),
+        random_tail_budget=int(raw.get("random_tail_budget", 0)),
+    )
+
+
 def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
     if raw is None:
         return FaultSweepConfig()
@@ -1267,6 +1375,7 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         partial_staging=raw.get("partial_staging"),
         nvs_corruption=_parse_nvs_corruption(raw.get("nvs_corruption")),
         fault_distribution=_parse_fault_distribution(raw.get("fault_distribution")),
+        heuristic_config=_parse_heuristic_config(raw.get("heuristic")),
     )
 
 

@@ -62,7 +62,7 @@ from partial_staging import (
     summarize_partial_staging,
     write_partial_image_to_temp,
 )
-from profile_loader import ProfileConfig, load_profile
+from profile_loader import HeuristicConfig, ProfileConfig, load_profile
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RENODE_TEST = os.environ.get("RENODE_TEST", "renode-test")
@@ -3063,12 +3063,19 @@ def main() -> int:
                 bl = profile.memory.bootloader_region
                 bl_region_for_heuristic = (bl.base, bl.base + bl.size)
 
+            heuristic_kwargs: Dict[str, Any] = {}
+            if profile.fault_sweep.heuristic_config is not None:
+                hc = profile.fault_sweep.heuristic_config
+                heuristic_kwargs["tier2_step"] = hc.tier2_step
+                heuristic_kwargs["tier3_step"] = hc.tier3_step
+                heuristic_kwargs["discontinuity_window"] = hc.discontinuity_window
             fault_points = classify_trace(
                 trace=trace,
                 slot_ranges=slot_ranges_for_heuristic,
                 flash_base=flash_base,
                 page_size=getattr(profile.memory, "page_size", 4096),
                 bootloader_region=bl_region_for_heuristic,
+                **heuristic_kwargs,
             )
             heuristic_summary = summarize_classification(
                 trace=trace,
@@ -3713,6 +3720,11 @@ def main() -> int:
             "fault_points_tested": len(fault_points),
             "quick": bool(args.quick),
             "heuristic": heuristic_summary,
+            "heuristic_config": (
+                profile.fault_sweep.heuristic_config.to_dict()
+                if profile.fault_sweep.heuristic_config is not None
+                else HeuristicConfig().to_dict()
+            ),
             "multi_fault": multi_fault_plan_summary(multi_fault_plan),
             "verdict": verdict,
             "summary": {
