@@ -642,16 +642,17 @@ def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_si
             fault_injected=fault_injected,
         )
     ]
+    followup_t0 = _time.time()
 
     if boot_cycles <= 1:
-        return None, None
+        return None, None, 0
 
     if not USE_FAST_PATH and not USE_MRAM_PATH:
         return cycle_records, {
             'status': 'unsupported_fast_path_required',
             'requested_cycles': int(boot_cycles),
             'completed_cycles': len(cycle_records),
-        }
+        }, 0
 
     cpu_ref = monitor.Machine['sysbus.cpu']
     if USE_MRAM_PATH:
@@ -701,7 +702,8 @@ def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_si
             )
         )
 
-    return cycle_records, analyze_boot_cycles(cycle_records)
+    followup_ms = int((_time.time() - followup_t0) * 1000)
+    return cycle_records, analyze_boot_cycles(cycle_records), followup_ms
 
 def effective_page_size():
     if USE_MRAM_PATH:
@@ -1857,7 +1859,7 @@ def run_timed_reset_fault(fault_at):
         'stage': 'post_boot',
     })
     fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
-    boot_cycle_records, multi_boot_analysis = run_followup_boot_cycles(
+    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
         boot_outcome,
         boot_slot,
         signals,
@@ -1865,6 +1867,7 @@ def run_timed_reset_fault(fault_at):
         fault_injected=fault_injected,
         label='fp{}_timed_followup'.format(fault_at),
     )
+    signals['followup_ms'] = int(followup_ms)
 
     result = {
         'fault_at': fault_at,
@@ -2107,7 +2110,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             'stage': 'post_boot',
         })
         fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
-        boot_cycle_records, multi_boot_analysis = run_followup_boot_cycles(
+        boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
             boot_outcome,
             boot_slot,
             signals,
@@ -2115,6 +2118,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             fault_injected=False,
             label='control_followup',
         )
+        signals['followup_ms'] = int(followup_ms)
 
         result = {
             'fault_at': fault_at,
@@ -2992,7 +2996,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         'stage': 'post_boot',
     })
     fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
-    boot_cycle_records, multi_boot_analysis = run_followup_boot_cycles(
+    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
         boot_outcome,
         boot_slot,
         signals,
@@ -3000,6 +3004,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         fault_injected=fault_injected,
         label='fp{}_native_followup'.format(fault_at),
     )
+    signals['followup_ms'] = int(followup_ms)
 
     if fault_at % 50 == 0:
         log('fp={} native writes={} reload={}ms replay={}ms reset={}ms setup={}ms emu={}ms({}iters) total={}ms outcome={}'.format(
@@ -3173,7 +3178,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         'stage': 'post_boot',
     })
     fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
-    boot_cycle_records, multi_boot_analysis = run_followup_boot_cycles(
+    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
         boot_outcome,
         boot_slot,
         signals,
@@ -3181,6 +3186,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         fault_injected=fault_injected,
         label='fp{}_python_followup'.format(fault_at),
     )
+    signals['followup_ms'] = int(followup_ms)
 
     if fault_at % 50 == 0:
         log('fp={} py_trace_replay writes={} reload={}ms replay={}ms reset={}ms setup={}ms emu={}ms({}iters) total={}ms outcome={}'.format(
@@ -3446,7 +3452,7 @@ else:
 
     # Aggregate timing summary for batch runs.
     if batch_mode and results:
-        timing_keys = ['reload_ms', 'replay_ms', 'reset_ms', 'setup_ms', 'emulation_ms', 'total_ms', 'p2_iters']
+        timing_keys = ['reload_ms', 'replay_ms', 'reset_ms', 'setup_ms', 'emulation_ms', 'followup_ms', 'total_ms', 'p2_iters']
         sums = {}
         maxes = {}
         count = 0
@@ -3473,6 +3479,8 @@ else:
                 sums.get('setup_ms', 0), sums.get('setup_ms', 0) // count, maxes.get('setup_ms', 0)))
             log('  emulation: sum={}ms  avg={}ms  max={}ms'.format(
                 sums.get('emulation_ms', 0), sums.get('emulation_ms', 0) // count, maxes.get('emulation_ms', 0)))
+            log('  followup:  sum={}ms  avg={}ms  max={}ms'.format(
+                sums.get('followup_ms', 0), sums.get('followup_ms', 0) // count, maxes.get('followup_ms', 0)))
             log('  p2_iters:  sum={}    avg={}    max={}'.format(
                 sums.get('p2_iters', 0), sums.get('p2_iters', 0) // count, maxes.get('p2_iters', 0)))
 

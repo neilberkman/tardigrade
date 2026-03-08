@@ -66,6 +66,9 @@ faultFlash: Miscellaneous.STM32H7FlashController @ sysbus 0x52002000
     flash2: flashBank2
     -> nvic@4
 
+// Native trace replay helper for fast sweep reconstruction.
+trace_replay: Memory.TraceReplayEngine @ sysbus 0x53000000
+
 externalFlash: Memory.MappedMemory @ sysbus 0x80000000
     size: 0x10000000
 
