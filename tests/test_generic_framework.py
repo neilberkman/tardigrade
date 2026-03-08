@@ -81,6 +81,9 @@ class GenericFrameworkTest(unittest.TestCase):
                     - semantic_state.confirmed
                 invariant_providers:
                   - {provider.as_posix()}
+                invariant_config:
+                  rollback_window: 3
+                  mode: strict
                 invariants:
                   - external_ok
                 expect:
@@ -96,6 +99,10 @@ class GenericFrameworkTest(unittest.TestCase):
                 ["semantic_state.confirmed"],
             )
             self.assertEqual(profile.invariant_providers, [str(provider)])
+            self.assertEqual(
+                profile.invariant_config,
+                {"rollback_window": 3, "mode": "strict"},
+            )
             robot_vars = profile.robot_vars(ROOT)
             self.assertIn("STATE_PROBE:{}".format(probe), robot_vars)
 
@@ -210,6 +217,74 @@ class GenericFrameworkTest(unittest.TestCase):
                 results[0]["invariant_violations"][0]["name"],
                 "external_probe_ok",
             )
+
+    def test_invariant_config_is_forwarded_to_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            provider = tempdir / "provider.py"
+            provider.write_text(
+                textwrap.dedent(
+                    """
+                    from invariants import InvariantViolation
+
+                    def check_external_probe(result, **context):
+                        cfg = context.get("invariant_config") or {}
+                        if cfg.get("expected_status") != "ok":
+                            raise InvariantViolation(
+                                invariant_name="external_probe_ok",
+                                description="unexpected invariant config",
+                                result=result,
+                                details={"config": cfg},
+                            )
+
+                    INVARIANTS = {"external_probe_ok": check_external_probe}
+                    """
+                ),
+                encoding="utf-8",
+            )
+            profile_path = self._write_profile(
+                tempdir,
+                f"""
+                schema_version: 1
+                name: provider_profile
+                description: provider
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: {{ start: 0x20000000, end: 0x20020000 }}
+                  write_granularity: 4
+                  slots:
+                    exec: {{ base: 0x10000000, size: 0x1000 }}
+                    staging: {{ base: 0x10001000, size: 0x1000 }}
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                invariant_providers:
+                  - {provider.as_posix()}
+                invariant_config:
+                  expected_status: ok
+                invariants:
+                  - external_probe_ok
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            results = [
+                {
+                    "fault_at": 1,
+                    "fault_injected": True,
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "semantic_state": {"status": "bad"},
+                    "is_control": False,
+                }
+            ]
+            annotate_result_checks(results, profile)
+            self.assertEqual(results[0].get("invariant_violations", []), [])
 
     def test_external_invariant_provider_loads_without_scripts_dir_on_sys_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:

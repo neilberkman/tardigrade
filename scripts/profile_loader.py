@@ -423,6 +423,7 @@ class ProfileConfig:
         semantic_assertions: Optional[Dict[str, Dict[str, Any]]] = None,
         invariants: Optional[List[str]] = None,
         invariant_providers: Optional[List[str]] = None,
+        invariant_config: Optional[Dict[str, Any]] = None,
         flash_backend: Optional[str] = None,
         initial_states: Optional[List["InitialStateConfig"]] = None,
         metadata_fault_regions: Optional[List[MetadataFaultRegion]] = None,
@@ -449,6 +450,7 @@ class ProfileConfig:
         self.semantic_assertions = semantic_assertions or {}
         self.invariants = invariants or []
         self.invariant_providers = invariant_providers or []
+        self.invariant_config = invariant_config or {}
         self.flash_backend = flash_backend
         self.initial_states: List[InitialStateConfig] = initial_states or []
         self.metadata_fault_regions: List[MetadataFaultRegion] = metadata_fault_regions or []
@@ -479,6 +481,7 @@ class ProfileConfig:
             scenario=self.scenario, update_trigger=new_trigger, state_probe=self.state_probe,
             semantic_assertions=self.semantic_assertions,
             invariants=self.invariants, invariant_providers=self.invariant_providers,
+            invariant_config=self.invariant_config,
             flash_backend=self.flash_backend, initial_states=[],
             metadata_fault_regions=self.metadata_fault_regions,
         )
@@ -1273,6 +1276,14 @@ def _parse_invariant_providers(raw: Optional[Any]) -> List[str]:
     raise ProfileError("invariant_providers: expected string or list of strings")
 
 
+def _parse_invariant_config(raw: Optional[Any]) -> Dict[str, Any]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ProfileError("invariant_config: expected mapping")
+    return dict(raw)
+
+
 def _parse_metadata_fault_regions(raw, slots=None):
     # type: (Optional[List[Any]], Optional[Dict[str, SlotConfig]]) -> List[MetadataFaultRegion]
     """Parse metadata_fault_regions from profile YAML."""
@@ -1450,6 +1461,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
     semantic_assertions = _parse_semantic_assertions(data.get("semantic_assertions"))
     invariants = _parse_invariants(data.get("invariants"))
     invariant_providers = _parse_invariant_providers(data.get("invariant_providers"))
+    invariant_config = _parse_invariant_config(data.get("invariant_config"))
     initial_states = _parse_initial_states(data.get("initial_states"))
     metadata_fault_regions = _parse_metadata_fault_regions(
         data.get("metadata_fault_regions"), slots=memory.slots
@@ -1500,6 +1512,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         semantic_assertions=semantic_assertions,
         invariants=invariants,
         invariant_providers=invariant_providers,
+        invariant_config=invariant_config,
         flash_backend=flash_backend,
         initial_states=initial_states,
         metadata_fault_regions=metadata_fault_regions,
@@ -1580,6 +1593,7 @@ def main() -> int:
         "semantic_assertions": profile.semantic_assertions,
         "invariants": profile.invariants,
         "invariant_providers": profile.invariant_providers,
+        "invariant_config": profile.invariant_config,
         "update_trigger": profile.update_trigger.type if profile.update_trigger else None,
         "pre_boot_state_count": len(profile.pre_boot_state),
         "initial_states": [{"name": s.name, "description": s.description}
