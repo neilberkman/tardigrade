@@ -1127,6 +1127,7 @@ def _evaluate_invariants(
         partition_ranges=_profile_partition_ranges(profile),
         multi_boot_analysis=result.get("multi_boot_analysis"),
         boot_cycles=result.get("boot_cycles"),
+        invariant_config=getattr(profile, "invariant_config", {}) or {},
     )
     return [
         {
