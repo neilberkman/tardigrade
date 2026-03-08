@@ -2382,7 +2382,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         'stage': 'post_boot',
     })
     fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
-    boot_cycle_records, multi_boot_analysis = run_followup_boot_cycles(
+    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
         boot_outcome,
         boot_slot,
         signals,
@@ -2390,6 +2390,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         fault_injected=fault_injected,
         label='fp{}_followup'.format(fault_at),
     )
+    signals['followup_ms'] = int(followup_ms)
 
     result = {
         'fault_at': fault_at,
