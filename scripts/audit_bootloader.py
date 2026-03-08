@@ -1505,7 +1505,16 @@ def annotate_nvs_config_results(results: List[Dict[str, Any]], profile: "Profile
 
 
 def classify_failure_class(result: Dict[str, Any]) -> str:
-    """Return normalized failure class for a sweep result."""
+    """Return normalized failure class for a sweep result.
+
+    Recognized classes:
+      - recoverable: device booted successfully after fault
+      - wrong_image: device booted the wrong firmware image
+      - silent_corruption: device booted but image integrity is unknown
+      - unrecoverable: device bricked (no boot, hard fault, etc.)
+      - rollback_accepted: device accepted a downgrade without rejection
+      - toctou_corruption: corruption injected between validation and execution
+    """
     raw = str(result.get("fault_class", "") or "").strip().lower()
     if raw:
         return raw
@@ -1518,6 +1527,10 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
         return "config_crash"
     if outcome == "success":
         return "recoverable"
+    if outcome == "rollback_accepted":
+        return "rollback_accepted"
+    if outcome == "toctou_corruption":
+        return "toctou_corruption"
     if outcome == "wrong_image":
         signals = result.get("signals", {})
         if not isinstance(signals, dict):
@@ -3366,6 +3379,11 @@ def main() -> int:
             },
             "expect": {
                 "should_find_issues": profile.expect.should_find_issues,
+            },
+            "security_policy": {
+                "anti_rollback": profile.security_policy.anti_rollback,
+                "minimum_version": profile.security_policy.minimum_version,
+                "toctou_protection": profile.security_policy.toctou_protection,
             },
             "runtime_sweep_results": sweep_results,
             "execution": {

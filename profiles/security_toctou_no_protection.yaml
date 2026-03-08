@@ -1,0 +1,50 @@
+schema_version: 1
+name: security_toctou_no_protection
+description: >-
+  TOCTOU (time-of-check-to-time-of-use) fault scenario WITHOUT
+  protection. Models an attacker who can corrupt flash contents between
+  the point where the bootloader validates an image and the point where
+  it begins executing it. In a copy-based OTA, this window spans the
+  entire swap operation: the image is validated in staging, then copied
+  word-by-word to the exec slot. Bit corruption during the copy
+  simulates an attacker modifying staging after validation passed.
+  Without TOCTOU protection (e.g., re-hashing after copy), the
+  corrupted image executes unchecked.
+
+platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 8
+  slots:
+    exec:    { base: 0x10000000, size: 0x38000 }
+    staging: { base: 0x10038000, size: 0x38000 }
+
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+
+security_policy:
+  anti_rollback: false
+  toctou_protection: false
+
+# Bit corruption during copy models the TOCTOU attack vector:
+# an adversary modifies flash between validation and use.
+fault_sweep:
+  mode: runtime
+  max_writes: 28672
+  max_writes_cap: 100000
+  run_duration: "0.01"
+  fault_types: [bit_corruption]
+
+success_criteria:
+  vtor_in_slot: exec
+
+# Without TOCTOU protection, bit corruption during copy can
+# plant a modified image that the bootloader executes without
+# re-validation. Expect issues.
+expect:
+  should_find_issues: true

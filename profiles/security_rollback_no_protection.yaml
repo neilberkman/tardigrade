@@ -1,0 +1,47 @@
+schema_version: 1
+name: security_rollback_no_protection
+description: >-
+  Rollback attack scenario WITHOUT anti-rollback protection.
+  Staging slot is seeded with an older firmware version (version 1)
+  while the active slot runs version 2. A bootloader without rollback
+  protection will accept the downgrade, exposing the device to known
+  vulnerabilities in the older firmware. This is the "broken" half of
+  the rollback attack pair — expect the bootloader to accept the
+  downgrade (wrong_image or rollback_accepted outcome).
+
+platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 8
+  slots:
+    exec:    { base: 0x10000000, size: 0x38000 }
+    staging: { base: 0x10038000, size: 0x38000 }
+
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+
+# No anti-rollback: the bootloader will blindly copy staging to exec
+# regardless of version. Staging contains an "older" image.
+security_policy:
+  anti_rollback: false
+  minimum_version: 2
+  toctou_protection: false
+
+success_criteria:
+  vtor_in_slot: exec
+
+fault_sweep:
+  mode: runtime
+  max_writes: 28672
+  max_writes_cap: 100000
+  run_duration: "0.01"
+
+# Without anti-rollback, a naive copy bootloader will accept the
+# downgrade on an unfaulted run. This is the expected broken behavior.
+expect:
+  should_find_issues: true

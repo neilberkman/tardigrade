@@ -1,0 +1,51 @@
+schema_version: 1
+name: security_rollback_with_protection
+description: >-
+  Rollback attack scenario WITH anti-rollback protection declared.
+  Staging slot is seeded with an older firmware version while the active
+  slot runs a newer version. A bootloader with proper anti-rollback
+  enforcement should reject the downgrade attempt. This is the "fixed"
+  half of the rollback attack pair — the security_policy declares that
+  anti-rollback is enabled with a minimum version threshold.
+  Fault injection tests whether power-loss during the version check
+  can bypass the anti-rollback gate.
+
+platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 8
+  slots:
+    exec:    { base: 0x10000000, size: 0x38000 }
+    staging: { base: 0x10038000, size: 0x38000 }
+
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+
+# Anti-rollback enabled: the bootloader should reject any image
+# with version < minimum_version. Staging image is version 1,
+# minimum_version is 2, so the downgrade should be blocked.
+security_policy:
+  anti_rollback: true
+  minimum_version: 2
+  toctou_protection: false
+
+success_criteria:
+  vtor_in_slot: exec
+
+fault_sweep:
+  mode: runtime
+  max_writes: 28672
+  max_writes_cap: 100000
+  run_duration: "0.01"
+
+# With anti-rollback enforcement, the bootloader should reject the
+# downgrade. Power-loss faults test whether the rejection logic
+# is itself resilient. Issues found here mean the anti-rollback
+# gate can be bypassed via power-loss.
+expect:
+  should_find_issues: true
