@@ -10,6 +10,51 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 @dataclasses.dataclass
+class ReadFaultSpec:
+    """Specification for a read-time bit-flip fault injection region."""
+
+    region_start: int
+    region_end: int
+    bit_flip_count: int = 1
+    probability: float = 1.0
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.region_end <= self.region_start:
+            raise ValueError(
+                "region_end (0x{:X}) must be greater than region_start (0x{:X})".format(
+                    self.region_end, self.region_start
+                )
+            )
+        if self.bit_flip_count < 1:
+            raise ValueError(
+                "bit_flip_count must be >= 1, got {}".format(self.bit_flip_count)
+            )
+        if not (0.0 <= self.probability <= 1.0):
+            raise ValueError(
+                "probability must be in [0.0, 1.0], got {}".format(self.probability)
+            )
+
+    @property
+    def region_size(self) -> int:
+        return self.region_end - self.region_start
+
+
+@dataclasses.dataclass
+class ReadFaultResult:
+    """Result from a read-time bit-flip fault injection run."""
+
+    fault_at: int
+    boot_outcome: str
+    boot_slot: Optional[str]
+    nvm_state: Any
+    raw_log: str
+    reads_corrupted: int
+    total_reads: int
+    is_control: bool = False
+
+
+@dataclasses.dataclass
 class FaultResult:
     fault_at: int
     boot_outcome: str
