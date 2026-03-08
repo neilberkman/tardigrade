@@ -2796,9 +2796,14 @@ def main() -> int:
                 if args.quick:
                     bit_fps = quick_subset(bit_fps)
 
+                # Always include uniform bit_corruption for all points.
+                combined += [(bp, 'b') for bp in bit_fps]
+                bit_count = len(bit_fps)
+
+                # If clustered distribution is configured, ADD extra
+                # spatially-weighted points (additive, not replacement).
                 dist = profile.fault_sweep.fault_distribution
                 if dist is not None and dist.mode == "clustered":
-                    # Resolve the slot base for address mapping.
                     slot_base = 0
                     wg = profile.memory.write_granularity
                     if profile.memory.slots:
@@ -2814,16 +2819,9 @@ def main() -> int:
                         write_granularity=wg,
                         slot_base=slot_base,
                     )
-                    # Each entry is (fault_point, corruption_seed).
-                    # Encode the seed into the fault type code so the
-                    # .resc dispatch can set CorruptionSeed per point.
                     for fp, cseed in filtered:
                         combined.append((fp, "b:{}".format(cseed)))
                     clustered_bit_count = len(filtered)
-                    bit_count = clustered_bit_count
-                else:
-                    combined += [(bp, 'b') for bp in bit_fps]
-                    bit_count = len(bit_fps)
 
             silent_count = 0
             if include_silent_write_failure:
