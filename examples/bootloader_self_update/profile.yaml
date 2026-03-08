@@ -1,0 +1,65 @@
+# Example profile for bootloader self-update fault injection.
+#
+# This profile demonstrates testing what happens when a bootloader updates
+# its own code region and power is lost mid-write.  The bootloader_region
+# field defines the address range of the bootloader's code, and any NVM
+# writes within that range are classified as Tier 0 (highest priority) in
+# the write-trace heuristic.
+#
+# The bootloader_integrity success criteria checks that the bootloader's
+# vector table (initial SP + reset vector) remains valid after recovery.
+#
+# Replace the placeholder paths with actual ELF/binary paths for your
+# target platform.
+
+schema_version: 1
+name: bootloader_self_update_example
+description: >
+  Fault injection targeting bootloader self-update: power loss during writes
+  to the bootloader's own code region.
+
+platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
+
+bootloader:
+  elf: path/to/bootloader.elf
+  entry: 0x00000000
+
+memory:
+  sram:
+    start: 0x20000000
+    end: 0x20020000
+  write_granularity: 4
+  slots:
+    exec:
+      base: 0x00010000
+      size: 0x00038000
+    staging:
+      base: 0x00048000
+      size: 0x00038000
+
+# The bootloader's own code region.  Writes here during a self-update
+# are the most dangerous -- every one is a potential permanent brick.
+bootloader_region:
+  base: 0x00000000
+  size: 0x00010000
+
+images:
+  staging: path/to/new_bootloader.bin
+
+success_criteria:
+  vtor_in_slot: exec
+  # Enable bootloader integrity check: after recovery boot, verify
+  # that the bootloader region still has a valid ARM vector table.
+  bootloader_integrity: true
+
+fault_sweep:
+  mode: runtime
+  max_writes: auto
+  run_duration: "0.5"
+  fault_types:
+    - power_loss
+  sweep_strategy: heuristic
+
+expect:
+  should_find_issues: true
