@@ -46,6 +46,7 @@ KNOWN_FAULT_TYPES = {
     "write_rejection",
     "reset_at_time",
     "read_bit_flip",
+    "nvs_corruption",
 }
 IMPLEMENTED_FAULT_TYPES = {
     "power_loss",
@@ -58,11 +59,61 @@ IMPLEMENTED_FAULT_TYPES = {
     "write_rejection",
     "reset_at_time",
     "read_bit_flip",
+    "nvs_corruption",
 }
 
 
 class ProfileError(Exception):
     """Raised when a profile is invalid or unsupported."""
+
+
+
+class NvsRegionConfig:
+    """Configuration for an NVS/config memory region subject to corruption testing."""
+    __slots__ = ("address", "size", "snapshot")
+    def __init__(self, address: int, size: int, snapshot: Optional[str] = None) -> None:
+        self.address = address
+        self.size = size
+        self.snapshot = snapshot
+
+
+class ConfigCheck:
+    """A single post-boot config check: verify memory at an address."""
+    __slots__ = ("address", "expected", "nonzero", "range_min", "range_max")
+    def __init__(self, address: int, expected: Optional[int] = None, nonzero: bool = False,
+                 range_min: Optional[int] = None, range_max: Optional[int] = None) -> None:
+        self.address = address
+        self.expected = expected
+        self.nonzero = nonzero
+        self.range_min = range_min
+        self.range_max = range_max
+
+    def evaluate(self, actual_value: int) -> bool:
+        """Evaluate this check against an actual memory value."""
+        if self.expected is not None and actual_value != self.expected:
+            return False
+        if self.nonzero and actual_value == 0:
+            return False
+        if self.range_min is not None and actual_value < self.range_min:
+            return False
+        if self.range_max is not None and actual_value > self.range_max:
+            return False
+        return True
+
+    def describe_failure(self, actual_value: int) -> str:
+        """Return a human-readable failure description."""
+        parts = ["config check at 0x{:X} failed:".format(self.address)]
+        parts.append("actual=0x{:X}".format(actual_value))
+        if self.expected is not None:
+            parts.append("expected=0x{:X}".format(self.expected))
+        if self.nonzero:
+            parts.append("expected nonzero")
+        if self.range_min is not None or self.range_max is not None:
+            parts.append("expected range [{}, {}]".format(
+                "0x{:X}".format(self.range_min) if self.range_min is not None else "-inf",
+                "0x{:X}".format(self.range_max) if self.range_max is not None else "+inf"))
+        return " ".join(parts)
+
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +157,7 @@ class SuccessCriteria:
         "otadata_expect",
         "otadata_expect_scope",
         "bootloader_integrity",
+        "config_checks",
     )
 
     def __init__(
@@ -121,6 +173,7 @@ class SuccessCriteria:
         otadata_expect: Optional[Dict[str, List[str]]] = None,
         otadata_expect_scope: str = "always",
         bootloader_integrity: bool = False,
+        config_checks: Optional[List["ConfigCheck"]] = None,
     ) -> None:
         self.vtor_in_slot = vtor_in_slot
         self.vector_table_offset = max(0, int(vector_table_offset))
@@ -133,7 +186,7 @@ class SuccessCriteria:
         self.otadata_expect = otadata_expect or {}
         self.otadata_expect_scope = otadata_expect_scope
         self.bootloader_integrity = bootloader_integrity
-
+        self.config_checks: List["ConfigCheck"] = config_checks or []
 
 
 class MultiFaultConfig:
@@ -458,7 +511,8 @@ class ProfileConfig:
         self.flash_backend = flash_backend
         self.initial_states: List[InitialStateConfig] = initial_states or []
         self.metadata_fault_regions: List[MetadataFaultRegion] = metadata_fault_regions or []
-        self.bootloader_region = bootloader_region
+        self.bootloader_region: Optional[BootloaderRegionConfig] = bootloader_region
+        self.bootloader_region: Optional[BootloaderRegionConfig] = bootloader_region
 
     def resolve_initial_state(self, state: "InitialStateConfig") -> "ProfileConfig":
         """Return a new ProfileConfig with the given initial state applied."""
@@ -881,6 +935,7 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         otadata_expect=_parse_otadata_expect(raw.get("otadata_expect")),
         otadata_expect_scope=otadata_expect_scope,
         bootloader_integrity=bool(raw.get("bootloader_integrity", False)),
+        config_checks=_parse_config_checks(raw.get("config_checks")),
     )
 
 
@@ -1087,6 +1142,55 @@ def _parse_metadata_fault(raw):
         if not fault_types:
             fault_types = ["power_loss"]
     return MetadataFaultConfig(enabled=enabled, fault_types=fault_types)
+
+
+
+def _parse_nvs_region(raw: Optional[Dict[str, Any]]) -> Optional["NvsRegionConfig"]:
+    """Parse nvs_region from profile YAML."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ProfileError("nvs_region: expected mapping")
+    address = _parse_int(_require(raw, "address", "nvs_region"), "nvs_region.address")
+    size = _parse_int(_require(raw, "size", "nvs_region"), "nvs_region.size")
+    if size <= 0:
+        raise ProfileError("nvs_region.size: expected positive integer")
+    snapshot = raw.get("snapshot")
+    if snapshot is not None:
+        snapshot = str(snapshot).strip()
+        if not snapshot:
+            raise ProfileError("nvs_region.snapshot: expected non-empty path")
+    return NvsRegionConfig(address=address, size=size, snapshot=snapshot)
+
+
+def _parse_config_checks(raw: Optional[list]) -> List["ConfigCheck"]:
+    """Parse success_criteria.config_checks from profile YAML."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("success_criteria.config_checks: expected list")
+    checks: List["ConfigCheck"] = []
+    for i, entry in enumerate(raw):
+        ctx = "success_criteria.config_checks[{}]".format(i)
+        if not isinstance(entry, dict):
+            raise ProfileError("{}: expected mapping".format(ctx))
+        address = _parse_int(_require(entry, "address", ctx), "{}.address".format(ctx))
+        expected = None
+        if "expected" in entry:
+            expected = _parse_int(entry["expected"], "{}.expected".format(ctx))
+        nonzero = bool(entry.get("nonzero", False))
+        range_min = None
+        range_max = None
+        if "range" in entry:
+            range_raw = entry["range"]
+            if not isinstance(range_raw, dict):
+                raise ProfileError("{}.range: expected mapping with min/max".format(ctx))
+            if "min" in range_raw:
+                range_min = _parse_int(range_raw["min"], "{}.range.min".format(ctx))
+            if "max" in range_raw:
+                range_max = _parse_int(range_raw["max"], "{}.range.max".format(ctx))
+        checks.append(ConfigCheck(address=address, expected=expected, nonzero=nonzero, range_min=range_min, range_max=range_max))
+    return checks
 
 
 def _parse_state_fuzzer(raw: Optional[Dict[str, Any]]) -> StateFuzzerConfig:

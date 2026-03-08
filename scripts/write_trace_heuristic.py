@@ -7,6 +7,10 @@ a reduced set of fault points that concentrates testing on high-risk writes
 (trailer/metadata regions, erase boundaries) while sparsely sampling bulk
 data copies.
 
+Tier 0 (CRITICAL): test every write -- bootloader self-update region
+  - Writes to the bootloader's own code region (if configured)
+  - Corruption here can permanently brick with no recovery path
+
 Tier 1 (EXHAUSTIVE): test every write
   - Writes to trailer regions (last page of each slot)
   - Writes where address jumps discontinuously (region transitions)
@@ -59,6 +63,8 @@ def classify_trace(
         tier3_step: Test every Nth write in tier 3 regions.
         discontinuity_window: Number of writes before/after a discontinuity
             to include as tier 1.
+        bootloader_region: Optional (bus_start, bus_end) of bootloader code
+            region.  Writes here are Tier 0 (always tested).
 
     Returns:
         Sorted list of fault point indices (0-based write numbers to test).
@@ -117,6 +123,7 @@ def classify_trace(
 
     # Pass 2: classify each write.
     tier0: Set[int] = set()
+    tier0: Set[int] = set()  # bootloader region (critical)
     tier1: Set[int] = set()
     tier2: Set[int] = set()
     tier3: Set[int] = set()
@@ -140,6 +147,7 @@ def classify_trace(
     selected: Set[int] = set()
 
     # Tier 0: all.
+    # Tier 0: all (bootloader region -- critical).
     selected.update(tier0)
 
     # Tier 1: all.
@@ -188,18 +196,23 @@ def summarize_classification(
         if any(s <= off < e for s, e in trailer_regions)
     )
 
-    result = {
-        "total_writes": len(trace),
-        "trailer_writes": trailer_writes,
-        "bulk_writes": len(trace) - trailer_writes,
-        "selected_fault_points": len(fault_points),
-        "reduction_ratio": round(len(fault_points) / max(len(trace), 1), 3),
-    }
+    bl_writes = 0
     if bootloader_region is not None:
         bl_start = bootloader_region[0] - flash_base
         bl_end = bootloader_region[1] - flash_base
-        bl_writes = sum(1 for _, off in trace if bl_start <= off < bl_end)
-        if bl_writes > 0:
-            result["bootloader_region_writes"] = bl_writes
-            result["bulk_writes"] = max(0, result["bulk_writes"] - bl_writes)
+        bl_writes = sum(
+            1
+            for _, off in trace
+            if bl_start <= off < bl_end
+        )
+    result = {
+        "total_writes": len(trace),
+        "trailer_writes": trailer_writes,
+        "bulk_writes": len(trace) - trailer_writes - bl_writes,
+        "selected_fault_points": len(fault_points),
+        "reduction_ratio": round(len(fault_points) / max(len(trace), 1), 3),
+    }
+    if bl_writes > 0:
+        result["bootloader_region_writes"] = bl_writes
+        result["bulk_writes"] = max(0, result["bulk_writes"] - bl_writes)
     return result

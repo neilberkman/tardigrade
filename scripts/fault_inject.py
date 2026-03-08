@@ -6,7 +6,142 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import random
+import struct as _struct
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+
+@dataclasses.dataclass
+class BootloaderRegionConfig:
+    """Address range of the bootloader's own code region."""
+
+    base: int
+    size: int
+
+    @property
+    def end(self) -> int:
+        return self.base + self.size
+
+    def contains(self, address: int) -> bool:
+        return self.base <= address < self.end
+
+
+def validate_bootloader_vector_table(
+    memory_bytes: bytes,
+    region_base: int,
+    region_size: int,
+    sram_start: int = 0x20000000,
+    sram_end: int = 0x30000000,
+) -> tuple:
+    """Validate the ARM vector table at the start of a bootloader region.
+
+    Checks:
+      1. Initial SP (first word) is in the SRAM range.
+      2. Reset vector (second word) points into the bootloader region.
+
+    Returns:
+        (True, "ok") if valid, or (False, reason_string) if invalid.
+    """
+    if len(memory_bytes) < 8:
+        return False, "region too small ({} bytes, need >= 8)".format(len(memory_bytes))
+    sp = _struct.unpack_from("<I", memory_bytes, 0)[0]
+    reset_vector = _struct.unpack_from("<I", memory_bytes, 4)[0]
+    region_end = region_base + region_size
+    if not (sram_start <= sp < sram_end):
+        return False, "initial SP 0x{:08X} not in SRAM range 0x{:08X}-0x{:08X}".format(
+            sp, sram_start, sram_end
+        )
+    if not (region_base <= reset_vector < region_end):
+        return False, "reset vector 0x{:08X} not in bootloader region 0x{:08X}-0x{:08X}".format(
+            reset_vector, region_base, region_end
+        )
+    return True, "ok"
+
+
+NVS_CORRUPTION_MODES = {"bit_flip", "partial_erase", "truncate", "scramble"}
+
+
+@dataclasses.dataclass
+class NvsCorruptionSpec:
+    """Specification for NVS/config region corruption fault injection."""
+
+    region_start: int
+    region_end: int
+    corruption_mode: str  # one of NVS_CORRUPTION_MODES
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.region_end <= self.region_start:
+            raise ValueError(
+                "region_end (0x{:X}) must be greater than region_start (0x{:X})".format(
+                    self.region_end, self.region_start
+                )
+            )
+        if self.corruption_mode not in NVS_CORRUPTION_MODES:
+            raise ValueError(
+                "corruption_mode must be one of {}, got {!r}".format(
+                    sorted(NVS_CORRUPTION_MODES), self.corruption_mode
+                )
+            )
+
+    @property
+    def region_size(self) -> int:
+        return self.region_end - self.region_start
+
+
+def generate_nvs_corruption_variants(
+    region_data: bytes,
+    region_size: int,
+    modes: Optional[List[str]] = None,
+    seed: int = 0,
+) -> List[Tuple[str, bytes]]:
+    """Generate corrupted NVS region variants for each requested mode.
+
+    Args:
+        region_data: Original NVS region contents (padded to region_size with 0xFF).
+        region_size: Total size of the NVS region in bytes.
+        modes: List of corruption modes to generate. Defaults to all modes.
+        seed: RNG seed for deterministic corruption.
+
+    Returns:
+        List of (mode_name, corrupted_bytes) tuples.
+    """
+    if modes is None:
+        modes = sorted(NVS_CORRUPTION_MODES)
+    for mode in modes:
+        if mode not in NVS_CORRUPTION_MODES:
+            raise ValueError(
+                "unknown NVS corruption mode {!r}, expected one of {}".format(
+                    mode, sorted(NVS_CORRUPTION_MODES)
+                )
+            )
+
+    data = bytearray(region_data[:region_size])
+    if len(data) < region_size:
+        data.extend(b"\xFF" * (region_size - len(data)))
+
+    variants: List[Tuple[str, bytes]] = []
+    rng = random.Random(seed)
+
+    for mode in modes:
+        corrupted = bytearray(data)
+        if mode == "bit_flip":
+            num_flips = max(1, min(8, region_size // 256))
+            for _ in range(num_flips):
+                byte_idx = rng.randint(0, len(corrupted) - 1)
+                bit_idx = rng.randint(0, 7)
+                corrupted[byte_idx] ^= 1 << bit_idx
+        elif mode == "partial_erase":
+            half = len(corrupted) // 2
+            corrupted[half:] = b"\xFF" * (len(corrupted) - half)
+        elif mode == "truncate":
+            if len(corrupted) > 16:
+                corrupted[16:] = b"\x00" * (len(corrupted) - 16)
+        elif mode == "scramble":
+            for i in range(len(corrupted)):
+                corrupted[i] = rng.randint(0, 255)
+        variants.append((mode, bytes(corrupted)))
+
+    return variants
 
 
 @dataclasses.dataclass
