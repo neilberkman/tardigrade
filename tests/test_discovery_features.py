@@ -1699,6 +1699,65 @@ class Phase2FaultTest(unittest.TestCase):
         self.assertEqual(p1_type, "w")
         self.assertEqual(p2_type, "w")
 
+    def test_phase2_skip_reasons_summarized(self) -> None:
+        results = [
+            {
+                "fault_at": 10,
+                "fault_type": "p2",
+                "fault_injected": False,
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "skip_reason": "phase2_no_write_at_index",
+                "phase2_fault": {
+                    "skip_reason": "no_write_at_index",
+                    "p2_total_ops": 3,
+                    "p2_max_fault_index": 2,
+                },
+            },
+            {
+                "fault_at": 11,
+                "fault_type": "p2",
+                "fault_injected": False,
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "skip_reason": "phase2_no_erase_at_index",
+                "phase2_fault": {
+                    "skip_reason": "no_erase_at_index",
+                    "p2_total_ops": 0,
+                    "p2_max_fault_index": -1,
+                },
+            },
+            {
+                "fault_at": 12,
+                "fault_type": "w",
+                "fault_injected": False,
+                "boot_outcome": "skipped",
+                "boot_slot": None,
+                "skip_reason": "probability_gate",
+            },
+        ]
+        summary = summarize_runtime_sweep(results, total_writes=100)
+        self.assertEqual(summary["discarded_no_fault_fired"], 3)
+        self.assertEqual(summary["skip_reasons"]["phase2_no_write_at_index"], 1)
+        self.assertEqual(summary["skip_reasons"]["phase2_no_erase_at_index"], 1)
+        self.assertEqual(summary["skip_reasons"]["probability_gate"], 1)
+        self.assertEqual(summary["phase2_skip_reasons"]["no_write_at_index"], 1)
+        self.assertEqual(summary["phase2_skip_reasons"]["no_erase_at_index"], 1)
+
+    def test_phase2_skip_reasons_absent_without_phase2_discards(self) -> None:
+        results = [
+            {
+                "fault_at": 1,
+                "fault_injected": False,
+                "boot_outcome": "skipped",
+                "boot_slot": None,
+                "skip_reason": "probability_gate",
+            }
+        ]
+        summary = summarize_runtime_sweep(results, total_writes=100)
+        self.assertIn("skip_reasons", summary)
+        self.assertNotIn("phase2_skip_reasons", summary)
+
 
 class MetadataFaultTest(unittest.TestCase):
     """Tests for metadata-write-fault injection feature."""

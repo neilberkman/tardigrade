@@ -3047,12 +3047,19 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     log('p2fault p1={}/{} phase1_done injected={} ops={}'.format(
         p1_fault_at, p1_fault_type, p1_injected, p1_ops))
 
-    if not ((USE_FAST_PATH or USE_MRAM_PATH) and p1_injected):
+    phase2_skip_reason = None
+    if not (USE_FAST_PATH or USE_MRAM_PATH):
+        phase2_skip_reason = 'unsupported_backend'
+    elif not p1_injected:
+        phase2_skip_reason = 'phase1_fault_not_injected'
+
+    if phase2_skip_reason is not None:
         return {
             'fault_at': p1_fault_at,
             'fault_requested': p1_fault_at,
             'fault_type': 'p2',
             'fault_injected': False,
+            'skip_reason': 'phase2_{}'.format(phase2_skip_reason),
             'fault_address': '0x00000000',
             'boot_outcome': 'success',
             'boot_slot': None,
@@ -3066,6 +3073,9 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
                 'p2_fault_type': p2_fault_type,
                 'p1_injected': False,
                 'p2_injected': False,
+                'skip_reason': phase2_skip_reason,
+                'p2_total_ops': 0,
+                'p2_max_fault_index': -1,
             },
         }
 
@@ -3154,6 +3164,11 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         )
         disarm_vtor_watchpoint()
         phase3_ms = int((_time.time() - phase3_t0) * 1000)
+    else:
+        if is_p2_erase:
+            phase2_skip_reason = 'no_erase_at_index'
+        else:
+            phase2_skip_reason = 'no_write_at_index'
 
     # Read final state.
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
@@ -3205,9 +3220,14 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
             'p1_injected': p1_injected,
             'p2_injected': p2_injected,
             'p2_ops': p2_ops,
+            'p2_total_ops': p2_ops,
+            'p2_max_fault_index': (p2_ops - 1) if p2_ops > 0 else -1,
+            'skip_reason': phase2_skip_reason,
             'elapsed_s': round(elapsed, 1),
         },
     }
+    if phase2_skip_reason is not None:
+        result['skip_reason'] = 'phase2_{}'.format(phase2_skip_reason)
     if semantic_state is not None:
         result['semantic_state'] = semantic_state
     if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
