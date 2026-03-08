@@ -1357,6 +1357,65 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertFalse((tempdir / "work" / "cleanup_batch_profile_batch" / "robot").exists())
             self.assertFalse((tempdir / "work" / "cleanup_batch_profile_batch" / ".tmp").exists())
 
+    def test_run_batch_scales_robot_timeout_with_batch_size(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = tempdir / "profile.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    """
+                    schema_version: 1
+                    name: timeout_batch_profile
+                    description: timeout
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    bootloader:
+                      elf: examples/vulnerable_ota/firmware.elf
+                      entry: 0x10000000
+                    memory:
+                      sram: { start: 0x20000000, end: 0x20020000 }
+                      write_granularity: 4
+                      slots:
+                        exec: { base: 0x10000000, size: 0x1000 }
+                        staging: { base: 0x10001000, size: 0x1000 }
+                    images:
+                      staging: examples/vulnerable_ota/firmware.bin
+                    success_criteria:
+                      vtor_in_slot: exec
+                    expect:
+                      should_find_issues: false
+                    """
+                ),
+                encoding="utf-8",
+            )
+            profile = load_profile(profile_path)
+
+            def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+                self.assertIn("TEST_TIMEOUT:4 minutes", cmd)
+                rf_results = Path(cmd[cmd.index("--results-dir") + 1])
+                rf_results.mkdir(parents=True, exist_ok=True)
+                result_var = next(
+                    entry for entry in cmd
+                    if isinstance(entry, str) and entry.startswith("RESULT_FILE:")
+                )
+                result_file = Path(result_var.split("RESULT_FILE:", 1)[1])
+                result_file.write_text("[]", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch("audit_bootloader.subprocess.run", side_effect=fake_run):
+                results = run_batch(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    fault_points=list(range(20)),
+                    robot_vars=[],
+                    work_dir=tempdir / "work",
+                    renode_remote_server_dir="",
+                    keep_run_artifacts=False,
+                )
+
+            self.assertEqual(results, [])
+
 
 class Phase2FaultTest(unittest.TestCase):
     """Tests for the phase2_fault profile schema and robot var generation."""

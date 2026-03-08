@@ -573,6 +573,13 @@ def run_batch(
     else:
         fault_types_mode = "write"
 
+    # Scale the Robot Framework per-suite timeout to the batch size. Large
+    # state-mode batches can legitimately exceed the default 2-minute timeout,
+    # which otherwise triggers expensive fallback splits even when the batch is
+    # healthy.
+    robot_test_timeout_s = max(120, 120 + len(fault_points) * 4)
+    robot_test_timeout_m = max(2, (robot_test_timeout_s + 59) // 60)
+
     cmd = [
         renode_test,
         "--renode-config", str(renode_config),
@@ -588,6 +595,7 @@ def run_batch(
         "--variable", "ERASE_TRACE_FILE_BIN:{}".format(erase_trace_file_bin or ""),
         "--variable", "FAULT_TYPES:{}".format(fault_types_mode),
         "--variable", "FAULT_TYPE_CSV:{}".format(ft_csv),
+        "--variable", "TEST_TIMEOUT:{} minutes".format(robot_test_timeout_m),
     ]
     if renode_remote_server_dir:
         cmd.extend(["--robot-framework-remote-server-full-directory", renode_remote_server_dir])
