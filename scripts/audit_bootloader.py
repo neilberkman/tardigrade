@@ -1058,9 +1058,10 @@ def _derive_runtime_pre_state(
     if not isinstance(control_result, dict):
         return None
     expected_outcome = getattr(profile.expect, "control_outcome", "success") or "success"
-    if control_result.get("boot_outcome") != expected_outcome:
+    eff_outcome, eff_slot = _effective_boot_result(control_result)
+    if eff_outcome != expected_outcome:
         return None
-    derived = _slot_validity_from_boot_slot(control_result.get("boot_slot"))
+    derived = _slot_validity_from_boot_slot(eff_slot)
     if not any(derived.values()):
         derived["slot_a_valid"] = True
     derived["derived_from"] = "control_result"
@@ -1139,7 +1140,8 @@ def annotate_result_checks(
 
 def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[str]:
     reasons: List[str] = []
-    if result.get("boot_outcome") != expected_outcome:
+    eff_outcome, _ = _effective_boot_result(result)
+    if eff_outcome != expected_outcome:
         reasons.append("boot_outcome")
     if result.get("semantic_assertion_failures"):
         reasons.append("semantic_assertion")
@@ -1153,7 +1155,8 @@ def result_has_issues(result: Dict[str, Any], expected_outcome: str) -> bool:
 
 
 def result_is_brick(result: Dict[str, Any]) -> bool:
-    outcome = str(result.get("boot_outcome", "unknown") or "unknown").strip().lower()
+    eff_outcome, _ = _effective_boot_result(result)
+    outcome = str(eff_outcome or "unknown").strip().lower()
     return outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}
 
 
@@ -1391,7 +1394,8 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
     if raw:
         return raw
 
-    outcome = str(result.get("boot_outcome", "unknown") or "unknown").strip().lower()
+    eff_outcome, _ = _effective_boot_result(result)
+    outcome = str(eff_outcome or "unknown").strip().lower()
     if outcome == "success":
         return "recoverable"
     if outcome == "wrong_image":
