@@ -2559,6 +2559,12 @@ def main() -> int:
                 max_pairs=mf_config.max_pairs,
                 explicit_sequences=mf_config.sequences or None,
                 seed=mf_config.seed,
+                fallback_strategy=mf_config.fallback_strategy,
+                fallback_points=[
+                    int(r.get("fault_at", 0))
+                    for r in sweep_results
+                    if r.get("fault_injected", False) and not r.get("is_control", False)
+                ],
             )
             multi_fault_plan = mf_plan
             multi_fault_plan_data = multi_fault_plan_summary(mf_plan)
