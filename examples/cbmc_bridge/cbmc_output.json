@@ -1,0 +1,115 @@
+[
+  { "messageType": "STATUS-MESSAGE", "messageText": "CBMC version 6.0.0" },
+  {
+    "result": [
+      {
+        "property": "main.assertion.1",
+        "description": "CRC gap: buggy parser accepts metadata that fixed parser rejects",
+        "status": "FAILURE",
+        "trace": [
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[0]",
+            "value": "77",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[1]",
+            "value": "65",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[2]",
+            "value": "84",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[3]",
+            "value": "79",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[4]",
+            "value": "1",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[5]",
+            "value": "0",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[6]",
+            "value": "0",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[7]",
+            "value": "0",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[8]",
+            "value": "1",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[9]",
+            "value": "0",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[10]",
+            "value": "0",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[11]",
+            "value": "0",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[12]",
+            "value": "132",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[13]",
+            "value": "148",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[14]",
+            "value": "198",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "assignment",
+            "lhs": "meta_bytes[15]",
+            "value": "192",
+            "assignmentType": "variable"
+          },
+          {
+            "stepType": "failure",
+            "property": "main.assertion.1",
+            "reason": "CRC gap: buggy parser accepts metadata that fixed parser rejects"
+          }
+        ]
+      }
+    ]
+  }
+]

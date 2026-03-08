@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<cprover>
+  <message type="STATUS-MESSAGE">
+    <text>CBMC version 6.0.0</text>
+  </message>
+  <result property="main.assertion.1" status="FAILURE">
+    <description>CRC gap: buggy parser accepts metadata that fixed parser rejects</description>
+    <goto_trace>
+      <assignment>
+        <lhs>meta_bytes[0]</lhs>
+        <full_lhs>meta_bytes[(signed long int)0]</full_lhs>
+        <full_lhs_value>77</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[1]</lhs>
+        <full_lhs>meta_bytes[(signed long int)1]</full_lhs>
+        <full_lhs_value>65</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[2]</lhs>
+        <full_lhs>meta_bytes[(signed long int)2]</full_lhs>
+        <full_lhs_value>84</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[3]</lhs>
+        <full_lhs>meta_bytes[(signed long int)3]</full_lhs>
+        <full_lhs_value>79</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[4]</lhs>
+        <full_lhs>meta_bytes[(signed long int)4]</full_lhs>
+        <full_lhs_value>1</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[5]</lhs>
+        <full_lhs>meta_bytes[(signed long int)5]</full_lhs>
+        <full_lhs_value>0</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[6]</lhs>
+        <full_lhs>meta_bytes[(signed long int)6]</full_lhs>
+        <full_lhs_value>0</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[7]</lhs>
+        <full_lhs>meta_bytes[(signed long int)7]</full_lhs>
+        <full_lhs_value>0</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[8]</lhs>
+        <full_lhs>meta_bytes[(signed long int)8]</full_lhs>
+        <full_lhs_value>1</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[9]</lhs>
+        <full_lhs>meta_bytes[(signed long int)9]</full_lhs>
+        <full_lhs_value>0</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[10]</lhs>
+        <full_lhs>meta_bytes[(signed long int)10]</full_lhs>
+        <full_lhs_value>0</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[11]</lhs>
+        <full_lhs>meta_bytes[(signed long int)11]</full_lhs>
+        <full_lhs_value>0</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[12]</lhs>
+        <full_lhs>meta_bytes[(signed long int)12]</full_lhs>
+        <full_lhs_value>132</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[13]</lhs>
+        <full_lhs>meta_bytes[(signed long int)13]</full_lhs>
+        <full_lhs_value>148</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[14]</lhs>
+        <full_lhs>meta_bytes[(signed long int)14]</full_lhs>
+        <full_lhs_value>198</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <assignment>
+        <lhs>meta_bytes[15]</lhs>
+        <full_lhs>meta_bytes[(signed long int)15]</full_lhs>
+        <full_lhs_value>192</full_lhs_value>
+        <type>unsigned char</type>
+      </assignment>
+      <failure property="main.assertion.1" reason="CRC gap: buggy parser accepts metadata that fixed parser rejects"/>
+    </goto_trace>
+  </result>
+</cprover>

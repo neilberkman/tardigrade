@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Convert CBMC counterexamples to tardigrade profile YAML files."""
+"""Convert CBMC counterexamples to tardigrade profile YAML files.
+
+Supports both JSON (``--json-ui``) and XML (``--xml-ui``) CBMC output
+formats.  An optional *address map* file lets you map CBMC symbolic
+variable names to absolute flash addresses so the generated
+``pre_boot_state`` writes target the correct memory locations.
+"""
 
 from __future__ import annotations
 
@@ -7,9 +13,11 @@ import argparse
 import copy
 import json
 import re
+import struct
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from xml.etree import ElementTree
 
 try:
     import yaml
@@ -23,17 +31,71 @@ DEFAULT_META_SIZE = 512
 ARRAY_CANDIDATES = ("meta_bytes", "nvm")
 
 
+# ---------------------------------------------------------------------------
+# Address-map helpers
+# ---------------------------------------------------------------------------
+
+def load_address_map(path: Optional[str]) -> Dict[str, int]:
+    """Load a variable-name -> flash-address mapping from a YAML or JSON file.
+
+    Expected format (YAML)::
+
+        # Map CBMC array names to absolute flash base addresses.
+        meta_bytes: 0x10070000
+        header:     0x10038000
+
+    Or JSON::
+
+        {"meta_bytes": "0x10070000", "header": "0x10038000"}
+
+    Returns a dict of ``{name: int_address}``.
+    """
+    if not path:
+        return {}
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    if p.suffix in (".yaml", ".yml"):
+        raw = yaml.safe_load(text)
+    else:
+        raw = json.loads(text)
+    if not isinstance(raw, dict):
+        raise RuntimeError("Address map must be a JSON/YAML object mapping names to addresses.")
+    result: Dict[str, int] = {}
+    for name, addr in raw.items():
+        if isinstance(addr, int):
+            result[str(name)] = addr
+        elif isinstance(addr, str):
+            result[str(name)] = int(addr, 0)
+        else:
+            raise RuntimeError(
+                "Address map entry '{}' has unsupported type: {}".format(name, type(addr).__name__)
+            )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert CBMC JSON counterexamples into tardigrade profiles."
+        description="Convert CBMC JSON or XML counterexamples into tardigrade profiles."
     )
-    parser.add_argument("--cbmc-output", required=True, help="Path to CBMC --json-ui output.")
+    parser.add_argument(
+        "--cbmc-output", required=True,
+        help="Path to CBMC output (JSON from --json-ui, or XML from --xml-ui).",
+    )
     parser.add_argument("--template", required=True, help="Template profile YAML to copy.")
     parser.add_argument("--output", required=True, help="Output profile path.")
     parser.add_argument(
         "--replay-output",
         default="",
         help="Optional output path for generic replay spec(s).",
+    )
+    parser.add_argument(
+        "--address-map",
+        default="",
+        help="Optional YAML/JSON file mapping CBMC variable names to flash addresses.",
     )
     parser.add_argument(
         "--meta-size",
@@ -49,6 +111,10 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
+
+# ---------------------------------------------------------------------------
+# JSON trace extraction (existing logic)
+# ---------------------------------------------------------------------------
 
 def _is_failure_dict(node: Dict[str, Any]) -> bool:
     for key in ("status", "result", "propertyStatus", "verificationStatus"):
@@ -96,6 +162,95 @@ def _collect_error_messages(node: Any, out: List[str]) -> None:
             _collect_error_messages(value, out)
 
 
+# ---------------------------------------------------------------------------
+# XML trace extraction
+# ---------------------------------------------------------------------------
+
+def _parse_xml_counterexamples(xml_path: Path) -> List[Dict[str, Any]]:
+    """Parse CBMC ``--xml-ui`` output and return a list of failure dicts.
+
+    Each returned dict has the same shape as the JSON failure dicts:
+    ``{"property": str, "status": "FAILURE", "trace": [step_dict, ...]}``.
+
+    CBMC XML structure (simplified)::
+
+        <cprover>
+          <result property="..." status="FAILURE">
+            <goto_trace>
+              <assignment ...>
+                <full_lhs>meta_bytes[0]</full_lhs>
+                <full_lhs_value>42</full_lhs_value>
+                ...
+              </assignment>
+            </goto_trace>
+          </result>
+        </cprover>
+    """
+    tree = ElementTree.parse(str(xml_path))
+    root = tree.getroot()
+    failures: List[Dict[str, Any]] = []
+
+    for result_elem in root.iter("result"):
+        status = (result_elem.get("status") or "").upper()
+        if "FAIL" not in status:
+            continue
+        prop_name = result_elem.get("property", "unknown")
+
+        trace_steps: List[Dict[str, Any]] = []
+        for goto_trace in result_elem.iter("goto_trace"):
+            for child in goto_trace:
+                if child.tag == "assignment":
+                    step: Dict[str, Any] = {"stepType": "assignment"}
+                    for field in child:
+                        if field.tag == "full_lhs":
+                            step["full_lhs"] = (field.text or "").strip()
+                        elif field.tag == "full_lhs_value":
+                            step["value"] = (field.text or "").strip()
+                        elif field.tag == "lhs":
+                            step["lhs"] = (field.text or "").strip()
+                        elif field.tag == "value":
+                            step.setdefault("value", (field.text or "").strip())
+                        elif field.tag == "type":
+                            step["type"] = (field.text or "").strip()
+                    # Also grab attributes
+                    for attr in ("identifier", "base_name", "display_name"):
+                        val = child.get(attr)
+                        if val:
+                            step[attr] = val
+                    trace_steps.append(step)
+                elif child.tag == "failure":
+                    step = {
+                        "stepType": "failure",
+                        "property": child.get("property", ""),
+                        "reason": child.get("reason", ""),
+                    }
+                    trace_steps.append(step)
+
+        failures.append({
+            "property": prop_name,
+            "status": "FAILURE",
+            "trace": trace_steps,
+        })
+
+    return failures
+
+
+def _xml_contains_success(xml_path: Path) -> bool:
+    """Check if the XML output indicates all properties passed."""
+    tree = ElementTree.parse(str(xml_path))
+    root = tree.getroot()
+    for result_elem in root.iter("result"):
+        status = (result_elem.get("status") or "").upper()
+        if "FAIL" in status:
+            return False
+    # If we found result elements and none failed, it's a success
+    return any(True for _ in root.iter("result"))
+
+
+# ---------------------------------------------------------------------------
+# Scalar/value parsing
+# ---------------------------------------------------------------------------
+
 def _parse_scalar_int(value: Any) -> Optional[int]:
     if isinstance(value, bool):
         return 1 if value else 0
@@ -128,11 +283,26 @@ def _parse_scalar_int(value: Any) -> Optional[int]:
     return None
 
 
-def _extract_byte_assignments(trace: Sequence[Any]) -> Tuple[str, Dict[int, int]]:
-    captures: Dict[str, Dict[int, int]] = {name: {} for name in ARRAY_CANDIDATES}
+# ---------------------------------------------------------------------------
+# Byte-assignment extraction from traces
+# ---------------------------------------------------------------------------
+
+def _extract_byte_assignments(
+    trace: Sequence[Any],
+    extra_arrays: Sequence[str] = (),
+) -> Tuple[str, Dict[int, int]]:
+    """Walk a CBMC trace and collect per-byte array assignments.
+
+    *extra_arrays* allows callers to supply additional array names (e.g.
+    from an address-map) beyond the built-in ``ARRAY_CANDIDATES``.
+    """
+    all_candidates = list(ARRAY_CANDIDATES) + [
+        n for n in extra_arrays if n not in ARRAY_CANDIDATES
+    ]
+    captures: Dict[str, Dict[int, int]] = {name: {} for name in all_candidates}
     patterns = {
         name: re.compile(r"\b{}\[(\d+)(?:[uUlL]*)\]".format(re.escape(name)))
-        for name in ARRAY_CANDIDATES
+        for name in all_candidates
     }
 
     for step in trace:
@@ -149,7 +319,7 @@ def _extract_byte_assignments(trace: Sequence[Any]) -> Tuple[str, Dict[int, int]
 
         # CBMC may emit aggregate assignments like:
         # lhs: "meta_bytes", value: {"elements":[{"index":0,"value":...}, ...]}
-        for candidate in ARRAY_CANDIDATES:
+        for candidate in all_candidates:
             if lhs == candidate and isinstance(step.get("value"), dict):
                 elements = step["value"].get("elements")
                 if isinstance(elements, list):
@@ -194,16 +364,35 @@ def _extract_byte_assignments(trace: Sequence[Any]) -> Tuple[str, Dict[int, int]
             continue
         captures[array_name][index] = value & 0xFF
 
-    for name in ARRAY_CANDIDATES:
+    for name in all_candidates:
         if captures[name]:
             return name, captures[name]
 
     return "", {}
 
 
-def _derive_meta_base(template: Dict[str, Any], override: Optional[int]) -> int:
+# ---------------------------------------------------------------------------
+# Address / metadata helpers
+# ---------------------------------------------------------------------------
+
+def _derive_meta_base(
+    template: Dict[str, Any],
+    override: Optional[int],
+    addr_map: Dict[str, int],
+    array_name: str,
+) -> int:
+    """Determine the metadata base address.
+
+    Priority order:
+    1. Explicit ``--meta-base`` CLI override.
+    2. Address-map entry for the matched *array_name*.
+    3. Inferred from template slot layout (end of last slot).
+    4. Hardcoded fallback ``0x10070000``.
+    """
     if override is not None:
         return override
+    if array_name and array_name in addr_map:
+        return addr_map[array_name]
     slots = (
         template.get("memory", {}).get("slots", {})
         if isinstance(template.get("memory"), dict)
@@ -265,6 +454,10 @@ def _bytes_to_pre_boot_state(meta_base: int, bytes_map: Dict[int, int]) -> List[
     return writes
 
 
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
 def _suffix_path(path: Path, index: int) -> Path:
     stem = path.stem
     suffix = path.suffix if path.suffix else ".yaml"
@@ -308,36 +501,64 @@ def _build_replay_spec(
     }
 
 
+# ---------------------------------------------------------------------------
+# Input detection
+# ---------------------------------------------------------------------------
+
+def _detect_format(path: Path) -> str:
+    """Return 'json' or 'xml' based on file content sniffing."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    stripped = text.lstrip()
+    if stripped.startswith("<") or stripped.startswith("<?xml"):
+        return "xml"
+    return "json"
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> int:
     args = parse_args()
     cbmc_path = Path(args.cbmc_output)
     template_path = Path(args.template)
     output_path = Path(args.output)
     replay_output_path = Path(args.replay_output).resolve() if args.replay_output else None
+    addr_map = load_address_map(args.address_map or None)
 
-    cbmc_data = json.loads(cbmc_path.read_text(encoding="utf-8"))
     template_data = yaml.safe_load(template_path.read_text(encoding="utf-8"))
     if not isinstance(template_data, dict):
         raise RuntimeError("Template profile must be a YAML mapping/object.")
 
-    failures: List[Dict[str, Any]] = []
-    _collect_failure_traces(cbmc_data, failures)
-    errors: List[str] = []
-    _collect_error_messages(cbmc_data, errors)
+    fmt = _detect_format(cbmc_path)
 
-    if not failures:
-        if errors:
-            first = errors[0]
-            raise RuntimeError(
-                "CBMC output contains errors and no failing trace: {}".format(first)
-            )
-        if _contains_verification_success(cbmc_data):
-            print("CBMC reported VERIFICATION SUCCESSFUL. No profile generated.")
+    if fmt == "xml":
+        failures = _parse_xml_counterexamples(cbmc_path)
+        if not failures:
+            if _xml_contains_success(cbmc_path):
+                print("CBMC reported VERIFICATION SUCCESSFUL. No profile generated.")
+                return 0
+            print("No failing CBMC traces found. No profile generated.")
             return 0
-        print("No failing CBMC traces found. No profile generated.")
-        return 0
+    else:
+        cbmc_data = json.loads(cbmc_path.read_text(encoding="utf-8"))
+        failures = []
+        _collect_failure_traces(cbmc_data, failures)
+        errors: List[str] = []
+        _collect_error_messages(cbmc_data, errors)
+        if not failures:
+            if errors:
+                first = errors[0]
+                raise RuntimeError(
+                    "CBMC output contains errors and no failing trace: {}".format(first)
+                )
+            if _contains_verification_success(cbmc_data):
+                print("CBMC reported VERIFICATION SUCCESSFUL. No profile generated.")
+                return 0
+            print("No failing CBMC traces found. No profile generated.")
+            return 0
 
-    meta_base = _derive_meta_base(template_data, args.meta_base)
+    extra_arrays = list(addr_map.keys())
     generated_paths: List[Path] = []
     generated_replays: List[Path] = []
 
@@ -346,12 +567,12 @@ def main() -> int:
         if not isinstance(trace, list):
             continue
 
-        array_name, byte_map = _extract_byte_assignments(trace)
+        array_name, byte_map = _extract_byte_assignments(trace, extra_arrays=extra_arrays)
         if not byte_map:
             raise RuntimeError(
                 "Counterexample {} does not contain array assignments for {}. "
                 "Run CBMC with --trace --json-ui and keep symbolic metadata arrays visible.".format(
-                    idx, ", ".join(ARRAY_CANDIDATES)
+                    idx, ", ".join(list(ARRAY_CANDIDATES) + extra_arrays)
                 )
             )
 
@@ -362,6 +583,8 @@ def main() -> int:
                     idx, args.meta_size
                 )
             )
+
+        meta_base = _derive_meta_base(template_data, args.meta_base, addr_map, array_name)
 
         profile = copy.deepcopy(template_data)
         base_name = str(profile.get("name") or "cbmc_finding")
