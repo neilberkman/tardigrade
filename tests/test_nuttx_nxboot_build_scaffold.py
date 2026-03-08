@@ -212,5 +212,35 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             shutil.rmtree(temp_dir)
 
 
+    def test_linker_script_origin_matches_defconfig_header_size(self) -> None:
+        """Regression guard: flash-nxboot-app.ld ORIGIN must equal
+        primary_slot_base + NXBOOT_HEADER_SIZE from the defconfig."""
+        import re
+
+        ld_path = ROOT / "targets" / "nuttx_nxboot" / "fixtures" / "nucleo_h743zi" / "scripts" / "flash-nxboot-app.ld"
+        defconfig_path = ROOT / "targets" / "nuttx_nxboot" / "fixtures" / "nucleo_h743zi" / "configs" / "nxboot-app.defconfig"
+
+        ld_text = ld_path.read_text()
+        defconfig_text = defconfig_path.read_text()
+
+        m = re.search(r'flash\s+\(rx\)\s*:\s*ORIGIN\s*=\s*(0x[0-9A-Fa-f]+)', ld_text)
+        self.assertIsNotNone(m, "Could not find flash ORIGIN in linker script")
+        ld_origin = int(m.group(1), 16)
+
+        m = re.search(r'CONFIG_NXBOOT_HEADER_SIZE=(0x[0-9A-Fa-f]+)', defconfig_text)
+        self.assertIsNotNone(m, "Could not find CONFIG_NXBOOT_HEADER_SIZE in defconfig")
+        header_size = int(m.group(1), 16)
+
+        primary_slot_base = 0x08040000
+        expected_origin = primary_slot_base + header_size
+
+        self.assertEqual(
+            ld_origin,
+            expected_origin,
+            f"Linker script flash ORIGIN 0x{ld_origin:08X} does not match "
+            f"primary_slot_base (0x{primary_slot_base:08X}) + "
+            f"NXBOOT_HEADER_SIZE (0x{header_size:X}) = 0x{expected_origin:08X}",
+        )
+
 if __name__ == "__main__":
     unittest.main()
