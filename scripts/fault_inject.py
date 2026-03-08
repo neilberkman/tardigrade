@@ -177,6 +177,8 @@ def generate_multi_fault_sequences(
     max_pairs: int = 5000,
     seed: Optional[int] = None,
     explicit_sequences: Optional[List[List[int]]] = None,
+    fallback_strategy: Optional[str] = None,
+    fallback_points: Optional[List[int]] = None,
 ) -> MultiFaultPlan:
     """Generate multi-fault sequences using the given strategy.
 
@@ -197,7 +199,17 @@ def generate_multi_fault_sequences(
     if strategy == "explicit":
         return generate_explicit(explicit_sequences, max_faults_per_run)
     elif strategy == "pairwise_interesting":
-        return generate_pairwise_interesting(interesting_points, max_faults_per_run, max_pairs)
+        plan = generate_pairwise_interesting(
+            interesting_points, max_faults_per_run, max_pairs
+        )
+        return maybe_apply_fallback(
+            primary_plan=plan,
+            fallback_strategy=fallback_strategy,
+            fallback_points=fallback_points,
+            max_faults_per_run=max_faults_per_run,
+            max_pairs=max_pairs,
+            seed=seed,
+        )
     else:
         return generate_random_sample(interesting_points, max_faults_per_run, max_pairs, seed)
 
@@ -322,6 +334,118 @@ def generate_random_sample(
             "theoretical_combinations": theoretical,
             "sampled": max_pairs,
         },
+    )
+
+
+def generate_boundary_pairs(
+    candidate_points: List[int],
+    max_faults_per_run: int,
+    max_pairs: int,
+) -> MultiFaultPlan:
+    """Generate deterministic boundary-focused sequences from candidate points."""
+    pts = sorted(set(candidate_points))
+    if len(pts) < 2:
+        return MultiFaultPlan(
+            sequences=[],
+            strategy="boundary_pairs",
+            interesting_point_count=len(pts),
+            max_faults_per_run=max_faults_per_run,
+            seed=None,
+            diagnostics={"reason": "insufficient_points"},
+        )
+
+    k = min(max_faults_per_run, len(pts))
+    seqs: List[List[int]] = []
+    seen = set()
+
+    def _add(seq: Iterable[int]) -> None:
+        norm = tuple(sorted(int(x) for x in seq))
+        if len(norm) < 2 or norm in seen:
+            return
+        seen.add(norm)
+        seqs.append(list(norm))
+
+    # Sliding windows capture adjacent boundaries.
+    for i in range(0, len(pts) - k + 1):
+        _add(pts[i : i + k])
+        if len(seqs) >= max_pairs:
+            break
+
+    # Wide boundary-spanning pair/window.
+    if len(seqs) < max_pairs:
+        if k == 2:
+            _add((pts[0], pts[-1]))
+        else:
+            _add(tuple([pts[0]] + pts[-(k - 1) :]))
+
+    if len(seqs) > max_pairs:
+        seqs = seqs[:max_pairs]
+
+    return MultiFaultPlan(
+        sequences=seqs,
+        strategy="boundary_pairs",
+        interesting_point_count=len(pts),
+        max_faults_per_run=max_faults_per_run,
+        seed=None,
+        diagnostics={
+            "exhaustive": False,
+            "candidate_points": len(pts),
+            "generated_sequences": len(seqs),
+            "capped_at": max_pairs if len(seqs) >= max_pairs else None,
+        },
+    )
+
+
+def maybe_apply_fallback(
+    primary_plan: MultiFaultPlan,
+    fallback_strategy: Optional[str],
+    fallback_points: Optional[List[int]],
+    max_faults_per_run: int,
+    max_pairs: int,
+    seed: Optional[int],
+) -> MultiFaultPlan:
+    """Apply a deterministic fallback plan when the primary plan yields nothing."""
+    strategy = str(fallback_strategy or "none")
+    if primary_plan.sequences or strategy == "none":
+        return primary_plan
+
+    candidates = list(fallback_points or [])
+    if strategy == "boundary_pairs":
+        fallback_plan = generate_boundary_pairs(
+            candidates, max_faults_per_run=max_faults_per_run, max_pairs=max_pairs
+        )
+    elif strategy == "random_sample":
+        fallback_plan = generate_random_sample(
+            candidates,
+            max_faults_per_run=max_faults_per_run,
+            max_pairs=max_pairs,
+            seed=seed,
+        )
+    else:
+        raise ValueError(
+            "unknown fallback strategy {!r}, expected one of {}".format(
+                strategy, ["none", "boundary_pairs", "random_sample"]
+            )
+        )
+
+    merged_diag = dict(primary_plan.diagnostics)
+    merged_diag.update(
+        {
+            "primary_strategy": primary_plan.strategy,
+            "primary_reason": primary_plan.diagnostics.get("reason"),
+            "fallback_strategy": strategy,
+            "fallback_candidate_points": len(set(candidates)),
+            "fallback_used": bool(fallback_plan.sequences),
+            "fallback_diagnostics": fallback_plan.diagnostics,
+        }
+    )
+    return MultiFaultPlan(
+        sequences=fallback_plan.sequences,
+        strategy=primary_plan.strategy,
+        interesting_point_count=primary_plan.interesting_point_count,
+        max_faults_per_run=max_faults_per_run,
+        seed=seed,
+        diagnostics=merged_diag,
     )
 
 

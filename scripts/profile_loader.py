@@ -136,13 +136,22 @@ class SuccessCriteria:
 class MultiFaultConfig:
     """Configuration for multi-fault (sequential interruption) sweeps."""
 
-    __slots__ = ("enabled", "max_faults_per_run", "strategy", "max_pairs", "seed", "sequences")
+    __slots__ = (
+        "enabled",
+        "max_faults_per_run",
+        "strategy",
+        "fallback_strategy",
+        "max_pairs",
+        "seed",
+        "sequences",
+    )
 
     def __init__(
         self,
         enabled: bool = False,
         max_faults_per_run: int = 2,
         strategy: str = "pairwise_interesting",
+        fallback_strategy: str = "boundary_pairs",
         max_pairs: int = 5000,
         seed=None,
         sequences=None,
@@ -150,6 +159,7 @@ class MultiFaultConfig:
         self.enabled = enabled
         self.max_faults_per_run = max(2, int(max_faults_per_run))
         self.strategy = strategy
+        self.fallback_strategy = fallback_strategy
         self.max_pairs = max(1, int(max_pairs))
         self.seed = seed
         self.sequences = sequences or []
@@ -966,6 +976,14 @@ def _parse_multi_fault(raw):
                 sorted(known_strategies), strategy
             )
         )
+    fallback_strategy = str(raw.get("fallback_strategy", "boundary_pairs"))
+    known_fallback = {"none", "boundary_pairs", "random_sample"}
+    if fallback_strategy not in known_fallback:
+        raise ProfileError(
+            "fault_sweep.multi_fault.fallback_strategy: must be one of {}, got {!r}".format(
+                sorted(known_fallback), fallback_strategy
+            )
+        )
     max_pairs = int(raw.get("max_pairs", 5000))
     if max_pairs < 1:
         raise ProfileError(
@@ -991,6 +1009,7 @@ def _parse_multi_fault(raw):
         enabled=enabled,
         max_faults_per_run=max_faults_per_run,
         strategy=strategy,
+        fallback_strategy=fallback_strategy,
         max_pairs=max_pairs,
         seed=seed,
         sequences=sequences,
@@ -1519,6 +1538,7 @@ def main() -> int:
         "multi_fault": {
             "enabled": profile.fault_sweep.multi_fault.enabled,
             "strategy": profile.fault_sweep.multi_fault.strategy,
+            "fallback_strategy": profile.fault_sweep.multi_fault.fallback_strategy,
             "max_faults_per_run": profile.fault_sweep.multi_fault.max_faults_per_run,
             "max_pairs": profile.fault_sweep.multi_fault.max_pairs,
             "seed": profile.fault_sweep.multi_fault.seed,

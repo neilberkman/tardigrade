@@ -182,7 +182,7 @@ class TestGeneratePairwiseInteresting(unittest.TestCase):
             strategy="pairwise_interesting",
             interesting_points=[],
         )
-        self.assertEqual(len(plan.sequences), 0)
+        self.assertEqual(plan.sequences, [])
         self.assertEqual(plan.diagnostics.get("reason"), "no_interesting_points")
 
     def test_single_point_returns_empty(self) -> None:
@@ -191,7 +191,7 @@ class TestGeneratePairwiseInteresting(unittest.TestCase):
             strategy="pairwise_interesting",
             interesting_points=[42],
         )
-        self.assertEqual(len(plan.sequences), 0)
+        self.assertEqual(plan.sequences, [])
 
     def test_cost_model_100_points(self) -> None:
         """Verify cost for 100 interesting points is manageable."""
@@ -205,6 +205,41 @@ class TestGeneratePairwiseInteresting(unittest.TestCase):
         self.assertEqual(len(plan.sequences), 4950)
         self.assertTrue(plan.diagnostics["exhaustive"])
         self.assertEqual(plan.diagnostics["theoretical_combinations"], 4950)
+
+    def test_boundary_fallback_used_when_no_interesting_points(self) -> None:
+        plan = generate_multi_fault_sequences(
+            strategy="pairwise_interesting",
+            interesting_points=[],
+            fallback_strategy="boundary_pairs",
+            fallback_points=[0, 10, 20, 30],
+        )
+        self.assertEqual(plan.strategy, "pairwise_interesting")
+        self.assertTrue(plan.diagnostics["fallback_used"])
+        self.assertEqual(plan.diagnostics["fallback_strategy"], "boundary_pairs")
+        self.assertEqual(plan.diagnostics["primary_reason"], "no_interesting_points")
+        self.assertIn([0, 10], plan.sequences)
+        self.assertIn([20, 30], plan.sequences)
+        self.assertIn([0, 30], plan.sequences)
+
+    def test_boundary_fallback_uses_nonempty_candidate_set(self) -> None:
+        plan = generate_multi_fault_sequences(
+            strategy="pairwise_interesting",
+            interesting_points=[42],
+            fallback_strategy="boundary_pairs",
+            fallback_points=[5, 15],
+        )
+        self.assertTrue(plan.diagnostics["fallback_used"])
+        self.assertEqual(plan.sequences, [[5, 15]])
+
+    def test_fallback_none_preserves_empty_plan(self) -> None:
+        plan = generate_multi_fault_sequences(
+            strategy="pairwise_interesting",
+            interesting_points=[],
+            fallback_strategy="none",
+            fallback_points=[0, 10, 20],
+        )
+        self.assertEqual(plan.sequences, [])
+        self.assertNotIn("fallback_used", plan.diagnostics)
 
 
 class TestGenerateRandomSample(unittest.TestCase):
@@ -373,6 +408,7 @@ class TestMultiFaultProfileParsing(unittest.TestCase):
             profile = load_profile(str(profile_path))
             self.assertTrue(profile.fault_sweep.multi_fault.enabled)
             self.assertEqual(profile.fault_sweep.multi_fault.strategy, "pairwise_interesting")
+            self.assertEqual(profile.fault_sweep.multi_fault.fallback_strategy, "boundary_pairs")
             self.assertEqual(profile.fault_sweep.multi_fault.max_pairs, 2000)
 
     def test_explicit_with_sequences(self) -> None:
@@ -448,8 +484,41 @@ class TestMultiFaultProfileParsing(unittest.TestCase):
             profile = load_profile(str(profile_path))
             self.assertTrue(profile.fault_sweep.multi_fault.enabled)
             self.assertEqual(profile.fault_sweep.multi_fault.strategy, "random_sample")
+            self.assertEqual(profile.fault_sweep.multi_fault.fallback_strategy, "boundary_pairs")
             self.assertEqual(profile.fault_sweep.multi_fault.seed, 42)
             self.assertEqual(profile.fault_sweep.multi_fault.max_pairs, 500)
+
+    def test_fallback_strategy_parses(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = self._write_profile(
+                Path(td),
+                """
+                schema_version: 1
+                name: test_fallback_strategy
+                platform: platforms/cortex_m0_nvm.repl
+                flash_backend: nvm_ctrl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 8
+                  slots:
+                    exec: { base: 0x10000000, size: 0x38000 }
+                    staging: { base: 0x10038000, size: 0x38000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  multi_fault:
+                    enabled: true
+                    strategy: pairwise_interesting
+                    fallback_strategy: none
+                """,
+            )
+            profile = load_profile(str(profile_path))
+            self.assertEqual(profile.fault_sweep.multi_fault.fallback_strategy, "none")
 
     def test_invalid_strategy_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -532,6 +601,14 @@ class TestMultiFaultValidation(unittest.TestCase):
                 strategy="pairwise_interesting",
                 interesting_points=[10, 20],
                 max_faults_per_run=1,
+            )
+
+    def test_unknown_fallback_strategy_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            generate_multi_fault_sequences(
+                strategy="pairwise_interesting",
+                interesting_points=[],
+                fallback_strategy="bogus",
             )
 
 
