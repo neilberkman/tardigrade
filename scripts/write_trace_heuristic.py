@@ -43,6 +43,7 @@ def classify_trace(
     tier2_step: int = 3,
     tier3_step: int = 100,
     discontinuity_window: int = 3,
+    bootloader_region: Optional[Tuple[int, int]] = None,
 ) -> List[int]:
     """
     Classify trace entries into priority tiers and return a sorted list of
@@ -64,6 +65,14 @@ def classify_trace(
     """
     if not trace:
         return []
+
+    # Tier 0: bootloader self-update region, if configured.
+    bl_region: Optional[Tuple[int, int]] = None
+    if bootloader_region is not None:
+        bl_region = (bootloader_region[0] - flash_base, bootloader_region[1] - flash_base)
+
+    def in_bootloader_region(offset: int) -> bool:
+        return bl_region is not None and bl_region[0] <= offset < bl_region[1]
 
     # Build trailer regions: last page of each slot.
     trailer_regions: List[Tuple[int, int]] = []
@@ -107,6 +116,7 @@ def classify_trace(
                 discontinuity_indices.add(j)
 
     # Pass 2: classify each write.
+    tier0: Set[int] = set()
     tier1: Set[int] = set()
     tier2: Set[int] = set()
     tier3: Set[int] = set()
@@ -115,7 +125,9 @@ def classify_trace(
         # Fault point is 0-based: write_idx is 1-based from NVMC.
         fault_point = write_idx - 1
 
-        if in_any_region(flash_off, trailer_regions):
+        if in_bootloader_region(flash_off):
+            tier0.add(fault_point)
+        elif in_any_region(flash_off, trailer_regions):
             tier1.add(fault_point)
         elif i in discontinuity_indices:
             tier1.add(fault_point)
@@ -126,6 +138,9 @@ def classify_trace(
 
     # Build final fault point list.
     selected: Set[int] = set()
+
+    # Tier 0: all.
+    selected.update(tier0)
 
     # Tier 1: all.
     selected.update(tier1)
@@ -158,6 +173,7 @@ def summarize_classification(
     slot_ranges: Dict[str, Tuple[int, int]],
     flash_base: int = 0,
     page_size: int = 4096,
+    bootloader_region: Optional[Tuple[int, int]] = None,
 ) -> Dict:
     """Return a summary dict for logging/JSON output."""
     trailer_regions: List[Tuple[int, int]] = []
@@ -172,10 +188,18 @@ def summarize_classification(
         if any(s <= off < e for s, e in trailer_regions)
     )
 
-    return {
+    result = {
         "total_writes": len(trace),
         "trailer_writes": trailer_writes,
         "bulk_writes": len(trace) - trailer_writes,
         "selected_fault_points": len(fault_points),
         "reduction_ratio": round(len(fault_points) / max(len(trace), 1), 3),
     }
+    if bootloader_region is not None:
+        bl_start = bootloader_region[0] - flash_base
+        bl_end = bootloader_region[1] - flash_base
+        bl_writes = sum(1 for _, off in trace if bl_start <= off < bl_end)
+        if bl_writes > 0:
+            result["bootloader_region_writes"] = bl_writes
+            result["bulk_writes"] = max(0, result["bulk_writes"] - bl_writes)
+    return result

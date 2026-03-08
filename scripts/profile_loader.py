@@ -25,7 +25,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fault_inject import MetadataFaultRegion
+from fault_inject import BootloaderRegionConfig, MetadataFaultRegion
 
 try:
     import yaml
@@ -105,6 +105,7 @@ class SuccessCriteria:
         "image_hash_slot",
         "otadata_expect",
         "otadata_expect_scope",
+        "bootloader_integrity",
     )
 
     def __init__(
@@ -119,6 +120,7 @@ class SuccessCriteria:
         image_hash_slot: Optional[str] = None,
         otadata_expect: Optional[Dict[str, List[str]]] = None,
         otadata_expect_scope: str = "always",
+        bootloader_integrity: bool = False,
     ) -> None:
         self.vtor_in_slot = vtor_in_slot
         self.vector_table_offset = max(0, int(vector_table_offset))
@@ -130,6 +132,7 @@ class SuccessCriteria:
         self.image_hash_slot = image_hash_slot
         self.otadata_expect = otadata_expect or {}
         self.otadata_expect_scope = otadata_expect_scope
+        self.bootloader_integrity = bootloader_integrity
 
 
 
@@ -427,6 +430,7 @@ class ProfileConfig:
         flash_backend: Optional[str] = None,
         initial_states: Optional[List["InitialStateConfig"]] = None,
         metadata_fault_regions: Optional[List[MetadataFaultRegion]] = None,
+        bootloader_region: Optional[BootloaderRegionConfig] = None,
     ) -> None:
         self.schema_version = schema_version
         self.name = name
@@ -454,6 +458,7 @@ class ProfileConfig:
         self.flash_backend = flash_backend
         self.initial_states: List[InitialStateConfig] = initial_states or []
         self.metadata_fault_regions: List[MetadataFaultRegion] = metadata_fault_regions or []
+        self.bootloader_region = bootloader_region
 
     def resolve_initial_state(self, state: "InitialStateConfig") -> "ProfileConfig":
         """Return a new ProfileConfig with the given initial state applied."""
@@ -484,6 +489,7 @@ class ProfileConfig:
             invariant_config=self.invariant_config,
             flash_backend=self.flash_backend, initial_states=[],
             metadata_fault_regions=self.metadata_fault_regions,
+            bootloader_region=self.bootloader_region,
         )
         if state.update_trigger is not None and state.pre_boot_state is None:
             resolved.pre_boot_state = resolved.expand_update_trigger()
@@ -874,6 +880,7 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         image_hash_slot=raw.get("image_hash_slot"),
         otadata_expect=_parse_otadata_expect(raw.get("otadata_expect")),
         otadata_expect_scope=otadata_expect_scope,
+        bootloader_integrity=bool(raw.get("bootloader_integrity", False)),
     )
 
 
@@ -1373,6 +1380,19 @@ def _parse_metadata_fault_regions(raw, slots=None):
     return regions
 
 
+def _parse_bootloader_region(raw: Optional[Dict[str, Any]]) -> Optional[BootloaderRegionConfig]:
+    """Parse bootloader_region from profile YAML."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ProfileError("bootloader_region: expected mapping with base and size")
+    base = _parse_int(_require(raw, "base", "bootloader_region"), "bootloader_region.base")
+    size = _parse_int(_require(raw, "size", "bootloader_region"), "bootloader_region.size")
+    if size <= 0:
+        raise ProfileError("bootloader_region.size must be > 0, got 0x{:X}".format(size))
+    return BootloaderRegionConfig(base=base, size=size)
+
+
 # ---------------------------------------------------------------------------
 # Main loader
 # ---------------------------------------------------------------------------
@@ -1466,6 +1486,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
     metadata_fault_regions = _parse_metadata_fault_regions(
         data.get("metadata_fault_regions"), slots=memory.slots
     )
+    bootloader_region = _parse_bootloader_region(data.get("bootloader_region"))
 
     scenario = str(data.get("scenario", "runtime"))
     if scenario not in VALID_SCENARIOS:
@@ -1516,6 +1537,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         flash_backend=flash_backend,
         initial_states=initial_states,
         metadata_fault_regions=metadata_fault_regions,
+        bootloader_region=bootloader_region,
     )
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.

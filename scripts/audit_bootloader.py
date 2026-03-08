@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fault_inject import (
+    BootloaderRegionConfig,
     FaultResult,
     MetadataFaultRegion,
     MultiFaultPlan,
@@ -43,6 +44,7 @@ from fault_inject import (
     encode_multi_fault_sequence,
     generate_multi_fault_sequences,
     multi_fault_plan_summary,
+    validate_bootloader_vector_table,
 )
 from invariants import resolve_invariants, run_invariants
 from profile_loader import ProfileConfig, load_profile
@@ -1473,10 +1475,11 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
 def enrich_results_with_fault_regions(
     results,  # type: List[Dict[str, Any]]
     metadata_regions,  # type: List[MetadataFaultRegion]
+    bootloader_region=None,  # type: Optional[BootloaderRegionConfig]
 ):
     # type: (...) -> None
     """Annotate each result dict with a 'fault_region' classification."""
-    if not metadata_regions:
+    if not metadata_regions and bootloader_region is None:
         return
     for r in results:
         if r.get("is_control", False):
@@ -1486,7 +1489,31 @@ def enrich_results_with_fault_regions(
             addr = int(fault_addr, 16)
         else:
             addr = int(fault_addr)
-        r["fault_region"] = classify_fault_region(addr, metadata_regions)
+        r["fault_region"] = classify_fault_region(
+            addr, metadata_regions, bootloader_region=bootloader_region
+        )
+
+
+def check_bootloader_integrity(
+    flash_bytes: bytes,
+    bootloader_region: BootloaderRegionConfig,
+    sram_start: int = 0x20000000,
+    sram_end: int = 0x30000000,
+):
+    # type: (...) -> Tuple[bool, str]
+    """Validate the bootloader region's vector table."""
+    region_offset = bootloader_region.base
+    region_end = region_offset + bootloader_region.size
+    if region_end > len(flash_bytes):
+        return False, "flash snapshot too small for bootloader region"
+    region_data = flash_bytes[region_offset:region_end]
+    return validate_bootloader_vector_table(
+        region_data,
+        bootloader_region.base,
+        bootloader_region.size,
+        sram_start=sram_start,
+        sram_end=sram_end,
+    )
 
 
 def compute_region_breakdown(
