@@ -2096,9 +2096,9 @@ def _read_fault_backend_support(obj, bit_flips):
     ]
     missing = [name for name in required if not hasattr(obj, name)]
     if missing:
-        return False, 'missing required properties: {}'.format(', '.join(missing))
+        return False, 'backend_missing_read_fault_properties: {}'.format(', '.join(missing))
     if bit_flips > 1 and not hasattr(obj, 'ReadFaultBitFlips'):
-        return False, 'backend does not support configurable bit-flip counts'
+        return False, 'backend_missing_read_fault_bit_count_support'
     return True, ''
 
 

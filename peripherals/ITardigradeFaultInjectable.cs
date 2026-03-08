@@ -47,6 +47,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // Read-fault injection: one-shot transient read corruption.
         // NVM content is unchanged; only the value returned to the CPU
         // on the first matching read is corrupted.
+        //
+        // Important: this only works when CPU reads flow through the
+        // fault-injectable peripheral itself (for example via
+        // IDoubleWordPeripheral/IMemory interception). Fast-path targets that
+        // expose flash through a backing MappedMemory can implement these
+        // properties, but the engine should still skip read faults if the CPU
+        // bypasses the peripheral on reads.
         bool ReadFaultEnabled { get; set; }
         long ReadFaultAddress { get; set; }
         uint ReadFaultSeed { get; set; }
