@@ -48,6 +48,7 @@ ${ERASE_TRACE_FILE_BIN}        ${EMPTY}
 ${FAULT_TYPES}                 write
 ${FAULT_TYPE_CSV}              ${EMPTY}
 ${BOOT_CYCLES}                 1
+${PHASE2_TIME_SLICE}           ${EMPTY}
 ${BOOT_CYCLE_HOOK}            ${EMPTY}
 ${EXPECTED_ROLLBACK_AT_CYCLE}    ${EMPTY}
 ${SUCCESS_IMAGE_HASH}          false
