@@ -128,7 +128,7 @@ Read Fault Is One Shot
     # First read fires the fault
     Execute Command    sysbus ReadDoubleWord 0x10000000
     ${fired}=          Read Normalized Bool    nvm ReadFaultFired
-    Should Be Equal    ${fired}    true
+    Should Be Equal As Strings    ${fired}    true
     # Second read returns correct data
     ${clean}=          Execute Command    sysbus ReadDoubleWord 0x10000000
     Should Be Equal As Numbers    ${clean}    0xAABBCCDD
@@ -159,7 +159,7 @@ Read Fault Disabled By Default
     Should Be Equal As Numbers    ${clean}    0xAABBCCDD
     # Confirm fault did not fire
     ${fired}=          Read Normalized Bool    nvm ReadFaultFired
-    Should Be Equal    ${fired}    false
+    Should Be Equal As Strings    ${fired}    false
 
 Read Fault Only At Armed Address
     Create NVM Machine
@@ -174,7 +174,7 @@ Read Fault Only At Armed Address
     Should Be Equal As Numbers    ${clean}    0xAABBCCDD
     # Fault should not have fired yet
     ${fired}=          Read Normalized Bool    nvm ReadFaultFired
-    Should Be Equal    ${fired}    false
+    Should Be Equal As Strings    ${fired}    false
     # Read at armed offset 0x100 — should be corrupted
     ${corrupted}=      Execute Command    sysbus ReadDoubleWord 0x10000100
     Should Not Be Equal As Numbers    ${corrupted}    0x11223344
