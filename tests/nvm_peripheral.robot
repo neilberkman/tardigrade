@@ -1,3 +1,6 @@
+*** Settings ***
+Library    String
+
 *** Keywords ***
 Create NVM Machine
     Execute Command    include "${CURDIR}/../peripherals/NVMemoryController.cs"
@@ -8,6 +11,14 @@ Create Flash Machine
     Execute Command    include "${CURDIR}/../peripherals/NVMemoryController.cs"
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${CURDIR}/../platforms/cortex_m0_nvm_flash.repl
+
+Read Normalized Bool
+    [Arguments]    ${command}
+    ${raw}=             Execute Command    ${command}
+    ${text}=            Convert To String    ${raw}
+    ${text}=            Strip String    ${text}
+    ${text}=            Convert To Lower Case    ${text}
+    RETURN    ${text}
 
 *** Test Cases ***
 NVM Persists Across Reset
@@ -116,8 +127,8 @@ Read Fault Is One Shot
     Execute Command    nvm ReadFaultEnabled true
     # First read fires the fault
     Execute Command    sysbus ReadDoubleWord 0x10000000
-    ${fired}=          Execute Command    nvm ReadFaultFired
-    Should Be Equal As Strings    ${fired}    True
+    ${fired}=          Read Normalized Bool    nvm ReadFaultFired
+    Should Be Equal    ${fired}    true
     # Second read returns correct data
     ${clean}=          Execute Command    sysbus ReadDoubleWord 0x10000000
     Should Be Equal As Numbers    ${clean}    0xAABBCCDD
@@ -147,8 +158,8 @@ Read Fault Disabled By Default
     ${clean}=          Execute Command    sysbus ReadDoubleWord 0x10000000
     Should Be Equal As Numbers    ${clean}    0xAABBCCDD
     # Confirm fault did not fire
-    ${fired}=          Execute Command    nvm ReadFaultFired
-    Should Be Equal As Strings    ${fired}    False
+    ${fired}=          Read Normalized Bool    nvm ReadFaultFired
+    Should Be Equal    ${fired}    false
 
 Read Fault Only At Armed Address
     Create NVM Machine
@@ -162,8 +173,8 @@ Read Fault Only At Armed Address
     ${clean}=          Execute Command    sysbus ReadDoubleWord 0x10000000
     Should Be Equal As Numbers    ${clean}    0xAABBCCDD
     # Fault should not have fired yet
-    ${fired}=          Execute Command    nvm ReadFaultFired
-    Should Be Equal As Strings    ${fired}    False
+    ${fired}=          Read Normalized Bool    nvm ReadFaultFired
+    Should Be Equal    ${fired}    false
     # Read at armed offset 0x100 — should be corrupted
     ${corrupted}=      Execute Command    sysbus ReadDoubleWord 0x10000100
     Should Not Be Equal As Numbers    ${corrupted}    0x11223344
