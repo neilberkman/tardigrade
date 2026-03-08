@@ -1902,9 +1902,17 @@ def summarize_runtime_sweep(
 
     # Break down skip reasons for discarded (non-injected) results.
     skip_reason_counts: Dict[str, int] = {}
+    phase2_skip_reason_counts: Dict[str, int] = {}
     for r in not_injected:
         reason = r.get("skip_reason", "unknown")
         skip_reason_counts[reason] = skip_reason_counts.get(reason, 0) + 1
+        if r.get("fault_type") == "p2":
+            phase2_fault = r.get("phase2_fault")
+            if isinstance(phase2_fault, dict):
+                phase2_reason = str(phase2_fault.get("skip_reason") or "unknown")
+                phase2_skip_reason_counts[phase2_reason] = (
+                    phase2_skip_reason_counts.get(phase2_reason, 0) + 1
+                )
 
     summary: Dict[str, Any] = {
         "total_fault_points": total,
@@ -1925,6 +1933,8 @@ def summarize_runtime_sweep(
     }
     if skip_reason_counts:
         summary["skip_reasons"] = skip_reason_counts
+    if phase2_skip_reason_counts:
+        summary["phase2_skip_reasons"] = phase2_skip_reason_counts
     if issue_reason_counts:
         summary["issue_reasons"] = issue_reason_counts
 
@@ -2550,6 +2560,17 @@ def main() -> int:
             _progress(
                 "Skipped {} fault points (not injected): {}".format(
                     sweep_summary.get("discarded_no_fault_fired", 0),
+                    ", ".join(parts),
+                )
+            )
+        phase2_skip_reasons = sweep_summary.get("phase2_skip_reasons")
+        if phase2_skip_reasons:
+            parts = [
+                "{} {}".format(count, reason)
+                for reason, count in sorted(phase2_skip_reasons.items())
+            ]
+            _progress(
+                "Phase 2 fault points skipped before injection: {}".format(
                     ", ".join(parts),
                 )
             )
