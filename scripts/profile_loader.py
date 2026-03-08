@@ -735,9 +735,6 @@ class ProfileConfig:
                 "PROGRESS_STALL_TIMEOUT_S:{}".format(fs.progress_stall_timeout_s)
             )
 
-        if fs.metadata_fault.enabled:
-            vars_list.append("METADATA_FAULT_ENABLED:true")
-
         # Metadata fault regions: semicolon-separated list of name,start,end triples.
         if self.metadata_fault_regions:
             encoded = ";".join(

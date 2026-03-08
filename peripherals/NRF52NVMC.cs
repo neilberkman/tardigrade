@@ -111,6 +111,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool ReadFaultEnabled { get; set; }
         public long ReadFaultAddress { get; set; } = -1;
         public uint ReadFaultSeed { get; set; }
+        public int ReadFaultBitFlips { get; set; } = 1;
         public bool ReadFaultFired { get; set; }
         public ulong ReadFaultSkipCount { get; set; }
         public ulong ReadFaultTotalReads { get; set; }
