@@ -918,6 +918,19 @@ def _serialize_value(value: Any) -> Any:
 
 
 def _result_state_payload(result: Dict[str, Any]) -> Any:
+    # Prefer the final boot cycle's semantic state when multi-boot cycles exist.
+    # The top-level semantic_state is captured after Phase 2 boot 0 (before
+    # followup cycles).  For non-power-loss faults (bit corruption, etc.) the
+    # bootloader doesn't restart during Phase 2, so the top-level state shows
+    # unrepaired corruption.  The final cycle state reflects the true end-state
+    # after all recovery boots.
+    boot_cycles = result.get("boot_cycles")
+    if isinstance(boot_cycles, list) and boot_cycles:
+        last_cycle = boot_cycles[-1]
+        if isinstance(last_cycle, dict):
+            cycle_state = last_cycle.get("semantic_state")
+            if isinstance(cycle_state, dict):
+                return cycle_state
     if isinstance(result.get("nvm_state"), dict):
         return result.get("nvm_state")
     if isinstance(result.get("semantic_state"), dict):
