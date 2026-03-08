@@ -457,6 +457,26 @@ class StateFuzzerConfig:
         self.metadata_model = metadata_model
 
 
+class SecurityPolicyConfig:
+    """Security policy declarations for adversarial fault scenarios.
+
+    Models security-relevant properties from the Uptane/SUIT threat model
+    at the flash level: rollback protection and TOCTOU race conditions.
+    """
+
+    __slots__ = ("anti_rollback", "minimum_version", "toctou_protection")
+
+    def __init__(
+        self,
+        anti_rollback: bool = False,
+        minimum_version: Optional[int] = None,
+        toctou_protection: bool = False,
+    ) -> None:
+        self.anti_rollback = anti_rollback
+        self.minimum_version = minimum_version
+        self.toctou_protection = toctou_protection
+
+
 class StateProbeConfig:
     __slots__ = ("script", "format", "contract_version", "required_paths")
 
@@ -585,6 +605,7 @@ class ProfileConfig:
         metadata_fault_regions: Optional[List[MetadataFaultRegion]] = None,
         bootloader_region: Optional[BootloaderRegionConfig] = None,
         multi_component: Optional["MultiComponentConfig"] = None,
+        security_policy: Optional["SecurityPolicyConfig"] = None,
     ) -> None:
         self.schema_version = schema_version
         self.name = name
@@ -610,6 +631,7 @@ class ProfileConfig:
         self.invariant_providers = invariant_providers or []
         self.invariant_config = invariant_config or {}
         self.flash_backend = flash_backend
+        self.security_policy = security_policy or SecurityPolicyConfig()
         self.initial_states: List[InitialStateConfig] = initial_states or []
         self.nvs_region: Optional[NvsRegionConfig] = nvs_region
         self.metadata_fault_regions: List[MetadataFaultRegion] = metadata_fault_regions or []
@@ -670,6 +692,7 @@ class ProfileConfig:
             nvs_region=self.nvs_region,
             metadata_fault_regions=self.metadata_fault_regions,
             bootloader_region=self.bootloader_region,
+            security_policy=self.security_policy,
         )
         if state.update_trigger is not None and state.pre_boot_state is None:
             resolved.pre_boot_state = resolved.expand_update_trigger()
@@ -941,6 +964,17 @@ class ProfileConfig:
                 for r in self.metadata_fault_regions
             )
             vars_list.append("METADATA_FAULT_REGIONS:{}".format(encoded))
+
+        # Security policy: advisory fields for adversarial fault classification.
+        sp = self.security_policy
+        if sp.anti_rollback:
+            vars_list.append("SECURITY_ANTI_ROLLBACK:true")
+        if sp.minimum_version is not None:
+            vars_list.append(
+                "SECURITY_MINIMUM_VERSION:{}".format(sp.minimum_version)
+            )
+        if sp.toctou_protection:
+            vars_list.append("SECURITY_TOCTOU_PROTECTION:true")
 
         return vars_list
 # ---------------------------------------------------------------------------
@@ -1318,6 +1352,30 @@ def _parse_config_checks(raw: Optional[list]) -> List["ConfigCheck"]:
                 range_max = _parse_int(range_raw["max"], "{}.range.max".format(ctx))
         checks.append(ConfigCheck(address=address, expected=expected, nonzero=nonzero, range_min=range_min, range_max=range_max))
     return checks
+
+
+def _parse_security_policy(raw: Optional[Dict[str, Any]]) -> SecurityPolicyConfig:
+    if raw is None:
+        return SecurityPolicyConfig()
+    if not isinstance(raw, dict):
+        raise ProfileError("security_policy: expected mapping")
+    anti_rollback = bool(raw.get("anti_rollback", False))
+    minimum_version_raw = raw.get("minimum_version")
+    minimum_version: Optional[int] = None
+    if minimum_version_raw is not None:
+        minimum_version = int(minimum_version_raw)
+        if minimum_version < 0:
+            raise ProfileError(
+                "security_policy.minimum_version: expected non-negative integer, got {}".format(
+                    minimum_version
+                )
+            )
+    toctou_protection = bool(raw.get("toctou_protection", False))
+    return SecurityPolicyConfig(
+        anti_rollback=anti_rollback,
+        minimum_version=minimum_version,
+        toctou_protection=toctou_protection,
+    )
 
 
 def _parse_state_fuzzer(raw: Optional[Dict[str, Any]]) -> StateFuzzerConfig:
@@ -1807,6 +1865,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
     success_criteria = _parse_success_criteria(data.get("success_criteria"))
     fault_sweep = _parse_fault_sweep(data.get("fault_sweep"))
     state_fuzzer = _parse_state_fuzzer(data.get("state_fuzzer"))
+    security_policy = _parse_security_policy(data.get("security_policy"))
     expect = _parse_expect(data.get("expect"))
     semantic_assertions = _parse_semantic_assertions(data.get("semantic_assertions"))
     invariants = _parse_invariants(data.get("invariants"))
@@ -1872,6 +1931,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         metadata_fault_regions=metadata_fault_regions,
         bootloader_region=bootloader_region,
         multi_component=multi_component,
+        security_policy=security_policy,
     )
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.
@@ -1992,6 +2052,11 @@ def main() -> int:
             else None
         ),
         "partial_staging": profile.fault_sweep.partial_staging is not None,
+        "security_policy": {
+            "anti_rollback": profile.security_policy.anti_rollback,
+            "minimum_version": profile.security_policy.minimum_version,
+            "toctou_protection": profile.security_policy.toctou_protection,
+        },
     }
     print(json.dumps(info, indent=2, sort_keys=True))
     return 0
