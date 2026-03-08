@@ -2415,7 +2415,7 @@ def main() -> int:
         payload["contracts"] = {
             "state_probe": (
                 {
-                    "script": profile.state_probe_script,
+                    "script": profile.state_probe.script,
                     "format": profile.state_probe.format,
                     "contract_version": profile.state_probe.contract_version,
                     "required_paths": profile.state_probe.required_paths,

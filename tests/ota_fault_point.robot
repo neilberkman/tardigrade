@@ -58,7 +58,7 @@ ${IMAGE_STAGING_SHA256}        ${EMPTY}
 ${EXPECTED_EXEC_SHA256}        ${EMPTY}
 ${SUCCESS_OTADATA_EXPECT}      ${EMPTY}
 ${SUCCESS_OTADATA_EXPECT_SCOPE}    always
-${STATE_PROBE_SCRIPT}          ${EMPTY}
+${STATE_PROBE}                 ${EMPTY}
 ${HASH_BYPASS_SYMBOLS}         ${EMPTY}
 ${PROGRESS_STALL_TIMEOUT_S}    5
 ${EXPECT_CONTROL_OUTCOME}      ${EMPTY}
@@ -160,7 +160,7 @@ Run Runtime Fault Point
     Execute Command    $expected_exec_sha256="${EXPECTED_EXEC_SHA256}"
     Execute Command    $success_otadata_expect="${SUCCESS_OTADATA_EXPECT}"
     Execute Command    $success_otadata_expect_scope="${SUCCESS_OTADATA_EXPECT_SCOPE}"
-    Execute Command    $state_probe_script="${STATE_PROBE_SCRIPT}"
+    Execute Command    $state_probe="${STATE_PROBE}"
     Execute Command    $hash_bypass_symbols="${HASH_BYPASS_SYMBOLS}"
     Execute Command    $progress_stall_timeout_s="${PROGRESS_STALL_TIMEOUT_S}"
     Execute Command    $expect_control_outcome="${EXPECT_CONTROL_OUTCOME}"

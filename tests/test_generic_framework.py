@@ -89,7 +89,7 @@ class GenericFrameworkTest(unittest.TestCase):
             )
             profile = load_profile(profile_path)
             self.assertIsNotNone(profile.state_probe)
-            self.assertEqual(profile.state_probe_script, str(probe))
+            self.assertEqual(profile.state_probe.script, str(probe))
             self.assertEqual(profile.state_probe.contract_version, 2)
             self.assertEqual(
                 profile.state_probe.required_paths,
@@ -97,7 +97,7 @@ class GenericFrameworkTest(unittest.TestCase):
             )
             self.assertEqual(profile.invariant_providers, [str(provider)])
             robot_vars = profile.robot_vars(ROOT)
-            self.assertIn("STATE_PROBE_SCRIPT:{}".format(probe), robot_vars)
+            self.assertIn("STATE_PROBE:{}".format(probe), robot_vars)
 
     def test_profile_loader_emits_optional_slot_and_image_vars(self) -> None:
         with tempfile.TemporaryDirectory() as td:

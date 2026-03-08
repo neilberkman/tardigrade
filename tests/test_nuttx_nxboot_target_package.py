@@ -16,11 +16,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from invariants import InvariantViolation  # noqa: E402
 from examples.nxboot_style.gen_nxboot_images import make_nxboot_image  # noqa: E402
-from targets.nuttx_nxboot.invariants import (  # noqa: E402
-    check_nuttx_nxboot_confirmed_has_recovery,
-    check_nuttx_nxboot_duplicate_update_consumed,
-    check_nuttx_nxboot_roles_distinct,
-    check_nuttx_nxboot_unconfirmed_internal_requires_revert,
+from targets.nxboot.invariants import (  # noqa: E402
+    check_nxboot_confirmed_has_recovery,
+    check_nxboot_duplicate_update_consumed,
+    check_nxboot_roles_distinct,
+    check_nxboot_unconfirmed_internal_requires_revert,
 )
 from targets.nuttx_nxboot.probe import (  # noqa: E402
     NXBOOT_HEADER_MAGIC_INT,
@@ -513,7 +513,7 @@ class NuttxNxbootTargetPackageTest(unittest.TestCase):
             }
         )
         with self.assertRaises(InvariantViolation):
-            check_nuttx_nxboot_confirmed_has_recovery(result)
+            check_nxboot_confirmed_has_recovery(result)
 
     def test_invariant_rejects_duplicate_update_loop(self) -> None:
         result = SimpleNamespace(
@@ -532,7 +532,7 @@ class NuttxNxbootTargetPackageTest(unittest.TestCase):
             }
         )
         with self.assertRaises(InvariantViolation):
-            check_nuttx_nxboot_duplicate_update_consumed(result)
+            check_nxboot_duplicate_update_consumed(result)
 
     def test_invariant_rejects_collapsed_roles(self) -> None:
         result = SimpleNamespace(
@@ -544,7 +544,7 @@ class NuttxNxbootTargetPackageTest(unittest.TestCase):
             }
         )
         with self.assertRaises(InvariantViolation):
-            check_nuttx_nxboot_roles_distinct(result)
+            check_nxboot_roles_distinct(result)
 
     def test_invariant_requires_revert_for_unconfirmed_internal_primary(self) -> None:
         result = SimpleNamespace(
@@ -560,7 +560,7 @@ class NuttxNxbootTargetPackageTest(unittest.TestCase):
             }
         )
         with self.assertRaises(InvariantViolation):
-            check_nuttx_nxboot_unconfirmed_internal_requires_revert(result)
+            check_nxboot_unconfirmed_internal_requires_revert(result)
 
 
 if __name__ == "__main__":

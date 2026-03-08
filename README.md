@@ -1,16 +1,39 @@
 # tardigrade
 
-Fault-injection resilience auditing for embedded bootloaders under [Renode](https://renode.io/).
+Fault-injection validation for embedded OTA bootloaders under [Renode](https://renode.io/).
 
-## What it does
+`tardigrade` answers one concrete question: if power dies or storage misbehaves during an update, does the device still reach the boot outcome you intended?
 
-Profile-driven fault injection that exercises NVM write points during a firmware update, injects faults (power loss, bit corruption, interrupted erase), and checks whether the bootloader reaches the expected boot outcome. Designed for Cortex-M firmware under Renode. You bring your ELF and binary images, define success criteria or target-specific state checks in a YAML profile, and tardigrade tells you whether your OTA path survives the exercised faults.
+You give it:
+- a bootloader ELF
+- slot images
+- a memory map
+- a YAML profile describing success, semantic state, and any target-specific invariants
 
-The core engine stays generic: fault injection, replay, semantic-state collection, assertions, invariants, and scenario orchestration live here. Bootloader-specific state probes, invariant providers, formal models, and exploratory generators should live in target-side adapters.
+It gives you:
+- a verdict
+- a per-fault report
+- boot-visible failures such as `no_boot`, `wrong_image`, and `hard_fault`
+- richer semantic/invariant failures when the target exposes them
+
+The engine is generic. Target-specific logic belongs in target adapters under [`targets/`](targets/).
+
+## What is real here
+
+The two public flagship integrations are:
+
+- MCUboot: narrow canary and exploratory validation against real upstream artifacts
+- real NuttX `nxboot`: real public build + exploratory validation + revert canary
+
+The built-in example families still matter, but for a different reason:
+
+- they validate the engine against controlled fault classes
+- they provide intentional broken/fixed examples for self-test
+- they let new generic features be exercised before a real upstream consumer exists
 
 ## Quick start: GitHub Action
 
-The narrow CI/canary path is the reusable GitHub Action:
+The lightweight CI/canary surface is the reusable GitHub Action:
 
 ```yaml
 - id: tardigrade
@@ -21,9 +44,11 @@ The narrow CI/canary path is the reusable GitHub Action:
     workers: 2
 ```
 
-Outputs: `verdict` (PASS/FAIL), `brick-rate`, `report-path`. The primary signal is the verdict; `brick-rate` counts unrecoverable execution failures only and is a narrow subset of the full report. Broader slot/hash/invariant issues live in the JSON report under `issue_points`.
+Outputs: `verdict` (PASS/FAIL), `report-path`, and `brick-rate`.
 
-The action defaults to `quick: true` (3 fault points) for fast smoke checks. For CI gates or canary runs, set `quick: false` to get the heuristic sweep (~1K targeted points).
+Use `verdict` as the main signal. `brick-rate` is intentionally narrow: it counts only unrecoverable execution failures. Broader mismatches such as wrong slot/image or invariant violations live in the JSON report under `issue_points`.
+
+The action defaults to `quick: true`, which is only a smoke path. For any real CI gate or canary signal, set `quick: false` and use the heuristic sweep.
 
 In CI, upload `report-path` as an artifact so failures include the full per-point diagnostics:
 
@@ -51,7 +76,7 @@ python3 scripts/audit_bootloader.py \
   --output results/report.json
 ```
 
-Add `--quick` only for a smoke test (3 fault points, seconds). It can miss narrow windows. For meaningful local validation, keep the default heuristic sweep and add `--workers 4` for parallelism.
+Add `--quick` only for a smoke test. It can miss narrow windows. For meaningful local validation, keep the default heuristic sweep and add `--workers` for parallelism.
 
 If native Renode is unavailable locally, you can run the same audit through Docker:
 
@@ -66,11 +91,11 @@ python3 scripts/audit_bootloader.py \
 
 | Mode       | Flag              | Points | Time    | Use case        |
 | ---------- | ----------------- | ------ | ------- | --------------- |
-| Quick      | `--quick`         | 3      | seconds | smoke test      |
-| Heuristic  | _(default)_       | ~1K    | 2-4 min | CI gate         |
-| Exhaustive | `--fault-start 0` | ~15K   | 15 min  | full validation |
+| Quick      | `--quick`         | 3      | seconds | smoke only      |
+| Heuristic  | _(default)_       | ~1K    | 2-4 min | normal CI / canary |
+| Exhaustive | `--fault-start 0` | ~15K   | 15 min  | deep manual validation |
 
-Heuristic mode uses write-trace analysis to prune the ~15K write points down to ~1K high-value targets (trailer boundaries, slot transitions). This is the default CI tradeoff, not a proof of equivalence to an exhaustive sweep.
+Heuristic mode uses write-trace analysis to prune the ~15K write points down to ~1K high-value targets. It is the normal CI tradeoff, not a proof of equivalence to an exhaustive sweep.
 
 ## Fault injection model
 
@@ -131,18 +156,19 @@ For `no_boot` outcomes in runtime execute mode, the result also includes:
 
 **Evaluation modes:** `state` (fast inference from NVM contents) or `execute` (full CPU recovery boot).
 
-## Included bootloader families
+## Included families
 
-Six architectures, from worst-case patterns to hardened OSS boot flows:
+These fall into two buckets: real integrations and reference examples.
 
-| Family         | Architecture                        | Representative signal                         | Why                                                                                     |
-| -------------- | ----------------------------------- | --------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `naive_copy`   | Copy staging to exec, no fallback   | catastrophic boot-visible failures            | Any mid-copy fault bricks; no recovery path                                             |
-| `vulnerable`   | Copy-in-place with pending flag     | frequent boot-visible failures                | Overwrites only image; mid-copy fault bricks                                            |
-| `nxboot_style` | Three-partition copy, CRC, recovery | standalone modeled family; example only       | Built-in model for exercising adapter/probe/invariant surfaces; not upstream validation |
-| `esp_idf`      | Dual otadata CRC + rollback FSM     | platform/profile dependent                    | Clean-room model of ESP-IDF OTA selection                                               |
-| `mcuboot`      | Swap-move / swap-scratch on nRF52   | profile dependent, good public validation set | Real MCUboot ELFs from upstream CI                                                      |
-| `riotboot`     | Slot selection via header metadata  | profile dependent                             | Standalone RIOTboot model                                                               |
+| Family         | Type               | Why it exists |
+| -------------- | ------------------ | ------------- |
+| `mcuboot`      | real integration   | real upstream artifacts; strongest public validation story today |
+| `nuttx_nxboot` | real integration   | real public build + exploratory validation + revert canary |
+| `naive_copy`   | reference example  | worst-case baseline; proves the engine catches obvious brick paths |
+| `vulnerable`   | reference example  | copy-in-place OTA with frequent boot-visible failures |
+| `nxboot_style` | reference example  | standalone modeled family for adapter/probe/invariant development |
+| `esp_idf`      | reference example  | clean-room model of ESP-IDF OTA slot-selection behavior |
+| `riotboot`     | reference example  | standalone RIOTboot-style slot-selection model |
 
 The repo includes dozens of profiles, including intentional-defect variants for self-testing.
 
@@ -224,12 +250,11 @@ expect:
   required_issue_reasons: ["boot_outcome"]
 ```
 
-Key fields: `platform`, `bootloader`, `memory`, `images`, `success_criteria`, `fault_sweep`, `expect`. See [`scripts/profile_loader.py`](scripts/profile_loader.py) for the full schema.
+Key fields: `platform`, `bootloader`, `memory`, `images`, `success_criteria`, `fault_sweep`, and `expect`. See [`scripts/profile_loader.py`](scripts/profile_loader.py) for the full schema.
 
 ### Discovery-oriented profile hooks
 
 - `state_probe`: profile-supplied semantic-state contract. `script` is the probe implementation; `format` and `contract_version` document the JSON shape; `required_paths` marks fields that must be observed for the probe contract to count as satisfied.
-- `state_probe_script`: deprecated shorthand for `state_probe.script`; still accepted for backward compatibility but no current profiles use it. Prefer the `state_probe` block.
 - `semantic_assertions`: path-based expectations over the runtime result (`semantic_state.*`, `multi_boot_analysis.*`, etc.). A point can fail even when the device still boots.
 - Missing semantic observations are reported separately from assertion failures so incomplete probes do not automatically look like discovered bugs.
 - `invariants`: named postconditions such as `multi_boot_converges` that run against the normalized result payload.
@@ -249,8 +274,8 @@ In practice, the repo exposes two complementary public surfaces:
 Public examples:
 
 - [`scenarios/mcuboot_head_exploratory.yaml`](scenarios/mcuboot_head_exploratory.yaml) attaches a target-side probe and invariant provider to the public `mcuboot_head_upgrade` and `mcuboot_head_revert` profiles, then checks both paths through the generic scenario runner.
-- [`scenarios/nxboot_style_exploratory.yaml`](scenarios/nxboot_style_exploratory.yaml) is a standalone modeled-family exercise for the generic scenario/probe/invariant surfaces. It is useful as a public adapter example, but it should not be read as a validated upstream `nxboot`/NuttX canary yet.
-- [`targets/nuttx_nxboot/`](targets/nuttx_nxboot) is the real upstream NuttX `nxboot` adapter. It builds real NuttX firmware, generates a runtime profile, and is wired to the [`nuttx-nxboot-real-exploratory.yml`](.github/workflows/nuttx-nxboot-real-exploratory.yml) workflow. Still early -- currently dispatch-only with a small fault-point budget.
+- [`scenarios/nxboot_style_exploratory.yaml`](scenarios/nxboot_style_exploratory.yaml) is a modeled-family exercise for the generic scenario/probe/invariant surfaces. It validates engine features; it is not the main public credibility story.
+- [`targets/nuttx_nxboot/`](targets/nuttx_nxboot) is the real upstream NuttX `nxboot` adapter. It builds real NuttX firmware, generates a runtime profile, and drives both exploratory validation and the revert canary workflows.
 
 Replay specs are generic override bundles, suitable for counterexamples from CBMC or any other model checker:
 
@@ -319,6 +344,7 @@ Per-point diagnostics are attached only when relevant:
 | `oss-validation.yml`                | push to `main`, schedule, manual | Runs selected OSS validation guards                                                       |
 | `mcuboot-head-exploratory.yml`      | workflow_dispatch                | Runs the public MCUboot exploratory scenario via `run_scenario.py`                        |
 | `nuttx-nxboot-real-exploratory.yml` | workflow_dispatch                | Builds real upstream NuttX nxboot firmware and runs an exploratory fault sweep            |
+| `nuttx-nxboot-revert-canary.yml`    | schedule, workflow_dispatch      | Real NuttX property canary: unconfirmed update must revert within the expected boot window |
 | `renode-latest-canary.yml`          | schedule, workflow_dispatch      | Tests against latest Renode build                                                         |
 
 ## Repository layout
@@ -351,13 +377,12 @@ tardigrade/
 │   │   ├── invariants.py                         # MCUboot-specific invariant provider
 │   │   └── state_fuzzer.py                       # MCUboot-specific trailer state exploration
 │   ├── nxboot/
-│   │   ├── probe.py                              # nxboot-style semantic probe
-│   │   └── invariants.py                         # nxboot-style invariant provider
+│   │   ├── probe.py                              # shared nxboot-style semantic probe
+│   │   └── invariants.py                         # shared nxboot-style invariant provider
 │   └── nuttx_nxboot/
 │       ├── build_public_target.py                # Builds real NuttX nxboot from upstream source
 │       ├── generate_runtime_profile.py           # Generates runtime profile from build artifacts
-│       ├── probe.py                              # Real NuttX nxboot semantic probe
-│       ├── invariants.py                         # Real NuttX nxboot invariants
+│       ├── probe.py                              # Real NuttX nxboot semantic probe wrapper
 │       └── fixtures/                             # Board configs and linker scripts
 ├── scenarios/
 │   ├── mcuboot_head_exploratory.yaml            # Public MCUboot multi-step scenario
@@ -392,12 +417,12 @@ See the included profiles for examples covering NVMemory, NVMC, and hybrid platf
 
 ## Beyond the primary audit
 
-The main workflow is `audit_bootloader.py --profile`, but the repo includes deeper analysis tools for bootloader authors:
+The main workflow is still `audit_bootloader.py --profile`. The repo also includes a few deeper tools:
 
 - **Geometry matrix** (`scripts/geometry_matrix.py`) -- generates parametric slot-layout permutations (alignment, sector size, slot count) to catch geometry-dependent bugs. This is how PR [#2206](https://github.com/mcu-tools/mcuboot/pull/2206) was validated across layout variants.
 - **State fuzzer** (`targets/mcuboot/state_fuzzer.py`) -- MCUboot-specific trailer-state exploration. Kept outside the core namespace so target logic stays separate from generic discovery plumbing.
 - **CBMC bridge** (`scripts/cbmc_to_profile.py`) -- converts CBMC counterexamples over modeled metadata/state into tardigrade profiles for dynamic replay. Bridges static and dynamic analysis when the counterexample can be projected into a concrete pre-boot state.
-- **OSS validation orchestrator** (`scripts/run_oss_validation.py`) -- internal to the `oss-validation.yml` workflow; not a user-facing CLI.
+- **OSS validation orchestrator** (`scripts/run_oss_validation.py`) -- internal to the `oss-validation.yml` workflow; not the main user-facing entry point.
 
 ## Limitations
 

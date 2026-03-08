@@ -330,7 +330,6 @@ class ProfileConfig:
         scenario: str = "runtime",
         update_trigger: Optional[UpdateTrigger] = None,
         state_probe: Optional[StateProbeConfig] = None,
-        state_probe_script: Optional[str] = None,
         semantic_assertions: Optional[Dict[str, Dict[str, Any]]] = None,
         invariants: Optional[List[str]] = None,
         invariant_providers: Optional[List[str]] = None,
@@ -356,9 +355,6 @@ class ProfileConfig:
         self.scenario = scenario
         self.update_trigger = update_trigger
         self.state_probe = state_probe
-        self.state_probe_script = (
-            state_probe.script if state_probe is not None else state_probe_script
-        )
         self.semantic_assertions = semantic_assertions or {}
         self.invariants = invariants or []
         self.invariant_providers = invariant_providers or []
@@ -389,7 +385,7 @@ class ProfileConfig:
             success_criteria=self.success_criteria, fault_sweep=self.fault_sweep,
             state_fuzzer=self.state_fuzzer, expect=new_expect, profile_path=self.profile_path,
             scenario=self.scenario, update_trigger=new_trigger, state_probe=self.state_probe,
-            state_probe_script=self.state_probe_script, semantic_assertions=self.semantic_assertions,
+            semantic_assertions=self.semantic_assertions,
             invariants=self.invariants, invariant_providers=self.invariant_providers,
             flash_backend=self.flash_backend, initial_states=[],
         )
@@ -607,10 +603,10 @@ class ProfileConfig:
             vars_list.append(
                 "SETUP_SCRIPT:{}".format(self.resolve_path(repo_root, self.setup_script))
             )
-        if self.state_probe_script:
+        if self.state_probe is not None:
             vars_list.append(
-                "STATE_PROBE_SCRIPT:{}".format(
-                    self.resolve_path(repo_root, self.state_probe_script)
+                "STATE_PROBE:{}".format(
+                    self.resolve_path(repo_root, self.state_probe.script)
                 )
             )
 
@@ -848,16 +844,9 @@ def _parse_state_fuzzer(raw: Optional[Dict[str, Any]]) -> StateFuzzerConfig:
     )
 
 
-def _parse_state_probe(
-    raw: Optional[Any],
-    legacy_script: Optional[str],
-) -> Optional[StateProbeConfig]:
+def _parse_state_probe(raw: Optional[Any]) -> Optional[StateProbeConfig]:
     if raw is None:
-        return StateProbeConfig(script=str(legacy_script)) if legacy_script else None
-    if legacy_script:
-        raise ProfileError(
-            "state_probe and state_probe_script are mutually exclusive; use state_probe.script"
-        )
+        return None
     if isinstance(raw, str):
         text = raw.strip()
         return StateProbeConfig(script=text) if text else None
@@ -1115,10 +1104,11 @@ def load_profile(path: str | Path) -> ProfileConfig:
             extra_peripherals = [str(p) for p in extra_peripherals_raw]
         else:
             extra_peripherals = [str(extra_peripherals_raw)]
-    legacy_state_probe_script = data.get("state_probe_script")
-    if legacy_state_probe_script is not None:
-        legacy_state_probe_script = str(legacy_state_probe_script)
-    state_probe = _parse_state_probe(data.get("state_probe"), legacy_state_probe_script)
+    if "state_probe_script" in data:
+        raise ProfileError(
+            "state_probe_script is no longer supported; use state_probe.script"
+        )
+    state_probe = _parse_state_probe(data.get("state_probe"))
 
     success_criteria = _parse_success_criteria(data.get("success_criteria"))
     fault_sweep = _parse_fault_sweep(data.get("fault_sweep"))
@@ -1171,7 +1161,6 @@ def load_profile(path: str | Path) -> ProfileConfig:
         scenario=scenario,
         update_trigger=update_trigger,
         state_probe=state_probe,
-        state_probe_script=legacy_state_probe_script,
         semantic_assertions=semantic_assertions,
         invariants=invariants,
         invariant_providers=invariant_providers,
@@ -1243,7 +1232,7 @@ def main() -> int:
         "otadata_expect_scope": profile.success_criteria.otadata_expect_scope,
         "state_probe": (
             {
-                "script": profile.state_probe_script,
+                "script": profile.state_probe.script,
                 "format": profile.state_probe.format,
                 "contract_version": profile.state_probe.contract_version,
                 "required_paths": profile.state_probe.required_paths,
@@ -1251,7 +1240,6 @@ def main() -> int:
             if profile.state_probe is not None
             else None
         ),
-        "state_probe_script": profile.state_probe_script,
         "semantic_assertions": profile.semantic_assertions,
         "invariants": profile.invariants,
         "invariant_providers": profile.invariant_providers,

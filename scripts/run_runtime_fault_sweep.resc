@@ -80,7 +80,7 @@ $phase2_time_slice?="0.05"
 $boot_cycles?="1"
 $boot_cycle_hook?=""
 $expected_rollback_at_cycle?=""
-$state_probe_script?=""
+$state_probe?=""
 $flash_backend?=""
 $enable_machine_snapshots?="false"
 
@@ -323,7 +323,7 @@ pre_boot_bin = str(monitor.GetVariable('pre_boot_state_bin')).strip()
 
 # Setup script.
 setup_script = str(monitor.GetVariable('setup_script')).strip()
-state_probe_script = str(monitor.GetVariable('state_probe_script')).strip()
+state_probe = str(monitor.GetVariable('state_probe')).strip()
 
 # Fault type support: 'write', 'erase', or 'both'.
 # fault_types controls which operations are tracked during calibration.
@@ -495,19 +495,19 @@ _state_probe_collect = None
 
 def load_state_probe():
     global _state_probe_collect
-    if _state_probe_collect is not None or not state_probe_script:
+    if _state_probe_collect is not None or not state_probe:
         return _state_probe_collect
-    with open(state_probe_script, 'r') as f:
-        code = compile(f.read(), state_probe_script, 'exec')
-    probe_ns = {'__builtins__': __builtins__, '__file__': state_probe_script}
+    with open(state_probe, 'r') as f:
+        code = compile(f.read(), state_probe, 'exec')
+    probe_ns = {'__builtins__': __builtins__, '__file__': state_probe}
     exec(code, probe_ns)
     collect_fn = probe_ns.get('collect_state')
     if not callable(collect_fn):
         raise RuntimeError(
-            'state_probe_script must define callable collect_state(bus, monitor, context)'
+            'state_probe must define callable collect_state(bus, monitor, context)'
         )
     _state_probe_collect = collect_fn
-    log('state_probe: loaded {}'.format(state_probe_script))
+    log('state_probe: loaded {}'.format(state_probe))
     return _state_probe_collect
 
 
@@ -522,7 +522,7 @@ def collect_semantic_state(context):
     if state is None:
         return None
     if not isinstance(state, dict):
-        raise RuntimeError('state_probe_script collect_state must return dict or None')
+        raise RuntimeError('state_probe collect_state must return dict or None')
     return state
 
 

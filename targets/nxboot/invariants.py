@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""nxboot-style invariants for tardigrade replay and audit runs.
-
-This module provides the shared invariant checks for all nxboot-style
-bootloaders.  Platform-specific adapters (e.g. nuttx_nxboot) re-export
-these under target-prefixed names.
-"""
+"""Shared nxboot-style invariants for tardigrade replay and audit runs."""
 
 from invariants import InvariantViolation
 
