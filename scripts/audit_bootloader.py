@@ -36,17 +36,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fault_inject import (
-    BootloaderRegionConfig,
+    FaultDistributionConfig,
     FaultResult,
     MetadataFaultRegion,
     MultiComponentFaultResult,
     MultiFaultPlan,
+    apply_clustered_distribution,
     classify_fault_region,
     classify_multi_component_outcome,
     encode_multi_fault_sequence,
     generate_multi_fault_sequences,
     multi_fault_plan_summary,
-    validate_bootloader_vector_table,
 )
 from invariants import resolve_invariants, run_invariants
 from partial_staging import (
@@ -587,8 +587,13 @@ def run_batch(
     # Determine fault_types mode for the .resc.
     erase_types = {'e', 'a'}
     write_types = {'w', 'b', 's', 'd', 'l', 'r', 't'}
-    has_erase = bool(fault_types_list and any(ft in erase_types for ft in fault_types_list))
-    has_write = bool(fault_types_list and any(ft in write_types for ft in fault_types_list))
+
+    def _ft_base(ft: str) -> str:
+        """Extract base fault type code (first character before any colon)."""
+        return ft.split(":")[0] if ":" in ft else ft
+
+    has_erase = bool(fault_types_list and any(_ft_base(ft) in erase_types for ft in fault_types_list))
+    has_write = bool(fault_types_list and any(_ft_base(ft) in write_types for ft in fault_types_list))
     if has_erase and has_write:
         fault_types_mode = "both"
     elif has_erase:
@@ -1227,7 +1232,7 @@ def _interesting_multi_fault_points(
 def result_is_brick(result: Dict[str, Any]) -> bool:
     eff_outcome, _ = _effective_boot_result(result)
     outcome = str(eff_outcome or "unknown").strip().lower()
-    return outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor", "config_crash"}
+    return outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}
 
 
 def _run_batch_worker(
@@ -1458,52 +1463,6 @@ def run_runtime_sweep(
     return results
 
 
-def evaluate_config_checks(result: Dict[str, Any], profile: "ProfileConfig") -> Optional[str]:
-    """Evaluate config checks against a boot result."""
-    config_checks = getattr(profile.success_criteria, "config_checks", None)
-    if not config_checks:
-        return None
-    eff_outcome, _ = _effective_boot_result(result)
-    outcome = str(eff_outcome or "unknown").strip().lower()
-    nvs_corruption_active = result.get("nvs_corruption_mode") is not None
-    if outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}:
-        if nvs_corruption_active:
-            return "config_crash"
-        return None
-    if outcome != "success":
-        return None
-    config_values = result.get("config_values", {})
-    if not isinstance(config_values, dict):
-        return None
-    for check in config_checks:
-        addr_key = "0x{:X}".format(check.address)
-        if addr_key not in config_values:
-            return "config_lost"
-        actual = config_values[addr_key]
-        if not isinstance(actual, int):
-            try:
-                actual = int(str(actual), 0)
-            except (ValueError, TypeError):
-                return "config_lost"
-        if not check.evaluate(actual):
-            return "config_lost"
-    return None
-
-
-def annotate_nvs_config_results(results: List[Dict[str, Any]], profile: "ProfileConfig") -> None:
-    """Annotate results with NVS config check outcomes."""
-    config_checks = getattr(profile.success_criteria, "config_checks", None)
-    if not config_checks:
-        return
-    for result in results:
-        if result.get("is_control", False):
-            continue
-        classification = evaluate_config_checks(result, profile)
-        if classification is not None:
-            result["nvs_config_outcome"] = classification
-            result["boot_outcome"] = classification
-
-
 def classify_failure_class(result: Dict[str, Any]) -> str:
     """Return normalized failure class for a sweep result.
 
@@ -1519,12 +1478,15 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
     if raw:
         return raw
 
+    # NVS-specific classifications take precedence when present.
+    config_outcome = result.get("config_outcome")
+    if config_outcome == "config_lost":
+        return "config_lost"
+    if config_outcome == "config_crash":
+        return "config_crash"
+
     eff_outcome, _ = _effective_boot_result(result)
     outcome = str(eff_outcome or "unknown").strip().lower()
-    if outcome == "config_lost":
-        return "config_lost"
-    if outcome == "config_crash":
-        return "config_crash"
     if outcome == "success":
         return "recoverable"
     if outcome == "rollback_accepted":
@@ -1551,11 +1513,10 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
 def enrich_results_with_fault_regions(
     results,  # type: List[Dict[str, Any]]
     metadata_regions,  # type: List[MetadataFaultRegion]
-    bootloader_region=None,  # type: Optional[BootloaderRegionConfig]
 ):
     # type: (...) -> None
     """Annotate each result dict with a 'fault_region' classification."""
-    if not metadata_regions and bootloader_region is None:
+    if not metadata_regions:
         return
     for r in results:
         if r.get("is_control", False):
@@ -1565,9 +1526,8 @@ def enrich_results_with_fault_regions(
             addr = int(fault_addr, 16)
         else:
             addr = int(fault_addr)
-        r["fault_region"] = classify_fault_region(
-            addr, metadata_regions, bootloader_region=bootloader_region
-        )
+        r["fault_region"] = classify_fault_region(addr, metadata_regions)
+
 
 def compute_region_breakdown(
     results,  # type: List[Dict[str, Any]]
@@ -1595,26 +1555,6 @@ def compute_region_breakdown(
         else:
             bucket["recoveries"] += 1
     return breakdown
-def check_bootloader_integrity(
-    flash_bytes: bytes,
-    bootloader_region: BootloaderRegionConfig,
-    sram_start: int = 0x20000000,
-    sram_end: int = 0x30000000,
-):
-    # type: (...) -> Tuple[bool, str]
-    """Validate the bootloader region's vector table."""
-    region_offset = bootloader_region.base
-    region_end = region_offset + bootloader_region.size
-    if region_end > len(flash_bytes):
-        return False, "flash snapshot too small for bootloader region"
-    region_data = flash_bytes[region_offset:region_end]
-    return validate_bootloader_vector_table(
-        region_data,
-        bootloader_region.base,
-        bootloader_region.size,
-        sram_start=sram_start,
-        sram_end=sram_end,
-    )
 
 
 def load_clean_write_trace(trace_file: Optional[str]) -> List[Dict[str, int]]:
@@ -1931,6 +1871,8 @@ def _fault_type_label(code: Any) -> str:
         "a": "multi_sector_atomicity",
         "f": "read_bit_flip",
     }
+    if code.startswith("b:"):
+        return "bit_corruption_clustered"
     if code.startswith("m:"):
         return "metadata_{}".format(_fault_type_label(code.split(":", 1)[1]))
     if code.startswith("p2:"):
@@ -2684,17 +2626,24 @@ def main() -> int:
             # In our platform, nvm starts at the exec slot base.
             flash_base = min(s.base for s in profile.memory.slots.values())
 
+            bl_region_for_heuristic = None
+            if profile.memory.bootloader_region is not None:
+                bl = profile.memory.bootloader_region
+                bl_region_for_heuristic = (bl.base, bl.base + bl.size)
+
             fault_points = classify_trace(
                 trace=trace,
                 slot_ranges=slot_ranges_for_heuristic,
                 flash_base=flash_base,
                 page_size=getattr(profile.memory, "page_size", 4096),
+                bootloader_region=bl_region_for_heuristic,
             )
             heuristic_summary = summarize_classification(
                 trace=trace,
                 fault_points=fault_points,
                 slot_ranges=slot_ranges_for_heuristic,
                 flash_base=flash_base,
+                bootloader_region=bl_region_for_heuristic,
             )
             print(
                 "Heuristic: {} fault points from {} writes (reduction {:.1f}x). "
@@ -2739,6 +2688,7 @@ def main() -> int:
             or profile.fault_sweep.multi_fault.enabled
             or include_metadata_fault
         )
+        clustered_bit_count = 0
         if has_mixed_types:
             write_fps: List[Tuple[int, str]] = []
             if include_power_loss:
@@ -2762,13 +2712,43 @@ def main() -> int:
                     atomicity_count = len(erase_fps)
 
             # Add bit-corruption fault points (same write indices, different mode).
+            # If a clustered fault_distribution is configured, apply spatial
+            # probability weighting to bias corruption toward specific sectors.
             bit_count = 0
+            clustered_bit_count = 0
             if include_bit_corruption:
                 bit_fps = list(fault_points)  # same write indices
                 if args.quick:
                     bit_fps = quick_subset(bit_fps)
-                combined += [(bp, 'b') for bp in bit_fps]
-                bit_count = len(bit_fps)
+
+                dist = profile.fault_sweep.fault_distribution
+                if dist is not None and dist.mode == "clustered":
+                    # Resolve the slot base for address mapping.
+                    slot_base = 0
+                    wg = profile.memory.write_granularity
+                    if profile.memory.slots:
+                        staging = profile.memory.slots.get(
+                            "staging",
+                            next(iter(profile.memory.slots.values())),
+                        )
+                        slot_base = staging.base
+
+                    filtered = apply_clustered_distribution(
+                        fault_points=bit_fps,
+                        distribution=dist,
+                        write_granularity=wg,
+                        slot_base=slot_base,
+                    )
+                    # Each entry is (fault_point, corruption_seed).
+                    # Encode the seed into the fault type code so the
+                    # .resc dispatch can set CorruptionSeed per point.
+                    for fp, cseed in filtered:
+                        combined.append((fp, "b:{}".format(cseed)))
+                    clustered_bit_count = len(filtered)
+                    bit_count = clustered_bit_count
+                else:
+                    combined += [(bp, 'b') for bp in bit_fps]
+                    bit_count = len(bit_fps)
 
             silent_count = 0
             if include_silent_write_failure:
@@ -2843,8 +2823,8 @@ def main() -> int:
             # points, also sweep faults during the recovery boot.
             p2_config = profile.fault_sweep.phase2_fault
             phase2_count = 0
-            if p2_config.enabled and write_fps:
-                p2_max = p2_config.max_points if p2_config.max_points > 0 else min(50, max_writes)
+            if p2_config.enabled and (write_fps or include_reset_at_time):
+                p2_max = p2_config.max_points if p2_config.max_points > 0 else min(50, max(max_writes, 1))
                 # Map profile fault type names to single-char codes.
                 p2_type_map = {
                     "power_loss": "w",
@@ -2856,21 +2836,44 @@ def main() -> int:
                     "write_rejection": "r",
                     "multi_sector_atomicity": "a",
                     "read_bit_flip": "f",
+                    "reset_at_time": "t",
                 }
                 p2_type_codes = [
                     p2_type_map.get(ft, "w") for ft in p2_config.fault_types
                 ]
                 if not p2_type_codes:
                     p2_type_codes = ["w"]
-                # Select representative Phase 1 points: quick subset of write fps.
-                p1_representatives = quick_subset([fp for fp, _ in write_fps])
-                p2_range = list(range(0, p2_max))
-                if args.quick:
-                    p2_range = quick_subset(p2_range)
-                for p1_fp in p1_representatives:
-                    for p2_fp in p2_range:
-                        for p2_code in p2_type_codes:
-                            enc = "p2:{}:{}:w:{}".format(p1_fp, p2_fp, p2_code)
+
+                # Separate timed-reset Phase 2 codes from write/erase codes.
+                p2_timed_codes = [c for c in p2_type_codes if c == "t"]
+                p2_write_codes = [c for c in p2_type_codes if c != "t"]
+
+                # Write/erase Phase 2: Phase 1 is always a write-fault.
+                if p2_write_codes and write_fps:
+                    p1_representatives = quick_subset([fp for fp, _ in write_fps])
+                    p2_range = list(range(0, p2_max))
+                    if args.quick:
+                        p2_range = quick_subset(p2_range)
+                    for p1_fp in p1_representatives:
+                        for p2_fp in p2_range:
+                            for p2_code in p2_write_codes:
+                                enc = "p2:{}:{}:w:{}".format(p1_fp, p2_fp, p2_code)
+                                combined.append((p1_fp, enc))
+                                phase2_count += 1
+
+                # Timed-reset Phase 2 (double-fault scenario):
+                # Phase 1 uses a timed reset, Phase 2 also uses a timed reset
+                # during recovery boot.  This tests whether a reset during
+                # recovery from a prior timed reset can brick the device.
+                if p2_timed_codes:
+                    timed_p1_fps = list(fault_points) if fault_points else [0]
+                    timed_p1_reps = quick_subset(timed_p1_fps)
+                    timed_p2_range = list(range(0, p2_max))
+                    if args.quick:
+                        timed_p2_range = quick_subset(timed_p2_range)
+                    for p1_fp in timed_p1_reps:
+                        for p2_fp in timed_p2_range:
+                            enc = "p2:{}:{}:t:t".format(p1_fp, p2_fp)
                             combined.append((p1_fp, enc))
                             phase2_count += 1
 
@@ -2882,7 +2885,10 @@ def main() -> int:
             if atomicity_count:
                 parts.append("{} multi-sector".format(atomicity_count))
             if bit_count:
-                parts.append("{} bit-corrupt".format(bit_count))
+                bit_label = "{} bit-corrupt".format(bit_count)
+                if clustered_bit_count:
+                    bit_label += " (clustered)"
+                parts.append(bit_label)
             if silent_count:
                 parts.append("{} silent-write".format(silent_count))
             if disturb_count:
@@ -3394,6 +3400,17 @@ def main() -> int:
             },
             "git": git_metadata(repo_root),
         }
+        dist = profile.fault_sweep.fault_distribution
+        if dist is not None and dist.mode != "uniform":
+            payload["fault_distribution"] = {
+                "mode": dist.mode,
+                "cluster_start": "0x{:X}".format(dist.cluster_start),
+                "cluster_end": "0x{:X}".format(dist.cluster_end),
+                "flip_probability_in_cluster": dist.flip_probability_in_cluster,
+                "flip_probability_outside": dist.flip_probability_outside,
+                "seed": dist.seed,
+                "clustered_bit_corruption_points": clustered_bit_count if has_mixed_types else 0,
+            }
         payload["contracts"] = {
             "state_probe": (
                 {

@@ -5,143 +5,10 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import math
 import random
-import struct as _struct
+import struct
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-
-
-@dataclasses.dataclass
-class BootloaderRegionConfig:
-    """Address range of the bootloader's own code region."""
-
-    base: int
-    size: int
-
-    @property
-    def end(self) -> int:
-        return self.base + self.size
-
-    def contains(self, address: int) -> bool:
-        return self.base <= address < self.end
-
-
-def validate_bootloader_vector_table(
-    memory_bytes: bytes,
-    region_base: int,
-    region_size: int,
-    sram_start: int = 0x20000000,
-    sram_end: int = 0x30000000,
-) -> tuple:
-    """Validate the ARM vector table at the start of a bootloader region.
-
-    Checks:
-      1. Initial SP (first word) is in the SRAM range.
-      2. Reset vector (second word) points into the bootloader region.
-
-    Returns:
-        (True, "ok") if valid, or (False, reason_string) if invalid.
-    """
-    if len(memory_bytes) < 8:
-        return False, "region too small ({} bytes, need >= 8)".format(len(memory_bytes))
-    sp = _struct.unpack_from("<I", memory_bytes, 0)[0]
-    reset_vector = _struct.unpack_from("<I", memory_bytes, 4)[0]
-    region_end = region_base + region_size
-    if not (sram_start <= sp < sram_end):
-        return False, "initial SP 0x{:08X} not in SRAM range 0x{:08X}-0x{:08X}".format(
-            sp, sram_start, sram_end
-        )
-    if not (region_base <= reset_vector < region_end):
-        return False, "reset vector 0x{:08X} not in bootloader region 0x{:08X}-0x{:08X}".format(
-            reset_vector, region_base, region_end
-        )
-    return True, "ok"
-
-
-NVS_CORRUPTION_MODES = {"bit_flip", "partial_erase", "truncate", "scramble"}
-
-
-@dataclasses.dataclass
-class NvsCorruptionSpec:
-    """Specification for NVS/config region corruption fault injection."""
-
-    region_start: int
-    region_end: int
-    corruption_mode: str  # one of NVS_CORRUPTION_MODES
-    seed: int = 0
-
-    def __post_init__(self) -> None:
-        if self.region_end <= self.region_start:
-            raise ValueError(
-                "region_end (0x{:X}) must be greater than region_start (0x{:X})".format(
-                    self.region_end, self.region_start
-                )
-            )
-        if self.corruption_mode not in NVS_CORRUPTION_MODES:
-            raise ValueError(
-                "corruption_mode must be one of {}, got {!r}".format(
-                    sorted(NVS_CORRUPTION_MODES), self.corruption_mode
-                )
-            )
-
-    @property
-    def region_size(self) -> int:
-        return self.region_end - self.region_start
-
-
-def generate_nvs_corruption_variants(
-    region_data: bytes,
-    region_size: int,
-    modes: Optional[List[str]] = None,
-    seed: int = 0,
-) -> List[Tuple[str, bytes]]:
-    """Generate corrupted NVS region variants for each requested mode.
-
-    Args:
-        region_data: Original NVS region contents (padded to region_size with 0xFF).
-        region_size: Total size of the NVS region in bytes.
-        modes: List of corruption modes to generate. Defaults to all modes.
-        seed: RNG seed for deterministic corruption.
-
-    Returns:
-        List of (mode_name, corrupted_bytes) tuples.
-    """
-    if modes is None:
-        modes = sorted(NVS_CORRUPTION_MODES)
-    for mode in modes:
-        if mode not in NVS_CORRUPTION_MODES:
-            raise ValueError(
-                "unknown NVS corruption mode {!r}, expected one of {}".format(
-                    mode, sorted(NVS_CORRUPTION_MODES)
-                )
-            )
-
-    data = bytearray(region_data[:region_size])
-    if len(data) < region_size:
-        data.extend(b"\xFF" * (region_size - len(data)))
-
-    variants: List[Tuple[str, bytes]] = []
-    rng = random.Random(seed)
-
-    for mode in modes:
-        corrupted = bytearray(data)
-        if mode == "bit_flip":
-            num_flips = max(1, min(8, region_size // 256))
-            for _ in range(num_flips):
-                byte_idx = rng.randint(0, len(corrupted) - 1)
-                bit_idx = rng.randint(0, 7)
-                corrupted[byte_idx] ^= 1 << bit_idx
-        elif mode == "partial_erase":
-            half = len(corrupted) // 2
-            corrupted[half:] = b"\xFF" * (len(corrupted) - half)
-        elif mode == "truncate":
-            if len(corrupted) > 16:
-                corrupted[16:] = b"\x00" * (len(corrupted) - 16)
-        elif mode == "scramble":
-            for i in range(len(corrupted)):
-                corrupted[i] = rng.randint(0, 255)
-        variants.append((mode, bytes(corrupted)))
-
-    return variants
 
 
 @dataclasses.dataclass
@@ -190,67 +57,6 @@ class ReadFaultResult:
 
 
 @dataclasses.dataclass
-class BootloaderRegionConfig:
-    """Address range of the bootloader's own code region."""
-
-    base: int
-    size: int
-
-    @property
-    def end(self) -> int:
-        return self.base + self.size
-
-    def contains(self, address: int) -> bool:
-        return self.base <= address < self.end
-
-
-def validate_bootloader_vector_table(
-    memory_bytes: bytes,
-    region_base: int,
-    region_size: int,
-    sram_start: int = 0x20000000,
-    sram_end: int = 0x30000000,
-) -> Tuple[bool, str]:
-    """Check that the bootloader region contains a valid ARM vector table.
-
-    Validates:
-      - Initial stack pointer (first 4 bytes) points into SRAM range.
-      - Reset vector (bytes 4-7) points into the bootloader region.
-
-    Args:
-        memory_bytes: Raw bytes of the bootloader region (must be >= 8 bytes).
-        region_base: Bus address of the start of the bootloader region.
-        region_size: Size of the bootloader region in bytes.
-        sram_start: Start of valid SRAM range (inclusive).
-        sram_end: End of valid SRAM range (exclusive).
-
-    Returns:
-        (valid, reason) tuple.  valid is True if the vector table looks good.
-    """
-    import struct as _struct
-
-    if len(memory_bytes) < 8:
-        return False, "region too small ({} bytes, need >= 8)".format(len(memory_bytes))
-
-    sp = _struct.unpack_from("<I", memory_bytes, 0)[0]
-    reset_vector = _struct.unpack_from("<I", memory_bytes, 4)[0]
-
-    region_end = region_base + region_size
-
-    if not (sram_start <= sp < sram_end):
-        return False, "initial SP 0x{:08X} not in SRAM range 0x{:08X}-0x{:08X}".format(
-            sp, sram_start, sram_end
-        )
-
-    if not (region_base <= reset_vector < region_end):
-        return False, "reset vector 0x{:08X} not in bootloader region 0x{:08X}-0x{:08X}".format(
-            reset_vector, region_base, region_end
-        )
-
-    return True, "ok"
-
-
-@dataclasses.dataclass
 class MetadataFaultRegion:
     """A named address range for metadata fault classification."""
 
@@ -265,22 +71,16 @@ class MetadataFaultRegion:
 def classify_fault_region(
     fault_address: int,
     metadata_regions: List[MetadataFaultRegion],
-    bootloader_region: Optional[BootloaderRegionConfig] = None,
 ) -> Optional[str]:
-    """Classify a fault address into a region category.
+    """Classify a fault address as metadata or data.
 
     Returns:
-        "bootloader_region" if bootloader_region is defined and the address
-            falls within it (highest priority).
-        "metadata:<name>" if the address falls within a metadata region.
-        "data" if metadata_regions or bootloader_region are defined but the
-            address doesn't match any named region.
-        None if no metadata_regions and no bootloader_region are defined.
+        "metadata:<name>" if the address falls within a metadata region,
+        "data" if metadata_regions are defined but the address doesn't match any,
+        None if no metadata_regions are defined.
     """
-    if not metadata_regions and bootloader_region is None:
+    if not metadata_regions:
         return None
-    if bootloader_region is not None and bootloader_region.contains(fault_address):
-        return "bootloader_region"
     for region in metadata_regions:
         if region.contains(fault_address):
             return "metadata:{}".format(region.name)
@@ -330,6 +130,105 @@ class MultiComponentFaultResult:
     combined_outcome: str  # "success", "split_brain", "all_failed", etc.
     is_control: bool = False
     fault_type: Optional[str] = None
+class FaultDistributionConfig:
+    """Configuration for spatially-correlated fault distribution.
+
+    Models sector-local degradation where faults cluster in a specific
+    address range rather than being uniformly distributed across all
+    write points.
+    """
+
+    mode: str = "uniform"  # "uniform" or "clustered"
+    cluster_start: int = 0
+    cluster_end: int = 0
+    flip_probability_in_cluster: float = 0.1
+    flip_probability_outside: float = 0.001
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("uniform", "clustered"):
+            raise ValueError(
+                "fault_distribution.mode must be 'uniform' or 'clustered', got {!r}".format(
+                    self.mode
+                )
+            )
+        if self.mode == "clustered":
+            if self.cluster_end <= self.cluster_start:
+                raise ValueError(
+                    "cluster_end (0x{:X}) must be > cluster_start (0x{:X})".format(
+                        self.cluster_end, self.cluster_start
+                    )
+                )
+            if not (0.0 <= self.flip_probability_in_cluster <= 1.0):
+                raise ValueError(
+                    "flip_probability_in_cluster must be in [0.0, 1.0], got {}".format(
+                        self.flip_probability_in_cluster
+                    )
+                )
+            if not (0.0 <= self.flip_probability_outside <= 1.0):
+                raise ValueError(
+                    "flip_probability_outside must be in [0.0, 1.0], got {}".format(
+                        self.flip_probability_outside
+                    )
+                )
+
+
+def apply_clustered_distribution(
+    fault_points: List[int],
+    distribution: FaultDistributionConfig,
+    write_addresses: Optional[List[int]] = None,
+    total_writes: int = 0,
+    write_granularity: int = 8,
+    slot_base: int = 0,
+) -> List[Tuple[int, int]]:
+    """Filter and annotate fault points using a clustered degradation model.
+
+    For each fault point, determines the NVM address it targets and applies
+    sector-local probability weighting.  Points inside the cluster sector
+    range have a higher probability of being included; points outside have
+    a lower probability.
+
+    Args:
+        fault_points: Write-index fault points to filter.
+        distribution: Clustered distribution parameters.
+        write_addresses: Optional pre-computed address for each write index.
+            If provided, must be same length as total_writes.
+        total_writes: Total writes in the OTA operation.
+        write_granularity: Bytes per write word.
+        slot_base: Base bus address of the target slot.
+
+    Returns:
+        List of (fault_point, corruption_seed) tuples for points that pass
+        the probability filter.  corruption_seed is a deterministic value
+        derived from the fault point and distribution seed.
+    """
+    if distribution.mode == "uniform":
+        return [(fp, distribution.seed) for fp in fault_points]
+
+    rng = random.Random(distribution.seed)
+    result: List[Tuple[int, int]] = []
+
+    for fp in fault_points:
+        # Determine the bus address for this write index.
+        if write_addresses is not None and 0 <= fp < len(write_addresses):
+            addr = write_addresses[fp]
+        else:
+            addr = slot_base + fp * write_granularity
+
+        in_cluster = distribution.cluster_start <= addr < distribution.cluster_end
+        prob = (
+            distribution.flip_probability_in_cluster
+            if in_cluster
+            else distribution.flip_probability_outside
+        )
+
+        if rng.random() < prob:
+            # Deterministic seed per point: combine distribution seed with
+            # fault point for reproducible per-write corruption patterns.
+            point_seed = (distribution.seed * 2654435761 + fp) & 0xFFFFFFFF
+            result.append((fp, point_seed))
+
+    return result
 
 
 @dataclasses.dataclass
@@ -764,3 +663,250 @@ def multi_fault_plan_summary(plan: Optional[MultiFaultPlan]) -> Optional[Dict[st
         "sample_truncated": len(plan.sequences) > preview_limit,
         "diagnostics": plan.diagnostics,
     }
+
+# ---------------------------------------------------------------------------
+# NVS / config region corruption engine
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class NvsRegion:
+    """Definition of a non-volatile storage region on flash."""
+
+    address: int
+    size: int
+    snapshot: Optional[str] = None  # path to binary snapshot file
+
+    def __post_init__(self) -> None:
+        if self.size <= 0:
+            raise ValueError(
+                "nvs_region size must be > 0, got {}".format(self.size)
+            )
+        if self.address < 0:
+            raise ValueError(
+                "nvs_region address must be >= 0, got 0x{:X}".format(self.address)
+            )
+
+    @property
+    def end(self) -> int:
+        return self.address + self.size
+
+
+@dataclasses.dataclass
+class ConfigCheck:
+    """A single config validation check against post-boot NVS state."""
+
+    address: int
+    expected: Optional[int] = None  # exact byte value
+    nonzero: bool = False  # check that value != 0
+    mask: Optional[int] = None  # bitmask for partial checks
+    expected_masked: Optional[int] = None  # expected value after masking
+
+    def evaluate(self, actual_byte: int) -> bool:
+        """Return True if the check passes for the given byte value."""
+        if self.expected is not None:
+            if actual_byte != (self.expected & 0xFF):
+                return False
+        if self.nonzero and actual_byte == 0:
+            return False
+        if self.mask is not None and self.expected_masked is not None:
+            if (actual_byte & self.mask) != (self.expected_masked & self.mask):
+                return False
+        return True
+
+
+@dataclasses.dataclass
+class NvsCorruptionSpec:
+    """Specification for a single NVS corruption fault injection."""
+
+    mode: str  # "bit_flip", "partial_erase", "truncation"
+    region: NvsRegion
+    seed: int = 0
+    bit_flip_count: int = 1  # for bit_flip mode
+    erase_fraction: float = 0.5  # for partial_erase mode (fraction of region)
+    truncate_offset: Optional[int] = None  # for truncation mode
+
+    def __post_init__(self) -> None:
+        valid_modes = {"bit_flip", "partial_erase", "truncation"}
+        if self.mode not in valid_modes:
+            raise ValueError(
+                "nvs_corruption mode must be one of {}, got {!r}".format(
+                    sorted(valid_modes), self.mode
+                )
+            )
+        if self.mode == "bit_flip" and self.bit_flip_count < 1:
+            raise ValueError(
+                "bit_flip_count must be >= 1, got {}".format(self.bit_flip_count)
+            )
+        if self.mode == "partial_erase":
+            if not (0.0 < self.erase_fraction <= 1.0):
+                raise ValueError(
+                    "erase_fraction must be in (0.0, 1.0], got {}".format(
+                        self.erase_fraction
+                    )
+                )
+
+
+@dataclasses.dataclass
+class NvsCorruptionResult:
+    """Result from an NVS corruption fault injection run."""
+
+    corruption_index: int  # which corruption variant was applied
+    mode: str
+    boot_outcome: str
+    config_check_results: Dict[str, bool]  # address -> pass/fail
+    config_outcome: str  # "config_ok", "config_lost", "config_crash"
+    raw_log: str
+    corruption_details: Dict[str, Any]
+
+
+def apply_nvs_corruption(
+    nvs_data: bytearray,
+    spec: NvsCorruptionSpec,
+) -> Tuple[bytearray, Dict[str, Any]]:
+    """Apply corruption to a copy of NVS data according to the spec.
+
+    Returns:
+        Tuple of (corrupted_data, details_dict).
+    """
+    corrupted = bytearray(nvs_data)
+    details: Dict[str, Any] = {"mode": spec.mode, "seed": spec.seed}
+    rng = random.Random(spec.seed)
+
+    if spec.mode == "bit_flip":
+        if len(corrupted) == 0:
+            details["bit_positions"] = []
+            return corrupted, details
+        bit_positions: List[int] = []
+        total_bits = len(corrupted) * 8
+        for _ in range(spec.bit_flip_count):
+            bit_pos = rng.randint(0, total_bits - 1)
+            byte_idx = bit_pos // 8
+            bit_idx = bit_pos % 8
+            corrupted[byte_idx] ^= (1 << bit_idx)
+            bit_positions.append(bit_pos)
+        details["bit_positions"] = bit_positions
+        details["bit_flip_count"] = spec.bit_flip_count
+
+    elif spec.mode == "partial_erase":
+        # Simulate partial erase: fill a contiguous fraction of the region
+        # with 0xFF (erased flash state), starting from a random offset.
+        erase_len = max(1, int(len(corrupted) * spec.erase_fraction))
+        max_start = max(0, len(corrupted) - erase_len)
+        erase_start = rng.randint(0, max_start) if max_start > 0 else 0
+        for i in range(erase_start, min(erase_start + erase_len, len(corrupted))):
+            corrupted[i] = 0xFF
+        details["erase_start"] = erase_start
+        details["erase_length"] = erase_len
+        details["erase_fraction"] = spec.erase_fraction
+
+    elif spec.mode == "truncation":
+        # Simulate truncated NVS: zero-fill everything after the truncation
+        # offset (as if a write was interrupted mid-migration).
+        trunc_offset = spec.truncate_offset
+        if trunc_offset is None:
+            trunc_offset = rng.randint(0, max(0, len(corrupted) - 1))
+        trunc_offset = max(0, min(trunc_offset, len(corrupted)))
+        for i in range(trunc_offset, len(corrupted)):
+            corrupted[i] = 0x00
+        details["truncate_offset"] = trunc_offset
+        details["truncated_bytes"] = len(corrupted) - trunc_offset
+
+    return corrupted, details
+
+
+def classify_nvs_outcome(
+    boot_outcome: str,
+    config_checks: List[ConfigCheck],
+    post_boot_nvs: bytearray,
+    nvs_base_address: int,
+) -> Tuple[str, Dict[str, bool]]:
+    """Classify the config outcome after NVS corruption.
+
+    Returns:
+        Tuple of (config_outcome, per_check_results).
+        config_outcome is one of: "config_ok", "config_lost", "config_crash".
+    """
+    # If the device didn't boot at all, it's a config_crash.
+    if boot_outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}:
+        return "config_crash", {}
+
+    if not config_checks:
+        # No checks defined -- if it booted, config is presumed OK.
+        return "config_ok", {}
+
+    check_results: Dict[str, bool] = {}
+    any_failed = False
+    for check in config_checks:
+        offset = check.address - nvs_base_address
+        key = "0x{:X}".format(check.address)
+        if offset < 0 or offset >= len(post_boot_nvs):
+            check_results[key] = False
+            any_failed = True
+            continue
+        actual = post_boot_nvs[offset]
+        passed = check.evaluate(actual)
+        check_results[key] = passed
+        if not passed:
+            any_failed = True
+
+    if any_failed:
+        return "config_lost", check_results
+    return "config_ok", check_results
+
+
+def generate_nvs_corruption_variants(
+    region: NvsRegion,
+    modes: Optional[List[str]] = None,
+    bit_flip_counts: Optional[List[int]] = None,
+    erase_fractions: Optional[List[float]] = None,
+    truncate_offsets: Optional[List[Optional[int]]] = None,
+    seed: int = 0,
+) -> List[NvsCorruptionSpec]:
+    """Generate a matrix of NVS corruption variants for sweep.
+
+    Returns a list of NvsCorruptionSpec instances covering the requested
+    corruption modes with varying parameters.
+    """
+    if modes is None:
+        modes = ["bit_flip", "partial_erase", "truncation"]
+    if bit_flip_counts is None:
+        bit_flip_counts = [1, 4, 16]
+    if erase_fractions is None:
+        erase_fractions = [0.25, 0.5, 1.0]
+    if truncate_offsets is None:
+        truncate_offsets = [None]  # random
+
+    specs: List[NvsCorruptionSpec] = []
+    variant_seed = seed
+
+    for mode in modes:
+        if mode == "bit_flip":
+            for count in bit_flip_counts:
+                specs.append(NvsCorruptionSpec(
+                    mode="bit_flip",
+                    region=region,
+                    seed=variant_seed,
+                    bit_flip_count=count,
+                ))
+                variant_seed += 1
+        elif mode == "partial_erase":
+            for frac in erase_fractions:
+                specs.append(NvsCorruptionSpec(
+                    mode="partial_erase",
+                    region=region,
+                    seed=variant_seed,
+                    erase_fraction=frac,
+                ))
+                variant_seed += 1
+        elif mode == "truncation":
+            for offset in truncate_offsets:
+                specs.append(NvsCorruptionSpec(
+                    mode="truncation",
+                    region=region,
+                    seed=variant_seed,
+                    truncate_offset=offset,
+                ))
+                variant_seed += 1
+
+    return specs
