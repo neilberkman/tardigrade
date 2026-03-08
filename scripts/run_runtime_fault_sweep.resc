@@ -2833,6 +2833,179 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         p1_fault_at, p2_fault_at, boot_outcome, fault_class, elapsed))
     return result
 
+
+def run_multi_fault_sequence(fault_sequence):
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    seq = [int(x) for x in fault_sequence]
+    if len(seq) < 2:
+        raise ValueError('multi-fault sequence needs >= 2 fault points')
+
+    seq_t0 = _time.time()
+    per_fault_states = []
+    saved_flash = None
+    sequence_injected = True
+
+    for idx, fault_at in enumerate(seq):
+        stage_t0 = _time.time()
+        stage_label = 'mf{}_{}'.format(idx + 1, fault_at)
+        if idx == 0:
+            log('mf seq={} phase1_setup'.format(seq))
+            restore_phase1_baseline()
+            cpu_ref = monitor.Machine['sysbus.cpu']
+            cpu_ref.IsHalted = False
+        else:
+            log('mf seq={} restore_stage{}'.format(seq, idx + 1))
+            restore_flash_and_boot(saved_flash)
+            if _hash_bypass_active:
+                apply_hash_bypass()
+        reset_nvmc_for_sweep()
+
+        base_writes = get_total_writes()
+        arm_at = base_writes + fault_at + 1
+        if arm_at > base_writes + max_writes_cap:
+            arm_at = base_writes + max_writes_cap + 1
+        arm_fault(arm_at)
+        disarm_erase_fault()
+
+        status = run_until_done(
+            cpu_ref,
+            label=stage_label,
+            stop_on_fault=True,
+            wall_timeout=60 if idx > 0 else max(120, progress_stall_timeout_s * 3),
+            time_slice=phase2_time_slice if idx > 0 else '0.02',
+        )
+        disarm_fault()
+        injected = was_write_fault_injected()
+        actual_writes = get_total_writes()
+        stage_ms = int((_time.time() - stage_t0) * 1000)
+        log('mf seq={} stage={} fault_at={} injected={} writes={}'.format(
+            seq, idx + 1, fault_at, injected, actual_writes))
+
+        stage_state = {
+            'stage': idx + 1,
+            'fault_at': fault_at,
+            'fault_injected': bool(injected),
+            'actual_writes': actual_writes,
+            'signals': {
+                'stage_ms': stage_ms,
+                'stop_reason': status.get('reason') if status is not None else None,
+                'emulated_s': status.get('emulated_s') if status is not None else None,
+            },
+        }
+
+        if not ((USE_FAST_PATH or USE_MRAM_PATH) and injected):
+            sequence_injected = False
+            per_fault_states.append(stage_state)
+            break
+
+        if USE_MRAM_PATH:
+            mram_size = int(mram.Size)
+            saved_flash = mram.ReadBytes(0, mram_size)
+        else:
+            saved_flash = faultFlash.FaultFlashSnapshot
+            if saved_flash is None:
+                flash_ref = faultFlash.Flash
+                flash_size = int(faultFlash.FlashSize)
+                saved_flash = flash_ref.ReadBytes(0, flash_size)
+
+        per_fault_states.append(stage_state)
+
+    if not sequence_injected:
+        return {
+            'fault_at': seq[0],
+            'fault_requested': seq[0],
+            'fault_type': 'mf',
+            'fault_sequence': seq,
+            'fault_injected': False,
+            'fault_address': '0x00000000',
+            'boot_outcome': 'success',
+            'boot_slot': None,
+            'fault_class': 'recoverable',
+            'actual_writes': per_fault_states[-1].get('actual_writes', 0) if per_fault_states else 0,
+            'per_fault_states': per_fault_states,
+            'signals': {
+                'multi_fault_count': len(seq),
+                'trace_replay_mode': 'execute',
+                'sequence_elapsed_s': round(_time.time() - seq_t0, 1),
+            },
+        }
+
+    recovery_t0 = _time.time()
+    restore_flash_and_boot(saved_flash)
+    if _hash_bypass_active:
+        apply_hash_bypass()
+    reset_nvmc_for_recovery()
+
+    log('mf seq={} final_recovery_step'.format(seq))
+    arm_vtor_watchpoint()
+    final_status = run_until_done(
+        cpu_ref,
+        label='mf_final_{}'.format(seq[0]),
+        expect_writes=False,
+        zero_writes_is_brick=False,
+        wall_timeout=30,
+        stop_on_fault=False,
+        time_slice=phase2_time_slice,
+    )
+    disarm_vtor_watchpoint()
+    recovery_ms = int((_time.time() - recovery_t0) * 1000)
+
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value, pc_value, fault_injected=True
+    )
+    signals['multi_fault_count'] = len(seq)
+    signals['multi_fault_recovery_ms'] = recovery_ms
+    signals['trace_replay_mode'] = 'execute'
+    if final_status is not None:
+        signals['phase2_stop_reason'] = final_status.get('reason')
+        signals['phase2_emulated_s'] = final_status.get('emulated_s')
+
+    semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'signals': signals,
+        'fault_injected': True,
+        'stage': 'post_boot',
+    })
+    fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
+    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
+        boot_outcome,
+        boot_slot,
+        signals,
+        initial_status=final_status,
+        fault_injected=True,
+        label='mf{}_followup'.format(seq[0]),
+    )
+    signals['followup_ms'] = int(followup_ms)
+
+    result = {
+        'fault_at': seq[0],
+        'fault_requested': seq[0],
+        'fault_type': 'mf',
+        'fault_sequence': seq,
+        'fault_injected': True,
+        'fault_address': '0x00000000',
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'fault_class': fault_class,
+        'actual_writes': per_fault_states[-1].get('actual_writes', 0) if per_fault_states else 0,
+        'per_fault_states': per_fault_states,
+        'signals': signals,
+    }
+    if semantic_state is not None:
+        result['semantic_state'] = semantic_state
+    if boot_cycle_records is not None:
+        result['boot_cycles'] = boot_cycle_records
+        result['multi_boot_analysis'] = multi_boot_analysis
+
+    if USE_FAST_PATH:
+        faultFlash.FaultFlashSnapshot = None
+
+    return result
+
 # ---------------------------------------------------------------------------
 # Trace replay mode: reconstruct flash state from calibration trace instead
 # of re-emulating Phase 1.  Eliminates the O(N^2) prefix cost — each fault
@@ -2892,6 +3065,17 @@ def load_erase_trace_data(path):
                 int(row.get('erase_size', 0)),
             ))
     return entries
+
+
+def decode_multi_fault_sequence_local(encoded):
+    if not encoded.startswith('mf:'):
+        raise ValueError('not a multi-fault encoding: {!r}'.format(encoded))
+    parts = encoded.split(':')
+    if len(parts) < 3:
+        raise ValueError(
+            'multi-fault encoding needs >= 2 fault points: {!r}'.format(encoded)
+        )
+    return [int(p) for p in parts[1:]]
 
 def run_trace_replay_fault_native(fault_at, fault_type='w'):
     import os as _os_native
@@ -3427,6 +3611,8 @@ else:
             p1_type = parts[3] if len(parts) > 3 else 'w'
             p2_type = parts[4] if len(parts) > 4 else 'w'
             results.append(run_phase2_fault(p1_at, p2_at, p1_type, p2_type))
+        elif ft.startswith('mf:'):
+            results.append(run_multi_fault_sequence(decode_multi_fault_sequence_local(ft)))
         # Cascade faults: 'c:W:E' where W=write_fault_at, E=erase_fault_at.
         elif ft.startswith('c:'):
             parts = ft.split(':')

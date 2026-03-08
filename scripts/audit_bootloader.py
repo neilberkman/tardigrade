@@ -1160,6 +1160,24 @@ def result_has_issues(result: Dict[str, Any], expected_outcome: str) -> bool:
     return bool(result_issue_reasons(result, expected_outcome))
 
 
+def _interesting_multi_fault_points(
+    results: List[Dict[str, Any]],
+    expected_outcome: str,
+) -> List[int]:
+    """Return fault points worth exploring with sequential multi-fault runs."""
+    interesting_fps: List[int] = []
+    for result in results:
+        if result.get("is_control", False):
+            continue
+        if not result.get("fault_injected", False):
+            continue
+        if result_is_brick(result) or result_has_issues(result, expected_outcome):
+            fp = result.get("fault_at")
+            if fp is not None:
+                interesting_fps.append(int(fp))
+    return sorted(set(interesting_fps))
+
+
 def result_is_brick(result: Dict[str, Any]) -> bool:
     eff_outcome, _ = _effective_boot_result(result)
     outcome = str(eff_outcome or "unknown").strip().lower()
@@ -2227,43 +2245,6 @@ def main() -> int:
                             combined.append((p1_fp, enc))
                             phase2_count += 1
 
-            # Multi-fault sequential interruption sequences.
-            multi_fault_count = 0
-            mf_config = profile.fault_sweep.multi_fault
-            if mf_config.enabled:
-                if mf_config.strategy == "explicit":
-                    mf_interesting: List[int] = []
-                else:
-                    # Use Tier 1 (trailer/metadata) write points as interesting points.
-                    # If write_trace_heuristic is available, use it; otherwise use all write fps.
-                    try:
-                        from write_trace_heuristic import classify_trace
-                        trace_csv = robot_vars.get("trace_file", "")
-                        if trace_csv and Path(trace_csv).exists():
-                            tiers = classify_trace(
-                                trace_csv,
-                                profile,
-                                tier2_step=999999,
-                                tier3_step=999999,
-                            )
-                            mf_interesting = sorted(tiers.get("tier1", []))
-                        else:
-                            mf_interesting = [fp for fp, ft in combined if ft == 'w']
-                    except ImportError:
-                        mf_interesting = [fp for fp, ft in combined if ft == 'w']
-                multi_fault_plan = generate_multi_fault_sequences(
-                    strategy=mf_config.strategy,
-                    interesting_points=mf_interesting,
-                    max_faults_per_run=mf_config.max_faults_per_run,
-                    max_pairs=mf_config.max_pairs,
-                    seed=mf_config.seed,
-                    explicit_sequences=mf_config.sequences if mf_config.strategy == "explicit" else None,
-                )
-                for seq in multi_fault_plan.sequences:
-                    enc = encode_multi_fault_sequence(seq)
-                    combined.append((seq[0], enc))
-                    multi_fault_count += 1
-
             fault_points = [fp for fp, _ in combined]
             fault_types_list = [ft for _, ft in combined]
             parts = ["{} writes".format(len(write_fps))]
@@ -2285,8 +2266,6 @@ def main() -> int:
                 parts.append("{} timed-reset".format(timed_reset_count))
             if phase2_count:
                 parts.append("{} phase2-recovery".format(phase2_count))
-            if multi_fault_count:
-                parts.append("{} multi-fault".format(multi_fault_count))
             print(
                 "Running {} fault points ({}) for '{}'...".format(
                     len(fault_points),
@@ -2393,26 +2372,17 @@ def main() -> int:
         # Multi-fault plan (opt-in)
         # -------------------------------------------------------------------
         multi_fault_plan_data = None
+        multi_fault_results: Optional[List[Dict[str, Any]]] = None
+        multi_fault_summary: Optional[Dict[str, Any]] = None
         mf_config = profile.fault_sweep.multi_fault
 
         if mf_config.enabled:
-            # Identify "interesting" fault points from single-fault results:
-            # those that bricked or produced wrong_image outcomes.
             expected_outcome = "success"
             if getattr(profile.expect, "control_outcome", None):
                 expected_outcome = profile.expect.control_outcome
-            interesting_fps = []
-            for r in sweep_results:
-                if r.get("is_control", False):
-                    continue
-                if not r.get("fault_injected", False):
-                    continue
-                if result_is_brick(r) or result_has_issues(r, expected_outcome):
-                    fp = r.get("fault_at")
-                    if fp is not None:
-                        interesting_fps.append(int(fp))
-
-            interesting_fps = sorted(set(interesting_fps))
+            interesting_fps = _interesting_multi_fault_points(
+                sweep_results, expected_outcome
+            )
             print(
                 "Multi-fault: {} interesting points from single-fault sweep "
                 "(strategy={}, max_pairs={}).".format(
@@ -2431,6 +2401,7 @@ def main() -> int:
                 explicit_sequences=mf_config.sequences or None,
                 seed=mf_config.seed,
             )
+            multi_fault_plan = mf_plan
             multi_fault_plan_data = multi_fault_plan_summary(mf_plan)
             print(
                 "Multi-fault plan: {} sequences generated.".format(
@@ -2438,6 +2409,51 @@ def main() -> int:
                 ),
                 file=sys.stderr,
             )
+            if mf_plan.sequences:
+                multi_fault_points = [seq[0] for seq in mf_plan.sequences]
+                multi_fault_types = [
+                    encode_multi_fault_sequence(seq) for seq in mf_plan.sequences
+                ]
+                mf_wall_t0 = _time_mod.time()
+                multi_fault_results = run_runtime_sweep(
+                    repo_root=repo_root,
+                    renode_test=renode_test,
+                    robot_suite=robot_suite,
+                    profile=profile,
+                    fault_points=multi_fault_points,
+                    robot_vars=robot_vars,
+                    work_dir=work_dir / "multi_fault",
+                    renode_remote_server_dir=args.renode_remote_server_dir,
+                    include_control=False,
+                    num_workers=args.workers,
+                    evaluation_mode="execute",
+                    max_batch_points=args.max_batch_points,
+                    trace_file=None,
+                    erase_trace_file=None,
+                    trace_file_bin=None,
+                    erase_trace_file_bin=None,
+                    fault_types_list=multi_fault_types,
+                    keep_run_artifacts=args.keep_run_artifacts,
+                )
+                mf_wall_s = _time_mod.time() - mf_wall_t0
+                annotate_result_checks(multi_fault_results, profile)
+                multi_fault_summary = summarize_runtime_sweep(
+                    multi_fault_results,
+                    total_writes=max_writes,
+                    profile=profile,
+                )
+                multi_fault_summary["wall_time_s"] = round(mf_wall_s, 1)
+                print(
+                    "Multi-fault sweep completed: {} sequences in {:.1f}s "
+                    "({:.0f}ms/sequence avg)".format(
+                        len(multi_fault_points),
+                        mf_wall_s,
+                        (mf_wall_s * 1000 / len(multi_fault_points))
+                        if multi_fault_points
+                        else 0,
+                    ),
+                    file=sys.stderr,
+                )
 
         # -------------------------------------------------------------------
         # State fuzzer (opt-in)
@@ -2458,7 +2474,18 @@ def main() -> int:
         # -------------------------------------------------------------------
         # Verdict
         # -------------------------------------------------------------------
-        found_issues = int(sweep_summary.get("issue_points", sweep_summary["bricks"])) > 0
+        found_issues = int(
+            sweep_summary.get("issue_points", sweep_summary["bricks"])
+        ) > 0
+        if multi_fault_summary is not None:
+            found_issues = found_issues or (
+                int(
+                    multi_fault_summary.get(
+                        "issue_points", multi_fault_summary["bricks"]
+                    )
+                )
+                > 0
+            )
         control_issue_count = int(
             (sweep_summary.get("control") or {}).get("issue_count", 0)
         )
@@ -2549,6 +2576,10 @@ def main() -> int:
 
         if multi_fault_plan_data is not None:
             payload["summary"]["multi_fault_plan"] = multi_fault_plan_data
+        if multi_fault_results is not None:
+            payload["multi_fault_results"] = multi_fault_results
+        if multi_fault_summary is not None:
+            payload["summary"]["multi_fault_runtime_sweep"] = multi_fault_summary
 
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)

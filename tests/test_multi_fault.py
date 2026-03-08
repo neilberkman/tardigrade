@@ -560,20 +560,10 @@ class TestInterestingPointIdentification(unittest.TestCase):
     """Test that interesting fault points are correctly extracted from sweep results."""
 
     def _identify_interesting(self, sweep_results):
-        """Replicate the interesting-point extraction logic from audit_bootloader."""
-        from audit_bootloader import result_has_issues, result_is_brick
+        """Use the actual audit_bootloader helper."""
+        from audit_bootloader import _interesting_multi_fault_points
 
-        interesting = []
-        for r in sweep_results:
-            if r.get("is_control", False):
-                continue
-            if not r.get("fault_injected", False):
-                continue
-            if result_is_brick(r) or result_has_issues(r, "success"):
-                fp = r.get("fault_at")
-                if fp is not None:
-                    interesting.append(int(fp))
-        return sorted(set(interesting))
+        return _interesting_multi_fault_points(sweep_results, "success")
 
     def test_bricks_are_interesting(self) -> None:
         results = [
