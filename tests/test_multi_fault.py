@@ -333,6 +333,8 @@ class TestMultiFaultPlanSummary(unittest.TestCase):
         self.assertEqual(summary["interesting_points"], 3)
         self.assertEqual(summary["max_faults_per_run"], 2)
         self.assertIsNone(summary["seed"])
+        self.assertEqual(summary["sequence_semantics"], "stage_relative_reboot")
+        self.assertIn("successive reboot/recovery stage", summary["sequence_description"])
         self.assertEqual(summary["sample_sequences"], [[10, 20], [10, 30], [20, 30]])
         self.assertFalse(summary["sample_truncated"])
         self.assertIn("diagnostics", summary)
