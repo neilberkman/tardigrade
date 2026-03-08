@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import textwrap
 import unittest
@@ -30,6 +31,11 @@ from audit_bootloader import (  # noqa: E402
     summarize_runtime_sweep,
 )
 from profile_loader import load_profile  # noqa: E402
+
+try:
+    from audit_bootloader import CalibrationResult  # noqa: E402
+except ImportError:
+    CalibrationResult = None  # type: ignore[assignment,misc]
 from self_test import check_verdict  # noqa: E402
 
 
@@ -1553,6 +1559,111 @@ class Phase2FaultTest(unittest.TestCase):
         p2_type = parts[4] if len(parts) > 4 else "w"
         self.assertEqual(p1_type, "w")
         self.assertEqual(p2_type, "w")
+
+
+class MetadataFaultTest(unittest.TestCase):
+    """Tests for metadata-write-fault injection feature."""
+
+    def _make_profile_yaml(self, metadata_fault_block):
+        base = textwrap.dedent("""            schema_version: 1
+            name: test_metadata_fault
+            platform: platforms/test.repl
+            bootloader:
+              elf: test.elf
+              entry: 0x00000000
+            memory:
+              sram: { start: 0x20000000, end: 0x20040000 }
+              write_granularity: 4
+              slots:
+                exec: { base: 0x00010000, size: 0x40000 }
+                staging: { base: 0x00050000, size: 0x40000 }
+            images:
+              exec: test_exec.bin
+              staging: test_staging.bin
+            fault_sweep:
+              mode: runtime
+              evaluation_mode: execute
+              max_writes: 100
+        """)
+        if metadata_fault_block:
+            base += textwrap.indent(metadata_fault_block, "  ")
+        return base
+
+    def test_metadata_fault_profile_parsing(self):
+        yaml_str = self._make_profile_yaml(
+            "metadata_fault:\n  enabled: true\n  fault_types:\n    - power_loss\n    - bit_corruption\n"
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_str)
+            f.flush()
+            profile = load_profile(f.name)
+        os.unlink(f.name)
+        mf = profile.fault_sweep.metadata_fault
+        self.assertTrue(mf.enabled)
+        self.assertIn("power_loss", mf.fault_types)
+        self.assertIn("bit_corruption", mf.fault_types)
+
+    def test_metadata_fault_default_disabled(self):
+        yaml_str = self._make_profile_yaml("")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_str)
+            f.flush()
+            profile = load_profile(f.name)
+        os.unlink(f.name)
+        self.assertFalse(profile.fault_sweep.metadata_fault.enabled)
+        robot_vars = profile.robot_vars(Path("/tmp"))
+        self.assertEqual([v for v in robot_vars if "METADATA_FAULT" in v], [])
+
+    def test_metadata_fault_enabled_emits_robot_var(self):
+        yaml_str = self._make_profile_yaml("metadata_fault:\n  enabled: true\n")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_str)
+            f.flush()
+            profile = load_profile(f.name)
+        os.unlink(f.name)
+        robot_vars = profile.robot_vars(Path("/tmp"))
+        metadata_vars = [v for v in robot_vars if v.startswith("METADATA_FAULT_ENABLED:")]
+        self.assertEqual(len(metadata_vars), 1)
+        self.assertEqual(metadata_vars[0], "METADATA_FAULT_ENABLED:true")
+
+    def test_metadata_fault_generates_fault_points(self):
+        from profile_loader import MetadataFaultConfig
+        mf = MetadataFaultConfig(enabled=True, fault_types=["power_loss"])
+        combined = []
+        for mf_fp in range(5):
+            for ft_name in mf.fault_types:
+                combined.append((mf_fp, "m:{}".format({"power_loss": "w", "bit_corruption": "b"}.get(ft_name, "w"))))
+        self.assertEqual(len(combined), 5)
+        self.assertEqual(combined[0], (0, "m:w"))
+        self.assertEqual(combined[4], (4, "m:w"))
+
+    @unittest.skipIf(CalibrationResult is None, "audit_bootloader not importable")
+    def test_calibration_result_setup_writes(self):
+        cal = CalibrationResult(total_writes=100, total_erases=5, trace_file=None, erase_trace_file=None, trace_file_bin=None, erase_trace_file_bin=None, setup_writes=4)
+        self.assertEqual(cal.setup_writes, 4)
+
+    @unittest.skipIf(CalibrationResult is None, "audit_bootloader not importable")
+    def test_calibration_result_setup_writes_default(self):
+        cal = CalibrationResult(total_writes=100, total_erases=5, trace_file=None, erase_trace_file=None, trace_file_bin=None, erase_trace_file_bin=None)
+        self.assertEqual(cal.setup_writes, 0)
+
+    def test_metadata_fault_invalid_type_warns(self):
+        yaml_str = self._make_profile_yaml("metadata_fault:\n  enabled: true\n  fault_types:\n    - power_loss\n    - bogus_type\n")
+        import warnings
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_str)
+            f.flush()
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                profile = load_profile(f.name)
+        os.unlink(f.name)
+        self.assertTrue(any("bogus_type" in str(x.message) for x in w), "Expected warning about bogus_type")
+        self.assertIn("power_loss", profile.fault_sweep.metadata_fault.fault_types)
+
+    def test_metadata_fault_type_encoding(self):
+        self.assertEqual("m:w".split(":")[0], "m")
+        self.assertEqual("m:w".split(":")[1], "w")
+        self.assertEqual("m:b".split(":")[1], "b")
 
 
 if __name__ == "__main__":

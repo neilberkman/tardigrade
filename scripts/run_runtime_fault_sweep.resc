@@ -87,6 +87,7 @@ $read_fault_regions?=""
 $read_fault_bit_flips?="0"
 $read_fault_probability?="1.0"
 $read_fault_seed?="0"
+$metadata_fault_enabled?="false"
 
 python """
 import json
@@ -324,6 +325,14 @@ if success_otadata_expect_scope not in ('always', 'control'):
 
 # Pre-boot state binary.
 pre_boot_bin = str(monitor.GetVariable('pre_boot_state_bin')).strip()
+metadata_fault_enabled = str(monitor.GetVariable('metadata_fault_enabled')).strip().lower() in ('1', 'true', 'yes')
+pre_boot_write_count = 0
+if pre_boot_bin:
+    try:
+        pbs_size = os.path.getsize(pre_boot_bin)
+        pre_boot_write_count = pbs_size // 8
+    except Exception:
+        pass
 
 # Setup script.
 setup_script = str(monitor.GetVariable('setup_script')).strip()
@@ -1141,6 +1150,32 @@ def apply_pre_boot_state():
     if setup_script:
         monitor.Parse('include @' + setup_script)
     prime_bootloader_entry()
+
+def apply_partial_pre_boot_state(max_writes, fault_type='w'):
+    if not pre_boot_bin:
+        return (0, 0, False)
+    with open(pre_boot_bin, 'rb') as f:
+        pbs_data = f.read()
+    total_entries = len(pbs_data) // 8
+    applied = 0
+    fault_address = 0
+    fault_injected = False
+    for i in range(total_entries):
+        addr, val = struct.unpack_from('<II', pbs_data, i * 8)
+        if i < max_writes:
+            bus.WriteDoubleWord(addr, val)
+            applied += 1
+        elif i == max_writes:
+            fault_address = addr
+            fault_injected = True
+            if fault_type == 'b':
+                corrupted = (val & 0xFFFF0000) | ((val ^ 0xA5A5) & 0x0000FFFF)
+                bus.WriteDoubleWord(addr, corrupted)
+                applied += 1
+            break
+        else:
+            break
+    return (applied, fault_address, fault_injected)
 
 def restore_hw_init():
     # Restore hardware init values cleared by machine Reset.
@@ -2130,6 +2165,48 @@ def run_timed_reset_fault(fault_at):
         )
     if boot_outcome == 'no_boot' and resume_trace_no_boot and saved_flash is not None:
         result['resume_trace'] = run_resume_trace_from_snapshot(saved_flash, fault_at, 't')
+    return result
+
+def run_metadata_fault(fault_at, fault_type='w'):
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    fp_t0 = _time.time()
+    m_type = fault_type
+    log('fp={} type=m:{} metadata_fault_setup'.format(fault_at, m_type))
+    monitor.Parse('machine Reset')
+    monitor.Parse('machine Pause')
+    reload_images()
+    if _hash_bypass_active:
+        apply_hash_bypass()
+    applied, fault_address, fault_injected = apply_partial_pre_boot_state(fault_at, fault_type=m_type)
+    log('fp={} type=m:{} applied={} fault_addr=0x{:08X} injected={}'.format(fault_at, m_type, applied, fault_address, fault_injected))
+    prime_bootloader_entry()
+    restore_hw_init()
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = False
+    reset_nvmc_for_sweep()
+    disarm_fault()
+    arm_vtor_watchpoint()
+    p2_status = run_until_done(cpu_ref, label='fp{}_m{}_boot'.format(fault_at, m_type), expect_writes=False, zero_writes_is_brick=False, wall_timeout=30, time_slice=phase2_time_slice)
+    disarm_vtor_watchpoint()
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(vtor_value, pc_value, fault_injected=fault_injected)
+    signals['metadata_fault_applied'] = applied
+    signals['metadata_fault_total'] = pre_boot_write_count
+    signals['phase2_stop_reason'] = p2_status.get('reason')
+    signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    semantic_state = collect_semantic_state({'cycle': 0, 'boot_outcome': boot_outcome, 'boot_slot': boot_slot, 'signals': signals, 'fault_injected': bool(fault_injected), 'stage': 'post_boot'})
+    fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
+    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(boot_outcome, boot_slot, signals, initial_status=p2_status, fault_injected=fault_injected, label='fp{}_meta_followup'.format(fault_at))
+    signals['followup_ms'] = int(followup_ms)
+    result = {'fault_at': fault_at, 'fault_requested': fault_at, 'fault_type': 'm:{}'.format(m_type), 'fault_injected': fault_injected, 'fault_address': fmt_u32(fault_address), 'boot_outcome': boot_outcome, 'boot_slot': boot_slot, 'fault_class': fault_class, 'actual_writes': applied, 'signals': signals}
+    if semantic_state is not None:
+        result['semantic_state'] = semantic_state
+    if boot_cycle_records is not None:
+        result['boot_cycles'] = boot_cycle_records
+        result['multi_boot_analysis'] = multi_boot_analysis
+    if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
+        result['postmortem_partition_dump'] = build_postmortem_partition_dump(snapshot_bytes=None, source='live_flash')
     return result
 
 def classify_fault_result(boot_outcome, boot_slot, signals):
@@ -3670,6 +3747,7 @@ if calibration_mode:
             'calibration': True,
             'total_writes': total_copy_writes,
             'base_writes': get_total_writes(),
+            'setup_writes': pre_boot_write_count,
         }
     else:
         cpu_ref = monitor.Machine['sysbus.cpu']
@@ -3782,6 +3860,7 @@ if calibration_mode:
             'total_writes': total_writes,
             'total_erases': total_erases,
             'base_writes': base_writes,
+            'setup_writes': pre_boot_write_count,
             'calibration_stop_reason': cal_status.get('reason', '?'),
             'calibration_emulated_s': cal_status.get('emulated_s', 0),
             'calibration_elapsed_s': cal_status.get('elapsed_s', 0),
@@ -3844,7 +3923,10 @@ else:
         ft = 'w'
         if idx < len(fault_type_list):
             ft = fault_type_list[idx]
-        if ft.startswith('p2:'):
+        if ft.startswith('m:'):
+            m_type = ft.split(':')[1] if ':' in ft else 'w'
+            results.append(run_metadata_fault(fp, fault_type=m_type))
+        elif ft.startswith('p2:'):
             parts = ft.split(':')
             p1_at = int(parts[1])
             p2_at = int(parts[2])
