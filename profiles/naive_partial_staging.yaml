@@ -1,0 +1,37 @@
+schema_version: 1
+name: naive_partial_staging
+description: >
+  Test a naive bare-copy bootloader against partially downloaded staging
+  images. The bootloader should reject truncated images and fall back to
+  the exec slot. A naive bootloader with no validation will attempt to
+  boot the partial image, demonstrating the defect.
+
+platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 8
+  slots:
+    exec: { base: 0x10000000, size: 0x38000 }
+    staging: { base: 0x10038000, size: 0x38000 }
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+success_criteria:
+  vtor_in_slot: exec
+fault_sweep:
+  mode: runtime
+  max_writes: 28672
+  max_writes_cap: 100000
+  run_duration: "0.01"
+  partial_staging:
+    staging_slot: staging
+    truncation_points: heuristic
+    fill_pattern: 0xFF
+    header_size: 0
+    sector_size: 4096
+    trailer_size: 0
+expect:
+  should_find_issues: true

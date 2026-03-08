@@ -397,6 +397,7 @@ class FaultSweepConfig:
         "multi_fault",
         "read_fault_config",
         "metadata_fault",
+        "partial_staging",
     )
 
     def __init__(
@@ -419,6 +420,7 @@ class FaultSweepConfig:
         multi_fault=None,
         read_fault_config: Optional["ReadFaultConfig"] = None,
         metadata_fault: Optional["MetadataFaultConfig"] = None,
+        partial_staging: Optional[Any] = None,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -444,6 +446,7 @@ class FaultSweepConfig:
         self.multi_fault = multi_fault or MultiFaultConfig()
         self.read_fault_config = read_fault_config
         self.metadata_fault = metadata_fault or MetadataFaultConfig()
+        self.partial_staging = partial_staging
 
 
 class StateFuzzerConfig:
@@ -1116,6 +1119,7 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         multi_fault=_parse_multi_fault(raw.get("multi_fault")),
         read_fault_config=_parse_read_fault_config(raw.get("read_fault_config")),
         metadata_fault=_parse_metadata_fault(raw.get("metadata_fault")),
+        partial_staging=raw.get("partial_staging"),
     )
 
 
@@ -1987,6 +1991,7 @@ def main() -> int:
             if profile.multi_component is not None
             else None
         ),
+        "partial_staging": profile.fault_sweep.partial_staging is not None,
     }
     print(json.dumps(info, indent=2, sort_keys=True))
     return 0

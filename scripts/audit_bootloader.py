@@ -49,6 +49,17 @@ from fault_inject import (
     validate_bootloader_vector_table,
 )
 from invariants import resolve_invariants, run_invariants
+from partial_staging import (
+    PartialStagingConfig,
+    PartialStagingResult,
+    TruncationPoint,
+    classify_partial_staging_outcome,
+    generate_partial_image,
+    generate_truncation_points,
+    parse_partial_staging_config,
+    summarize_partial_staging,
+    write_partial_image_to_temp,
+)
 from profile_loader import ProfileConfig, load_profile
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -3122,6 +3133,178 @@ def main() -> int:
             state_fuzz_summary = {"status": "not_yet_wired", "metadata_model": profile.state_fuzzer.metadata_model}
 
         # -------------------------------------------------------------------
+        # Partial staging sweep (opt-in)
+        # -------------------------------------------------------------------
+        partial_staging_results: Optional[List[Dict[str, Any]]] = None
+        partial_staging_summary: Optional[Dict[str, Any]] = None
+
+        ps_raw = profile.fault_sweep.partial_staging
+        if ps_raw is not None:
+            ps_config = parse_partial_staging_config(
+                ps_raw,
+                images=profile.images,
+                slots=profile.memory.slots,
+                sector_size=profile.memory.write_granularity or 4096,
+            )
+            if ps_config is not None:
+                staging_image_path = profile.resolve_path(
+                    repo_root, ps_config.staging_image_path
+                )
+                if not os.path.exists(staging_image_path):
+                    _progress(
+                        "WARNING: partial_staging image not found: {}".format(
+                            staging_image_path
+                        )
+                    )
+                else:
+                    with open(staging_image_path, "rb") as fh:
+                        original_image = fh.read()
+                    image_size = len(original_image)
+
+                    trunc_points = generate_truncation_points(
+                        image_size=image_size,
+                        strategy=ps_config.truncation_points,
+                        header_size=ps_config.header_size,
+                        sector_size=ps_config.sector_size,
+                        trailer_size=ps_config.trailer_size,
+                        explicit_offsets=ps_config.explicit_offsets,
+                    )
+                    _progress(
+                        "Partial staging: {} truncation points for {}-byte image".format(
+                            len(trunc_points), image_size
+                        )
+                    )
+
+                    staging_slot = profile.memory.slots.get(
+                        ps_config.staging_slot_name
+                    )
+                    exec_slot_name = "exec"
+                    for sn in profile.memory.slots:
+                        if sn in {"exec", "primary", "slot_a", "slot0"}:
+                            exec_slot_name = sn
+                            break
+
+                    ps_results_typed: List[PartialStagingResult] = []
+                    temp_files: List[str] = []
+
+                    for tp in trunc_points:
+                        temp_path = write_partial_image_to_temp(
+                            original_image,
+                            tp.offset,
+                            fill=ps_config.fill_pattern,
+                            label=tp.label,
+                        )
+                        temp_files.append(temp_path)
+
+                        # Build a modified robot vars list that overrides the
+                        # staging image path with the truncated variant.
+                        ps_robot_vars = list(robot_vars)
+                        staging_key = "IMAGE_{}_PATH".format(
+                            ps_config.staging_slot_name.upper()
+                        )
+                        staging_var = "IMAGE_{}".format(
+                            ps_config.staging_slot_name.upper()
+                        )
+                        # Replace existing staging image vars.
+                        ps_robot_vars = [
+                            rv
+                            for rv in ps_robot_vars
+                            if not rv.startswith(staging_key + ":")
+                            and not rv.startswith(staging_var + ":")
+                        ]
+                        ps_robot_vars.append(
+                            "{}:{}".format(staging_var, temp_path)
+                        )
+                        ps_robot_vars.append(
+                            "{}:{}".format(staging_key, temp_path)
+                        )
+
+                        try:
+                            data = run_single_point(
+                                repo_root=repo_root,
+                                renode_test=renode_test,
+                                robot_suite=robot_suite,
+                                profile=profile,
+                                fault_at=-1,  # no fault injection, just boot
+                                robot_vars=ps_robot_vars,
+                                work_dir=work_dir / "partial_staging",
+                                renode_remote_server_dir=args.renode_remote_server_dir,
+                                is_control=True,
+                                keep_run_artifacts=args.keep_run_artifacts,
+                            )
+                            boot_outcome = str(
+                                data.get("boot_outcome", "unknown")
+                            )
+                            boot_slot = data.get("boot_slot")
+                        except Exception as exc:
+                            _progress(
+                                "Partial staging point {} (offset=0x{:X}) "
+                                "failed: {}".format(tp.label, tp.offset, exc)
+                            )
+                            boot_outcome = "infra_error"
+                            boot_slot = None
+                            data = None
+
+                        classification = classify_partial_staging_outcome(
+                            boot_outcome=boot_outcome,
+                            boot_slot=boot_slot,
+                            truncation_offset=tp.offset,
+                            image_size=image_size,
+                            expected_exec_slot=exec_slot_name,
+                        )
+
+                        ps_results_typed.append(
+                            PartialStagingResult(
+                                truncation_point=tp,
+                                boot_outcome=boot_outcome,
+                                boot_slot=boot_slot,
+                                classification=classification,
+                                temp_image_path=temp_path,
+                                raw_result=data,
+                            )
+                        )
+                        _progress(
+                            "  {} (0x{:X}): {} -> {}".format(
+                                tp.label,
+                                tp.offset,
+                                boot_outcome,
+                                classification,
+                            )
+                        )
+
+                    partial_staging_summary = summarize_partial_staging(
+                        ps_results_typed
+                    )
+                    partial_staging_results = [
+                        {
+                            "truncation_point": r.truncation_point.as_dict,
+                            "boot_outcome": r.boot_outcome,
+                            "boot_slot": r.boot_slot,
+                            "classification": r.classification,
+                        }
+                        for r in ps_results_typed
+                    ]
+
+                    _progress(
+                        "Partial staging complete: {} points, {} issues "
+                        "({} bricks, {} partial boots)".format(
+                            partial_staging_summary["total_points"],
+                            partial_staging_summary["issue_count"],
+                            partial_staging_summary.get("brick", 0),
+                            partial_staging_summary.get(
+                                "partial_image_booted", 0
+                            ),
+                        )
+                    )
+
+                    # Clean up temp files.
+                    for tf in temp_files:
+                        try:
+                            os.unlink(tf)
+                        except OSError:
+                            pass
+
+        # -------------------------------------------------------------------
         # Verdict
         # -------------------------------------------------------------------
         found_issues = int(
@@ -3135,6 +3318,10 @@ def main() -> int:
                     )
                 )
                 > 0
+            )
+        if partial_staging_summary is not None:
+            found_issues = found_issues or (
+                int(partial_staging_summary.get("issue_count", 0)) > 0
             )
         control_issue_count = int(
             (sweep_summary.get("control") or {}).get("issue_count", 0)
@@ -3231,6 +3418,11 @@ def main() -> int:
             payload["multi_fault_results"] = multi_fault_results
         if multi_fault_summary is not None:
             payload["summary"]["multi_fault_runtime_sweep"] = multi_fault_summary
+
+        if partial_staging_results is not None:
+            payload["partial_staging_results"] = partial_staging_results
+        if partial_staging_summary is not None:
+            payload["summary"]["partial_staging"] = partial_staging_summary
 
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
