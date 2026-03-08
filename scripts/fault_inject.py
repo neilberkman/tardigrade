@@ -484,6 +484,17 @@ def multi_fault_plan_summary(plan: Optional[MultiFaultPlan]) -> Optional[Dict[st
         "interesting_points": plan.interesting_point_count,
         "max_faults_per_run": plan.max_faults_per_run,
         "seed": plan.seed,
+        "sequence_semantics": (
+            "stage_relative_reboot"
+            if plan.max_faults_per_run >= 2
+            else "single_fault"
+        ),
+        "sequence_description": (
+            "Each sequence element is the fault index for a successive "
+            "reboot/recovery stage, not two faults in one uninterrupted run."
+            if plan.max_faults_per_run >= 2
+            else "Single-fault execution."
+        ),
         "sample_sequences": preview,
         "sample_truncated": len(plan.sequences) > preview_limit,
         "diagnostics": plan.diagnostics,
