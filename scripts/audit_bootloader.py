@@ -1807,6 +1807,7 @@ def summarize_runtime_sweep(
                 "reset_ms",
                 "setup_ms",
                 "emulation_ms",
+                "followup_ms",
                 "total_ms",
                 "p2_iters",
                 "vtor",
@@ -1835,7 +1836,7 @@ def summarize_runtime_sweep(
     # Aggregate per-step timing from signals.
     timing_keys = [
         "reload_ms", "replay_ms", "reset_ms", "setup_ms",
-        "emulation_ms", "total_ms", "p2_iters",
+        "emulation_ms", "followup_ms", "total_ms", "p2_iters",
     ]
     timing_sums: Dict[str, int] = {}
     timing_maxes: Dict[str, int] = {}
