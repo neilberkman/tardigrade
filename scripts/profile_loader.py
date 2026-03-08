@@ -482,6 +482,7 @@ class ProfileConfig:
         invariant_config: Optional[Dict[str, Any]] = None,
         flash_backend: Optional[str] = None,
         initial_states: Optional[List["InitialStateConfig"]] = None,
+        nvs_region: Optional["NvsRegionConfig"] = None,
         metadata_fault_regions: Optional[List[MetadataFaultRegion]] = None,
         bootloader_region: Optional[BootloaderRegionConfig] = None,
     ) -> None:
@@ -510,6 +511,7 @@ class ProfileConfig:
         self.invariant_config = invariant_config or {}
         self.flash_backend = flash_backend
         self.initial_states: List[InitialStateConfig] = initial_states or []
+        self.nvs_region: Optional[NvsRegionConfig] = nvs_region
         self.metadata_fault_regions: List[MetadataFaultRegion] = metadata_fault_regions or []
         self.bootloader_region: Optional[BootloaderRegionConfig] = bootloader_region
         self.bootloader_region: Optional[BootloaderRegionConfig] = bootloader_region
@@ -542,6 +544,7 @@ class ProfileConfig:
             invariants=self.invariants, invariant_providers=self.invariant_providers,
             invariant_config=self.invariant_config,
             flash_backend=self.flash_backend, initial_states=[],
+            nvs_region=self.nvs_region,
             metadata_fault_regions=self.metadata_fault_regions,
             bootloader_region=self.bootloader_region,
         )
@@ -1587,6 +1590,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
     invariant_providers = _parse_invariant_providers(data.get("invariant_providers"))
     invariant_config = _parse_invariant_config(data.get("invariant_config"))
     initial_states = _parse_initial_states(data.get("initial_states"))
+    nvs_region = _parse_nvs_region(data.get("nvs_region"))
     metadata_fault_regions = _parse_metadata_fault_regions(
         data.get("metadata_fault_regions"), slots=memory.slots
     )
@@ -1640,6 +1644,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         invariant_config=invariant_config,
         flash_backend=flash_backend,
         initial_states=initial_states,
+        nvs_region=nvs_region,
         metadata_fault_regions=metadata_fault_regions,
         bootloader_region=bootloader_region,
     )
