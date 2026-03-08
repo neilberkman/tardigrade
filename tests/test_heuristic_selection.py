@@ -338,3 +338,199 @@ class TestEmptyTrace:
     def test_empty_trace_returns_empty(self):
         result = classify_trace([], SLOT_RANGES, page_size=PAGE)
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# 7. Target points budget
+# ---------------------------------------------------------------------------
+
+
+class TestTargetPoints:
+    """target_points trims low-risk tiers only, never tier0/tier1."""
+
+    def test_target_points_trims_total(self):
+        """Result should not exceed target_points."""
+        # Mix tier1 (trailer) + tier2 (boundary) + tier3 (bulk).
+        # Structural signal promotions inflate tier1, so target must
+        # exceed the mandatory core to see trimming on lower tiers.
+        trailer_offsets = _bulk_offsets(0x4F000, 10)  # tier1
+        boundary_offsets = _bulk_offsets(0x10000, 20)  # tier2 (first page)
+        bulk_offsets = _bulk_offsets(0x25000, 500)  # tier3
+        trace = _make_trace(trailer_offsets + boundary_offsets + bulk_offsets)
+
+        uncapped = classify_trace(trace, SLOT_RANGES, page_size=PAGE)
+        # Target above tier0+tier1 core but below total.
+        target = 25
+        assert len(uncapped) > target
+        capped = classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE, target_points=target
+        )
+        assert len(capped) <= target
+
+    def test_target_points_preserves_tier0(self):
+        """Bootloader region (tier0) is never trimmed."""
+        bl_region = (0x0, 0x8000)
+        bl_offsets = _bulk_offsets(0x1000, 20)
+        bulk_offsets = _bulk_offsets(0x25000, 300)
+        trace = _make_trace(bl_offsets + bulk_offsets)
+
+        result = classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE,
+            bootloader_region=bl_region, target_points=25,
+        )
+        # All 20 bootloader writes must survive.
+        for fp in range(20):
+            assert fp in result
+
+    def test_target_points_preserves_tier1(self):
+        """Trailer writes (tier1) are never trimmed."""
+        trailer_offsets = _bulk_offsets(0x4F000, 15)  # exec trailer
+        bulk_offsets = _bulk_offsets(0x25000, 300)
+        trace = _make_trace(trailer_offsets + bulk_offsets)
+
+        result = classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE, target_points=20,
+        )
+        # All 15 trailer writes must survive.
+        for fp in range(15):
+            assert fp in result
+
+    def test_target_points_no_effect_when_under(self):
+        """When total points <= target_points, no trimming."""
+        offsets = _bulk_offsets(0x25000, 10)
+        trace = _make_trace(offsets)
+
+        uncapped = classify_trace(trace, SLOT_RANGES, page_size=PAGE)
+        capped = classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE, target_points=1000
+        )
+        assert uncapped == capped
+
+
+# ---------------------------------------------------------------------------
+# 8. Sharding
+# ---------------------------------------------------------------------------
+
+
+class TestSharding:
+    """shard_count/shard_index partitions tier3 across shards."""
+
+    def test_shards_all_contain_critical_core(self):
+        """Every shard gets all tier1 (trailer) points."""
+        trailer_offsets = _bulk_offsets(0x4F000, 10)
+        bulk_offsets = _bulk_offsets(0x25000, 200)
+        trace = _make_trace(trailer_offsets + bulk_offsets)
+
+        trailer_fps = set(range(10))
+        for shard_idx in range(4):
+            result = classify_trace(
+                trace, SLOT_RANGES, page_size=PAGE,
+                shard_count=4, shard_index=shard_idx,
+            )
+            # All trailer points in every shard.
+            assert trailer_fps.issubset(set(result))
+
+    def test_shards_are_different(self):
+        """Different shards select different tier3 points."""
+        offsets = _bulk_offsets(0x25000, 500)
+        trace = _make_trace(offsets)
+
+        shard0 = set(classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE,
+            shard_count=4, shard_index=0,
+        ))
+        shard1 = set(classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE,
+            shard_count=4, shard_index=1,
+        ))
+        # They should differ (different tier3 slices).
+        assert shard0 != shard1
+
+    def test_shards_union_covers_full_selection(self):
+        """All shards together cover the same points as shard_count=1."""
+        offsets = _bulk_offsets(0x25000, 200)
+        trace = _make_trace(offsets)
+
+        full = set(classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE, shard_count=1,
+        ))
+        union = set()
+        for i in range(4):
+            shard = classify_trace(
+                trace, SLOT_RANGES, page_size=PAGE,
+                shard_count=4, shard_index=i,
+            )
+            union.update(shard)
+        assert union == full
+
+    def test_shard_count_1_is_no_op(self):
+        """shard_count=1 produces identical output to default."""
+        offsets = _bulk_offsets(0x25000, 200)
+        trace = _make_trace(offsets)
+
+        default = classify_trace(trace, SLOT_RANGES, page_size=PAGE)
+        sharded = classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE,
+            shard_count=1, shard_index=0,
+        )
+        assert default == sharded
+
+
+# ---------------------------------------------------------------------------
+# 9. Random tail budget
+# ---------------------------------------------------------------------------
+
+
+class TestRandomTailBudget:
+    """random_tail_budget adds extra points from unselected tier3 pool."""
+
+    def test_random_tail_adds_points(self):
+        """With random_tail_budget > 0, result has more points."""
+        offsets = _bulk_offsets(0x25000, 500)
+        trace = _make_trace(offsets)
+
+        base = classify_trace(trace, SLOT_RANGES, page_size=PAGE)
+        with_tail = classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE, random_tail_budget=20,
+        )
+        assert len(with_tail) > len(base)
+
+    def test_random_tail_deterministic(self):
+        """Same seed produces same extra points."""
+        offsets = _bulk_offsets(0x25000, 500)
+        trace = _make_trace(offsets)
+
+        r1 = classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE, random_tail_budget=10,
+        )
+        r2 = classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE, random_tail_budget=10,
+        )
+        assert r1 == r2
+
+    def test_random_tail_different_shards_different_extra(self):
+        """Different shard_index gives different random extra points."""
+        offsets = _bulk_offsets(0x25000, 500)
+        trace = _make_trace(offsets)
+
+        r0 = set(classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE,
+            shard_count=2, shard_index=0, random_tail_budget=10,
+        ))
+        r1 = set(classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE,
+            shard_count=2, shard_index=1, random_tail_budget=10,
+        ))
+        # The random extras should differ due to different seed.
+        assert r0 != r1
+
+    def test_random_tail_zero_is_no_op(self):
+        """random_tail_budget=0 is identical to default."""
+        offsets = _bulk_offsets(0x25000, 200)
+        trace = _make_trace(offsets)
+
+        default = classify_trace(trace, SLOT_RANGES, page_size=PAGE)
+        with_zero = classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE, random_tail_budget=0,
+        )
+        assert default == with_zero

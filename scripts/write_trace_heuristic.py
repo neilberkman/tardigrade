@@ -32,6 +32,7 @@ Tier 3 (SPARSE): stratified sampling of bulk sequential copies
 import csv
 import json
 import os
+import random
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 
@@ -173,6 +174,10 @@ def classify_trace(
     discontinuity_window: int = 3,
     bootloader_region: Optional[Tuple[int, int]] = None,
     return_details: bool = False,
+    target_points: Optional[int] = None,
+    shard_count: int = 1,
+    shard_index: int = 0,
+    random_tail_budget: int = 0,
 ) -> Union[List[int], Dict[str, Any]]:
     """
     Classify trace entries into priority tiers and return a sorted list of
@@ -192,6 +197,16 @@ def classify_trace(
             region.  Writes here are Tier 0 (always tested).
         return_details: If True, return a dict with fault_points and per-tier
             membership info instead of a plain list.
+        target_points: Optional maximum number of fault points.  When set,
+            trims low-risk tiers (tier3 first, then tier2) to fit the budget.
+            Tier 0 and Tier 1 are never trimmed.
+        shard_count: Number of shards to split tier3 bulk points across.
+            Each shard gets the full critical core (tier0+tier1+tier2) plus
+            its deterministic slice of tier3.  Default 1 (no sharding).
+        shard_index: Which shard to select (0-based, must be < shard_count).
+        random_tail_budget: Number of additional random points to add from
+            the unselected tier3 pool.  Uses a deterministic seed derived
+            from shard_index for reproducibility.
 
     Returns:
         If return_details is False: sorted list of fault point indices.
@@ -214,6 +229,10 @@ def classify_trace(
                     "tier2_step": tier2_step,
                     "tier3_step": tier3_step,
                     "discontinuity_window": discontinuity_window,
+                    "target_points": target_points,
+                    "shard_count": shard_count,
+                    "shard_index": shard_index,
+                    "random_tail_budget": random_tail_budget,
                 },
             }
         return []
@@ -339,7 +358,7 @@ def classify_trace(
     selected.update(tier2_selected)
 
     # Tier 3: stratified bulk sampling via run segmentation.
-    tier3_selected: Set[int] = set()
+    tier3_all_sampled: Set[int] = set()
     runs = _segment_runs(tier3_trace_indices, trace, page_size)
 
     for run_start, run_end, run_length in runs:
@@ -348,14 +367,75 @@ def classify_trace(
         )
         for trace_idx in sampled_trace_indices:
             fault_point = trace[trace_idx][0] - 1
-            tier3_selected.add(fault_point)
+            tier3_all_sampled.add(fault_point)
+
+    # Sharding: partition tier3 bulk points across shards.  The critical
+    # core (tier0 + tier1 + tier2) is always included in every shard.
+    if shard_count > 1:
+        tier3_sorted_for_shard = sorted(tier3_all_sampled)
+        tier3_selected = set()
+        for i, fp in enumerate(tier3_sorted_for_shard):
+            if i % shard_count == shard_index:
+                tier3_selected.add(fp)
+    else:
+        tier3_selected = tier3_all_sampled
+
     selected.update(tier3_selected)
+
+    # Random tail budget: add extra points from the unselected tier3 pool.
+    if random_tail_budget > 0:
+        # Full tier3 pool = all tier3 fault points (not just sampled ones).
+        tier3_full_pool = set()
+        for ti in tier3_trace_indices:
+            tier3_full_pool.add(trace[ti][0] - 1)
+        unselected_tier3 = sorted(tier3_full_pool - selected)
+        if unselected_tier3:
+            rng = random.Random(42 + shard_index)
+            pick_count = min(random_tail_budget, len(unselected_tier3))
+            extra = rng.sample(unselected_tier3, pick_count)
+            tier3_selected.update(extra)
+            selected.update(extra)
 
     # Always include first and last fault points.
     all_fps = [w - 1 for w, _ in trace]
     if all_fps:
         selected.add(min(all_fps))
         selected.add(max(all_fps))
+
+    # Target points budget: trim low-risk tiers to fit.  Never trim
+    # tier0 or tier1 — only tier3 then tier2 are expendable.
+    if target_points is not None and len(selected) > target_points:
+        core = tier0 | tier1
+        # How many non-core points can we keep?
+        budget_for_lower = max(0, target_points - len(core))
+
+        # Trim tier3 first, then tier2 if still over.
+        tier3_list = sorted(tier3_selected)
+        tier2_list = sorted(tier2_selected)
+        lower_pool = tier2_list + tier3_list  # tier2 before tier3 = keep tier2 first
+
+        if budget_for_lower < len(lower_pool):
+            # Evenly sample from the combined lower pool, preferring tier2.
+            kept_lower: Set[int] = set()
+            if budget_for_lower == 0:
+                pass
+            elif budget_for_lower >= len(tier2_list):
+                # Keep all tier2, sample tier3.
+                kept_lower.update(tier2_list)
+                tier3_budget = budget_for_lower - len(tier2_list)
+                if tier3_budget > 0 and tier3_list:
+                    step = max(1, len(tier3_list) / tier3_budget)
+                    for i in range(tier3_budget):
+                        kept_lower.add(tier3_list[min(round(i * step), len(tier3_list) - 1)])
+            else:
+                # Even tier2 must be trimmed.
+                step = max(1, len(tier2_list) / budget_for_lower)
+                for i in range(budget_for_lower):
+                    kept_lower.add(tier2_list[min(round(i * step), len(tier2_list) - 1)])
+
+            selected = core | kept_lower
+            tier3_selected = tier3_selected & selected
+            tier2_selected = tier2_selected & selected
 
     result = sorted(selected)
 
@@ -373,6 +453,10 @@ def classify_trace(
                 "tier2_step": tier2_step,
                 "tier3_step": tier3_step,
                 "discontinuity_window": discontinuity_window,
+                "target_points": target_points,
+                "shard_count": shard_count,
+                "shard_index": shard_index,
+                "random_tail_budget": random_tail_budget,
             },
         }
 
