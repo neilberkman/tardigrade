@@ -1,0 +1,114 @@
+# Example: seeded initial-state matrix for A/B bootloader auditing.
+#
+# This profile declares multiple starting conditions under `initial_states`.
+# When the audit runner encounters initial_states, it runs a separate sweep
+# for each named state, producing results tagged with the state name.
+#
+# Each state can override:
+#   - pre_boot_state: raw memory writes before boot
+#   - setup_script: a Renode .resc script to configure NVM state
+#   - update_trigger: a declarative trigger (e.g., mcuboot_trailer_magic)
+#   - expect: per-state expectation overrides (should_find_issues, control_outcome)
+#
+# Fields not specified in a state are inherited from the parent profile.
+
+schema_version: 1
+name: seeded_initial_states_example
+description: >-
+  Demonstrates sweep matrix expansion across different initial NVM states.
+  Each initial state creates a different starting condition for the same
+  bootloader firmware, testing resilience across degraded-state scenarios.
+
+platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 8
+  slots:
+    exec:    { base: 0x10000000, size: 0x38000 }
+    staging: { base: 0x10038000, size: 0x38000 }
+
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+
+# Default pre_boot_state (used when a state omits pre_boot_state).
+pre_boot_state:
+  - { address: 0x10070000, u32: 0x4F54414D }  # replica 0 magic
+  - { address: 0x10070004, u32: 1 }            # seq = 1
+  - { address: 0x10070008, u32: 0 }            # active_slot = 0
+  - { address: 0x10070100, u32: 0x4F54414D }  # replica 1 magic
+  - { address: 0x10070104, u32: 1 }            # seq = 1
+  - { address: 0x10070108, u32: 0 }            # active_slot = 0
+
+success_criteria:
+  vtor_in_slot: exec
+
+fault_sweep:
+  mode: runtime
+  max_writes: 28672
+  run_duration: "0.01"
+
+# --------------------------------------------------------------------------
+# Initial state matrix
+# --------------------------------------------------------------------------
+initial_states:
+
+  - name: only_replica_0
+    description: >-
+      Only metadata replica 0 is valid. Tests recovery when replica 1
+      is corrupted or erased.
+    pre_boot_state:
+      - { address: 0x10070000, u32: 0x4F54414D }
+      - { address: 0x10070004, u32: 1 }
+      - { address: 0x10070008, u32: 0 }
+      # replica 1 left as erased (0xFF)
+
+  - name: only_replica_1
+    description: >-
+      Only metadata replica 1 is valid. Tests recovery when replica 0
+      is corrupted or erased.
+    pre_boot_state:
+      # replica 0 left as erased (0xFF)
+      - { address: 0x10070100, u32: 0x4F54414D }
+      - { address: 0x10070104, u32: 1 }
+      - { address: 0x10070108, u32: 0 }
+
+  - name: both_valid_different_seq
+    description: >-
+      Both replicas valid but with different sequence numbers.
+      Verifies the bootloader picks the higher-seq replica.
+    pre_boot_state:
+      - { address: 0x10070000, u32: 0x4F54414D }
+      - { address: 0x10070004, u32: 2 }            # seq = 2 (higher)
+      - { address: 0x10070008, u32: 0 }
+      - { address: 0x10070100, u32: 0x4F54414D }
+      - { address: 0x10070104, u32: 1 }            # seq = 1 (lower)
+      - { address: 0x10070108, u32: 1 }            # points to slot B
+
+  - name: both_invalid
+    description: >-
+      Neither replica is valid. Tests the bootloader's last-resort
+      fallback behavior (should still boot from a valid slot).
+    pre_boot_state: []
+    expect:
+      control_outcome: no_boot
+      should_find_issues: true
+
+  - name: seq_near_wraparound
+    description: >-
+      Sequence number near 0xFFFFFFFF wraparound boundary.
+      Tests wrapping comparison logic.
+    pre_boot_state:
+      - { address: 0x10070000, u32: 0x4F54414D }
+      - { address: 0x10070004, u32: 0xFFFFFFFE }   # seq near max
+      - { address: 0x10070008, u32: 0 }
+      - { address: 0x10070100, u32: 0x4F54414D }
+      - { address: 0x10070104, u32: 0xFFFFFFFE }
+      - { address: 0x10070108, u32: 0 }
+
+expect:
+  should_find_issues: true
