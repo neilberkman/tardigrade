@@ -1273,8 +1273,8 @@ def _parse_invariant_providers(raw: Optional[Any]) -> List[str]:
     raise ProfileError("invariant_providers: expected string or list of strings")
 
 
-def _parse_metadata_fault_regions(raw):
-    # type: (Optional[List[Any]]) -> List[MetadataFaultRegion]
+def _parse_metadata_fault_regions(raw, slots=None):
+    # type: (Optional[List[Any]], Optional[Dict[str, SlotConfig]]) -> List[MetadataFaultRegion]
     """Parse metadata_fault_regions from profile YAML."""
     if raw is None:
         return []
@@ -1297,14 +1297,61 @@ def _parse_metadata_fault_regions(raw):
                 "metadata_fault_regions: duplicate name '{}'".format(name)
             )
         seen_names.add(name)
-        start = _parse_int(
-            _require(entry, "start", "metadata_fault_regions[{}]".format(idx)),
-            "metadata_fault_regions[{}].start".format(idx),
-        )
-        end = _parse_int(
-            _require(entry, "end", "metadata_fault_regions[{}]".format(idx)),
-            "metadata_fault_regions[{}].end".format(idx),
-        )
+
+        has_absolute = "start" in entry or "end" in entry
+        has_relative = "slot" in entry or "offset" in entry or "size" in entry or "end_offset" in entry
+        if has_absolute and has_relative:
+            raise ProfileError(
+                "metadata_fault_regions[{}]: choose either absolute (start/end) or relative (slot/offset/size) form".format(
+                    idx
+                )
+            )
+
+        if has_relative:
+            slot_name = str(_require(entry, "slot", "metadata_fault_regions[{}]".format(idx))).strip()
+            if not slot_name:
+                raise ProfileError(
+                    "metadata_fault_regions[{}].slot: expected non-empty string".format(idx)
+                )
+            if slots is None or slot_name not in slots:
+                raise ProfileError(
+                    "metadata_fault_regions[{}].slot: unknown slot '{}'".format(idx, slot_name)
+                )
+            slot = slots[slot_name]
+            offset = _parse_int(
+                _require(entry, "offset", "metadata_fault_regions[{}]".format(idx)),
+                "metadata_fault_regions[{}].offset".format(idx),
+            )
+            if "size" in entry and "end_offset" in entry:
+                raise ProfileError(
+                    "metadata_fault_regions[{}]: specify only one of size or end_offset".format(idx)
+                )
+            if "size" in entry:
+                size = _parse_int(
+                    entry["size"],
+                    "metadata_fault_regions[{}].size".format(idx),
+                )
+                start = slot.base + offset
+                end = start + size
+            elif "end_offset" in entry:
+                start = slot.base + offset
+                end = slot.base + _parse_int(
+                    entry["end_offset"],
+                    "metadata_fault_regions[{}].end_offset".format(idx),
+                )
+            else:
+                raise ProfileError(
+                    "metadata_fault_regions[{}]: relative form requires size or end_offset".format(idx)
+                )
+        else:
+            start = _parse_int(
+                _require(entry, "start", "metadata_fault_regions[{}]".format(idx)),
+                "metadata_fault_regions[{}].start".format(idx),
+            )
+            end = _parse_int(
+                _require(entry, "end", "metadata_fault_regions[{}]".format(idx)),
+                "metadata_fault_regions[{}].end".format(idx),
+            )
         if end <= start:
             raise ProfileError(
                 "metadata_fault_regions[{}]: end (0x{:X}) must be greater than start (0x{:X})".format(
@@ -1404,7 +1451,9 @@ def load_profile(path: str | Path) -> ProfileConfig:
     invariants = _parse_invariants(data.get("invariants"))
     invariant_providers = _parse_invariant_providers(data.get("invariant_providers"))
     initial_states = _parse_initial_states(data.get("initial_states"))
-    metadata_fault_regions = _parse_metadata_fault_regions(data.get("metadata_fault_regions"))
+    metadata_fault_regions = _parse_metadata_fault_regions(
+        data.get("metadata_fault_regions"), slots=memory.slots
+    )
 
     scenario = str(data.get("scenario", "runtime"))
     if scenario not in VALID_SCENARIOS:
