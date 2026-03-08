@@ -25,6 +25,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from fault_inject import MetadataFaultRegion
+
 try:
     import yaml
 except ImportError:
@@ -199,6 +201,19 @@ class ReadFaultConfig:
                     )
                 )
 
+class MetadataFaultConfig:
+    """Configuration for faulting host-side metadata/setup writes before boot."""
+
+    __slots__ = ("enabled", "fault_types")
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        fault_types: Optional[List[str]] = None,
+    ) -> None:
+        self.enabled = enabled
+        self.fault_types = fault_types or ["power_loss"]
+
 
 class FaultSweepConfig:
     __slots__ = (
@@ -219,6 +234,7 @@ class FaultSweepConfig:
         "phase2_fault",
         "multi_fault",
         "read_fault_config",
+        "metadata_fault",
     )
 
     def __init__(
@@ -240,6 +256,7 @@ class FaultSweepConfig:
         phase2_fault: Optional["Phase2FaultConfig"] = None,
         multi_fault=None,
         read_fault_config: Optional["ReadFaultConfig"] = None,
+        metadata_fault: Optional["MetadataFaultConfig"] = None,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -264,6 +281,7 @@ class FaultSweepConfig:
         self.phase2_fault = phase2_fault or Phase2FaultConfig()
         self.multi_fault = multi_fault or MultiFaultConfig()
         self.read_fault_config = read_fault_config
+        self.metadata_fault = metadata_fault or MetadataFaultConfig()
 
 
 class StateFuzzerConfig:
@@ -397,6 +415,7 @@ class ProfileConfig:
         invariant_providers: Optional[List[str]] = None,
         flash_backend: Optional[str] = None,
         initial_states: Optional[List["InitialStateConfig"]] = None,
+        metadata_fault_regions: Optional[List[MetadataFaultRegion]] = None,
     ) -> None:
         self.schema_version = schema_version
         self.name = name
@@ -422,6 +441,7 @@ class ProfileConfig:
         self.invariant_providers = invariant_providers or []
         self.flash_backend = flash_backend
         self.initial_states: List[InitialStateConfig] = initial_states or []
+        self.metadata_fault_regions: List[MetadataFaultRegion] = metadata_fault_regions or []
 
     def resolve_initial_state(self, state: "InitialStateConfig") -> "ProfileConfig":
         """Return a new ProfileConfig with the given initial state applied."""
@@ -450,6 +470,7 @@ class ProfileConfig:
             semantic_assertions=self.semantic_assertions,
             invariants=self.invariants, invariant_providers=self.invariant_providers,
             flash_backend=self.flash_backend, initial_states=[],
+            metadata_fault_regions=self.metadata_fault_regions,
         )
         if state.update_trigger is not None and state.pre_boot_state is None:
             resolved.pre_boot_state = resolved.expand_update_trigger()
@@ -714,6 +735,9 @@ class ProfileConfig:
                 "PROGRESS_STALL_TIMEOUT_S:{}".format(fs.progress_stall_timeout_s)
             )
 
+        if fs.metadata_fault.enabled:
+            vars_list.append("METADATA_FAULT_ENABLED:true")
+
         return vars_list
 # ---------------------------------------------------------------------------
 # Parsing helpers
@@ -888,6 +912,7 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         phase2_fault=_parse_phase2_fault(raw.get("phase2_fault")),
         multi_fault=_parse_multi_fault(raw.get("multi_fault")),
         read_fault_config=_parse_read_fault_config(raw.get("read_fault_config")),
+        metadata_fault=_parse_metadata_fault(raw.get("metadata_fault")),
     )
 
 
@@ -996,6 +1021,39 @@ def _parse_read_fault_config(raw: Optional[Dict[str, Any]]) -> Optional[ReadFaul
         fault_probability=fault_probability,
         seed=seed,
     )
+
+
+
+def _parse_metadata_fault(raw):
+    """Parse metadata_fault config from fault_sweep YAML block."""
+    if raw is None:
+        return MetadataFaultConfig()
+    if isinstance(raw, bool):
+        return MetadataFaultConfig(enabled=raw)
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep.metadata_fault: expected mapping or bool")
+    enabled = bool(raw.get("enabled", False))
+    raw_types = raw.get("fault_types")
+    fault_types = None
+    if raw_types is not None:
+        if isinstance(raw_types, str):
+            raw_types = [raw_types]
+        if not isinstance(raw_types, list):
+            raise ProfileError("metadata_fault.fault_types: expected list of strings")
+        valid_mf_types = {"power_loss", "bit_corruption"}
+        fault_types = []
+        for ft in raw_types:
+            ft_str = str(ft).strip()
+            if ft_str not in valid_mf_types:
+                import warnings
+                warnings.warn(
+                    "metadata_fault.fault_types: unknown type '{}', ignoring".format(ft_str)
+                )
+                continue
+            fault_types.append(ft_str)
+        if not fault_types:
+            fault_types = ["power_loss"]
+    return MetadataFaultConfig(enabled=enabled, fault_types=fault_types)
 
 
 def _parse_state_fuzzer(raw: Optional[Dict[str, Any]]) -> StateFuzzerConfig:
@@ -1192,6 +1250,48 @@ def _parse_invariant_providers(raw: Optional[Any]) -> List[str]:
     raise ProfileError("invariant_providers: expected string or list of strings")
 
 
+def _parse_metadata_fault_regions(raw):
+    # type: (Optional[List[Any]]) -> List[MetadataFaultRegion]
+    """Parse metadata_fault_regions from profile YAML."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("metadata_fault_regions: expected list of region definitions")
+    regions = []  # type: List[MetadataFaultRegion]
+    seen_names = set()  # type: set
+    for idx, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ProfileError(
+                "metadata_fault_regions[{}]: expected mapping".format(idx)
+            )
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            raise ProfileError(
+                "metadata_fault_regions[{}].name: expected non-empty string".format(idx)
+            )
+        if name in seen_names:
+            raise ProfileError(
+                "metadata_fault_regions: duplicate name '{}'".format(name)
+            )
+        seen_names.add(name)
+        start = _parse_int(
+            _require(entry, "start", "metadata_fault_regions[{}]".format(idx)),
+            "metadata_fault_regions[{}].start".format(idx),
+        )
+        end = _parse_int(
+            _require(entry, "end", "metadata_fault_regions[{}]".format(idx)),
+            "metadata_fault_regions[{}].end".format(idx),
+        )
+        if end <= start:
+            raise ProfileError(
+                "metadata_fault_regions[{}]: end (0x{:X}) must be greater than start (0x{:X})".format(
+                    idx, end, start
+                )
+            )
+        regions.append(MetadataFaultRegion(name=name, start=start, end=end))
+    return regions
+
+
 # ---------------------------------------------------------------------------
 # Main loader
 # ---------------------------------------------------------------------------
@@ -1281,6 +1381,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
     invariants = _parse_invariants(data.get("invariants"))
     invariant_providers = _parse_invariant_providers(data.get("invariant_providers"))
     initial_states = _parse_initial_states(data.get("initial_states"))
+    metadata_fault_regions = _parse_metadata_fault_regions(data.get("metadata_fault_regions"))
 
     scenario = str(data.get("scenario", "runtime"))
     if scenario not in VALID_SCENARIOS:
@@ -1329,6 +1430,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         invariant_providers=invariant_providers,
         flash_backend=flash_backend,
         initial_states=initial_states,
+        metadata_fault_regions=metadata_fault_regions,
     )
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.
@@ -1431,6 +1533,10 @@ def main() -> int:
             if profile.fault_sweep.read_fault_config is not None
             else None
         ),
+        "metadata_fault_regions": [
+            {"name": r.name, "start": "0x{:X}".format(r.start), "end": "0x{:X}".format(r.end)}
+            for r in profile.metadata_fault_regions
+        ],
     }
     print(json.dumps(info, indent=2, sort_keys=True))
     return 0
