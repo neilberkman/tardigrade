@@ -35,7 +35,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-<<<<<<< HEAD
 from fault_inject import (
     FaultResult,
     MetadataFaultRegion,
