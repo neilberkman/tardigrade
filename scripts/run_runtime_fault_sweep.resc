@@ -499,7 +499,7 @@ def load_state_probe():
         return _state_probe_collect
     with open(state_probe_script, 'r') as f:
         code = compile(f.read(), state_probe_script, 'exec')
-    probe_ns = {'__builtins__': __builtins__}
+    probe_ns = {'__builtins__': __builtins__, '__file__': state_probe_script}
     exec(code, probe_ns)
     collect_fn = probe_ns.get('collect_state')
     if not callable(collect_fn):
