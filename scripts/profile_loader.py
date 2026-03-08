@@ -25,8 +25,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fault_inject import MetadataFaultRegion, NvsRegion, ConfigCheck
-from fault_inject import FaultDistributionConfig, MetadataFaultRegion
+from fault_inject import BootloaderRegionConfig, FaultDistributionConfig, MetadataFaultRegion
 
 try:
     import yaml
@@ -82,20 +81,6 @@ class SlotConfig:
         self.size = size
 
 
-class BootloaderRegion:
-    """Address range of the bootloader's own code in NVM."""
-
-    __slots__ = ("base", "size")
-
-    def __init__(self, base: int, size: int) -> None:
-        self.base = base
-        self.size = size
-
-    @property
-    def end(self) -> int:
-        return self.base + self.size
-
-
 class MemoryConfig:
     __slots__ = ("sram_start", "sram_end", "write_granularity", "slots", "bootloader_region")
 
@@ -105,7 +90,7 @@ class MemoryConfig:
         sram_end: int,
         write_granularity: int,
         slots: Dict[str, SlotConfig],
-        bootloader_region: Optional["BootloaderRegion"] = None,
+        bootloader_region: Optional[BootloaderRegionConfig] = None,
     ) -> None:
         self.sram_start = sram_start
         self.sram_end = sram_end
@@ -359,6 +344,53 @@ class NvsRegionConfig:
         self.address = address
         self.size = size
         self.snapshot = snapshot
+
+
+class ConfigCheck:
+    """A single post-boot config check: verify memory at an address."""
+    __slots__ = ("address", "expected", "nonzero", "range_min", "range_max", "mask", "expected_masked")
+    def __init__(self, address: int, expected: Optional[int] = None, nonzero: bool = False,
+                 range_min: Optional[int] = None, range_max: Optional[int] = None,
+                 mask: Optional[int] = None, expected_masked: Optional[int] = None) -> None:
+        self.address = address
+        self.expected = expected
+        self.nonzero = nonzero
+        self.range_min = range_min
+        self.range_max = range_max
+        self.mask = mask
+        self.expected_masked = expected_masked
+
+    def evaluate(self, actual_value: int) -> bool:
+        """Evaluate this check against an actual memory value."""
+        if self.expected is not None and actual_value != self.expected:
+            return False
+        if self.nonzero and actual_value == 0:
+            return False
+        if self.range_min is not None and actual_value < self.range_min:
+            return False
+        if self.range_max is not None and actual_value > self.range_max:
+            return False
+        if self.mask is not None and self.expected_masked is not None:
+            if (actual_value & self.mask) != (self.expected_masked & self.mask):
+                return False
+        return True
+
+    def describe_failure(self, actual_value: int) -> str:
+        """Return a human-readable failure description."""
+        parts = ["config check at 0x{:X} failed:".format(self.address)]
+        parts.append("actual=0x{:X}".format(actual_value))
+        if self.expected is not None:
+            parts.append("expected=0x{:X}".format(self.expected))
+        if self.nonzero:
+            parts.append("expected nonzero")
+        if self.range_min is not None or self.range_max is not None:
+            parts.append("expected range [{}, {}]".format(
+                "0x{:X}".format(self.range_min) if self.range_min is not None else "-inf",
+                "0x{:X}".format(self.range_max) if self.range_max is not None else "+inf"))
+        if self.mask is not None:
+            parts.append("mask=0x{:X} expected_masked=0x{:X}".format(
+                self.mask, self.expected_masked if self.expected_masked is not None else 0))
+        return " ".join(parts)
 
 
 class NvsCorruptionConfig:
@@ -623,6 +655,7 @@ class ProfileConfig:
         multi_component: Optional["MultiComponentConfig"] = None,
         nvs_region: Optional[NvsRegionConfig] = None,
         security_policy: Optional["SecurityPolicyConfig"] = None,
+        bootloader_region: Optional[BootloaderRegionConfig] = None,
     ) -> None:
         self.schema_version = schema_version
         self.name = name
@@ -653,6 +686,7 @@ class ProfileConfig:
         self.metadata_fault_regions: List[MetadataFaultRegion] = metadata_fault_regions or []
         self.multi_component: Optional[MultiComponentConfig] = multi_component
         self.nvs_region = nvs_region
+        self.bootloader_region: Optional[BootloaderRegionConfig] = bootloader_region
 
     @property
     def is_multi_component(self) -> bool:
@@ -1124,16 +1158,16 @@ def _parse_slots(raw: Dict[str, Any]) -> Dict[str, SlotConfig]:
     return slots
 
 
-def _parse_bootloader_region(raw: Optional[Dict[str, Any]]) -> Optional[BootloaderRegion]:
+def _parse_bootloader_region(raw: Optional[Dict[str, Any]]) -> Optional[BootloaderRegionConfig]:
     if raw is None:
         return None
     if not isinstance(raw, dict):
-        raise ProfileError("memory.bootloader_region: expected mapping with base and size")
-    base = _parse_int(_require(raw, "base", "memory.bootloader_region"), "memory.bootloader_region.base")
-    size = _parse_int(_require(raw, "size", "memory.bootloader_region"), "memory.bootloader_region.size")
+        raise ProfileError("bootloader_region: expected mapping with base and size")
+    base = _parse_int(_require(raw, "base", "bootloader_region"), "bootloader_region.base")
+    size = _parse_int(_require(raw, "size", "bootloader_region"), "bootloader_region.size")
     if size <= 0:
-        raise ProfileError("memory.bootloader_region.size: must be positive, got {}".format(size))
-    return BootloaderRegion(base=base, size=size)
+        raise ProfileError("bootloader_region.size must be > 0, got 0x{:X}".format(size))
+    return BootloaderRegionConfig(base=base, size=size)
 
 
 def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
@@ -1410,9 +1444,18 @@ def _parse_config_checks(raw: Optional[List[Any]]) -> List[ConfigCheck]:
             expected_masked = _parse_int(
                 entry["expected_masked"], "{}.expected_masked".format(ctx)
             )
-        if expected is None and not nonzero and mask is None:
+        range_min: Optional[int] = None
+        range_max: Optional[int] = None
+        if "range" in entry:
+            rng = entry["range"]
+            if isinstance(rng, dict):
+                if "min" in rng:
+                    range_min = int(rng["min"])
+                if "max" in rng:
+                    range_max = int(rng["max"])
+        if expected is None and not nonzero and mask is None and range_min is None and range_max is None:
             raise ProfileError(
-                "{}: must specify at least one of expected, nonzero, or mask+expected_masked".format(
+                "{}: must specify at least one of expected, nonzero, mask+expected_masked, or range".format(
                     ctx
                 )
             )
@@ -1422,6 +1465,8 @@ def _parse_config_checks(raw: Optional[List[Any]]) -> List[ConfigCheck]:
             nonzero=nonzero,
             mask=mask,
             expected_masked=expected_masked,
+            range_min=range_min,
+            range_max=range_max,
         ))
     return checks
 
@@ -2072,6 +2117,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
     )
     multi_component = _parse_components(data.get("multi_component"))
     nvs_region = _parse_nvs_region(data.get("nvs_region"))
+    bootloader_region = _parse_bootloader_region(data.get("bootloader_region"))
 
     scenario = str(data.get("scenario", "runtime"))
     if scenario not in VALID_SCENARIOS:
@@ -2125,6 +2171,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         multi_component=multi_component,
         nvs_region=nvs_region,
         security_policy=security_policy,
+        bootloader_region=bootloader_region,
     )
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.
