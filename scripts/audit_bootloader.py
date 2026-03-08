@@ -35,7 +35,13 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fault_inject import FaultResult
+from fault_inject import (
+    FaultResult,
+    MultiFaultPlan,
+    encode_multi_fault_sequence,
+    generate_multi_fault_sequences,
+    multi_fault_plan_summary,
+)
 from invariants import resolve_invariants, run_invariants
 from profile_loader import ProfileConfig, load_profile
 
@@ -2100,6 +2106,7 @@ def main() -> int:
         #   'l' wear-leveling corruption, 't' reset-at-time,
         #   'e' interrupted erase, 'a' multi-sector atomicity fault.
         fault_types_list: Optional[List[str]] = None
+        multi_fault_plan: Optional[MultiFaultPlan] = None
         has_mixed_types = (
             (include_erases and total_erases > 0)
             or include_bit_corruption
@@ -2109,6 +2116,7 @@ def main() -> int:
             or include_write_rejection
             or include_reset_at_time
             or profile.fault_sweep.phase2_fault.enabled
+            or profile.fault_sweep.multi_fault.enabled
         )
         if has_mixed_types:
             write_fps: List[Tuple[int, str]] = []
@@ -2219,6 +2227,43 @@ def main() -> int:
                             combined.append((p1_fp, enc))
                             phase2_count += 1
 
+            # Multi-fault sequential interruption sequences.
+            multi_fault_count = 0
+            mf_config = profile.fault_sweep.multi_fault
+            if mf_config.enabled:
+                if mf_config.strategy == "explicit":
+                    mf_interesting: List[int] = []
+                else:
+                    # Use Tier 1 (trailer/metadata) write points as interesting points.
+                    # If write_trace_heuristic is available, use it; otherwise use all write fps.
+                    try:
+                        from write_trace_heuristic import classify_trace
+                        trace_csv = robot_vars.get("trace_file", "")
+                        if trace_csv and Path(trace_csv).exists():
+                            tiers = classify_trace(
+                                trace_csv,
+                                profile,
+                                tier2_step=999999,
+                                tier3_step=999999,
+                            )
+                            mf_interesting = sorted(tiers.get("tier1", []))
+                        else:
+                            mf_interesting = [fp for fp, ft in combined if ft == 'w']
+                    except ImportError:
+                        mf_interesting = [fp for fp, ft in combined if ft == 'w']
+                multi_fault_plan = generate_multi_fault_sequences(
+                    strategy=mf_config.strategy,
+                    interesting_points=mf_interesting,
+                    max_faults_per_run=mf_config.max_faults_per_run,
+                    max_pairs=mf_config.max_pairs,
+                    seed=mf_config.seed,
+                    explicit_sequences=mf_config.sequences if mf_config.strategy == "explicit" else None,
+                )
+                for seq in multi_fault_plan.sequences:
+                    enc = encode_multi_fault_sequence(seq)
+                    combined.append((seq[0], enc))
+                    multi_fault_count += 1
+
             fault_points = [fp for fp, _ in combined]
             fault_types_list = [ft for _, ft in combined]
             parts = ["{} writes".format(len(write_fps))]
@@ -2240,6 +2285,8 @@ def main() -> int:
                 parts.append("{} timed-reset".format(timed_reset_count))
             if phase2_count:
                 parts.append("{} phase2-recovery".format(phase2_count))
+            if multi_fault_count:
+                parts.append("{} multi-fault".format(multi_fault_count))
             print(
                 "Running {} fault points ({}) for '{}'...".format(
                     len(fault_points),
@@ -2397,6 +2444,7 @@ def main() -> int:
             "fault_points_tested": len(fault_points),
             "quick": bool(args.quick),
             "heuristic": heuristic_summary,
+            "multi_fault": multi_fault_plan_summary(multi_fault_plan),
             "verdict": verdict,
             "summary": {
                 "runtime_sweep": sweep_summary,

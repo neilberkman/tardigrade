@@ -128,6 +128,29 @@ class SuccessCriteria:
         self.otadata_expect_scope = otadata_expect_scope
 
 
+
+class MultiFaultConfig:
+    """Configuration for multi-fault (sequential interruption) sweeps."""
+
+    __slots__ = ("enabled", "max_faults_per_run", "strategy", "max_pairs", "seed", "sequences")
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        max_faults_per_run: int = 2,
+        strategy: str = "pairwise_interesting",
+        max_pairs: int = 5000,
+        seed=None,
+        sequences=None,
+    ) -> None:
+        self.enabled = enabled
+        self.max_faults_per_run = max(2, int(max_faults_per_run))
+        self.strategy = strategy
+        self.max_pairs = max(1, int(max_pairs))
+        self.seed = seed
+        self.sequences = sequences or []
+
+
 class Phase2FaultConfig:
     """Configuration for injecting faults during Phase 2 recovery writes."""
 
@@ -161,6 +184,7 @@ class FaultSweepConfig:
         "boot_cycle_hook",
         "expected_rollback_at_cycle",
         "phase2_fault",
+        "multi_fault",
     )
 
     def __init__(
@@ -180,6 +204,7 @@ class FaultSweepConfig:
         boot_cycle_hook: Optional[str] = None,
         expected_rollback_at_cycle: Optional[int] = None,
         phase2_fault: Optional["Phase2FaultConfig"] = None,
+        multi_fault=None,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -202,6 +227,7 @@ class FaultSweepConfig:
             else max(1, int(expected_rollback_at_cycle))
         )
         self.phase2_fault = phase2_fault or Phase2FaultConfig()
+        self.multi_fault = multi_fault or MultiFaultConfig()
 
 
 class StateFuzzerConfig:
@@ -806,6 +832,7 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         boot_cycle_hook=boot_cycle_hook,
         expected_rollback_at_cycle=expected_rollback_at_cycle,
         phase2_fault=_parse_phase2_fault(raw.get("phase2_fault")),
+        multi_fault=_parse_multi_fault(raw.get("multi_fault")),
     )
 
 
@@ -832,6 +859,58 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
         enabled=enabled,
         fault_types=fault_types,
         max_points=max_points,
+    )
+
+
+
+def _parse_multi_fault(raw):
+    """Parse multi_fault configuration from profile YAML."""
+    if raw is None:
+        return MultiFaultConfig()
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep.multi_fault: expected mapping")
+    enabled = bool(raw.get("enabled", False))
+    max_faults_per_run = int(raw.get("max_faults_per_run", 2))
+    if max_faults_per_run < 2:
+        raise ProfileError(
+            "fault_sweep.multi_fault.max_faults_per_run: expected integer >= 2"
+        )
+    strategy = str(raw.get("strategy", "pairwise_interesting"))
+    known_strategies = {"explicit", "pairwise_interesting", "random_sample"}
+    if strategy not in known_strategies:
+        raise ProfileError(
+            "fault_sweep.multi_fault.strategy: must be one of {}, got {!r}".format(
+                sorted(known_strategies), strategy
+            )
+        )
+    max_pairs = int(raw.get("max_pairs", 5000))
+    if max_pairs < 1:
+        raise ProfileError(
+            "fault_sweep.multi_fault.max_pairs: expected positive integer"
+        )
+    seed_raw = raw.get("seed")
+    seed = int(seed_raw) if seed_raw is not None else None
+    sequences_raw = raw.get("sequences")
+    sequences = None
+    if sequences_raw is not None:
+        if not isinstance(sequences_raw, list):
+            raise ProfileError(
+                "fault_sweep.multi_fault.sequences: expected list of lists"
+            )
+        sequences = []
+        for i, seq in enumerate(sequences_raw):
+            if not isinstance(seq, list) or len(seq) < 2:
+                raise ProfileError(
+                    "fault_sweep.multi_fault.sequences[{}]: expected list of >= 2 integers".format(i)
+                )
+            sequences.append([int(x) for x in seq])
+    return MultiFaultConfig(
+        enabled=enabled,
+        max_faults_per_run=max_faults_per_run,
+        strategy=strategy,
+        max_pairs=max_pairs,
+        seed=seed,
+        sequences=sequences,
     )
 
 
@@ -1247,6 +1326,14 @@ def main() -> int:
         "pre_boot_state_count": len(profile.pre_boot_state),
         "initial_states": [{"name": s.name, "description": s.description}
                            for s in profile.initial_states],
+        "multi_fault": {
+            "enabled": profile.fault_sweep.multi_fault.enabled,
+            "strategy": profile.fault_sweep.multi_fault.strategy,
+            "max_faults_per_run": profile.fault_sweep.multi_fault.max_faults_per_run,
+            "max_pairs": profile.fault_sweep.multi_fault.max_pairs,
+            "seed": profile.fault_sweep.multi_fault.seed,
+            "sequences_count": len(profile.fault_sweep.multi_fault.sequences),
+        },
     }
     print(json.dumps(info, indent=2, sort_keys=True))
     return 0
