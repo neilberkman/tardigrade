@@ -648,5 +648,292 @@ class TestProfileIntegration(unittest.TestCase):
         self.assertEqual(config.truncation_points, "heuristic")
 
 
+class TestMaxPointsCap(unittest.TestCase):
+    """Test max_points cap for exhaustive mode."""
+
+    def test_max_points_caps_exhaustive(self):
+        """Exhaustive with max_points should return at most that many points."""
+        image_size = 0x10000  # 64KB
+        sector_size = 0x1000  # 4KB
+        max_points = 5
+
+        full = generate_truncation_points(
+            image_size=image_size,
+            strategy="exhaustive",
+            header_size=32,
+            sector_size=sector_size,
+        )
+        capped = generate_truncation_points(
+            image_size=image_size,
+            strategy="exhaustive",
+            header_size=32,
+            sector_size=sector_size,
+            max_points=max_points,
+        )
+        self.assertGreater(len(full), max_points)
+        self.assertEqual(len(capped), max_points)
+
+    def test_max_points_preserves_first_and_last(self):
+        """Capping should always keep first and last points."""
+        image_size = 0x10000
+        sector_size = 0x1000
+        max_points = 4
+
+        capped = generate_truncation_points(
+            image_size=image_size,
+            strategy="exhaustive",
+            header_size=32,
+            sector_size=sector_size,
+            max_points=max_points,
+        )
+        offsets = [p.offset for p in capped]
+        # First point is always offset 0.
+        self.assertEqual(offsets[0], 0)
+        # Last point is always the complete image.
+        self.assertEqual(offsets[-1], image_size)
+
+    def test_max_points_no_effect_on_heuristic(self):
+        """max_points should not affect heuristic mode."""
+        heuristic_full = generate_truncation_points(
+            image_size=0x10000,
+            strategy="heuristic",
+            header_size=32,
+            sector_size=4096,
+        )
+        heuristic_capped = generate_truncation_points(
+            image_size=0x10000,
+            strategy="heuristic",
+            header_size=32,
+            sector_size=4096,
+            max_points=3,
+        )
+        self.assertEqual(len(heuristic_full), len(heuristic_capped))
+
+    def test_max_points_no_effect_when_under_cap(self):
+        """When total points <= max_points, no capping happens."""
+        points = generate_truncation_points(
+            image_size=0x2000,  # 8KB, only 1 sector boundary
+            strategy="exhaustive",
+            header_size=32,
+            sector_size=4096,
+            max_points=100,
+        )
+        points_no_cap = generate_truncation_points(
+            image_size=0x2000,
+            strategy="exhaustive",
+            header_size=32,
+            sector_size=4096,
+        )
+        self.assertEqual(len(points), len(points_no_cap))
+
+    def test_max_points_result_sorted(self):
+        """Capped points should remain sorted by offset."""
+        capped = generate_truncation_points(
+            image_size=0x10000,
+            strategy="exhaustive",
+            header_size=32,
+            sector_size=0x400,  # 1KB sectors = many boundaries
+            max_points=8,
+        )
+        offsets = [p.offset for p in capped]
+        self.assertEqual(offsets, sorted(offsets))
+
+    def test_max_points_no_duplicates(self):
+        """Capped points should have no duplicate offsets."""
+        capped = generate_truncation_points(
+            image_size=0x10000,
+            strategy="exhaustive",
+            header_size=32,
+            sector_size=0x400,
+            max_points=10,
+        )
+        offsets = [p.offset for p in capped]
+        self.assertEqual(len(offsets), len(set(offsets)))
+
+    def test_max_points_config_validation(self):
+        """max_points=0 or negative should raise ValueError."""
+        with self.assertRaises(ValueError):
+            PartialStagingConfig(
+                staging_image_path="test.bin",
+                staging_slot_name="staging",
+                truncation_points="exhaustive",
+                fill_pattern=0xFF,
+                header_size=32,
+                sector_size=4096,
+                trailer_size=0,
+                max_points=0,
+            )
+        with self.assertRaises(ValueError):
+            PartialStagingConfig(
+                staging_image_path="test.bin",
+                staging_slot_name="staging",
+                truncation_points="exhaustive",
+                fill_pattern=0xFF,
+                header_size=32,
+                sector_size=4096,
+                trailer_size=0,
+                max_points=-5,
+            )
+
+    def test_max_points_none_is_valid(self):
+        """max_points=None (default) should not raise."""
+        config = PartialStagingConfig(
+            staging_image_path="test.bin",
+            staging_slot_name="staging",
+            truncation_points="exhaustive",
+            fill_pattern=0xFF,
+            header_size=32,
+            sector_size=4096,
+            trailer_size=0,
+            max_points=None,
+        )
+        self.assertIsNone(config.max_points)
+
+    def test_parse_config_max_points(self):
+        """max_points from YAML config should be parsed correctly."""
+        raw = {
+            "staging_slot": "staging",
+            "truncation_points": "exhaustive",
+            "max_points": 20,
+        }
+        images = {"staging": "staging.bin"}
+
+        class MockSlot:
+            base = 0x10000
+            size = 0x38000
+
+        slots = {"staging": MockSlot()}
+        config = parse_partial_staging_config(raw, images, slots)
+        self.assertEqual(config.max_points, 20)
+
+    def test_parse_config_no_max_points(self):
+        """Omitted max_points should parse as None."""
+        raw = {
+            "staging_slot": "staging",
+            "truncation_points": "exhaustive",
+        }
+        images = {"staging": "staging.bin"}
+
+        class MockSlot:
+            base = 0x10000
+            size = 0x38000
+
+        slots = {"staging": MockSlot()}
+        config = parse_partial_staging_config(raw, images, slots)
+        self.assertIsNone(config.max_points)
+
+
+class TestSummaryDeterminism(unittest.TestCase):
+    """Test that summary computation is deterministic regardless of input order."""
+
+    def _make_result(self, offset, label, classification, outcome="success", slot=None):
+        return PartialStagingResult(
+            truncation_point=TruncationPoint(
+                offset=offset, label=label, description="test"
+            ),
+            boot_outcome=outcome,
+            boot_slot=slot,
+            classification=classification,
+        )
+
+    def test_summary_independent_of_input_order(self):
+        """Summary should be identical regardless of result ordering."""
+        results_ordered = [
+            self._make_result(0, "empty", "brick", outcome="no_boot"),
+            self._make_result(500, "half", "safe_fallback"),
+            self._make_result(750, "three_q", "partial_image_booted", slot="staging"),
+            self._make_result(1000, "complete", "complete_image_ok"),
+        ]
+        # Reverse order.
+        results_reversed = list(reversed(results_ordered))
+        # Shuffled order.
+        results_shuffled = [
+            results_ordered[2],
+            results_ordered[0],
+            results_ordered[3],
+            results_ordered[1],
+        ]
+
+        s1 = summarize_partial_staging(results_ordered)
+        s2 = summarize_partial_staging(results_reversed)
+        s3 = summarize_partial_staging(results_shuffled)
+
+        # Core statistics must match.
+        for key in ["total_points", "safe_fallback", "brick",
+                     "partial_image_booted", "complete_image_ok",
+                     "issue_count", "issue_rate", "classifications"]:
+            self.assertEqual(s1[key], s2[key], msg="mismatch on '{}' (ordered vs reversed)".format(key))
+            self.assertEqual(s1[key], s3[key], msg="mismatch on '{}' (ordered vs shuffled)".format(key))
+
+    def test_summary_issues_content_independent_of_order(self):
+        """Issue entries should contain the same offsets regardless of input order."""
+        results_a = [
+            self._make_result(100, "a", "brick", outcome="no_boot"),
+            self._make_result(200, "b", "safe_fallback"),
+            self._make_result(300, "c", "partial_image_booted", slot="staging"),
+        ]
+        results_b = list(reversed(results_a))
+
+        sa = summarize_partial_staging(results_a)
+        sb = summarize_partial_staging(results_b)
+
+        offsets_a = sorted(i["offset"] for i in sa["issues"])
+        offsets_b = sorted(i["offset"] for i in sb["issues"])
+        self.assertEqual(offsets_a, offsets_b)
+
+
+class TestTempFileIsolation(unittest.TestCase):
+    """Test that multiple concurrent temp file writes do not collide."""
+
+    def test_multiple_temp_files_unique_paths(self):
+        """Writing multiple partial images should produce unique file paths."""
+        original = b"\xAA" * 1024
+        paths = []
+        try:
+            for i in range(10):
+                path = write_partial_image_to_temp(
+                    original, i * 100, fill=0xFF, label="point_{}".format(i)
+                )
+                paths.append(path)
+
+            # All paths must be unique.
+            self.assertEqual(len(paths), len(set(paths)))
+
+            # All files must exist and have correct size.
+            for path in paths:
+                self.assertTrue(os.path.exists(path))
+                self.assertEqual(os.path.getsize(path), 1024)
+        finally:
+            for path in paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    def test_worker_labelled_temp_files_unique(self):
+        """Temp files with worker-id labels should not collide."""
+        original = b"\xBB" * 512
+        paths = []
+        try:
+            for worker_id in range(4):
+                for point_idx in range(3):
+                    path = write_partial_image_to_temp(
+                        original,
+                        point_idx * 128,
+                        fill=0xFF,
+                        label="w{}_point_{}".format(worker_id, point_idx),
+                    )
+                    paths.append(path)
+
+            self.assertEqual(len(paths), 12)
+            self.assertEqual(len(set(paths)), 12)
+        finally:
+            for path in paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -64,6 +64,7 @@ class PartialStagingConfig:
     sector_size: int
     trailer_size: int
     explicit_offsets: Optional[List[int]] = None
+    max_points: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.fill_pattern not in (0x00, 0xFF):
@@ -84,6 +85,10 @@ class PartialStagingConfig:
             raise ValueError(
                 "trailer_size must be non-negative, got {}".format(self.trailer_size)
             )
+        if self.max_points is not None and self.max_points < 1:
+            raise ValueError(
+                "max_points must be positive or None, got {}".format(self.max_points)
+            )
 
 
 def generate_truncation_points(
@@ -93,6 +98,7 @@ def generate_truncation_points(
     sector_size: int = 4096,
     trailer_size: int = 0,
     explicit_offsets: Optional[List[int]] = None,
+    max_points: Optional[int] = None,
 ) -> List[TruncationPoint]:
     """Generate truncation offsets for a given image size.
 
@@ -108,6 +114,9 @@ def generate_truncation_points(
         sector_size: Flash sector/page size in bytes.
         trailer_size: Size of trailer/TLV area at end of image.
         explicit_offsets: User-provided truncation offsets (for explicit strategy).
+        max_points: Maximum number of truncation points to return (exhaustive
+            mode only). When set, points are evenly sampled from the full set
+            to stay within this cap. Heuristic mode is unaffected.
 
     Returns:
         Sorted list of TruncationPoint objects.
@@ -297,7 +306,43 @@ def generate_truncation_points(
                 )
             )
 
-    return _deduplicate_and_sort(points)
+    result = _deduplicate_and_sort(points)
+
+    # Apply max_points cap for exhaustive mode only.
+    if (
+        max_points is not None
+        and strategy == "exhaustive"
+        and len(result) > max_points
+    ):
+        result = _evenly_sample(result, max_points)
+
+    return result
+
+
+def _evenly_sample(
+    points: List[TruncationPoint], max_points: int
+) -> List[TruncationPoint]:
+    """Evenly sample from a sorted list of truncation points.
+
+    Always keeps the first and last points, then selects evenly spaced
+    points from the interior to fill the budget.
+    """
+    if max_points < 1:
+        return []
+    if max_points >= len(points):
+        return points
+    if max_points == 1:
+        return [points[0]]
+
+    # Always include first and last.
+    indices = {0, len(points) - 1}
+    interior_budget = max_points - 2
+    if interior_budget > 0:
+        step = (len(points) - 1) / (interior_budget + 1)
+        for i in range(1, interior_budget + 1):
+            indices.add(round(i * step))
+
+    return [points[i] for i in sorted(indices)]
 
 
 def _deduplicate_and_sort(points: List[TruncationPoint]) -> List[TruncationPoint]:
@@ -539,6 +584,9 @@ def parse_partial_staging_config(
             raise ValueError("partial_staging.offsets: expected list of integers")
         explicit_offsets = [int(str(o), 0) for o in offsets_raw]
 
+    max_points_raw = raw.get("max_points")
+    max_points = int(max_points_raw) if max_points_raw is not None else None
+
     return PartialStagingConfig(
         staging_image_path=str(staging_image),
         staging_slot_name=staging_slot,
@@ -548,4 +596,5 @@ def parse_partial_staging_config(
         sector_size=sector_size,
         trailer_size=trailer_size,
         explicit_offsets=explicit_offsets,
+        max_points=max_points,
     )

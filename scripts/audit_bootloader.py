@@ -1333,6 +1333,341 @@ def _run_batch_worker(
     return results
 
 
+def _run_partial_staging_worker(
+    repo_root_str: str,
+    renode_test: str,
+    robot_suite: str,
+    profile_path: str,
+    original_image: bytes,
+    image_size: int,
+    trunc_points_dicts: List[Dict[str, Any]],
+    base_robot_vars: List[str],
+    staging_slot_name: str,
+    exec_slot_name: str,
+    fill_pattern: int,
+    work_dir_str: str,
+    renode_remote_server_dir: str,
+    worker_id: int,
+    keep_run_artifacts: bool = False,
+) -> List[Dict[str, Any]]:
+    """Worker function for parallel partial staging execution.
+
+    Runs in a subprocess via ProcessPoolExecutor.  Reloads the profile
+    from disk so everything is picklable.  Each worker gets its own
+    work_dir and temp files to avoid collisions.
+    """
+    repo_root = Path(repo_root_str)
+    work_dir = Path(work_dir_str)
+    worker_dir = work_dir / "partial_staging" / "worker_{}".format(worker_id)
+    worker_dir.mkdir(parents=True, exist_ok=True)
+
+    # Re-create the renode config for this worker's directory.
+    renode_config = worker_dir / "renode.config"
+    renode_config.write_text(
+        "[general]\n"
+        "terminal = Termsharp\n"
+        "compiler-cache-enabled = False\n"
+        "serialization-mode = Generated\n"
+        "use-synchronous-logging = False\n"
+        "always-log-machine-name = False\n"
+        "collapse-repeated-log-entries = True\n"
+        "log-history-limit = 1000\n"
+        "store-table-bits = 41\n"
+        "[monitor]\n"
+        "consume-exceptions-from-command = True\n"
+        "break-script-on-exception = True\n"
+        "number-format = Hexadecimal\n"
+        "[plugins]\n"
+        "enabled-plugins = \n"
+        "[translation]\n"
+        "min-tb-size = 33554432\n"
+        "max-tb-size = 536870912\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(profile_path)
+    staging_key = "IMAGE_{}_PATH".format(staging_slot_name.upper())
+    staging_var = "IMAGE_{}".format(staging_slot_name.upper())
+
+    results: List[Dict[str, Any]] = []
+    temp_files: List[str] = []
+
+    for tp_dict in trunc_points_dicts:
+        tp = TruncationPoint(
+            offset=tp_dict["offset"],
+            label=tp_dict["label"],
+            description=tp_dict["description"],
+        )
+        # Write temp image with worker_id in the label to avoid collisions.
+        temp_path = write_partial_image_to_temp(
+            original_image,
+            tp.offset,
+            fill=fill_pattern,
+            label="w{}_{}".format(worker_id, tp.label),
+        )
+        temp_files.append(temp_path)
+
+        # Build robot vars with the truncated staging image.
+        ps_robot_vars = [
+            rv
+            for rv in base_robot_vars
+            if not rv.startswith(staging_key + ":")
+            and not rv.startswith(staging_var + ":")
+        ]
+        ps_robot_vars.append("{}:{}".format(staging_var, temp_path))
+        ps_robot_vars.append("{}:{}".format(staging_key, temp_path))
+
+        try:
+            data = run_single_point(
+                repo_root=repo_root,
+                renode_test=renode_test,
+                robot_suite=robot_suite,
+                profile=profile,
+                fault_at=-1,
+                robot_vars=ps_robot_vars,
+                work_dir=worker_dir,
+                renode_remote_server_dir=renode_remote_server_dir,
+                is_control=True,
+                keep_run_artifacts=keep_run_artifacts,
+            )
+            boot_outcome = str(data.get("boot_outcome", "unknown"))
+            boot_slot = data.get("boot_slot")
+        except Exception as exc:
+            _progress(
+                "PS worker {} point {} (offset=0x{:X}) failed: {}".format(
+                    worker_id, tp.label, tp.offset, exc
+                )
+            )
+            boot_outcome = "infra_error"
+            boot_slot = None
+            data = None
+
+        classification = classify_partial_staging_outcome(
+            boot_outcome=boot_outcome,
+            boot_slot=boot_slot,
+            truncation_offset=tp.offset,
+            image_size=image_size,
+            expected_exec_slot=exec_slot_name,
+        )
+
+        results.append({
+            "truncation_point": tp.as_dict,
+            "boot_outcome": boot_outcome,
+            "boot_slot": boot_slot,
+            "classification": classification,
+        })
+        _progress(
+            "  PS w{}: {} (0x{:X}): {} -> {}".format(
+                worker_id, tp.label, tp.offset, boot_outcome, classification
+            )
+        )
+
+    # Clean up temp files.
+    for tf in temp_files:
+        try:
+            os.unlink(tf)
+        except OSError:
+            pass
+
+    _progress("PS worker {} complete: {} results.".format(worker_id, len(results)))
+    return results
+
+
+def run_partial_staging_sweep(
+    repo_root: Path,
+    renode_test: str,
+    robot_suite: str,
+    profile: ProfileConfig,
+    ps_config: PartialStagingConfig,
+    original_image: bytes,
+    trunc_points: List[TruncationPoint],
+    robot_vars: List[str],
+    work_dir: Path,
+    renode_remote_server_dir: str,
+    num_workers: int = 1,
+    keep_run_artifacts: bool = False,
+) -> Tuple[List[PartialStagingResult], List[Dict[str, Any]]]:
+    """Run the partial staging sweep, optionally in parallel.
+
+    Returns a tuple of (typed results, serializable dicts).
+    """
+    image_size = len(original_image)
+
+    # Determine exec slot name.
+    exec_slot_name = "exec"
+    for sn in profile.memory.slots:
+        if sn in {"exec", "primary", "slot_a", "slot0"}:
+            exec_slot_name = sn
+            break
+
+    if num_workers > 1 and len(trunc_points) > 1:
+        # Parallel: distribute points across workers via round-robin interleave.
+        n = min(num_workers, len(trunc_points))
+        chunks = [trunc_points[i::n] for i in range(n)]
+
+        _progress(
+            "Parallel partial staging: {} workers, ~{} points each".format(
+                len(chunks), len(chunks[0])
+            )
+        )
+
+        # Serialize truncation points as dicts for pickling.
+        chunks_dicts = [[tp.as_dict for tp in chunk] for chunk in chunks]
+
+        all_result_dicts: List[Dict[str, Any]] = []
+        with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
+            futures = {}
+            for wid, chunk_dicts in enumerate(chunks_dicts):
+                f = pool.submit(
+                    _run_partial_staging_worker,
+                    repo_root_str=str(repo_root),
+                    renode_test=renode_test,
+                    robot_suite=robot_suite,
+                    profile_path=str(profile.profile_path),
+                    original_image=original_image,
+                    image_size=image_size,
+                    trunc_points_dicts=chunk_dicts,
+                    base_robot_vars=robot_vars,
+                    staging_slot_name=ps_config.staging_slot_name,
+                    exec_slot_name=exec_slot_name,
+                    fill_pattern=ps_config.fill_pattern,
+                    work_dir_str=str(work_dir),
+                    renode_remote_server_dir=renode_remote_server_dir,
+                    worker_id=wid,
+                    keep_run_artifacts=keep_run_artifacts,
+                )
+                futures[f] = wid
+
+            for f in as_completed(futures):
+                wid = futures[f]
+                try:
+                    worker_results = f.result()
+                    all_result_dicts.extend(worker_results)
+                    _progress(
+                        "PS worker {} finished: {} results".format(
+                            wid, len(worker_results)
+                        )
+                    )
+                except Exception as exc:
+                    _progress("PS worker {} FAILED: {}".format(wid, exc))
+                    raise
+
+        # Sort by offset for deterministic output.
+        all_result_dicts.sort(key=lambda r: r["truncation_point"]["offset"])
+
+        # Reconstruct typed results from dicts.
+        ps_results_typed = []
+        for rd in all_result_dicts:
+            tp_d = rd["truncation_point"]
+            ps_results_typed.append(
+                PartialStagingResult(
+                    truncation_point=TruncationPoint(
+                        offset=tp_d["offset"],
+                        label=tp_d["label"],
+                        description=tp_d["description"],
+                    ),
+                    boot_outcome=rd["boot_outcome"],
+                    boot_slot=rd["boot_slot"],
+                    classification=rd["classification"],
+                )
+            )
+
+        return ps_results_typed, all_result_dicts
+
+    # Serial path (single worker).
+    staging_key = "IMAGE_{}_PATH".format(ps_config.staging_slot_name.upper())
+    staging_var = "IMAGE_{}".format(ps_config.staging_slot_name.upper())
+
+    ps_results_typed: List[PartialStagingResult] = []
+    temp_files: List[str] = []
+
+    for tp in trunc_points:
+        temp_path = write_partial_image_to_temp(
+            original_image,
+            tp.offset,
+            fill=ps_config.fill_pattern,
+            label=tp.label,
+        )
+        temp_files.append(temp_path)
+
+        ps_robot_vars = [
+            rv
+            for rv in robot_vars
+            if not rv.startswith(staging_key + ":")
+            and not rv.startswith(staging_var + ":")
+        ]
+        ps_robot_vars.append("{}:{}".format(staging_var, temp_path))
+        ps_robot_vars.append("{}:{}".format(staging_key, temp_path))
+
+        try:
+            data = run_single_point(
+                repo_root=repo_root,
+                renode_test=renode_test,
+                robot_suite=robot_suite,
+                profile=profile,
+                fault_at=-1,
+                robot_vars=ps_robot_vars,
+                work_dir=work_dir / "partial_staging",
+                renode_remote_server_dir=renode_remote_server_dir,
+                is_control=True,
+                keep_run_artifacts=keep_run_artifacts,
+            )
+            boot_outcome = str(data.get("boot_outcome", "unknown"))
+            boot_slot = data.get("boot_slot")
+        except Exception as exc:
+            _progress(
+                "Partial staging point {} (offset=0x{:X}) failed: {}".format(
+                    tp.label, tp.offset, exc
+                )
+            )
+            boot_outcome = "infra_error"
+            boot_slot = None
+            data = None
+
+        classification = classify_partial_staging_outcome(
+            boot_outcome=boot_outcome,
+            boot_slot=boot_slot,
+            truncation_offset=tp.offset,
+            image_size=image_size,
+            expected_exec_slot=exec_slot_name,
+        )
+
+        ps_results_typed.append(
+            PartialStagingResult(
+                truncation_point=tp,
+                boot_outcome=boot_outcome,
+                boot_slot=boot_slot,
+                classification=classification,
+                temp_image_path=temp_path,
+                raw_result=data,
+            )
+        )
+        _progress(
+            "  {} (0x{:X}): {} -> {}".format(
+                tp.label, tp.offset, boot_outcome, classification
+            )
+        )
+
+    # Clean up temp files.
+    for tf in temp_files:
+        try:
+            os.unlink(tf)
+        except OSError:
+            pass
+
+    serial_dicts = [
+        {
+            "truncation_point": r.truncation_point.as_dict,
+            "boot_outcome": r.boot_outcome,
+            "boot_slot": r.boot_slot,
+            "classification": r.classification,
+        }
+        for r in ps_results_typed
+    ]
+
+    return ps_results_typed, serial_dicts
+
+
 def run_runtime_sweep(
     repo_root: Path,
     renode_test: str,
@@ -3282,6 +3617,7 @@ def main() -> int:
                         sector_size=ps_config.sector_size,
                         trailer_size=ps_config.trailer_size,
                         explicit_offsets=ps_config.explicit_offsets,
+                        max_points=ps_config.max_points,
                     )
                     _progress(
                         "Partial staging: {} truncation points for {}-byte image".format(
@@ -3289,115 +3625,26 @@ def main() -> int:
                         )
                     )
 
-                    staging_slot = profile.memory.slots.get(
-                        ps_config.staging_slot_name
+                    ps_results_typed, partial_staging_results = (
+                        run_partial_staging_sweep(
+                            repo_root=repo_root,
+                            renode_test=renode_test,
+                            robot_suite=robot_suite,
+                            profile=profile,
+                            ps_config=ps_config,
+                            original_image=original_image,
+                            trunc_points=trunc_points,
+                            robot_vars=robot_vars,
+                            work_dir=work_dir,
+                            renode_remote_server_dir=args.renode_remote_server_dir,
+                            num_workers=args.workers,
+                            keep_run_artifacts=args.keep_run_artifacts,
+                        )
                     )
-                    exec_slot_name = "exec"
-                    for sn in profile.memory.slots:
-                        if sn in {"exec", "primary", "slot_a", "slot0"}:
-                            exec_slot_name = sn
-                            break
-
-                    ps_results_typed: List[PartialStagingResult] = []
-                    temp_files: List[str] = []
-
-                    for tp in trunc_points:
-                        temp_path = write_partial_image_to_temp(
-                            original_image,
-                            tp.offset,
-                            fill=ps_config.fill_pattern,
-                            label=tp.label,
-                        )
-                        temp_files.append(temp_path)
-
-                        # Build a modified robot vars list that overrides the
-                        # staging image path with the truncated variant.
-                        ps_robot_vars = list(robot_vars)
-                        staging_key = "IMAGE_{}_PATH".format(
-                            ps_config.staging_slot_name.upper()
-                        )
-                        staging_var = "IMAGE_{}".format(
-                            ps_config.staging_slot_name.upper()
-                        )
-                        # Replace existing staging image vars.
-                        ps_robot_vars = [
-                            rv
-                            for rv in ps_robot_vars
-                            if not rv.startswith(staging_key + ":")
-                            and not rv.startswith(staging_var + ":")
-                        ]
-                        ps_robot_vars.append(
-                            "{}:{}".format(staging_var, temp_path)
-                        )
-                        ps_robot_vars.append(
-                            "{}:{}".format(staging_key, temp_path)
-                        )
-
-                        try:
-                            data = run_single_point(
-                                repo_root=repo_root,
-                                renode_test=renode_test,
-                                robot_suite=robot_suite,
-                                profile=profile,
-                                fault_at=-1,  # no fault injection, just boot
-                                robot_vars=ps_robot_vars,
-                                work_dir=work_dir / "partial_staging",
-                                renode_remote_server_dir=args.renode_remote_server_dir,
-                                is_control=True,
-                                keep_run_artifacts=args.keep_run_artifacts,
-                            )
-                            boot_outcome = str(
-                                data.get("boot_outcome", "unknown")
-                            )
-                            boot_slot = data.get("boot_slot")
-                        except Exception as exc:
-                            _progress(
-                                "Partial staging point {} (offset=0x{:X}) "
-                                "failed: {}".format(tp.label, tp.offset, exc)
-                            )
-                            boot_outcome = "infra_error"
-                            boot_slot = None
-                            data = None
-
-                        classification = classify_partial_staging_outcome(
-                            boot_outcome=boot_outcome,
-                            boot_slot=boot_slot,
-                            truncation_offset=tp.offset,
-                            image_size=image_size,
-                            expected_exec_slot=exec_slot_name,
-                        )
-
-                        ps_results_typed.append(
-                            PartialStagingResult(
-                                truncation_point=tp,
-                                boot_outcome=boot_outcome,
-                                boot_slot=boot_slot,
-                                classification=classification,
-                                temp_image_path=temp_path,
-                                raw_result=data,
-                            )
-                        )
-                        _progress(
-                            "  {} (0x{:X}): {} -> {}".format(
-                                tp.label,
-                                tp.offset,
-                                boot_outcome,
-                                classification,
-                            )
-                        )
 
                     partial_staging_summary = summarize_partial_staging(
                         ps_results_typed
                     )
-                    partial_staging_results = [
-                        {
-                            "truncation_point": r.truncation_point.as_dict,
-                            "boot_outcome": r.boot_outcome,
-                            "boot_slot": r.boot_slot,
-                            "classification": r.classification,
-                        }
-                        for r in ps_results_typed
-                    ]
 
                     _progress(
                         "Partial staging complete: {} points, {} issues "
@@ -3410,13 +3657,6 @@ def main() -> int:
                             ),
                         )
                     )
-
-                    # Clean up temp files.
-                    for tf in temp_files:
-                        try:
-                            os.unlink(tf)
-                        except OSError:
-                            pass
 
         # -------------------------------------------------------------------
         # Verdict
