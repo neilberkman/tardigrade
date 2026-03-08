@@ -50,6 +50,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         bool ReadFaultEnabled { get; set; }
         long ReadFaultAddress { get; set; }
         uint ReadFaultSeed { get; set; }
+        int ReadFaultBitFlips { get; set; }
         bool ReadFaultFired { get; set; }
         ulong ReadFaultSkipCount { get; set; }
         ulong ReadFaultTotalReads { get; set; }

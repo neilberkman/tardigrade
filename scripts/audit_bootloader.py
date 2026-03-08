@@ -1790,6 +1790,31 @@ def categorize_failure(
     return payload
 
 
+def _fault_type_label(code: Any) -> str:
+    code = str(code or "w")
+    mapping = {
+        "w": "power_loss",
+        "b": "bit_corruption",
+        "s": "silent_write_failure",
+        "d": "write_disturb",
+        "l": "wear_leveling_corruption",
+        "r": "write_rejection",
+        "t": "reset_at_time",
+        "e": "interrupted_erase",
+        "a": "multi_sector_atomicity",
+        "f": "read_bit_flip",
+    }
+    if code.startswith("m:"):
+        return "metadata_{}".format(_fault_type_label(code.split(":", 1)[1]))
+    if code.startswith("p2:"):
+        return "phase2_{}".format(_fault_type_label(code.rsplit(":", 1)[-1]))
+    if code.startswith("c:"):
+        return "cascading_{}".format(_fault_type_label(code.rsplit(":", 1)[-1]))
+    if code.startswith("mf:"):
+        return "multi_fault_sequence"
+    return mapping.get(code, code)
+
+
 def summarize_runtime_sweep(
     results: List[Dict[str, Any]],
     total_writes: int = 0,
@@ -1824,7 +1849,17 @@ def summarize_runtime_sweep(
     outcome_counts: Dict[str, int] = {}
     class_counts: Dict[str, int] = {}
     issue_reason_counts: Dict[str, int] = {}
+    fault_type_counts: Dict[str, int] = {}
+    fault_type_issue_counts: Dict[str, int] = {}
+    fault_type_brick_counts: Dict[str, int] = {}
     categorized_failures: List[Dict[str, Any]] = []
+    for r in injected:
+        ft_name = _fault_type_label(r.get("fault_type"))
+        fault_type_counts[ft_name] = fault_type_counts.get(ft_name, 0) + 1
+        if result_is_brick(r):
+            fault_type_brick_counts[ft_name] = fault_type_brick_counts.get(ft_name, 0) + 1
+        if result_has_issues(r, expected_outcome):
+            fault_type_issue_counts[ft_name] = fault_type_issue_counts.get(ft_name, 0) + 1
     for r in failures:
         eff_out, _ = _effective_boot_result(r)
         if eff_out != expected_outcome:
@@ -1851,6 +1886,9 @@ def summarize_runtime_sweep(
         "discarded_no_fault_fired": len(not_injected),
         "failure_outcomes": outcome_counts,
         "failure_classes": class_counts,
+        "fault_type_points": fault_type_counts,
+        "fault_type_issue_points": fault_type_issue_counts,
+        "fault_type_bricks": fault_type_brick_counts,
     }
     if issue_reason_counts:
         summary["issue_reasons"] = issue_reason_counts

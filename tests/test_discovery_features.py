@@ -318,6 +318,86 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertEqual(timing["averages"]["followup_ms"], 60)
             self.assertEqual(timing["maximums"]["followup_ms"], 60)
 
+    def test_summary_includes_fault_type_breakdown(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: fault_type_summary_profile
+                description: discovery
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            results = [
+                {
+                    "fault_at": 1,
+                    "fault_type": "f",
+                    "fault_injected": True,
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "is_control": False,
+                },
+                {
+                    "fault_at": 2,
+                    "fault_type": "m:b",
+                    "fault_injected": True,
+                    "boot_outcome": "hard_fault",
+                    "boot_slot": None,
+                    "signals": {"execution_observed": False},
+                    "is_control": False,
+                },
+                {
+                    "fault_at": 3,
+                    "fault_type": "mf:10:200",
+                    "fault_injected": True,
+                    "boot_outcome": "wrong_image",
+                    "boot_slot": "staging",
+                    "signals": {"execution_observed": True, "vtor_ok": False},
+                    "is_control": False,
+                },
+            ]
+
+            summary = summarize_runtime_sweep(results, total_writes=10, profile=profile)
+            self.assertEqual(
+                summary["fault_type_points"],
+                {
+                    "read_bit_flip": 1,
+                    "metadata_bit_corruption": 1,
+                    "multi_fault_sequence": 1,
+                },
+            )
+            self.assertEqual(
+                summary["fault_type_issue_points"],
+                {
+                    "metadata_bit_corruption": 1,
+                    "multi_fault_sequence": 1,
+                },
+            )
+            self.assertEqual(
+                summary["fault_type_bricks"],
+                {
+                    "metadata_bit_corruption": 1,
+                },
+            )
+
     def test_rollback_converged_satisfies_generic_invariants(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
@@ -1614,7 +1694,7 @@ class MetadataFaultTest(unittest.TestCase):
         robot_vars = profile.robot_vars(Path("/tmp"))
         self.assertEqual([v for v in robot_vars if "METADATA_FAULT" in v], [])
 
-    def test_metadata_fault_enabled_emits_robot_var(self):
+    def test_metadata_fault_enabled_emits_no_legacy_robot_var(self):
         yaml_str = self._make_profile_yaml("metadata_fault:\n  enabled: true\n")
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(yaml_str)
@@ -1623,8 +1703,7 @@ class MetadataFaultTest(unittest.TestCase):
         os.unlink(f.name)
         robot_vars = profile.robot_vars(Path("/tmp"))
         metadata_vars = [v for v in robot_vars if v.startswith("METADATA_FAULT_ENABLED:")]
-        self.assertEqual(len(metadata_vars), 1)
-        self.assertEqual(metadata_vars[0], "METADATA_FAULT_ENABLED:true")
+        self.assertEqual(metadata_vars, [])
 
     def test_metadata_fault_generates_fault_points(self):
         from profile_loader import MetadataFaultConfig

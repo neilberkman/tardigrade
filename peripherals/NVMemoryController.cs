@@ -360,6 +360,9 @@ namespace Antmicro.Renode.Peripherals.Memory
         // PRNG seed for deterministic bit selection during read corruption.
         public uint ReadFaultSeed { get; set; }
 
+        // Number of bits to flip when the read fault fires.
+        public int ReadFaultBitFlips { get; set; } = 1;
+
         // Sticky: set when the read fault fires, cleared when re-arming.
         public bool ReadFaultFired { get; set; }
 
@@ -426,7 +429,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             var seed = ReadFaultSeed != 0 ? ReadFaultSeed : (uint)(ReadFaultAddress ^ 0xDEAD);
             // Deterministic bit-flip: LCG PRNG selects bit positions.
             if(seed == 0) seed = 0xDEAD;
-            var flipCount = 1 + (seed % 3);
+            var flipCount = ReadFaultBitFlips > 0 ? (uint)ReadFaultBitFlips : 1u;
             for(var i = 0u; i < flipCount; i++)
             {
                 seed = (uint)((seed * 1103515245u + 12345u) & 0xFFFFFFFF);
