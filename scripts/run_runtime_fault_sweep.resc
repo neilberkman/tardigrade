@@ -3370,20 +3370,25 @@ def run_multi_fault_sequence(fault_sequence):
         per_fault_states.append(stage_state)
 
     if not sequence_injected:
+        failed_stage = len(per_fault_states)
+        max_writes = per_fault_states[-1].get('actual_writes', 0) if per_fault_states else 0
         return {
             'fault_at': seq[0],
             'fault_requested': seq[0],
             'fault_type': 'mf',
             'fault_sequence': seq,
             'fault_injected': False,
+            'skip_reason': 'stage{}_fault_index_beyond_writes'.format(failed_stage),
             'fault_address': '0x00000000',
             'boot_outcome': 'success',
             'boot_slot': None,
             'fault_class': 'recoverable',
-            'actual_writes': per_fault_states[-1].get('actual_writes', 0) if per_fault_states else 0,
+            'actual_writes': max_writes,
             'per_fault_states': per_fault_states,
             'signals': {
                 'multi_fault_count': len(seq),
+                'failed_stage': failed_stage,
+                'stage_max_writes': max_writes,
                 'trace_replay_mode': 'execute',
                 'sequence_elapsed_s': round(_time.time() - seq_t0, 1),
             },
