@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fault_inject import (
+    BootloaderRegionConfig,
     FaultDistributionConfig,
     FaultResult,
     MetadataFaultRegion,
@@ -47,6 +48,7 @@ from fault_inject import (
     encode_multi_fault_sequence,
     generate_multi_fault_sequences,
     multi_fault_plan_summary,
+    validate_bootloader_vector_table,
 )
 from invariants import resolve_invariants, run_invariants
 from partial_staging import (
@@ -1232,7 +1234,7 @@ def _interesting_multi_fault_points(
 def result_is_brick(result: Dict[str, Any]) -> bool:
     eff_outcome, _ = _effective_boot_result(result)
     outcome = str(eff_outcome or "unknown").strip().lower()
-    return outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}
+    return outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor", "config_crash"}
 
 
 def _run_batch_worker(
@@ -1463,6 +1465,52 @@ def run_runtime_sweep(
     return results
 
 
+def evaluate_config_checks(result: Dict[str, Any], profile: "ProfileConfig") -> Optional[str]:
+    """Evaluate config checks against a boot result."""
+    config_checks = getattr(profile.success_criteria, "config_checks", None)
+    if not config_checks:
+        return None
+    eff_outcome, _ = _effective_boot_result(result)
+    outcome = str(eff_outcome or "unknown").strip().lower()
+    nvs_corruption_active = result.get("nvs_corruption_mode") is not None
+    if outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}:
+        if nvs_corruption_active:
+            return "config_crash"
+        return None
+    if outcome != "success":
+        return None
+    config_values = result.get("config_values", {})
+    if not isinstance(config_values, dict):
+        return None
+    for check in config_checks:
+        addr_key = "0x{:X}".format(check.address)
+        if addr_key not in config_values:
+            return "config_lost"
+        actual = config_values[addr_key]
+        if not isinstance(actual, int):
+            try:
+                actual = int(str(actual), 0)
+            except (ValueError, TypeError):
+                return "config_lost"
+        if not check.evaluate(actual):
+            return "config_lost"
+    return None
+
+
+def annotate_nvs_config_results(results: List[Dict[str, Any]], profile: "ProfileConfig") -> None:
+    """Annotate results with NVS config check outcomes."""
+    config_checks = getattr(profile.success_criteria, "config_checks", None)
+    if not config_checks:
+        return
+    for result in results:
+        if result.get("is_control", False):
+            continue
+        classification = evaluate_config_checks(result, profile)
+        if classification is not None:
+            result["nvs_config_outcome"] = classification
+            result["boot_outcome"] = classification
+
+
 def classify_failure_class(result: Dict[str, Any]) -> str:
     """Return normalized failure class for a sweep result.
 
@@ -1487,6 +1535,10 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
 
     eff_outcome, _ = _effective_boot_result(result)
     outcome = str(eff_outcome or "unknown").strip().lower()
+    if outcome == "config_lost":
+        return "config_lost"
+    if outcome == "config_crash":
+        return "config_crash"
     if outcome == "success":
         return "recoverable"
     if outcome == "rollback_accepted":
@@ -1513,10 +1565,11 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
 def enrich_results_with_fault_regions(
     results,  # type: List[Dict[str, Any]]
     metadata_regions,  # type: List[MetadataFaultRegion]
+    bootloader_region=None,  # type: Optional[BootloaderRegionConfig]
 ):
     # type: (...) -> None
     """Annotate each result dict with a 'fault_region' classification."""
-    if not metadata_regions:
+    if not metadata_regions and bootloader_region is None:
         return
     for r in results:
         if r.get("is_control", False):
@@ -1526,7 +1579,7 @@ def enrich_results_with_fault_regions(
             addr = int(fault_addr, 16)
         else:
             addr = int(fault_addr)
-        r["fault_region"] = classify_fault_region(addr, metadata_regions)
+        r["fault_region"] = classify_fault_region(addr, metadata_regions, bootloader_region=bootloader_region)
 
 
 def compute_region_breakdown(
@@ -1555,6 +1608,28 @@ def compute_region_breakdown(
         else:
             bucket["recoveries"] += 1
     return breakdown
+
+
+def check_bootloader_integrity(
+    flash_bytes: bytes,
+    bootloader_region: BootloaderRegionConfig,
+    sram_start: int = 0x20000000,
+    sram_end: int = 0x30000000,
+):
+    # type: (...) -> Tuple[bool, str]
+    """Validate the bootloader region's vector table."""
+    region_offset = bootloader_region.base
+    region_end = region_offset + bootloader_region.size
+    if region_end > len(flash_bytes):
+        return False, "flash snapshot too small for bootloader region"
+    region_data = flash_bytes[region_offset:region_end]
+    return validate_bootloader_vector_table(
+        region_data,
+        bootloader_region.base,
+        bootloader_region.size,
+        sram_start=sram_start,
+        sram_end=sram_end,
+    )
 
 
 def load_clean_write_trace(trace_file: Optional[str]) -> List[Dict[str, int]]:

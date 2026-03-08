@@ -7,8 +7,142 @@ import dataclasses
 import itertools
 import math
 import random
-import struct
+import struct as _struct
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+
+@dataclasses.dataclass
+class BootloaderRegionConfig:
+    """Address range of the bootloader's own code region."""
+
+    base: int
+    size: int
+
+    @property
+    def end(self) -> int:
+        return self.base + self.size
+
+    def contains(self, address: int) -> bool:
+        return self.base <= address < self.end
+
+
+def validate_bootloader_vector_table(
+    memory_bytes: bytes,
+    region_base: int,
+    region_size: int,
+    sram_start: int = 0x20000000,
+    sram_end: int = 0x30000000,
+) -> tuple:
+    """Validate the ARM vector table at the start of a bootloader region.
+
+    Checks:
+      1. Initial SP (first word) is in the SRAM range.
+      2. Reset vector (second word) points into the bootloader region.
+
+    Returns:
+        (True, "ok") if valid, or (False, reason_string) if invalid.
+    """
+    if len(memory_bytes) < 8:
+        return False, "region too small ({} bytes, need >= 8)".format(len(memory_bytes))
+    sp = _struct.unpack_from("<I", memory_bytes, 0)[0]
+    reset_vector = _struct.unpack_from("<I", memory_bytes, 4)[0]
+    region_end = region_base + region_size
+    if not (sram_start <= sp < sram_end):
+        return False, "initial SP 0x{:08X} not in SRAM range 0x{:08X}-0x{:08X}".format(
+            sp, sram_start, sram_end
+        )
+    if not (region_base <= reset_vector < region_end):
+        return False, "reset vector 0x{:08X} not in bootloader region 0x{:08X}-0x{:08X}".format(
+            reset_vector, region_base, region_end
+        )
+    return True, "ok"
+
+
+NVS_CORRUPTION_MODES = {"bit_flip", "partial_erase", "truncate", "scramble"}
+
+
+@dataclasses.dataclass
+class NvsCorruptionSpec:
+    """Specification for NVS/config region corruption fault injection."""
+
+    region_start: int
+    region_end: int
+    corruption_mode: str  # one of NVS_CORRUPTION_MODES
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.region_end <= self.region_start:
+            raise ValueError(
+                "region_end (0x{:X}) must be greater than region_start (0x{:X})".format(
+                    self.region_end, self.region_start
+                )
+            )
+        if self.corruption_mode not in NVS_CORRUPTION_MODES:
+            raise ValueError(
+                "corruption_mode must be one of {}, got {!r}".format(
+                    sorted(NVS_CORRUPTION_MODES), self.corruption_mode
+                )
+            )
+
+    @property
+    def region_size(self) -> int:
+        return self.region_end - self.region_start
+
+
+def generate_nvs_corruption_variants(
+    region_data: bytes,
+    region_size: int,
+    modes: Optional[List[str]] = None,
+    seed: int = 0,
+) -> List[Tuple[str, bytes]]:
+    """Generate corrupted NVS region variants for each requested mode.
+
+    Args:
+        region_data: Original NVS region contents (padded to region_size with 0xFF).
+        region_size: Total size of the NVS region in bytes.
+        modes: List of corruption modes to generate. Defaults to all modes.
+        seed: RNG seed for deterministic corruption.
+
+    Returns:
+        List of (mode_name, corrupted_bytes) tuples.
+    """
+    if modes is None:
+        modes = sorted(NVS_CORRUPTION_MODES)
+    for mode in modes:
+        if mode not in NVS_CORRUPTION_MODES:
+            raise ValueError(
+                "unknown NVS corruption mode {!r}, expected one of {}".format(
+                    mode, sorted(NVS_CORRUPTION_MODES)
+                )
+            )
+
+    data = bytearray(region_data[:region_size])
+    if len(data) < region_size:
+        data.extend(b"\xFF" * (region_size - len(data)))
+
+    variants: List[Tuple[str, bytes]] = []
+    rng = random.Random(seed)
+
+    for mode in modes:
+        corrupted = bytearray(data)
+        if mode == "bit_flip":
+            num_flips = max(1, min(8, region_size // 256))
+            for _ in range(num_flips):
+                byte_idx = rng.randint(0, len(corrupted) - 1)
+                bit_idx = rng.randint(0, 7)
+                corrupted[byte_idx] ^= 1 << bit_idx
+        elif mode == "partial_erase":
+            half = len(corrupted) // 2
+            corrupted[half:] = b"\xFF" * (len(corrupted) - half)
+        elif mode == "truncate":
+            if len(corrupted) > 16:
+                corrupted[16:] = b"\x00" * (len(corrupted) - 16)
+        elif mode == "scramble":
+            for i in range(len(corrupted)):
+                corrupted[i] = rng.randint(0, 255)
+        variants.append((mode, bytes(corrupted)))
+
+    return variants
 
 
 @dataclasses.dataclass
@@ -71,16 +205,22 @@ class MetadataFaultRegion:
 def classify_fault_region(
     fault_address: int,
     metadata_regions: List[MetadataFaultRegion],
+    bootloader_region: Optional[BootloaderRegionConfig] = None,
 ) -> Optional[str]:
-    """Classify a fault address as metadata or data.
+    """Classify a fault address into a region category.
 
     Returns:
-        "metadata:<name>" if the address falls within a metadata region,
-        "data" if metadata_regions are defined but the address doesn't match any,
-        None if no metadata_regions are defined.
+        "bootloader_region" if bootloader_region is defined and the address
+            falls within it (highest priority).
+        "metadata:<name>" if the address falls within a metadata region.
+        "data" if metadata_regions or bootloader_region are defined but the
+            address doesn't match any named region.
+        None if no metadata_regions and no bootloader_region are defined.
     """
-    if not metadata_regions:
+    if not metadata_regions and bootloader_region is None:
         return None
+    if bootloader_region is not None and bootloader_region.contains(fault_address):
+        return "bootloader_region"
     for region in metadata_regions:
         if region.contains(fault_address):
             return "metadata:{}".format(region.name)
@@ -114,6 +254,7 @@ class MultiFaultResult:
 
 
 @dataclasses.dataclass
+
 class MultiComponentFaultResult:
     """Result from a multi-component fault injection run.
 
@@ -130,6 +271,9 @@ class MultiComponentFaultResult:
     combined_outcome: str  # "success", "split_brain", "all_failed", etc.
     is_control: bool = False
     fault_type: Optional[str] = None
+
+
+@dataclasses.dataclass
 class FaultDistributionConfig:
     """Configuration for spatially-correlated fault distribution.
 
@@ -231,18 +375,6 @@ def apply_clustered_distribution(
     return result
 
 
-@dataclasses.dataclass
-class MultiFaultPlan:
-    """Generated plan for multi-fault sweep runs."""
-
-    sequences: List[List[int]]
-    strategy: str
-    interesting_point_count: int
-    max_faults_per_run: int
-    seed: Optional[int]
-    diagnostics: Dict[str, Any]
-
-
 def classify_multi_component_outcome(
     per_component: Dict[str, Dict[str, Any]],
 ) -> str:
@@ -285,6 +417,19 @@ def classify_multi_component_outcome(
     if any_success and any_failed:
         return "split_brain"
     return "degraded"
+
+
+
+@dataclasses.dataclass
+class MultiFaultPlan:
+    """Generated plan for multi-fault sweep runs."""
+
+    sequences: List[List[int]]
+    strategy: str
+    interesting_point_count: int
+    max_faults_per_run: int
+    seed: Optional[int]
+    diagnostics: Dict[str, Any]
 
 
 def parse_fault_range(expr: str) -> Iterable[int]:
@@ -663,250 +808,3 @@ def multi_fault_plan_summary(plan: Optional[MultiFaultPlan]) -> Optional[Dict[st
         "sample_truncated": len(plan.sequences) > preview_limit,
         "diagnostics": plan.diagnostics,
     }
-
-# ---------------------------------------------------------------------------
-# NVS / config region corruption engine
-# ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass
-class NvsRegion:
-    """Definition of a non-volatile storage region on flash."""
-
-    address: int
-    size: int
-    snapshot: Optional[str] = None  # path to binary snapshot file
-
-    def __post_init__(self) -> None:
-        if self.size <= 0:
-            raise ValueError(
-                "nvs_region size must be > 0, got {}".format(self.size)
-            )
-        if self.address < 0:
-            raise ValueError(
-                "nvs_region address must be >= 0, got 0x{:X}".format(self.address)
-            )
-
-    @property
-    def end(self) -> int:
-        return self.address + self.size
-
-
-@dataclasses.dataclass
-class ConfigCheck:
-    """A single config validation check against post-boot NVS state."""
-
-    address: int
-    expected: Optional[int] = None  # exact byte value
-    nonzero: bool = False  # check that value != 0
-    mask: Optional[int] = None  # bitmask for partial checks
-    expected_masked: Optional[int] = None  # expected value after masking
-
-    def evaluate(self, actual_byte: int) -> bool:
-        """Return True if the check passes for the given byte value."""
-        if self.expected is not None:
-            if actual_byte != (self.expected & 0xFF):
-                return False
-        if self.nonzero and actual_byte == 0:
-            return False
-        if self.mask is not None and self.expected_masked is not None:
-            if (actual_byte & self.mask) != (self.expected_masked & self.mask):
-                return False
-        return True
-
-
-@dataclasses.dataclass
-class NvsCorruptionSpec:
-    """Specification for a single NVS corruption fault injection."""
-
-    mode: str  # "bit_flip", "partial_erase", "truncation"
-    region: NvsRegion
-    seed: int = 0
-    bit_flip_count: int = 1  # for bit_flip mode
-    erase_fraction: float = 0.5  # for partial_erase mode (fraction of region)
-    truncate_offset: Optional[int] = None  # for truncation mode
-
-    def __post_init__(self) -> None:
-        valid_modes = {"bit_flip", "partial_erase", "truncation"}
-        if self.mode not in valid_modes:
-            raise ValueError(
-                "nvs_corruption mode must be one of {}, got {!r}".format(
-                    sorted(valid_modes), self.mode
-                )
-            )
-        if self.mode == "bit_flip" and self.bit_flip_count < 1:
-            raise ValueError(
-                "bit_flip_count must be >= 1, got {}".format(self.bit_flip_count)
-            )
-        if self.mode == "partial_erase":
-            if not (0.0 < self.erase_fraction <= 1.0):
-                raise ValueError(
-                    "erase_fraction must be in (0.0, 1.0], got {}".format(
-                        self.erase_fraction
-                    )
-                )
-
-
-@dataclasses.dataclass
-class NvsCorruptionResult:
-    """Result from an NVS corruption fault injection run."""
-
-    corruption_index: int  # which corruption variant was applied
-    mode: str
-    boot_outcome: str
-    config_check_results: Dict[str, bool]  # address -> pass/fail
-    config_outcome: str  # "config_ok", "config_lost", "config_crash"
-    raw_log: str
-    corruption_details: Dict[str, Any]
-
-
-def apply_nvs_corruption(
-    nvs_data: bytearray,
-    spec: NvsCorruptionSpec,
-) -> Tuple[bytearray, Dict[str, Any]]:
-    """Apply corruption to a copy of NVS data according to the spec.
-
-    Returns:
-        Tuple of (corrupted_data, details_dict).
-    """
-    corrupted = bytearray(nvs_data)
-    details: Dict[str, Any] = {"mode": spec.mode, "seed": spec.seed}
-    rng = random.Random(spec.seed)
-
-    if spec.mode == "bit_flip":
-        if len(corrupted) == 0:
-            details["bit_positions"] = []
-            return corrupted, details
-        bit_positions: List[int] = []
-        total_bits = len(corrupted) * 8
-        for _ in range(spec.bit_flip_count):
-            bit_pos = rng.randint(0, total_bits - 1)
-            byte_idx = bit_pos // 8
-            bit_idx = bit_pos % 8
-            corrupted[byte_idx] ^= (1 << bit_idx)
-            bit_positions.append(bit_pos)
-        details["bit_positions"] = bit_positions
-        details["bit_flip_count"] = spec.bit_flip_count
-
-    elif spec.mode == "partial_erase":
-        # Simulate partial erase: fill a contiguous fraction of the region
-        # with 0xFF (erased flash state), starting from a random offset.
-        erase_len = max(1, int(len(corrupted) * spec.erase_fraction))
-        max_start = max(0, len(corrupted) - erase_len)
-        erase_start = rng.randint(0, max_start) if max_start > 0 else 0
-        for i in range(erase_start, min(erase_start + erase_len, len(corrupted))):
-            corrupted[i] = 0xFF
-        details["erase_start"] = erase_start
-        details["erase_length"] = erase_len
-        details["erase_fraction"] = spec.erase_fraction
-
-    elif spec.mode == "truncation":
-        # Simulate truncated NVS: zero-fill everything after the truncation
-        # offset (as if a write was interrupted mid-migration).
-        trunc_offset = spec.truncate_offset
-        if trunc_offset is None:
-            trunc_offset = rng.randint(0, max(0, len(corrupted) - 1))
-        trunc_offset = max(0, min(trunc_offset, len(corrupted)))
-        for i in range(trunc_offset, len(corrupted)):
-            corrupted[i] = 0x00
-        details["truncate_offset"] = trunc_offset
-        details["truncated_bytes"] = len(corrupted) - trunc_offset
-
-    return corrupted, details
-
-
-def classify_nvs_outcome(
-    boot_outcome: str,
-    config_checks: List[ConfigCheck],
-    post_boot_nvs: bytearray,
-    nvs_base_address: int,
-) -> Tuple[str, Dict[str, bool]]:
-    """Classify the config outcome after NVS corruption.
-
-    Returns:
-        Tuple of (config_outcome, per_check_results).
-        config_outcome is one of: "config_ok", "config_lost", "config_crash".
-    """
-    # If the device didn't boot at all, it's a config_crash.
-    if boot_outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}:
-        return "config_crash", {}
-
-    if not config_checks:
-        # No checks defined -- if it booted, config is presumed OK.
-        return "config_ok", {}
-
-    check_results: Dict[str, bool] = {}
-    any_failed = False
-    for check in config_checks:
-        offset = check.address - nvs_base_address
-        key = "0x{:X}".format(check.address)
-        if offset < 0 or offset >= len(post_boot_nvs):
-            check_results[key] = False
-            any_failed = True
-            continue
-        actual = post_boot_nvs[offset]
-        passed = check.evaluate(actual)
-        check_results[key] = passed
-        if not passed:
-            any_failed = True
-
-    if any_failed:
-        return "config_lost", check_results
-    return "config_ok", check_results
-
-
-def generate_nvs_corruption_variants(
-    region: NvsRegion,
-    modes: Optional[List[str]] = None,
-    bit_flip_counts: Optional[List[int]] = None,
-    erase_fractions: Optional[List[float]] = None,
-    truncate_offsets: Optional[List[Optional[int]]] = None,
-    seed: int = 0,
-) -> List[NvsCorruptionSpec]:
-    """Generate a matrix of NVS corruption variants for sweep.
-
-    Returns a list of NvsCorruptionSpec instances covering the requested
-    corruption modes with varying parameters.
-    """
-    if modes is None:
-        modes = ["bit_flip", "partial_erase", "truncation"]
-    if bit_flip_counts is None:
-        bit_flip_counts = [1, 4, 16]
-    if erase_fractions is None:
-        erase_fractions = [0.25, 0.5, 1.0]
-    if truncate_offsets is None:
-        truncate_offsets = [None]  # random
-
-    specs: List[NvsCorruptionSpec] = []
-    variant_seed = seed
-
-    for mode in modes:
-        if mode == "bit_flip":
-            for count in bit_flip_counts:
-                specs.append(NvsCorruptionSpec(
-                    mode="bit_flip",
-                    region=region,
-                    seed=variant_seed,
-                    bit_flip_count=count,
-                ))
-                variant_seed += 1
-        elif mode == "partial_erase":
-            for frac in erase_fractions:
-                specs.append(NvsCorruptionSpec(
-                    mode="partial_erase",
-                    region=region,
-                    seed=variant_seed,
-                    erase_fraction=frac,
-                ))
-                variant_seed += 1
-        elif mode == "truncation":
-            for offset in truncate_offsets:
-                specs.append(NvsCorruptionSpec(
-                    mode="truncation",
-                    region=region,
-                    seed=variant_seed,
-                    truncate_offset=offset,
-                ))
-                variant_seed += 1
-
-    return specs
