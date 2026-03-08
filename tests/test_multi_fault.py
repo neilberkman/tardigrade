@@ -333,7 +333,20 @@ class TestMultiFaultPlanSummary(unittest.TestCase):
         self.assertEqual(summary["interesting_points"], 3)
         self.assertEqual(summary["max_faults_per_run"], 2)
         self.assertIsNone(summary["seed"])
+        self.assertEqual(summary["sample_sequences"], [[10, 20], [10, 30], [20, 30]])
+        self.assertFalse(summary["sample_truncated"])
         self.assertIn("diagnostics", summary)
+
+    def test_summary_preview_truncates(self) -> None:
+        plan = generate_multi_fault_sequences(
+            strategy="pairwise_interesting",
+            interesting_points=list(range(6)),
+            max_pairs=100,
+        )
+        summary = multi_fault_plan_summary(plan)
+        self.assertEqual(summary["sequences"], 15)
+        self.assertEqual(len(summary["sample_sequences"]), 10)
+        self.assertTrue(summary["sample_truncated"])
 
 
 class TestMultiFaultProfileParsing(unittest.TestCase):
