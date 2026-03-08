@@ -1210,14 +1210,12 @@ def reset_nvmc_for_sweep():
         # multiple writes, needs diff to count them).  Skip for STM32F4-style
         # controllers where each PG deactivation = exactly 1 word write —
         # shadow scanning adds 1MB ReadBytes per write with no accuracy benefit.
-        try:
-            if getattr(faultFlash, 'PerWriteAccurate', False):
-                faultFlash.SkipShadowScan = True
-            else:
-                faultFlash.SkipShadowScan = False
-                faultFlash.InvalidateShadow()
-        except Exception:
-            pass  # NRF52NVMC doesn't have these
+        if getattr(faultFlash, 'PerWriteAccurate', False):
+            faultFlash.SkipShadowScan = True
+        else:
+            faultFlash.SkipShadowScan = False
+            faultFlash.InvalidateShadow()
+        faultFlash.PassthroughMode = False
     else:
         ctrl.Nvm.TotalWordWrites = 0
         ctrl.Nvm.FaultEverFired = False
@@ -1240,10 +1238,8 @@ def reset_nvmc_for_recovery():
         faultFlash.LastFaultAddress = 0
         # Skip shadow scanning during recovery boot — just count PG transitions
         # for progress tracking. Avoids O(flash_size) ReadBytes per write.
-        try:
-            faultFlash.SkipShadowScan = True
-        except Exception:
-            pass  # NRF52NVMC doesn't have this property
+        faultFlash.SkipShadowScan = True
+        faultFlash.PassthroughMode = True
         disarm_fault()
     else:
         ctrl.Nvm.TotalWordWrites = 0

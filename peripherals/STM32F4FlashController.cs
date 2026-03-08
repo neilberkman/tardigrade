@@ -78,6 +78,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public bool SkipShadowScan { get; set; }
 
+        // Recovery boots already use the direct-write fast path here, so this
+        // remains a defined no-op for interface consistency.
+        public bool PassthroughMode { get; set; }
+
         // --- PG state ---
 
         public bool PgActive { get; private set; }

@@ -98,6 +98,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // Missing interface members (NRF52 uses WEN->REN window counting).
         public bool PerWriteAccurate => false;
         public bool SkipShadowScan { get; set; }
+        // Recovery boots already avoid the expensive full diff path via
+        // SkipShadowScan, so this stays as a defined no-op.
+        public bool PassthroughMode { get; set; }
         public void InvalidateShadow() { wenSnapshot = null; }
 
         // Read-fault injection stubs.  NRF52NVMC uses MappedMemory for CPU
