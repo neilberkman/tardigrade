@@ -281,6 +281,102 @@ class MetadataFaultConfig:
         self.fault_types = fault_types or ["power_loss"]
 
 
+class ComponentConfig:
+    """Configuration for a single component in a multi-component profile.
+
+    Each component represents an independently updatable firmware image
+    (e.g. application MCU, radio coprocessor) with its own platform,
+    bootloader, memory layout, images, and success criteria.
+    """
+
+    __slots__ = (
+        "name",
+        "platform",
+        "bootloader_elf",
+        "bootloader_entry",
+        "memory",
+        "images",
+        "pre_boot_state",
+        "setup_script",
+        "extra_peripherals",
+        "success_criteria",
+        "fault_sweep",
+        "flash_backend",
+    )
+
+    def __init__(
+        self,
+        name: str,
+        platform: str,
+        bootloader_elf: str,
+        bootloader_entry: int,
+        memory: "MemoryConfig",
+        images: Dict[str, str],
+        pre_boot_state: List["PreBootWrite"],
+        setup_script: Optional[str] = None,
+        extra_peripherals: Optional[List[str]] = None,
+        success_criteria: Optional["SuccessCriteria"] = None,
+        fault_sweep: Optional["FaultSweepConfig"] = None,
+        flash_backend: Optional[str] = None,
+    ) -> None:
+        self.name = name
+        self.platform = platform
+        self.bootloader_elf = bootloader_elf
+        self.bootloader_entry = bootloader_entry
+        self.memory = memory
+        self.images = images
+        self.pre_boot_state = pre_boot_state
+        self.setup_script = setup_script
+        self.extra_peripherals = extra_peripherals or []
+        self.success_criteria = success_criteria or SuccessCriteria()
+        self.fault_sweep = fault_sweep
+        self.flash_backend = flash_backend
+
+    def to_profile_config(
+        self,
+        parent: "ProfileConfig",
+    ) -> "ProfileConfig":
+        """Convert this component into a standalone ProfileConfig.
+
+        Inherits expect, invariants, and other top-level settings from
+        the parent multi-component profile.
+        """
+        return ProfileConfig(
+            schema_version=parent.schema_version,
+            name="{}/{}".format(parent.name, self.name),
+            description="Component '{}' of {}".format(self.name, parent.name),
+            platform=self.platform,
+            bootloader_elf=self.bootloader_elf,
+            bootloader_entry=self.bootloader_entry,
+            memory=self.memory,
+            images=self.images,
+            pre_boot_state=list(self.pre_boot_state),
+            setup_script=self.setup_script,
+            extra_peripherals=self.extra_peripherals,
+            success_criteria=self.success_criteria,
+            fault_sweep=self.fault_sweep or parent.fault_sweep,
+            state_fuzzer=parent.state_fuzzer,
+            expect=parent.expect,
+            profile_path=parent.profile_path,
+            scenario=parent.scenario,
+            flash_backend=self.flash_backend,
+        )
+
+
+class MultiComponentConfig:
+    """Top-level configuration for multi-component fault injection."""
+
+    __slots__ = ("components", "fault_matrix")
+
+    def __init__(
+        self,
+        components: List[ComponentConfig],
+        fault_matrix: str = "cross_product",
+    ) -> None:
+        self.components = components
+        self.fault_matrix = fault_matrix
+
+
 class FaultSweepConfig:
     __slots__ = (
         "mode",
@@ -485,6 +581,7 @@ class ProfileConfig:
         nvs_region: Optional["NvsRegionConfig"] = None,
         metadata_fault_regions: Optional[List[MetadataFaultRegion]] = None,
         bootloader_region: Optional[BootloaderRegionConfig] = None,
+        multi_component: Optional["MultiComponentConfig"] = None,
     ) -> None:
         self.schema_version = schema_version
         self.name = name
@@ -515,6 +612,29 @@ class ProfileConfig:
         self.metadata_fault_regions: List[MetadataFaultRegion] = metadata_fault_regions or []
         self.bootloader_region: Optional[BootloaderRegionConfig] = bootloader_region
         self.bootloader_region: Optional[BootloaderRegionConfig] = bootloader_region
+        self.multi_component: Optional[MultiComponentConfig] = multi_component
+
+    @property
+    def is_multi_component(self) -> bool:
+        """Return True if this profile defines a multi-component scenario."""
+        return (
+            self.multi_component is not None
+            and len(self.multi_component.components) >= 2
+        )
+
+    def component_profiles(self) -> List["ProfileConfig"]:
+        """Return per-component ProfileConfig instances.
+
+        Each component is converted into a standalone ProfileConfig that
+        can be individually calibrated and swept.  Returns an empty list
+        for single-component profiles.
+        """
+        if not self.is_multi_component:
+            return []
+        return [
+            comp.to_profile_config(self)
+            for comp in self.multi_component.components
+        ]
 
     def resolve_initial_state(self, state: "InitialStateConfig") -> "ProfileConfig":
         """Return a new ProfileConfig with the given initial state applied."""
@@ -1371,6 +1491,105 @@ def _parse_initial_states(raw: Optional[List[Any]]) -> List[InitialStateConfig]:
     return states
 
 
+def _parse_component(raw: Dict[str, Any], idx: int) -> ComponentConfig:
+    """Parse a single component definition from the components list."""
+    ctx = "components[{}]".format(idx)
+    name = str(_require(raw, "name", ctx)).strip()
+    if not name:
+        raise ProfileError("{}.name: expected non-empty string".format(ctx))
+
+    platform = str(_require(raw, "platform", ctx))
+
+    bootloader = _require(raw, "bootloader", ctx)
+    bootloader_elf = str(_require(bootloader, "elf", "{}.bootloader".format(ctx)))
+    bootloader_entry = _parse_int(
+        _require(bootloader, "entry", "{}.bootloader".format(ctx)),
+        "{}.bootloader.entry".format(ctx),
+    )
+
+    memory = _parse_memory(_require(raw, "memory", ctx))
+
+    images: Dict[str, str] = {}
+    raw_images = raw.get("images", {})
+    if isinstance(raw_images, dict):
+        images = {str(k): str(v) for k, v in raw_images.items()}
+
+    pre_boot_state = _parse_pre_boot_state(raw.get("pre_boot_state"))
+    setup_script = raw.get("setup_script")
+    if setup_script is not None:
+        setup_script = str(setup_script)
+
+    extra_peripherals_raw = raw.get("extra_peripherals")
+    extra_peripherals: Optional[List[str]] = None
+    if extra_peripherals_raw is not None:
+        if isinstance(extra_peripherals_raw, list):
+            extra_peripherals = [str(p) for p in extra_peripherals_raw]
+        else:
+            extra_peripherals = [str(extra_peripherals_raw)]
+
+    success_criteria = _parse_success_criteria(raw.get("success_criteria"))
+    fault_sweep = _parse_fault_sweep(raw.get("fault_sweep")) if "fault_sweep" in raw else None
+
+    flash_backend_raw = raw.get("flash_backend")
+    flash_backend: Optional[str] = str(flash_backend_raw) if flash_backend_raw is not None else None
+
+    return ComponentConfig(
+        name=name,
+        platform=platform,
+        bootloader_elf=bootloader_elf,
+        bootloader_entry=bootloader_entry,
+        memory=memory,
+        images=images,
+        pre_boot_state=pre_boot_state,
+        setup_script=setup_script,
+        extra_peripherals=extra_peripherals,
+        success_criteria=success_criteria,
+        fault_sweep=fault_sweep,
+        flash_backend=flash_backend,
+    )
+
+
+def _parse_components(raw: Optional[Any]) -> Optional[MultiComponentConfig]:
+    """Parse the components list from a multi-component profile."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ProfileError("multi_component: expected mapping with 'components' list")
+    components_raw = raw.get("components")
+    if components_raw is None or not isinstance(components_raw, list):
+        raise ProfileError("multi_component.components: expected non-empty list")
+    if len(components_raw) < 2:
+        raise ProfileError(
+            "multi_component.components: need at least 2 components, got {}".format(
+                len(components_raw)
+            )
+        )
+    components: List[ComponentConfig] = []
+    seen_names: set = set()
+    for idx, entry in enumerate(components_raw):
+        if not isinstance(entry, dict):
+            raise ProfileError("multi_component.components[{}]: expected mapping".format(idx))
+        comp = _parse_component(entry, idx)
+        if comp.name in seen_names:
+            raise ProfileError(
+                "multi_component.components: duplicate name '{}'".format(comp.name)
+            )
+        seen_names.add(comp.name)
+        components.append(comp)
+    fault_matrix = str(raw.get("fault_matrix", "cross_product"))
+    valid_matrices = {"cross_product"}
+    if fault_matrix not in valid_matrices:
+        raise ProfileError(
+            "multi_component.fault_matrix: must be one of {}, got {!r}".format(
+                sorted(valid_matrices), fault_matrix
+            )
+        )
+    return MultiComponentConfig(
+        components=components,
+        fault_matrix=fault_matrix,
+    )
+
+
 def _parse_invariant_providers(raw: Optional[Any]) -> List[str]:
     if raw is None:
         return []
@@ -1595,6 +1814,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         data.get("metadata_fault_regions"), slots=memory.slots
     )
     bootloader_region = _parse_bootloader_region(data.get("bootloader_region"))
+    multi_component = _parse_components(data.get("multi_component"))
 
     scenario = str(data.get("scenario", "runtime"))
     if scenario not in VALID_SCENARIOS:
@@ -1647,6 +1867,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         nvs_region=nvs_region,
         metadata_fault_regions=metadata_fault_regions,
         bootloader_region=bootloader_region,
+        multi_component=multi_component,
     )
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.
@@ -1755,6 +1976,17 @@ def main() -> int:
             {"name": r.name, "start": "0x{:X}".format(r.start), "end": "0x{:X}".format(r.end)}
             for r in profile.metadata_fault_regions
         ],
+        "multi_component": (
+            {
+                "fault_matrix": profile.multi_component.fault_matrix,
+                "components": [
+                    {"name": c.name, "platform": c.platform}
+                    for c in profile.multi_component.components
+                ],
+            }
+            if profile.multi_component is not None
+            else None
+        ),
     }
     print(json.dumps(info, indent=2, sort_keys=True))
     return 0

@@ -1,0 +1,74 @@
+schema_version: 1
+name: multi_component_dual_mcu
+description: >
+  Example multi-component OTA profile: dual MCU system where both
+  processors receive independent firmware updates.  A power loss during
+  one MCU's update while the other has already completed creates a
+  split-brain state -- the two MCUs run firmware versions that may use
+  incompatible communication protocols.
+
+# Primary component fields (backward-compatible fallback).
+platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 8
+  slots:
+    exec: { base: 0x10000000, size: 0x38000 }
+    staging: { base: 0x10038000, size: 0x38000 }
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+success_criteria:
+  vtor_in_slot: exec
+fault_sweep:
+  mode: runtime
+  max_writes: 28672
+
+expect:
+  should_find_issues: true
+
+multi_component:
+  fault_matrix: cross_product
+  components:
+    - name: primary_mcu
+      platform: platforms/cortex_m0_nvm.repl
+      flash_backend: nvm_ctrl
+      bootloader:
+        elf: examples/vulnerable_ota/firmware.elf
+        entry: 0x10000000
+      memory:
+        sram: { start: 0x20000000, end: 0x20020000 }
+        write_granularity: 8
+        slots:
+          exec: { base: 0x10000000, size: 0x38000 }
+          staging: { base: 0x10038000, size: 0x38000 }
+      images:
+        staging: examples/vulnerable_ota/firmware.bin
+      success_criteria:
+        vtor_in_slot: exec
+      fault_sweep:
+        mode: runtime
+        max_writes: 28672
+
+    - name: secondary_mcu
+      platform: platforms/cortex_m0_nvm.repl
+      flash_backend: nvm_ctrl
+      bootloader:
+        elf: examples/vulnerable_ota/firmware.elf
+        entry: 0x10000000
+      memory:
+        sram: { start: 0x20000000, end: 0x20020000 }
+        write_granularity: 8
+        slots:
+          exec: { base: 0x10000000, size: 0x38000 }
+          staging: { base: 0x10038000, size: 0x38000 }
+      images:
+        staging: examples/vulnerable_ota/firmware.bin
+      success_criteria:
+        vtor_in_slot: exec
+      fault_sweep:
+        mode: runtime
+        max_writes: 28672

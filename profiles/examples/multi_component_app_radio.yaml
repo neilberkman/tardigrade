@@ -1,0 +1,70 @@
+schema_version: 1
+name: multi_component_app_radio
+description: >
+  Example multi-component OTA profile: application MCU + radio coprocessor.
+  Demonstrates split-brain detection where one component updates successfully
+  but the other is bricked by a power loss during its OTA copy, leaving the
+  device in a state where the two components run incompatible firmware versions.
+
+# Top-level fields are still required for backward-compatible tooling.
+# They describe the "primary" component (app MCU) and are used when the
+# profile is loaded by tools that don't understand multi_component.
+platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 8
+  slots:
+    exec: { base: 0x10000000, size: 0x38000 }
+    staging: { base: 0x10038000, size: 0x38000 }
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+success_criteria:
+  vtor_in_slot: exec
+fault_sweep:
+  mode: runtime
+  max_writes: 28672
+
+expect:
+  should_find_issues: true
+
+# Multi-component configuration.
+multi_component:
+  fault_matrix: cross_product
+  components:
+    - name: app_mcu
+      platform: platforms/cortex_m0_nvm.repl
+      flash_backend: nvm_ctrl
+      bootloader:
+        elf: examples/vulnerable_ota/firmware.elf
+        entry: 0x10000000
+      memory:
+        sram: { start: 0x20000000, end: 0x20020000 }
+        write_granularity: 8
+        slots:
+          exec: { base: 0x10000000, size: 0x38000 }
+          staging: { base: 0x10038000, size: 0x38000 }
+      images:
+        staging: examples/vulnerable_ota/firmware.bin
+      success_criteria:
+        vtor_in_slot: exec
+
+    - name: radio_coprocessor
+      platform: platforms/cortex_m0_nvm.repl
+      flash_backend: nvm_ctrl
+      bootloader:
+        elf: examples/vulnerable_ota/firmware.elf
+        entry: 0x10000000
+      memory:
+        sram: { start: 0x20000000, end: 0x20020000 }
+        write_granularity: 8
+        slots:
+          exec: { base: 0x10000000, size: 0x38000 }
+          staging: { base: 0x10038000, size: 0x38000 }
+      images:
+        staging: examples/vulnerable_ota/firmware.bin
+      success_criteria:
+        vtor_in_slot: exec

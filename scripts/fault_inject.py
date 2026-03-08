@@ -314,6 +314,25 @@ class MultiFaultResult:
 
 
 @dataclasses.dataclass
+class MultiComponentFaultResult:
+    """Result from a multi-component fault injection run.
+
+    In multi-component scenarios, one component is faulted while the
+    others run cleanly.  A ``split_brain`` outcome indicates the faulted
+    component failed while the clean component succeeded, leaving the
+    device in an inconsistent state where components are running
+    different firmware versions.
+    """
+
+    faulted_component: str
+    fault_at: int
+    per_component: Dict[str, Dict[str, Any]]  # component_name -> result dict
+    combined_outcome: str  # "success", "split_brain", "all_failed", etc.
+    is_control: bool = False
+    fault_type: Optional[str] = None
+
+
+@dataclasses.dataclass
 class MultiFaultPlan:
     """Generated plan for multi-fault sweep runs."""
 
@@ -323,6 +342,50 @@ class MultiFaultPlan:
     max_faults_per_run: int
     seed: Optional[int]
     diagnostics: Dict[str, Any]
+
+
+def classify_multi_component_outcome(
+    per_component: Dict[str, Dict[str, Any]],
+) -> str:
+    """Classify the combined outcome of a multi-component fault run.
+
+    Returns:
+        "success" if all components booted successfully.
+        "split_brain" if some components succeeded and others failed --
+            the most dangerous OTA failure mode where components end up
+            running incompatible firmware versions.
+        "all_failed" if every component failed to boot.
+        "degraded" if multiple components were tested and outcomes are
+            mixed but don't constitute a clean split-brain (e.g. one
+            component has wrong_image while another has no_boot).
+    """
+    if not per_component:
+        return "unknown"
+
+    success_outcomes = {"success"}
+    brick_outcomes = {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}
+
+    outcomes = {}
+    for name, result in per_component.items():
+        outcome = str(result.get("boot_outcome", "unknown")).strip().lower()
+        outcomes[name] = outcome
+
+    all_success = all(o in success_outcomes for o in outcomes.values())
+    all_failed = all(
+        o in brick_outcomes or o == "wrong_image" for o in outcomes.values()
+    )
+    any_success = any(o in success_outcomes for o in outcomes.values())
+    any_failed = any(
+        o in brick_outcomes or o == "wrong_image" for o in outcomes.values()
+    )
+
+    if all_success:
+        return "success"
+    if all_failed:
+        return "all_failed"
+    if any_success and any_failed:
+        return "split_brain"
+    return "degraded"
 
 
 def parse_fault_range(expr: str) -> Iterable[int]:
