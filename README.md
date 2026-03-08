@@ -2,7 +2,7 @@
 
 Fault-injection testing for embedded OTA bootloaders. Answers one question: **if power dies mid-update, does the device recover?**
 
-Tardigrade runs your bootloader under [Renode](https://renode.io/), systematically faults every NVM write in the update path, and checks whether the device still reaches the boot outcome you intended.
+Tardigrade runs your bootloader under [Renode](https://renode.io/), systematically faults every NVM write in the update path, and checks whether the device still boots correctly.
 
 ### Proven results
 
@@ -15,8 +15,6 @@ Retroactive validation against known MCUboot bugs (catches the broken commit, pa
 | [#2199](https://github.com/mcu-tools/mcuboot/pull/2199) | Stuck revert: primary trailer never cleared (swap-move)             | 1 wrong_image (100%) |
 
 Additional differential profiles for PRs [#2205](https://github.com/mcu-tools/mcuboot/pull/2205), [#2206](https://github.com/mcu-tools/mcuboot/pull/2206), and [#2214](https://github.com/mcu-tools/mcuboot/pull/2214).
-
-The public flagship integrations are MCUboot and real NuttX `nxboot`. The built-in example families still matter, but as an engine-validation matrix: they exercise controlled fault classes, provide intentional broken/fixed cases for self-test, and let new generic features be proven before a real upstream target uses them.
 
 ## Quick start: GitHub Action
 
