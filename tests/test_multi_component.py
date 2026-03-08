@@ -15,6 +15,7 @@ import sys
 
 sys.path.insert(0, str(SCRIPTS))
 
+from audit_bootloader import merge_robot_vars
 from fault_inject import (
     MultiComponentFaultResult,
     classify_multi_component_outcome,
@@ -503,6 +504,86 @@ class TestComponentConfigParsing(unittest.TestCase):
                 len(profile.multi_component.components), 2,
                 "{} should have >= 2 components".format(yaml_file.name),
             )
+
+
+class TestMergeRobotVars(unittest.TestCase):
+    """Test merge_robot_vars helper used by multi-component sweep."""
+
+    def test_base_vars_survive_when_no_conflict(self) -> None:
+        """PHASE2_TIME_SLICE from base vars must propagate into merged output."""
+        base = [
+            "PHASE2_TIME_SLICE:0.050",
+            "PROGRESS_STALL_TIMEOUT_S:30.000000",
+            "EVALUATION_MODE:state",
+        ]
+        overlay = [
+            "PLATFORM_REPL:platforms/cortex_m0_nvm.repl",
+            "BOOTLOADER_ELF:firmware.elf",
+        ]
+        merged = merge_robot_vars(base, overlay)
+        merged_dict = dict(v.split(":", 1) for v in merged)
+        self.assertEqual(merged_dict["PHASE2_TIME_SLICE"], "0.050")
+        self.assertEqual(merged_dict["PROGRESS_STALL_TIMEOUT_S"], "30.000000")
+        self.assertEqual(merged_dict["EVALUATION_MODE"], "state")
+        self.assertIn("PLATFORM_REPL", merged_dict)
+        self.assertIn("BOOTLOADER_ELF", merged_dict)
+
+    def test_stall_timeout_survives(self) -> None:
+        """PROGRESS_STALL_TIMEOUT_S from base must survive component merge."""
+        base = ["PROGRESS_STALL_TIMEOUT_S:25.000000"]
+        overlay = ["BOOTLOADER_ELF:fw.elf"]
+        merged = merge_robot_vars(base, overlay)
+        merged_dict = dict(v.split(":", 1) for v in merged)
+        self.assertEqual(merged_dict["PROGRESS_STALL_TIMEOUT_S"], "25.000000")
+
+    def test_component_local_vars_override_base(self) -> None:
+        """Component-specific vars must win over base when same key exists."""
+        base = [
+            "PLATFORM_REPL:parent_platform.repl",
+            "BOOTLOADER_ELF:parent_firmware.elf",
+            "PHASE2_TIME_SLICE:0.050",
+        ]
+        overlay = [
+            "PLATFORM_REPL:component_platform.repl",
+            "BOOTLOADER_ELF:component_firmware.elf",
+        ]
+        merged = merge_robot_vars(base, overlay)
+        merged_dict = dict(v.split(":", 1) for v in merged)
+        # Component-local values win on conflict.
+        self.assertEqual(merged_dict["PLATFORM_REPL"], "component_platform.repl")
+        self.assertEqual(merged_dict["BOOTLOADER_ELF"], "component_firmware.elf")
+        # Non-conflicting base var survives.
+        self.assertEqual(merged_dict["PHASE2_TIME_SLICE"], "0.050")
+
+    def test_component_vars_win_same_key(self) -> None:
+        """Explicit test: when both set the same key, overlay (component) wins."""
+        base = ["TEST_TIMEOUT:120", "WRITE_GRANULARITY:4"]
+        overlay = ["TEST_TIMEOUT:60", "WRITE_GRANULARITY:8"]
+        merged = merge_robot_vars(base, overlay)
+        merged_dict = dict(v.split(":", 1) for v in merged)
+        self.assertEqual(merged_dict["TEST_TIMEOUT"], "60")
+        self.assertEqual(merged_dict["WRITE_GRANULARITY"], "8")
+
+    def test_empty_base(self) -> None:
+        overlay = ["FOO:bar", "BAZ:qux"]
+        merged = merge_robot_vars([], overlay)
+        self.assertEqual(len(merged), 2)
+
+    def test_empty_overlay(self) -> None:
+        base = ["FOO:bar", "BAZ:qux"]
+        merged = merge_robot_vars(base, [])
+        self.assertEqual(len(merged), 2)
+
+    def test_both_empty(self) -> None:
+        self.assertEqual(merge_robot_vars([], []), [])
+
+    def test_values_with_colons_preserved(self) -> None:
+        """Values that contain colons (e.g. paths) must not be truncated."""
+        base = ["IMAGE_STAGING:C:\\firmware\\image.bin"]
+        overlay: List[str] = []
+        merged = merge_robot_vars(base, overlay)
+        merged_dict = dict(v.split(":", 1) for v in merged)
+        self.assertEqual(merged_dict["IMAGE_STAGING"], "C:\\firmware\\image.bin")
 
 
 if __name__ == "__main__":

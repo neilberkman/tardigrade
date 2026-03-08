@@ -322,6 +322,25 @@ def parse_robot_vars(raw_vars: List[str]) -> List[str]:
     return parsed
 
 
+def merge_robot_vars(base: List[str], overlay: List[str]) -> List[str]:
+    """Merge two robot var lists, with *overlay* winning on key conflicts.
+
+    Each entry is ``KEY:VALUE``.  Base vars provide campaign-level defaults
+    (CLI overrides, stall timeouts, etc.) while overlay vars are the
+    component-specific values that should take precedence.
+    """
+    merged: Dict[str, str] = {}
+    for var in base:
+        key, _sep, value = var.partition(":")
+        if key:
+            merged[key] = value
+    for var in overlay:
+        key, _sep, value = var.partition(":")
+        if key:
+            merged[key] = value
+    return ["{}:{}".format(k, v) for k, v in merged.items()]
+
+
 def parse_renode_point_timeout(env: Dict[str, str]) -> Optional[float]:
     """Read per-run renode-test timeout from environment.
 
@@ -2223,8 +2242,11 @@ def run_multi_component_sweep(
             )
         )
 
-        # Build robot vars for this component.
-        comp_robot_vars = comp_profile.robot_vars(repo_root)
+        # Build robot vars for this component.  Start from caller-supplied
+        # base vars (CLI overrides, stall timeouts, etc.) and layer the
+        # component-specific profile vars on top so that component-local
+        # settings win on conflict.
+        comp_robot_vars = merge_robot_vars(robot_vars_base, comp_profile.robot_vars(repo_root))
         comp_robot_vars.append("EVALUATION_MODE:{}".format(evaluation_mode))
         comp_robot_vars.append(
             "EXPECT_CONTROL_OUTCOME:{}".format(comp_profile.expect.control_outcome)
