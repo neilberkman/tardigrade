@@ -1995,6 +1995,7 @@ def main() -> int:
         include_write_rejection = "write_rejection" in fault_types
         include_reset_at_time = "reset_at_time" in fault_types
         include_multi_sector_atomicity = "multi_sector_atomicity" in fault_types
+        include_read_bit_flip = "read_bit_flip" in fault_types
 
         # Pass fault_types to calibration so erase trace is captured.
         if include_erases:
@@ -2122,7 +2123,8 @@ def main() -> int:
         #   'w' write power-loss, 'b' bit corruption, 's' silent write failure,
         #   'r' write rejection, 'd' write disturb,
         #   'l' wear-leveling corruption, 't' reset-at-time,
-        #   'e' interrupted erase, 'a' multi-sector atomicity fault.
+        #   'e' interrupted erase, 'a' multi-sector atomicity fault,
+        #   'f' read bit-flip (transient read corruption).
         fault_types_list: Optional[List[str]] = None
         multi_fault_plan: Optional[MultiFaultPlan] = None
         has_mixed_types = (
@@ -2133,6 +2135,7 @@ def main() -> int:
             or include_wear_leveling
             or include_write_rejection
             or include_reset_at_time
+            or include_read_bit_flip
             or profile.fault_sweep.phase2_fault.enabled
             or profile.fault_sweep.multi_fault.enabled
         )
@@ -2211,6 +2214,14 @@ def main() -> int:
                 combined += [(tp, 't') for tp in timed_reset_fps]
                 timed_reset_count = len(timed_reset_fps)
 
+            read_flip_count = 0
+            if include_read_bit_flip:
+                read_flip_fps = list(fault_points)
+                if args.quick:
+                    read_flip_fps = quick_subset(read_flip_fps)
+                combined += [(fp, 'f') for fp in read_flip_fps]
+                read_flip_count = len(read_flip_fps)
+
             # Phase 2 recovery fault injection: for selected Phase 1 fault
             # points, also sweep faults during the recovery boot.
             p2_config = profile.fault_sweep.phase2_fault
@@ -2227,6 +2238,7 @@ def main() -> int:
                     "wear_leveling_corruption": "l",
                     "write_rejection": "r",
                     "multi_sector_atomicity": "a",
+                    "read_bit_flip": "f",
                 }
                 p2_type_codes = [
                     p2_type_map.get(ft, "w") for ft in p2_config.fault_types
@@ -2264,6 +2276,8 @@ def main() -> int:
                 parts.append("{} write-reject".format(rejection_count))
             if timed_reset_count:
                 parts.append("{} timed-reset".format(timed_reset_count))
+            if read_flip_count:
+                parts.append("{} read-flip".format(read_flip_count))
             if phase2_count:
                 parts.append("{} phase2-recovery".format(phase2_count))
             print(

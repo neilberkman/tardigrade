@@ -153,6 +153,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             flashShadow = null;
         }
 
+        // Read-fault injection stubs (fast-path: CPU reads bypass controller).
+        public bool ReadFaultEnabled { get; set; }
+        public long ReadFaultAddress { get; set; } = -1;
+        public uint ReadFaultSeed { get; set; }
+        public bool ReadFaultFired { get; set; }
+        public ulong ReadFaultSkipCount { get; set; }
+        public ulong ReadFaultTotalReads { get; set; }
+
         private void DefineRegisters()
         {
             Registers.AccessControl.Define(this, 0x37)

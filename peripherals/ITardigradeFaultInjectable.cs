@@ -42,5 +42,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         int EraseTraceCount { get; }
         string EraseTraceToString();
         void EraseTraceClear();
+
+        // Read-fault injection: one-shot transient read corruption.
+        // NVM content is unchanged; only the value returned to the CPU
+        // on the first matching read is corrupted.
+        bool ReadFaultEnabled { get; set; }
+        long ReadFaultAddress { get; set; }
+        uint ReadFaultSeed { get; set; }
+        bool ReadFaultFired { get; set; }
+        ulong ReadFaultSkipCount { get; set; }
+        ulong ReadFaultTotalReads { get; set; }
     }
 }
