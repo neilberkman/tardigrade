@@ -126,6 +126,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public bool SkipShadowScan { get; set; }
 
+        public bool PassthroughMode { get; set; }
+
         public int WriteFaultMode { get => tracker.WriteFaultMode; set => tracker.WriteFaultMode = value; }
 
         public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
@@ -284,6 +286,28 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void HandleTrackedWrite(Bank bank, long localOffset, uint width, ulong value)
         {
+            if(PassthroughMode)
+            {
+                if(AnyFaultFired || width == 0)
+                {
+                    return;
+                }
+
+                var passthroughByteCount = (int)width;
+                var passthroughCombinedOffset = bank.CombinedBaseOffset + localOffset;
+                var passthroughCursor = 0;
+                while(passthroughCursor < passthroughByteCount)
+                {
+                    var chunkOffset = passthroughCombinedOffset + passthroughCursor;
+                    var alignedOffset = chunkOffset & ~3L;
+                    var inWordOffset = (int)(chunkOffset - alignedOffset);
+                    var bytesInWord = Math.Min(4 - inWordOffset, passthroughByteCount - passthroughCursor);
+                    tracker.IncrementWriteCount();
+                    passthroughCursor += bytesInWord;
+                }
+                return;
+            }
+
             EnsureShadow();
 
             if(AnyFaultFired)

@@ -32,6 +32,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         int DiffLookahead { get; set; }
         bool SkipShadowScan { get; set; }
+        bool PassthroughMode { get; set; }
         void InvalidateShadow();
 
         bool WriteTraceEnabled { get; set; }
