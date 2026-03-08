@@ -27,13 +27,7 @@ Additional differential profiles for PRs [#2205](https://github.com/mcu-tools/mc
     workers: 2
 ```
 
-Outputs: `verdict` (PASS/FAIL), `report-path`, `brick-rate`. Use `verdict` as the CI gate signal.
-
-`brick-rate` is intentionally narrow: it counts only unrecoverable execution failures. Broader mismatches such as wrong slot/image, semantic assertion failures, or invariant violations show up in the JSON report under `issue_points`.
-
-The action defaults to `quick: true`, which is only a smoke path. For any real CI gate or canary signal, set `quick: false` and use the heuristic sweep.
-
-Upload the report as an artifact so failures include the full per-point diagnostics:
+Outputs: `verdict` (PASS/FAIL), `report-path`, `brick-rate`. Use `verdict` as the CI gate signal. Upload the report as an artifact for per-point diagnostics on failure:
 
 ```yaml
 - name: Upload tardigrade report
@@ -273,7 +267,7 @@ tardigrade/
 │   ├── write_trace_heuristic.py     # Write-trace classification
 │   ├── render_results_html.py       # HTML report renderer
 │   ├── geometry_matrix.py           # Parametric slot-layout generator
-│   └── cbmc_to_profile.py           # CBMC counterexample converter
+│   └── cbmc_to_profile.py          # CBMC counterexample converter
 ├── targets/
 │   ├── mcuboot/                     # MCUboot probe, invariants, state fuzzer
 │   ├── nuttx_nxboot/                # Real NuttX build + runtime profile gen
