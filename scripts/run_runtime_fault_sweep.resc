@@ -374,6 +374,12 @@ if _rf_regions_str:
         elif ':' in pair:
             s, e = pair.split(':', 1)
             read_fault_regions.append((int(s, 0), int(e, 0)))
+read_fault_preflight = {
+    'checked': False,
+    'supported': None,
+    'reason': '',
+    'backend': '',
+}
 
 # Slot lookup table.
 slot_ranges = {
@@ -1867,6 +1873,7 @@ def run_read_bit_flip_fault(fault_at):
     fault_injected = False
     read_fault_actually_fired = False
     skip_reason = None
+    preflight = ensure_read_fault_preflight()
 
     # Compute target address: if read_fault_regions is configured, map
     # fault_at into the configured region space; otherwise use staging slot.
@@ -1890,12 +1897,8 @@ def run_read_bit_flip_fault(fault_at):
     else:
         target_address = slot_staging_base + fault_word_offset
 
-    if USE_FAST_PATH:
-        # Fast-path targets use MappedMemory which the CPU reads directly.
-        # We cannot intercept individual reads, so read-fault injection is
-        # not supported.  Log clearly and return an unarmed result.
-        skip_reason = 'fast_path_no_read_intercept'
-        log('fp={} type=f SKIP: fast-path target cannot intercept CPU reads'.format(fault_at))
+    if not preflight.get('supported'):
+        skip_reason = preflight.get('reason') or 'read_fault_backend_unsupported'
     elif not should_arm:
         skip_reason = 'probability_gate'
         log('fp={} type=f SKIP: probability gate did not arm fault (p={})'.format(
@@ -1905,23 +1908,18 @@ def run_read_bit_flip_fault(fault_at):
         nvm_offset = read_fault_address - slot_exec_base
         if 0 <= nvm_offset < int(mram.Size):
             original_word = as_int(bus.ReadDoubleWord(read_fault_address))
-            supported, reason = _read_fault_backend_support(mram, fault_bit_flips)
-            if supported:
-                mram.ReadFaultEnabled = True
-                mram.ReadFaultAddress = nvm_offset
-                mram.ReadFaultSeed = fault_seed & 0xFFFFFFFF
-                mram.ReadFaultFired = False
-                mram.ReadFaultSkipCount = 0
-                mram.ReadFaultTotalReads = 0
-                if hasattr(mram, 'ReadFaultBitFlips'):
-                    mram.ReadFaultBitFlips = fault_bit_flips if fault_bit_flips > 0 else 1
-                fault_injected = True
-                corrupted_word = _compute_read_bit_flip(original_word, fault_seed, fault_bit_flips)
-                log('fp={} type=f armed nvm_offset=0x{:X} orig=0x{:08X} expected_corrupt=0x{:08X}'.format(
-                    fault_at, nvm_offset, original_word, corrupted_word))
-            else:
-                skip_reason = reason
-                log('fp={} type=f SKIP: {}'.format(fault_at, reason))
+            mram.ReadFaultEnabled = True
+            mram.ReadFaultAddress = nvm_offset
+            mram.ReadFaultSeed = fault_seed & 0xFFFFFFFF
+            mram.ReadFaultFired = False
+            mram.ReadFaultSkipCount = 0
+            mram.ReadFaultTotalReads = 0
+            if hasattr(mram, 'ReadFaultBitFlips'):
+                mram.ReadFaultBitFlips = fault_bit_flips if fault_bit_flips > 0 else 1
+            fault_injected = True
+            corrupted_word = _compute_read_bit_flip(original_word, fault_seed, fault_bit_flips)
+            log('fp={} type=f armed nvm_offset=0x{:X} orig=0x{:08X} expected_corrupt=0x{:08X}'.format(
+                fault_at, nvm_offset, original_word, corrupted_word))
         else:
             skip_reason = 'address_out_of_range'
             log('fp={} type=f WARNING: fault address 0x{:X} outside NVM'.format(
@@ -1932,23 +1930,18 @@ def run_read_bit_flip_fault(fault_at):
         nvm_ref = ctrl.Nvm
         if 0 <= nvm_offset < int(nvm_ref.Size):
             original_word = as_int(bus.ReadDoubleWord(read_fault_address))
-            supported, reason = _read_fault_backend_support(nvm_ref, fault_bit_flips)
-            if supported:
-                nvm_ref.ReadFaultEnabled = True
-                nvm_ref.ReadFaultAddress = nvm_offset
-                nvm_ref.ReadFaultSeed = fault_seed & 0xFFFFFFFF
-                nvm_ref.ReadFaultFired = False
-                nvm_ref.ReadFaultSkipCount = 0
-                nvm_ref.ReadFaultTotalReads = 0
-                if hasattr(nvm_ref, 'ReadFaultBitFlips'):
-                    nvm_ref.ReadFaultBitFlips = fault_bit_flips if fault_bit_flips > 0 else 1
-                fault_injected = True
-                corrupted_word = _compute_read_bit_flip(original_word, fault_seed, fault_bit_flips)
-                log('fp={} type=f armed nvm_offset=0x{:X} orig=0x{:08X} expected_corrupt=0x{:08X}'.format(
-                    fault_at, nvm_offset, original_word, corrupted_word))
-            else:
-                skip_reason = reason
-                log('fp={} type=f SKIP: {}'.format(fault_at, reason))
+            nvm_ref.ReadFaultEnabled = True
+            nvm_ref.ReadFaultAddress = nvm_offset
+            nvm_ref.ReadFaultSeed = fault_seed & 0xFFFFFFFF
+            nvm_ref.ReadFaultFired = False
+            nvm_ref.ReadFaultSkipCount = 0
+            nvm_ref.ReadFaultTotalReads = 0
+            if hasattr(nvm_ref, 'ReadFaultBitFlips'):
+                nvm_ref.ReadFaultBitFlips = fault_bit_flips if fault_bit_flips > 0 else 1
+            fault_injected = True
+            corrupted_word = _compute_read_bit_flip(original_word, fault_seed, fault_bit_flips)
+            log('fp={} type=f armed nvm_offset=0x{:X} orig=0x{:08X} expected_corrupt=0x{:08X}'.format(
+                fault_at, nvm_offset, original_word, corrupted_word))
         else:
             skip_reason = 'address_out_of_range'
             log('fp={} type=f WARNING: fault address 0x{:X} outside NVM'.format(
@@ -2100,6 +2093,36 @@ def _read_fault_backend_support(obj, bit_flips):
     if bit_flips > 1 and not hasattr(obj, 'ReadFaultBitFlips'):
         return False, 'backend_missing_read_fault_bit_count_support'
     return True, ''
+
+
+def ensure_read_fault_preflight():
+    if read_fault_preflight.get('checked'):
+        return read_fault_preflight
+    read_fault_preflight['checked'] = True
+
+    if USE_FAST_PATH:
+        read_fault_preflight['backend'] = 'fast'
+        read_fault_preflight['supported'] = False
+        read_fault_preflight['reason'] = 'fast_path_no_read_intercept'
+        log('read_fault preflight: unsupported backend=fast reason={}'.format(
+            read_fault_preflight['reason']))
+        return read_fault_preflight
+
+    backend_obj = mram if USE_MRAM_PATH else ctrl.Nvm
+    read_fault_preflight['backend'] = 'mram' if USE_MRAM_PATH else 'slow'
+    supported, reason = _read_fault_backend_support(backend_obj, read_fault_bit_flips)
+    read_fault_preflight['supported'] = bool(supported)
+    read_fault_preflight['reason'] = reason or ''
+    if supported:
+        log('read_fault preflight: supported backend={} bit_flips={}'.format(
+            read_fault_preflight['backend'],
+            read_fault_bit_flips if read_fault_bit_flips > 0 else 1,
+        ))
+    else:
+        log('read_fault preflight: unsupported backend={} reason={}'.format(
+            read_fault_preflight['backend'],
+            read_fault_preflight['reason']))
+    return read_fault_preflight
 
 
 def run_timed_reset_fault(fault_at):
@@ -3974,6 +3997,8 @@ else:
         ft = 'w'
         if idx < len(fault_type_list):
             ft = fault_type_list[idx]
+        if ft == 'f':
+            ensure_read_fault_preflight()
         if ft.startswith('m:'):
             m_type = ft.split(':')[1] if ':' in ft else 'w'
             results.append(run_metadata_fault(fp, fault_type=m_type))
