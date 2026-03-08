@@ -19,6 +19,7 @@ from fault_inject import MetadataFaultRegion, classify_fault_region, FaultResult
 from profile_loader import (  # noqa: E402
     ProfileConfig,
     ProfileError,
+    SlotConfig,
     _parse_metadata_fault_regions,
     load_profile,
 )
@@ -181,6 +182,44 @@ class TestParseMetadataFaultRegions(unittest.TestCase):
         self.assertEqual(regions[0].start, 0xFF00)
         self.assertEqual(regions[0].end, 0xFFFF)
 
+    def test_relative_slot_regions(self):
+        slots = {
+            "exec": SlotConfig(base=0x10000000, size=0x40000),
+        }
+        regions = _parse_metadata_fault_regions([
+            {"name": "trailer", "slot": "exec", "offset": 0x3F000, "size": 0x1000},
+        ], slots=slots)
+        self.assertEqual(regions[0].start, 0x1003F000)
+        self.assertEqual(regions[0].end, 0x10040000)
+
+    def test_relative_slot_regions_with_end_offset(self):
+        slots = {
+            "exec": SlotConfig(base=0x10000000, size=0x40000),
+        }
+        regions = _parse_metadata_fault_regions([
+            {"name": "trailer", "slot": "exec", "offset": 0x3F000, "end_offset": 0x40000},
+        ], slots=slots)
+        self.assertEqual(regions[0].start, 0x1003F000)
+        self.assertEqual(regions[0].end, 0x10040000)
+
+    def test_relative_slot_unknown_slot_raises(self):
+        with self.assertRaises(ProfileError):
+            _parse_metadata_fault_regions([
+                {"name": "trailer", "slot": "missing", "offset": 0, "size": 0x100},
+            ], slots={"exec": SlotConfig(base=0, size=0x1000)})
+
+    def test_relative_slot_requires_size_or_end_offset(self):
+        with self.assertRaises(ProfileError):
+            _parse_metadata_fault_regions([
+                {"name": "trailer", "slot": "exec", "offset": 0x100},
+            ], slots={"exec": SlotConfig(base=0, size=0x1000)})
+
+    def test_absolute_and_relative_forms_conflict(self):
+        with self.assertRaises(ProfileError):
+            _parse_metadata_fault_regions([
+                {"name": "trailer", "start": 0x100, "end": 0x200, "slot": "exec", "offset": 0},
+            ], slots={"exec": SlotConfig(base=0, size=0x1000)})
+
 
 class TestProfileLoadMetadataFaultRegions(unittest.TestCase):
     """Test metadata_fault_regions in full profile loading."""
@@ -247,6 +286,37 @@ class TestProfileLoadMetadataFaultRegions(unittest.TestCase):
             self.assertEqual(profile.metadata_fault_regions[0].name, "trailer")
             self.assertEqual(profile.metadata_fault_regions[0].start, 0x3F000)
             self.assertEqual(profile.metadata_fault_regions[1].name, "header")
+
+    def test_profile_with_relative_regions(self):
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            elf = tempdir / "boot.elf"
+            elf.write_bytes(b"\x00")
+            path = self._write_profile(tempdir, f"""
+                schema_version: 1
+                name: with_relative_regions
+                platform: platforms/test.repl
+                bootloader:
+                    elf: {elf}
+                    entry: 0x0
+                memory:
+                    sram:
+                        start: 0x20000000
+                        end: 0x20010000
+                    slots:
+                        exec:
+                            base: 0x10000000
+                            size: 0x40000
+                metadata_fault_regions:
+                    - name: trailer
+                      slot: exec
+                      offset: 0x3F000
+                      size: 0x1000
+            """)
+            profile = load_profile(path)
+            self.assertEqual(len(profile.metadata_fault_regions), 1)
+            self.assertEqual(profile.metadata_fault_regions[0].start, 0x1003F000)
+            self.assertEqual(profile.metadata_fault_regions[0].end, 0x10040000)
 
     def test_robot_vars_include_regions(self):
         with tempfile.TemporaryDirectory() as td:
