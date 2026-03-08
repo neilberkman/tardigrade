@@ -738,6 +738,15 @@ class ProfileConfig:
         if fs.metadata_fault.enabled:
             vars_list.append("METADATA_FAULT_ENABLED:true")
 
+
+        # Metadata fault regions: semicolon-separated list of name,start,end triples.
+        if self.metadata_fault_regions:
+            encoded = ";".join(
+                "{},0x{:X},0x{:X}".format(r.name, r.start, r.end)
+                for r in self.metadata_fault_regions
+            )
+            vars_list.append("METADATA_FAULT_REGIONS:{}".format(encoded))
+
         return vars_list
 # ---------------------------------------------------------------------------
 # Parsing helpers
