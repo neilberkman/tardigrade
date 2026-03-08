@@ -439,6 +439,7 @@ class CalibrationResult:
     emulated_s: Optional[float] = None
     elapsed_s: Optional[float] = None
     pc: Optional[str] = None
+    setup_writes: int = 0
 
 
 def calibration_completed(
@@ -523,6 +524,7 @@ def run_calibration(
         emulated_s=data.get("calibration_emulated_s"),
         elapsed_s=data.get("calibration_elapsed_s"),
         pc=data.get("calibration_pc"),
+        setup_writes=int(data.get("setup_writes", 0)),
     )
 
 
@@ -2041,6 +2043,7 @@ def main() -> int:
         trace_file_bin: Optional[str] = None
         erase_trace_file_bin: Optional[str] = None
         total_erases: int = 0
+        setup_writes: int = 0
         # Determine which fault classes are requested.
         fault_types = profile.fault_sweep.fault_types
         include_erases = (
@@ -2054,6 +2057,7 @@ def main() -> int:
         include_wear_leveling = "wear_leveling_corruption" in fault_types
         include_write_rejection = "write_rejection" in fault_types
         include_reset_at_time = "reset_at_time" in fault_types
+        include_metadata_fault = profile.fault_sweep.metadata_fault.enabled
         include_multi_sector_atomicity = "multi_sector_atomicity" in fault_types
         include_read_bit_flip = "read_bit_flip" in fault_types
 
@@ -2098,6 +2102,7 @@ def main() -> int:
                         ),
                         file=sys.stderr,
                     )
+                setup_writes = cal.setup_writes
                 if include_erases:
                     print("Calibration: {} NVM writes, {} page erases.".format(max_writes, total_erases), file=sys.stderr)
                 else:
@@ -2198,6 +2203,7 @@ def main() -> int:
             or include_read_bit_flip
             or profile.fault_sweep.phase2_fault.enabled
             or profile.fault_sweep.multi_fault.enabled
+            or include_metadata_fault
         )
         if has_mixed_types:
             write_fps: List[Tuple[int, str]] = []
@@ -2282,6 +2288,23 @@ def main() -> int:
                 combined += [(fp, 'f') for fp in read_flip_fps]
                 read_flip_count = len(read_flip_fps)
 
+            # Metadata fault injection: fault during pre_boot_state writes.
+            metadata_count = 0
+            if include_metadata_fault:
+                if setup_writes == 0:
+                    setup_writes = len(profile.pre_boot_state)
+                if setup_writes > 0:
+                    mf_type_map = {"power_loss": "w", "bit_corruption": "b"}
+                    mf_types = profile.fault_sweep.metadata_fault.fault_types
+                    mf_fps = list(range(0, setup_writes))
+                    if args.quick:
+                        mf_fps = quick_subset(mf_fps)
+                    for mf_fp in mf_fps:
+                        for mf_name in mf_types:
+                            mf_code = mf_type_map.get(mf_name, "w")
+                            combined.append((mf_fp, "m:{}".format(mf_code)))
+                            metadata_count += 1
+
             # Phase 2 recovery fault injection: for selected Phase 1 fault
             # points, also sweep faults during the recovery boot.
             p2_config = profile.fault_sweep.phase2_fault
@@ -2340,6 +2363,8 @@ def main() -> int:
                 parts.append("{} read-flip".format(read_flip_count))
             if phase2_count:
                 parts.append("{} phase2-recovery".format(phase2_count))
+            if metadata_count:
+                parts.append("{} metadata-fault".format(metadata_count))
             print(
                 "Running {} fault points ({}) for '{}'...".format(
                     len(fault_points),
@@ -2592,6 +2617,7 @@ def main() -> int:
             "schema_version": profile.schema_version,
             "calibrated_writes": max_writes,
             "calibrated_erases": total_erases,
+            "setup_writes": setup_writes,
             "fault_points_tested": len(fault_points),
             "quick": bool(args.quick),
             "heuristic": heuristic_summary,
