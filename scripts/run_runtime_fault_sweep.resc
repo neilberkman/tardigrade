@@ -1673,8 +1673,8 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
                 break
         cur_writes = get_total_writes()
         cur_erases = get_total_erases()
-        pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
         if op_trace is not None:
+            pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
             if cur_writes < trace_prev_writes:
                 trace_prev_writes = cur_writes
             while trace_prev_writes < cur_writes:

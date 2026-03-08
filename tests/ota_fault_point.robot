@@ -149,6 +149,7 @@ Run Runtime Fault Point
     Execute Command    $fault_types="${FAULT_TYPES}"
     Execute Command    $fault_type_csv="${FAULT_TYPE_CSV}"
     Execute Command    $boot_cycles="${BOOT_CYCLES}"
+    Run Keyword If    '${PHASE2_TIME_SLICE}' != ''    Execute Command    $phase2_time_slice="${PHASE2_TIME_SLICE}"
     Run Keyword If    '${BOOT_CYCLE_HOOK}' != ''    Execute Command    $boot_cycle_hook="${BOOT_CYCLE_HOOK}"
     Run Keyword If    '${EXPECTED_ROLLBACK_AT_CYCLE}' != ''    Execute Command    $expected_rollback_at_cycle=${EXPECTED_ROLLBACK_AT_CYCLE}
     Execute Command    $success_image_hash="${SUCCESS_IMAGE_HASH}"
