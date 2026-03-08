@@ -70,6 +70,8 @@ ${RESUME_TRACE_WALL_TIMEOUT_S}    30
 ${EXTRA_PERIPHERALS}           ${EMPTY}
 ${FLASH_BACKEND}               ${EMPTY}
 ${ENABLE_MACHINE_SNAPSHOTS}    false
+${PHASE2_FAULT_ENABLED}        false
+${PHASE2_FAULT_MAX_POINTS}     0
 ${TEST_TIMEOUT}                2 minutes
 
 *** Keywords ***

@@ -128,6 +128,22 @@ class SuccessCriteria:
         self.otadata_expect_scope = otadata_expect_scope
 
 
+class Phase2FaultConfig:
+    """Configuration for injecting faults during Phase 2 recovery writes."""
+
+    __slots__ = ("enabled", "fault_types", "max_points")
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        fault_types: Optional[List[str]] = None,
+        max_points: int = 0,
+    ) -> None:
+        self.enabled = enabled
+        self.fault_types = fault_types or ["power_loss"]
+        self.max_points = max(0, int(max_points))
+
+
 class FaultSweepConfig:
     __slots__ = (
         "mode",
@@ -143,6 +159,7 @@ class FaultSweepConfig:
         "boot_cycles",
         "boot_cycle_hook",
         "expected_rollback_at_cycle",
+        "phase2_fault",
     )
 
     def __init__(
@@ -160,6 +177,7 @@ class FaultSweepConfig:
         boot_cycles: int = 1,
         boot_cycle_hook: Optional[str] = None,
         expected_rollback_at_cycle: Optional[int] = None,
+        phase2_fault: Optional["Phase2FaultConfig"] = None,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -178,6 +196,7 @@ class FaultSweepConfig:
             if expected_rollback_at_cycle is None
             else max(1, int(expected_rollback_at_cycle))
         )
+        self.phase2_fault = phase2_fault or Phase2FaultConfig()
 
 
 class StateFuzzerConfig:
@@ -488,6 +507,12 @@ class ProfileConfig:
                     fs.expected_rollback_at_cycle
                 )
             )
+        if fs.phase2_fault.enabled:
+            vars_list.append("PHASE2_FAULT_ENABLED:true")
+            if fs.phase2_fault.max_points > 0:
+                vars_list.append(
+                    "PHASE2_FAULT_MAX_POINTS:{}".format(fs.phase2_fault.max_points)
+                )
 
         # Slot info.
         for slot_name, slot_cfg in mem.slots.items():
@@ -776,6 +801,33 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         boot_cycles=boot_cycles,
         boot_cycle_hook=boot_cycle_hook,
         expected_rollback_at_cycle=expected_rollback_at_cycle,
+        phase2_fault=_parse_phase2_fault(raw.get("phase2_fault")),
+    )
+
+
+def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
+    if raw is None:
+        return Phase2FaultConfig()
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep.phase2_fault: expected mapping")
+    enabled = bool(raw.get("enabled", False))
+    fault_types = raw.get("fault_types", ["power_loss"])
+    if not isinstance(fault_types, list):
+        fault_types = [str(fault_types)]
+    for ft in fault_types:
+        if ft not in KNOWN_FAULT_TYPES:
+            import warnings
+
+            warnings.warn("Unknown phase2_fault type '{}'; ignoring.".format(ft))
+    max_points = int(raw.get("max_points", 0))
+    if max_points < 0:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.max_points: expected non-negative integer"
+        )
+    return Phase2FaultConfig(
+        enabled=enabled,
+        fault_types=fault_types,
+        max_points=max_points,
     )
 
 
@@ -1168,6 +1220,9 @@ def main() -> int:
         "boot_cycles": profile.fault_sweep.boot_cycles,
         "boot_cycle_hook": profile.fault_sweep.boot_cycle_hook,
         "expected_rollback_at_cycle": profile.fault_sweep.expected_rollback_at_cycle,
+        "phase2_fault_enabled": profile.fault_sweep.phase2_fault.enabled,
+        "phase2_fault_max_points": profile.fault_sweep.phase2_fault.max_points,
+        "phase2_fault_types": profile.fault_sweep.phase2_fault.fault_types,
         "state_fuzzer_enabled": profile.state_fuzzer.enabled,
         "expect_should_find_issues": profile.expect.should_find_issues,
         "expect_control_outcome": profile.expect.control_outcome,

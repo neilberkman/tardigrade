@@ -2593,6 +2593,242 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
     return result
 
 # ---------------------------------------------------------------------------
+# Phase 2 fault injection: generic 3-phase execution.
+#
+# Phase 1: inject fault at p1_fault_at to create degraded state
+# Phase 2: recovery boot with fault injection armed at p2_fault_at
+# Phase 3: boot from double-faulted state, validate recovery
+# ---------------------------------------------------------------------------
+def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type='w'):
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    fp_t0 = _time.time()
+    is_p1_erase = p1_fault_type in ('e', 'a')
+    is_p2_erase = p2_fault_type in ('e', 'a')
+    log('p2fault p1={}/{} p2={}/{} phase1_setup'.format(
+        p1_fault_at, p1_fault_type, p2_fault_at, p2_fault_type))
+
+    # --- Phase 1: create degraded state ---
+    restore_phase1_baseline()
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = False
+    reset_nvmc_for_sweep()
+
+    if is_p1_erase:
+        erase_mode = 1 if p1_fault_type == 'a' else 0
+        base_erases = get_total_erases()
+        arm_at = base_erases + p1_fault_at + 1
+        arm_erase_fault(arm_at, erase_fault_mode=erase_mode)
+        disarm_write_fault()
+    else:
+        write_mode = {'w': 0, 'b': 1, 's': 2, 'r': 3, 'd': 4, 'l': 5}.get(
+            p1_fault_type, 0
+        )
+        base_writes = get_total_writes()
+        arm_at = base_writes + p1_fault_at + 1
+        if arm_at > base_writes + max_writes_cap:
+            arm_at = base_writes + max_writes_cap + 1
+        arm_fault(arm_at, write_fault_mode=write_mode)
+        disarm_erase_fault()
+
+    p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
+    p1_max_iters = phase1_max_iters(default_s=4.0)
+    p1_status = run_until_done(
+        cpu_ref,
+        label='p2fault_p1_{}'.format(p1_fault_at),
+        stop_on_fault=True,
+        max_iters=p1_max_iters,
+        wall_timeout=p1_wall_timeout,
+    )
+    disarm_fault()
+
+    p1_injected = was_fault_injected()
+    if is_p1_erase:
+        p1_ops = get_total_erases()
+    else:
+        p1_ops = get_total_writes()
+    phase1_ms = int((_time.time() - fp_t0) * 1000)
+
+    log('p2fault p1={}/{} phase1_done injected={} ops={}'.format(
+        p1_fault_at, p1_fault_type, p1_injected, p1_ops))
+
+    if not ((USE_FAST_PATH or USE_MRAM_PATH) and p1_injected):
+        return {
+            'fault_at': p1_fault_at,
+            'fault_requested': p1_fault_at,
+            'fault_type': 'p2',
+            'fault_injected': False,
+            'fault_address': '0x00000000',
+            'boot_outcome': 'success',
+            'boot_slot': None,
+            'fault_class': 'recoverable',
+            'actual_writes': p1_ops,
+            'signals': {'phase1_ms': phase1_ms, 'phase2_ms': 0, 'phase3_ms': 0},
+            'phase2_fault': {
+                'p1_fault_at': p1_fault_at,
+                'p2_fault_at': p2_fault_at,
+                'p1_fault_type': p1_fault_type,
+                'p2_fault_type': p2_fault_type,
+                'p1_injected': False,
+                'p2_injected': False,
+            },
+        }
+
+    # Snapshot faulted NVM from Phase 1.
+    if USE_MRAM_PATH:
+        mram_size = int(mram.Size)
+        saved_flash_p1 = mram.ReadBytes(0, mram_size)
+    else:
+        saved_flash_p1 = faultFlash.FaultFlashSnapshot
+        if saved_flash_p1 is None:
+            flash_ref = faultFlash.Flash
+            flash_size = int(faultFlash.FlashSize)
+            saved_flash_p1 = flash_ref.ReadBytes(0, flash_size)
+
+    # --- Phase 2: recovery boot with fault armed ---
+    phase2_t0 = _time.time()
+    restore_flash_and_boot(saved_flash_p1)
+    if _hash_bypass_active:
+        apply_hash_bypass()
+
+    reset_nvmc_for_sweep()
+
+    if is_p2_erase:
+        erase_mode = 1 if p2_fault_type == 'a' else 0
+        arm_erase_fault(p2_fault_at + 1, erase_fault_mode=erase_mode)
+        disarm_write_fault()
+    else:
+        write_mode = {'w': 0, 'b': 1, 's': 2, 'r': 3, 'd': 4, 'l': 5}.get(
+            p2_fault_type, 0
+        )
+        base_writes = get_total_writes()
+        arm_at = base_writes + p2_fault_at + 1
+        arm_fault(arm_at, write_fault_mode=write_mode)
+        disarm_erase_fault()
+
+    log('p2fault p1={} p2={}/{} phase2_step'.format(
+        p1_fault_at, p2_fault_at, p2_fault_type))
+    p2_status = run_until_done(
+        cpu_ref,
+        label='p2fault_p2_{}_{}'.format(p1_fault_at, p2_fault_at),
+        stop_on_fault=True,
+        time_slice=phase2_time_slice,
+        wall_timeout=60,
+    )
+    disarm_fault()
+
+    p2_injected = was_fault_injected()
+    if is_p2_erase:
+        p2_ops = get_total_erases()
+    else:
+        p2_ops = get_total_writes()
+    phase2_ms = int((_time.time() - phase2_t0) * 1000)
+
+    log('p2fault p1={} p2={}/{} phase2_done injected={} ops={}'.format(
+        p1_fault_at, p2_fault_at, p2_fault_type, p2_injected, p2_ops))
+
+    phase3_ms = 0
+    p3_status = None
+    if p2_injected:
+        if USE_MRAM_PATH:
+            saved_flash_p2 = mram.ReadBytes(0, mram_size)
+        else:
+            saved_flash_p2 = faultFlash.FaultFlashSnapshot
+            if saved_flash_p2 is None:
+                flash_ref = faultFlash.Flash
+                flash_size = int(faultFlash.FlashSize)
+                saved_flash_p2 = flash_ref.ReadBytes(0, flash_size)
+
+        # --- Phase 3: boot from double-faulted state ---
+        phase3_t0 = _time.time()
+        restore_flash_and_boot(saved_flash_p2)
+        if _hash_bypass_active:
+            apply_hash_bypass()
+        reset_nvmc_for_recovery()
+
+        log('p2fault p1={} p2={} phase3_step'.format(p1_fault_at, p2_fault_at))
+        arm_vtor_watchpoint()
+        p3_status = run_until_done(
+            cpu_ref,
+            label='p2fault_p3_{}_{}'.format(p1_fault_at, p2_fault_at),
+            expect_writes=False,
+            zero_writes_is_brick=False,
+            wall_timeout=30,
+            stop_on_fault=False,
+            time_slice=phase2_time_slice,
+        )
+        disarm_vtor_watchpoint()
+        phase3_ms = int((_time.time() - phase3_t0) * 1000)
+
+    # Read final state.
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value, pc_value, fault_injected=(p1_injected and p2_injected)
+    )
+    signals['phase1_ms'] = phase1_ms
+    signals['phase2_ms'] = phase2_ms
+    signals['phase3_ms'] = phase3_ms
+    signals['trace_replay_mode'] = 'execute'
+    if p1_status is not None:
+        signals['phase1_stop_reason'] = p1_status.get('reason')
+    if p2_status is not None:
+        signals['phase2_stop_reason'] = p2_status.get('reason')
+    if p3_status is not None:
+        signals['phase3_stop_reason'] = p3_status.get('reason')
+
+    semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'signals': signals,
+        'fault_injected': bool(p1_injected and p2_injected),
+        'stage': 'post_boot',
+    })
+    fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
+
+    if USE_FAST_PATH:
+        faultFlash.FaultFlashSnapshot = None
+
+    elapsed = _time.time() - fp_t0
+    result = {
+        'fault_at': p1_fault_at,
+        'fault_requested': p1_fault_at,
+        'fault_type': 'p2',
+        'fault_injected': p1_injected and p2_injected,
+        'fault_address': '0x00000000',
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'fault_class': fault_class,
+        'actual_writes': p1_ops,
+        'signals': signals,
+        'phase2_fault': {
+            'p1_fault_at': p1_fault_at,
+            'p2_fault_at': p2_fault_at,
+            'p1_fault_type': p1_fault_type,
+            'p2_fault_type': p2_fault_type,
+            'p1_injected': p1_injected,
+            'p2_injected': p2_injected,
+            'p2_ops': p2_ops,
+            'elapsed_s': round(elapsed, 1),
+        },
+    }
+    if semantic_state is not None:
+        result['semantic_state'] = semantic_state
+    if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
+        snapshot = saved_flash_p2 if p2_injected else saved_flash_p1
+        result['postmortem_partition_dump'] = build_postmortem_partition_dump(
+            snapshot_bytes=to_py_bytes(snapshot),
+            source='fault_snapshot',
+        )
+    if boot_outcome == 'no_boot' and resume_trace_no_boot and p2_injected:
+        result['resume_trace'] = run_resume_trace_from_snapshot(
+            saved_flash_p2, p1_fault_at, 'p2')
+
+    log('p2fault p1={} p2={} done outcome={} class={} elapsed={:.1f}s'.format(
+        p1_fault_at, p2_fault_at, boot_outcome, fault_class, elapsed))
+    return result
+
+# ---------------------------------------------------------------------------
 # Trace replay mode: reconstruct flash state from calibration trace instead
 # of re-emulating Phase 1.  Eliminates the O(N^2) prefix cost — each fault
 # point costs only O(K) Python writes + ~1s Phase 2 recovery boot.
@@ -3177,8 +3413,15 @@ else:
         ft = 'w'
         if idx < len(fault_type_list):
             ft = fault_type_list[idx]
+        if ft.startswith('p2:'):
+            parts = ft.split(':')
+            p1_at = int(parts[1])
+            p2_at = int(parts[2])
+            p1_type = parts[3] if len(parts) > 3 else 'w'
+            p2_type = parts[4] if len(parts) > 4 else 'w'
+            results.append(run_phase2_fault(p1_at, p2_at, p1_type, p2_type))
         # Cascade faults: 'c:W:E' where W=write_fault_at, E=erase_fault_at.
-        if ft.startswith('c:'):
+        elif ft.startswith('c:'):
             parts = ft.split(':')
             w_at = int(parts[1])
             e_at = int(parts[2])
