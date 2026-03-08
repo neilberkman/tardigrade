@@ -3069,6 +3069,13 @@ def main() -> int:
                 heuristic_kwargs["tier2_step"] = hc.tier2_step
                 heuristic_kwargs["tier3_step"] = hc.tier3_step
                 heuristic_kwargs["discontinuity_window"] = hc.discontinuity_window
+                if hc.target_points is not None:
+                    heuristic_kwargs["target_points"] = hc.target_points
+                if hc.shard_count > 1:
+                    heuristic_kwargs["shard_count"] = hc.shard_count
+                    heuristic_kwargs["shard_index"] = hc.shard_index
+                if hc.random_tail_budget > 0:
+                    heuristic_kwargs["random_tail_budget"] = hc.random_tail_budget
             classification = classify_trace(
                 trace=trace,
                 slot_ranges=slot_ranges_for_heuristic,
