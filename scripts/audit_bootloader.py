@@ -1111,6 +1111,15 @@ def _evaluate_invariants(
         profile.invariants,
         provider_paths=provider_paths,
     )
+    signals = result.get("signals")
+    elapsed_virtual_time_s: Optional[float] = None
+    if isinstance(signals, dict):
+        emulated = signals.get("phase2_emulated_s")
+        if emulated is not None:
+            try:
+                elapsed_virtual_time_s = float(emulated)
+            except (TypeError, ValueError):
+                elapsed_virtual_time_s = None
     fault_result = FaultResult(
         fault_at=int(result.get("fault_at", 0)),
         boot_outcome=str(result.get("boot_outcome", "unknown")),
@@ -1118,6 +1127,7 @@ def _evaluate_invariants(
         nvm_state=_result_state_payload(result),
         raw_log="",
         is_control=bool(result.get("is_control", False)),
+        elapsed_virtual_time_s=elapsed_virtual_time_s,
     )
     violations = run_invariants(
         fault_result,
