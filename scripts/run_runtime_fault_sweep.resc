@@ -76,6 +76,7 @@ $resume_trace_no_boot?="true"
 $resume_trace_max_ops?="1024"
 $resume_trace_time_slice?="0.02"
 $resume_trace_wall_timeout_s?="30"
+$phase2_time_slice?="0.05"
 $boot_cycles?="1"
 $boot_cycle_hook?=""
 $expected_rollback_at_cycle?=""
@@ -238,6 +239,9 @@ if resume_trace_max_ops < 1:
 resume_trace_time_slice = str(monitor.GetVariable('resume_trace_time_slice')).strip()
 if not resume_trace_time_slice:
     resume_trace_time_slice = '0.02'
+phase2_time_slice = str(monitor.GetVariable('phase2_time_slice')).strip()
+if not phase2_time_slice:
+    phase2_time_slice = '0.05'
 resume_trace_wall_timeout_raw = str(monitor.GetVariable('resume_trace_wall_timeout_s')).strip()
 try:
     resume_trace_wall_timeout_s = float(resume_trace_wall_timeout_raw)
@@ -672,6 +676,7 @@ def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_si
             zero_writes_is_brick=False,
             wall_timeout=30,
             stop_on_fault=False,
+            time_slice=phase2_time_slice,
         )
         disarm_vtor_watchpoint()
         vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
@@ -1829,6 +1834,7 @@ def run_timed_reset_fault(fault_at):
         expect_writes=False,
         zero_writes_is_brick=False,
         wall_timeout=30,
+        time_slice=phase2_time_slice,
     )
     disarm_vtor_watchpoint()
 
@@ -2269,6 +2275,7 @@ def run_execute_fault(fault_at, fault_type='w'):
                 zero_writes_is_brick=False,
                 wall_timeout=30,
                 stop_on_fault=False,
+                time_slice=phase2_time_slice,
             )
             disarm_vtor_watchpoint()
             recovery_writes = get_total_writes()
@@ -2295,6 +2302,7 @@ def run_execute_fault(fault_at, fault_type='w'):
                 label='fp{}_p1c'.format(fault_at),
                 wall_timeout=30,
                 stop_on_fault=False,
+                time_slice=phase2_time_slice,
             )
             disarm_vtor_watchpoint()
             phase2_ms = int((_time.time() - phase2_t0) * 1000)
@@ -2324,6 +2332,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             zero_writes_is_brick=False,
             wall_timeout=30,
             stop_on_fault=False,
+            time_slice=phase2_time_slice,
         )
         disarm_vtor_watchpoint()
         recovery_writes = get_total_writes()
@@ -2338,6 +2347,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             label='fp{}_p1c'.format(fault_at),
             wall_timeout=30,
             stop_on_fault=False,
+            time_slice=phase2_time_slice,
         )
         disarm_vtor_watchpoint()
         phase2_ms = int((_time.time() - phase2_t0) * 1000)
@@ -2500,7 +2510,11 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
     arm_erase_fault(erase_fault_at + 1)  # 0-indexed → 1-indexed
 
     log('cascade w={} e={} phase2_step'.format(write_fault_at, erase_fault_at))
-    run_until_done(cpu_ref, label='cascade_w{}_e{}_p2'.format(write_fault_at, erase_fault_at))
+    run_until_done(
+        cpu_ref,
+        label='cascade_w{}_e{}_p2'.format(write_fault_at, erase_fault_at),
+        time_slice=phase2_time_slice,
+    )
     disarm_fault()
 
     p2_injected = was_erase_fault_injected()
@@ -2530,6 +2544,7 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
             expect_writes=False,
             zero_writes_is_brick=False,
             wall_timeout=30,
+            time_slice=phase2_time_slice,
         )
         disarm_vtor_watchpoint()
 
@@ -2707,7 +2722,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         expect_writes=False,
         zero_writes_is_brick=False,
         wall_timeout=30,
-        time_slice='0.05',
+        time_slice=phase2_time_slice,
     )
     emulation_ms = int((_time.time() - t_emu) * 1000)
     disarm_vtor_watchpoint()
@@ -2888,7 +2903,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         expect_writes=False,
         zero_writes_is_brick=False,
         wall_timeout=30,
-        time_slice='0.05',
+        time_slice=phase2_time_slice,
     )
     emulation_ms = int((_time.time() - t_emu) * 1000)
     disarm_vtor_watchpoint()
