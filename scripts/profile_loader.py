@@ -738,7 +738,6 @@ class ProfileConfig:
         if fs.metadata_fault.enabled:
             vars_list.append("METADATA_FAULT_ENABLED:true")
 
-
         # Metadata fault regions: semicolon-separated list of name,start,end triples.
         if self.metadata_fault_regions:
             encoded = ";".join(
@@ -1030,7 +1029,6 @@ def _parse_read_fault_config(raw: Optional[Dict[str, Any]]) -> Optional[ReadFaul
         fault_probability=fault_probability,
         seed=seed,
     )
-
 
 
 def _parse_metadata_fault(raw):

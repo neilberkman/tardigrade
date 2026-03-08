@@ -2188,11 +2188,14 @@ def run_metadata_fault(fault_at, fault_type='w'):
     arm_vtor_watchpoint()
     p2_status = run_until_done(cpu_ref, label='fp{}_m{}_boot'.format(fault_at, m_type), expect_writes=False, zero_writes_is_brick=False, wall_timeout=30, time_slice=phase2_time_slice)
     disarm_vtor_watchpoint()
+    phase1_ms = int((_time.time() - fp_t0) * 1000)
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(vtor_value, pc_value, fault_injected=fault_injected)
     signals['metadata_fault_applied'] = applied
     signals['metadata_fault_total'] = pre_boot_write_count
+    signals['phase1_ms'] = phase1_ms
+    signals['phase2_ms'] = 0
     signals['phase2_stop_reason'] = p2_status.get('reason')
     signals['phase2_emulated_s'] = p2_status.get('emulated_s')
     semantic_state = collect_semantic_state({'cycle': 0, 'boot_outcome': boot_outcome, 'boot_slot': boot_slot, 'signals': signals, 'fault_injected': bool(fault_injected), 'stage': 'post_boot'})
