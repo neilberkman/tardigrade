@@ -332,6 +332,7 @@ state_probe = str(monitor.GetVariable('state_probe')).strip()
 #                'd' write_disturb, 'l' wear_leveling_corruption,
 #                'r' write_rejection, 't' reset_at_time
 #   erase-based: 'e' interrupted_erase, 'a' multi_sector_atomicity
+#   read-based:  'f' read_bit_flip (transient one-shot read corruption)
 fault_types_raw = str(monitor.GetVariable('fault_types')).strip().lower()
 if fault_types_raw in ('both', 'write_and_erase', 'write,erase'):
     fault_types_mode = 'both'
@@ -1783,6 +1784,181 @@ def phase1_max_iters(default_s=4.0, time_slice_s=0.02):
     slice_s = max(0.001, float(time_slice_s))
     return max(200, int((duration_s / slice_s) + 0.999))
 
+def run_read_bit_flip_fault(fault_at):
+    # read_bit_flip: storage is correct, but a specific word returns
+    # corrupted data on the first read during boot.  Models transient
+    # single-event upsets (SEU) on the NVM read bus.
+    #
+    # For the slow path (NVMemory), the fault is injected natively via
+    # NVMemory.ReadFaultEnabled / ReadFaultAddress.
+    #
+    # For the fast path (MappedMemory + NVMC), CPU reads bypass the
+    # controller so we corrupt the MappedMemory word directly before
+    # boot, then restore it after boot.
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    fp_t0 = _time.time()
+    log('fp={} type=f phase1_setup'.format(fault_at))
+
+    fault_word_offset = int(fault_at) * write_granularity
+    fault_seed = 0xBEEF ^ (int(fault_at) * 2654435761 & 0xFFFFFFFF)
+
+    restore_phase1_baseline()
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = False
+    reset_nvmc_for_sweep()
+    disarm_fault()
+
+    read_fault_address = 0
+    original_word = 0
+    corrupted_word = 0
+    fault_injected = False
+
+    if USE_MRAM_PATH:
+        read_fault_address = slot_staging_base + fault_word_offset
+        nvm_offset = read_fault_address - slot_exec_base
+        if 0 <= nvm_offset < int(mram.Size):
+            original_word = as_int(bus.ReadDoubleWord(read_fault_address))
+            mram.ReadFaultEnabled = True
+            mram.ReadFaultAddress = nvm_offset
+            mram.ReadFaultSeed = fault_seed & 0xFFFFFFFF
+            mram.ReadFaultFired = False
+            mram.ReadFaultSkipCount = 0
+            mram.ReadFaultTotalReads = 0
+            fault_injected = True
+            corrupted_word = _compute_read_bit_flip(original_word, fault_seed)
+            log('fp={} type=f armed nvm_offset=0x{:X} orig=0x{:08X} expected_corrupt=0x{:08X}'.format(
+                fault_at, nvm_offset, original_word, corrupted_word))
+        else:
+            log('fp={} type=f WARNING: fault address 0x{:X} outside NVM'.format(
+                fault_at, read_fault_address))
+    elif not USE_FAST_PATH:
+        read_fault_address = slot_staging_base + fault_word_offset
+        nvm_offset = read_fault_address - slot_exec_base
+        nvm_ref = ctrl.Nvm
+        if 0 <= nvm_offset < int(nvm_ref.Size):
+            original_word = as_int(bus.ReadDoubleWord(read_fault_address))
+            nvm_ref.ReadFaultEnabled = True
+            nvm_ref.ReadFaultAddress = nvm_offset
+            nvm_ref.ReadFaultSeed = fault_seed & 0xFFFFFFFF
+            nvm_ref.ReadFaultFired = False
+            nvm_ref.ReadFaultSkipCount = 0
+            nvm_ref.ReadFaultTotalReads = 0
+            fault_injected = True
+            corrupted_word = _compute_read_bit_flip(original_word, fault_seed)
+            log('fp={} type=f armed nvm_offset=0x{:X} orig=0x{:08X} expected_corrupt=0x{:08X}'.format(
+                fault_at, nvm_offset, original_word, corrupted_word))
+        else:
+            log('fp={} type=f WARNING: fault address 0x{:X} outside NVM'.format(
+                fault_at, read_fault_address))
+    else:
+        read_fault_address = slot_staging_base + fault_word_offset
+        flash_ref = faultFlash.Flash
+        flash_base = int(faultFlash.FlashBaseAddress)
+        flash_size = int(faultFlash.FlashSize)
+        flash_offset = read_fault_address - flash_base
+        if 0 <= flash_offset < flash_size - 3:
+            original_word = as_int(bus.ReadDoubleWord(read_fault_address))
+            corrupted_word = _compute_read_bit_flip(original_word, fault_seed)
+            bus.WriteDoubleWord(read_fault_address, corrupted_word)
+            fault_injected = True
+            log('fp={} type=f fast_path corrupt addr=0x{:X} orig=0x{:08X} corrupt=0x{:08X}'.format(
+                fault_at, read_fault_address, original_word, corrupted_word))
+        else:
+            log('fp={} type=f WARNING: fault address 0x{:X} outside flash'.format(
+                fault_at, read_fault_address))
+
+    log('fp={} type=f phase2_step'.format(fault_at))
+    arm_vtor_watchpoint()
+    p2_status = run_until_done(
+        cpu_ref,
+        label='fp{}_f_p2'.format(fault_at),
+        expect_writes=False,
+        zero_writes_is_brick=False,
+        wall_timeout=30,
+        time_slice=phase2_time_slice,
+    )
+    disarm_vtor_watchpoint()
+
+    phase1_ms = int((_time.time() - fp_t0) * 1000)
+
+    if USE_MRAM_PATH:
+        mram.ReadFaultEnabled = False
+        read_fault_actually_fired = bool(mram.ReadFaultFired)
+    elif not USE_FAST_PATH:
+        nvm_ref = ctrl.Nvm
+        nvm_ref.ReadFaultEnabled = False
+        read_fault_actually_fired = bool(nvm_ref.ReadFaultFired)
+    else:
+        if fault_injected:
+            bus.WriteDoubleWord(read_fault_address, original_word)
+        read_fault_actually_fired = fault_injected
+
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value, pc_value, fault_injected=fault_injected
+    )
+    signals['read_fault_address'] = fmt_u32(read_fault_address)
+    signals['read_fault_original'] = fmt_u32(original_word)
+    signals['read_fault_corrupted'] = fmt_u32(corrupted_word)
+    signals['read_fault_fired'] = read_fault_actually_fired
+    signals['phase1_ms'] = phase1_ms
+    signals['phase2_ms'] = 0
+    signals['phase2_stop_reason'] = p2_status.get('reason')
+    signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+
+    semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'signals': signals,
+        'fault_injected': bool(fault_injected),
+        'stage': 'post_boot',
+    })
+    fault_class = classify_fault_result(boot_outcome, boot_slot, signals)
+    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
+        boot_outcome,
+        boot_slot,
+        signals,
+        initial_status=p2_status,
+        fault_injected=fault_injected,
+        label='fp{}_readflip_followup'.format(fault_at),
+    )
+    signals['followup_ms'] = int(followup_ms)
+
+    result = {
+        'fault_at': fault_at,
+        'fault_requested': fault_at,
+        'fault_type': 'f',
+        'fault_injected': fault_injected,
+        'fault_address': fmt_u32(read_fault_address),
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'fault_class': fault_class,
+        'actual_writes': 0,
+        'signals': signals,
+    }
+    if semantic_state is not None:
+        result['semantic_state'] = semantic_state
+    if boot_cycle_records is not None:
+        result['boot_cycles'] = boot_cycle_records
+        result['multi_boot_analysis'] = multi_boot_analysis
+    return result
+
+
+def _compute_read_bit_flip(value, seed):
+    # Deterministic bit-flip matching FaultTracker.ApplyReadBitFlip.
+    seed = seed & 0xFFFFFFFF
+    if seed == 0:
+        seed = 0xDEAD
+    flip_count = 1 + (seed % 3)
+    for _ in range(flip_count):
+        seed = (seed * 1103515245 + 12345) & 0xFFFFFFFF
+        bit_pos = seed % 32
+        value ^= (1 << bit_pos)
+    return value & 0xFFFFFFFF
+
+
 def run_timed_reset_fault(fault_at):
     # reset_at_time: run Phase 1 for a deterministic time offset, then
     # simulate a power reset regardless of write/erase boundaries.
@@ -2043,6 +2219,7 @@ def run_execute_fault(fault_at, fault_type='w'):
     #          'l' wear_leveling_corruption
     #   erase: 'e' interrupted_erase, 'a' multi_sector_atomicity
     #   timed: 't' reset_at_time
+    #   read:  'f' read_bit_flip (transient one-shot read corruption)
     #
     # Fast path (NVMC CONFIG tracking): fault injection works by counting
     # NVMC CONFIG WEN->REN transitions. When the target write count is
@@ -2059,6 +2236,9 @@ def run_execute_fault(fault_at, fault_type='w'):
 
     if fault_type == 't':
         return run_timed_reset_fault(fault_at)
+
+    if fault_type == 'f':
+        return run_read_bit_flip_fault(fault_at)
 
     cpu_ref = monitor.Machine['sysbus.cpu']
     if int(fault_at) < 0:
@@ -3621,7 +3801,7 @@ else:
             results.append(run_cascading_fault(w_at, e_at))
         # Synthetic/non-default faults always use full execute mode
         # (not trace replay — they depend on NVMC peripheral state/PRNG).
-        elif ft in ('e', 'a', 'b', 's', 'd', 'l', 'r', 't'):
+        elif ft in ('e', 'a', 'b', 's', 'd', 'l', 'r', 't', 'f'):
             results.append(run_execute_fault(fp, fault_type=ft))
         elif run_fn == run_trace_replay_fault:
             results.append(run_fn(fp, fault_type=ft))

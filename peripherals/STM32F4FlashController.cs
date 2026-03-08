@@ -113,6 +113,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             localityCacheIdx = 0;
         }
 
+        // Read-fault injection stubs.  STM32F4 uses MappedMemory for CPU
+        // reads (fast path), so read-time interception is not possible.
+        public bool ReadFaultEnabled { get; set; }
+        public long ReadFaultAddress { get; set; } = -1;
+        public uint ReadFaultSeed { get; set; }
+        public bool ReadFaultFired { get; set; }
+        public ulong ReadFaultSkipCount { get; set; }
+        public ulong ReadFaultTotalReads { get; set; }
+
         // ---------------------------------------------------------------
         // Direct write interception (called by STM32F4FlashInterceptor).
         // O(1) per write — no shadow scan needed.

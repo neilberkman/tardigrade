@@ -97,3 +97,103 @@ Flash Partial Write Uses EraseFill
     ${word}=           Execute Command    sysbus ReadDoubleWord 0x10000000
     # First 2 bytes preserved (0xCCDD), last 2 bytes erased to 0xFFFF
     Should Be Equal As Numbers    ${word}    0xFFFFCCDD
+
+Read Fault Corrupts First Read
+    Create NVM Machine
+    Execute Command    sysbus WriteDoubleWord 0x10000000 0xAABBCCDD
+    # Arm read fault at NVM offset 0, seed 3 => flip bit 0 => 0xAABBCCDC
+    Execute Command    nvm ReadFaultAddress 0
+    Execute Command    nvm ReadFaultSeed 3
+    Execute Command    nvm ReadFaultEnabled true
+    ${corrupted}=      Execute Command    sysbus ReadDoubleWord 0x10000000
+    Should Be Equal As Numbers    ${corrupted}    0xAABBCCDC
+
+Read Fault Is One Shot
+    Create NVM Machine
+    Execute Command    sysbus WriteDoubleWord 0x10000000 0xAABBCCDD
+    Execute Command    nvm ReadFaultAddress 0
+    Execute Command    nvm ReadFaultSeed 3
+    Execute Command    nvm ReadFaultEnabled true
+    # First read fires the fault
+    Execute Command    sysbus ReadDoubleWord 0x10000000
+    ${fired}=          Execute Command    nvm ReadFaultFired
+    Should Be Equal As Strings    ${fired}    True
+    # Second read returns correct data
+    ${clean}=          Execute Command    sysbus ReadDoubleWord 0x10000000
+    Should Be Equal As Numbers    ${clean}    0xAABBCCDD
+
+Read Fault Does Not Modify Storage
+    Create NVM Machine
+    Execute Command    sysbus WriteDoubleWord 0x10000000 0xDEADBEEF
+    Execute Command    nvm ReadFaultAddress 0
+    Execute Command    nvm ReadFaultSeed 3
+    Execute Command    nvm ReadFaultEnabled true
+    # Trigger the fault via read
+    ${corrupted}=      Execute Command    sysbus ReadDoubleWord 0x10000000
+    Should Not Be Equal As Numbers    ${corrupted}    0xDEADBEEF
+    # Re-arm by clearing the fired flag — but read the ALIAS port which
+    # delegates to the same NVM without going through ApplyReadFault on the
+    # alias (alias ReadDoubleWord delegates to target which WILL apply fault).
+    # Instead, just verify: after fault fired, storage is correct on next read.
+    ${clean}=          Execute Command    sysbus ReadDoubleWord 0x10000000
+    Should Be Equal As Numbers    ${clean}    0xDEADBEEF
+
+Read Fault Disabled By Default
+    Create NVM Machine
+    Execute Command    sysbus WriteDoubleWord 0x10000000 0xAABBCCDD
+    # Set address and seed but do NOT enable
+    Execute Command    nvm ReadFaultAddress 0
+    Execute Command    nvm ReadFaultSeed 3
+    ${clean}=          Execute Command    sysbus ReadDoubleWord 0x10000000
+    Should Be Equal As Numbers    ${clean}    0xAABBCCDD
+    # Confirm fault did not fire
+    ${fired}=          Execute Command    nvm ReadFaultFired
+    Should Be Equal As Strings    ${fired}    False
+
+Read Fault Only At Armed Address
+    Create NVM Machine
+    Execute Command    sysbus WriteDoubleWord 0x10000000 0xAABBCCDD
+    Execute Command    sysbus WriteDoubleWord 0x10000100 0x11223344
+    # Arm at offset 0x100 (sysbus 0x10000100)
+    Execute Command    nvm ReadFaultAddress 0x100
+    Execute Command    nvm ReadFaultSeed 3
+    Execute Command    nvm ReadFaultEnabled true
+    # Read at offset 0 — should be clean (not armed)
+    ${clean}=          Execute Command    sysbus ReadDoubleWord 0x10000000
+    Should Be Equal As Numbers    ${clean}    0xAABBCCDD
+    # Fault should not have fired yet
+    ${fired}=          Execute Command    nvm ReadFaultFired
+    Should Be Equal As Strings    ${fired}    False
+    # Read at armed offset 0x100 — should be corrupted
+    ${corrupted}=      Execute Command    sysbus ReadDoubleWord 0x10000100
+    Should Not Be Equal As Numbers    ${corrupted}    0x11223344
+
+Read Fault Skip Count
+    Create NVM Machine
+    Execute Command    sysbus WriteDoubleWord 0x10000000 0xAABBCCDD
+    Execute Command    nvm ReadFaultAddress 0
+    Execute Command    nvm ReadFaultSeed 3
+    Execute Command    nvm ReadFaultSkipCount 2
+    Execute Command    nvm ReadFaultEnabled true
+    # First two reads of armed address are clean (skip count = 2)
+    ${r1}=             Execute Command    sysbus ReadDoubleWord 0x10000000
+    Should Be Equal As Numbers    ${r1}    0xAABBCCDD
+    ${r2}=             Execute Command    sysbus ReadDoubleWord 0x10000000
+    Should Be Equal As Numbers    ${r2}    0xAABBCCDD
+    # Third read fires the fault
+    ${r3}=             Execute Command    sysbus ReadDoubleWord 0x10000000
+    Should Be Equal As Numbers    ${r3}    0xAABBCCDC
+
+Read Fault Total Reads Counter
+    Create NVM Machine
+    Execute Command    sysbus WriteDoubleWord 0x10000000 0xAABBCCDD
+    Execute Command    nvm ReadFaultAddress 0
+    Execute Command    nvm ReadFaultSeed 3
+    Execute Command    nvm ReadFaultSkipCount 100
+    Execute Command    nvm ReadFaultEnabled true
+    # Read the armed address 3 times (none will fire due to high skip count)
+    Execute Command    sysbus ReadDoubleWord 0x10000000
+    Execute Command    sysbus ReadDoubleWord 0x10000000
+    Execute Command    sysbus ReadDoubleWord 0x10000000
+    ${total}=          Execute Command    nvm ReadFaultTotalReads
+    Should Be Equal As Numbers    ${total}    3

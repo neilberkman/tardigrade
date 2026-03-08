@@ -100,6 +100,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool SkipShadowScan { get; set; }
         public void InvalidateShadow() { wenSnapshot = null; }
 
+        // Read-fault injection stubs.  NRF52NVMC uses MappedMemory for CPU
+        // reads (fast path), so read-time interception is not possible.
+        // These properties exist to satisfy ITardigradeFaultInjectable; the
+        // sweep engine uses them for state tracking but the fault is applied
+        // via direct MappedMemory corruption (see run_runtime_fault_sweep.resc).
+        public bool ReadFaultEnabled { get; set; }
+        public long ReadFaultAddress { get; set; } = -1;
+        public uint ReadFaultSeed { get; set; }
+        public bool ReadFaultFired { get; set; }
+        public ulong ReadFaultSkipCount { get; set; }
+        public ulong ReadFaultTotalReads { get; set; }
+
         private uint configValue = 0;
 
         private byte[] wenSnapshot;

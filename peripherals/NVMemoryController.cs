@@ -40,6 +40,10 @@ namespace Antmicro.Renode.Peripherals.Memory
             WriteInProgress = false;
             LastFaultInjected = false;
             FaultEverFired = false;
+            // Read-fault state is intentionally NOT cleared on Reset: the
+            // sweep engine re-arms between iterations, and clearing here
+            // would hide the fact that a fault was scheduled but the boot
+            // path never read the armed address.
         }
 
         public byte ReadByte(long offset)
@@ -70,10 +74,11 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return AliasTarget.ReadDoubleWord(offset);
             }
             ValidateRange(offset, 4);
-            return (uint)(ReadByte(offset)
+            var value = (uint)(ReadByte(offset)
                 | (ReadByte(offset + 1) << 8)
                 | (ReadByte(offset + 2) << 16)
                 | (ReadByte(offset + 3) << 24));
+            return ApplyReadFault(offset, 4, value);
         }
 
         public ulong ReadQuadWord(long offset)
@@ -338,6 +343,33 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         public List<long> WriteLog { get { return writeLog; } }
 
+        // --- Read-fault injection ---
+        //
+        // One-shot transient read corruption: the underlying NVM is unchanged,
+        // but the first ReadDoubleWord that overlaps the armed address returns
+        // data with deterministic bit flips.  Subsequent reads return correct
+        // data.  Models single-event upsets (SEU) on the read bus.
+
+        // Master switch: when false, read-fault logic is completely bypassed.
+        public bool ReadFaultEnabled { get; set; }
+
+        // NVM-relative byte offset of the word to corrupt on read.
+        // Must be word-aligned (aligned to WordSize).
+        public long ReadFaultAddress { get; set; } = -1;
+
+        // PRNG seed for deterministic bit selection during read corruption.
+        public uint ReadFaultSeed { get; set; }
+
+        // Sticky: set when the read fault fires, cleared when re-arming.
+        public bool ReadFaultFired { get; set; }
+
+        // Number of reads of the armed address to skip before firing.
+        // 0 = fire on the very first read.
+        public ulong ReadFaultSkipCount { get; set; }
+
+        // Total reads counted against the armed address (for diagnostics).
+        public ulong ReadFaultTotalReads { get; set; }
+
         public void EraseSector(long offset, int sectorSize)
         {
             if(AliasTarget != null)
@@ -361,6 +393,37 @@ namespace Antmicro.Renode.Peripherals.Memory
         public void ResetWriteLog()
         {
             writeLog.Clear();
+        }
+
+        // Apply one-shot read-fault injection if the access overlaps the
+        // armed address.  Returns the (possibly corrupted) value.
+        private uint ApplyReadFault(long offset, int accessSize, uint value)
+        {
+            if(!ReadFaultEnabled || ReadFaultFired || ReadFaultAddress < 0)
+            {
+                return value;
+            }
+
+            // Check overlap: armed region is [ReadFaultAddress, ReadFaultAddress + 4),
+            // access region is [offset, offset + accessSize).
+            var armedEnd = ReadFaultAddress + 4;
+            var accessEnd = offset + accessSize;
+            if(offset >= armedEnd || accessEnd <= ReadFaultAddress)
+            {
+                return value;
+            }
+
+            // This read overlaps the armed address. Count it.
+            ReadFaultTotalReads++;
+            if(ReadFaultTotalReads <= ReadFaultSkipCount)
+            {
+                return value;
+            }
+
+            // Fire the fault: flip deterministic bits. NVM is NOT modified.
+            ReadFaultFired = true;
+            var seed = ReadFaultSeed != 0 ? ReadFaultSeed : (uint)(ReadFaultAddress ^ 0xDEAD);
+            return Antmicro.Renode.Peripherals.Miscellaneous.FaultTracker.ApplyReadBitFlip(value, seed);
         }
 
         private void WriteBytesInternal(long offset, byte[] data)
