@@ -692,6 +692,29 @@ class TestMaxPointsCap(unittest.TestCase):
         # Last point is always the complete image.
         self.assertEqual(offsets[-1], image_size)
 
+    def test_max_points_preserves_structural_anchors(self):
+        """Capping must keep structural anchors (header, trailer, etc.) over sector fills."""
+        image_size = 0x10000  # 64KB
+        sector_size = 0x1000  # 4KB
+        max_points = 5
+
+        capped = generate_truncation_points(
+            image_size=image_size,
+            strategy="exhaustive",
+            header_size=32,
+            sector_size=sector_size,
+            trailer_size=256,
+            max_points=max_points,
+        )
+        labels = {p.label for p in capped}
+        # Structural anchors must survive the cap — not replaced by sector_* points.
+        self.assertIn("empty", labels)
+        self.assertIn("complete", labels)
+        # At least some non-sector heuristic anchors must be present.
+        non_sector = [p for p in capped if not p.label.startswith("sector_")]
+        self.assertGreaterEqual(len(non_sector), 3,
+            "max_points cap dropped too many structural anchors: {}".format(labels))
+
     def test_max_points_no_effect_on_heuristic(self):
         """max_points should not affect heuristic mode."""
         heuristic_full = generate_truncation_points(
