@@ -587,6 +587,10 @@ def parse_partial_staging_config(
     max_points_raw = raw.get("max_points")
     max_points = int(max_points_raw) if max_points_raw is not None else None
 
+    # Profile-level sector_size overrides the caller default.
+    if "sector_size" in raw:
+        sector_size = int(raw["sector_size"])
+
     return PartialStagingConfig(
         staging_image_path=str(staging_image),
         staging_slot_name=staging_slot,
