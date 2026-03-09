@@ -20,7 +20,7 @@ from targets.nxboot.invariants import (  # noqa: E402
     check_nxboot_duplicate_update_consumed,
     check_nxboot_unconfirmed_internal_requires_revert,
 )
-from targets.nxboot.probe import _crc32_update, collect_state  # noqa: E402
+from targets.nxboot.probe import _crc32, collect_state  # noqa: E402
 
 
 class _FakeBus:
@@ -34,6 +34,9 @@ class _FakeBus:
     def ReadByte(self, addr: int) -> int:
         return self._bytes.get(addr, 0xFF)
 
+    def ReadBytes(self, addr: int, size: int):
+        return bytes([self._bytes.get(addr + i, 0xFF) for i in range(size)])
+
 
 class _FakeMonitor:
     def __init__(self, variables):
@@ -44,10 +47,10 @@ class _FakeMonitor:
 
 
 class NxbootTargetPackageTest(unittest.TestCase):
-    def test_crc_helper_accepts_legacy_char_iteration(self) -> None:
-        expected = _crc32_update(0xFFFFFFFF, b"ABC") ^ 0xFFFFFFFF
-        legacy = _crc32_update(0xFFFFFFFF, "ABC") ^ 0xFFFFFFFF
-        self.assertEqual(legacy, expected)
+    def test_crc_helper_matches_binascii(self) -> None:
+        import binascii
+        expected = binascii.crc32(b"ABC") & 0xFFFFFFFF
+        self.assertEqual(_crc32(b"ABC"), expected)
 
     def test_probe_models_pending_update_roles(self) -> None:
         slot_size = 0x23000

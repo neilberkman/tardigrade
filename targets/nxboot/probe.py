@@ -6,6 +6,7 @@ Platform-specific adapters (e.g. nuttx_nxboot) delegate here rather than
 duplicating the slot-probing and role-determination logic.
 """
 
+import binascii
 import struct
 
 
@@ -33,48 +34,20 @@ def _get_monitor_int(monitor, names, default=None):
     return default
 
 
-def _read_byte(bus, addr):
-    return int(bus.ReadByte(addr)) & 0xFF
-
-
 def _read_bytes(bus, addr, size):
     size = int(size)
     addr = int(addr)
-    result = bytearray(size)
-    # Read 4-byte words where possible (4x fewer IronPython→C# calls).
-    offset = 0
-    # Handle unaligned prefix.
-    while offset < size and (addr + offset) % 4 != 0:
-        result[offset] = _read_byte(bus, addr + offset)
-        offset += 1
-    # Bulk word reads.
-    while offset + 4 <= size:
-        word = int(bus.ReadDoubleWord(addr + offset)) & 0xFFFFFFFF
-        struct.pack_into("<I", result, offset, word)
-        offset += 4
-    # Handle trailing bytes.
-    while offset < size:
-        result[offset] = _read_byte(bus, addr + offset)
-        offset += 1
-    return bytes(result)
+    raw = bus.ReadBytes(addr, size)
+    return bytes([(int(b) & 0xFF) for b in raw])
 
 
 def _read_u32(bus, addr):
     return struct.unpack("<I", _read_bytes(bus, addr, 4))[0]
 
 
-def _crc32_update(crc, raw):
-    for byte in raw:
-        if not isinstance(byte, int):
-            byte = ord(byte)
-        crc ^= int(byte) & 0xFF
-        for _ in range(8):
-            if crc & 1:
-                crc = (crc >> 1) ^ 0xEDB88320
-            else:
-                crc >>= 1
-            crc &= 0xFFFFFFFF
-    return crc
+def _crc32(data):
+    """Standard CRC-32 using C-implemented binascii instead of byte-by-byte Python."""
+    return binascii.crc32(data) & 0xFFFFFFFF
 
 
 def _magic_kind(magic):
@@ -128,7 +101,7 @@ def _slot_probe(bus, base, slot_size, sram_start=SRAM_START, sram_end=SRAM_END):
         and total_image_size <= int(slot_size)
     ):
         crc_data = _read_bytes(bus, int(base) + 12, total_image_size - 12)
-        computed_crc = _crc32_update(0xFFFFFFFF, crc_data) ^ 0xFFFFFFFF
+        computed_crc = _crc32(crc_data)
         crc_valid = computed_crc == image_crc
     image_valid = bool(magic_kind in ("external", "internal") and crc_valid)
     vector_valid = False

@@ -40,6 +40,9 @@ class _FakeBus:
     def ReadByte(self, addr: int) -> int:
         return self._bytes.get(addr, 0xFF)
 
+    def ReadBytes(self, addr: int, size: int):
+        return bytes([self._bytes.get(addr + i, 0xFF) for i in range(size)])
+
 
 class _FakeMonitor:
     def __init__(self, variables):

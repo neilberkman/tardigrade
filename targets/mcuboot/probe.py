@@ -20,33 +20,15 @@ def _as_int(value, default=0):
         return int(default)
 
 
-def _read_byte(bus, addr):
-    return int(bus.ReadByte(addr)) & 0xFF
-
-
 def _read_bytes(bus, addr, size):
     size = int(size)
     addr = int(addr)
-    result = bytearray(size)
-    offset = 0
-    # Handle unaligned prefix.
-    while offset < size and (addr + offset) % 4 != 0:
-        result[offset] = _read_byte(bus, addr + offset)
-        offset += 1
-    # Bulk word reads (4x fewer IronPython→C# calls).
-    while offset + 4 <= size:
-        word = int(bus.ReadDoubleWord(addr + offset)) & 0xFFFFFFFF
-        struct.pack_into("<I", result, offset, word)
-        offset += 4
-    # Trailing bytes.
-    while offset < size:
-        result[offset] = _read_byte(bus, addr + offset)
-        offset += 1
-    return bytes(result)
+    raw = bus.ReadBytes(addr, size)
+    return bytes([(int(b) & 0xFF) for b in raw])
 
 
 def _read_flag(bus, addr):
-    raw = _read_byte(bus, addr)
+    raw = _read_bytes(bus, addr, 1)[0]
     if raw == 0xFF:
         state = "unset"
     elif raw == 0x01:
