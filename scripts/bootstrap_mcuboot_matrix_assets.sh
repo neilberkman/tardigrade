@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-ZEPHYR_REF="${ZEPHYR_REF:-v3.6.0}"
+ZEPHYR_REF="${ZEPHYR_REF:-v3.7.0}"
 ZEPHYR_WS="${REPO_ROOT}/third_party/zephyr_ws"
 ZEPHYR_VENV="${REPO_ROOT}/third_party/zephyr-venv"
 MCUBOOT_DIR="${ZEPHYR_WS}/bootloader/mcuboot"
