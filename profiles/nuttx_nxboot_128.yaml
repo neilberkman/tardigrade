@@ -1,6 +1,9 @@
 schema_version: 1
 name: NuttX nxboot STM32H743 fw128
 description: Real NuttX nxboot STM32H7 update profile generated from public build outputs
+# Benchmark profile with generated build artifacts under results/nuttx_nxboot/.
+# Validated by dedicated NuttX workflows, not the generic repo self-test shard.
+skip_self_test: true
 platform: platforms/nucleo_h753zi_tardigrade.repl
 flash_backend: faultFlash
 bootloader:

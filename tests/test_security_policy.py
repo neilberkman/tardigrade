@@ -21,6 +21,7 @@ from audit_bootloader import (
     classify_failure_class,
     result_has_issues,
     result_is_brick,
+    validate_runtime_fault_mode_compat,
 )
 from profile_loader import (
     ProfileError,
@@ -418,6 +419,25 @@ class SecurityProfileLoadTests(unittest.TestCase):
         self.assertEqual(profile.name, "security_toctou_with_protection")
         self.assertTrue(profile.security_policy.toctou_protection)
         self.assertIn("bit_corruption", profile.fault_sweep.fault_types)
+
+    def test_toctou_profiles_fail_fast_in_state_mode_on_pure_nvm(self):
+        for name in (
+            "security_toctou_no_protection.yaml",
+            "security_toctou_with_protection.yaml",
+        ):
+            path = ROOT / "profiles" / name
+            if not path.exists():
+                self.skipTest("profile not found")
+            profile = load_profile(path)
+            with self.assertRaisesRegex(RuntimeError, "does not support fault type"):
+                validate_runtime_fault_mode_compat(profile, "state")
+
+    def test_power_loss_profile_remains_valid_in_state_mode_on_pure_nvm(self):
+        path = ROOT / "profiles" / "security_rollback_with_protection.yaml"
+        if not path.exists():
+            self.skipTest("profile not found")
+        profile = load_profile(path)
+        validate_runtime_fault_mode_compat(profile, "state")
 
 
 class SecurityPolicyCLIOutputTests(unittest.TestCase):

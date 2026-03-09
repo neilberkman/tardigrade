@@ -1,8 +1,8 @@
 # tardigrade
 
-Fault-injection testing for embedded OTA bootloaders. Answers one question: **if power dies mid-update, does the device recover?**
+Fault-injection testing for embedded OTA bootloaders. Answers one question: **under realistic update-time reset and storage faults, does the device recover safely?**
 
-Tardigrade runs your bootloader under [Renode](https://renode.io/), systematically faults every NVM write in the update path, and checks whether the device still boots correctly.
+Tardigrade runs your bootloader under [Renode](https://renode.io/), systematically injects reset, partial-write, erase-tear, bit-flip, dropped-write, and related NVM faults along the update path, and checks whether the device still boots correctly.
 
 ### Proven results
 
