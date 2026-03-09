@@ -18,7 +18,7 @@ try:
         NXBOOT_HEADER_MAGIC,
         NXBOOT_HEADER_MAGIC_INT,
         _compute_roles_and_flags,
-        _crc32_update,
+        _crc32,
         _determine_roles,
         _get_monitor_int,
         _hex_u64,
@@ -37,7 +37,7 @@ except ImportError:
     NXBOOT_HEADER_MAGIC = _ns["NXBOOT_HEADER_MAGIC"]
     NXBOOT_HEADER_MAGIC_INT = _ns["NXBOOT_HEADER_MAGIC_INT"]
     _compute_roles_and_flags = _ns.get("_compute_roles_and_flags")
-    _crc32_update = _ns["_crc32_update"]
+    _crc32 = _ns["_crc32"]
     _determine_roles = _ns.get("_determine_roles")
     _get_monitor_int = _ns["_get_monitor_int"]
     _hex_u64 = _ns["_hex_u64"]
