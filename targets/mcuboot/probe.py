@@ -25,9 +25,24 @@ def _read_byte(bus, addr):
 
 
 def _read_bytes(bus, addr, size):
-    # Renode's embedded Python/.NET bridge is unhappy when a generator is passed
-    # through byte-oriented helpers; force eager materialization.
-    return bytes([_read_byte(bus, addr + i) for i in range(size)])
+    size = int(size)
+    addr = int(addr)
+    result = bytearray(size)
+    offset = 0
+    # Handle unaligned prefix.
+    while offset < size and (addr + offset) % 4 != 0:
+        result[offset] = _read_byte(bus, addr + offset)
+        offset += 1
+    # Bulk word reads (4x fewer IronPython→C# calls).
+    while offset + 4 <= size:
+        word = int(bus.ReadDoubleWord(addr + offset)) & 0xFFFFFFFF
+        struct.pack_into("<I", result, offset, word)
+        offset += 4
+    # Trailing bytes.
+    while offset < size:
+        result[offset] = _read_byte(bus, addr + offset)
+        offset += 1
+    return bytes(result)
 
 
 def _read_flag(bus, addr):

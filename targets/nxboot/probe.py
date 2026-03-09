@@ -38,10 +38,25 @@ def _read_byte(bus, addr):
 
 
 def _read_bytes(bus, addr, size):
-    raw = []
-    for offset in range(int(size)):
-        raw.append(_read_byte(bus, addr + offset))
-    return struct.pack("{}B".format(len(raw)), *raw)
+    size = int(size)
+    addr = int(addr)
+    result = bytearray(size)
+    # Read 4-byte words where possible (4x fewer IronPython→C# calls).
+    offset = 0
+    # Handle unaligned prefix.
+    while offset < size and (addr + offset) % 4 != 0:
+        result[offset] = _read_byte(bus, addr + offset)
+        offset += 1
+    # Bulk word reads.
+    while offset + 4 <= size:
+        word = int(bus.ReadDoubleWord(addr + offset)) & 0xFFFFFFFF
+        struct.pack_into("<I", result, offset, word)
+        offset += 4
+    # Handle trailing bytes.
+    while offset < size:
+        result[offset] = _read_byte(bus, addr + offset)
+        offset += 1
+    return bytes(result)
 
 
 def _read_u32(bus, addr):
