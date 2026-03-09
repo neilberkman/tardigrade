@@ -10,11 +10,70 @@ from __future__ import annotations
 import json
 import sys
 from collections import defaultdict
-from typing import Any, Dict, List, Set
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
 
 
 # Outcomes that count as "no issue" (device recovered correctly).
 SUCCESS_OUTCOMES: Set[str] = {"success", "complete_image_ok", "safe_fallback"}
+
+
+def normalize_results(
+    rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Normalize result rows from either audit output or harness-native format."""
+    normalized: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("result row must be a mapping, got {!r}".format(type(row)))
+        if row.get("is_control", False):
+            continue
+
+        raw_fp = row.get("fault_point", row.get("fault_at"))
+        raw_outcome = row.get("outcome", row.get("boot_outcome"))
+        if raw_fp is None or raw_outcome is None:
+            raise ValueError(
+                "result row missing fault point/outcome fields: {}".format(row)
+            )
+
+        entry: Dict[str, Any] = {
+            "fault_point": int(raw_fp),
+            "outcome": str(raw_outcome),
+        }
+        if "fault_type" in row:
+            entry["fault_type"] = row.get("fault_type")
+        normalized.append(entry)
+    return normalized
+
+
+def load_results_payload(payload: Any) -> List[Dict[str, Any]]:
+    """Extract and normalize results from supported JSON payload shapes."""
+    if isinstance(payload, list):
+        return normalize_results(payload)
+    if not isinstance(payload, dict):
+        raise ValueError("unsupported payload type {!r}".format(type(payload)))
+
+    if "runtime_sweep_results" in payload:
+        return normalize_results(payload["runtime_sweep_results"])
+
+    results = payload.get("results")
+    if isinstance(results, list):
+        return normalize_results(results)
+    if isinstance(results, dict):
+        nested = results.get("results")
+        if isinstance(nested, list):
+            return normalize_results(nested)
+
+    raise ValueError(
+        "unsupported results payload: expected list, results, or runtime_sweep_results"
+    )
+
+
+def load_results_file(path: Path) -> List[Dict[str, Any]]:
+    """Load and normalize results from a JSON file."""
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    return load_results_payload(payload)
 
 
 def compare_results(
@@ -31,6 +90,9 @@ def compare_results(
     Returns:
         Dict with recall metrics, missed points, and per-fault-type breakdown.
     """
+    exhaustive_results = normalize_results(exhaustive_results)
+    heuristic_results = normalize_results(heuristic_results)
+
     heuristic_fps: Set[int] = {r["fault_point"] for r in heuristic_results}
 
     # Identify issue points in exhaustive.
@@ -97,21 +159,11 @@ def main() -> None:
         )
         sys.exit(1)
 
-    exhaustive_path, heuristic_path = sys.argv[1], sys.argv[2]
+    exhaustive_path = Path(sys.argv[1])
+    heuristic_path = Path(sys.argv[2])
 
-    with open(exhaustive_path, "r") as f:
-        exhaustive_data = json.load(f)
-    with open(heuristic_path, "r") as f:
-        heuristic_data = json.load(f)
-
-    exhaustive_results = exhaustive_data.get("results", exhaustive_data)
-    heuristic_results = heuristic_data.get("results", heuristic_data)
-
-    if isinstance(exhaustive_results, dict):
-        exhaustive_results = exhaustive_results.get("results", [])
-    if isinstance(heuristic_results, dict):
-        heuristic_results = heuristic_results.get("results", [])
-
+    exhaustive_results = load_results_file(exhaustive_path)
+    heuristic_results = load_results_file(heuristic_path)
     comparison = compare_results(exhaustive_results, heuristic_results)
     print(json.dumps(comparison, indent=2))
 

@@ -406,6 +406,18 @@ class TestTargetPoints:
         )
         assert uncapped == capped
 
+    def test_target_points_preserves_first_and_last_points(self):
+        """Budgeting keeps the trace endpoints even when only tier3 is trimmed."""
+        offsets = _bulk_offsets(0x25000, 500)
+        trace = _make_trace(offsets)
+
+        result = classify_trace(
+            trace, SLOT_RANGES, page_size=PAGE, target_points=5
+        )
+        assert len(result) <= 5
+        assert 0 in result
+        assert 499 in result
+
 
 # ---------------------------------------------------------------------------
 # 8. Sharding
