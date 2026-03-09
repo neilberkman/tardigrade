@@ -12,7 +12,11 @@ SCRIPTS = ROOT / "scripts"
 
 sys.path.insert(0, str(SCRIPTS))
 
-from compare_heuristic_vs_exhaustive import compare_results  # noqa: E402
+from compare_heuristic_vs_exhaustive import (  # noqa: E402
+    compare_results,
+    load_results_payload,
+    normalize_results,
+)
 from write_trace_heuristic import classify_trace, summarize_classification  # noqa: E402
 
 
@@ -436,6 +440,53 @@ class TestCompareResults(unittest.TestCase):
         # fp 5 was tested by heuristic, so it counts as covered.
         self.assertEqual(result["issue_recall"], 1.0)
         self.assertEqual(result["missed_issue_points"], [])
+
+    def test_runtime_sweep_results_payload_normalized(self):
+        """Real audit JSON payloads are accepted and control points are skipped."""
+        payload = {
+            "runtime_sweep_results": [
+                {"fault_at": 1, "boot_outcome": "no_boot", "fault_type": "w"},
+                {"fault_at": 2, "boot_outcome": "success", "fault_type": "b"},
+                {"fault_at": 999, "boot_outcome": "success", "is_control": True},
+            ]
+        }
+        rows = load_results_payload(payload)
+        self.assertEqual(
+            rows,
+            [
+                {"fault_point": 1, "outcome": "no_boot", "fault_type": "w"},
+                {"fault_point": 2, "outcome": "success", "fault_type": "b"},
+            ],
+        )
+
+    def test_compare_results_accepts_audit_rows(self):
+        """Audit-style rows compare correctly without manual normalization."""
+        exhaustive = [
+            {"fault_at": 1, "boot_outcome": "no_boot"},
+            {"fault_at": 2, "boot_outcome": "success"},
+            {"fault_at": 3, "boot_outcome": "wrong_image"},
+        ]
+        heuristic = [
+            {"fault_at": 1, "boot_outcome": "success"},
+            {"fault_at": 2, "boot_outcome": "success"},
+        ]
+        result = compare_results(exhaustive, heuristic)
+        self.assertEqual(result["total_exhaustive_points"], 3)
+        self.assertEqual(result["total_heuristic_points"], 2)
+        self.assertEqual(result["exhaustive_issue_count"], 2)
+        self.assertEqual(result["heuristic_issue_count"], 0)
+        self.assertEqual(result["issue_recall"], 0.5)
+        self.assertEqual(result["missed_issue_points"], [3])
+
+    def test_invalid_payload_rejected(self):
+        """Unsupported JSON shapes fail loudly instead of comparing empty lists."""
+        with self.assertRaises(ValueError):
+            load_results_payload({"summary": {"runtime_sweep": {}}})
+
+    def test_missing_fields_rejected(self):
+        """Rows missing a point or outcome are rejected."""
+        with self.assertRaises(ValueError):
+            normalize_results([{"fault_at": 1}])
 
 
 if __name__ == "__main__":

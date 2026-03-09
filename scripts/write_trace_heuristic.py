@@ -396,16 +396,24 @@ def classify_trace(
             tier3_selected.update(extra)
             selected.update(extra)
 
+    first_fp: Optional[int] = None
+    last_fp: Optional[int] = None
     # Always include first and last fault points.
     all_fps = [w - 1 for w, _ in trace]
     if all_fps:
-        selected.add(min(all_fps))
-        selected.add(max(all_fps))
+        first_fp = min(all_fps)
+        last_fp = max(all_fps)
+        selected.add(first_fp)
+        selected.add(last_fp)
 
     # Target points budget: trim low-risk tiers to fit.  Never trim
     # tier0 or tier1 — only tier3 then tier2 are expendable.
     if target_points is not None and len(selected) > target_points:
-        core = tier0 | tier1
+        core = set(tier0 | tier1)
+        if first_fp is not None:
+            core.add(first_fp)
+        if last_fp is not None:
+            core.add(last_fp)
         # How many non-core points can we keep?
         budget_for_lower = max(0, target_points - len(core))
 
