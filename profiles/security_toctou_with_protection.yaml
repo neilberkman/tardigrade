@@ -10,6 +10,12 @@ description: >-
   The security_policy.toctou_protection flag declares this expectation.
   Fault injection tests whether the re-validation is itself resilient
   to interruption.
+#
+# Uses bit_corruption on a pure NVMemory platform. That path currently
+# escalates to execute-mode fault handling in the runtime runner, which
+# is too slow for generic quick self-test CI. Keep it out of the broad
+# self-test shard until it has a dedicated workflow or state-mode model.
+skip_self_test: true
 
 platform: platforms/cortex_m0_nvm.repl
 flash_backend: nvm_ctrl

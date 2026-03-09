@@ -2138,6 +2138,50 @@ def build_clean_operation_trace(
     return ops
 
 
+EXECUTE_ONLY_FAULT_TYPES = {
+    "bit_corruption",
+    "interrupted_erase",
+    "multi_sector_atomicity",
+    "silent_write_failure",
+    "write_rejection",
+    "write_disturb",
+    "wear_leveling_corruption",
+    "reset_at_time",
+    "read_bit_flip",
+}
+
+
+def validate_runtime_fault_mode_compat(profile: "ProfileConfig", eval_mode: str) -> None:
+    """Fail fast on profile/mode combinations the runtime runner cannot support."""
+    if str(getattr(profile.fault_sweep, "mode", "runtime")) != "runtime":
+        return
+    if str(eval_mode) != "state":
+        return
+
+    platform = str(getattr(profile, "platform", "") or "")
+    pure_nvm_platform = (
+        "nvm" in platform
+        and "flash_fast" not in platform
+        and "hybrid" not in platform
+    )
+    if not pure_nvm_platform:
+        return
+
+    fault_types = list(getattr(profile.fault_sweep, "fault_types", []) or [])
+    incompatible = sorted(set(fault_types) & EXECUTE_ONLY_FAULT_TYPES)
+    if not incompatible:
+        return
+
+    raise RuntimeError(
+        "evaluation_mode 'state' on pure NVMemory platform '{}' does not support "
+        "fault type(s) {}. These faults currently use execute-mode handling in "
+        "the runtime runner, and execute mode is intentionally unsupported on "
+        "pure NVMemory platforms. Use power_loss only, move the target to a "
+        "flash_fast/hybrid platform, or keep this profile out of generic "
+        "self-test.".format(platform, ", ".join(incompatible))
+    )
+
+
 def _compact_operation(op: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not isinstance(op, dict):
         return None
@@ -2786,7 +2830,6 @@ def main() -> int:
     temp_ctx: Optional[tempfile.TemporaryDirectory[str]] = None
 
     try:
-        renode_test = ensure_tool(args.renode_test)
         profile = load_profile(args.profile)
         robot_suite = args.robot_suite
 
@@ -2808,6 +2851,8 @@ def main() -> int:
             a.startswith("--evaluation-mode") for a in sys.argv
         ):
             eval_mode = profile.fault_sweep.evaluation_mode
+        validate_runtime_fault_mode_compat(profile, eval_mode)
+        renode_test = ensure_tool(args.renode_test)
 
         # Build robot vars from profile + CLI extras.
         robot_vars = profile.robot_vars(repo_root) + parse_robot_vars(args.robot_var)
