@@ -278,6 +278,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
+            // Fast-path: skip expensive sysbus lookup for addresses outside flash.
+            // This hook fires on EVERY CPU memory write (stack, RAM, MMIO, etc.).
+            // Without this check, WhatIsAt() dominates emulation time during OTA.
+            var addr = (long)physicalAddress;
+            if(addr < FlashBaseAddress || addr >= FlashBaseAddress + FlashSize)
+            {
+                return;
+            }
+
             var registration = machine.GetSystemBus(this).WhatIsAt(physicalAddress);
             if(registration == null)
             {
