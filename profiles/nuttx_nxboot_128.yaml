@@ -1,0 +1,51 @@
+schema_version: 1
+name: NuttX nxboot STM32H743 fw128
+description: Real NuttX nxboot STM32H7 update profile generated from public build outputs
+platform: platforms/nucleo_h753zi_tardigrade.repl
+flash_backend: faultFlash
+bootloader:
+  elf: results/nuttx_nxboot/nxboot-loader.elf
+  entry: 0x08000000
+memory:
+  sram: { start: 0x20000000, end: 0x240A0000 }
+  write_granularity: 8
+  slots:
+    exec: { base: 0x08040000, size: 0x80000 }
+    staging: { base: 0x080C0000, size: 0x80000 }
+    tertiary: { base: 0x08140000, size: 0x80000 }
+images:
+  exec: results/nuttx_nxboot/nxboot-primary-v1-h400.img
+  staging: results/nuttx_nxboot/nxboot-update-v2-h400.img
+extra_peripherals:
+  - peripherals/STM32H7FlashController.cs
+success_criteria:
+  vtor_in_slot: exec
+  vector_table_offset: 0x400
+  image_hash: false
+fault_sweep:
+  mode: runtime
+  max_writes: 128
+  evaluation_mode: execute
+  run_duration: "8.0"
+  boot_cycles: 2
+  expected_rollback_at_cycle: 1
+state_probe:
+  script: targets/nuttx_nxboot/probe.py
+semantic_assertions:
+  control:
+    semantic_state.roles.primary_confirmed: false
+    semantic_state.roles.recovery_valid: true
+    semantic_state.roles.next_boot: revert
+    semantic_state.slots.primary.magic_kind: internal
+    multi_boot_analysis.final_outcome: success
+    multi_boot_analysis.final_slot: exec
+invariant_providers:
+  - targets/nxboot/invariants.py
+invariants:
+  - nxboot_roles_distinct
+  - nxboot_confirmed_has_recovery
+  - nxboot_duplicate_update_consumed
+  - nxboot_unconfirmed_internal_requires_revert
+  - successful_rollback
+expect:
+  should_find_issues: false
