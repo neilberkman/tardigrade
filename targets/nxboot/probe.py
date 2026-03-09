@@ -6,8 +6,11 @@ Platform-specific adapters (e.g. nuttx_nxboot) delegate here rather than
 duplicating the slot-probing and role-determination logic.
 """
 
-import binascii
 import struct
+try:
+    import binascii as _binascii
+except ImportError:
+    _binascii = None
 
 
 NXBOOT_HEADER_MAGIC = 0x534F584E
@@ -38,7 +41,7 @@ def _read_bytes(bus, addr, size):
     size = int(size)
     addr = int(addr)
     raw = bus.ReadBytes(addr, size)
-    return bytes([(int(b) & 0xFF) for b in raw])
+    return bytearray(int(b) & 0xFF for b in raw)
 
 
 def _read_u32(bus, addr):
@@ -46,8 +49,20 @@ def _read_u32(bus, addr):
 
 
 def _crc32(data):
-    """Standard CRC-32 using C-implemented binascii instead of byte-by-byte Python."""
-    return binascii.crc32(data) & 0xFFFFFFFF
+    """CRC-32 compatible with both CPython 3 and IronPython 2 (Renode)."""
+    if _binascii is not None:
+        try:
+            return _binascii.crc32(data) & 0xFFFFFFFF
+        except TypeError:
+            # IronPython 2: binascii.crc32 expects str, not bytes/bytearray
+            return _binascii.crc32(''.join(chr(b) for b in data)) & 0xFFFFFFFF
+    # Pure-Python fallback
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc ^= int(b) & 0xFF
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xEDB88320 if crc & 1 else crc >> 1
+    return crc ^ 0xFFFFFFFF
 
 
 def _magic_kind(magic):

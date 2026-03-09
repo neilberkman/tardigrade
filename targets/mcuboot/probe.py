@@ -24,7 +24,7 @@ def _read_bytes(bus, addr, size):
     size = int(size)
     addr = int(addr)
     raw = bus.ReadBytes(addr, size)
-    return bytes([(int(b) & 0xFF) for b in raw])
+    return bytearray(int(b) & 0xFF for b in raw)
 
 
 def _read_flag(bus, addr):
