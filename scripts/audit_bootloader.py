@@ -2418,6 +2418,7 @@ def summarize_runtime_sweep(
     # Break down skip reasons for discarded (non-injected) results.
     skip_reason_counts: Dict[str, int] = {}
     phase2_skip_reason_counts: Dict[str, int] = {}
+    hook_skip_reason_counts: Dict[str, int] = {}
     for r in not_injected:
         reason = r.get("skip_reason", "unknown")
         skip_reason_counts[reason] = skip_reason_counts.get(reason, 0) + 1
@@ -2427,6 +2428,13 @@ def summarize_runtime_sweep(
                 phase2_reason = str(phase2_fault.get("skip_reason") or "unknown")
                 phase2_skip_reason_counts[phase2_reason] = (
                     phase2_skip_reason_counts.get(phase2_reason, 0) + 1
+                )
+        if r.get("fault_type") == "h":
+            hook_fault = r.get("hook_fault")
+            if isinstance(hook_fault, dict):
+                hook_reason = str(hook_fault.get("skip_reason") or "unknown")
+                hook_skip_reason_counts[hook_reason] = (
+                    hook_skip_reason_counts.get(hook_reason, 0) + 1
                 )
 
     summary: Dict[str, Any] = {
@@ -2450,6 +2458,8 @@ def summarize_runtime_sweep(
         summary["skip_reasons"] = skip_reason_counts
     if phase2_skip_reason_counts:
         summary["phase2_skip_reasons"] = phase2_skip_reason_counts
+    if hook_skip_reason_counts:
+        summary["hook_skip_reasons"] = hook_skip_reason_counts
     if issue_reason_counts:
         summary["issue_reasons"] = issue_reason_counts
 
@@ -3311,6 +3321,33 @@ def main() -> int:
                             combined.append((mf_fp, "m:{}".format(mf_code)))
                             metadata_count += 1
 
+            # Hook fault injection: fault writes performed by boot_cycle_hook
+            # between boot cycles.
+            hook_count = 0
+            hf_config = profile.fault_sweep.hook_fault
+            if (
+                hf_config.enabled
+                and profile.fault_sweep.boot_cycle_hook
+                and profile.fault_sweep.boot_cycles > 1
+            ):
+                hook_max = (
+                    hf_config.max_points
+                    if hf_config.max_points > 0
+                    else min(50, max(max_writes, 1))
+                )
+                hf_type_map = {
+                    "power_loss": "w",
+                    "bit_corruption": "b",
+                }
+                hf_types = [hf_type_map.get(ft, "w") for ft in hf_config.fault_types]
+                hook_fps = list(range(0, hook_max))
+                if args.quick:
+                    hook_fps = quick_subset(hook_fps)
+                for hf_fp in hook_fps:
+                    for hf_code in hf_types:
+                        combined.append((hf_fp, "h:{}:{}".format(hf_fp, hf_code)))
+                        hook_count += 1
+
             # Phase 2 recovery fault injection: for selected Phase 1 fault
             # points, also sweep faults during the recovery boot.
             p2_config = profile.fault_sweep.phase2_fault
@@ -3397,6 +3434,8 @@ def main() -> int:
                 parts.append("{} phase2-recovery".format(phase2_count))
             if metadata_count:
                 parts.append("{} metadata-fault".format(metadata_count))
+            if hook_count:
+                parts.append("{} hook-fault".format(hook_count))
             print(
                 "Running {} fault points ({}) for '{}'...".format(
                     len(fault_points),
@@ -3520,6 +3559,17 @@ def main() -> int:
             ]
             _progress(
                 "Phase 2 fault points skipped before injection: {}".format(
+                    ", ".join(parts),
+                )
+            )
+        hook_skip_reasons = sweep_summary.get("hook_skip_reasons")
+        if hook_skip_reasons:
+            parts = [
+                "{} {}".format(count, reason)
+                for reason, count in sorted(hook_skip_reasons.items())
+            ]
+            _progress(
+                "Hook fault points skipped before injection: {}".format(
                     ", ".join(parts),
                 )
             )

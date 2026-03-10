@@ -193,6 +193,22 @@ class Phase2FaultConfig:
         self.max_points = max(0, int(max_points))
 
 
+class HookFaultConfig:
+    """Configuration for injecting faults during boot-cycle hook writes."""
+
+    __slots__ = ("enabled", "fault_types", "max_points")
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        fault_types: Optional[List[str]] = None,
+        max_points: int = 0,
+    ) -> None:
+        self.enabled = enabled
+        self.fault_types = fault_types or ["power_loss"]
+        self.max_points = max(0, int(max_points))
+
+
 class ReadFaultConfig:
     """Configuration for read-time bit-flip fault injection."""
 
@@ -525,6 +541,7 @@ class FaultSweepConfig:
         "boot_cycle_hook",
         "expected_rollback_at_cycle",
         "phase2_fault",
+        "hook_fault",
         "multi_fault",
         "read_fault_config",
         "metadata_fault",
@@ -551,6 +568,7 @@ class FaultSweepConfig:
         boot_cycle_hook: Optional[str] = None,
         expected_rollback_at_cycle: Optional[int] = None,
         phase2_fault: Optional["Phase2FaultConfig"] = None,
+        hook_fault: Optional["HookFaultConfig"] = None,
         multi_fault=None,
         read_fault_config: Optional["ReadFaultConfig"] = None,
         metadata_fault: Optional["MetadataFaultConfig"] = None,
@@ -580,6 +598,7 @@ class FaultSweepConfig:
             else max(1, int(expected_rollback_at_cycle))
         )
         self.phase2_fault = phase2_fault or Phase2FaultConfig()
+        self.hook_fault = hook_fault or HookFaultConfig()
         self.multi_fault = multi_fault or MultiFaultConfig()
         self.read_fault_config = read_fault_config
         self.metadata_fault = metadata_fault or MetadataFaultConfig()
@@ -1369,6 +1388,7 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         boot_cycle_hook=boot_cycle_hook,
         expected_rollback_at_cycle=expected_rollback_at_cycle,
         phase2_fault=_parse_phase2_fault(raw.get("phase2_fault")),
+        hook_fault=_parse_hook_fault(raw.get("hook_fault")),
         multi_fault=_parse_multi_fault(raw.get("multi_fault")),
         read_fault_config=_parse_read_fault_config(raw.get("read_fault_config")),
         metadata_fault=_parse_metadata_fault(raw.get("metadata_fault")),
@@ -1401,6 +1421,47 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
     return Phase2FaultConfig(
         enabled=enabled,
         fault_types=fault_types,
+        max_points=max_points,
+    )
+
+
+def _parse_hook_fault(raw: Optional[Dict[str, Any]]) -> HookFaultConfig:
+    if raw is None:
+        return HookFaultConfig()
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep.hook_fault: expected mapping")
+    enabled = bool(raw.get("enabled", False))
+    fault_types = raw.get("fault_types", ["power_loss"])
+    if not isinstance(fault_types, list):
+        fault_types = [str(fault_types)]
+    valid_hook_types = {"power_loss", "bit_corruption"}
+    parsed_types: List[str] = []
+    for ft in fault_types:
+        if ft not in KNOWN_FAULT_TYPES:
+            import warnings
+
+            warnings.warn("Unknown hook_fault type '{}'; ignoring.".format(ft))
+            continue
+        if ft not in valid_hook_types:
+            import warnings
+
+            warnings.warn(
+                "Unsupported hook_fault type '{}'; only {} are supported.".format(
+                    ft, sorted(valid_hook_types)
+                )
+            )
+            continue
+        parsed_types.append(ft)
+    if not parsed_types:
+        parsed_types = ["power_loss"]
+    max_points = int(raw.get("max_points", 0))
+    if max_points < 0:
+        raise ProfileError(
+            "fault_sweep.hook_fault.max_points: expected non-negative integer"
+        )
+    return HookFaultConfig(
+        enabled=enabled,
+        fault_types=parsed_types,
         max_points=max_points,
     )
 
@@ -2336,6 +2397,9 @@ def main() -> int:
         "phase2_fault_enabled": profile.fault_sweep.phase2_fault.enabled,
         "phase2_fault_max_points": profile.fault_sweep.phase2_fault.max_points,
         "phase2_fault_types": profile.fault_sweep.phase2_fault.fault_types,
+        "hook_fault_enabled": profile.fault_sweep.hook_fault.enabled,
+        "hook_fault_max_points": profile.fault_sweep.hook_fault.max_points,
+        "hook_fault_types": profile.fault_sweep.hook_fault.fault_types,
         "state_fuzzer_enabled": profile.state_fuzzer.enabled,
         "expect_should_find_issues": profile.expect.should_find_issues,
         "expect_control_outcome": profile.expect.control_outcome,
