@@ -385,6 +385,271 @@ def check_successful_rollback(
     )
 
 
+def check_metadata_seq_monotonic(
+    result: FaultResult,
+    pre_state: Optional[Dict[str, Any]] = None,
+    **_: Any,
+) -> None:
+    """After a fault, the active metadata sequence number should not regress.
+
+    If a bootloader uses dual-replica metadata with monotonic sequence
+    numbers, a single fault should not cause the bootloader to select an
+    older replica over a newer one.  Regression indicates a write-ordering
+    bug where both replicas were updated in a window that left the newer
+    one vulnerable to corruption.
+
+    Requires the state probe to report ``replica0_seq`` and ``replica1_seq``
+    (or ``active_seq``) in both pre-state and post-fault nvm_state.
+    """
+    if pre_state is None:
+        return
+    if result.is_control:
+        return
+
+    nvm = result.nvm_state
+    if not isinstance(nvm, dict):
+        return
+
+    def _max_seq(state: Dict[str, Any]) -> Optional[int]:
+        active = state.get("active_seq")
+        if active is not None:
+            return int(active)
+        r0 = state.get("replica0_seq")
+        r1 = state.get("replica1_seq")
+        if r0 is None and r1 is None:
+            return None
+        vals = []
+        if r0 is not None:
+            vals.append(int(r0))
+        if r1 is not None:
+            vals.append(int(r1))
+        return max(vals) if vals else None
+
+    pre_seq = _max_seq(pre_state)
+    post_seq = _max_seq(nvm)
+    if pre_seq is None or post_seq is None:
+        return
+
+    # Signed comparison for uint32 wraparound: if (post - pre) interpreted
+    # as signed is negative, the sequence went backwards.
+    delta = (post_seq - pre_seq) & 0xFFFFFFFF
+    if delta > 0x7FFFFFFF:
+        signed_delta = delta - 0x100000000
+        raise InvariantViolation(
+            invariant_name="metadata_seq_monotonic",
+            description=(
+                "Metadata sequence number regressed after fault: "
+                "pre={}, post={} (delta={}).  The bootloader may have "
+                "selected a stale replica.".format(pre_seq, post_seq, signed_delta)
+            ),
+            result=result,
+            details={
+                "pre_seq": pre_seq,
+                "post_seq": post_seq,
+                "signed_delta": signed_delta,
+                "pre_replica0_seq": pre_state.get("replica0_seq"),
+                "pre_replica1_seq": pre_state.get("replica1_seq"),
+                "post_replica0_seq": nvm.get("replica0_seq"),
+                "post_replica1_seq": nvm.get("replica1_seq"),
+                "fault_at": result.fault_at,
+            },
+        )
+
+
+def check_slot_hash_consistent(
+    result: FaultResult,
+    **_: Any,
+) -> None:
+    """If metadata records a hash for a slot, it must match the actual image.
+
+    Many bootloaders store image hashes (SHA-256, CRC-32, etc.) in metadata
+    for fast re-validation without reading the entire image.  After a fault,
+    a stale or corrupted hash field that still passes the metadata integrity
+    check would cause the bootloader to trust a wrong hash — potentially
+    skipping re-validation of a corrupted image on the next boot.
+
+    Requires the state probe to report per-slot ``hash_recorded`` and
+    ``hash_computed`` fields (any comparable format — hex strings or ints).
+    Checks all slots found in the nvm_state dict.
+    """
+    nvm = result.nvm_state
+    if not isinstance(nvm, dict):
+        return
+
+    if result.boot_outcome != "success":
+        return
+
+    # Check top-level per-slot fields.
+    _SLOT_PREFIXES = ("slot_a", "slot_b", "exec", "staging", "primary", "secondary")
+    mismatches: List[str] = []
+
+    for prefix in _SLOT_PREFIXES:
+        recorded = nvm.get("{}_hash_recorded".format(prefix))
+        computed = nvm.get("{}_hash_computed".format(prefix))
+        if recorded is None or computed is None:
+            continue
+        if recorded != computed:
+            mismatches.append(prefix)
+
+    # Also check nested slots dict (probes may use either convention).
+    slots = nvm.get("slots")
+    if isinstance(slots, dict):
+        for slot_name, slot_data in slots.items():
+            if not isinstance(slot_data, dict):
+                continue
+            recorded = slot_data.get("hash_recorded")
+            computed = slot_data.get("hash_computed")
+            if recorded is None or computed is None:
+                continue
+            if recorded != computed and slot_name not in mismatches:
+                mismatches.append(slot_name)
+
+    if mismatches:
+        raise InvariantViolation(
+            invariant_name="slot_hash_consistent",
+            description=(
+                "Recorded image hash does not match computed hash for slot(s): {}. "
+                "Metadata may contain stale or corrupted hash values.".format(
+                    ", ".join(mismatches)
+                )
+            ),
+            result=result,
+            details={
+                "mismatched_slots": mismatches,
+                "boot_outcome": result.boot_outcome,
+            },
+        )
+
+
+def check_rollback_version_bounded(
+    result: FaultResult,
+    pre_state: Optional[Dict[str, Any]] = None,
+    **_: Any,
+) -> None:
+    """Anti-rollback version floor should not spike from a single fault.
+
+    If the bootloader maintains a minimum-version floor for anti-rollback,
+    a single fault should not cause it to jump by a large amount.  A spike
+    indicates corrupt metadata was salvaged and a garbage value was injected
+    into the version floor, potentially locking out all valid firmware.
+
+    Requires the state probe to report ``rollback_min_version`` in both
+    pre-state and post-fault nvm_state.
+    """
+    if pre_state is None:
+        return
+    if result.is_control:
+        return
+
+    nvm = result.nvm_state
+    if not isinstance(nvm, dict):
+        return
+
+    pre_rmv = pre_state.get("rollback_min_version")
+    post_rmv = nvm.get("rollback_min_version")
+    if pre_rmv is None or post_rmv is None:
+        return
+
+    pre_rmv = int(pre_rmv)
+    post_rmv = int(post_rmv)
+
+    # During normal operation the version floor only advances by the delta
+    # between the old and new firmware versions — typically single digits.
+    # A jump of more than 256 is almost certainly corrupt metadata being
+    # misinterpreted as a version number.
+    max_delta = 256
+    delta = post_rmv - pre_rmv
+    if delta > max_delta:
+        raise InvariantViolation(
+            invariant_name="rollback_version_bounded",
+            description=(
+                "Anti-rollback version floor spiked from {} to {} (delta={}) "
+                "after a single fault.  Corrupt metadata may have been "
+                "salvaged with a garbage version field.".format(
+                    pre_rmv, post_rmv, delta
+                )
+            ),
+            result=result,
+            details={
+                "pre_rollback_min_version": pre_rmv,
+                "post_rollback_min_version": post_rmv,
+                "delta": delta,
+                "max_allowed_delta": max_delta,
+                "fault_at": result.fault_at,
+            },
+        )
+
+
+def check_no_unauthorized_state_promotion(
+    result: FaultResult,
+    pre_state: Optional[Dict[str, Any]] = None,
+    **_: Any,
+) -> None:
+    """A slot should not be promoted from testing to accepted by a fault.
+
+    If a slot was in a trial/testing state before the fault, it should not
+    appear as accepted/confirmed after the fault unless the device actually
+    completed a successful boot cycle into that slot and the application
+    explicitly confirmed it.  A fault that skips the trial-boot verification
+    could permanently activate a broken firmware image.
+
+    Requires the state probe to report per-slot state fields (e.g.
+    ``slot_a_state``, ``slot_b_state``) with generic values like
+    ``"testing"``, ``"pending_test"``, ``"accepted"``, ``"confirmed"``.
+    """
+    if pre_state is None:
+        return
+    if result.is_control:
+        return
+
+    nvm = result.nvm_state
+    if not isinstance(nvm, dict):
+        return
+
+    _TESTING = {"testing", "pending_test", "pending", "unconfirmed", "trial"}
+    _ACCEPTED = {"accepted", "confirmed", "ok", "permanent"}
+
+    _SLOT_KEYS = (
+        "slot_a_state", "slot_b_state",
+        "exec_state", "staging_state",
+        "primary_state", "secondary_state",
+    )
+
+    promotions: List[Tuple[str, str, str]] = []
+    for key in _SLOT_KEYS:
+        pre_val = pre_state.get(key)
+        post_val = nvm.get(key)
+        if pre_val is None or post_val is None:
+            continue
+        pre_str = str(pre_val).lower()
+        post_str = str(post_val).lower()
+        if pre_str in _TESTING and post_str in _ACCEPTED:
+            promotions.append((key, pre_str, post_str))
+
+    if promotions:
+        raise InvariantViolation(
+            invariant_name="no_unauthorized_state_promotion",
+            description=(
+                "Slot state was promoted from testing to accepted after a "
+                "fault without completing a trial boot: {}.".format(
+                    ", ".join(
+                        "{}: {} -> {}".format(k, pre, post)
+                        for k, pre, post in promotions
+                    )
+                )
+            ),
+            result=result,
+            details={
+                "promotions": [
+                    {"slot": k, "pre": pre, "post": post}
+                    for k, pre, post in promotions
+                ],
+                "boot_outcome": result.boot_outcome,
+                "fault_at": result.fault_at,
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -397,6 +662,10 @@ _ALL_INVARIANTS: List[InvariantFn] = [
     check_slot_integrity,
     check_multi_boot_converges,
     check_successful_rollback,
+    check_metadata_seq_monotonic,
+    check_slot_hash_consistent,
+    check_rollback_version_bounded,
+    check_no_unauthorized_state_promotion,
 ]
 
 _INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
@@ -407,6 +676,10 @@ _INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
     "slot_integrity": check_slot_integrity,
     "multi_boot_converges": check_multi_boot_converges,
     "successful_rollback": check_successful_rollback,
+    "metadata_seq_monotonic": check_metadata_seq_monotonic,
+    "slot_hash_consistent": check_slot_hash_consistent,
+    "rollback_version_bounded": check_rollback_version_bounded,
+    "no_unauthorized_state_promotion": check_no_unauthorized_state_promotion,
 }
 _PROVIDER_CACHE: Dict[str, Dict[str, InvariantFn]] = {}
 
