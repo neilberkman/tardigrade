@@ -1759,6 +1759,272 @@ class Phase2FaultTest(unittest.TestCase):
         self.assertNotIn("phase2_skip_reasons", summary)
 
 
+class HookFaultTest(unittest.TestCase):
+    """Tests for the hook_fault profile schema and summary reporting."""
+
+    def _write_profile(self, tempdir: Path, body: str) -> Path:
+        path = tempdir / "profile.yaml"
+        path.write_text(textwrap.dedent(body), encoding="utf-8")
+        return path
+
+    def test_hook_fault_defaults_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: no_hook_fault
+                platform: platforms/cortex_m4_flash_fast.repl
+                flash_backend: faultFlash
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  mode: runtime
+                """,
+            )
+            profile = load_profile(profile_path)
+            self.assertFalse(profile.fault_sweep.hook_fault.enabled)
+            self.assertEqual(profile.fault_sweep.hook_fault.max_points, 0)
+            self.assertEqual(profile.fault_sweep.hook_fault.fault_types, ["power_loss"])
+
+    def test_hook_fault_enabled_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: with_hook_fault
+                platform: platforms/cortex_m4_flash_fast.repl
+                flash_backend: faultFlash
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  mode: runtime
+                  boot_cycles: 3
+                  boot_cycle_hook: examples/esp_idf_ota/hooks/confirm_pending_verify.py
+                  hook_fault:
+                    enabled: true
+                    fault_types:
+                      - power_loss
+                      - bit_corruption
+                    max_points: 12
+                """,
+            )
+            profile = load_profile(profile_path)
+            hf = profile.fault_sweep.hook_fault
+            self.assertTrue(hf.enabled)
+            self.assertEqual(hf.max_points, 12)
+            self.assertEqual(hf.fault_types, ["power_loss", "bit_corruption"])
+
+    def test_hook_fault_negative_max_points_rejected(self) -> None:
+        from profile_loader import ProfileError
+
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: bad_hook_fault
+                platform: platforms/cortex_m4_flash_fast.repl
+                flash_backend: faultFlash
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  mode: runtime
+                  boot_cycles: 2
+                  boot_cycle_hook: examples/esp_idf_ota/hooks/confirm_pending_verify.py
+                  hook_fault:
+                    enabled: true
+                    max_points: -1
+                """,
+            )
+            with self.assertRaises(ProfileError):
+                load_profile(profile_path)
+
+    def test_hook_fault_invalid_type_warns(self) -> None:
+        import warnings
+
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: warn_hook_fault
+                platform: platforms/cortex_m4_flash_fast.repl
+                flash_backend: faultFlash
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  mode: runtime
+                  boot_cycles: 2
+                  boot_cycle_hook: examples/esp_idf_ota/hooks/confirm_pending_verify.py
+                  hook_fault:
+                    enabled: true
+                    fault_types:
+                      - power_loss
+                      - nonsense_type
+                """,
+            )
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                profile = load_profile(profile_path)
+            self.assertTrue(any("nonsense_type" in str(x.message) for x in w))
+            self.assertEqual(profile.fault_sweep.hook_fault.fault_types, ["power_loss"])
+
+    def test_hook_fault_cli_output(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: cli_hook_fault
+                platform: platforms/cortex_m4_flash_fast.repl
+                flash_backend: faultFlash
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  mode: runtime
+                  boot_cycles: 2
+                  boot_cycle_hook: examples/esp_idf_ota/hooks/confirm_pending_verify.py
+                  hook_fault:
+                    enabled: true
+                    max_points: 7
+                    fault_types:
+                      - power_loss
+                """,
+            )
+            import json
+            from io import StringIO
+
+            with mock.patch("sys.argv", ["profile_loader.py", str(profile_path)]):
+                captured = StringIO()
+                with redirect_stderr(StringIO()):
+                    import profile_loader
+                    with mock.patch("sys.stdout", captured):
+                        profile_loader.main()
+                output = json.loads(captured.getvalue())
+            self.assertTrue(output["hook_fault_enabled"])
+            self.assertEqual(output["hook_fault_max_points"], 7)
+            self.assertEqual(output["hook_fault_types"], ["power_loss"])
+
+    def test_hook_fault_type_encoding(self) -> None:
+        encoded = "h:5:w"
+        parts = encoded.split(":")
+        self.assertEqual(parts[0], "h")
+        self.assertEqual(int(parts[1]), 5)
+        self.assertEqual(parts[2], "w")
+
+    def test_hook_skip_reasons_summarized(self) -> None:
+        results = [
+            {
+                "fault_at": 2,
+                "fault_type": "h",
+                "fault_injected": False,
+                "boot_outcome": "skipped",
+                "boot_slot": None,
+                "skip_reason": "hook_no_write_at_index",
+                "hook_fault": {
+                    "skip_reason": "no_write_at_index",
+                    "hook_total_ops": 3,
+                    "hook_max_fault_index": 2,
+                },
+            },
+            {
+                "fault_at": 3,
+                "fault_type": "h",
+                "fault_injected": False,
+                "boot_outcome": "skipped",
+                "boot_slot": None,
+                "skip_reason": "hook_hook_script_not_python",
+                "hook_fault": {
+                    "skip_reason": "hook_script_not_python",
+                    "hook_total_ops": 0,
+                    "hook_max_fault_index": -1,
+                },
+            },
+        ]
+        profile = load_profile(ROOT / "profiles" / "naive_bare_copy.yaml")
+        summary = summarize_runtime_sweep(results, profile=profile)
+        self.assertEqual(summary["hook_skip_reasons"], {
+            "hook_script_not_python": 1,
+            "no_write_at_index": 1,
+        })
+
+    def test_hook_skip_reasons_absent_without_hook_faults(self) -> None:
+        results = [
+            {
+                "fault_at": 1,
+                "fault_type": "w",
+                "fault_injected": True,
+                "boot_outcome": "no_boot",
+                "boot_slot": None,
+            }
+        ]
+        profile = load_profile(ROOT / "profiles" / "naive_bare_copy.yaml")
+        summary = summarize_runtime_sweep(results, profile=profile)
+        self.assertNotIn("hook_skip_reasons", summary)
+
+
 class MetadataFaultTest(unittest.TestCase):
     """Tests for metadata-write-fault injection feature."""
 
