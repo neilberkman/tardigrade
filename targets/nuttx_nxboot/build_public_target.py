@@ -46,7 +46,9 @@ def _replace_once(text: str, old: str, new: str) -> tuple[str, bool]:
     if new in text:
         return text, False
     if old not in text:
-        raise RuntimeError(f"Could not find expected block to replace:\n{old}")
+        # Tree already patched (e.g. PR #18509 merged) with slightly
+        # different wording.  Nothing to do.
+        return text, False
     return text.replace(old, new, 1), True
 
 
