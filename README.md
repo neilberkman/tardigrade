@@ -2,7 +2,7 @@
 
 Fault-injection testing for embedded OTA bootloaders. Answers one question: **under realistic update-time reset and storage faults, does the device recover safely?**
 
-Tardigrade runs your bootloader under [Renode](https://renode.io/), systematically injects reset, partial-write, erase-tear, bit-flip, dropped-write, and related NVM faults along the update path, and checks whether the device still boots correctly.
+Tardigrade runs your bootloader under [Renode](https://renode.io/), systematically injects reset, partial-write, erase-tear, bit-flip, dropped-write, and related NVM faults along the update path, and checks whether the device still boots correctly. The current engine also covers staged recovery faults, boot-cycle hooks, metadata/config corruption, and compound faults across successive reboot/recovery stages.
 
 ### Proven results
 
@@ -82,6 +82,8 @@ The `examples/` directory contains standalone bootloader firmware for engine val
 | `nxboot_style`        | Modeled nxboot family for adapter/probe/invariant development      |
 | `esp_idf_ota`         | Clean-room model of ESP-IDF OTA slot-selection behavior            |
 | `riotboot_standalone` | Standalone RIOTboot-style slot-selection model                     |
+| `bootloader_self_update` | Bootloader-region integrity and self-update fault modeling      |
+| `nvs_config_migration` | Config/NVS-region corruption and migration validation             |
 
 ## How it works
 
@@ -131,11 +133,31 @@ flowchart TD
 2. **Heuristic pruning** -- classify writes into tiers to reduce sweep points ~10x.
 3. **Phase 1** -- replay the write trace up to write N and inject the fault (trace replay eliminates O(N^2) prefix re-emulation).
 4. **Phase 2** -- `execute` mode resets the CPU and performs a full recovery boot; `state` mode infers the outcome from NVM contents.
-5. **Classification** -- boot outcomes (`success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`) and failure classes (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`).
+5. **Follow-up cycles / hooks** -- optional repeated boots and between-cycle hook actions model confirm-or-rollback flows and staged recovery writes.
+6. **Classification** -- boot outcomes (`success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`) and failure classes (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`).
 
 ### Fault types
 
-`power_loss` (partial write), `bit_corruption` (NOR-physics bit flips), `interrupted_erase` (partial page erase), `multi_sector_atomicity` (cross-page partial erase), `silent_write_failure`, `write_rejection` (dropped write), `write_disturb` (adjacent-word corruption), `wear_leveling_corruption` (extra spurious write), `reset_at_time`.
+Core write/storage faults:
+
+- `power_loss` -- partial write / dropped tail
+- `bit_corruption` -- NOR-physics bit flips
+- `interrupted_erase` -- partial page erase
+- `multi_sector_atomicity` -- cross-page partial erase
+- `silent_write_failure`
+- `write_rejection`
+- `write_disturb`
+- `wear_leveling_corruption`
+- `reset_at_time`
+- `read_bit_flip` -- transient corrupted read without modifying storage
+- `nvs_corruption` -- config/NVS-region corruption variants
+
+Staged fault surfaces:
+
+- `metadata_fault` -- faults during pre-boot metadata/setup writes
+- `hook_fault` -- faults during between-boot hook actions such as confirm/accept operations
+- `phase2_fault` -- faults during the recovery/repair write path itself
+- `multi_fault` -- compound staged faults across successive reboot/recovery stages
 
 ### Execute-mode hardening
 
@@ -213,14 +235,28 @@ python3 scripts/audit_bootloader.py \
 
 See [`scripts/profile_loader.py`](scripts/profile_loader.py) for the full schema. See included profiles for NVMemory, NVMC, and hybrid platform examples.
 
-### Discovery hooks
+### Discovery hooks and advanced sweep controls
 
 Profiles can attach richer semantic checking beyond boot/no-boot:
 
 - **`state_probe`** -- target-supplied script that reads NVM and exports semantic state (e.g., trailer flags, slot confirmation).
 - **`semantic_assertions`** -- path-based expectations over semantic state and multi-boot analysis. A point can fail even when the device boots.
 - **`invariants`** / **`invariant_providers`** -- named postconditions (e.g., `multi_boot_converges`) and external Python modules for target-specific checks.
+- **`invariant_config`** -- per-profile configuration forwarded into invariant providers.
 - **`boot_cycles`** -- repeat boots after faulted recovery to catch stuck-revert or oscillation bugs.
+- **`boot_cycle_hook`** -- run a script between boot cycles to model confirm/accept or other post-boot state changes.
+
+Advanced sweep controls:
+
+- **`initial_states`** -- expand one profile into a seeded sweep matrix of named starting states.
+- **`metadata_fault`** + **`metadata_fault_regions`** -- inject setup-time metadata faults and attribute failures to named metadata or bootloader regions.
+- **`phase2_fault`** -- fault the recovery/repair write path itself.
+- **`hook_fault`** -- fault the hook write path between boot cycles.
+- **`read_fault_config`** -- target-region, bit-count, and probability controls for transient read corruption.
+- **`multi_fault`** -- generate compound staged-fault plans, with explain output and deterministic fallbacks.
+- **`partial_staging`** -- analyze interrupted or overlapping staging-image writes.
+- **`nvs_region`** / **`nvs_corruption`** -- model config/NVS corruption separately from firmware slots.
+- **`multi_component`** -- coordinate fault analysis across multiple components in one profile.
 
 ## Report structure
 
@@ -239,6 +275,7 @@ Per-point diagnostics attached when relevant: `fault_window` (clean-run context 
 - **Geometry matrix** (`scripts/geometry_matrix.py`) -- parametric slot-layout permutations to catch geometry-dependent bugs.
 - **State fuzzer** (`targets/mcuboot/state_fuzzer.py`) -- MCUboot-specific trailer-state exploration.
 - **HTML report** (`scripts/render_results_html.py`) -- renders JSON reports as HTML.
+- **Reference profiles** -- see [`examples/bootloader_self_update/profile.yaml`](examples/bootloader_self_update/profile.yaml), [`examples/nvs_config_migration/profile.yaml`](examples/nvs_config_migration/profile.yaml), and [`examples/seeded_initial_states.yaml`](examples/seeded_initial_states.yaml) for concrete examples of newer engine capabilities.
 
 ## CI workflows
 
