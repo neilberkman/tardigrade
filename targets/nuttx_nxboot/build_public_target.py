@@ -354,6 +354,10 @@ def main() -> int:
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--package-only", type=Path, default=None, metavar="APP_BIN")
     args = parser.parse_args()
+    args.nuttx_root = args.nuttx_root.resolve()
+    if args.apps_root is not None:
+        args.apps_root = args.apps_root.resolve()
+    args.output_dir = args.output_dir.resolve()
 
     changed = patch_nuttx_tree(args.nuttx_root)
     for path in changed:
