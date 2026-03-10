@@ -20,7 +20,7 @@
       "ota_header_size": 512,
       "source_checkout": {
         "repo": "third_party/zephyr_ws/bootloader/mcuboot",
-        "ref": "8a9e204ccf66bb9e7c7c072a66135569dbebcd6d",
+        "ref": "664093d07023bb3051f00f3ad5585b3220ad2354",
         "fetch_remote": "upstream"
       },
       "setup_commands": [
