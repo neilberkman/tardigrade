@@ -335,7 +335,12 @@ class TestMultiFaultPlanSummary(unittest.TestCase):
         self.assertIsNone(summary["seed"])
         self.assertEqual(summary["sequence_semantics"], "stage_relative_reboot")
         self.assertIn("successive reboot/recovery stage", summary["sequence_description"])
-        self.assertEqual(summary["sample_sequences"], [[10, 20], [10, 30], [20, 30]])
+        # sample_sequences are now dicts with fault_points, rationale, etc.
+        sample_fps = [s["fault_points"] for s in summary["sample_sequences"]]
+        self.assertEqual(sample_fps, [[10, 20], [10, 30], [20, 30]])
+        # Each sample should have a rationale
+        for s in summary["sample_sequences"]:
+            self.assertIn("rationale", s)
         self.assertFalse(summary["sample_truncated"])
         self.assertIn("diagnostics", summary)
 
@@ -747,28 +752,38 @@ class TestInterestingPointIdentification(unittest.TestCase):
 
         return _interesting_multi_fault_points(sweep_results, "success")
 
+    def _fault_ats(self, sweep_results):
+        """Return just the fault_at ints for backward-compat assertions."""
+        return [p.fault_at for p in self._identify_interesting(sweep_results)]
+
     def test_bricks_are_interesting(self) -> None:
         results = [
             {"fault_at": 10, "fault_injected": True, "boot_outcome": "no_boot"},
             {"fault_at": 20, "fault_injected": True, "boot_outcome": "success", "boot_slot": "exec"},
             {"fault_at": 30, "fault_injected": True, "boot_outcome": "hard_fault"},
         ]
-        pts = self._identify_interesting(results)
+        pts = self._fault_ats(results)
         self.assertEqual(pts, [10, 30])
+        # Verify provenance
+        raw = self._identify_interesting(results)
+        self.assertEqual(raw[0].reason, "brick")
+        self.assertEqual(raw[1].reason, "brick")
 
     def test_wrong_image_is_interesting(self) -> None:
         results = [
             {"fault_at": 5, "fault_injected": True, "boot_outcome": "wrong_image"},
         ]
-        pts = self._identify_interesting(results)
+        pts = self._fault_ats(results)
         self.assertEqual(pts, [5])
+        raw = self._identify_interesting(results)
+        self.assertEqual(raw[0].reason, "wrong_image")
 
     def test_control_excluded(self) -> None:
         results = [
             {"fault_at": 999999, "fault_injected": True, "boot_outcome": "no_boot", "is_control": True},
             {"fault_at": 10, "fault_injected": True, "boot_outcome": "no_boot"},
         ]
-        pts = self._identify_interesting(results)
+        pts = self._fault_ats(results)
         self.assertEqual(pts, [10])
 
     def test_no_fault_injected_excluded(self) -> None:
@@ -776,7 +791,7 @@ class TestInterestingPointIdentification(unittest.TestCase):
             {"fault_at": 10, "fault_injected": False, "boot_outcome": "no_boot"},
             {"fault_at": 20, "fault_injected": True, "boot_outcome": "no_boot"},
         ]
-        pts = self._identify_interesting(results)
+        pts = self._fault_ats(results)
         self.assertEqual(pts, [20])
 
     def test_success_not_interesting(self) -> None:
@@ -784,7 +799,7 @@ class TestInterestingPointIdentification(unittest.TestCase):
             {"fault_at": 10, "fault_injected": True, "boot_outcome": "success", "boot_slot": "exec"},
             {"fault_at": 20, "fault_injected": True, "boot_outcome": "success", "boot_slot": "staging"},
         ]
-        pts = self._identify_interesting(results)
+        pts = self._fault_ats(results)
         self.assertEqual(pts, [])
 
     def test_deduplicates(self) -> None:
@@ -792,7 +807,7 @@ class TestInterestingPointIdentification(unittest.TestCase):
             {"fault_at": 10, "fault_injected": True, "boot_outcome": "no_boot"},
             {"fault_at": 10, "fault_injected": True, "boot_outcome": "hard_fault"},
         ]
-        pts = self._identify_interesting(results)
+        pts = self._fault_ats(results)
         self.assertEqual(pts, [10])
 
 

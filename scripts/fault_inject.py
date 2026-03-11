@@ -420,12 +420,57 @@ def classify_multi_component_outcome(
     return "degraded"
 
 
+@dataclasses.dataclass
+class AnnotatedSequence:
+    """A multi-fault sequence with human-readable rationale and machine-readable provenance.
+
+    Supports list-like access for backward compatibility: indexing, iteration,
+    len(), and equality comparison against plain ``List[int]`` all delegate to
+    ``fault_points``.
+    """
+
+    fault_points: List[int]
+    rationale: str
+    selection_basis: Optional[Dict[str, Any]] = None
+
+    # -- list-like compatibility so existing code that treats sequences as
+    #    List[int] keeps working unchanged. ----------------------------------
+
+    def __len__(self) -> int:  # noqa: D105
+        return len(self.fault_points)
+
+    def __getitem__(self, idx):  # noqa: D105
+        return self.fault_points[idx]
+
+    def __iter__(self):  # noqa: D105
+        return iter(self.fault_points)
+
+    def __eq__(self, other: object) -> bool:  # noqa: D105
+        if isinstance(other, AnnotatedSequence):
+            return self.fault_points == other.fault_points
+        if isinstance(other, list):
+            return self.fault_points == other
+        return NotImplemented
+
+    def __hash__(self) -> int:  # noqa: D105
+        return hash(tuple(self.fault_points))
+
+    def to_dict(self) -> Dict[str, Any]:
+        """JSON-serializable representation."""
+        d: Dict[str, Any] = {
+            "fault_points": list(self.fault_points),
+            "rationale": self.rationale,
+        }
+        if self.selection_basis is not None:
+            d["selection_basis"] = self.selection_basis
+        return d
+
 
 @dataclasses.dataclass
 class MultiFaultPlan:
     """Generated plan for multi-fault sweep runs."""
 
-    sequences: List[List[int]]
+    sequences: List[AnnotatedSequence]
     strategy: str
     interesting_point_count: int
     max_faults_per_run: int
@@ -490,6 +535,7 @@ def generate_multi_fault_sequences(
     explicit_sequences: Optional[List[List[int]]] = None,
     fallback_strategy: Optional[str] = None,
     fallback_points: Optional[List[int]] = None,
+    point_provenance: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> MultiFaultPlan:
     """Generate multi-fault sequences using the given strategy.
 
@@ -497,6 +543,13 @@ def generate_multi_fault_sequences(
         explicit            - Use user-provided sequences verbatim.
         pairwise_interesting - C(N,2) pairwise from interesting points.
         random_sample        - Seeded random sampling from interesting points.
+
+    Args:
+        point_provenance: Optional mapping from fault-point index to a dict
+            with keys ``reason``, ``boot_outcome``, and optionally
+            ``fault_address``.  When provided, each generated
+            ``AnnotatedSequence`` will include a human-readable rationale
+            explaining why each point was selected.
 
     Returns a MultiFaultPlan with sequences and diagnostics.
     """
@@ -511,7 +564,8 @@ def generate_multi_fault_sequences(
         return generate_explicit(explicit_sequences, max_faults_per_run)
     elif strategy == "pairwise_interesting":
         plan = generate_pairwise_interesting(
-            interesting_points, max_faults_per_run, max_pairs
+            interesting_points, max_faults_per_run, max_pairs,
+            point_provenance=point_provenance,
         )
         return maybe_apply_fallback(
             primary_plan=plan,
@@ -522,7 +576,10 @@ def generate_multi_fault_sequences(
             seed=seed,
         )
     else:
-        return generate_random_sample(interesting_points, max_faults_per_run, max_pairs, seed)
+        return generate_random_sample(
+            interesting_points, max_faults_per_run, max_pairs, seed,
+            point_provenance=point_provenance,
+        )
 
 
 def generate_explicit(
@@ -531,7 +588,7 @@ def generate_explicit(
     """Validate and return user-provided explicit sequences."""
     if not sequences:
         raise ValueError("explicit strategy requires non-empty sequences list")
-    validated: List[List[int]] = []
+    validated: List[AnnotatedSequence] = []
     for seq in sequences:
         if len(seq) < 2:
             raise ValueError(
@@ -541,7 +598,10 @@ def generate_explicit(
             raise ValueError(
                 "sequence {} exceeds max_faults_per_run={}".format(seq, max_faults_per_run)
             )
-        validated.append(sorted(seq))
+        validated.append(AnnotatedSequence(
+            fault_points=sorted(seq),
+            rationale="explicit: user-specified sequence",
+        ))
     return MultiFaultPlan(
         sequences=validated,
         strategy="explicit",
@@ -553,10 +613,15 @@ def generate_explicit(
 
 
 def generate_pairwise_interesting(
-    interesting_points: List[int], max_faults_per_run: int, max_pairs: int
+    interesting_points: List[int],
+    max_faults_per_run: int,
+    max_pairs: int,
+    point_provenance: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> MultiFaultPlan:
     """Generate C(N, k) combinations from deduplicated interesting points."""
     pts = sorted(set(interesting_points))
+    prov = point_provenance or {}
+
     if len(pts) < 2:
         reason = "no_interesting_points" if len(pts) == 0 else "single_point"
         return MultiFaultPlan(
@@ -573,18 +638,20 @@ def generate_pairwise_interesting(
     exhaustive = theoretical <= max_pairs
 
     if exhaustive:
-        seqs = [list(c) for c in itertools.combinations(pts, k)]
+        raw_seqs = [list(c) for c in itertools.combinations(pts, k)]
     else:
         # Random sampling to avoid bias toward low-index combinations.
         # Sample without materializing all C(n,k) combinations.
         rng = random.Random(42)
-        seen: Set[Tuple[int, ...]] = set()
-        seqs = []
-        while len(seqs) < max_pairs:
+        seen: set = set()
+        raw_seqs = []
+        while len(raw_seqs) < max_pairs:
             combo = tuple(sorted(rng.sample(range(len(pts)), k)))
             if combo not in seen:
                 seen.add(combo)
-                seqs.append([pts[i] for i in combo])
+                raw_seqs.append([pts[i] for i in combo])
+
+    seqs = [_annotate_pairwise(combo, prov) for combo in raw_seqs]
 
     return MultiFaultPlan(
         sequences=seqs,
@@ -597,6 +664,35 @@ def generate_pairwise_interesting(
             "theoretical_combinations": theoretical,
             "capped_at": max_pairs if not exhaustive else None,
         },
+    )
+
+
+def _annotate_pairwise(
+    combo: List[int],
+    provenance: Dict[int, Dict[str, Any]],
+) -> AnnotatedSequence:
+    """Build an AnnotatedSequence for a pairwise-interesting combination."""
+    parts = []
+    basis: Dict[str, Any] = {}
+    for pt in combo:
+        info = provenance.get(pt)
+        if info:
+            reason = info.get("reason", "issue")
+            outcome = info.get("boot_outcome", "unknown")
+            parts.append("point {} ({})".format(pt, reason))
+            basis[str(pt)] = {
+                "single_fault_outcome": outcome,
+                "reason": reason,
+            }
+            if info.get("fault_address"):
+                basis[str(pt)]["fault_address"] = info["fault_address"]
+        else:
+            parts.append("point {}".format(pt))
+    rationale = "pairwise: " + " x ".join(parts)
+    return AnnotatedSequence(
+        fault_points=list(combo),
+        rationale=rationale,
+        selection_basis={"point_provenance": basis} if basis else None,
     )
 
 
@@ -628,9 +724,11 @@ def generate_random_sample(
     max_faults_per_run: int,
     max_pairs: int,
     seed: Optional[int],
+    point_provenance: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> MultiFaultPlan:
     """Random sampling of fault-point combinations with collision avoidance."""
     pts = sorted(set(interesting_points))
+    prov = point_provenance or {}
     if len(pts) < 2:
         return MultiFaultPlan(
             sequences=[],
@@ -648,8 +746,18 @@ def generate_random_sample(
 
     if theoretical <= max_pairs:
         # All fit; shuffle for variety but return all.
-        seqs = [list(c) for c in itertools.combinations(pts, k)]
-        rng.shuffle(seqs)
+        raw_seqs = [list(c) for c in itertools.combinations(pts, k)]
+        rng.shuffle(raw_seqs)
+        seqs = [
+            AnnotatedSequence(
+                fault_points=combo,
+                rationale="random_sample: sampled from C({},{})={} (seed={}, exhaustive)".format(
+                    len(pts), k, theoretical, seed
+                ),
+                selection_basis=_random_sample_basis(combo, prov, seed),
+            )
+            for combo in raw_seqs
+        ]
         return MultiFaultPlan(
             sequences=seqs,
             strategy="random_sample",
@@ -662,10 +770,16 @@ def generate_random_sample(
     # Sample without replacement using index unranking.
     sampled_indices = rng.sample(range(theoretical), max_pairs)
     n = len(pts)
-    seqs = [
-        [pts[i] for i in _unrank_combination(rank, n, k)]
-        for rank in sorted(sampled_indices)
-    ]
+    seqs = []
+    for rank in sorted(sampled_indices):
+        combo = [pts[i] for i in _unrank_combination(rank, n, k)]
+        seqs.append(AnnotatedSequence(
+            fault_points=combo,
+            rationale="random_sample: sampled from C({},{})={} (seed={}, rank={})".format(
+                n, k, theoretical, seed, rank
+            ),
+            selection_basis=_random_sample_basis(combo, prov, seed, rank=rank),
+        ))
 
     return MultiFaultPlan(
         sequences=seqs,
@@ -679,6 +793,29 @@ def generate_random_sample(
             "sampled": max_pairs,
         },
     )
+
+
+def _random_sample_basis(
+    combo: List[int],
+    provenance: Dict[int, Dict[str, Any]],
+    seed: Optional[int],
+    rank: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build selection_basis dict for a random-sample sequence."""
+    basis: Dict[str, Any] = {"seed": seed}
+    if rank is not None:
+        basis["combination_rank"] = rank
+    pt_prov: Dict[str, Any] = {}
+    for pt in combo:
+        info = provenance.get(pt)
+        if info:
+            pt_prov[str(pt)] = {
+                "single_fault_outcome": info.get("boot_outcome", "unknown"),
+                "reason": info.get("reason", "issue"),
+            }
+    if pt_prov:
+        basis["point_provenance"] = pt_prov
+    return basis
 
 
 def generate_boundary_pairs(
@@ -699,31 +836,42 @@ def generate_boundary_pairs(
         )
 
     k = min(max_faults_per_run, len(pts))
-    seqs: List[List[int]] = []
-    seen = set()
+    raw_seqs: List[List[int]] = []
+    rationales: List[str] = []
+    seen: set = set()
 
-    def _add(seq: Iterable[int]) -> None:
+    def _add(seq: Iterable[int], is_wide: bool = False) -> None:
         norm = tuple(sorted(int(x) for x in seq))
         if len(norm) < 2 or norm in seen:
             return
         seen.add(norm)
-        seqs.append(list(norm))
+        raw_seqs.append(list(norm))
+        if is_wide:
+            rationales.append("boundary: wide span {}".format(list(norm)))
+        else:
+            rationales.append("boundary: adjacent points {}".format(list(norm)))
 
     # Sliding windows capture adjacent boundaries.
     for i in range(0, len(pts) - k + 1):
         _add(pts[i : i + k])
-        if len(seqs) >= max_pairs:
+        if len(raw_seqs) >= max_pairs:
             break
 
     # Wide boundary-spanning pair/window.
-    if len(seqs) < max_pairs:
+    if len(raw_seqs) < max_pairs:
         if k == 2:
-            _add((pts[0], pts[-1]))
+            _add((pts[0], pts[-1]), is_wide=True)
         else:
-            _add(tuple([pts[0]] + pts[-(k - 1) :]))
+            _add(tuple([pts[0]] + pts[-(k - 1) :]), is_wide=True)
 
-    if len(seqs) > max_pairs:
-        seqs = seqs[:max_pairs]
+    if len(raw_seqs) > max_pairs:
+        raw_seqs = raw_seqs[:max_pairs]
+        rationales = rationales[:max_pairs]
+
+    seqs = [
+        AnnotatedSequence(fault_points=fp, rationale=rat)
+        for fp, rat in zip(raw_seqs, rationales)
+    ]
 
     return MultiFaultPlan(
         sequences=seqs,
@@ -734,8 +882,8 @@ def generate_boundary_pairs(
         diagnostics={
             "exhaustive": False,
             "candidate_points": len(pts),
-            "generated_sequences": len(seqs),
-            "capped_at": max_pairs if len(seqs) >= max_pairs else None,
+            "generated_sequences": len(raw_seqs),
+            "capped_at": max_pairs if len(raw_seqs) >= max_pairs else None,
         },
     )
 
@@ -820,7 +968,12 @@ def multi_fault_plan_summary(plan: Optional[MultiFaultPlan]) -> Optional[Dict[st
     if plan is None:
         return None
     preview_limit = 10
-    preview = [list(seq) for seq in plan.sequences[:preview_limit]]
+    preview: List[Any] = []
+    for seq in plan.sequences[:preview_limit]:
+        if isinstance(seq, AnnotatedSequence):
+            preview.append(seq.to_dict())
+        else:
+            preview.append(list(seq))
     return {
         "strategy": plan.strategy,
         "sequences": len(plan.sequences),
