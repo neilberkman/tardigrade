@@ -75,15 +75,15 @@ Heuristic mode classifies writes into tiers (trailer/boundary/bulk) and prunes ~
 
 The `examples/` directory contains standalone bootloader firmware for engine validation and self-testing:
 
-| Example               | Purpose                                                            |
-| --------------------- | ------------------------------------------------------------------ |
-| `naive_copy`          | Worst-case baseline; proves the engine catches obvious brick paths |
-| `vulnerable_ota`      | Copy-in-place OTA with frequent boot-visible failures              |
-| `nxboot_style`        | Modeled nxboot family for adapter/probe/invariant development      |
-| `esp_idf_ota`         | Clean-room model of ESP-IDF OTA slot-selection behavior            |
-| `riotboot_standalone` | Standalone RIOTboot-style slot-selection model                     |
-| `bootloader_self_update` | Bootloader-region integrity and self-update fault modeling      |
-| `nvs_config_migration` | Config/NVS-region corruption and migration validation             |
+| Example                  | Purpose                                                            |
+| ------------------------ | ------------------------------------------------------------------ |
+| `naive_copy`             | Worst-case baseline; proves the engine catches obvious brick paths |
+| `vulnerable_ota`         | Copy-in-place OTA with frequent boot-visible failures              |
+| `nxboot_style`           | Modeled nxboot family for adapter/probe/invariant development      |
+| `esp_idf_ota`            | Clean-room model of ESP-IDF OTA slot-selection behavior            |
+| `riotboot_standalone`    | Standalone RIOTboot-style slot-selection model                     |
+| `bootloader_self_update` | Bootloader-region integrity and self-update fault modeling         |
+| `nvs_config_migration`   | Config/NVS-region corruption and migration validation              |
 
 ## How it works
 
@@ -149,8 +149,8 @@ Core write/storage faults:
 - `write_disturb`
 - `wear_leveling_corruption`
 - `reset_at_time`
-- `read_bit_flip` -- transient corrupted read without modifying storage
-- `nvs_corruption` -- config/NVS-region corruption variants
+- `read_bit_flip` -- transient corrupted read without modifying storage _(NVMemory slow-path backends only)_
+- `command_drop` -- silently dropped NVM controller command _(GenericNvmController backends only)_
 
 Staged fault surfaces:
 
@@ -217,6 +217,7 @@ fault_sweep:
   mode: runtime
   evaluation_mode: execute
   max_writes: auto
+  flash_backend: sysbus.nvmc # sysbus path to the NVM controller
   boot_cycles: 3
   hash_bypass_symbols: ["bootutil_img_validate"]
 
@@ -255,7 +256,7 @@ Advanced sweep controls:
 - **`read_fault_config`** -- target-region, bit-count, and probability controls for transient read corruption.
 - **`multi_fault`** -- generate compound staged-fault plans, with explain output and deterministic fallbacks.
 - **`partial_staging`** -- analyze interrupted or overlapping staging-image writes.
-- **`nvs_region`** / **`nvs_corruption`** -- model config/NVS corruption separately from firmware slots.
+- **`nvs_region`** -- model config/NVS regions separately from firmware slots (corruption variants are schema-defined but not yet wired into the sweep engine).
 - **`multi_component`** -- coordinate fault analysis across multiple components in one profile.
 
 ## Report structure
@@ -273,7 +274,7 @@ Per-point diagnostics attached when relevant: `fault_window` (clean-run context 
 - **Scenarios** ([`scripts/run_scenario.py`](scripts/run_scenario.py)) -- multi-step discovery runs with profile overrides per step. See [`scenarios/`](scenarios/) for MCUboot and nxboot examples.
 - **CBMC bridge** (`scripts/cbmc_to_profile.py`) -- converts CBMC counterexamples into tardigrade replay profiles.
 - **Geometry matrix** (`scripts/geometry_matrix.py`) -- parametric slot-layout permutations to catch geometry-dependent bugs.
-- **State fuzzer** (`targets/mcuboot/state_fuzzer.py`) -- MCUboot-specific trailer-state exploration.
+- **State fuzzer** (`targets/mcuboot/state_fuzzer.py`) -- MCUboot-specific trailer-state exploration _(not yet wired into the main sweep engine)_.
 - **HTML report** (`scripts/render_results_html.py`) -- renders JSON reports as HTML.
 - **Reference profiles** -- see [`examples/bootloader_self_update/profile.yaml`](examples/bootloader_self_update/profile.yaml), [`examples/nvs_config_migration/profile.yaml`](examples/nvs_config_migration/profile.yaml), and [`examples/seeded_initial_states.yaml`](examples/seeded_initial_states.yaml) for concrete examples of newer engine capabilities.
 
@@ -323,6 +324,8 @@ tardigrade/
 
 - Fault model operates at write-operation granularity, not analog brownout simulation.
 - Cortex-M targets only; non-Cortex architectures are not first-class.
+- Some fault types are backend-specific: `read_bit_flip` requires the NVMemory slow-path backend; `command_drop` requires GenericNvmController. The profile loader warns at load time when these are used with incompatible backends, but the check is heuristic.
+- Multi-fault sweeps currently execute all stages as power-loss faults regardless of the original fault type. The planner picks interesting points from all fault types but execution does not preserve the original fault semantics.
 - Semantic bugs that don't change boot outcome require explicit target instrumentation.
 - Exhaustive sweeps take ~15 min on a 2-core CI runner; heuristic mode is 2-4 min.
 

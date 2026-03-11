@@ -386,6 +386,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public override void Reset()
         {
             base.Reset();
+            tracker.Reset();
             crValue = LOCK_BIT;
             locked = true;
             keySequence = 0;

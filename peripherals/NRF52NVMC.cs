@@ -53,6 +53,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public long Size => 0x1000;
 
+        public override void Reset()
+        {
+            base.Reset();
+            tracker.Reset();
+            configValue = 0;
+            wenSnapshot = null;
+        }
+
         public NVMemory Nvm { get; set; }
 
         public long NvmBaseAddress { get; set; } = 0x00000000;

@@ -536,7 +536,7 @@ class TestMultiFaultFallbackRedundantSystems(unittest.TestCase):
             fallback_strategy="boundary_pairs",
             fallback_points=[0, 50, 100, 150, 200, 250],
         )
-        self.assertEqual(plan.strategy, "pairwise_interesting")
+        self.assertEqual(plan.strategy, "boundary_pairs")
         self.assertTrue(len(plan.sequences) > 0)
         diag = plan.diagnostics
         self.assertTrue(diag["fallback_used"])
