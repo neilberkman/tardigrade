@@ -369,12 +369,14 @@ if success_otadata_expect_scope not in ('always', 'control'):
     success_otadata_expect_scope = 'always'
 
 # Per-fault-type success criteria overrides.
-# JSON dict mapping fault type names to partial criteria dicts.
+# Base64-encoded JSON dict mapping fault type names to partial criteria dicts.
 _success_criteria_overrides_raw = get_optional_var('success_criteria_overrides', '')
 _success_criteria_overrides = {}
 if _success_criteria_overrides_raw:
     try:
-        _success_criteria_overrides = json.loads(_success_criteria_overrides_raw)
+        import base64
+        _decoded = base64.b64decode(_success_criteria_overrides_raw).decode()
+        _success_criteria_overrides = json.loads(_decoded)
         if not isinstance(_success_criteria_overrides, dict):
             log('WARNING: success_criteria_overrides is not a dict, ignoring')
             _success_criteria_overrides = {}
@@ -382,7 +384,7 @@ if _success_criteria_overrides_raw:
             log('success_criteria_overrides: loaded {} fault type overrides'.format(
                 len(_success_criteria_overrides)))
     except Exception as e:
-        log('WARNING: failed to parse success_criteria_overrides JSON: {}'.format(e))
+        log('WARNING: failed to parse success_criteria_overrides: {}'.format(e))
         _success_criteria_overrides = {}
 
 # Map single-char fault type codes to full fault type names for override lookup.
