@@ -115,6 +115,7 @@ class SuccessCriteria:
         "otadata_expect_scope",
         "bootloader_integrity",
         "config_checks",
+        "boot_register_values",
     )
 
     def __init__(
@@ -131,6 +132,7 @@ class SuccessCriteria:
         otadata_expect_scope: str = "always",
         bootloader_integrity: bool = False,
         config_checks: Optional[List[ConfigCheck]] = None,
+        boot_register_values: Optional[Dict[str, int]] = None,
     ) -> None:
         self.vtor_in_slot = vtor_in_slot
         self.vector_table_offset = max(0, int(vector_table_offset))
@@ -144,6 +146,7 @@ class SuccessCriteria:
         self.otadata_expect_scope = otadata_expect_scope
         self.bootloader_integrity = bootloader_integrity
         self.config_checks = config_checks or []
+        self.boot_register_values = boot_register_values or {}
 
 
 
@@ -552,6 +555,9 @@ class FaultSweepConfig:
         "nvs_corruption",
         "fault_distribution",
         "heuristic_config",
+        "boot_registers",
+        "reset_mode",
+        "write_order_constraints",
     )
 
     def __init__(
@@ -579,6 +585,9 @@ class FaultSweepConfig:
         nvs_corruption: Optional["NvsCorruptionConfig"] = None,
         fault_distribution: Optional["FaultDistributionConfig"] = None,
         heuristic_config: Optional["HeuristicConfig"] = None,
+        boot_registers: Optional[List[Dict[str, Any]]] = None,
+        reset_mode: str = "warm",
+        write_order_constraints: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -609,6 +618,9 @@ class FaultSweepConfig:
         self.nvs_corruption = nvs_corruption or NvsCorruptionConfig()
         self.fault_distribution = fault_distribution or FaultDistributionConfig()
         self.heuristic_config = heuristic_config
+        self.boot_registers = boot_registers or []
+        self.reset_mode = reset_mode if reset_mode in ("warm", "cold") else "warm"
+        self.write_order_constraints = write_order_constraints or []
 
 
 class StateFuzzerConfig:
@@ -707,6 +719,34 @@ class InitialStateConfig:
         self.expect_overrides = expect_overrides or {}
 
 
+class BootRegisterDef:
+    """A register to capture at boot-detection time."""
+    __slots__ = ("address", "name")
+
+    def __init__(self, address: int, name: str) -> None:
+        self.address = address
+        self.name = name
+
+
+class WriteOrderConstraint:
+    """Assert that writes to one region precede writes to another."""
+    __slots__ = ("first_start", "first_size", "then_start", "then_size", "label")
+
+    def __init__(
+        self,
+        first_start: int,
+        first_size: int,
+        then_start: int,
+        then_size: int,
+        label: str = "",
+    ) -> None:
+        self.first_start = first_start
+        self.first_size = first_size
+        self.then_start = then_start
+        self.then_size = then_size
+        self.label = label
+
+
 # MCUboot trailer magic: 4 words written at (slot_end - 16).
 MCUBOOT_GOOD_MAGIC = [0xF395C277, 0x7FEFD260, 0x0F505235, 0x8079B62C]
 
@@ -770,6 +810,8 @@ class ProfileConfig:
         security_policy: Optional["SecurityPolicyConfig"] = None,
         bootloader_region: Optional[BootloaderRegionConfig] = None,
         success_criteria_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+        boot_registers: Optional[List[BootRegisterDef]] = None,
+        write_order_constraints: Optional[List[WriteOrderConstraint]] = None,
     ) -> None:
         self.schema_version = schema_version
         self.name = name
@@ -803,6 +845,8 @@ class ProfileConfig:
         self.nvs_region = nvs_region
         self.bootloader_region: Optional[BootloaderRegionConfig] = bootloader_region
         self.success_criteria_overrides: Dict[str, Dict[str, Any]] = success_criteria_overrides or {}
+        self.boot_registers: List[BootRegisterDef] = boot_registers or []
+        self.write_order_constraints: List[WriteOrderConstraint] = write_order_constraints or []
 
     @property
     def is_multi_component(self) -> bool:
@@ -986,6 +1030,14 @@ class ProfileConfig:
                 vars_list.append(
                     "PHASE2_FAULT_MAX_POINTS:{}".format(fs.phase2_fault.max_points)
                 )
+
+        if self.boot_registers:
+            parts = []
+            for reg in self.boot_registers:
+                parts.append("0x{:08X}={}".format(reg.address, reg.name))
+            vars_list.append("BOOT_REGISTERS:{}".format(",".join(parts)))
+        if fs.reset_mode != "warm":
+            vars_list.append("RESET_MODE:{}".format(fs.reset_mode))
 
         # Slot info.
         for slot_name, slot_cfg in mem.slots.items():
@@ -1337,6 +1389,7 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         otadata_expect_scope=otadata_expect_scope,
         bootloader_integrity=bool(raw.get("bootloader_integrity", False)),
         config_checks=_parse_config_checks(raw.get("config_checks")),
+        boot_register_values=_parse_boot_register_values(raw.get("boot_register_values")),
     )
 
 
@@ -1581,6 +1634,7 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         nvs_corruption=_parse_nvs_corruption(raw.get("nvs_corruption")),
         fault_distribution=_parse_fault_distribution(raw.get("fault_distribution")),
         heuristic_config=_parse_heuristic_config(raw.get("heuristic")),
+        reset_mode=str(raw.get("reset_mode", "warm")),
     )
 
 
@@ -1824,6 +1878,73 @@ def _parse_config_checks(raw: Optional[List[Any]]) -> List[ConfigCheck]:
             range_max=range_max,
         ))
     return checks
+
+
+def _parse_boot_register_values(
+    raw: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, int]]:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ProfileError("success_criteria.boot_register_values: expected mapping")
+    result: Dict[str, int] = {}
+    for name, val in raw.items():
+        result[str(name)] = _parse_int(val, "boot_register_values.{}".format(name))
+    return result
+
+
+def _parse_boot_registers_list(
+    raw: Optional[List[Any]],
+) -> List[BootRegisterDef]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("boot_registers: expected list")
+    regs: List[BootRegisterDef] = []
+    for i, entry in enumerate(raw):
+        ctx = "boot_registers[{}]".format(i)
+        if not isinstance(entry, dict):
+            raise ProfileError("{}: expected mapping".format(ctx))
+        address = _parse_int(
+            _require(entry, "address", ctx), "{}.address".format(ctx)
+        )
+        name = str(_require(entry, "name", ctx))
+        regs.append(BootRegisterDef(address=address, name=name))
+    return regs
+
+
+def _parse_write_order_constraints_list(
+    raw: Optional[List[Any]],
+) -> List[WriteOrderConstraint]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("write_order_constraints: expected list")
+    constraints: List[WriteOrderConstraint] = []
+    for i, entry in enumerate(raw):
+        ctx = "write_order_constraints[{}]".format(i)
+        if not isinstance(entry, dict):
+            raise ProfileError("{}: expected mapping".format(ctx))
+        first = entry.get("first")
+        then = entry.get("then")
+        if not isinstance(first, dict) or not isinstance(then, dict):
+            raise ProfileError("{}: 'first' and 'then' must be mappings".format(ctx))
+        constraints.append(WriteOrderConstraint(
+            first_start=_parse_int(
+                _require(first, "start", ctx + ".first"), ctx + ".first.start"
+            ),
+            first_size=_parse_int(
+                _require(first, "size", ctx + ".first"), ctx + ".first.size"
+            ),
+            then_start=_parse_int(
+                _require(then, "start", ctx + ".then"), ctx + ".then.start"
+            ),
+            then_size=_parse_int(
+                _require(then, "size", ctx + ".then"), ctx + ".then.size"
+            ),
+            label=str(entry.get("label", "")),
+        ))
+    return constraints
 
 
 def _parse_nvs_region(raw: Optional[Dict[str, Any]]) -> Optional[NvsRegionConfig]:
@@ -2479,6 +2600,10 @@ def load_profile(path: str | Path) -> ProfileConfig:
     multi_component = _parse_components(data.get("multi_component"))
     nvs_region = _parse_nvs_region(data.get("nvs_region"))
     bootloader_region = _parse_bootloader_region(data.get("bootloader_region"))
+    boot_registers = _parse_boot_registers_list(data.get("boot_registers"))
+    write_order_constraints = _parse_write_order_constraints_list(
+        data.get("write_order_constraints")
+    )
 
     scenario = str(data.get("scenario", "runtime"))
     if scenario not in VALID_SCENARIOS:
@@ -2543,6 +2668,8 @@ def load_profile(path: str | Path) -> ProfileConfig:
         security_policy=security_policy,
         bootloader_region=bootloader_region,
         success_criteria_overrides=success_criteria_overrides,
+        boot_registers=boot_registers,
+        write_order_constraints=write_order_constraints,
     )
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.
