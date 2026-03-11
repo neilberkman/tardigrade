@@ -668,6 +668,91 @@ def check_no_unauthorized_state_promotion(
 
 
 # ---------------------------------------------------------------------------
+# Boot register snapshot invariant
+# ---------------------------------------------------------------------------
+
+
+def check_boot_registers_match(
+    result: FaultResult,
+    boot_register_values: Optional[Dict[str, int]] = None,
+    result_signals: Optional[Dict[str, Any]] = None,
+    **_: Any,
+) -> None:
+    """Check that boot-time register values match expected values.
+
+    At VTOR detection time the harness captures a configurable set of
+    register addresses.  This invariant compares each captured value
+    against the expected value from ``success_criteria.boot_register_values``.
+
+    Only runs when the device booted successfully and register snapshots
+    are present.
+    """
+    if not boot_register_values:
+        return
+    if result.boot_outcome != "success":
+        return
+
+    # The snapshot lives in signals.boot_register_snapshot.
+    snapshot = None
+    if isinstance(result_signals, dict):
+        snapshot = result_signals.get("boot_register_snapshot")
+    if not isinstance(snapshot, dict):
+        return
+
+    mismatches: List[str] = []
+    details_mismatches: List[Dict[str, Any]] = []
+    for reg_name, expected_val in boot_register_values.items():
+        actual_raw = snapshot.get(reg_name)
+        if actual_raw is None:
+            mismatches.append("{}: not captured".format(reg_name))
+            details_mismatches.append({
+                "register": reg_name,
+                "expected": "0x{:08X}".format(expected_val),
+                "actual": None,
+            })
+            continue
+        try:
+            actual_val = int(str(actual_raw), 0)
+        except (ValueError, TypeError):
+            mismatches.append(
+                "{}: unparseable value {!r}".format(reg_name, actual_raw)
+            )
+            details_mismatches.append({
+                "register": reg_name,
+                "expected": "0x{:08X}".format(expected_val),
+                "actual": str(actual_raw),
+            })
+            continue
+        if actual_val != expected_val:
+            mismatches.append(
+                "{}: expected 0x{:08X}, got 0x{:08X}".format(
+                    reg_name, expected_val, actual_val
+                )
+            )
+            details_mismatches.append({
+                "register": reg_name,
+                "expected": "0x{:08X}".format(expected_val),
+                "actual": "0x{:08X}".format(actual_val),
+            })
+
+    if mismatches:
+        raise InvariantViolation(
+            invariant_name="boot_registers_match",
+            description=(
+                "Boot register mismatch after fault: {}".format(
+                    "; ".join(mismatches)
+                )
+            ),
+            result=result,
+            details={
+                "mismatches": details_mismatches,
+                "boot_outcome": result.boot_outcome,
+                "fault_at": result.fault_at,
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -683,6 +768,7 @@ _ALL_INVARIANTS: List[InvariantFn] = [
     check_slot_hash_consistent,
     check_rollback_version_bounded,
     check_no_unauthorized_state_promotion,
+    check_boot_registers_match,
 ]
 
 _INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
@@ -697,6 +783,7 @@ _INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
     "slot_hash_consistent": check_slot_hash_consistent,
     "rollback_version_bounded": check_rollback_version_bounded,
     "no_unauthorized_state_promotion": check_no_unauthorized_state_promotion,
+    "boot_registers_match": check_boot_registers_match,
 }
 _PROVIDER_CACHE: Dict[str, Dict[str, InvariantFn]] = {}
 

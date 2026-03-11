@@ -1136,6 +1136,59 @@ def _derive_runtime_pre_state(
     return derived
 
 
+def check_write_order_constraints(
+    trace: List[Dict[str, Any]],
+    constraints: List[Any],
+) -> List[Dict[str, Any]]:
+    """Check write-order constraints against a calibration write trace.
+
+    Each constraint specifies a ``first`` region that must be written before
+    a ``then`` region.  Returns a list of violation dicts (empty = all OK).
+    """
+    violations: List[Dict[str, Any]] = []
+    for c in constraints:
+        first_start = c.first_start
+        first_end = first_start + c.first_size
+        then_start = c.then_start
+        then_end = then_start + c.then_size
+
+        first_idx: Optional[int] = None
+        then_idx: Optional[int] = None
+
+        for entry in trace:
+            addr = entry.get("flash_offset", 0)
+            idx = entry.get("write_index", 0)
+            if first_start <= addr < first_end and (first_idx is None or idx < first_idx):
+                first_idx = idx
+            if then_start <= addr < then_end and (then_idx is None or idx < then_idx):
+                then_idx = idx
+
+        if first_idx is None and then_idx is None:
+            continue
+        if then_idx is None:
+            continue
+        if first_idx is None:
+            violations.append({
+                "label": c.label,
+                "status": "violated",
+                "reason": "first region never written, then region written at index {}".format(then_idx),
+                "first_write_index": None,
+                "then_write_index": then_idx,
+            })
+            continue
+        if then_idx < first_idx:
+            violations.append({
+                "label": c.label,
+                "status": "violated",
+                "reason": "then region written at index {} before first region at {}".format(
+                    then_idx, first_idx
+                ),
+                "first_write_index": first_idx,
+                "then_write_index": then_idx,
+            })
+    return violations
+
+
 def _evaluate_invariants(
     result: Dict[str, Any],
     profile: ProfileConfig,
@@ -1178,6 +1231,10 @@ def _evaluate_invariants(
         elapsed_virtual_time_s=elapsed_virtual_time_s,
         fault_sequence=fault_sequence,
     )
+    boot_register_values = getattr(
+        profile.success_criteria, "boot_register_values", None
+    ) or None
+    result_signals = result.get("signals") if isinstance(result.get("signals"), dict) else {}
     violations = run_invariants(
         fault_result,
         invariant_fns,
@@ -1187,6 +1244,8 @@ def _evaluate_invariants(
         multi_boot_analysis=result.get("multi_boot_analysis"),
         boot_cycles=result.get("boot_cycles"),
         invariant_config=getattr(profile, "invariant_config", {}) or {},
+        boot_register_values=boot_register_values,
+        result_signals=result_signals,
     )
     violation_dicts = []
     for v in violations:
