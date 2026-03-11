@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fault_inject import (
+    AnnotatedSequence,
     BootloaderRegionConfig,
     FaultDistributionConfig,
     FaultResult,
@@ -1245,12 +1246,32 @@ def result_has_issues(result: Dict[str, Any], expected_outcome: str) -> bool:
     return bool(result_issue_reasons(result, expected_outcome))
 
 
+@dataclasses.dataclass
+class InterestingPoint:
+    """A fault point identified as worth exploring in multi-fault runs.
+
+    Carries provenance about *why* the point was selected, enabling
+    downstream generators to produce human-readable rationale for each
+    planned multi-fault sequence.
+    """
+
+    fault_at: int
+    reason: str  # "brick", "wrong_image", "semantic", "invariant", "issue"
+    boot_outcome: str
+    fault_address: Optional[str] = None
+
+
 def _interesting_multi_fault_points(
     results: List[Dict[str, Any]],
     expected_outcome: str,
-) -> List[int]:
-    """Return fault points worth exploring with sequential multi-fault runs."""
-    interesting_fps: List[int] = []
+) -> List[InterestingPoint]:
+    """Return fault points worth exploring with sequential multi-fault runs.
+
+    Each returned ``InterestingPoint`` carries provenance about why the
+    point was selected (brick, wrong_image, semantic assertion failure,
+    invariant violation, or generic boot-outcome mismatch).
+    """
+    points: Dict[int, InterestingPoint] = {}
     for result in results:
         if result.get("is_control", False):
             continue
@@ -1258,9 +1279,25 @@ def _interesting_multi_fault_points(
             continue
         if result_is_brick(result) or result_has_issues(result, expected_outcome):
             fp = result.get("fault_at")
-            if fp is not None:
-                interesting_fps.append(int(fp))
-    return sorted(set(interesting_fps))
+            if fp is not None and int(fp) not in points:
+                # Determine the most specific reason.
+                if result_is_brick(result):
+                    reason = "brick"
+                elif str(result.get("boot_outcome", "")).strip().lower() == "wrong_image":
+                    reason = "wrong_image"
+                elif result.get("semantic_assertion_failures"):
+                    reason = "semantic"
+                elif result.get("invariant_violations"):
+                    reason = "invariant"
+                else:
+                    reason = "issue"
+                points[int(fp)] = InterestingPoint(
+                    fault_at=int(fp),
+                    reason=reason,
+                    boot_outcome=str(result.get("boot_outcome", "unknown")),
+                    fault_address=result.get("fault_address"),
+                )
+    return sorted(points.values(), key=lambda p: p.fault_at)
 
 
 def result_is_brick(result: Dict[str, Any]) -> bool:
@@ -3630,9 +3667,19 @@ def main() -> int:
             expected_outcome = "success"
             if getattr(profile.expect, "control_outcome", None):
                 expected_outcome = profile.expect.control_outcome
-            interesting_fps = _interesting_multi_fault_points(
+            interesting_pts = _interesting_multi_fault_points(
                 sweep_results, expected_outcome
             )
+            interesting_fps = [p.fault_at for p in interesting_pts]
+            # Build provenance mapping for the plan generator.
+            point_provenance: Dict[int, Dict[str, Any]] = {
+                p.fault_at: {
+                    "reason": p.reason,
+                    "boot_outcome": p.boot_outcome,
+                    "fault_address": p.fault_address,
+                }
+                for p in interesting_pts
+            }
             print(
                 "Multi-fault: {} interesting points from single-fault sweep "
                 "(strategy={}, max_pairs={}).".format(
@@ -3656,6 +3703,7 @@ def main() -> int:
                     for r in sweep_results
                     if r.get("fault_injected", False) and not r.get("is_control", False)
                 ],
+                point_provenance=point_provenance,
             )
             multi_fault_plan = mf_plan
             multi_fault_plan_data = multi_fault_plan_summary(mf_plan)
@@ -3667,6 +3715,9 @@ def main() -> int:
             )
             if args.explain_multi_fault_plan and multi_fault_plan_data is not None:
                 multi_fault_plan_data["execution_skipped"] = True
+                multi_fault_plan_data["interesting_point_provenance"] = [
+                    dataclasses.asdict(p) for p in interesting_pts
+                ]
                 print(
                     json.dumps(
                         {"multi_fault_plan": multi_fault_plan_data},
@@ -3680,6 +3731,13 @@ def main() -> int:
                 multi_fault_types = [
                     encode_multi_fault_sequence(seq) for seq in mf_plan.sequences
                 ]
+                # Build a lookup from encoded sequence -> rationale for
+                # attaching provenance to each result after execution.
+                _mf_rationale_lookup: Dict[str, str] = {}
+                for _seq_obj in mf_plan.sequences:
+                    if isinstance(_seq_obj, AnnotatedSequence):
+                        _mf_key = encode_multi_fault_sequence(_seq_obj)
+                        _mf_rationale_lookup[_mf_key] = _seq_obj.rationale
                 mf_wall_t0 = _time_mod.time()
                 multi_fault_results = run_runtime_sweep(
                     repo_root=repo_root,
@@ -3712,6 +3770,9 @@ def main() -> int:
                             mf_r["fault_sequence"] = decode_multi_fault_sequence(ft)
                         except (ValueError, TypeError):
                             pass
+                        _rat = _mf_rationale_lookup.get(ft)
+                        if _rat:
+                            mf_r["sequence_rationale"] = _rat
                 annotate_result_checks(multi_fault_results, profile)
                 multi_fault_summary = summarize_runtime_sweep(
                     multi_fault_results,
