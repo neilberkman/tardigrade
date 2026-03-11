@@ -109,7 +109,56 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional absolute metadata base address override (e.g. 0x10070000).",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Show what would be generated without writing files.",
+    )
     return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Input validation
+# ---------------------------------------------------------------------------
+
+REQUIRED_TEMPLATE_KEYS = ("schema_version", "bootloader")
+
+
+def _validate_cbmc_path(path):
+    """Check that the CBMC output file exists and is non-empty."""
+    p = Path(path)
+    if not p.exists():
+        raise RuntimeError("CBMC output file does not exist: {}".format(p))
+    if p.stat().st_size == 0:
+        raise RuntimeError("CBMC output file is empty: {}".format(p))
+
+
+def _validate_template(data, path):
+    """Check that the template profile has required top-level keys."""
+    if not isinstance(data, dict):
+        raise RuntimeError("Template profile must be a YAML mapping/object: {}".format(path))
+    missing = [k for k in REQUIRED_TEMPLATE_KEYS if k not in data]
+    if missing:
+        raise RuntimeError(
+            "Template profile {} is missing required key(s): {}".format(
+                path, ", ".join(missing)
+            )
+        )
+
+
+def _validate_trace(trace, index):
+    """Check that a counterexample trace is a non-empty list of dicts."""
+    if not isinstance(trace, list):
+        raise RuntimeError(
+            "Counterexample {} has invalid trace: expected list, got {}.".format(
+                index, type(trace).__name__
+            )
+        )
+    if len(trace) == 0:
+        raise RuntimeError(
+            "Counterexample {} has an empty trace (no steps).".format(index)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -524,11 +573,17 @@ def main() -> int:
     template_path = Path(args.template)
     output_path = Path(args.output)
     replay_output_path = Path(args.replay_output).resolve() if args.replay_output else None
+    dry_run = args.dry_run
     addr_map = load_address_map(args.address_map or None)
 
+    # --- Validate inputs early ---
+    _validate_cbmc_path(cbmc_path)
+
+    if not template_path.exists():
+        raise RuntimeError("Template file does not exist: {}".format(template_path))
+
     template_data = yaml.safe_load(template_path.read_text(encoding="utf-8"))
-    if not isinstance(template_data, dict):
-        raise RuntimeError("Template profile must be a YAML mapping/object.")
+    _validate_template(template_data, template_path)
 
     fmt = _detect_format(cbmc_path)
 
@@ -541,7 +596,12 @@ def main() -> int:
             print("No failing CBMC traces found. No profile generated.")
             return 0
     else:
-        cbmc_data = json.loads(cbmc_path.read_text(encoding="utf-8"))
+        try:
+            cbmc_data = json.loads(cbmc_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "CBMC output is not valid JSON: {}".format(exc)
+            ) from exc
         failures = []
         _collect_failure_traces(cbmc_data, failures)
         errors: List[str] = []
@@ -564,8 +624,7 @@ def main() -> int:
 
     for idx, failure in enumerate(failures, start=1):
         trace = failure.get("trace")
-        if not isinstance(trace, list):
-            continue
+        _validate_trace(trace, idx)
 
         array_name, byte_map = _extract_byte_assignments(trace, extra_arrays=extra_arrays)
         if not byte_map:
@@ -604,17 +663,26 @@ def main() -> int:
             dest = output_path
         else:
             dest = _suffix_path(output_path, idx)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
-        generated_paths.append(dest)
-        print(
-            "Generated {} from property '{}' using {} byte assignments from '{}'.".format(
-                dest,
-                _property_name(failure, idx),
-                len(normalized),
-                array_name,
+
+        profile_yaml = yaml.safe_dump(profile, sort_keys=False)
+
+        if dry_run:
+            print("--- dry-run: {} ---".format(dest))
+            print(profile_yaml)
+            generated_paths.append(dest)
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(profile_yaml, encoding="utf-8")
+            generated_paths.append(dest)
+            print(
+                "Generated {} from property '{}' using {} byte assignments from '{}'.".format(
+                    dest,
+                    _property_name(failure, idx),
+                    len(normalized),
+                    array_name,
+                )
             )
-        )
+
         if replay_output_path is not None:
             replay_spec = _build_replay_spec(
                 profile=profile,
@@ -628,18 +696,23 @@ def main() -> int:
                 replay_dest = replay_output_path
             else:
                 replay_dest = _suffix_path(replay_output_path, idx)
-            replay_dest.parent.mkdir(parents=True, exist_ok=True)
-            replay_dest.write_text(
-                yaml.safe_dump(replay_spec, sort_keys=False),
-                encoding="utf-8",
-            )
-            generated_replays.append(replay_dest)
-            print(
-                "Generated replay spec {} for property '{}'.".format(
-                    replay_dest,
-                    _property_name(failure, idx),
+
+            replay_yaml = yaml.safe_dump(replay_spec, sort_keys=False)
+
+            if dry_run:
+                print("--- dry-run replay: {} ---".format(replay_dest))
+                print(replay_yaml)
+                generated_replays.append(replay_dest)
+            else:
+                replay_dest.parent.mkdir(parents=True, exist_ok=True)
+                replay_dest.write_text(replay_yaml, encoding="utf-8")
+                generated_replays.append(replay_dest)
+                print(
+                    "Generated replay spec {} for property '{}'.".format(
+                        replay_dest,
+                        _property_name(failure, idx),
+                    )
                 )
-            )
 
     if not generated_paths:
         raise RuntimeError("No profiles were generated from the failing traces.")
