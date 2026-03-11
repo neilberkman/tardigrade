@@ -752,6 +752,140 @@ def check_boot_registers_match(
         )
 
 
+def check_boot_target_matches_metadata(
+    result: FaultResult,
+    result_signals: Optional[Dict[str, Any]] = None,
+    **_: Any,
+) -> None:
+    """After a successful boot, the boot slot should match what metadata declares active.
+
+    The state probe may report a ``semantic_state`` dict inside
+    ``result_signals`` with an ``active_slot`` or ``target_slot`` field.
+    If the bootloader booted into a different slot than the metadata
+    indicates, the metadata interpretation is inconsistent — potentially
+    caused by a fault corrupting the metadata without invalidating its
+    integrity check.
+
+    Skipped when the device did not boot successfully, when
+    ``result_signals`` is absent, or when the metadata slot info cannot
+    be determined (conservative — no false positives).
+    """
+    if result.boot_outcome != "success":
+        return
+
+    if not isinstance(result_signals, dict):
+        return
+
+    semantic = result_signals.get("semantic_state")
+    if not isinstance(semantic, dict):
+        return
+
+    metadata_slot = semantic.get("active_slot") or semantic.get("target_slot")
+    if metadata_slot is None:
+        return
+
+    boot_slot = result.boot_slot
+    if boot_slot is None:
+        return
+
+    # Normalize to strings for comparison (probes may report ints or strings).
+    if str(metadata_slot) != str(boot_slot):
+        raise InvariantViolation(
+            invariant_name="boot_target_matches_metadata",
+            description=(
+                "Bootloader booted into slot {!r} but metadata declares "
+                "active/target slot {!r}. The metadata interpretation is "
+                "inconsistent with the actual boot path.".format(
+                    boot_slot, metadata_slot
+                )
+            ),
+            result=result,
+            details={
+                "boot_slot": boot_slot,
+                "metadata_slot": metadata_slot,
+                "semantic_state": semantic,
+            },
+        )
+
+
+def check_last_known_good_preserved(
+    result: FaultResult,
+    result_signals: Optional[Dict[str, Any]] = None,
+    **_: Any,
+) -> None:
+    """After any fault, at least one slot must still contain a valid image.
+
+    This catches catastrophic corruption where ALL copies of firmware are
+    destroyed by a single fault — a violation of the fundamental OTA safety
+    property that a known-good image must always be recoverable.
+
+    Looks for per-slot image validity or hash-match results in
+    ``result_signals.semantic_state``.  Keys checked (in order of
+    preference):
+
+    - ``slot_a_image_ok`` / ``slot_b_image_ok`` (boolean)
+    - ``slot_a_hash_match`` / ``slot_b_hash_match`` (boolean)
+    - ``slots`` dict with per-slot ``image_ok`` or ``hash_match`` keys
+
+    Skipped conservatively when the necessary signal data is absent —
+    will never false-positive on missing information.
+    """
+    if not isinstance(result_signals, dict):
+        return
+
+    semantic = result_signals.get("semantic_state")
+    if not isinstance(semantic, dict):
+        return
+
+    # Strategy 1: top-level per-slot boolean fields.
+    slot_validity: Dict[str, bool] = {}
+
+    for slot_name in ("slot_a", "slot_b", "exec", "staging", "primary", "secondary"):
+        ok_key = "{}_image_ok".format(slot_name)
+        hash_key = "{}_hash_match".format(slot_name)
+        val = semantic.get(ok_key)
+        if val is None:
+            val = semantic.get(hash_key)
+        if val is not None:
+            slot_validity[slot_name] = bool(val)
+
+    # Strategy 2: nested slots dict.
+    slots = semantic.get("slots")
+    if isinstance(slots, dict) and not slot_validity:
+        for slot_name, slot_data in slots.items():
+            if not isinstance(slot_data, dict):
+                continue
+            val = slot_data.get("image_ok")
+            if val is None:
+                val = slot_data.get("hash_match")
+            if val is not None:
+                slot_validity[slot_name] = bool(val)
+
+    # If we couldn't determine ANY slot's image validity, skip.
+    if not slot_validity:
+        return
+
+    if not any(slot_validity.values()):
+        raise InvariantViolation(
+            invariant_name="last_known_good_preserved",
+            description=(
+                "All slots have corrupted/invalid images after fault. "
+                "No known-good firmware remains: {}.".format(
+                    ", ".join(
+                        "{}={}".format(k, v)
+                        for k, v in sorted(slot_validity.items())
+                    )
+                )
+            ),
+            result=result,
+            details={
+                "slot_validity": slot_validity,
+                "fault_at": result.fault_at,
+                "boot_outcome": result.boot_outcome,
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -769,6 +903,8 @@ _ALL_INVARIANTS: List[InvariantFn] = [
     check_rollback_version_bounded,
     check_no_unauthorized_state_promotion,
     check_boot_registers_match,
+    check_boot_target_matches_metadata,
+    check_last_known_good_preserved,
 ]
 
 _INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
@@ -784,6 +920,8 @@ _INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
     "rollback_version_bounded": check_rollback_version_bounded,
     "no_unauthorized_state_promotion": check_no_unauthorized_state_promotion,
     "boot_registers_match": check_boot_registers_match,
+    "boot_target_matches_metadata": check_boot_target_matches_metadata,
+    "last_known_good_preserved": check_last_known_good_preserved,
 }
 _PROVIDER_CACHE: Dict[str, Dict[str, InvariantFn]] = {}
 
