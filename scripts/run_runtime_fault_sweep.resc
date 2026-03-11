@@ -93,6 +93,7 @@ $read_fault_bit_flips?="0"
 $read_fault_probability?="1.0"
 $read_fault_seed?="0"
 $success_criteria_overrides?=""
+$success_criteria_overrides_file?=""
 
 python """
 import json
@@ -369,25 +370,30 @@ if success_otadata_expect_scope not in ('always', 'control'):
     success_otadata_expect_scope = 'always'
 
 # Per-fault-type success criteria overrides.
-# Base64-encoded JSON dict mapping fault type names to partial criteria dicts.
-_success_criteria_overrides_raw = get_optional_var('success_criteria_overrides', '')
-log('DEBUG success_criteria_overrides_raw: [{}]'.format(repr(_success_criteria_overrides_raw)))
+# Prefer file-based transport (avoids Robot->Renode variable escaping).
+# Falls back to base64-encoded variable if no file is set.
 _success_criteria_overrides = {}
-if _success_criteria_overrides_raw:
+_overrides_file = get_optional_var('success_criteria_overrides_file', '')
+if _overrides_file:
     try:
-        import base64
-        _padded = _success_criteria_overrides_raw + '=' * (-len(_success_criteria_overrides_raw) % 4)
-        _decoded = base64.b64decode(_padded).decode()
-        _success_criteria_overrides = json.loads(_decoded)
-        if not isinstance(_success_criteria_overrides, dict):
-            log('WARNING: success_criteria_overrides is not a dict, ignoring')
-            _success_criteria_overrides = {}
-        else:
-            log('success_criteria_overrides: loaded {} fault type overrides'.format(
-                len(_success_criteria_overrides)))
+        with open(_overrides_file, 'r') as _f:
+            _success_criteria_overrides = json.loads(_f.read())
+        log('success_criteria_overrides: loaded {} fault type overrides from file'.format(
+            len(_success_criteria_overrides)))
     except Exception as e:
-        log('WARNING: failed to parse success_criteria_overrides: {}'.format(e))
-        _success_criteria_overrides = {}
+        log('WARNING: failed to read success_criteria_overrides_file: {}'.format(e))
+else:
+    _overrides_raw = get_optional_var('success_criteria_overrides', '')
+    if _overrides_raw:
+        try:
+            import base64
+            _padded = _overrides_raw + '=' * (-len(_overrides_raw) % 4)
+            _decoded = base64.b64decode(_padded).decode()
+            _success_criteria_overrides = json.loads(_decoded)
+            log('success_criteria_overrides: loaded {} fault type overrides from base64'.format(
+                len(_success_criteria_overrides)))
+        except Exception as e:
+            log('WARNING: failed to parse success_criteria_overrides: {}'.format(e))
 
 # Map single-char fault type codes to full fault type names for override lookup.
 _FAULT_CODE_TO_NAME = {
