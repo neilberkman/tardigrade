@@ -6,13 +6,18 @@
 #   execute — Full CPU boot: arm FaultAtWordWrite, machine Reset, RunFor.
 #             Slow but truly zero-knowledge.
 #
-# Two platform paths:
-#   slow (NVMemory + NVMemoryController) — per-write tracking via C# callbacks.
-#   fast (MappedMemory + NVMC CONFIG tracking) — write counting via NVMC
-#         CONFIG WEN->REN transitions.  Much faster for bootloaders that do
-#         significant flash reads (SHA-256 etc).
+# Three backend kinds (auto-detected from $flash_backend peripheral name):
+#   mram — MRAMMemory with word-level fault injection.
+#   fast — MappedMemory + NVMC CONFIG tracking; write counting via
+#          WEN->REN transitions.  Much faster for bootloaders with
+#          significant flash reads (SHA-256 etc).
+#   slow — NVMemory + NVMemoryController; per-write tracking via callbacks.
 #
-# The script auto-detects which path based on whether 'sysbus.nvm_ctrl' exists.
+# An optional separate NVM controller ($nvm_controller) enables command_drop
+# fault injection on any backend.
+#
+# All backend dispatch flows through a single `backend` dict resolved at
+# startup by resolve_backend().
 #
 # Batch mode: set $fault_points_csv to a comma-separated list of fault point
 # indices (e.g. "0,100,500,1000").  The script loops over all points in a
@@ -126,54 +131,84 @@ def get_optional_int_var(names, default=None):
     return default
 
 
-def refresh_runtime_handles():
-    global bus, _backend_obj, mram, faultFlash, ctrl
-    bus = monitor.Machine.SystemBus
-    _backend_obj = monitor.Machine[_backend_name]
-    if USE_MRAM_PATH:
-        mram = _backend_obj
-    elif USE_FAST_PATH:
-        faultFlash = _backend_obj
-    else:
-        ctrl = _backend_obj
-    # Refresh separate controller handle if configured.
-    if _nvm_controller_var:
-        ctrl = monitor.Machine[_ctrl_name]
-
 # ---------------------------------------------------------------------------
-# Flash backend selection.
+# Flash backend selection — unified backend object model.
+#
+# resolve_backend() determines the backend kind ('mram', 'fast', 'slow'),
+# resolves all peripheral handles, and pre-computes capabilities.  The
+# returned dict is the single source of truth for all backend dispatch.
 #
 # $flash_backend must name the sysbus peripheral (e.g. faultFlash, nvm_ctrl,
 # mram).  The profile YAML declares this; the resc looks it up and fails if
 # it is missing or incompatible.
 # ---------------------------------------------------------------------------
 
-USE_FAST_PATH = False
-USE_MRAM_PATH = False
+def resolve_backend():
+    flash_backend_var = str(monitor.GetVariable('flash_backend')).strip()
+    if not flash_backend_var:
+        raise Exception(
+            'flash_backend not set.  Every profile must declare '
+            'flash_backend: <sysbus-name> (e.g. faultFlash, nvm_ctrl, mram).'
+        )
 
-_flash_backend_var = str(monitor.GetVariable('flash_backend')).strip()
-if not _flash_backend_var:
-    raise Exception(
-        'flash_backend not set.  Every profile must declare '
-        'flash_backend: <sysbus-name> (e.g. faultFlash, nvm_ctrl, mram).'
-    )
+    backend_name = 'sysbus.' + flash_backend_var if not flash_backend_var.startswith('sysbus.') else flash_backend_var
+    try:
+        backend_obj = monitor.Machine[backend_name]
+    except:
+        raise Exception(
+            'flash_backend "{}" not found on sysbus. '
+            'Check that the platform .repl registers this peripheral.'.format(flash_backend_var)
+        )
 
-_backend_name = 'sysbus.' + _flash_backend_var if not _flash_backend_var.startswith('sysbus.') else _flash_backend_var
-try:
-    _backend_obj = monitor.Machine[_backend_name]
-except:
-    raise Exception(
-        'flash_backend "{}" not found on sysbus. '
-        'Check that the platform .repl registers this peripheral.'.format(_flash_backend_var)
-    )
+    # Classify the backend path.
+    if 'mram' in backend_name.lower():
+        kind = 'mram'
+    elif 'nvm_ctrl' in backend_name.lower():
+        kind = 'slow'
+    else:
+        kind = 'fast'
 
-# Classify the backend path.
-if 'mram' in _backend_name.lower():
-    USE_MRAM_PATH = True
-elif 'nvm_ctrl' in _backend_name.lower():
-    pass  # slow path (default)
-else:
-    USE_FAST_PATH = True
+    # Optional separate NVM controller (e.g. command-register controller in
+    # front of MRAM memory).  Enables command_drop fault injection.
+    controller = None
+    ctrl_sysbus_name = None
+    nvm_controller_var = str(monitor.GetVariable('nvm_controller')).strip()
+    if nvm_controller_var and nvm_controller_var.lower() not in ('', 'none'):
+        ctrl_sysbus_name = 'sysbus.' + nvm_controller_var if not nvm_controller_var.startswith('sysbus.') else nvm_controller_var
+        try:
+            controller = monitor.Machine[ctrl_sysbus_name]
+        except:
+            raise Exception(
+                'nvm_controller "{}" not found on sysbus. '
+                'Check that the platform .repl registers this peripheral.'.format(nvm_controller_var)
+            )
+
+    # Pre-compute command fault capability.
+    supports_command_fault = False
+    command_fault_reason = ''
+    if controller is None:
+        command_fault_reason = '{}_backend_no_command_controller'.format(kind)
+    else:
+        cmd_required = ['FaultAtCommandExecution', 'CommandFaultMode',
+                        'CommandFaultFired', 'CommandExecutions']
+        cmd_missing = [n for n in cmd_required if not hasattr(controller, n)]
+        if cmd_missing:
+            command_fault_reason = 'backend_missing_command_fault_properties: {}'.format(
+                ', '.join(cmd_missing))
+        else:
+            supports_command_fault = True
+
+    return {
+        'kind': kind,
+        'data': backend_obj,
+        'controller': controller,
+        'backend_sysbus_name': backend_name,
+        'ctrl_sysbus_name': ctrl_sysbus_name,
+        'supports_command_fault': supports_command_fault,
+        'command_fault_reason': command_fault_reason,
+    }
+
+backend = resolve_backend()
 
 _cached_erase_page = None
 _cached_initial_flash = None
@@ -181,28 +216,13 @@ _cached_phase1_snapshot_path = None
 _cached_recovery_snapshot_path = None
 _machine_selector = '0'
 
-ctrl = None
-if USE_MRAM_PATH:
-    mram = _backend_obj
-elif USE_FAST_PATH:
-    faultFlash = _backend_obj
-else:
-    ctrl = _backend_obj
 
-# Optional separate NVM controller (e.g. command-register controller in front
-# of MRAM memory).  Enables command_drop fault injection on MRAM paths.
-_nvm_controller_var = str(monitor.GetVariable('nvm_controller')).strip()
-if _nvm_controller_var and _nvm_controller_var.lower() not in ('', 'none'):
-    _ctrl_name = 'sysbus.' + _nvm_controller_var if not _nvm_controller_var.startswith('sysbus.') else _nvm_controller_var
-    try:
-        ctrl = monitor.Machine[_ctrl_name]
-    except:
-        raise Exception(
-            'nvm_controller "{}" not found on sysbus. '
-            'Check that the platform .repl registers this peripheral.'.format(_nvm_controller_var)
-        )
-
-HAS_CONTROLLER = ctrl is not None
+def refresh_runtime_handles():
+    global backend, bus
+    bus = monitor.Machine.SystemBus
+    backend['data'] = monitor.Machine[backend['backend_sysbus_name']]
+    if backend['ctrl_sysbus_name']:
+        backend['controller'] = monitor.Machine[backend['ctrl_sysbus_name']]
 
 # Read monitor variables.
 result_file = str(monitor.GetVariable('result_file'))
@@ -530,7 +550,7 @@ def disarm_vtor_watchpoint():
 # ---------------------------------------------------------------------------
 _hash_bypass_symbols_raw = str(monitor.GetVariable('hash_bypass_symbols')).strip()
 _hash_bypass_patches = []
-if _hash_bypass_symbols_raw and (USE_FAST_PATH or USE_MRAM_PATH):
+if _hash_bypass_symbols_raw and backend['kind'] in ('fast', 'mram'):
     for sym_name in _hash_bypass_symbols_raw.split(','):
         sym_name = sym_name.strip()
         if not sym_name:
@@ -866,10 +886,11 @@ def analyze_boot_cycles(cycle_records):
 
 
 def _snapshot_current_flash():
-    if USE_MRAM_PATH:
-        return mram.ReadBytes(0, int(mram.Size))
-    if USE_FAST_PATH:
-        return faultFlash.Flash.ReadBytes(0, int(faultFlash.FlashSize))
+    b = backend
+    if b['kind'] == 'mram':
+        return b['data'].ReadBytes(0, int(b['data'].Size))
+    if b['kind'] == 'fast':
+        return b['data'].Flash.ReadBytes(0, int(b['data'].FlashSize))
     return None
 
 
@@ -909,7 +930,8 @@ def _boot_followup_cycle(cycle_index, fault_injected, label):
 
 
 def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injected, label):
-    if not USE_FAST_PATH and not USE_MRAM_PATH:
+    b = backend
+    if b['kind'] == 'slow':
         return cycle_records, {
             'status': 'unsupported_fast_path_required',
             'requested_cycles': int(boot_cycles),
@@ -918,17 +940,17 @@ def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injec
 
     followup_t0 = _time.time()
     cpu_ref = monitor.Machine['sysbus.cpu']
-    if USE_MRAM_PATH:
-        flash_size = int(mram.Size)
+    if b['kind'] == 'mram':
+        flash_size = int(b['data'].Size)
     else:
-        flash_size = int(faultFlash.FlashSize)
+        flash_size = int(b['data'].FlashSize)
 
     for cycle_index in range(int(start_cycle_index), int(boot_cycles)):
         run_boot_cycle_hook(cycle_index, cycle_records)
-        if USE_MRAM_PATH:
-            current_flash = mram.ReadBytes(0, flash_size)
+        if b['kind'] == 'mram':
+            current_flash = b['data'].ReadBytes(0, flash_size)
         else:
-            current_flash = faultFlash.Flash.ReadBytes(0, flash_size)
+            current_flash = b['data'].Flash.ReadBytes(0, flash_size)
         restore_flash_and_boot(current_flash)
         if _hash_bypass_active:
             apply_hash_bypass()
@@ -1004,7 +1026,7 @@ def run_hook_fault(hook_fault_at, hook_fault_type='w'):
         return skipped_result('boot_cycles_not_enabled')
     if not boot_cycle_hook:
         return skipped_result('hook_not_configured')
-    if not (USE_FAST_PATH or USE_MRAM_PATH):
+    if backend['kind'] == 'slow':
         return skipped_result('unsupported_fast_path_required')
 
     log('hookfault at={} type={} phase1_setup'.format(hook_fault_at, hook_fault_type))
@@ -1136,11 +1158,12 @@ def run_hook_fault(hook_fault_at, hook_fault_type='w'):
     return result
 
 def effective_page_size():
-    if USE_MRAM_PATH:
-        return int(mram.WordSize)
-    if USE_FAST_PATH:
+    b = backend
+    if b['kind'] == 'mram':
+        return int(b['data'].WordSize)
+    if b['kind'] == 'fast':
         try:
-            p = int(faultFlash.PageSize)
+            p = int(b['data'].PageSize)
             if p > 0:
                 return p
         except Exception:
@@ -1159,17 +1182,18 @@ def flash_geometry():
     if slot_recovery_base is not None and slot_recovery_size is not None:
         slot_bases.append(int(slot_recovery_base))
         slot_ends.append(int(slot_recovery_base) + int(slot_recovery_size))
-    if USE_MRAM_PATH:
+    b = backend
+    if b['kind'] == 'mram':
         # Derive MRAM bus base by aligning lowest slot address down to
         # MRAM size boundary (MRAM size is always a power of two).
-        mram_size = int(mram.Size)
+        mram_size = int(b['data'].Size)
         lowest_slot = min(slot_bases)
         base = lowest_slot & ~(mram_size - 1)
         return base, mram_size
-    if USE_FAST_PATH:
-        return int(faultFlash.FlashBaseAddress), int(faultFlash.FlashSize)
+    if b['kind'] == 'fast':
+        return int(b['data'].FlashBaseAddress), int(b['data'].FlashSize)
     try:
-        return int(slot_exec_base), int(ctrl.Nvm.Size)
+        return int(slot_exec_base), int(b['data'].Nvm.Size)
     except Exception:
         flash_base = min(slot_bases)
         flash_end = max(slot_ends)
@@ -1187,10 +1211,11 @@ def read_flash_span(start_addr, size, snapshot_bytes=None):
         return b''
     if snapshot_bytes is not None:
         return bytes(snapshot_bytes[rel:rel + max_len])
-    if USE_MRAM_PATH:
-        return to_py_bytes(mram.ReadBytes(rel, max_len))
-    if USE_FAST_PATH:
-        return to_py_bytes(faultFlash.Flash.ReadBytes(rel, max_len))
+    b = backend
+    if b['kind'] == 'mram':
+        return to_py_bytes(b['data'].ReadBytes(rel, max_len))
+    if b['kind'] == 'fast':
+        return to_py_bytes(b['data'].Flash.ReadBytes(rel, max_len))
     return bytes([as_int(bus.ReadByte(start_addr + i)) & 0xFF for i in range(max_len)])
 
 def region_dump(region_bytes, region_addr):
@@ -1412,17 +1437,19 @@ def collect_otadata_signals():
     }
 
 # ---------------------------------------------------------------------------
-# Write tracking abstraction: slow path (NVMemory) vs fast path (NVMC).
+# Write tracking abstraction — dispatches on backend['kind'].
 # ---------------------------------------------------------------------------
 def get_total_writes():
-    if USE_MRAM_PATH:
-        return int(mram.TotalWordWrites)
-    if USE_FAST_PATH:
-        return int(faultFlash.TotalWordWrites)
-    return int(ctrl.Nvm.TotalWordWrites)
+    b = backend
+    if b['kind'] == 'mram':
+        return int(b['data'].TotalWordWrites)
+    if b['kind'] == 'fast':
+        return int(b['data'].TotalWordWrites)
+    return int(b['data'].Nvm.TotalWordWrites)
 
 def get_total_commands():
-    if not HAS_CONTROLLER:
+    ctrl = backend['controller']
+    if ctrl is None:
         return 0
     try:
         return int(ctrl.CommandExecutions)
@@ -1430,28 +1457,31 @@ def get_total_commands():
         return 0
 
 def get_total_erases():
-    if USE_MRAM_PATH:
+    b = backend
+    if b['kind'] == 'mram':
         return 0  # MRAM has no page erases.
-    if USE_FAST_PATH:
-        return int(faultFlash.TotalPageErases)
+    if b['kind'] == 'fast':
+        return int(b['data'].TotalPageErases)
     return 0  # Slow path doesn't track erases.
 
 def arm_fault(absolute_write_index, write_fault_mode=0):
-    if USE_MRAM_PATH:
-        mram.FaultAtWordWrite = absolute_write_index
-        mram.LastFaultInjected = False
-        mram.FaultEverFired = False
-    elif USE_FAST_PATH:
-        faultFlash.WriteFaultMode = write_fault_mode
-        faultFlash.FaultAtWordWrite = absolute_write_index
-        faultFlash.FaultFired = False
+    b = backend
+    if b['kind'] == 'mram':
+        b['data'].FaultAtWordWrite = absolute_write_index
+        b['data'].LastFaultInjected = False
+        b['data'].FaultEverFired = False
+    elif b['kind'] == 'fast':
+        b['data'].WriteFaultMode = write_fault_mode
+        b['data'].FaultAtWordWrite = absolute_write_index
+        b['data'].FaultFired = False
     else:
-        ctrl.Nvm.WriteFaultMode = write_fault_mode
-        ctrl.Nvm.FaultAtWordWrite = absolute_write_index
-        ctrl.Nvm.FaultEverFired = False
+        b['data'].Nvm.WriteFaultMode = write_fault_mode
+        b['data'].Nvm.FaultAtWordWrite = absolute_write_index
+        b['data'].Nvm.FaultEverFired = False
 
 def arm_controller_fault(absolute_command_index, command_fault_mode=1):
-    if not HAS_CONTROLLER:
+    ctrl = backend['controller']
+    if ctrl is None:
         return
     try:
         ctrl.FaultAtCommandExecution = absolute_command_index
@@ -1461,39 +1491,44 @@ def arm_controller_fault(absolute_command_index, command_fault_mode=1):
         pass
 
 def arm_erase_fault(absolute_erase_index, erase_fault_mode=0):
-    if USE_MRAM_PATH:
+    b = backend
+    if b['kind'] == 'mram':
         pass  # MRAM has no page erases.
-    elif USE_FAST_PATH:
-        faultFlash.EraseFaultMode = erase_fault_mode
-        faultFlash.FaultAtPageErase = absolute_erase_index
-        faultFlash.EraseFaultFired = False
+    elif b['kind'] == 'fast':
+        b['data'].EraseFaultMode = erase_fault_mode
+        b['data'].FaultAtPageErase = absolute_erase_index
+        b['data'].EraseFaultFired = False
 
 def disarm_fault():
-    if USE_MRAM_PATH:
-        mram.FaultAtWordWrite = 18446744073709551615
-    elif USE_FAST_PATH:
-        faultFlash.FaultAtWordWrite = 18446744073709551615
-        faultFlash.FaultAtPageErase = 18446744073709551615
+    b = backend
+    if b['kind'] == 'mram':
+        b['data'].FaultAtWordWrite = 18446744073709551615
+    elif b['kind'] == 'fast':
+        b['data'].FaultAtWordWrite = 18446744073709551615
+        b['data'].FaultAtPageErase = 18446744073709551615
     else:
-        ctrl.Nvm.FaultAtWordWrite = 18446744073709551615
+        b['data'].Nvm.FaultAtWordWrite = 18446744073709551615
         disarm_controller_fault()
 
 def disarm_write_fault():
-    if USE_MRAM_PATH:
-        mram.FaultAtWordWrite = 18446744073709551615
-    elif USE_FAST_PATH:
-        faultFlash.FaultAtWordWrite = 18446744073709551615
+    b = backend
+    if b['kind'] == 'mram':
+        b['data'].FaultAtWordWrite = 18446744073709551615
+    elif b['kind'] == 'fast':
+        b['data'].FaultAtWordWrite = 18446744073709551615
     else:
-        ctrl.Nvm.FaultAtWordWrite = 18446744073709551615
+        b['data'].Nvm.FaultAtWordWrite = 18446744073709551615
 
 def disarm_erase_fault():
-    if USE_MRAM_PATH:
+    b = backend
+    if b['kind'] == 'mram':
         pass  # MRAM has no page erases.
-    elif USE_FAST_PATH:
-        faultFlash.FaultAtPageErase = 18446744073709551615
+    elif b['kind'] == 'fast':
+        b['data'].FaultAtPageErase = 18446744073709551615
 
 def disarm_controller_fault():
-    if not HAS_CONTROLLER:
+    ctrl = backend['controller']
+    if ctrl is None:
         return
     try:
         ctrl.FaultAtCommandExecution = 18446744073709551615
@@ -1503,32 +1538,34 @@ def disarm_controller_fault():
         pass
 
 def was_fault_injected():
-    if USE_MRAM_PATH:
+    b = backend
+    if b['kind'] == 'mram':
         # FaultEverFired is a sticky flag set when any write fault fires
         # and never cleared by subsequent writes or disarm_fault().
-        # The old TotalWordWrites >= FaultAtWordWrite check broke when
-        # disarm_fault() reset FaultAtWordWrite before the check.
-        return bool(mram.FaultEverFired) or was_controller_fault_injected()
-    if USE_FAST_PATH:
-        return bool(faultFlash.FaultFired) or bool(faultFlash.EraseFaultFired) or was_controller_fault_injected()
-    return bool(ctrl.Nvm.FaultEverFired) or was_controller_fault_injected()
+        return bool(b['data'].FaultEverFired) or was_controller_fault_injected()
+    if b['kind'] == 'fast':
+        return bool(b['data'].FaultFired) or bool(b['data'].EraseFaultFired) or was_controller_fault_injected()
+    return bool(b['data'].Nvm.FaultEverFired) or was_controller_fault_injected()
 
 def was_write_fault_injected():
-    if USE_MRAM_PATH:
-        return bool(mram.FaultEverFired)
-    if USE_FAST_PATH:
-        return bool(faultFlash.FaultFired)
-    return bool(ctrl.Nvm.FaultEverFired) or was_controller_fault_injected()
+    b = backend
+    if b['kind'] == 'mram':
+        return bool(b['data'].FaultEverFired)
+    if b['kind'] == 'fast':
+        return bool(b['data'].FaultFired)
+    return bool(b['data'].Nvm.FaultEverFired) or was_controller_fault_injected()
 
 def was_erase_fault_injected():
-    if USE_MRAM_PATH:
+    b = backend
+    if b['kind'] == 'mram':
         return False  # MRAM has no page erases.
-    if USE_FAST_PATH:
-        return bool(faultFlash.EraseFaultFired)
+    if b['kind'] == 'fast':
+        return bool(b['data'].EraseFaultFired)
     return False
 
 def was_controller_fault_injected():
-    if not HAS_CONTROLLER:
+    ctrl = backend['controller']
+    if ctrl is None:
         return False
     try:
         return bool(ctrl.CommandFaultFired)
@@ -1536,17 +1573,19 @@ def was_controller_fault_injected():
         return False
 
 def get_last_write_address():
-    if USE_MRAM_PATH:
+    b = backend
+    if b['kind'] == 'mram':
         return 0  # MRAMMemory does not track fault address.
-    if USE_FAST_PATH:
+    if b['kind'] == 'fast':
         try:
-            return int(faultFlash.LastFaultAddress)
+            return int(b['data'].LastFaultAddress)
         except Exception:
             return 0
-    return int(ctrl.Nvm.LastWriteAddress)
+    return int(b['data'].Nvm.LastWriteAddress)
 
 def get_last_command_address():
-    if not HAS_CONTROLLER:
+    ctrl = backend['controller']
+    if ctrl is None:
         return 0
     try:
         return int(ctrl.LastCommandAddress)
@@ -1629,7 +1668,7 @@ def restore_hw_init():
     # Restore hardware init values cleared by machine Reset.
     # These are nRF52 NVMC/FICR registers needed for correct operation.
     # Skip for MRAM path — these addresses overlap MRAM and would corrupt data.
-    if USE_MRAM_PATH:
+    if backend['kind'] == 'mram':
         return
     bus.WriteDoubleWord(0x10000010, 0x1000)
     bus.WriteDoubleWord(0x10000014, 0x100)
@@ -1638,63 +1677,65 @@ def restore_hw_init():
 
 def reset_nvmc_for_sweep():
     # Reset NVM counters and prepare for fault-injected run.
-    if USE_MRAM_PATH:
-        mram.TotalWordWrites = 0
-        mram.LastFaultInjected = False
-        mram.FaultEverFired = False
+    b = backend
+    if b['kind'] == 'mram':
+        b['data'].TotalWordWrites = 0
+        b['data'].LastFaultInjected = False
+        b['data'].FaultEverFired = False
         return
-    if USE_FAST_PATH:
+    if b['kind'] == 'fast':
         # Keep default as full diff for index precision, but allow profile/CLI
         # overrides for performance experiments.
-        faultFlash.DiffLookahead = sweep_diff_lookahead
-        faultFlash.TotalWordWrites = 0
-        faultFlash.TotalPageErases = 0
-        faultFlash.WriteFaultMode = 0
-        faultFlash.EraseFaultMode = 0
-        faultFlash.FaultFired = False
-        faultFlash.EraseFaultFired = False
-        faultFlash.LastFaultAddress = 0
-        faultFlash.FaultFlashSnapshot = None
+        b['data'].DiffLookahead = sweep_diff_lookahead
+        b['data'].TotalWordWrites = 0
+        b['data'].TotalPageErases = 0
+        b['data'].WriteFaultMode = 0
+        b['data'].EraseFaultMode = 0
+        b['data'].FaultFired = False
+        b['data'].EraseFaultFired = False
+        b['data'].LastFaultAddress = 0
+        b['data'].FaultFlashSnapshot = None
         # Shadow scanning: enable for NRF52-style controllers (WEN batches
         # multiple writes, needs diff to count them).  Skip for STM32F4-style
         # controllers where each PG deactivation = exactly 1 word write —
         # shadow scanning adds 1MB ReadBytes per write with no accuracy benefit.
-        if getattr(faultFlash, 'PerWriteAccurate', False):
-            faultFlash.SkipShadowScan = True
+        if getattr(b['data'], 'PerWriteAccurate', False):
+            b['data'].SkipShadowScan = True
         else:
-            faultFlash.SkipShadowScan = False
-            faultFlash.InvalidateShadow()
-        faultFlash.PassthroughMode = False
+            b['data'].SkipShadowScan = False
+            b['data'].InvalidateShadow()
+        b['data'].PassthroughMode = False
     else:
-        ctrl.Nvm.TotalWordWrites = 0
-        ctrl.Nvm.FaultEverFired = False
+        b['data'].Nvm.TotalWordWrites = 0
+        b['data'].Nvm.FaultEverFired = False
         disarm_controller_fault()
 
 def reset_nvmc_for_recovery():
     # Reset NVM for recovery boot: no write counting needed, fast mode.
-    if USE_MRAM_PATH:
-        mram.TotalWordWrites = 0
-        mram.LastFaultInjected = False
-        mram.FaultEverFired = False
+    b = backend
+    if b['kind'] == 'mram':
+        b['data'].TotalWordWrites = 0
+        b['data'].LastFaultInjected = False
+        b['data'].FaultEverFired = False
         disarm_fault()
         return
-    if USE_FAST_PATH:
-        faultFlash.DiffLookahead = 32
-        faultFlash.TotalWordWrites = 0
-        faultFlash.TotalPageErases = 0
-        faultFlash.WriteFaultMode = 0
-        faultFlash.EraseFaultMode = 0
-        faultFlash.FaultFired = False
-        faultFlash.EraseFaultFired = False
-        faultFlash.LastFaultAddress = 0
+    if b['kind'] == 'fast':
+        b['data'].DiffLookahead = 32
+        b['data'].TotalWordWrites = 0
+        b['data'].TotalPageErases = 0
+        b['data'].WriteFaultMode = 0
+        b['data'].EraseFaultMode = 0
+        b['data'].FaultFired = False
+        b['data'].EraseFaultFired = False
+        b['data'].LastFaultAddress = 0
         # Skip shadow scanning during recovery boot — just count PG transitions
         # for progress tracking. Avoids O(flash_size) ReadBytes per write.
-        faultFlash.SkipShadowScan = True
-        faultFlash.PassthroughMode = True
+        b['data'].SkipShadowScan = True
+        b['data'].PassthroughMode = True
         disarm_fault()
     else:
-        ctrl.Nvm.TotalWordWrites = 0
-        ctrl.Nvm.FaultEverFired = False
+        b['data'].Nvm.TotalWordWrites = 0
+        b['data'].Nvm.FaultEverFired = False
         disarm_fault()
 
 
@@ -1720,11 +1761,12 @@ def restore_initial_flash_cache():
         monitor.Parse('machine Pause')
     except:
         pass
-    if _cached_initial_flash is not None and USE_MRAM_PATH:
-        mram.WriteBytes(0, _cached_initial_flash, 0, len(_cached_initial_flash))
+    b = backend
+    if _cached_initial_flash is not None and b['kind'] == 'mram':
+        b['data'].WriteBytes(0, _cached_initial_flash, 0, len(_cached_initial_flash))
         return True
-    if _cached_initial_flash is not None and USE_FAST_PATH:
-        faultFlash.Flash.WriteBytes(0, _cached_initial_flash)
+    if _cached_initial_flash is not None and b['kind'] == 'fast':
+        b['data'].Flash.WriteBytes(0, _cached_initial_flash)
         return True
     reload_images()
     apply_pre_boot_state()
@@ -1776,12 +1818,13 @@ def restore_flash_and_boot(saved_flash):
             save_machine_snapshot(_cached_recovery_snapshot_path)
         else:
             load_machine_snapshot(_cached_recovery_snapshot_path)
-    if USE_MRAM_PATH:
+    b = backend
+    if b['kind'] == 'mram':
         # MRAMMemory may or may not survive machine Reset depending on
         # vtable dispatch.  Always restore to be safe.
-        mram.WriteBytes(0, saved_flash, 0, len(saved_flash))
+        b['data'].WriteBytes(0, saved_flash, 0, len(saved_flash))
     else:
-        flash_ref = faultFlash.Flash
+        flash_ref = b['data'].Flash
         flash_ref.WriteBytes(0, saved_flash)
     # Do NOT re-run setup_script here.  The faulted snapshot is the
     # ground-truth state for the recovery boot — re-running setup would
@@ -1794,23 +1837,24 @@ def reload_images():
         monitor.Parse('machine Pause')
     except:
         pass
-    if USE_MRAM_PATH:
+    b = backend
+    if b['kind'] == 'mram':
         # MRAM erased state: fill with EraseFill byte (typically 0x00).
-        mram_size = int(mram.Size)
+        mram_size = int(b['data'].Size)
         import System
-        erase_fill = int(mram.EraseFill)
+        erase_fill = int(b['data'].EraseFill)
         erased = System.Array.CreateInstance(System.Byte, mram_size)
         if erase_fill != 0:
             for i in range(mram_size):
                 erased[i] = erase_fill
-        mram.WriteBytes(0, erased, 0, mram_size)
-    elif USE_FAST_PATH:
+        b['data'].WriteBytes(0, erased, 0, mram_size)
+    elif b['kind'] == 'fast':
         # Fast path: fill MappedMemory with 0xFF (erased state).
         # Use page-size chunks via NVMC ERASEPAGE for efficient fill.
-        flash_size = int(faultFlash.FlashSize)
-        flash_base = int(faultFlash.FlashBaseAddress)
-        page_size = int(faultFlash.PageSize)
-        flash_ref = faultFlash.Flash
+        flash_size = int(b['data'].FlashSize)
+        flash_base = int(b['data'].FlashBaseAddress)
+        page_size = int(b['data'].PageSize)
+        flash_ref = b['data'].Flash
         # Create one page of 0xFF, reuse for all pages.
         import System
         global _cached_erase_page
@@ -1830,11 +1874,11 @@ def reload_images():
                 flash_ref.WriteBytes(offset, partial)
     else:
         # Slow path: use NVMemory.EraseSector.
-        nvm_size = int(ctrl.Nvm.Size)
+        nvm_size = int(b['data'].Nvm.Size)
         sector = 4096
         for offset in range(0, nvm_size, sector):
             chunk = min(sector, nvm_size - offset)
-            ctrl.Nvm.EraseSector(offset, chunk)
+            b['data'].Nvm.EraseSector(offset, chunk)
     bus.LoadELF(bootloader_elf)
     if image_staging_path:
         bus.LoadBinary(image_staging_path, slot_staging_base)
@@ -1850,11 +1894,12 @@ def cache_initial_flash():
     # fault points can restore with a single bulk WriteBytes instead of
     # 244 page erases + 3 binary loads.
     global _cached_initial_flash
-    if USE_MRAM_PATH:
-        _cached_initial_flash = mram.ReadBytes(0, int(mram.Size))
-    elif USE_FAST_PATH:
-        flash_ref = faultFlash.Flash
-        _cached_initial_flash = flash_ref.ReadBytes(0, int(faultFlash.FlashSize))
+    b = backend
+    if b['kind'] == 'mram':
+        _cached_initial_flash = b['data'].ReadBytes(0, int(b['data'].Size))
+    elif b['kind'] == 'fast':
+        flash_ref = b['data'].Flash
+        _cached_initial_flash = flash_ref.ReadBytes(0, int(b['data'].FlashSize))
 
 def reload_images_cached():
     # Restore flash from cached snapshot if available; otherwise fall back
@@ -1864,10 +1909,11 @@ def reload_images_cached():
         monitor.Parse('machine Pause')
     except:
         pass
-    if _cached_initial_flash is not None and USE_MRAM_PATH:
-        mram.WriteBytes(0, _cached_initial_flash, 0, len(_cached_initial_flash))
-    elif _cached_initial_flash is not None and USE_FAST_PATH:
-        faultFlash.Flash.WriteBytes(0, _cached_initial_flash)
+    b = backend
+    if _cached_initial_flash is not None and b['kind'] == 'mram':
+        b['data'].WriteBytes(0, _cached_initial_flash, 0, len(_cached_initial_flash))
+    elif _cached_initial_flash is not None and b['kind'] == 'fast':
+        b['data'].Flash.WriteBytes(0, _cached_initial_flash)
     else:
         reload_images()
         apply_pre_boot_state()
@@ -1883,13 +1929,14 @@ def compute_exec_slot_hash():
     data_size = slot_exec_size - page_size
     if data_size <= 0:
         data_size = slot_exec_size
-    if USE_MRAM_PATH:
+    b = backend
+    if b['kind'] == 'mram':
         mram_base, _ = flash_geometry()
         offset = slot_exec_base - mram_base
-        data = bytes(mram.ReadBytes(offset, data_size))
-    elif USE_FAST_PATH:
-        flash_ref = faultFlash.Flash
-        flash_base_addr = int(faultFlash.FlashBaseAddress)
+        data = bytes(b['data'].ReadBytes(offset, data_size))
+    elif b['kind'] == 'fast':
+        flash_ref = b['data'].Flash
+        flash_base_addr = int(b['data'].FlashBaseAddress)
         offset = slot_exec_base - flash_base_addr
         data = bytes(flash_ref.ReadBytes(offset, data_size))
     else:
@@ -2048,8 +2095,8 @@ def run_state_fault(fault_at):
         dst = slot_exec_base + i * write_granularity
 
         if i == fault_at:
-            if not USE_FAST_PATH:
-                ctrl.InjectPartialWrite(dst)
+            if backend['kind'] == 'slow':
+                backend['data'].InjectPartialWrite(dst)
             fault_injected = True
             fault_address = dst
             actual_writes = i
@@ -2360,19 +2407,20 @@ def run_read_bit_flip_fault(fault_at):
         skip_reason = 'probability_gate'
         log('fp={} type=f SKIP: probability gate did not arm fault (p={})'.format(
             fault_at, read_fault_probability))
-    elif USE_MRAM_PATH:
+    elif backend['kind'] == 'mram':
         read_fault_address = target_address
         nvm_offset = read_fault_address - nvm_base_address
-        if 0 <= nvm_offset < int(mram.Size):
+        _rf_data = backend['data']
+        if 0 <= nvm_offset < int(_rf_data.Size):
             original_word = as_int(bus.ReadDoubleWord(read_fault_address))
-            mram.ReadFaultEnabled = True
-            mram.ReadFaultAddress = nvm_offset
-            mram.ReadFaultSeed = fault_seed & 0xFFFFFFFF
-            mram.ReadFaultFired = False
-            mram.ReadFaultSkipCount = 0
-            mram.ReadFaultTotalReads = 0
-            if hasattr(mram, 'ReadFaultBitFlips'):
-                mram.ReadFaultBitFlips = fault_bit_flips if fault_bit_flips > 0 else 1
+            _rf_data.ReadFaultEnabled = True
+            _rf_data.ReadFaultAddress = nvm_offset
+            _rf_data.ReadFaultSeed = fault_seed & 0xFFFFFFFF
+            _rf_data.ReadFaultFired = False
+            _rf_data.ReadFaultSkipCount = 0
+            _rf_data.ReadFaultTotalReads = 0
+            if hasattr(_rf_data, 'ReadFaultBitFlips'):
+                _rf_data.ReadFaultBitFlips = fault_bit_flips if fault_bit_flips > 0 else 1
             corrupted_word = _compute_read_bit_flip(original_word, fault_seed, fault_bit_flips)
             log('fp={} type=f armed nvm_offset=0x{:X} orig=0x{:08X} expected_corrupt=0x{:08X}'.format(
                 fault_at, nvm_offset, original_word, corrupted_word))
@@ -2383,7 +2431,7 @@ def run_read_bit_flip_fault(fault_at):
     else:
         read_fault_address = target_address
         nvm_offset = read_fault_address - nvm_base_address
-        nvm_ref = ctrl.Nvm
+        nvm_ref = backend['data'].Nvm
         if 0 <= nvm_offset < int(nvm_ref.Size):
             original_word = as_int(bus.ReadDoubleWord(read_fault_address))
             nvm_ref.ReadFaultEnabled = True
@@ -2446,11 +2494,11 @@ def run_read_bit_flip_fault(fault_at):
     phase1_ms = int((_time.time() - fp_t0) * 1000)
 
     # Disarm and check whether the fault actually fired (one-shot semantics).
-    if USE_MRAM_PATH:
-        mram.ReadFaultEnabled = False
-        read_fault_actually_fired = bool(mram.ReadFaultFired)
+    if backend['kind'] == 'mram':
+        backend['data'].ReadFaultEnabled = False
+        read_fault_actually_fired = bool(backend['data'].ReadFaultFired)
     else:
-        nvm_ref = ctrl.Nvm
+        nvm_ref = backend['data'].Nvm
         nvm_ref.ReadFaultEnabled = False
         read_fault_actually_fired = bool(nvm_ref.ReadFaultFired)
     fault_injected = read_fault_actually_fired
@@ -2563,8 +2611,9 @@ def ensure_read_fault_preflight():
     if read_fault_preflight.get('checked'):
         return read_fault_preflight
     read_fault_preflight['checked'] = True
+    b = backend
 
-    if USE_FAST_PATH:
+    if b['kind'] == 'fast':
         read_fault_preflight['backend'] = 'fast'
         read_fault_preflight['supported'] = False
         read_fault_preflight['reason'] = 'fast_path_no_read_intercept'
@@ -2572,8 +2621,8 @@ def ensure_read_fault_preflight():
             read_fault_preflight['reason']))
         return read_fault_preflight
 
-    backend_obj = mram if USE_MRAM_PATH else ctrl.Nvm
-    read_fault_preflight['backend'] = 'mram' if USE_MRAM_PATH else 'slow'
+    backend_obj = b['data'] if b['kind'] == 'mram' else b['data'].Nvm
+    read_fault_preflight['backend'] = b['kind']
     supported, reason = _read_fault_backend_support(backend_obj, read_fault_bit_flips)
     read_fault_preflight['supported'] = bool(supported)
     read_fault_preflight['reason'] = reason or ''
@@ -2603,12 +2652,10 @@ def _command_fault_backend_support(obj):
 
 
 def ensure_command_fault_preflight():
-    if USE_MRAM_PATH and not HAS_CONTROLLER:
-        return {'supported': False, 'reason': 'mram_backend_no_command_controller'}
-    if USE_FAST_PATH and not HAS_CONTROLLER:
-        return {'supported': False, 'reason': 'fast_path_no_command_controller'}
-    supported, reason = _command_fault_backend_support(ctrl)
-    return {'supported': bool(supported), 'reason': reason or ''}
+    return {
+        'supported': backend['supports_command_fault'],
+        'reason': backend['command_fault_reason'],
+    }
 
 
 def run_timed_reset_fault(fault_at):
@@ -2634,17 +2681,17 @@ def run_timed_reset_fault(fault_at):
 
     fault_injected = True
     fault_address = 0
-    actual_writes = get_total_writes() if (USE_FAST_PATH or USE_MRAM_PATH) else 0
+    actual_writes = get_total_writes() if backend['kind'] != 'slow' else 0
 
-    if USE_MRAM_PATH:
-        mram_size = int(mram.Size)
-        saved_flash = mram.ReadBytes(0, mram_size)
+    if backend['kind'] == 'mram':
+        mram_size = int(backend['data'].Size)
+        saved_flash = backend['data'].ReadBytes(0, mram_size)
         fault_snapshot_bytes = to_py_bytes(saved_flash)
         restore_flash_and_boot(saved_flash)
         reset_nvmc_for_recovery()
-    elif USE_FAST_PATH:
-        flash_ref = faultFlash.Flash
-        flash_size = int(faultFlash.FlashSize)
+    elif backend['kind'] == 'fast':
+        flash_ref = backend['data'].Flash
+        flash_size = int(backend['data'].FlashSize)
         saved_flash = flash_ref.ReadBytes(0, flash_size)
         fault_snapshot_bytes = to_py_bytes(saved_flash)
         restore_flash_and_boot(saved_flash)
@@ -2840,7 +2887,7 @@ def parse_erase_trace_map(trace_text):
     return mapping
 
 def run_resume_trace_from_snapshot(snapshot_flash, fault_at, fault_type):
-    if not USE_FAST_PATH:
+    if backend['kind'] != 'fast':
         return {
             'enabled': False,
             'reason': 'fast_path_required',
@@ -2854,11 +2901,11 @@ def run_resume_trace_from_snapshot(snapshot_flash, fault_at, fault_type):
     cpu_ref = monitor.Machine['sysbus.cpu']
     restore_flash_and_boot(snapshot_flash)
     reset_nvmc_for_recovery()
-    faultFlash.DiffLookahead = 2147483647
-    faultFlash.WriteTraceClear()
-    faultFlash.EraseTraceClear()
-    faultFlash.WriteTraceEnabled = True
-    faultFlash.EraseTraceEnabled = True
+    backend['data'].DiffLookahead = 2147483647
+    backend['data'].WriteTraceClear()
+    backend['data'].EraseTraceClear()
+    backend['data'].WriteTraceEnabled = True
+    backend['data'].EraseTraceEnabled = True
 
     op_events = []
     arm_vtor_watchpoint()
@@ -2875,10 +2922,10 @@ def run_resume_trace_from_snapshot(snapshot_flash, fault_at, fault_type):
     )
     disarm_vtor_watchpoint()
 
-    faultFlash.WriteTraceEnabled = False
-    faultFlash.EraseTraceEnabled = False
-    write_map = parse_write_trace_map(faultFlash.WriteTraceToString())
-    erase_map = parse_erase_trace_map(faultFlash.EraseTraceToString())
+    backend['data'].WriteTraceEnabled = False
+    backend['data'].EraseTraceEnabled = False
+    write_map = parse_write_trace_map(backend['data'].WriteTraceToString())
+    erase_map = parse_erase_trace_map(backend['data'].EraseTraceToString())
 
     enriched_ops = []
     for event in op_events:
@@ -2912,8 +2959,8 @@ def run_resume_trace_from_snapshot(snapshot_flash, fault_at, fault_type):
         'final_vtor': fmt_u32(vtor_value),
         'boot_outcome': boot_outcome,
         'boot_slot': boot_slot,
-        'total_writes': int(faultFlash.TotalWordWrites),
-        'total_erases': int(faultFlash.TotalPageErases),
+        'total_writes': int(backend['data'].TotalWordWrites),
+        'total_erases': int(backend['data'].TotalPageErases),
         'operation_count': len(enriched_ops),
         'nvm_operations': enriched_ops,
     }
@@ -3146,16 +3193,16 @@ def run_execute_fault(fault_at, fault_type='w'):
         fault_at, fault_type, fault_injected, phase1_ops, actual_writes))
     disarm_fault()
 
-    if (USE_FAST_PATH or USE_MRAM_PATH) and fault_injected:
+    if backend['kind'] != 'slow' and fault_injected:
         # Snapshot the faulted NVM state.
-        if USE_MRAM_PATH:
-            mram_size = int(mram.Size)
-            saved_flash = mram.ReadBytes(0, mram_size)
+        if backend['kind'] == 'mram':
+            mram_size = int(backend['data'].Size)
+            saved_flash = backend['data'].ReadBytes(0, mram_size)
             fault_snapshot_bytes = to_py_bytes(saved_flash)
         else:
-            flash_ref = faultFlash.Flash
-            flash_size = int(faultFlash.FlashSize)
-            saved_flash = faultFlash.FaultFlashSnapshot
+            flash_ref = backend['data'].Flash
+            flash_size = int(backend['data'].FlashSize)
+            saved_flash = backend['data'].FaultFlashSnapshot
             if saved_flash is None:
                 log('fp={} WARNING: no snapshot, falling back to current flash'.format(fault_at))
                 saved_flash = flash_ref.ReadBytes(0, flash_size)
@@ -3213,13 +3260,13 @@ def run_execute_fault(fault_at, fault_type='w'):
             # executing in the same boot attempt (no simulated reset).
             phase2_t0 = _time.time()
             monitor.Parse('machine Pause')
-            if USE_MRAM_PATH:
-                mram.WriteBytes(0, saved_flash, 0, len(saved_flash))
-                mram.LastFaultInjected = False
+            if backend['kind'] == 'mram':
+                backend['data'].WriteBytes(0, saved_flash, 0, len(saved_flash))
+                backend['data'].LastFaultInjected = False
             else:
                 flash_ref.WriteBytes(0, saved_flash)
-                faultFlash.FaultFired = False
-                faultFlash.EraseFaultFired = False
+                backend['data'].FaultFired = False
+                backend['data'].EraseFaultFired = False
             disarm_fault()
             cpu_ref.IsHalted = False
             log('fp={} phase1_continue_non_power'.format(fault_at))
@@ -3233,7 +3280,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             )
             disarm_vtor_watchpoint()
             phase2_ms = int((_time.time() - phase2_t0) * 1000)
-    elif not USE_FAST_PATH and fault_injected and is_power_loss_fault:
+    elif backend['kind'] == 'slow' and fault_injected and is_power_loss_fault:
         # Slow path power-loss: NVMemory is non-volatile and retains the
         # faulted write across machine Reset.  Reset CPU, reload bootloader
         # ELF and slot images (MappedMemory regions are cleared by reset,
@@ -3335,7 +3382,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         result['boot_cycles'] = boot_cycle_records
         result['multi_boot_analysis'] = multi_boot_analysis
 
-    if (USE_FAST_PATH or USE_MRAM_PATH) and fault_injected and is_power_loss_fault:
+    if backend['kind'] != 'slow' and fault_injected and is_power_loss_fault:
         if debug_trailer is not None:
             result['debug_trailer'] = debug_trailer
         result['recovery_writes'] = recovery_writes
@@ -3358,8 +3405,8 @@ def run_execute_fault(fault_at, fault_type='w'):
         result['resume_trace'] = resume_trace
 
     # Release large .NET byte[] to prevent memory exhaustion in batch mode.
-    if USE_FAST_PATH:
-        faultFlash.FaultFlashSnapshot = None
+    if backend['kind'] == 'fast':
+        backend['data'].FaultFlashSnapshot = None
 
     return result
 
@@ -3406,7 +3453,7 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
     log('cascade w={} phase1_done injected={} writes={} erases={}'.format(
         write_fault_at, p1_injected, p1_writes, p1_erases))
 
-    if not ((USE_FAST_PATH or USE_MRAM_PATH) and p1_injected):
+    if not (backend['kind'] != 'slow' and p1_injected):
         # Phase 1 didn't fire — return as non-injected.
         return {
             'fault_at': write_fault_at,
@@ -3426,9 +3473,9 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
         }
 
     # --- Phase 2: recovery boot with erase fault armed ---
-    flash_ref = faultFlash.Flash
-    flash_size = int(faultFlash.FlashSize)
-    saved_flash = faultFlash.FaultFlashSnapshot
+    flash_ref = backend['data'].Flash
+    flash_size = int(backend['data'].FlashSize)
+    saved_flash = backend['data'].FaultFlashSnapshot
     if saved_flash is None:
         saved_flash = flash_ref.ReadBytes(0, flash_size)
 
@@ -3459,7 +3506,7 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
         pass
     else:
         # --- Phase 3: boot from double-faulted state ---
-        saved_flash2 = faultFlash.FaultFlashSnapshot
+        saved_flash2 = backend['data'].FaultFlashSnapshot
         if saved_flash2 is None:
             saved_flash2 = flash_ref.ReadBytes(0, flash_size)
 
@@ -3488,8 +3535,8 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
     fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
 
     # Release large .NET byte[] to prevent memory exhaustion in batch mode.
-    if USE_FAST_PATH:
-        faultFlash.FaultFlashSnapshot = None
+    if backend['kind'] == 'fast':
+        backend['data'].FaultFlashSnapshot = None
 
     elapsed = _time.time() - fp_t0
     result = {
@@ -3561,7 +3608,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         log('p2fault p1={} type=t trigger_s={:.3f}'.format(p1_fault_at, trigger_s))
         monitor.Parse('emulation RunFor "{:.3f}"'.format(trigger_s))
         p1_injected = True  # Timed resets always "inject".
-        p1_ops = get_total_writes() if (USE_FAST_PATH or USE_MRAM_PATH) else 0
+        p1_ops = get_total_writes() if backend['kind'] != 'slow' else 0
     elif is_p1_erase:
         erase_mode = 1 if p1_fault_type == 'a' else 0
         base_erases = get_total_erases()
@@ -3611,7 +3658,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         p1_fault_at, p1_fault_type, p1_injected, p1_ops))
 
     phase2_skip_reason = None
-    if not (USE_FAST_PATH or USE_MRAM_PATH):
+    if backend['kind'] == 'slow':
         phase2_skip_reason = 'unsupported_backend'
     elif not p1_injected:
         phase2_skip_reason = 'phase1_fault_not_injected'
@@ -3643,14 +3690,14 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         }
 
     # Snapshot faulted NVM from Phase 1.
-    if USE_MRAM_PATH:
-        mram_size = int(mram.Size)
-        saved_flash_p1 = mram.ReadBytes(0, mram_size)
+    if backend['kind'] == 'mram':
+        mram_size = int(backend['data'].Size)
+        saved_flash_p1 = backend['data'].ReadBytes(0, mram_size)
     else:
-        saved_flash_p1 = faultFlash.FaultFlashSnapshot
+        saved_flash_p1 = backend['data'].FaultFlashSnapshot
         if saved_flash_p1 is None:
-            flash_ref = faultFlash.Flash
-            flash_size = int(faultFlash.FlashSize)
+            flash_ref = backend['data'].Flash
+            flash_size = int(backend['data'].FlashSize)
             saved_flash_p1 = flash_ref.ReadBytes(0, flash_size)
 
     # --- Phase 2: recovery boot with fault armed ---
@@ -3673,7 +3720,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
             p1_fault_at, p2_fault_at, p2_trigger_s))
         monitor.Parse('emulation RunFor "{:.3f}"'.format(p2_trigger_s))
         p2_injected = True  # Timed resets always "inject".
-        p2_ops = get_total_writes() if (USE_FAST_PATH or USE_MRAM_PATH) else 0
+        p2_ops = get_total_writes() if backend['kind'] != 'slow' else 0
     elif is_p2_erase:
         erase_mode = 1 if p2_fault_type == 'a' else 0
         arm_erase_fault(p2_fault_at + 1, erase_fault_mode=erase_mode)
@@ -3721,13 +3768,13 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     phase3_ms = 0
     p3_status = None
     if p2_injected:
-        if USE_MRAM_PATH:
-            saved_flash_p2 = mram.ReadBytes(0, mram_size)
+        if backend['kind'] == 'mram':
+            saved_flash_p2 = backend['data'].ReadBytes(0, mram_size)
         else:
-            saved_flash_p2 = faultFlash.FaultFlashSnapshot
+            saved_flash_p2 = backend['data'].FaultFlashSnapshot
             if saved_flash_p2 is None:
-                flash_ref = faultFlash.Flash
-                flash_size = int(faultFlash.FlashSize)
+                flash_ref = backend['data'].Flash
+                flash_size = int(backend['data'].FlashSize)
                 saved_flash_p2 = flash_ref.ReadBytes(0, flash_size)
 
         # --- Phase 3: boot from double-faulted state ---
@@ -3783,8 +3830,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     })
     fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
 
-    if USE_FAST_PATH:
-        faultFlash.FaultFlashSnapshot = None
+    if backend['kind'] == 'fast':
+        backend['data'].FaultFlashSnapshot = None
 
     elapsed = _time.time() - fp_t0
     result = {
@@ -3897,14 +3944,14 @@ def run_multi_fault_sequence(fault_sequence):
             per_fault_states.append(stage_state)
             break
 
-        if USE_MRAM_PATH:
-            mram_size = int(mram.Size)
-            saved_flash = mram.ReadBytes(0, mram_size)
+        if backend['kind'] == 'mram':
+            mram_size = int(backend['data'].Size)
+            saved_flash = backend['data'].ReadBytes(0, mram_size)
         else:
-            saved_flash = faultFlash.FaultFlashSnapshot
+            saved_flash = backend['data'].FaultFlashSnapshot
             if saved_flash is None:
-                flash_ref = faultFlash.Flash
-                flash_size = int(faultFlash.FlashSize)
+                flash_ref = backend['data'].Flash
+                flash_size = int(backend['data'].FlashSize)
                 saved_flash = flash_ref.ReadBytes(0, flash_size)
 
         per_fault_states.append(stage_state)
@@ -4008,8 +4055,8 @@ def run_multi_fault_sequence(fault_sequence):
         result['boot_cycles'] = boot_cycle_records
         result['multi_boot_analysis'] = multi_boot_analysis
 
-    if USE_FAST_PATH:
-        faultFlash.FaultFlashSnapshot = None
+    if backend['kind'] == 'fast':
+        backend['data'].FaultFlashSnapshot = None
 
     return result
 
@@ -4034,13 +4081,13 @@ def ensure_trace_replay_engine():
     if trace_replay_engine_attempted:
         return None
     trace_replay_engine_attempted = True
-    if not USE_FAST_PATH:
+    if backend['kind'] != 'fast':
         return None
     try:
         trace_replay_engine = monitor.Machine['sysbus.trace_replay']
         if trace_replay_engine.Target is None:
-            trace_replay_engine.Target = faultFlash.Flash
-            trace_replay_engine.TargetBaseAddress = int(faultFlash.FlashBaseAddress)
+            trace_replay_engine.Target = backend['data'].Flash
+            trace_replay_engine.TargetBaseAddress = int(backend['data'].FlashBaseAddress)
         log('trace_replay: native engine enabled')
         return trace_replay_engine
     except Exception as exc:
@@ -4119,15 +4166,15 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
             trace_file_bin_path,
             erase_trace_file_bin_path,
             stop_at,
-            int(faultFlash.PageSize),
-            int(faultFlash.EraseFill)
+            int(backend['data'].PageSize),
+            int(backend['data'].EraseFill)
         ))
     else:
         writes_applied = int(engine.Replay(trace_file_bin_path, stop_at))
 
     fault_injected = bool(engine.LastFaultEncountered)
     fault_address = int(engine.LastFaultAddress)
-    faulted_flash = faultFlash.Flash.ReadBytes(0, int(faultFlash.FlashSize))
+    faulted_flash = backend['data'].Flash.ReadBytes(0, int(backend['data'].FlashSize))
     fault_snapshot_bytes = to_py_bytes(faulted_flash)
     replay_ms = int((_time.time() - t_replay) * 1000)
     phase1_ms = int((_time.time() - fp_t0) * 1000)
@@ -4267,9 +4314,9 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 
     t_replay = _time.time()
     import System
-    flash_ref = faultFlash.Flash
-    flash_base_addr = int(faultFlash.FlashBaseAddress)
-    page_size = int(faultFlash.PageSize)
+    flash_ref = backend['data'].Flash
+    flash_base_addr = int(backend['data'].FlashBaseAddress)
+    page_size = int(backend['data'].PageSize)
 
     pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace_loaded]
     pending_erases.sort()
@@ -4311,7 +4358,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
             erase_buf[bi] = 0xFF
         flash_ref.WriteBytes(int(e_off), erase_buf)
         erase_idx += 1
-    faulted_flash = flash_ref.ReadBytes(0, int(faultFlash.FlashSize))
+    faulted_flash = flash_ref.ReadBytes(0, int(backend['data'].FlashSize))
     fault_snapshot_bytes = to_py_bytes(faulted_flash)
 
     replay_ms = int((_time.time() - t_replay) * 1000)
@@ -4423,7 +4470,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 # Fill AFTER images were loaded by robot suite — only the areas not covered
 # by LoadBinary need the fill.  Reload images after fill to restore them.
 # ---------------------------------------------------------------------------
-if USE_FAST_PATH or USE_MRAM_PATH:
+if backend['kind'] in ('fast', 'mram'):
     reload_images()
 
 # ---------------------------------------------------------------------------
@@ -4456,12 +4503,12 @@ if calibration_mode:
         # Force word-level diff for calibration so the count matches sweep.
         # Enable write trace to record (writeIndex, flashOffset) for heuristic.
         reset_nvmc_for_sweep()
-        if USE_FAST_PATH:
-            faultFlash.WriteTraceClear()
-            faultFlash.WriteTraceEnabled = True
+        if backend['kind'] == 'fast':
+            backend['data'].WriteTraceClear()
+            backend['data'].WriteTraceEnabled = True
             # Always capture erase trace — needed for trace replay correctness.
-            faultFlash.EraseTraceClear()
-            faultFlash.EraseTraceEnabled = True
+            backend['data'].EraseTraceClear()
+            backend['data'].EraseTraceEnabled = True
         log('calibration: starting step (fault_types={})'.format(fault_types_mode))
         base_writes = get_total_writes()
         base_erases = get_total_erases()
@@ -4485,13 +4532,13 @@ if calibration_mode:
         # Export write trace if available.
         trace_file = None
         trace_file_bin = None
-        if USE_FAST_PATH and faultFlash.WriteTraceEnabled:
-            faultFlash.WriteTraceEnabled = False
-            trace_count = faultFlash.WriteTraceCount
+        if backend['kind'] == 'fast' and backend['data'].WriteTraceEnabled:
+            backend['data'].WriteTraceEnabled = False
+            trace_count = backend['data'].WriteTraceCount
             if trace_count > 0:
                 trace_file = result_file.replace('.json', '_trace.csv')
                 trace_file_bin = result_file.replace('.json', '_trace.bin')
-                trace_data = faultFlash.WriteTraceToString()
+                trace_data = backend['data'].WriteTraceToString()
                 with open(trace_file, 'w') as tf:
                     tf.write('write_index,flash_offset,value\n')
                     with open(trace_file_bin, 'wb') as tfb:
@@ -4517,13 +4564,13 @@ if calibration_mode:
         # Export erase trace — always captured for trace replay correctness.
         erase_trace_file = None
         erase_trace_file_bin = None
-        if USE_FAST_PATH:
-            faultFlash.EraseTraceEnabled = False
-            erase_count = faultFlash.EraseTraceCount
+        if backend['kind'] == 'fast':
+            backend['data'].EraseTraceEnabled = False
+            erase_count = backend['data'].EraseTraceCount
             if erase_count > 0:
                 erase_trace_file = result_file.replace('.json', '_erase_trace.csv')
                 erase_trace_file_bin = result_file.replace('.json', '_erase_trace.bin')
-                erase_data = faultFlash.EraseTraceToString()
+                erase_data = backend['data'].EraseTraceToString()
                 with open(erase_trace_file, 'w') as ef:
                     ef.write('erase_index,flash_offset,writes_at_this_point,erase_size\n')
                     with open(erase_trace_file_bin, 'wb') as efb:
@@ -4543,7 +4590,7 @@ if calibration_mode:
                                 erase_idx = int(parts[0]) & 0xFFFFFFFF
                                 flash_off = int(parts[1]) & 0xFFFFFFFF
                                 writes_at = int(parts[2]) & 0xFFFFFFFF
-                                fallback_sz = int(faultFlash.PageSize) & 0xFFFFFFFF
+                                fallback_sz = int(backend['data'].PageSize) & 0xFFFFFFFF
                                 ef.write('{},{},{},{}\n'.format(erase_idx, flash_off, writes_at, fallback_sz))
                                 efb.write(struct.pack('<III', writes_at, flash_off, fallback_sz))
                                 erase_bin_count += 1
@@ -4595,7 +4642,7 @@ else:
         or (trace_file_path and _os.path.exists(trace_file_path))
     )
     use_trace_replay = (
-        USE_FAST_PATH
+        backend['kind'] == 'fast'
         and evaluation_mode == 'execute'
         and trace_source_exists
     )
@@ -4648,18 +4695,18 @@ else:
         # running a standard bit_corruption fault.
         elif ft.startswith('b:') and ft[2:].isdigit():
             cseed = int(ft[2:])
-            if USE_FAST_PATH:
-                faultFlash.CorruptionSeed = cseed
-            elif USE_MRAM_PATH:
+            if backend['kind'] == 'fast':
+                backend['data'].CorruptionSeed = cseed
+            elif backend['kind'] == 'mram':
                 pass  # MRAM uses built-in fault model.
             else:
-                ctrl.Nvm.CorruptionSeed = cseed
+                backend['data'].Nvm.CorruptionSeed = cseed
             results.append(run_execute_fault(fp, fault_type='b'))
             # Reset seed for subsequent points.
-            if USE_FAST_PATH:
-                faultFlash.CorruptionSeed = 0
-            elif not USE_MRAM_PATH:
-                ctrl.Nvm.CorruptionSeed = 0
+            if backend['kind'] == 'fast':
+                backend['data'].CorruptionSeed = 0
+            elif backend['kind'] != 'mram':
+                backend['data'].Nvm.CorruptionSeed = 0
         # Synthetic/non-default faults always use full execute mode
         # (not trace replay — they depend on NVMC peripheral state/PRNG).
         elif ft in ('e', 'a', 'b', 's', 'd', 'l', 'r', 't', 'f', 'k'):
@@ -4674,7 +4721,7 @@ else:
         # Force .NET GC periodically to prevent memory exhaustion.
         # Every-iteration GC is wasteful; every 10th iteration is sufficient
         # since the main allocations (flash snapshots) are reused via cache.
-        if USE_FAST_PATH and idx % 10 == 9:
+        if backend['kind'] == 'fast' and idx % 10 == 9:
             import System
             System.GC.Collect()
 
