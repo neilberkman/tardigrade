@@ -307,6 +307,12 @@ bootloader_entry = int(str(monitor.GetVariable('bootloader_entry')), 0)
 bootloader_elf = str(monitor.GetVariable('bootloader_elf')).strip()
 write_granularity = int(str(monitor.GetVariable('write_granularity')).strip())
 
+# NVM base address: the lowest address in the NVM region.  Used for converting
+# absolute bus addresses to peripheral-relative offsets (e.g. read fault
+# injection).  For MRAM the bootloader sits at MRAM offset 0, so
+# bootloader_entry == MRAM base.  For NRF52 flash starts at 0x0.
+nvm_base_address = min(bootloader_entry, slot_exec_base, slot_staging_base)
+
 # Image paths for reload between batch iterations.
 image_staging_path = str(monitor.GetVariable('image_staging_path')).strip()
 image_exec_path = str(monitor.GetVariable('image_exec_path')).strip()
@@ -1363,6 +1369,7 @@ def arm_fault(absolute_write_index, write_fault_mode=0):
     if USE_MRAM_PATH:
         mram.FaultAtWordWrite = absolute_write_index
         mram.LastFaultInjected = False
+        mram.FaultEverFired = False
     elif USE_FAST_PATH:
         faultFlash.WriteFaultMode = write_fault_mode
         faultFlash.FaultAtWordWrite = absolute_write_index
@@ -1426,18 +1433,18 @@ def disarm_controller_fault():
 
 def was_fault_injected():
     if USE_MRAM_PATH:
-        # LastFaultInjected is cleared on every subsequent write (line 188
-        # of MRAMMemory.cs), so it's only true if the fault was the LAST
-        # write.  Use TotalWordWrites >= FaultAtWordWrite as a sticky check:
-        # if we reached or passed the armed index, the fault fired.
-        return int(mram.TotalWordWrites) >= int(mram.FaultAtWordWrite) or was_controller_fault_injected()
+        # FaultEverFired is a sticky flag set when any write fault fires
+        # and never cleared by subsequent writes or disarm_fault().
+        # The old TotalWordWrites >= FaultAtWordWrite check broke when
+        # disarm_fault() reset FaultAtWordWrite before the check.
+        return bool(mram.FaultEverFired) or was_controller_fault_injected()
     if USE_FAST_PATH:
         return bool(faultFlash.FaultFired) or bool(faultFlash.EraseFaultFired) or was_controller_fault_injected()
     return bool(ctrl.Nvm.FaultEverFired) or was_controller_fault_injected()
 
 def was_write_fault_injected():
     if USE_MRAM_PATH:
-        return int(mram.TotalWordWrites) >= int(mram.FaultAtWordWrite)
+        return bool(mram.FaultEverFired)
     if USE_FAST_PATH:
         return bool(faultFlash.FaultFired)
     return bool(ctrl.Nvm.FaultEverFired) or was_controller_fault_injected()
@@ -1563,6 +1570,7 @@ def reset_nvmc_for_sweep():
     if USE_MRAM_PATH:
         mram.TotalWordWrites = 0
         mram.LastFaultInjected = False
+        mram.FaultEverFired = False
         return
     if USE_FAST_PATH:
         # Keep default as full diff for index precision, but allow profile/CLI
@@ -1596,6 +1604,7 @@ def reset_nvmc_for_recovery():
     if USE_MRAM_PATH:
         mram.TotalWordWrites = 0
         mram.LastFaultInjected = False
+        mram.FaultEverFired = False
         disarm_fault()
         return
     if USE_FAST_PATH:
@@ -2269,7 +2278,7 @@ def run_read_bit_flip_fault(fault_at):
             fault_at, read_fault_probability))
     elif USE_MRAM_PATH:
         read_fault_address = target_address
-        nvm_offset = read_fault_address - slot_exec_base
+        nvm_offset = read_fault_address - nvm_base_address
         if 0 <= nvm_offset < int(mram.Size):
             original_word = as_int(bus.ReadDoubleWord(read_fault_address))
             mram.ReadFaultEnabled = True
@@ -2289,7 +2298,7 @@ def run_read_bit_flip_fault(fault_at):
                 fault_at, read_fault_address))
     else:
         read_fault_address = target_address
-        nvm_offset = read_fault_address - slot_exec_base
+        nvm_offset = read_fault_address - nvm_base_address
         nvm_ref = ctrl.Nvm
         if 0 <= nvm_offset < int(nvm_ref.Size):
             original_word = as_int(bus.ReadDoubleWord(read_fault_address))
