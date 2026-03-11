@@ -761,6 +761,7 @@ class ProfileConfig:
         invariant_providers: Optional[List[str]] = None,
         invariant_config: Optional[Dict[str, Any]] = None,
         flash_backend: Optional[str] = None,
+        nvm_controller: Optional[str] = None,
         initial_states: Optional[List["InitialStateConfig"]] = None,
         metadata_fault_regions: Optional[List[MetadataFaultRegion]] = None,
         multi_component: Optional["MultiComponentConfig"] = None,
@@ -792,6 +793,7 @@ class ProfileConfig:
         self.invariant_providers = invariant_providers or []
         self.invariant_config = invariant_config or {}
         self.flash_backend = flash_backend
+        self.nvm_controller = nvm_controller
         self.security_policy = security_policy or SecurityPolicyConfig()
         self.initial_states: List[InitialStateConfig] = initial_states or []
         self.metadata_fault_regions: List[MetadataFaultRegion] = metadata_fault_regions or []
@@ -1091,6 +1093,12 @@ class ProfileConfig:
         if self.flash_backend:
             vars_list.append("FLASH_BACKEND:{}".format(self.flash_backend))
 
+        # NVM controller: optional separate command-based controller peripheral
+        # (e.g. for MRAM platforms where flash_backend is the memory, not the
+        # controller).  Enables command_drop fault injection on MRAM paths.
+        if self.nvm_controller:
+            vars_list.append("NVM_CONTROLLER:{}".format(self.nvm_controller))
+
         # Extra peripherals: comma-separated list of .cs files to compile
         # before platform loading (e.g. controller stubs for custom SoCs).
         if self.extra_peripherals:
@@ -1341,6 +1349,7 @@ def _warn_fault_backend_compat(
     fs: FaultSweepConfig,
     platform: str,
     flash_backend: Optional[str],
+    nvm_controller: Optional[str] = None,
 ) -> None:
     """Emit warnings when fault_types are likely incompatible with the backend.
 
@@ -1385,9 +1394,12 @@ def _warn_fault_backend_compat(
             )
 
     # command_drop: only supported on GenericNvmController (command-based).
+    # Also satisfied by an explicit nvm_controller field (separate controller
+    # peripheral on MRAM platforms).
     if "command_drop" in all_types:
         looks_gfc = (
-            "gfc" in platform_lower or "gfc" in backend_lower
+            nvm_controller is not None
+            or "gfc" in platform_lower or "gfc" in backend_lower
             or "nvm_ctrl" in backend_lower or "generic_nvm" in backend_lower
             or "nvm_ctrl" in platform_lower or "generic_nvm" in platform_lower
         )
@@ -2324,6 +2336,9 @@ def load_profile(path: str | Path) -> ProfileConfig:
     flash_backend_raw = data.get("flash_backend")
     flash_backend: Optional[str] = str(flash_backend_raw) if flash_backend_raw is not None else None
 
+    nvm_controller_raw = data.get("nvm_controller")
+    nvm_controller: Optional[str] = str(nvm_controller_raw) if nvm_controller_raw is not None else None
+
     extra_peripherals_raw = data.get("extra_peripherals")
     extra_peripherals: Optional[List[str]] = None
     if extra_peripherals_raw is not None:
@@ -2382,7 +2397,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
     # based on the ``platform`` and ``flash_backend`` strings.  A definitive
     # check would require querying Renode's sysbus after machine creation,
     # which is outside the scope of the profile loader.
-    _warn_fault_backend_compat(fault_sweep, platform, flash_backend)
+    _warn_fault_backend_compat(fault_sweep, platform, flash_backend, nvm_controller)
 
     profile = ProfileConfig(
         schema_version=schema_version,
@@ -2409,6 +2424,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         invariant_providers=invariant_providers,
         invariant_config=invariant_config,
         flash_backend=flash_backend,
+        nvm_controller=nvm_controller,
         initial_states=initial_states,
         metadata_fault_regions=metadata_fault_regions,
         multi_component=multi_component,
