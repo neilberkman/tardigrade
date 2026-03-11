@@ -1838,7 +1838,7 @@ def _parse_metadata_fault(raw):
             raw_types = [raw_types]
         if not isinstance(raw_types, list):
             raise ProfileError("metadata_fault.fault_types: expected list of strings")
-        valid_mf_types = {"power_loss", "bit_corruption"}
+        valid_mf_types = {"power_loss", "bit_corruption", "command_drop"}
         fault_types = []
         for ft in raw_types:
             ft_str = str(ft).strip()
