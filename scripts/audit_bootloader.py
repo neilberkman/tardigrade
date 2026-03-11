@@ -2893,6 +2893,30 @@ def main() -> int:
         if args.no_hash_bypass:
             robot_vars = [v for v in robot_vars if not v.startswith("HASH_BYPASS_SYMBOLS:")]
 
+        # Write success_criteria_overrides to a temp file so the .resc can
+        # read it directly, bypassing Robot→Renode variable escaping issues.
+        _overrides_file = None
+        _overrides_prefix = "SUCCESS_CRITERIA_OVERRIDES:"
+        for rv in robot_vars:
+            if rv.startswith(_overrides_prefix):
+                import base64
+                b64_val = rv[len(_overrides_prefix):]
+                padded = b64_val + "=" * (-len(b64_val) % 4)
+                raw_json = base64.b64decode(padded).decode()
+                _overrides_file = tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".json", prefix="tardigrade_overrides_",
+                    delete=False,
+                )
+                _overrides_file.write(raw_json)
+                _overrides_file.close()
+                robot_vars = [
+                    v for v in robot_vars if not v.startswith(_overrides_prefix)
+                ]
+                robot_vars.append(
+                    "SUCCESS_CRITERIA_OVERRIDES_FILE:{}".format(_overrides_file.name)
+                )
+                break
+
         # -------------------------------------------------------------------
         # Multi-component dispatch
         # -------------------------------------------------------------------

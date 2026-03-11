@@ -75,6 +75,7 @@ ${ENABLE_MACHINE_SNAPSHOTS}    false
 ${PHASE2_FAULT_ENABLED}        false
 ${PHASE2_FAULT_MAX_POINTS}     0
 ${SUCCESS_CRITERIA_OVERRIDES}    ${EMPTY}
+${SUCCESS_CRITERIA_OVERRIDES_FILE}    ${EMPTY}
 ${TEST_TIMEOUT}                2 minutes
 
 *** Keywords ***
@@ -174,6 +175,7 @@ Run Runtime Fault Point
     Execute Command    $resume_trace_time_slice="${RESUME_TRACE_TIME_SLICE}"
     Execute Command    $resume_trace_wall_timeout_s="${RESUME_TRACE_WALL_TIMEOUT_S}"
     Run Keyword If    '${SUCCESS_CRITERIA_OVERRIDES}' != ''    Execute Command    $success_criteria_overrides="${SUCCESS_CRITERIA_OVERRIDES}"
+    Run Keyword If    '${SUCCESS_CRITERIA_OVERRIDES_FILE}' != ''    Execute Command    $success_criteria_overrides_file="${SUCCESS_CRITERIA_OVERRIDES_FILE}"
 
     Execute Script    ${ROOT}/scripts/run_runtime_fault_sweep.resc
 
