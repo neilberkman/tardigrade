@@ -177,28 +177,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             data[offset + 3] = (byte)(value >> 24);
         }
 
-        // --- Read-fault utilities ---
-
-        /// <summary>
-        /// Apply deterministic single-bit flips to a 32-bit value.
-        /// Flips 1-3 bits based on the seed.  Does NOT modify NVM content.
-        /// </summary>
-        public static uint ApplyReadBitFlip(uint value, uint seed)
-        {
-            if(seed == 0)
-            {
-                seed = 0xDEAD;
-            }
-            var flipCount = 1 + (int)(seed % 3);
-            for(var i = 0; i < flipCount; i++)
-            {
-                seed = seed * 1103515245u + 12345u;
-                var bitPos = (int)(seed % 32);
-                value ^= (1u << bitPos);
-            }
-            return value;
-        }
-
         // --- Private trace storage ---
         private readonly List<Tuple<ulong, int, uint>> writeTrace = new List<Tuple<ulong, int, uint>>();
         private readonly List<Tuple<ulong, long, ulong, int>> eraseTrace = new List<Tuple<ulong, long, ulong, int>>();

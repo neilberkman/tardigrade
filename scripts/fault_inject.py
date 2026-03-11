@@ -237,6 +237,7 @@ class FaultResult:
     is_control: bool = False
     fault_region: Optional[str] = None
     elapsed_virtual_time_s: Optional[float] = None
+    fault_sequence: Optional[List[int]] = None
 
 
 @dataclasses.dataclass
@@ -574,8 +575,16 @@ def generate_pairwise_interesting(
     if exhaustive:
         seqs = [list(c) for c in itertools.combinations(pts, k)]
     else:
-        # Deterministic truncation: lazily iterate and stop at cap.
-        seqs = [list(c) for c in itertools.islice(itertools.combinations(pts, k), max_pairs)]
+        # Random sampling to avoid bias toward low-index combinations.
+        # Sample without materializing all C(n,k) combinations.
+        rng = random.Random(42)
+        seen: Set[Tuple[int, ...]] = set()
+        seqs = []
+        while len(seqs) < max_pairs:
+            combo = tuple(sorted(rng.sample(range(len(pts)), k)))
+            if combo not in seen:
+                seen.add(combo)
+                seqs.append([pts[i] for i in combo])
 
     return MultiFaultPlan(
         sequences=seqs,
@@ -776,7 +785,7 @@ def maybe_apply_fallback(
     )
     return MultiFaultPlan(
         sequences=fallback_plan.sequences,
-        strategy=primary_plan.strategy,
+        strategy=fallback_plan.strategy,
         interesting_point_count=primary_plan.interesting_point_count,
         max_faults_per_run=max_faults_per_run,
         seed=seed,

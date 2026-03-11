@@ -1158,16 +1158,14 @@ class ProfileConfig:
             for chk in sc.config_checks:
                 parts: List[str] = ["addr=0x{:X}".format(chk.address)]
                 if chk.expected is not None:
-                    parts.append("expected=0x{:02X}".format(chk.expected & 0xFF))
+                    parts.append("expected=0x{:08X}".format(chk.expected))
                 if chk.nonzero:
                     parts.append("nonzero=true")
                 if chk.mask is not None:
-                    parts.append("mask=0x{:02X}".format(chk.mask & 0xFF))
+                    parts.append("mask=0x{:08X}".format(chk.mask))
                 if chk.expected_masked is not None:
                     parts.append(
-                        "expected_masked=0x{:02X}".format(
-                            chk.expected_masked & 0xFF
-                        )
+                        "expected_masked=0x{:08X}".format(chk.expected_masked)
                     )
                 check_parts.append(",".join(parts))
             vars_list.append(
@@ -1337,6 +1335,71 @@ def _parse_heuristic_config(raw: Optional[Dict[str, Any]]) -> Optional[Heuristic
         shard_index=int(raw.get("shard_index", 0)),
         random_tail_budget=int(raw.get("random_tail_budget", 0)),
     )
+
+
+def _warn_fault_backend_compat(
+    fs: FaultSweepConfig,
+    platform: str,
+    flash_backend: Optional[str],
+) -> None:
+    """Emit warnings when fault_types are likely incompatible with the backend.
+
+    ``read_bit_flip`` requires NVMemory (the slow-path peripheral that
+    intercepts individual reads).  ``command_drop`` requires a
+    GenericNvmController (command-based flash controller).
+
+    The profile loader cannot definitively determine the Renode peripheral
+    class — that is resolved at runtime from the .repl file.  This check
+    uses heuristics on ``platform`` and ``flash_backend`` to catch obvious
+    mismatches early.  A runtime preflight in the audit harness could
+    query ``sysbus.WhatIsAt`` for a definitive check, but that is outside
+    the profile loader's scope.
+    """
+    import warnings
+
+    # Collect every fault_type referenced across all sub-configs.
+    all_types: set = set(fs.fault_types)
+    if fs.phase2_fault:
+        all_types.update(fs.phase2_fault.fault_types)
+    if fs.hook_fault:
+        all_types.update(fs.hook_fault.fault_types)
+    if fs.metadata_fault:
+        all_types.update(fs.metadata_fault.fault_types)
+
+    platform_lower = platform.lower()
+    backend_lower = flash_backend.lower() if flash_backend else ""
+
+    # read_bit_flip: only supported on NVMemory (slow-path peripheral).
+    # MappedMemory, NVMC, MRAM backends do not intercept reads.
+    if "read_bit_flip" in all_types:
+        is_nvm_slow = "nvm" in platform_lower and "nvmc" not in platform_lower
+        if backend_lower:
+            # If flash_backend is explicitly set, check it directly.
+            is_nvm_slow = "nvm" in backend_lower and "nvmc" not in backend_lower
+        if not is_nvm_slow:
+            warnings.warn(
+                "fault_type 'read_bit_flip' requires an NVMemory (slow-path) "
+                "backend, but platform '{}' / flash_backend '{}' does not "
+                "appear to use one. Read-fault injection may silently do "
+                "nothing.".format(platform, flash_backend or "(not set)")
+            )
+
+    # command_drop: only supported on GenericNvmController (command-based).
+    if "command_drop" in all_types:
+        looks_gfc = (
+            "gfc" in platform_lower or "gfc" in backend_lower
+            or "nvm_ctrl" in backend_lower or "generic_nvm" in backend_lower
+            or "nvm_ctrl" in platform_lower or "generic_nvm" in platform_lower
+        )
+        if not looks_gfc:
+            warnings.warn(
+                "fault_type 'command_drop' requires a GenericNvmController "
+                "(command-based) backend, but platform '{}' / flash_backend "
+                "'{}' does not appear to use one. Command-drop fault "
+                "injection may silently do nothing.".format(
+                    platform, flash_backend or "(not set)"
+                )
+            )
 
 
 def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
@@ -2312,6 +2375,14 @@ def load_profile(path: str | Path) -> ProfileConfig:
             "NVMemory instruction fetch is too slow for CPU emulation. "
             "Use evaluation_mode 'state' or switch to a MappedMemory/hybrid platform.".format(platform)
         )
+
+    # Warn when fault_types require a specific backend that the profile hints
+    # it doesn't have.  The actual Renode peripheral class is only known at
+    # runtime (determined by the .repl/.resc files), so this is best-effort
+    # based on the ``platform`` and ``flash_backend`` strings.  A definitive
+    # check would require querying Renode's sysbus after machine creation,
+    # which is outside the scope of the profile loader.
+    _warn_fault_backend_compat(fault_sweep, platform, flash_backend)
 
     profile = ProfileConfig(
         schema_version=schema_version,

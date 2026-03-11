@@ -463,7 +463,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     continue;
                 }
                 var oldWord = ReadWordFromShadow(offset);
-                var disturbed = oldWord & 0xEEEEEEEEU;
+                var seed = tracker.BuildFaultSeed((int)offset);
+                var disturbMask = FaultTracker.NextLcg(ref seed) & 0x11111111U;
+                var disturbed = oldWord & ~disturbMask;
                 var bytes = FaultTracker.WordToBytes(disturbed);
                 Flash.WriteBytes(offset, bytes, 0, bytes.Length, this);
                 WriteSnapshotBytes(offset, bytes);
@@ -483,7 +485,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     continue;
                 }
                 var oldWord = ReadWordFromShadow(candidate);
-                var corrupted = oldWord & ~(1u << (int)(FaultTracker.NextLcg(ref seed) % 31));
+                var corrupted = oldWord & ~(1u << (int)(FaultTracker.NextLcg(ref seed) % 32));
                 var bytes = FaultTracker.WordToBytes(corrupted);
                 Flash.WriteBytes(candidate, bytes, 0, bytes.Length, this);
                 WriteSnapshotBytes(candidate, bytes);

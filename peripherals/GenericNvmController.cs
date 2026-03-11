@@ -234,6 +234,18 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return;
             }
 
+            // Cross-suppression: if any fault has already fired (write fault on
+            // the underlying NVMemory, or a command-drop fault on this controller),
+            // silently drop all subsequent commands.  This matches the behavior of
+            // NRF52NVMC and STM32F4FlashController which suppress all operations
+            // after AnyFaultFired.
+            if(Nvm.FaultEverFired || commandFaultFired)
+            {
+                statusRegisterValue = SuccessStatusValue;
+                registers[StatusRegisterOffset] = statusRegisterValue;
+                return;
+            }
+
             try
             {
                 var nvmOffset = NormalizeAddress((long)addressRegisterValue);

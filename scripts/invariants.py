@@ -52,6 +52,11 @@ class InvariantViolation(Exception):
         self.description = description
         self.result = result
         self.details = details or {}
+        # Surface multi-fault sequence in details so violations aren't
+        # misattributed to only the first fault point.
+        fault_seq = getattr(result, "fault_sequence", None)
+        if fault_seq is not None and "fault_sequence" not in self.details:
+            self.details["fault_sequence"] = fault_seq
         super().__init__(f"{invariant_name}: {description}")
 
 
@@ -125,8 +130,14 @@ def check_boot_matches_metadata(result: FaultResult, **_: Any) -> None:
     if requested is None or chosen is None:
         return
 
-    slot_a_valid = nvm.get("replica0_valid", nvm.get("slot_a_valid"))
-    slot_b_valid = nvm.get("replica1_valid", nvm.get("slot_b_valid"))
+    slot_a_valid = nvm.get("slot_a_valid")
+    slot_b_valid = nvm.get("slot_b_valid")
+
+    # If slot validity flags are not present, skip rather than falling back
+    # to replica0_valid/replica1_valid — those are metadata CRC checks, not
+    # vector table checks (see check_at_least_one_bootable).
+    if slot_a_valid is None or slot_b_valid is None:
+        return
 
     # Only meaningful when both slots are valid — if one is corrupt the
     # bootloader is free to fall back.
@@ -410,19 +421,25 @@ def check_metadata_seq_monotonic(
     if not isinstance(nvm, dict):
         return
 
+    def _parse_int(val: Any) -> int:
+        """Parse an int that may be a hex string like '0xFFFFFFFF'."""
+        if isinstance(val, str):
+            return int(val, 0)
+        return int(val)
+
     def _max_seq(state: Dict[str, Any]) -> Optional[int]:
         active = state.get("active_seq")
         if active is not None:
-            return int(active)
+            return _parse_int(active)
         r0 = state.get("replica0_seq")
         r1 = state.get("replica1_seq")
         if r0 is None and r1 is None:
             return None
         vals = []
         if r0 is not None:
-            vals.append(int(r0))
+            vals.append(_parse_int(r0))
         if r1 is not None:
-            vals.append(int(r1))
+            vals.append(_parse_int(r1))
         return max(vals) if vals else None
 
     pre_seq = _max_seq(pre_state)
@@ -711,6 +728,11 @@ def run_invariants(
             check_fn(result, **context)
         except InvariantViolation as v:
             violations.append(v)
+        except (ValueError, TypeError):
+            # Don't crash the entire invariant run if a state probe returns
+            # unparseable values (e.g. hex strings, unexpected types).
+            # The individual invariant is simply skipped.
+            pass
     return violations
 
 

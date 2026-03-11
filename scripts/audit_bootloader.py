@@ -45,6 +45,7 @@ from fault_inject import (
     apply_clustered_distribution,
     classify_fault_region,
     classify_multi_component_outcome,
+    decode_multi_fault_sequence,
     encode_multi_fault_sequence,
     generate_multi_fault_sequences,
     multi_fault_plan_summary,
@@ -1161,6 +1162,14 @@ def _evaluate_invariants(
                 elapsed_virtual_time_s = float(emulated)
             except (TypeError, ValueError):
                 elapsed_virtual_time_s = None
+    # Decode multi-fault sequence from fault_type if present.
+    fault_sequence: Optional[List[int]] = None
+    fault_type = result.get("fault_type", "")
+    if isinstance(fault_type, str) and fault_type.startswith("mf:"):
+        try:
+            fault_sequence = decode_multi_fault_sequence(fault_type)
+        except (ValueError, TypeError):
+            fault_sequence = None
     fault_result = FaultResult(
         fault_at=int(result.get("fault_at", 0)),
         boot_outcome=str(result.get("boot_outcome", "unknown")),
@@ -1169,6 +1178,7 @@ def _evaluate_invariants(
         raw_log="",
         is_control=bool(result.get("is_control", False)),
         elapsed_virtual_time_s=elapsed_virtual_time_s,
+        fault_sequence=fault_sequence,
     )
     violations = run_invariants(
         fault_result,
@@ -1180,14 +1190,17 @@ def _evaluate_invariants(
         boot_cycles=result.get("boot_cycles"),
         invariant_config=getattr(profile, "invariant_config", {}) or {},
     )
-    return [
-        {
+    violation_dicts = []
+    for v in violations:
+        vd: Dict[str, Any] = {
             "name": v.invariant_name,
             "description": v.description,
             "details": v.details,
         }
-        for v in violations
-    ]
+        if fault_sequence is not None:
+            vd["fault_sequence"] = fault_sequence
+        violation_dicts.append(vd)
+    return violation_dicts
 
 
 def annotate_result_checks(
@@ -1851,20 +1864,6 @@ def evaluate_config_checks(result: Dict[str, Any], profile: "ProfileConfig") -> 
     return None
 
 
-def annotate_nvs_config_results(results: List[Dict[str, Any]], profile: "ProfileConfig") -> None:
-    """Annotate results with NVS config check outcomes."""
-    config_checks = getattr(profile.success_criteria, "config_checks", None)
-    if not config_checks:
-        return
-    for result in results:
-        if result.get("is_control", False):
-            continue
-        classification = evaluate_config_checks(result, profile)
-        if classification is not None:
-            result["nvs_config_outcome"] = classification
-            result["boot_outcome"] = classification
-
-
 def classify_failure_class(result: Dict[str, Any]) -> str:
     """Return normalized failure class for a sweep result.
 
@@ -1991,6 +1990,7 @@ def load_clean_write_trace(trace_file: Optional[str]) -> List[Dict[str, int]]:
     if not trace_file or not os.path.exists(trace_file):
         return []
     entries: List[Dict[str, int]] = []
+    skip_count = 0
     with open(trace_file, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -2003,7 +2003,10 @@ def load_clean_write_trace(trace_file: Optional[str]) -> List[Dict[str, int]]:
                     }
                 )
             except Exception:
+                skip_count += 1
                 continue
+    if skip_count:
+        _progress("WARNING: skipped {} malformed rows in write trace".format(skip_count))
     entries.sort(key=lambda e: e["write_index"])
     return entries
 
@@ -2325,6 +2328,8 @@ def categorize_failure(
         )
     if result.get("invariant_violations"):
         payload["invariant_violations"] = result.get("invariant_violations")
+    if result.get("fault_sequence"):
+        payload["fault_sequence"] = result["fault_sequence"]
     window = result.get("fault_window")
     if isinstance(window, dict):
         payload["fault_window"] = window
@@ -2345,6 +2350,7 @@ def _fault_type_label(code: Any) -> str:
         "a": "multi_sector_atomicity",
         "f": "read_bit_flip",
         "k": "command_drop",
+        "p2": "phase2",
     }
     if code.startswith("b:"):
         return "bit_corruption_clustered"
@@ -2753,7 +2759,7 @@ def run_multi_component_sweep(
             if not result.get("fault_injected", False):
                 continue
 
-            faulted_outcome = str(result.get("boot_outcome", "unknown"))
+            faulted_outcome, _ = _effective_boot_result(result)
             per_comp_outcomes: Dict[str, Dict[str, Any]] = {
                 comp_name: {
                     "boot_outcome": faulted_outcome,
@@ -3672,6 +3678,16 @@ def main() -> int:
                     keep_run_artifacts=args.keep_run_artifacts,
                 )
                 mf_wall_s = _time_mod.time() - mf_wall_t0
+                # Decode and attach fault_sequence to each multi-fault result
+                # so invariants and failure categorization see the full
+                # sequence, not just seq[0].
+                for mf_r in multi_fault_results:
+                    ft = mf_r.get("fault_type", "")
+                    if isinstance(ft, str) and ft.startswith("mf:"):
+                        try:
+                            mf_r["fault_sequence"] = decode_multi_fault_sequence(ft)
+                        except (ValueError, TypeError):
+                            pass
                 annotate_result_checks(multi_fault_results, profile)
                 multi_fault_summary = summarize_runtime_sweep(
                     multi_fault_results,
@@ -3698,9 +3714,7 @@ def main() -> int:
         state_fuzz_summary: Optional[Dict[str, Any]] = None
 
         if profile.state_fuzzer.enabled:
-            print("State fuzzer enabled (model={}), running...".format(
-                profile.state_fuzzer.metadata_model
-            ), file=sys.stderr)
+            _progress("WARNING: state_fuzzer is enabled but not yet implemented — skipping")
             # State fuzzer runs via audit.robot / run_state_fuzz_point.resc
             # using a future scenario generator plugin.
             # This is the opt-in plugin path. For now, mark as placeholder.
@@ -3813,8 +3827,13 @@ def main() -> int:
         elif profile.expect.should_find_issues and not found_issues:
             verdict = "FAIL — expected to find issues but found none"
         elif not profile.expect.should_find_issues and found_issues:
+            total_issues = sweep_summary.get("issue_points", 0)
+            if multi_fault_summary:
+                total_issues += int(multi_fault_summary.get("issue_points", multi_fault_summary.get("bricks", 0)))
+            if partial_staging_summary:
+                total_issues += int(partial_staging_summary.get("issue_count", 0))
             verdict = "FAIL — found {} issue points ({} boot mismatches, {} semantic, {} invariant)".format(
-                sweep_summary.get("issue_points", 0),
+                total_issues,
                 sweep_summary.get("bricks", 0),
                 sweep_summary.get("semantic_issue_points", 0),
                 sweep_summary.get("invariant_issue_points", 0),

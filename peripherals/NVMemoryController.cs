@@ -53,7 +53,8 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return AliasTarget.ReadByte(offset);
             }
             ValidateRange(offset, 1);
-            return storage[offset];
+            var value = storage[offset];
+            return (byte)ApplyReadFault(offset, 1, value);
         }
 
         public ushort ReadWord(long offset)
@@ -63,8 +64,9 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return AliasTarget.ReadWord(offset);
             }
             ValidateRange(offset, 2);
-            return (ushort)(ReadByte(offset)
-                | (ReadByte(offset + 1) << 8));
+            var value = (ushort)(storage[offset]
+                | (storage[offset + 1] << 8));
+            return (ushort)ApplyReadFault(offset, 2, value);
         }
 
         public uint ReadDoubleWord(long offset)
@@ -74,10 +76,10 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return AliasTarget.ReadDoubleWord(offset);
             }
             ValidateRange(offset, 4);
-            var value = (uint)(ReadByte(offset)
-                | (ReadByte(offset + 1) << 8)
-                | (ReadByte(offset + 2) << 16)
-                | (ReadByte(offset + 3) << 24));
+            var value = (uint)(storage[offset]
+                | (storage[offset + 1] << 8)
+                | (storage[offset + 2] << 16)
+                | (storage[offset + 3] << 24));
             return ApplyReadFault(offset, 4, value);
         }
 
@@ -88,8 +90,17 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return AliasTarget.ReadQuadWord(offset);
             }
             ValidateRange(offset, 8);
-            return ReadDoubleWord(offset)
-                | ((ulong)ReadDoubleWord(offset + 4) << 32);
+            var lo = (uint)(storage[offset]
+                | (storage[offset + 1] << 8)
+                | (storage[offset + 2] << 16)
+                | (storage[offset + 3] << 24));
+            var hi = (uint)(storage[offset + 4]
+                | (storage[offset + 5] << 8)
+                | (storage[offset + 6] << 16)
+                | (storage[offset + 7] << 24));
+            var value = (ulong)lo | ((ulong)hi << 32);
+            return (ulong)ApplyReadFault(offset, 4, lo)
+                | ((ulong)ApplyReadFault(offset + 4, 4, hi) << 32);
         }
 
         public void WriteByte(long offset, byte value)
@@ -393,11 +404,6 @@ namespace Antmicro.Renode.Peripherals.Memory
             writeLog.Clear();
         }
 
-        public void ResetWriteLog()
-        {
-            writeLog.Clear();
-        }
-
         // Apply one-shot read-fault injection if the access overlaps the
         // armed address.  Returns the (possibly corrupted) value.
         private uint ApplyReadFault(long offset, int accessSize, uint value)
@@ -407,9 +413,9 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return value;
             }
 
-            // Check overlap: armed region is [ReadFaultAddress, ReadFaultAddress + 4),
+            // Check overlap: armed region is [ReadFaultAddress, ReadFaultAddress + WordSize),
             // access region is [offset, offset + accessSize).
-            var armedEnd = ReadFaultAddress + 4;
+            var armedEnd = ReadFaultAddress + Math.Max(4, WordSize);
             var accessEnd = offset + accessSize;
             if(offset >= armedEnd || accessEnd <= ReadFaultAddress)
             {
@@ -566,13 +572,13 @@ namespace Antmicro.Renode.Peripherals.Memory
 
                             for(var i = partialBytes; i < WordSize; i++)
                             {
-                                storage[wordStart + i] = 0x00;
+                                storage[wordStart + i] = EraseFill;
                             }
                         }
 
                         LastFaultInjected = true;
                         FaultEverFired = true;
-                        LastFaultPattern = (byte)(WriteFaultMode == 1 ? 0xCC : 0x00);
+                        LastFaultPattern = (byte)(WriteFaultMode == 1 ? 0xCC : EraseFill);
                         TotalWordWrites++;
                         writeLog.Add(wordStart);
                         break;
