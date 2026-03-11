@@ -901,7 +901,7 @@ def _snapshot_current_flash():
     return None
 
 
-def _boot_followup_cycle(cycle_index, fault_injected, label):
+def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=None):
     cpu_ref = monitor.Machine['sysbus.cpu']
     reset_nvmc_for_recovery()
     arm_vtor_watchpoint()
@@ -922,6 +922,7 @@ def _boot_followup_cycle(cycle_index, fault_injected, label):
         pc_value,
         fault_injected=fault_injected,
         enforce_content_criteria=False,
+        effective_criteria=effective_criteria,
     )
     signals['followup_cycle'] = int(cycle_index)
     signals['phase_followup_stop_reason'] = status.get('reason')
@@ -936,7 +937,7 @@ def _boot_followup_cycle(cycle_index, fault_injected, label):
     )
 
 
-def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injected, label):
+def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injected, label, effective_criteria=None):
     b = backend
     if b['kind'] == 'slow':
         return cycle_records, {
@@ -961,14 +962,15 @@ def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injec
         restore_flash_and_boot(current_flash)
         if _hash_bypass_active:
             apply_hash_bypass()
-        cycle_records.append(_boot_followup_cycle(cycle_index, fault_injected, label))
+        cycle_records.append(_boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=effective_criteria))
 
     followup_ms = int((_time.time() - followup_t0) * 1000)
     return cycle_records, analyze_boot_cycles(cycle_records), followup_ms
 
 
 def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_signals,
-                             initial_status=None, fault_injected=False, label='followup'):
+                             initial_status=None, fault_injected=False, label='followup',
+                             effective_criteria=None):
     cycle_records = [
         build_cycle_record(
             0,
@@ -989,6 +991,7 @@ def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_si
         start_cycle_index=1,
         fault_injected=fault_injected,
         label=label,
+        effective_criteria=effective_criteria,
     )
 
 
@@ -2540,6 +2543,7 @@ def run_read_bit_flip_fault(fault_at):
         initial_status=p2_status,
         fault_injected=fault_injected,
         label='fp{}_readflip_followup'.format(fault_at),
+        effective_criteria=eff_criteria,
     )
     signals['followup_ms'] = int(followup_ms)
 
@@ -2749,6 +2753,7 @@ def run_timed_reset_fault(fault_at):
         initial_status=p2_status,
         fault_injected=fault_injected,
         label='fp{}_timed_followup'.format(fault_at),
+        effective_criteria=eff_criteria,
     )
     signals['followup_ms'] = int(followup_ms)
 
@@ -2815,7 +2820,7 @@ def run_metadata_fault(fault_at, fault_type='w'):
     signals['phase2_emulated_s'] = p2_status.get('emulated_s')
     semantic_state = collect_semantic_state({'cycle': 0, 'boot_outcome': boot_outcome, 'boot_slot': boot_slot, 'signals': signals, 'fault_injected': bool(fault_injected), 'stage': 'post_boot'})
     fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
-    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(boot_outcome, boot_slot, signals, initial_status=p2_status, fault_injected=fault_injected, label='fp{}_meta_followup'.format(fault_at))
+    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(boot_outcome, boot_slot, signals, initial_status=p2_status, fault_injected=fault_injected, label='fp{}_meta_followup'.format(fault_at), effective_criteria=eff_criteria)
     signals['followup_ms'] = int(followup_ms)
     result = {'fault_at': fault_at, 'fault_requested': fault_at, 'fault_type': 'm:{}'.format(m_type), 'fault_injected': fault_injected, 'fault_address': fmt_u32(fault_address), 'boot_outcome': boot_outcome, 'boot_slot': boot_slot, 'fault_class': fault_class, 'actual_writes': applied, 'signals': signals}
     if eff_criteria is not None:
@@ -3082,6 +3087,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             initial_status=phase1_status,
             fault_injected=False,
             label='control_followup',
+            effective_criteria=eff_criteria,
         )
         signals['followup_ms'] = int(followup_ms)
 
@@ -3366,6 +3372,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         initial_status=phase2_status,
         fault_injected=fault_injected,
         label='fp{}_followup'.format(fault_at),
+        effective_criteria=eff_criteria,
     )
     signals['followup_ms'] = int(followup_ms)
 
@@ -4037,6 +4044,7 @@ def run_multi_fault_sequence(fault_sequence):
         initial_status=final_status,
         fault_injected=True,
         label='mf{}_followup'.format(seq[0]),
+        effective_criteria=eff_criteria,
     )
     signals['followup_ms'] = int(followup_ms)
 
@@ -4250,6 +4258,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         initial_status=p2_status,
         fault_injected=fault_injected,
         label='fp{}_native_followup'.format(fault_at),
+        effective_criteria=eff_criteria,
     )
     signals['followup_ms'] = int(followup_ms)
 
@@ -4435,6 +4444,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         initial_status=p2_status,
         fault_injected=fault_injected,
         label='fp{}_python_followup'.format(fault_at),
+        effective_criteria=eff_criteria,
     )
     signals['followup_ms'] = int(followup_ms)
 
