@@ -243,7 +243,7 @@ Profiles support semantic checking beyond boot/no-boot:
 
 ### Real upstream integrations
 
-**MCUboot** -- the primary validation target. Narrow canary profiles against MCUboot HEAD, retroactive differential profiles for 6 known bugs, and multi-step exploratory scenarios with semantic probes and invariant checking. See `profiles/mcuboot_*.yaml` and [`targets/mcuboot/`](targets/mcuboot/).
+**MCUboot** -- narrow canary profiles against MCUboot HEAD, retroactive differential profiles for 3 known bugs (broken/fixed pairs), and multi-step exploratory scenarios with semantic probes and invariant checking. See `profiles/mcuboot_*.yaml` and [`targets/mcuboot/`](targets/mcuboot/).
 
 **NuttX nxboot** -- real upstream NuttX firmware built from source. Exploratory validation, a revert canary workflow, and a full target adapter (build, runtime profile generation, audit). See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
 
