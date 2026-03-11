@@ -607,7 +607,7 @@ def run_batch(
 
     # Determine fault_types mode for the .resc.
     erase_types = {'e', 'a'}
-    write_types = {'w', 'b', 's', 'd', 'l', 'r', 't'}
+    write_types = {'w', 'b', 's', 'd', 'l', 'r', 't', 'k'}
 
     def _ft_base(ft: str) -> str:
         """Extract base fault type code (first character before any colon)."""
@@ -2148,6 +2148,7 @@ EXECUTE_ONLY_FAULT_TYPES = {
     "wear_leveling_corruption",
     "reset_at_time",
     "read_bit_flip",
+    "command_drop",
 }
 
 
@@ -2343,6 +2344,7 @@ def _fault_type_label(code: Any) -> str:
         "e": "interrupted_erase",
         "a": "multi_sector_atomicity",
         "f": "read_bit_flip",
+        "k": "command_drop",
     }
     if code.startswith("b:"):
         return "bit_corruption_clustered"
@@ -3023,6 +3025,7 @@ def main() -> int:
         include_metadata_fault = profile.fault_sweep.metadata_fault.enabled
         include_multi_sector_atomicity = "multi_sector_atomicity" in fault_types
         include_read_bit_flip = "read_bit_flip" in fault_types
+        include_command_drop = "command_drop" in fault_types
 
         # Pass fault_types to calibration so erase trace is captured.
         if include_erases:
@@ -3188,6 +3191,7 @@ def main() -> int:
             or include_write_rejection
             or include_reset_at_time
             or include_read_bit_flip
+            or include_command_drop
             or profile.fault_sweep.phase2_fault.enabled
             or profile.fault_sweep.multi_fault.enabled
             or include_metadata_fault
@@ -3303,6 +3307,14 @@ def main() -> int:
                     read_flip_fps = quick_subset(read_flip_fps)
                 combined += [(fp, 'f') for fp in read_flip_fps]
                 read_flip_count = len(read_flip_fps)
+
+            command_drop_count = 0
+            if include_command_drop:
+                command_drop_fps = list(fault_points)
+                if args.quick:
+                    command_drop_fps = quick_subset(command_drop_fps)
+                combined += [(fp, 'k') for fp in command_drop_fps]
+                command_drop_count = len(command_drop_fps)
 
             # Metadata fault injection: fault during pre_boot_state writes.
             metadata_count = 0
@@ -3430,6 +3442,8 @@ def main() -> int:
                 parts.append("{} timed-reset".format(timed_reset_count))
             if read_flip_count:
                 parts.append("{} read-flip".format(read_flip_count))
+            if command_drop_count:
+                parts.append("{} command-drop".format(command_drop_count))
             if phase2_count:
                 parts.append("{} phase2-recovery".format(phase2_count))
             if metadata_count:

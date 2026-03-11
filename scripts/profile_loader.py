@@ -46,6 +46,7 @@ KNOWN_FAULT_TYPES = {
     "write_rejection",
     "reset_at_time",
     "read_bit_flip",
+    "command_drop",
     "bootloader_region_write",
     "nvs_corruption",
 }
@@ -60,6 +61,7 @@ IMPLEMENTED_FAULT_TYPES = {
     "write_rejection",
     "reset_at_time",
     "read_bit_flip",
+    "command_drop",
     "bootloader_region_write",
     "nvs_corruption",
 }

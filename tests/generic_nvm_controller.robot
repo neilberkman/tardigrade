@@ -25,3 +25,18 @@ Generic Controller Honors FaultAtWordWrite
     Execute Command    sysbus WriteDoubleWord 0x40001014 0x00000002
     ${word}=           Execute Command    sysbus ReadQuadWord 0x10000020
     Should Be Equal As Numbers    ${word}    0x00000000DEADBEEF
+
+Generic Controller Command Drop Silently Skips Write
+    Create Generic Controller Machine
+    Execute Command    sysbus WriteDoubleWord 0x10000020 0xFFFFFFFF
+    Execute Command    nvm_ctrl FaultAtCommandExecution 1
+    Execute Command    nvm_ctrl CommandFaultMode 1
+    Execute Command    sysbus WriteDoubleWord 0x4000101C 0x10000020
+    Execute Command    sysbus WriteDoubleWord 0x40001020 0xDEADBEEF
+    Execute Command    sysbus WriteDoubleWord 0x40001014 0x00000002
+    ${status}=         Execute Command    sysbus ReadDoubleWord 0x40001018
+    Should Be Equal As Numbers    ${status}    0x00000004
+    ${fired}=          Execute Command    nvm_ctrl CommandFaultFired
+    Should Be Equal As Strings    ${fired}    True
+    ${word}=           Execute Command    sysbus ReadDoubleWord 0x10000020
+    Should Be Equal As Numbers    ${word}    0xFFFFFFFF

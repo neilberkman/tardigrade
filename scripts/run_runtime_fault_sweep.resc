@@ -1322,6 +1322,14 @@ def get_total_writes():
         return int(faultFlash.TotalWordWrites)
     return int(ctrl.Nvm.TotalWordWrites)
 
+def get_total_commands():
+    if USE_MRAM_PATH or USE_FAST_PATH:
+        return 0
+    try:
+        return int(ctrl.CommandExecutions)
+    except Exception:
+        return 0
+
 def get_total_erases():
     if USE_MRAM_PATH:
         return 0  # MRAM has no page erases.
@@ -1342,6 +1350,16 @@ def arm_fault(absolute_write_index, write_fault_mode=0):
         ctrl.Nvm.FaultAtWordWrite = absolute_write_index
         ctrl.Nvm.FaultEverFired = False
 
+def arm_controller_fault(absolute_command_index, command_fault_mode=1):
+    if USE_MRAM_PATH or USE_FAST_PATH:
+        return
+    try:
+        ctrl.FaultAtCommandExecution = absolute_command_index
+        ctrl.CommandFaultMode = command_fault_mode
+        ctrl.CommandFaultFired = False
+    except Exception:
+        pass
+
 def arm_erase_fault(absolute_erase_index, erase_fault_mode=0):
     if USE_MRAM_PATH:
         pass  # MRAM has no page erases.
@@ -1358,6 +1376,7 @@ def disarm_fault():
         faultFlash.FaultAtPageErase = 18446744073709551615
     else:
         ctrl.Nvm.FaultAtWordWrite = 18446744073709551615
+        disarm_controller_fault()
 
 def disarm_write_fault():
     if USE_MRAM_PATH:
@@ -1373,6 +1392,16 @@ def disarm_erase_fault():
     elif USE_FAST_PATH:
         faultFlash.FaultAtPageErase = 18446744073709551615
 
+def disarm_controller_fault():
+    if USE_MRAM_PATH or USE_FAST_PATH:
+        return
+    try:
+        ctrl.FaultAtCommandExecution = 18446744073709551615
+        ctrl.CommandFaultMode = 0
+        ctrl.CommandFaultFired = False
+    except Exception:
+        pass
+
 def was_fault_injected():
     if USE_MRAM_PATH:
         # LastFaultInjected is cleared on every subsequent write (line 188
@@ -1382,14 +1411,14 @@ def was_fault_injected():
         return int(mram.TotalWordWrites) >= int(mram.FaultAtWordWrite)
     if USE_FAST_PATH:
         return bool(faultFlash.FaultFired) or bool(faultFlash.EraseFaultFired)
-    return bool(ctrl.Nvm.FaultEverFired)
+    return bool(ctrl.Nvm.FaultEverFired) or was_controller_fault_injected()
 
 def was_write_fault_injected():
     if USE_MRAM_PATH:
         return int(mram.TotalWordWrites) >= int(mram.FaultAtWordWrite)
     if USE_FAST_PATH:
         return bool(faultFlash.FaultFired)
-    return bool(ctrl.Nvm.FaultEverFired)
+    return bool(ctrl.Nvm.FaultEverFired) or was_controller_fault_injected()
 
 def was_erase_fault_injected():
     if USE_MRAM_PATH:
@@ -1397,6 +1426,14 @@ def was_erase_fault_injected():
     if USE_FAST_PATH:
         return bool(faultFlash.EraseFaultFired)
     return False
+
+def was_controller_fault_injected():
+    if USE_MRAM_PATH or USE_FAST_PATH:
+        return False
+    try:
+        return bool(ctrl.CommandFaultFired)
+    except Exception:
+        return False
 
 def get_last_write_address():
     if USE_MRAM_PATH:
@@ -1407,6 +1444,14 @@ def get_last_write_address():
         except Exception:
             return 0
     return int(ctrl.Nvm.LastWriteAddress)
+
+def get_last_command_address():
+    if USE_MRAM_PATH or USE_FAST_PATH:
+        return 0
+    try:
+        return int(ctrl.LastCommandAddress)
+    except Exception:
+        return 0
 
 def prime_bootloader_entry():
     # Some Cortex-M platforms do not reliably restore SP/PC from the loaded
@@ -1522,6 +1567,7 @@ def reset_nvmc_for_sweep():
     else:
         ctrl.Nvm.TotalWordWrites = 0
         ctrl.Nvm.FaultEverFired = False
+        disarm_controller_fault()
 
 def reset_nvmc_for_recovery():
     # Reset NVM for recovery boot: no write counting needed, fast mode.
@@ -2421,6 +2467,28 @@ def ensure_read_fault_preflight():
     return read_fault_preflight
 
 
+def _command_fault_backend_support(obj):
+    required = [
+        'FaultAtCommandExecution',
+        'CommandFaultMode',
+        'CommandFaultFired',
+        'CommandExecutions',
+    ]
+    missing = [name for name in required if not hasattr(obj, name)]
+    if missing:
+        return False, 'backend_missing_command_fault_properties: {}'.format(', '.join(missing))
+    return True, ''
+
+
+def ensure_command_fault_preflight():
+    if USE_MRAM_PATH:
+        return {'supported': False, 'reason': 'mram_backend_no_command_controller'}
+    if USE_FAST_PATH:
+        return {'supported': False, 'reason': 'fast_path_no_command_controller'}
+    supported, reason = _command_fault_backend_support(ctrl)
+    return {'supported': bool(supported), 'reason': reason or ''}
+
+
 def run_timed_reset_fault(fault_at):
     # reset_at_time: run Phase 1 for a deterministic time offset, then
     # simulate a power reset regardless of write/erase boundaries.
@@ -2727,6 +2795,7 @@ def run_execute_fault(fault_at, fault_type='w'):
     #   erase: 'e' interrupted_erase, 'a' multi_sector_atomicity
     #   timed: 't' reset_at_time
     #   read:  'f' read_bit_flip (transient one-shot read corruption)
+    #   ctrl:  'k' command_drop (drop one controller write command)
     #
     # Fast path (NVMC CONFIG tracking): fault injection works by counting
     # NVMC CONFIG WEN->REN transitions. When the target write count is
@@ -2746,6 +2815,24 @@ def run_execute_fault(fault_at, fault_type='w'):
 
     if fault_type == 'f':
         return run_read_bit_flip_fault(fault_at)
+
+    if fault_type == 'k':
+        preflight = ensure_command_fault_preflight()
+        if not preflight.get('supported'):
+            skip_reason = preflight.get('reason') or 'command_fault_backend_unsupported'
+            return {
+                'fault_at': fault_at,
+                'fault_requested': fault_at,
+                'fault_type': 'k',
+                'fault_injected': False,
+                'fault_address': fmt_u32(0),
+                'boot_outcome': 'skipped',
+                'boot_slot': None,
+                'fault_class': 'skipped',
+                'actual_writes': 0,
+                'signals': {'phase1_ms': 0, 'phase2_ms': 0},
+                'skip_reason': skip_reason,
+            }
 
     cpu_ref = monitor.Machine['sysbus.cpu']
     if int(fault_at) < 0:
@@ -2841,7 +2928,8 @@ def run_execute_fault(fault_at, fault_type='w'):
     saved_flash = None
     is_erase_fault = fault_type in ('e', 'a')
     is_power_loss_fault = fault_type in ('w', 'e', 'a')
-    is_non_power_write_fault = fault_type in ('b', 's', 'r', 'd', 'l')
+    is_non_power_write_fault = fault_type in ('b', 's', 'r', 'd', 'l', 'k')
+    is_command_fault = fault_type == 'k'
     log('fp={} type={} phase1_setup'.format(fault_at, fault_type))
 
     # Phase 1: Reset and set up for the faulted boot.
@@ -2860,6 +2948,15 @@ def run_execute_fault(fault_at, fault_type='w'):
         log('fp={} phase1_step erase_arm_at={} mode={}'.format(fault_at, arm_at, erase_mode))
         arm_erase_fault(arm_at, erase_fault_mode=erase_mode)
         disarm_write_fault()
+    elif is_command_fault:
+        base_commands = get_total_commands()
+        arm_at = base_commands + fault_at + 1
+        if arm_at > base_commands + max_writes_cap:
+            arm_at = base_commands + max_writes_cap + 1
+        log('fp={} phase1_step command_arm_at={} mode=1'.format(fault_at, arm_at))
+        arm_controller_fault(arm_at, command_fault_mode=1)
+        disarm_write_fault()
+        disarm_erase_fault()
     else:
         # Write faults:
         #   'w' power_loss (0), 'b' bit_corruption (1),
@@ -2896,12 +2993,14 @@ def run_execute_fault(fault_at, fault_type='w'):
     phase1_ms = int((_time.time() - fp_t0) * 1000)
 
     fault_injected = was_fault_injected()
-    fault_address = get_last_write_address()
+    fault_address = get_last_command_address() if is_command_fault else get_last_write_address()
     if is_erase_fault:
         phase1_ops = get_total_erases()
+    elif is_command_fault:
+        phase1_ops = get_total_commands()
     else:
         phase1_ops = get_total_writes()
-    if fault_injected and (is_erase_fault or fault_type in ('w', 'b', 's', 'r', 'd', 'l')):
+    if fault_injected and (is_erase_fault or fault_type in ('w', 'b', 's', 'r', 'd', 'l', 'k')):
         # Unified semantics: successful operations before the faulted operation.
         actual_writes = max(0, phase1_ops - 1)
     else:
@@ -4409,7 +4508,7 @@ else:
                 ctrl.Nvm.CorruptionSeed = 0
         # Synthetic/non-default faults always use full execute mode
         # (not trace replay — they depend on NVMC peripheral state/PRNG).
-        elif ft in ('e', 'a', 'b', 's', 'd', 'l', 'r', 't', 'f'):
+        elif ft in ('e', 'a', 'b', 's', 'd', 'l', 'r', 't', 'f', 'k'):
             results.append(run_execute_fault(fp, fault_type=ft))
         elif run_fn == run_trace_replay_fault:
             results.append(run_fn(fp, fault_type=ft))

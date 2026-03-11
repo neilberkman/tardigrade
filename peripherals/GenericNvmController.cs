@@ -36,6 +36,9 @@ namespace Antmicro.Renode.Peripherals.Memory
             statusRegisterValue = SuccessStatusValue;
             illegalOperation = false;
             commandExecutions = 0UL;
+            commandFaultFired = false;
+            commandFaultMode = 0;
+            faultAtCommandExecution = ulong.MaxValue;
 
             registers[StatusRegisterOffset] = statusRegisterValue;
         }
@@ -191,6 +194,29 @@ namespace Antmicro.Renode.Peripherals.Memory
             get { return commandExecutions; }
         }
 
+        public ulong FaultAtCommandExecution
+        {
+            get { return faultAtCommandExecution; }
+            set { faultAtCommandExecution = value; }
+        }
+
+        public bool CommandFaultFired
+        {
+            get { return commandFaultFired; }
+            set { commandFaultFired = value; }
+        }
+
+        public int CommandFaultMode
+        {
+            get { return commandFaultMode; }
+            set { commandFaultMode = value; }
+        }
+
+        public uint LastCommandAddress
+        {
+            get { return addressRegisterValue; }
+        }
+
         private void ExecuteIfWriteCommand()
         {
             if(commandRegisterValue != WriteCommandValue)
@@ -211,6 +237,14 @@ namespace Antmicro.Renode.Peripherals.Memory
             try
             {
                 var nvmOffset = NormalizeAddress((long)addressRegisterValue);
+                if(commandFaultMode == 1 && commandExecutions == faultAtCommandExecution)
+                {
+                    commandFaultFired = true;
+                    statusRegisterValue = SuccessStatusValue;
+                    illegalOperation = false;
+                    registers[StatusRegisterOffset] = statusRegisterValue;
+                    return;
+                }
                 Nvm.WriteDoubleWord(nvmOffset, dataRegisterValue);
                 statusRegisterValue = SuccessStatusValue;
                 illegalOperation = false;
@@ -259,6 +293,9 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         private bool illegalOperation;
         private ulong commandExecutions;
+        private ulong faultAtCommandExecution;
+        private bool commandFaultFired;
+        private int commandFaultMode;
 
         private const long MinControllerWindowSize = 0x24;
     }
