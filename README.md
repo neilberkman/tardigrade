@@ -88,41 +88,44 @@ python3 scripts/audit_bootloader.py \
 ```mermaid
 flowchart TD
     subgraph setup["Setup"]
-        A["Load profile YAML"] --> B["Calibration: run firmware,<br/>count total NVM writes"]
-        B --> C["Generate fault point list"]
+        A["Load profile YAML"] --> B["Calibration: run firmware,<br/>record NVM write trace"]
+        B --> C["Heuristic: classify writes<br/>by address (~15K → ~1K)"]
+        C --> D["Fault point list"]
     end
 
-    C --> D
+    D --> E
 
     subgraph pf["Per fault point"]
-        D["Phase 1: run firmware to write N"] --> E{"Fault type"}
-        E -->|power_loss| F["Truncate write N<br/>(partial word)"]
-        E -->|bit_corruption| G["Flip random bits<br/>in write N (NOR physics)"]
-        E -->|interrupted_erase| H["Partial page erase<br/>(first half only)"]
+        E["Phase 1: replay trace<br/>to write N (~20ms)"] --> F{"Fault type"}
+        F -->|power_loss| G["Truncate write N<br/>(partial word)"]
+        F -->|bit_corruption| H["Flip random bits<br/>(NOR physics model)"]
+        F -->|interrupted_erase| I["Partial page erase"]
+        F -->|"8 others<br/>(command_drop,<br/>write_disturb, ...)"| J["Backend-specific<br/>fault injection"]
 
-        F --> I["Faulted NVM state"]
-        G --> I
-        H --> I
+        G --> K["Faulted NVM state"]
+        H --> K
+        I --> K
+        J --> K
 
-        I --> J{"evaluation_mode"}
+        K --> L{"evaluation_mode"}
 
-        J -->|state| K["Infer boot outcome<br/>from NVM contents"]
-        J -->|execute| L["Phase 2: reset CPU,<br/>recovery boot"]
+        L -->|state| M["Infer boot outcome<br/>from NVM contents"]
+        L -->|execute| N["Phase 2: reset CPU,<br/>recovery boot"]
 
-        L --> M{"Platform path"}
-        M -->|"NVMC<br/>(flash_fast)"| N["Restore flash snapshot<br/>+ reload ELF"]
-        M -->|"NVMemory<br/>(slow path)"| O["Storage persists<br/>across reset"]
-        M -->|"Hybrid<br/>(nvm_hybrid)"| P["Metadata persists,<br/>reload code + slot images"]
+        N --> O{"Backend"}
+        O -->|"NVMC<br/>(flash)"| P["Restore flash snapshot<br/>+ reload ELF"]
+        O -->|"MRAM"| Q["MRAM persists,<br/>restore + reload ELF"]
+        O -->|"NVMemory<br/>(slow path)"| R["Storage persists<br/>across reset"]
 
-        N --> Q["Boot from faulted state"]
-        O --> Q
-        P --> Q
-        Q --> R["VTOR polling<br/>captures boot slot"]
+        P --> S["Boot from faulted state"]
+        Q --> S
+        R --> S
+        S --> T["VTOR detection +<br/>invariant checks"]
     end
 
-    K --> S
-    R --> S
-    S["Classify outcome + failure class"] --> T["Aggregate into results JSON"]
+    M --> U
+    T --> U
+    U["Classify outcome + failure class"] --> V["Aggregate into results JSON"]
 ```
 
 1. **Calibration** -- run the firmware once, count total NVM writes, record a write trace.
