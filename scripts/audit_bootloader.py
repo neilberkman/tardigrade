@@ -2154,6 +2154,23 @@ EXECUTE_ONLY_FAULT_TYPES = {
     "command_drop",
 }
 
+# Canonical mapping from human-readable fault type names to single-char
+# wire codes used in batch dispatch and result encoding.  Used by metadata
+# fault, hook fault, and phase2 fault point generation.
+FAULT_TYPE_NAME_TO_CODE = {
+    "power_loss": "w",
+    "bit_corruption": "b",
+    "silent_write_failure": "s",
+    "write_disturb": "d",
+    "wear_leveling_corruption": "l",
+    "write_rejection": "r",
+    "interrupted_erase": "e",
+    "multi_sector_atomicity": "a",
+    "read_bit_flip": "f",
+    "reset_at_time": "t",
+    "command_drop": "k",
+}
+
 
 def validate_runtime_fault_mode_compat(profile: "ProfileConfig", eval_mode: str) -> None:
     """Fail fast on profile/mode combinations the runtime runner cannot support."""
@@ -2350,12 +2367,17 @@ def _fault_type_label(code: Any) -> str:
         "a": "multi_sector_atomicity",
         "f": "read_bit_flip",
         "k": "command_drop",
+        "h": "hook_fault",
         "p2": "phase2",
     }
     if code.startswith("b:"):
         return "bit_corruption_clustered"
     if code.startswith("m:"):
         return "metadata_{}".format(_fault_type_label(code.split(":", 1)[1]))
+    if code.startswith("h:"):
+        sub_type = code.rsplit(":", 1)[-1]
+        sub_label = _fault_type_label(sub_type)
+        return "hook_{}".format(sub_label)
     if code.startswith("p2:"):
         return "phase2_{}".format(_fault_type_label(code.rsplit(":", 1)[-1]))
     if code.startswith("c:"):
@@ -2437,7 +2459,8 @@ def summarize_runtime_sweep(
                 phase2_skip_reason_counts[phase2_reason] = (
                     phase2_skip_reason_counts.get(phase2_reason, 0) + 1
                 )
-        if r.get("fault_type") == "h":
+        _ft = str(r.get("fault_type", ""))
+        if _ft == "h" or _ft.startswith("h:"):
             hook_fault = r.get("hook_fault")
             if isinstance(hook_fault, dict):
                 hook_reason = str(hook_fault.get("skip_reason") or "unknown")
@@ -3236,9 +3259,14 @@ def main() -> int:
             combined = list(write_fps)
 
             # Add erase-based fault points.
+            # MRAM has no page erases -- skip erase fault points entirely.
+            is_mram_backend = (
+                profile.flash_backend
+                and "mram" in profile.flash_backend.lower()
+            )
             erase_count = 0
             atomicity_count = 0
-            if include_erases and total_erases > 0:
+            if include_erases and total_erases > 0 and not is_mram_backend:
                 erase_fps = list(range(0, total_erases))
                 if args.quick:
                     erase_fps = quick_subset(erase_fps)
@@ -3248,6 +3276,12 @@ def main() -> int:
                 if include_multi_sector_atomicity:
                     combined += [(ep, 'a') for ep in erase_fps]
                     atomicity_count = len(erase_fps)
+            elif include_erases and is_mram_backend:
+                print(
+                    "Skipping erase fault points: MRAM backend '{}' has no "
+                    "page erases.".format(profile.flash_backend),
+                    file=sys.stderr,
+                )
 
             # Add bit-corruption fault points (same write indices, different mode).
             # If a clustered fault_distribution is configured, apply spatial
@@ -3352,14 +3386,13 @@ def main() -> int:
                 if setup_writes == 0:
                     setup_writes = len(profile.pre_boot_state)
                 if setup_writes > 0:
-                    mf_type_map = {"power_loss": "w", "bit_corruption": "b"}
                     mf_types = profile.fault_sweep.metadata_fault.fault_types
                     mf_fps = list(range(0, setup_writes))
                     if args.quick:
                         mf_fps = quick_subset(mf_fps)
                     for mf_fp in mf_fps:
                         for mf_name in mf_types:
-                            mf_code = mf_type_map.get(mf_name, "w")
+                            mf_code = FAULT_TYPE_NAME_TO_CODE.get(mf_name, "w")
                             combined.append((mf_fp, "m:{}".format(mf_code)))
                             metadata_count += 1
 
@@ -3377,11 +3410,7 @@ def main() -> int:
                     if hf_config.max_points > 0
                     else min(50, max(max_writes, 1))
                 )
-                hf_type_map = {
-                    "power_loss": "w",
-                    "bit_corruption": "b",
-                }
-                hf_types = [hf_type_map.get(ft, "w") for ft in hf_config.fault_types]
+                hf_types = [FAULT_TYPE_NAME_TO_CODE.get(ft, "w") for ft in hf_config.fault_types]
                 hook_fps = list(range(0, hook_max))
                 if args.quick:
                     hook_fps = quick_subset(hook_fps)
@@ -3396,21 +3425,8 @@ def main() -> int:
             phase2_count = 0
             if p2_config.enabled and (write_fps or include_reset_at_time):
                 p2_max = p2_config.max_points if p2_config.max_points > 0 else min(50, max(max_writes, 1))
-                # Map profile fault type names to single-char codes.
-                p2_type_map = {
-                    "power_loss": "w",
-                    "interrupted_erase": "e",
-                    "bit_corruption": "b",
-                    "silent_write_failure": "s",
-                    "write_disturb": "d",
-                    "wear_leveling_corruption": "l",
-                    "write_rejection": "r",
-                    "multi_sector_atomicity": "a",
-                    "read_bit_flip": "f",
-                    "reset_at_time": "t",
-                }
                 p2_type_codes = [
-                    p2_type_map.get(ft, "w") for ft in p2_config.fault_types
+                    FAULT_TYPE_NAME_TO_CODE.get(ft, "w") for ft in p2_config.fault_types
                 ]
                 if not p2_type_codes:
                     p2_type_codes = ["w"]
