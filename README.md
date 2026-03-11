@@ -4,9 +4,9 @@ High-speed fault-injection testing for embedded OTA bootloaders. Tardigrade syst
 
 Trace replay and write-address heuristics make exhaustive fault sweeps (~15K points) feasible in minutes, not hours -- fast enough for CI gating. An optional CBMC bridge connects formal verification to empirical testing by converting counterexamples into replay profiles.
 
-## Proven results
+## Validation
 
-Retroactive differential validation against known MCUboot bugs. Given the broken and fixed commits for each PR, tardigrade's sweep detects the vulnerability in the broken version and passes the fixed one:
+These are retroactive tests against known MCUboot bugs -- not discoveries. The point is showing that tardigrade's generic sweep catches real bug classes without target-specific tuning:
 
 | PR                                                      | Bug                                                                 | Broken               | Fixed    |
 | ------------------------------------------------------- | ------------------------------------------------------------------- | -------------------- | -------- |
@@ -16,9 +16,7 @@ Retroactive differential validation against known MCUboot bugs. Given the broken
 
 Additional differential profiles for PRs [#2205](https://github.com/mcu-tools/mcuboot/pull/2205), [#2206](https://github.com/mcu-tools/mcuboot/pull/2206), and [#2214](https://github.com/mcu-tools/mcuboot/pull/2214).
 
-These are retroactive validations -- the bugs were already known and fixed. The point is demonstrating that tardigrade's standard sweep reliably catches these bug classes without target-specific tuning.
-
-## What makes this different
+## How this works under the hood
 
 ### Formal-to-empirical bridge (experimental)
 
