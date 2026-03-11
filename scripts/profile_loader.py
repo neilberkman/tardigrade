@@ -1499,6 +1499,40 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
             raise ProfileError(
                 "fault_sweep.expected_rollback_at_cycle: expected integer >= 1"
             )
+    hook_fault = _parse_hook_fault(raw.get("hook_fault"))
+
+    # -- Boot-cycle config consistency checks --
+    if expected_rollback_at_cycle is not None and boot_cycles <= 1:
+        raise ProfileError(
+            "fault_sweep.expected_rollback_at_cycle requires boot_cycles >= 2 "
+            "(currently boot_cycles={})".format(boot_cycles)
+        )
+    if boot_cycle_hook is not None and boot_cycles <= 1:
+        import warnings
+
+        warnings.warn(
+            "fault_sweep.boot_cycle_hook is set but boot_cycles=1; "
+            "the hook will never run. Set boot_cycles >= 2."
+        )
+    if hook_fault.enabled and not boot_cycle_hook:
+        raise ProfileError(
+            "fault_sweep.hook_fault.enabled requires boot_cycle_hook to be set"
+        )
+    if hook_fault.enabled and boot_cycles <= 1:
+        raise ProfileError(
+            "fault_sweep.hook_fault.enabled requires boot_cycles >= 2 "
+            "(currently boot_cycles={})".format(boot_cycles)
+        )
+    if expected_rollback_at_cycle is not None and expected_rollback_at_cycle >= boot_cycles:
+        import warnings
+
+        warnings.warn(
+            "fault_sweep.expected_rollback_at_cycle={} but boot_cycles={}; "
+            "rollback must happen before the last cycle to be observable".format(
+                expected_rollback_at_cycle, boot_cycles
+            )
+        )
+
     return FaultSweepConfig(
         mode=raw.get("mode", "runtime"),
         max_writes=raw.get("max_writes", "auto"),
@@ -1515,7 +1549,7 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         boot_cycle_hook=boot_cycle_hook,
         expected_rollback_at_cycle=expected_rollback_at_cycle,
         phase2_fault=_parse_phase2_fault(raw.get("phase2_fault")),
-        hook_fault=_parse_hook_fault(raw.get("hook_fault")),
+        hook_fault=hook_fault,
         multi_fault=_parse_multi_fault(raw.get("multi_fault")),
         read_fault_config=_parse_read_fault_config(raw.get("read_fault_config")),
         metadata_fault=_parse_metadata_fault(raw.get("metadata_fault")),

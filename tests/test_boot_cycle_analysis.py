@@ -68,7 +68,14 @@ class BootCycleAnalysisTests(unittest.TestCase):
             expected_rollback_at_cycle=1,
         )
         self.assertEqual(analysis["status"], "converged")
+        # Backward compat: old key still present
         self.assertTrue(analysis["rollback_not_applicable"])
+        # New keys
+        self.assertTrue(analysis["rollback_skipped"])
+        self.assertEqual(
+            analysis["rollback_skipped_reason"],
+            "initial_boot_already_on_target_slot",
+        )
 
     def test_rollback_late(self) -> None:
         analysis = analyze_boot_cycles(
