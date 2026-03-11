@@ -773,6 +773,8 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                         "completed_cycles": 3,
                         "expected_rollback_at_cycle": 2,
                         "rollback_not_applicable": True,
+                        "rollback_skipped": True,
+                        "rollback_skipped_reason": "initial_boot_already_on_target_slot",
                         "initial_slot": "exec",
                         "initial_outcome": "success",
                         "final_slot": "exec",
