@@ -1,22 +1,44 @@
 # tardigrade
 
-Fault-injection testing for embedded OTA bootloaders. Answers one question: **under realistic update-time reset and storage faults, does the device recover safely?**
+A fault-injection engine for embedded OTA bootloaders that bridges formal verification and empirical testing. Tardigrade systematically injects NVM faults along the firmware update path under [Renode](https://renode.io/) emulation, then checks whether the device recovers -- going beyond boot/no-boot to catch state-correctness bugs that corrupt the update state machine without necessarily bricking the device.
 
-Tardigrade runs your bootloader under [Renode](https://renode.io/), systematically injects reset, partial-write, erase-tear, bit-flip, dropped-write, and related NVM faults along the update path, and checks whether the device still boots correctly. The current engine also covers staged recovery faults, boot-cycle hooks, metadata/config corruption, and compound faults across successive reboot/recovery stages.
+Most fault-injection tools either prove properties formally or test empirically. Tardigrade connects both: its CBMC bridge converts formal counterexamples into empirical replay profiles, letting you validate whether a mathematically possible bug actually manifests under realistic fault conditions.
 
-### Proven results
+## Proven results
 
-Retroactive validation against known MCUboot bugs (catches the broken commit, passes the fixed one):
+Retroactive differential validation against known MCUboot bugs. Given the broken and fixed commits for each PR, tardigrade's sweep detects the vulnerability in the broken version and passes the fixed one:
 
-| PR                                                      | Bug                                                                 | Signal               |
-| ------------------------------------------------------- | ------------------------------------------------------------------- | -------------------- |
-| [#2100](https://github.com/mcu-tools/mcuboot/pull/2100) | Revert magic left in bad state (swap-move)                          | 3 bricks (9.7%)      |
-| [#2109](https://github.com/mcu-tools/mcuboot/pull/2109) | Header reload from wrong slot after interrupted swap (swap-scratch) | 19 bricks (33.3%)    |
-| [#2199](https://github.com/mcu-tools/mcuboot/pull/2199) | Stuck revert: primary trailer never cleared (swap-move)             | 1 wrong_image (100%) |
+| PR                                                      | Bug                                                                 | Broken               | Fixed    |
+| ------------------------------------------------------- | ------------------------------------------------------------------- | -------------------- | -------- |
+| [#2100](https://github.com/mcu-tools/mcuboot/pull/2100) | Revert magic left in bad state (swap-move)                          | 3 bricks (9.7%)      | 0 bricks |
+| [#2109](https://github.com/mcu-tools/mcuboot/pull/2109) | Header reload from wrong slot after interrupted swap (swap-scratch) | 19 bricks (33.3%)    | 0 bricks |
+| [#2199](https://github.com/mcu-tools/mcuboot/pull/2199) | Stuck revert: primary trailer never cleared (swap-move)             | 1 wrong_image (100%) | 0 issues |
 
 Additional differential profiles for PRs [#2205](https://github.com/mcu-tools/mcuboot/pull/2205), [#2206](https://github.com/mcu-tools/mcuboot/pull/2206), and [#2214](https://github.com/mcu-tools/mcuboot/pull/2214).
 
-## Quick start: GitHub Action
+This is not "it finds bugs" -- it is "we can prove it would have caught this class of bug before it shipped."
+
+## What makes this different
+
+### Formal-to-empirical bridge
+
+`scripts/cbmc_to_profile.py` converts CBMC counterexamples into tardigrade replay profiles. A formal verification tool proves a fault sequence _could_ cause corruption; tardigrade then runs the actual bootloader firmware under that exact fault sequence to confirm whether it _does_. This closes the gap between "mathematically possible" and "actually exploitable."
+
+### Trace replay engine
+
+Naive fault injection re-emulates the entire firmware prefix for each fault point -- O(N^2) total emulation for N fault points. Tardigrade records a write trace during calibration, then replays it from the trace file (~20ms) instead of re-emulating Phase 1. This is what makes 15,000-point exhaustive sweeps feasible in minutes instead of hours.
+
+### Write-address heuristic
+
+Not all NVM writes are equally interesting. The heuristic classifier (`scripts/write_trace_heuristic.py`) analyzes write addresses and groups them into tiers: trailer metadata (exhaustive coverage), slot boundaries (dense sampling), and bulk data copies (sparse sampling). Result: ~10x reduction in sweep points while preserving coverage of the writes most likely to cause state-machine corruption. This makes fault injection practical for CI pipelines.
+
+### Semantic assertions beyond boot/no-boot
+
+A device that boots to the wrong slot, confirms a corrupt image, or gets stuck in a revert loop is not "working." Tardigrade's state probes, semantic assertions, and composable invariant providers catch state-correctness bugs that pass a naive boot check. PR #2199 (stuck revert) is an example: the device boots, but it boots the wrong image permanently. Tardigrade catches it.
+
+## Quick start
+
+### GitHub Action
 
 ```yaml
 - id: tardigrade
@@ -27,7 +49,7 @@ Additional differential profiles for PRs [#2205](https://github.com/mcu-tools/mc
     workers: 2
 ```
 
-Outputs: `verdict` (PASS/FAIL), `report-path`, `brick-rate`. Use `verdict` as the CI gate signal. Upload the report as an artifact for per-point diagnostics on failure:
+Outputs: `verdict` (PASS/FAIL), `report-path`, `brick-rate`. Use `verdict` as the CI gate signal.
 
 ```yaml
 - name: Upload tardigrade report
@@ -40,7 +62,7 @@ Outputs: `verdict` (PASS/FAIL), `report-path`, `brick-rate`. Use `verdict` as th
 
 See [`action.yml`](action.yml) for all inputs and outputs.
 
-## Quick start: local
+### Local
 
 Prerequisites: `python3`, `pyyaml`, and either `renode-test` on PATH or Docker.
 
@@ -51,39 +73,15 @@ python3 scripts/audit_bootloader.py \
   --output results/report.json
 ```
 
-`--quick` runs a 3-point smoke test. Default is the heuristic sweep (~1K points, 2-4 min). Add `--workers N` for parallelism. Docker works too: `--renode-test docker://renode-patched:test`.
+`--quick` runs a 3-point smoke test. Default is the heuristic sweep (~1K points, 2-4 min). Add `--workers N` for parallelism. Docker: `--renode-test docker://renode-patched:test`.
 
-## Run modes
+### Run modes
 
 | Mode       | Flag              | Points | Time    | Use case               |
 | ---------- | ----------------- | ------ | ------- | ---------------------- |
 | Quick      | `--quick`         | 3      | seconds | smoke only             |
 | Heuristic  | _(default)_       | ~1K    | 2-4 min | normal CI / canary     |
 | Exhaustive | `--fault-start 0` | ~15K   | 15 min  | deep manual validation |
-
-Heuristic mode classifies writes into tiers (trailer/boundary/bulk) and prunes ~15K points to ~1K high-value targets. It is a coverage/performance tradeoff, not equivalent to exhaustive.
-
-## Supported targets
-
-### Real upstream integrations
-
-**MCUboot** -- the primary validation target. Narrow canary profiles against MCUboot HEAD, retroactive differential profiles for 6 known bugs, and multi-step exploratory scenarios with semantic probes and invariant checking. See `profiles/mcuboot_*.yaml` and [`targets/mcuboot/`](targets/mcuboot/).
-
-**NuttX nxboot** -- real upstream NuttX firmware built from source. Exploratory validation, a revert canary workflow, and a full target adapter (build, runtime profile generation, audit). See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
-
-### Reference examples
-
-The `examples/` directory contains standalone bootloader firmware for engine validation and self-testing:
-
-| Example                  | Purpose                                                            |
-| ------------------------ | ------------------------------------------------------------------ |
-| `naive_copy`             | Worst-case baseline; proves the engine catches obvious brick paths |
-| `vulnerable_ota`         | Copy-in-place OTA with frequent boot-visible failures              |
-| `nxboot_style`           | Modeled nxboot family for adapter/probe/invariant development      |
-| `esp_idf_ota`            | Clean-room model of ESP-IDF OTA slot-selection behavior            |
-| `riotboot_standalone`    | Standalone RIOTboot-style slot-selection model                     |
-| `bootloader_self_update` | Bootloader-region integrity and self-update fault modeling         |
-| `nvs_config_migration`   | Config/NVS-region corruption and migration validation              |
 
 ## How it works
 
@@ -130,40 +128,39 @@ flowchart TD
 ```
 
 1. **Calibration** -- run the firmware once, count total NVM writes, record a write trace.
-2. **Heuristic pruning** -- classify writes into tiers to reduce sweep points ~10x.
+2. **Heuristic pruning** -- classify writes by address into tiers, reduce sweep points ~10x.
 3. **Phase 1** -- replay the write trace up to write N and inject the fault (trace replay eliminates O(N^2) prefix re-emulation).
-4. **Phase 2** -- `execute` mode resets the CPU and performs a full recovery boot; `state` mode infers the outcome from NVM contents.
-5. **Follow-up cycles / hooks** -- optional repeated boots and between-cycle hook actions model confirm-or-rollback flows and staged recovery writes.
+4. **Phase 2** -- `execute` mode resets the CPU and performs a full recovery boot from faulted NVM; `state` mode infers the outcome from NVM contents alone.
+5. **Follow-up cycles / hooks** -- optional repeated boots and between-cycle hook actions model confirm-or-rollback flows and staged recovery.
 6. **Classification** -- boot outcomes (`success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`) and failure classes (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`).
 
 ### Fault types
 
-Core write/storage faults:
+11 fault types across 3 backend architectures (MRAM, NVMC flash-fast, NVMemory slow-path):
+
+**Core write/storage faults:**
 
 - `power_loss` -- partial write / dropped tail
-- `bit_corruption` -- NOR-physics bit flips
+- `bit_corruption` -- NOR-physics bit flips (deterministic seed, physically modeled 1-to-0 transitions)
 - `interrupted_erase` -- partial page erase
 - `multi_sector_atomicity` -- cross-page partial erase
-- `silent_write_failure`
-- `write_rejection`
-- `write_disturb`
-- `wear_leveling_corruption`
+- `silent_write_failure` / `write_rejection` / `write_disturb` / `wear_leveling_corruption`
 - `reset_at_time`
-- `read_bit_flip` -- transient corrupted read without modifying storage _(NVMemory slow-path backends only)_
-- `command_drop` -- silently dropped NVM controller command _(GenericNvmController backends only)_
+- `read_bit_flip` -- transient corrupted read without modifying storage _(NVMemory backends)_
+- `command_drop` -- silently dropped NVM controller command _(GenericNvmController backends)_
 
-Staged fault surfaces:
+**Staged fault surfaces** (faults injected at different points in the update lifecycle):
 
-- `metadata_fault` -- faults during pre-boot metadata/setup writes
-- `hook_fault` -- faults during between-boot hook actions such as confirm/accept operations
-- `phase2_fault` -- faults during the recovery/repair write path itself
+- `metadata_fault` -- during pre-boot metadata/setup writes
+- `hook_fault` -- during between-boot confirm/accept operations
+- `phase2_fault` -- during the recovery/repair write path itself
 - `multi_fault` -- compound staged faults across successive reboot/recovery stages
 
 ### Execute-mode hardening
 
-In `execute` mode, Phase 2 performs a full CPU recovery boot from faulted flash:
+In `execute` mode, Phase 2 performs a full CPU recovery boot from faulted NVM:
 
-- **VTOR polling** detects which slot the bootloader jumped to (SCB registers are CPU-private; watchpoints don't work).
+- **VTOR polling** detects which slot the bootloader jumped to.
 - **5ms confirmation window + CFSR HardFault check** verifies boot stability.
 - **Sticky fault signal** (`FaultEverFired`) survives subsequent writes and resets.
 - **Write stabilization early-exit** reduces per-point runtime when writes settle.
@@ -171,18 +168,16 @@ In `execute` mode, Phase 2 performs a full CPU recovery boot from faulted flash:
 
 ### Performance
 
-- **Trace replay** -- replays from recorded trace (~20ms) instead of re-emulating Phase 1
+- **Trace replay** -- recorded trace replay (~20ms) replaces full Phase 1 re-emulation
 - **Cached flash restore** -- single `WriteBytes` per fault point instead of per-page erase+load
-- **Hash bypass** -- patches out crypto validation in emulation via `hash_bypass_symbols`
-- **Parallel workers** -- `--workers N` across N Renode instances
-- **Heuristic pruning** -- ~15K points to ~1K for routine CI
-- **Interleaved distribution** -- round-robin assignment balances load
+- **Hash bypass** -- patches out crypto validation via `hash_bypass_symbols` profile field
+- **Parallel workers** -- `--workers N` distributes fault points across N Renode instances
+- **Heuristic pruning** -- ~15K to ~1K points for routine CI
+- **Interleaved distribution** -- round-robin assignment balances load across workers
 
-## Writing a profile
+## Profile-driven architecture
 
-1. Build your bootloader ELF and slot binary images.
-2. Pick or create a Renode platform (`.repl`) that matches your memory map.
-3. Write a profile YAML. Annotated example:
+Everything is declarative YAML. No code changes to test a new bootloader -- describe the memory layout, slots, images, and success criteria:
 
 ```yaml
 schema_version: 1
@@ -217,7 +212,7 @@ fault_sweep:
   mode: runtime
   evaluation_mode: execute
   max_writes: auto
-  flash_backend: sysbus.nvmc # sysbus path to the NVM controller
+  flash_backend: sysbus.nvmc
   boot_cycles: 3
   hash_bypass_symbols: ["bootutil_img_validate"]
 
@@ -225,39 +220,45 @@ expect:
   should_find_issues: true
 ```
 
-4. Run:
-
-```bash
-python3 scripts/audit_bootloader.py \
-  --profile your_profile.yaml \
-  --renode-test /path/to/renode-test \
-  --output results/your_report.json
-```
-
-See [`scripts/profile_loader.py`](scripts/profile_loader.py) for the full schema. See included profiles for NVMemory, NVMC, and hybrid platform examples.
+See [`scripts/profile_loader.py`](scripts/profile_loader.py) for the full schema.
 
 ### Discovery hooks and advanced sweep controls
 
-Profiles can attach richer semantic checking beyond boot/no-boot:
+Profiles support semantic checking beyond boot/no-boot:
 
-- **`state_probe`** -- target-supplied script that reads NVM and exports semantic state (e.g., trailer flags, slot confirmation).
+- **`state_probe`** -- target-supplied script that reads NVM and exports semantic state (trailer flags, slot confirmation, etc.).
 - **`semantic_assertions`** -- path-based expectations over semantic state and multi-boot analysis. A point can fail even when the device boots.
 - **`invariants`** / **`invariant_providers`** -- named postconditions (e.g., `multi_boot_converges`) and external Python modules for target-specific checks.
-- **`invariant_config`** -- per-profile configuration forwarded into invariant providers.
-- **`boot_cycles`** -- repeat boots after faulted recovery to catch stuck-revert or oscillation bugs.
-- **`boot_cycle_hook`** -- run a script between boot cycles to model confirm/accept or other post-boot state changes.
-
-Advanced sweep controls:
-
+- **`boot_cycles`** + **`boot_cycle_hook`** -- repeated boots with between-cycle actions model confirm-or-rollback flows.
 - **`initial_states`** -- expand one profile into a seeded sweep matrix of named starting states.
-- **`metadata_fault`** + **`metadata_fault_regions`** -- inject setup-time metadata faults and attribute failures to named metadata or bootloader regions.
-- **`phase2_fault`** -- fault the recovery/repair write path itself.
-- **`hook_fault`** -- fault the hook write path between boot cycles.
+- **`metadata_fault`** + **`metadata_fault_regions`** -- inject setup-time metadata faults and attribute failures to named regions.
+- **`phase2_fault`** / **`hook_fault`** / **`multi_fault`** -- fault injection at different lifecycle stages.
 - **`read_fault_config`** -- target-region, bit-count, and probability controls for transient read corruption.
-- **`multi_fault`** -- generate compound staged-fault plans, with explain output and deterministic fallbacks.
 - **`partial_staging`** -- analyze interrupted or overlapping staging-image writes.
-- **`nvs_region`** -- model config/NVS regions separately from firmware slots (corruption variants are schema-defined but not yet wired into the sweep engine).
+- **`nvs_region`** -- model config/NVS regions separately from firmware slots.
 - **`multi_component`** -- coordinate fault analysis across multiple components in one profile.
+
+## Supported targets
+
+### Real upstream integrations
+
+**MCUboot** -- the primary validation target. Narrow canary profiles against MCUboot HEAD, retroactive differential profiles for 6 known bugs, and multi-step exploratory scenarios with semantic probes and invariant checking. See `profiles/mcuboot_*.yaml` and [`targets/mcuboot/`](targets/mcuboot/).
+
+**NuttX nxboot** -- real upstream NuttX firmware built from source. Exploratory validation, a revert canary workflow, and a full target adapter (build, runtime profile generation, audit). See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
+
+### Reference examples
+
+The `examples/` directory contains standalone bootloader firmware for engine validation and self-testing:
+
+| Example                  | Purpose                                                            |
+| ------------------------ | ------------------------------------------------------------------ |
+| `naive_copy`             | Worst-case baseline; proves the engine catches obvious brick paths |
+| `vulnerable_ota`         | Copy-in-place OTA with frequent boot-visible failures              |
+| `nxboot_style`           | Modeled nxboot family for adapter/probe/invariant development      |
+| `esp_idf_ota`            | Clean-room model of ESP-IDF OTA slot-selection behavior            |
+| `riotboot_standalone`    | Standalone RIOTboot-style slot-selection model                     |
+| `bootloader_self_update` | Bootloader-region integrity and self-update fault modeling         |
+| `nvs_config_migration`   | Config/NVS-region corruption and migration validation              |
 
 ## Report structure
 
@@ -271,12 +272,11 @@ Per-point diagnostics attached when relevant: `fault_window` (clean-run context 
 
 ## Additional tools
 
-- **Scenarios** ([`scripts/run_scenario.py`](scripts/run_scenario.py)) -- multi-step discovery runs with profile overrides per step. See [`scenarios/`](scenarios/) for MCUboot and nxboot examples.
-- **CBMC bridge** (`scripts/cbmc_to_profile.py`) -- converts CBMC counterexamples into tardigrade replay profiles.
+- **Scenarios** ([`scripts/run_scenario.py`](scripts/run_scenario.py)) -- multi-step discovery runs with profile overrides per step. See [`scenarios/`](scenarios/).
+- **CBMC bridge** (`scripts/cbmc_to_profile.py`) -- converts CBMC counterexamples into tardigrade replay profiles, bridging formal verification and empirical fault injection.
 - **Geometry matrix** (`scripts/geometry_matrix.py`) -- parametric slot-layout permutations to catch geometry-dependent bugs.
 - **State fuzzer** (`targets/mcuboot/state_fuzzer.py`) -- MCUboot-specific trailer-state exploration _(not yet wired into the main sweep engine)_.
 - **HTML report** (`scripts/render_results_html.py`) -- renders JSON reports as HTML.
-- **Reference profiles** -- see [`examples/bootloader_self_update/profile.yaml`](examples/bootloader_self_update/profile.yaml), [`examples/nvs_config_migration/profile.yaml`](examples/nvs_config_migration/profile.yaml), and [`examples/seeded_initial_states.yaml`](examples/seeded_initial_states.yaml) for concrete examples of newer engine capabilities.
 
 ## CI workflows
 
@@ -324,8 +324,8 @@ tardigrade/
 
 - Fault model operates at write-operation granularity, not analog brownout simulation.
 - Cortex-M targets only; non-Cortex architectures are not first-class.
-- Some fault types are backend-specific: `read_bit_flip` requires the NVMemory slow-path backend; `command_drop` requires GenericNvmController. The profile loader warns at load time when these are used with incompatible backends, but the check is heuristic.
-- Multi-fault sweeps currently execute all stages as power-loss faults regardless of the original fault type. The planner picks interesting points from all fault types but execution does not preserve the original fault semantics.
+- Some fault types are backend-specific: `read_bit_flip` requires the NVMemory slow-path backend; `command_drop` requires GenericNvmController. The profile loader warns at load time for incompatible combinations.
+- Multi-fault sweeps currently execute all stages as power-loss faults regardless of the original fault type.
 - Semantic bugs that don't change boot outcome require explicit target instrumentation.
 - Exhaustive sweeps take ~15 min on a 2-core CI runner; heuristic mode is 2-4 min.
 
