@@ -334,6 +334,7 @@ class ComponentConfig:
             profile_path=parent.profile_path,
             scenario=parent.scenario,
             flash_backend=self.flash_backend,
+            success_criteria_overrides=parent.success_criteria_overrides,
         )
 
 
@@ -768,6 +769,7 @@ class ProfileConfig:
         nvs_region: Optional[NvsRegionConfig] = None,
         security_policy: Optional["SecurityPolicyConfig"] = None,
         bootloader_region: Optional[BootloaderRegionConfig] = None,
+        success_criteria_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         self.schema_version = schema_version
         self.name = name
@@ -800,6 +802,7 @@ class ProfileConfig:
         self.multi_component: Optional[MultiComponentConfig] = multi_component
         self.nvs_region = nvs_region
         self.bootloader_region: Optional[BootloaderRegionConfig] = bootloader_region
+        self.success_criteria_overrides: Dict[str, Dict[str, Any]] = success_criteria_overrides or {}
 
     @property
     def is_multi_component(self) -> bool:
@@ -854,6 +857,7 @@ class ProfileConfig:
             metadata_fault_regions=self.metadata_fault_regions,
             nvs_region=self.nvs_region,
             security_policy=self.security_policy,
+            success_criteria_overrides=self.success_criteria_overrides,
         )
         if state.update_trigger is not None and state.pre_boot_state is None:
             resolved.pre_boot_state = resolved.expand_update_trigger()
@@ -1190,6 +1194,14 @@ class ProfileConfig:
         if sp.toctou_protection:
             vars_list.append("SECURITY_TOCTOU_PROTECTION:true")
 
+        # Success criteria overrides: per-fault-type criteria as JSON.
+        if self.success_criteria_overrides:
+            vars_list.append(
+                "SUCCESS_CRITERIA_OVERRIDES:{}".format(
+                    json.dumps(self.success_criteria_overrides, separators=(",", ":"))
+                )
+            )
+
         return vars_list
 # ---------------------------------------------------------------------------
 # Parsing helpers
@@ -1325,6 +1337,43 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         bootloader_integrity=bool(raw.get("bootloader_integrity", False)),
         config_checks=_parse_config_checks(raw.get("config_checks")),
     )
+
+
+def _parse_success_criteria_overrides(
+    raw: Optional[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Parse per-fault-type success criteria overrides.
+
+    Returns a dict mapping fault type names (e.g. 'read_bit_flip') to
+    partial success criteria dicts that merge over the global criteria
+    at evaluation time.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ProfileError(
+            "success_criteria_overrides: expected mapping, got {}".format(
+                type(raw).__name__
+            )
+        )
+    result: Dict[str, Dict[str, Any]] = {}
+    for fault_type_name, overrides in raw.items():
+        fault_type_name = str(fault_type_name)
+        if fault_type_name not in KNOWN_FAULT_TYPES:
+            raise ProfileError(
+                "success_criteria_overrides: unknown fault type '{}'. "
+                "Known types: {}".format(
+                    fault_type_name, sorted(KNOWN_FAULT_TYPES)
+                )
+            )
+        if not isinstance(overrides, dict):
+            raise ProfileError(
+                "success_criteria_overrides.{}: expected mapping, got {}".format(
+                    fault_type_name, type(overrides).__name__
+                )
+            )
+        result[fault_type_name] = dict(overrides)
+    return result
 
 
 def _parse_heuristic_config(raw: Optional[Dict[str, Any]]) -> Optional[HeuristicConfig]:
@@ -2353,6 +2402,9 @@ def load_profile(path: str | Path) -> ProfileConfig:
     state_probe = _parse_state_probe(data.get("state_probe"))
 
     success_criteria = _parse_success_criteria(data.get("success_criteria"))
+    success_criteria_overrides = _parse_success_criteria_overrides(
+        data.get("success_criteria_overrides")
+    )
     fault_sweep = _parse_fault_sweep(data.get("fault_sweep"))
     state_fuzzer = _parse_state_fuzzer(data.get("state_fuzzer"))
     security_policy = _parse_security_policy(data.get("security_policy"))
@@ -2431,6 +2483,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         nvs_region=nvs_region,
         security_policy=security_policy,
         bootloader_region=bootloader_region,
+        success_criteria_overrides=success_criteria_overrides,
     )
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.

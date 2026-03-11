@@ -74,6 +74,7 @@ ${NVM_CONTROLLER}              ${EMPTY}
 ${ENABLE_MACHINE_SNAPSHOTS}    false
 ${PHASE2_FAULT_ENABLED}        false
 ${PHASE2_FAULT_MAX_POINTS}     0
+${SUCCESS_CRITERIA_OVERRIDES}    ${EMPTY}
 ${TEST_TIMEOUT}                2 minutes
 
 *** Keywords ***
@@ -172,6 +173,7 @@ Run Runtime Fault Point
     Execute Command    $resume_trace_max_ops="${RESUME_TRACE_MAX_OPS}"
     Execute Command    $resume_trace_time_slice="${RESUME_TRACE_TIME_SLICE}"
     Execute Command    $resume_trace_wall_timeout_s="${RESUME_TRACE_WALL_TIMEOUT_S}"
+    Run Keyword If    '${SUCCESS_CRITERIA_OVERRIDES}' != ''    Execute Command    $success_criteria_overrides="${SUCCESS_CRITERIA_OVERRIDES}"
 
     Execute Script    ${ROOT}/scripts/run_runtime_fault_sweep.resc
 
