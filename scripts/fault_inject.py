@@ -429,9 +429,19 @@ class AnnotatedSequence:
     ``fault_points``.
     """
 
-    fault_points: List[int]
+    fault_points: Tuple[int, ...]
     rationale: str
     selection_basis: Optional[Dict[str, Any]] = None
+
+    def __init__(
+        self,
+        fault_points: Any,
+        rationale: str,
+        selection_basis: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        object.__setattr__(self, "fault_points", tuple(fault_points))
+        object.__setattr__(self, "rationale", rationale)
+        object.__setattr__(self, "selection_basis", selection_basis)
 
     # -- list-like compatibility so existing code that treats sequences as
     #    List[int] keeps working unchanged. ----------------------------------
@@ -448,12 +458,12 @@ class AnnotatedSequence:
     def __eq__(self, other: object) -> bool:  # noqa: D105
         if isinstance(other, AnnotatedSequence):
             return self.fault_points == other.fault_points
-        if isinstance(other, list):
-            return self.fault_points == other
+        if isinstance(other, (list, tuple)):
+            return self.fault_points == tuple(other)
         return NotImplemented
 
     def __hash__(self) -> int:  # noqa: D105
-        return hash(tuple(self.fault_points))
+        return hash(self.fault_points)
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-serializable representation."""
