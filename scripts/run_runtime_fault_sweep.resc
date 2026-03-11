@@ -405,15 +405,12 @@ _FAULT_CODE_TO_NAME = {
 
 
 def get_effective_criteria(fault_type_code):
-    """Return effective success criteria for a given fault type code.
-
-    Merges per-fault-type overrides (from the profile) over the global
-    criteria.  Returns a dict with the effective values.  If no override
-    exists for the fault type, returns the global criteria unchanged.
-
-    The control run (fault_type_code='control' or negative fault_at)
-    always uses global criteria.
-    """
+    # Return effective success criteria for a given fault type code.
+    # Merges per-fault-type overrides (from the profile) over the global
+    # criteria.  Returns a dict with the effective values.  If no override
+    # exists for the fault type, returns the global criteria unchanged.
+    # The control run (fault_type_code='control' or negative fault_at)
+    # always uses global criteria.
     global_criteria = {
         'vtor_slot': success_vtor_slot,
         'image_hash': success_image_hash,
