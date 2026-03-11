@@ -1518,7 +1518,7 @@ def disarm_fault():
         b['data'].FaultAtPageErase = 18446744073709551615
     else:
         b['data'].Nvm.FaultAtWordWrite = 18446744073709551615
-        disarm_controller_fault()
+    disarm_controller_fault()
 
 def disarm_write_fault():
     b = backend
@@ -1563,7 +1563,7 @@ def was_write_fault_injected():
         return bool(b['data'].FaultEverFired)
     if b['kind'] == 'fast':
         return bool(b['data'].FaultFired)
-    return bool(b['data'].Nvm.FaultEverFired) or was_controller_fault_injected()
+    return bool(b['data'].Nvm.FaultEverFired)
 
 def was_erase_fault_injected():
     b = backend
@@ -1692,8 +1692,7 @@ def reset_nvmc_for_sweep():
         b['data'].TotalWordWrites = 0
         b['data'].LastFaultInjected = False
         b['data'].FaultEverFired = False
-        return
-    if b['kind'] == 'fast':
+    elif b['kind'] == 'fast':
         # Keep default as full diff for index precision, but allow profile/CLI
         # overrides for performance experiments.
         b['data'].DiffLookahead = sweep_diff_lookahead
@@ -1718,7 +1717,9 @@ def reset_nvmc_for_sweep():
     else:
         b['data'].Nvm.TotalWordWrites = 0
         b['data'].Nvm.FaultEverFired = False
-        disarm_controller_fault()
+    # Reset controller fault state on all backends — command_drop can be
+    # used with any backend via the separate nvm_controller field.
+    disarm_controller_fault()
 
 def reset_nvmc_for_recovery():
     # Reset NVM for recovery boot: no write counting needed, fast mode.
@@ -2647,19 +2648,6 @@ def ensure_read_fault_preflight():
             read_fault_preflight['backend'],
             read_fault_preflight['reason']))
     return read_fault_preflight
-
-
-def _command_fault_backend_support(obj):
-    required = [
-        'FaultAtCommandExecution',
-        'CommandFaultMode',
-        'CommandFaultFired',
-        'CommandExecutions',
-    ]
-    missing = [name for name in required if not hasattr(obj, name)]
-    if missing:
-        return False, 'backend_missing_command_fault_properties: {}'.format(', '.join(missing))
-    return True, ''
 
 
 def ensure_command_fault_preflight():
