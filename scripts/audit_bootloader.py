@@ -1268,6 +1268,7 @@ def _interesting_multi_fault_points(
     point was selected (brick, wrong_image, semantic assertion failure,
     invariant violation, or generic boot-outcome mismatch).
     """
+    _REASON_SEVERITY = {"brick": 0, "wrong_image": 1, "semantic": 2, "invariant": 3, "issue": 4}
     points: Dict[int, InterestingPoint] = {}
     for result in results:
         if result.get("is_control", False):
@@ -1276,7 +1277,7 @@ def _interesting_multi_fault_points(
             continue
         if result_is_brick(result) or result_has_issues(result, expected_outcome):
             fp = result.get("fault_at")
-            if fp is not None and int(fp) not in points:
+            if fp is not None:
                 # Determine the most specific reason.
                 if result_is_brick(result):
                     reason = "brick"
@@ -1288,12 +1289,15 @@ def _interesting_multi_fault_points(
                     reason = "invariant"
                 else:
                     reason = "issue"
-                points[int(fp)] = InterestingPoint(
-                    fault_at=int(fp),
-                    reason=reason,
-                    boot_outcome=str(result.get("boot_outcome", "unknown")),
-                    fault_address=result.get("fault_address"),
-                )
+                key = int(fp)
+                existing = points.get(key)
+                if existing is None or _REASON_SEVERITY[reason] < _REASON_SEVERITY[existing.reason]:
+                    points[key] = InterestingPoint(
+                        fault_at=key,
+                        reason=reason,
+                        boot_outcome=str(result.get("boot_outcome", "unknown")),
+                        fault_address=result.get("fault_address"),
+                    )
     return sorted(points.values(), key=lambda p: p.fault_at)
 
 
