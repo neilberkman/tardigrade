@@ -70,6 +70,7 @@ ${RESUME_TRACE_TIME_SLICE}     0.02
 ${RESUME_TRACE_WALL_TIMEOUT_S}    30
 ${EXTRA_PERIPHERALS}           ${EMPTY}
 ${FLASH_BACKEND}               ${EMPTY}
+${NVM_CONTROLLER}              ${EMPTY}
 ${ENABLE_MACHINE_SNAPSHOTS}    false
 ${PHASE2_FAULT_ENABLED}        false
 ${PHASE2_FAULT_MAX_POINTS}     0
@@ -132,6 +133,7 @@ Run Runtime Fault Point
     Execute Command    $pre_boot_state_bin="${PRE_BOOT_STATE_BIN}"
     Execute Command    $setup_script="${SETUP_SCRIPT}"
     Execute Command    $flash_backend="${FLASH_BACKEND}"
+    Run Keyword If    '${NVM_CONTROLLER}' != ''    Execute Command    $nvm_controller="${NVM_CONTROLLER}"
     Execute Command    $enable_machine_snapshots="${ENABLE_MACHINE_SNAPSHOTS}"
     Execute Command    $success_vtor_slot="${SUCCESS_VTOR_SLOT}"
     Execute Command    $success_vector_offset=${SUCCESS_VECTOR_OFFSET}
