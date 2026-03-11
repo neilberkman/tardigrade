@@ -191,7 +191,7 @@ else:
 # Optional separate NVM controller (e.g. command-register controller in front
 # of MRAM memory).  Enables command_drop fault injection on MRAM paths.
 _nvm_controller_var = str(monitor.GetVariable('nvm_controller')).strip()
-if _nvm_controller_var:
+if _nvm_controller_var and _nvm_controller_var.lower() not in ('', 'none'):
     _ctrl_name = 'sysbus.' + _nvm_controller_var if not _nvm_controller_var.startswith('sysbus.') else _nvm_controller_var
     try:
         ctrl = monitor.Machine[_ctrl_name]
