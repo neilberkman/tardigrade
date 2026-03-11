@@ -1,8 +1,8 @@
 # tardigrade
 
-A fault-injection engine for embedded OTA bootloaders that bridges formal verification and empirical testing. Tardigrade systematically injects NVM faults along the firmware update path under [Renode](https://renode.io/) emulation, then checks whether the device recovers -- going beyond boot/no-boot to catch state-correctness bugs that corrupt the update state machine without necessarily bricking the device.
+High-speed fault-injection testing for embedded OTA bootloaders. Tardigrade systematically injects NVM faults along the firmware update path under [Renode](https://renode.io/) emulation, then checks whether the device recovers -- going beyond boot/no-boot to catch state-correctness bugs that corrupt the update state machine without necessarily bricking the device.
 
-Most fault-injection tools either prove properties formally or test empirically. Tardigrade connects both: its CBMC bridge converts formal counterexamples into empirical replay profiles, letting you validate whether a mathematically possible bug actually manifests under realistic fault conditions.
+Trace replay and write-address heuristics make exhaustive fault sweeps (~15K points) feasible in minutes, not hours -- fast enough for CI gating. An optional CBMC bridge connects formal verification to empirical testing by converting counterexamples into replay profiles.
 
 ## Proven results
 
@@ -16,13 +16,13 @@ Retroactive differential validation against known MCUboot bugs. Given the broken
 
 Additional differential profiles for PRs [#2205](https://github.com/mcu-tools/mcuboot/pull/2205), [#2206](https://github.com/mcu-tools/mcuboot/pull/2206), and [#2214](https://github.com/mcu-tools/mcuboot/pull/2214).
 
-This is not "it finds bugs" -- it is "we can prove it would have caught this class of bug before it shipped."
+These are retroactive validations -- the bugs were already known and fixed. The point is demonstrating that tardigrade's standard sweep reliably catches these bug classes without target-specific tuning.
 
 ## What makes this different
 
-### Formal-to-empirical bridge
+### Formal-to-empirical bridge (experimental)
 
-`scripts/cbmc_to_profile.py` converts CBMC counterexamples into tardigrade replay profiles. A formal verification tool proves a fault sequence _could_ cause corruption; tardigrade then runs the actual bootloader firmware under that exact fault sequence to confirm whether it _does_. This closes the gap between "mathematically possible" and "actually exploitable."
+`scripts/cbmc_to_profile.py` converts CBMC counterexamples into tardigrade replay profiles. CBMC proves a fault sequence _could_ cause corruption at the source level; tardigrade then runs the compiled bootloader firmware under that fault sequence to confirm whether it manifests in practice. The bridge maps source-level state violations to NVM write indices using the counterexample's variable traces and the calibration write log. This requires a CBMC harness that models NVM writes as observable state.
 
 ### Trace replay engine
 
@@ -177,7 +177,7 @@ In `execute` mode, Phase 2 performs a full CPU recovery boot from faulted NVM:
 
 ## Profile-driven architecture
 
-Everything is declarative YAML. No code changes to test a new bootloader -- describe the memory layout, slots, images, and success criteria:
+Basic sweeps are purely declarative YAML -- describe the memory layout, slots, images, and success criteria. Advanced semantic checking (state probes, custom invariants) requires small Python hooks:
 
 ```yaml
 schema_version: 1
