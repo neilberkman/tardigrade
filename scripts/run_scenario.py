@@ -189,12 +189,6 @@ def _lookup_path(data: Any, path: str) -> Any:
     return current
 
 
-def _resolve_path(base_dir: Path, value: str) -> str:
-    path = Path(value)
-    if path.is_absolute():
-        return str(path)
-    return str((base_dir / path).resolve())
-
 
 def _resolve_repo_or_scenario_path(repo_root: Path, scenario_dir: Path, value: str) -> str:
     path = Path(value)
