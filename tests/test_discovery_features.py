@@ -721,7 +721,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             violation_names = [v["name"] for v in violations]
             self.assertIn("multi_boot_converges", violation_names)
 
-    def test_rollback_not_applicable_when_already_in_target_slot(self) -> None:
+    def test_rollback_skipped_when_already_in_target_slot(self) -> None:
         """When initial boot is already in the target slot, rollback is N/A."""
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
@@ -758,7 +758,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             profile = load_profile(profile_path)
 
             # Already in exec (target slot) -- rollback is not applicable.
-            # analyze_boot_cycles sets rollback_not_applicable=True and
+            # analyze_boot_cycles sets rollback_skipped=True and
             # status = converged (since all cycles are the same).
             results = [
                 {
@@ -772,7 +772,6 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                         "requested_cycles": 3,
                         "completed_cycles": 3,
                         "expected_rollback_at_cycle": 2,
-                        "rollback_not_applicable": True,
                         "rollback_skipped": True,
                         "rollback_skipped_reason": "initial_boot_already_on_target_slot",
                         "initial_slot": "exec",

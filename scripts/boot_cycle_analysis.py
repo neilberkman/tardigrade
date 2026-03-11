@@ -79,7 +79,6 @@ def analyze_boot_cycles(
         target_slot = initial_slot
     if target_slot == initial_slot:
         analysis["status"] = generic_status
-        analysis["rollback_not_applicable"] = True
         analysis["rollback_skipped"] = True
         analysis["rollback_skipped_reason"] = "initial_boot_already_on_target_slot"
         return analysis
