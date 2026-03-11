@@ -23,6 +23,7 @@ from invariants import (  # noqa: E402
 )
 from profile_loader import (  # noqa: E402
     BootRegisterDef,
+    BootRegisterPreWrite,
     ProfileError,
     WriteOrderConstraint,
     load_profile,
@@ -478,6 +479,491 @@ class WriteOrderConstraintsCheckTest(unittest.TestCase):
         ]
         violations = check_write_order_constraints(trace, [])
         self.assertEqual(violations, [])
+
+
+class BootRegisterPreWritesProfileParsingTest(unittest.TestCase):
+    """Test YAML parsing of boot_register_pre_writes."""
+
+    def _write_profile(self, tempdir: Path, body: str) -> Path:
+        path = tempdir / "profile.yaml"
+        path.write_text(textwrap.dedent(body), encoding="utf-8")
+        return path
+
+    def test_pre_writes_parses(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: test_pre_writes
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                boot_register_pre_writes:
+                  - { address: 0xE000ED98, value: 0x00000000 }
+                  - { address: 0xE000ED00, value: 0x00000001 }
+                boot_registers:
+                  - { address: 0xE000ED94, name: "MPU_CTRL" }
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            self.assertEqual(len(profile.boot_register_pre_writes), 2)
+            self.assertEqual(profile.boot_register_pre_writes[0].address, 0xE000ED98)
+            self.assertEqual(profile.boot_register_pre_writes[0].value, 0x00000000)
+            self.assertEqual(profile.boot_register_pre_writes[1].address, 0xE000ED00)
+            self.assertEqual(profile.boot_register_pre_writes[1].value, 0x00000001)
+
+    def test_no_pre_writes_defaults_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: test_no_pre_writes
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            self.assertEqual(profile.boot_register_pre_writes, [])
+
+    def test_pre_writes_robot_vars(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: test_pre_writes_rv
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                boot_register_pre_writes:
+                  - { address: 0xE000ED98, value: 0x00000000 }
+                boot_registers:
+                  - { address: 0xE000ED94, name: "MPU_CTRL" }
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            robot_vars = profile.robot_vars(ROOT)
+            pw_var = [v for v in robot_vars if v.startswith("BOOT_REGISTER_PRE_WRITES:")]
+            self.assertEqual(len(pw_var), 1)
+            self.assertIn("0xE000ED98=0x00000000", pw_var[0])
+
+    def test_pre_writes_invalid_type_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: test_bad_pre_writes
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                boot_register_pre_writes: "not_a_list"
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            with self.assertRaises(ProfileError):
+                load_profile(profile_path)
+
+    def test_pre_writes_missing_value_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: test_bad_pre_writes2
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                boot_register_pre_writes:
+                  - { address: 0xE000ED98 }
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            with self.assertRaises(ProfileError):
+                load_profile(profile_path)
+
+
+class BidirectionalWriteOrderConstraintParsingTest(unittest.TestCase):
+    """Test YAML parsing of bidirectional write_order_constraints."""
+
+    def _write_profile(self, tempdir: Path, body: str) -> Path:
+        path = tempdir / "profile.yaml"
+        path.write_text(textwrap.dedent(body), encoding="utf-8")
+        return path
+
+    def test_bidirectional_parses(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: test_bidir_woc
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                write_order_constraints:
+                  - first: { start: 0x70100, size: 256 }
+                    then: { start: 0x70000, size: 256 }
+                    bidirectional: true
+                    label: "no_interleave"
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            self.assertEqual(len(profile.write_order_constraints), 1)
+            c = profile.write_order_constraints[0]
+            self.assertTrue(c.bidirectional)
+            self.assertEqual(c.label, "no_interleave")
+
+    def test_bidirectional_defaults_false(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: test_default_bidir
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                write_order_constraints:
+                  - first: { start: 0x70100, size: 256 }
+                    then: { start: 0x70000, size: 256 }
+                    label: "strict"
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            c = profile.write_order_constraints[0]
+            self.assertFalse(c.bidirectional)
+
+
+class BidirectionalWriteOrderCheckTest(unittest.TestCase):
+    """Test check_write_order_constraints with bidirectional mode."""
+
+    def _constraint(
+        self,
+        first_start: int,
+        first_size: int,
+        then_start: int,
+        then_size: int,
+        label: str = "test",
+        bidirectional: bool = False,
+    ) -> WriteOrderConstraint:
+        return WriteOrderConstraint(
+            first_start=first_start,
+            first_size=first_size,
+            then_start=then_start,
+            then_size=then_size,
+            label=label,
+            bidirectional=bidirectional,
+        )
+
+    def test_bidir_first_before_then_passes(self) -> None:
+        """Normal order passes in bidirectional mode."""
+        trace = [
+            {"write_index": 0, "flash_offset": 0x70100, "value": 1},
+            {"write_index": 1, "flash_offset": 0x70108, "value": 2},
+            {"write_index": 2, "flash_offset": 0x70000, "value": 3},
+            {"write_index": 3, "flash_offset": 0x70008, "value": 4},
+        ]
+        constraints = [
+            self._constraint(0x70100, 256, 0x70000, 256, "bidir", bidirectional=True),
+        ]
+        violations = check_write_order_constraints(trace, constraints)
+        self.assertEqual(violations, [])
+
+    def test_bidir_then_before_first_passes(self) -> None:
+        """Reverse order passes in bidirectional mode."""
+        trace = [
+            {"write_index": 0, "flash_offset": 0x70000, "value": 1},
+            {"write_index": 1, "flash_offset": 0x70008, "value": 2},
+            {"write_index": 2, "flash_offset": 0x70100, "value": 3},
+            {"write_index": 3, "flash_offset": 0x70108, "value": 4},
+        ]
+        constraints = [
+            self._constraint(0x70100, 256, 0x70000, 256, "bidir", bidirectional=True),
+        ]
+        violations = check_write_order_constraints(trace, constraints)
+        self.assertEqual(violations, [])
+
+    def test_bidir_interleaved_violates(self) -> None:
+        """Interleaved writes violate in bidirectional mode."""
+        trace = [
+            {"write_index": 0, "flash_offset": 0x70100, "value": 1},
+            {"write_index": 1, "flash_offset": 0x70000, "value": 2},
+            {"write_index": 2, "flash_offset": 0x70108, "value": 3},
+            {"write_index": 3, "flash_offset": 0x70008, "value": 4},
+        ]
+        constraints = [
+            self._constraint(0x70100, 256, 0x70000, 256, "bidir", bidirectional=True),
+        ]
+        violations = check_write_order_constraints(trace, constraints)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("interleaved", violations[0]["reason"])
+
+    def test_bidir_only_one_region_passes(self) -> None:
+        """Only one region written -- no interleaving possible."""
+        trace = [
+            {"write_index": 0, "flash_offset": 0x70000, "value": 1},
+        ]
+        constraints = [
+            self._constraint(0x70100, 256, 0x70000, 256, "bidir", bidirectional=True),
+        ]
+        violations = check_write_order_constraints(trace, constraints)
+        self.assertEqual(violations, [])
+
+    def test_non_bidir_reverse_order_still_violates(self) -> None:
+        """Non-bidirectional constraint still violates on reverse order."""
+        trace = [
+            {"write_index": 0, "flash_offset": 0x70000, "value": 1},
+            {"write_index": 1, "flash_offset": 0x70008, "value": 2},
+            {"write_index": 2, "flash_offset": 0x70100, "value": 3},
+        ]
+        constraints = [
+            self._constraint(0x70100, 256, 0x70000, 256, "strict", bidirectional=False),
+        ]
+        violations = check_write_order_constraints(trace, constraints)
+        self.assertEqual(len(violations), 1)
+
+
+class HookFaultCommandDropTest(unittest.TestCase):
+    """Test that command_drop is accepted in hook_fault.fault_types."""
+
+    def _write_profile(self, tempdir: Path, body: str) -> Path:
+        path = tempdir / "profile.yaml"
+        path.write_text(textwrap.dedent(body), encoding="utf-8")
+        return path
+
+    def test_command_drop_accepted_in_hook_fault(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: test_hook_cmd_drop
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                fault_sweep:
+                  boot_cycles: 2
+                  boot_cycle_hook: scripts/run_runtime_fault_sweep.resc
+                  hook_fault:
+                    enabled: true
+                    fault_types: [command_drop]
+                """,
+            )
+            profile = load_profile(profile_path)
+            self.assertIn("command_drop", profile.fault_sweep.hook_fault.fault_types)
+
+
+class HookFaultMultiFaultWarningTest(unittest.TestCase):
+    """Test that enabling both hook_fault and multi_fault produces a warning."""
+
+    def _write_profile(self, tempdir: Path, body: str) -> Path:
+        path = tempdir / "profile.yaml"
+        path.write_text(textwrap.dedent(body), encoding="utf-8")
+        return path
+
+    def test_hook_and_multi_fault_warns(self) -> None:
+        import warnings as _warnings
+
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: test_hook_multi_warn
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                fault_sweep:
+                  boot_cycles: 2
+                  boot_cycle_hook: scripts/run_runtime_fault_sweep.resc
+                  hook_fault:
+                    enabled: true
+                    fault_types: [power_loss]
+                  multi_fault:
+                    enabled: true
+                """,
+            )
+            with _warnings.catch_warnings(record=True) as caught:
+                _warnings.simplefilter("always")
+                load_profile(profile_path)
+            msgs = [str(w.message) for w in caught]
+            self.assertTrue(
+                any("hook_fault and multi_fault" in m for m in msgs),
+                "Expected warning about hook_fault + multi_fault interaction, "
+                "got: {}".format(msgs),
+            )
+
+    def test_hook_only_no_warning(self) -> None:
+        import warnings as _warnings
+
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: test_hook_only
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                fault_sweep:
+                  boot_cycles: 2
+                  boot_cycle_hook: scripts/run_runtime_fault_sweep.resc
+                  hook_fault:
+                    enabled: true
+                    fault_types: [power_loss]
+                """,
+            )
+            with _warnings.catch_warnings(record=True) as caught:
+                _warnings.simplefilter("always")
+                load_profile(profile_path)
+            msgs = [str(w.message) for w in caught]
+            self.assertFalse(
+                any("hook_fault and multi_fault" in m for m in msgs),
+                "Should not warn when multi_fault is not enabled, "
+                "got: {}".format(msgs),
+            )
 
 
 if __name__ == "__main__":

@@ -719,6 +719,15 @@ class InitialStateConfig:
         self.expect_overrides = expect_overrides or {}
 
 
+class BootRegisterPreWrite:
+    """An address/value pair to write before capturing boot registers."""
+    __slots__ = ("address", "value")
+
+    def __init__(self, address: int, value: int) -> None:
+        self.address = address
+        self.value = value
+
+
 class BootRegisterDef:
     """A register to capture at boot-detection time."""
     __slots__ = ("address", "name")
@@ -730,7 +739,7 @@ class BootRegisterDef:
 
 class WriteOrderConstraint:
     """Assert that writes to one region precede writes to another."""
-    __slots__ = ("first_start", "first_size", "then_start", "then_size", "label")
+    __slots__ = ("first_start", "first_size", "then_start", "then_size", "label", "bidirectional")
 
     def __init__(
         self,
@@ -739,12 +748,14 @@ class WriteOrderConstraint:
         then_start: int,
         then_size: int,
         label: str = "",
+        bidirectional: bool = False,
     ) -> None:
         self.first_start = first_start
         self.first_size = first_size
         self.then_start = then_start
         self.then_size = then_size
         self.label = label
+        self.bidirectional = bidirectional
 
 
 # MCUboot trailer magic: 4 words written at (slot_end - 16).
@@ -810,6 +821,7 @@ class ProfileConfig:
         security_policy: Optional["SecurityPolicyConfig"] = None,
         bootloader_region: Optional[BootloaderRegionConfig] = None,
         success_criteria_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+        boot_register_pre_writes: Optional[List[BootRegisterPreWrite]] = None,
         boot_registers: Optional[List[BootRegisterDef]] = None,
         write_order_constraints: Optional[List[WriteOrderConstraint]] = None,
     ) -> None:
@@ -845,6 +857,7 @@ class ProfileConfig:
         self.nvs_region = nvs_region
         self.bootloader_region: Optional[BootloaderRegionConfig] = bootloader_region
         self.success_criteria_overrides: Dict[str, Dict[str, Any]] = success_criteria_overrides or {}
+        self.boot_register_pre_writes: List[BootRegisterPreWrite] = boot_register_pre_writes or []
         self.boot_registers: List[BootRegisterDef] = boot_registers or []
         self.write_order_constraints: List[WriteOrderConstraint] = write_order_constraints or []
 
@@ -1031,6 +1044,11 @@ class ProfileConfig:
                     "PHASE2_FAULT_MAX_POINTS:{}".format(fs.phase2_fault.max_points)
                 )
 
+        if self.boot_register_pre_writes:
+            pw_parts = []
+            for pw in self.boot_register_pre_writes:
+                pw_parts.append("0x{:08X}=0x{:08X}".format(pw.address, pw.value))
+            vars_list.append("BOOT_REGISTER_PRE_WRITES:{}".format(",".join(pw_parts)))
         if self.boot_registers:
             parts = []
             for reg in self.boot_registers:
@@ -1600,6 +1618,15 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
             "fault_sweep.hook_fault.enabled requires boot_cycles >= 2 "
             "(currently boot_cycles={})".format(boot_cycles)
         )
+    multi_fault_config = _parse_multi_fault(raw.get("multi_fault"))
+    if hook_fault.enabled and multi_fault_config.enabled:
+        import warnings
+
+        warnings.warn(
+            "fault_sweep: both hook_fault and multi_fault are enabled. "
+            "Compound fault sequences during hook writes are experimental "
+            "and may produce unexpected interactions."
+        )
     if expected_rollback_at_cycle is not None and expected_rollback_at_cycle >= boot_cycles:
         import warnings
 
@@ -1627,7 +1654,7 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         expected_rollback_at_cycle=expected_rollback_at_cycle,
         phase2_fault=_parse_phase2_fault(raw.get("phase2_fault")),
         hook_fault=hook_fault,
-        multi_fault=_parse_multi_fault(raw.get("multi_fault")),
+        multi_fault=multi_fault_config,
         read_fault_config=_parse_read_fault_config(raw.get("read_fault_config")),
         metadata_fault=_parse_metadata_fault(raw.get("metadata_fault")),
         partial_staging=raw.get("partial_staging"),
@@ -1673,7 +1700,7 @@ def _parse_hook_fault(raw: Optional[Dict[str, Any]]) -> HookFaultConfig:
     fault_types = raw.get("fault_types", ["power_loss"])
     if not isinstance(fault_types, list):
         fault_types = [str(fault_types)]
-    valid_hook_types = {"power_loss", "bit_corruption"}
+    valid_hook_types = {"power_loss", "bit_corruption", "command_drop"}
     parsed_types: List[str] = []
     for ft in fault_types:
         if ft not in KNOWN_FAULT_TYPES:
@@ -1893,6 +1920,28 @@ def _parse_boot_register_values(
     return result
 
 
+def _parse_boot_register_pre_writes_list(
+    raw: Optional[List[Any]],
+) -> List[BootRegisterPreWrite]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("boot_register_pre_writes: expected list")
+    writes: List[BootRegisterPreWrite] = []
+    for i, entry in enumerate(raw):
+        ctx = "boot_register_pre_writes[{}]".format(i)
+        if not isinstance(entry, dict):
+            raise ProfileError("{}: expected mapping".format(ctx))
+        address = _parse_int(
+            _require(entry, "address", ctx), "{}.address".format(ctx)
+        )
+        value = _parse_int(
+            _require(entry, "value", ctx), "{}.value".format(ctx)
+        )
+        writes.append(BootRegisterPreWrite(address=address, value=value))
+    return writes
+
+
 def _parse_boot_registers_list(
     raw: Optional[List[Any]],
 ) -> List[BootRegisterDef]:
@@ -1943,6 +1992,7 @@ def _parse_write_order_constraints_list(
                 _require(then, "size", ctx + ".then"), ctx + ".then.size"
             ),
             label=str(entry.get("label", "")),
+            bidirectional=bool(entry.get("bidirectional", False)),
         ))
     return constraints
 
@@ -2600,6 +2650,9 @@ def load_profile(path: str | Path) -> ProfileConfig:
     multi_component = _parse_components(data.get("multi_component"))
     nvs_region = _parse_nvs_region(data.get("nvs_region"))
     bootloader_region = _parse_bootloader_region(data.get("bootloader_region"))
+    boot_register_pre_writes = _parse_boot_register_pre_writes_list(
+        data.get("boot_register_pre_writes")
+    )
     boot_registers = _parse_boot_registers_list(data.get("boot_registers"))
     write_order_constraints = _parse_write_order_constraints_list(
         data.get("write_order_constraints")
@@ -2668,6 +2721,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         security_policy=security_policy,
         bootloader_region=bootloader_region,
         success_criteria_overrides=success_criteria_overrides,
+        boot_register_pre_writes=boot_register_pre_writes,
         boot_registers=boot_registers,
         write_order_constraints=write_order_constraints,
     )

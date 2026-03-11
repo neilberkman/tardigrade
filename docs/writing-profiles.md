@@ -186,7 +186,8 @@ Capture and verify hardware register state at boot time. Useful for checking MPU
 ```yaml
 boot_registers:
   - { address: 0xE000ED94, name: mpu_ctrl }
-  - { address: 0xE000ED98, name: mpu_rbar }
+  - { address: 0xE000ED9C, name: mpu_rbar }
+  - { address: 0xE000EDA0, name: mpu_rasr }
 
 success_criteria:
   vtor_in_slot: exec
@@ -195,6 +196,22 @@ success_criteria:
 ```
 
 Registers are captured at VTOR detection time. The `boot_registers_match` invariant compares against expected values.
+
+#### Pre-writes for banked registers
+
+Some registers (e.g., MPU_RBAR and MPU_RASR on ARMv6-M) are banked -- the value returned depends on which region MPU_RNR currently selects. Use `boot_register_pre_writes` to write specific values before the capture reads:
+
+```yaml
+boot_register_pre_writes:
+  - { address: 0xE000ED98, value: 0x00000000 } # select MPU region 0
+
+boot_registers:
+  - { address: 0xE000ED94, name: mpu_ctrl }
+  - { address: 0xE000ED9C, name: mpu_rbar }
+  - { address: 0xE000EDA0, name: mpu_rasr }
+```
+
+Each entry is written via `bus.WriteDoubleWord` before any register reads occur.
 
 ### Config checks
 
@@ -304,18 +321,28 @@ def run(monitor):
 
 ## Write-order constraints
 
-Assert that calibration writes happen in the correct order — e.g., inactive replica updated before active:
+Assert that calibration writes happen in the correct order -- e.g., inactive replica updated before active:
 
 ```yaml
 write_order_constraints:
-  - first_start: 0x10070100
-    first_size: 0x20
-    then_start: 0x10070000
-    then_size: 0x20
+  - first: { start: 0x10070100, size: 0x20 }
+    then: { start: 0x10070000, size: 0x20 }
     label: "inactive replica before active"
 ```
 
 Checked against the calibration write trace. Violations are reported before the sweep starts.
+
+#### Bidirectional constraints
+
+For dual-replica metadata where the active/inactive role alternates (e.g., based on sequence numbers), use `bidirectional: true`. The constraint passes if either region is fully written before the other starts. It only violates when writes to both regions are interleaved:
+
+```yaml
+write_order_constraints:
+  - first: { start: 0x10070000, size: 0x20 }
+    then: { start: 0x10070100, size: 0x20 }
+    bidirectional: true
+    label: "replicas must not interleave"
+```
 
 ## State probes and semantic assertions
 

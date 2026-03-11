@@ -94,6 +94,7 @@ $read_fault_probability?="1.0"
 $read_fault_seed?="0"
 $success_criteria_overrides?=""
 $success_criteria_overrides_file?=""
+$boot_register_pre_writes?=""
 $boot_registers?=""
 $reset_mode?="warm"
 
@@ -587,6 +588,22 @@ if _hash_bypass_active:
 # Boot register snapshot: capture configurable registers at VTOR detection.
 # Format: "0xADDR1=NAME1,0xADDR2=NAME2,..."
 # ---------------------------------------------------------------------------
+_boot_register_pre_writes_raw = get_optional_var('boot_register_pre_writes', '')
+_boot_register_pre_writes = []
+if _boot_register_pre_writes_raw:
+    for part in _boot_register_pre_writes_raw.split(','):
+        part = part.strip()
+        if '=' not in part:
+            continue
+        addr_str, val_str = part.split('=', 1)
+        try:
+            addr = int(addr_str, 0)
+            val = int(val_str, 0)
+            _boot_register_pre_writes.append((addr, val))
+            log('boot_register_pre_write: 0x{:08X}=0x{:08X}'.format(addr & 0xFFFFFFFF, val & 0xFFFFFFFF))
+        except (ValueError, TypeError) as e:
+            log('boot_register_pre_write: bad entry {!r} ({})'.format(part, e))
+
 _boot_registers_raw = get_optional_var('boot_registers', '')
 _boot_register_defs = []
 if _boot_registers_raw:
@@ -605,6 +622,12 @@ if _boot_registers_raw:
 def capture_boot_registers():
     if not _boot_register_defs:
         return None
+    # Apply pre-writes before reading (e.g., set MPU_RNR to select region 0).
+    for addr, val in _boot_register_pre_writes:
+        try:
+            bus.WriteDoubleWord(addr, val)
+        except Exception as e:
+            log('boot_register_pre_write failed: 0x{:08X}=0x{:08X} ({})'.format(addr, val, e))
     snapshot = {}
     for addr, name in _boot_register_defs:
         try:
