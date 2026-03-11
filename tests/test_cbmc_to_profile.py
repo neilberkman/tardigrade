@@ -355,3 +355,283 @@ class TestFormatDetection:
         f = tmp_path / "test.xml"
         f.write_text("<cprover></cprover>")
         assert ctp._detect_format(f) == "xml"
+
+
+# ---------------------------------------------------------------------------
+# Tests: input validation
+# ---------------------------------------------------------------------------
+
+class TestInputValidation:
+    def test_cbmc_file_missing(self, tmp_path):
+        with pytest.raises(RuntimeError, match="does not exist"):
+            ctp._validate_cbmc_path(tmp_path / "nonexistent.json")
+
+    def test_cbmc_file_empty(self, tmp_path):
+        f = tmp_path / "empty.json"
+        f.write_text("")
+        with pytest.raises(RuntimeError, match="empty"):
+            ctp._validate_cbmc_path(f)
+
+    def test_cbmc_file_valid(self, tmp_path):
+        f = tmp_path / "ok.json"
+        f.write_text('[{"result": []}]')
+        ctp._validate_cbmc_path(f)  # should not raise
+
+    def test_template_missing_schema_version(self):
+        data = {"bootloader": {"elf": "test.elf"}}
+        with pytest.raises(RuntimeError, match="schema_version"):
+            ctp._validate_template(data, "test.yaml")
+
+    def test_template_missing_bootloader(self):
+        data = {"schema_version": 1}
+        with pytest.raises(RuntimeError, match="bootloader"):
+            ctp._validate_template(data, "test.yaml")
+
+    def test_template_not_a_dict(self):
+        with pytest.raises(RuntimeError, match="mapping"):
+            ctp._validate_template("just a string", "test.yaml")
+
+    def test_template_valid(self):
+        data = {"schema_version": 1, "bootloader": {"elf": "test.elf"}}
+        ctp._validate_template(data, "test.yaml")  # should not raise
+
+    def test_validate_trace_not_a_list(self):
+        with pytest.raises(RuntimeError, match="expected list"):
+            ctp._validate_trace("not a list", 1)
+
+    def test_validate_trace_empty(self):
+        with pytest.raises(RuntimeError, match="empty trace"):
+            ctp._validate_trace([], 1)
+
+    def test_validate_trace_valid(self):
+        ctp._validate_trace([{"stepType": "assignment"}], 1)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# Tests: malformed CBMC input (end-to-end)
+# ---------------------------------------------------------------------------
+
+class TestMalformedInput:
+    def test_invalid_json(self, tmp_path):
+        template_file = tmp_path / "template.yaml"
+        template_file.write_text(TEMPLATE_YAML)
+
+        cbmc_file = tmp_path / "bad.json"
+        cbmc_file.write_text("{not valid json!!")
+
+        output_file = tmp_path / "output.yaml"
+        sys.argv = [
+            "cbmc_to_profile.py",
+            "--cbmc-output", str(cbmc_file),
+            "--template", str(template_file),
+            "--output", str(output_file),
+        ]
+        with pytest.raises(RuntimeError, match="not valid JSON"):
+            ctp.main()
+
+    def test_missing_cbmc_file(self, tmp_path):
+        template_file = tmp_path / "template.yaml"
+        template_file.write_text(TEMPLATE_YAML)
+
+        output_file = tmp_path / "output.yaml"
+        sys.argv = [
+            "cbmc_to_profile.py",
+            "--cbmc-output", str(tmp_path / "ghost.json"),
+            "--template", str(template_file),
+            "--output", str(output_file),
+        ]
+        with pytest.raises(RuntimeError, match="does not exist"):
+            ctp.main()
+
+    def test_missing_template_file(self, tmp_path):
+        cbmc_file = tmp_path / "cbmc.json"
+        cbmc_file.write_text('[{"result": []}]')
+
+        output_file = tmp_path / "output.yaml"
+        sys.argv = [
+            "cbmc_to_profile.py",
+            "--cbmc-output", str(cbmc_file),
+            "--template", str(tmp_path / "ghost_template.yaml"),
+            "--output", str(output_file),
+        ]
+        with pytest.raises(RuntimeError, match="does not exist"):
+            ctp.main()
+
+    def test_template_missing_required_keys(self, tmp_path):
+        template_file = tmp_path / "bad_template.yaml"
+        template_file.write_text("name: incomplete\n")
+
+        cbmc_file = tmp_path / "cbmc.json"
+        cbmc_file.write_text('[{"result": []}]')
+
+        output_file = tmp_path / "output.yaml"
+        sys.argv = [
+            "cbmc_to_profile.py",
+            "--cbmc-output", str(cbmc_file),
+            "--template", str(template_file),
+            "--output", str(output_file),
+        ]
+        with pytest.raises(RuntimeError, match="missing required key"):
+            ctp.main()
+
+    def test_trace_with_no_array_assignments(self, tmp_path):
+        """Trace has steps but none are array assignments we recognize."""
+        template_file = tmp_path / "template.yaml"
+        template_file.write_text(TEMPLATE_YAML)
+
+        steps = [
+            {"stepType": "assignment", "lhs": "some_scalar", "value": "42"},
+            {"stepType": "failure", "property": "p1", "reason": "fail"},
+        ]
+        cbmc_json = json.dumps([{
+            "result": [{
+                "property": "p1",
+                "status": "FAILURE",
+                "trace": steps,
+            }]
+        }])
+        cbmc_file = tmp_path / "cbmc.json"
+        cbmc_file.write_text(cbmc_json)
+
+        output_file = tmp_path / "output.yaml"
+        sys.argv = [
+            "cbmc_to_profile.py",
+            "--cbmc-output", str(cbmc_file),
+            "--template", str(template_file),
+            "--output", str(output_file),
+            "--meta-size", "16",
+        ]
+        with pytest.raises(RuntimeError, match="does not contain array assignments"):
+            ctp.main()
+
+    def test_indices_out_of_meta_range(self, tmp_path):
+        """Array indices exist but all fall outside meta_size."""
+        template_file = tmp_path / "template.yaml"
+        template_file.write_text(TEMPLATE_YAML)
+
+        # Indices 2000..2003 with meta_size=16 -- normalization will
+        # set base_index=2000 and rel offsets 0..3, which IS within 16.
+        # Use indices far apart straddling a huge gap instead:
+        # index 0 and index 5000 -- with meta_size=4, index 5000 is out.
+        steps = [
+            {"stepType": "assignment", "lhs": "meta_bytes[0]", "value": "1"},
+            {"stepType": "assignment", "lhs": "meta_bytes[5000]", "value": "2"},
+            {"stepType": "failure", "property": "p1", "reason": "fail"},
+        ]
+        cbmc_json = json.dumps([{
+            "result": [{
+                "property": "p1",
+                "status": "FAILURE",
+                "trace": steps,
+            }]
+        }])
+        cbmc_file = tmp_path / "cbmc.json"
+        cbmc_file.write_text(cbmc_json)
+
+        output_file = tmp_path / "output.yaml"
+        sys.argv = [
+            "cbmc_to_profile.py",
+            "--cbmc-output", str(cbmc_file),
+            "--template", str(template_file),
+            "--output", str(output_file),
+            "--meta-size", "4",
+            "--meta-base", "0x1000",
+        ]
+        # Index 0 maps to rel 0 (within meta_size=4), so this should succeed
+        # with only index 0 captured. Index 5000 is outside 0..3, so dropped.
+        rc = ctp.main()
+        assert rc == 0
+        profile = yaml.safe_load(output_file.read_text())
+        assert len(profile["pre_boot_state"]) == 1
+        assert profile["pre_boot_state"][0]["address"] == "0x00001000"
+
+    def test_address_map_bad_type(self, tmp_path):
+        m = tmp_path / "map.json"
+        m.write_text('{"nvm": [1, 2, 3]}')
+        with pytest.raises(RuntimeError, match="unsupported type"):
+            ctp.load_address_map(str(m))
+
+    def test_address_map_not_a_dict(self, tmp_path):
+        m = tmp_path / "map.json"
+        m.write_text("[1, 2, 3]")
+        with pytest.raises(RuntimeError, match="must be a JSON/YAML object"):
+            ctp.load_address_map(str(m))
+
+
+# ---------------------------------------------------------------------------
+# Tests: dry-run mode
+# ---------------------------------------------------------------------------
+
+class TestDryRun:
+    def test_dry_run_no_file_written(self, tmp_path, capsys):
+        template_file = tmp_path / "template.yaml"
+        template_file.write_text(TEMPLATE_YAML)
+
+        byte_vals = {0: 0xAA, 1: 0xBB, 2: 0xCC, 3: 0xDD}
+        cbmc_file = tmp_path / "cbmc.json"
+        cbmc_file.write_text(_make_json_trace(byte_vals))
+
+        output_file = tmp_path / "output.yaml"
+        sys.argv = [
+            "cbmc_to_profile.py",
+            "--cbmc-output", str(cbmc_file),
+            "--template", str(template_file),
+            "--output", str(output_file),
+            "--meta-size", "16",
+            "--meta-base", "0x10070000",
+            "--dry-run",
+        ]
+        rc = ctp.main()
+        assert rc == 0
+        assert not output_file.exists(), "dry-run should not write the output file"
+
+    def test_dry_run_prints_yaml(self, tmp_path, capsys):
+        template_file = tmp_path / "template.yaml"
+        template_file.write_text(TEMPLATE_YAML)
+
+        byte_vals = {0: 0xAA, 1: 0xBB, 2: 0xCC, 3: 0xDD}
+        cbmc_file = tmp_path / "cbmc.json"
+        cbmc_file.write_text(_make_json_trace(byte_vals))
+
+        output_file = tmp_path / "output.yaml"
+        sys.argv = [
+            "cbmc_to_profile.py",
+            "--cbmc-output", str(cbmc_file),
+            "--template", str(template_file),
+            "--output", str(output_file),
+            "--meta-size", "16",
+            "--meta-base", "0x10070000",
+            "--dry-run",
+        ]
+        ctp.main()
+        captured = capsys.readouterr()
+        assert "dry-run" in captured.out
+        assert "pre_boot_state" in captured.out
+        assert "0x10070000" in captured.out
+
+    def test_dry_run_replay_no_file_written(self, tmp_path, capsys):
+        template_file = tmp_path / "template.yaml"
+        template_file.write_text(TEMPLATE_YAML)
+
+        byte_vals = {0: 0xAA, 1: 0xBB, 2: 0xCC, 3: 0xDD}
+        cbmc_file = tmp_path / "cbmc.json"
+        cbmc_file.write_text(_make_json_trace(byte_vals))
+
+        output_file = tmp_path / "output.yaml"
+        replay_file = tmp_path / "replay.yaml"
+        sys.argv = [
+            "cbmc_to_profile.py",
+            "--cbmc-output", str(cbmc_file),
+            "--template", str(template_file),
+            "--output", str(output_file),
+            "--replay-output", str(replay_file),
+            "--meta-size", "16",
+            "--meta-base", "0x10070000",
+            "--dry-run",
+        ]
+        rc = ctp.main()
+        assert rc == 0
+        assert not output_file.exists()
+        assert not replay_file.exists()
+        captured = capsys.readouterr()
+        assert "dry-run replay" in captured.out
