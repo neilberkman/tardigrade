@@ -1143,7 +1143,11 @@ def check_write_order_constraints(
     """Check write-order constraints against a calibration write trace.
 
     Each constraint specifies a ``first`` region that must be written before
-    a ``then`` region.  Returns a list of violation dicts (empty = all OK).
+    a ``then`` region.  When ``bidirectional`` is True, the constraint passes
+    if either region completes all its writes before the other region's first
+    write -- i.e., one region is fully written before the other starts,
+    regardless of direction.  Only violates when writes are interleaved.
+    Returns a list of violation dicts (empty = all OK).
     """
     violations: List[Dict[str, Any]] = []
     for c in constraints:
@@ -1151,41 +1155,74 @@ def check_write_order_constraints(
         first_end = first_start + c.first_size
         then_start = c.then_start
         then_end = then_start + c.then_size
+        bidirectional = getattr(c, "bidirectional", False)
 
-        first_idx: Optional[int] = None
-        then_idx: Optional[int] = None
+        first_min: Optional[int] = None
+        first_max: Optional[int] = None
+        then_min: Optional[int] = None
+        then_max: Optional[int] = None
 
         for entry in trace:
             addr = entry.get("flash_offset", 0)
             idx = entry.get("write_index", 0)
-            if first_start <= addr < first_end and (first_idx is None or idx < first_idx):
-                first_idx = idx
-            if then_start <= addr < then_end and (then_idx is None or idx < then_idx):
-                then_idx = idx
+            if first_start <= addr < first_end:
+                if first_min is None or idx < first_min:
+                    first_min = idx
+                if first_max is None or idx > first_max:
+                    first_max = idx
+            if then_start <= addr < then_end:
+                if then_min is None or idx < then_min:
+                    then_min = idx
+                if then_max is None or idx > then_max:
+                    then_max = idx
 
-        if first_idx is None and then_idx is None:
+        if first_min is None and then_min is None:
             continue
-        if then_idx is None:
+        if then_min is None:
             continue
-        if first_idx is None:
+        if first_min is None:
+            if bidirectional:
+                # Only one region written -- no interleaving possible.
+                continue
             violations.append({
                 "label": c.label,
                 "status": "violated",
-                "reason": "first region never written, then region written at index {}".format(then_idx),
+                "reason": "first region never written, then region written at index {}".format(then_min),
                 "first_write_index": None,
-                "then_write_index": then_idx,
+                "then_write_index": then_min,
             })
             continue
-        if then_idx < first_idx:
-            violations.append({
-                "label": c.label,
-                "status": "violated",
-                "reason": "then region written at index {} before first region at {}".format(
-                    then_idx, first_idx
-                ),
-                "first_write_index": first_idx,
-                "then_write_index": then_idx,
-            })
+
+        if bidirectional:
+            # Pass if either region completes before the other starts.
+            # first fully before then: first_max < then_min
+            # then fully before first: then_max < first_min
+            first_before_then = first_max <= then_min  # type: ignore[operator]
+            then_before_first = then_max <= first_min  # type: ignore[operator]
+            if not first_before_then and not then_before_first:
+                violations.append({
+                    "label": c.label,
+                    "status": "violated",
+                    "reason": (
+                        "bidirectional: writes are interleaved "
+                        "(first region [{}-{}], then region [{}-{}])".format(
+                            first_min, first_max, then_min, then_max
+                        )
+                    ),
+                    "first_write_index": first_min,
+                    "then_write_index": then_min,
+                })
+        else:
+            if then_min < first_min:
+                violations.append({
+                    "label": c.label,
+                    "status": "violated",
+                    "reason": "then region written at index {} before first region at {}".format(
+                        then_min, first_min
+                    ),
+                    "first_write_index": first_min,
+                    "then_write_index": then_min,
+                })
     return violations
 
 
