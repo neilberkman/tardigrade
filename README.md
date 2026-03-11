@@ -18,7 +18,7 @@ Additional differential profiles for PRs [#2205](https://github.com/mcu-tools/mc
 
 ## How this works under the hood
 
-### Formal-to-empirical bridge (experimental)
+### Formal-to-empirical bridge
 
 `scripts/cbmc_to_profile.py` converts CBMC counterexamples into tardigrade replay profiles. CBMC proves a fault sequence _could_ cause corruption at the source level; tardigrade then runs the compiled bootloader firmware under that fault sequence to confirm whether it manifests in practice. The bridge maps source-level state violations to NVM write indices using the counterexample's variable traces and the calibration write log. This requires a CBMC harness that models NVM writes as observable state.
 
