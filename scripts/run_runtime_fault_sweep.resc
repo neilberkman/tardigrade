@@ -135,6 +135,9 @@ def refresh_runtime_handles():
         faultFlash = _backend_obj
     else:
         ctrl = _backend_obj
+    # Refresh separate controller handle if configured.
+    if _nvm_controller_var:
+        ctrl = monitor.Machine[_ctrl_name]
 
 # ---------------------------------------------------------------------------
 # Flash backend selection.
@@ -177,12 +180,28 @@ _cached_phase1_snapshot_path = None
 _cached_recovery_snapshot_path = None
 _machine_selector = '0'
 
+ctrl = None
 if USE_MRAM_PATH:
     mram = _backend_obj
 elif USE_FAST_PATH:
     faultFlash = _backend_obj
 else:
     ctrl = _backend_obj
+
+# Optional separate NVM controller (e.g. command-register controller in front
+# of MRAM memory).  Enables command_drop fault injection on MRAM paths.
+_nvm_controller_var = str(monitor.GetVariable('nvm_controller')).strip()
+if _nvm_controller_var:
+    _ctrl_name = 'sysbus.' + _nvm_controller_var if not _nvm_controller_var.startswith('sysbus.') else _nvm_controller_var
+    try:
+        ctrl = monitor.Machine[_ctrl_name]
+    except:
+        raise Exception(
+            'nvm_controller "{}" not found on sysbus. '
+            'Check that the platform .repl registers this peripheral.'.format(_nvm_controller_var)
+        )
+
+HAS_CONTROLLER = ctrl is not None
 
 # Read monitor variables.
 result_file = str(monitor.GetVariable('result_file'))
@@ -1354,7 +1373,7 @@ def arm_fault(absolute_write_index, write_fault_mode=0):
         ctrl.Nvm.FaultEverFired = False
 
 def arm_controller_fault(absolute_command_index, command_fault_mode=1):
-    if USE_MRAM_PATH or USE_FAST_PATH:
+    if not HAS_CONTROLLER:
         return
     try:
         ctrl.FaultAtCommandExecution = absolute_command_index
@@ -1396,7 +1415,7 @@ def disarm_erase_fault():
         faultFlash.FaultAtPageErase = 18446744073709551615
 
 def disarm_controller_fault():
-    if USE_MRAM_PATH or USE_FAST_PATH:
+    if not HAS_CONTROLLER:
         return
     try:
         ctrl.FaultAtCommandExecution = 18446744073709551615
@@ -1431,7 +1450,7 @@ def was_erase_fault_injected():
     return False
 
 def was_controller_fault_injected():
-    if USE_MRAM_PATH or USE_FAST_PATH:
+    if not HAS_CONTROLLER:
         return False
     try:
         return bool(ctrl.CommandFaultFired)
