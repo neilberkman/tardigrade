@@ -71,6 +71,9 @@ ${RESUME_TRACE_WALL_TIMEOUT_S}    30
 ${EXTRA_PERIPHERALS}           ${EMPTY}
 ${FLASH_BACKEND}               ${EMPTY}
 ${NVM_CONTROLLER}              ${EMPTY}
+${BOOT_REGISTER_PRE_WRITES}    ${EMPTY}
+${BOOT_REGISTERS}              ${EMPTY}
+${RESET_MODE}                  warm
 ${ENABLE_MACHINE_SNAPSHOTS}    false
 ${PHASE2_FAULT_ENABLED}        false
 ${PHASE2_FAULT_MAX_POINTS}     0
@@ -176,6 +179,9 @@ Run Runtime Fault Point
     Execute Command    $resume_trace_wall_timeout_s="${RESUME_TRACE_WALL_TIMEOUT_S}"
     Run Keyword If    '${SUCCESS_CRITERIA_OVERRIDES}' != ''    Execute Command    $success_criteria_overrides="${SUCCESS_CRITERIA_OVERRIDES}"
     Run Keyword If    '${SUCCESS_CRITERIA_OVERRIDES_FILE}' != ''    Execute Command    $success_criteria_overrides_file="${SUCCESS_CRITERIA_OVERRIDES_FILE}"
+    Run Keyword If    '${BOOT_REGISTER_PRE_WRITES}' != ''    Execute Command    $boot_register_pre_writes="${BOOT_REGISTER_PRE_WRITES}"
+    Run Keyword If    '${BOOT_REGISTERS}' != ''    Execute Command    $boot_registers="${BOOT_REGISTERS}"
+    Execute Command    $reset_mode="${RESET_MODE}"
 
     Execute Script    ${ROOT}/scripts/run_runtime_fault_sweep.resc
 
