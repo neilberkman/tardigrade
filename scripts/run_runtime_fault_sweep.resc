@@ -2508,9 +2508,9 @@ def _command_fault_backend_support(obj):
 
 
 def ensure_command_fault_preflight():
-    if USE_MRAM_PATH:
+    if USE_MRAM_PATH and not HAS_CONTROLLER:
         return {'supported': False, 'reason': 'mram_backend_no_command_controller'}
-    if USE_FAST_PATH:
+    if USE_FAST_PATH and not HAS_CONTROLLER:
         return {'supported': False, 'reason': 'fast_path_no_command_controller'}
     supported, reason = _command_fault_backend_support(ctrl)
     return {'supported': bool(supported), 'reason': reason or ''}
