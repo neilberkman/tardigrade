@@ -1278,10 +1278,12 @@ def _interesting_multi_fault_points(
         if result_is_brick(result) or result_has_issues(result, expected_outcome):
             fp = result.get("fault_at")
             if fp is not None:
+                eff_outcome, _ = _effective_boot_result(result)
+                eff_outcome_str = str(eff_outcome or "unknown").strip().lower()
                 # Determine the most specific reason.
                 if result_is_brick(result):
                     reason = "brick"
-                elif str(result.get("boot_outcome", "")).strip().lower() == "wrong_image":
+                elif eff_outcome_str == "wrong_image":
                     reason = "wrong_image"
                 elif result.get("semantic_assertion_failures"):
                     reason = "semantic"
@@ -1295,7 +1297,7 @@ def _interesting_multi_fault_points(
                     points[key] = InterestingPoint(
                         fault_at=key,
                         reason=reason,
-                        boot_outcome=str(result.get("boot_outcome", "unknown")),
+                        boot_outcome=eff_outcome_str,
                         fault_address=result.get("fault_address"),
                     )
     return sorted(points.values(), key=lambda p: p.fault_at)
