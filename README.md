@@ -137,25 +137,9 @@ flowchart TD
 
 ### Fault types
 
-11 fault types across 3 backend architectures (MRAM, NVMC flash-fast, NVMemory slow-path):
+11 fault types across 3 backend architectures (MRAM, NVMC flash-fast, NVMemory slow-path): `power_loss`, `bit_corruption`, `interrupted_erase`, `multi_sector_atomicity`, `silent_write_failure`, `write_rejection`, `write_disturb`, `wear_leveling_corruption`, `reset_at_time`, `read_bit_flip` (NVMemory), `command_drop` (GenericNvmController).
 
-**Core write/storage faults:**
-
-- `power_loss` -- partial write / dropped tail
-- `bit_corruption` -- NOR-physics bit flips (deterministic seed, physically modeled 1-to-0 transitions)
-- `interrupted_erase` -- partial page erase
-- `multi_sector_atomicity` -- cross-page partial erase
-- `silent_write_failure` / `write_rejection` / `write_disturb` / `wear_leveling_corruption`
-- `reset_at_time`
-- `read_bit_flip` -- transient corrupted read without modifying storage _(NVMemory backends)_
-- `command_drop` -- silently dropped NVM controller command _(GenericNvmController backends)_
-
-**Staged fault surfaces** (faults injected at different points in the update lifecycle):
-
-- `metadata_fault` -- during pre-boot metadata/setup writes
-- `hook_fault` -- during between-boot confirm/accept operations
-- `phase2_fault` -- during the recovery/repair write path itself
-- `multi_fault` -- compound staged faults across successive reboot/recovery stages
+Faults can be injected at different lifecycle stages: during the initial update write path, during pre-boot metadata/setup writes (`metadata_fault`), during between-boot confirm/accept hooks (`hook_fault`), during the recovery write path itself (`phase2_fault`), or as compound sequences (`multi_fault`).
 
 ### Execute-mode hardening
 
@@ -178,66 +162,9 @@ In `execute` mode, Phase 2 performs a full CPU recovery boot from faulted NVM:
 
 ## Profile-driven architecture
 
-Basic sweeps are purely declarative YAML -- describe the memory layout, slots, images, and success criteria. Advanced semantic checking (state probes, custom invariants) requires small Python hooks:
+Sweeps are purely declarative YAML -- describe the memory layout, slots, images, and success criteria. Advanced semantic checking (state probes, custom invariants, boot register capture, write-order constraints) requires small Python hooks.
 
-```yaml
-schema_version: 1
-name: mcuboot_pr2100_broken
-description: "MCUboot swap-move BEFORE PR #2100 fix"
-
-platform: platforms/cortex_m4_flash_fast.repl
-
-bootloader:
-  elf: results/oss_validation/assets/oss_mcuboot_pr2100_broken.elf
-  entry: 0x00000000
-
-memory:
-  sram: { start: 0x20000000, end: 0x20040000 }
-  write_granularity: 4
-  slots:
-    exec: { base: 0x0000C000, size: 0x76000 }
-    staging: { base: 0x00082000, size: 0x76000 }
-
-images:
-  exec: results/oss_validation/assets/zephyr_slot1_padded.bin
-  staging: results/oss_validation/assets/zephyr_slot0_padded.bin
-
-pre_boot_state:
-  - { address: 0x00081FF0, u32: 0xF395C277 }
-
-success_criteria:
-  marker_address: 0x0000C014
-  marker_value: 0x00000001
-
-fault_sweep:
-  mode: runtime
-  evaluation_mode: execute
-  max_writes: auto
-  flash_backend: sysbus.nvmc
-  boot_cycles: 3
-  hash_bypass_symbols: ["bootutil_img_validate"]
-
-expect:
-  should_find_issues: true
-```
-
-See [`scripts/profile_loader.py`](scripts/profile_loader.py) for the full schema.
-
-### Discovery hooks and advanced sweep controls
-
-Profiles support semantic checking beyond boot/no-boot:
-
-- **`state_probe`** -- target-supplied script that reads NVM and exports semantic state (trailer flags, slot confirmation, etc.).
-- **`semantic_assertions`** -- path-based expectations over semantic state and multi-boot analysis. A point can fail even when the device boots.
-- **`invariants`** / **`invariant_providers`** -- named postconditions (e.g., `multi_boot_converges`) and external Python modules for target-specific checks.
-- **`boot_cycles`** + **`boot_cycle_hook`** -- repeated boots with between-cycle actions model confirm-or-rollback flows.
-- **`initial_states`** -- expand one profile into a seeded sweep matrix of named starting states.
-- **`metadata_fault`** + **`metadata_fault_regions`** -- inject setup-time metadata faults and attribute failures to named regions.
-- **`phase2_fault`** / **`hook_fault`** / **`multi_fault`** -- fault injection at different lifecycle stages.
-- **`read_fault_config`** -- target-region, bit-count, and probability controls for transient read corruption.
-- **`partial_staging`** -- analyze interrupted or overlapping staging-image writes.
-- **`nvs_region`** -- model config/NVS regions separately from firmware slots.
-- **`multi_component`** -- coordinate fault analysis across multiple components in one profile.
+See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the complete profile-writing guide: field-by-field reference, platform selection, success criteria options, invariant configuration, and result interpretation.
 
 ## Supported targets
 
@@ -263,13 +190,9 @@ The `examples/` directory contains standalone bootloader firmware for engine val
 
 ## Report structure
 
-- `summary.runtime_sweep` -- aggregate outcomes, failure classes, brick rate, issue rate, control result, timing.
-- `runtime_sweep_results[]` -- per-point records: `fault_type`, `boot_outcome`, `fault_class`, `signals`, optional diagnostics.
-- `semantic_observation_failures` -- probe observation gaps (not verdict-driving by default).
+Top-level verdict is `PASS` or `FAIL` -- use this as the CI gate signal. `bricks` counts unrecoverable failures (device didn't boot). `issue_points` includes broader mismatches (wrong slot, semantic assertions, invariant violations). Boot outcomes: `success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`.
 
-Per-point diagnostics attached when relevant: `fault_window` (clean-run context around the injected operation), `postmortem_partition_dump` (for `no_boot`: slot header/trailer data), `resume_trace` (for `no_boot`: second boot with per-operation PC samples).
-
-`bricks` counts unrecoverable execution failures. `issue_points` includes broader mismatches (wrong slot, semantic assertions, invariant violations).
+See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the full report JSON structure and how to interpret results.
 
 ## Additional tools
 
@@ -319,6 +242,7 @@ tardigrade/
 ├── tests/                           # Robot Framework test suites
 ├── results/oss_validation/assets/   # Pre-built MCUboot ELFs + slot images
 └── docs/
+    └── writing-profiles.md          # Profile-writing guide + result interpretation
 ```
 
 ## Limitations
