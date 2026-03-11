@@ -1194,13 +1194,14 @@ class ProfileConfig:
         if sp.toctou_protection:
             vars_list.append("SECURITY_TOCTOU_PROTECTION:true")
 
-        # Success criteria overrides: per-fault-type criteria as JSON.
+        # Success criteria overrides: per-fault-type criteria as base64-encoded
+        # JSON.  Base64 avoids brace/quote escaping issues in Robot→Renode
+        # variable passing.
         if self.success_criteria_overrides:
-            vars_list.append(
-                "SUCCESS_CRITERIA_OVERRIDES:{}".format(
-                    json.dumps(self.success_criteria_overrides, separators=(",", ":"))
-                )
-            )
+            import base64
+            raw_json = json.dumps(self.success_criteria_overrides, separators=(",", ":"))
+            b64 = base64.b64encode(raw_json.encode()).decode()
+            vars_list.append("SUCCESS_CRITERIA_OVERRIDES:{}".format(b64))
 
         return vars_list
 # ---------------------------------------------------------------------------
