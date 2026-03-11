@@ -501,6 +501,63 @@ nvm_controller: gfc100
 
 Enables `command_drop` fault type on MRAM paths.
 
+### Partial staging
+
+Model interrupted or overlapping staging-image writes (the update was only partially downloaded before the fault):
+
+```yaml
+fault_sweep:
+  partial_staging:
+    enabled: true
+```
+
+### NVS region
+
+Model a separate config/NVS region that gets corrupted independently of firmware slots:
+
+```yaml
+nvs_region:
+  address: 0x000F0000
+  size: 0x8000
+  snapshot: path/to/nvs_snapshot.bin
+```
+
+Used with `nvs_corruption` fault sweep config for NVS-specific fault injection modes (bit flip, partial erase, truncation).
+
+### Bootloader region
+
+Model the bootloader's own code region for self-update or integrity fault scenarios:
+
+```yaml
+bootloader_region:
+  start: 0x00000000
+  size: 0xC000
+```
+
+Enables the `bootloader_region_write` fault type.
+
+### Multi-component
+
+Coordinate fault analysis across independently-updatable firmware components (e.g., app MCU + radio coprocessor):
+
+```yaml
+multi_component:
+  fault_matrix: cross_product
+  components:
+    - name: app_mcu
+      platform: platforms/cortex_m4_flash_fast.repl
+      bootloader: { elf: app_boot.elf, entry: 0x00000000 }
+      memory: { ... }
+      images: { ... }
+    - name: radio
+      platform: platforms/cortex_m0_nvm.repl
+      bootloader: { elf: radio_boot.elf, entry: 0x10000000 }
+      memory: { ... }
+      images: { ... }
+```
+
+Each component is swept independently; `fault_matrix: cross_product` tests fault combinations across components.
+
 ### Security policy
 
 Model anti-rollback and TOCTOU scenarios:
@@ -564,6 +621,153 @@ runtime_sweep_results[]                 -- per-point detail
 ```
 
 Use `scripts/render_results_html.py` to render the JSON as a browsable HTML report.
+
+## CBMC bridge: formal verification to fault injection
+
+`scripts/cbmc_to_profile.py` converts CBMC counterexamples into tardigrade profiles. The pipeline: CBMC proves a fault sequence _could_ cause corruption at the source level, then tardigrade runs the compiled firmware under that sequence to confirm whether it manifests in practice.
+
+### Workflow
+
+1. Write a CBMC harness that models your metadata parser with nondeterministic NVM contents.
+2. Run CBMC to get a counterexample (JSON or XML output).
+3. Convert to a tardigrade profile:
+
+```bash
+python3 scripts/cbmc_to_profile.py \
+    --cbmc-output cbmc_output.json \
+    --template    my_base_profile.yaml \
+    --address-map address_map.yaml \
+    --meta-size 16 \
+    --output      /tmp/cbmc_generated.yaml
+```
+
+4. Run the generated profile:
+
+```bash
+python3 scripts/audit_bootloader.py --profile /tmp/cbmc_generated.yaml
+```
+
+The tool extracts byte-level array assignments from the counterexample trace, maps them to absolute flash addresses using the address map, and injects them as `pre_boot_state` writes in a copy of the template profile.
+
+### Address map
+
+Maps CBMC symbolic variable names to flash addresses:
+
+```yaml
+# address_map.yaml
+meta_bytes: 0x10070000
+header: 0x10038000
+```
+
+### Dry run
+
+Use `--dry-run` to see the generated profile without writing files:
+
+```bash
+python3 scripts/cbmc_to_profile.py \
+    --cbmc-output cbmc_output.json \
+    --template    template.yaml \
+    --address-map address_map.yaml \
+    --output      /tmp/out.yaml \
+    --dry-run
+```
+
+See [`examples/cbmc_bridge/`](../examples/cbmc_bridge/) for a complete worked example with a buggy metadata parser, CBMC harness, pre-generated counterexamples, and address maps.
+
+## Fuzzer crash-to-profile bridge
+
+`scripts/fuzz_to_profile.py` converts raw binary crash files from AFL or libFuzzer into tardigrade profiles. The address map describes how to partition crash bytes into flash regions:
+
+```yaml
+# fuzz_address_map.yaml
+regions:
+  - { name: metadata, address: 0x10070000, offset: 0, size: 16 }
+  - { name: header, address: 0x10038000, offset: 16, size: 256 }
+```
+
+```bash
+python3 scripts/fuzz_to_profile.py \
+    --crash-input crash_001.bin \
+    --template    my_base_profile.yaml \
+    --address-map fuzz_address_map.yaml \
+    --output      /tmp/fuzz_generated.yaml
+```
+
+## Scenarios
+
+`scripts/run_scenario.py` runs multi-step discovery sequences — each step is a profile sweep with optional overrides. Define scenarios in `scenarios/`:
+
+```yaml
+# scenarios/mcuboot_upgrade_then_revert.yaml
+steps:
+  - profile: profiles/mcuboot_head_upgrade.yaml
+    description: "Forward upgrade"
+  - profile: profiles/mcuboot_head_revert.yaml
+    description: "Revert after failed confirmation"
+    overrides:
+      fault_sweep:
+        fault_types: [power_loss, bit_corruption]
+```
+
+```bash
+python3 scripts/run_scenario.py --scenario scenarios/mcuboot_upgrade_then_revert.yaml
+```
+
+## Geometry matrix
+
+`scripts/geometry_matrix.py` generates parametric slot-layout permutations from a base profile to catch geometry-dependent bugs (e.g., different slot sizes, alignments, or offsets):
+
+```bash
+python3 scripts/geometry_matrix.py \
+    --base-profile profiles/mcuboot_head_upgrade.yaml \
+    --output-dir /tmp/geometry_profiles/
+```
+
+## Running sweeps
+
+### Parallel workers
+
+`--workers N` distributes fault points across N Renode instances. Points are interleaved (round-robin) for balanced load:
+
+```bash
+python3 scripts/audit_bootloader.py \
+    --profile profiles/mcuboot_head_upgrade.yaml \
+    --workers 4
+```
+
+### Docker
+
+If you don't have `renode-test` installed locally, use the Docker backend:
+
+```bash
+python3 scripts/audit_bootloader.py \
+    --profile profiles/mcuboot_head_upgrade.yaml \
+    --renode-test docker://renode-patched:test
+```
+
+### Self-test
+
+`scripts/self_test.py` runs the full defect corpus — all profiles with `skip_self_test: false` — and verifies each one matches its `expect` block:
+
+```bash
+python3 scripts/self_test.py \
+    --renode-test /path/to/renode-test
+```
+
+Profiles with `skip_self_test: true` are skipped (typically narrow-window or CI-only profiles that need pre-built assets).
+
+### Heuristic sharding
+
+For large sweep suites in CI, shard across runners:
+
+```yaml
+fault_sweep:
+  heuristic_config:
+    shard_count: 4
+    shard_index: 0 # 0, 1, 2, 3 on separate runners
+```
+
+Each shard gets a disjoint subset of heuristic fault points.
 
 ## Profile checklist
 
