@@ -111,12 +111,6 @@ def _sector_total(sectors: List[SectorRange]) -> int:
     return sum(s.count * s.size for s in sectors)
 
 
-def _largest_sector(sectors: List[SectorRange]) -> int:
-    """Return the largest sector size in a sector map."""
-    if not sectors:
-        return 0
-    return max(s.size for s in sectors)
-
 
 # ---------------------------------------------------------------------------
 # Validation

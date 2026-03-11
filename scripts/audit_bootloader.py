@@ -38,10 +38,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from fault_inject import (
     AnnotatedSequence,
     BootloaderRegionConfig,
-    FaultDistributionConfig,
     FaultResult,
     MetadataFaultRegion,
-    MultiComponentFaultResult,
     MultiFaultPlan,
     apply_clustered_distribution,
     classify_fault_region,
@@ -58,7 +56,6 @@ from partial_staging import (
     PartialStagingResult,
     TruncationPoint,
     classify_partial_staging_outcome,
-    generate_partial_image,
     generate_truncation_points,
     parse_partial_staging_config,
     summarize_partial_staging,
