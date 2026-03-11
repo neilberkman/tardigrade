@@ -1443,6 +1443,30 @@ def _warn_fault_backend_compat(
                 "nothing.".format(platform, flash_backend or "(not set)")
             )
 
+    # interrupted_erase / multi_sector_atomicity: MRAM has no page erases.
+    # Erase faults will silently no-op on MRAM backends.
+    erase_types = {"interrupted_erase", "multi_sector_atomicity"}
+    if all_types & erase_types:
+        is_mram = "mram" in platform_lower or "mram" in backend_lower
+        if is_mram:
+            warnings.warn(
+                "Erase fault types {} are configured but platform '{}' / "
+                "flash_backend '{}' appears to be MRAM, which has no page "
+                "erases. Erase fault points will be skipped.".format(
+                    sorted(all_types & erase_types),
+                    platform,
+                    flash_backend or "(not set)",
+                )
+            )
+
+    # read_fault_config without read_bit_flip in fault_types is likely a
+    # user error -- the config will be parsed but never used.
+    if fs.read_fault_config is not None and "read_bit_flip" not in all_types:
+        warnings.warn(
+            "read_fault_config is set but 'read_bit_flip' is not in "
+            "fault_types. The read fault configuration will have no effect."
+        )
+
     # command_drop: only supported on GenericNvmController (command-based).
     # Also satisfied by an explicit nvm_controller field (separate controller
     # peripheral on MRAM platforms).
