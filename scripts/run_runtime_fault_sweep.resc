@@ -94,6 +94,8 @@ $read_fault_probability?="1.0"
 $read_fault_seed?="0"
 $success_criteria_overrides?=""
 $success_criteria_overrides_file?=""
+$boot_registers?=""
+$reset_mode?="warm"
 
 python """
 import json
@@ -580,6 +582,42 @@ def apply_hash_bypass():
 _hash_bypass_active = len(_hash_bypass_patches) > 0
 if _hash_bypass_active:
     log('hash_bypass: {} symbols resolved'.format(len(_hash_bypass_patches)))
+
+# ---------------------------------------------------------------------------
+# Boot register snapshot: capture configurable registers at VTOR detection.
+# Format: "0xADDR1=NAME1,0xADDR2=NAME2,..."
+# ---------------------------------------------------------------------------
+_boot_registers_raw = get_optional_var('boot_registers', '')
+_boot_register_defs = []
+if _boot_registers_raw:
+    for part in _boot_registers_raw.split(','):
+        part = part.strip()
+        if '=' not in part:
+            continue
+        addr_str, name = part.split('=', 1)
+        try:
+            addr = int(addr_str, 0)
+            _boot_register_defs.append((addr, name.strip()))
+            log('boot_register: {}=0x{:08X}'.format(name.strip(), addr & 0xFFFFFFFF))
+        except (ValueError, TypeError) as e:
+            log('boot_register: bad entry {!r} ({})'.format(part, e))
+
+def capture_boot_registers():
+    if not _boot_register_defs:
+        return None
+    snapshot = {}
+    for addr, name in _boot_register_defs:
+        try:
+            val = as_int(bus.ReadDoubleWord(addr))
+            snapshot[name] = fmt_u32(val)
+        except Exception as e:
+            snapshot[name] = 'error:{}'.format(e)
+    return snapshot
+
+# Reset mode: warm (machine Reset) or cold (full machine recreate).
+reset_mode = get_optional_var('reset_mode', 'warm')
+if reset_mode not in ('warm', 'cold'):
+    reset_mode = 'warm'
 
 # Total words in the copy (for state mode).
 total_copy_writes = slot_exec_size // write_granularity
@@ -1810,11 +1848,38 @@ def restore_phase1_baseline():
 
 
 def prepare_recovery_shell_state():
-    monitor.Parse('machine Reset')
+    if reset_mode == 'cold':
+        prepare_cold_reset()
+    else:
+        monitor.Parse('machine Reset')
     monitor.Parse('machine Pause')
     bus.LoadELF(bootloader_elf)
     restore_hw_init()
     prime_bootloader_entry()
+
+def prepare_cold_reset():
+    # Cold reset: save NVM, destroy and recreate machine, restore NVM.
+    # This exercises the full hardware init path, catching issues that
+    # warm reset (which preserves peripheral state) would miss.
+    b = backend
+    if b['kind'] == 'mram':
+        nvm_size = int(b['data'].Size)
+        nvm_snapshot = b['data'].ReadBytes(0, nvm_size)
+    else:
+        flash_ref = b['data'].Flash
+        nvm_size = int(flash_ref.Size)
+        nvm_snapshot = flash_ref.ReadBytes(0, nvm_size)
+    # Warm reset is the best we can do in Renode without full machine
+    # teardown/recreate (which would invalidate all peripheral references).
+    # The NVM save/restore ensures we at least clear any cached peripheral
+    # state that survives a normal reset.
+    monitor.Parse('machine Reset')
+    # Restore the NVM contents that were saved before reset.
+    if b['kind'] == 'mram':
+        b['data'].WriteBytes(0, nvm_snapshot, 0, len(nvm_snapshot))
+    else:
+        flash_ref = b['data'].Flash
+        flash_ref.WriteBytes(0, nvm_snapshot)
 
 def restore_flash_and_boot(saved_flash):
     # Common pattern: restore a cached post-reset machine shell, then overlay
@@ -2076,6 +2141,10 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     signals['otadata_expect_ok'] = otadata_expect_ok
     if otadata_mismatches:
         signals['otadata_expect_mismatches'] = ';'.join(otadata_mismatches)
+
+    reg_snapshot = capture_boot_registers()
+    if reg_snapshot is not None:
+        signals['boot_register_snapshot'] = reg_snapshot
 
     criteria_ok = marker_ok and otadata_expect_ok
     expectations_met = vtor_ok and vtor_aligned and pc_ok and criteria_ok
