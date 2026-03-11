@@ -371,11 +371,13 @@ if success_otadata_expect_scope not in ('always', 'control'):
 # Per-fault-type success criteria overrides.
 # Base64-encoded JSON dict mapping fault type names to partial criteria dicts.
 _success_criteria_overrides_raw = get_optional_var('success_criteria_overrides', '')
+log('DEBUG success_criteria_overrides_raw: [{}]'.format(repr(_success_criteria_overrides_raw)))
 _success_criteria_overrides = {}
 if _success_criteria_overrides_raw:
     try:
         import base64
-        _decoded = base64.b64decode(_success_criteria_overrides_raw).decode()
+        _padded = _success_criteria_overrides_raw + '=' * (-len(_success_criteria_overrides_raw) % 4)
+        _decoded = base64.b64decode(_padded).decode()
         _success_criteria_overrides = json.loads(_decoded)
         if not isinstance(_success_criteria_overrides, dict):
             log('WARNING: success_criteria_overrides is not a dict, ignoring')

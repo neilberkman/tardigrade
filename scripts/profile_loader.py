@@ -1200,7 +1200,7 @@ class ProfileConfig:
         if self.success_criteria_overrides:
             import base64
             raw_json = json.dumps(self.success_criteria_overrides, separators=(",", ":"))
-            b64 = base64.b64encode(raw_json.encode()).decode()
+            b64 = base64.b64encode(raw_json.encode()).decode().rstrip("=")
             vars_list.append("SUCCESS_CRITERIA_OVERRIDES:{}".format(b64))
 
         return vars_list
