@@ -390,3 +390,57 @@ def git_metadata(repo_root: Path) -> Dict[str, str]:
         "short_commit": short_commit,
         "dirty": "true" if run_git("status", "--porcelain") else "false",
     }
+
+
+def compute_verdict(
+    sweep_summary: Dict[str, Any],
+    profile_expect: Any,
+    multi_fault_summary: Optional[Dict[str, Any]] = None,
+    partial_staging_summary: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Derive a PASS/FAIL verdict from sweep summaries and profile expectations."""
+    found_issues = int(
+        sweep_summary.get("issue_points", sweep_summary["bricks"])
+    ) > 0
+    if multi_fault_summary is not None:
+        found_issues = found_issues or (
+            int(
+                multi_fault_summary.get(
+                    "issue_points", multi_fault_summary["bricks"]
+                )
+            )
+            > 0
+        )
+    if partial_staging_summary is not None:
+        found_issues = found_issues or (
+            int(partial_staging_summary.get("issue_count", 0)) > 0
+        )
+    control_issue_count = int(
+        (sweep_summary.get("control") or {}).get("issue_count", 0)
+    )
+
+    verdict = "PASS"
+    if control_issue_count:
+        verdict = "FAIL \u2014 control checks failed"
+    elif profile_expect.should_find_issues and not found_issues:
+        verdict = "FAIL \u2014 expected to find issues but found none"
+    elif not profile_expect.should_find_issues and found_issues:
+        total_issues = sweep_summary.get("issue_points", 0)
+        if multi_fault_summary:
+            total_issues += int(
+                multi_fault_summary.get(
+                    "issue_points", multi_fault_summary.get("bricks", 0)
+                )
+            )
+        if partial_staging_summary:
+            total_issues += int(partial_staging_summary.get("issue_count", 0))
+        verdict = (
+            "FAIL \u2014 found {} issue points "
+            "({} boot mismatches, {} semantic, {} invariant)"
+        ).format(
+            total_issues,
+            sweep_summary.get("bricks", 0),
+            sweep_summary.get("semantic_issue_points", 0),
+            sweep_summary.get("invariant_issue_points", 0),
+        )
+    return verdict
