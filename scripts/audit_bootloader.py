@@ -396,6 +396,9 @@ def main() -> int:
         include_instruction_skip = "instruction_skip" in fault_types
         include_i2c_faults = any(ft.startswith("i2c_") for ft in fault_types)
         i2c_fault_types = [ft for ft in fault_types if ft.startswith("i2c_")]
+        include_otp_faults = any(ft.startswith("otp_") for ft in fault_types)
+        otp_fault_types = [ft for ft in fault_types if ft.startswith("otp_")]
+        include_nvs_corruption = "nvs_corruption" in fault_types
 
         # Pass fault_types to calibration so erase trace is captured.
         if include_erases:
@@ -567,6 +570,8 @@ def main() -> int:
             or include_command_drop
             or include_instruction_skip
             or include_i2c_faults
+            or include_otp_faults
+            or include_nvs_corruption
             or profile.fault_sweep.phase2_fault.enabled
             or profile.fault_sweep.multi_fault.enabled
             or include_metadata_fault
@@ -714,6 +719,45 @@ def main() -> int:
                     combined += [(fp, i2c_code) for fp in i2c_fps]
                     i2c_fault_count += len(i2c_fps)
 
+            # OTP fault injection: same write indices as power-loss, but
+            # each OTP fault type uses a different BlowFaultMode on the
+            # OTPMemory peripheral.
+            otp_fault_count = 0
+            if include_otp_faults:
+                otp_fps = list(fault_points)
+                if args.quick:
+                    otp_fps = quick_subset(otp_fps)
+                for otp_ft in otp_fault_types:
+                    otp_code = FAULT_TYPE_NAME_TO_CODE.get(otp_ft, "op")
+                    combined += [(fp, otp_code) for fp in otp_fps]
+                    otp_fault_count += len(otp_fps)
+
+            # NVS corruption: pre-boot region corruption variants.
+            # Each variant corrupts the NVS region with a different mode
+            # (bit_flip, partial_erase, truncate, scramble) and boots.
+            # Encoded as 'nv:<variant_index>' where variant_index selects
+            # the corruption mode from the NvsCorruptionConfig.
+            nvs_fault_count = 0
+            if include_nvs_corruption:
+                nvs_cfg = profile.fault_sweep.nvs_corruption
+                if nvs_cfg.enabled and profile.memory.nvs_region is not None:
+                    nvs_modes = nvs_cfg.modes
+                    for vi, mode in enumerate(nvs_modes):
+                        combined.append((vi, "nv:{}".format(vi)))
+                        nvs_fault_count += 1
+                elif not nvs_cfg.enabled:
+                    print(
+                        "nvs_corruption in fault_types but nvs_corruption "
+                        "config not enabled; skipping.",
+                        file=sys.stderr,
+                    )
+                elif profile.memory.nvs_region is None:
+                    print(
+                        "nvs_corruption in fault_types but no nvs_region "
+                        "configured; skipping.",
+                        file=sys.stderr,
+                    )
+
             # Instruction-skip fault injection: enumerate halfword-aligned
             # addresses in configured target ranges.  Each fault point is
             # an address (not a write index), encoded as 'i:<addr>'.
@@ -847,6 +891,10 @@ def main() -> int:
                 parts.append("{} command-drop".format(command_drop_count))
             if i2c_fault_count:
                 parts.append("{} i2c-fault".format(i2c_fault_count))
+            if otp_fault_count:
+                parts.append("{} otp-fault".format(otp_fault_count))
+            if nvs_fault_count:
+                parts.append("{} nvs-corruption".format(nvs_fault_count))
             if instruction_skip_count:
                 parts.append("{} instruction-skip".format(instruction_skip_count))
             if phase2_count:

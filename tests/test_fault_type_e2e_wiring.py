@@ -41,6 +41,7 @@ from fault_types import (  # noqa: E402
     _fault_type_label as ft_label,
 )
 from profile_loader import (  # noqa: E402
+    CLASSIFICATION_ONLY_FAULT_TYPES,
     IMPLEMENTED_FAULT_TYPES,
     KNOWN_FAULT_TYPES,
     I2C_FAULT_TYPE_CODES,
@@ -105,13 +106,8 @@ RESC_EXECUTE_ONLY = _extract_resc_frozenset("_EXECUTE_ONLY_FAULT_TYPES")
 # Each entry documents WHY it's exempt.
 # ---------------------------------------------------------------------------
 SEPARATE_SUBSYSTEM_TYPES = {
-    # nvs_corruption has its own NvsCorruptionConfig subsystem with region-
-    # based corruption modes (bit_flip, partial_erase, truncate, scramble).
-    # It applies pre-boot state corruption, not per-write fault injection.
-    "nvs_corruption",
-    # bootloader_region_write uses BootloaderRegionConfig to inject writes
-    # into the bootloader's own code region.  It does not use the fault_type
-    # wire-code path.
+    # bootloader_region_write is a classification/heuristic label, not an
+    # injectable fault type.  It's in CLASSIFICATION_ONLY_FAULT_TYPES.
     "bootloader_region_write",
 }
 
@@ -133,11 +129,11 @@ class TestRegistrationConsistency(unittest.TestCase):
         )
 
     def test_known_equals_implemented(self):
-        """If a type is KNOWN, it should be IMPLEMENTED (no dead declarations)."""
-        unimplemented = KNOWN_FAULT_TYPES - IMPLEMENTED_FAULT_TYPES
+        """If a type is KNOWN, it should be IMPLEMENTED or CLASSIFICATION_ONLY."""
+        unimplemented = KNOWN_FAULT_TYPES - IMPLEMENTED_FAULT_TYPES - CLASSIFICATION_ONLY_FAULT_TYPES
         self.assertFalse(
             unimplemented,
-            "Types in KNOWN but not IMPLEMENTED: {}".format(sorted(unimplemented)),
+            "Types in KNOWN but not IMPLEMENTED or CLASSIFICATION_ONLY: {}".format(sorted(unimplemented)),
         )
 
     def test_wire_coded_types_are_implemented(self):
@@ -280,6 +276,9 @@ class TestRuntimeDispatchCoverage(unittest.TestCase):
             # instruction_skip: always dispatched via 'i:<addr>' prefix,
             # never as bare 'i'.
             "i",
+            # nvs_corruption: dispatched via 'nv:<variant_index>' prefix,
+            # not as bare 'nv'.
+            "nv",
         }
 
         # Convert EXECUTE_ONLY names to wire codes for comparison.

@@ -267,7 +267,6 @@ Default is `[power_loss]`. Available types (23 total):
 | `reset_at_time`            | CPU reset at a time offset              | All                  |
 | `read_bit_flip`            | Transient read corruption               | NVMemory, MRAM       |
 | `instruction_skip`         | Voltage-glitch instruction skip (NOP)   | All                  |
-| `bootloader_region_write`  | Fault during bootloader self-update     | All                  |
 | `nvs_corruption`           | NVS/config region corruption            | All                  |
 | `i2c_nack`                 | I2C NACK on secure element transaction  | I2CFaultProxy        |
 | `i2c_timeout`              | I2C bus timeout                         | I2CFaultProxy        |
@@ -638,7 +637,11 @@ bootloader_region:
   size: 0xC000
 ```
 
-Enables the `bootloader_region_write` fault type.
+Enables Tier 0 heuristic classification: writes targeting the bootloader
+region are always included in the fault point set regardless of the
+heuristic sampling strategy. Note that `bootloader_region_write` is a
+classification label, not an injectable fault type -- the actual fault
+injection uses `power_loss`, `bit_corruption`, etc. at those write indices.
 
 ### Multi-component
 
