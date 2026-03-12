@@ -7,8 +7,9 @@ post-sweep reporting and region enrichment logic.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fault_classification import (
     _effective_boot_result,
@@ -444,3 +445,32 @@ def compute_verdict(
             sweep_summary.get("invariant_issue_points", 0),
         )
     return verdict
+
+
+def report_skip_reasons(
+    sweep_summary: Dict[str, Any],
+    progress_fn: Callable[[str], Any],
+) -> None:
+    """Print skip-reason diagnostics from a sweep summary."""
+    _SKIP_KEYS = [
+        ("skip_reasons", "Skipped {} fault points (not injected): {}",
+         "discarded_no_fault_fired"),
+        ("phase2_skip_reasons", "Phase 2 fault points skipped before injection: {}",
+         None),
+        ("hook_skip_reasons", "Hook fault points skipped before injection: {}",
+         None),
+    ]
+    for key, template, count_key in _SKIP_KEYS:
+        reasons = sweep_summary.get(key)
+        if not reasons:
+            continue
+        parts = [
+            "{} {}".format(count, reason)
+            for reason, count in sorted(reasons.items())
+        ]
+        if count_key:
+            progress_fn(template.format(
+                sweep_summary.get(count_key, 0), ", ".join(parts),
+            ))
+        else:
+            progress_fn(template.format(", ".join(parts)))
