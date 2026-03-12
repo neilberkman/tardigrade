@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from audit_bootloader import (
+from fault_types import (
     EXECUTE_ONLY_FAULT_TYPES,
     FAULT_TYPE_NAME_TO_CODE,
     _fault_type_label,

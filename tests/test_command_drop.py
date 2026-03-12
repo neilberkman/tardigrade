@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from audit_bootloader import EXECUTE_ONLY_FAULT_TYPES, _fault_type_label  # noqa: E402
+from fault_types import EXECUTE_ONLY_FAULT_TYPES, _fault_type_label  # noqa: E402
 from profile_loader import IMPLEMENTED_FAULT_TYPES, KNOWN_FAULT_TYPES  # noqa: E402
 
 

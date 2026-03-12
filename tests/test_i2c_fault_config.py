@@ -26,7 +26,7 @@ from profile_loader import (
     load_profile,
 )
 
-from audit_bootloader import (
+from fault_types import (
     EXECUTE_ONLY_FAULT_TYPES,
     FAULT_TYPE_NAME_TO_CODE,
     _fault_type_label,

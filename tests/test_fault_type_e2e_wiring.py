@@ -47,13 +47,8 @@ from profile_loader import (  # noqa: E402
     OTP_FAULT_TYPE_CODES,
 )
 
-# audit_bootloader.py has its own copies of these constants.
-# Import them to verify they stay in sync with fault_types.py.
-from audit_bootloader import (  # noqa: E402
-    EXECUTE_ONLY_FAULT_TYPES as AB_EXECUTE_ONLY,
-    FAULT_TYPE_NAME_TO_CODE as AB_NAME_TO_CODE,
-    _fault_type_label as ab_label,
-)
+# audit_bootloader.py now imports directly from fault_types.py —
+# no separate copies to sync.
 
 # ---------------------------------------------------------------------------
 # Read the runtime .resc file as text for dispatch-table verification.
@@ -197,58 +192,10 @@ class TestRegistrationConsistency(unittest.TestCase):
 # ====================================================================
 # 2. Cross-module constant synchronization
 # ====================================================================
-
-
-class TestConstantSync(unittest.TestCase):
-    """audit_bootloader.py has duplicate constants; they must match fault_types.py."""
-
-    def test_execute_only_sets_match(self):
-        """EXECUTE_ONLY sets in fault_types.py and audit_bootloader.py must agree."""
-        ft_only = FT_EXECUTE_ONLY
-        ab_only = AB_EXECUTE_ONLY
-        only_in_ft = ft_only - ab_only
-        only_in_ab = ab_only - ft_only
-        self.assertFalse(
-            only_in_ft or only_in_ab,
-            "EXECUTE_ONLY drift: only in fault_types.py={}, only in "
-            "audit_bootloader.py={}".format(sorted(only_in_ft), sorted(only_in_ab)),
-        )
-
-    def test_name_to_code_maps_match(self):
-        """FAULT_TYPE_NAME_TO_CODE maps must be identical across modules."""
-        ft_map = FT_NAME_TO_CODE
-        ab_map = AB_NAME_TO_CODE
-        # Check same keys.
-        ft_keys = set(ft_map.keys())
-        ab_keys = set(ab_map.keys())
-        only_ft = ft_keys - ab_keys
-        only_ab = ab_keys - ft_keys
-        self.assertFalse(
-            only_ft or only_ab,
-            "NAME_TO_CODE key drift: only in fault_types.py={}, only in "
-            "audit_bootloader.py={}".format(sorted(only_ft), sorted(only_ab)),
-        )
-        # Check same values.
-        for name in sorted(ft_keys & ab_keys):
-            self.assertEqual(
-                ft_map[name],
-                ab_map[name],
-                "Wire code mismatch for '{}': fault_types='{}', "
-                "audit_bootloader='{}'".format(name, ft_map[name], ab_map[name]),
-            )
-
-    def test_label_functions_agree(self):
-        """_fault_type_label in both modules must produce identical output."""
-        all_codes = set(FT_NAME_TO_CODE.values())
-        for code in sorted(all_codes):
-            ft_result = ft_label(code)
-            ab_result = ab_label(code)
-            self.assertEqual(
-                ft_result,
-                ab_result,
-                "_fault_type_label('{}') differs: fault_types='{}', "
-                "audit_bootloader='{}'".format(code, ft_result, ab_result),
-            )
+# audit_bootloader.py now imports EXECUTE_ONLY_FAULT_TYPES and
+# FAULT_TYPE_NAME_TO_CODE directly from fault_types.py, so there are
+# no duplicate copies to drift.  The sync tests that were here have
+# been removed as they became tautological after the extraction.
 
 
 # ====================================================================
