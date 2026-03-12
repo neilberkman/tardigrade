@@ -390,11 +390,8 @@ class TestNvsRegionProfileParsing(unittest.TestCase):
 
 class TestNvsConfigClassification(unittest.TestCase):
     def setUp(self) -> None:
-        from audit_bootloader import (
-            classify_failure_class,
-            evaluate_config_checks,
-            result_is_brick,
-        )
+        from audit_bootloader import evaluate_config_checks
+        from fault_classification import classify_failure_class, result_is_brick
 
         self.classify_failure_class = classify_failure_class
         self.evaluate_config_checks = evaluate_config_checks

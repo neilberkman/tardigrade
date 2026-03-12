@@ -498,22 +498,22 @@ class TestFaultTypeLabelWithTimedReset(unittest.TestCase):
     """Test _fault_type_label handles timed reset Phase 2 encodings."""
 
     def test_phase2_timed_label(self) -> None:
-        from audit_bootloader import _fault_type_label
+        from fault_types import _fault_type_label
 
         self.assertEqual(_fault_type_label("p2:10:5:t:t"), "phase2_reset_at_time")
 
     def test_phase2_write_label(self) -> None:
-        from audit_bootloader import _fault_type_label
+        from fault_types import _fault_type_label
 
         self.assertEqual(_fault_type_label("p2:10:5:w:w"), "phase2_power_loss")
 
     def test_clustered_bit_corruption_label(self) -> None:
-        from audit_bootloader import _fault_type_label
+        from fault_types import _fault_type_label
 
         self.assertEqual(_fault_type_label("b:12345"), "bit_corruption_clustered")
 
     def test_plain_bit_corruption_label(self) -> None:
-        from audit_bootloader import _fault_type_label
+        from fault_types import _fault_type_label
 
         self.assertEqual(_fault_type_label("b"), "bit_corruption")
 

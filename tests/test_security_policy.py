@@ -17,11 +17,11 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from audit_bootloader import (
+from audit_bootloader import validate_runtime_fault_mode_compat
+from fault_classification import (
     classify_failure_class,
     result_has_issues,
     result_is_brick,
-    validate_runtime_fault_mode_compat,
 )
 from profile_loader import (
     ProfileError,

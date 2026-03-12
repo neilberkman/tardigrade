@@ -20,7 +20,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import csv
 import dataclasses
 import datetime as dt
 import json
@@ -37,18 +36,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fault_inject import (
     AnnotatedSequence,
-    BootloaderRegionConfig,
     FaultResult,
-    MetadataFaultRegion,
     MultiFaultPlan,
     apply_clustered_distribution,
-    classify_fault_region,
     classify_multi_component_outcome,
     decode_multi_fault_sequence,
     encode_multi_fault_sequence,
     generate_multi_fault_sequences,
     multi_fault_plan_summary,
-    validate_bootloader_vector_table,
 )
 from invariants import resolve_invariants, run_invariants
 from partial_staging import (
@@ -66,15 +61,11 @@ from fault_classification import (
     _MULTI_BOOT_SUCCESS_STATUSES,
     _effective_boot_result,
     _interesting_multi_fault_points,
-    classify_failure_class,
-    result_has_issues,
     result_is_brick,
-    result_issue_reasons,
 )
 from fault_types import (
     EXECUTE_ONLY_FAULT_TYPES,
     FAULT_TYPE_NAME_TO_CODE,
-    _fault_type_label,
 )
 from trace_utils import (
     annotate_fault_windows,
