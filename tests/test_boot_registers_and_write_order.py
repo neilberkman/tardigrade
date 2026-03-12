@@ -30,7 +30,7 @@ from profile_loader import (  # noqa: E402
 )
 
 # Inline import of audit function
-from audit_bootloader import check_write_order_constraints  # noqa: E402
+from result_checks import check_write_order_constraints  # noqa: E402
 
 
 class BootRegistersProfileParsingTest(unittest.TestCase):

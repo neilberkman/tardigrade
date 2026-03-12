@@ -18,7 +18,7 @@ import sys
 
 sys.path.insert(0, str(SCRIPTS))
 
-from audit_bootloader import annotate_result_checks  # noqa: E402
+from result_checks import annotate_result_checks  # noqa: E402
 from profile_loader import load_profile  # noqa: E402
 from invariants import resolve_invariants  # noqa: E402
 from run_scenario import (  # noqa: E402
