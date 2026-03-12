@@ -62,7 +62,10 @@ namespace Antmicro.Renode.Peripherals.Memory
             // OTP memory is non-volatile and one-time-programmable.
             // Storage intentionally survives reset — fuses cannot be unblown.
             // Only transient tracking state is reset.
+            TotalBlows = 0;
             BlowFaultFired = false;
+            LastFaultAddress = 0;
+            FaultSnapshot = null;
         }
 
         // --- Read interface ---
@@ -393,9 +396,9 @@ namespace Antmicro.Renode.Peripherals.Memory
             ValidateRange(offset, data.Length);
 
             // Determine how many blow operations this write represents.
-            // Granularity: 1 bit = each changed bit is a blow,
-            //              8 bits = each byte is a blow,
-            //              32 bits = each 4-byte word is a blow.
+            // Only count entries that actually have new 0->1 bit transitions.
+            // No-op entries are skipped to avoid consuming FaultAtBlow on
+            // unchanged data (Bug fix: faults on no-op writes).
             int blowsInThisWrite;
             switch(writeGranularity)
             {
@@ -403,13 +406,13 @@ namespace Antmicro.Renode.Peripherals.Memory
                     blowsInThisWrite = CountNewBits(offset, data);
                     break;
                 case 8:
-                    blowsInThisWrite = data.Length;
+                    blowsInThisWrite = CountNewBytes(offset, data);
                     break;
                 case 32:
-                    blowsInThisWrite = Math.Max(1, (data.Length + 3) / 4);
+                    blowsInThisWrite = CountNewWords(offset, data);
                     break;
                 default:
-                    blowsInThisWrite = data.Length;
+                    blowsInThisWrite = CountNewBytes(offset, data);
                     break;
             }
 
@@ -428,22 +431,30 @@ namespace Antmicro.Renode.Peripherals.Memory
                     BlowFaultFired = true;
                     LastFaultAddress = offset;
 
-                    // Apply partial blow based on fault mode.
-                    int blowByteStart;
-                    int blowByteEnd;
-                    ComputeBlowWindow(offset, data.Length, blowIdx, out blowByteStart, out blowByteEnd);
-
-                    // Apply all blows BEFORE the faulted one normally.
-                    for(int prior = 0; prior < blowIdx; prior++)
+                    if(writeGranularity == 1)
                     {
-                        int priorStart;
-                        int priorEnd;
-                        ComputeBlowWindow(offset, data.Length, prior, out priorStart, out priorEnd);
-                        ApplyNormalBlow(offset, data, priorStart, priorEnd);
+                        // Bit-level: apply individual new bits up to the
+                        // faulted one, then apply the faulted bit.
+                        ApplyBitLevelFault(offset, data, blowIdx);
                     }
+                    else
+                    {
+                        // Byte/word-level: apply prior blow windows normally,
+                        // then apply the faulted window.
+                        int blowByteStart;
+                        int blowByteEnd;
+                        ComputeBlowWindow(offset, data, blowIdx, out blowByteStart, out blowByteEnd);
 
-                    // Apply the faulted blow.
-                    ApplyFaultedBlow(offset, data, blowByteStart, blowByteEnd);
+                        for(int prior = 0; prior < blowIdx; prior++)
+                        {
+                            int priorStart;
+                            int priorEnd;
+                            ComputeBlowWindow(offset, data, prior, out priorStart, out priorEnd);
+                            ApplyNormalBlow(offset, data, priorStart, priorEnd);
+                        }
+
+                        ApplyFaultedBlow(offset, data, blowByteStart, blowByteEnd);
+                    }
 
                     // Snapshot OTP state at fault moment.
                     FaultSnapshot = new byte[size];
@@ -456,6 +467,48 @@ namespace Antmicro.Renode.Peripherals.Memory
             if(!BlowFaultFired)
             {
                 ApplyNormalBlow(offset, data, 0, data.Length);
+            }
+        }
+
+        /// <summary>
+        /// Bit-level fault application. Walks new 0->1 bits in order, applies
+        /// each one individually up to the faulted bit index, then applies the
+        /// faulted bit with the configured fault mode. This ensures prior bits
+        /// in the same buffer don't clobber later bit positions.
+        /// </summary>
+        private void ApplyBitLevelFault(long offset, byte[] data, int faultBitIdx)
+        {
+            int bitsSeen = 0;
+            for(int i = 0; i < data.Length; i++)
+            {
+                byte newBits = (byte)(data[i] & ~storage[offset + i]);
+                if(newBits == 0)
+                {
+                    continue;
+                }
+
+                for(int bit = 0; bit < 8; bit++)
+                {
+                    if((newBits & (1 << bit)) == 0)
+                    {
+                        continue;
+                    }
+
+                    if(bitsSeen < faultBitIdx)
+                    {
+                        // Prior bit: apply normally.
+                        byte stuckMask = PermanentStuckBits ? stuckBitMask[offset + i] : (byte)0;
+                        byte bitValue = (byte)((1 << bit) & ~stuckMask);
+                        storage[offset + i] |= bitValue;
+                        bitsSeen++;
+                    }
+                    else
+                    {
+                        // This is the faulted bit: apply via fault mode.
+                        ApplyFaultedBlow(offset, data, i, i + 1);
+                        return;
+                    }
+                }
             }
         }
 
@@ -556,29 +609,78 @@ namespace Antmicro.Renode.Peripherals.Memory
             }
         }
 
-        private void ComputeBlowWindow(long offset, int dataLength, int blowIdx,
+        /// <summary>
+        /// Compute the byte window for the Nth blow operation, skipping no-op
+        /// entries (bytes/words with no new 0->1 transitions).
+        /// For granularity 8, maps blowIdx to the Nth byte that has new bits.
+        /// For granularity 32, maps blowIdx to the Nth 4-byte word that has new bits.
+        /// Not used for granularity 1 (handled by ApplyBitLevelFault).
+        /// </summary>
+        private void ComputeBlowWindow(long offset, byte[] data, int blowIdx,
                                         out int startByte, out int endByte)
         {
             switch(writeGranularity)
             {
-                case 1:
-                    // Bit-granularity: each blow is one bit. Map to containing byte.
-                    startByte = 0;
-                    endByte = dataLength;
-                    break;
                 case 8:
-                    // Byte-granularity: each blow is one byte.
-                    startByte = Math.Min(blowIdx, dataLength);
-                    endByte = Math.Min(blowIdx + 1, dataLength);
+                {
+                    // Byte-granularity: find the Nth byte with new bits.
+                    int found = 0;
+                    for(int i = 0; i < data.Length; i++)
+                    {
+                        byte newBits = (byte)(data[i] & ~storage[offset + i]);
+                        if(newBits == 0)
+                        {
+                            continue;
+                        }
+                        if(found == blowIdx)
+                        {
+                            startByte = i;
+                            endByte = i + 1;
+                            return;
+                        }
+                        found++;
+                    }
+                    // Fallback (should not happen if blowsInThisWrite is correct).
+                    startByte = 0;
+                    endByte = data.Length;
                     break;
+                }
                 case 32:
-                    // Word-granularity: each blow is 4 bytes.
-                    startByte = Math.Min(blowIdx * 4, dataLength);
-                    endByte = Math.Min(startByte + 4, dataLength);
+                {
+                    // Word-granularity: find the Nth 4-byte word with new bits.
+                    int found = 0;
+                    for(int w = 0; w < data.Length; w += 4)
+                    {
+                        int wEnd = Math.Min(w + 4, data.Length);
+                        bool hasNew = false;
+                        for(int i = w; i < wEnd; i++)
+                        {
+                            if((data[i] & ~storage[offset + i]) != 0)
+                            {
+                                hasNew = true;
+                                break;
+                            }
+                        }
+                        if(!hasNew)
+                        {
+                            continue;
+                        }
+                        if(found == blowIdx)
+                        {
+                            startByte = w;
+                            endByte = wEnd;
+                            return;
+                        }
+                        found++;
+                    }
+                    // Fallback.
+                    startByte = 0;
+                    endByte = data.Length;
                     break;
+                }
                 default:
                     startByte = 0;
-                    endByte = dataLength;
+                    endByte = data.Length;
                     break;
             }
         }
@@ -590,6 +692,44 @@ namespace Antmicro.Renode.Peripherals.Memory
             {
                 byte newBits = (byte)(data[i] & ~storage[offset + i]);
                 count += PopCount(newBits);
+            }
+            return count;
+        }
+
+        /// <summary>
+        /// Count bytes with at least one new 0->1 bit transition.
+        /// </summary>
+        private int CountNewBytes(long offset, byte[] data)
+        {
+            int count = 0;
+            for(int i = 0; i < data.Length; i++)
+            {
+                byte newBits = (byte)(data[i] & ~storage[offset + i]);
+                if(newBits != 0)
+                {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        /// <summary>
+        /// Count 4-byte words with at least one new 0->1 bit transition.
+        /// </summary>
+        private int CountNewWords(long offset, byte[] data)
+        {
+            int count = 0;
+            for(int w = 0; w < data.Length; w += 4)
+            {
+                int wEnd = Math.Min(w + 4, data.Length);
+                for(int i = w; i < wEnd; i++)
+                {
+                    if((data[i] & ~storage[offset + i]) != 0)
+                    {
+                        count++;
+                        break;
+                    }
+                }
             }
             return count;
         }

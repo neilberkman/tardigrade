@@ -223,6 +223,17 @@ class BackendCompatWarningTest(unittest.TestCase):
 class FaultPointGenerationTest(unittest.TestCase):
     """Verify instruction_skip fault points are generated from address ranges."""
 
+    @staticmethod
+    def _enumerate(isc: InstructionSkipConfig):
+        """Replicate the enumeration logic from audit_bootloader.py."""
+        sc = isc.skip_count if isc.skip_count > 0 else 1
+        addrs = []
+        for start, end in isc.target_addresses:
+            stop = end - (sc - 1) * 2
+            for addr in range(start, max(stop, start), 2):
+                addrs.append(addr)
+        return addrs
+
     def test_address_enumeration(self) -> None:
         """Each halfword in target ranges should produce one fault point."""
         isc = InstructionSkipConfig(
@@ -230,10 +241,7 @@ class FaultPointGenerationTest(unittest.TestCase):
             skip_count=1,
         )
         # 0x1010 - 0x1000 = 16 bytes = 8 halfwords
-        addrs = []
-        for start, end in isc.target_addresses:
-            for addr in range(start, end, 2):
-                addrs.append(addr)
+        addrs = self._enumerate(isc)
         self.assertEqual(len(addrs), 8)
         self.assertEqual(addrs[0], 0x1000)
         self.assertEqual(addrs[-1], 0x100E)
@@ -258,6 +266,59 @@ class FaultPointGenerationTest(unittest.TestCase):
         parts = code.split(":")
         self.assertEqual(parts[0], "i")
         self.assertEqual(int(parts[1], 0), 0x1234)
+
+    def test_skip_count_boundary_no_overflow(self) -> None:
+        """With skip_count=3, addresses within 4 bytes of region_end must be excluded.
+
+        Patching 3 consecutive halfwords (6 bytes) from start address must
+        not extend past region_end.  So the last valid start is
+        region_end - skip_count * 2 (exclusive upper bound of range).
+        """
+        # Region: 0x1000..0x100C (12 bytes = 6 halfwords)
+        isc = InstructionSkipConfig(
+            target_addresses=[(0x1000, 0x100C)],
+            skip_count=3,
+        )
+        addrs = self._enumerate(isc)
+        # skip_count=3 means each fault patches 3 halfwords (6 bytes).
+        # Last safe start: 0x100C - 3*2 = 0x1006.
+        # Valid starts: 0x1000, 0x1002, 0x1004, 0x1006 = 4 addresses.
+        self.assertEqual(len(addrs), 4)
+        self.assertEqual(addrs[0], 0x1000)
+        self.assertEqual(addrs[-1], 0x1006)
+        # Verify that the last address + skip_count*2 does NOT exceed region_end
+        for a in addrs:
+            self.assertLessEqual(a + 3 * 2, 0x100C)
+
+    def test_skip_count_1_unchanged(self) -> None:
+        """skip_count=1 should behave identically to the original logic."""
+        isc = InstructionSkipConfig(
+            target_addresses=[(0x1000, 0x1008)],
+            skip_count=1,
+        )
+        addrs = self._enumerate(isc)
+        self.assertEqual(len(addrs), 4)
+        self.assertEqual(addrs[-1], 0x1006)
+
+    def test_skip_count_equals_region_size(self) -> None:
+        """When skip_count covers the entire region, only one address is valid."""
+        # 4 bytes = 2 halfwords, skip_count=2
+        isc = InstructionSkipConfig(
+            target_addresses=[(0x2000, 0x2004)],
+            skip_count=2,
+        )
+        addrs = self._enumerate(isc)
+        self.assertEqual(addrs, [0x2000])
+
+    def test_skip_count_exceeds_region(self) -> None:
+        """When skip_count > region halfwords, no addresses should be enumerated."""
+        # 4 bytes = 2 halfwords, skip_count=3
+        isc = InstructionSkipConfig(
+            target_addresses=[(0x3000, 0x3004)],
+            skip_count=3,
+        )
+        addrs = self._enumerate(isc)
+        self.assertEqual(addrs, [])
 
 
 if __name__ == "__main__":

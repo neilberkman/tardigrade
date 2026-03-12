@@ -53,6 +53,7 @@ namespace Antmicro.Renode.Peripherals.I2C
         public void Reset()
         {
             totalTransactions = 0;
+            currentTransactionActive = false;
             faultFired = false;
             lastFaultType = 0;
             transactionLog.Clear();
@@ -85,7 +86,10 @@ namespace Antmicro.Renode.Peripherals.I2C
                 return;
             }
 
-            totalTransactions++;
+            // Mark that this transaction has activity (fault decision
+            // deferred to FinishTransmission where the full transaction
+            // boundary is known).
+            currentTransactionActive = true;
 
             if(ShouldInjectFault())
             {
@@ -106,7 +110,10 @@ namespace Antmicro.Renode.Peripherals.I2C
 
         public byte[] Read(int count = 1)
         {
-            totalTransactions++;
+            // Mark that this transaction has activity (fault decision
+            // deferred to FinishTransmission where the full transaction
+            // boundary is known).
+            currentTransactionActive = true;
 
             if(ShouldInjectFault())
             {
@@ -134,6 +141,12 @@ namespace Antmicro.Renode.Peripherals.I2C
 
         public void FinishTransmission()
         {
+            if(currentTransactionActive)
+            {
+                totalTransactions++;
+                currentTransactionActive = false;
+            }
+
             if(DownstreamDevice != null)
             {
                 DownstreamDevice.FinishTransmission();
@@ -282,13 +295,17 @@ namespace Antmicro.Renode.Peripherals.I2C
                 return false;
             }
 
-            if(totalTransactions == faultAtTransaction)
+            // totalTransactions counts completed transactions (incremented in
+            // FinishTransmission).  During an active transaction the current
+            // transaction number is totalTransactions + 1.
+            ulong currentTransaction = totalTransactions + 1;
+            if(currentTransaction == faultAtTransaction)
             {
                 faultFired = true;
                 lastFaultType = faultType;
                 this.Log(LogLevel.Info,
                     "I2CFaultProxy: injecting fault type {0} at transaction {1}",
-                    FaultTypeName(faultType), totalTransactions);
+                    FaultTypeName(faultType), currentTransaction);
                 return true;
             }
 
@@ -482,6 +499,7 @@ namespace Antmicro.Renode.Peripherals.I2C
         // -------------------------------------------------------------------
 
         private ulong totalTransactions;
+        private bool currentTransactionActive;
         private ulong faultAtTransaction = ulong.MaxValue;
         private int faultType;
         private uint faultSeed;

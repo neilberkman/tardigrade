@@ -307,6 +307,9 @@ def generate_profile(
             images = {}
         images["staging"] = staging_image_path
         profile["images"] = images
+        # Remove stale pre_boot_state -- staging_image mode replaces the
+        # binary; leftover pre_boot_state writes would conflict.
+        profile.pop("pre_boot_state", None)
     else:
         # pre_boot_state mode
         if regions:
@@ -347,7 +350,7 @@ def find_crash_files(crash_dir: Path) -> List[Path]:
     all_files: List[Path] = []
 
     for entry in sorted(crash_dir.iterdir()):
-        if not entry.is_file():
+        if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
             continue
         all_files.append(entry)
         name = entry.name

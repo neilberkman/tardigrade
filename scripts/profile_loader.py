@@ -58,6 +58,7 @@ KNOWN_FAULT_TYPES = {
     "otp_partial_program",
     "otp_stuck_bit",
     "otp_read_disturb",
+    "otp_overblow",
 }
 IMPLEMENTED_FAULT_TYPES = {
     "power_loss",
@@ -82,6 +83,7 @@ IMPLEMENTED_FAULT_TYPES = {
     "otp_partial_program",
     "otp_stuck_bit",
     "otp_read_disturb",
+    "otp_overblow",
 }
 
 # Map OTP fault type names to their OTPMemory BlowFaultMode codes.
@@ -89,6 +91,7 @@ OTP_FAULT_TYPE_CODES = {
     "otp_partial_program": 0,
     "otp_stuck_bit": 1,
     "otp_read_disturb": 2,
+    "otp_overblow": 3,
 }
 
 # Map I2C fault type names to their I2CFaultProxy FaultType codes.
@@ -1741,7 +1744,7 @@ def _warn_fault_backend_compat(
         )
 
     # OTP fault types require an OTPMemory peripheral on the platform.
-    otp_types = {"otp_partial_program", "otp_stuck_bit", "otp_read_disturb"}
+    otp_types = {"otp_partial_program", "otp_stuck_bit", "otp_read_disturb", "otp_overblow"}
     if all_types & otp_types:
         has_otp = (
             otp_peripheral is not None
