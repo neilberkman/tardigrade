@@ -268,20 +268,39 @@ def install_board_fixtures(nuttx_root: Path) -> list[Path]:
     return written
 
 
-def patch_nuttx_tree(nuttx_root: Path) -> list[Path]:
+def _tree_has_nxboot_upstream(nuttx_root: Path) -> bool:
+    """Return True if the NuttX tree already has nxboot support (PR #18509+)."""
+    kconfig = nuttx_root / "arch" / "arm" / "src" / "stm32h7" / "Kconfig"
+    if not kconfig.exists():
+        return False
+    return "STM32_APP_FORMAT_NXBOOT" in kconfig.read_text()
+
+
+def patch_nuttx_tree(nuttx_root: Path, *, skip_patches: bool = False) -> list[Path]:
     changed: list[Path] = []
-    targets = [
-        (nuttx_root / "arch" / "arm" / "src" / "stm32h7" / "Kconfig", patch_stm32h7_kconfig),
-        (nuttx_root / "boards" / "arm" / "stm32h7" / "nucleo-h743zi" / "scripts" / "Make.defs", patch_make_defs),
-        (nuttx_root / "boards" / "arm" / "stm32h7" / "nucleo-h743zi" / "src" / "CMakeLists.txt", patch_cmakelists),
-        (nuttx_root / "boards" / "arm" / "stm32h7" / "nucleo-h743zi" / "src" / "stm32_progmem.c", patch_progmem),
-    ]
-    for path, patch_fn in targets:
-        patched, did_change = patch_fn(path.read_text())
-        if _write_if_changed(path, patched):
-            changed.append(path)
-        elif did_change:
-            changed.append(path)
+
+    if skip_patches:
+        print("--skip-patches: skipping all source tree patches")
+    elif _tree_has_nxboot_upstream(nuttx_root):
+        print("nxboot support detected in upstream tree (PR #18509+), skipping source patches")
+        skip_patches = True
+
+    if not skip_patches:
+        targets = [
+            (nuttx_root / "arch" / "arm" / "src" / "stm32h7" / "Kconfig", patch_stm32h7_kconfig),
+            (nuttx_root / "boards" / "arm" / "stm32h7" / "nucleo-h743zi" / "scripts" / "Make.defs", patch_make_defs),
+            (nuttx_root / "boards" / "arm" / "stm32h7" / "nucleo-h743zi" / "src" / "CMakeLists.txt", patch_cmakelists),
+            (nuttx_root / "boards" / "arm" / "stm32h7" / "nucleo-h743zi" / "src" / "stm32_progmem.c", patch_progmem),
+        ]
+        for path, patch_fn in targets:
+            patched, did_change = patch_fn(path.read_text())
+            if _write_if_changed(path, patched):
+                changed.append(path)
+            elif did_change:
+                changed.append(path)
+
+    # Fixture files (defconfigs, linker scripts) are always installed as a
+    # safety net — they are tiny and the install is idempotent.
     changed.extend(install_board_fixtures(nuttx_root))
     return changed
 
@@ -353,13 +372,18 @@ def main() -> int:
     parser.add_argument("--jobs", type=int, default=8)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--package-only", type=Path, default=None, metavar="APP_BIN")
+    parser.add_argument(
+        "--skip-patches",
+        action="store_true",
+        help="Skip source tree patches (use when building against NuttX with upstream nxboot support, PR #18509+)",
+    )
     args = parser.parse_args()
     args.nuttx_root = args.nuttx_root.resolve()
     if args.apps_root is not None:
         args.apps_root = args.apps_root.resolve()
     args.output_dir = args.output_dir.resolve()
 
-    changed = patch_nuttx_tree(args.nuttx_root)
+    changed = patch_nuttx_tree(args.nuttx_root, skip_patches=args.skip_patches)
     for path in changed:
         print(f"prepared {path}")
 
