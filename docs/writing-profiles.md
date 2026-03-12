@@ -265,7 +265,7 @@ Default is `[power_loss]`. Available types (23 total):
 | `multi_sector_atomicity`   | Cross-page partial erase                | All                  |
 | `wear_leveling_corruption` | Wear-leveling metadata corruption       | All                  |
 | `reset_at_time`            | CPU reset at a time offset              | All                  |
-| `read_bit_flip`            | Transient read corruption               | NVMemory             |
+| `read_bit_flip`            | Transient read corruption               | NVMemory, MRAM       |
 | `instruction_skip`         | Voltage-glitch instruction skip (NOP)   | All                  |
 | `bootloader_region_write`  | Fault during bootloader self-update     | All                  |
 | `nvs_corruption`           | NVS/config region corruption            | All                  |

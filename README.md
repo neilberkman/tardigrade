@@ -152,12 +152,12 @@ flowchart TD
 
 ### Fault types
 
-23 fault types across 5 backend categories:
+23 fault types across 7 backend categories:
 
 | Category        | Fault types                                                                                                                                                           | Backend              |
 | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
 | NVM write/erase | `power_loss`, `bit_corruption`, `interrupted_erase`, `silent_write_failure`, `write_disturb`, `write_rejection`, `multi_sector_atomicity`, `wear_leveling_corruption` | All                  |
-| NVM read/time   | `read_bit_flip`, `reset_at_time`                                                                                                                                      | NVMemory / All       |
+| NVM read/time   | `read_bit_flip`, `reset_at_time`                                                                                                                                      | NVMemory, MRAM / All |
 | NVM controller  | `command_drop`                                                                                                                                                        | GenericNvmController |
 | NVM region      | `bootloader_region_write`, `nvs_corruption`                                                                                                                           | All                  |
 | CPU glitch      | `instruction_skip`                                                                                                                                                    | All                  |
@@ -295,7 +295,7 @@ tardigrade/
 
 - Fault model operates at write-operation granularity, not analog brownout simulation.
 - Cortex-M targets only; non-Cortex architectures are not first-class.
-- Some fault types are backend-specific: `read_bit_flip` requires the NVMemory slow-path backend; `command_drop` requires GenericNvmController; I2C faults require the I2CFaultProxy peripheral; OTP faults require the OTPMemory peripheral. The profile loader warns at load time for incompatible combinations.
+- Some fault types are backend-specific: `read_bit_flip` requires a backend that intercepts CPU reads (NVMemory or MRAMMemory -- fast-path backends like NVMC/STM32 expose flash via MappedMemory that the CPU reads directly); `command_drop` requires GenericNvmController; I2C faults require the I2CFaultProxy peripheral; OTP faults require the OTPMemory peripheral. The profile loader warns at load time for incompatible combinations.
 - Multi-fault sweeps currently execute all stages as power-loss faults regardless of the original fault type.
 - Semantic bugs that don't change boot outcome require explicit target instrumentation.
 - Exhaustive sweeps take ~15 min on a 2-core CI runner; heuristic mode is 2-4 min.
