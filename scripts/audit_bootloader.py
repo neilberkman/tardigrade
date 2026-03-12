@@ -374,29 +374,12 @@ def main() -> int:
         total_erases: int = 0
         total_i2c_transactions: int = 0
         setup_writes: int = 0
-        # Determine which fault classes are requested.
+        # Determine whether erase-trace capture is needed during calibration.
         fault_types = profile.fault_sweep.fault_types
         include_erases = (
             "interrupted_erase" in fault_types
             or "multi_sector_atomicity" in fault_types
         )
-        include_power_loss = "power_loss" in fault_types
-        include_bit_corruption = "bit_corruption" in fault_types
-        include_silent_write_failure = "silent_write_failure" in fault_types
-        include_write_disturb = "write_disturb" in fault_types
-        include_wear_leveling = "wear_leveling_corruption" in fault_types
-        include_write_rejection = "write_rejection" in fault_types
-        include_reset_at_time = "reset_at_time" in fault_types
-        include_metadata_fault = profile.fault_sweep.metadata_fault.enabled
-        include_multi_sector_atomicity = "multi_sector_atomicity" in fault_types
-        include_read_bit_flip = "read_bit_flip" in fault_types
-        include_command_drop = "command_drop" in fault_types
-        include_instruction_skip = "instruction_skip" in fault_types
-        include_i2c_faults = any(ft.startswith("i2c_") for ft in fault_types)
-        i2c_fault_types = [ft for ft in fault_types if ft.startswith("i2c_")]
-        include_otp_faults = any(ft.startswith("otp_") for ft in fault_types)
-        otp_fault_types = [ft for ft in fault_types if ft.startswith("otp_")]
-        include_nvs_corruption = "nvs_corruption" in fault_types
 
         # Pass fault_types to calibration so erase trace is captured.
         if include_erases:
@@ -931,7 +914,7 @@ def main() -> int:
                 "flip_probability_in_cluster": dist.flip_probability_in_cluster,
                 "flip_probability_outside": dist.flip_probability_outside,
                 "seed": dist.seed,
-                "clustered_bit_corruption_points": clustered_bit_count if has_mixed_types else 0,
+                "clustered_bit_corruption_points": clustered_bit_count,
             }
         payload["contracts"] = {
             "state_probe": (

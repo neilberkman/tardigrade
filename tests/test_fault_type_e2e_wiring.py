@@ -364,8 +364,12 @@ class TestPlannerReachability(unittest.TestCase):
     OTP_TYPES = set(OTP_FAULT_TYPE_CODES.keys())
 
     def _read_planner_source(self) -> str:
-        ab_path = ROOT / "scripts" / "audit_bootloader.py"
-        return ab_path.read_text(encoding="utf-8")
+        parts = []
+        for name in ("audit_bootloader.py", "fault_plan.py"):
+            p = ROOT / "scripts" / name
+            if p.exists():
+                parts.append(p.read_text(encoding="utf-8"))
+        return "\n".join(parts)
 
     def test_standard_types_have_planner_generation(self):
         """Each standard fault type must have point-generation code."""
