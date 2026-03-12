@@ -115,6 +115,12 @@ def log(msg):
 
 bus = monitor.Machine.SystemBus
 
+# Sentinel value used to disarm fault injection (max uint64).
+_DISARM_SENTINEL = _DISARM_SENTINEL
+
+# Write fault mode codes shared between run_execute_fault and run_phase2_fault.
+_WRITE_FAULT_MODE = {'w': 0, 'b': 1, 's': 2, 'r': 3, 'd': 4, 'l': 5}
+
 def get_optional_var(name, default=''):
     try:
         value = monitor.GetVariable(name)
@@ -471,6 +477,10 @@ _FAULT_CODE_TO_NAME = {
     'k': 'command_drop',
     'i': 'instruction_skip',
     'h': 'power_loss',  # hook faults are power-loss during hook writes
+    'op': 'otp_partial_program',
+    'os': 'otp_stuck_bit',
+    'od': 'otp_read_disturb',
+    'oo': 'otp_overblow',
     'in': 'i2c_nack',
     'it': 'i2c_timeout',
     'ib': 'i2c_bit_flip',
@@ -1652,26 +1662,26 @@ def arm_erase_fault(absolute_erase_index, erase_fault_mode=0):
 def disarm_fault():
     b = backend
     if b['kind'] == 'otp':
-        b['data'].FaultAtBlow = 18446744073709551615
+        b['data'].FaultAtBlow = _DISARM_SENTINEL
     elif b['kind'] == 'mram':
-        b['data'].FaultAtWordWrite = 18446744073709551615
+        b['data'].FaultAtWordWrite = _DISARM_SENTINEL
     elif b['kind'] == 'fast':
-        b['data'].FaultAtWordWrite = 18446744073709551615
-        b['data'].FaultAtPageErase = 18446744073709551615
+        b['data'].FaultAtWordWrite = _DISARM_SENTINEL
+        b['data'].FaultAtPageErase = _DISARM_SENTINEL
     else:
-        b['data'].Nvm.FaultAtWordWrite = 18446744073709551615
+        b['data'].Nvm.FaultAtWordWrite = _DISARM_SENTINEL
     disarm_controller_fault()
 
 def disarm_write_fault():
     b = backend
     if b['kind'] == 'otp':
-        b['data'].FaultAtBlow = 18446744073709551615
+        b['data'].FaultAtBlow = _DISARM_SENTINEL
     elif b['kind'] == 'mram':
-        b['data'].FaultAtWordWrite = 18446744073709551615
+        b['data'].FaultAtWordWrite = _DISARM_SENTINEL
     elif b['kind'] == 'fast':
-        b['data'].FaultAtWordWrite = 18446744073709551615
+        b['data'].FaultAtWordWrite = _DISARM_SENTINEL
     else:
-        b['data'].Nvm.FaultAtWordWrite = 18446744073709551615
+        b['data'].Nvm.FaultAtWordWrite = _DISARM_SENTINEL
 
 def disarm_erase_fault():
     b = backend
@@ -1680,14 +1690,14 @@ def disarm_erase_fault():
     elif b['kind'] == 'mram':
         pass  # MRAM has no page erases.
     elif b['kind'] == 'fast':
-        b['data'].FaultAtPageErase = 18446744073709551615
+        b['data'].FaultAtPageErase = _DISARM_SENTINEL
 
 def disarm_controller_fault():
     ctrl = backend['controller']
     if ctrl is None:
         return
     try:
-        ctrl.FaultAtCommandExecution = 18446744073709551615
+        ctrl.FaultAtCommandExecution = _DISARM_SENTINEL
         ctrl.CommandFaultMode = 0
         ctrl.CommandFaultFired = False
     except Exception:
@@ -1784,7 +1794,7 @@ def disarm_i2c_fault():
     if proxy is None:
         return
     try:
-        proxy.FaultAtTransaction = 18446744073709551615
+        proxy.FaultAtTransaction = _DISARM_SENTINEL
         proxy.FaultType = 0
         proxy.FaultFired = False
     except Exception:
@@ -2775,46 +2785,12 @@ def run_read_bit_flip_fault(fault_at):
     signals['phase2_stop_reason'] = p2_status.get('reason')
     signals['phase2_emulated_s'] = p2_status.get('emulated_s')
 
-    semantic_state = collect_semantic_state({
-        'cycle': 0,
-        'boot_outcome': boot_outcome,
-        'boot_slot': boot_slot,
-        'signals': signals,
-        'fault_injected': bool(fault_injected),
-        'stage': 'post_boot',
-    })
-    fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
-    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
-        boot_outcome,
-        boot_slot,
-        signals,
-        initial_status=p2_status,
-        fault_injected=fault_injected,
-        label='fp{}_readflip_followup'.format(fault_at),
-        effective_criteria=eff_criteria,
+    return _build_fault_result(
+        fault_at, 'f', fault_injected, read_fault_address, 0, signals,
+        boot_outcome=boot_outcome, boot_slot=boot_slot,
+        eff_criteria=eff_criteria, p2_status=p2_status,
+        followup_label='fp{}_readflip_followup'.format(fault_at),
     )
-    signals['followup_ms'] = int(followup_ms)
-
-    result = {
-        'fault_at': fault_at,
-        'fault_requested': fault_at,
-        'fault_type': 'f',
-        'fault_injected': fault_injected,
-        'fault_address': fmt_u32(read_fault_address),
-        'boot_outcome': boot_outcome,
-        'boot_slot': boot_slot,
-        'fault_class': fault_class,
-        'actual_writes': 0,
-        'signals': signals,
-    }
-    if eff_criteria is not None:
-        result['effective_success_criteria'] = eff_criteria
-    if semantic_state is not None:
-        result['semantic_state'] = semantic_state
-    if boot_cycle_records is not None:
-        result['boot_cycles'] = boot_cycle_records
-        result['multi_boot_analysis'] = multi_boot_analysis
-    return result
 
 
 def _compute_read_bit_flip(value, seed, bit_flips=0):
@@ -2973,35 +2949,13 @@ def run_instruction_skip_fault(skip_addr, skip_count=None):
         signals['phase1_stop_reason'] = phase1_status.get('reason')
         signals['phase1_emulated_s'] = phase1_status.get('emulated_s')
 
-    fault_class = classify_fault_result(
-        boot_outcome, boot_slot, signals, effective_criteria=eff_criteria
+    return _build_fault_result(
+        skip_addr, 'i', True,
+        '0x{:08X}'.format(skip_addr & 0xFFFFFFFF),
+        0, signals, boot_outcome=boot_outcome, boot_slot=boot_slot,
+        eff_criteria=eff_criteria, p2_status=phase1_status,
+        followup_label='fp0x{:X}_followup'.format(skip_addr),
     )
-    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
-        boot_outcome, boot_slot, signals,
-        initial_status=phase1_status,
-        fault_injected=True,
-        label='fp0x{:X}_followup'.format(skip_addr),
-        effective_criteria=eff_criteria,
-    )
-    signals['followup_ms'] = int(followup_ms)
-
-    result = {
-        'fault_at': skip_addr,
-        'fault_requested': skip_addr,
-        'fault_type': 'i',
-        'fault_injected': True,
-        'fault_address': '0x{:08X}'.format(skip_addr & 0xFFFFFFFF),
-        'boot_outcome': boot_outcome,
-        'boot_slot': boot_slot,
-        'fault_class': fault_class,
-        'actual_writes': 0,
-        'signals': signals,
-    }
-    if boot_cycle_records:
-        result['boot_cycle_records'] = boot_cycle_records
-    if multi_boot_analysis:
-        result['multi_boot_analysis'] = multi_boot_analysis
-    return result
 
 
 def run_timed_reset_fault(fault_at):
@@ -3072,54 +3026,13 @@ def run_timed_reset_fault(fault_at):
     signals['timed_reset_elapsed_s'] = round(_time.time() - fp_t0, 6)
     signals['phase2_stop_reason'] = p2_status.get('reason')
     signals['phase2_emulated_s'] = p2_status.get('emulated_s')
-    semantic_state = collect_semantic_state({
-        'cycle': 0,
-        'boot_outcome': boot_outcome,
-        'boot_slot': boot_slot,
-        'signals': signals,
-        'fault_injected': bool(fault_injected),
-        'stage': 'post_boot',
-    })
-    fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
-    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
-        boot_outcome,
-        boot_slot,
-        signals,
-        initial_status=p2_status,
-        fault_injected=fault_injected,
-        label='fp{}_timed_followup'.format(fault_at),
-        effective_criteria=eff_criteria,
+    return _build_fault_result(
+        fault_at, 't', fault_injected, fault_address, actual_writes, signals,
+        boot_outcome=boot_outcome, boot_slot=boot_slot,
+        eff_criteria=eff_criteria, p2_status=p2_status,
+        followup_label='fp{}_timed_followup'.format(fault_at),
+        saved_flash=saved_flash, fault_snapshot_bytes=fault_snapshot_bytes,
     )
-    signals['followup_ms'] = int(followup_ms)
-
-    result = {
-        'fault_at': fault_at,
-        'fault_requested': fault_at,
-        'fault_type': 't',
-        'fault_injected': fault_injected,
-        'fault_address': fmt_u32(fault_address),
-        'boot_outcome': boot_outcome,
-        'boot_slot': boot_slot,
-        'fault_class': fault_class,
-        'actual_writes': actual_writes,
-        'signals': signals,
-    }
-    if eff_criteria is not None:
-        result['effective_success_criteria'] = eff_criteria
-    if semantic_state is not None:
-        result['semantic_state'] = semantic_state
-    if boot_cycle_records is not None:
-        result['boot_cycles'] = boot_cycle_records
-        result['multi_boot_analysis'] = multi_boot_analysis
-    if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
-        dump_source = 'fault_snapshot' if fault_snapshot_bytes is not None else 'live_flash'
-        result['postmortem_partition_dump'] = build_postmortem_partition_dump(
-            snapshot_bytes=fault_snapshot_bytes,
-            source=dump_source,
-        )
-    if boot_outcome == 'no_boot' and resume_trace_no_boot and saved_flash is not None:
-        result['resume_trace'] = run_resume_trace_from_snapshot(saved_flash, fault_at, 't')
-    return result
 
 def run_metadata_fault(fault_at, fault_type='w'):
     eff_criteria = get_effective_criteria(fault_type)
@@ -3153,21 +3066,12 @@ def run_metadata_fault(fault_at, fault_type='w'):
     signals['phase2_ms'] = 0
     signals['phase2_stop_reason'] = p2_status.get('reason')
     signals['phase2_emulated_s'] = p2_status.get('emulated_s')
-    semantic_state = collect_semantic_state({'cycle': 0, 'boot_outcome': boot_outcome, 'boot_slot': boot_slot, 'signals': signals, 'fault_injected': bool(fault_injected), 'stage': 'post_boot'})
-    fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
-    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(boot_outcome, boot_slot, signals, initial_status=p2_status, fault_injected=fault_injected, label='fp{}_meta_followup'.format(fault_at), effective_criteria=eff_criteria)
-    signals['followup_ms'] = int(followup_ms)
-    result = {'fault_at': fault_at, 'fault_requested': fault_at, 'fault_type': 'm:{}'.format(m_type), 'fault_injected': fault_injected, 'fault_address': fmt_u32(fault_address), 'boot_outcome': boot_outcome, 'boot_slot': boot_slot, 'fault_class': fault_class, 'actual_writes': applied, 'signals': signals}
-    if eff_criteria is not None:
-        result['effective_success_criteria'] = eff_criteria
-    if semantic_state is not None:
-        result['semantic_state'] = semantic_state
-    if boot_cycle_records is not None:
-        result['boot_cycles'] = boot_cycle_records
-        result['multi_boot_analysis'] = multi_boot_analysis
-    if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
-        result['postmortem_partition_dump'] = build_postmortem_partition_dump(snapshot_bytes=None, source='live_flash')
-    return result
+    return _build_fault_result(
+        fault_at, 'm:{}'.format(m_type), fault_injected, fault_address,
+        applied, signals, boot_outcome=boot_outcome, boot_slot=boot_slot,
+        eff_criteria=eff_criteria, p2_status=p2_status,
+        followup_label='fp{}_meta_followup'.format(fault_at),
+    )
 
 def classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=None):
     if boot_outcome == 'success':
@@ -3190,6 +3094,84 @@ def classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=N
     if boot_outcome in ('wrong_pc', 'misaligned_vtor', 'hard_fault', 'no_boot'):
         return 'unrecoverable'
     return 'unrecoverable'
+
+
+def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
+                        actual_writes, signals, boot_outcome=None,
+                        boot_slot=None, eff_criteria=None,
+                        p2_status=None, followup_label='followup',
+                        saved_flash=None, fault_snapshot_bytes=None,
+                        extra_fields=None):
+    """Shared epilogue for all fault runners.
+
+    Handles: classify_fault_result, run_followup_boot_cycles, semantic state
+    collection, postmortem dump, resume trace, and optional field attachment.
+    Returns the fully assembled result dict.
+
+    Callers must have already called evaluate_boot_outcome() and populated
+    signals with timing/phase data BEFORE calling this.
+    """
+    fault_class = classify_fault_result(
+        boot_outcome, boot_slot, signals, effective_criteria=eff_criteria
+    )
+    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
+        boot_outcome,
+        boot_slot,
+        signals,
+        initial_status=p2_status,
+        fault_injected=fault_injected,
+        label=followup_label,
+        effective_criteria=eff_criteria,
+    )
+    signals['followup_ms'] = int(followup_ms)
+
+    semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'signals': signals,
+        'fault_injected': bool(fault_injected),
+        'stage': 'post_boot',
+    })
+
+    result = {
+        'fault_at': fault_at,
+        'fault_requested': fault_at,
+        'fault_type': fault_type,
+        'fault_injected': fault_injected,
+        'fault_address': fmt_u32(fault_address) if isinstance(fault_address, int) else fault_address,
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'fault_class': fault_class,
+        'actual_writes': actual_writes,
+        'signals': signals,
+    }
+    if eff_criteria is not None:
+        result['effective_success_criteria'] = eff_criteria
+    if semantic_state is not None:
+        result['semantic_state'] = semantic_state
+    if boot_cycle_records is not None:
+        result['boot_cycles'] = boot_cycle_records
+        result['multi_boot_analysis'] = multi_boot_analysis
+    if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
+        dump_source = 'fault_snapshot' if fault_snapshot_bytes is not None else 'live_flash'
+        result['postmortem_partition_dump'] = build_postmortem_partition_dump(
+            snapshot_bytes=fault_snapshot_bytes,
+            source=dump_source,
+        )
+    if (
+        boot_outcome == 'no_boot'
+        and resume_trace_no_boot
+        and fault_injected
+        and saved_flash is not None
+    ):
+        result['resume_trace'] = run_resume_trace_from_snapshot(
+            saved_flash, fault_at, fault_type
+        )
+    if extra_fields:
+        result.update(extra_fields)
+    return result
+
 
 def parse_write_trace_map(trace_text):
     flash_base, _ = flash_geometry()
@@ -3428,48 +3410,12 @@ def run_execute_fault(fault_at, fault_type='w'):
             signals['phase1_stop_reason'] = phase1_status.get('reason')
             signals['phase1_emulated_s'] = phase1_status.get('emulated_s')
 
-        semantic_state = collect_semantic_state({
-            'cycle': 0,
-            'boot_outcome': boot_outcome,
-            'boot_slot': boot_slot,
-            'signals': signals,
-            'fault_injected': False,
-            'stage': 'post_boot',
-        })
-        fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
-        boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
-            boot_outcome,
-            boot_slot,
-            signals,
-            initial_status=phase1_status,
-            fault_injected=False,
-            label='control_followup',
-            effective_criteria=eff_criteria,
+        return _build_fault_result(
+            fault_at, 'control', False, '0x00000000', actual_writes, signals,
+            boot_outcome=boot_outcome, boot_slot=boot_slot,
+            eff_criteria=eff_criteria, p2_status=phase1_status,
+            followup_label='control_followup',
         )
-        signals['followup_ms'] = int(followup_ms)
-
-        result = {
-            'fault_at': fault_at,
-            'fault_requested': fault_at,
-            'fault_type': 'control',
-            'fault_injected': False,
-            'fault_address': '0x00000000',
-            'boot_outcome': boot_outcome,
-            'boot_slot': boot_slot,
-            'fault_class': fault_class,
-            'actual_writes': actual_writes,
-            'signals': signals,
-        }
-        if semantic_state is not None:
-            result['semantic_state'] = semantic_state
-        if boot_cycle_records is not None:
-            result['boot_cycles'] = boot_cycle_records
-            result['multi_boot_analysis'] = multi_boot_analysis
-        if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
-            result['postmortem_partition_dump'] = build_postmortem_partition_dump(
-                source='live_flash',
-            )
-        return result
 
     fp_t0 = _time.time()
     phase1_ms = 0
@@ -3528,14 +3474,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         #   's' silent_write_failure (2), 'r' write_rejection (3),
         #   'd' write_disturb (4),
         #   'l' wear_leveling_corruption (5).
-        write_mode = {
-            'w': 0,
-            'b': 1,
-            's': 2,
-            'r': 3,
-            'd': 4,
-            'l': 5,
-        }.get(fault_type, 0)
+        write_mode = _WRITE_FAULT_MODE.get(fault_type, 0)
         base_writes = get_total_writes()
         arm_at = base_writes + fault_at + 1
         if arm_at > base_writes + max_writes_cap:
@@ -3742,69 +3681,25 @@ def run_execute_fault(fault_at, fault_type='w'):
         signals['phase2_stop_reason'] = phase2_status.get('reason')
         signals['phase2_emulated_s'] = phase2_status.get('emulated_s')
 
-    semantic_state = collect_semantic_state({
-        'cycle': 0,
-        'boot_outcome': boot_outcome,
-        'boot_slot': boot_slot,
-        'signals': signals,
-        'fault_injected': bool(fault_injected),
-        'stage': 'post_boot',
-    })
-    fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
-    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
-        boot_outcome,
-        boot_slot,
-        signals,
-        initial_status=phase2_status,
-        fault_injected=fault_injected,
-        label='fp{}_followup'.format(fault_at),
-        effective_criteria=eff_criteria,
-    )
-    signals['followup_ms'] = int(followup_ms)
-
-    result = {
-        'fault_at': fault_at,
-        'fault_requested': fault_at,
-        'fault_type': fault_type,
-        'fault_injected': fault_injected,
-        'fault_address': fmt_u32(fault_address),
-        'boot_outcome': boot_outcome,
-        'boot_slot': boot_slot,
-        'fault_class': fault_class,
-        'actual_writes': actual_writes,
-        'signals': signals,
-    }
+    # Build extra fields specific to run_execute_fault.
+    extras = {}
     if not fault_injected and int(fault_at) >= 0:
-        result['skip_reason'] = 'fault_index_beyond_total'
-    if eff_criteria is not None:
-        result['effective_success_criteria'] = eff_criteria
-    if semantic_state is not None:
-        result['semantic_state'] = semantic_state
-    if boot_cycle_records is not None:
-        result['boot_cycles'] = boot_cycle_records
-        result['multi_boot_analysis'] = multi_boot_analysis
-
+        extras['skip_reason'] = 'fault_index_beyond_total'
     if backend['kind'] != 'slow' and fault_injected and is_power_loss_fault:
         if debug_trailer is not None:
-            result['debug_trailer'] = debug_trailer
-        result['recovery_writes'] = recovery_writes
+            extras['debug_trailer'] = debug_trailer
+        extras['recovery_writes'] = recovery_writes
 
-    if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
-        dump_source = 'fault_snapshot' if fault_snapshot_bytes is not None else 'live_flash'
-        postmortem_dump = build_postmortem_partition_dump(
-            snapshot_bytes=fault_snapshot_bytes,
-            source=dump_source,
-        )
-        result['postmortem_partition_dump'] = postmortem_dump
-
-    if (
-        boot_outcome == 'no_boot'
-        and resume_trace_no_boot
-        and fault_injected
-        and is_power_loss_fault
-    ):
-        resume_trace = run_resume_trace_from_snapshot(saved_flash, fault_at, fault_type)
-        result['resume_trace'] = resume_trace
+    result = _build_fault_result(
+        fault_at, fault_type, fault_injected, fault_address,
+        actual_writes, signals, boot_outcome=boot_outcome,
+        boot_slot=boot_slot, eff_criteria=eff_criteria,
+        p2_status=phase2_status,
+        followup_label='fp{}_followup'.format(fault_at),
+        saved_flash=saved_flash if is_power_loss_fault else None,
+        fault_snapshot_bytes=fault_snapshot_bytes,
+        extra_fields=extras,
+    )
 
     # Release large .NET byte[] to prevent memory exhaustion in batch mode.
     if backend['kind'] == 'fast':
@@ -4031,9 +3926,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         p1_injected = was_fault_injected()
         p1_ops = get_total_erases()
     else:
-        write_mode = {'w': 0, 'b': 1, 's': 2, 'r': 3, 'd': 4, 'l': 5}.get(
-            p1_fault_type, 0
-        )
+        write_mode = _WRITE_FAULT_MODE.get(p1_fault_type, 0)
         base_writes = get_total_writes()
         arm_at = base_writes + p1_fault_at + 1
         if arm_at > base_writes + max_writes_cap:
@@ -4141,9 +4034,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         p2_injected = was_fault_injected()
         p2_ops = get_total_erases()
     else:
-        write_mode = {'w': 0, 'b': 1, 's': 2, 'r': 3, 'd': 4, 'l': 5}.get(
-            p2_fault_type, 0
-        )
+        write_mode = _WRITE_FAULT_MODE.get(p2_fault_type, 0)
         base_writes = get_total_writes()
         arm_at = base_writes + p2_fault_at + 1
         arm_fault(arm_at, write_fault_mode=write_mode)
@@ -4630,58 +4521,18 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     signals['trace_replay_mode'] = 'native'
     signals['phase2_stop_reason'] = p2_status.get('reason')
     signals['phase2_emulated_s'] = p2_status.get('emulated_s')
-    semantic_state = collect_semantic_state({
-        'cycle': 0,
-        'boot_outcome': boot_outcome,
-        'boot_slot': boot_slot,
-        'signals': signals,
-        'fault_injected': bool(fault_injected),
-        'stage': 'post_boot',
-    })
-    fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
-    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
-        boot_outcome,
-        boot_slot,
-        signals,
-        initial_status=p2_status,
-        fault_injected=fault_injected,
-        label='fp{}_native_followup'.format(fault_at),
-        effective_criteria=eff_criteria,
-    )
-    signals['followup_ms'] = int(followup_ms)
-
     if fault_at % 50 == 0:
         log('fp={} native writes={} reload={}ms replay={}ms reset={}ms setup={}ms emu={}ms({}iters) total={}ms outcome={}'.format(
             fault_at, writes_applied, reload_ms, replay_ms, reset_ms, setup_ms,
             emulation_ms, p2_status.get('iters'), total_ms, boot_outcome))
 
-    result = {
-        'fault_at': fault_at,
-        'fault_requested': fault_at,
-        'fault_type': fault_type,
-        'fault_injected': fault_injected,
-        'fault_address': fmt_u32(fault_address),
-        'boot_outcome': boot_outcome,
-        'boot_slot': boot_slot,
-        'fault_class': fault_class,
-        'actual_writes': writes_applied,
-        'signals': signals,
-    }
-    if eff_criteria is not None:
-        result['effective_success_criteria'] = eff_criteria
-    if semantic_state is not None:
-        result['semantic_state'] = semantic_state
-    if boot_cycle_records is not None:
-        result['boot_cycles'] = boot_cycle_records
-        result['multi_boot_analysis'] = multi_boot_analysis
-    if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
-        result['postmortem_partition_dump'] = build_postmortem_partition_dump(
-            snapshot_bytes=fault_snapshot_bytes,
-            source='fault_snapshot',
-        )
-    if boot_outcome == 'no_boot' and resume_trace_no_boot and fault_injected:
-        result['resume_trace'] = run_resume_trace_from_snapshot(faulted_flash, fault_at, fault_type)
-    return result
+    return _build_fault_result(
+        fault_at, fault_type, fault_injected, fault_address,
+        writes_applied, signals, boot_outcome=boot_outcome,
+        boot_slot=boot_slot, eff_criteria=eff_criteria, p2_status=p2_status,
+        followup_label='fp{}_native_followup'.format(fault_at),
+        saved_flash=faulted_flash, fault_snapshot_bytes=fault_snapshot_bytes,
+    )
 
 def run_trace_replay_fault(fault_at, fault_type='w'):
     global trace_data_loaded, erase_trace_loaded
@@ -4816,58 +4667,94 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     signals['trace_replay_mode'] = 'python'
     signals['phase2_stop_reason'] = p2_status.get('reason')
     signals['phase2_emulated_s'] = p2_status.get('emulated_s')
-    semantic_state = collect_semantic_state({
-        'cycle': 0,
-        'boot_outcome': boot_outcome,
-        'boot_slot': boot_slot,
-        'signals': signals,
-        'fault_injected': bool(fault_injected),
-        'stage': 'post_boot',
-    })
-    fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
-    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
-        boot_outcome,
-        boot_slot,
-        signals,
-        initial_status=p2_status,
-        fault_injected=fault_injected,
-        label='fp{}_python_followup'.format(fault_at),
-        effective_criteria=eff_criteria,
-    )
-    signals['followup_ms'] = int(followup_ms)
-
     if fault_at % 50 == 0:
         log('fp={} py_trace_replay writes={} reload={}ms replay={}ms reset={}ms setup={}ms emu={}ms({}iters) total={}ms outcome={}'.format(
             fault_at, writes_applied, reload_ms, replay_ms, reset_ms, setup_ms,
             emulation_ms, p2_status.get('iters'), total_ms, boot_outcome))
 
-    result = {
-        'fault_at': fault_at,
-        'fault_requested': fault_at,
-        'fault_type': fault_type,
-        'fault_injected': fault_injected,
-        'fault_address': fmt_u32(fault_address),
-        'boot_outcome': boot_outcome,
-        'boot_slot': boot_slot,
-        'fault_class': fault_class,
-        'actual_writes': writes_applied,
-        'signals': signals,
-    }
-    if eff_criteria is not None:
-        result['effective_success_criteria'] = eff_criteria
-    if semantic_state is not None:
-        result['semantic_state'] = semantic_state
-    if boot_cycle_records is not None:
-        result['boot_cycles'] = boot_cycle_records
-        result['multi_boot_analysis'] = multi_boot_analysis
-    if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
-        result['postmortem_partition_dump'] = build_postmortem_partition_dump(
-            snapshot_bytes=fault_snapshot_bytes,
-            source='fault_snapshot',
-        )
-    if boot_outcome == 'no_boot' and resume_trace_no_boot and fault_injected:
-        result['resume_trace'] = run_resume_trace_from_snapshot(faulted_flash, fault_at, fault_type)
-    return result
+    return _build_fault_result(
+        fault_at, fault_type, fault_injected, fault_address,
+        writes_applied, signals, boot_outcome=boot_outcome,
+        boot_slot=boot_slot, eff_criteria=eff_criteria, p2_status=p2_status,
+        followup_label='fp{}_python_followup'.format(fault_at),
+        saved_flash=faulted_flash, fault_snapshot_bytes=fault_snapshot_bytes,
+    )
+
+# ---------------------------------------------------------------------------
+# Fault type dispatch: maps fault type codes to runner functions.
+#
+# Prefix-based codes (e.g. 'm:w', 'h:3:b', 'p2:100:5:w:e') encode
+# parameters after the prefix.  Simple codes ('w', 'e', 'b', etc.)
+# route to run_execute_fault.  The default path uses the run_fn selected
+# at sweep start (trace replay or execute).
+# ---------------------------------------------------------------------------
+
+# Fault types that must always use full execute mode (not trace replay)
+# because they depend on NVMC peripheral state or PRNG.
+_EXECUTE_ONLY_FAULT_TYPES = frozenset(
+    ('e', 'a', 'b', 's', 'd', 'l', 'r', 't', 'f', 'k',
+     'in', 'it', 'ib', 'ic', 'iw')
+)
+
+
+def _dispatch_fault_point(fp, ft, default_run_fn):
+    """Dispatch a single fault point to the appropriate runner function.
+
+    Returns the result dict from the runner.
+    """
+    # --- Prefix-based compound fault types ---
+    if ft.startswith('m:'):
+        m_type = ft.split(':')[1] if ':' in ft else 'w'
+        return run_metadata_fault(fp, fault_type=m_type)
+
+    if ft.startswith('h:'):
+        parts = ft.split(':')
+        h_at = int(parts[1]) if len(parts) > 1 else fp
+        h_type = parts[2] if len(parts) > 2 else 'w'
+        return run_hook_fault(h_at, hook_fault_type=h_type)
+
+    if ft.startswith('p2:'):
+        parts = ft.split(':')
+        p1_at = int(parts[1])
+        p2_at = int(parts[2])
+        p1_type = parts[3] if len(parts) > 3 else 'w'
+        p2_type = parts[4] if len(parts) > 4 else 'w'
+        return run_phase2_fault(p1_at, p2_at, p1_type, p2_type)
+
+    if ft.startswith('mf:'):
+        return run_multi_fault_sequence(decode_multi_fault_sequence_local(ft))
+
+    if ft.startswith('i:'):
+        skip_addr = int(ft.split(':')[1], 0)
+        return run_instruction_skip_fault(skip_addr)
+
+    if ft.startswith('c:'):
+        parts = ft.split(':')
+        return run_cascading_fault(int(parts[1]), int(parts[2]))
+
+    # Clustered bit-corruption: 'b:<seed>' sets CorruptionSeed.
+    if ft.startswith('b:') and ft[2:].isdigit():
+        cseed = int(ft[2:])
+        if backend['kind'] == 'fast':
+            backend['data'].CorruptionSeed = cseed
+        elif backend['kind'] != 'mram':
+            backend['data'].Nvm.CorruptionSeed = cseed
+        result = run_execute_fault(fp, fault_type='b')
+        if backend['kind'] == 'fast':
+            backend['data'].CorruptionSeed = 0
+        elif backend['kind'] != 'mram':
+            backend['data'].Nvm.CorruptionSeed = 0
+        return result
+
+    # --- Simple fault types that require full execute mode ---
+    if ft in _EXECUTE_ONLY_FAULT_TYPES:
+        return run_execute_fault(fp, fault_type=ft)
+
+    # --- Default: use the pre-selected run function (trace replay or execute) ---
+    if default_run_fn == run_state_fault:
+        return default_run_fn(fp)
+    return default_run_fn(fp, fault_type=ft)
+
 
 # ---------------------------------------------------------------------------
 # Initial NVM fill: MappedMemory starts as 0x00, flash must be 0xFF (erased).
@@ -5076,62 +4963,8 @@ else:
             ft = fault_type_list[idx]
         if ft == 'f':
             ensure_read_fault_preflight()
-        if ft.startswith('m:'):
-            m_type = ft.split(':')[1] if ':' in ft else 'w'
-            results.append(run_metadata_fault(fp, fault_type=m_type))
-        elif ft.startswith('h:'):
-            parts = ft.split(':')
-            h_at = int(parts[1]) if len(parts) > 1 else fp
-            h_type = parts[2] if len(parts) > 2 else 'w'
-            results.append(run_hook_fault(h_at, hook_fault_type=h_type))
-        elif ft.startswith('p2:'):
-            parts = ft.split(':')
-            p1_at = int(parts[1])
-            p2_at = int(parts[2])
-            p1_type = parts[3] if len(parts) > 3 else 'w'
-            p2_type = parts[4] if len(parts) > 4 else 'w'
-            results.append(run_phase2_fault(p1_at, p2_at, p1_type, p2_type))
-        elif ft.startswith('mf:'):
-            results.append(run_multi_fault_sequence(decode_multi_fault_sequence_local(ft)))
-        # Instruction skip: 'i:0xADDR' — NOP the instruction at ADDR.
-        elif ft.startswith('i:'):
-            skip_addr = int(ft.split(':')[1], 0)
-            results.append(run_instruction_skip_fault(skip_addr))
-        # Cascade faults: 'c:W:E' where W=write_fault_at, E=erase_fault_at.
-        elif ft.startswith('c:'):
-            parts = ft.split(':')
-            w_at = int(parts[1])
-            e_at = int(parts[2])
-            results.append(run_cascading_fault(w_at, e_at))
-        # Clustered bit-corruption: 'b:<seed>' sets CorruptionSeed before
-        # running a standard bit_corruption fault.
-        elif ft.startswith('b:') and ft[2:].isdigit():
-            cseed = int(ft[2:])
-            if backend['kind'] == 'fast':
-                backend['data'].CorruptionSeed = cseed
-            elif backend['kind'] == 'mram':
-                pass  # MRAM uses built-in fault model.
-            else:
-                backend['data'].Nvm.CorruptionSeed = cseed
-            results.append(run_execute_fault(fp, fault_type='b'))
-            # Reset seed for subsequent points.
-            if backend['kind'] == 'fast':
-                backend['data'].CorruptionSeed = 0
-            elif backend['kind'] != 'mram':
-                backend['data'].Nvm.CorruptionSeed = 0
-        # I2C bus faults: always full execute mode.
-        elif ft in ('in', 'it', 'ib', 'ic', 'iw'):
-            results.append(run_execute_fault(fp, fault_type=ft))
-        # Synthetic/non-default faults always use full execute mode
-        # (not trace replay — they depend on NVMC peripheral state/PRNG).
-        elif ft in ('e', 'a', 'b', 's', 'd', 'l', 'r', 't', 'f', 'k'):
-            results.append(run_execute_fault(fp, fault_type=ft))
-        elif run_fn == run_trace_replay_fault:
-            results.append(run_fn(fp, fault_type=ft))
-        elif run_fn == run_execute_fault:
-            results.append(run_fn(fp, fault_type=ft))
-        else:
-            results.append(run_fn(fp))
+        result = _dispatch_fault_point(fp, ft, run_fn)
+        results.append(result)
 
         # Force .NET GC periodically to prevent memory exhaustion.
         # Every-iteration GC is wasteful; every 10th iteration is sufficient
@@ -5157,22 +4990,20 @@ else:
                 maxes[k] = max(maxes.get(k, 0), v)
         if count > 0:
             log('=== TIMING SUMMARY ({} points) ==='.format(count))
-            log('  total:     sum={}ms  avg={}ms  max={}ms'.format(
-                sums.get('total_ms', 0), sums.get('total_ms', 0) // count, maxes.get('total_ms', 0)))
-            log('  reload:    sum={}ms  avg={}ms  max={}ms'.format(
-                sums.get('reload_ms', 0), sums.get('reload_ms', 0) // count, maxes.get('reload_ms', 0)))
-            log('  replay:    sum={}ms  avg={}ms  max={}ms'.format(
-                sums.get('replay_ms', 0), sums.get('replay_ms', 0) // count, maxes.get('replay_ms', 0)))
-            log('  reset:     sum={}ms  avg={}ms  max={}ms'.format(
-                sums.get('reset_ms', 0), sums.get('reset_ms', 0) // count, maxes.get('reset_ms', 0)))
-            log('  setup:     sum={}ms  avg={}ms  max={}ms'.format(
-                sums.get('setup_ms', 0), sums.get('setup_ms', 0) // count, maxes.get('setup_ms', 0)))
-            log('  emulation: sum={}ms  avg={}ms  max={}ms'.format(
-                sums.get('emulation_ms', 0), sums.get('emulation_ms', 0) // count, maxes.get('emulation_ms', 0)))
-            log('  followup:  sum={}ms  avg={}ms  max={}ms'.format(
-                sums.get('followup_ms', 0), sums.get('followup_ms', 0) // count, maxes.get('followup_ms', 0)))
-            log('  p2_iters:  sum={}    avg={}    max={}'.format(
-                sums.get('p2_iters', 0), sums.get('p2_iters', 0) // count, maxes.get('p2_iters', 0)))
+            _ms_labels = [
+                ('total',     'total_ms'),
+                ('reload',    'reload_ms'),
+                ('replay',    'replay_ms'),
+                ('reset',     'reset_ms'),
+                ('setup',     'setup_ms'),
+                ('emulation', 'emulation_ms'),
+                ('followup',  'followup_ms'),
+            ]
+            for label, key in _ms_labels:
+                log('  {:<10s} sum={}ms  avg={}ms  max={}ms'.format(
+                    label + ':', sums.get(key, 0), sums.get(key, 0) // count, maxes.get(key, 0)))
+            log('  {:<10s} sum={}    avg={}    max={}'.format(
+                'p2_iters:', sums.get('p2_iters', 0), sums.get('p2_iters', 0) // count, maxes.get('p2_iters', 0)))
 
     # Write results.
     if batch_mode:

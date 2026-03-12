@@ -51,15 +51,18 @@ python3 scripts/audit_bootloader.py --profile my_profile.yaml --quick
 
 ## Choosing a platform
 
-Tardigrade ships three platform backends. Pick the one that matches your NVM technology:
+Tardigrade ships several platform backends. Pick the one that matches your NVM technology:
 
-| Platform file                         | Backend               | NVM type    | Write granularity |
-| ------------------------------------- | --------------------- | ----------- | ----------------- |
-| `platforms/cortex_m4_flash_fast.repl` | `faultFlash` (NVMC)   | NOR flash   | 4 bytes           |
-| `platforms/cortex_m0_nvm.repl`        | `nvm_ctrl` (NVMemory) | Generic NVM | 8 bytes           |
-| `platforms/cortex_m0_mram.repl`       | `mram` (MRAMMemory)   | MRAM        | 8 bytes           |
+| Platform file                             | Backend               | NVM type    | Write granularity |
+| ----------------------------------------- | --------------------- | ----------- | ----------------- |
+| `platforms/cortex_m4_flash_fast.repl`     | `faultFlash` (NVMC)   | NOR flash   | 4 bytes           |
+| `platforms/cortex_m0_nvm.repl`            | `nvm_ctrl` (NVMemory) | Generic NVM | 8 bytes           |
+| `platforms/cortex_m0_mram.repl`           | `mram` (MRAMMemory)   | MRAM        | 8 bytes           |
+| `platforms/stm32f4.repl`                  | STM32F4 flash         | NOR flash   | 4 bytes           |
+| `platforms/nucleo_h753zi_tardigrade.repl` | STM32H7 flash         | NOR flash   | 4 bytes           |
+| `platforms/cortex_m0_otp.repl`            | OTPMemory             | OTP fuses   | 4 bytes           |
 
-The STM32H7 platform (`platforms/nucleo_h753zi_tardigrade.repl`) uses a separate `STM32H7FlashController.cs` peripheral listed under `extra_peripherals`.
+The STM32H7 and STM32F4 platforms use separate flash controller peripherals (`STM32H7FlashController.cs`, `STM32F4FlashController.cs`) listed under `extra_peripherals`. The OTP platform enables OTP fuse-blow fault types.
 
 `flash_backend` must name the sysbus peripheral that tardigrade instruments for fault injection. This is required.
 
@@ -248,7 +251,7 @@ fault_sweep:
   fault_types: [power_loss, bit_corruption, interrupted_erase]
 ```
 
-Default is `[power_loss]`. Available types:
+Default is `[power_loss]`. Available types (23 total):
 
 | Fault type                 | What it does                            | Backend requirement  |
 | -------------------------- | --------------------------------------- | -------------------- |
@@ -264,6 +267,17 @@ Default is `[power_loss]`. Available types:
 | `reset_at_time`            | CPU reset at a time offset              | All                  |
 | `read_bit_flip`            | Transient read corruption               | NVMemory             |
 | `instruction_skip`         | Voltage-glitch instruction skip (NOP)   | All                  |
+| `bootloader_region_write`  | Fault during bootloader self-update     | All                  |
+| `nvs_corruption`           | NVS/config region corruption            | All                  |
+| `i2c_nack`                 | I2C NACK on secure element transaction  | I2CFaultProxy        |
+| `i2c_timeout`              | I2C bus timeout                         | I2CFaultProxy        |
+| `i2c_bit_flip`             | I2C data bit flip in transit            | I2CFaultProxy        |
+| `i2c_truncated`            | Truncated I2C transaction               | I2CFaultProxy        |
+| `i2c_wrong_address`        | I2C response from wrong address         | I2CFaultProxy        |
+| `otp_partial_program`      | Partial OTP fuse blow                   | OTPMemory            |
+| `otp_stuck_bit`            | OTP bit stuck at 0 or 1                 | OTPMemory            |
+| `otp_read_disturb`         | OTP read returns wrong value            | OTPMemory            |
+| `otp_overblow`             | OTP fuse blown past threshold           | OTPMemory            |
 
 ### Instruction skip (voltage glitch)
 
@@ -550,6 +564,46 @@ nvm_controller: flash_ctrl
 ```
 
 Enables `command_drop` fault type on MRAM paths.
+
+### OTP peripheral
+
+For platforms with one-time-programmable fuse memory (anti-rollback counters, security fuses):
+
+```yaml
+otp_peripheral: sysbus.otp
+```
+
+Enables the OTP fault types (`otp_partial_program`, `otp_stuck_bit`, `otp_read_disturb`, `otp_overblow`). Requires the `OTPMemory.cs` peripheral on the platform. See [`docs/otp-backend.md`](otp-backend.md) for the OTP fault model.
+
+### I2C fault injection
+
+For platforms with I2C-attached secure elements (e.g., ATECC608 for ECDSA signature verification):
+
+```yaml
+fault_sweep:
+  fault_types: [power_loss, i2c_nack, i2c_timeout]
+  i2c_fault_config:
+    peripheral_name: sysbus.i2c_proxy
+    target_address: 0x60
+    fault_types:
+      [i2c_nack, i2c_timeout, i2c_bit_flip, i2c_truncated, i2c_wrong_address]
+```
+
+`peripheral_name` is the sysbus name of the `I2CFaultProxy.cs` peripheral. `target_address` is the 7-bit I2C address of the device to fault (0-127). The proxy intercepts I2C transactions to the target and injects the configured fault types. See [`docs/i2c-fault-model.md`](i2c-fault-model.md) for the I2C fault model.
+
+### Success criteria overrides
+
+Override success criteria for specific fault types. Useful when certain fault classes are expected to produce different outcomes:
+
+```yaml
+success_criteria_overrides:
+  bit_corruption:
+    vtor_in_slot: any
+  i2c_nack:
+    vtor_in_slot: exec
+```
+
+Each key is a fault type name; the value is a partial success criteria dict that overrides the top-level `success_criteria` for that fault type.
 
 ### Partial staging
 

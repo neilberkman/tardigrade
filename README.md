@@ -100,7 +100,7 @@ flowchart TD
         F -->|power_loss| G["Truncate write N<br/>(partial word)"]
         F -->|bit_corruption| H["Flip random bits<br/>(NOR physics model)"]
         F -->|interrupted_erase| I["Partial page erase"]
-        F -->|"8 others<br/>(command_drop,<br/>write_disturb, ...)"| J["Backend-specific<br/>fault injection"]
+        F -->|"20 others<br/>(I2C, OTP, NVM,<br/>instruction_skip, ...)"| J["Backend-specific<br/>fault injection"]
 
         G --> K["Faulted NVM state"]
         H --> K
@@ -137,7 +137,17 @@ flowchart TD
 
 ### Fault types
 
-11 fault types across 3 backend architectures (MRAM, NVMC flash-fast, NVMemory slow-path): `power_loss`, `bit_corruption`, `interrupted_erase`, `multi_sector_atomicity`, `silent_write_failure`, `write_rejection`, `write_disturb`, `wear_leveling_corruption`, `reset_at_time`, `read_bit_flip` (NVMemory), `command_drop` (GenericNvmController).
+23 fault types across 5 backend categories:
+
+| Category        | Fault types                                                                                                                                                           | Backend              |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| NVM write/erase | `power_loss`, `bit_corruption`, `interrupted_erase`, `silent_write_failure`, `write_disturb`, `write_rejection`, `multi_sector_atomicity`, `wear_leveling_corruption` | All                  |
+| NVM read/time   | `read_bit_flip`, `reset_at_time`                                                                                                                                      | NVMemory / All       |
+| NVM controller  | `command_drop`                                                                                                                                                        | GenericNvmController |
+| NVM region      | `bootloader_region_write`, `nvs_corruption`                                                                                                                           | All                  |
+| CPU glitch      | `instruction_skip`                                                                                                                                                    | All                  |
+| I2C bus         | `i2c_nack`, `i2c_timeout`, `i2c_bit_flip`, `i2c_truncated`, `i2c_wrong_address`                                                                                       | I2CFaultProxy        |
+| OTP fuse        | `otp_partial_program`, `otp_stuck_bit`, `otp_read_disturb`, `otp_overblow`                                                                                            | OTPMemory            |
 
 Faults can be injected at different lifecycle stages: during the initial update write path, during pre-boot metadata/setup writes (`metadata_fault`), during between-boot confirm/accept hooks (`hook_fault`), during the recovery write path itself (`phase2_fault`), or as compound sequences (`multi_fault`).
 
@@ -170,7 +180,7 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the complete 
 
 ### Real upstream integrations
 
-**MCUboot** -- narrow canary profiles against MCUboot HEAD, retroactive differential profiles for 3 known bugs (broken/fixed pairs), and multi-step exploratory scenarios with semantic probes and invariant checking. See `profiles/mcuboot_*.yaml` and [`targets/mcuboot/`](targets/mcuboot/).
+**MCUboot** -- narrow canary profiles against MCUboot HEAD, retroactive differential profiles for 6 known bugs (broken/fixed pairs for PRs #2100, #2109, #2199, #2205, #2206, #2214), geometry-variant profiles, and multi-step exploratory scenarios with semantic probes and invariant checking. Platforms include nRF52840 (NVMC) and STM32F4. See `profiles/mcuboot_*.yaml` and [`targets/mcuboot/`](targets/mcuboot/).
 
 **NuttX nxboot** -- real upstream NuttX firmware built from source. Board configs (defconfigs, linker scripts, Kconfig, progmem) are upstream as of [apache/nuttx#18509](https://github.com/apache/nuttx/pull/18509); the build script auto-detects this and skips local patches. Exploratory validation, a revert canary workflow, and a full target adapter (build, runtime profile generation, audit). See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
 
@@ -197,10 +207,11 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the full repo
 ## Additional tools
 
 - **Scenarios** ([`scripts/run_scenario.py`](scripts/run_scenario.py)) -- multi-step discovery runs with profile overrides per step. See [`scenarios/`](scenarios/).
-- **CBMC bridge** (`scripts/cbmc_to_profile.py`) -- converts CBMC counterexamples into tardigrade replay profiles, bridging formal verification and empirical fault injection.
-- **Geometry matrix** (`scripts/geometry_matrix.py`) -- parametric slot-layout permutations to catch geometry-dependent bugs.
+- **CBMC bridge** ([`scripts/cbmc_to_profile.py`](scripts/cbmc_to_profile.py)) -- converts CBMC counterexamples into tardigrade replay profiles, bridging formal verification and empirical fault injection.
+- **Fuzzer bridge** ([`scripts/fuzz_crash_to_profile.py`](scripts/fuzz_crash_to_profile.py)) -- converts libFuzzer/AFL/honggfuzz crash inputs into regression profiles; supports batch mode, staging-image injection, and auto-detection of fuzzer types. Template harness at [`harnesses/fuzz_ota_header_template.c`](harnesses/fuzz_ota_header_template.c). Legacy converter: `scripts/fuzz_to_profile.py`.
+- **Geometry matrix** ([`scripts/geometry_matrix.py`](scripts/geometry_matrix.py)) -- parametric slot-layout permutations to catch geometry-dependent bugs.
 - **State fuzzer** (`targets/mcuboot/state_fuzzer.py`) -- MCUboot-specific trailer-state exploration _(not yet wired into the main sweep engine)_.
-- **HTML report** (`scripts/render_results_html.py`) -- renders JSON reports as HTML.
+- **HTML report** ([`scripts/render_results_html.py`](scripts/render_results_html.py)) -- renders JSON reports as HTML.
 
 ## CI workflows
 
@@ -219,37 +230,57 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the full repo
 
 ```text
 tardigrade/
-├── action.yml                       # Reusable GitHub Action
+├── action.yml                        # Reusable GitHub Action
 ├── scripts/
-│   ├── audit_bootloader.py          # Primary CLI entry point
-│   ├── run_scenario.py              # Multi-step scenario runner
-│   ├── profile_loader.py            # YAML profile parser + validation
-│   ├── self_test.py                 # Self-test across known defect corpus
-│   ├── run_runtime_fault_sweep.resc # Renode fault sweep engine
-│   ├── write_trace_heuristic.py     # Write-trace classification
-│   ├── render_results_html.py       # HTML report renderer
-│   ├── geometry_matrix.py           # Parametric slot-layout generator
-│   └── cbmc_to_profile.py          # CBMC counterexample converter
+│   ├── audit_bootloader.py           # Primary CLI entry point
+│   ├── run_scenario.py               # Multi-step scenario runner
+│   ├── profile_loader.py             # YAML profile parser + validation
+│   ├── invariants.py                 # 14 built-in postcondition invariants
+│   ├── self_test.py                  # Self-test across known defect corpus
+│   ├── run_runtime_fault_sweep.resc  # Renode fault sweep engine
+│   ├── write_trace_heuristic.py      # Write-trace classification
+│   ├── boot_cycle_analysis.py        # Multi-boot convergence analysis
+│   ├── fault_inject.py               # Fault injection helpers
+│   ├── partial_staging.py            # Partial staging-image simulation
+│   ├── render_results_html.py        # HTML report renderer
+│   ├── geometry_matrix.py            # Parametric slot-layout generator
+│   ├── cbmc_to_profile.py            # CBMC counterexample converter
+│   ├── fuzz_crash_to_profile.py      # Fuzzer crash-to-profile converter
+│   ├── fuzz_to_profile.py            # Legacy fuzzer bridge
+│   └── run_oss_validation.py         # OSS validation runner
 ├── targets/
-│   ├── mcuboot/                     # MCUboot probe, invariants, state fuzzer
-│   ├── nuttx_nxboot/                # Real NuttX build + runtime profile gen
-│   └── nxboot/                      # Shared nxboot-style probe + invariants
-├── profiles/                        # YAML audit profiles
-├── scenarios/                       # Multi-step scenario definitions
-├── examples/                        # Built-in reference bootloader firmware
-├── peripherals/                     # Renode C# peripherals with fault hooks
-├── platforms/                       # Renode platform definitions (.repl)
-├── tests/                           # Robot Framework test suites
-├── results/oss_validation/assets/   # Pre-built MCUboot ELFs + slot images
+│   ├── mcuboot/                      # MCUboot probe, invariants, state fuzzer
+│   ├── nuttx_nxboot/                 # Real NuttX build + runtime profile gen
+│   └── nxboot/                       # Shared nxboot-style probe + invariants
+├── profiles/                         # YAML audit profiles (~80 profiles)
+├── scenarios/                        # Multi-step scenario definitions
+├── examples/                         # Built-in reference bootloader firmware
+├── harnesses/                        # Fuzzer harness templates
+├── peripherals/                      # Renode C# peripherals with fault hooks
+│   ├── NRF52NVMC.cs                  #   NVMC flash with write/erase faults
+│   ├── NVMemoryController.cs         #   NVMemory slow-path backend
+│   ├── GenericNvmController.cs       #   Command-register NVM controller
+│   ├── I2CFaultProxy.cs              #   I2C bus fault injection proxy
+│   ├── OTPMemory.cs                  #   OTP fuse-blow fault model
+│   ├── STM32F4FlashController.cs     #   STM32F4 flash controller
+│   ├── STM32H7FlashController.cs     #   STM32H7 flash controller
+│   ├── TraceReplayEngine.cs          #   Trace replay for fast Phase 1
+│   └── FaultTracker.cs               #   Shared fault-tracking interface
+├── platforms/                        # Renode platform definitions (.repl)
+├── tests/                            # Robot Framework + pytest suites
+├── docker/                           # Dockerfiles for CI
+├── results/oss_validation/assets/    # Pre-built MCUboot ELFs + slot images
 └── docs/
-    └── writing-profiles.md          # Profile-writing guide + result interpretation
+    ├── writing-profiles.md           # Profile-writing guide + result interpretation
+    ├── i2c-fault-model.md            # I2C fault injection model
+    └── otp-backend.md                # OTP fuse-blow backend
 ```
 
 ## Limitations
 
 - Fault model operates at write-operation granularity, not analog brownout simulation.
 - Cortex-M targets only; non-Cortex architectures are not first-class.
-- Some fault types are backend-specific: `read_bit_flip` requires the NVMemory slow-path backend; `command_drop` requires GenericNvmController. The profile loader warns at load time for incompatible combinations.
+- Some fault types are backend-specific: `read_bit_flip` requires the NVMemory slow-path backend; `command_drop` requires GenericNvmController; I2C faults require the I2CFaultProxy peripheral; OTP faults require the OTPMemory peripheral. The profile loader warns at load time for incompatible combinations.
 - Multi-fault sweeps currently execute all stages as power-loss faults regardless of the original fault type.
 - Semantic bugs that don't change boot outcome require explicit target instrumentation.
 - Exhaustive sweeps take ~15 min on a 2-core CI runner; heuristic mode is 2-4 min.
