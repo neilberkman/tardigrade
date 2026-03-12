@@ -23,10 +23,12 @@ from profile_loader import (  # noqa: E402
     _parse_metadata_fault_regions,
     load_profile,
 )
-from audit_bootloader import (  # noqa: E402
+from audit_report import (  # noqa: E402
     enrich_results_with_fault_regions,
     compute_region_breakdown,
     summarize_runtime_sweep,
+)
+from fault_classification import (  # noqa: E402
     result_is_brick,
     result_has_issues,
 )

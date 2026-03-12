@@ -28,8 +28,8 @@ from audit_bootloader import (  # noqa: E402
     prepare_renode_command,
     run_batch,
     run_single_point,
-    summarize_runtime_sweep,
 )
+from audit_report import summarize_runtime_sweep  # noqa: E402
 from profile_loader import load_profile  # noqa: E402
 
 try:
