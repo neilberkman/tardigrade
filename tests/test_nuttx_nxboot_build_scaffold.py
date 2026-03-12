@@ -17,12 +17,14 @@ sys.path.insert(0, str(SCRIPTS))
 
 from examples.nxboot_style.gen_nxboot_images import wrap_nxboot_image  # noqa: E402
 from targets.nuttx_nxboot.build_public_target import (  # noqa: E402
+    _tree_has_nxboot_upstream,
     build_env,
     ensure_host_tools,
     normalize_generated_config,
     package_images,
     patch_cmakelists,
     patch_make_defs,
+    patch_nuttx_tree,
     patch_progmem,
     patch_stm32h7_kconfig,
 )
@@ -241,6 +243,37 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             f"primary_slot_base (0x{primary_slot_base:08X}) + "
             f"NXBOOT_HEADER_SIZE (0x{header_size:X}) = 0x{expected_origin:08X}",
         )
+
+class UpstreamDetectionTest(unittest.TestCase):
+    """Tests for _tree_has_nxboot_upstream and skip-patches behavior."""
+
+    def test_detects_upstream_nxboot(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_upstream_"))
+        try:
+            kconfig = temp_dir / "arch" / "arm" / "src" / "stm32h7" / "Kconfig"
+            kconfig.parent.mkdir(parents=True)
+            kconfig.write_text('config STM32_APP_FORMAT_NXBOOT\n\tbool "NuttX nxboot"\n')
+            self.assertTrue(_tree_has_nxboot_upstream(temp_dir))
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_detects_missing_nxboot(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_no_upstream_"))
+        try:
+            kconfig = temp_dir / "arch" / "arm" / "src" / "stm32h7" / "Kconfig"
+            kconfig.parent.mkdir(parents=True)
+            kconfig.write_text('config STM32_APP_FORMAT_MCUBOOT\n\tbool "MCUboot"\n')
+            self.assertFalse(_tree_has_nxboot_upstream(temp_dir))
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_missing_kconfig_returns_false(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_empty_"))
+        try:
+            self.assertFalse(_tree_has_nxboot_upstream(temp_dir))
+        finally:
+            shutil.rmtree(temp_dir)
+
 
 if __name__ == "__main__":
     unittest.main()

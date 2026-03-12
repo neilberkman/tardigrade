@@ -172,7 +172,7 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the complete 
 
 **MCUboot** -- narrow canary profiles against MCUboot HEAD, retroactive differential profiles for 3 known bugs (broken/fixed pairs), and multi-step exploratory scenarios with semantic probes and invariant checking. See `profiles/mcuboot_*.yaml` and [`targets/mcuboot/`](targets/mcuboot/).
 
-**NuttX nxboot** -- real upstream NuttX firmware built from source. Exploratory validation, a revert canary workflow, and a full target adapter (build, runtime profile generation, audit). See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
+**NuttX nxboot** -- real upstream NuttX firmware built from source. Board configs (defconfigs, linker scripts, Kconfig, progmem) are upstream as of [apache/nuttx#18509](https://github.com/apache/nuttx/pull/18509); the build script auto-detects this and skips local patches. Exploratory validation, a revert canary workflow, and a full target adapter (build, runtime profile generation, audit). See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
 
 ### Reference examples
 
