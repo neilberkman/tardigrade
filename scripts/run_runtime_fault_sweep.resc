@@ -121,7 +121,7 @@ def log(msg):
 bus = monitor.Machine.SystemBus
 
 # Sentinel value used to disarm fault injection (max uint64).
-_DISARM_SENTINEL = _DISARM_SENTINEL
+_DISARM_SENTINEL = 18446744073709551615
 
 # Write fault mode codes shared between run_execute_fault and run_phase2_fault.
 # For flash/NVMC backends: WriteFaultMode 0=power_loss, 1=bit_corruption, etc.
