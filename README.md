@@ -16,6 +16,21 @@ These are retroactive tests against known MCUboot bugs -- not discoveries. The p
 
 Additional differential profiles for PRs [#2205](https://github.com/mcu-tools/mcuboot/pull/2205), [#2206](https://github.com/mcu-tools/mcuboot/pull/2206), and [#2214](https://github.com/mcu-tools/mcuboot/pull/2214).
 
+## Complementary to fuzzers and static analysis
+
+Fuzzers and static analyzers excel at finding memory-safety bugs in bootloader code -- integer overflows, buffer overflows, unsafe string handling. Tardigrade covers a different surface: what happens when NVM state is corrupted mid-operation, and does the device recover correctly?
+
+| Bug class                               | Fuzzers / static analysis | Tardigrade       |
+| --------------------------------------- | ------------------------- | ---------------- |
+| Integer overflow in allocation          | Primary strength          | Not in scope     |
+| Buffer overflow in parser               | Primary strength          | Not in scope     |
+| Interrupted write corrupts boot state   | Rarely tested             | Primary strength |
+| Partial update leaves device unbootable | Rarely tested             | Primary strength |
+| Rollback stuck after power loss         | Rarely tested             | Primary strength |
+| Timing side-channel in hash compare     | Primary strength          | Not in scope     |
+
+The **[fuzzer bridge](scripts/fuzz_crash_to_profile.py)** connects these worlds: when a fuzzer finds a crash that corrupts an OTA header or metadata region, the bridge converts the crash artifact into a tardigrade regression profile that tests whether the corruption actually bricks the device or whether the bootloader recovers safely. Pipeline: `libFuzzer/AFL finds crash` → `fuzz_crash_to_profile.py` → `tardigrade sweep from corrupted state`.
+
 ## How this works under the hood
 
 ### Formal-to-empirical bridge
@@ -180,7 +195,7 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the complete 
 
 ### Real upstream integrations
 
-**MCUboot** -- narrow canary profiles against MCUboot HEAD, retroactive differential profiles for 6 known bugs (broken/fixed pairs for PRs #2100, #2109, #2199, #2205, #2206, #2214), geometry-variant profiles, and multi-step exploratory scenarios with semantic probes and invariant checking. Platforms include nRF52840 (NVMC) and STM32F4. See `profiles/mcuboot_*.yaml` and [`targets/mcuboot/`](targets/mcuboot/).
+**MCUboot** -- narrow canary profiles against MCUboot HEAD, retroactive differential profiles for 6 known bugs (broken/fixed pairs for PRs #2100, #2109, #2199, #2205, #2206, #2214), geometry-variant profiles, and multi-step exploratory scenarios with semantic probes and invariant checking. Platforms include nRF52840 (NVMC) and STM32F4. The MCUboot differentials cover three distinct fault-resilience bug classes (revert-magic corruption, header-reload-after-resume, stuck-revert-trailer) -- each was also checked against the other swap algorithms to test for cross-algorithm variants. See `profiles/mcuboot_*.yaml` and [`targets/mcuboot/`](targets/mcuboot/).
 
 **NuttX nxboot** -- real upstream NuttX firmware built from source. Board configs (defconfigs, linker scripts, Kconfig, progmem) are upstream as of [apache/nuttx#18509](https://github.com/apache/nuttx/pull/18509); the build script auto-detects this and skips local patches. Exploratory validation, a revert canary workflow, and a full target adapter (build, runtime profile generation, audit). See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
 
