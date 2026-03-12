@@ -483,6 +483,7 @@ class CalibrationResult:
     elapsed_s: Optional[float] = None
     pc: Optional[str] = None
     setup_writes: int = 0
+    total_i2c_transactions: int = 0
 
 
 def calibration_completed(
@@ -568,6 +569,7 @@ def run_calibration(
         elapsed_s=data.get("calibration_elapsed_s"),
         pc=data.get("calibration_pc"),
         setup_writes=int(data.get("setup_writes", 0)),
+        total_i2c_transactions=int(data.get("total_i2c_transactions", 0)),
     )
 
 
@@ -2292,6 +2294,7 @@ EXECUTE_ONLY_FAULT_TYPES = {
     "otp_partial_program",
     "otp_stuck_bit",
     "otp_read_disturb",
+    "otp_overblow",
     "i2c_nack",
     "i2c_timeout",
     "i2c_bit_flip",
@@ -2318,6 +2321,7 @@ FAULT_TYPE_NAME_TO_CODE = {
     "otp_partial_program": "op",
     "otp_stuck_bit": "os",
     "otp_read_disturb": "od",
+    "otp_overblow": "oo",
     "i2c_nack": "in",
     "i2c_timeout": "it",
     "i2c_bit_flip": "ib",
@@ -2525,6 +2529,7 @@ def _fault_type_label(code: Any) -> str:
         "op": "otp_partial_program",
         "os": "otp_stuck_bit",
         "od": "otp_read_disturb",
+        "oo": "otp_overblow",
         "in": "i2c_nack",
         "it": "i2c_timeout",
         "ib": "i2c_bit_flip",
@@ -3224,6 +3229,7 @@ def main() -> int:
         trace_file_bin: Optional[str] = None
         erase_trace_file_bin: Optional[str] = None
         total_erases: int = 0
+        total_i2c_transactions: int = 0
         setup_writes: int = 0
         # Determine which fault classes are requested.
         fault_types = profile.fault_sweep.fault_types
@@ -3243,6 +3249,8 @@ def main() -> int:
         include_read_bit_flip = "read_bit_flip" in fault_types
         include_command_drop = "command_drop" in fault_types
         include_instruction_skip = "instruction_skip" in fault_types
+        include_i2c_faults = any(ft.startswith("i2c_") for ft in fault_types)
+        i2c_fault_types = [ft for ft in fault_types if ft.startswith("i2c_")]
 
         # Pass fault_types to calibration so erase trace is captured.
         if include_erases:
@@ -3286,10 +3294,13 @@ def main() -> int:
                         file=sys.stderr,
                     )
                 setup_writes = cal.setup_writes
+                total_i2c_transactions = cal.total_i2c_transactions
+                cal_parts = ["{} NVM writes".format(max_writes)]
                 if include_erases:
-                    print("Calibration: {} NVM writes, {} page erases.".format(max_writes, total_erases), file=sys.stderr)
-                else:
-                    print("Calibration: {} NVM writes.".format(max_writes), file=sys.stderr)
+                    cal_parts.append("{} page erases".format(total_erases))
+                if total_i2c_transactions > 0:
+                    cal_parts.append("{} I2C transactions".format(total_i2c_transactions))
+                print("Calibration: {}.".format(", ".join(cal_parts)), file=sys.stderr)
         else:
             max_writes = int(max_writes)
 
@@ -3410,6 +3421,7 @@ def main() -> int:
             or include_read_bit_flip
             or include_command_drop
             or include_instruction_skip
+            or include_i2c_faults
             or profile.fault_sweep.phase2_fault.enabled
             or profile.fault_sweep.multi_fault.enabled
             or include_metadata_fault
@@ -3545,6 +3557,18 @@ def main() -> int:
                 combined += [(fp, 'k') for fp in command_drop_fps]
                 command_drop_count = len(command_drop_fps)
 
+            # I2C bus fault injection: iterate FaultAtTransaction from 1 to N
+            # for each configured I2C fault type.
+            i2c_fault_count = 0
+            if include_i2c_faults and total_i2c_transactions > 0:
+                i2c_fps = list(range(total_i2c_transactions))
+                if args.quick:
+                    i2c_fps = quick_subset(i2c_fps)
+                for i2c_ft in i2c_fault_types:
+                    i2c_code = FAULT_TYPE_NAME_TO_CODE.get(i2c_ft, "in")
+                    combined += [(fp, i2c_code) for fp in i2c_fps]
+                    i2c_fault_count += len(i2c_fps)
+
             # Instruction-skip fault injection: enumerate halfword-aligned
             # addresses in configured target ranges.  Each fault point is
             # an address (not a write index), encoded as 'i:<addr>'.
@@ -3553,8 +3577,12 @@ def main() -> int:
                 isc = profile.fault_sweep.instruction_skip_config
                 if isc is not None and isc.target_addresses:
                     skip_addrs: List[int] = []
+                    sc = isc.skip_count if isc.skip_count > 0 else 1
                     for region_start, region_end in isc.target_addresses:
-                        for addr in range(region_start, region_end, 2):
+                        # Stop early so that patching skip_count consecutive
+                        # halfwords from the start address stays in bounds.
+                        end = region_end - (sc - 1) * 2
+                        for addr in range(region_start, max(end, region_start), 2):
                             skip_addrs.append(addr)
                     if args.quick:
                         skip_addrs = quick_subset(skip_addrs)
@@ -3672,6 +3700,8 @@ def main() -> int:
                 parts.append("{} read-flip".format(read_flip_count))
             if command_drop_count:
                 parts.append("{} command-drop".format(command_drop_count))
+            if i2c_fault_count:
+                parts.append("{} i2c-fault".format(i2c_fault_count))
             if instruction_skip_count:
                 parts.append("{} instruction-skip".format(instruction_skip_count))
             if phase2_count:

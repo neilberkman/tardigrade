@@ -309,6 +309,30 @@ class TestGenerateProfile:
         expected_sha = hashlib.sha256(data).hexdigest()
         assert profile["fuzz_metadata"]["crash_sha256"] == expected_sha
 
+    def test_staging_image_removes_stale_pre_boot_state(self, tmp_path):
+        """staging_image mode must remove pre_boot_state from the template."""
+        tmpl = self._template()
+        # Inject a pre_boot_state into the template (simulates a template
+        # that was originally written for pre_boot_state mode).
+        tmpl["pre_boot_state"] = [
+            {"address": "0x00080000", "u32": "0xDEADBEEF"},
+        ]
+
+        data = b"\x01\x02\x03\x04"
+        staging_path = str(tmp_path / "staging.bin")
+        (tmp_path / "staging.bin").write_bytes(data)
+
+        profile = fcp.generate_profile(
+            crash_data=data,
+            crash_path=Path("crash-stale"),
+            template=tmpl,
+            regions=[],
+            mode="staging_image",
+            staging_image_path=staging_path,
+        )
+        assert "pre_boot_state" not in profile
+        assert profile["images"]["staging"] == staging_path
+
     def test_empty_writes_raises(self):
         # Zero-length region that produces no writes
         regions = [{"name": "empty", "address": 0x1000, "size": 0}]
@@ -356,6 +380,23 @@ class TestFindCrashFiles:
     def test_empty_dir(self, tmp_path):
         files = fcp.find_crash_files(tmp_path)
         assert files == []
+
+    def test_skips_symlinks(self, tmp_path):
+        """Symlinks in crash dir must be excluded to prevent traversal."""
+        real_file = tmp_path / "crash-real"
+        real_file.write_bytes(b"\xAA")
+
+        # Create a symlink that points to an arbitrary file outside the dir
+        target = tmp_path / "outside" / "secret.key"
+        target.parent.mkdir()
+        target.write_text("sensitive data")
+        link = tmp_path / "crash-link"
+        link.symlink_to(target)
+
+        files = fcp.find_crash_files(tmp_path)
+        names = [f.name for f in files]
+        assert "crash-real" in names
+        assert "crash-link" not in names
 
 
 # ---------------------------------------------------------------------------

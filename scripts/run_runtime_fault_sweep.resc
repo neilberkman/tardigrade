@@ -98,6 +98,7 @@ $boot_register_pre_writes?=""
 $boot_registers?=""
 $reset_mode?="warm"
 $otp_peripheral?=""
+$i2c_fault_peripheral?=""
 $instruction_skip_regions?=""
 $instruction_skip_count?="1"
 
@@ -218,6 +219,31 @@ def resolve_backend():
         except:
             log('WARNING: otp_peripheral "{}" not found on sysbus'.format(otp_var))
 
+    # Optional I2C fault proxy peripheral for I2C bus fault injection.
+    i2c_proxy = None
+    i2c_sysbus_name = None
+    i2c_var = get_optional_var('i2c_fault_peripheral', '')
+    if i2c_var and i2c_var.lower() not in ('', 'none'):
+        i2c_sysbus_name = 'sysbus.' + i2c_var if not i2c_var.startswith('sysbus.') else i2c_var
+        try:
+            i2c_proxy = monitor.Machine[i2c_sysbus_name]
+        except:
+            log('WARNING: i2c_fault_peripheral "{}" not found on sysbus'.format(i2c_var))
+
+    # Pre-compute I2C fault capability.
+    supports_i2c_fault = False
+    i2c_fault_reason = ''
+    if i2c_proxy is None:
+        i2c_fault_reason = 'no_i2c_fault_peripheral'
+    else:
+        i2c_required = ['FaultAtTransaction', 'FaultType', 'FaultFired', 'TotalTransactions']
+        i2c_missing = [n for n in i2c_required if not hasattr(i2c_proxy, n)]
+        if i2c_missing:
+            i2c_fault_reason = 'i2c_peripheral_missing_properties: {}'.format(
+                ', '.join(i2c_missing))
+        else:
+            supports_i2c_fault = True
+
     return {
         'kind': kind,
         'data': backend_obj,
@@ -228,6 +254,10 @@ def resolve_backend():
         'command_fault_reason': command_fault_reason,
         'otp': otp,
         'otp_sysbus_name': otp_sysbus_name,
+        'i2c_proxy': i2c_proxy,
+        'i2c_sysbus_name': i2c_sysbus_name,
+        'supports_i2c_fault': supports_i2c_fault,
+        'i2c_fault_reason': i2c_fault_reason,
     }
 
 backend = resolve_backend()
@@ -248,6 +278,11 @@ def refresh_runtime_handles():
     if backend.get('otp_sysbus_name'):
         try:
             backend['otp'] = monitor.Machine[backend['otp_sysbus_name']]
+        except:
+            pass
+    if backend.get('i2c_sysbus_name'):
+        try:
+            backend['i2c_proxy'] = monitor.Machine[backend['i2c_sysbus_name']]
         except:
             pass
 
@@ -436,6 +471,11 @@ _FAULT_CODE_TO_NAME = {
     'k': 'command_drop',
     'i': 'instruction_skip',
     'h': 'power_loss',  # hook faults are power-loss during hook writes
+    'in': 'i2c_nack',
+    'it': 'i2c_timeout',
+    'ib': 'i2c_bit_flip',
+    'ic': 'i2c_truncated',
+    'iw': 'i2c_wrong_address',
 }
 
 
@@ -1714,6 +1754,66 @@ def get_last_command_address():
     except Exception:
         return 0
 
+# ---------------------------------------------------------------------------
+# I2C fault injection helpers — dispatch on backend['i2c_proxy'].
+# ---------------------------------------------------------------------------
+
+def get_total_i2c_transactions():
+    proxy = backend.get('i2c_proxy')
+    if proxy is None:
+        return 0
+    try:
+        return int(proxy.TotalTransactions)
+    except Exception:
+        return 0
+
+def arm_i2c_fault(absolute_transaction_index, i2c_fault_type=1, i2c_fault_seed=0):
+    proxy = backend.get('i2c_proxy')
+    if proxy is None:
+        return
+    try:
+        proxy.FaultAtTransaction = absolute_transaction_index
+        proxy.FaultType = i2c_fault_type
+        proxy.FaultSeed = i2c_fault_seed
+        proxy.FaultFired = False
+    except Exception:
+        pass
+
+def disarm_i2c_fault():
+    proxy = backend.get('i2c_proxy')
+    if proxy is None:
+        return
+    try:
+        proxy.FaultAtTransaction = 18446744073709551615
+        proxy.FaultType = 0
+        proxy.FaultFired = False
+    except Exception:
+        pass
+
+def was_i2c_fault_injected():
+    proxy = backend.get('i2c_proxy')
+    if proxy is None:
+        return False
+    try:
+        return bool(proxy.FaultFired)
+    except Exception:
+        return False
+
+def ensure_i2c_fault_preflight():
+    return {
+        'supported': backend.get('supports_i2c_fault', False),
+        'reason': backend.get('i2c_fault_reason', 'no_i2c_fault_peripheral'),
+    }
+
+# I2C wire code to I2CFaultProxy FaultType integer mapping.
+_I2C_WIRE_CODE_TO_FAULT_TYPE = {
+    'in': 1,  # NACK
+    'it': 2,  # Timeout
+    'ib': 3,  # BitFlip
+    'ic': 4,  # TruncatedResponse
+    'iw': 5,  # WrongAddress
+}
+
 def prime_bootloader_entry():
     # Some Cortex-M platforms do not reliably restore SP/PC from the loaded
     # bootloader image after machine Reset. Re-prime the core from the vector
@@ -1832,6 +1932,8 @@ def reset_nvmc_for_sweep():
     # Reset controller fault state on all backends — command_drop can be
     # used with any backend via the separate nvm_controller field.
     disarm_controller_fault()
+    # Reset I2C fault state.
+    disarm_i2c_fault()
 
 def reset_nvmc_for_recovery():
     # Reset NVM for recovery boot: no write counting needed, fast mode.
@@ -1860,6 +1962,8 @@ def reset_nvmc_for_recovery():
         b['data'].Nvm.TotalWordWrites = 0
         b['data'].Nvm.FaultEverFired = False
         disarm_fault()
+    # Reset I2C fault state for recovery boot.
+    disarm_i2c_fault()
 
 
 def get_machine_snapshot_path(kind):
@@ -3219,6 +3323,8 @@ def run_execute_fault(fault_at, fault_type='w'):
     #   timed: 't' reset_at_time
     #   read:  'f' read_bit_flip (transient one-shot read corruption)
     #   ctrl:  'k' command_drop (drop one controller write command)
+    #   i2c:   'in' i2c_nack, 'it' i2c_timeout, 'ib' i2c_bit_flip,
+    #          'ic' i2c_truncated, 'iw' i2c_wrong_address
     #   cpu:   'i' instruction_skip (handled by run_instruction_skip_fault,
     #              dispatched from batch loop, NOT routed here)
     #
@@ -3249,6 +3355,24 @@ def run_execute_fault(fault_at, fault_type='w'):
                 'fault_at': fault_at,
                 'fault_requested': fault_at,
                 'fault_type': 'k',
+                'fault_injected': False,
+                'fault_address': fmt_u32(0),
+                'boot_outcome': 'skipped',
+                'boot_slot': None,
+                'fault_class': 'skipped',
+                'actual_writes': 0,
+                'signals': {'phase1_ms': 0, 'phase2_ms': 0, 'followup_ms': 0},
+                'skip_reason': skip_reason,
+            }
+
+    if fault_type in _I2C_WIRE_CODE_TO_FAULT_TYPE:
+        preflight = ensure_i2c_fault_preflight()
+        if not preflight.get('supported'):
+            skip_reason = preflight.get('reason') or 'i2c_fault_backend_unsupported'
+            return {
+                'fault_at': fault_at,
+                'fault_requested': fault_at,
+                'fault_type': fault_type,
                 'fault_injected': False,
                 'fault_address': fmt_u32(0),
                 'boot_outcome': 'skipped',
@@ -3360,6 +3484,7 @@ def run_execute_fault(fault_at, fault_type='w'):
     is_power_loss_fault = fault_type in ('w', 'e', 'a')
     is_non_power_write_fault = fault_type in ('b', 's', 'r', 'd', 'l', 'k')
     is_command_fault = fault_type == 'k'
+    is_i2c_fault = fault_type in _I2C_WIRE_CODE_TO_FAULT_TYPE
     log('fp={} type={} phase1_setup'.format(fault_at, fault_type))
 
     # Phase 1: Reset and set up for the faulted boot.
@@ -3385,6 +3510,16 @@ def run_execute_fault(fault_at, fault_type='w'):
             arm_at = base_commands + max_writes_cap + 1
         log('fp={} phase1_step command_arm_at={} mode=1'.format(fault_at, arm_at))
         arm_controller_fault(arm_at, command_fault_mode=1)
+        disarm_write_fault()
+        disarm_erase_fault()
+    elif is_i2c_fault:
+        i2c_ft_code = _I2C_WIRE_CODE_TO_FAULT_TYPE[fault_type]
+        base_txns = get_total_i2c_transactions()
+        arm_at = base_txns + fault_at + 1
+        if arm_at > base_txns + max_writes_cap:
+            arm_at = base_txns + max_writes_cap + 1
+        log('fp={} phase1_step i2c_arm_at={} type={}'.format(fault_at, arm_at, i2c_ft_code))
+        arm_i2c_fault(arm_at, i2c_fault_type=i2c_ft_code)
         disarm_write_fault()
         disarm_erase_fault()
     else:
@@ -3422,15 +3557,17 @@ def run_execute_fault(fault_at, fault_type='w'):
     disarm_vtor_watchpoint()
     phase1_ms = int((_time.time() - fp_t0) * 1000)
 
-    fault_injected = was_fault_injected()
+    fault_injected = was_i2c_fault_injected() if is_i2c_fault else was_fault_injected()
     fault_address = get_last_command_address() if is_command_fault else get_last_write_address()
     if is_erase_fault:
         phase1_ops = get_total_erases()
     elif is_command_fault:
         phase1_ops = get_total_commands()
+    elif is_i2c_fault:
+        phase1_ops = get_total_i2c_transactions()
     else:
         phase1_ops = get_total_writes()
-    if fault_injected and (is_erase_fault or fault_type in ('w', 'b', 's', 'r', 'd', 'l', 'k')):
+    if fault_injected and (is_erase_fault or fault_type in ('w', 'b', 's', 'r', 'd', 'l', 'k') or is_i2c_fault):
         # Unified semantics: successful operations before the faulted operation.
         actual_writes = max(0, phase1_ops - 1)
     else:
@@ -3565,6 +3702,22 @@ def run_execute_fault(fault_at, fault_type='w'):
         phase2_status = run_until_done(
             cpu_ref,
             label='fp{}_p1c'.format(fault_at),
+            wall_timeout=30,
+            stop_on_fault=False,
+            time_slice=phase2_time_slice,
+        )
+        disarm_vtor_watchpoint()
+        phase2_ms = int((_time.time() - phase2_t0) * 1000)
+    elif fault_injected and is_i2c_fault:
+        # I2C bus fault: no flash corruption, boot continues in the same
+        # attempt.  The I2CFaultProxy already injected the bus-level fault
+        # (NACK/timeout/bit-flip/etc); just let the CPU keep running.
+        phase2_t0 = _time.time()
+        disarm_i2c_fault()
+        arm_vtor_watchpoint()
+        phase2_status = run_until_done(
+            cpu_ref,
+            label='fp{}_i2c_cont'.format(fault_at),
             wall_timeout=30,
             stop_on_fault=False,
             time_slice=phase2_time_slice,
@@ -4850,10 +5003,13 @@ if calibration_mode:
                 log('calibration: wrote {} binary erase entries to {}'.format(erase_bin_count, erase_trace_file_bin))
                 log('calibration: {} total erases'.format(total_erases))
 
+        total_i2c_transactions = get_total_i2c_transactions()
+
         result = {
             'calibration': True,
             'total_writes': int(total_writes),
             'total_erases': int(total_erases),
+            'total_i2c_transactions': int(total_i2c_transactions),
             'base_writes': int(base_writes),
             'setup_writes': int(pre_boot_write_count),
             'calibration_stop_reason': cal_status.get('reason', '?'),
@@ -4963,6 +5119,9 @@ else:
                 backend['data'].CorruptionSeed = 0
             elif backend['kind'] != 'mram':
                 backend['data'].Nvm.CorruptionSeed = 0
+        # I2C bus faults: always full execute mode.
+        elif ft in ('in', 'it', 'ib', 'ic', 'iw'):
+            results.append(run_execute_fault(fp, fault_type=ft))
         # Synthetic/non-default faults always use full execute mode
         # (not trace replay — they depend on NVMC peripheral state/PRNG).
         elif ft in ('e', 'a', 'b', 's', 'd', 'l', 'r', 't', 'f', 'k'):
