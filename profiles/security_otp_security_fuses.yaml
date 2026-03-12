@@ -1,0 +1,46 @@
+schema_version: 1
+name: security_otp_security_fuses
+description: >-
+  Security configuration fuses (debug disable, secure boot enable, JTAG
+  lock) stored in OTP eFuse. Tests whether fault injection during fuse
+  programming can leave security features in an inconsistent or partially
+  enabled state. A partial blow to the secure-boot-enable fuse could
+  leave the device in an ambiguous state where some checks pass and
+  others fail.
+
+platform: platforms/cortex_m0_otp.repl
+flash_backend: nvm_ctrl
+otp_peripheral: otp
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 8
+  slots:
+    exec:    { base: 0x10000000, size: 0x38000 }
+    staging: { base: 0x10038000, size: 0x38000 }
+
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+
+security_policy:
+  anti_rollback: true
+  minimum_version: 1
+
+success_criteria:
+  vtor_in_slot: exec
+
+fault_sweep:
+  mode: runtime
+  max_writes: 28672
+  max_writes_cap: 100000
+  run_duration: "0.01"
+  fault_types:
+    - power_loss
+    - otp_partial_program
+    - otp_read_disturb
+
+expect:
+  should_find_issues: true

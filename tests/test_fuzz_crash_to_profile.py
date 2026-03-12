@@ -29,7 +29,7 @@ BASE_PROFILE_YAML = textwrap.dedent("""\
       write_granularity: 8
       slots:
         exec:    { base: 0x10000000, size: 0x38000 }
-        staging: { base: 0x10038000, size: 0x38000 }
+        staging: { base: 0x00040000, size: 0x38000 }
     images:
       staging: examples/vulnerable_ota/firmware.bin
     success_criteria:
@@ -92,12 +92,12 @@ class TestLoadRegionMap:
         m.write_text(textwrap.dedent("""\
             regions:
               - name: meta
-                address: 0x10070000
+                address: 0x00080000
                 size: 16
         """))
         regions = fcp.load_region_map(str(m))
         assert len(regions) == 1
-        assert regions[0]["address"] == 0x10070000
+        assert regions[0]["address"] == 0x00080000
 
     def test_no_map(self):
         assert fcp.load_region_map(None) == []
@@ -168,15 +168,15 @@ class TestDeriveMetaBase:
         template = {
             "memory": {
                 "slots": {
-                    "exec": {"base": 0x10000000, "size": 0x38000},
-                    "staging": {"base": 0x10038000, "size": 0x38000},
+                    "exec": {"base": 0x00008000, "size": 0x38000},
+                    "staging": {"base": 0x00040000, "size": 0x38000},
                 }
             }
         }
-        assert fcp.derive_meta_base(template, None) == 0x10070000
+        assert fcp.derive_meta_base(template, None) == 0x00078000
 
     def test_default(self):
-        assert fcp.derive_meta_base({}, None) == 0x10070000
+        assert fcp.derive_meta_base({}, None) == 0x00080000
 
 
 # ---------------------------------------------------------------------------
@@ -217,11 +217,11 @@ class TestGenerateProfile:
             crash_path=crash_path,
             template=self._template(),
             regions=[],
-            meta_base=0x10070000,
+            meta_base=0x00080000,
         )
         assert "fuzz" in profile["name"]
         assert len(profile["pre_boot_state"]) == 2
-        assert profile["pre_boot_state"][0]["address"] == "0x10070000"
+        assert profile["pre_boot_state"][0]["address"] == "0x00080000"
         assert profile["expect"]["should_find_issues"] is True
         assert "fuzz_metadata" in profile
         assert profile["fuzz_metadata"]["crash_file"] == "crash-test"
@@ -283,8 +283,8 @@ class TestGenerateProfile:
     def test_with_regions(self):
         data = struct.pack("<IIII", 0x11, 0x22, 0x33, 0x44)
         regions = [
-            {"name": "meta", "address": 0x10070000, "size": 8},
-            {"name": "hdr", "address": 0x10038000, "size": 8},
+            {"name": "meta", "address": 0x00080000, "size": 8},
+            {"name": "hdr", "address": 0x00040000, "size": 8},
         ]
         profile = fcp.generate_profile(
             crash_data=data,
@@ -294,8 +294,8 @@ class TestGenerateProfile:
         )
         writes = profile["pre_boot_state"]
         assert len(writes) == 4
-        assert writes[0]["address"] == "0x10070000"
-        assert writes[2]["address"] == "0x10038000"
+        assert writes[0]["address"] == "0x00080000"
+        assert writes[2]["address"] == "0x00040000"
 
     def test_metadata_sha256(self):
         data = b"hello fuzzer"
@@ -373,7 +373,7 @@ class TestCLISingleCrash:
         rc = fcp.main([
             "--crash-input", str(crash),
             "--base-profile", str(template),
-            "--meta-base", "0x10070000",
+            "--meta-base", "0x00080000",
             "-o", str(output),
         ])
         assert rc == 0
@@ -414,7 +414,7 @@ class TestCLISingleCrash:
         addr_map.write_text(textwrap.dedent("""\
             regions:
               - name: metadata
-                address: 0x10070000
+                address: 0x00080000
                 size: 8
         """))
 
@@ -432,7 +432,7 @@ class TestCLISingleCrash:
 
         profile = yaml.safe_load(output.read_text())
         assert len(profile["pre_boot_state"]) == 2
-        assert profile["pre_boot_state"][0]["address"] == "0x10070000"
+        assert profile["pre_boot_state"][0]["address"] == "0x00080000"
 
     def test_empty_crash_fails(self, tmp_path):
         template = tmp_path / "base.yaml"
@@ -595,7 +595,7 @@ class TestFuzzCorpusField:
               write_granularity: 8
               slots:
                 exec: { base: 0x10000000, size: 0x38000 }
-                staging: { base: 0x10038000, size: 0x38000 }
+                staging: { base: 0x00040000, size: 0x38000 }
             images:
               staging: examples/vulnerable_ota/firmware.bin
             success_criteria:
@@ -630,7 +630,7 @@ class TestFuzzCorpusField:
               write_granularity: 8
               slots:
                 exec: { base: 0x10000000, size: 0x38000 }
-                staging: { base: 0x10038000, size: 0x38000 }
+                staging: { base: 0x00040000, size: 0x38000 }
             images:
               staging: examples/vulnerable_ota/firmware.bin
             success_criteria:

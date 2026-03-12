@@ -2292,6 +2292,11 @@ EXECUTE_ONLY_FAULT_TYPES = {
     "otp_partial_program",
     "otp_stuck_bit",
     "otp_read_disturb",
+    "i2c_nack",
+    "i2c_timeout",
+    "i2c_bit_flip",
+    "i2c_truncated",
+    "i2c_wrong_address",
 }
 
 # Canonical mapping from human-readable fault type names to single-char
@@ -2313,6 +2318,11 @@ FAULT_TYPE_NAME_TO_CODE = {
     "otp_partial_program": "op",
     "otp_stuck_bit": "os",
     "otp_read_disturb": "od",
+    "i2c_nack": "in",
+    "i2c_timeout": "it",
+    "i2c_bit_flip": "ib",
+    "i2c_truncated": "ic",
+    "i2c_wrong_address": "iw",
 }
 
 
@@ -2515,6 +2525,11 @@ def _fault_type_label(code: Any) -> str:
         "op": "otp_partial_program",
         "os": "otp_stuck_bit",
         "od": "otp_read_disturb",
+        "in": "i2c_nack",
+        "it": "i2c_timeout",
+        "ib": "i2c_bit_flip",
+        "ic": "i2c_truncated",
+        "iw": "i2c_wrong_address",
         "h": "hook_fault",
         "p2": "phase2",
     }
