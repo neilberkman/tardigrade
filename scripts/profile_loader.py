@@ -1642,9 +1642,12 @@ def _warn_fault_backend_compat(
 ) -> None:
     """Emit warnings when fault_types are likely incompatible with the backend.
 
-    ``read_bit_flip`` requires NVMemory (the slow-path peripheral that
-    intercepts individual reads).  ``command_drop`` requires a
-    GenericNvmController (command-based flash controller).
+    ``read_bit_flip`` requires a backend that intercepts CPU reads --
+    NVMemory (slow-path) or MRAMMemory.  Fast-path backends
+    (MappedMemory + NVMC/STM32) expose flash via a backing
+    MappedMemory that the CPU reads directly, so read faults cannot be
+    injected.  ``command_drop`` requires a GenericNvmController
+    (command-based flash controller).
 
     The profile loader cannot definitively determine the Renode peripheral
     class — that is resolved at runtime from the .repl file.  This check
@@ -1667,18 +1670,27 @@ def _warn_fault_backend_compat(
     platform_lower = platform.lower()
     backend_lower = flash_backend.lower() if flash_backend else ""
 
-    # read_bit_flip: only supported on NVMemory (slow-path peripheral).
-    # MappedMemory, NVMC, MRAM backends do not intercept reads.
+    # read_bit_flip: supported on NVMemory (slow-path) and MRAMMemory --
+    # both intercept CPU reads.  Fast-path backends (MappedMemory + NVMC,
+    # STM32 controllers) expose flash via a backing MappedMemory that the
+    # CPU reads directly, so read faults cannot be injected.
     if "read_bit_flip" in all_types:
-        is_nvm_slow = "nvm" in platform_lower and "nvmc" not in platform_lower
+        is_read_capable = "mram" in platform_lower
+        if not is_read_capable:
+            is_read_capable = (
+                "nvm" in platform_lower and "nvmc" not in platform_lower
+            )
         if backend_lower:
             # If flash_backend is explicitly set, check it directly.
-            is_nvm_slow = "nvm" in backend_lower and "nvmc" not in backend_lower
-        if not is_nvm_slow:
+            is_read_capable = "mram" in backend_lower or (
+                "nvm" in backend_lower and "nvmc" not in backend_lower
+            )
+        if not is_read_capable:
             warnings.warn(
-                "fault_type 'read_bit_flip' requires an NVMemory (slow-path) "
-                "backend, but platform '{}' / flash_backend '{}' does not "
-                "appear to use one. Read-fault injection may silently do "
+                "fault_type 'read_bit_flip' requires a backend that "
+                "intercepts CPU reads (NVMemory or MRAMMemory), but "
+                "platform '{}' / flash_backend '{}' does not appear to "
+                "use one. Read-fault injection may silently do "
                 "nothing.".format(platform, flash_backend or "(not set)")
             )
 

@@ -19,8 +19,10 @@ from fault_inject import ReadFaultResult, ReadFaultSpec  # noqa: E402
 from profile_loader import (  # noqa: E402
     IMPLEMENTED_FAULT_TYPES,
     KNOWN_FAULT_TYPES,
+    FaultSweepConfig,
     ProfileError,
     ReadFaultConfig,
+    _warn_fault_backend_compat,
     load_profile,
 )
 
@@ -506,6 +508,110 @@ class RobotVarEmissionTest(unittest.TestCase):
             robot_vars = profile.robot_vars(ROOT)
             read_vars = [v for v in robot_vars if v.startswith("READ_FAULT_")]
             self.assertEqual(read_vars, [])
+
+
+# ---------------------------------------------------------------------------
+# Backend-compat warnings
+# ---------------------------------------------------------------------------
+
+
+class BackendCompatWarningTest(unittest.TestCase):
+    """Tests that _warn_fault_backend_compat correctly identifies which
+    backends support read_bit_flip and which do not.
+
+    Supported: NVMemory (slow-path), MRAMMemory.
+    Unsupported: MappedMemory+NVMC (fast-path), STM32 controllers.
+    """
+
+    def _make_fs(self, fault_types: list) -> FaultSweepConfig:
+        return FaultSweepConfig(fault_types=fault_types)
+
+    # -- NVMemory (slow-path) should NOT warn --
+
+    def test_no_warning_nvm_ctrl_backend(self) -> None:
+        fs = self._make_fs(["read_bit_flip"])
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _warn_fault_backend_compat(fs, "platforms/nvm_slow.repl", "nvm_ctrl")
+        read_warnings = [x for x in w if "read_bit_flip" in str(x.message)]
+        self.assertEqual(read_warnings, [])
+
+    def test_no_warning_nvm_platform_no_backend(self) -> None:
+        fs = self._make_fs(["read_bit_flip"])
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _warn_fault_backend_compat(fs, "platforms/nvm_slow.repl", None)
+        read_warnings = [x for x in w if "read_bit_flip" in str(x.message)]
+        self.assertEqual(read_warnings, [])
+
+    # -- MRAMMemory should NOT warn --
+
+    def test_no_warning_mram_backend(self) -> None:
+        fs = self._make_fs(["read_bit_flip"])
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _warn_fault_backend_compat(fs, "platforms/mram_full.repl", "mram")
+        read_warnings = [x for x in w if "read_bit_flip" in str(x.message)]
+        self.assertEqual(read_warnings, [])
+
+    def test_no_warning_mram_platform_no_backend(self) -> None:
+        fs = self._make_fs(["read_bit_flip"])
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _warn_fault_backend_compat(
+                fs, "platforms/cortex_m0_mram_endpoint.repl", None
+            )
+        read_warnings = [x for x in w if "read_bit_flip" in str(x.message)]
+        self.assertEqual(read_warnings, [])
+
+    # -- Fast-path (NVMC) SHOULD warn --
+
+    def test_warning_nvmc_backend(self) -> None:
+        fs = self._make_fs(["read_bit_flip"])
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _warn_fault_backend_compat(
+                fs, "platforms/cortex_m4_flash_fast.repl", "faultFlash"
+            )
+        read_warnings = [x for x in w if "read_bit_flip" in str(x.message)]
+        self.assertEqual(len(read_warnings), 1)
+        self.assertIn("NVMemory or MRAMMemory", str(read_warnings[0].message))
+
+    def test_warning_nvmc_platform_no_backend(self) -> None:
+        fs = self._make_fs(["read_bit_flip"])
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _warn_fault_backend_compat(
+                fs, "platforms/cortex_m4_flash_fast.repl", None
+            )
+        read_warnings = [x for x in w if "read_bit_flip" in str(x.message)]
+        self.assertEqual(len(read_warnings), 1)
+
+    # -- No warning when read_bit_flip not in fault_types --
+
+    def test_no_warning_without_read_bit_flip(self) -> None:
+        fs = self._make_fs(["power_loss"])
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _warn_fault_backend_compat(
+                fs, "platforms/cortex_m4_flash_fast.repl", "faultFlash"
+            )
+        read_warnings = [x for x in w if "read_bit_flip" in str(x.message)]
+        self.assertEqual(read_warnings, [])
 
 
 if __name__ == "__main__":
