@@ -50,7 +50,7 @@ from trace_utils import (
     load_clean_erase_trace,
     load_clean_write_trace,
 )
-from audit_report import git_metadata, summarize_runtime_sweep
+from audit_report import compute_verdict, git_metadata, summarize_runtime_sweep
 from result_checks import annotate_result_checks
 from renode_runner import (
     CalibrationResult,
@@ -821,43 +821,12 @@ def main() -> int:
         # -------------------------------------------------------------------
         # Verdict
         # -------------------------------------------------------------------
-        found_issues = int(
-            sweep_summary.get("issue_points", sweep_summary["bricks"])
-        ) > 0
-        if multi_fault_summary is not None:
-            found_issues = found_issues or (
-                int(
-                    multi_fault_summary.get(
-                        "issue_points", multi_fault_summary["bricks"]
-                    )
-                )
-                > 0
-            )
-        if partial_staging_summary is not None:
-            found_issues = found_issues or (
-                int(partial_staging_summary.get("issue_count", 0)) > 0
-            )
-        control_issue_count = int(
-            (sweep_summary.get("control") or {}).get("issue_count", 0)
+        verdict = compute_verdict(
+            sweep_summary,
+            profile.expect,
+            multi_fault_summary=multi_fault_summary,
+            partial_staging_summary=partial_staging_summary,
         )
-
-        verdict = "PASS"
-        if control_issue_count:
-            verdict = "FAIL — control checks failed"
-        elif profile.expect.should_find_issues and not found_issues:
-            verdict = "FAIL — expected to find issues but found none"
-        elif not profile.expect.should_find_issues and found_issues:
-            total_issues = sweep_summary.get("issue_points", 0)
-            if multi_fault_summary:
-                total_issues += int(multi_fault_summary.get("issue_points", multi_fault_summary.get("bricks", 0)))
-            if partial_staging_summary:
-                total_issues += int(partial_staging_summary.get("issue_count", 0))
-            verdict = "FAIL — found {} issue points ({} boot mismatches, {} semantic, {} invariant)".format(
-                total_issues,
-                sweep_summary.get("bricks", 0),
-                sweep_summary.get("semantic_issue_points", 0),
-                sweep_summary.get("invariant_issue_points", 0),
-            )
 
         # -------------------------------------------------------------------
         # Build output
