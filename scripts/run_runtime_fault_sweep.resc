@@ -97,6 +97,8 @@ $success_criteria_overrides_file?=""
 $boot_register_pre_writes?=""
 $boot_registers?=""
 $reset_mode?="warm"
+$instruction_skip_regions?=""
+$instruction_skip_count?="1"
 
 python """
 import json
@@ -411,6 +413,7 @@ _FAULT_CODE_TO_NAME = {
     't': 'reset_at_time',
     'f': 'read_bit_flip',
     'k': 'command_drop',
+    'i': 'instruction_skip',
     'h': 'power_loss',  # hook faults are power-loss during hook writes
 }
 
@@ -466,6 +469,7 @@ state_probe = str(monitor.GetVariable('state_probe')).strip()
 #                'r' write_rejection, 't' reset_at_time
 #   erase-based: 'e' interrupted_erase, 'a' multi_sector_atomicity
 #   read-based:  'f' read_bit_flip (transient one-shot read corruption)
+#   cpu-based:   'i' instruction_skip (voltage-glitch NOP, encoded as 'i:0xADDR')
 fault_types_raw = str(monitor.GetVariable('fault_types')).strip().lower()
 if fault_types_raw in ('both', 'write_and_erase', 'write,erase'):
     fault_types_mode = 'both'
@@ -2750,6 +2754,106 @@ def ensure_command_fault_preflight():
     }
 
 
+# ---------------------------------------------------------------------------
+# Instruction skip (voltage glitch) fault injection.
+# Models a voltage glitch that causes the CPU to skip one or more
+# instructions by replacing them with Thumb NOP (0xBF00).
+# ---------------------------------------------------------------------------
+_instruction_skip_count = int(str(monitor.GetVariable('instruction_skip_count')).strip() or '1')
+
+
+def run_instruction_skip_fault(skip_addr, skip_count=None):
+    """Run a single instruction-skip fault: NOP the instruction(s) at
+    *skip_addr*, then boot the firmware and check recovery.
+
+    The address is patched AFTER images and pre-boot state are loaded,
+    so the patch applies to the code the bootloader will execute.
+    After the test, images are reloaded to restore original code.
+    """
+    if skip_count is None:
+        skip_count = _instruction_skip_count
+    skip_addr = int(skip_addr)
+    eff_criteria = get_effective_criteria('i')
+    fp_t0 = _time.time()
+    log('fp=0x{:X} type=i skip_count={} phase1_setup'.format(skip_addr, skip_count))
+
+    # Phase 1: restore baseline, apply the instruction skip patch, then boot.
+    restore_phase1_baseline()
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = False
+    reset_nvmc_for_sweep()
+    disarm_fault()
+
+    # Patch: replace skip_count consecutive halfwords with Thumb NOP (0xBF00).
+    # Save original values so we can report them.
+    original_halfwords = []
+    for i in range(skip_count):
+        addr = skip_addr + i * 2
+        orig = int(bus.ReadWord(addr)) & 0xFFFF
+        original_halfwords.append(orig)
+        bus.WriteWord(addr, 0xBF00)
+    log('fp=0x{:X} type=i patched {} halfword(s) at 0x{:08X}'.format(
+        skip_addr, skip_count, skip_addr & 0xFFFFFFFF))
+
+    arm_vtor_watchpoint()
+    p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
+    p1_max_iters = phase1_max_iters(default_s=4.0)
+    phase1_status = run_until_done(
+        cpu_ref,
+        label='fp0x{:X}_p1'.format(skip_addr),
+        stop_on_fault=False,
+        max_iters=p1_max_iters,
+        wall_timeout=p1_wall_timeout,
+    )
+    disarm_vtor_watchpoint()
+    phase1_ms = int((_time.time() - fp_t0) * 1000)
+
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value, pc_value, fault_injected=True, effective_criteria=eff_criteria
+    )
+    signals['phase1_ms'] = phase1_ms
+    signals['phase2_ms'] = 0
+    signals['trace_replay_mode'] = 'execute'
+    signals['skip_address'] = '0x{:08X}'.format(skip_addr & 0xFFFFFFFF)
+    signals['skip_count'] = skip_count
+    signals['original_halfwords'] = ['0x{:04X}'.format(h) for h in original_halfwords]
+    if phase1_status is not None:
+        signals['phase1_stop_reason'] = phase1_status.get('reason')
+        signals['phase1_emulated_s'] = phase1_status.get('emulated_s')
+
+    fault_class = classify_fault_result(
+        boot_outcome, boot_slot, signals, effective_criteria=eff_criteria
+    )
+    boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
+        boot_outcome, boot_slot, signals,
+        initial_status=phase1_status,
+        fault_injected=True,
+        label='fp0x{:X}_followup'.format(skip_addr),
+        effective_criteria=eff_criteria,
+    )
+    signals['followup_ms'] = int(followup_ms)
+
+    result = {
+        'fault_at': skip_addr,
+        'fault_requested': skip_addr,
+        'fault_type': 'i',
+        'fault_injected': True,
+        'fault_address': '0x{:08X}'.format(skip_addr & 0xFFFFFFFF),
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'fault_class': fault_class,
+        'actual_writes': 0,
+        'signals': signals,
+    }
+    if boot_cycle_records:
+        result['boot_cycle_records'] = boot_cycle_records
+    if multi_boot_analysis:
+        result['multi_boot_analysis'] = multi_boot_analysis
+    return result
+
+
 def run_timed_reset_fault(fault_at):
     # reset_at_time: run Phase 1 for a deterministic time offset, then
     # simulate a power reset regardless of write/erase boundaries.
@@ -3069,6 +3173,8 @@ def run_execute_fault(fault_at, fault_type='w'):
     #   timed: 't' reset_at_time
     #   read:  'f' read_bit_flip (transient one-shot read corruption)
     #   ctrl:  'k' command_drop (drop one controller write command)
+    #   cpu:   'i' instruction_skip (handled by run_instruction_skip_fault,
+    #              dispatched from batch loop, NOT routed here)
     #
     # Fast path (NVMC CONFIG tracking): fault injection works by counting
     # NVMC CONFIG WEN->REN transitions. When the target write count is
@@ -4785,6 +4891,10 @@ else:
             results.append(run_phase2_fault(p1_at, p2_at, p1_type, p2_type))
         elif ft.startswith('mf:'):
             results.append(run_multi_fault_sequence(decode_multi_fault_sequence_local(ft)))
+        # Instruction skip: 'i:0xADDR' — NOP the instruction at ADDR.
+        elif ft.startswith('i:'):
+            skip_addr = int(ft.split(':')[1], 0)
+            results.append(run_instruction_skip_fault(skip_addr))
         # Cascade faults: 'c:W:E' where W=write_fault_at, E=erase_fault_at.
         elif ft.startswith('c:'):
             parts = ft.split(':')
