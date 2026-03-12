@@ -76,7 +76,7 @@ def run_audit(
         except json.JSONDecodeError:
             pass
 
-    return proc.returncode, report
+    return proc.returncode, report, proc.stderr
 
 
 def check_verdict(
@@ -219,7 +219,7 @@ def main() -> int:
                 extra_args.extend(["--fault-step", str(args.fault_step)])
 
             try:
-                exit_code, report = run_audit(
+                exit_code, report, audit_stderr = run_audit(
                     repo_root=repo_root,
                     profile_path=profile_path,
                     output_path=output_path,
@@ -243,6 +243,9 @@ def main() -> int:
 
             if not report:
                 print("  FAIL: no report produced (exit={})".format(exit_code))
+                if audit_stderr:
+                    for line in audit_stderr.strip().splitlines()[-20:]:
+                        print("    stderr: {}".format(line))
                 results.append((name, False, "no report (exit={})".format(exit_code)))
                 detailed_results.append({
                     "profile": name,

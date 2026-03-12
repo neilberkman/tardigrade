@@ -1735,6 +1735,34 @@ def disarm_erase_fault():
     elif b['kind'] == 'fast':
         b['data'].FaultAtPageErase = _DISARM_SENTINEL
 
+_OTP_WIRE_CODES = frozenset(('op', 'os', 'od', 'oo'))
+
+def arm_otp_fault(absolute_blow_index, blow_fault_mode=0):
+    otp_dev = backend.get('otp')
+    if otp_dev is None:
+        return
+    otp_dev.BlowFaultMode = blow_fault_mode
+    otp_dev.FaultAtBlow = absolute_blow_index
+    otp_dev.BlowFaultFired = False
+
+def disarm_otp_fault():
+    otp_dev = backend.get('otp')
+    if otp_dev is None:
+        return
+    otp_dev.FaultAtBlow = _DISARM_SENTINEL
+
+def was_otp_fault_injected():
+    otp_dev = backend.get('otp')
+    if otp_dev is None:
+        return False
+    return bool(otp_dev.BlowFaultFired)
+
+def get_total_otp_blows():
+    otp_dev = backend.get('otp')
+    if otp_dev is None:
+        return 0
+    return int(otp_dev.TotalBlows)
+
 def disarm_controller_fault():
     ctrl = backend['controller']
     if ctrl is None:
@@ -2521,7 +2549,7 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
     for iters in range(max_iters):
         monitor.Parse('emulation RunFor "{}"'.format(time_slice))
         emulated_s += slice_s
-        if stop_on_fault and was_fault_injected():
+        if stop_on_fault and (was_fault_injected() or was_otp_fault_injected()):
             reason = 'fault_fired'
             break
         # Early exit: check if VTOR has been set to a valid slot.
@@ -3594,6 +3622,7 @@ def run_execute_fault(fault_at, fault_type='w'):
     is_non_power_write_fault = fault_type in ('b', 's', 'r', 'd', 'l', 'k')
     is_command_fault = fault_type == 'k'
     is_i2c_fault = fault_type in _I2C_WIRE_CODE_TO_FAULT_TYPE
+    is_otp_fault = fault_type in _OTP_WIRE_CODES and backend.get('otp') is not None
     log('fp={} type={} phase1_setup'.format(fault_at, fault_type))
 
     # Phase 1: Reset and set up for the faulted boot.
@@ -3631,6 +3660,16 @@ def run_execute_fault(fault_at, fault_type='w'):
         arm_i2c_fault(arm_at, i2c_fault_type=i2c_ft_code)
         disarm_write_fault()
         disarm_erase_fault()
+    elif is_otp_fault:
+        blow_mode = _WRITE_FAULT_MODE.get(fault_type, 0)
+        base_blows = get_total_otp_blows()
+        arm_at = base_blows + fault_at + 1
+        if arm_at > base_blows + max_writes_cap:
+            arm_at = base_blows + max_writes_cap + 1
+        log('fp={} phase1_step otp_arm_at={} mode={}'.format(fault_at, arm_at, blow_mode))
+        arm_otp_fault(arm_at, blow_fault_mode=blow_mode)
+        disarm_write_fault()
+        disarm_erase_fault()
     else:
         # Write faults:
         #   'w' power_loss (0), 'b' bit_corruption (1),
@@ -3659,7 +3698,12 @@ def run_execute_fault(fault_at, fault_type='w'):
     disarm_vtor_watchpoint()
     phase1_ms = int((_time.time() - fp_t0) * 1000)
 
-    fault_injected = was_i2c_fault_injected() if is_i2c_fault else was_fault_injected()
+    if is_i2c_fault:
+        fault_injected = was_i2c_fault_injected()
+    elif is_otp_fault:
+        fault_injected = was_otp_fault_injected()
+    else:
+        fault_injected = was_fault_injected()
     fault_address = get_last_command_address() if is_command_fault else get_last_write_address()
     if is_erase_fault:
         phase1_ops = get_total_erases()
@@ -3667,9 +3711,11 @@ def run_execute_fault(fault_at, fault_type='w'):
         phase1_ops = get_total_commands()
     elif is_i2c_fault:
         phase1_ops = get_total_i2c_transactions()
+    elif is_otp_fault:
+        phase1_ops = get_total_otp_blows()
     else:
         phase1_ops = get_total_writes()
-    if fault_injected and (is_erase_fault or fault_type in ('w', 'b', 's', 'r', 'd', 'l', 'k') or is_i2c_fault):
+    if fault_injected and (is_erase_fault or is_otp_fault or fault_type in ('w', 'b', 's', 'r', 'd', 'l', 'k') or is_i2c_fault):
         # Unified semantics: successful operations before the faulted operation.
         actual_writes = max(0, phase1_ops - 1)
     else:
@@ -3677,6 +3723,8 @@ def run_execute_fault(fault_at, fault_type='w'):
     log('fp={} type={} phase1_done injected={} ops_total={} ops_before_fault={}'.format(
         fault_at, fault_type, fault_injected, phase1_ops, actual_writes))
     disarm_fault()
+    if is_otp_fault:
+        disarm_otp_fault()
 
     if backend['kind'] != 'slow' and fault_injected:
         # Snapshot the faulted NVM state.
