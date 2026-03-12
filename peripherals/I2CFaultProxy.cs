@@ -460,7 +460,7 @@ namespace Antmicro.Renode.Peripherals.I2C
             Array.Copy(data, corrupted, data.Length);
 
             uint seed = faultSeed != 0 ? faultSeed : (uint)totalTransactions;
-            seed ^= (uint)(data.Length * 2654435761UL);
+            seed ^= (uint)((ulong)data.Length * 2654435761UL);
 
             // Flip 1-4 bits across the data.
             int flips = 1 + (int)(NextLcg(ref seed) % 4U);

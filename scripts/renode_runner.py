@@ -338,6 +338,7 @@ class CalibrationResult:
     pc: Optional[str] = None
     setup_writes: int = 0
     total_i2c_transactions: int = 0
+    total_otp_blows: int = 0
 
 
 def calibration_completed(
@@ -424,6 +425,7 @@ def run_calibration(
         pc=data.get("calibration_pc"),
         setup_writes=int(data.get("setup_writes", 0)),
         total_i2c_transactions=int(data.get("total_i2c_transactions", 0)),
+        total_otp_blows=int(data.get("total_otp_blows", 0)),
     )
 
 
