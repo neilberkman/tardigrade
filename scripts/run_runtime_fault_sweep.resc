@@ -2932,13 +2932,12 @@ _instruction_skip_count = int(str(monitor.GetVariable('instruction_skip_count'))
 
 
 def run_instruction_skip_fault(skip_addr, skip_count=None):
-    """Run a single instruction-skip fault: NOP the instruction(s) at
-    *skip_addr*, then boot the firmware and check recovery.
-
-    The address is patched AFTER images and pre-boot state are loaded,
-    so the patch applies to the code the bootloader will execute.
-    After the test, images are reloaded to restore original code.
-    """
+    # Run a single instruction-skip fault: NOP the instruction(s) at
+    # *skip_addr*, then boot the firmware and check recovery.
+    #
+    # The address is patched AFTER images and pre-boot state are loaded,
+    # so the patch applies to the code the bootloader will execute.
+    # After the test, images are reloaded to restore original code.
     if skip_count is None:
         skip_count = _instruction_skip_count
     skip_addr = int(skip_addr)
@@ -3267,15 +3266,14 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
                         p2_status=None, followup_label='followup',
                         saved_flash=None, fault_snapshot_bytes=None,
                         extra_fields=None):
-    """Shared epilogue for all fault runners.
-
-    Handles: classify_fault_result, run_followup_boot_cycles, semantic state
-    collection, postmortem dump, resume trace, and optional field attachment.
-    Returns the fully assembled result dict.
-
-    Callers must have already called evaluate_boot_outcome() and populated
-    signals with timing/phase data BEFORE calling this.
-    """
+    # Shared epilogue for all fault runners.
+    #
+    # Handles: classify_fault_result, run_followup_boot_cycles, semantic state
+    # collection, postmortem dump, resume trace, and optional field attachment.
+    # Returns the fully assembled result dict.
+    #
+    # Callers must have already called evaluate_boot_outcome() and populated
+    # signals with timing/phase data BEFORE calling this.
     fault_class = classify_fault_result(
         boot_outcome, boot_slot, signals, effective_criteria=eff_criteria
     )
@@ -4864,10 +4862,9 @@ _EXECUTE_ONLY_FAULT_TYPES = frozenset(
 
 
 def _dispatch_fault_point(fp, ft, default_run_fn):
-    """Dispatch a single fault point to the appropriate runner function.
-
-    Returns the result dict from the runner.
-    """
+    # Dispatch a single fault point to the appropriate runner function.
+    #
+    # Returns the result dict from the runner.
     # --- Prefix-based compound fault types ---
     if ft.startswith('m:'):
         m_type = ft.split(':')[1] if ':' in ft else 'w'
