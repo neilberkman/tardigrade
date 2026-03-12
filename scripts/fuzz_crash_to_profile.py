@@ -237,7 +237,7 @@ def derive_meta_base(template: Dict[str, Any], override: Optional[int]) -> int:
             slot_ends.append(b + s)
     if slot_ends:
         return max(slot_ends)
-    return 0x10070000
+    return 0x00080000
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +416,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--meta-base",
         type=lambda v: int(v, 0),
         default=None,
-        help="Metadata base address override (e.g. 0x10070000).",
+        help="Metadata base address override (e.g. 0x00080000).",
     )
 
     # -- Mode --

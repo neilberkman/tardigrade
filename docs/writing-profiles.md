@@ -348,8 +348,8 @@ Assert that calibration writes happen in the correct order -- e.g., inactive rep
 
 ```yaml
 write_order_constraints:
-  - first: { start: 0x10070100, size: 0x20 }
-    then: { start: 0x10070000, size: 0x20 }
+  - first: { start: 0x00080100, size: 0x20 }
+    then: { start: 0x00080000, size: 0x20 }
     label: "inactive replica before active"
 ```
 
@@ -361,8 +361,8 @@ For dual-replica metadata where the active/inactive role alternates (e.g., based
 
 ```yaml
 write_order_constraints:
-  - first: { start: 0x10070000, size: 0x20 }
-    then: { start: 0x10070100, size: 0x20 }
+  - first: { start: 0x00080000, size: 0x20 }
+    then: { start: 0x00080100, size: 0x20 }
     bidirectional: true
     label: "replicas must not interleave"
 ```
@@ -546,7 +546,7 @@ extra_peripherals:
 For MRAM platforms with a separate command-register controller:
 
 ```yaml
-nvm_controller: gfc100
+nvm_controller: flash_ctrl
 ```
 
 Enables `command_drop` fault type on MRAM paths.
@@ -705,8 +705,8 @@ Maps CBMC symbolic variable names to flash addresses:
 
 ```yaml
 # address_map.yaml
-meta_bytes: 0x10070000
-header: 0x10038000
+meta_bytes: 0x00080000
+header: 0x00040000
 ```
 
 ### Dry run
@@ -789,10 +789,10 @@ Describes how to partition sequential crash bytes into flash memory regions:
 # address_map.yaml
 regions:
   - name: metadata
-    address: 0x10070000
+    address: 0x00080000
     size: 16
   - name: header
-    address: 0x10038000
+    address: 0x00040000
     size: 256
 ```
 

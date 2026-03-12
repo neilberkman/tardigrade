@@ -97,6 +97,7 @@ $success_criteria_overrides_file?=""
 $boot_register_pre_writes?=""
 $boot_registers?=""
 $reset_mode?="warm"
+$otp_peripheral?=""
 $instruction_skip_regions?=""
 $instruction_skip_count?="1"
 
@@ -167,7 +168,9 @@ def resolve_backend():
         )
 
     # Classify the backend path.
-    if 'mram' in backend_name.lower():
+    if 'otp' in backend_name.lower():
+        kind = 'otp'
+    elif 'mram' in backend_name.lower():
         kind = 'mram'
     elif 'nvm_ctrl' in backend_name.lower():
         kind = 'slow'
@@ -204,6 +207,17 @@ def resolve_backend():
         else:
             supports_command_fault = True
 
+    # Optional OTP peripheral (separate from flash backend).
+    otp = None
+    otp_sysbus_name = None
+    otp_var = get_optional_var('otp_peripheral', '')
+    if otp_var and otp_var.lower() not in ('', 'none'):
+        otp_sysbus_name = 'sysbus.' + otp_var if not otp_var.startswith('sysbus.') else otp_var
+        try:
+            otp = monitor.Machine[otp_sysbus_name]
+        except:
+            log('WARNING: otp_peripheral "{}" not found on sysbus'.format(otp_var))
+
     return {
         'kind': kind,
         'data': backend_obj,
@@ -212,6 +226,8 @@ def resolve_backend():
         'ctrl_sysbus_name': ctrl_sysbus_name,
         'supports_command_fault': supports_command_fault,
         'command_fault_reason': command_fault_reason,
+        'otp': otp,
+        'otp_sysbus_name': otp_sysbus_name,
     }
 
 backend = resolve_backend()
@@ -229,6 +245,11 @@ def refresh_runtime_handles():
     backend['data'] = monitor.Machine[backend['backend_sysbus_name']]
     if backend['ctrl_sysbus_name']:
         backend['controller'] = monitor.Machine[backend['ctrl_sysbus_name']]
+    if backend.get('otp_sysbus_name'):
+        try:
+            backend['otp'] = monitor.Machine[backend['otp_sysbus_name']]
+        except:
+            pass
 
 # Read monitor variables.
 result_file = str(monitor.GetVariable('result_file'))
@@ -959,6 +980,8 @@ def analyze_boot_cycles(cycle_records):
 
 def _snapshot_current_flash():
     b = backend
+    if b['kind'] == 'otp':
+        return b['data'].ReadBytes(0, int(b['data'].Size))
     if b['kind'] == 'mram':
         return b['data'].ReadBytes(0, int(b['data'].Size))
     if b['kind'] == 'fast':
@@ -1516,6 +1539,8 @@ def collect_otadata_signals():
 # ---------------------------------------------------------------------------
 def get_total_writes():
     b = backend
+    if b['kind'] == 'otp':
+        return int(b['data'].TotalBlows)
     if b['kind'] == 'mram':
         return int(b['data'].TotalWordWrites)
     if b['kind'] == 'fast':
@@ -1533,6 +1558,8 @@ def get_total_commands():
 
 def get_total_erases():
     b = backend
+    if b['kind'] == 'otp':
+        return 0  # OTP has no page erases.
     if b['kind'] == 'mram':
         return 0  # MRAM has no page erases.
     if b['kind'] == 'fast':
@@ -1541,7 +1568,11 @@ def get_total_erases():
 
 def arm_fault(absolute_write_index, write_fault_mode=0):
     b = backend
-    if b['kind'] == 'mram':
+    if b['kind'] == 'otp':
+        b['data'].BlowFaultMode = write_fault_mode
+        b['data'].FaultAtBlow = absolute_write_index
+        b['data'].BlowFaultFired = False
+    elif b['kind'] == 'mram':
         b['data'].FaultAtWordWrite = absolute_write_index
         b['data'].LastFaultInjected = False
         b['data'].FaultEverFired = False
@@ -1567,6 +1598,9 @@ def arm_controller_fault(absolute_command_index, command_fault_mode=1):
 
 def arm_erase_fault(absolute_erase_index, erase_fault_mode=0):
     b = backend
+    if b['kind'] == 'otp':
+        log('WARNING: erase fault requested on OTP backend (no page erases)')
+        return  # OTP has no page erases.
     if b['kind'] == 'mram':
         log('WARNING: erase fault requested on MRAM backend (no page erases)')
         return  # MRAM has no page erases.
@@ -1577,7 +1611,9 @@ def arm_erase_fault(absolute_erase_index, erase_fault_mode=0):
 
 def disarm_fault():
     b = backend
-    if b['kind'] == 'mram':
+    if b['kind'] == 'otp':
+        b['data'].FaultAtBlow = 18446744073709551615
+    elif b['kind'] == 'mram':
         b['data'].FaultAtWordWrite = 18446744073709551615
     elif b['kind'] == 'fast':
         b['data'].FaultAtWordWrite = 18446744073709551615
@@ -1588,7 +1624,9 @@ def disarm_fault():
 
 def disarm_write_fault():
     b = backend
-    if b['kind'] == 'mram':
+    if b['kind'] == 'otp':
+        b['data'].FaultAtBlow = 18446744073709551615
+    elif b['kind'] == 'mram':
         b['data'].FaultAtWordWrite = 18446744073709551615
     elif b['kind'] == 'fast':
         b['data'].FaultAtWordWrite = 18446744073709551615
@@ -1597,7 +1635,9 @@ def disarm_write_fault():
 
 def disarm_erase_fault():
     b = backend
-    if b['kind'] == 'mram':
+    if b['kind'] == 'otp':
+        pass  # OTP has no page erases.
+    elif b['kind'] == 'mram':
         pass  # MRAM has no page erases.
     elif b['kind'] == 'fast':
         b['data'].FaultAtPageErase = 18446744073709551615
@@ -1615,6 +1655,8 @@ def disarm_controller_fault():
 
 def was_fault_injected():
     b = backend
+    if b['kind'] == 'otp':
+        return bool(b['data'].BlowFaultFired) or was_controller_fault_injected()
     if b['kind'] == 'mram':
         # FaultEverFired is a sticky flag set when any write fault fires
         # and never cleared by subsequent writes or disarm_fault().
@@ -1625,6 +1667,8 @@ def was_fault_injected():
 
 def was_write_fault_injected():
     b = backend
+    if b['kind'] == 'otp':
+        return bool(b['data'].BlowFaultFired)
     if b['kind'] == 'mram':
         return bool(b['data'].FaultEverFired)
     if b['kind'] == 'fast':
@@ -1633,6 +1677,8 @@ def was_write_fault_injected():
 
 def was_erase_fault_injected():
     b = backend
+    if b['kind'] == 'otp':
+        return False  # OTP has no page erases.
     if b['kind'] == 'mram':
         return False  # MRAM has no page erases.
     if b['kind'] == 'fast':

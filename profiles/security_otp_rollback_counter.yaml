@@ -1,0 +1,46 @@
+schema_version: 1
+name: security_otp_rollback_counter
+description: >-
+  Anti-rollback counter stored in OTP eFuse region. The bootloader reads
+  a monotonic counter from the OTP array and rejects firmware images with
+  a version below the counter value. Fault injection during the counter
+  update (fuse blow) tests whether partial programming can leave the
+  counter in an inconsistent state, potentially allowing rollback or
+  bricking the device if the counter becomes unreadable.
+
+platform: platforms/cortex_m0_otp.repl
+flash_backend: nvm_ctrl
+otp_peripheral: otp
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 8
+  slots:
+    exec:    { base: 0x10000000, size: 0x38000 }
+    staging: { base: 0x10038000, size: 0x38000 }
+
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+
+security_policy:
+  anti_rollback: true
+  minimum_version: 2
+
+success_criteria:
+  vtor_in_slot: exec
+
+fault_sweep:
+  mode: runtime
+  max_writes: 28672
+  max_writes_cap: 100000
+  run_duration: "0.01"
+  fault_types:
+    - power_loss
+    - otp_partial_program
+    - otp_stuck_bit
+
+expect:
+  should_find_issues: true
