@@ -72,7 +72,6 @@ IMPLEMENTED_FAULT_TYPES = {
     "reset_at_time",
     "read_bit_flip",
     "command_drop",
-    "bootloader_region_write",
     "nvs_corruption",
     "instruction_skip",
     "i2c_nack",
@@ -84,6 +83,14 @@ IMPLEMENTED_FAULT_TYPES = {
     "otp_stuck_bit",
     "otp_read_disturb",
     "otp_overblow",
+}
+
+# Fault types that are classification/heuristic labels, not injectable fault
+# mechanisms.  They appear in KNOWN_FAULT_TYPES (so profiles can reference them
+# for heuristic tuning) but are NOT in IMPLEMENTED_FAULT_TYPES because the
+# sweep planner does not generate fault points for them directly.
+CLASSIFICATION_ONLY_FAULT_TYPES = {
+    "bootloader_region_write",
 }
 
 # Map OTP fault type names to their OTPMemory BlowFaultMode codes.
@@ -555,7 +562,7 @@ class NvsCorruptionConfig:
         seed: int = 0,
     ) -> None:
         self.enabled = enabled
-        self.modes = modes or ["bit_flip", "partial_erase", "truncation"]
+        self.modes = modes or ["bit_flip", "partial_erase", "truncate"]
         self.bit_flip_counts = bit_flip_counts or [1, 4, 16]
         self.erase_fractions = erase_fractions or [0.25, 0.5, 1.0]
         self.truncate_offsets = truncate_offsets
@@ -1401,6 +1408,16 @@ class ProfileConfig:
                     )
                 )
 
+        # NVS corruption config (modes + seed for runtime dispatch).
+        nvs_cfg = self.fault_sweep.nvs_corruption
+        if nvs_cfg.enabled and self.nvs_region:
+            vars_list.append(
+                "NVS_CORRUPTION_MODES:{}".format(",".join(nvs_cfg.modes))
+            )
+            vars_list.append(
+                "NVS_CORRUPTION_SEED:{}".format(nvs_cfg.seed)
+            )
+
         # Config checks: semicolon-separated list of check specs.
         if sc.config_checks:
             check_parts: List[str] = []
@@ -1784,7 +1801,14 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         if ft not in KNOWN_FAULT_TYPES:
             import warnings
             warnings.warn("Unknown fault type '{}' in profile; ignoring.".format(ft))
-        if ft in KNOWN_FAULT_TYPES and ft not in IMPLEMENTED_FAULT_TYPES:
+        elif ft in CLASSIFICATION_ONLY_FAULT_TYPES:
+            import warnings
+            warnings.warn(
+                "Fault type '{}' is a classification/heuristic label, not an "
+                "injectable fault type. It does not generate fault points in "
+                "the sweep planner. Remove it from fault_types.".format(ft)
+            )
+        elif ft not in IMPLEMENTED_FAULT_TYPES:
             import warnings
             warnings.warn("Fault type '{}' is not yet implemented; skipping.".format(ft))
     eval_mode = raw.get("evaluation_mode")
@@ -2311,7 +2335,8 @@ def _parse_nvs_corruption(raw: Optional[Dict[str, Any]]) -> NvsCorruptionConfig:
             modes = [modes]
         if not isinstance(modes, list):
             raise ProfileError("nvs_corruption.modes: expected list of strings")
-        valid_modes = {"bit_flip", "partial_erase", "truncation"}
+        valid_modes = {"bit_flip", "partial_erase", "truncate", "truncation", "scramble"}
+        normalized = []
         for m in modes:
             if m not in valid_modes:
                 raise ProfileError(
@@ -2319,6 +2344,9 @@ def _parse_nvs_corruption(raw: Optional[Dict[str, Any]]) -> NvsCorruptionConfig:
                         m, sorted(valid_modes)
                     )
                 )
+            # Normalize 'truncation' -> 'truncate' for consistency with fault_inject.py.
+            normalized.append("truncate" if m == "truncation" else m)
+        modes = normalized
     bit_flip_counts = raw.get("bit_flip_counts")
     if bit_flip_counts is not None:
         if not isinstance(bit_flip_counts, list):

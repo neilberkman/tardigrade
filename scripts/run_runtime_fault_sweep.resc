@@ -98,6 +98,11 @@ $boot_register_pre_writes?=""
 $boot_registers?=""
 $reset_mode?="warm"
 $otp_peripheral?=""
+$nvs_region_addr?=""
+$nvs_region_size?=""
+$nvs_region_snapshot?=""
+$nvs_corruption_modes?=""
+$nvs_corruption_seed?="0"
 $i2c_fault_peripheral?=""
 $instruction_skip_regions?=""
 $instruction_skip_count?="1"
@@ -119,7 +124,13 @@ bus = monitor.Machine.SystemBus
 _DISARM_SENTINEL = _DISARM_SENTINEL
 
 # Write fault mode codes shared between run_execute_fault and run_phase2_fault.
-_WRITE_FAULT_MODE = {'w': 0, 'b': 1, 's': 2, 'r': 3, 'd': 4, 'l': 5}
+# For flash/NVMC backends: WriteFaultMode 0=power_loss, 1=bit_corruption, etc.
+# For OTP backends: BlowFaultMode 0=partial_program, 1=stuck_bit, 2=read_disturb, 3=overblow.
+# OTP wire codes map to their BlowFaultMode integers directly.
+_WRITE_FAULT_MODE = {
+    'w': 0, 'b': 1, 's': 2, 'r': 3, 'd': 4, 'l': 5,
+    'op': 0, 'os': 1, 'od': 2, 'oo': 3,
+}
 
 def get_optional_var(name, default=''):
     try:
@@ -481,6 +492,7 @@ _FAULT_CODE_TO_NAME = {
     'os': 'otp_stuck_bit',
     'od': 'otp_read_disturb',
     'oo': 'otp_overblow',
+    'nv': 'nvs_corruption',
     'in': 'i2c_nack',
     'it': 'i2c_timeout',
     'ib': 'i2c_bit_flip',
@@ -577,6 +589,37 @@ read_fault_preflight = {
     'reason': '',
     'backend': '',
 }
+
+# NVS region config for nvs_corruption fault type.
+_nvs_region_addr_raw = get_optional_var('nvs_region_addr', '')
+_nvs_region_size_raw = get_optional_var('nvs_region_size', '')
+nvs_region_addr = int(_nvs_region_addr_raw, 0) if _nvs_region_addr_raw else None
+nvs_region_size = int(_nvs_region_size_raw, 0) if _nvs_region_size_raw else None
+nvs_snapshot_path = get_optional_var('nvs_region_snapshot', '')
+_nvs_modes_raw = get_optional_var('nvs_corruption_modes', '')
+nvs_corruption_modes = [m.strip() for m in _nvs_modes_raw.split(',') if m.strip()] if _nvs_modes_raw else []
+nvs_corruption_seed = int(get_optional_var('nvs_corruption_seed', '0') or '0')
+_nvs_clean_data = None
+
+def _load_nvs_clean_data():
+    # Load or synthesize the clean NVS region data (lazy, cached).
+    global _nvs_clean_data
+    if _nvs_clean_data is not None:
+        return _nvs_clean_data
+    if nvs_region_addr is None or nvs_region_size is None:
+        _nvs_clean_data = b''
+        return _nvs_clean_data
+    if nvs_snapshot_path and os.path.isfile(nvs_snapshot_path):
+        with open(nvs_snapshot_path, 'rb') as f:
+            _nvs_clean_data = f.read()[:nvs_region_size]
+    else:
+        # Read current NVS region from flash.
+        raw = bus.ReadBytes(nvs_region_addr, nvs_region_size)
+        _nvs_clean_data = to_py_bytes(raw)
+    # Pad to region_size.
+    if len(_nvs_clean_data) < nvs_region_size:
+        _nvs_clean_data = _nvs_clean_data + b'\xFF' * (nvs_region_size - len(_nvs_clean_data))
+    return _nvs_clean_data
 
 # Slot lookup table.
 slot_ranges = {
@@ -3034,6 +3077,128 @@ def run_timed_reset_fault(fault_at):
         saved_flash=saved_flash, fault_snapshot_bytes=fault_snapshot_bytes,
     )
 
+def _generate_nvs_corruption(clean_data, mode, seed=0):
+    # Generate a single corrupted NVS variant in-process.
+    # Modes: bit_flip, partial_erase, truncate, scramble.
+    # Returns corrupted bytes of same length as clean_data.
+    import random as _rng_mod
+    rng = _rng_mod.Random(seed)
+    data = bytearray(clean_data)
+    if mode == 'bit_flip':
+        num_flips = max(1, min(8, len(data) // 256))
+        for _ in range(num_flips):
+            idx = rng.randint(0, len(data) - 1)
+            bit = rng.randint(0, 7)
+            data[idx] ^= (1 << bit)
+    elif mode == 'partial_erase':
+        half = len(data) // 2
+        data[half:] = b'\xFF' * (len(data) - half)
+    elif mode == 'truncate':
+        if len(data) > 16:
+            data[16:] = b'\x00' * (len(data) - 16)
+    elif mode == 'scramble':
+        for i in range(len(data)):
+            data[i] = rng.randint(0, 255)
+    return bytes(data)
+
+
+def run_nvs_corruption_fault(variant_idx):
+    # Run an NVS corruption fault: corrupt the NVS region, boot, check outcome.
+    if nvs_region_addr is None or nvs_region_size is None or nvs_region_size == 0:
+        return {
+            'fault_at': variant_idx,
+            'fault_requested': variant_idx,
+            'fault_type': 'nv:{}'.format(variant_idx),
+            'fault_injected': False,
+            'fault_address': '0x00000000',
+            'boot_outcome': 'skipped',
+            'boot_slot': None,
+            'fault_class': 'skipped',
+            'actual_writes': 0,
+            'signals': {'phase1_ms': 0, 'phase2_ms': 0, 'followup_ms': 0},
+            'skip_reason': 'no_nvs_region_configured',
+        }
+
+    if variant_idx >= len(nvs_corruption_modes):
+        return {
+            'fault_at': variant_idx,
+            'fault_requested': variant_idx,
+            'fault_type': 'nv:{}'.format(variant_idx),
+            'fault_injected': False,
+            'fault_address': '0x00000000',
+            'boot_outcome': 'skipped',
+            'boot_slot': None,
+            'fault_class': 'skipped',
+            'actual_writes': 0,
+            'signals': {'phase1_ms': 0, 'phase2_ms': 0, 'followup_ms': 0},
+            'skip_reason': 'nvs_variant_index_out_of_range',
+        }
+
+    mode = nvs_corruption_modes[variant_idx]
+    clean_data = _load_nvs_clean_data()
+    corrupted = _generate_nvs_corruption(clean_data, mode, seed=nvs_corruption_seed + variant_idx)
+
+    eff_criteria = get_effective_criteria('nv')
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    fp_t0 = _time.time()
+    log('nvs_corruption variant={} mode={} addr=0x{:08X} size={}'.format(
+        variant_idx, mode, nvs_region_addr, nvs_region_size))
+
+    # Reset machine and reload images.
+    monitor.Parse('machine Reset')
+    monitor.Parse('machine Pause')
+    reload_images()
+    apply_pre_boot_state()
+    if _hash_bypass_active:
+        apply_hash_bypass()
+
+    # Write corrupted NVS data to the region.
+    from System import Array, Byte
+    arr = Array[Byte](len(corrupted))
+    for i, b in enumerate(corrupted):
+        arr[i] = b
+    bus.WriteBytes(arr, nvs_region_addr)
+    log('nvs_corruption: wrote {} bytes of mode={} to 0x{:08X}'.format(
+        len(corrupted), mode, nvs_region_addr))
+
+    prime_bootloader_entry()
+    restore_hw_init()
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = False
+    reset_nvmc_for_sweep()
+    disarm_fault()
+    arm_vtor_watchpoint()
+    p2_status = run_until_done(
+        cpu_ref,
+        label='nvs_{}'.format(variant_idx),
+        expect_writes=False,
+        zero_writes_is_brick=False,
+        wall_timeout=30,
+        time_slice=phase2_time_slice,
+    )
+    disarm_vtor_watchpoint()
+    phase1_ms = int((_time.time() - fp_t0) * 1000)
+
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value, pc_value, fault_injected=True, effective_criteria=eff_criteria
+    )
+    signals['nvs_corruption_mode'] = mode
+    signals['nvs_corruption_variant'] = variant_idx
+    signals['phase1_ms'] = phase1_ms
+    signals['phase2_ms'] = 0
+    signals['phase2_stop_reason'] = p2_status.get('reason')
+    signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    return _build_fault_result(
+        variant_idx, 'nv:{}'.format(variant_idx), True,
+        '0x{:08X}'.format(nvs_region_addr),
+        0, signals, boot_outcome=boot_outcome, boot_slot=boot_slot,
+        eff_criteria=eff_criteria, p2_status=p2_status,
+        followup_label='nvs_{}_followup'.format(variant_idx),
+    )
+
+
 def run_metadata_fault(fault_at, fault_type='w'):
     eff_criteria = get_effective_criteria(fault_type)
     cpu_ref = monitor.Machine['sysbus.cpu']
@@ -4693,6 +4858,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 # because they depend on NVMC peripheral state or PRNG.
 _EXECUTE_ONLY_FAULT_TYPES = frozenset(
     ('e', 'a', 'b', 's', 'd', 'l', 'r', 't', 'f', 'k',
+     'op', 'os', 'od', 'oo',
      'in', 'it', 'ib', 'ic', 'iw')
 )
 
@@ -4723,6 +4889,10 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
 
     if ft.startswith('mf:'):
         return run_multi_fault_sequence(decode_multi_fault_sequence_local(ft))
+
+    if ft.startswith('nv:'):
+        variant_idx = int(ft.split(':')[1])
+        return run_nvs_corruption_fault(variant_idx)
 
     if ft.startswith('i:'):
         skip_addr = int(ft.split(':')[1], 0)

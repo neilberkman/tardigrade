@@ -27,6 +27,7 @@ EXECUTE_ONLY_FAULT_TYPES = {
     "otp_stuck_bit",
     "otp_read_disturb",
     "otp_overblow",
+    "nvs_corruption",
     "i2c_nack",
     "i2c_timeout",
     "i2c_bit_flip",
@@ -54,12 +55,23 @@ FAULT_TYPE_NAME_TO_CODE = {
     "otp_stuck_bit": "os",
     "otp_read_disturb": "od",
     "otp_overblow": "oo",
+    "nvs_corruption": "nv",
     "i2c_nack": "in",
     "i2c_timeout": "it",
     "i2c_bit_flip": "ib",
     "i2c_truncated": "ic",
     "i2c_wrong_address": "iw",
 }
+
+# OTP wire-code to BlowFaultMode mapping (used by sweep planner).
+_OTP_WIRE_CODE_TO_BLOW_MODE = {
+    "op": 0,  # otp_partial_program
+    "os": 1,  # otp_stuck_bit
+    "od": 2,  # otp_read_disturb
+    "oo": 3,  # otp_overblow
+}
+
+_OTP_WIRE_CODES = frozenset(_OTP_WIRE_CODE_TO_BLOW_MODE.keys())
 
 
 def _fault_type_label(code: Any) -> str:
@@ -82,6 +94,7 @@ def _fault_type_label(code: Any) -> str:
         "os": "otp_stuck_bit",
         "od": "otp_read_disturb",
         "oo": "otp_overblow",
+        "nv": "nvs_corruption",
         "in": "i2c_nack",
         "it": "i2c_timeout",
         "ib": "i2c_bit_flip",
@@ -102,6 +115,8 @@ def _fault_type_label(code: Any) -> str:
         return "phase2_{}".format(_fault_type_label(code.rsplit(":", 1)[-1]))
     if code.startswith("c:"):
         return "cascading_{}".format(_fault_type_label(code.rsplit(":", 1)[-1]))
+    if code.startswith("nv:"):
+        return "nvs_corruption_variant"
     if code.startswith("mf:"):
         return "multi_fault_sequence"
     return mapping.get(code, code)
