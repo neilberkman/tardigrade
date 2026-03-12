@@ -61,6 +61,16 @@ from partial_staging import (
     summarize_partial_staging,
     write_partial_image_to_temp,
 )
+from fault_classification import (
+    InterestingPoint,
+    _MULTI_BOOT_SUCCESS_STATUSES,
+    _effective_boot_result,
+    _interesting_multi_fault_points,
+    classify_failure_class,
+    result_has_issues,
+    result_is_brick,
+    result_issue_reasons,
+)
 from fault_types import (
     EXECUTE_ONLY_FAULT_TYPES,
     FAULT_TYPE_NAME_TO_CODE,
@@ -1076,38 +1086,8 @@ def _evaluate_state_probe_contract(
     return failures
 
 
-# Multi-boot statuses that represent a successful final state.
-_MULTI_BOOT_SUCCESS_STATUSES = frozenset({"converged", "rollback_converged"})
-
-
-def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
-    """Return (effective_outcome, effective_slot) accounting for multi-boot.
-
-    If the result has a ``multi_boot_analysis`` whose status indicates the
-    device converged (or rolled back successfully) to a final slot with a
-    successful outcome, use those final values instead of the raw cycle-0
-    ``boot_outcome`` / ``boot_slot``.
-
-    Statuses that are NOT promoted:
-      - rollback_missing
-      - rollback_late
-      - rollback_observed_oscillating
-      - stuck_revert
-      - oscillating
-    """
-    raw_outcome = result.get("boot_outcome", "unknown")
-    raw_slot = result.get("boot_slot")
-    mba = result.get("multi_boot_analysis")
-    if not isinstance(mba, dict):
-        return (raw_outcome, raw_slot)
-    status = mba.get("status")
-    if status not in _MULTI_BOOT_SUCCESS_STATUSES:
-        return (raw_outcome, raw_slot)
-    final_outcome = mba.get("final_outcome")
-    final_slot = mba.get("final_slot")
-    if final_outcome is None:
-        return (raw_outcome, raw_slot)
-    return (final_outcome, final_slot)
+# _MULTI_BOOT_SUCCESS_STATUSES, _effective_boot_result imported from
+# fault_classification.py (single source of truth).
 
 
 def _slot_validity_from_boot_slot(boot_slot: Optional[str]) -> Dict[str, bool]:
@@ -1330,86 +1310,8 @@ def annotate_result_checks(
             result["invariant_violations"] = invariant_failures
 
 
-def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[str]:
-    reasons: List[str] = []
-    eff_outcome, _ = _effective_boot_result(result)
-    if eff_outcome != expected_outcome:
-        reasons.append("boot_outcome")
-    if result.get("semantic_assertion_failures"):
-        reasons.append("semantic_assertion")
-    if result.get("invariant_violations"):
-        reasons.append("invariant")
-    return reasons
-
-
-def result_has_issues(result: Dict[str, Any], expected_outcome: str) -> bool:
-    return bool(result_issue_reasons(result, expected_outcome))
-
-
-@dataclasses.dataclass
-class InterestingPoint:
-    """A fault point identified as worth exploring in multi-fault runs.
-
-    Carries provenance about *why* the point was selected, enabling
-    downstream generators to produce human-readable rationale for each
-    planned multi-fault sequence.
-    """
-
-    fault_at: int
-    reason: str  # "brick", "wrong_image", "semantic", "invariant", "issue"
-    boot_outcome: str
-    fault_address: Optional[str] = None
-
-
-def _interesting_multi_fault_points(
-    results: List[Dict[str, Any]],
-    expected_outcome: str,
-) -> List[InterestingPoint]:
-    """Return fault points worth exploring with sequential multi-fault runs.
-
-    Each returned ``InterestingPoint`` carries provenance about why the
-    point was selected (brick, wrong_image, semantic assertion failure,
-    invariant violation, or generic boot-outcome mismatch).
-    """
-    _REASON_SEVERITY = {"brick": 0, "wrong_image": 1, "semantic": 2, "invariant": 3, "issue": 4}
-    points: Dict[int, InterestingPoint] = {}
-    for result in results:
-        if result.get("is_control", False):
-            continue
-        if not result.get("fault_injected", False):
-            continue
-        if result_is_brick(result) or result_has_issues(result, expected_outcome):
-            fp = result.get("fault_at")
-            if fp is not None:
-                eff_outcome, _ = _effective_boot_result(result)
-                eff_outcome_str = str(eff_outcome or "unknown").strip().lower()
-                # Determine the most specific reason.
-                if result_is_brick(result):
-                    reason = "brick"
-                elif eff_outcome_str == "wrong_image":
-                    reason = "wrong_image"
-                elif result.get("semantic_assertion_failures"):
-                    reason = "semantic"
-                elif result.get("invariant_violations"):
-                    reason = "invariant"
-                else:
-                    reason = "issue"
-                key = int(fp)
-                existing = points.get(key)
-                if existing is None or _REASON_SEVERITY[reason] < _REASON_SEVERITY[existing.reason]:
-                    points[key] = InterestingPoint(
-                        fault_at=key,
-                        reason=reason,
-                        boot_outcome=eff_outcome_str,
-                        fault_address=result.get("fault_address"),
-                    )
-    return sorted(points.values(), key=lambda p: p.fault_at)
-
-
-def result_is_brick(result: Dict[str, Any]) -> bool:
-    eff_outcome, _ = _effective_boot_result(result)
-    outcome = str(eff_outcome or "unknown").strip().lower()
-    return outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor", "config_crash"}
+# InterestingPoint, _interesting_multi_fault_points, result_is_brick
+# imported from fault_classification.py.
 
 
 def _run_batch_worker(
@@ -2007,55 +1909,7 @@ def evaluate_config_checks(result: Dict[str, Any], profile: "ProfileConfig") -> 
     return None
 
 
-def classify_failure_class(result: Dict[str, Any]) -> str:
-    """Return normalized failure class for a sweep result.
-
-    Recognized classes:
-      - recoverable: device booted successfully after fault
-      - wrong_image: device booted the wrong firmware image
-      - silent_corruption: device booted but image integrity is unknown
-      - unrecoverable: device bricked (no boot, hard fault, etc.)
-      - rollback_accepted: device accepted a downgrade without rejection
-      - toctou_corruption: corruption injected between validation and execution
-    """
-    raw = str(result.get("fault_class", "") or "").strip().lower()
-    if raw:
-        return raw
-
-    # NVS-specific classifications take precedence when present.
-    config_outcome = result.get("config_outcome")
-    if config_outcome == "config_lost":
-        return "config_lost"
-    if config_outcome == "config_crash":
-        return "config_crash"
-
-    eff_outcome, _ = _effective_boot_result(result)
-    outcome = str(eff_outcome or "unknown").strip().lower()
-    if outcome == "config_lost":
-        return "config_lost"
-    if outcome == "config_crash":
-        return "config_crash"
-    if outcome == "success":
-        return "recoverable"
-    if outcome == "rollback_accepted":
-        return "rollback_accepted"
-    if outcome == "toctou_corruption":
-        return "toctou_corruption"
-    if outcome == "wrong_image":
-        signals = result.get("signals", {})
-        if not isinstance(signals, dict):
-            signals = {}
-        hash_match = str(signals.get("image_hash_match", "") or "").strip().lower()
-        expected_slot = str(signals.get("image_hash_slot", "") or "").strip().lower()
-        boot_slot = str(result.get("boot_slot", "") or "").strip().lower()
-        if hash_match == "unknown" and (
-            not expected_slot or expected_slot == "any" or boot_slot == expected_slot
-        ):
-            return "silent_corruption"
-        return "wrong_image"
-    if outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}:
-        return "unrecoverable"
-    return "unrecoverable"
+# classify_failure_class imported from fault_classification.py.
 
 
 def enrich_results_with_fault_regions(
