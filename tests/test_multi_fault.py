@@ -748,7 +748,7 @@ class TestInterestingPointIdentification(unittest.TestCase):
 
     def _identify_interesting(self, sweep_results):
         """Use the actual audit_bootloader helper."""
-        from audit_bootloader import _interesting_multi_fault_points
+        from fault_classification import _interesting_multi_fault_points
 
         return _interesting_multi_fault_points(sweep_results, "success")
 

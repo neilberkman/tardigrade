@@ -20,7 +20,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import datetime as dt
 import json
 import os
@@ -31,11 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fault_inject import (
-    AnnotatedSequence,
     MultiFaultPlan,
-    decode_multi_fault_sequence,
-    encode_multi_fault_sequence,
-    generate_multi_fault_sequences,
     multi_fault_plan_summary,
 )
 from partial_staging import (
@@ -43,7 +38,6 @@ from partial_staging import (
     parse_partial_staging_config,
     summarize_partial_staging,
 )
-from fault_classification import _interesting_multi_fault_points
 from trace_utils import annotate_clean_trace
 from audit_report import (
     compute_verdict,
@@ -61,8 +55,10 @@ from renode_runner import (
 )
 from fault_plan import CalibrationInputs, FaultPlan, build_fault_plan
 from sweep import (
+    MultiFaultPhaseResult,
     evaluate_config_checks,
     run_multi_component_sweep,
+    run_multi_fault_phase,
     run_partial_staging_sweep,
     run_runtime_sweep,
     validate_runtime_fault_mode_compat,
@@ -520,139 +516,25 @@ def main() -> int:
         # -------------------------------------------------------------------
         # Multi-fault plan (opt-in)
         # -------------------------------------------------------------------
-        multi_fault_plan_data = None
-        multi_fault_results: Optional[List[Dict[str, Any]]] = None
-        multi_fault_summary: Optional[Dict[str, Any]] = None
-        mf_config = profile.fault_sweep.multi_fault
-
-        if mf_config.enabled:
-            expected_outcome = "success"
-            if getattr(profile.expect, "control_outcome", None):
-                expected_outcome = profile.expect.control_outcome
-            interesting_pts = _interesting_multi_fault_points(
-                sweep_results, expected_outcome
-            )
-            interesting_fps = [p.fault_at for p in interesting_pts]
-            # Build provenance mapping for the plan generator.
-            point_provenance: Dict[int, Dict[str, Any]] = {
-                p.fault_at: {
-                    "reason": p.reason,
-                    "boot_outcome": p.boot_outcome,
-                    "fault_address": p.fault_address,
-                }
-                for p in interesting_pts
-            }
-            print(
-                "Multi-fault: {} interesting points from single-fault sweep "
-                "(strategy={}, max_pairs={}).".format(
-                    len(interesting_fps),
-                    mf_config.strategy,
-                    mf_config.max_pairs,
-                ),
-                file=sys.stderr,
-            )
-
-            mf_plan = generate_multi_fault_sequences(
-                strategy=mf_config.strategy,
-                interesting_points=interesting_fps,
-                max_faults_per_run=mf_config.max_faults_per_run,
-                max_pairs=mf_config.max_pairs,
-                explicit_sequences=mf_config.sequences or None,
-                seed=mf_config.seed,
-                fallback_strategy=mf_config.fallback_strategy,
-                fallback_points=[
-                    int(r.get("fault_at", 0))
-                    for r in sweep_results
-                    if r.get("fault_injected", False) and not r.get("is_control", False)
-                ],
-                point_provenance=point_provenance,
-            )
-            multi_fault_plan = mf_plan
-            multi_fault_plan_data = multi_fault_plan_summary(mf_plan)
-            print(
-                "Multi-fault plan: {} sequences generated.".format(
-                    len(mf_plan.sequences)
-                ),
-                file=sys.stderr,
-            )
-            if args.explain_multi_fault_plan and multi_fault_plan_data is not None:
-                multi_fault_plan_data["execution_skipped"] = True
-                multi_fault_plan_data["interesting_point_provenance"] = [
-                    dataclasses.asdict(p) for p in interesting_pts
-                ]
-                print(
-                    json.dumps(
-                        {"multi_fault_plan": multi_fault_plan_data},
-                        indent=2,
-                        sort_keys=True,
-                    ),
-                    file=sys.stderr,
-                )
-            if mf_plan.sequences and not args.explain_multi_fault_plan:
-                multi_fault_points = [seq[0] for seq in mf_plan.sequences]
-                multi_fault_types = [
-                    encode_multi_fault_sequence(seq) for seq in mf_plan.sequences
-                ]
-                # Build a lookup from encoded sequence -> rationale for
-                # attaching provenance to each result after execution.
-                _mf_rationale_lookup: Dict[str, str] = {}
-                for _seq_obj in mf_plan.sequences:
-                    if isinstance(_seq_obj, AnnotatedSequence):
-                        _mf_key = encode_multi_fault_sequence(_seq_obj)
-                        _mf_rationale_lookup[_mf_key] = _seq_obj.rationale
-                mf_wall_t0 = _time_mod.time()
-                multi_fault_results = run_runtime_sweep(
-                    repo_root=repo_root,
-                    renode_test=renode_test,
-                    robot_suite=robot_suite,
-                    profile=profile,
-                    fault_points=multi_fault_points,
-                    robot_vars=robot_vars,
-                    work_dir=work_dir / "multi_fault",
-                    renode_remote_server_dir=args.renode_remote_server_dir,
-                    include_control=False,
-                    num_workers=args.workers,
-                    evaluation_mode="execute",
-                    max_batch_points=args.max_batch_points,
-                    trace_file=None,
-                    erase_trace_file=None,
-                    trace_file_bin=None,
-                    erase_trace_file_bin=None,
-                    fault_types_list=multi_fault_types,
-                    keep_run_artifacts=args.keep_run_artifacts,
-                )
-                mf_wall_s = _time_mod.time() - mf_wall_t0
-                # Decode and attach fault_sequence to each multi-fault result
-                # so invariants and failure categorization see the full
-                # sequence, not just seq[0].
-                for mf_r in multi_fault_results:
-                    ft = mf_r.get("fault_type", "")
-                    if isinstance(ft, str) and ft.startswith("mf:"):
-                        try:
-                            mf_r["fault_sequence"] = decode_multi_fault_sequence(ft)
-                        except (ValueError, TypeError):
-                            pass
-                        _rat = _mf_rationale_lookup.get(ft)
-                        if _rat:
-                            mf_r["sequence_rationale"] = _rat
-                annotate_result_checks(multi_fault_results, profile)
-                multi_fault_summary = summarize_runtime_sweep(
-                    multi_fault_results,
-                    total_writes=max_writes,
-                    profile=profile,
-                )
-                multi_fault_summary["wall_time_s"] = round(mf_wall_s, 1)
-                print(
-                    "Multi-fault sweep completed: {} sequences in {:.1f}s "
-                    "({:.0f}ms/sequence avg)".format(
-                        len(multi_fault_points),
-                        mf_wall_s,
-                        (mf_wall_s * 1000 / len(multi_fault_points))
-                        if multi_fault_points
-                        else 0,
-                    ),
-                    file=sys.stderr,
-                )
+        mf_phase = run_multi_fault_phase(
+            profile=profile,
+            sweep_results=sweep_results,
+            repo_root=repo_root,
+            renode_test=renode_test,
+            robot_suite=robot_suite,
+            robot_vars=robot_vars,
+            work_dir=work_dir,
+            renode_remote_server_dir=args.renode_remote_server_dir,
+            num_workers=args.workers,
+            max_batch_points=args.max_batch_points,
+            max_writes=max_writes,
+            explain_only=args.explain_multi_fault_plan,
+            keep_run_artifacts=args.keep_run_artifacts,
+        )
+        multi_fault_plan: Optional[MultiFaultPlan] = mf_phase.plan
+        multi_fault_plan_data = mf_phase.plan_data
+        multi_fault_results = mf_phase.results
+        multi_fault_summary = mf_phase.summary
 
         # -------------------------------------------------------------------
         # State fuzzer (opt-in)

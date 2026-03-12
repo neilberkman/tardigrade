@@ -12,9 +12,21 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import dataclasses
+import json
+import time as _time_mod
+
 from audit_report import summarize_runtime_sweep
-from fault_classification import _effective_boot_result
-from fault_inject import classify_multi_component_outcome
+from fault_classification import _effective_boot_result, _interesting_multi_fault_points
+from fault_inject import (
+    AnnotatedSequence,
+    MultiFaultPlan,
+    classify_multi_component_outcome,
+    decode_multi_fault_sequence,
+    encode_multi_fault_sequence,
+    generate_multi_fault_sequences,
+    multi_fault_plan_summary,
+)
 from fault_types import EXECUTE_ONLY_FAULT_TYPES
 from partial_staging import (
     PartialStagingConfig,
@@ -916,3 +928,165 @@ def run_multi_component_sweep(
         "combined_results": combined_results,
         "combined_summary": combined_summary,
     }
+
+
+@dataclasses.dataclass
+class MultiFaultPhaseResult:
+    """Aggregated outputs from the multi-fault planning and execution phase."""
+    plan: Optional[MultiFaultPlan] = None
+    plan_data: Optional[Dict[str, Any]] = None
+    results: Optional[List[Dict[str, Any]]] = None
+    summary: Optional[Dict[str, Any]] = None
+
+
+def run_multi_fault_phase(
+    *,
+    profile: ProfileConfig,
+    sweep_results: List[Dict[str, Any]],
+    repo_root: Path,
+    renode_test: str,
+    robot_suite: str,
+    robot_vars: List[str],
+    work_dir: Path,
+    renode_remote_server_dir: Optional[str],
+    num_workers: int,
+    max_batch_points: int,
+    max_writes: int,
+    explain_only: bool = False,
+    keep_run_artifacts: bool = False,
+) -> MultiFaultPhaseResult:
+    """Plan and optionally execute multi-fault sequences.
+
+    Returns a :class:`MultiFaultPhaseResult` with plan, execution results,
+    and summary.  If the multi-fault config is disabled, returns an empty
+    result with all fields ``None``.
+    """
+    from result_checks import annotate_result_checks  # avoid circular import
+
+    out = MultiFaultPhaseResult()
+    mf_config = profile.fault_sweep.multi_fault
+    if not mf_config.enabled:
+        return out
+
+    expected_outcome = "success"
+    if getattr(profile.expect, "control_outcome", None):
+        expected_outcome = profile.expect.control_outcome
+    interesting_pts = _interesting_multi_fault_points(
+        sweep_results, expected_outcome
+    )
+    interesting_fps = [p.fault_at for p in interesting_pts]
+    point_provenance: Dict[int, Dict[str, Any]] = {
+        p.fault_at: {
+            "reason": p.reason,
+            "boot_outcome": p.boot_outcome,
+            "fault_address": p.fault_address,
+        }
+        for p in interesting_pts
+    }
+    print(
+        "Multi-fault: {} interesting points from single-fault sweep "
+        "(strategy={}, max_pairs={}).".format(
+            len(interesting_fps), mf_config.strategy, mf_config.max_pairs,
+        ),
+        file=sys.stderr,
+    )
+
+    mf_plan = generate_multi_fault_sequences(
+        strategy=mf_config.strategy,
+        interesting_points=interesting_fps,
+        max_faults_per_run=mf_config.max_faults_per_run,
+        max_pairs=mf_config.max_pairs,
+        explicit_sequences=mf_config.sequences or None,
+        seed=mf_config.seed,
+        fallback_strategy=mf_config.fallback_strategy,
+        fallback_points=[
+            int(r.get("fault_at", 0))
+            for r in sweep_results
+            if r.get("fault_injected", False) and not r.get("is_control", False)
+        ],
+        point_provenance=point_provenance,
+    )
+    out.plan = mf_plan
+    out.plan_data = multi_fault_plan_summary(mf_plan)
+    print(
+        "Multi-fault plan: {} sequences generated.".format(
+            len(mf_plan.sequences)
+        ),
+        file=sys.stderr,
+    )
+
+    if explain_only and out.plan_data is not None:
+        out.plan_data["execution_skipped"] = True
+        out.plan_data["interesting_point_provenance"] = [
+            dataclasses.asdict(p) for p in interesting_pts
+        ]
+        print(
+            json.dumps(
+                {"multi_fault_plan": out.plan_data}, indent=2, sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return out
+
+    if not mf_plan.sequences:
+        return out
+
+    multi_fault_points = [seq[0] for seq in mf_plan.sequences]
+    multi_fault_types = [
+        encode_multi_fault_sequence(seq) for seq in mf_plan.sequences
+    ]
+    _mf_rationale_lookup: Dict[str, str] = {}
+    for _seq_obj in mf_plan.sequences:
+        if isinstance(_seq_obj, AnnotatedSequence):
+            _mf_key = encode_multi_fault_sequence(_seq_obj)
+            _mf_rationale_lookup[_mf_key] = _seq_obj.rationale
+
+    mf_wall_t0 = _time_mod.time()
+    out.results = run_runtime_sweep(
+        repo_root=repo_root,
+        renode_test=renode_test,
+        robot_suite=robot_suite,
+        profile=profile,
+        fault_points=multi_fault_points,
+        robot_vars=robot_vars,
+        work_dir=work_dir / "multi_fault",
+        renode_remote_server_dir=renode_remote_server_dir,
+        include_control=False,
+        num_workers=num_workers,
+        evaluation_mode="execute",
+        max_batch_points=max_batch_points,
+        trace_file=None,
+        erase_trace_file=None,
+        trace_file_bin=None,
+        erase_trace_file_bin=None,
+        fault_types_list=multi_fault_types,
+        keep_run_artifacts=keep_run_artifacts,
+    )
+    mf_wall_s = _time_mod.time() - mf_wall_t0
+
+    for mf_r in out.results:
+        ft = mf_r.get("fault_type", "")
+        if isinstance(ft, str) and ft.startswith("mf:"):
+            try:
+                mf_r["fault_sequence"] = decode_multi_fault_sequence(ft)
+            except (ValueError, TypeError):
+                pass
+            _rat = _mf_rationale_lookup.get(ft)
+            if _rat:
+                mf_r["sequence_rationale"] = _rat
+
+    annotate_result_checks(out.results, profile)
+    out.summary = summarize_runtime_sweep(
+        out.results, total_writes=max_writes, profile=profile,
+    )
+    out.summary["wall_time_s"] = round(mf_wall_s, 1)
+    print(
+        "Multi-fault sweep completed: {} sequences in {:.1f}s "
+        "({:.0f}ms/sequence avg)".format(
+            len(multi_fault_points), mf_wall_s,
+            (mf_wall_s * 1000 / len(multi_fault_points))
+            if multi_fault_points else 0,
+        ),
+        file=sys.stderr,
+    )
+    return out
