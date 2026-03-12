@@ -45,7 +45,12 @@ from partial_staging import (
 )
 from fault_classification import _interesting_multi_fault_points
 from trace_utils import annotate_clean_trace
-from audit_report import compute_verdict, git_metadata, summarize_runtime_sweep
+from audit_report import (
+    compute_verdict,
+    git_metadata,
+    report_skip_reasons,
+    summarize_runtime_sweep,
+)
 from result_checks import annotate_result_checks
 from renode_runner import (
     CalibrationResult,
@@ -510,41 +515,7 @@ def main() -> int:
         )
         sweep_summary["wall_time_s"] = round(sweep_wall_s, 1)
 
-        # Report skip reasons so operators know why points were discarded.
-        skip_reasons = sweep_summary.get("skip_reasons")
-        if skip_reasons:
-            parts = [
-                "{} {}".format(count, reason)
-                for reason, count in sorted(skip_reasons.items())
-            ]
-            _progress(
-                "Skipped {} fault points (not injected): {}".format(
-                    sweep_summary.get("discarded_no_fault_fired", 0),
-                    ", ".join(parts),
-                )
-            )
-        phase2_skip_reasons = sweep_summary.get("phase2_skip_reasons")
-        if phase2_skip_reasons:
-            parts = [
-                "{} {}".format(count, reason)
-                for reason, count in sorted(phase2_skip_reasons.items())
-            ]
-            _progress(
-                "Phase 2 fault points skipped before injection: {}".format(
-                    ", ".join(parts),
-                )
-            )
-        hook_skip_reasons = sweep_summary.get("hook_skip_reasons")
-        if hook_skip_reasons:
-            parts = [
-                "{} {}".format(count, reason)
-                for reason, count in sorted(hook_skip_reasons.items())
-            ]
-            _progress(
-                "Hook fault points skipped before injection: {}".format(
-                    ", ".join(parts),
-                )
-            )
+        report_skip_reasons(sweep_summary, _progress)
 
         # -------------------------------------------------------------------
         # Multi-fault plan (opt-in)
