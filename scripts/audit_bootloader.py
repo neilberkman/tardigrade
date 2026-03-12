@@ -2288,6 +2288,10 @@ EXECUTE_ONLY_FAULT_TYPES = {
     "reset_at_time",
     "read_bit_flip",
     "command_drop",
+    "instruction_skip",
+    "otp_partial_program",
+    "otp_stuck_bit",
+    "otp_read_disturb",
 }
 
 # Canonical mapping from human-readable fault type names to single-char
@@ -2305,6 +2309,10 @@ FAULT_TYPE_NAME_TO_CODE = {
     "read_bit_flip": "f",
     "reset_at_time": "t",
     "command_drop": "k",
+    "instruction_skip": "i",
+    "otp_partial_program": "op",
+    "otp_stuck_bit": "os",
+    "otp_read_disturb": "od",
 }
 
 
@@ -2503,6 +2511,10 @@ def _fault_type_label(code: Any) -> str:
         "a": "multi_sector_atomicity",
         "f": "read_bit_flip",
         "k": "command_drop",
+        "i": "instruction_skip",
+        "op": "otp_partial_program",
+        "os": "otp_stuck_bit",
+        "od": "otp_read_disturb",
         "h": "hook_fault",
         "p2": "phase2",
     }
@@ -3215,6 +3227,7 @@ def main() -> int:
         include_multi_sector_atomicity = "multi_sector_atomicity" in fault_types
         include_read_bit_flip = "read_bit_flip" in fault_types
         include_command_drop = "command_drop" in fault_types
+        include_instruction_skip = "instruction_skip" in fault_types
 
         # Pass fault_types to calibration so erase trace is captured.
         if include_erases:
@@ -3381,6 +3394,7 @@ def main() -> int:
             or include_reset_at_time
             or include_read_bit_flip
             or include_command_drop
+            or include_instruction_skip
             or profile.fault_sweep.phase2_fault.enabled
             or profile.fault_sweep.multi_fault.enabled
             or include_metadata_fault
@@ -3516,6 +3530,23 @@ def main() -> int:
                 combined += [(fp, 'k') for fp in command_drop_fps]
                 command_drop_count = len(command_drop_fps)
 
+            # Instruction-skip fault injection: enumerate halfword-aligned
+            # addresses in configured target ranges.  Each fault point is
+            # an address (not a write index), encoded as 'i:<addr>'.
+            instruction_skip_count = 0
+            if include_instruction_skip:
+                isc = profile.fault_sweep.instruction_skip_config
+                if isc is not None and isc.target_addresses:
+                    skip_addrs: List[int] = []
+                    for region_start, region_end in isc.target_addresses:
+                        for addr in range(region_start, region_end, 2):
+                            skip_addrs.append(addr)
+                    if args.quick:
+                        skip_addrs = quick_subset(skip_addrs)
+                    for addr in skip_addrs:
+                        combined.append((addr, "i:0x{:X}".format(addr)))
+                    instruction_skip_count = len(skip_addrs)
+
             # Metadata fault injection: fault during pre_boot_state writes.
             metadata_count = 0
             if include_metadata_fault:
@@ -3626,6 +3657,8 @@ def main() -> int:
                 parts.append("{} read-flip".format(read_flip_count))
             if command_drop_count:
                 parts.append("{} command-drop".format(command_drop_count))
+            if instruction_skip_count:
+                parts.append("{} instruction-skip".format(instruction_skip_count))
             if phase2_count:
                 parts.append("{} phase2-recovery".format(phase2_count))
             if metadata_count:
