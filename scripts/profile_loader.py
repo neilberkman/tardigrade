@@ -49,6 +49,15 @@ KNOWN_FAULT_TYPES = {
     "command_drop",
     "bootloader_region_write",
     "nvs_corruption",
+    "instruction_skip",
+    "i2c_nack",
+    "i2c_timeout",
+    "i2c_bit_flip",
+    "i2c_truncated",
+    "i2c_wrong_address",
+    "otp_partial_program",
+    "otp_stuck_bit",
+    "otp_read_disturb",
 }
 IMPLEMENTED_FAULT_TYPES = {
     "power_loss",
@@ -64,6 +73,31 @@ IMPLEMENTED_FAULT_TYPES = {
     "command_drop",
     "bootloader_region_write",
     "nvs_corruption",
+    "instruction_skip",
+    "i2c_nack",
+    "i2c_timeout",
+    "i2c_bit_flip",
+    "i2c_truncated",
+    "i2c_wrong_address",
+    "otp_partial_program",
+    "otp_stuck_bit",
+    "otp_read_disturb",
+}
+
+# Map OTP fault type names to their OTPMemory BlowFaultMode codes.
+OTP_FAULT_TYPE_CODES = {
+    "otp_partial_program": 0,
+    "otp_stuck_bit": 1,
+    "otp_read_disturb": 2,
+}
+
+# Map I2C fault type names to their I2CFaultProxy FaultType codes.
+I2C_FAULT_TYPE_CODES = {
+    "i2c_nack": 1,
+    "i2c_timeout": 2,
+    "i2c_bit_flip": 3,
+    "i2c_truncated": 4,
+    "i2c_wrong_address": 5,
 }
 
 
@@ -243,6 +277,88 @@ class ReadFaultConfig:
                         i, end, start
                     )
                 )
+
+class I2CFaultConfig:
+    """Configuration for I2C bus fault injection via I2CFaultProxy.
+
+    Models faults on the I2C bus between the CPU and an external device
+    (e.g. a secure element used for signature verification during boot).
+    The proxy peripheral intercepts I2C transactions and injects the
+    configured fault at a specified transaction index.
+    """
+
+    __slots__ = (
+        "peripheral_name",
+        "target_address",
+        "fault_types",
+        "fault_at_transaction",
+        "fault_seed",
+    )
+
+    def __init__(
+        self,
+        peripheral_name: str = "i2cProxy",
+        target_address: int = 0,
+        fault_types: Optional[List[str]] = None,
+        fault_at_transaction: int = 0,
+        fault_seed: int = 0,
+    ) -> None:
+        self.peripheral_name = peripheral_name
+        if not (0 <= target_address <= 127):
+            raise ProfileError(
+                "i2c_fault_config.target_address must be 0-127 (7-bit I2C address), got {}".format(
+                    target_address
+                )
+            )
+        self.target_address = target_address
+        valid_i2c = {"i2c_nack", "i2c_timeout", "i2c_bit_flip", "i2c_truncated", "i2c_wrong_address"}
+        supplied = fault_types or ["i2c_nack"]
+        for ft in supplied:
+            if ft not in valid_i2c:
+                raise ProfileError(
+                    "i2c_fault_config.fault_types: unknown I2C fault type {!r}. "
+                    "Valid: {}".format(ft, sorted(valid_i2c))
+                )
+        self.fault_types: List[str] = supplied
+        self.fault_at_transaction = max(0, int(fault_at_transaction))
+        self.fault_seed = int(fault_seed)
+
+
+class InstructionSkipConfig:
+    """Configuration for instruction-skip (voltage glitch) fault injection.
+
+    Models a voltage glitch that causes the CPU to skip one or more
+    instructions.  Each fault point is an instruction address; the sweep
+    replaces the instruction at that address with a Thumb NOP (``0xBF00``)
+    and verifies the system still boots correctly.
+
+    ``target_addresses`` is a list of ``(start, end)`` address ranges to
+    scan.  Every halfword-aligned address in each range is a potential
+    fault point.  ``skip_count`` controls how many consecutive halfwords
+    to NOP (default 1, i.e. one 16-bit Thumb instruction).
+    """
+
+    __slots__ = ("target_addresses", "skip_count")
+
+    def __init__(
+        self,
+        target_addresses: Optional[List[Tuple[int, int]]] = None,
+        skip_count: int = 1,
+    ) -> None:
+        self.target_addresses: List[Tuple[int, int]] = target_addresses or []
+        self.skip_count = max(1, int(skip_count))
+        for i, (start, end) in enumerate(self.target_addresses):
+            if end <= start:
+                raise ProfileError(
+                    "instruction_skip_config.target_addresses[{}]: "
+                    "end (0x{:X}) must be > start (0x{:X})".format(i, end, start)
+                )
+            if start % 2 != 0:
+                raise ProfileError(
+                    "instruction_skip_config.target_addresses[{}]: "
+                    "start (0x{:X}) must be halfword-aligned".format(i, start)
+                )
+
 
 class MetadataFaultConfig:
     """Configuration for faulting host-side metadata/setup writes before boot."""
@@ -550,6 +666,7 @@ class FaultSweepConfig:
         "hook_fault",
         "multi_fault",
         "read_fault_config",
+        "instruction_skip_config",
         "metadata_fault",
         "partial_staging",
         "nvs_corruption",
@@ -558,6 +675,7 @@ class FaultSweepConfig:
         "boot_registers",
         "reset_mode",
         "write_order_constraints",
+        "i2c_fault_config",
     )
 
     def __init__(
@@ -580,6 +698,7 @@ class FaultSweepConfig:
         hook_fault: Optional["HookFaultConfig"] = None,
         multi_fault=None,
         read_fault_config: Optional["ReadFaultConfig"] = None,
+        instruction_skip_config: Optional["InstructionSkipConfig"] = None,
         metadata_fault: Optional["MetadataFaultConfig"] = None,
         partial_staging: Optional[Any] = None,
         nvs_corruption: Optional["NvsCorruptionConfig"] = None,
@@ -588,6 +707,7 @@ class FaultSweepConfig:
         boot_registers: Optional[List[Dict[str, Any]]] = None,
         reset_mode: str = "warm",
         write_order_constraints: Optional[List[Dict[str, Any]]] = None,
+        i2c_fault_config: Optional["I2CFaultConfig"] = None,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -613,6 +733,7 @@ class FaultSweepConfig:
         self.hook_fault = hook_fault or HookFaultConfig()
         self.multi_fault = multi_fault or MultiFaultConfig()
         self.read_fault_config = read_fault_config
+        self.instruction_skip_config = instruction_skip_config
         self.metadata_fault = metadata_fault or MetadataFaultConfig()
         self.partial_staging = partial_staging
         self.nvs_corruption = nvs_corruption or NvsCorruptionConfig()
@@ -621,6 +742,7 @@ class FaultSweepConfig:
         self.boot_registers = boot_registers or []
         self.reset_mode = reset_mode if reset_mode in ("warm", "cold") else "warm"
         self.write_order_constraints = write_order_constraints or []
+        self.i2c_fault_config = i2c_fault_config
 
 
 class StateFuzzerConfig:
@@ -814,6 +936,7 @@ class ProfileConfig:
         invariant_config: Optional[Dict[str, Any]] = None,
         flash_backend: Optional[str] = None,
         nvm_controller: Optional[str] = None,
+        otp_peripheral: Optional[str] = None,
         initial_states: Optional[List["InitialStateConfig"]] = None,
         metadata_fault_regions: Optional[List[MetadataFaultRegion]] = None,
         multi_component: Optional["MultiComponentConfig"] = None,
@@ -824,6 +947,7 @@ class ProfileConfig:
         boot_register_pre_writes: Optional[List[BootRegisterPreWrite]] = None,
         boot_registers: Optional[List[BootRegisterDef]] = None,
         write_order_constraints: Optional[List[WriteOrderConstraint]] = None,
+        fuzz_corpus: Optional[str] = None,
     ) -> None:
         self.schema_version = schema_version
         self.name = name
@@ -850,6 +974,7 @@ class ProfileConfig:
         self.invariant_config = invariant_config or {}
         self.flash_backend = flash_backend
         self.nvm_controller = nvm_controller
+        self.otp_peripheral = otp_peripheral
         self.security_policy = security_policy or SecurityPolicyConfig()
         self.initial_states: List[InitialStateConfig] = initial_states or []
         self.metadata_fault_regions: List[MetadataFaultRegion] = metadata_fault_regions or []
@@ -860,6 +985,7 @@ class ProfileConfig:
         self.boot_register_pre_writes: List[BootRegisterPreWrite] = boot_register_pre_writes or []
         self.boot_registers: List[BootRegisterDef] = boot_registers or []
         self.write_order_constraints: List[WriteOrderConstraint] = write_order_constraints or []
+        self.fuzz_corpus: Optional[str] = fuzz_corpus
 
     @property
     def is_multi_component(self) -> bool:
@@ -915,6 +1041,7 @@ class ProfileConfig:
             nvs_region=self.nvs_region,
             security_policy=self.security_policy,
             success_criteria_overrides=self.success_criteria_overrides,
+            fuzz_corpus=self.fuzz_corpus,
         )
         if state.update_trigger is not None and state.pre_boot_state is None:
             resolved.pre_boot_state = resolved.expand_update_trigger()
@@ -1173,6 +1300,10 @@ class ProfileConfig:
         if self.nvm_controller:
             vars_list.append("NVM_CONTROLLER:{}".format(self.nvm_controller))
 
+        # OTP peripheral: sysbus name for OTP/eFuse memory region.
+        if self.otp_peripheral:
+            vars_list.append("OTP_PERIPHERAL:{}".format(self.otp_peripheral))
+
         # Extra peripherals: comma-separated list of .cs files to compile
         # before platform loading (e.g. controller stubs for custom SoCs).
         if self.extra_peripherals:
@@ -1204,6 +1335,39 @@ class ProfileConfig:
                 "READ_FAULT_PROBABILITY:{}".format(rfc.fault_probability)
             )
             vars_list.append("READ_FAULT_SEED:{}".format(rfc.seed))
+
+        # Instruction skip config: emit target address ranges and skip count.
+        if "instruction_skip" in fs.fault_types and fs.instruction_skip_config is not None:
+            isc = fs.instruction_skip_config
+            if isc.target_addresses:
+                region_strs = [
+                    "0x{:08X}-0x{:08X}".format(s, e)
+                    for s, e in isc.target_addresses
+                ]
+                vars_list.append(
+                    "INSTRUCTION_SKIP_REGIONS:{}".format(",".join(region_strs))
+                )
+            vars_list.append(
+                "INSTRUCTION_SKIP_COUNT:{}".format(isc.skip_count)
+            )
+
+        # I2C fault config: emit when any i2c_* fault type is active.
+        i2c_types_active = [ft for ft in fs.fault_types if ft.startswith("i2c_")]
+        if i2c_types_active and fs.i2c_fault_config is not None:
+            ifc = fs.i2c_fault_config
+            vars_list.append("I2C_FAULT_PERIPHERAL:{}".format(ifc.peripheral_name))
+            vars_list.append("I2C_FAULT_TARGET_ADDRESS:{}".format(ifc.target_address))
+            # Encode fault types as comma-separated type codes.
+            i2c_codes = ",".join(
+                str(I2C_FAULT_TYPE_CODES.get(ft, 0)) for ft in i2c_types_active
+            )
+            vars_list.append("I2C_FAULT_TYPE_CODES:{}".format(i2c_codes))
+            vars_list.append("I2C_FAULT_TYPES:{}".format(",".join(i2c_types_active)))
+            if ifc.fault_at_transaction > 0:
+                vars_list.append(
+                    "I2C_FAULT_AT_TRANSACTION:{}".format(ifc.fault_at_transaction)
+                )
+            vars_list.append("I2C_FAULT_SEED:{}".format(ifc.fault_seed))
 
         # Per-profile stall timeout override.
         if fs.progress_stall_timeout_s is not None:
@@ -1471,6 +1635,7 @@ def _warn_fault_backend_compat(
     platform: str,
     flash_backend: Optional[str],
     nvm_controller: Optional[str] = None,
+    otp_peripheral: Optional[str] = None,
 ) -> None:
     """Emit warnings when fault_types are likely incompatible with the backend.
 
@@ -1555,6 +1720,43 @@ def _warn_fault_backend_compat(
                 "'{}' does not appear to use one. Command-drop fault "
                 "injection may silently do nothing.".format(
                     platform, flash_backend or "(not set)"
+                )
+            )
+
+    # instruction_skip_config without instruction_skip in fault_types is
+    # likely a user error.
+    if fs.instruction_skip_config is not None and "instruction_skip" not in all_types:
+        warnings.warn(
+            "instruction_skip_config is set but 'instruction_skip' is not in "
+            "fault_types. The instruction skip configuration will have no effect."
+        )
+
+    # instruction_skip without instruction_skip_config is a user error --
+    # target addresses are required.
+    if "instruction_skip" in all_types and fs.instruction_skip_config is None:
+        warnings.warn(
+            "fault_type 'instruction_skip' is enabled but no "
+            "instruction_skip_config is set. No instruction-skip fault "
+            "points will be generated."
+        )
+
+    # OTP fault types require an OTPMemory peripheral on the platform.
+    otp_types = {"otp_partial_program", "otp_stuck_bit", "otp_read_disturb"}
+    if all_types & otp_types:
+        has_otp = (
+            otp_peripheral is not None
+            or "otp" in platform_lower
+            or "otp" in backend_lower
+        )
+        if not has_otp:
+            warnings.warn(
+                "OTP fault types {} are configured but platform '{}' / "
+                "flash_backend '{}' does not appear to include an OTP "
+                "peripheral. OTP fault injection may silently do "
+                "nothing.".format(
+                    sorted(all_types & otp_types),
+                    platform,
+                    flash_backend or "(not set)",
                 )
             )
 
@@ -1656,12 +1858,16 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         hook_fault=hook_fault,
         multi_fault=multi_fault_config,
         read_fault_config=_parse_read_fault_config(raw.get("read_fault_config")),
+        instruction_skip_config=_parse_instruction_skip_config(
+            raw.get("instruction_skip_config")
+        ),
         metadata_fault=_parse_metadata_fault(raw.get("metadata_fault")),
         partial_staging=raw.get("partial_staging"),
         nvs_corruption=_parse_nvs_corruption(raw.get("nvs_corruption")),
         fault_distribution=_parse_fault_distribution(raw.get("fault_distribution")),
         heuristic_config=_parse_heuristic_config(raw.get("heuristic")),
         reset_mode=str(raw.get("reset_mode", "warm")),
+        i2c_fault_config=_parse_i2c_fault_config(raw.get("i2c_fault_config")),
     )
 
 
@@ -1819,6 +2025,64 @@ def _parse_read_fault_config(raw: Optional[Dict[str, Any]]) -> Optional[ReadFaul
         bit_flip_count=bit_flip_count,
         fault_probability=fault_probability,
         seed=seed,
+    )
+
+
+def _parse_instruction_skip_config(
+    raw: Optional[Dict[str, Any]],
+) -> Optional[InstructionSkipConfig]:
+    """Parse instruction_skip_config from fault_sweep YAML block."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ProfileError("instruction_skip_config: expected mapping")
+    target_addresses_raw = raw.get("target_addresses", [])
+    if not isinstance(target_addresses_raw, list):
+        raise ProfileError("instruction_skip_config.target_addresses: expected list")
+    target_addresses: List[Tuple[int, int]] = []
+    for i, region in enumerate(target_addresses_raw):
+        ctx = "instruction_skip_config.target_addresses[{}]".format(i)
+        if not isinstance(region, dict):
+            raise ProfileError("{}: expected mapping with start/end".format(ctx))
+        start = _parse_int(_require(region, "start", ctx), "{}.start".format(ctx))
+        end = _parse_int(_require(region, "end", ctx), "{}.end".format(ctx))
+        target_addresses.append((start, end))
+    skip_count = int(raw.get("skip_count", 1))
+    if skip_count < 1:
+        raise ProfileError(
+            "instruction_skip_config.skip_count: expected integer >= 1"
+        )
+    return InstructionSkipConfig(
+        target_addresses=target_addresses,
+        skip_count=skip_count,
+    )
+
+
+
+def _parse_i2c_fault_config(raw):
+    # type: (Optional[Dict[str, Any]]) -> Optional[I2CFaultConfig]
+    """Parse i2c_fault_config block from fault_sweep YAML."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep.i2c_fault_config: expected mapping")
+    peripheral_name = str(raw.get("peripheral_name", "i2cProxy")).strip()
+    if not peripheral_name:
+        raise ProfileError("fault_sweep.i2c_fault_config.peripheral_name: must be non-empty")
+    target_address = int(raw.get("target_address", 0))
+    fault_types_raw = raw.get("fault_types", ["i2c_nack"])
+    if not isinstance(fault_types_raw, list):
+        fault_types_raw = [str(fault_types_raw)]
+    else:
+        fault_types_raw = [str(ft) for ft in fault_types_raw]
+    fault_at = int(raw.get("fault_at_transaction", 0))
+    seed = int(raw.get("fault_seed", 0))
+    return I2CFaultConfig(
+        peripheral_name=peripheral_name,
+        target_address=target_address,
+        fault_types=fault_types_raw,
+        fault_at_transaction=fault_at,
+        fault_seed=seed,
     )
 
 
@@ -2618,6 +2882,9 @@ def load_profile(path: str | Path) -> ProfileConfig:
     nvm_controller_raw = data.get("nvm_controller")
     nvm_controller: Optional[str] = str(nvm_controller_raw) if nvm_controller_raw is not None else None
 
+    otp_peripheral_raw = data.get("otp_peripheral")
+    otp_peripheral: Optional[str] = str(otp_peripheral_raw) if otp_peripheral_raw is not None else None
+
     extra_peripherals_raw = data.get("extra_peripherals")
     extra_peripherals: Optional[List[str]] = None
     if extra_peripherals_raw is not None:
@@ -2638,6 +2905,9 @@ def load_profile(path: str | Path) -> ProfileConfig:
     fault_sweep = _parse_fault_sweep(data.get("fault_sweep"))
     state_fuzzer = _parse_state_fuzzer(data.get("state_fuzzer"))
     security_policy = _parse_security_policy(data.get("security_policy"))
+
+    fuzz_corpus_raw = data.get("fuzz_corpus")
+    fuzz_corpus: Optional[str] = str(fuzz_corpus_raw) if fuzz_corpus_raw is not None else None
     expect = _parse_expect(data.get("expect"))
     semantic_assertions = _parse_semantic_assertions(data.get("semantic_assertions"))
     invariants = _parse_invariants(data.get("invariants"))
@@ -2686,7 +2956,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
     # based on the ``platform`` and ``flash_backend`` strings.  A definitive
     # check would require querying Renode's sysbus after machine creation,
     # which is outside the scope of the profile loader.
-    _warn_fault_backend_compat(fault_sweep, platform, flash_backend, nvm_controller)
+    _warn_fault_backend_compat(fault_sweep, platform, flash_backend, nvm_controller, otp_peripheral)
 
     profile = ProfileConfig(
         schema_version=schema_version,
@@ -2714,6 +2984,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         invariant_config=invariant_config,
         flash_backend=flash_backend,
         nvm_controller=nvm_controller,
+        otp_peripheral=otp_peripheral,
         initial_states=initial_states,
         metadata_fault_regions=metadata_fault_regions,
         multi_component=multi_component,
@@ -2724,6 +2995,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         boot_register_pre_writes=boot_register_pre_writes,
         boot_registers=boot_registers,
         write_order_constraints=write_order_constraints,
+        fuzz_corpus=fuzz_corpus,
     )
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.
