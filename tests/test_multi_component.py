@@ -15,7 +15,7 @@ import sys
 
 sys.path.insert(0, str(SCRIPTS))
 
-from audit_bootloader import merge_robot_vars
+from renode_runner import merge_robot_vars
 from fault_inject import (
     MultiComponentFaultResult,
     classify_multi_component_outcome,

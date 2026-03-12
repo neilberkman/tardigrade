@@ -20,22 +20,18 @@ import sys
 
 sys.path.insert(0, str(SCRIPTS))
 
-from audit_bootloader import (  # noqa: E402
-    annotate_result_checks,
-    calibration_completed,
-    _run_batch_with_fallback,
+from renode_runner import (  # noqa: E402
+    CalibrationResult,
     _run_batches_chunked,
+    _run_batch_with_fallback,
+    calibration_completed,
     prepare_renode_command,
     run_batch,
     run_single_point,
 )
+from result_checks import annotate_result_checks  # noqa: E402
 from audit_report import summarize_runtime_sweep  # noqa: E402
 from profile_loader import load_profile  # noqa: E402
-
-try:
-    from audit_bootloader import CalibrationResult  # noqa: E402
-except ImportError:
-    CalibrationResult = None  # type: ignore[assignment,misc]
 from self_test import check_verdict  # noqa: E402
 
 
@@ -988,7 +984,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 result_file.write_text('{"boot_outcome":"success"}', encoding="utf-8")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-            with mock.patch("audit_bootloader.subprocess.run", side_effect=fake_run):
+            with mock.patch("renode_runner.subprocess.run", side_effect=fake_run):
                 result = run_single_point(
                     repo_root=ROOT,
                     renode_test="renode-test",
@@ -1054,7 +1050,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 result_file.write_text('{"boot_outcome":"success"}', encoding="utf-8")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-            with mock.patch("audit_bootloader.subprocess.run", side_effect=fake_run):
+            with mock.patch("renode_runner.subprocess.run", side_effect=fake_run):
                 run_single_point(
                     repo_root=ROOT,
                     renode_test="renode-test",
@@ -1117,7 +1113,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 result_file.write_text('{"boot_outcome":"success","fault_injected":false}', encoding="utf-8")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-            with mock.patch("audit_bootloader.subprocess.run", side_effect=fake_run):
+            with mock.patch("renode_runner.subprocess.run", side_effect=fake_run):
                 result = run_single_point(
                     repo_root=ROOT,
                     renode_test="renode-test",
@@ -1168,7 +1164,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 return [{"fault_at": fp, "boot_outcome": "success"} for fp in points]
 
             with mock.patch(
-                "audit_bootloader._run_batch_with_fallback",
+                "renode_runner._run_batch_with_fallback",
                 side_effect=fake_batch,
             ):
                 with redirect_stderr(stderr):
@@ -1229,7 +1225,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                     raise RuntimeError("batch timeout")
                 return [{"fault_at": fp, "boot_outcome": "success"} for fp in points]
 
-            with mock.patch("audit_bootloader.run_batch", side_effect=fake_run_batch):
+            with mock.patch("renode_runner.run_batch", side_effect=fake_run_batch):
                 results = _run_batch_with_fallback(
                     repo_root=ROOT,
                     renode_test="renode-test",
@@ -1283,7 +1279,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                     raise RuntimeError("batch timeout")
                 return [{"fault_at": points[0], "boot_outcome": "success"}]
 
-            with mock.patch("audit_bootloader.run_batch", side_effect=fake_run_batch):
+            with mock.patch("renode_runner.run_batch", side_effect=fake_run_batch):
                 results = _run_batch_with_fallback(
                     repo_root=ROOT,
                     renode_test="renode-test",
@@ -1341,7 +1337,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 (rf_results / "snapshots" / "dummy.bin").write_text("x", encoding="utf-8")
                 return SimpleNamespace(returncode=1, stdout="boom", stderr="bad")
 
-            with mock.patch("audit_bootloader.subprocess.run", side_effect=fake_run):
+            with mock.patch("renode_runner.subprocess.run", side_effect=fake_run):
                 with self.assertRaises(RuntimeError):
                     run_batch(
                         repo_root=ROOT,
@@ -1402,7 +1398,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 result_file.write_text("[]", encoding="utf-8")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-            with mock.patch("audit_bootloader.subprocess.run", side_effect=fake_run):
+            with mock.patch("renode_runner.subprocess.run", side_effect=fake_run):
                 results = run_batch(
                     repo_root=ROOT,
                     renode_test="renode-test",
