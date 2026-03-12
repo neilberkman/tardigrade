@@ -34,6 +34,7 @@ class CalibrationInputs:
     max_writes: int
     total_erases: int = 0
     total_i2c_transactions: int = 0
+    total_otp_blows: int = 0
     setup_writes: int = 0
     trace_file: Optional[str] = None
 
@@ -54,6 +55,7 @@ def build_fault_plan(
     max_writes = calibration.max_writes
     total_erases = calibration.total_erases
     total_i2c_transactions = calibration.total_i2c_transactions
+    total_otp_blows = calibration.total_otp_blows
     setup_writes = calibration.setup_writes
     trace_file = calibration.trace_file
 
@@ -319,14 +321,19 @@ def build_fault_plan(
 
         # OTP fault injection.
         otp_fault_count = 0
-        if include_otp_faults:
-            otp_fps = list(fault_points)
+        if include_otp_faults and total_otp_blows > 0:
+            otp_fps = list(range(total_otp_blows))
             if quick:
                 otp_fps = quick_subset(otp_fps)
             for otp_ft in otp_fault_types:
                 otp_code = FAULT_TYPE_NAME_TO_CODE.get(otp_ft, "op")
                 combined += [(fp, otp_code) for fp in otp_fps]
                 otp_fault_count += len(otp_fps)
+        elif include_otp_faults and total_otp_blows == 0:
+            print(
+                "Skipping OTP fault points: calibration found 0 OTP blows.",
+                file=sys.stderr,
+            )
 
         # NVS corruption variants.
         nvs_fault_count = 0

@@ -5106,12 +5106,14 @@ if calibration_mode:
                 log('calibration: {} total erases'.format(total_erases))
 
         total_i2c_transactions = get_total_i2c_transactions()
+        total_otp_blows = get_total_otp_blows()
 
         result = {
             'calibration': True,
             'total_writes': int(total_writes),
             'total_erases': int(total_erases),
             'total_i2c_transactions': int(total_i2c_transactions),
+            'total_otp_blows': int(total_otp_blows),
             'base_writes': int(base_writes),
             'setup_writes': int(pre_boot_write_count),
             'calibration_stop_reason': cal_status.get('reason', '?'),

@@ -369,6 +369,7 @@ def main() -> int:
         erase_trace_file_bin: Optional[str] = None
         total_erases: int = 0
         total_i2c_transactions: int = 0
+        total_otp_blows: int = 0
         setup_writes: int = 0
         # Determine whether erase-trace capture is needed during calibration.
         fault_types = profile.fault_sweep.fault_types
@@ -420,11 +421,14 @@ def main() -> int:
                     )
                 setup_writes = cal.setup_writes
                 total_i2c_transactions = cal.total_i2c_transactions
+                total_otp_blows = cal.total_otp_blows
                 cal_parts = ["{} NVM writes".format(max_writes)]
                 if include_erases:
                     cal_parts.append("{} page erases".format(total_erases))
                 if total_i2c_transactions > 0:
                     cal_parts.append("{} I2C transactions".format(total_i2c_transactions))
+                if total_otp_blows > 0:
+                    cal_parts.append("{} OTP blows".format(total_otp_blows))
                 print("Calibration: {}.".format(", ".join(cal_parts)), file=sys.stderr)
         else:
             max_writes = int(max_writes)
@@ -448,6 +452,7 @@ def main() -> int:
                 max_writes=max_writes,
                 total_erases=total_erases,
                 total_i2c_transactions=total_i2c_transactions,
+                total_otp_blows=total_otp_blows,
                 setup_writes=setup_writes,
                 trace_file=trace_file,
             ),
