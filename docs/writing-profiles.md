@@ -263,6 +263,29 @@ Default is `[power_loss]`. Available types:
 | `wear_leveling_corruption` | Wear-leveling metadata corruption       | All                  |
 | `reset_at_time`            | CPU reset at a time offset              | All                  |
 | `read_bit_flip`            | Transient read corruption               | NVMemory             |
+| `instruction_skip`         | Voltage-glitch instruction skip (NOP)   | All                  |
+
+### Instruction skip (voltage glitch)
+
+The `instruction_skip` fault type models a voltage-glitch attack that causes the CPU to skip one or more instructions. Each fault point is an instruction address rather than an NVM write index. The harness replaces the instruction at the target address with a Thumb NOP (`0xBF00`), boots the firmware, and checks whether the system still recovers.
+
+This requires an `instruction_skip_config` block inside `fault_sweep`:
+
+```yaml
+fault_sweep:
+  fault_types: [power_loss, instruction_skip]
+  instruction_skip_config:
+    target_addresses:
+      - { start: 0x00000100, end: 0x00000400 }
+      - { start: 0x00001000, end: 0x00001200 }
+    skip_count: 1
+```
+
+`target_addresses` lists address ranges to scan. Every halfword-aligned address in each range becomes a fault point. `start` must be halfword-aligned (Thumb instruction boundary). `skip_count` controls how many consecutive 16-bit halfwords to NOP (default 1). Set it to 2 to model skipping a 32-bit Thumb-2 instruction.
+
+Instruction-skip fault points are always run in execute mode (full CPU boot) -- trace replay is not applicable since the fault is CPU-level, not NVM-level.
+
+To find good target ranges, disassemble your bootloader ELF and identify critical code paths: hash validation, signature checks, version comparisons, or metadata parsing. Narrow ranges produce faster sweeps; whole-function ranges give broader coverage.
 
 ### Sweep strategy
 
@@ -701,24 +724,101 @@ python3 scripts/cbmc_to_profile.py \
 
 See [`examples/cbmc_bridge/`](../examples/cbmc_bridge/) for a complete worked example with a buggy metadata parser, CBMC harness, pre-generated counterexamples, and address maps.
 
-## Fuzzer crash-to-profile bridge
+## Fuzzer integration
 
-`scripts/fuzz_to_profile.py` converts raw binary crash files from AFL or libFuzzer into tardigrade profiles. The address map describes how to partition crash bytes into flash regions:
+Tardigrade bridges the gap between fuzz testing and fault-injection analysis. The pipeline: a fuzzer (libFuzzer, AFL, honggfuzz) finds crash inputs that break your header parser, then `fuzz_crash_to_profile.py` converts each crash into a regression profile that tardigrade runs under full emulation with fault injection.
 
-```yaml
-# fuzz_address_map.yaml
-regions:
-  - { name: metadata, address: 0x10070000, offset: 0, size: 16 }
-  - { name: header, address: 0x10038000, offset: 16, size: 256 }
-```
+### Template harness
+
+`harnesses/fuzz_ota_header_template.c` is a generic libFuzzer harness for OTA image header parsers. Adapt it for your bootloader:
+
+1. Replace the header struct and `parse_image_header()` stub with your real parser.
+2. Add post-parse invariant checks (size bounds, version constraints, flag consistency).
+3. Build and run:
 
 ```bash
-python3 scripts/fuzz_to_profile.py \
-    --crash-input crash_001.bin \
-    --template    my_base_profile.yaml \
-    --address-map fuzz_address_map.yaml \
-    --output      /tmp/fuzz_generated.yaml
+clang -g -O1 -fsanitize=fuzzer,address \
+    -I/path/to/your/include \
+    harnesses/fuzz_ota_header_template.c \
+    /path/to/your/header_parser.c \
+    -o fuzz_ota_header
+
+mkdir -p corpus
+./fuzz_ota_header corpus/ -max_len=512
 ```
+
+Seed the corpus with a known-good header binary for faster coverage.
+
+### Converting crashes to profiles
+
+`scripts/fuzz_crash_to_profile.py` is a standalone CLI tool (usable outside tardigrade) that takes crash inputs and produces regression profiles.
+
+**Single crash:**
+
+```bash
+python3 scripts/fuzz_crash_to_profile.py \
+    --crash-input crashes/crash-abc123 \
+    --base-profile profiles/my_bootloader.yaml \
+    --address-map address_map.yaml \
+    -o profiles/regression/fuzz_crash_abc123.yaml
+```
+
+**Batch mode** (process all crashes in a directory):
+
+```bash
+python3 scripts/fuzz_crash_to_profile.py \
+    --crash-dir crashes/ \
+    --base-profile profiles/my_bootloader.yaml \
+    --address-map address_map.yaml \
+    --output-dir profiles/regression/
+```
+
+The tool auto-detects AFL (`id:NNNNNN`) and libFuzzer (`crash-*`, `oom-*`, `timeout-*`) naming conventions.
+
+#### Injection modes
+
+`--mode pre_boot_state` (default): Crash bytes are mapped to NVM addresses via the address map and injected as `pre_boot_state` writes. Use this for metadata/trailer corruption.
+
+`--mode staging_image`: Crash bytes replace the staging image binary. Use this for malformed firmware image testing -- the bootloader should reject the image and stay on the exec slot.
+
+#### Address map
+
+Describes how to partition sequential crash bytes into flash memory regions:
+
+```yaml
+# address_map.yaml
+regions:
+  - name: metadata
+    address: 0x10070000
+    size: 16
+  - name: header
+    address: 0x10038000
+    size: 256
+```
+
+Without an address map, crash bytes go to sequential addresses starting at the end of the last slot (or `--meta-base` override).
+
+#### Generated profile structure
+
+Each generated profile includes:
+
+- `fuzz_metadata` block with crash SHA-256, file name, size, fuzzer type, and generation timestamp
+- `pre_boot_state` writes (pre_boot_state mode) or modified `images.staging` path (staging_image mode)
+- `expect.should_find_issues: true` (override with `--no-expect-rejection`)
+
+### fuzz_corpus profile field
+
+Profiles can declare a `fuzz_corpus` directory containing fuzzer inputs to use as staging images in batch mode:
+
+```yaml
+fuzz_corpus: corpus/crashes/
+```
+
+This is an optional field. When set, the audit runner can iterate over all inputs in the directory and run each as a separate staging image, testing whether the bootloader correctly rejects every malformed input.
+
+### Legacy bridge
+
+`scripts/fuzz_to_profile.py` is the original simpler converter. It still works and is tested, but `fuzz_crash_to_profile.py` is preferred for new workflows -- it adds crash metadata, batch mode, staging-image injection, and auto-detection of fuzzer types.
 
 ## Scenarios
 
