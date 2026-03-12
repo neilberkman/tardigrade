@@ -93,7 +93,11 @@ Load Runtime Scenario
     Execute Command    include "${ROOT}/peripherals/SimpleCacheController.cs"
     Execute Command    include "${ROOT}/peripherals/TraceReplayEngine.cs"
     Execute Command    include "${ROOT}/peripherals/STM32F4FlashController.cs"
+    Execute Command    include "${ROOT}/peripherals/STM32F4FlashInterceptor.cs"
+    Execute Command    include "${ROOT}/peripherals/STM32H7FlashController.cs"
     Execute Command    include "${ROOT}/peripherals/STM32DummyUSART.cs"
+    Execute Command    include "${ROOT}/peripherals/OTPMemory.cs"
+    Execute Command    include "${ROOT}/peripherals/I2CFaultProxy.cs"
     Run Keyword If    '${EXTRA_PERIPHERALS}' != ''    Load Extra Peripherals
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${PLATFORM_REPL}
