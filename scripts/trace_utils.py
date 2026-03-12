@@ -9,7 +9,7 @@ from __future__ import annotations
 import csv
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def _parse_optional_int(value: Any) -> Optional[int]:
@@ -245,4 +245,61 @@ def annotate_fault_windows(
     return {
         "annotated": annotated,
         "skipped_unknown_interleaving": skipped_unknown_interleaving,
+    }
+
+
+def annotate_clean_trace(
+    sweep_results: List[Dict[str, Any]],
+    trace_file: Optional[str],
+    erase_trace_file: Optional[str],
+    flash_base: int,
+) -> Optional[Dict[str, Any]]:
+    """Load clean traces, annotate sweep results with fault windows, return metadata.
+
+    Returns None if *trace_file* is absent or does not exist on disk.
+    As a side-effect, each entry in *sweep_results* is enriched with a
+    ``fault_window`` key by :func:`annotate_fault_windows`.
+    """
+    if not trace_file or not os.path.exists(trace_file):
+        return None
+
+    clean_write_trace = load_clean_write_trace(trace_file)
+    clean_erase_trace = load_clean_erase_trace(erase_trace_file)
+    clean_ops = build_clean_operation_trace(
+        write_entries=clean_write_trace,
+        erase_entries=clean_erase_trace,
+        flash_base=flash_base,
+    )
+    erase_missing_writes_at = sum(
+        1 for e in clean_erase_trace if e.get("writes_at_this_point") is None
+    )
+    window_stats = annotate_fault_windows(sweep_results, clean_ops)
+
+    print(
+        "Fault-window annotation: {} points mapped to clean trace.".format(
+            window_stats["annotated"]
+        ),
+        file=sys.stderr,
+    )
+    if erase_missing_writes_at > 0:
+        print(
+            "Clean erase trace: {} entries missing writes_at; "
+            "{} fault windows skipped because precise erase ordering is unknown.".format(
+                erase_missing_writes_at,
+                window_stats["skipped_unknown_interleaving"],
+            ),
+            file=sys.stderr,
+        )
+
+    return {
+        "trace_file": trace_file,
+        "erase_trace_file": erase_trace_file,
+        "writes": len(clean_write_trace),
+        "erases": len(clean_erase_trace),
+        "erases_missing_writes_at": erase_missing_writes_at,
+        "operations": len(clean_ops),
+        "fault_windows_annotated": window_stats["annotated"],
+        "fault_windows_skipped_unknown_interleaving": window_stats[
+            "skipped_unknown_interleaving"
+        ],
     }
