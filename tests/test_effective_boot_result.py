@@ -15,14 +15,14 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from audit_bootloader import (
+from fault_classification import (
     _effective_boot_result,
     classify_failure_class,
     result_has_issues,
     result_is_brick,
     result_issue_reasons,
-    summarize_runtime_sweep,
 )
+from audit_report import summarize_runtime_sweep
 
 
 class EffectiveBootResultTests(unittest.TestCase):

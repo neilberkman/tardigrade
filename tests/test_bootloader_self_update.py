@@ -462,7 +462,7 @@ class TestCheckBootloaderIntegrity(unittest.TestCase):
     """Tests for check_bootloader_integrity in audit_bootloader."""
 
     def test_valid_integrity(self):
-        from audit_bootloader import check_bootloader_integrity
+        from audit_report import check_bootloader_integrity
 
         bl_region = BootloaderRegionConfig(base=0x0, size=0x10000)
         data = struct.pack("<II", 0x20004000, 0x00000100)
@@ -474,7 +474,7 @@ class TestCheckBootloaderIntegrity(unittest.TestCase):
         self.assertEqual(reason, "ok")
 
     def test_corrupted_vector_table(self):
-        from audit_bootloader import check_bootloader_integrity
+        from audit_report import check_bootloader_integrity
 
         bl_region = BootloaderRegionConfig(base=0x0, size=0x10000)
         # All 0xFF -- erased flash
@@ -494,7 +494,7 @@ class TestEnrichResultsWithBootloaderRegion(unittest.TestCase):
     """Tests for enrich_results_with_fault_regions with bootloader_region."""
 
     def test_bootloader_region_enrichment(self):
-        from audit_bootloader import enrich_results_with_fault_regions
+        from audit_report import enrich_results_with_fault_regions
 
         bl_region = BootloaderRegionConfig(base=0x0, size=0x10000)
         results = [
@@ -506,7 +506,7 @@ class TestEnrichResultsWithBootloaderRegion(unittest.TestCase):
         self.assertEqual(results[1]["fault_region"], "data")
 
     def test_no_enrichment_without_either(self):
-        from audit_bootloader import enrich_results_with_fault_regions
+        from audit_report import enrich_results_with_fault_regions
 
         results = [
             {"fault_at": 1, "fault_address": "0x00005000", "fault_injected": True},
