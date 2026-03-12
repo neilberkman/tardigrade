@@ -79,6 +79,19 @@ ${PHASE2_FAULT_ENABLED}        false
 ${PHASE2_FAULT_MAX_POINTS}     0
 ${SUCCESS_CRITERIA_OVERRIDES}    ${EMPTY}
 ${SUCCESS_CRITERIA_OVERRIDES_FILE}    ${EMPTY}
+${OTP_PERIPHERAL}              ${EMPTY}
+${NVS_REGION_ADDR}             ${EMPTY}
+${NVS_REGION_SIZE}             ${EMPTY}
+${NVS_REGION_SNAPSHOT}         ${EMPTY}
+${NVS_CORRUPTION_MODES}        ${EMPTY}
+${NVS_CORRUPTION_SEED}         0
+${I2C_FAULT_PERIPHERAL}        ${EMPTY}
+${INSTRUCTION_SKIP_REGIONS}    ${EMPTY}
+${INSTRUCTION_SKIP_COUNT}      1
+${READ_FAULT_REGIONS}          ${EMPTY}
+${READ_FAULT_BIT_FLIPS}        0
+${READ_FAULT_PROBABILITY}      1.0
+${READ_FAULT_SEED}             0
 ${TEST_TIMEOUT}                2 minutes
 
 *** Keywords ***
@@ -186,6 +199,19 @@ Run Runtime Fault Point
     Run Keyword If    '${BOOT_REGISTER_PRE_WRITES}' != ''    Execute Command    $boot_register_pre_writes="${BOOT_REGISTER_PRE_WRITES}"
     Run Keyword If    '${BOOT_REGISTERS}' != ''    Execute Command    $boot_registers="${BOOT_REGISTERS}"
     Execute Command    $reset_mode="${RESET_MODE}"
+    Run Keyword If    '${OTP_PERIPHERAL}' != ''    Execute Command    $otp_peripheral="${OTP_PERIPHERAL}"
+    Run Keyword If    '${NVS_REGION_ADDR}' != ''    Execute Command    $nvs_region_addr="${NVS_REGION_ADDR}"
+    Run Keyword If    '${NVS_REGION_SIZE}' != ''    Execute Command    $nvs_region_size="${NVS_REGION_SIZE}"
+    Run Keyword If    '${NVS_REGION_SNAPSHOT}' != ''    Execute Command    $nvs_region_snapshot="${NVS_REGION_SNAPSHOT}"
+    Run Keyword If    '${NVS_CORRUPTION_MODES}' != ''    Execute Command    $nvs_corruption_modes="${NVS_CORRUPTION_MODES}"
+    Run Keyword If    '${NVS_CORRUPTION_SEED}' != '0'    Execute Command    $nvs_corruption_seed="${NVS_CORRUPTION_SEED}"
+    Run Keyword If    '${I2C_FAULT_PERIPHERAL}' != ''    Execute Command    $i2c_fault_peripheral="${I2C_FAULT_PERIPHERAL}"
+    Run Keyword If    '${INSTRUCTION_SKIP_REGIONS}' != ''    Execute Command    $instruction_skip_regions="${INSTRUCTION_SKIP_REGIONS}"
+    Run Keyword If    '${INSTRUCTION_SKIP_COUNT}' != '1'    Execute Command    $instruction_skip_count="${INSTRUCTION_SKIP_COUNT}"
+    Run Keyword If    '${READ_FAULT_REGIONS}' != ''    Execute Command    $read_fault_regions="${READ_FAULT_REGIONS}"
+    Run Keyword If    '${READ_FAULT_BIT_FLIPS}' != '0'    Execute Command    $read_fault_bit_flips="${READ_FAULT_BIT_FLIPS}"
+    Run Keyword If    '${READ_FAULT_PROBABILITY}' != '1.0'    Execute Command    $read_fault_probability="${READ_FAULT_PROBABILITY}"
+    Run Keyword If    '${READ_FAULT_SEED}' != '0'    Execute Command    $read_fault_seed="${READ_FAULT_SEED}"
 
     Execute Script    ${ROOT}/scripts/run_runtime_fault_sweep.resc
 
