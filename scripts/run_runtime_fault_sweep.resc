@@ -2515,11 +2515,15 @@ def run_state_fault(fault_at):
 
 def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, label='',
                    expect_writes=True, stop_on_fault=True, op_trace=None, op_trace_limit=0,
-                   zero_writes_is_brick=True):
+                   zero_writes_is_brick=True, vtor_settle_iters=0):
     # Run CPU in continuous mode until it settles or budget exhausted.
     #
     # Uses `emulation RunFor` which runs in continuous mode — much faster
     # than cpu.Step() which uses single-step synchronization (~30x faster).
+    #
+    # vtor_settle_iters: after first VTOR capture, continue running for
+    #   this many more iterations to let the boot complete and capture the
+    #   final VTOR value. 0 = stop immediately on capture (default).
     #
     # Termination conditions (checked after each time slice):
     #   1. FaultFired set by NVMC (fault injection hit target write)
@@ -2534,6 +2538,7 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
     no_boot_zero_write_count = 0
     prev_progress_key = None
     last_progress_t = t0
+    vtor_settle_remaining = -1
     try:
         slice_s = max(0.001, float(time_slice))
     except Exception:
@@ -2554,17 +2559,34 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
             break
         # Early exit: check if VTOR has been set to a valid slot.
         # Bus watchpoints don't fire for SCB (CPU-private), so we poll.
-        if not sticky_vtor['captured']:
-            vtor_now = as_int(bus.ReadDoubleWord(0xE000ED08))
-            if vtor_now != 0:
-                for sn, (s_lo, s_hi) in slot_ranges.items():
-                    if s_lo <= vtor_now < s_hi:
-                        sticky_vtor['value'] = vtor_now
-                        sticky_vtor['slot'] = sn
-                        sticky_vtor['captured'] = True
-                        break
-            if sticky_vtor['captured']:
-                # Confirmation: run 5ms more to let app execute / HardFault.
+        # Always poll — even after capture — so vtor_settle can update.
+        vtor_now = as_int(bus.ReadDoubleWord(0xE000ED08))
+        if vtor_now != 0:
+            for sn, (s_lo, s_hi) in slot_ranges.items():
+                if s_lo <= vtor_now < s_hi:
+                    sticky_vtor['value'] = vtor_now
+                    sticky_vtor['slot'] = sn
+                    sticky_vtor['captured'] = True
+                    break
+        if sticky_vtor['captured']:
+            if vtor_settle_remaining < 0:
+                # First capture.
+                if vtor_settle_iters == 0:
+                    # Immediate stop (default/sweep behavior).
+                    monitor.Parse('emulation RunFor "0.005"')
+                    cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
+                    if cfsr != 0:
+                        reason = 'vtor_captured_hardfault'
+                    else:
+                        reason = 'vtor_captured'
+                    break
+                else:
+                    # Start settle countdown.
+                    vtor_settle_remaining = vtor_settle_iters
+            elif vtor_settle_remaining > 0:
+                vtor_settle_remaining -= 1
+            else:
+                # Settle countdown done — capture final VTOR.
                 monitor.Parse('emulation RunFor "0.005"')
                 cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
                 if cfsr != 0:
@@ -5029,7 +5051,8 @@ if calibration_mode:
         cal_max_iters = max(500, int(float(run_duration) * 5 / 0.02))
         cal_status = run_until_done(cpu_ref, label='calibration',
                                     wall_timeout=cal_wall_timeout,
-                                    max_iters=cal_max_iters)
+                                    max_iters=cal_max_iters,
+                                    vtor_settle_iters=50)
         progress_stall_timeout_s = saved_stall
         log('calibration: stop_reason={}'.format(cal_status.get('reason', '?')))
         total_writes = get_total_writes() - base_writes
