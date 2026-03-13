@@ -77,7 +77,7 @@ See [`action.yml`](action.yml) for all inputs and outputs.
 
 ### Local
 
-Prerequisites: `python3`, `pyyaml`, and either `renode-test` on PATH or Docker.
+Prerequisites: `python3`, `python3 -m pip install -r requirements.txt`, and either `renode-test` on PATH or Docker.
 
 ```bash
 python3 scripts/audit_bootloader.py \
@@ -180,7 +180,7 @@ In `execute` mode, Phase 2 performs a full CPU recovery boot from faulted NVM:
 
 - **Trace replay** -- recorded trace replay (~20ms) replaces full Phase 1 re-emulation
 - **Cached flash restore** -- single `WriteBytes` per fault point instead of per-page erase+load
-- **Hash bypass** -- patches out crypto validation via `hash_bypass_symbols` profile field
+- **Hash bypass** -- patches out crypto validation on faulted sweep runs via `sweep_hash_bypass_symbols`
 - **Parallel workers** -- `--workers N` distributes fault points across N Renode instances
 - **Heuristic pruning** -- ~15K to ~1K points for routine CI
 - **Interleaved distribution** -- round-robin assignment balances load across workers

@@ -22,6 +22,7 @@ import json
 import struct
 import sys
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,6 +32,11 @@ try:
     import yaml
 except ImportError:
     yaml = None  # type: ignore[assignment]
+
+try:
+    from elftools.elf.elffile import ELFFile
+except ImportError:
+    ELFFile = None  # type: ignore[assignment]
 
 
 SUPPORTED_SCHEMA_VERSIONS = {1}
@@ -668,7 +674,7 @@ class FaultSweepConfig:
         "fault_types",
         "evaluation_mode",
         "sweep_strategy",
-        "hash_bypass_symbols",
+        "sweep_hash_bypass_symbols",
         "progress_stall_timeout_s",
         "boot_cycles",
         "boot_cycle_hook",
@@ -700,7 +706,7 @@ class FaultSweepConfig:
         fault_types: Optional[List[str]] = None,
         evaluation_mode: Optional[str] = None,
         sweep_strategy: str = "heuristic",
-        hash_bypass_symbols: Optional[List[str]] = None,
+        sweep_hash_bypass_symbols: Optional[List[str]] = None,
         progress_stall_timeout_s: Optional[float] = None,
         boot_cycles: int = 1,
         boot_cycle_hook: Optional[str] = None,
@@ -731,7 +737,7 @@ class FaultSweepConfig:
         self.fault_types = fault_types or ["power_loss"]
         self.evaluation_mode = evaluation_mode
         self.sweep_strategy = sweep_strategy
-        self.hash_bypass_symbols = hash_bypass_symbols or []
+        self.sweep_hash_bypass_symbols = sweep_hash_bypass_symbols or []
         self.progress_stall_timeout_s = progress_stall_timeout_s
         self.boot_cycles = max(1, int(boot_cycles))
         self.boot_cycle_hook = str(boot_cycle_hook).strip() if boot_cycle_hook else None
@@ -1507,12 +1513,6 @@ class ProfileConfig:
             ]
             vars_list.append("EXTRA_PERIPHERALS:{}".format(",".join(resolved)))
 
-        # Hash bypass: comma-separated list of function symbols to short-circuit.
-        if fs.hash_bypass_symbols:
-            vars_list.append(
-                "HASH_BYPASS_SYMBOLS:{}".format(",".join(fs.hash_bypass_symbols))
-            )
-
         # Read fault config: emit when read_bit_flip is an active fault type.
         if "read_bit_flip" in fs.fault_types and fs.read_fault_config is not None:
             rfc = fs.read_fault_config
@@ -1985,7 +1985,12 @@ def _warn_fault_backend_compat(
             )
 
 
-def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
+def _parse_fault_sweep(
+    raw: Optional[Dict[str, Any]],
+    *,
+    bootloader_elf: Optional[str] = None,
+    profile_path: Optional[Path] = None,
+) -> FaultSweepConfig:
     if raw is None:
         return FaultSweepConfig()
     fault_types = raw.get("fault_types", ["power_loss"])
@@ -2006,9 +2011,14 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
     eval_mode = raw.get("evaluation_mode")
     if eval_mode is not None:
         eval_mode = str(eval_mode)
-    hash_bypass = raw.get("hash_bypass_symbols")
-    if hash_bypass is not None and not isinstance(hash_bypass, list):
-        hash_bypass = [str(hash_bypass)]
+    if "hash_bypass_symbols" in raw:
+        raise ProfileError(
+            "fault_sweep.hash_bypass_symbols was renamed to "
+            "fault_sweep.sweep_hash_bypass_symbols"
+        )
+    sweep_hash_bypass = raw.get("sweep_hash_bypass_symbols")
+    if sweep_hash_bypass is not None and not isinstance(sweep_hash_bypass, list):
+        sweep_hash_bypass = [str(sweep_hash_bypass)]
     stall_timeout = raw.get("progress_stall_timeout_s")
     if stall_timeout is not None:
         stall_timeout = float(stall_timeout)
@@ -2080,7 +2090,7 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         fault_types=fault_types,
         evaluation_mode=eval_mode,
         sweep_strategy=str(raw.get("sweep_strategy", "heuristic")),
-        hash_bypass_symbols=hash_bypass,
+        sweep_hash_bypass_symbols=sweep_hash_bypass,
         progress_stall_timeout_s=stall_timeout,
         boot_cycles=boot_cycles,
         boot_cycle_hook=boot_cycle_hook,
@@ -2090,7 +2100,9 @@ def _parse_fault_sweep(raw: Optional[Dict[str, Any]]) -> FaultSweepConfig:
         multi_fault=multi_fault_config,
         read_fault_config=_parse_read_fault_config(raw.get("read_fault_config")),
         instruction_skip_config=_parse_instruction_skip_config(
-            raw.get("instruction_skip_config")
+            raw.get("instruction_skip_config"),
+            bootloader_elf=bootloader_elf,
+            profile_path=profile_path,
         ),
         metadata_fault=_parse_metadata_fault(raw.get("metadata_fault")),
         partial_staging=raw.get("partial_staging"),
@@ -2259,14 +2271,173 @@ def _parse_read_fault_config(raw: Optional[Dict[str, Any]]) -> Optional[ReadFaul
     )
 
 
+def _count_instruction_skip_fault_points(start: int, end: int, skip_count: int) -> int:
+    stop = max(end - (max(1, skip_count) - 1) * 2, start)
+    return len(range(start, stop, 2))
+
+
+def _resolve_existing_profile_path(
+    value: str,
+    *,
+    profile_path: Optional[Path],
+    ctx: str,
+) -> Path:
+    candidate = Path(value)
+    candidates: List[Path] = []
+    if candidate.is_absolute():
+        candidates.append(candidate)
+    else:
+        candidates.append(Path.cwd() / candidate)
+        if profile_path is not None:
+            profile_candidate = profile_path.parent / candidate
+            if profile_candidate not in candidates:
+                candidates.append(profile_candidate)
+    tried = []
+    for path_candidate in candidates:
+        tried.append(str(path_candidate))
+        if path_candidate.exists():
+            return path_candidate.resolve()
+    raise ProfileError(
+        "{}: could not resolve path {!r}; tried {}".format(
+            ctx,
+            value,
+            ", ".join(tried),
+        )
+    )
+
+
+@lru_cache(maxsize=None)
+def _load_elf_function_symbols(elf_path: str) -> List[Tuple[str, int, Optional[int]]]:
+    if ELFFile is None:
+        raise ProfileError(
+            "instruction_skip_config symbol resolution requires pyelftools. "
+            "Install it with: pip install -r requirements.txt"
+        )
+    elf_file_path = Path(elf_path)
+    try:
+        with elf_file_path.open("rb") as handle:
+            elf = ELFFile(handle)
+            symtab = elf.get_section_by_name(".symtab")
+            if symtab is None:
+                raise ProfileError(
+                    "bootloader ELF '{}' has no .symtab; symbol-based "
+                    "instruction_skip targets require function symbols".format(elf_file_path)
+                )
+            raw_symbols: List[Tuple[str, int, int]] = []
+            for symbol in symtab.iter_symbols():
+                if not symbol.name or symbol["st_info"]["type"] != "STT_FUNC":
+                    continue
+                if symbol["st_shndx"] == "SHN_UNDEF":
+                    continue
+                # Clear the Thumb-state bit so address ranges stay halfword-aligned.
+                start = int(symbol["st_value"]) & ~1
+                size = int(symbol["st_size"])
+                raw_symbols.append((symbol.name, start, size))
+    except ProfileError:
+        raise
+    except Exception as exc:
+        raise ProfileError(
+            "failed to read function symbols from '{}': {}".format(elf_file_path, exc)
+        ) from exc
+
+    raw_symbols.sort(key=lambda item: (item[1], item[0]))
+    resolved_symbols: List[Tuple[str, int, Optional[int]]] = []
+    for idx, (name, start, size) in enumerate(raw_symbols):
+        end: Optional[int] = None
+        if size > 0:
+            end = start + size
+        else:
+            for _, next_start, _ in raw_symbols[idx + 1:]:
+                if next_start > start:
+                    end = next_start
+                    break
+        resolved_symbols.append((name, start, end))
+    return resolved_symbols
+
+
+def _resolve_instruction_skip_symbol_targets(
+    symbol_query: str,
+    *,
+    bootloader_elf: Optional[str],
+    profile_path: Optional[Path],
+    skip_count: int,
+    ctx: str,
+) -> List[Tuple[int, int]]:
+    if not bootloader_elf:
+        raise ProfileError(
+            "{}: symbol resolution requires bootloader.elf".format(ctx)
+        )
+    elf_path = _resolve_existing_profile_path(
+        bootloader_elf,
+        profile_path=profile_path,
+        ctx="bootloader.elf",
+    )
+    functions = _load_elf_function_symbols(str(elf_path))
+    available_symbols = sorted({name for name, _, _ in functions})
+    matches = [
+        (name, start, end)
+        for name, start, end in functions
+        if symbol_query in name
+    ]
+    if not matches:
+        raise ProfileError(
+            "{}: no function symbols matching {!r} in {}. "
+            "Available function symbols: {}".format(
+                ctx,
+                symbol_query,
+                elf_path,
+                ", ".join(available_symbols),
+            )
+        )
+
+    resolved_ranges: List[Tuple[int, int]] = []
+    seen_ranges: set[Tuple[int, int]] = set()
+    unresolved_symbols: List[str] = []
+    for name, start, end in matches:
+        if end is None or end <= start:
+            unresolved_symbols.append(name)
+            continue
+        if (start, end) not in seen_ranges:
+            seen_ranges.add((start, end))
+            resolved_ranges.append((start, end))
+        print(
+            "Resolved {!r} -> {} [0x{:x}, 0x{:x}) ({} bytes, {} fault points)".format(
+                symbol_query,
+                name,
+                start,
+                end,
+                end - start,
+                _count_instruction_skip_fault_points(start, end, skip_count),
+            ),
+            file=sys.stderr,
+        )
+    if unresolved_symbols:
+        raise ProfileError(
+            "{}: matched function symbols without a resolvable end address in {}: {}".format(
+                ctx,
+                elf_path,
+                ", ".join(unresolved_symbols),
+            )
+        )
+    return resolved_ranges
+
+
 def _parse_instruction_skip_config(
     raw: Optional[Dict[str, Any]],
+    *,
+    bootloader_elf: Optional[str] = None,
+    profile_path: Optional[Path] = None,
 ) -> Optional[InstructionSkipConfig]:
     """Parse instruction_skip_config from fault_sweep YAML block."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise ProfileError("instruction_skip_config: expected mapping")
+    skip_count = int(raw.get("skip_count", 1))
+    if skip_count < 1:
+        raise ProfileError(
+            "instruction_skip_config.skip_count: expected integer >= 1"
+        )
     target_addresses_raw = raw.get("target_addresses", [])
     if not isinstance(target_addresses_raw, list):
         raise ProfileError("instruction_skip_config.target_addresses: expected list")
@@ -2274,15 +2445,31 @@ def _parse_instruction_skip_config(
     for i, region in enumerate(target_addresses_raw):
         ctx = "instruction_skip_config.target_addresses[{}]".format(i)
         if not isinstance(region, dict):
-            raise ProfileError("{}: expected mapping with start/end".format(ctx))
+            raise ProfileError("{}: expected mapping with start/end or symbol".format(ctx))
+        has_symbol = "symbol" in region
+        has_start = "start" in region
+        has_end = "end" in region
+        if has_symbol:
+            if has_start or has_end:
+                raise ProfileError(
+                    "{}: use either symbol or start/end, not both".format(ctx)
+                )
+            symbol_query = str(_require(region, "symbol", ctx)).strip()
+            if not symbol_query:
+                raise ProfileError("{}.symbol: expected non-empty string".format(ctx))
+            target_addresses.extend(
+                _resolve_instruction_skip_symbol_targets(
+                    symbol_query,
+                    bootloader_elf=bootloader_elf,
+                    profile_path=profile_path,
+                    skip_count=skip_count,
+                    ctx="{}.symbol".format(ctx),
+                )
+            )
+            continue
         start = _parse_int(_require(region, "start", ctx), "{}.start".format(ctx))
         end = _parse_int(_require(region, "end", ctx), "{}.end".format(ctx))
         target_addresses.append((start, end))
-    skip_count = int(raw.get("skip_count", 1))
-    if skip_count < 1:
-        raise ProfileError(
-            "instruction_skip_config.skip_count: expected integer >= 1"
-        )
     return InstructionSkipConfig(
         target_addresses=target_addresses,
         skip_count=skip_count,
@@ -2973,7 +3160,12 @@ def _parse_initial_states(raw: Optional[List[Any]]) -> List[InitialStateConfig]:
     return states
 
 
-def _parse_component(raw: Dict[str, Any], idx: int) -> ComponentConfig:
+def _parse_component(
+    raw: Dict[str, Any],
+    idx: int,
+    *,
+    profile_path: Optional[Path] = None,
+) -> ComponentConfig:
     """Parse a single component definition from the components list."""
     ctx = "components[{}]".format(idx)
     name = str(_require(raw, "name", ctx)).strip()
@@ -3010,7 +3202,15 @@ def _parse_component(raw: Dict[str, Any], idx: int) -> ComponentConfig:
             extra_peripherals = [str(extra_peripherals_raw)]
 
     success_criteria = _parse_success_criteria(raw.get("success_criteria"))
-    fault_sweep = _parse_fault_sweep(raw.get("fault_sweep")) if "fault_sweep" in raw else None
+    fault_sweep = (
+        _parse_fault_sweep(
+            raw.get("fault_sweep"),
+            bootloader_elf=bootloader_elf,
+            profile_path=profile_path,
+        )
+        if "fault_sweep" in raw
+        else None
+    )
 
     flash_backend_raw = raw.get("flash_backend")
     flash_backend: Optional[str] = str(flash_backend_raw) if flash_backend_raw is not None else None
@@ -3031,7 +3231,11 @@ def _parse_component(raw: Dict[str, Any], idx: int) -> ComponentConfig:
     )
 
 
-def _parse_components(raw: Optional[Any]) -> Optional[MultiComponentConfig]:
+def _parse_components(
+    raw: Optional[Any],
+    *,
+    profile_path: Optional[Path] = None,
+) -> Optional[MultiComponentConfig]:
     """Parse the components list from a multi-component profile."""
     if raw is None:
         return None
@@ -3051,7 +3255,7 @@ def _parse_components(raw: Optional[Any]) -> Optional[MultiComponentConfig]:
     for idx, entry in enumerate(components_raw):
         if not isinstance(entry, dict):
             raise ProfileError("multi_component.components[{}]: expected mapping".format(idx))
-        comp = _parse_component(entry, idx)
+        comp = _parse_component(entry, idx, profile_path=profile_path)
         if comp.name in seen_names:
             raise ProfileError(
                 "multi_component.components: duplicate name '{}'".format(comp.name)
@@ -3279,7 +3483,11 @@ def load_profile(path: str | Path) -> ProfileConfig:
     success_criteria_overrides = _parse_success_criteria_overrides(
         data.get("success_criteria_overrides")
     )
-    fault_sweep = _parse_fault_sweep(data.get("fault_sweep"))
+    fault_sweep = _parse_fault_sweep(
+        data.get("fault_sweep"),
+        bootloader_elf=bootloader_elf,
+        profile_path=path,
+    )
     update_sequence = _parse_update_sequence(
         data.get("update_sequence"),
         images=images,
@@ -3305,7 +3513,10 @@ def load_profile(path: str | Path) -> ProfileConfig:
     metadata_fault_regions = _parse_metadata_fault_regions(
         data.get("metadata_fault_regions"), slots=memory.slots
     )
-    multi_component = _parse_components(data.get("multi_component"))
+    multi_component = _parse_components(
+        data.get("multi_component"),
+        profile_path=path,
+    )
     nvs_region = _parse_nvs_region(data.get("nvs_region"))
     bootloader_region = _parse_bootloader_region(data.get("bootloader_region"))
     boot_register_pre_writes = _parse_boot_register_pre_writes_list(
@@ -3456,6 +3667,7 @@ def main() -> int:
         "phase2_fault_enabled": profile.fault_sweep.phase2_fault.enabled,
         "phase2_fault_max_points": profile.fault_sweep.phase2_fault.max_points,
         "phase2_fault_types": profile.fault_sweep.phase2_fault.fault_types,
+        "sweep_hash_bypass_symbols": profile.fault_sweep.sweep_hash_bypass_symbols,
         "hook_fault_enabled": profile.fault_sweep.hook_fault.enabled,
         "hook_fault_max_points": profile.fault_sweep.hook_fault.max_points,
         "hook_fault_types": profile.fault_sweep.hook_fault.fault_types,

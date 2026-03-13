@@ -289,12 +289,17 @@ fault_sweep:
   fault_types: [power_loss, instruction_skip]
   instruction_skip_config:
     target_addresses:
+      - { symbol: Reset }
       - { start: 0x00000100, end: 0x00000400 }
       - { start: 0x00001000, end: 0x00001200 }
     skip_count: 1
 ```
 
-`target_addresses` lists address ranges to scan. Every halfword-aligned address in each range becomes a fault point. `start` must be halfword-aligned (Thumb instruction boundary). `skip_count` controls how many consecutive 16-bit halfwords to NOP (default 1). Set it to 2 to model skipping a 32-bit Thumb-2 instruction.
+Each `target_addresses` entry may be either an explicit `{ start, end }` range or a `{ symbol }` query. `symbol` uses substring matching against `STT_FUNC` names in the bootloader ELF `.symtab`, so `{ symbol: Validate }` matches every function whose name contains `Validate`. Mixed lists are supported.
+
+When a symbol matches multiple functions, tardigrade includes every matching range and logs the resolved addresses at profile-load time. If a query matches nothing, profile loading fails with a clear error that lists the available function symbols. For `STT_FUNC` entries with `st_size: 0`, tardigrade infers the end address from the next function symbol.
+
+`target_addresses` ultimately resolves to address ranges to scan. Every halfword-aligned address in each range becomes a fault point. `start` must be halfword-aligned (Thumb instruction boundary). `skip_count` controls how many consecutive 16-bit halfwords to NOP (default 1). Set it to 2 to model skipping a 32-bit Thumb-2 instruction.
 
 Instruction-skip fault points are always run in execute mode (full CPU boot) -- trace replay is not applicable since the fault is CPU-level, not NVM-level.
 
@@ -310,10 +315,10 @@ If your bootloader validates image hashes (SHA-256, CRC), the Phase 2 recovery b
 
 ```yaml
 fault_sweep:
-  hash_bypass_symbols: ["bootutil_img_validate"]
+  sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 ```
 
-Patches the named function to return 0 immediately. Add `--no-hash-bypass` on the CLI for hyper-realistic mode.
+Patches the named function to return 0 immediately, but only for faulted sweep runs. Control boots, calibration, and `partial_staging` keep normal validation behavior. Add `--no-hash-bypass` on the CLI to disable the optimization entirely.
 
 ### Heuristic tuning
 
@@ -613,6 +618,8 @@ fault_sweep:
   partial_staging:
     enabled: true
 ```
+
+`partial_staging` always runs with normal image validation behavior. Even if the profile sets `sweep_hash_bypass_symbols`, those bypass patches apply only to faulted runtime sweep points, not to partial-staging checks.
 
 ### NVS region
 
@@ -970,7 +977,7 @@ Before submitting a profile:
 | Profile                                          | What it demonstrates                                            |
 | ------------------------------------------------ | --------------------------------------------------------------- |
 | `profiles/fault_no_crc.yaml`                     | Minimal vulnerable-OTA profile                                  |
-| `profiles/mcuboot_head_upgrade.yaml`             | MCUboot upgrade with image hash, update trigger, hash bypass    |
+| `profiles/mcuboot_head_upgrade.yaml`             | MCUboot upgrade with image hash, update trigger, sweep-only hash bypass |
 | `profiles/mcuboot_pr2100_broken_discovery.yaml`  | Differential testing (known bug, broken commit)                 |
 | `profiles/nuttx_nxboot_128.yaml`                 | State probe, semantic assertions, custom invariants, multi-boot |
 | `profiles/esp_idf_ota_upgrade_confirm_hook.yaml` | Boot-cycle hook for confirm-or-rollback                         |

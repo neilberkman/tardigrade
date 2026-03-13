@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import sys
+import tempfile
+import textwrap
 import unittest
 import warnings
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +28,7 @@ from profile_loader import (  # noqa: E402
     InstructionSkipConfig,
     ProfileError,
     _parse_instruction_skip_config,
+    load_profile,
 )
 
 
@@ -142,6 +147,104 @@ class ParseInstructionSkipConfigTest(unittest.TestCase):
     def test_invalid_skip_count_raises(self) -> None:
         with self.assertRaises(ProfileError):
             _parse_instruction_skip_config({"skip_count": -1})
+
+
+class InstructionSkipSymbolResolutionTest(unittest.TestCase):
+    EXAMPLE_ELF = ROOT / "examples" / "vulnerable_ota" / "firmware.elf"
+    ZERO_SIZE_ELF = (
+        ROOT / "results" / "oss_validation" / "assets" / "oss_mcuboot_mcuboot_swap_current_guard.elf"
+    )
+
+    def _write_profile(self, tempdir: Path, target_block: str) -> Path:
+        profile_path = tempdir / "profile.yaml"
+        profile_path.write_text(
+            textwrap.dedent(
+                f"""
+                schema_version: 1
+                name: instruction_skip_symbol_profile
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: {self.EXAMPLE_ELF}
+                  entry: 0x10000000
+                memory:
+                  sram: {{ start: 0x20000000, end: 0x20020000 }}
+                  write_granularity: 4
+                  slots:
+                    primary: {{ base: 0x10000000, size: 0x1000 }}
+                    staging: {{ base: 0x10001000, size: 0x1000 }}
+                fault_sweep:
+                  fault_types: [instruction_skip]
+                  evaluation_mode: execute
+                  instruction_skip_config:
+                    target_addresses:
+                {target_block}
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        return profile_path
+
+    def test_load_profile_resolves_single_symbol_target(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = self._write_profile(
+                Path(td),
+                "      - { symbol: Reset }",
+            )
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                profile = load_profile(profile_path)
+        self.assertEqual(
+            profile.fault_sweep.instruction_skip_config.target_addresses,
+            [(0x10000044, 0x100000F8)],
+        )
+        self.assertIn("Resolved 'Reset' -> Reset_Handler", stderr.getvalue())
+        self.assertIn("90 fault points", stderr.getvalue())
+
+    def test_symbol_target_resolves_multiple_matches(self) -> None:
+        cfg = _parse_instruction_skip_config(
+            {"target_addresses": [{"symbol": "Handler"}]},
+            bootloader_elf=str(self.EXAMPLE_ELF),
+        )
+        self.assertEqual(
+            cfg.target_addresses,
+            [(0x10000040, 0x10000042), (0x10000044, 0x100000F8)],
+        )
+
+    def test_symbol_target_no_match_lists_available_symbols(self) -> None:
+        with self.assertRaises(ProfileError) as ctx:
+            _parse_instruction_skip_config(
+                {"target_addresses": [{"symbol": "NoSuchFunction"}]},
+                bootloader_elf=str(self.EXAMPLE_ELF),
+            )
+        message = str(ctx.exception)
+        self.assertIn("Available function symbols:", message)
+        self.assertIn("Default_Handler", message)
+        self.assertIn("Reset_Handler", message)
+
+    def test_mixed_symbol_and_explicit_ranges_are_allowed(self) -> None:
+        cfg = _parse_instruction_skip_config(
+            {
+                "target_addresses": [
+                    {"symbol": "Default"},
+                    {"start": "0x2000", "end": "0x2008"},
+                ]
+            },
+            bootloader_elf=str(self.EXAMPLE_ELF),
+        )
+        self.assertEqual(
+            cfg.target_addresses,
+            [(0x10000040, 0x10000042), (0x2000, 0x2008)],
+        )
+
+    def test_zero_size_function_uses_next_function_start(self) -> None:
+        if not self.ZERO_SIZE_ELF.exists():
+            self.skipTest("zero-size ELF fixture not present")
+        cfg = _parse_instruction_skip_config(
+            {"target_addresses": [{"symbol": "arch_cpu_idle"}]},
+            bootloader_elf=str(self.ZERO_SIZE_ELF),
+        )
+        self.assertEqual(cfg.target_addresses, [(0x1F38, 0x1F54)])
 
 
 class FaultSweepConfigIntegrationTest(unittest.TestCase):

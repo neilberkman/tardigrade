@@ -120,7 +120,7 @@ jobs:
           "${RUNNER_TEMP}/renode/renode-test" --help >/dev/null
 
       - name: Install Python dependencies
-        run: python3 -m pip install --user pyyaml intelhex cbor2 click cryptography
+        run: python3 -m pip install --user -r requirements.txt intelhex cbor2 click cryptography
 
       - name: Run MCUboot current guard (must pass)
         run: |
