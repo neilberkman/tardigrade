@@ -765,11 +765,19 @@ class FaultSweepConfig:
 
 
 class StateFuzzerConfig:
-    __slots__ = ("enabled", "metadata_model")
+    __slots__ = ("enabled", "metadata_model", "iterations", "seed")
 
-    def __init__(self, enabled: bool = False, metadata_model: str = "ab_replica") -> None:
-        self.enabled = enabled
+    def __init__(
+        self,
+        enabled: bool = False,
+        metadata_model: Any = "ab_replica",
+        iterations: int = 100,
+        seed: int = 0,
+    ) -> None:
+        self.enabled = bool(enabled)
         self.metadata_model = metadata_model
+        self.iterations = max(1, int(iterations))
+        self.seed = int(seed)
 
 
 class SecurityPolicyConfig:
@@ -2847,12 +2855,151 @@ def _parse_fault_distribution(raw: Optional[Dict[str, Any]]) -> Optional[FaultDi
     )
 
 
+def _normalize_state_fuzzer_metadata_model(raw: Any) -> Any:
+    if raw is None:
+        return "ab_replica"
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            raise ProfileError("state_fuzzer.metadata_model: expected non-empty string or mapping")
+        return text
+    if not isinstance(raw, dict):
+        raise ProfileError("state_fuzzer.metadata_model: expected string or mapping")
+
+    base_address = _parse_int(
+        _require(raw, "base_address", "state_fuzzer.metadata_model"),
+        "state_fuzzer.metadata_model.base_address",
+    )
+    fields_raw = raw.get("fields")
+    if not isinstance(fields_raw, list) or not fields_raw:
+        raise ProfileError("state_fuzzer.metadata_model.fields: expected non-empty list")
+
+    normalized_fields: List[Dict[str, Any]] = []
+    crc_fields = 0
+    for i, entry in enumerate(fields_raw):
+        if not isinstance(entry, dict):
+            raise ProfileError(
+                "state_fuzzer.metadata_model.fields[{}]: expected mapping".format(i)
+            )
+        name = str(_require(entry, "name", "state_fuzzer.metadata_model.fields[{}]".format(i))).strip()
+        if not name:
+            raise ProfileError(
+                "state_fuzzer.metadata_model.fields[{}].name: expected non-empty string".format(i)
+            )
+        offset = _parse_int(
+            _require(entry, "offset", "state_fuzzer.metadata_model.fields[{}]".format(i)),
+            "state_fuzzer.metadata_model.fields[{}].offset".format(i),
+        )
+        size = _parse_int(
+            _require(entry, "size", "state_fuzzer.metadata_model.fields[{}]".format(i)),
+            "state_fuzzer.metadata_model.fields[{}].size".format(i),
+        )
+        if offset < 0:
+            raise ProfileError(
+                "state_fuzzer.metadata_model.fields[{}].offset: expected >= 0".format(i)
+            )
+        if size <= 0:
+            raise ProfileError(
+                "state_fuzzer.metadata_model.fields[{}].size: expected > 0".format(i)
+            )
+
+        normalized: Dict[str, Any] = {
+            "name": name,
+            "offset": offset,
+            "size": size,
+        }
+        if "type" in entry:
+            field_type = str(entry.get("type", "")).strip()
+            if not field_type:
+                raise ProfileError(
+                    "state_fuzzer.metadata_model.fields[{}].type: expected non-empty string".format(i)
+                )
+            normalized["type"] = field_type
+            if field_type == "computed_crc32":
+                crc_fields += 1
+        if "valid" in entry:
+            valid_raw = entry.get("valid")
+            if not isinstance(valid_raw, list) or not valid_raw:
+                raise ProfileError(
+                    "state_fuzzer.metadata_model.fields[{}].valid: expected non-empty list".format(i)
+                )
+            normalized["valid"] = [
+                _parse_int(v, "state_fuzzer.metadata_model.fields[{}].valid".format(i))
+                for v in valid_raw
+            ]
+        if "valid_range" in entry:
+            range_raw = entry.get("valid_range")
+            if not isinstance(range_raw, list) or len(range_raw) != 2:
+                raise ProfileError(
+                    "state_fuzzer.metadata_model.fields[{}].valid_range: expected [min, max]".format(i)
+                )
+            lo = _parse_int(
+                range_raw[0],
+                "state_fuzzer.metadata_model.fields[{}].valid_range[0]".format(i),
+            )
+            hi = _parse_int(
+                range_raw[1],
+                "state_fuzzer.metadata_model.fields[{}].valid_range[1]".format(i),
+            )
+            if hi < lo:
+                raise ProfileError(
+                    "state_fuzzer.metadata_model.fields[{}].valid_range: max must be >= min".format(i)
+                )
+            normalized["valid_range"] = [lo, hi]
+        normalized_fields.append(normalized)
+
+    # Check for overlapping fields.
+    sorted_fields = sorted(normalized_fields, key=lambda f: f["offset"])
+    for j in range(1, len(sorted_fields)):
+        prev = sorted_fields[j - 1]
+        curr = sorted_fields[j]
+        if curr["offset"] < prev["offset"] + prev["size"]:
+            raise ProfileError(
+                "state_fuzzer.metadata_model: fields '{}' and '{}' overlap".format(
+                    prev["name"], curr["name"]
+                )
+            )
+
+    if crc_fields > 1:
+        raise ProfileError("state_fuzzer.metadata_model: at most one computed_crc32 field is supported")
+    if crc_fields == 1:
+        model_size = max(
+            field["offset"] + field["size"] for field in normalized_fields
+        )
+        crc_field = next(
+            field for field in normalized_fields
+            if field.get("type") == "computed_crc32"
+        )
+        if crc_field["offset"] + crc_field["size"] != model_size:
+            raise ProfileError(
+                "state_fuzzer.metadata_model: computed_crc32 field must be the final field"
+            )
+
+    normalized_model: Dict[str, Any] = {
+        "base_address": base_address,
+        "fields": normalized_fields,
+    }
+    if "fill" in raw:
+        fill = _parse_int(raw.get("fill"), "state_fuzzer.metadata_model.fill")
+        if not 0 <= fill <= 0xFF:
+            raise ProfileError("state_fuzzer.metadata_model.fill: expected byte value 0..255")
+        normalized_model["fill"] = fill
+    return normalized_model
+
+
 def _parse_state_fuzzer(raw: Optional[Dict[str, Any]]) -> StateFuzzerConfig:
     if raw is None:
         return StateFuzzerConfig()
+    if not isinstance(raw, dict):
+        raise ProfileError("state_fuzzer: expected mapping")
+    iterations = _parse_int(raw.get("iterations", 100), "state_fuzzer.iterations")
+    if iterations <= 0:
+        raise ProfileError("state_fuzzer.iterations: expected integer > 0")
     return StateFuzzerConfig(
         enabled=bool(raw.get("enabled", False)),
-        metadata_model=str(raw.get("metadata_model", "ab_replica")),
+        metadata_model=_normalize_state_fuzzer_metadata_model(raw.get("metadata_model")),
+        iterations=iterations,
+        seed=_parse_int(raw.get("seed", 0), "state_fuzzer.seed"),
     )
 
 
@@ -3702,6 +3849,8 @@ def main() -> int:
         "hook_fault_max_points": profile.fault_sweep.hook_fault.max_points,
         "hook_fault_types": profile.fault_sweep.hook_fault.fault_types,
         "state_fuzzer_enabled": profile.state_fuzzer.enabled,
+        "state_fuzzer_iterations": profile.state_fuzzer.iterations,
+        "state_fuzzer_metadata_model": profile.state_fuzzer.metadata_model,
         "expect_should_find_issues": profile.expect.should_find_issues,
         "expect_control_outcome": profile.expect.control_outcome,
         "expect_allow_semantic_only_issues": profile.expect.allow_semantic_only_issues,

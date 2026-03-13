@@ -381,22 +381,22 @@ class TestFindCrashFiles:
         files = fcp.find_crash_files(tmp_path)
         assert files == []
 
-    def test_skips_symlinks(self, tmp_path):
-        """Symlinks in crash dir must be excluded to prevent traversal."""
+    def test_follows_symlinks(self, tmp_path):
+        """Symlinks in crash dir are followed (AFL uses symlinks in corpora)."""
         real_file = tmp_path / "crash-real"
         real_file.write_bytes(b"\xAA")
 
-        # Create a symlink that points to an arbitrary file outside the dir
-        target = tmp_path / "outside" / "secret.key"
+        # Create a symlink that points to a file outside the dir
+        target = tmp_path / "outside" / "crash-target"
         target.parent.mkdir()
-        target.write_text("sensitive data")
+        target.write_bytes(b"\xBB")
         link = tmp_path / "crash-link"
         link.symlink_to(target)
 
         files = fcp.find_crash_files(tmp_path)
         names = [f.name for f in files]
         assert "crash-real" in names
-        assert "crash-link" not in names
+        assert "crash-link" in names
 
 
 # ---------------------------------------------------------------------------

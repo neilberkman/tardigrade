@@ -878,7 +878,19 @@ Profiles can declare a `fuzz_corpus` directory containing fuzzer inputs to use a
 fuzz_corpus: corpus/crashes/
 ```
 
-This is an optional field. When set, the audit runner can iterate over all inputs in the directory and run each as a separate staging image, testing whether the bootloader correctly rejects every malformed input.
+This is an optional field for documenting the corpus associated with a profile. To run a crash corpus through the audit pipeline, use either:
+
+```bash
+python3 scripts/fuzz_corpus.py convert \
+  --crash-dir corpus/crashes/ \
+  --base-profile profiles/my_bootloader.yaml \
+  --output-dir profiles/regression/
+
+python3 scripts/audit_bootloader.py \
+  --profile profiles/my_bootloader.yaml \
+  --fuzz-crash-dir corpus/crashes/ \
+  --output results/fuzz_regression_audit.json
+```
 
 ### Legacy bridge
 

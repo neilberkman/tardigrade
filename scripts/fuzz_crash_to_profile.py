@@ -237,6 +237,7 @@ def derive_meta_base(template: Dict[str, Any], override: Optional[int]) -> int:
             slot_ends.append(b + s)
     if slot_ends:
         return max(slot_ends)
+    # Default metadata base when no slot geometry is available (512KB).
     return 0x00080000
 
 
@@ -350,7 +351,7 @@ def find_crash_files(crash_dir: Path) -> List[Path]:
     all_files: List[Path] = []
 
     for entry in sorted(crash_dir.iterdir()):
-        if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+        if not entry.is_file():
             continue
         all_files.append(entry)
         name = entry.name

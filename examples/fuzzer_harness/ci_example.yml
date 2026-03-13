@@ -1,0 +1,36 @@
+name: Fuzz To Regression
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  fuzz-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build harness
+        run: make -C examples/fuzzer_harness
+
+      - name: Run short fuzzing session
+        run: |
+          mkdir -p corpus crashes
+          ./examples/fuzzer_harness/fuzz_header_parser corpus/ \
+            -max_total_time=60 \
+            -artifact_prefix=crashes/
+
+      - name: Convert crashes
+        run: |
+          python3 scripts/fuzz_corpus.py convert \
+            --crash-dir crashes/ \
+            --base-profile profiles/esp_idf_ota_upgrade.yaml \
+            --output-dir profiles/regression/
+
+      - name: Audit converted crashes
+        run: |
+          python3 scripts/audit_bootloader.py \
+            --profile profiles/esp_idf_ota_upgrade.yaml \
+            --fuzz-crash-dir crashes/ \
+            --output results/fuzz_regression_audit.json \
+            --no-assert-verdict

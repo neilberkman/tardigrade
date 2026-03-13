@@ -20,10 +20,12 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import json
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -46,12 +48,21 @@ from audit_report import (
     summarize_runtime_sweep,
 )
 from result_checks import annotate_result_checks
+from state_fuzz import (
+    derive_default_metadata_base,
+    extract_state_fuzz_result,
+    generate_state_scenarios,
+    resolve_metadata_model,
+    summarize_state_campaign,
+)
+from fuzz_corpus import convert_corpus
 from renode_runner import (
     CalibrationResult,
     _progress,
     ensure_tool,
     parse_robot_vars,
     run_calibration,
+    run_single_point,
 )
 from fault_plan import CalibrationInputs, FaultPlan, build_fault_plan
 from sweep import (
@@ -63,7 +74,7 @@ from sweep import (
     run_runtime_sweep,
     validate_runtime_fault_mode_compat,
 )
-from profile_loader import HeuristicConfig, ProfileConfig, load_profile
+from profile_loader import HeuristicConfig, PreBootWrite, ProfileConfig, load_profile, load_profile_raw
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RENODE_TEST = os.environ.get("RENODE_TEST", "renode-test")
@@ -168,7 +179,249 @@ def parse_args() -> argparse.Namespace:
             "multi-fault sweep."
         ),
     )
+    parser.add_argument(
+        "--fuzz-crash-dir",
+        default="",
+        help=(
+            "Directory of fuzzer crash inputs to auto-convert into regression "
+            "profiles and audit alongside the main profile."
+        ),
+    )
     return parser.parse_args()
+
+
+def _cleanup_generated_robot_files(robot_vars: List[str]) -> None:
+    for prefix in ("PRE_BOOT_STATE_BIN:", "UPDATE_SEQUENCE_FILE:"):
+        for entry in robot_vars:
+            if not entry.startswith(prefix):
+                continue
+            path = entry.split(":", 1)[1]
+            if path:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+
+def _common_robot_vars(
+    profile: ProfileConfig,
+    repo_root: Path,
+    *,
+    evaluation_mode: str,
+    stall_timeout: float,
+    extra_robot_vars: List[str],
+) -> List[str]:
+    robot_vars = profile.robot_vars(repo_root) + list(extra_robot_vars)
+    robot_vars.append("EVALUATION_MODE:{}".format(evaluation_mode))
+    robot_vars.append("PROGRESS_STALL_TIMEOUT_S:{:.6f}".format(stall_timeout))
+    robot_vars.append(
+        "EXPECT_CONTROL_OUTCOME:{}".format(profile.expect.control_outcome)
+    )
+    return robot_vars
+
+
+def run_state_fuzz_campaign(
+    profile: ProfileConfig,
+    *,
+    repo_root: Path,
+    renode_test: str,
+    robot_suite: str,
+    work_dir: Path,
+    renode_remote_server_dir: str,
+    evaluation_mode: str,
+    stall_timeout: float,
+    extra_robot_vars: List[str],
+    keep_run_artifacts: bool,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    default_base = derive_default_metadata_base(profile.memory.slots)
+    model = resolve_metadata_model(profile.state_fuzzer.metadata_model, default_base)
+    scenarios = generate_state_scenarios(
+        model,
+        iterations=profile.state_fuzzer.iterations,
+        seed=profile.state_fuzzer.seed,
+    )
+    results: List[Dict[str, Any]] = []
+    state_fuzz_dir = work_dir / "state_fuzz"
+    state_fuzz_dir.mkdir(parents=True, exist_ok=True)
+
+    _progress(
+        "State fuzzer: {} scenarios from {} model".format(
+            len(scenarios),
+            "legacy" if isinstance(profile.state_fuzzer.metadata_model, str) else "structured",
+        )
+    )
+
+    for scenario in scenarios:
+        scenario_profile = copy.deepcopy(profile)
+        scenario_profile.name = "{}_statefuzz_{:03d}".format(
+            profile.name,
+            int(scenario["index"]),
+        )
+        scenario_profile.pre_boot_state = list(profile.pre_boot_state) + [
+            PreBootWrite(address=addr, u32=value)
+            for addr, value in scenario["pre_boot_state"]
+        ]
+        robot_vars = _common_robot_vars(
+            scenario_profile,
+            repo_root,
+            evaluation_mode=evaluation_mode,
+            stall_timeout=stall_timeout,
+            extra_robot_vars=extra_robot_vars,
+        )
+        try:
+            data = run_single_point(
+                repo_root=repo_root,
+                renode_test=renode_test,
+                robot_suite=robot_suite,
+                profile=scenario_profile,
+                fault_at=0,
+                robot_vars=robot_vars,
+                work_dir=state_fuzz_dir,
+                renode_remote_server_dir=renode_remote_server_dir,
+                is_control=True,
+                keep_run_artifacts=keep_run_artifacts,
+            )
+        finally:
+            _cleanup_generated_robot_files(robot_vars)
+        data["is_control"] = True
+        annotate_result_checks([data], scenario_profile)
+        results.append(
+            extract_state_fuzz_result(
+                scenario=scenario,
+                result=data,
+                expected_outcome=profile.expect.control_outcome,
+            )
+        )
+
+    return (
+        results,
+        summarize_state_campaign(
+            results,
+            expected_outcome=profile.expect.control_outcome,
+            metadata_model=profile.state_fuzzer.metadata_model,
+            iterations=profile.state_fuzzer.iterations,
+        ),
+    )
+
+
+def _build_fuzz_audit_command(
+    script_path: Path,
+    generated_profile_path: Path,
+    output_path: Path,
+    args: argparse.Namespace,
+) -> List[str]:
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--profile",
+        str(generated_profile_path),
+        "--output",
+        str(output_path),
+        "--evaluation-mode",
+        args.evaluation_mode,
+        "--renode-test",
+        args.renode_test,
+        "--robot-suite",
+        args.robot_suite,
+        "--fault-step",
+        str(args.fault_step),
+        "--workers",
+        str(args.workers),
+        "--max-batch-points",
+        str(args.max_batch_points),
+        "--progress-stall-timeout-s",
+        str(args.progress_stall_timeout_s),
+        "--no-assert-verdict",
+        "--no-assert-control-boots",
+    ]
+    if args.quick:
+        cmd.append("--quick")
+    if args.keep_run_artifacts:
+        cmd.append("--keep-run-artifacts")
+    if args.no_trace_replay:
+        cmd.append("--no-trace-replay")
+    if args.no_hash_bypass:
+        cmd.append("--no-hash-bypass")
+    if args.renode_remote_server_dir:
+        cmd.extend(["--renode-remote-server-dir", args.renode_remote_server_dir])
+    if args.fault_start is not None:
+        cmd.extend(["--fault-start", str(args.fault_start)])
+    if args.fault_end is not None:
+        cmd.extend(["--fault-end", str(args.fault_end)])
+    for robot_var in args.robot_var:
+        cmd.extend(["--robot-var", robot_var])
+    return cmd
+
+
+def run_fuzz_crash_campaign(
+    profile: ProfileConfig,
+    *,
+    repo_root: Path,
+    args: argparse.Namespace,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    if profile.profile_path is None:
+        raise RuntimeError("--fuzz-crash-dir requires a profile loaded from disk")
+    crash_dir = Path(args.fuzz_crash_dir)
+    if not crash_dir.is_dir():
+        raise RuntimeError("fuzz crash dir does not exist: {}".format(crash_dir))
+
+    with tempfile.TemporaryDirectory(prefix="fuzz_crash_regressions_") as td:
+        output_dir = Path(td)
+        convert_summary = convert_corpus(
+            crash_dir=crash_dir,
+            base_profile=Path(profile.profile_path),
+            output_dir=output_dir,
+            skip_existing=False,
+        )
+        results: List[Dict[str, Any]] = []
+        for generated in convert_summary["generated"]:
+            generated_profile_path = Path(generated["profile_path"])
+            audit_output_path = output_dir / "{}.json".format(generated_profile_path.stem)
+            cmd = _build_fuzz_audit_command(
+                Path(__file__),
+                generated_profile_path,
+                audit_output_path,
+                args,
+            )
+            proc = subprocess.run(
+                cmd,
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if audit_output_path.exists():
+                audit_payload = json.loads(
+                    audit_output_path.read_text(encoding="utf-8")
+                )
+            else:
+                audit_payload = {}
+            security_finding = bool(
+                audit_payload.get("expect", {}).get("should_find_issues")
+                and str(audit_payload.get("verdict", "")).startswith("PASS")
+            )
+            result_entry: Dict[str, Any] = {
+                "crash_file": generated["crash_file"],
+                "sha256": generated["sha256"],
+                "generated_profile": generated_profile_path.name,
+                "returncode": proc.returncode,
+                "verdict": audit_payload.get("verdict"),
+                "security_finding": security_finding,
+            }
+            if audit_payload:
+                result_entry["summary"] = audit_payload.get("summary", {})
+            if proc.returncode != 0 and not audit_payload:
+                result_entry["error"] = proc.stderr.strip() or proc.stdout.strip()
+            results.append(result_entry)
+
+    summary = {
+        "status": "completed",
+        "crash_dir": str(crash_dir),
+        "generated_profiles": int(convert_summary.get("generated_count", 0)),
+        "security_findings": sum(1 for entry in results if entry.get("security_finding")),
+        "results": len(results),
+    }
+    return results, summary
 
 
 
@@ -203,7 +456,8 @@ def main() -> int:
         renode_test = ensure_tool(args.renode_test)
 
         # Build robot vars from profile + CLI extras.
-        robot_vars = profile.robot_vars(repo_root) + parse_robot_vars(args.robot_var)
+        extra_robot_vars = parse_robot_vars(args.robot_var)
+        robot_vars = profile.robot_vars(repo_root) + extra_robot_vars
         robot_vars.append("EVALUATION_MODE:{}".format(eval_mode))
         # Stall timeout: CLI overrides profile, profile overrides default.
         stall_timeout = args.progress_stall_timeout_s
@@ -546,18 +800,26 @@ def main() -> int:
         state_fuzz_summary: Optional[Dict[str, Any]] = None
 
         if profile.state_fuzzer.enabled:
-            _progress("WARNING: state_fuzzer is enabled but not yet implemented — skipping")
-            # State fuzzer runs via audit.robot / run_state_fuzz_point.resc
-            # using a future scenario generator plugin.
-            # This is the opt-in plugin path. For now, mark as placeholder.
-            state_fuzz_results = []
-            state_fuzz_summary = {"status": "not_yet_wired", "metadata_model": profile.state_fuzzer.metadata_model}
+            state_fuzz_results, state_fuzz_summary = run_state_fuzz_campaign(
+                profile,
+                repo_root=repo_root,
+                renode_test=renode_test,
+                robot_suite=robot_suite,
+                work_dir=work_dir,
+                renode_remote_server_dir=args.renode_remote_server_dir,
+                evaluation_mode=eval_mode,
+                stall_timeout=stall_timeout,
+                extra_robot_vars=extra_robot_vars,
+                keep_run_artifacts=args.keep_run_artifacts,
+            )
 
         # -------------------------------------------------------------------
         # Partial staging sweep (opt-in)
         # -------------------------------------------------------------------
         partial_staging_results: Optional[List[Dict[str, Any]]] = None
         partial_staging_summary: Optional[Dict[str, Any]] = None
+        fuzz_crash_results: Optional[List[Dict[str, Any]]] = None
+        fuzz_crash_summary: Optional[Dict[str, Any]] = None
 
         ps_raw = profile.fault_sweep.partial_staging
         if ps_raw is not None:
@@ -629,6 +891,16 @@ def main() -> int:
                             ),
                         )
                     )
+
+        # -------------------------------------------------------------------
+        # Fuzzer crash regression campaign (opt-in)
+        # -------------------------------------------------------------------
+        if args.fuzz_crash_dir:
+            fuzz_crash_results, fuzz_crash_summary = run_fuzz_crash_campaign(
+                profile,
+                repo_root=repo_root,
+                args=args,
+            )
 
         # -------------------------------------------------------------------
         # Verdict
@@ -744,6 +1016,10 @@ def main() -> int:
             payload["partial_staging_results"] = partial_staging_results
         if partial_staging_summary is not None:
             payload["summary"]["partial_staging"] = partial_staging_summary
+        if fuzz_crash_results is not None:
+            payload["fuzz_crash_results"] = fuzz_crash_results
+        if fuzz_crash_summary is not None:
+            payload["summary"]["fuzz_crash"] = fuzz_crash_summary
 
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
