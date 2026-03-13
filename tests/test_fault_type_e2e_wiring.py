@@ -186,12 +186,61 @@ class TestRegistrationConsistency(unittest.TestCase):
 
 
 # ====================================================================
-# 2. Cross-module constant synchronization
+# 2. Planner imports canonical constants (no duplicate definitions)
 # ====================================================================
-# audit_bootloader.py now imports EXECUTE_ONLY_FAULT_TYPES and
-# FAULT_TYPE_NAME_TO_CODE directly from fault_types.py, so there are
-# no duplicate copies to drift.  The sync tests that were here have
-# been removed as they became tautological after the extraction.
+
+
+class TestPlannerImportsCanonical(unittest.TestCase):
+    """Verify fault_plan.py imports wire codes from fault_types.py.
+
+    After the planner extraction, fault_plan.py must use the canonical
+    FAULT_TYPE_NAME_TO_CODE from fault_types.py rather than defining its
+    own copy.  This prevents the constants from drifting apart.
+    """
+
+    def _read_source(self, name: str) -> str:
+        p = ROOT / "scripts" / name
+        self.assertTrue(p.exists(), "{} not found".format(p))
+        return p.read_text(encoding="utf-8")
+
+    def test_fault_plan_imports_wire_codes(self):
+        """fault_plan.py must import FAULT_TYPE_NAME_TO_CODE from fault_types."""
+        src = self._read_source("fault_plan.py")
+        self.assertIn(
+            "from fault_types import",
+            src,
+            "fault_plan.py does not import from fault_types module",
+        )
+        self.assertIn(
+            "FAULT_TYPE_NAME_TO_CODE",
+            src,
+            "fault_plan.py does not reference FAULT_TYPE_NAME_TO_CODE",
+        )
+
+    def test_fault_plan_does_not_redefine_wire_codes(self):
+        """fault_plan.py must not redefine FAULT_TYPE_NAME_TO_CODE locally."""
+        src = self._read_source("fault_plan.py")
+        self.assertNotIn(
+            "FAULT_TYPE_NAME_TO_CODE = {",
+            src,
+            "fault_plan.py redefines FAULT_TYPE_NAME_TO_CODE instead of "
+            "importing it from fault_types.py",
+        )
+
+    def test_audit_bootloader_imports_from_fault_plan(self):
+        """audit_bootloader.py must import from fault_plan, not duplicate it."""
+        src = self._read_source("audit_bootloader.py")
+        self.assertIn(
+            "from fault_plan import",
+            src,
+            "audit_bootloader.py does not import from fault_plan module",
+        )
+        self.assertNotIn(
+            "FAULT_TYPE_NAME_TO_CODE = {",
+            src,
+            "audit_bootloader.py redefines FAULT_TYPE_NAME_TO_CODE instead of "
+            "importing it from fault_types.py",
+        )
 
 
 # ====================================================================
@@ -330,10 +379,10 @@ class TestRuntimeDispatchCoverage(unittest.TestCase):
 class TestPlannerReachability(unittest.TestCase):
     """Verify that each wire-coded fault type has a planner code path.
 
-    We inspect the audit_bootloader.py source for the ``include_*``
-    boolean pattern and the point-generation block that emits combined
-    entries for each type.  This catches the "added to the registry but
-    the planner never generates points" class of bug.
+    We inspect fault_plan.py (the extracted planner module) for the
+    ``include_*`` boolean pattern and the point-generation block that
+    emits combined entries for each type.  This catches the "added to
+    the registry but the planner never generates points" class of bug.
     """
 
     # Fault types whose planner path is through a sub-config object
@@ -364,12 +413,9 @@ class TestPlannerReachability(unittest.TestCase):
     OTP_TYPES = set(OTP_FAULT_TYPE_CODES.keys())
 
     def _read_planner_source(self) -> str:
-        parts = []
-        for name in ("audit_bootloader.py", "fault_plan.py"):
-            p = ROOT / "scripts" / name
-            if p.exists():
-                parts.append(p.read_text(encoding="utf-8"))
-        return "\n".join(parts)
+        p = ROOT / "scripts" / "fault_plan.py"
+        self.assertTrue(p.exists(), "fault_plan.py not found at {}".format(p))
+        return p.read_text(encoding="utf-8")
 
     def test_standard_types_have_planner_generation(self):
         """Each standard fault type must have point-generation code."""
@@ -411,7 +457,7 @@ class TestPlannerReachability(unittest.TestCase):
             self.assertTrue(
                 has_planner_path,
                 "Fault type '{}' (code='{}') has no visible planner path in "
-                "audit_bootloader.py. Either add point generation or add it "
+                "fault_plan.py. Either add point generation or add it "
                 "to an exemption set with rationale.".format(name, code),
             )
 
@@ -443,7 +489,7 @@ class TestPlannerReachability(unittest.TestCase):
 
     def test_all_dispatch_prefixes_present(self):
         """All compound-dispatch prefixes must exist in _dispatch_fault_point."""
-        expected_prefixes = ["m:", "h:", "p2:", "mf:", "i:", "c:", "b:"]
+        expected_prefixes = ["m:", "h:", "p2:", "mf:", "i:", "c:", "b:", "nv:"]
         for prefix in expected_prefixes:
             self.assertIn(
                 "ft.startswith('{}')".format(prefix),
