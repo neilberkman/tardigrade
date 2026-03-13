@@ -963,6 +963,9 @@ class _FaultInjectingHookBus(object):
             return
         self.fired = True
         self.fault_address = addr
+        if self._fault_type == 'k':
+            # command_drop: silently discard the write, let hook continue
+            return
         if self._fault_type == 'b':
             writer(addr, self._mutate_u32(value))
         raise _HookFaultStop()

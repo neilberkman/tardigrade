@@ -186,6 +186,7 @@ def build_fault_plan(
         or profile.fault_sweep.phase2_fault.enabled
         or profile.fault_sweep.multi_fault.enabled
         or include_metadata_fault
+        or profile.fault_sweep.hook_fault.enabled
     )
     clustered_bit_count = 0
     if has_mixed_types:
