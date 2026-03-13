@@ -1,0 +1,60 @@
+schema_version: 1
+name: nxboot_style_multi_cycle_bit_corruption
+description: >
+  Multi-cycle OTA stress with bit-corruption during second update.
+  Phase 1 (clean): v1 -> v2 upgrade + confirm. Phase 2 (faulted):
+  v2 -> v3 upgrade with single-bit flip during copy. Tests whether
+  nxboot's CRC validation catches bit-corrupted partial copies and
+  reverts to the confirmed v2 image.
+platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
+bootloader:
+  elf: examples/nxboot_style/bootloader_nxboot_none.elf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x10002000, size: 0x23000 }
+    staging: { base: 0x10025000, size: 0x23000 }
+images:
+  exec: examples/nxboot_style/nxboot_primary.bin
+success_criteria:
+  vtor_in_slot: exec
+  vector_table_offset: 0x200
+  image_hash: true
+  image_hash_slot: exec
+  expected_image: staging
+fault_sweep:
+  mode: runtime
+  run_duration: "0.5"
+  max_writes: 2048
+  fault_types: [bit_corruption]
+update_sequence:
+  - name: initial_upgrade_and_confirm
+    description: "v1 -> v2 upgrade, then confirm"
+    images:
+      staging: examples/nxboot_style/nxboot_update.bin
+    success_criteria:
+      vtor_in_slot: exec
+      vector_table_offset: 0x200
+      image_hash: true
+      image_hash_slot: exec
+      expected_image: staging
+    boot_cycles: 2
+    boot_cycle_hook: examples/nxboot_style/hooks/confirm_nxboot.py
+    fault_injection: false
+
+  - name: second_upgrade_faulted
+    description: "v2 -> v3 upgrade with bit-corruption during copy"
+    images:
+      staging: examples/nxboot_style/nxboot_v3.bin
+    success_criteria:
+      vtor_in_slot: exec
+      vector_table_offset: 0x200
+    boot_cycles: 3
+    fault_injection: true
+    fault_types: [bit_corruption]
+
+expect:
+  should_find_issues: false
