@@ -646,6 +646,10 @@ def validate_runtime_fault_mode_compat(profile: "ProfileConfig", eval_mode: str)
     """Fail fast on profile/mode combinations the runtime runner cannot support."""
     if str(getattr(profile.fault_sweep, "mode", "runtime")) != "runtime":
         return
+    if getattr(profile, "has_update_sequence", False) and str(eval_mode) != "execute":
+        raise RuntimeError(
+            "update_sequence profiles currently require evaluation_mode 'execute'."
+        )
     if str(eval_mode) != "state":
         return
 
