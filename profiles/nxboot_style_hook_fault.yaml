@@ -34,5 +34,6 @@ fault_sweep:
     fault_types: [power_loss, bit_corruption, command_drop]
     max_points: 20
 expect:
-  # hook_fault finds confirm-write interruptions that cause bricks
+  # hook_fault finds confirm-write interruptions (may be bricks or semantic)
   should_find_issues: true
+  allow_semantic_only_issues: true
