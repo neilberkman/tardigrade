@@ -2,7 +2,7 @@ schema_version: 1
 name: mcuboot_pr2214_offset_geom_fixed
 description: >
   MCUboot swap-offset geometry trigger for PR #2214 (fixed commit 90fd59d2).
-  Companion profile to compare against the broken geometry-trigger variant.
+  find_last_idx correctly returns index; full-slot upgrade succeeds.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash

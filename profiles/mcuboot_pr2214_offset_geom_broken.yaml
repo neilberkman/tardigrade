@@ -1,9 +1,9 @@
 schema_version: 1
 name: mcuboot_pr2214_offset_geom_broken
 description: >
-  MCUboot swap-offset geometry trigger for PR #2214 (broken parent commit 429e2fea).
-  Uses a fuller staging image (0x75000 payload) to drive swap size toward
-  full-slot sector coverage.
+  MCUboot swap-offset geometry trigger for PR #2214 (broken commit 429e2fea).
+  find_last_idx off-by-one: returns count instead of index.  Full-slot staging
+  image forces last_idx >= first_trailer_idx, aborting the upgrade.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -46,5 +46,7 @@ fault_sweep:
 
 skip_self_test: true
 expect:
+  # Broken: find_last_idx off-by-one causes last_idx >= first_trailer_idx,
+  # aborting the upgrade.  Control run boots the old exec image = wrong_image.
+  control_outcome: wrong_image
   should_find_issues: false
-
