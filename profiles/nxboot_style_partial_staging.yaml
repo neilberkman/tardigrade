@@ -37,5 +37,6 @@ fault_sweep:
     # No TLV-style trailer in nxboot; CRC covers header+payload
     trailer_size: 0
 expect:
-  # nxboot should correctly reject all partial images
-  should_find_issues: false
+  # nxboot try_boot path lacks validate_image() call — truncated headers
+  # with garbage vector tables cause hard faults at 4 truncation points
+  should_find_issues: true
