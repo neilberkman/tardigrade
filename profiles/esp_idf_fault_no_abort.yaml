@@ -32,10 +32,10 @@ pre_boot_state:
   # Trigger one-shot copy-on-boot path (magic at UPDATE_REQ_ADDR).
   - { address: 0x000FC040, u32: 0x55445021 }
 success_criteria:
-  # Correct bootloader rolls back to exec (slot 0).
-  # Defective bootloader boots staging (slot 1) — the unconfirmed image.
-  # Use staging as success criteria to match defective behavior.
-  vtor_in_slot: staging
+  # Defective bootloader selects staging (PENDING_VERIFY not aborted),
+  # copies it to exec via copy-on-boot, then boots from exec.
+  # VTOR ends up in exec after the copy completes.
+  vtor_in_slot: exec
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
@@ -45,9 +45,8 @@ fault_sweep:
   max_step_limit: 20000000
   fault_types: [power_loss, interrupted_erase]
 expect:
-  # Known residual limitation for flash metadata updates under power loss:
-  # control follows no-abort behavior, and fault sweep can expose benign
-  # "old image still boots" outcomes. Keep this as a documented detection in
-  # tardigrade (not an upstream bug filing target).
-  should_find_issues: true
-  allow_semantic_only_issues: true
+  # The no-abort defect means the bootloader always selects staging,
+  # copies it to exec, and boots. Power loss during copy is tolerated:
+  # the copy-on-boot path retries on next boot. No additional issues
+  # beyond the inherent no-abort defect.
+  should_find_issues: false
