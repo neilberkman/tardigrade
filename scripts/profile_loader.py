@@ -3286,6 +3286,11 @@ def load_profile(path: str | Path) -> ProfileConfig:
         success_criteria=success_criteria,
         fault_sweep=fault_sweep,
     )
+    if update_sequence and setup_script:
+        raise ProfileError(
+            "setup_script is not supported with update_sequence — "
+            "per-phase state preparation does not run the setup script"
+        )
     state_fuzzer = _parse_state_fuzzer(data.get("state_fuzzer"))
     security_policy = _parse_security_policy(data.get("security_policy"))
 

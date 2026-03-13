@@ -5328,7 +5328,10 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
 # ---------------------------------------------------------------------------
 if backend['kind'] in ('fast', 'mram'):
     if update_sequence_enabled:
-        _apply_phase_context(update_sequence_fault_phase)
+        # Don't apply phase context or reload images here —
+        # ensure_update_sequence_fault_baseline() handles both after
+        # running the clean phases to build the pre-fault baseline.
+        pass
     else:
         reload_images()
 
