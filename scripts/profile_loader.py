@@ -1735,10 +1735,17 @@ def _warn_fault_backend_compat(
             "fault_types. The read fault configuration will have no effect."
         )
 
-    # command_drop: only supported on GenericNvmController (command-based).
+    # command_drop: only supported on GenericNvmController (command-based)
+    # for main/phase2/metadata faults.  hook_fault command_drop operates on
+    # the hook bus, not the flash backend, so it works on any platform.
     # Also satisfied by an explicit nvm_controller field (separate controller
     # peripheral on MRAM platforms).
-    if "command_drop" in all_types:
+    non_hook_types = set(fs.fault_types)
+    if fs.phase2_fault:
+        non_hook_types.update(fs.phase2_fault.fault_types)
+    if fs.metadata_fault:
+        non_hook_types.update(fs.metadata_fault.fault_types)
+    if "command_drop" in non_hook_types:
         looks_gfc = (
             nvm_controller is not None
             or "gfc" in platform_lower or "gfc" in backend_lower

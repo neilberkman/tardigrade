@@ -77,6 +77,7 @@ class FaultInjectingHookBusCommandDropTest(unittest.TestCase):
                     return
                 if self._fault_type == 'b':
                     writer(addr, self._mutate_u32(value))
+                    return
                 raise _HookFaultStop()
 
             def WriteDoubleWord(self, addr, value):
@@ -110,15 +111,20 @@ class FaultInjectingHookBusCommandDropTest(unittest.TestCase):
         with self.assertRaises(self._HookFaultStop):
             bus.WriteDoubleWord(0x1000, 0xAA)
 
-    def test_bit_corruption_raises_stop(self):
-        """bit_corruption should mutate value and raise _HookFaultStop."""
+    def test_bit_corruption_continues_execution(self):
+        """bit_corruption should mutate value but NOT raise _HookFaultStop."""
         bus = self._make_hook_bus(fault_at=0, fault_type='b')
-        with self.assertRaises(self._HookFaultStop):
-            bus.WriteDoubleWord(0x1000, 0x0000FFFF)
+        # Should not raise — bit flip corrupts data but CPU keeps running
+        bus.WriteDoubleWord(0x1000, 0x0000FFFF)
         # The real bus should have been called with a mutated value
         bus._bus.WriteDoubleWord.assert_called_once()
         written_val = bus._bus.WriteDoubleWord.call_args[0][1]
         self.assertNotEqual(written_val, 0x0000FFFF)
+        self.assertTrue(bus.fired)
+        # Subsequent writes should pass through normally
+        bus._bus.reset_mock()
+        bus.WriteDoubleWord(0x2000, 0xBB)
+        bus._bus.WriteDoubleWord.assert_called_once_with(0x2000, 0xBB)
 
     def test_command_drop_only_fires_once(self):
         """After command_drop fires, subsequent writes pass through."""
@@ -169,9 +175,9 @@ class HookFaultProfileLoadTest(unittest.TestCase):
         self.assertTrue(profile.fault_sweep.boot_cycle_hook)
         self.assertIn("confirm_pending_verify.py", profile.fault_sweep.boot_cycle_hook)
 
-    def test_boot_cycles_at_least_2(self):
+    def test_boot_cycles_at_least_3(self):
         profile = load_profile(HOOK_FAULT_PROFILE)
-        self.assertGreaterEqual(profile.fault_sweep.boot_cycles, 2)
+        self.assertGreaterEqual(profile.fault_sweep.boot_cycles, 3)
 
     def test_not_skipped_in_self_test(self):
         """The hook_fault profile should be included in self-test runs."""
