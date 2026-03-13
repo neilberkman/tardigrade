@@ -45,6 +45,7 @@ $run_duration?="0.01"
 $max_step_limit?=5000000
 $max_writes_cap?=100000
 $pre_boot_state_bin?=""
+$update_sequence_file?=""
 $setup_script?=""
 $success_vtor_slot?="exec"
 $success_vector_offset?="0"
@@ -447,6 +448,89 @@ success_otadata_expect_scope = str(monitor.GetVariable('success_otadata_expect_s
 if success_otadata_expect_scope not in ('always', 'control'):
     success_otadata_expect_scope = 'always'
 
+_base_phase_context = {
+    'boot_cycles': int(boot_cycles),
+    'boot_cycle_hook': boot_cycle_hook,
+    'expected_rollback_at_cycle': expected_rollback_at_cycle,
+    'success_criteria': {
+        'vtor_in_slot': success_vtor_slot,
+        'vector_table_offset': int(success_vector_offset),
+        'pc_in_slot': success_pc_slot or '',
+        'marker_address': int(success_marker_addr),
+        'marker_value': int(success_marker_value),
+        'image_hash': bool(success_image_hash),
+        'image_hash_slot': success_image_hash_slot or '',
+        'image_exec_sha256': image_exec_sha256,
+        'image_staging_sha256': image_staging_sha256,
+        'expected_exec_sha256': expected_exec_sha256,
+        'otadata_expect': {},
+        'otadata_expect_scope': success_otadata_expect_scope,
+    },
+}
+
+
+def _apply_phase_context(phase=None):
+    global boot_cycles, boot_cycle_hook, expected_rollback_at_cycle
+    global success_vtor_slot, success_vector_offset, success_pc_slot
+    global success_marker_addr, success_marker_value
+    global success_image_hash, success_image_hash_slot
+    global image_exec_sha256, image_staging_sha256, expected_exec_sha256
+    global success_otadata_expect, success_otadata_expect_scope
+
+    context = _base_phase_context if phase is None else phase
+    criteria = context.get('success_criteria', {}) if isinstance(context, dict) else {}
+    boot_cycles = max(1, int(context.get('boot_cycles', _base_phase_context['boot_cycles']) or 1))
+    boot_cycle_hook = str(
+        context.get('boot_cycle_hook', _base_phase_context['boot_cycle_hook']) or ''
+    ).strip()
+    expected_rollback_at_cycle = context.get(
+        'expected_rollback_at_cycle',
+        _base_phase_context['expected_rollback_at_cycle'],
+    )
+    if expected_rollback_at_cycle is not None:
+        expected_rollback_at_cycle = int(expected_rollback_at_cycle)
+    success_vtor_slot = str(criteria.get('vtor_in_slot', _base_phase_context['success_criteria']['vtor_in_slot']) or '')
+    success_vector_offset = int(
+        criteria.get('vector_table_offset', _base_phase_context['success_criteria']['vector_table_offset']) or 0
+    )
+    success_pc_slot = str(
+        criteria.get('pc_in_slot', _base_phase_context['success_criteria']['pc_in_slot']) or ''
+    ).strip() or None
+    success_marker_addr = int(
+        criteria.get('marker_address', _base_phase_context['success_criteria']['marker_address']) or 0
+    )
+    success_marker_value = int(
+        criteria.get('marker_value', _base_phase_context['success_criteria']['marker_value']) or 0
+    )
+    success_image_hash = bool(
+        criteria.get('image_hash', _base_phase_context['success_criteria']['image_hash'])
+    )
+    success_image_hash_slot = str(
+        criteria.get('image_hash_slot', _base_phase_context['success_criteria']['image_hash_slot']) or ''
+    ).strip()
+    image_exec_sha256 = str(
+        criteria.get('image_exec_sha256', _base_phase_context['success_criteria']['image_exec_sha256']) or ''
+    ).strip()
+    image_staging_sha256 = str(
+        criteria.get('image_staging_sha256', _base_phase_context['success_criteria']['image_staging_sha256']) or ''
+    ).strip()
+    expected_exec_sha256 = str(
+        criteria.get('expected_exec_sha256', _base_phase_context['success_criteria']['expected_exec_sha256']) or ''
+    ).strip()
+    success_otadata_expect = criteria.get(
+        'otadata_expect',
+        _base_phase_context['success_criteria']['otadata_expect'],
+    ) or {}
+    success_otadata_expect_scope = str(
+        criteria.get(
+            'otadata_expect_scope',
+            _base_phase_context['success_criteria']['otadata_expect_scope'],
+        )
+        or 'always'
+    ).strip().lower()
+    if success_otadata_expect_scope not in ('always', 'control'):
+        success_otadata_expect_scope = 'always'
+
 # Per-fault-type success criteria overrides.
 # Prefer file-based transport (avoids Robot->Renode variable escaping).
 # Falls back to base64-encoded variable if no file is set.
@@ -539,6 +623,35 @@ if pre_boot_bin:
         pre_boot_write_count = pbs_size // 8
     except Exception:
         pass
+
+update_sequence_file = get_optional_var('update_sequence_file', '')
+update_sequence_data = None
+update_sequence_phases = []
+update_sequence_fault_phase_index = -1
+update_sequence_fault_phase = None
+if update_sequence_file:
+    with open(update_sequence_file, 'r') as update_sequence_fp:
+        update_sequence_data = json.loads(update_sequence_fp.read())
+    if not isinstance(update_sequence_data, dict):
+        raise RuntimeError('update_sequence_file must contain a JSON object')
+    raw_phases = update_sequence_data.get('phases', [])
+    if not isinstance(raw_phases, list):
+        raise RuntimeError('update_sequence_file.phases must be a list')
+    update_sequence_phases = raw_phases
+    update_sequence_fault_phase_index = int(update_sequence_data.get('fault_phase_index', -1))
+    if 0 <= update_sequence_fault_phase_index < len(update_sequence_phases):
+        update_sequence_fault_phase = update_sequence_phases[update_sequence_fault_phase_index]
+update_sequence_enabled = bool(update_sequence_phases) and update_sequence_fault_phase is not None
+if update_sequence_enabled:
+    log('update_sequence: loaded {} phases (fault phase #{}, {})'.format(
+        len(update_sequence_phases),
+        update_sequence_fault_phase_index,
+        update_sequence_fault_phase.get('name', 'unnamed'),
+    ))
+    if backend['kind'] == 'slow':
+        raise RuntimeError(
+            'update_sequence currently requires fast or mram flash backends'
+        )
 
 # Setup script.
 setup_script = str(monitor.GetVariable('setup_script')).strip()
@@ -636,6 +749,42 @@ if slot_recovery_base is not None and slot_recovery_size is not None:
         slot_recovery_base,
         slot_recovery_base + slot_recovery_size,
     )
+
+slot_load_addresses = {
+    'exec': slot_exec_base,
+    'staging': slot_staging_base,
+}
+if slot_tertiary_base is not None:
+    slot_load_addresses['tertiary'] = slot_tertiary_base
+if slot_recovery_base is not None:
+    slot_load_addresses['recovery'] = slot_recovery_base
+
+_cached_update_sequence_fault_flash = None
+
+
+def _update_sequence_summary():
+    if not update_sequence_enabled:
+        return None
+    return {
+        'fault_phase_index': int(update_sequence_fault_phase_index),
+        'fault_phase': update_sequence_fault_phase.get('name', ''),
+        'fault_phase_start_images': dict(update_sequence_fault_phase.get('start_images', {})),
+        'fault_phase_image_overlays': dict(update_sequence_fault_phase.get('images', {})),
+        'fault_phase_pre_boot_writes': len(update_sequence_fault_phase.get('pre_boot_state', [])),
+        'phases': [str(phase.get('name', '')) for phase in update_sequence_phases],
+        'clean_phases': [
+            str(phase.get('name', ''))
+            for phase in update_sequence_phases
+            if not bool(phase.get('fault_injection'))
+        ],
+    }
+
+
+def annotate_update_sequence_result(result):
+    summary = _update_sequence_summary()
+    if summary is not None and isinstance(result, dict):
+        result['update_sequence'] = summary
+    return result
 
 # Sticky state for VTOR detection during execute runs.
 sticky_vtor = {'value': 0, 'slot': None, 'captured': False}
@@ -1576,6 +1725,7 @@ def parse_otadata_expect(raw):
     return parsed
 
 success_otadata_expect = parse_otadata_expect(success_otadata_expect_raw)
+_base_phase_context['success_criteria']['otadata_expect'] = dict(success_otadata_expect)
 
 def read_otadata_entry(base_addr):
     seq = as_int(bus.ReadDoubleWord(base_addr + OTADATA_SEQ_OFF))
@@ -1948,6 +2098,17 @@ def apply_pre_boot_state():
         monitor.Parse('include @' + setup_script)
     prime_bootloader_entry()
 
+
+def _apply_pre_boot_entries(entries):
+    if not entries:
+        prime_bootloader_entry()
+        return
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        bus.WriteDoubleWord(int(entry.get('address', 0)), int(entry.get('u32', 0)))
+    prime_bootloader_entry()
+
 def apply_partial_pre_boot_state(max_writes, fault_type='w'):
     if not pre_boot_bin:
         return (0, 0, False)
@@ -2101,6 +2262,13 @@ def prepare_clean_phase1_state():
 
 def restore_phase1_baseline():
     global _cached_phase1_snapshot_path
+    if update_sequence_enabled:
+        ensure_update_sequence_fault_baseline()
+        _apply_phase_context(update_sequence_fault_phase)
+        restore_flash_and_boot(_cached_update_sequence_fault_flash)
+        if _hash_bypass_active:
+            apply_hash_bypass()
+        return
     if not enable_machine_snapshots:
         prepare_clean_phase1_state()
         return
@@ -2172,8 +2340,20 @@ def restore_flash_and_boot(saved_flash):
     # ground-truth state for the recovery boot — re-running setup would
     # overwrite it with clean data and mask the fault.
 
-def reload_images():
-    # Restore flash/NVM to pre-test state by erasing, then reloading images.
+def _load_images_mapping(images_map):
+    if not images_map:
+        return
+    for slot_name, image_path in images_map.items():
+        if not image_path:
+            continue
+        base_addr = slot_load_addresses.get(str(slot_name))
+        if base_addr is None:
+            raise RuntimeError('unknown slot in update_sequence images: {}'.format(slot_name))
+        bus.LoadBinary(str(image_path), int(base_addr))
+
+
+def reload_images_from_map(images_map):
+    # Restore flash/NVM to a clean erased state, then load the requested images.
     # Ensure machine is paused before loading binaries.
     try:
         monitor.Parse('machine Pause')
@@ -2222,14 +2402,118 @@ def reload_images():
             chunk = min(sector, nvm_size - offset)
             b['data'].Nvm.EraseSector(offset, chunk)
     bus.LoadELF(bootloader_elf)
-    if image_staging_path:
-        bus.LoadBinary(image_staging_path, slot_staging_base)
-    if image_exec_path:
-        bus.LoadBinary(image_exec_path, slot_exec_base)
-    if image_tertiary_path and slot_tertiary_base is not None:
-        bus.LoadBinary(image_tertiary_path, slot_tertiary_base)
-    if image_recovery_path and slot_recovery_base is not None:
-        bus.LoadBinary(image_recovery_path, slot_recovery_base)
+    _load_images_mapping(images_map)
+
+
+def reload_images():
+    reload_images_from_map({
+        'staging': image_staging_path,
+        'exec': image_exec_path,
+        'tertiary': image_tertiary_path,
+        'recovery': image_recovery_path,
+    })
+
+
+def _prepare_update_phase_start_state(phase, phase_index):
+    try:
+        monitor.Parse('machine Pause')
+    except:
+        pass
+    if int(phase_index) == 0:
+        reload_images_from_map(phase.get('start_images', {}))
+    else:
+        _load_images_mapping(phase.get('images', {}))
+    _apply_pre_boot_entries(phase.get('pre_boot_state', []))
+    if _hash_bypass_active:
+        apply_hash_bypass()
+
+
+def _run_clean_update_phase(phase, phase_index):
+    _apply_phase_context(phase)
+    _prepare_update_phase_start_state(phase, phase_index)
+    phase_name = str(phase.get('name', 'phase_{}'.format(phase_index)))
+    phase_start_flash = _snapshot_current_flash()
+    restore_flash_and_boot(phase_start_flash)
+    if _hash_bypass_active:
+        apply_hash_bypass()
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = False
+    reset_nvmc_for_recovery()
+    disarm_fault()
+
+    arm_vtor_watchpoint()
+    wall_timeout = max(120, progress_stall_timeout_s * 3)
+    max_iters = phase1_max_iters(default_s=4.0)
+    status = run_until_done(
+        cpu_ref,
+        label='update_phase_{}_p1'.format(phase_name),
+        stop_on_fault=False,
+        max_iters=max_iters,
+        wall_timeout=wall_timeout,
+    )
+    disarm_vtor_watchpoint()
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value,
+        pc_value,
+        fault_injected=False,
+    )
+    cycle_records, multi_boot_analysis, _followup_ms = run_followup_boot_cycles(
+        boot_outcome,
+        boot_slot,
+        signals,
+        initial_status=status,
+        fault_injected=False,
+        label='update_phase_{}_followup'.format(phase_name),
+    )
+    final_outcome = boot_outcome
+    final_slot = boot_slot
+    if cycle_records:
+        last_cycle = cycle_records[-1]
+        final_outcome = last_cycle.get('boot_outcome', final_outcome)
+        final_slot = last_cycle.get('boot_slot', final_slot)
+    return {
+        'phase_name': phase_name,
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'final_outcome': final_outcome,
+        'final_slot': final_slot,
+        'stop_reason': status.get('reason') if status is not None else None,
+        'multi_boot_analysis': multi_boot_analysis,
+    }
+
+
+def ensure_update_sequence_fault_baseline():
+    global _cached_update_sequence_fault_flash
+    if not update_sequence_enabled:
+        return False
+    if _cached_update_sequence_fault_flash is not None:
+        return True
+    for idx, phase in enumerate(update_sequence_phases):
+        phase_name = str(phase.get('name', 'phase_{}'.format(idx)))
+        if bool(phase.get('fault_injection')):
+            _apply_phase_context(phase)
+            _prepare_update_phase_start_state(phase, idx)
+            _cached_update_sequence_fault_flash = _snapshot_current_flash()
+            log('update_sequence: cached fault baseline for phase {}'.format(phase_name))
+            return True
+        clean_result = _run_clean_update_phase(phase, idx)
+        log('update_sequence: clean phase {} boot={} final={}'.format(
+            phase_name,
+            clean_result.get('boot_outcome'),
+            clean_result.get('final_outcome'),
+        ))
+        if clean_result.get('final_outcome') != 'success':
+            raise RuntimeError(
+                "update_sequence clean phase '{}' failed (boot_outcome={}, final_outcome={}, stop_reason={})".format(
+                    phase_name,
+                    clean_result.get('boot_outcome'),
+                    clean_result.get('final_outcome'),
+                    clean_result.get('stop_reason'),
+                )
+            )
+    raise RuntimeError('update_sequence fault baseline could not be prepared')
 
 def cache_initial_flash():
     # Snapshot flash after reload_images + apply_pre_boot_state so subsequent
@@ -2246,6 +2530,19 @@ def cache_initial_flash():
 def reload_images_cached():
     # Restore flash from cached snapshot if available; otherwise fall back
     # to full reload_images + apply_pre_boot_state and cache the result.
+    if update_sequence_enabled:
+        ensure_update_sequence_fault_baseline()
+        try:
+            monitor.Parse('machine Pause')
+        except:
+            pass
+        b = backend
+        if b['kind'] == 'mram':
+            b['data'].WriteBytes(0, _cached_update_sequence_fault_flash, 0, len(_cached_update_sequence_fault_flash))
+        elif b['kind'] == 'fast':
+            b['data'].Flash.WriteBytes(0, _cached_update_sequence_fault_flash)
+        _apply_phase_context(update_sequence_fault_phase)
+        return
     global _cached_initial_flash
     try:
         monitor.Parse('machine Pause')
@@ -5030,15 +5327,20 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
 # by LoadBinary need the fill.  Reload images after fill to restore them.
 # ---------------------------------------------------------------------------
 if backend['kind'] in ('fast', 'mram'):
-    reload_images()
+    if update_sequence_enabled:
+        _apply_phase_context(update_sequence_fault_phase)
+    else:
+        reload_images()
 
 # ---------------------------------------------------------------------------
 # Apply initial pre-boot state
 # ---------------------------------------------------------------------------
-apply_pre_boot_state()
+if not update_sequence_enabled:
+    apply_pre_boot_state()
 
 # Cache initial flash state for fast restore during sweep.
-cache_initial_flash()
+if not update_sequence_enabled:
+    cache_initial_flash()
 
 # ---------------------------------------------------------------------------
 # Calibration mode
@@ -5054,11 +5356,14 @@ if calibration_mode:
     else:
         cpu_ref = monitor.Machine['sysbus.cpu']
         disarm_fault()
-        monitor.Parse('machine Reset')
-        reload_images()
-        apply_pre_boot_state()
-        if _hash_bypass_active:
-            apply_hash_bypass()
+        if update_sequence_enabled:
+            restore_phase1_baseline()
+        else:
+            monitor.Parse('machine Reset')
+            reload_images()
+            apply_pre_boot_state()
+            if _hash_bypass_active:
+                apply_hash_bypass()
         # Force word-level diff for calibration so the count matches sweep.
         # Enable write trace to record (writeIndex, flashOffset) for heuristic.
         reset_nvmc_for_sweep()
@@ -5243,7 +5548,7 @@ else:
             ft = fault_type_list[idx]
         if ft == 'f':
             ensure_read_fault_preflight()
-        result = _dispatch_fault_point(fp, ft, run_fn)
+        result = annotate_update_sequence_result(_dispatch_fault_point(fp, ft, run_fn))
         results.append(result)
 
         # Force .NET GC periodically to prevent memory exhaustion.

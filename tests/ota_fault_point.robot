@@ -30,6 +30,7 @@ ${IMAGE_STAGING}               ${ROOT}/examples/vulnerable_ota/firmware.bin
 ${IMAGE_TERTIARY}              ${EMPTY}
 ${IMAGE_RECOVERY}              ${EMPTY}
 ${PRE_BOOT_STATE_BIN}          ${EMPTY}
+${UPDATE_SEQUENCE_FILE}        ${EMPTY}
 ${SETUP_SCRIPT}                ${EMPTY}
 ${SUCCESS_VTOR_SLOT}           exec
 ${SUCCESS_VECTOR_OFFSET}       0
@@ -153,6 +154,7 @@ Run Runtime Fault Point
     Run Keyword If    '${SLOT_RECOVERY_BASE}' != ''    Execute Command    $slot_recovery_base=${SLOT_RECOVERY_BASE}
     Run Keyword If    '${SLOT_RECOVERY_SIZE}' != ''    Execute Command    $slot_recovery_size=${SLOT_RECOVERY_SIZE}
     Execute Command    $pre_boot_state_bin="${PRE_BOOT_STATE_BIN}"
+    Run Keyword If    '${UPDATE_SEQUENCE_FILE}' != ''    Execute Command    $update_sequence_file="${UPDATE_SEQUENCE_FILE}"
     Execute Command    $setup_script="${SETUP_SCRIPT}"
     Execute Command    $flash_backend="${FLASH_BACKEND}"
     Run Keyword If    '${NVM_CONTROLLER}' != ''    Execute Command    $nvm_controller="${NVM_CONTROLLER}"
