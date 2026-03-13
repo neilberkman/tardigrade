@@ -354,15 +354,17 @@ class InstructionSkipConfig:
     to NOP (default 1, i.e. one 16-bit Thumb instruction).
     """
 
-    __slots__ = ("target_addresses", "skip_count")
+    __slots__ = ("target_addresses", "skip_count", "include_literal_pools")
 
     def __init__(
         self,
         target_addresses: Optional[List[Tuple[int, int]]] = None,
         skip_count: int = 1,
+        include_literal_pools: bool = False,
     ) -> None:
         self.target_addresses: List[Tuple[int, int]] = target_addresses or []
         self.skip_count = max(1, int(skip_count))
+        self.include_literal_pools = bool(include_literal_pools)
         for i, (start, end) in enumerate(self.target_addresses):
             if end <= start:
                 raise ProfileError(
@@ -2470,9 +2472,11 @@ def _parse_instruction_skip_config(
         start = _parse_int(_require(region, "start", ctx), "{}.start".format(ctx))
         end = _parse_int(_require(region, "end", ctx), "{}.end".format(ctx))
         target_addresses.append((start, end))
+    include_literal_pools = bool(raw.get("include_literal_pools", False))
     return InstructionSkipConfig(
         target_addresses=target_addresses,
         skip_count=skip_count,
+        include_literal_pools=include_literal_pools,
     )
 
 

@@ -3370,6 +3370,37 @@ def run_instruction_skip_fault(skip_addr, skip_count=None):
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
         vtor_value, pc_value, fault_injected=True, effective_criteria=eff_criteria
     )
+
+    # Bus fault detection: check CFSR for BusFault indicators.
+    # On real Cortex-M silicon, unmapped accesses trigger a synchronous
+    # BusFault escalated to HardFault — a safe denial-of-service, not a
+    # security bypass.  Renode silently drops unmapped writes, so we also
+    # check whether the HardFault handler was entered.
+    cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
+    bfsr = (cfsr >> 8) & 0xFF  # BusFault Status Register is bits [15:8]
+    signals['cfsr'] = fmt_u32(cfsr)
+    signals['bfsr'] = '0x{:02X}'.format(bfsr)
+    hardfault_detected = False
+    if bfsr != 0:
+        hardfault_detected = True
+    elif phase1_status is not None and phase1_status.get('reason') == 'vtor_captured_hardfault':
+        hardfault_detected = True
+    else:
+        # Check if PC landed in the HardFault handler (vector table offset 0xC).
+        try:
+            vtor_base = as_int(bus.ReadDoubleWord(0xE000ED08))
+            if vtor_base == 0:
+                vtor_base = 0  # Default vector table at 0x0
+            hardfault_handler = as_int(bus.ReadDoubleWord(vtor_base + 0x0C))
+            # Thumb bit: handler address may have bit 0 set
+            if hardfault_handler != 0 and (pc_value & ~1) == (hardfault_handler & ~1):
+                hardfault_detected = True
+        except Exception:
+            pass
+    signals['hardfault_detected'] = hardfault_detected
+    if hardfault_detected and boot_outcome != 'success':
+        boot_outcome = 'bus_fault'
+
     signals['phase1_ms'] = phase1_ms
     signals['phase2_ms'] = 0
     signals['trace_replay_mode'] = 'execute'
@@ -3644,6 +3675,8 @@ def classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=N
         if hash_match == 'unknown' and (expected_slot is None or expected_slot == boot_slot):
             return 'silent_corruption'
         return 'wrong_image'
+    if boot_outcome == 'bus_fault':
+        return 'safe_dos'
     if boot_outcome in ('wrong_pc', 'misaligned_vtor', 'hard_fault', 'no_boot'):
         return 'unrecoverable'
     return 'unrecoverable'
