@@ -50,7 +50,7 @@ fault_sweep:
   fault_types:
     - power_loss
     - interrupted_erase
-  hash_bypass_symbols: ["bootutil_img_validate"]
+  sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 
 # Brick window is 19/57 points — --quick's 3 evenly-spaced points can miss it.
 skip_self_test: true

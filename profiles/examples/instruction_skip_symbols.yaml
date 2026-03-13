@@ -1,0 +1,38 @@
+schema_version: 1
+name: instruction_skip_symbols_example
+description: >-
+  Example execute-mode instruction-skip profile that mixes symbol-based
+  function selection with an explicit address range. Useful when some
+  critical paths are stable function names and others are small
+  hand-picked windows from a disassembly review.
+
+platform: platforms/cortex_m4_flash_fast.repl
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x10000000, size: 0x1000 }
+    staging: { base: 0x10001000, size: 0x1000 }
+
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+
+success_criteria:
+  vtor_in_slot: exec
+
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [instruction_skip]
+  instruction_skip_config:
+    target_addresses:
+      - { symbol: Reset }
+      - { start: 0x10000040, end: 0x10000042 }
+    skip_count: 1
+
+expect:
+  should_find_issues: false

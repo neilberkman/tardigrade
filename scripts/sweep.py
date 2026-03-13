@@ -47,6 +47,40 @@ from renode_runner import (
 from result_checks import annotate_result_checks
 
 
+def _with_sweep_hash_bypass(
+    robot_vars: List[str],
+    profile: ProfileConfig,
+    *,
+    enabled: bool,
+) -> List[str]:
+    """Scope hash-bypass patches to faulted sweep runs only."""
+    filtered_vars = [
+        rv for rv in robot_vars if not rv.startswith("HASH_BYPASS_SYMBOLS:")
+    ]
+    if not enabled:
+        return filtered_vars
+
+    symbols: List[str] = []
+    seen: set[str] = set()
+    for rv in robot_vars:
+        if not rv.startswith("HASH_BYPASS_SYMBOLS:"):
+            continue
+        for symbol in rv.split(":", 1)[1].split(","):
+            cleaned = symbol.strip()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                symbols.append(cleaned)
+    for symbol in getattr(profile.fault_sweep, "sweep_hash_bypass_symbols", []) or []:
+        cleaned = str(symbol).strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            symbols.append(cleaned)
+
+    if symbols:
+        filtered_vars.append("HASH_BYPASS_SYMBOLS:{}".format(",".join(symbols)))
+    return filtered_vars
+
+
 def _run_batch_worker(
     repo_root_str: str,
     renode_test: str,
@@ -480,6 +514,7 @@ def run_runtime_sweep(
     erase_trace_file_bin: Optional[str] = None,
     fault_types_list: Optional[List[str]] = None,
     keep_run_artifacts: bool = False,
+    no_hash_bypass: bool = False,
 ) -> List[Dict[str, Any]]:
     """Run the full runtime fault sweep.
 
@@ -493,6 +528,17 @@ def run_runtime_sweep(
 
     fault_types_list: parallel list of per-point fault type codes.
     """
+    control_robot_vars = _with_sweep_hash_bypass(
+        robot_vars,
+        profile,
+        enabled=False,
+    )
+    fault_robot_vars = _with_sweep_hash_bypass(
+        robot_vars,
+        profile,
+        enabled=not no_hash_bypass,
+    )
+
     # Full execute-mode without trace replay is memory-heavy in long single
     # Renode sessions. Enforce safe sub-batching by default.
     if (
@@ -537,7 +583,7 @@ def run_runtime_sweep(
                     robot_suite=robot_suite,
                     profile_path=str(profile.profile_path),
                     fault_points=chunk,
-                    robot_vars=robot_vars,
+                    robot_vars=fault_robot_vars,
                     work_dir_str=str(work_dir),
                     renode_remote_server_dir=renode_remote_server_dir,
                     worker_id=wid,
@@ -571,7 +617,7 @@ def run_runtime_sweep(
             robot_suite=robot_suite,
             profile=profile,
             fault_points=fault_points,
-            robot_vars=robot_vars,
+            robot_vars=fault_robot_vars,
             work_dir=work_dir,
             renode_remote_server_dir=renode_remote_server_dir,
             trace_file=trace_file,
@@ -600,7 +646,7 @@ def run_runtime_sweep(
             robot_suite=robot_suite,
             profile=profile,
             fault_at=control_at,
-            robot_vars=robot_vars,
+            robot_vars=control_robot_vars,
             work_dir=work_dir,
             renode_remote_server_dir=renode_remote_server_dir,
             is_control=True,
@@ -748,11 +794,6 @@ def run_multi_component_sweep(
         if comp_profile.fault_sweep.evaluation_mode:
             comp_eval_mode = comp_profile.fault_sweep.evaluation_mode
 
-        if no_hash_bypass:
-            comp_robot_vars = [
-                v for v in comp_robot_vars if not v.startswith("HASH_BYPASS_SYMBOLS:")
-            ]
-
         # Calibrate this component.
         comp_max_writes = comp_profile.fault_sweep.max_writes
         trace_file: Optional[str] = None
@@ -831,6 +872,7 @@ def run_multi_component_sweep(
             trace_file_bin=trace_file_bin if not no_trace_replay else None,
             erase_trace_file_bin=erase_trace_file_bin if not no_trace_replay else None,
             keep_run_artifacts=keep_run_artifacts,
+            no_hash_bypass=no_hash_bypass,
         )
 
         annotate_result_checks(comp_results, comp_profile)
@@ -958,6 +1000,7 @@ def run_multi_fault_phase(
     num_workers: int,
     max_batch_points: int,
     max_writes: int,
+    no_hash_bypass: bool = False,
     explain_only: bool = False,
     keep_run_artifacts: bool = False,
 ) -> MultiFaultPhaseResult:
@@ -1067,6 +1110,7 @@ def run_multi_fault_phase(
         erase_trace_file_bin=None,
         fault_types_list=multi_fault_types,
         keep_run_artifacts=keep_run_artifacts,
+        no_hash_bypass=no_hash_bypass,
     )
     mf_wall_s = _time_mod.time() - mf_wall_t0
 

@@ -34,7 +34,7 @@ jobs:
           echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
 
       - name: Install Python dependencies
-        run: python3 -m pip install --user pyyaml
+        run: python3 -m pip install --user -r requirements.txt
 
       - name: Run exploratory scenario
         run: |

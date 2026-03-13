@@ -149,7 +149,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-hash-bypass", action="store_true",
-        help="Disable hash validation bypass; run full crypto in emulation (slower but hyper-realistic).",
+        help="Disable sweep-only hash validation bypass; run full crypto in emulation (slower but hyper-realistic).",
     )
     parser.add_argument(
         "--progress-stall-timeout-s",
@@ -218,10 +218,6 @@ def main() -> int:
         robot_vars.append(
             "EXPECT_CONTROL_OUTCOME:{}".format(profile.expect.control_outcome)
         )
-
-        # Strip hash bypass symbols if --no-hash-bypass was requested.
-        if args.no_hash_bypass:
-            robot_vars = [v for v in robot_vars if not v.startswith("HASH_BYPASS_SYMBOLS:")]
 
         # Write success_criteria_overrides to a temp file so the .resc can
         # read it directly, bypassing Robot→Renode variable escaping issues.
@@ -492,6 +488,7 @@ def main() -> int:
             erase_trace_file_bin=erase_trace_file_bin if not args.no_trace_replay else None,
             fault_types_list=fault_types_list,
             keep_run_artifacts=args.keep_run_artifacts,
+            no_hash_bypass=args.no_hash_bypass,
         )
 
         sweep_wall_s = _time_mod.time() - sweep_wall_t0
@@ -533,6 +530,7 @@ def main() -> int:
             num_workers=args.workers,
             max_batch_points=args.max_batch_points,
             max_writes=max_writes,
+            no_hash_bypass=args.no_hash_bypass,
             explain_only=args.explain_multi_fault_plan,
             keep_run_artifacts=args.keep_run_artifacts,
         )
