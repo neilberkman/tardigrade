@@ -107,15 +107,9 @@ def _try_mapping_symbols(
 
     # For each region, walk mapping symbols to find data ranges
     for region_start, region_end in regions:
-        # Find which mapping symbols fall in or before this region
+        # Find the mapping type active at region_start by scanning
+        # all symbols up to and including region_start.
         current_type = "code"  # default assumption
-        for sym_addr, sym_type in mapping_syms:
-            if sym_addr <= region_start:
-                current_type = sym_type
-            elif sym_addr >= region_end:
-                break
-
-        # Walk through the region
         sym_idx = 0
         while sym_idx < len(mapping_syms) and mapping_syms[sym_idx][0] <= region_start:
             current_type = mapping_syms[sym_idx][1]
@@ -201,16 +195,18 @@ def _capstone_classify(
             for offset in range(insn.size):
                 decoded_addrs.add(insn.address + offset)
 
-            # Find PC-relative loads: ldr rN, [pc, #imm]
-            if insn.mnemonic == "ldr" and len(insn.operands) == 2:
-                op_mem = insn.operands[1]
+            # Find PC-relative loads: ldr/ldrb/ldrh/ldrd/vldr rN, [pc, #imm]
+            mnem = insn.mnemonic
+            if (mnem.startswith("ldr") or mnem == "vldr") and len(insn.operands) >= 2:
+                op_mem = insn.operands[-1]  # memory operand is last
                 if op_mem.type == CS_OP_MEM and op_mem.mem.base == ARM_REG_PC:
                     # Thumb PC-relative: target = (PC+4 & ~3) + disp
                     pc_val = (insn.address + 4) & ~3
                     target = pc_val + op_mem.mem.disp
-                    # Mark both halfwords of the 32-bit literal
-                    literal_addrs.add(target)
-                    literal_addrs.add(target + 2)
+                    # Mark the literal: 4 bytes for ldr, 8 bytes for ldrd/vldr.d
+                    literal_size = 8 if mnem in ("ldrd", "vldr") else 4
+                    for off in range(0, literal_size, 2):
+                        literal_addrs.add(target + off)
 
         # Any halfword in the region that wasn't decoded = data
         for addr in range(region_start, region_end, 2):

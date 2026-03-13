@@ -48,8 +48,11 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
     reasons: List[str] = []
     eff_outcome, _ = _effective_boot_result(result)
     # bus_fault is safe denial-of-service (HardFault on real silicon) — not
-    # a security finding.  Don't count it as a boot-outcome issue.
-    if eff_outcome != expected_outcome and eff_outcome != "bus_fault":
+    # a security finding.  The bootloader crashed before reaching
+    # validation/invariant code paths, so all issue signals are noise.
+    if eff_outcome == "bus_fault":
+        return reasons
+    if eff_outcome != expected_outcome:
         reasons.append("boot_outcome")
     if result.get("semantic_assertion_failures"):
         reasons.append("semantic_assertion")

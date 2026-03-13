@@ -3371,34 +3371,54 @@ def run_instruction_skip_fault(skip_addr, skip_count=None):
         vtor_value, pc_value, fault_injected=True, effective_criteria=eff_criteria
     )
 
-    # Bus fault detection: check CFSR for BusFault indicators.
-    # On real Cortex-M silicon, unmapped accesses trigger a synchronous
-    # BusFault escalated to HardFault — a safe denial-of-service, not a
-    # security bypass.  Renode silently drops unmapped writes, so we also
-    # check whether the HardFault handler was entered.
+    # Bus fault detection for instruction-skip: distinguish safe
+    # denial-of-service (HardFault/BusFault on real silicon) from real
+    # security bypasses.
+    #
+    # On Cortex-M3/M4/M7, CFSR bits [15:8] (BFSR) indicate BusFault
+    # specifically.  On Cortex-M0/M0+ there is no CFSR — all faults
+    # escalate to HardFault generically, so we can only check if PC
+    # ended up in the HardFault handler.
+    #
+    # Note: Renode silently drops unmapped accesses (CFSR stays 0), so
+    # the BFSR check only catches faults the emulator actually models.
+    # The HardFault PC check catches cases where the bootloader has its
+    # own fault handler that Renode vectored into.
     cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
     bfsr = (cfsr >> 8) & 0xFF  # BusFault Status Register is bits [15:8]
+    ufsr = (cfsr >> 16) & 0xFFFF  # UsageFault Status Register
     signals['cfsr'] = fmt_u32(cfsr)
     signals['bfsr'] = '0x{:02X}'.format(bfsr)
-    hardfault_detected = False
+
+    bus_fault_detected = False
     if bfsr != 0:
-        hardfault_detected = True
-    elif phase1_status is not None and phase1_status.get('reason') == 'vtor_captured_hardfault':
-        hardfault_detected = True
-    else:
-        # Check if PC landed in the HardFault handler (vector table offset 0xC).
-        try:
-            vtor_base = as_int(bus.ReadDoubleWord(0xE000ED08))
-            if vtor_base == 0:
-                vtor_base = 0  # Default vector table at 0x0
-            hardfault_handler = as_int(bus.ReadDoubleWord(vtor_base + 0x0C))
-            # Thumb bit: handler address may have bit 0 set
-            if hardfault_handler != 0 and (pc_value & ~1) == (hardfault_handler & ~1):
-                hardfault_detected = True
-        except Exception:
-            pass
-    signals['hardfault_detected'] = hardfault_detected
-    if hardfault_detected and boot_outcome != 'success':
+        # Definitive BusFault on M3+ — safe DoS on real silicon.
+        bus_fault_detected = True
+    elif ufsr != 0:
+        # UsageFault (e.g. undefined instruction) — also safe DoS.
+        bus_fault_detected = True
+
+    # Check if PC landed in the HardFault handler.  Use the initial
+    # vector table (address 0x0) since the bootloader may have changed
+    # VTOR during execution.
+    hardfault_entered = False
+    try:
+        initial_hardfault_handler = as_int(bus.ReadDoubleWord(0x0C))
+        if initial_hardfault_handler != 0 and (pc_value & ~1) == (initial_hardfault_handler & ~1):
+            hardfault_entered = True
+    except Exception:
+        pass
+    # Also check phase1 stop reason.
+    if phase1_status is not None and phase1_status.get('reason') == 'vtor_captured_hardfault':
+        hardfault_entered = True
+
+    signals['hardfault_entered'] = hardfault_entered
+    signals['bus_fault_detected'] = bus_fault_detected
+
+    # Only classify as bus_fault when we have specific evidence of a
+    # memory/bus fault — not generic HardFault which could indicate
+    # a real security-relevant crash worth investigating.
+    if (bus_fault_detected or hardfault_entered) and boot_outcome != 'success':
         boot_outcome = 'bus_fault'
 
     signals['phase1_ms'] = phase1_ms

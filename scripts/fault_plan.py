@@ -369,24 +369,29 @@ def build_fault_plan(
                 if not isc.include_literal_pools:
                     elf_path = getattr(profile, "bootloader_elf", None)
                     if elf_path:
-                        try:
-                            from thumb_classify import find_literal_pools
+                        from thumb_classify import find_literal_pools
 
-                            literal_pools = find_literal_pools(
-                                elf_path, isc.target_addresses
-                            )
-                        except Exception as exc:
-                            print(
-                                "WARNING: literal pool detection failed: {}".format(exc),
-                                file=sys.stderr,
-                            )
+                        literal_pools = find_literal_pools(
+                            elf_path, isc.target_addresses
+                        )
+                    else:
+                        print(
+                            "WARNING: no bootloader ELF — literal pool "
+                            "filtering disabled",
+                            file=sys.stderr,
+                        )
 
                 skip_addrs: List[int] = []
                 sc = isc.skip_count if isc.skip_count > 0 else 1
                 for region_start, region_end in isc.target_addresses:
                     end = region_end - (sc - 1) * 2
                     for addr in range(region_start, max(end, region_start), 2):
-                        if addr in literal_pools:
+                        # Check all halfwords that would be patched
+                        hits_pool = any(
+                            (addr + i * 2) in literal_pools
+                            for i in range(sc)
+                        )
+                        if hits_pool:
                             literal_pool_excluded += 1
                             continue
                         skip_addrs.append(addr)
