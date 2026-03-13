@@ -1,0 +1,34 @@
+// MappedMemory platform with NRF52NVMC for tardigrade fault injection.
+//
+// Uses MappedMemory for flash (fast CPU instruction fetch) plus an
+// NRF52NVMC controller that provides the FlashSize/FaultAtWordWrite/
+// WriteFaultMode properties tardigrade needs.  The bootloader writes
+// directly to memory-mapped flash and never touches the NVMC registers,
+// but tardigrade uses the NVMC handle for write tracking and fault
+// injection during execute-mode evaluation.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m0+"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+
+flash: Memory.MappedMemory @ sysbus 0x10000000
+    size: 0x80000
+
+flash_boot_alias: Memory.MappedMemory @ sysbus 0x00000000
+    size: 0x80000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x20000
+
+// NVMC controller for tardigrade fault injection.
+// The bootloader never interacts with this — it exists solely to give
+// tardigrade a backend with FlashSize, FaultAtWordWrite, etc.
+faultFlash: Miscellaneous.NRF52NVMC @ sysbus 0x4001E000
+    Flash: flash
+    FlashBaseAddress: 0x10000000
+    FlashSize: 0x80000
+    EraseFill: 0xFF
+    PageSize: 4096
