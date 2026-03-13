@@ -47,6 +47,11 @@ def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
 def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[str]:
     reasons: List[str] = []
     eff_outcome, _ = _effective_boot_result(result)
+    # bus_fault is safe denial-of-service (HardFault on real silicon) — not
+    # a security finding.  The bootloader crashed before reaching
+    # validation/invariant code paths, so all issue signals are noise.
+    if eff_outcome == "bus_fault":
+        return reasons
     if eff_outcome != expected_outcome:
         reasons.append("boot_outcome")
     if result.get("semantic_assertion_failures"):
@@ -96,6 +101,8 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
         return "config_crash"
     if outcome == "success":
         return "recoverable"
+    if outcome == "bus_fault":
+        return "safe_dos"
     if outcome == "rollback_accepted":
         return "rollback_accepted"
     if outcome == "toctou_corruption":

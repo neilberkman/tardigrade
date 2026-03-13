@@ -360,14 +360,40 @@ def build_fault_plan(
 
         # Instruction-skip fault injection.
         instruction_skip_count = 0
+        literal_pool_excluded = 0
         if include_instruction_skip:
             isc = profile.fault_sweep.instruction_skip_config
             if isc is not None and isc.target_addresses:
+                # Classify halfwords as code vs literal pool data.
+                literal_pools: set = set()
+                if not isc.include_literal_pools:
+                    elf_path = profile.bootloader_elf
+                    if elf_path:
+                        from thumb_classify import find_literal_pools
+
+                        literal_pools = find_literal_pools(
+                            elf_path, isc.target_addresses
+                        )
+                    else:
+                        print(
+                            "WARNING: no bootloader ELF — literal pool "
+                            "filtering disabled",
+                            file=sys.stderr,
+                        )
+
                 skip_addrs: List[int] = []
                 sc = isc.skip_count if isc.skip_count > 0 else 1
                 for region_start, region_end in isc.target_addresses:
                     end = region_end - (sc - 1) * 2
                     for addr in range(region_start, max(end, region_start), 2):
+                        # Check all halfwords that would be patched
+                        hits_pool = any(
+                            (addr + i * 2) in literal_pools
+                            for i in range(sc)
+                        )
+                        if hits_pool:
+                            literal_pool_excluded += 1
+                            continue
                         skip_addrs.append(addr)
                 if quick:
                     skip_addrs = quick_subset(skip_addrs)
@@ -485,7 +511,12 @@ def build_fault_plan(
         if nvs_fault_count:
             parts.append("{} nvs-corruption".format(nvs_fault_count))
         if instruction_skip_count:
-            parts.append("{} instruction-skip".format(instruction_skip_count))
+            isc_label = "{} instruction-skip".format(instruction_skip_count)
+            if literal_pool_excluded:
+                isc_label += " ({} literal-pool excluded)".format(
+                    literal_pool_excluded
+                )
+            parts.append(isc_label)
         if phase2_count:
             parts.append("{} phase2-recovery".format(phase2_count))
         if metadata_count:

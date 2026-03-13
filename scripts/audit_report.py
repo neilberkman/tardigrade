@@ -201,6 +201,10 @@ def summarize_runtime_sweep(
         1 for r in injected if r.get("semantic_observation_failures")
     )
     invariant_issue_points = sum(1 for r in injected if r.get("invariant_violations"))
+    bus_fault_points = sum(
+        1 for r in injected
+        if _effective_boot_result(r)[0] == "bus_fault"
+    )
 
     # Categorize failures by outcome type.
     outcome_counts: Dict[str, int] = {}
@@ -260,6 +264,7 @@ def summarize_runtime_sweep(
         "semantic_issue_points": semantic_issue_points,
         "semantic_observation_points": semantic_observation_points,
         "invariant_issue_points": invariant_issue_points,
+        "bus_fault_points": bus_fault_points,
         "recoveries": recoveries,
         "brick_rate": (float(len(boot_failures)) / float(total)) if total else 0.0,
         "issue_rate": (float(len(failures)) / float(total)) if total else 0.0,
