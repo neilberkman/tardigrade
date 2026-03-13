@@ -3050,6 +3050,7 @@ def _parse_update_sequence(
         phase.start_images = start_images
         current_images = dict(start_images)
         expected_name = phase.success_criteria.expected_image
+        is_last = idx == len(phases) - 1
         if expected_name:
             if expected_name not in start_images:
                 raise ProfileError(
@@ -3057,6 +3058,31 @@ def _parse_update_sequence(
                     "is not present in the phase images".format(idx, expected_name)
                 )
             current_images["exec"] = start_images[expected_name]
+        elif not is_last and not phase.fault_injection:
+            # Clean phases that feed into subsequent phases MUST declare
+            # expected_image so the next phase knows which image ended up
+            # in the exec slot.  Without it, phase N+1 hashes against
+            # stale images.
+            raise ProfileError(
+                "update_sequence[{}] ('{}'): clean phases that precede another phase "
+                "must set success_criteria.expected_image so the next phase can "
+                "infer the post-swap exec image".format(idx, phase.name)
+            )
+
+        # Validate image paths exist at parse time.
+        for slot_name, img_path in phase.images.items():
+            if not Path(img_path).is_file():
+                raise ProfileError(
+                    "update_sequence[{}].images.{}: file not found: {}".format(
+                        idx, slot_name, img_path
+                    )
+                )
+        if phase.boot_cycle_hook and not Path(phase.boot_cycle_hook).is_file():
+            raise ProfileError(
+                "update_sequence[{}].boot_cycle_hook: file not found: {}".format(
+                    idx, phase.boot_cycle_hook
+                )
+            )
 
     return phases
 
