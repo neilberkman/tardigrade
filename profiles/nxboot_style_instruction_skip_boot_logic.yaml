@@ -6,7 +6,7 @@ description: >
   a single branch instruction could bypass revert after a failed update,
   skip recovery creation, or jump to an unvalidated image. This is the
   highest-value glitch attack surface in nxboot.
-platform: platforms/cortex_m0_mapped_nvmc.repl
+platform: platforms/cortex_m0_mapped_faultctrl.repl
 flash_backend: faultFlash
 bootloader:
   elf: examples/nxboot_style/bootloader_nxboot_none.elf
