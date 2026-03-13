@@ -25,6 +25,7 @@ def render_runtime_profile(
     boot_cycles: int = 2,
     run_duration: str = "8.0",
     name: str = "nuttx_nxboot_real_update",
+    fault_types: str = "",
 ) -> str:
     build_dir = build_dir.resolve()
     loader_elf = build_dir / "nxboot-loader.elf"
@@ -65,7 +66,7 @@ fault_sweep:
   evaluation_mode: execute
   run_duration: "{run_duration}"
   boot_cycles: {boot_cycles}
-  expected_rollback_at_cycle: 1
+  expected_rollback_at_cycle: 1{fault_types_line}
 state_probe:
   script: targets/nuttx_nxboot/probe.py
 semantic_assertions:
@@ -87,6 +88,10 @@ invariants:
 expect:
   should_find_issues: false
 """.format(
+        fault_types_line=(
+            "\n  fault_types: [{}]".format(fault_types)
+            if fault_types else ""
+        ),
         name=name,
         loader_elf=loader_elf,
         primary_img=primary_img,
@@ -115,6 +120,11 @@ def main() -> int:
     parser.add_argument("--boot-cycles", type=int, default=2)
     parser.add_argument("--run-duration", default="8.0")
     parser.add_argument("--name", default="nuttx_nxboot_real_update")
+    parser.add_argument(
+        "--fault-types",
+        default="",
+        help="Comma-separated fault types (e.g. 'power_loss, bit_corruption')",
+    )
     args = parser.parse_args()
 
     rendered = render_runtime_profile(
@@ -124,6 +134,7 @@ def main() -> int:
         boot_cycles=args.boot_cycles,
         run_duration=args.run_duration,
         name=args.name,
+        fault_types=args.fault_types,
     )
     args.output_profile.parent.mkdir(parents=True, exist_ok=True)
     args.output_profile.write_text(rendered)

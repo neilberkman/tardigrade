@@ -1,0 +1,42 @@
+schema_version: 1
+name: nxboot_style_partial_staging
+description: >
+  Test nxboot-style bootloader against partially downloaded staging images.
+  nxboot validates image magic and CRC before attempting a copy, so
+  truncated images should be rejected and the bootloader should boot
+  the primary slot unchanged. Verifies behavior across a range of
+  truncation points including mid-header, mid-payload, and near-end.
+platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
+bootloader:
+  elf: examples/nxboot_style/bootloader_nxboot_none.elf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x10002000, size: 0x23000 }
+    staging: { base: 0x10025000, size: 0x23000 }
+images:
+  exec: examples/nxboot_style/nxboot_primary.bin
+  staging: examples/nxboot_style/nxboot_update.bin
+success_criteria:
+  vtor_in_slot: exec
+  vector_table_offset: 0x200
+fault_sweep:
+  mode: runtime
+  run_duration: "0.5"
+  max_writes: 2048
+  partial_staging:
+    staging_slot: staging
+    truncation_points: heuristic
+    fill_pattern: 0xFF
+    # nxboot header is 512 bytes (0x200)
+    header_size: 512
+    sector_size: 4096
+    # No TLV-style trailer in nxboot; CRC covers header+payload
+    trailer_size: 0
+expect:
+  # nxboot try_boot path lacks validate_image() call — truncated headers
+  # with garbage vector tables cause hard faults at 4 truncation points
+  should_find_issues: true
