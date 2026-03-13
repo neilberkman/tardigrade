@@ -2473,6 +2473,18 @@ def _run_clean_update_phase(phase, phase_index):
         last_cycle = cycle_records[-1]
         final_outcome = last_cycle.get('boot_outcome', final_outcome)
         final_slot = last_cycle.get('boot_slot', final_slot)
+
+    # Content verification: followup cycles skip content criteria
+    # (enforce_content_criteria=False) so a rollback could be hidden behind
+    # a passing VTOR check.  Re-verify the final flash state with full
+    # content criteria to catch this.
+    if final_outcome == 'success' and success_image_hash and expected_exec_sha256:
+        actual_hash = compute_exec_slot_hash()
+        if actual_hash != expected_exec_sha256:
+            log('update_phase {}: content verification FAILED after followup cycles '
+                '(expected={}, actual={})'.format(phase_name, expected_exec_sha256[:16], actual_hash[:16]))
+            final_outcome = 'wrong_image'
+
     return {
         'phase_name': phase_name,
         'boot_outcome': boot_outcome,
