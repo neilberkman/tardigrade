@@ -6,7 +6,7 @@ description: >
   image is interrupted (power_loss), corrupted (bit_corruption), or
   silently dropped (command_drop). The bootloader should handle all
   three gracefully — either the image is confirmed or it reverts.
-platform: platforms/cortex_m0_mapped.repl
+platform: platforms/cortex_m0_nvm.repl
 flash_backend: nvm_ctrl
 bootloader:
   elf: examples/nxboot_style/bootloader_nxboot_none.elf
