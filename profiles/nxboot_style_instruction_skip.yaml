@@ -1,0 +1,38 @@
+schema_version: 1
+name: nxboot_style_instruction_skip
+description: >
+  Instruction-skip fault injection against nxboot-style bootloader.
+  Targets validate_image (CRC check) and copy_partition (flash copy)
+  to test whether skipping any single Thumb instruction in these
+  critical functions leads to a brick or wrong-image boot.
+  Models glitch attacks on the instruction pipeline.
+platform: platforms/cortex_m0_mapped_faultctrl.repl
+flash_backend: faultFlash
+bootloader:
+  elf: examples/nxboot_style/bootloader_nxboot_none.elf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x10002000, size: 0x23000 }
+    staging: { base: 0x10025000, size: 0x23000 }
+images:
+  exec: examples/nxboot_style/nxboot_primary.bin
+  staging: examples/nxboot_style/nxboot_update.bin
+success_criteria:
+  vtor_in_slot: exec
+  vector_table_offset: 0x200
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  run_duration: "0.5"
+  fault_types: [instruction_skip]
+  instruction_skip_config:
+    target_addresses:
+      - { symbol: validate_image }
+      - { symbol: copy_partition }
+    skip_count: 1
+skip_self_test: true
+expect:
+  should_find_issues: false
