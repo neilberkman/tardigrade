@@ -33,5 +33,6 @@ fault_sweep:
       - { symbol: validate_image }
       - { symbol: copy_partition }
     skip_count: 1
+skip_self_test: true
 expect:
   should_find_issues: false

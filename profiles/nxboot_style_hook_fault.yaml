@@ -34,4 +34,5 @@ fault_sweep:
     fault_types: [power_loss, bit_corruption, command_drop]
     max_points: 20
 expect:
-  should_find_issues: false
+  # hook_fault finds confirm-write interruptions that cause bricks
+  should_find_issues: true
