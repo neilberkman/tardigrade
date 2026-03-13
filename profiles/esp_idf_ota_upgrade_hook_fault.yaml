@@ -38,7 +38,7 @@ fault_sweep:
   run_duration: "2.0"
   max_step_limit: 20000000
   fault_types: [power_loss]
-  boot_cycles: 2
+  boot_cycles: 3
   boot_cycle_hook: examples/esp_idf_ota/hooks/confirm_pending_verify.py
   hook_fault:
     enabled: true
