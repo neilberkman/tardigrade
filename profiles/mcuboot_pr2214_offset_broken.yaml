@@ -1,8 +1,9 @@
 schema_version: 1
 name: mcuboot_pr2214_offset_broken
 description: >
-  MCUboot swap-offset BEFORE PR #2214 geometry fix (broken commit 429e2fea).
-  Uses a near-max signed staging image to stress trailer/image boundary logic.
+  MCUboot swap-offset BEFORE PR #2214 find_last_idx fix (broken commit 429e2fea).
+  find_last_idx returns count instead of index; with a max-size staging image
+  this triggers "Not enough free space" and the upgrade is wrongly aborted.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -45,5 +46,8 @@ fault_sweep:
 
 skip_self_test: true
 expect:
+  # Broken: find_last_idx returns count instead of index, so bootloader
+  # refuses the upgrade ("Not enough free space") when the image fills all
+  # sectors.  Control run boots the old exec image = wrong_image.
+  control_outcome: wrong_image
   should_find_issues: false
-
