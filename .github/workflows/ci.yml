@@ -90,7 +90,7 @@ jobs:
           "${RUNNER_TEMP}/renode/renode-test" --help >/dev/null
 
       - name: Install Python dependencies
-        run: python3 -m pip install --user pyyaml
+        run: python3 -m pip install --user -r requirements.txt
 
       - name: Run discovery feature unit tests
         run: python3 tests/test_discovery_features.py

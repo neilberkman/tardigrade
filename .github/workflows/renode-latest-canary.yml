@@ -54,7 +54,7 @@ jobs:
           "${RUNNER_TEMP}/renode/renode-test" --help >/dev/null
 
       - name: Install Python dependencies
-        run: python3 -m pip install pyyaml
+        run: python3 -m pip install -r requirements.txt
 
       - name: Native-AOT RunFor regression test (expected FAIL)
         continue-on-error: true

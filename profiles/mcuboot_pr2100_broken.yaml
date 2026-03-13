@@ -47,7 +47,7 @@ fault_sweep:
   max_writes_cap: 200000
   run_duration: "2.0"
   max_step_limit: 20000000
-  hash_bypass_symbols: ["bootutil_img_validate"]
+  sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 # Vulnerability window is 3 writes out of ~15K — too narrow for --quick.
 skip_self_test: true
 expect:
