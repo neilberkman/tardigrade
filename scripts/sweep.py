@@ -204,6 +204,7 @@ def _run_partial_staging_worker(
             for rv in base_robot_vars
             if not rv.startswith(staging_key + ":")
             and not rv.startswith(staging_var + ":")
+            and not rv.startswith("HASH_BYPASS_SYMBOLS:")
         ]
         ps_robot_vars.append("{}:{}".format(staging_var, temp_path))
         ps_robot_vars.append("{}:{}".format(staging_key, temp_path))
@@ -386,6 +387,7 @@ def run_partial_staging_sweep(
             for rv in robot_vars
             if not rv.startswith(staging_key + ":")
             and not rv.startswith(staging_var + ":")
+            and not rv.startswith("HASH_BYPASS_SYMBOLS:")
         ]
         ps_robot_vars.append("{}:{}".format(staging_var, temp_path))
         ps_robot_vars.append("{}:{}".format(staging_key, temp_path))
