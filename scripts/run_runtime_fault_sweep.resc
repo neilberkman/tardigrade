@@ -5072,10 +5072,20 @@ if calibration_mode:
         progress_stall_timeout_s = 0
         cal_wall_timeout = max(600, int(float(run_duration) * 300))
         cal_max_iters = max(500, int(float(run_duration) * 5 / 0.02))
+        # Copy-on-boot bootloaders (vtor_in_slot=exec, expected_image=staging)
+        # briefly set VTOR to staging before copying image to exec.  Use
+        # vtor_settle to capture the final VTOR, not the transient one.
+        # For all other profiles, stop immediately on first VTOR capture
+        # to avoid inflating write/erase counts with post-boot app activity.
+        is_copy_on_boot = (
+            success_vtor_slot == 'exec'
+            and success_image_hash_slot == 'staging'
+        )
+        cal_settle = 50 if is_copy_on_boot else 0
         cal_status = run_until_done(cpu_ref, label='calibration',
                                     wall_timeout=cal_wall_timeout,
                                     max_iters=cal_max_iters,
-                                    vtor_settle_iters=50)
+                                    vtor_settle_iters=cal_settle)
         progress_stall_timeout_s = saved_stall
         log('calibration: stop_reason={}'.format(cal_status.get('reason', '?')))
         total_writes = get_total_writes() - base_writes
