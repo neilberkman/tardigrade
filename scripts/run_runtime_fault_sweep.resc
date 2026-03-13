@@ -2586,7 +2586,15 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
             elif vtor_settle_remaining > 0:
                 vtor_settle_remaining -= 1
             else:
-                # Settle countdown done — capture final VTOR.
+                # Settle countdown done — re-read VTOR to capture the
+                # actual final value (may have changed during settle).
+                vtor_final = as_int(bus.ReadDoubleWord(0xE000ED08))
+                if vtor_final != 0:
+                    for sn, (s_lo, s_hi) in slot_ranges.items():
+                        if s_lo <= vtor_final < s_hi:
+                            sticky_vtor['value'] = vtor_final
+                            sticky_vtor['slot'] = sn
+                            break
                 monitor.Parse('emulation RunFor "0.005"')
                 cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
                 if cfsr != 0:
@@ -2674,6 +2682,21 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
         if elapsed > wall_timeout:
             reason = 'wall_timeout({:.0f}s)'.format(elapsed)
             break
+    # If we hit max_iters while mid-settle, finalize the VTOR capture.
+    if reason == 'budget' and vtor_settle_remaining >= 0 and sticky_vtor['captured']:
+        vtor_final = as_int(bus.ReadDoubleWord(0xE000ED08))
+        if vtor_final != 0:
+            for sn, (s_lo, s_hi) in slot_ranges.items():
+                if s_lo <= vtor_final < s_hi:
+                    sticky_vtor['value'] = vtor_final
+                    sticky_vtor['slot'] = sn
+                    break
+        monitor.Parse('emulation RunFor "0.005"')
+        cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
+        if cfsr != 0:
+            reason = 'vtor_captured_hardfault'
+        else:
+            reason = 'vtor_captured'
     elapsed = _time.time() - t0
     writes_now = get_total_writes()
     erases_now = get_total_erases()
