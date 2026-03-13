@@ -7,6 +7,7 @@ description: >
   critical functions leads to a brick or wrong-image boot.
   Models glitch attacks on the instruction pipeline.
 platform: platforms/cortex_m0_mapped.repl
+flash_backend: flash
 bootloader:
   elf: examples/nxboot_style/bootloader_nxboot_none.elf
   entry: 0x10000000
