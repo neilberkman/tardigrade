@@ -5,7 +5,7 @@ description: >
   Models an NVM controller silently losing a single write command.
   The bootloader should either complete the update or revert to
   the confirmed primary — never brick.
-platform: platforms/cortex_m0_nvm.repl
+platform: platforms/cortex_m0_mapped.repl
 flash_backend: nvm_ctrl
 bootloader:
   elf: examples/nxboot_style/bootloader_nxboot_none.elf
