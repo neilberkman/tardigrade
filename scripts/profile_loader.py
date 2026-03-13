@@ -462,6 +462,7 @@ class ComponentConfig:
             expect=parent.expect,
             profile_path=parent.profile_path,
             scenario=parent.scenario,
+            update_sequence=parent.update_sequence,
             flash_backend=self.flash_backend,
             success_criteria_overrides=parent.success_criteria_overrides,
         )
@@ -833,6 +834,54 @@ class UpdateTrigger:
         self.fields = fields or {}
 
 
+class UpdatePhase:
+    """One phase in a multi-update runtime sequence."""
+
+    __slots__ = (
+        "name",
+        "description",
+        "images",
+        "start_images",
+        "pre_boot_state",
+        "success_criteria",
+        "boot_cycles",
+        "boot_cycle_hook",
+        "expected_rollback_at_cycle",
+        "fault_injection",
+        "fault_types",
+    )
+
+    def __init__(
+        self,
+        name: str,
+        description: str = "",
+        images: Optional[Dict[str, str]] = None,
+        start_images: Optional[Dict[str, str]] = None,
+        pre_boot_state: Optional[List["PreBootWrite"]] = None,
+        success_criteria: Optional["SuccessCriteria"] = None,
+        boot_cycles: int = 1,
+        boot_cycle_hook: Optional[str] = None,
+        expected_rollback_at_cycle: Optional[int] = None,
+        fault_injection: bool = False,
+        fault_types: Optional[List[str]] = None,
+    ) -> None:
+        self.name = name
+        self.description = description
+        self.images = images or {}
+        self.start_images = start_images or {}
+        self.pre_boot_state = pre_boot_state or []
+        self.success_criteria = success_criteria or SuccessCriteria()
+        self.boot_cycles = max(1, int(boot_cycles))
+        self.boot_cycle_hook = str(boot_cycle_hook).strip() if boot_cycle_hook else None
+        self.expected_rollback_at_cycle = (
+            None
+            if expected_rollback_at_cycle is None
+            else max(1, int(expected_rollback_at_cycle))
+        )
+        self.fault_injection = bool(fault_injection)
+        self.fault_types = fault_types or ["power_loss"]
+
+
 class InitialStateConfig:
     """A named initial-state seed for sweep matrix expansion."""
     __slots__ = ("name", "description", "pre_boot_state", "setup_script",
@@ -939,6 +988,7 @@ class ProfileConfig:
         profile_path: Optional[Path] = None,
         scenario: str = "runtime",
         update_trigger: Optional[UpdateTrigger] = None,
+        update_sequence: Optional[List["UpdatePhase"]] = None,
         state_probe: Optional[StateProbeConfig] = None,
         semantic_assertions: Optional[Dict[str, Dict[str, Any]]] = None,
         invariants: Optional[List[str]] = None,
@@ -977,6 +1027,7 @@ class ProfileConfig:
         self.profile_path = profile_path
         self.scenario = scenario
         self.update_trigger = update_trigger
+        self.update_sequence: List[UpdatePhase] = update_sequence or []
         self.state_probe = state_probe
         self.semantic_assertions = semantic_assertions or {}
         self.invariants = invariants or []
@@ -1004,6 +1055,19 @@ class ProfileConfig:
             self.multi_component is not None
             and len(self.multi_component.components) >= 2
         )
+
+    @property
+    def has_update_sequence(self) -> bool:
+        """Return True if this profile defines multi-phase runtime updates."""
+        return bool(self.update_sequence)
+
+    @property
+    def faulted_update_phase(self) -> Optional["UpdatePhase"]:
+        """Return the phase that injects runtime faults, if configured."""
+        for phase in self.update_sequence:
+            if phase.fault_injection:
+                return phase
+        return None
 
     def component_profiles(self) -> List["ProfileConfig"]:
         """Return per-component ProfileConfig instances.
@@ -1042,7 +1106,8 @@ class ProfileConfig:
             setup_script=new_setup, extra_peripherals=self.extra_peripherals,
             success_criteria=self.success_criteria, fault_sweep=self.fault_sweep,
             state_fuzzer=self.state_fuzzer, expect=new_expect, profile_path=self.profile_path,
-            scenario=self.scenario, update_trigger=new_trigger, state_probe=self.state_probe,
+            scenario=self.scenario, update_trigger=new_trigger, update_sequence=self.update_sequence,
+            state_probe=self.state_probe,
             semantic_assertions=self.semantic_assertions,
             invariants=self.invariants, invariant_providers=self.invariant_providers,
             invariant_config=self.invariant_config,
@@ -1082,6 +1147,123 @@ class ProfileConfig:
             prefix="pre_boot_state_", suffix=".bin", delete=False
         )
         tmp.write(bytes(data))
+        tmp.close()
+        return tmp.name
+
+    def _compute_image_digests(
+        self,
+        repo_root: Path,
+        images: Dict[str, str],
+    ) -> Dict[str, str]:
+        import hashlib
+
+        exec_slot = self.memory.slots.get("exec")
+        page_size = 4096
+        data_size = None
+        if exec_slot is not None and exec_slot.size > page_size:
+            data_size = exec_slot.size - page_size
+
+        digests: Dict[str, str] = {}
+        for img_name, img_path in images.items():
+            resolved = self.resolve_path(repo_root, img_path)
+            with open(resolved, "rb") as fh:
+                raw = fh.read()
+            if data_size is not None:
+                if len(raw) >= data_size:
+                    raw = raw[:data_size]
+                else:
+                    raw = raw + (b"\xFF" * (data_size - len(raw)))
+            digests[img_name] = hashlib.sha256(raw).hexdigest()
+        return digests
+
+    def _success_criteria_runtime_dict(
+        self,
+        repo_root: Path,
+        criteria: "SuccessCriteria",
+        images: Dict[str, str],
+    ) -> Dict[str, Any]:
+        digests = self._compute_image_digests(repo_root, images) if criteria.image_hash else {}
+        expected_exec_sha256 = ""
+        expected_name = criteria.expected_image or "staging"
+        if expected_name in digests:
+            expected_exec_sha256 = digests[expected_name]
+
+        return {
+            "vtor_in_slot": criteria.vtor_in_slot or "",
+            "vector_table_offset": int(criteria.vector_table_offset),
+            "pc_in_slot": criteria.pc_in_slot or "",
+            "marker_address": criteria.marker_address,
+            "marker_value": criteria.marker_value,
+            "image_hash": bool(criteria.image_hash),
+            "expected_image": criteria.expected_image or "",
+            "image_hash_slot": criteria.image_hash_slot or "",
+            "image_exec_sha256": digests.get("exec", ""),
+            "image_staging_sha256": digests.get("staging", ""),
+            "expected_exec_sha256": expected_exec_sha256,
+            "otadata_expect": criteria.otadata_expect,
+            "otadata_expect_scope": criteria.otadata_expect_scope or "always",
+        }
+
+    def update_sequence_runtime_payload(self, repo_root: Path) -> Optional[Dict[str, Any]]:
+        """Serialize update_sequence for the Renode runtime script."""
+        if not self.update_sequence:
+            return None
+
+        phases_payload: List[Dict[str, Any]] = []
+        fault_phase_index = -1
+        for idx, phase in enumerate(self.update_sequence):
+            if phase.fault_injection:
+                fault_phase_index = idx
+            resolved_delta = {
+                name: self.resolve_path(repo_root, path)
+                for name, path in phase.images.items()
+            }
+            resolved_start = {
+                name: self.resolve_path(repo_root, path)
+                for name, path in phase.start_images.items()
+            }
+            phases_payload.append(
+                {
+                    "index": idx,
+                    "name": phase.name,
+                    "description": phase.description,
+                    "images": resolved_delta,
+                    "start_images": resolved_start,
+                    "pre_boot_state": [
+                        {"address": int(write.address), "u32": int(write.u32)}
+                        for write in phase.pre_boot_state
+                    ],
+                    "success_criteria": self._success_criteria_runtime_dict(
+                        repo_root,
+                        phase.success_criteria,
+                        phase.start_images,
+                    ),
+                    "boot_cycles": int(phase.boot_cycles),
+                    "boot_cycle_hook": (
+                        self.resolve_path(repo_root, phase.boot_cycle_hook)
+                        if phase.boot_cycle_hook
+                        else ""
+                    ),
+                    "expected_rollback_at_cycle": phase.expected_rollback_at_cycle,
+                    "fault_injection": bool(phase.fault_injection),
+                    "fault_types": list(phase.fault_types),
+                }
+            )
+
+        return {
+            "fault_phase_index": fault_phase_index,
+            "phases": phases_payload,
+        }
+
+    def generate_update_sequence_file(self, repo_root: Path) -> Optional[str]:
+        """Write the runtime update_sequence payload to a temp JSON file."""
+        payload = self.update_sequence_runtime_payload(repo_root)
+        if payload is None:
+            return None
+        tmp = tempfile.NamedTemporaryFile(
+            prefix="update_sequence_", suffix=".json", delete=False
+        )
+        tmp.write(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
         tmp.close()
         return tmp.name
 
@@ -1274,6 +1456,9 @@ class ProfileConfig:
         pre_boot_bin = self.generate_pre_boot_bin()
         if pre_boot_bin:
             vars_list.append("PRE_BOOT_STATE_BIN:{}".format(pre_boot_bin))
+        update_sequence_file = self.generate_update_sequence_file(repo_root)
+        if update_sequence_file:
+            vars_list.append("UPDATE_SEQUENCE_FILE:{}".format(update_sequence_file))
 
         # Setup script.
         if self.setup_script:
@@ -2547,6 +2732,148 @@ def _parse_update_trigger(raw: Optional[Dict[str, Any]]) -> Optional[UpdateTrigg
     return UpdateTrigger(type=trigger_type, slot=slot, fields=fields)
 
 
+def _normalize_fault_types(raw: Any, field_name: str) -> List[str]:
+    if raw is None:
+        fault_types = ["power_loss"]
+    elif isinstance(raw, list):
+        fault_types = [str(ft) for ft in raw]
+    else:
+        fault_types = [str(raw)]
+
+    import warnings
+
+    normalized: List[str] = []
+    for ft in fault_types:
+        if ft not in KNOWN_FAULT_TYPES:
+            warnings.warn("Unknown fault type '{}' in {}; ignoring.".format(ft, field_name))
+            continue
+        if ft in CLASSIFICATION_ONLY_FAULT_TYPES:
+            warnings.warn(
+                "Fault type '{}' in {} is a classification label only and "
+                "does not generate runtime fault points.".format(ft, field_name)
+            )
+            continue
+        if ft not in IMPLEMENTED_FAULT_TYPES:
+            warnings.warn("Fault type '{}' in {} is not yet implemented; skipping.".format(ft, field_name))
+            continue
+        normalized.append(ft)
+
+    return normalized or ["power_loss"]
+
+
+def _parse_update_sequence(
+    raw: Optional[Any],
+    *,
+    images: Dict[str, str],
+    success_criteria: SuccessCriteria,
+    fault_sweep: FaultSweepConfig,
+) -> List[UpdatePhase]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not raw:
+        raise ProfileError("update_sequence: expected non-empty list of phase mappings")
+
+    phases: List[UpdatePhase] = []
+    seen_names: set[str] = set()
+    for idx, entry in enumerate(raw):
+        ctx = "update_sequence[{}]".format(idx)
+        if not isinstance(entry, dict):
+            raise ProfileError("{}: expected mapping".format(ctx))
+        name = str(_require(entry, "name", ctx)).strip()
+        if not name:
+            raise ProfileError("{}.name: expected non-empty string".format(ctx))
+        if name in seen_names:
+            raise ProfileError("update_sequence: duplicate phase name '{}'".format(name))
+        seen_names.add(name)
+
+        raw_images = entry.get("images", {})
+        if raw_images is None:
+            raw_images = {}
+        if not isinstance(raw_images, dict):
+            raise ProfileError("{}.images: expected mapping".format(ctx))
+        phase_images = {str(k): str(v) for k, v in raw_images.items()}
+
+        phase_success = (
+            _parse_success_criteria(entry.get("success_criteria"))
+            if "success_criteria" in entry
+            else success_criteria
+        )
+        phase_boot_cycles = int(entry.get("boot_cycles", fault_sweep.boot_cycles))
+        if phase_boot_cycles < 1:
+            raise ProfileError("{}.boot_cycles: expected integer >= 1".format(ctx))
+        phase_hook = entry.get("boot_cycle_hook", fault_sweep.boot_cycle_hook)
+        if phase_hook is not None:
+            phase_hook = str(phase_hook).strip()
+            if not phase_hook:
+                raise ProfileError("{}.boot_cycle_hook: expected non-empty path".format(ctx))
+        expected_rollback_at_cycle = entry.get(
+            "expected_rollback_at_cycle",
+            fault_sweep.expected_rollback_at_cycle,
+        )
+        if expected_rollback_at_cycle is not None:
+            expected_rollback_at_cycle = int(expected_rollback_at_cycle)
+            if expected_rollback_at_cycle < 1:
+                raise ProfileError(
+                    "{}.expected_rollback_at_cycle: expected integer >= 1".format(ctx)
+                )
+        phase_fault_types = _normalize_fault_types(
+            entry.get("fault_types", list(fault_sweep.fault_types)),
+            "{}.fault_types".format(ctx),
+        )
+        phases.append(
+            UpdatePhase(
+                name=name,
+                description=str(entry.get("description", "")),
+                images=phase_images,
+                pre_boot_state=_parse_pre_boot_state(entry.get("pre_boot_state")),
+                success_criteria=phase_success,
+                boot_cycles=phase_boot_cycles,
+                boot_cycle_hook=phase_hook,
+                expected_rollback_at_cycle=expected_rollback_at_cycle,
+                fault_injection=bool(entry.get("fault_injection", False)),
+                fault_types=phase_fault_types,
+            )
+        )
+
+    faulted_indices = [idx for idx, phase in enumerate(phases) if phase.fault_injection]
+    if len(faulted_indices) != 1:
+        raise ProfileError(
+            "update_sequence: expected exactly one phase with fault_injection=true, got {}".format(
+                len(faulted_indices)
+            )
+        )
+    faulted_idx = faulted_indices[0]
+    if faulted_idx != len(phases) - 1:
+        raise ProfileError(
+            "update_sequence: the fault_injection phase must currently be the last phase"
+        )
+
+    current_images = dict(images)
+    if not current_images and not phases[0].images:
+        raise ProfileError(
+            "update_sequence[0]: no initial images available; add top-level images or phase images"
+        )
+    for idx, phase in enumerate(phases):
+        start_images = dict(current_images)
+        start_images.update(phase.images)
+        if not start_images:
+            raise ProfileError(
+                "update_sequence[{}]: phase has no effective start images".format(idx)
+            )
+        phase.start_images = start_images
+        current_images = dict(start_images)
+        expected_name = phase.success_criteria.expected_image
+        if expected_name:
+            if expected_name not in start_images:
+                raise ProfileError(
+                    "update_sequence[{}].success_criteria.expected_image='{}' "
+                    "is not present in the phase images".format(idx, expected_name)
+                )
+            current_images["exec"] = start_images[expected_name]
+
+    return phases
+
+
 def _parse_pre_boot_state(raw: Optional[list]) -> List[PreBootWrite]:
     if raw is None:
         return []
@@ -2953,6 +3280,17 @@ def load_profile(path: str | Path) -> ProfileConfig:
         data.get("success_criteria_overrides")
     )
     fault_sweep = _parse_fault_sweep(data.get("fault_sweep"))
+    update_sequence = _parse_update_sequence(
+        data.get("update_sequence"),
+        images=images,
+        success_criteria=success_criteria,
+        fault_sweep=fault_sweep,
+    )
+    if update_sequence and setup_script:
+        raise ProfileError(
+            "setup_script is not supported with update_sequence — "
+            "per-phase state preparation does not run the setup script"
+        )
     state_fuzzer = _parse_state_fuzzer(data.get("state_fuzzer"))
     security_policy = _parse_security_policy(data.get("security_policy"))
 
@@ -3027,6 +3365,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         profile_path=path,
         scenario=scenario,
         update_trigger=update_trigger,
+        update_sequence=update_sequence,
         state_probe=state_probe,
         semantic_assertions=semantic_assertions,
         invariants=invariants,
@@ -3051,6 +3390,22 @@ def load_profile(path: str | Path) -> ProfileConfig:
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.
     if update_trigger and not profile.pre_boot_state:
         profile.pre_boot_state = profile.expand_update_trigger()
+
+    if profile.has_update_sequence:
+        faulted_phase = profile.faulted_update_phase
+        if faulted_phase is None:
+            raise ProfileError(
+                "update_sequence: missing phase with fault_injection=true after parsing"
+            )
+        profile.images = dict(faulted_phase.start_images)
+        profile.pre_boot_state = list(faulted_phase.pre_boot_state)
+        profile.success_criteria = faulted_phase.success_criteria
+        profile.fault_sweep.boot_cycles = int(faulted_phase.boot_cycles)
+        profile.fault_sweep.boot_cycle_hook = faulted_phase.boot_cycle_hook
+        profile.fault_sweep.expected_rollback_at_cycle = (
+            faulted_phase.expected_rollback_at_cycle
+        )
+        profile.fault_sweep.fault_types = list(faulted_phase.fault_types)
 
     return profile
 
@@ -3128,6 +3483,16 @@ def main() -> int:
         "invariant_providers": profile.invariant_providers,
         "invariant_config": profile.invariant_config,
         "update_trigger": profile.update_trigger.type if profile.update_trigger else None,
+        "update_sequence": [
+            {
+                "name": phase.name,
+                "fault_injection": phase.fault_injection,
+                "boot_cycles": phase.boot_cycles,
+                "boot_cycle_hook": phase.boot_cycle_hook,
+                "fault_types": phase.fault_types,
+            }
+            for phase in profile.update_sequence
+        ],
         "pre_boot_state_count": len(profile.pre_boot_state),
         "initial_states": [{"name": s.name, "description": s.description}
                            for s in profile.initial_states],
