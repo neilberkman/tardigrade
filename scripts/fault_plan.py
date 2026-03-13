@@ -367,7 +367,7 @@ def build_fault_plan(
                 # Classify halfwords as code vs literal pool data.
                 literal_pools: set = set()
                 if not isc.include_literal_pools:
-                    elf_path = getattr(profile, "bootloader_elf", None)
+                    elf_path = profile.bootloader_elf
                     if elf_path:
                         from thumb_classify import find_literal_pools
 
