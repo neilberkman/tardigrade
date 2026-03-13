@@ -188,6 +188,47 @@ class UpdateSequenceSchemaTest(unittest.TestCase):
             with self.assertRaises(ProfileError):
                 load_profile(profile_path)
 
+    def test_clean_phase_requires_expected_image(self) -> None:
+        """Clean phases feeding into subsequent phases must declare expected_image."""
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            v1 = self._write_image(tempdir, "v1.bin", 0x44)
+            v2 = self._write_image(tempdir, "v2.bin", 0x55)
+            profile_path = self._write_profile(
+                tempdir,
+                f"""
+                schema_version: 1
+                name: missing_expected_image
+                platform: platforms/cortex_m4_flash_fast.repl
+                flash_backend: faultFlash
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: {{ start: 0x20000000, end: 0x20020000 }}
+                  write_granularity: 4
+                  slots:
+                    exec: {{ base: 0x10000000, size: 0x2000 }}
+                    staging: {{ base: 0x10002000, size: 0x2000 }}
+                images:
+                  exec: {v1}
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  mode: runtime
+                update_sequence:
+                  - name: initial_upgrade
+                    images:
+                      staging: {v2}
+                    fault_injection: false
+                  - name: faulted_upgrade
+                    fault_injection: true
+                """,
+            )
+            with self.assertRaises(ProfileError) as cm:
+                load_profile(profile_path)
+            self.assertIn("expected_image", str(cm.exception))
+
     def test_update_sequence_requires_execute_mode(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
@@ -219,6 +260,9 @@ class UpdateSequenceSchemaTest(unittest.TestCase):
                   - name: initial_upgrade
                     images:
                       staging: {v2}
+                    success_criteria:
+                      vtor_in_slot: exec
+                      expected_image: staging
                     fault_injection: false
                   - name: faulted_upgrade
                     fault_injection: true
