@@ -963,8 +963,15 @@ class _FaultInjectingHookBus(object):
             return
         self.fired = True
         self.fault_address = addr
+        if self._fault_type == 'k':
+            # command_drop: silently discard the write, let hook continue
+            return
         if self._fault_type == 'b':
+            # bit_corruption: write mutated value, let hook continue
+            # (CPU keeps running after a bit flip — only the data is wrong)
             writer(addr, self._mutate_u32(value))
+            return
+        # power_loss ('w'): halt execution (power died mid-write)
         raise _HookFaultStop()
 
     def ReadDoubleWord(self, addr):
