@@ -50,6 +50,13 @@ MCUBOOT_HEAD="$(git -C "${MCUBOOT_REPO}" rev-parse HEAD)"
 msg "MCUboot HEAD: ${MCUBOOT_HEAD}"
 echo "${MCUBOOT_HEAD}" > "${ASSETS_DIR}/mcuboot_head_commit.txt"
 
+# Patch module.yml if it has 'package-managers' (unsupported by Zephyr < 4.0).
+MODULE_YML="${MCUBOOT_REPO}/zephyr/module.yml"
+if grep -q 'package-managers' "${MODULE_YML}" 2>/dev/null; then
+    msg "Stripping unsupported 'package-managers' from module.yml"
+    sed -i.bak '/^package-managers:/,/^[^ ]/{ /^package-managers:/d; /^  /d; }' "${MODULE_YML}"
+fi
+
 # --- DTS overlays ---
 
 # nrf52840dk scratch overlay: redefine partitions with scratch + code-partition
