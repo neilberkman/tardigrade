@@ -11,6 +11,14 @@
 # Each config gets two DIFFERENT-SIZED test images to expose geometry bugs.
 set -euo pipefail
 
+msg() { echo ">> $*" >&2; }
+
+require_file() {
+    if [[ ! -e "$1" ]]; then
+        echo "ERROR: missing required path: $1" >&2; exit 1
+    fi
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ASSETS_DIR="${REPO_ROOT}/results/oss_validation/assets"
@@ -47,14 +55,6 @@ else
     echo "ERROR: no ARM toolchain found" >&2; exit 1
 fi
 STRIP_BIN="${TOOLCHAIN_PATH}/bin/arm-none-eabi-strip"
-
-msg() { echo ">> $*" >&2; }
-
-require_file() {
-    if [[ ! -e "$1" ]]; then
-        echo "ERROR: missing required path: $1" >&2; exit 1
-    fi
-}
 
 require_file "${WEST}"
 require_file "${STRIP_BIN}"
