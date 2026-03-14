@@ -545,11 +545,16 @@ def run_runtime_sweep(
     # Use a time-budget approach: pack variable-sized batches so each Renode
     # session completes within ~180s.  Early cheap points get packed densely
     # (up to 64/batch), late expensive points get packed sparsely (down to 1).
+    # Check if any fault types in this sweep require full execute mode.
+    # Bit-corruption, erase faults etc. always need execute even when trace
+    # files exist (trace files are used for power-loss points only).
+    _has_execute_only_points = fault_types_list and any(
+        ft in ('b', 'e', 'a', 's', 'r', 'd', 'l', 'k') for ft in fault_types_list
+    )
     if (
         max_batch_points <= 0
         and evaluation_mode == "execute"
-        and not trace_file
-        and not trace_file_bin
+        and (_has_execute_only_points or (not trace_file and not trace_file_bin))
         and fault_points
     ):
         _BATCH_TIME_BUDGET_S = 180.0
