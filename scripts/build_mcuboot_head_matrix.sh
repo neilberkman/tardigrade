@@ -24,17 +24,24 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ASSETS_DIR="${REPO_ROOT}/results/oss_validation/assets"
 BUILD_DIR="${REPO_ROOT}/results/oss_validation/build"
 
-# CMake/DTC choke on spaces in paths (e.g. "/Volumes/External SSD/").
-# Use symlinks through /tmp to give everything a space-free path.
-if [[ "${REPO_ROOT}" == *" "* ]]; then
-    msg "Space in REPO_ROOT — setting up /tmp symlinks"
-    ln -sfn "${REPO_ROOT}/third_party/zephyr_ws" /tmp/zephyr_ws
-    ln -sfn "${REPO_ROOT}/third_party/zephyr-venv" /tmp/zephyr-venv
-    ZEPHYR_WS="/tmp/zephyr_ws"
-    ZEPHYR_VENV="/tmp/zephyr-venv"
-else
+# CMake/DTC/GCC all choke on spaces in paths (e.g. "/Volumes/External SSD/").
+# The Zephyr workspace MUST live on a space-free path. Check /tmp first
+# (where we move it on External SSD setups), then fall back to repo-local.
+if [[ -d "/tmp/mcuboot_build/zephyr_ws" ]]; then
+    ZEPHYR_WS="/tmp/mcuboot_build/zephyr_ws"
+    ZEPHYR_VENV="/tmp/mcuboot_build/zephyr-venv"
+    msg "Using space-free workspace at ${ZEPHYR_WS}"
+elif [[ -d "${REPO_ROOT}/third_party/zephyr_ws" ]]; then
     ZEPHYR_WS="${REPO_ROOT}/third_party/zephyr_ws"
     ZEPHYR_VENV="${REPO_ROOT}/third_party/zephyr-venv"
+    if [[ "${ZEPHYR_WS}" == *" "* ]]; then
+        echo "ERROR: Zephyr workspace is on a path with spaces: ${ZEPHYR_WS}" >&2
+        echo "Move it to /tmp/mcuboot_build/zephyr_ws first." >&2
+        exit 1
+    fi
+else
+    echo "ERROR: no Zephyr workspace found. Run bootstrap_mcuboot_matrix_assets.sh first." >&2
+    exit 1
 fi
 
 MCUBOOT_REPO="${ZEPHYR_WS}/bootloader/mcuboot"
