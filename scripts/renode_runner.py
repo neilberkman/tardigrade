@@ -263,6 +263,10 @@ def run_single_point(
 
     point_fault_at = -1 if is_control else fault_at
 
+    # Calibration can take much longer than 2 minutes for large swap operations
+    # (e.g. MCUboot HEAD 448KB swap-move). Give it 15 minutes.
+    single_point_timeout_m = 15 if calibration else 2
+
     cmd = [
         renode_test,
         "--renode-config", str(renode_config),
@@ -271,6 +275,7 @@ def run_single_point(
         "--variable", "FAULT_AT:{}".format(point_fault_at),
         "--variable", "RESULT_FILE:{}".format(result_file),
         "--variable", "CALIBRATION_MODE:{}".format("true" if calibration else "false"),
+        "--variable", "TEST_TIMEOUT:{} minutes".format(single_point_timeout_m),
     ]
     if renode_remote_server_dir:
         cmd.extend(["--robot-framework-remote-server-full-directory", renode_remote_server_dir])
