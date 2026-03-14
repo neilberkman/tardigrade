@@ -76,9 +76,7 @@ from sweep import (
 )
 from profile_loader import HeuristicConfig, PreBootWrite, ProfileConfig, load_profile, load_profile_raw
 
-# Use absolute() not resolve() to preserve symlinks — resolve() follows
-# them, breaking paths through /tmp symlinks on "External SSD" volumes.
-REPO_ROOT = Path(__file__).absolute().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RENODE_TEST = os.environ.get("RENODE_TEST", "renode-test")
 DEFAULT_ROBOT_SUITE = "tests/ota_fault_point.robot"
 EXIT_ASSERTION_FAILURE = 1
@@ -187,6 +185,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Directory of fuzzer crash inputs to auto-convert into regression "
             "profiles and audit alongside the main profile."
+        ),
+    )
+    parser.add_argument(
+        "--repo-root",
+        default="",
+        help=(
+            "Override repo root path. Useful when running via symlinks to "
+            "avoid space-in-path issues (e.g. /tmp/tardigrade_repo)."
         ),
     )
     return parser.parse_args()
@@ -429,7 +435,7 @@ def run_fuzz_crash_campaign(
 
 def main() -> int:
     args = parse_args()
-    repo_root = REPO_ROOT
+    repo_root = Path(args.repo_root) if args.repo_root else REPO_ROOT
     temp_ctx: Optional[tempfile.TemporaryDirectory[str]] = None
 
     try:
