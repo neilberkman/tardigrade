@@ -108,6 +108,8 @@ Load Runtime Scenario
     Execute Command    include "${ROOT}/peripherals/TraceReplayEngine.cs"
     Execute Command    include "${ROOT}/peripherals/STM32F4FlashController.cs"
     Execute Command    include "${ROOT}/peripherals/STM32F4FlashInterceptor.cs"
+    Execute Command    include "${ROOT}/peripherals/STM32F4FastFlash.cs"
+    Execute Command    include "${ROOT}/peripherals/STM32F4RCCStub.cs"
     Execute Command    include "${ROOT}/peripherals/STM32H7FlashController.cs"
     Execute Command    include "${ROOT}/peripherals/STM32DummyUSART.cs"
     Execute Command    include "${ROOT}/peripherals/OTPMemory.cs"

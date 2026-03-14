@@ -110,6 +110,22 @@ For upgrade scenarios, `exec` has the old image and `staging` has the new one. F
 
 If your bootloader reads image headers from the binary, include them. If it reads metadata from a separate trailer region, use `pre_boot_state` or `update_trigger` instead.
 
+## Different-sized images
+
+Some bootloader bugs only manifest when the two slot images have different sizes. For example, MCUboot PR [#2109](https://github.com/mcu-tools/mcuboot/pull/2109) corrupts headers after an interrupted swap-scratch resume because `boot_read_image_headers` reloads from the wrong slot -- but same-sized images hide the bug since both headers describe identical lengths.
+
+To test with asymmetric images, use different binaries in the `images:` section:
+
+```yaml
+images:
+  exec: path/to/app_19kb.bin # smaller image in exec
+  staging: path/to/app_36kb.bin # larger image in staging
+```
+
+No special profile flag is needed -- the size difference comes from the image files themselves. The build script `scripts/build_mcuboot_head_matrix.sh` produces size-asymmetric pairs by truncating the slot1 payload to a specific size (e.g., 36KB vs the full ~19KB app), ensuring every MCUboot HEAD matrix config exercises geometry-dependent code paths.
+
+If your bootloader validates image hashes (MCUboot does), the hash in the image header must match the actual payload. You cannot simply pad an arbitrary binary -- the image must be properly signed/hashed at the new size.
+
 ## Pre-boot state and update triggers
 
 ### Raw writes

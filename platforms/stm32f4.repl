@@ -38,6 +38,7 @@ faultFlash: Miscellaneous.STM32F4FlashController @ sysbus 0x40023800
 // Dummy USARTs: always return TXE=1 so firmware UART output doesn't hang.
 uart1: Miscellaneous.STM32DummyUSART @ sysbus 0x40011000
 uart2: Miscellaneous.STM32DummyUSART @ sysbus 0x40004400
+uart3: Miscellaneous.STM32DummyUSART @ sysbus 0x40004800
 
 sysbus:
     init:
