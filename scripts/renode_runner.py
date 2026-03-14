@@ -488,8 +488,10 @@ def run_batch(
     # state-mode batches can legitimately exceed the default 2-minute timeout,
     # which otherwise triggers expensive fallback splits even when the batch is
     # healthy.
-    robot_test_timeout_s = max(120, 120 + len(fault_points) * 4)
-    robot_test_timeout_m = max(2, (robot_test_timeout_s + 59) // 60)
+    # Scale robot test timeout with actual fault point cost, not just count.
+    # Execute-mode late points (fp=10000+) need long Phase 1 emulation.
+    robot_test_timeout_s = max(120, 120 + sum(2.0 + fp * 0.003 for fp in fault_points))
+    robot_test_timeout_m = max(2, (int(robot_test_timeout_s) + 59) // 60)
 
     cmd = [
         renode_test,
