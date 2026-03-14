@@ -540,7 +540,11 @@ def run_runtime_sweep(
     )
 
     # Full execute-mode without trace replay is memory-heavy in long single
-    # Renode sessions. Enforce safe sub-batching by default.
+    # Renode sessions.  Late fault points (high fp value) are much more
+    # expensive than early ones because Phase 1 must emulate up to fp writes.
+    # Use a time-budget approach: pack variable-sized batches so each Renode
+    # session completes within ~180s.  Early cheap points get packed densely
+    # (up to 64/batch), late expensive points get packed sparsely (down to 1).
     if (
         max_batch_points <= 0
         and evaluation_mode == "execute"
@@ -548,9 +552,43 @@ def run_runtime_sweep(
         and not trace_file_bin
         and fault_points
     ):
-        max_batch_points = 32
+        _BATCH_TIME_BUDGET_S = 180.0
+        _BASE_COST_S = 2.0     # overhead per point (setup + Phase 2)
+        _PER_WRITE_COST_S = 0.003  # Phase 1 emulation scales with fp value
+        _MAX_PER_BATCH = 64    # cap for memory safety
+
+        # Compute variable-sized chunk boundaries.
+        _exe_chunk_boundaries: List[int] = [0]
+        _budget_used = 0.0
+        for i, fp in enumerate(fault_points):
+            cost = _BASE_COST_S + abs(fp) * _PER_WRITE_COST_S
+            _budget_used += cost
+            pts_in_chunk = i - _exe_chunk_boundaries[-1] + 1
+            if _budget_used > _BATCH_TIME_BUDGET_S or pts_in_chunk >= _MAX_PER_BATCH:
+                _exe_chunk_boundaries.append(i)
+                _budget_used = cost
+        _n_chunks = len(_exe_chunk_boundaries)
+        # Derive a representative max_batch_points for the chunking below.
+        # The actual chunk sizes vary, but the downstream chunker uses this
+        # as a uniform cap — set it to the median chunk size so most chunks
+        # are processed in one go, and the few oversized ones get one split.
+        _chunk_sizes = []
+        for j in range(len(_exe_chunk_boundaries)):
+            start = _exe_chunk_boundaries[j]
+            end = _exe_chunk_boundaries[j + 1] if j + 1 < len(_exe_chunk_boundaries) else len(fault_points)
+            _chunk_sizes.append(end - start)
+        _chunk_sizes.sort()
+        max_batch_points = max(1, _chunk_sizes[len(_chunk_sizes) // 2])
+        # Clamp to [1, 64]
+        max_batch_points = max(1, min(_MAX_PER_BATCH, max_batch_points))
+        _total_est = sum(_BASE_COST_S + abs(fp) * _PER_WRITE_COST_S for fp in fault_points)
         print(
-            "Execute mode without trace replay: enforcing sub-batches of 32 points.",
+            "Execute mode without trace replay: ~{} batches, median {} pts/batch "
+            "({}s budget, {:.0f}s total est, {} points, max fp={}).".format(
+                _n_chunks, max_batch_points, int(_BATCH_TIME_BUDGET_S),
+                _total_est, len(fault_points),
+                max(fault_points) if fault_points else 0,
+            ),
             file=sys.stderr,
         )
 

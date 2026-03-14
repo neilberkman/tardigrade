@@ -517,12 +517,17 @@ def run_batch(
     env = prepare_run_environment(os.environ.copy(), bundle_dir, temp_root)
     cmd = prepare_renode_command(renode_test, cmd, repo_root, env)
     per_point_timeout = parse_renode_point_timeout(env)
-    # Scale batch timeout by number of fault points.  Each point typically
-    # takes 0.5-3s on CI runners; add 120s startup overhead.
+    # Scale batch timeout by fault point values, not just count.
+    # Execute-mode late fault points (fp=10000+) need long Phase 1
+    # emulation — 4s/point is fine for trace replay but way too low
+    # for execute-mode where each point must emulate up to fp writes.
     if per_point_timeout is not None:
+        # Estimate per-point cost: base 2s + 0.003s per fault_at value
+        # (fp=0 → 2s, fp=1000 → 5s, fp=10000 → 32s, fp=14000 → 44s)
+        estimated_s = sum(2.0 + fp * 0.003 for fp in fault_points)
         timeout_s: Optional[float] = max(
             per_point_timeout,
-            120.0 + len(fault_points) * 4.0,
+            120.0 + estimated_s,
         )
     else:
         timeout_s = None
