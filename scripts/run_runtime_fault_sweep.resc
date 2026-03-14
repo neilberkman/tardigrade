@@ -2892,7 +2892,15 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
                     monitor.Parse('emulation RunFor "0.005"')
                     cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
                     if cfsr != 0:
-                        reason = 'vtor_captured_hardfault'
+                        # CFSR non-zero after VTOR capture. Only flag as hardfault if
+                        # VTOR is NOT in the expected slot — post-handoff CFSR is the
+                        # app's problem, not the bootloader's.
+                        _vtor_expected = False
+                        if success_vtor_slot == 'any':
+                            _vtor_expected = sticky_vtor.get('slot') is not None
+                        elif success_vtor_slot and success_vtor_slot in slot_ranges:
+                            _vtor_expected = sticky_vtor.get('slot') == success_vtor_slot
+                        reason = 'vtor_captured' if _vtor_expected else 'vtor_captured_hardfault'
                     else:
                         reason = 'vtor_captured'
                     break
@@ -2914,7 +2922,12 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
                 monitor.Parse('emulation RunFor "0.005"')
                 cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
                 if cfsr != 0:
-                    reason = 'vtor_captured_hardfault'
+                    _vtor_expected = False
+                    if success_vtor_slot == 'any':
+                        _vtor_expected = sticky_vtor.get('slot') is not None
+                    elif success_vtor_slot and success_vtor_slot in slot_ranges:
+                        _vtor_expected = sticky_vtor.get('slot') == success_vtor_slot
+                    reason = 'vtor_captured' if _vtor_expected else 'vtor_captured_hardfault'
                 else:
                     reason = 'vtor_captured'
                 break
@@ -3010,7 +3023,12 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
         monitor.Parse('emulation RunFor "0.005"')
         cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
         if cfsr != 0:
-            reason = 'vtor_captured_hardfault'
+            _vtor_expected = False
+            if success_vtor_slot == 'any':
+                _vtor_expected = sticky_vtor.get('slot') is not None
+            elif success_vtor_slot and success_vtor_slot in slot_ranges:
+                _vtor_expected = sticky_vtor.get('slot') == success_vtor_slot
+            reason = 'vtor_captured' if _vtor_expected else 'vtor_captured_hardfault'
         else:
             reason = 'vtor_captured'
     elapsed = _time.time() - t0
@@ -4032,8 +4050,8 @@ def run_execute_fault(fault_at, fault_type='w'):
     fault_snapshot_bytes = None
     saved_flash = None
     is_erase_fault = fault_type in ('e', 'a')
-    is_power_loss_fault = fault_type in ('w', 'e', 'a')
-    is_non_power_write_fault = fault_type in ('b', 's', 'r', 'd', 'l', 'k')
+    is_power_loss_fault = fault_type in ('w', 'e', 'a', 'b')
+    is_non_power_write_fault = fault_type in ('s', 'r', 'd', 'l', 'k')
     is_command_fault = fault_type == 'k'
     is_i2c_fault = fault_type in _I2C_WIRE_CODE_TO_FAULT_TYPE
     is_otp_fault = fault_type in _OTP_WIRE_CODES and backend.get('otp') is not None
