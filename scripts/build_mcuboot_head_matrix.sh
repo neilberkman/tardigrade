@@ -13,22 +13,34 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ZEPHYR_WS="${REPO_ROOT}/third_party/zephyr_ws"
-ZEPHYR_VENV="${REPO_ROOT}/third_party/zephyr-venv"
-MCUBOOT_REPO="${ZEPHYR_WS}/bootloader/mcuboot"
 ASSETS_DIR="${REPO_ROOT}/results/oss_validation/assets"
 BUILD_DIR="${REPO_ROOT}/results/oss_validation/build"
-# DTS overlays and build dirs go in /tmp to avoid space-in-path issues
-# with CMake/DTC on "External SSD" volumes.
+
+# CMake/DTC choke on spaces in paths (e.g. "/Volumes/External SSD/").
+# Use symlinks through /tmp to give everything a space-free path.
+if [[ "${REPO_ROOT}" == *" "* ]]; then
+    msg "Space in REPO_ROOT — setting up /tmp symlinks"
+    ln -sfn "${REPO_ROOT}/third_party/zephyr_ws" /tmp/zephyr_ws
+    ln -sfn "${REPO_ROOT}/third_party/zephyr-venv" /tmp/zephyr-venv
+    ZEPHYR_WS="/tmp/zephyr_ws"
+    ZEPHYR_VENV="/tmp/zephyr-venv"
+else
+    ZEPHYR_WS="${REPO_ROOT}/third_party/zephyr_ws"
+    ZEPHYR_VENV="${REPO_ROOT}/third_party/zephyr-venv"
+fi
+
+MCUBOOT_REPO="${ZEPHYR_WS}/bootloader/mcuboot"
+IMGTOOL_PY="${MCUBOOT_REPO}/scripts/imgtool.py"
 OVERLAY_DIR="$(mktemp -d /tmp/mcuboot_head_overlays.XXXXXX)"
 BUILD_TMP="$(mktemp -d /tmp/mcuboot_head_builds.XXXXXX)"
 WEST="${ZEPHYR_VENV}/bin/west"
-IMGTOOL_PY="${MCUBOOT_REPO}/scripts/imgtool.py"
 IMGTOOL_PYTHON="${ZEPHYR_VENV}/bin/python3"
 
-# Auto-detect toolchain: prefer External SSD copy, fall back to ~/tools
+# Auto-detect toolchain: prefer External SSD copy, fall back to ~/tools.
+# Symlink to /tmp if path has spaces.
 if [[ -d "/Volumes/External SSD/tardigrade/tools/arm-gnu-toolchain" ]]; then
-    TOOLCHAIN_PATH="/Volumes/External SSD/tardigrade/tools/arm-gnu-toolchain"
+    ln -sfn "/Volumes/External SSD/tardigrade/tools/arm-gnu-toolchain" /tmp/arm-toolchain
+    TOOLCHAIN_PATH="/tmp/arm-toolchain"
 elif [[ -d "${HOME}/tools/gcc-arm-none-eabi-8-2018-q4-major" ]]; then
     TOOLCHAIN_PATH="${HOME}/tools/gcc-arm-none-eabi-8-2018-q4-major"
 else
@@ -294,7 +306,7 @@ build_mcuboot() {
           -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
           -DCONFIG_BOOT_MAX_IMG_SECTORS=1024 \
           -DCMAKE_GDB:FILEPATH="${TOOLCHAIN_PATH}/bin/arm-none-eabi-gdb" \
-          -DPython3_EXECUTABLE:FILEPATH="${IMGTOOL_PYTHON}" \
+          "-DPython3_EXECUTABLE:FILEPATH=${IMGTOOL_PYTHON}" \
           "${extra_cmake[@]}"
     )
 
@@ -323,7 +335,7 @@ build_test_app() {
           -- \
           -DDTC_OVERLAY_FILE="${overlay}" \
           -DCMAKE_GDB:FILEPATH="${TOOLCHAIN_PATH}/bin/arm-none-eabi-gdb" \
-          -DPython3_EXECUTABLE:FILEPATH="${IMGTOOL_PYTHON}"
+          "-DPython3_EXECUTABLE:FILEPATH=${IMGTOOL_PYTHON}"
     )
 }
 
