@@ -1,0 +1,41 @@
+// Fast STM32F4 platform for execute-mode testing.
+//
+// Uses MappedMemory for flash at both 0x00000000 and 0x08000000
+// (STM32F4 dual-mapped flash). CPU reads/writes go directly through
+// MappedMemory (fast tlib pointer access). Write tracking is done
+// through the STM32F4FastFlash peripheral counting PG transitions.
+//
+// RCC is a separate lightweight stub — no callback overhead on
+// clock register polling.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+
+flash: Memory.MappedMemory @ { sysbus 0x00000000; sysbus 0x08000000 }
+    size: 0x100000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x40000
+
+rcc: Miscellaneous.STM32F4RCCStub @ sysbus 0x40023800
+
+faultFlash: Miscellaneous.STM32F4FastFlash @ sysbus 0x40023C00
+    Flash: flash
+    FlashBaseAddress: 0x08000000
+    FlashSize: 0x100000
+    PageSize: 0x20000
+    EraseFill: 0xFF
+
+uart1: Miscellaneous.STM32DummyUSART @ sysbus 0x40011000
+uart2: Miscellaneous.STM32DummyUSART @ sysbus 0x40004400
+uart3: Miscellaneous.STM32DummyUSART @ sysbus 0x40004800
+
+sysbus:
+    init:
+        Tag <0x00000000 0x100000> "FLASH_LO"
+        Tag <0x08000000 0x100000> "FLASH_HI"
+        Tag <0x20000000 0x40000> "SRAM"
