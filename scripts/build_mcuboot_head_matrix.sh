@@ -18,6 +18,10 @@ ZEPHYR_VENV="${REPO_ROOT}/third_party/zephyr-venv"
 MCUBOOT_REPO="${ZEPHYR_WS}/bootloader/mcuboot"
 ASSETS_DIR="${REPO_ROOT}/results/oss_validation/assets"
 BUILD_DIR="${REPO_ROOT}/results/oss_validation/build"
+# DTS overlays and build dirs go in /tmp to avoid space-in-path issues
+# with CMake/DTC on "External SSD" volumes.
+OVERLAY_DIR="$(mktemp -d /tmp/mcuboot_head_overlays.XXXXXX)"
+BUILD_TMP="$(mktemp -d /tmp/mcuboot_head_builds.XXXXXX)"
 WEST="${ZEPHYR_VENV}/bin/west"
 IMGTOOL_PY="${MCUBOOT_REPO}/scripts/imgtool.py"
 IMGTOOL_PYTHON="${ZEPHYR_VENV}/bin/python3"
@@ -60,7 +64,7 @@ fi
 # --- DTS overlays ---
 
 # nrf52840dk scratch overlay: redefine partitions with scratch + code-partition
-cat > "${BUILD_DIR}/nrf52_scratch.dts" <<'DTS'
+cat > "${OVERLAY_DIR}/nrf52_scratch.dts" <<'DTS'
 / {
     /delete-node/ partitions;
 };
@@ -102,7 +106,7 @@ cat > "${BUILD_DIR}/nrf52_scratch.dts" <<'DTS'
 DTS
 
 # nrf52840dk small-slot move overlay: 128KB slots
-cat > "${BUILD_DIR}/nrf52_small_move.dts" <<'DTS'
+cat > "${OVERLAY_DIR}/nrf52_small_move.dts" <<'DTS'
 / {
     /delete-node/ partitions;
 };
@@ -140,7 +144,7 @@ cat > "${BUILD_DIR}/nrf52_small_move.dts" <<'DTS'
 DTS
 
 # nrf52840dk small-slot scratch overlay: 128KB slots + 4KB scratch
-cat > "${BUILD_DIR}/nrf52_small_scratch.dts" <<'DTS'
+cat > "${OVERLAY_DIR}/nrf52_small_scratch.dts" <<'DTS'
 / {
     /delete-node/ partitions;
 };
@@ -182,7 +186,7 @@ cat > "${BUILD_DIR}/nrf52_small_scratch.dts" <<'DTS'
 DTS
 
 # STM32F4 (nucleo_f429zi) swap-move overlay
-cat > "${BUILD_DIR}/stm32f4_move.dts" <<'DTS'
+cat > "${OVERLAY_DIR}/stm32f4_move.dts" <<'DTS'
 / {
     /delete-node/ partitions;
 };
@@ -220,7 +224,7 @@ cat > "${BUILD_DIR}/stm32f4_move.dts" <<'DTS'
 DTS
 
 # STM32F4 (nucleo_f429zi) swap-scratch overlay
-cat > "${BUILD_DIR}/stm32f4_scratch.dts" <<'DTS'
+cat > "${OVERLAY_DIR}/stm32f4_scratch.dts" <<'DTS'
 / {
     /delete-node/ partitions;
 };
@@ -270,7 +274,7 @@ build_mcuboot() {
     shift 3
     local extra_cmake=("$@")
 
-    local out_build="${BUILD_DIR}/head_${name}"
+    local out_build="${BUILD_TMP}/head_${name}"
     local out_elf="${ASSETS_DIR}/oss_mcuboot_head_${name}.elf"
 
     msg "Building head_${name} (board=${board})"
@@ -304,7 +308,7 @@ build_test_app() {
     local board="$2"
     local overlay="$3"
 
-    local out_build="${BUILD_DIR}/hello_${name}"
+    local out_build="${BUILD_TMP}/hello_${name}"
 
     msg "Building hello_world for ${name} (board=${board})"
     (
@@ -330,8 +334,8 @@ sign_image() {
     local out_name="$4"
     local payload_size="${5:-}"
 
-    local hex="${BUILD_DIR}/hello_${name}/zephyr/zephyr.hex"
-    local bin="${BUILD_DIR}/hello_${name}/zephyr/zephyr.bin"
+    local hex="${BUILD_TMP}/hello_${name}/zephyr/zephyr.hex"
+    local bin="${BUILD_TMP}/hello_${name}/zephyr/zephyr.bin"
     local out="${ASSETS_DIR}/${out_name}"
 
     local sign_input="${bin}"
@@ -363,7 +367,7 @@ sign_image() {
 
 # --- 1. head_move_nrf52: swap-move, nrf52840dk, default geometry ---
 # Default nrf52840dk: slot0 @ 0xC000 (0x76000), slot1 @ 0x82000 (0x76000)
-cat > "${BUILD_DIR}/nrf52_move_default.dts" <<'DTS'
+cat > "${OVERLAY_DIR}/nrf52_move_default.dts" <<'DTS'
 / {
     chosen {
         zephyr,code-partition = &boot_partition;
@@ -371,55 +375,55 @@ cat > "${BUILD_DIR}/nrf52_move_default.dts" <<'DTS'
 };
 DTS
 
-build_mcuboot "move_nrf52" "nrf52840dk/nrf52840" "${BUILD_DIR}/nrf52_move_default.dts" \
+build_mcuboot "move_nrf52" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_move_default.dts" \
     -DCONFIG_BOOT_SWAP_USING_MOVE=y -DCONFIG_BOOT_PREFER_SWAP_MOVE=y
 
-build_test_app "move_nrf52" "nrf52840dk/nrf52840" "${BUILD_DIR}/nrf52_move_default.dts"
+build_test_app "move_nrf52" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_move_default.dts"
 sign_image "move_nrf52" "0x76000" "1.0.0+0" "zephyr_head_move_nrf52_slot0.bin"
 sign_image "move_nrf52" "0x76000" "1.1.0+0" "zephyr_head_move_nrf52_slot1.bin" "36864"
 
 # --- 2. head_scratch_nrf52: swap-scratch, nrf52840dk ---
 # Slots: 0x6E000 (440KB) each, scratch: 0x10000 (64KB)
-build_mcuboot "scratch_nrf52" "nrf52840dk/nrf52840" "${BUILD_DIR}/nrf52_scratch.dts" \
+build_mcuboot "scratch_nrf52" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_scratch.dts" \
     -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
 
-build_test_app "scratch_nrf52" "nrf52840dk/nrf52840" "${BUILD_DIR}/nrf52_scratch.dts"
+build_test_app "scratch_nrf52" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_scratch.dts"
 sign_image "scratch_nrf52" "0x6e000" "1.0.0+0" "zephyr_head_scratch_nrf52_slot0.bin"
 sign_image "scratch_nrf52" "0x6e000" "1.1.0+0" "zephyr_head_scratch_nrf52_slot1.bin" "36864"
 
 # --- 3. head_move_stm32f4: swap-move, nucleo_f429zi, non-uniform sectors ---
 # Slots: 0x60000 (384KB) each
-build_mcuboot "move_stm32f4" "nucleo_f429zi" "${BUILD_DIR}/stm32f4_move.dts" \
+build_mcuboot "move_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_move.dts" \
     -DCONFIG_BOOT_SWAP_USING_MOVE=y -DCONFIG_BOOT_PREFER_SWAP_MOVE=y
 
-build_test_app "move_stm32f4" "nucleo_f429zi" "${BUILD_DIR}/stm32f4_move.dts"
+build_test_app "move_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_move.dts"
 sign_image "move_stm32f4" "0x60000" "1.0.0+0" "zephyr_head_move_stm32f4_slot0.bin"
 sign_image "move_stm32f4" "0x60000" "1.1.0+0" "zephyr_head_move_stm32f4_slot1.bin" "36864"
 
 # --- 4. head_scratch_stm32f4: swap-scratch, nucleo_f429zi ---
 # Slots: 0x58000 (352KB) each, scratch: 0x10000 (64KB)
-build_mcuboot "scratch_stm32f4" "nucleo_f429zi" "${BUILD_DIR}/stm32f4_scratch.dts" \
+build_mcuboot "scratch_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_scratch.dts" \
     -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
 
-build_test_app "scratch_stm32f4" "nucleo_f429zi" "${BUILD_DIR}/stm32f4_scratch.dts"
+build_test_app "scratch_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_scratch.dts"
 sign_image "scratch_stm32f4" "0x58000" "1.0.0+0" "zephyr_head_scratch_stm32f4_slot0.bin"
 sign_image "scratch_stm32f4" "0x58000" "1.1.0+0" "zephyr_head_scratch_stm32f4_slot1.bin" "36864"
 
 # --- 5. head_move_small: swap-move, nrf52840dk, 128KB slots ---
 # Slots: 0x20000 (128KB) each
-build_mcuboot "move_small" "nrf52840dk/nrf52840" "${BUILD_DIR}/nrf52_small_move.dts" \
+build_mcuboot "move_small" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_small_move.dts" \
     -DCONFIG_BOOT_SWAP_USING_MOVE=y -DCONFIG_BOOT_PREFER_SWAP_MOVE=y
 
-build_test_app "move_small" "nrf52840dk/nrf52840" "${BUILD_DIR}/nrf52_small_move.dts"
+build_test_app "move_small" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_small_move.dts"
 sign_image "move_small" "0x20000" "1.0.0+0" "zephyr_head_move_small_slot0.bin"
 sign_image "move_small" "0x20000" "1.1.0+0" "zephyr_head_move_small_slot1.bin" "16384"
 
 # --- 6. head_scratch_small: swap-scratch, nrf52840dk, 128KB + 4KB scratch ---
 # Slots: 0x20000 (128KB) each, scratch: 0x1000 (4KB)
-build_mcuboot "scratch_small" "nrf52840dk/nrf52840" "${BUILD_DIR}/nrf52_small_scratch.dts" \
+build_mcuboot "scratch_small" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_small_scratch.dts" \
     -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
 
-build_test_app "scratch_small" "nrf52840dk/nrf52840" "${BUILD_DIR}/nrf52_small_scratch.dts"
+build_test_app "scratch_small" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_small_scratch.dts"
 sign_image "scratch_small" "0x20000" "1.0.0+0" "zephyr_head_scratch_small_slot0.bin"
 sign_image "scratch_small" "0x20000" "1.1.0+0" "zephyr_head_scratch_small_slot1.bin" "16384"
 
