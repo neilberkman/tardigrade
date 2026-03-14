@@ -1064,6 +1064,82 @@ Before submitting a profile:
 6. Does `expect.should_find_issues` match your expectation?
 7. For differential testing: do you have both broken and fixed ELFs?
 
+## ESP-IDF OTA profiles
+
+ESP-IDF uses a dual-sector otadata partition to track which OTA app slot to boot. Each sector contains a 32-byte `esp_ota_select_entry_t` with a sequence number, OTA state, and CRC-32. The bootloader selects the entry with the highest valid `ota_seq` and maps it to a slot index via `(ota_seq - 1) % num_slots`.
+
+Tardigrade ships a clean-room model of this algorithm (`examples/esp_idf_ota/esp_idf_ota.c`) that compiles to a Cortex-M4 ELF running on the `cortex_m4_flash_fast.repl` platform. This is not ESP-IDF code -- it is a standalone reimplementation of the same algorithm for fault-injection testing.
+
+### otadata layout
+
+The otadata partition is two 4KB sectors, each starting with:
+
+| Offset | Size | Field     | Description              |
+| ------ | ---- | --------- | ------------------------ |
+| 0      | 4    | ota_seq   | 1-based sequence number  |
+| 4      | 20   | seq_label | Unused (0xFF from erase) |
+| 24     | 4    | ota_state | State enum (see below)   |
+| 28     | 4    | crc       | CRC-32 of ota_seq only   |
+
+OTA state values: `NEW` (0), `PENDING_VERIFY` (1), `VALID` (2), `INVALID` (3), `ABORTED` (4), `UNDEFINED` (0xFFFFFFFF).
+
+### Pre-boot state for ESP-IDF
+
+Set up otadata entries using `pre_boot_state`. Each entry needs three writes (ota_seq, ota_state, crc):
+
+```yaml
+pre_boot_state:
+  # Entry 0: ota_seq=1, VALID
+  - { address: 0x000F8000, u32: 0x00000001 } # ota_seq
+  - { address: 0x000F8018, u32: 0x00000002 } # ota_state = VALID
+  - { address: 0x000F801C, u32: 0x4743989A } # CRC-32 of ota_seq=1
+  # Entry 1: ota_seq=2, NEW
+  - { address: 0x000F9000, u32: 0x00000002 } # ota_seq
+  - { address: 0x000F9018, u32: 0x00000000 } # ota_state = NEW
+  - { address: 0x000F901C, u32: 0x55F63774 } # CRC-32 of ota_seq=2
+```
+
+Use `examples/esp_idf_ota/gen_esp_idf_images.py otadata` to compute correct CRC values for arbitrary sequence numbers.
+
+### State probe and invariants
+
+The ESP-IDF target adapter (`targets/esp_idf/`) provides a state probe and four invariants:
+
+```yaml
+state_probe:
+  script: targets/esp_idf/probe.py
+
+invariant_providers:
+  - targets/esp_idf/invariants.py
+invariants:
+  - esp_idf_otadata_crc_integrity # dual-sector CRC: at least one valid after fault
+  - esp_idf_pending_verify_gets_aborted # unconfirmed images get ABORTED on reboot
+  - esp_idf_active_entry_maps_to_valid_slot # selected slot matches actual boot
+  - esp_idf_seq_not_zero # ota_seq=0 would silently select wrong slot
+```
+
+The probe reads both otadata sectors, validates CRC-32, determines the active entry, and exposes `replica0_valid`/`replica1_valid` for the built-in `metadata_single_fault_consistency` invariant.
+
+### Upgrade vs rollback scenarios
+
+**Upgrade** (`esp_idf_ota_upgrade.yaml`): Entry 0 = seq 1/VALID, entry 1 = seq 2/NEW. Bootloader writes PENDING_VERIFY to entry 1 and boots slot 1. Fault during the state transition tests whether the device falls back to slot 0.
+
+**Rollback** (`esp_idf_ota_rollback.yaml`): Entry 0 = seq 1/VALID, entry 1 = seq 2/PENDING_VERIFY. Bootloader ABORTs entry 1 (app never confirmed) and boots slot 0. Fault during the ABORT write tests whether rollback completes.
+
+### Defect variants
+
+The model supports compile-time defect injection via `-DESP_DEFECT=N`. Each defect produces a separate ELF with a known vulnerability:
+
+| Defect | Name             | What it breaks                                   | Profile                               |
+| ------ | ---------------- | ------------------------------------------------ | ------------------------------------- |
+| 1      | NO_CRC           | Skips CRC validation, accepts corrupt entries    | `esp_idf_fault_no_crc.yaml`           |
+| 2      | SINGLE_SECTOR    | Only reads sector 0, no redundancy               | `esp_idf_fault_single_sector.yaml`    |
+| 3      | NO_ABORT         | Skips PENDING_VERIFY abort, no rollback          | `esp_idf_fault_no_abort.yaml`         |
+| 4      | NO_FALLBACK      | No fallback to other slot if selected is invalid | `esp_idf_fault_no_fallback.yaml`      |
+| 5      | CRC_COVERS_STATE | CRC covers seq+state, breaks after state change  | `esp_idf_fault_crc_covers_state.yaml` |
+
+Guard profiles (e.g., `esp_idf_ota_crc_guard.yaml`) test that the correct implementation handles the defect scenario properly.
+
 ## Examples to study
 
 | Profile                                          | What it demonstrates                                                    |
@@ -1072,4 +1148,6 @@ Before submitting a profile:
 | `profiles/mcuboot_head_upgrade.yaml`             | MCUboot upgrade with image hash, update trigger, sweep-only hash bypass |
 | `profiles/mcuboot_pr2100_broken_discovery.yaml`  | Differential testing (known bug, broken commit)                         |
 | `profiles/nuttx_nxboot_128.yaml`                 | State probe, semantic assertions, custom invariants, multi-boot         |
+| `profiles/esp_idf_ota_upgrade.yaml`              | ESP-IDF upgrade with state probe and otadata invariants                 |
+| `profiles/esp_idf_ota_rollback.yaml`             | ESP-IDF rollback with semantic assertions on otadata state              |
 | `profiles/esp_idf_ota_upgrade_confirm_hook.yaml` | Boot-cycle hook for confirm-or-rollback                                 |

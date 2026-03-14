@@ -42,6 +42,24 @@ success_criteria:
   marker_address: 0x000FC000
   marker_value: 0x00000000
 
+state_probe:
+  script: targets/esp_idf/probe.py
+
+invariant_providers:
+  - targets/esp_idf/invariants.py
+invariants:
+  - esp_idf_otadata_crc_integrity
+  - esp_idf_pending_verify_gets_aborted
+  - esp_idf_active_entry_maps_to_valid_slot
+  - esp_idf_seq_not_zero
+
+semantic_assertions:
+  control:
+    # After rollback, entry 1 should be ABORTED (not PENDING_VERIFY)
+    semantic_state.entries.sector1.ota_state: aborted
+    # Entry 0 should still be valid
+    semantic_state.entries.sector0.crc_valid: true
+
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
