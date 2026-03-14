@@ -605,8 +605,16 @@ def _run_batch_with_fallback(
     erase_trace_file_bin: Optional[str] = None,
     fault_types_list: Optional[List[str]] = None,
     keep_run_artifacts: bool = False,
+    _depth: int = 0,
+    _fallback_root: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
-    """Run one batch; on failure recursively retry smaller sub-batches."""
+    """Run one batch; on failure recursively retry smaller sub-batches.
+
+    Fallback directories are FLAT (all at _fallback_root level) to avoid
+    deeply nested paths that exceed OS path length limits on macOS.
+    Max recursion depth is 10 to prevent infinite spirals.
+    """
+    _MAX_FALLBACK_DEPTH = 10
     try:
         results = run_batch(
             repo_root=repo_root,
@@ -628,7 +636,14 @@ def _run_batch_with_fallback(
             _progress("Fallback point {} complete.".format(fault_points[0]))
         return results
     except Exception as exc:
-        if len(fault_points) <= 1:
+        if len(fault_points) <= 1 or _depth >= _MAX_FALLBACK_DEPTH:
+            if _depth >= _MAX_FALLBACK_DEPTH:
+                _progress(
+                    "Fallback depth limit ({}) reached for {} points (fp {}..{}); skipping.".format(
+                        _MAX_FALLBACK_DEPTH, len(fault_points),
+                        fault_points[0], fault_points[-1],
+                    )
+                )
             raise
         mid = max(1, len(fault_points) // 2)
         left_points = fault_points[:mid]
@@ -636,13 +651,16 @@ def _run_batch_with_fallback(
         left_types = fault_types_list[:mid] if fault_types_list else None
         right_types = fault_types_list[mid:] if fault_types_list else None
         _progress(
-            "Batch run failed; retrying smaller sub-batches ({} -> {} + {}). {}".format(
-                len(fault_points), len(left_points), len(right_points), exc
+            "Batch run failed (depth {}); retrying sub-batches ({} -> {} + {}). {}".format(
+                _depth, len(fault_points), len(left_points), len(right_points), exc
             )
         )
         results: List[Dict[str, Any]] = []
-        fallback_root = work_dir / "batch_fallback"
-        fallback_root.mkdir(parents=True, exist_ok=True)
+        # Use a FLAT fallback directory to avoid deeply nested paths.
+        # All sub-batches at all depths share the same fallback_root.
+        if _fallback_root is None:
+            _fallback_root = work_dir / "batch_fallback"
+        _fallback_root.mkdir(parents=True, exist_ok=True)
         if left_points:
             results.extend(
                 _run_batch_with_fallback(
@@ -652,8 +670,8 @@ def _run_batch_with_fallback(
                     profile=profile,
                     fault_points=left_points,
                     robot_vars=robot_vars,
-                    work_dir=fallback_root / "chunk_{:07d}_{:07d}".format(
-                        left_points[0], left_points[-1]
+                    work_dir=_fallback_root / "d{}_fp{:07d}_{:07d}".format(
+                        _depth + 1, left_points[0], left_points[-1]
                     ),
                     renode_remote_server_dir=renode_remote_server_dir,
                     trace_file=trace_file,
@@ -662,6 +680,8 @@ def _run_batch_with_fallback(
                     erase_trace_file_bin=erase_trace_file_bin,
                     fault_types_list=left_types,
                     keep_run_artifacts=keep_run_artifacts,
+                    _depth=_depth + 1,
+                    _fallback_root=_fallback_root,
                 )
             )
         if right_points:
@@ -673,8 +693,8 @@ def _run_batch_with_fallback(
                     profile=profile,
                     fault_points=right_points,
                     robot_vars=robot_vars,
-                    work_dir=fallback_root / "chunk_{:07d}_{:07d}".format(
-                        right_points[0], right_points[-1]
+                    work_dir=_fallback_root / "d{}_fp{:07d}_{:07d}".format(
+                        _depth + 1, right_points[0], right_points[-1]
                     ),
                     renode_remote_server_dir=renode_remote_server_dir,
                     trace_file=trace_file,
@@ -683,6 +703,8 @@ def _run_batch_with_fallback(
                     erase_trace_file_bin=erase_trace_file_bin,
                     fault_types_list=right_types,
                     keep_run_artifacts=keep_run_artifacts,
+                    _depth=_depth + 1,
+                    _fallback_root=_fallback_root,
                 )
             )
         return results
