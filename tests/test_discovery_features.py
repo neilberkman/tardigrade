@@ -1387,7 +1387,9 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             profile = load_profile(profile_path)
 
             def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
-                self.assertIn("TEST_TIMEOUT:4 minutes", cmd)
+                # Robot timeout scales with fault point cost (2s + fp*0.003s each).
+                # fps 0-19 = 160s → 3 minutes.
+                self.assertIn("TEST_TIMEOUT:3 minutes", cmd)
                 rf_results = Path(cmd[cmd.index("--results-dir") + 1])
                 rf_results.mkdir(parents=True, exist_ok=True)
                 result_var = next(
