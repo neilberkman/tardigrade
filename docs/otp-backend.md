@@ -73,13 +73,14 @@ otp_peripheral: otp # Sysbus name of OTPMemory peripheral
 
 ### OTP-specific fault types
 
-Three fault types target OTP programming:
+Four fault types target OTP programming:
 
 | Fault Type            | Wire Code | Description                                                  |
 | --------------------- | --------- | ------------------------------------------------------------ |
 | `otp_partial_program` | `op`      | Partial fuse blow (some bits stay 0)                         |
 | `otp_stuck_bit`       | `os`      | Manufacturing defect prevents specific bits from programming |
 | `otp_read_disturb`    | `od`      | Programming disturbs adjacent fuse bits                      |
+| `otp_overblow`        | `oo`      | Fuse blown past threshold, extra neighboring bits affected   |
 
 These are execute-only fault types (require full CPU emulation, not state mode).
 

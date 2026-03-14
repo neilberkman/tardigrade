@@ -53,14 +53,22 @@ python3 scripts/audit_bootloader.py --profile my_profile.yaml --quick
 
 Tardigrade ships several platform backends. Pick the one that matches your NVM technology:
 
-| Platform file                             | Backend               | NVM type    | Write granularity |
-| ----------------------------------------- | --------------------- | ----------- | ----------------- |
-| `platforms/cortex_m4_flash_fast.repl`     | `faultFlash` (NVMC)   | NOR flash   | 4 bytes           |
-| `platforms/cortex_m0_nvm.repl`            | `nvm_ctrl` (NVMemory) | Generic NVM | 8 bytes           |
-| `platforms/cortex_m0_mram.repl`           | `mram` (MRAMMemory)   | MRAM        | 8 bytes           |
-| `platforms/stm32f4.repl`                  | STM32F4 flash         | NOR flash   | 4 bytes           |
-| `platforms/nucleo_h753zi_tardigrade.repl` | STM32H7 flash         | NOR flash   | 4 bytes           |
-| `platforms/cortex_m0_otp.repl`            | OTPMemory             | OTP fuses   | 4 bytes           |
+| Platform file                               | Backend                                           | NVM type                               | Write granularity |
+| ------------------------------------------- | ------------------------------------------------- | -------------------------------------- | ----------------- |
+| `platforms/cortex_m4_flash_fast.repl`       | `faultFlash` (NVMC)                               | NOR flash                              | 4 bytes           |
+| `platforms/cortex_m4_flash.repl`            | `faultFlash` (NVMC) + `nvm_ctrl` (NVMemory)       | NOR flash (NVMemory for slot data)     | 4 bytes           |
+| `platforms/cortex_m0_nvm.repl`              | `nvm_ctrl` (NVMemory)                             | Generic NVM                            | 8 bytes           |
+| `platforms/cortex_m0_nvm_flash.repl`        | `nvm_ctrl` (NVMemoryController)                   | NVMemory with flash controller         | 4 bytes           |
+| `platforms/cortex_m0_nvm_generic_ctrl.repl` | `nvm_ctrl` (GenericNvmController)                 | NVMemory with command-register ctrl    | 8 bytes           |
+| `platforms/cortex_m0_mapped.repl`           | `flash` (MappedMemory)                            | MappedMemory (no fault controller)     | N/A               |
+| `platforms/cortex_m0_mapped_faultctrl.repl` | `faultFlash` (NVMC)                               | MappedMemory + NVMC fault controller   | 4 bytes           |
+| `platforms/cortex_m0_hybrid.repl`           | `flash` (MappedMemory) + `nvm_sidecar` (NVMemory) | Hybrid MappedMemory + NVMemory         | 8 bytes           |
+| `platforms/stm32f4.repl`                    | STM32F4 flash                                     | NOR flash                              | 4 bytes           |
+| `platforms/stm32h743_tardigrade.repl`       | `faultFlash` (STM32H7FlashController)             | STM32H743 dual-bank NOR flash          | 4 bytes           |
+| `platforms/stm32h753_tardigrade.repl`       | `faultFlash` (STM32H7FlashController)             | STM32H753 dual-bank NOR flash + crypto | 4 bytes           |
+| `platforms/nucleo_h753zi_tardigrade.repl`   | STM32H7 flash                                     | NOR flash                              | 4 bytes           |
+| `platforms/nrf52840_nvmc_psel.repl`         | Built-in nRF52840 NVMC                            | nRF52840 NOR flash                     | 4 bytes           |
+| `platforms/cortex_m0_otp.repl`              | OTPMemory                                         | OTP fuses                              | 4 bytes           |
 
 The STM32H7 and STM32F4 platforms use separate flash controller peripherals (`STM32H7FlashController.cs`, `STM32F4FlashController.cs`) listed under `extra_peripherals`. The OTP platform enables OTP fuse-blow fault types.
 
@@ -683,6 +691,46 @@ security_policy:
   toctou_protection: true
 ```
 
+## State fuzzer
+
+The `state_fuzzer` block generates random and boundary-value metadata states to stress-test bootloader invariants. Instead of replaying a single known-good metadata configuration, it synthesizes many plausible and deliberately invalid metadata blobs, writes them as `pre_boot_state`, and runs the sweep for each -- catching bootloaders that crash or misbehave on unexpected metadata combinations.
+
+### Configuration
+
+```yaml
+state_fuzzer:
+  enabled: true
+  iterations: 200 # number of random states to generate (default: 100)
+  seed: 42 # PRNG seed for reproducibility (default: 0)
+  metadata_model: ab_replica # built-in model name, or inline model (see below)
+```
+
+`metadata_model` can be either a built-in name (`ab_replica`) or an inline model that describes the metadata region layout:
+
+```yaml
+state_fuzzer:
+  enabled: true
+  iterations: 50
+  seed: 0
+  metadata_model:
+    base_address: 0x00080000
+    fill: 0xFF # fill byte for unspecified offsets (default: 0xFF)
+    fields:
+      - { name: magic, offset: 0, size: 4, valid: [0x4F54414D] }
+      - { name: seq, offset: 4, size: 4, type: uint32 }
+      - { name: active_slot, offset: 8, size: 4, valid: [0, 1] }
+      - { name: state, offset: 16, size: 4, valid_range: [0, 4] }
+      - { name: crc, offset: 252, size: 4, type: computed_crc32 }
+```
+
+Each field requires `name`, `offset`, and `size`. Optional properties:
+
+- `valid`: list of allowed values (fuzzer picks from these for valid states, generates out-of-range values for invalid states)
+- `valid_range`: `[min, max]` inclusive range of allowed values
+- `type`: `uint32` (generic integer) or `computed_crc32` (auto-computed CRC-32 over preceding fields; must be the final field; at most one per model)
+
+The fuzzer generates a mix of fully valid states, single-field boundary violations, and random combinations, then checks whether the bootloader handles each gracefully.
+
 ## Interpreting results
 
 ### Verdicts
@@ -986,10 +1034,10 @@ Before submitting a profile:
 
 ## Examples to study
 
-| Profile                                          | What it demonstrates                                            |
-| ------------------------------------------------ | --------------------------------------------------------------- |
-| `profiles/fault_no_crc.yaml`                     | Minimal vulnerable-OTA profile                                  |
+| Profile                                          | What it demonstrates                                                    |
+| ------------------------------------------------ | ----------------------------------------------------------------------- |
+| `profiles/fault_no_crc.yaml`                     | Minimal vulnerable-OTA profile                                          |
 | `profiles/mcuboot_head_upgrade.yaml`             | MCUboot upgrade with image hash, update trigger, sweep-only hash bypass |
-| `profiles/mcuboot_pr2100_broken_discovery.yaml`  | Differential testing (known bug, broken commit)                 |
-| `profiles/nuttx_nxboot_128.yaml`                 | State probe, semantic assertions, custom invariants, multi-boot |
-| `profiles/esp_idf_ota_upgrade_confirm_hook.yaml` | Boot-cycle hook for confirm-or-rollback                         |
+| `profiles/mcuboot_pr2100_broken_discovery.yaml`  | Differential testing (known bug, broken commit)                         |
+| `profiles/nuttx_nxboot_128.yaml`                 | State probe, semantic assertions, custom invariants, multi-boot         |
+| `profiles/esp_idf_ota_upgrade_confirm_hook.yaml` | Boot-cycle hook for confirm-or-rollback                                 |

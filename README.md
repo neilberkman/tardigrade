@@ -230,16 +230,17 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the full repo
 
 ## CI workflows
 
-| Workflow                            | Trigger                  | What it does                         |
-| ----------------------------------- | ------------------------ | ------------------------------------ |
-| `ci.yml`                            | push, PR                 | Robot suites + sharded self-test     |
-| `profile-sweep.yml`                 | workflow_dispatch        | On-demand single-profile sweep       |
-| `action-validation.yml`             | push, PR                 | Validates the reusable GitHub Action |
-| `oss-validation.yml`                | push to `main`, schedule | OSS validation guards                |
-| `mcuboot-head-exploratory.yml`      | workflow_dispatch        | MCUboot exploratory scenario         |
-| `nuttx-nxboot-real-exploratory.yml` | workflow_dispatch        | Real NuttX nxboot exploratory sweep  |
-| `nuttx-nxboot-revert-canary.yml`    | schedule, dispatch       | NuttX revert property canary         |
-| `renode-latest-canary.yml`          | schedule, dispatch       | Tests against latest Renode build    |
+| Workflow                              | Trigger                  | What it does                          |
+| ------------------------------------- | ------------------------ | ------------------------------------- |
+| `ci.yml`                              | push, PR                 | Robot suites + sharded self-test      |
+| `profile-sweep.yml`                   | workflow_dispatch        | On-demand single-profile sweep        |
+| `action-validation.yml`               | push, PR                 | Validates the reusable GitHub Action  |
+| `oss-validation.yml`                  | push to `main`, schedule | OSS validation guards                 |
+| `mcuboot-head-exploratory.yml`        | workflow_dispatch        | MCUboot exploratory scenario          |
+| `nuttx-nxboot-real-exploratory.yml`   | workflow_dispatch        | Real NuttX nxboot exploratory sweep   |
+| `nuttx-nxboot-revert-canary.yml`      | schedule, dispatch       | NuttX revert property canary          |
+| `nuttx-nxboot-multi-fault-canary.yml` | schedule, dispatch       | NuttX nxboot multi-fault sweep canary |
+| `renode-latest-canary.yml`            | schedule, dispatch       | Tests against latest Renode build     |
 
 ## Repository layout
 
