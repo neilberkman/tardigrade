@@ -528,6 +528,12 @@ fault_sweep:
     max_points: 50
 ```
 
+Gotcha: `phase2_fault` does not sweep the full Cartesian product of every
+single-fault point against every recovery write. It uses representative phase-1
+points (first/middle/last from the main write plan) and then sweeps recovery
+indices across `max_points`. This keeps the execute-mode search bounded while
+still exercising the second-stage recovery machinery.
+
 ### Multi-fault sweeps
 
 Test compound failures (two sequential faults):
@@ -540,6 +546,16 @@ fault_sweep:
     strategy: pairwise_interesting
     max_pairs: 5000
 ```
+
+Gotcha: `pairwise_interesting` is seeded by the issue-producing points from the
+preceding single-fault sweep. If the single-fault campaign finds no interesting
+points, the default fallback is `boundary_pairs`, which still exercises the
+multi-fault runtime path using boundary points from the original sweep.
+
+Reference smoke profiles:
+
+- `profiles/mcuboot_head_move_nrf52_revert_phase2fault_selftest.yaml`
+- `profiles/mcuboot_head_move_nrf52_upgrade_multifault_selftest.yaml`
 
 ### Initial states
 
