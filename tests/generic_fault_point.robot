@@ -38,6 +38,7 @@ ${BOOTLOADER_ENTRY}            ${EMPTY}
 ${RUN_DURATION}                ${EMPTY}
 ${TRACE_EXECUTION}             false
 ${TRACE_FILE}                  ${EMPTY}
+${HASH_BYPASS_SYMBOLS}         ${EMPTY}
 
 *** Keywords ***
 Resolve Path
@@ -112,6 +113,7 @@ Run Generic Fault Point
     Run Keyword If    '${META_SIZE}' != '${EMPTY}'    Execute Command    $meta_size=${META_SIZE}
     Run Keyword If    '${BOOTLOADER_ENTRY}' != '${EMPTY}'    Execute Command    $bootloader_entry=${BOOTLOADER_ENTRY}
     Run Keyword If    '${RUN_DURATION}' != '${EMPTY}'    Execute Command    $run_duration="${RUN_DURATION}"
+    Run Keyword If    '${HASH_BYPASS_SYMBOLS}' != '${EMPTY}'    Execute Command    $hash_bypass_symbols="${HASH_BYPASS_SYMBOLS}"
     Execute Command    $trace_execution=${TRACE_EXECUTION}
     Run Keyword If    '${TRACE_FILE}' != '${EMPTY}'    Execute Command    $trace_file="${TRACE_FILE}"
     ${resolved_slot_a_image}=    Run Keyword If    '${SLOT_A_IMAGE_FILE}' != '${EMPTY}'    Resolve Path    ${SLOT_A_IMAGE_FILE}

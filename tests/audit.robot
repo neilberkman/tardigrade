@@ -39,6 +39,7 @@ ${RUN_DURATION}                ${EMPTY}
 ${OTA_HEADER_SIZE}             ${EMPTY}
 ${BOOT_CYCLES}                 ${EMPTY}
 ${RUNTIME_FAULT_WRITE}         ${EMPTY}
+${HASH_BYPASS_SYMBOLS}         ${EMPTY}
 
 *** Keywords ***
 Resolve Path
@@ -94,6 +95,7 @@ Run Audit Point
     Run Keyword If    '${OTA_HEADER_SIZE}' != '${EMPTY}'    Execute Command    $ota_header_size=${OTA_HEADER_SIZE}
     Run Keyword If    '${BOOT_CYCLES}' != '${EMPTY}'    Execute Command    $boot_cycles=${BOOT_CYCLES}
     Run Keyword If    '${RUNTIME_FAULT_WRITE}' != '${EMPTY}'    Execute Command    $runtime_fault_write=${RUNTIME_FAULT_WRITE}
+    Run Keyword If    '${HASH_BYPASS_SYMBOLS}' != '${EMPTY}'    Execute Command    $hash_bypass_symbols="${HASH_BYPASS_SYMBOLS}"
 
     # Load platform + firmware.
     Execute Command    include "${ROOT}/peripherals/NVMemoryController.cs"

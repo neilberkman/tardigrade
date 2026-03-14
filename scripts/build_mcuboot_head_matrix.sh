@@ -316,11 +316,19 @@ build_mcuboot() {
 build_test_app() {
     local name="$1"
     local board="$2"
-    local overlay="$3"
+    local mcuboot_overlay="$3"
 
     local out_build="${BUILD_TMP}/hello_${name}"
 
+    # Create app overlay: same partition layout as MCUboot but link at slot0.
+    local app_overlay="${OVERLAY_DIR}/app_${name}.dts"
+    sed 's/zephyr,code-partition = &boot_partition/zephyr,code-partition = \&slot0_partition/' \
+        "${mcuboot_overlay}" > "${app_overlay}"
+
     msg "Building hello_world for ${name} (board=${board})"
+    # CONFIG_BOOTLOADER_MCUBOOT=y reserves header space (0x200) in the binary
+    # and links code at slot0_base + 0x200. Do NOT also use --pad-header in
+    # imgtool or you get a double header.
     (
         cd "${ZEPHYR_WS}"
         ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb \
@@ -331,7 +339,8 @@ build_test_app() {
           -b "${board}" \
           "${ZEPHYR_WS}/zephyr/samples/hello_world" \
           -- \
-          -DDTC_OVERLAY_FILE="${overlay}" \
+          -DDTC_OVERLAY_FILE="${app_overlay}" \
+          -DCONFIG_BOOTLOADER_MCUBOOT=y \
           -DCMAKE_GDB:FILEPATH="${TOOLCHAIN_PATH}/bin/arm-none-eabi-gdb" \
           "-DPython3_EXECUTABLE:FILEPATH=${IMGTOOL_PYTHON}"
     )
@@ -361,14 +370,15 @@ sign_image() {
         sign_input="${tmp}"
     fi
 
+    # App binary built with CONFIG_BOOTLOADER_MCUBOOT=y already reserves
+    # 0x200 bytes for the header. Do NOT use --pad-header (double header).
+    # Do NOT use --pad (fills to slot size, makes image huge and swap slow).
+    # Profile system handles update_trigger (trailer magic) separately.
     "${IMGTOOL_PYTHON}" "${IMGTOOL_PY}" sign \
       --key "${MCUBOOT_REPO}/root-rsa-2048.pem" \
       --align 8 \
       --header-size 0x200 \
       --slot-size "${slot_size}" \
-      --pad-header \
-      --pad \
-      --confirm \
       --version "${version}" \
       "${sign_input}" "${out}"
 
@@ -386,7 +396,7 @@ cat > "${OVERLAY_DIR}/nrf52_move_default.dts" <<'DTS'
 DTS
 
 build_mcuboot "move_nrf52" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_move_default.dts" \
-    -DCONFIG_BOOT_SWAP_USING_MOVE=y -DCONFIG_BOOT_PREFER_SWAP_MOVE=y
+    -DCONFIG_BOOT_SWAP_USING_MOVE=y -DCONFIG_BOOT_PREFER_SWAP_MOVE=y -DCONFIG_BOOT_PREFER_SWAP_OFFSET=n
 
 build_test_app "move_nrf52" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_move_default.dts"
 sign_image "move_nrf52" "0x76000" "1.0.0+0" "zephyr_head_move_nrf52_slot0.bin"
@@ -404,7 +414,7 @@ sign_image "scratch_nrf52" "0x6e000" "1.1.0+0" "zephyr_head_scratch_nrf52_slot1.
 # --- 3. head_move_stm32f4: swap-move, nucleo_f429zi, non-uniform sectors ---
 # Slots: 0x60000 (384KB) each
 build_mcuboot "move_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_move.dts" \
-    -DCONFIG_BOOT_SWAP_USING_MOVE=y -DCONFIG_BOOT_PREFER_SWAP_MOVE=y
+    -DCONFIG_BOOT_SWAP_USING_MOVE=y -DCONFIG_BOOT_PREFER_SWAP_MOVE=y -DCONFIG_BOOT_PREFER_SWAP_OFFSET=n
 
 build_test_app "move_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_move.dts"
 sign_image "move_stm32f4" "0x60000" "1.0.0+0" "zephyr_head_move_stm32f4_slot0.bin"
@@ -422,7 +432,7 @@ sign_image "scratch_stm32f4" "0x58000" "1.1.0+0" "zephyr_head_scratch_stm32f4_sl
 # --- 5. head_move_small: swap-move, nrf52840dk, 128KB slots ---
 # Slots: 0x20000 (128KB) each
 build_mcuboot "move_small" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_small_move.dts" \
-    -DCONFIG_BOOT_SWAP_USING_MOVE=y -DCONFIG_BOOT_PREFER_SWAP_MOVE=y
+    -DCONFIG_BOOT_SWAP_USING_MOVE=y -DCONFIG_BOOT_PREFER_SWAP_MOVE=y -DCONFIG_BOOT_PREFER_SWAP_OFFSET=n
 
 build_test_app "move_small" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_small_move.dts"
 sign_image "move_small" "0x20000" "1.0.0+0" "zephyr_head_move_small_slot0.bin"
@@ -436,6 +446,31 @@ build_mcuboot "scratch_small" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_small_
 build_test_app "scratch_small" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_small_scratch.dts"
 sign_image "scratch_small" "0x20000" "1.0.0+0" "zephyr_head_scratch_small_slot0.bin"
 sign_image "scratch_small" "0x20000" "1.1.0+0" "zephyr_head_scratch_small_slot1.bin" "16384"
+
+# --- 7. head_offset_nrf52: swap-offset (NEW algorithm), nrf52840dk, default geometry ---
+# swap-offset is the new default in MCUboot HEAD — prime zero-day target.
+build_mcuboot "offset_nrf52" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_move_default.dts" \
+    -DCONFIG_BOOT_SWAP_USING_OFFSET=y -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y
+
+build_test_app "offset_nrf52" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_move_default.dts"
+sign_image "offset_nrf52" "0x76000" "1.0.0+0" "zephyr_head_offset_nrf52_slot0.bin"
+sign_image "offset_nrf52" "0x76000" "1.1.0+0" "zephyr_head_offset_nrf52_slot1.bin" "36864"
+
+# --- 8. head_offset_stm32f4: swap-offset, nucleo_f429zi, non-uniform sectors ---
+build_mcuboot "offset_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_move.dts" \
+    -DCONFIG_BOOT_SWAP_USING_OFFSET=y -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y
+
+build_test_app "offset_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_move.dts"
+sign_image "offset_stm32f4" "0x60000" "1.0.0+0" "zephyr_head_offset_stm32f4_slot0.bin"
+sign_image "offset_stm32f4" "0x60000" "1.1.0+0" "zephyr_head_offset_stm32f4_slot1.bin" "36864"
+
+# --- 9. head_offset_small: swap-offset, nrf52840dk, 128KB slots ---
+build_mcuboot "offset_small" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_small_move.dts" \
+    -DCONFIG_BOOT_SWAP_USING_OFFSET=y -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y
+
+build_test_app "offset_small" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_small_move.dts"
+sign_image "offset_small" "0x20000" "1.0.0+0" "zephyr_head_offset_small_slot0.bin"
+sign_image "offset_small" "0x20000" "1.1.0+0" "zephyr_head_offset_small_slot1.bin" "16384"
 
 msg "=== MCUboot HEAD matrix build complete ==="
 msg "MCUboot commit: ${MCUBOOT_HEAD}"

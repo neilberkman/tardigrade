@@ -640,6 +640,16 @@ def main() -> int:
         if include_erases:
             robot_vars.append("FAULT_TYPES:both")
 
+        # Apply hash bypass during calibration too — hash validation doesn't
+        # affect write/erase counts but consumes enormous virtual time on
+        # large images (MCUboot SHA-256 on 448KB in emulation).
+        if not args.no_hash_bypass:
+            bypass_syms = profile.fault_sweep.sweep_hash_bypass_symbols
+            if bypass_syms:
+                robot_vars.append(
+                    "HASH_BYPASS_SYMBOLS:{}".format(",".join(bypass_syms))
+                )
+
         if max_writes == "auto":
             if eval_mode == "state" and "exec" in profile.memory.slots:
                 # State mode: compute write count from slot geometry.

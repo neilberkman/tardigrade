@@ -1,14 +1,14 @@
 schema_version: 1
-name: mcuboot_head_move_stm32f4_upgrade
+name: mcuboot_head_offset_stm32f4_upgrade
 description: >
-  Zero-day hunt: MCUboot HEAD swap-move upgrade on nucleo_f429zi.
-  Non-uniform flash sectors (16KB/64KB/128KB). Tests geometry-dependent
-  swap bugs that only manifest on non-uniform sector layouts.
+  Zero-day hunt: MCUboot HEAD swap-offset upgrade on nucleo_f429zi.
+  Non-uniform flash sectors (16KB/64KB/128KB). Tests new swap-offset
+  algorithm on non-uniform geometry.
 
 platform: platforms/stm32f4.repl
 flash_backend: faultFlash
 bootloader:
-  elf: results/oss_validation/assets/oss_mcuboot_head_move_stm32f4.elf
+  elf: results/oss_validation/assets/oss_mcuboot_head_offset_stm32f4.elf
   entry: 0x08000000
 memory:
   sram: { start: 0x20000000, end: 0x20040000 }
@@ -17,8 +17,8 @@ memory:
     exec: { base: 0x08020000, size: 0x60000 }
     staging: { base: 0x08080000, size: 0x60000 }
 images:
-  exec: results/oss_validation/assets/zephyr_head_move_stm32f4_slot0.bin
-  staging: results/oss_validation/assets/zephyr_head_move_stm32f4_slot1.bin
+  exec: results/oss_validation/assets/zephyr_head_offset_stm32f4_slot0.bin
+  staging: results/oss_validation/assets/zephyr_head_offset_stm32f4_slot1.bin
 update_trigger:
   type: mcuboot_trailer_magic
   slot: staging
