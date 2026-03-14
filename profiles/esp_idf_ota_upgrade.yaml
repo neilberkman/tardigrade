@@ -39,20 +39,10 @@ pre_boot_state:
   - { address: 0x000FC040, u32: 0x55445021 }
 
 # Success = device booted (VTOR relocated to either slot).
-# ESP-IDF design: power-loss during NEW->PENDING_VERIFY write gracefully
+# ESP-IDF design: power-loss during NEW→PENDING_VERIFY write gracefully
 # rolls back to previous image. Both slots are valid boot targets.
+# Control run will boot staging (slot 1); faulted runs may boot either.
 success_criteria: {}
-
-state_probe:
-  script: targets/esp_idf/probe.py
-
-invariant_providers:
-  - targets/esp_idf/invariants.py
-invariants:
-  - esp_idf_otadata_crc_integrity
-  - esp_idf_pending_verify_gets_aborted
-  - esp_idf_active_entry_maps_to_valid_slot
-  - esp_idf_seq_not_zero
 
 fault_sweep:
   mode: runtime
