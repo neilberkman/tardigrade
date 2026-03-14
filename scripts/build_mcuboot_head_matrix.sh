@@ -312,6 +312,7 @@ build_mcuboot() {
           -DCONFIG_BOOT_SIGNATURE_TYPE_RSA=n \
           -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
           -DCONFIG_BOOT_MAX_IMG_SECTORS=1024 \
+          -DCONFIG_BOOTLOADER_SRAM_SIZE=64 \
           -DCMAKE_GDB:FILEPATH="${TOOLCHAIN_PATH}/bin/arm-none-eabi-gdb" \
           "-DPython3_EXECUTABLE:FILEPATH=${IMGTOOL_PYTHON}" \
           "${extra_cmake[@]}"
