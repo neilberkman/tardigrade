@@ -76,7 +76,9 @@ from sweep import (
 )
 from profile_loader import HeuristicConfig, PreBootWrite, ProfileConfig, load_profile, load_profile_raw
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# Use absolute() not resolve() to preserve symlinks — resolve() follows
+# them, breaking paths through /tmp symlinks on "External SSD" volumes.
+REPO_ROOT = Path(__file__).absolute().parent.parent
 DEFAULT_RENODE_TEST = os.environ.get("RENODE_TEST", "renode-test")
 DEFAULT_ROBOT_SUITE = "tests/ota_fault_point.robot"
 EXIT_ASSERTION_FAILURE = 1

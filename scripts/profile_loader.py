@@ -1143,7 +1143,13 @@ class ProfileConfig:
         p = Path(value)
         if p.is_absolute():
             return str(p)
-        return str((repo_root / p).resolve())
+        # Use absolute() not resolve() to preserve symlinks — resolve()
+        # follows symlinks, breaking paths through /tmp symlinks used to
+        # avoid space-in-path issues on "External SSD" volumes.
+        result = repo_root / p
+        if not result.is_absolute():
+            result = Path.cwd() / result
+        return str(result)
 
     def generate_pre_boot_bin(self) -> Optional[str]:
         """Write pre_boot_state entries to a temp .bin file.
