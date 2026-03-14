@@ -84,11 +84,9 @@ fi
 
 # nrf52840dk scratch overlay: redefine partitions with scratch + code-partition
 cat > "${OVERLAY_DIR}/nrf52_scratch.dts" <<'DTS'
-/ {
-    /delete-node/ partitions;
-};
-
 &flash0 {
+    /delete-node/ partitions;
+
     partitions {
         compatible = "fixed-partitions";
         #address-cells = <1>;
@@ -126,11 +124,9 @@ DTS
 
 # nrf52840dk small-slot move overlay: 128KB slots
 cat > "${OVERLAY_DIR}/nrf52_small_move.dts" <<'DTS'
-/ {
-    /delete-node/ partitions;
-};
-
 &flash0 {
+    /delete-node/ partitions;
+
     partitions {
         compatible = "fixed-partitions";
         #address-cells = <1>;
@@ -164,11 +160,9 @@ DTS
 
 # nrf52840dk small-slot scratch overlay: 128KB slots + 4KB scratch
 cat > "${OVERLAY_DIR}/nrf52_small_scratch.dts" <<'DTS'
-/ {
-    /delete-node/ partitions;
-};
-
 &flash0 {
+    /delete-node/ partitions;
+
     partitions {
         compatible = "fixed-partitions";
         #address-cells = <1>;
@@ -206,11 +200,9 @@ DTS
 
 # STM32F4 (nucleo_f429zi) swap-move overlay
 cat > "${OVERLAY_DIR}/stm32f4_move.dts" <<'DTS'
-/ {
-    /delete-node/ partitions;
-};
-
 &flash0 {
+    /delete-node/ partitions;
+
     partitions {
         compatible = "fixed-partitions";
         #address-cells = <1>;
@@ -244,11 +236,9 @@ DTS
 
 # STM32F4 (nucleo_f429zi) swap-scratch overlay
 cat > "${OVERLAY_DIR}/stm32f4_scratch.dts" <<'DTS'
-/ {
-    /delete-node/ partitions;
-};
-
 &flash0 {
+    /delete-node/ partitions;
+
     partitions {
         compatible = "fixed-partitions";
         #address-cells = <1>;
