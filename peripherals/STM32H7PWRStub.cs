@@ -27,8 +27,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             switch(offset)
             {
+            case 0x04:
+                // CSR1: ACTVOSRDY (bit 13) = ready. NuttX polls this during
+                // clock init and spins in a busy-wait loop until it's set.
+                return 0x2000;
             case 0x18:
-                // D3CR.VOSRDY set: matches the upstream stm32h743.repl tag.
+                // D3CR: VOSRDY (bit 13) = ready.
                 return 0x2000;
             default:
                 return 0;
