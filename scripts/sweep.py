@@ -559,7 +559,7 @@ def run_runtime_sweep(
     ):
         _BATCH_TIME_BUDGET_S = 180.0
         _BASE_COST_S = 2.0     # overhead per point (setup + Phase 2)
-        _PER_WRITE_COST_S = 0.003  # Phase 1 emulation scales with fp value
+        _PER_WRITE_COST_S = 0.012  # Phase 1 emulation scales with fp value
         _MAX_PER_BATCH = 64    # cap for memory safety
 
         # Compute variable-sized chunk boundaries.

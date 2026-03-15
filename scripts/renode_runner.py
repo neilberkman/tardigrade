@@ -490,7 +490,8 @@ def run_batch(
     # healthy.
     # Scale robot test timeout with actual fault point cost, not just count.
     # Execute-mode late points (fp=10000+) need long Phase 1 emulation.
-    robot_test_timeout_s = max(120, 120 + sum(2.0 + fp * 0.003 for fp in fault_points))
+    # 0.012s/fp matches measured ~160s for fp=13000 execute-mode points.
+    robot_test_timeout_s = max(120, 120 + sum(2.0 + fp * 0.012 for fp in fault_points))
     robot_test_timeout_m = max(2, (int(robot_test_timeout_s) + 59) // 60)
 
     cmd = [
@@ -524,9 +525,9 @@ def run_batch(
     # emulation — 4s/point is fine for trace replay but way too low
     # for execute-mode where each point must emulate up to fp writes.
     if per_point_timeout is not None:
-        # Estimate per-point cost: base 2s + 0.003s per fault_at value
-        # (fp=0 → 2s, fp=1000 → 5s, fp=10000 → 32s, fp=14000 → 44s)
-        estimated_s = sum(2.0 + fp * 0.003 for fp in fault_points)
+        # Estimate per-point cost: base 2s + 0.012s per fault_at value.
+        # 0.012 matches measured ~160s for fp=13000 execute-mode points.
+        estimated_s = sum(2.0 + fp * 0.012 for fp in fault_points)
         timeout_s: Optional[float] = max(
             per_point_timeout,
             120.0 + estimated_s,
