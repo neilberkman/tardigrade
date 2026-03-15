@@ -3,8 +3,12 @@ name: rustboot_nrf52840_update
 description: >
   rustBoot nRF52840 swap-scratch update scenario. Boot partition has v1
   firmware, update partition has v2. UPDATE trailer marked as Updating
-  (0x70) to trigger swap. Tests power-loss resilience during the
-  sector-by-sector swap operation.
+  (0x70) to trigger swap. The current nRF52 fast backend can observe page
+  erases for rustBoot reliably, but rustBoot's NVMC HAL does not expose
+  per-word write counts in the way the fast write tracer expects, so this
+  profile currently targets interrupted-erase faults across the swap path.
+  The checked-in asset is intentionally a bug-finding campaign: quick
+  erase-fault sampling already reproduces a brick during swap.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -32,14 +36,41 @@ pre_boot_state:
   - { address: 0x0007FFFC, u32: 0x544F4F42 }
 success_criteria:
   vtor_in_slot: exec
+  image_hash: true
+  image_hash_slot: exec
+  expected_image: staging
+state_probe:
+  script: targets/rustboot/probe.py
+  required_paths:
+    - semantic_state.target
+    - semantic_state.boot.magic_valid
+    - semantic_state.boot.state
+    - semantic_state.flags.boot_flags_monotonic
+    - semantic_state.flags.update_flags_monotonic
+semantic_assertions:
+  control:
+    semantic_state.target: rustboot
+    semantic_state.boot.magic_valid: true
+    semantic_state.boot.state: testing
+    semantic_state.flags.boot_flags_monotonic: true
+    semantic_state.flags.update_flags_monotonic: true
+invariant_providers:
+  - targets/rustboot/invariants.py
+invariants:
+  - rustboot_boot_not_empty
+  - rustboot_swap_flags_consistent
+  - rustboot_no_packed_flag_corruption
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  # rustBoot's nRF52840 HAL keeps NVMC in WEN across flash writes, so the
+  # fast nRF52 backend cannot derive a reliable write index trace yet.
+  # Page-erase tracking still works, so start with erase-fault coverage.
+  fault_types: [interrupted_erase]
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "20.0"
   max_step_limit: 200000000
-  sweep_hash_bypass_symbols: ["verify_integrity", "verify_authenticity"]
 skip_self_test: true
 expect:
-  should_find_issues: false
+  should_find_issues: true

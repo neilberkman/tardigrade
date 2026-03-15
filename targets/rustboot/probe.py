@@ -55,12 +55,13 @@ RUSTBOOT_MAGIC = 0x544F4F42
 # Flag nibble ordering for monotonicity checks
 _FLAG_ORDER = {0x0F: 0, 0x07: 1, 0x03: 2, 0x00: 3}
 
-# Default partition layout (nRF52840, 1MB flash)
-_DEFAULT_BOOT_BASE = 0x00020000
-_DEFAULT_BOOT_SIZE = 0x00060000    # 384KB
-_DEFAULT_UPDATE_BASE = 0x00080000
-_DEFAULT_UPDATE_SIZE = 0x00060000  # 384KB
-_DEFAULT_SWAP_BASE = 0x000E0000
+# Default partition layout for the checked-in nRF52840 rustBoot build.
+# These defaults match the public assets under results/oss_validation/assets/.
+_DEFAULT_BOOT_BASE = 0x0002F000
+_DEFAULT_BOOT_SIZE = 0x00028000    # 160KB
+_DEFAULT_UPDATE_BASE = 0x00058000
+_DEFAULT_UPDATE_SIZE = 0x00028000  # 160KB
+_DEFAULT_SWAP_BASE = 0x00057000
 _DEFAULT_SWAP_SIZE = 0x00001000    # 4KB (one sector)
 _DEFAULT_SECTOR_SIZE = 0x00001000  # 4KB
 
@@ -75,9 +76,14 @@ def _as_int(value, default=0):
 def _get_monitor_var(monitor, name, default=None):
     """Safely read a Renode monitor variable, returning default on failure."""
     try:
-        return _as_int(monitor.GetVariable(name))
+        value = monitor.GetVariable(name)
     except Exception:
         return default
+    if value is None:
+        return default
+    if isinstance(value, str) and not value.strip():
+        return default
+    return _as_int(value, default)
 
 
 def _read_bytes(bus, addr, size):

@@ -199,6 +199,8 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the complete 
 
 **NuttX nxboot** -- real upstream NuttX firmware built from source. Board configs (defconfigs, linker scripts, Kconfig, progmem) are upstream as of [apache/nuttx#18509](https://github.com/apache/nuttx/pull/18509); the build script auto-detects this and skips local patches. Exploratory validation, a revert canary workflow, and a full target adapter (build, runtime profile generation, audit). See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
 
+**rustBoot** -- initial real upstream nRF52840 integration using checked-in public assets, a rustBoot-specific state probe/invariant package, and a first interrupted-erase campaign over the swap-scratch update path. Current limitation: the fast nRF52 backend does not yet recover write-index traces from rustBoot's NVMC usage, so the shipped profile is erase-fault focused and expected to find issues. See [`profiles/rustboot_nrf52840_update.yaml`](profiles/rustboot_nrf52840_update.yaml), [`targets/rustboot/`](targets/rustboot/), and [`docs/rustboot-target.md`](docs/rustboot-target.md).
+
 ### Reference examples
 
 The `examples/` directory contains standalone bootloader firmware for engine validation and self-testing:

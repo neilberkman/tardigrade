@@ -138,33 +138,38 @@ rustBoot on nRF52840 maps directly to tardigrade's existing infrastructure:
 - **Platform file**: Existing `cortex_m4_flash_fast.repl` or nRF52840 repl
 - **Flash size**: 1MB (0x00000000 - 0x000FFFFF)
 
-Partition mapping for a typical nRF52840 rustBoot build:
+Partition mapping for the checked-in nRF52840 rustBoot build:
 
 ```
-0x00000000 - 0x0001FFFF  Bootloader (128KB)
-0x00020000 - 0x0007FFFF  BOOT partition (384KB)
-0x00080000 - 0x000DFFFF  UPDATE partition (384KB)
-0x000E0000 - 0x000E0FFF  SWAP partition (4KB)
-0x000E1000 - 0x000FFFFF  Unused / config
+0x00000000 - 0x0002EFFF  Bootloader / immutable region
+0x0002F000 - 0x00056FFF  BOOT partition (160KB)
+0x00057000 - 0x00057FFF  SWAP partition (4KB)
+0x00058000 - 0x0007FFFF  UPDATE partition (160KB)
+0x00080000 - 0x000FFFFF  Unused / config
 ```
 
 Profile YAML variables:
 
 ```yaml
-flash_backend: sysbus.nvmc
-slot_exec_base: 0x00020000
-slot_exec_size: 0x00060000
-slot_staging_base: 0x00080000
-slot_staging_size: 0x00060000
-extra_vars:
-  rustboot_boot_base: 0x00020000
-  rustboot_boot_size: 0x00060000
-  rustboot_update_base: 0x00080000
-  rustboot_update_size: 0x00060000
-  rustboot_swap_base: 0x000E0000
-  rustboot_swap_size: 0x00001000
-  rustboot_sector_size: 0x00001000
+flash_backend: faultFlash
+slot_exec_base: 0x0002F000
+slot_exec_size: 0x00028000
+slot_staging_base: 0x00058000
+slot_staging_size: 0x00028000
+state_probe:
+  script: targets/rustboot/probe.py
+invariant_providers:
+  - targets/rustboot/invariants.py
 ```
+
+Note: the current rustBoot probe defaults are pinned to this checked-in
+nRF52840 layout. The current fast nRF52 backend also infers write indices
+from NVMC mode transitions; rustBoot's nRF52840 HAL leaves NVMC in
+write-enable mode across flash writes, so the first working repo profile
+currently uses `interrupted_erase` coverage instead of write-indexed
+`power_loss` points. The checked-in ELF also does not export stable
+unmangled hash-bypass symbols, so the current profile runs without
+`sweep_hash_bypass_symbols`.
 
 ## Estimated work for a working profile
 
@@ -172,15 +177,17 @@ extra_vars:
 
 Build rustBoot for nRF52840, get it running in Renode on the existing
 nRF52840 platform. Create a profile YAML with the partition layout above.
-Run a calibration pass to identify the write trace during a normal OTA
-swap, then do a write-fault sweep.
+Run a calibration pass to identify the erase trace during a normal OTA
+swap, then do an erase-fault sweep. The checked-in profile now does this
+and is expected to find issues. Extending this to write-indexed power-loss
+coverage still requires a rustBoot-aware nRF52 fast backend.
 
 Deliverables:
 
 - rustBoot ELF built for nRF52840
 - Profile YAML with partition addresses and probe/invariant paths
-- Calibration write trace showing swap write pattern
-- Initial sweep results showing brick rate
+- Calibration erase trace showing swap progress
+- Initial erase-fault sweep results showing brick rate
 
 ### Phase 2: Differential validation against known bugs (~1 day)
 
