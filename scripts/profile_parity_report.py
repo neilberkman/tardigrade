@@ -230,7 +230,6 @@ def build_report(repo_root: Path) -> Dict[str, Any]:
                 if key != "profiles"
             }
             for target, metrics in per_target.items()
-            if metrics["profiles_total"] or metrics["oss_validation_profiles"]
         },
         "totals": totals,
         "claimable_totals": claimable_totals,
