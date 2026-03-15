@@ -307,38 +307,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
-            var sysbus = machine.GetSystemBus(this);
-            ConfigureMemoryProgramHooks(sysbus, flash1, banks[0], enabled);
-            ConfigureMemoryProgramHooks(sysbus, flash2, banks[1], enabled);
+            var cpus = machine.GetSystemBus(this).GetCPUs().OfType<ICPUWithMemoryAccessHooks>();
+            foreach(var cpu in cpus)
+            {
+                cpu.SetHookAtMemoryAccess(enabled ? (MemoryAccessHook)OnMemoryProgramWrite : null);
+            }
             memoryProgramHooksInstalled = enabled;
-        }
-
-        private void ConfigureMemoryProgramHooks(IBusController sysbus, MappedMemory flash, Bank bank, bool enabled)
-        {
-            sysbus.SetHookBeforePeripheralWrite<byte>(flash, enabled ? (value, offset) => OnBankWriteByte(bank, offset, value) : null);
-            sysbus.SetHookBeforePeripheralWrite<ushort>(flash, enabled ? (value, offset) => OnBankWriteWord(bank, offset, value) : null);
-            sysbus.SetHookBeforePeripheralWrite<uint>(flash, enabled ? (value, offset) => OnBankWriteDoubleWord(bank, offset, value) : null);
-            sysbus.SetHookBeforePeripheralWrite<ulong>(flash, enabled ? (value, offset) => OnBankWriteQuadWord(bank, offset, value) : null);
-        }
-
-        private byte OnBankWriteByte(Bank bank, long offset, byte value)
-        {
-            return (byte)bank.HandleMemoryProgramWrite(offset, 1, value);
-        }
-
-        private ushort OnBankWriteWord(Bank bank, long offset, ushort value)
-        {
-            return (ushort)bank.HandleMemoryProgramWrite(offset, 2, value);
-        }
-
-        private uint OnBankWriteDoubleWord(Bank bank, long offset, uint value)
-        {
-            return (uint)bank.HandleMemoryProgramWrite(offset, 4, value);
-        }
-
-        private ulong OnBankWriteQuadWord(Bank bank, long offset, ulong value)
-        {
-            return bank.HandleMemoryProgramWrite(offset, 8, value);
         }
 
         private ulong HandleTrackedWrite(Bank bank, long localOffset, uint width, ulong value)
