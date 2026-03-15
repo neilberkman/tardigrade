@@ -22,6 +22,8 @@ images:
 update_trigger:
   type: mcuboot_trailer_magic
   slot: staging
+# image_hash verifies the correct image is in exec after swap.
+# Requires max_writes:auto so the full swap completes during calibration.
 success_criteria:
   vtor_in_slot: exec
   image_hash: true
