@@ -47,5 +47,4 @@ fault_sweep:
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 
 expect:
-  should_find_issues: true
-  allow_semantic_only_issues: true
+  should_find_issues: false

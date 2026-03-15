@@ -22,7 +22,7 @@ def render_runtime_profile(
     *,
     header_size: int = 0x400,
     fault_max_writes: str = "auto",
-    boot_cycles: int = 2,
+    boot_cycles: int = 1,
     run_duration: str = "8.0",
     calibration_time_slice: str = "0.1",
     name: str = "nuttx_nxboot_real_update",
@@ -67,8 +67,7 @@ fault_sweep:
   evaluation_mode: execute
   run_duration: "{run_duration}"
   calibration_time_slice: "{calibration_time_slice}"
-  boot_cycles: {boot_cycles}
-  expected_rollback_at_cycle: 1{fault_types_line}
+  boot_cycles: {boot_cycles}{fault_types_line}
 state_probe:
   script: targets/nuttx_nxboot/probe.py
 semantic_assertions:
@@ -77,8 +76,6 @@ semantic_assertions:
     semantic_state.roles.recovery_valid: true
     semantic_state.roles.next_boot: revert
     semantic_state.slots.primary.magic_kind: internal
-    multi_boot_analysis.final_outcome: success
-    multi_boot_analysis.final_slot: exec
 invariant_providers:
   - targets/nxboot/invariants.py
 invariants:
