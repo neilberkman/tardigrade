@@ -27,6 +27,21 @@ success_criteria:
   vtor_in_slot: exec
   marker_address: 0x0000C014
   marker_value: 0x00000001
+state_probe:
+  script: targets/mcuboot/probe.py
+  required_paths:
+    - semantic_state.target
+    - semantic_state.slots.exec.magic_state
+    - semantic_state.slots.staging.magic_state
+    - semantic_state.flags.any_partial_magic
+semantic_assertions:
+  control:
+    semantic_state.target: mcuboot
+    semantic_state.flags.any_partial_magic: false
+invariant_providers:
+  - targets/mcuboot/invariants.py
+invariants:
+  - mcuboot_no_partial_magic
 security_policy:
   anti_rollback: true
   minimum_version: 2

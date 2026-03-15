@@ -1,0 +1,64 @@
+schema_version: 1
+name: esp_idf_ota_upgrade_full_fault_coverage
+description: "Full NVM fault coverage: exercises all general fault types the engine\
+  \ supports. ESP-IDF OTA bootloader model \u2014 upgrade scenario with rollback enabled.\
+  \ Implements the exact otadata dual-sector format and state machine from ESP-IDF\
+  \ (Apache 2.0). Slot 0 has current image (ota_seq=1, VALID). Slot 1 has new image\
+  \ (ota_seq=2, NEW). Bootloader transitions slot 1 to PENDING_VERIFY and boots it.\
+  \ Tests power-loss resilience during the otadata state transition writes.\n"
+platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
+bootloader:
+  elf: examples/esp_idf_ota/esp_idf_ota.elf
+  entry: 0
+memory:
+  sram:
+    start: 536870912
+    end: 537133056
+  write_granularity: 4
+  slots:
+    exec:
+      base: 49152
+      size: 475136
+    staging:
+      base: 524288
+      size: 475136
+images:
+  exec: examples/esp_idf_ota/slot0.bin
+  staging: examples/esp_idf_ota/slot1.bin
+pre_boot_state:
+- address: 1015808
+  u32: 1
+- address: 1015832
+  u32: 2
+- address: 1015836
+  u32: 1195612314
+- address: 1019904
+  u32: 2
+- address: 1019928
+  u32: 0
+- address: 1019932
+  u32: 1442199412
+- address: 1032256
+  u32: 1430540321
+success_criteria: {}
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: '2.0'
+  max_step_limit: 20000000
+  fault_types:
+  - power_loss
+  - interrupted_erase
+  - bit_corruption
+  - silent_write_failure
+  - write_disturb
+  - write_rejection
+  - multi_sector_atomicity
+  - wear_leveling_corruption
+  - read_bit_flip
+expect:
+  should_find_issues: false
+skip_self_test: true

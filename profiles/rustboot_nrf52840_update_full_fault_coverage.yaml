@@ -1,0 +1,83 @@
+schema_version: 1
+name: rustboot_nrf52840_update_full_fault_coverage
+description: 'Full NVM fault coverage: exercises all general fault types the engine
+  supports. rustBoot nRF52840 swap-scratch update scenario. Boot partition has v1
+  firmware, update partition has v2. UPDATE trailer marked as Updating (0x70) to trigger
+  swap. The current nRF52 fast backend can observe page erases for rustBoot reliably,
+  but rustBoot''s NVMC HAL does not expose per-word write counts in the way the fast
+  write tracer expects, so this profile currently targets interrupted-erase faults
+  across the swap path. The checked-in asset is intentionally a bug-finding campaign:
+  quick erase-fault sampling already reproduces a brick during swap.
+
+  '
+platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
+bootloader:
+  elf: results/oss_validation/assets/rustboot_nrf52840.elf
+  entry: 0
+memory:
+  sram:
+    start: 536870912
+    end: 537133056
+  write_granularity: 4
+  slots:
+    exec:
+      base: 192512
+      size: 163840
+    staging:
+      base: 360448
+      size: 163840
+images:
+  exec: results/oss_validation/assets/rustboot_boot_v1.bin
+  staging: results/oss_validation/assets/rustboot_update_v2.bin
+pre_boot_state:
+- address: 524280
+  u32: 1895825407
+- address: 524284
+  u32: 1414483778
+success_criteria:
+  vtor_in_slot: exec
+  image_hash: true
+  image_hash_slot: exec
+  expected_image: staging
+state_probe:
+  script: targets/rustboot/probe.py
+  required_paths:
+  - semantic_state.target
+  - semantic_state.boot.magic_valid
+  - semantic_state.boot.state
+  - semantic_state.flags.boot_flags_monotonic
+  - semantic_state.flags.update_flags_monotonic
+semantic_assertions:
+  control:
+    semantic_state.target: rustboot
+    semantic_state.boot.magic_valid: true
+    semantic_state.boot.state: testing
+    semantic_state.flags.boot_flags_monotonic: true
+    semantic_state.flags.update_flags_monotonic: true
+invariant_providers:
+- targets/rustboot/invariants.py
+invariants:
+- rustboot_boot_not_empty
+- rustboot_swap_flags_consistent
+- rustboot_no_packed_flag_corruption
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types:
+  - power_loss
+  - interrupted_erase
+  - bit_corruption
+  - silent_write_failure
+  - write_disturb
+  - write_rejection
+  - multi_sector_atomicity
+  - wear_leveling_corruption
+  - read_bit_flip
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: '20.0'
+  max_step_limit: 200000000
+skip_self_test: true
+expect:
+  should_find_issues: true
