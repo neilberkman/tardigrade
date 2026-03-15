@@ -832,49 +832,63 @@ def disarm_vtor_watchpoint():
 _hash_bypass_symbols_raw = str(monitor.GetVariable('hash_bypass_symbols')).strip()
 _hash_bypass_patches = []
 if _hash_bypass_symbols_raw and backend['kind'] in ('fast', 'mram'):
+    # Rust generics produce multiple monomorphizations (e.g. 4x verify_integrity).
+    # Renode's GetSymbolAddress returns only the first match. Use nm on the
+    # bootloader ELF to find ALL addresses containing each symbol name.
+    _nm_symbols = {}  # cache: sym_name -> set of addresses
+    try:
+        import subprocess as _sp
+        _elf_path = str(monitor.GetVariable('bootloader_elf')).strip()
+        if _elf_path:
+            _nm_out = _sp.run(['nm', _elf_path], capture_output=True, text=True, timeout=5)
+            if _nm_out.returncode == 0:
+                _nm_lines = _nm_out.stdout.splitlines()
+                log('hash_bypass: parsed {} symbols from ELF via nm'.format(len(_nm_lines)))
+            else:
+                _nm_lines = []
+                log('hash_bypass: nm failed (rc={}), falling back to single-match'.format(_nm_out.returncode))
+        else:
+            _nm_lines = []
+    except Exception as _e:
+        _nm_lines = []
+        log('hash_bypass: nm not available ({}), falling back to single-match'.format(_e))
+
     for sym_name in _hash_bypass_symbols_raw.split(','):
         sym_name = sym_name.strip()
         if not sym_name:
             continue
-        # GetSymbolAddress returns only ONE match. For Rust generics with
-        # multiple monomorphizations (e.g. verify_integrity<Boot,Testing>),
-        # we need ALL matches. Try GetSymbolAddress first (covers C symbols),
-        # then scan the ELF for additional matches via FindSymbolsByName.
         found_addrs = set()
-        try:
-            addr = int(bus.GetSymbolAddress(sym_name))
-            found_addrs.add(addr & ~1)
-        except Exception:
-            pass
-        # Scan for all symbols containing the name (Rust mangled names).
-        try:
-            all_syms = monitor.Machine['sysbus'].GetAllSymbolAddresses(sym_name)
-            for s in all_syms:
-                found_addrs.add(int(s) & ~1)
-        except Exception:
-            pass
-        # Fallback: parse the ELF with subprocess nm if available.
-        if len(found_addrs) <= 1:
+        # Primary: scan nm output for ALL matches (handles Rust monomorphizations).
+        for line in _nm_lines:
+            if sym_name in line:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    try:
+                        found_addrs.add(int(parts[0], 16) & ~1)
+                    except ValueError:
+                        pass
+        # Fallback: Renode single-symbol lookup (for hosts without nm).
+        # WARN: this only patches ONE match. If the ELF has multiple
+        # monomorphizations (Rust generics), the others stay unpatched
+        # and the bypass silently fails.
+        if not found_addrs:
             try:
-                import subprocess as _sp
-                elf_path = str(monitor.GetVariable('bootloader_elf')).strip()
-                if elf_path:
-                    nm_out = _sp.run(['nm', elf_path], capture_output=True, text=True, timeout=5)
-                    for line in nm_out.stdout.splitlines():
-                        if sym_name in line:
-                            parts = line.strip().split()
-                            if len(parts) >= 2:
-                                try:
-                                    found_addrs.add(int(parts[0], 16) & ~1)
-                                except ValueError:
-                                    pass
+                addr = int(bus.GetSymbolAddress(sym_name))
+                found_addrs.add(addr & ~1)
+                if not _nm_lines:
+                    log('hash_bypass: WARNING: nm unavailable, only single-match '
+                        'for {}. If ELF has Rust monomorphizations, bypass is '
+                        'INCOMPLETE — results may be invalid.'.format(sym_name))
             except Exception:
                 pass
         for addr in sorted(found_addrs):
             _hash_bypass_patches.append((addr, sym_name))
             log('hash_bypass: {}=0x{:08X}'.format(sym_name, addr & 0xFFFFFFFF))
         if not found_addrs:
-            log('hash_bypass: symbol {} not found'.format(sym_name))
+            raise RuntimeError(
+                'hash_bypass: symbol {} not found in ELF. Cannot proceed with '
+                'bypass — calibration would produce invalid results.'.format(sym_name)
+            )
 
 def apply_hash_bypass():
     # ARM Thumb: movs r0, #0 + bx lr = return 0.  Little-endian 32-bit: 0x47702000.
