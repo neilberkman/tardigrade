@@ -836,13 +836,45 @@ if _hash_bypass_symbols_raw and backend['kind'] in ('fast', 'mram'):
         sym_name = sym_name.strip()
         if not sym_name:
             continue
+        # GetSymbolAddress returns only ONE match. For Rust generics with
+        # multiple monomorphizations (e.g. verify_integrity<Boot,Testing>),
+        # we need ALL matches. Try GetSymbolAddress first (covers C symbols),
+        # then scan the ELF for additional matches via FindSymbolsByName.
+        found_addrs = set()
         try:
             addr = int(bus.GetSymbolAddress(sym_name))
-            addr = addr & ~1  # Clear Thumb bit
+            found_addrs.add(addr & ~1)
+        except Exception:
+            pass
+        # Scan for all symbols containing the name (Rust mangled names).
+        try:
+            all_syms = monitor.Machine['sysbus'].GetAllSymbolAddresses(sym_name)
+            for s in all_syms:
+                found_addrs.add(int(s) & ~1)
+        except Exception:
+            pass
+        # Fallback: parse the ELF with subprocess nm if available.
+        if len(found_addrs) <= 1:
+            try:
+                import subprocess as _sp
+                elf_path = str(monitor.GetVariable('bootloader_elf')).strip()
+                if elf_path:
+                    nm_out = _sp.run(['nm', elf_path], capture_output=True, text=True, timeout=5)
+                    for line in nm_out.stdout.splitlines():
+                        if sym_name in line:
+                            parts = line.strip().split()
+                            if len(parts) >= 2:
+                                try:
+                                    found_addrs.add(int(parts[0], 16) & ~1)
+                                except ValueError:
+                                    pass
+            except Exception:
+                pass
+        for addr in sorted(found_addrs):
             _hash_bypass_patches.append((addr, sym_name))
             log('hash_bypass: {}=0x{:08X}'.format(sym_name, addr & 0xFFFFFFFF))
-        except Exception as e:
-            log('hash_bypass: symbol {} not found ({})'.format(sym_name, e))
+        if not found_addrs:
+            log('hash_bypass: symbol {} not found'.format(sym_name))
 
 def apply_hash_bypass():
     # ARM Thumb: movs r0, #0 + bx lr = return 0.  Little-endian 32-bit: 0x47702000.
