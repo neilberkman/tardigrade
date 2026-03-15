@@ -65,6 +65,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public override void Reset()
         {
             base.Reset();
+            UpdateMemoryProgramHooks(false);
             foreach(var bank in banks)
             {
                 bank.Reset();
@@ -287,27 +288,66 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
-            var registration = machine.GetSystemBus(this).WhatIsAt(physicalAddress);
-            if(registration == null)
+            if(!TryResolveFlashBank(addr, out var bank, out var localOffset))
             {
                 return;
             }
-
-            var writeTarget = registration.Peripheral;
-            var localOffset = (long)(physicalAddress - registration.RegistrationPoint.Range.StartAddress);
-            foreach(var bank in banks)
-            {
-                bank.HandleMemoryProgramWrite(writeTarget, localOffset, width, value);
-            }
+            bank.HandleMemoryProgramWrite(localOffset, width, value);
         }
 
-        private void HandleTrackedWrite(Bank bank, long localOffset, uint width, ulong value)
+        private void UpdateMemoryProgramHooks(bool enabled)
+        {
+            if(memoryProgramHooksInstalled == enabled)
+            {
+                return;
+            }
+            if(!machine.IsRegistered(this) || !machine.IsRegistered(flash1) || !machine.IsRegistered(flash2))
+            {
+                memoryProgramHooksInstalled = false;
+                return;
+            }
+
+            var sysbus = machine.GetSystemBus(this);
+            ConfigureMemoryProgramHooks(sysbus, flash1, banks[0], enabled);
+            ConfigureMemoryProgramHooks(sysbus, flash2, banks[1], enabled);
+            memoryProgramHooksInstalled = enabled;
+        }
+
+        private void ConfigureMemoryProgramHooks(IBusController sysbus, MappedMemory flash, Bank bank, bool enabled)
+        {
+            sysbus.SetHookBeforePeripheralWrite<byte>(flash, enabled ? (value, offset) => OnBankWriteByte(bank, offset, value) : null);
+            sysbus.SetHookBeforePeripheralWrite<ushort>(flash, enabled ? (value, offset) => OnBankWriteWord(bank, offset, value) : null);
+            sysbus.SetHookBeforePeripheralWrite<uint>(flash, enabled ? (value, offset) => OnBankWriteDoubleWord(bank, offset, value) : null);
+            sysbus.SetHookBeforePeripheralWrite<ulong>(flash, enabled ? (value, offset) => OnBankWriteQuadWord(bank, offset, value) : null);
+        }
+
+        private byte OnBankWriteByte(Bank bank, long offset, byte value)
+        {
+            return (byte)bank.HandleMemoryProgramWrite(offset, 1, value);
+        }
+
+        private ushort OnBankWriteWord(Bank bank, long offset, ushort value)
+        {
+            return (ushort)bank.HandleMemoryProgramWrite(offset, 2, value);
+        }
+
+        private uint OnBankWriteDoubleWord(Bank bank, long offset, uint value)
+        {
+            return (uint)bank.HandleMemoryProgramWrite(offset, 4, value);
+        }
+
+        private ulong OnBankWriteQuadWord(Bank bank, long offset, ulong value)
+        {
+            return bank.HandleMemoryProgramWrite(offset, 8, value);
+        }
+
+        private ulong HandleTrackedWrite(Bank bank, long localOffset, uint width, ulong value)
         {
             if(PassthroughMode)
             {
                 if(AnyFaultFired || width == 0)
                 {
-                    return;
+                    return ReadCurrentValue(bank, localOffset, width);
                 }
 
                 var passthroughByteCount = (int)width;
@@ -322,29 +362,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     tracker.IncrementWriteCount();
                     passthroughCursor += bytesInWord;
                 }
-                return;
+                return value;
             }
 
             EnsureShadow();
 
             if(AnyFaultFired)
             {
-                RestoreRangeFromShadow(bank.CombinedBaseOffset + localOffset, (int)width);
-                return;
+                return ReadCurrentValue(bank, localOffset, width);
             }
 
             if(width == 0)
             {
-                return;
+                return value;
             }
 
             var byteCount = (int)width;
             var combinedOffset = bank.CombinedBaseOffset + localOffset;
-            var valueBytes = new byte[byteCount];
-            for(var i = 0; i < byteCount; i++)
-            {
-                valueBytes[i] = (byte)((value >> (8 * i)) & 0xFF);
-            }
 
             var cursor = 0;
             while(cursor < byteCount)
@@ -355,13 +389,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var bytesInWord = Math.Min(4 - inWordOffset, byteCount - cursor);
 
                 var oldWord = ReadWordFromShadow(alignedOffset);
-                var newWord = oldWord;
-                for(var i = 0; i < bytesInWord; i++)
-                {
-                    var shift = (inWordOffset + i) * 8;
-                    newWord = (newWord & ~(0xFFu << shift))
-                        | ((uint)valueBytes[cursor + i] << shift);
-                }
+                var newWord = OverlayWriteChunk(oldWord, value, cursor, inWordOffset, bytesInWord);
 
                 if(tracker.RecordWriteAndCheckFault((int)alignedOffset, newWord))
                 {
@@ -369,22 +397,71 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     LastFaultAddress = (uint)(FlashBaseAddress + alignedOffset);
                     FaultFlashSnapshot = ReadFlashSnapshot();
                     ApplyWriteFault(alignedOffset, oldWord, newWord);
-
-                    // Power loss after the fault point suppresses any remaining
-                    // bytes from the same access as well.
-                    cursor += bytesInWord;
-                    while(cursor < byteCount)
+                    var faultedAccessValue = ReadCurrentValue(bank, localOffset, width);
+                    if(cursor > 0)
                     {
-                        var restOffset = (combinedOffset + cursor) & ~3L;
-                        RestoreWordFromShadow(restOffset);
-                        cursor += 4;
+                        faultedAccessValue = OverlayWriteChunk64(faultedAccessValue, value, 0, 0, cursor);
                     }
-                    return;
+                    return faultedAccessValue;
                 }
 
-                UpdateShadowWord(alignedOffset);
+                WriteShadowWord(alignedOffset, newWord);
                 cursor += bytesInWord;
             }
+
+            return value;
+        }
+
+        private bool TryResolveFlashBank(long physicalAddress, out Bank bank, out long localOffset)
+        {
+            var relative = physicalAddress - FlashBaseAddress;
+            if(relative < 0 || relative >= FlashSize)
+            {
+                bank = null;
+                localOffset = 0;
+                return false;
+            }
+
+            if(relative < flash1Size)
+            {
+                bank = banks[0];
+                localOffset = relative;
+                return true;
+            }
+
+            bank = banks[1];
+            localOffset = relative - flash1Size;
+            return true;
+        }
+
+        private static uint OverlayWriteChunk(uint oldWord, ulong value, int sourceByteOffset, int inWordOffset, int bytesInWord)
+        {
+            var newWord = oldWord;
+            for(var i = 0; i < bytesInWord; i++)
+            {
+                var sourceIndex = sourceByteOffset + i;
+                var sourceByte = sourceIndex < sizeof(ulong)
+                    ? (uint)((value >> (8 * sourceIndex)) & 0xFFUL)
+                    : 0u;
+                var targetShift = (inWordOffset + i) * 8;
+                newWord = (newWord & ~(0xFFu << targetShift)) | (sourceByte << targetShift);
+            }
+            return newWord;
+        }
+
+        private static ulong OverlayWriteChunk64(ulong oldValue, ulong value, int sourceByteOffset, int inValueOffset, int bytesToWrite)
+        {
+            var newValue = oldValue;
+            for(var i = 0; i < bytesToWrite; i++)
+            {
+                var sourceIndex = sourceByteOffset + i;
+                var sourceByte = sourceIndex < sizeof(ulong)
+                    ? (value >> (8 * sourceIndex)) & 0xFFUL
+                    : 0UL;
+                var targetShift = (inValueOffset + i) * 8;
+                newValue = (newValue & ~(0xFFUL << targetShift)) | (sourceByte << targetShift);
+            }
+            return newValue;
         }
 
         private void HandleTrackedErase(Bank bank, long sectorOffset, int eraseSize)
@@ -564,6 +641,34 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 | (flashShadow[off + 3] << 24));
         }
 
+        private ulong ReadCurrentValue(Bank bank, long localOffset, uint width)
+        {
+            switch(width)
+            {
+            case 0:
+                return 0;
+            case 1:
+                return bank.Memory.ReadByte(localOffset);
+            case 2:
+                return bank.Memory.ReadWord(localOffset);
+            case 4:
+                return bank.Memory.ReadDoubleWord(localOffset);
+            case 8:
+                return (ulong)bank.Memory.ReadDoubleWord(localOffset)
+                    | ((ulong)bank.Memory.ReadDoubleWord(localOffset + 4) << 32);
+            default:
+            {
+                var bytes = Flash.ReadBytes(bank.CombinedBaseOffset + localOffset, checked((int)width));
+                ulong value = 0;
+                for(var i = 0; i < bytes.Length && i < sizeof(ulong); i++)
+                {
+                    value |= (ulong)bytes[i] << (8 * i);
+                }
+                return value;
+            }
+            }
+        }
+
         private void UpdateShadowWord(long alignedOffset)
         {
             if(flashShadow == null)
@@ -572,6 +677,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             var bytes = Flash.ReadBytes(alignedOffset, 4);
             WriteShadowBytes(alignedOffset, bytes);
+        }
+
+        private void WriteShadowWord(long alignedOffset, uint value)
+        {
+            if(flashShadow == null)
+            {
+                return;
+            }
+            WriteShadowBytes(alignedOffset, FaultTracker.WordToBytes(value));
         }
 
         private void WriteShadowBytes(long offset, byte[] bytes)
@@ -600,6 +714,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly MappedMemory flash2;
         private readonly long flash1Size;
         private byte[] flashShadow;
+        private bool memoryProgramHooksInstalled;
 
         private static readonly uint[] ControlBankKey = { 0x45670123, 0xCDEF89AB };
         private static readonly uint[] OptionControlKey = { 0x08192A3B, 0x4C5D6E7F };
@@ -670,18 +785,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 parent.UpdateInterrupts();
             }
 
-            public void HandleMemoryProgramWrite(IPeripheral writeTarget, long localOffset, uint width, ulong value)
+            public ulong HandleMemoryProgramWrite(long localOffset, uint width, ulong value)
             {
-                if(writeTarget != memory)
-                {
-                    return;
-                }
-
                 if(!bankWriteEnabled.Value || bankInconsistencyErrorStatus.Value)
                 {
                     bankProgrammingErrorStatus.Value = true;
                     parent.UpdateInterrupts();
-                    return;
+                    return parent.ReadCurrentValue(this, localOffset, width);
                 }
 
                 if(bankWriteBufferCounter == 0)
@@ -692,10 +802,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     bankInconsistencyErrorStatus.Value = true;
                     parent.UpdateInterrupts();
-                    return;
+                    return parent.ReadCurrentValue(this, localOffset, width);
                 }
 
-                parent.HandleTrackedWrite(this, localOffset, width, value);
+                var filteredValue = parent.HandleTrackedWrite(this, localOffset, width, value);
 
                 bankWriteBufferCounter += (int)width;
                 if(bankWriteBufferCounter >= WriteBufferSize)
@@ -706,6 +816,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     }
                     FinishProgramWrite();
                 }
+                return filteredValue;
             }
 
             public void DefineRegisters()
@@ -821,6 +932,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             public bool WriteEnabled => bankWriteEnabled.Value;
 
+            public MappedMemory Memory => memory;
+
             private void BankErase()
             {
                 if(bankEraseRequest.Value)
@@ -845,15 +958,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             private void HandleProgramWriteEnableChange(bool value)
             {
-                var areOtherBanksInWriteState = parent.banks.Any(bank => bank.Id != Id && bank.WriteEnabled);
-                if(!areOtherBanksInWriteState)
-                {
-                    var cpus = parent.machine.GetSystemBus(parent).GetCPUs().OfType<ICPUWithMemoryAccessHooks>();
-                    foreach(var cpu in cpus)
-                    {
-                        cpu.SetHookAtMemoryAccess(value ? (MemoryAccessHook)parent.OnMemoryProgramWrite : null);
-                    }
-                }
+                var hooksShouldBeInstalled = value || parent.banks.Any(bank => bank.Id != Id && bank.WriteEnabled);
+                parent.UpdateMemoryProgramHooks(hooksShouldBeInstalled);
 
                 bankWriteBufferCounter = 0;
             }

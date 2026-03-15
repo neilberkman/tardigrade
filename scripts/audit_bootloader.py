@@ -65,6 +65,7 @@ from renode_runner import (
     run_single_point,
 )
 from fault_plan import CalibrationInputs, FaultPlan, build_fault_plan
+from fault_types import EXECUTE_ONLY_FAULT_TYPES
 from sweep import (
     MultiFaultPhaseResult,
     evaluate_config_checks,
@@ -81,6 +82,11 @@ DEFAULT_RENODE_TEST = os.environ.get("RENODE_TEST", "renode-test")
 DEFAULT_ROBOT_SUITE = "tests/ota_fault_point.robot"
 EXIT_ASSERTION_FAILURE = 1
 EXIT_INFRA_FAILURE = 2
+
+
+def _trace_replay_eligible_fault_types(fault_types: List[str]) -> bool:
+    normalized = {str(ft or "power_loss") for ft in fault_types or ["power_loss"]}
+    return not normalized.intersection(EXECUTE_ONLY_FAULT_TYPES)
 
 
 def parse_args() -> argparse.Namespace:
@@ -640,6 +646,12 @@ def main() -> int:
         if include_erases:
             robot_vars.append("FAULT_TYPES:both")
 
+        should_calibrate_for_trace = (
+            eval_mode == "execute"
+            and not args.no_trace_replay
+            and _trace_replay_eligible_fault_types(fault_types)
+        )
+
         # Apply hash bypass during calibration too — hash validation doesn't
         # affect write/erase counts but consumes enormous virtual time on
         # large images (MCUboot SHA-256 on 448KB in emulation).
@@ -700,6 +712,57 @@ def main() -> int:
                 print("Calibration: {}.".format(", ".join(cal_parts)), file=sys.stderr)
         else:
             max_writes = int(max_writes)
+            if should_calibrate_for_trace:
+                print(
+                    "Calibrating trace for bounded execute-mode sweep '{}'...".format(
+                        profile.name
+                    ),
+                    file=sys.stderr,
+                )
+                cal = run_calibration(
+                    repo_root=repo_root,
+                    renode_test=renode_test,
+                    robot_suite=robot_suite,
+                    profile=profile,
+                    robot_vars=robot_vars,
+                    work_dir=work_dir,
+                    renode_remote_server_dir=args.renode_remote_server_dir,
+                    keep_run_artifacts=args.keep_run_artifacts,
+                )
+                total_erases = cal.total_erases
+                trace_file = cal.trace_file
+                erase_trace_file = cal.erase_trace_file
+                trace_file_bin = cal.trace_file_bin
+                erase_trace_file_bin = cal.erase_trace_file_bin
+                if cal.calibration_exec_hash:
+                    robot_vars.append(
+                        "EXPECTED_EXEC_SHA256:{}".format(cal.calibration_exec_hash)
+                    )
+                    print(
+                        "Calibration: exec slot hash = {}...".format(
+                            cal.calibration_exec_hash[:16]
+                        ),
+                        file=sys.stderr,
+                    )
+                setup_writes = cal.setup_writes
+                total_i2c_transactions = cal.total_i2c_transactions
+                total_otp_blows = cal.total_otp_blows
+                cal_parts = ["{} NVM writes (trace source)".format(cal.total_writes)]
+                if include_erases:
+                    cal_parts.append("{} page erases".format(total_erases))
+                if total_i2c_transactions > 0:
+                    cal_parts.append(
+                        "{} I2C transactions".format(total_i2c_transactions)
+                    )
+                if total_otp_blows > 0:
+                    cal_parts.append("{} OTP blows".format(total_otp_blows))
+                print("Calibration: {}.".format(", ".join(cal_parts)), file=sys.stderr)
+                print(
+                    "Bounded execute-mode sweep: limiting tested write indices to first {} writes.".format(
+                        max_writes
+                    ),
+                    file=sys.stderr,
+                )
 
         # Apply safety cap.
         cap = profile.fault_sweep.max_writes_cap

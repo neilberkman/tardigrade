@@ -112,6 +112,7 @@ Load Runtime Scenario
     Execute Command    include "${ROOT}/peripherals/STM32F4FastFlash.cs"
     Execute Command    include "${ROOT}/peripherals/STM32F4RCCStub.cs"
     Execute Command    include "${ROOT}/peripherals/STM32H7FlashController.cs"
+    Execute Command    include "${ROOT}/peripherals/STM32H7PWRStub.cs"
     Execute Command    include "${ROOT}/peripherals/STM32DummyUSART.cs"
     Execute Command    include "${ROOT}/peripherals/OTPMemory.cs"
     Execute Command    include "${ROOT}/peripherals/I2CFaultProxy.cs"
