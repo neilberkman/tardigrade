@@ -33,8 +33,13 @@ pre_boot_state:
   # Trigger one-shot copy-on-boot update path (staging -> exec).
   - { address: 0x000FC040, u32: 0x55445021 }
 
+# Allow boot to either slot, but if exec is reached verify it contains the
+# new (staging) image. Catches old-image-in-exec from skipped copy logic.
 success_criteria:
-  vtor_in_slot: exec
+  vtor_in_slot: any
+  image_hash: true
+  image_hash_slot: exec
+  expected_image: staging
 
 fault_sweep:
   mode: runtime
