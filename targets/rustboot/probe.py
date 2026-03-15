@@ -191,16 +191,19 @@ def _flags_monotonic(sector_flags):
     if not sector_flags:
         return True
 
-    max_order_seen = -1
+    # Sectors are swapped in order: sector 0 first, then 1, etc.
+    # So earlier sectors should be MORE progressed (higher order value)
+    # than later sectors. Flags must be non-increasing.
+    min_order_seen = 999
     for flag in sector_flags:
         nibble = flag.get("nibble", 0x0F)
         order = _FLAG_ORDER.get(nibble, -1)
         if order < 0:
             # Unknown flag value -- not monotonic
             return False
-        if order < max_order_seen:
+        if order > min_order_seen:
             return False
-        max_order_seen = order
+        min_order_seen = order
     return True
 
 
