@@ -70,6 +70,7 @@ $image_staging_sha256?=""
 $expected_exec_sha256?=""
 $success_otadata_expect?=""
 $success_otadata_expect_scope?="always"
+$security_anti_rollback?="false"
 $progress_stall_timeout_s?="20"
 $expect_control_outcome?=""
 $no_boot_zero_write_slices?="10"
@@ -447,6 +448,9 @@ success_otadata_expect_raw = str(monitor.GetVariable('success_otadata_expect')).
 success_otadata_expect_scope = str(monitor.GetVariable('success_otadata_expect_scope')).strip().lower()
 if success_otadata_expect_scope not in ('always', 'control'):
     success_otadata_expect_scope = 'always'
+
+# Security policy: anti-rollback enforcement.
+security_anti_rollback = str(monitor.GetVariable('security_anti_rollback')).strip().lower() in ('1', 'true', 'yes')
 
 _base_phase_context = {
     'boot_cycles': int(boot_cycles),
@@ -2672,6 +2676,16 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
             actual_marker_val = as_int(bus.ReadDoubleWord(success_marker_addr))
             marker_ok = (actual_marker_val == success_marker_value)
 
+    # Anti-rollback: when enabled, a boot that lands on the old (pre-upgrade)
+    # image is a rollback failure even if other checks pass. Detected via
+    # image_hash: after upgrade, exec should contain the staging image.
+    rollback_ok = True
+    if security_anti_rollback and enforce_content_criteria and hash_result is not None:
+        if expected_exec_sha256 and hash_result == 'exec_image':
+            rollback_ok = False
+        elif not expected_exec_sha256 and hash_result == 'exec_image' and image_staging_sha256:
+            rollback_ok = False
+
     signals = {
         'vtor': fmt_u32(actual_vtor),
         'vtor_final': fmt_u32(vtor_value),
@@ -2688,6 +2702,8 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
         signals['image_hash_match'] = hash_result
     if eff_image_hash_slot:
         signals['image_hash_slot'] = eff_image_hash_slot
+    if security_anti_rollback:
+        signals['anti_rollback_ok'] = rollback_ok
     signals.update(collect_otadata_signals())
 
     otadata_expect_ok = True
@@ -2720,7 +2736,7 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     if reg_snapshot is not None:
         signals['boot_register_snapshot'] = reg_snapshot
 
-    criteria_ok = marker_ok and otadata_expect_ok
+    criteria_ok = marker_ok and otadata_expect_ok and rollback_ok
     expectations_met = vtor_ok and vtor_aligned and pc_ok and criteria_ok
     signals['expectations_met'] = expectations_met
 

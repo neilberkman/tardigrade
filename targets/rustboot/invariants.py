@@ -145,7 +145,9 @@ def _find_regression(sector_flags):
     """Find where monotonicity breaks in sector flag list."""
     if not sector_flags:
         return "empty flags"
-    max_order = -1
+    # Sectors are swapped in order (0 first), so earlier sectors should be
+    # MORE progressed. Flags must be non-increasing.
+    min_order = 999
     for flag in sector_flags:
         nibble = flag.get("nibble", 0x0F)
         order = _FLAG_ORDER.get(nibble, -1)
@@ -153,11 +155,11 @@ def _find_regression(sector_flags):
             return "sector {} has unknown flag 0x{:01X}".format(
                 flag.get("sector", "?"), nibble
             )
-        if order < max_order:
-            return "sector {} regressed to {} after a more-progressed sector".format(
+        if order > min_order:
+            return "sector {} is more progressed ({}) than an earlier sector".format(
                 flag.get("sector", "?"), flag.get("state", "?")
             )
-        max_order = order
+        min_order = order
     return "no regression found"
 
 
