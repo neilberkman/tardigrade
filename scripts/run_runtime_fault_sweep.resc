@@ -5542,15 +5542,9 @@ if calibration_mode:
             and success_image_hash_slot == 'staging'
         )
         cal_settle = 50 if is_copy_on_boot else 0
-        # Adaptive calibration slice: start at 0.1s (5x default) and let
-        # run_until_done's internal logic handle VTOR detection. This balances
-        # IPC overhead reduction vs VTOR capture accuracy. Avoids the 0.02s
-        # default that causes hundreds of round-trips on heavy targets.
-        cal_time_slice = '0.1'
         cal_status = run_until_done(cpu_ref, label='calibration',
                                     wall_timeout=cal_wall_timeout,
                                     max_iters=cal_max_iters,
-                                    time_slice=cal_time_slice,
                                     vtor_settle_iters=cal_settle)
         progress_stall_timeout_s = saved_stall
         log('calibration: stop_reason={}'.format(cal_status.get('reason', '?')))
