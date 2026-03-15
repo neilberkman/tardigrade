@@ -42,7 +42,18 @@ pre_boot_state:
 # ESP-IDF design: power-loss during NEW→PENDING_VERIFY write gracefully
 # rolls back to previous image. Both slots are valid boot targets.
 # Control run will boot staging (slot 1); faulted runs may boot either.
-success_criteria: {}
+success_criteria:
+  vtor_in_slot: any
+
+# state_probe crashes Renode during calibration (probe.py loads inside
+# the Renode Python env which lacks some dependencies). Invariants work
+# without it — they run post-sweep in the host Python, not inside Renode.
+invariant_providers:
+  - targets/esp_idf/invariants.py
+invariants:
+  - esp_idf_otadata_crc_integrity
+  - esp_idf_pending_verify_gets_aborted
+  - esp_idf_seq_not_zero
 
 fault_sweep:
   mode: runtime

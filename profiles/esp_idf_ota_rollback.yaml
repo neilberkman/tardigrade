@@ -42,6 +42,13 @@ success_criteria:
   marker_address: 0x000FC000
   marker_value: 0x00000000
 
+invariant_providers:
+  - targets/esp_idf/invariants.py
+invariants:
+  - esp_idf_otadata_crc_integrity
+  - esp_idf_pending_verify_gets_aborted
+  - esp_idf_seq_not_zero
+
 fault_sweep:
   mode: runtime
   evaluation_mode: execute

@@ -99,6 +99,12 @@ def check_esp_idf_pending_verify_gets_aborted(result, **_):
     if getattr(result, "boot_outcome", None) != "success":
         return
 
+    # On the control run (no fault injected), PENDING_VERIFY is the expected
+    # state — the bootloader transitions NEW→PENDING_VERIFY before booting.
+    # The abort check only applies after a faulted recovery boot.
+    if not getattr(result, "fault_injected", True):
+        return
+
     root = _root(result)
     entries = _entries(root)
 
@@ -173,11 +179,16 @@ def check_esp_idf_active_entry_maps_to_valid_slot(result, **_):
         boot_slot_str = "staging"
 
     if target_slot != boot_slot_str:
+        # In copy-on-boot mode, the bootloader copies staging→exec before
+        # booting. The otadata still points to staging but exec has the
+        # new image. This mismatch is expected and not a violation.
+        if boot_slot_str == "exec" and target_slot == "staging":
+            return
+
         # Mismatch is not necessarily a violation -- the bootloader may
         # have fallen back because the target slot's image was corrupt.
-        # But we flag it as informational state for downstream analysis.
-        # Only raise if the device booted but the metadata disagrees
-        # AND both entries are selectable (meaning fallback wasn't needed).
+        # Only raise if both entries are selectable (meaning fallback
+        # wasn't needed).
         if flags.get("both_selectable"):
             raise InvariantViolation(
                 invariant_name="esp_idf_active_entry_maps_to_valid_slot",

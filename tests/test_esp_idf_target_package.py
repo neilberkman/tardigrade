@@ -255,7 +255,8 @@ class TestInvariants(unittest.TestCase):
         check_esp_idf_pending_verify_gets_aborted(
             self._result(state, boot_outcome="no_boot"))
 
-    def test_active_slot_mismatch_with_both_selectable(self) -> None:
+    def test_copy_on_boot_mismatch_is_accepted(self) -> None:
+        """target=staging, boot=exec is expected for copy-on-boot models."""
         state = {
             "target_slot": "staging",
             "active_entry": 1,
@@ -266,9 +267,25 @@ class TestInvariants(unittest.TestCase):
                 "neither_selectable": False,
             },
         }
+        # Should NOT raise — copy-on-boot copies staging→exec
+        check_esp_idf_active_entry_maps_to_valid_slot(
+            self._result(state, boot_slot="exec"))
+
+    def test_reverse_mismatch_is_violation(self) -> None:
+        """target=exec, boot=staging is genuinely wrong."""
+        state = {
+            "target_slot": "exec",
+            "active_entry": 0,
+            "active_seq": 1,
+            "boot_slot": "staging",
+            "flags": {
+                "both_selectable": True,
+                "neither_selectable": False,
+            },
+        }
         with self.assertRaises(InvariantViolation) as ctx:
             check_esp_idf_active_entry_maps_to_valid_slot(
-                self._result(state, boot_slot="exec"))
+                self._result(state, boot_slot="staging"))
         self.assertEqual(ctx.exception.invariant_name,
                          "esp_idf_active_entry_maps_to_valid_slot")
 
