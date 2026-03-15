@@ -276,10 +276,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                             || (FaultAtWordWrite != ulong.MaxValue
                                 && TotalWordWrites + (ulong)DiffLookahead >= FaultAtWordWrite));
 
-                    // Entering WEN: snapshot flash if we need word-level diff.
+                    // Entering WEN: snapshot flash if we need word-level diff,
+                    // or if WriteFaultMode requires pre/post comparison.
                     if(val == 1 && oldConfig != 1)
                     {
-                        if(needDiff)
+                        if(needDiff || (WriteFaultMode != 0 && !AnyFaultFired))
                         {
                             wenSnapshot = Flash.ReadBytes(0, checked((int)FlashSize));
                         }
@@ -350,6 +351,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         else if(!AnyFaultFired)
                         {
                             // Fast path: assume 1 word write per WEN->REN.
+                            // Only reachable for power-loss mode (WriteFaultMode==0)
+                            // because the WEN entry guard captures wenSnapshot for
+                            // all non-power-loss modes, routing them through the
+                            // slow diff path above which calls ApplyWriteFaultAtOffset.
                             if(tracker.IncrementWriteCount())
                             {
                                 FaultFired = true;
