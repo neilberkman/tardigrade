@@ -22,12 +22,13 @@ images:
 update_trigger:
   type: mcuboot_trailer_magic
   slot: staging
-# image_hash+expected_image requires max_writes:auto (full swap completes
-# during calibration to capture the correct hash). With max_writes:256
-# the swap truncates and calibration captures the wrong hash. Use marker
-# check instead for bounded selftest.
+# image_hash requires max_writes:auto (full swap during calibration).
+# With max_writes:256, use marker to verify the staging image landed in exec.
+# staging image has 0x00000101 at offset 0x14; exec base is 0xC000.
 success_criteria:
   vtor_in_slot: exec
+  marker_address: 0x0000C014
+  marker_value: 0x00000101
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
