@@ -1,10 +1,10 @@
 schema_version: 1
 name: mcuboot_head_move_nrf52_revert_instruction_skip
 description: >
-  Zero-day hunt: MCUboot HEAD swap-move revert on nrf52840dk with
-  instruction skip (voltage glitch) fault injection.
-  Default geometry (448KB slots). Images swapped, upgrade unconfirmed —
-  MCUboot should revert to original. Different-sized images.
+  MCUboot HEAD swap-move revert on nrf52840dk with instruction skip
+  (voltage glitch) fault injection. Targets boot_swap_type_multi and
+  boot_swap_image — skipping instructions in swap-type determination
+  or the swap loop itself.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -17,12 +17,9 @@ memory:
   slots:
     exec: { base: 0x0000C000, size: 0x76000 }
     staging: { base: 0x00082000, size: 0x76000 }
-# Revert: images already swapped, upgrade not confirmed.
-# Primary has staging image (new), secondary has exec image (old).
 images:
   exec: results/oss_validation/assets/zephyr_head_move_nrf52_slot1.bin
   staging: results/oss_validation/assets/zephyr_head_move_nrf52_slot0.bin
-# Primary trailer: magic=GOOD, copy_done=SET, image_ok=UNSET → REVERT.
 pre_boot_state:
   - { address: 0x00081FF0, u32: 0xF395C277 }
   - { address: 0x00081FF4, u32: 0x7FEFD260 }
@@ -36,12 +33,17 @@ success_criteria:
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  fault_types: [instruction_skip]
+  instruction_skip_config:
+    target_addresses:
+      - { symbol: boot_swap_type_multi }
+      - { symbol: boot_swap_image }
+    skip_count: 1
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "20.0"
   max_step_limit: 200000000
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
-fault_types: ["instruction_skip"]
 skip_self_test: true
 expect:
   should_find_issues: false

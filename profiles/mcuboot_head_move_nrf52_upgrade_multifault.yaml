@@ -24,6 +24,8 @@ update_trigger:
   slot: staging
 success_criteria:
   vtor_in_slot: exec
+  image_hash: true
+  expected_image: staging
 fault_sweep:
   mode: runtime
   evaluation_mode: execute

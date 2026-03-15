@@ -33,7 +33,8 @@ pre_boot_state:
   # Trigger one-shot copy-on-boot update path (staging -> exec).
   - { address: 0x000FC040, u32: 0x55445021 }
 
-success_criteria: {}
+success_criteria:
+  vtor_in_slot: exec
 
 fault_sweep:
   mode: runtime
