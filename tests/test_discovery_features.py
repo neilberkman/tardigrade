@@ -75,6 +75,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                   mode: runtime
                   evaluation_mode: execute
                   boot_cycles: 3
+                  calibration_time_slice: "0.11"
                   phase2_time_slice: "0.07"
                   boot_cycle_hook: {probe.as_posix()}
                   expected_rollback_at_cycle: 2
@@ -93,6 +94,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             )
             profile = load_profile(profile_path)
             self.assertEqual(profile.fault_sweep.boot_cycles, 3)
+            self.assertEqual(profile.fault_sweep.calibration_time_slice, "0.11")
             self.assertEqual(profile.fault_sweep.phase2_time_slice, "0.07")
             self.assertEqual(profile.fault_sweep.boot_cycle_hook, str(probe))
             self.assertEqual(profile.fault_sweep.expected_rollback_at_cycle, 2)
@@ -104,6 +106,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertEqual(profile.success_criteria.vector_table_offset, 0x200)
             robot_vars = profile.robot_vars(ROOT)
             self.assertIn("BOOT_CYCLES:3", robot_vars)
+            self.assertIn("CALIBRATION_TIME_SLICE:0.11", robot_vars)
             self.assertIn("PHASE2_TIME_SLICE:0.07", robot_vars)
             self.assertIn("BOOT_CYCLE_HOOK:{}".format(probe), robot_vars)
             self.assertIn("EXPECTED_ROLLBACK_AT_CYCLE:2", robot_vars)

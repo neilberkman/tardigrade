@@ -672,6 +672,7 @@ class FaultSweepConfig:
         "max_writes_cap",
         "max_step_limit",
         "run_duration",
+        "calibration_time_slice",
         "phase2_time_slice",
         "fault_types",
         "evaluation_mode",
@@ -704,6 +705,7 @@ class FaultSweepConfig:
         max_writes_cap: int = 100000,
         max_step_limit: int = 500000,
         run_duration: str = "0.5",
+        calibration_time_slice: Optional[str] = None,
         phase2_time_slice: Optional[str] = None,
         fault_types: Optional[List[str]] = None,
         evaluation_mode: Optional[str] = None,
@@ -733,6 +735,11 @@ class FaultSweepConfig:
         self.max_writes_cap = max_writes_cap
         self.max_step_limit = max_step_limit
         self.run_duration = run_duration
+        self.calibration_time_slice = (
+            str(calibration_time_slice).strip()
+            if calibration_time_slice
+            else None
+        )
         self.phase2_time_slice = (
             str(phase2_time_slice).strip() if phase2_time_slice else None
         )
@@ -1364,6 +1371,10 @@ class ProfileConfig:
             "BOOT_CYCLES:{}".format(fs.boot_cycles),
             "RUNTIME_MODE:true",
         ]
+        if fs.calibration_time_slice:
+            vars_list.append(
+                "CALIBRATION_TIME_SLICE:{}".format(fs.calibration_time_slice)
+            )
         if fs.phase2_time_slice:
             vars_list.append("PHASE2_TIME_SLICE:{}".format(fs.phase2_time_slice))
         if fs.boot_cycle_hook:
@@ -2102,6 +2113,7 @@ def _parse_fault_sweep(
         max_writes_cap=int(raw.get("max_writes_cap", 100000)),
         max_step_limit=int(raw.get("max_step_limit", 500000)),
         run_duration=str(raw.get("run_duration", "0.5")),
+        calibration_time_slice=raw.get("calibration_time_slice"),
         phase2_time_slice=raw.get("phase2_time_slice"),
         fault_types=fault_types,
         evaluation_mode=eval_mode,
@@ -3844,6 +3856,7 @@ def main() -> int:
         "fault_sweep_mode": profile.fault_sweep.mode,
         "max_writes": profile.fault_sweep.max_writes,
         "boot_cycles": profile.fault_sweep.boot_cycles,
+        "calibration_time_slice": profile.fault_sweep.calibration_time_slice,
         "phase2_time_slice": profile.fault_sweep.phase2_time_slice,
         "boot_cycle_hook": profile.fault_sweep.boot_cycle_hook,
         "expected_rollback_at_cycle": profile.fault_sweep.expected_rollback_at_cycle,

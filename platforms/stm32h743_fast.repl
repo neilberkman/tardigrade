@@ -60,6 +60,7 @@ flashBank1: Memory.MappedMemory @ sysbus 0x08000000
 flashBank2: Memory.MappedMemory @ sysbus 0x08100000
     size: 0x100000
 
+// Smoke/perf platform only; not for hardware-faithful fault indexing.
 faultFlash: Miscellaneous.STM32H7FastFlash @ sysbus 0x52002000
     Flash1: flashBank1
     Flash2: flashBank2

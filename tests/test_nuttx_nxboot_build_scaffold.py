@@ -114,6 +114,7 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             self.assertEqual(profile.fault_sweep.boot_cycles, 3)
             self.assertEqual(profile.fault_sweep.expected_rollback_at_cycle, 1)
             self.assertEqual(profile.fault_sweep.run_duration, "8.0")
+            self.assertEqual(profile.fault_sweep.calibration_time_slice, "0.1")
             self.assertEqual(
                 profile.semantic_assertions["control"]["semantic_state.roles.next_boot"],
                 "revert",
@@ -128,6 +129,7 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
                 robot_vars,
             )
             self.assertIn("EXPECTED_ROLLBACK_AT_CYCLE:1", robot_vars)
+            self.assertIn("CALIBRATION_TIME_SLICE:0.1", robot_vars)
             self.assertIn("successful_rollback", profile.invariants)
         finally:
             shutil.rmtree(temp_dir)

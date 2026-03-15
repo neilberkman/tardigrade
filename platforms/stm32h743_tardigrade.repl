@@ -357,7 +357,7 @@ flashBank2: Memory.MappedMemory @ sysbus 0x08100000
 itcm: Memory.MappedMemory @ sysbus 0x00000000
     size: 0x10000
 
-rcc: Miscellaneous.STM32H7_RCC @ sysbus 0x58024400
+rcc: Miscellaneous.STM32H7RCCStub @ sysbus 0x58024400
 
 crc: CRC.STM32_CRC @ sysbus 0x58024C00
     series: STM32Series.F0

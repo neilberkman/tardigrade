@@ -83,6 +83,7 @@ $resume_trace_no_boot?="true"
 $resume_trace_max_ops?="1024"
 $resume_trace_time_slice?="0.02"
 $resume_trace_wall_timeout_s?="30"
+$calibration_time_slice?=""
 $phase2_time_slice?="0.05"
 $boot_cycles?="1"
 $boot_cycle_hook?=""
@@ -364,6 +365,9 @@ if resume_trace_max_ops < 1:
 resume_trace_time_slice = str(monitor.GetVariable('resume_trace_time_slice')).strip()
 if not resume_trace_time_slice:
     resume_trace_time_slice = '0.02'
+calibration_time_slice = str(monitor.GetVariable('calibration_time_slice')).strip()
+if not calibration_time_slice:
+    calibration_time_slice = '0.02'
 phase2_time_slice = str(monitor.GetVariable('phase2_time_slice')).strip()
 if not phase2_time_slice:
     phase2_time_slice = '0.05'
@@ -5545,6 +5549,7 @@ if calibration_mode:
         cal_status = run_until_done(cpu_ref, label='calibration',
                                     wall_timeout=cal_wall_timeout,
                                     max_iters=cal_max_iters,
+                                    time_slice=calibration_time_slice,
                                     vtor_settle_iters=cal_settle)
         progress_stall_timeout_s = saved_stall
         log('calibration: stop_reason={}'.format(cal_status.get('reason', '?')))

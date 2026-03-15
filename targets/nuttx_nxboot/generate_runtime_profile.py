@@ -24,6 +24,7 @@ def render_runtime_profile(
     fault_max_writes: str = "auto",
     boot_cycles: int = 2,
     run_duration: str = "8.0",
+    calibration_time_slice: str = "0.1",
     name: str = "nuttx_nxboot_real_update",
     fault_types: str = "",
 ) -> str:
@@ -65,6 +66,7 @@ fault_sweep:
   max_writes: {fault_max_writes}
   evaluation_mode: execute
   run_duration: "{run_duration}"
+  calibration_time_slice: "{calibration_time_slice}"
   boot_cycles: {boot_cycles}
   expected_rollback_at_cycle: 1{fault_types_line}
 state_probe:
@@ -108,6 +110,7 @@ expect:
         fault_max_writes=fault_max_writes,
         boot_cycles=max(1, int(boot_cycles)),
         run_duration=str(run_duration),
+        calibration_time_slice=str(calibration_time_slice),
     )
 
 
@@ -119,6 +122,7 @@ def main() -> int:
     parser.add_argument("--fault-max-writes", default="auto")
     parser.add_argument("--boot-cycles", type=int, default=2)
     parser.add_argument("--run-duration", default="8.0")
+    parser.add_argument("--calibration-time-slice", default="0.1")
     parser.add_argument("--name", default="nuttx_nxboot_real_update")
     parser.add_argument(
         "--fault-types",
@@ -133,6 +137,7 @@ def main() -> int:
         fault_max_writes=args.fault_max_writes,
         boot_cycles=args.boot_cycles,
         run_duration=args.run_duration,
+        calibration_time_slice=args.calibration_time_slice,
         name=args.name,
         fault_types=args.fault_types,
     )

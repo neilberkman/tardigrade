@@ -3,8 +3,10 @@
 // Minimal STM32H7 dual-bank FLASH peripheral for fast emulation.
 //
 // Registered at 0x52002000 (STM32H7 FLASH register base), size 0x200.
-// Counts writes on PG 1->0 transitions (per-word accurate).
-// No shadow scanning — each PG deactivation = exactly 1 word write.
+// Counts writes on PG 1->0 transitions for smoke/perf experiments.
+// This is intentionally not fully faithful to H7's 32-byte programming
+// granularity: a single PG deactivation may cover multiple changed words.
+// Use STM32H7FlashController for hardware-faithful fault indexing.
 //
 // When WriteTraceEnabled or fault snapshot is needed, captures flash
 // on PG 0->1 and diffs on PG 1->0 to find the changed address.
@@ -72,7 +74,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
 
-        public bool PerWriteAccurate => true;
+        public bool PerWriteAccurate => false;
 
         public bool SkipShadowScan { get; set; } = true;
         public bool PassthroughMode { get; set; }
