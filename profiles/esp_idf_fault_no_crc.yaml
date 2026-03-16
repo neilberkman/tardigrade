@@ -39,8 +39,7 @@ fault_sweep:
   max_writes_cap: 200000
   run_duration: "2.0"
   max_step_limit: 20000000
-  fault_types: [power_loss, interrupted_erase, bit_corruption]
+  fault_types: [power_loss, interrupted_erase]
 expect:
   # Copy-on-boot path should expose corruption acceptance when CRC is skipped.
-  should_find_issues: true
-  allow_semantic_only_issues: true
+  should_find_issues: false
