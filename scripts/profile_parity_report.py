@@ -111,7 +111,7 @@ def _empty_totals() -> Dict[str, Any]:
     }
 
 
-def _profile_features(raw: Dict[str, Any]) -> List[str]:
+def _profile_features(raw: Dict[str, Any], repo_root: Path | None = None) -> List[str]:
     features: List[str] = []
     fault_sweep = raw.get("fault_sweep")
     if not isinstance(fault_sweep, dict):
@@ -137,22 +137,33 @@ def _profile_features(raw: Dict[str, Any]) -> List[str]:
     if isinstance(phase2_fault, dict) and phase2_fault.get("enabled"):
         features.append("phase2_fault")
 
+    # Tightened security_policy accounting: mere YAML presence is not enough.
+    # Only count when anti_rollback is explicitly true AND the profile
+    # references a real bootloader ELF that exists on disk and isn't the
+    # intentionally-insecure vulnerable_ota demo firmware (which has zero
+    # security logic and exists solely to exercise the YAML schema).
     security_policy = raw.get("security_policy")
-    if isinstance(security_policy, dict):
-        if any(
-            value not in (None, False, "", 0)
-            for value in security_policy.values()
-        ):
-            features.append("security_policy")
+    if isinstance(security_policy, dict) and security_policy.get("anti_rollback") is True:
+        bootloader = raw.get("bootloader") if isinstance(raw.get("bootloader"), dict) else {}
+        elf_path = str(bootloader.get("elf", ""))
+        if elf_path and "vulnerable_ota" not in elf_path:
+            if repo_root is None or (repo_root / elf_path).exists():
+                features.append("security_policy")
 
     return features
 
 
 def _has_semantic_wiring(raw: Dict[str, Any]) -> bool:
-    return any(
-        bool(raw.get(key))
-        for key in ("state_probe", "semantic_assertions", "invariant_providers", "invariants")
-    )
+    # Tightened: semantic_assertions without a state_probe are inert metadata
+    # — the probe supplies the runtime state that assertions evaluate against.
+    # Count state_probe, invariant_providers, and invariants on their own, but
+    # only credit semantic_assertions when state_probe is also present.
+    if bool(raw.get("state_probe")):
+        return True
+    if bool(raw.get("invariant_providers")) or bool(raw.get("invariants")):
+        return True
+    # semantic_assertions alone (no state_probe) = not wired
+    return False
 
 
 def _has_invariants(raw: Dict[str, Any]) -> bool:
@@ -179,7 +190,7 @@ def collect_profile_metrics(repo_root: Path) -> Dict[str, Dict[str, Any]]:
             metrics["skip_self_test_profiles"] += 1
         else:
             metrics["self_test_profiles"] += 1
-        for feature in _profile_features(raw):
+        for feature in _profile_features(raw, repo_root):
             metrics["features"][feature] += 1
 
     return results
