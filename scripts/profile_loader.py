@@ -671,6 +671,24 @@ class HeuristicConfig:
         }
 
 
+class WritebackConfig:
+    """Configuration for the writeback-cache durability model."""
+
+    __slots__ = ("buffer_capacity", "domains", "barriers", "erase_flushes_domain")
+
+    def __init__(
+        self,
+        buffer_capacity: Any = "auto",
+        domains: Any = "auto",
+        barriers: Optional[List[Dict[str, Any]]] = None,
+        erase_flushes_domain: bool = False,
+    ) -> None:
+        self.buffer_capacity = buffer_capacity
+        self.domains = domains
+        self.barriers: List[Dict[str, Any]] = barriers if barriers is not None else []
+        self.erase_flushes_domain = bool(erase_flushes_domain)
+
+
 class FaultSweepConfig:
     __slots__ = (
         "mode",
@@ -702,6 +720,8 @@ class FaultSweepConfig:
         "reset_mode",
         "write_order_constraints",
         "i2c_fault_config",
+        "durability_model",
+        "writeback",
     )
 
     def __init__(
@@ -735,6 +755,8 @@ class FaultSweepConfig:
         reset_mode: str = "warm",
         write_order_constraints: Optional[List[Dict[str, Any]]] = None,
         i2c_fault_config: Optional["I2CFaultConfig"] = None,
+        durability_model: str = "direct",
+        writeback: Optional["WritebackConfig"] = None,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -775,6 +797,8 @@ class FaultSweepConfig:
         self.reset_mode = reset_mode if reset_mode in ("warm", "cold") else "warm"
         self.write_order_constraints = write_order_constraints or []
         self.i2c_fault_config = i2c_fault_config
+        self.durability_model = durability_model if durability_model in ("direct", "writeback") else "direct"
+        self.writeback = writeback
 
 
 class StateFuzzerConfig:
@@ -2103,6 +2127,18 @@ def _parse_fault_sweep(
             )
         )
 
+    durability_model = str(raw.get("durability_model", "direct"))
+    writeback = None
+    if durability_model == "writeback":
+        wb_raw = raw.get("writeback") or {}
+        barriers = wb_raw.get("barriers", [])
+        writeback = WritebackConfig(
+            buffer_capacity=wb_raw.get("buffer_capacity", "auto"),
+            domains=wb_raw.get("domains", "auto"),
+            barriers=barriers,
+            erase_flushes_domain=wb_raw.get("erase_flushes_domain", False),
+        )
+
     return FaultSweepConfig(
         mode=raw.get("mode", "runtime"),
         max_writes=raw.get("max_writes", "auto"),
@@ -2135,6 +2171,8 @@ def _parse_fault_sweep(
         heuristic_config=_parse_heuristic_config(raw.get("heuristic")),
         reset_mode=str(raw.get("reset_mode", "warm")),
         i2c_fault_config=_parse_i2c_fault_config(raw.get("i2c_fault_config")),
+        durability_model=durability_model,
+        writeback=writeback,
     )
 
 
