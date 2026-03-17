@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from fault_classification import (
     _effective_boot_result,
     classify_failure_class,
+    is_resilient_rollback,
     result_has_issues,
     result_is_brick,
     result_issue_reasons,
@@ -196,6 +197,7 @@ def summarize_runtime_sweep(
     boot_failures = [r for r in injected if result_is_brick(r)]
     failures = [r for r in injected if result_has_issues(r, expected_outcome)]
     recoveries = sum(1 for r in injected if not result_has_issues(r, expected_outcome))
+    resilient_rollbacks = sum(1 for r in injected if is_resilient_rollback(r))
     semantic_issue_points = sum(1 for r in injected if r.get("semantic_assertion_failures"))
     semantic_observation_points = sum(
         1 for r in injected if r.get("semantic_observation_failures")
@@ -266,6 +268,7 @@ def summarize_runtime_sweep(
         "invariant_issue_points": invariant_issue_points,
         "bus_fault_points": bus_fault_points,
         "recoveries": recoveries,
+        "resilient_rollbacks": resilient_rollbacks,
         "brick_rate": (float(len(boot_failures)) / float(total)) if total else 0.0,
         "issue_rate": (float(len(failures)) / float(total)) if total else 0.0,
         "discarded_no_fault_fired": len(not_injected),
@@ -431,6 +434,9 @@ def compute_verdict(
         (sweep_summary.get("control") or {}).get("issue_count", 0)
     )
 
+    resilient_rollbacks = int(sweep_summary.get("resilient_rollbacks", 0))
+    invariant_observations = int(sweep_summary.get("invariant_issue_points", 0))
+
     verdict = "PASS"
     if control_issue_count:
         verdict = "FAIL \u2014 control checks failed"
@@ -453,8 +459,14 @@ def compute_verdict(
             total_issues,
             sweep_summary.get("bricks", 0),
             sweep_summary.get("semantic_issue_points", 0),
-            sweep_summary.get("invariant_issue_points", 0),
+            invariant_observations,
         )
+    elif resilient_rollbacks > 0:
+        # All fault points recovered or rolled back correctly — no real issues.
+        parts = ["0 bricks", "{} resilient rollbacks".format(resilient_rollbacks)]
+        if invariant_observations > 0:
+            parts.append("{} invariant observations".format(invariant_observations))
+        verdict = "PASS \u2014 " + ", ".join(parts)
     return verdict
 
 

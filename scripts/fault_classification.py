@@ -48,6 +48,29 @@ def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     return (final_outcome, final_slot)
 
 
+def is_resilient_rollback(result: Dict[str, Any]) -> bool:
+    """Return True when the result represents a correct rollback after fault injection.
+
+    A resilient rollback is when:
+    - A fault was injected (fault_injected is True)
+    - The device booted successfully (raw/initial boot_outcome is "success")
+    - The final boot outcome is "wrong_image" (booted original firmware, not the
+      expected post-update image)
+
+    This is correct bootloader behavior: the bootloader detected the corrupted
+    update and fell back to the known-good image.
+    """
+    if not result.get("fault_injected", False):
+        return False
+    raw_outcome = result.get("initial_boot_outcome", result.get("boot_outcome", "unknown"))
+    raw_outcome = str(raw_outcome or "unknown").strip().lower()
+    if raw_outcome != "success":
+        return False
+    eff_outcome, _ = _effective_boot_result(result)
+    eff_outcome = str(eff_outcome or "unknown").strip().lower()
+    return eff_outcome == "wrong_image"
+
+
 def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[str]:
     reasons: List[str] = []
     eff_outcome, _ = _effective_boot_result(result)
@@ -57,7 +80,13 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
     if eff_outcome == "bus_fault":
         return reasons
     if eff_outcome != expected_outcome:
-        reasons.append("boot_outcome")
+        # Resilient rollback: fault during OTA update caused the bootloader to
+        # correctly fall back to the original image.  The device booted fine
+        # (raw outcome = success) but not into the expected post-update image
+        # (effective outcome = wrong_image).  This is correct behavior, not an
+        # issue.
+        if not is_resilient_rollback(result):
+            reasons.append("boot_outcome")
     if result.get("semantic_assertion_failures"):
         reasons.append("semantic_assertion")
     if result.get("invariant_violations"):
@@ -112,6 +141,8 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
     if outcome == "toctou_corruption":
         return "toctou_corruption"
     if outcome == "wrong_image":
+        if is_resilient_rollback(result):
+            return "resilient_rollback"
         signals = result.get("signals", {})
         if not isinstance(signals, dict):
             signals = {}
