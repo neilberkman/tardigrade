@@ -1082,8 +1082,6 @@ writeback_erase_flushes = str(monitor.GetVariable('writeback_erase_flushes')).st
 
 writeback_domains = {}
 _writeback_barriers = set()
-_writeback_buffer = []  # list of (write_index, flash_offset, old_value_bytes)
-_writeback_committed_up_to = -1  # highest write_index that has been committed
 _writeback_barrier_events = []  # list of dicts recording barrier flush events
 
 if durability_model == 'writeback':
@@ -1135,16 +1133,6 @@ def writeback_capacity():
     for d in writeback_domains.values():
         return d['capacity']
     return 4096
-
-
-def writeback_committed_write_count(fault_at):
-    # Return the number of writes that are committed to physical flash
-    # at fault point fault_at.  Writes 0..fault_at have occurred; the last
-    # min(capacity, fault_at+1) are in the buffer (uncommitted).
-    cap = writeback_capacity()
-    total = fault_at + 1  # writes 0..fault_at inclusive
-    buffered = min(cap, total)
-    return max(0, total - buffered)
 
 
 def writeback_domain_for_address(bus_addr):
@@ -1493,13 +1481,12 @@ def writeback_strip_uncommitted_from_snapshot(snapshot_bytes, trace_data, erase_
             # Restore to the last committed write's value.
             _struct.pack_into('<I', committed, boff, committed_value)
         else:
-            # No committed write to this offset — restore to erased state (0xFF).
-            # Check if an erase happened at this offset.  For simplicity, assume
-            # initial flash state (which varies by backend: 0xFF for NOR, 0x00 for MRAM).
-            # NOR flash (fast backend) erases to 0xFF.
+            # No committed write to this offset — restore to initial/erased state.
+            # MRAM erases to 0x00, NOR flash to 0xFF.
+            erase_byte = 0x00 if backend['kind'] == 'mram' else 0xFF
             for byte_i in range(4):
                 if boff + byte_i < len(committed):
-                    committed[boff + byte_i] = 0xFF
+                    committed[boff + byte_i] = erase_byte
 
     return bytes(committed), len(buffer)
 

@@ -1,10 +1,11 @@
 schema_version: 1
 name: resilient_writeback
-skip_self_test: false
+skip_self_test: true
 description: >
-  nxboot-style resilient bootloader under writeback durability mode. The resilient
-  implementation's design handles buffered writes safely, so it should pass even
-  when uncommitted writes can be lost on power failure.
+  Writeback durability mode on a resilient bootloader with proper flush barriers.
+  Should pass under writeback because barriers ensure writes are committed before
+  critical state transitions. TODO: needs an ELF with actual flush barriers;
+  currently uses the same nxboot-style ELF which lacks them.
 platform: platforms/cortex_m0_nvm.repl
 flash_backend: nvm_ctrl
 bootloader:

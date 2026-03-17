@@ -269,6 +269,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         /// Called when erase_flushes_domain is false — the erase hits
         /// flash directly but stale overlay entries must be removed
         /// so reads don't return pre-erase data.
+        ///
+        /// Note: WriteCount is intentionally NOT decremented here.
+        /// WriteCount tracks "writes since last commit" (bus transactions),
+        /// not "live overlay entries." An erased-then-cleared write still
+        /// counts toward the buffer-full threshold, making the model
+        /// slightly conservative (commits sooner than hardware might).
         /// </summary>
         public int ClearEraseRange(long eraseOffset, long eraseSize)
         {
