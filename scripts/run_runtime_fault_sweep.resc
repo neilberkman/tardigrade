@@ -6265,6 +6265,81 @@ if calibration_mode:
             result['writeback_capacity'] = writeback_capacity()
             result['writeback_barriers'] = len(_writeback_barriers)
             result['writeback_erase_flushes'] = writeback_erase_flushes
+
+            # Barrier audit: analyze write timeline for phase boundaries and
+            # barrier coverage.  Phases are detected by domain switches — when
+            # writes move from one slot's domain to another.
+            if trace_file and total_writes > 0:
+                try:
+                    _ba_trace = load_trace_data(trace_file)
+                    _ba_erase = []
+                    if erase_trace_file:
+                        import os as _ba_os
+                        if _ba_os.path.exists(erase_trace_file):
+                            _ba_erase = load_erase_trace_data(erase_trace_file)
+                    _ba_flash_base, _ = flash_geometry()
+                    _ba_page_size = effective_page_size()
+
+                    # Run full simulation with event recording.
+                    _, _, _ba_events = writeback_simulate_buffer(
+                        _ba_trace, _ba_erase, total_writes - 1,
+                        _ba_flash_base, _ba_page_size, record_events=True,
+                    )
+
+                    # Detect phases by scanning writes for domain switches.
+                    _ba_phases = []
+                    _ba_cur_domain = None
+                    _ba_phase_start = 0
+                    _ba_phase_writes = 0
+                    for _ba_wi, _ba_foff, _ba_val in _ba_trace:
+                        _ba_addr = _ba_foff + _ba_flash_base
+                        _ba_dom = writeback_domain_for_address(_ba_addr)
+                        if _ba_dom is not None and _ba_dom != _ba_cur_domain:
+                            if _ba_cur_domain is not None:
+                                # Phase boundary: domain switch.
+                                # Check if a barrier event occurred between
+                                # the previous phase's last write and this one.
+                                _ba_has_barrier = False
+                                for _ba_ev in _ba_events:
+                                    if _ba_phase_start <= _ba_ev['write_index'] <= _ba_wi:
+                                        _ba_has_barrier = True
+                                        break
+                                _ba_phases.append({
+                                    'domain': _ba_cur_domain,
+                                    'start_write': _ba_phase_start,
+                                    'end_write': _ba_wi - 1,
+                                    'write_count': _ba_phase_writes,
+                                    'barrier_at_end': _ba_has_barrier,
+                                })
+                            _ba_cur_domain = _ba_dom
+                            _ba_phase_start = _ba_wi
+                            _ba_phase_writes = 0
+                        if _ba_dom is not None:
+                            _ba_phase_writes += 1
+                    # Final phase.
+                    if _ba_cur_domain is not None and _ba_phase_writes > 0:
+                        _ba_phases.append({
+                            'domain': _ba_cur_domain,
+                            'start_write': _ba_phase_start,
+                            'end_write': _ba_phase_start + _ba_phase_writes - 1,
+                            'write_count': _ba_phase_writes,
+                            'barrier_at_end': True,  # end of trace is implicit barrier
+                        })
+                    _ba_missing = sum(1 for p in _ba_phases if not p.get('barrier_at_end'))
+                    barrier_audit = {
+                        'total_phases': len(_ba_phases),
+                        'phases': _ba_phases,
+                        'total_barrier_events': len(_ba_events),
+                        'missing_barriers': _ba_missing,
+                        'verdict': 'ok' if _ba_missing == 0 else 'missing_barriers',
+                    }
+                    result['barrier_audit'] = barrier_audit
+                    log('calibration: barrier_audit phases={} missing={} verdict={}'.format(
+                        len(_ba_phases), _ba_missing, barrier_audit['verdict']))
+                except Exception as _ba_exc:
+                    log('calibration: barrier_audit failed: {}'.format(_ba_exc))
+                    result['barrier_audit'] = {'error': str(_ba_exc)}
+
         if trace_file:
             result['trace_file'] = trace_file
         if trace_file_bin:
