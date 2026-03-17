@@ -1650,6 +1650,19 @@ class ProfileConfig:
                 "NVS_CORRUPTION_SEED:{}".format(nvs_cfg.seed)
             )
 
+        # Writeback durability model.
+        vars_list.append("DURABILITY_MODEL:{}".format(fs.durability_model))
+        if fs.writeback is not None:
+            wb = fs.writeback
+            vars_list.append("WRITEBACK_BUFFER_CAPACITY:{}".format(wb.buffer_capacity))
+            barrier_strs = []
+            for b in wb.barriers:
+                barrier_strs.append(str(b.get("address", b.get("symbol", ""))))
+            vars_list.append("WRITEBACK_BARRIERS:{}".format(",".join(barrier_strs)))
+            vars_list.append(
+                "WRITEBACK_ERASE_FLUSHES:{}".format("true" if wb.erase_flushes_domain else "false")
+            )
+
         # Config checks: semicolon-separated list of check specs.
         if sc.config_checks:
             check_parts: List[str] = []

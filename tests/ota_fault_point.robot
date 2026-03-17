@@ -95,6 +95,10 @@ ${READ_FAULT_REGIONS}          ${EMPTY}
 ${READ_FAULT_BIT_FLIPS}        0
 ${READ_FAULT_PROBABILITY}      1.0
 ${READ_FAULT_SEED}             0
+${DURABILITY_MODEL}            direct
+${WRITEBACK_BUFFER_CAPACITY}   auto
+${WRITEBACK_BARRIERS}          ${EMPTY}
+${WRITEBACK_ERASE_FLUSHES}     false
 ${TEST_TIMEOUT}                2 minutes
 
 *** Keywords ***
@@ -222,6 +226,10 @@ Run Runtime Fault Point
     Run Keyword If    '${READ_FAULT_BIT_FLIPS}' != '0'    Execute Command    $read_fault_bit_flips="${READ_FAULT_BIT_FLIPS}"
     Run Keyword If    '${READ_FAULT_PROBABILITY}' != '1.0'    Execute Command    $read_fault_probability="${READ_FAULT_PROBABILITY}"
     Run Keyword If    '${READ_FAULT_SEED}' != '0'    Execute Command    $read_fault_seed="${READ_FAULT_SEED}"
+    Execute Command    $durability_model="${DURABILITY_MODEL}"
+    Execute Command    $writeback_buffer_capacity="${WRITEBACK_BUFFER_CAPACITY}"
+    Execute Command    $writeback_barriers="${WRITEBACK_BARRIERS}"
+    Execute Command    $writeback_erase_flushes="${WRITEBACK_ERASE_FLUSHES}"
 
     Execute Script    ${ROOT}/scripts/run_runtime_fault_sweep.resc
 

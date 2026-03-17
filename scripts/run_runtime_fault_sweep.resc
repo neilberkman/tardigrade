@@ -109,6 +109,10 @@ $nvs_corruption_seed?="0"
 $i2c_fault_peripheral?=""
 $instruction_skip_regions?=""
 $instruction_skip_count?="1"
+$durability_model?="direct"
+$writeback_buffer_capacity?="auto"
+$writeback_barriers?=""
+$writeback_erase_flushes?="false"
 
 python """
 import json
@@ -1048,6 +1052,10 @@ def capture_boot_registers():
 reset_mode = get_optional_var('reset_mode', 'warm')
 if reset_mode not in ('warm', 'cold'):
     reset_mode = 'warm'
+durability_model = str(monitor.GetVariable('durability_model')).strip()
+writeback_buffer_capacity = str(monitor.GetVariable('writeback_buffer_capacity')).strip()
+writeback_barriers = str(monitor.GetVariable('writeback_barriers')).strip()
+writeback_erase_flushes = str(monitor.GetVariable('writeback_erase_flushes')).strip().lower() in ('1', 'true', 'yes')
 
 # Total words in the copy (for state mode).
 total_copy_writes = slot_exec_size // write_granularity
