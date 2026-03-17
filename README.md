@@ -49,6 +49,12 @@ Not all NVM writes are equally interesting. The heuristic classifier (`scripts/w
 
 A device that boots to the wrong slot, confirms a corrupt image, or gets stuck in a revert loop is not "working." Tardigrade's state probes, semantic assertions, and composable invariant providers catch state-correctness bugs that pass a naive boot check. PR #2199 (stuck revert) is an example: the device boots, but it boots the wrong image permanently. Tardigrade catches it.
 
+### Write-back durability model
+
+Real storage stacks often buffer writes in RAM before committing to flash. A bootloader that assumes write-through durability can have latent bugs invisible to direct fault injection. The optional `durability_model: writeback` mode adds a volatile overlay between the bootloader's writes and physical flash -- writes accumulate in the overlay, explicit barriers commit them, and power-loss discards uncommitted data. This exposes missing flush barriers without requiring the firmware to be built with a specific storage configuration.
+
+Diagnostic annotations include a barrier audit (detects missing flush barriers between update phases), per-fault dirty-domain state, and a `commit_ratio` metric that quantifies how much of the write stream is uncommitted at each fault point.
+
 ## Quick start
 
 ### GitHub Action
@@ -148,7 +154,7 @@ flowchart TD
 3. **Phase 1** -- replay the write trace up to write N and inject the fault (trace replay eliminates O(N^2) prefix re-emulation).
 4. **Phase 2** -- `execute` mode resets the CPU and performs a full recovery boot from faulted NVM; `state` mode infers the outcome from NVM contents alone.
 5. **Follow-up cycles / hooks** -- optional repeated boots and between-cycle hook actions model confirm-or-rollback flows and staged recovery.
-6. **Classification** -- boot outcomes (`success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`) and failure classes (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`).
+6. **Classification** -- boot outcomes (`success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`) and failure classes (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`). A `timeout` means the bootloader was still actively working when the wall-clock budget expired -- this is not counted as a failure.
 
 ### Fault types
 
@@ -164,7 +170,7 @@ flowchart TD
 | I2C bus         | `i2c_nack`, `i2c_timeout`, `i2c_bit_flip`, `i2c_truncated`, `i2c_wrong_address`                                                                                       | I2CFaultProxy        |
 | OTP fuse        | `otp_partial_program`, `otp_stuck_bit`, `otp_read_disturb`, `otp_overblow`                                                                                            | OTPMemory            |
 
-Faults can be injected at different lifecycle stages: during the initial update write path, during pre-boot metadata/setup writes (`metadata_fault`), during between-boot confirm/accept hooks (`hook_fault`), during the recovery write path itself (`phase2_fault`), or as compound sequences (`multi_fault`).
+Faults can be injected at different lifecycle stages: during the initial update write path, during pre-boot metadata/setup writes (`metadata_fault`), during between-boot confirm/accept hooks (`hook_fault`), during the recovery write path itself (`phase2_fault`), or as compound sequences (`multi_fault`). The optional `durability_model: writeback` composes with any fault type to simulate write-buffering storage stacks.
 
 ### Execute-mode hardening
 
@@ -197,7 +203,7 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the complete 
 
 **MCUboot** -- narrow canary profiles against MCUboot HEAD, retroactive differential profiles for 6 known bugs (broken/fixed pairs for PRs #2100, #2109, #2199, #2205, #2206, #2214), geometry-variant profiles, and multi-step exploratory scenarios with semantic probes and invariant checking. Platforms include nRF52840 (NVMC) and STM32F4. The MCUboot differentials cover three distinct fault-resilience bug classes (revert-magic corruption, header-reload-after-resume, stuck-revert-trailer) -- each was also checked against the other swap algorithms to test for cross-algorithm variants. See `profiles/mcuboot_*.yaml` and [`targets/mcuboot/`](targets/mcuboot/).
 
-**NuttX nxboot** -- real upstream NuttX firmware built from source. Board configs (defconfigs, linker scripts, Kconfig, progmem) are upstream as of [apache/nuttx#18509](https://github.com/apache/nuttx/pull/18509); the build script auto-detects this and skips local patches. Exploratory validation, a revert canary workflow, and a full target adapter (build, runtime profile generation, audit). See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
+**NuttX nxboot** -- real upstream NuttX firmware built from source. Board configs (defconfigs, linker scripts, Kconfig, progmem) are upstream as of [apache/nuttx#18509](https://github.com/apache/nuttx/pull/18509); the build script auto-detects this and skips local patches. The target adapter (`targets/nuttx_nxboot/`) includes a build script, runtime profile generator, and state probe. CI workflows build fresh from NuttX source and generate profiles at runtime. See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
 
 **rustBoot** -- initial real upstream nRF52840 integration using checked-in public assets, a rustBoot-specific state probe/invariant package, and a first interrupted-erase campaign over the swap-scratch update path. Current limitation: the fast nRF52 backend does not yet recover write-index traces from rustBoot's NVMC usage, so the shipped profile is erase-fault focused and expected to find issues. See [`profiles/rustboot_nrf52840_update.yaml`](profiles/rustboot_nrf52840_update.yaml), [`targets/rustboot/`](targets/rustboot/), and [`docs/rustboot-target.md`](docs/rustboot-target.md).
 
@@ -217,7 +223,7 @@ The `examples/` directory contains standalone bootloader firmware for engine val
 
 ## Report structure
 
-Top-level verdict is `PASS` or `FAIL` -- use this as the CI gate signal. `bricks` counts unrecoverable failures (device didn't boot). `issue_points` includes broader mismatches (wrong slot, semantic assertions, invariant violations). Boot outcomes: `success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`.
+Top-level verdict is `PASS` or `FAIL` -- use this as the CI gate signal. `bricks` counts unrecoverable failures (device didn't boot). `issue_points` includes broader mismatches (wrong slot, semantic assertions, invariant violations). `timeout_points` counts fault points where the bootloader was still actively working when the wall-clock budget expired -- these are not failures (increase `run_duration` to resolve). Boot outcomes: `success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`.
 
 See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the full report JSON structure and how to interpret results.
 
@@ -270,7 +276,7 @@ tardigrade/
 │   ├── mcuboot/                      # MCUboot probe, invariants, state fuzzer
 │   ├── nuttx_nxboot/                 # Real NuttX build + runtime profile gen
 │   └── nxboot/                       # Shared nxboot-style probe + invariants
-├── profiles/                         # YAML audit profiles (~80 profiles)
+├── profiles/                         # YAML audit profiles (~140 profiles)
 ├── scenarios/                        # Multi-step scenario definitions
 ├── examples/                         # Built-in reference bootloader firmware
 ├── harnesses/                        # Fuzzer harness templates
@@ -283,7 +289,7 @@ tardigrade/
 │   ├── STM32F4FlashController.cs     #   STM32F4 flash controller
 │   ├── STM32H7FlashController.cs     #   STM32H7 flash controller
 │   ├── TraceReplayEngine.cs          #   Trace replay for fast Phase 1
-│   └── FaultTracker.cs               #   Shared fault-tracking interface
+│   └── FaultTracker.cs               #   Shared fault-tracking + writeback overlay
 ├── platforms/                        # Renode platform definitions (.repl)
 ├── tests/                            # Robot Framework + pytest suites
 ├── docker/                           # Dockerfiles for CI
