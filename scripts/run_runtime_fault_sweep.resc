@@ -1057,6 +1057,329 @@ writeback_buffer_capacity = str(monitor.GetVariable('writeback_buffer_capacity')
 writeback_barriers = str(monitor.GetVariable('writeback_barriers')).strip()
 writeback_erase_flushes = str(monitor.GetVariable('writeback_erase_flushes')).strip().lower() in ('1', 'true', 'yes')
 
+# ---------------------------------------------------------------------------
+# Writeback durability layer
+#
+# When durability_model == 'writeback', writes are modeled as going through a
+# volatile write-back buffer before reaching physical flash.  The buffer has
+# a finite capacity (in write operations).  At any fault point F, the last
+# min(capacity, F) writes are "in buffer" (uncommitted).  Power loss discards
+# these uncommitted writes; the faulted flash state only contains committed
+# writes.
+#
+# Barriers: certain addresses can force a flush of the entire buffer,
+# modeling explicit cache-flush / write-barrier instructions.
+#
+# v1 known limitation: reads are NOT intercepted.  The bootloader reads from
+# Renode's memory which contains ALL writes (committed + uncommitted).  This
+# means the bootloader's execution during Phase 1 is optimistic — it sees
+# writes that would not yet be on physical flash.  The writeback model only
+# affects the faulted flash snapshot used for Phase 2 recovery boot.  This is
+# conservative: if the bootloader survives with the writeback model, it would
+# also survive on real hardware where reads might return stale data.  A future
+# v2 could intercept reads via a C# overlay peripheral.
+# ---------------------------------------------------------------------------
+
+writeback_domains = {}
+_writeback_barriers = set()
+_writeback_buffer = []  # list of (write_index, flash_offset, old_value_bytes)
+_writeback_committed_up_to = -1  # highest write_index that has been committed
+
+if durability_model == 'writeback':
+    # Inline erase size calc (effective_page_size not yet defined at this point).
+    if backend['kind'] == 'mram':
+        _erase_sz = int(backend['data'].WordSize)
+    elif backend['kind'] == 'fast':
+        try:
+            _erase_sz = int(backend['data'].PageSize)
+            if _erase_sz <= 0:
+                _erase_sz = 4096
+        except Exception:
+            _erase_sz = 4096
+    else:
+        _erase_sz = 4096
+    _wb_cap = writeback_buffer_capacity
+    if _wb_cap == 'auto':
+        # Default: one erase sector worth of writes.
+        _wb_cap = _erase_sz // write_granularity if _erase_sz > 0 else 4096
+    else:
+        _wb_cap = int(_wb_cap)
+    for _slot_name, (_slot_base, _slot_end) in slot_ranges.items():
+        writeback_domains[_slot_name] = {
+            'base': _slot_base,
+            'size': _slot_end - _slot_base,
+            'capacity': _wb_cap,
+        }
+    # Parse barrier addresses.
+    if writeback_barriers:
+        for _b_tok in writeback_barriers.split(','):
+            _b_tok = _b_tok.strip()
+            if _b_tok:
+                try:
+                    _writeback_barriers.add(int(_b_tok, 0))
+                except ValueError:
+                    log('writeback: ignoring invalid barrier: {}'.format(_b_tok))
+    log('writeback: {} domains initialized (cap={}, barriers={})'.format(
+        len(writeback_domains), _wb_cap, len(_writeback_barriers)))
+
+
+def writeback_active():
+    return durability_model == 'writeback' and len(writeback_domains) > 0
+
+
+def writeback_capacity():
+    if not writeback_domains:
+        return 4096
+    # All domains share the same capacity in v1.
+    for d in writeback_domains.values():
+        return d['capacity']
+    return 4096
+
+
+def writeback_committed_write_count(fault_at):
+    # Return the number of writes that are committed to physical flash
+    # at fault point fault_at.  Writes 0..fault_at have occurred; the last
+    # min(capacity, fault_at+1) are in the buffer (uncommitted).
+    cap = writeback_capacity()
+    total = fault_at + 1  # writes 0..fault_at inclusive
+    buffered = min(cap, total)
+    return max(0, total - buffered)
+
+
+def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_at, flash_base_addr, page_size):
+    # Trace-replay variant: replay only committed writes to flash.
+    #
+    # Returns (writes_applied, fault_injected, fault_address, discarded).
+    #
+    # In writeback mode, the last `capacity` writes before the fault point
+    # are uncommitted (in the volatile buffer).  Only writes that have been
+    # flushed -- either by buffer overflow or by hitting a barrier address --
+    # are applied to physical flash.
+    #
+    # Barrier semantics: when a write targets a barrier address, the entire
+    # buffer (including that write) is flushed to flash immediately.
+    import System
+
+    cap = writeback_capacity()
+    has_barriers = len(_writeback_barriers) > 0
+
+    # Pre-sort erases by their write-at-point for interleaving.
+    pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace]
+    pending_erases.sort()
+    erase_idx = [0]  # mutable container to allow mutation from helper scope
+
+    # Buffer: list of (write_index, flash_offset, value) for uncommitted writes.
+    buffer = []
+    writes_applied = [0]  # mutable container for same reason
+    fault_injected = False
+    fault_address = 0
+
+    def _wb_write_word(flash_off, value):
+        # Write a single 4-byte word to flash.
+        b = System.Array.CreateInstance(System.Byte, 4)
+        b[0] = value & 0xFF
+        b[1] = (value >> 8) & 0xFF
+        b[2] = (value >> 16) & 0xFF
+        b[3] = (value >> 24) & 0xFF
+        flash_ref.WriteBytes(flash_off, b)
+
+    def _wb_flush_buffer():
+        # Flush all buffered writes to physical flash.
+        for _bi, _boff, _bval in buffer:
+            _wb_write_word(_boff, _bval)
+            writes_applied[0] += 1
+        buffer[:] = []
+
+    def _wb_erase_region(e_off, e_sz):
+        # Apply a single erase to flash, handling buffer interactions.
+        if writeback_erase_flushes and buffer:
+            _wb_flush_buffer()
+        else:
+            # Clear buffered writes that fall in the erased range.
+            buffer[:] = [
+                (bi, boff, bval) for bi, boff, bval in buffer
+                if not (e_off <= boff < e_off + e_sz)
+            ]
+        erase_buf = System.Array.CreateInstance(System.Byte, e_sz)
+        for bi in range(e_sz):
+            erase_buf[bi] = 0xFF
+        flash_ref.WriteBytes(int(e_off), erase_buf)
+
+    for write_idx, flash_off, value in trace_data:
+        if write_idx > fault_at + 1:
+            break
+
+        # Apply pending erases whose write-at-point < this write.
+        while erase_idx[0] < len(pending_erases) and pending_erases[erase_idx[0]][0] < write_idx:
+            e_wap, e_off, e_sz = pending_erases[erase_idx[0]]
+            _wb_erase_region(e_off, e_sz)
+            erase_idx[0] += 1
+
+        if write_idx <= fault_at:
+            # Add to buffer.
+            buffer.append((write_idx, flash_off, value))
+
+            # Check barrier: if the bus address hits a barrier, flush everything.
+            bus_addr = flash_off + flash_base_addr
+            if has_barriers and bus_addr in _writeback_barriers:
+                _wb_flush_buffer()
+            else:
+                # Evict oldest if buffer exceeds capacity.
+                while len(buffer) > cap:
+                    _bi, _boff, _bval = buffer.pop(0)
+                    _wb_write_word(_boff, _bval)
+                    writes_applied[0] += 1
+        elif write_idx == fault_at + 1:
+            fault_injected = True
+            fault_address = flash_off + flash_base_addr
+            break
+
+    # Apply any remaining erases up to fault_at.
+    while erase_idx[0] < len(pending_erases) and pending_erases[erase_idx[0]][0] <= fault_at:
+        e_wap, e_off, e_sz = pending_erases[erase_idx[0]]
+        _wb_erase_region(e_off, e_sz)
+        erase_idx[0] += 1
+
+    # Discard remaining buffer contents -- they represent uncommitted writes
+    # lost on power failure.
+    discarded = len(buffer)
+    buffer[:] = []
+
+    return writes_applied[0], fault_injected, fault_address, discarded
+
+
+def writeback_strip_uncommitted_from_snapshot(snapshot_bytes, trace_data, erase_trace, fault_at, flash_base_addr, page_size):
+    # Execute-mode variant: given a full flash snapshot (with ALL writes
+    # applied), revert the uncommitted writes to produce the committed-only
+    # state.
+    #
+    # Returns (committed_snapshot_bytes, uncommitted_count).
+    #
+    # This works by identifying which writes are uncommitted at fault_at
+    # (the last `capacity` writes, unless a barrier forced a flush) and
+    # reverting their flash locations to the pre-write value.
+    #
+    # The pre-write value is determined by replaying the trace up to each
+    # uncommitted write and taking the byte values that existed before that
+    # write was applied.  For simplicity in v1, we rebuild the committed
+    # state from scratch using the trace (same as trace replay), then copy
+    # the committed bytes into the snapshot at the affected offsets.
+    if not trace_data:
+        log('writeback: no trace data for execute-mode snapshot stripping')
+        return snapshot_bytes, 0
+
+    cap = writeback_capacity()
+    has_barriers = len(_writeback_barriers) > 0
+
+    # Pre-sort erases by their write-at-point.
+    pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace]
+    pending_erases.sort()
+    erase_idx = 0
+
+    # Simulate the writeback buffer to find which writes are uncommitted.
+    buffer = []  # (write_index, flash_offset, value)
+
+    for write_idx, flash_off, value in trace_data:
+        if write_idx > fault_at:
+            break
+
+        # Process erases.
+        while erase_idx < len(pending_erases) and pending_erases[erase_idx][0] < write_idx:
+            e_wap, e_off, e_sz = pending_erases[erase_idx]
+            if writeback_erase_flushes:
+                buffer[:] = []
+            else:
+                buffer[:] = [
+                    (bi, boff, bval) for bi, boff, bval in buffer
+                    if not (e_off <= boff < e_off + e_sz)
+                ]
+            erase_idx += 1
+
+        if write_idx <= fault_at:
+            buffer.append((write_idx, flash_off, value))
+            bus_addr = flash_off + flash_base_addr
+            if has_barriers and bus_addr in _writeback_barriers:
+                buffer[:] = []
+            else:
+                while len(buffer) > cap:
+                    buffer.pop(0)
+
+    # `buffer` now contains the uncommitted writes at fault_at.
+    if not buffer:
+        return snapshot_bytes, 0
+
+    # Build the committed-only flash image by replaying ONLY committed writes
+    # from the trace.  We need to know what bytes were at each uncommitted
+    # offset before those writes happened.
+    #
+    # Strategy: rebuild flash from initial state + committed writes only.
+    # For each uncommitted write offset, the committed image has the correct
+    # pre-write value.  Copy those bytes into the snapshot.
+    uncommitted_offsets = set()
+    for _bi, boff, _bval in buffer:
+        for byte_i in range(4):
+            uncommitted_offsets.add(boff + byte_i)
+
+    # Replay committed writes into a mutable copy of the initial image.
+    # Start from the snapshot and undo uncommitted writes.
+    import struct as _struct
+    committed = bytearray(snapshot_bytes)
+
+    # For each uncommitted write, we need to know what the committed state
+    # is at that offset.  We reconstruct by replaying from scratch.
+    # Build a map of committed values at affected offsets.
+    #
+    # Simpler approach: replay the entire trace as committed-only into a
+    # sparse map, then patch the snapshot.  But that requires knowing the
+    # initial flash state.  Since we have the FULL snapshot, we can work
+    # backwards: for each uncommitted write, restore the pre-write value.
+    #
+    # The pre-write value for write W at offset O is whatever was at O
+    # just before W executed.  If an earlier write also wrote to O, that
+    # earlier write's value is the pre-write value.  If no earlier write
+    # touched O, the initial flash value is the pre-write value.
+    #
+    # For correctness, process uncommitted writes in REVERSE order: the
+    # last uncommitted write's pre-write value might be another uncommitted
+    # write (if the same address was written multiple times in the buffer).
+    # Reversing ensures we peel back layers correctly.
+
+    uncommitted_set = set(bi for bi, _, _ in buffer)
+
+    # Build a map: flash_offset -> list of (write_index, value) for ALL
+    # writes to that offset, both committed and uncommitted.
+    offset_history = {}
+    for write_idx, flash_off, value in trace_data:
+        if write_idx > fault_at:
+            break
+        if flash_off not in offset_history:
+            offset_history[flash_off] = []
+        offset_history[flash_off].append((write_idx, value))
+
+    # For each uncommitted write, find the committed value at that offset.
+    for _bi, boff, _bval in buffer:
+        history = offset_history.get(boff, [])
+        # Find the latest committed write to this offset (before this uncommitted write).
+        committed_value = None
+        for hw_idx, hw_val in reversed(history):
+            if hw_idx not in uncommitted_set:
+                committed_value = hw_val
+                break
+        if committed_value is not None:
+            # Restore to the last committed write's value.
+            _struct.pack_into('<I', committed, boff, committed_value)
+        else:
+            # No committed write to this offset — restore to erased state (0xFF).
+            # Check if an erase happened at this offset.  For simplicity, assume
+            # initial flash state (which varies by backend: 0xFF for NOR, 0x00 for MRAM).
+            # NOR flash (fast backend) erases to 0xFF.
+            for byte_i in range(4):
+                if boff + byte_i < len(committed):
+                    committed[boff + byte_i] = 0xFF
+
+    return bytes(committed), len(buffer)
+
+
 # Total words in the copy (for state mode).
 total_copy_writes = slot_exec_size // write_granularity
 
@@ -3950,6 +4273,11 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         'actual_writes': actual_writes,
         'signals': signals,
     }
+    if writeback_active():
+        result['durability_model'] = 'writeback'
+        result['writeback_capacity'] = writeback_capacity()
+    elif durability_model != 'direct':
+        result['durability_model'] = durability_model
     if eff_criteria is not None:
         result['effective_success_criteria'] = eff_criteria
     if semantic_state is not None:
@@ -4353,6 +4681,33 @@ def run_execute_fault(fault_at, fault_type='w'):
                 log('fp={} WARNING: no snapshot, falling back to current flash'.format(fault_at))
                 saved_flash = flash_ref.ReadBytes(0, flash_size)
             fault_snapshot_bytes = to_py_bytes(saved_flash)
+
+        # Writeback durability: strip uncommitted writes from the snapshot.
+        # In execute mode, the C# peripheral captured ALL writes in the
+        # snapshot.  The writeback model says the last `capacity` writes
+        # are in a volatile buffer and lost on power failure.  We revert
+        # them using the calibration trace data.
+        if writeback_active() and fault_snapshot_bytes is not None and is_power_loss_fault:
+            _wb_trace = trace_data_loaded
+            if _wb_trace is None and trace_file_path:
+                _wb_trace = load_trace_data(trace_file_path)
+            _wb_erase = erase_trace_loaded if erase_trace_loaded is not None else []
+            if _wb_trace:
+                _wb_flash_base, _ = flash_geometry()
+                _wb_page_size = effective_page_size()
+                fault_snapshot_bytes, _wb_discarded = writeback_strip_uncommitted_from_snapshot(
+                    fault_snapshot_bytes, _wb_trace, _wb_erase, fault_at,
+                    _wb_flash_base, _wb_page_size,
+                )
+                # Convert Python bytes back to .NET byte[] for restore_flash_and_boot.
+                import System as _WbSys
+                saved_flash = _WbSys.Array.CreateInstance(_WbSys.Byte, len(fault_snapshot_bytes))
+                for _wbi in range(len(fault_snapshot_bytes)):
+                    saved_flash[_wbi] = fault_snapshot_bytes[_wbi]
+                log('fp={} writeback: stripped {} uncommitted writes from snapshot'.format(
+                    fault_at, _wb_discarded))
+            else:
+                log('fp={} writeback: WARNING no trace data, using full snapshot (direct-mode fallback)'.format(fault_at))
 
         if is_power_loss_fault:
             # Power-loss class: simulate a cold reset and recovery boot.
@@ -5252,6 +5607,12 @@ def decode_multi_fault_sequence_local(encoded):
 def run_trace_replay_fault_native(fault_at, fault_type='w'):
     import os as _os_native
 
+    # Writeback mode requires Python-level buffer simulation — the native
+    # C# TraceReplayEngine doesn't know about the writeback overlay.
+    # Fall back to the Python trace replay path.
+    if writeback_active():
+        return None
+
     if not trace_file_bin_path:
         return None
     if not _os_native.path.exists(trace_file_bin_path):
@@ -5397,19 +5758,52 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     flash_base_addr = int(backend['data'].FlashBaseAddress)
     page_size = int(backend['data'].PageSize)
 
-    pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace_loaded]
-    pending_erases.sort()
-    erase_idx = 0
+    if writeback_active():
+        # Writeback mode: only committed writes go to flash.
+        writes_applied, fault_injected, fault_address, _wb_discarded = \
+            writeback_apply_to_trace_snapshot(
+                flash_ref, trace_data_loaded, erase_trace_loaded,
+                fault_at, flash_base_addr, page_size,
+            )
+        if fault_at % 50 == 0:
+            log('fp={} writeback_trace_replay: committed={} discarded={}'.format(
+                fault_at, writes_applied, _wb_discarded))
+    else:
+        # Direct mode: all writes go to flash (original path).
+        pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace_loaded]
+        pending_erases.sort()
+        erase_idx = 0
 
-    writes_applied = 0
-    fault_injected = False
-    fault_address = 0
+        writes_applied = 0
+        fault_injected = False
+        fault_address = 0
 
-    for write_idx, flash_off, value in trace_data_loaded:
-        if write_idx > fault_at + 1:
-            break
+        for write_idx, flash_off, value in trace_data_loaded:
+            if write_idx > fault_at + 1:
+                break
 
-        while erase_idx < len(pending_erases) and pending_erases[erase_idx][0] < write_idx:
+            while erase_idx < len(pending_erases) and pending_erases[erase_idx][0] < write_idx:
+                e_wap, e_off, e_sz = pending_erases[erase_idx]
+                erase_buf = System.Array.CreateInstance(System.Byte, e_sz)
+                for bi in range(e_sz):
+                    erase_buf[bi] = 0xFF
+                flash_ref.WriteBytes(int(e_off), erase_buf)
+                erase_idx += 1
+
+            if write_idx <= fault_at:
+                b = System.Array.CreateInstance(System.Byte, 4)
+                b[0] = value & 0xFF
+                b[1] = (value >> 8) & 0xFF
+                b[2] = (value >> 16) & 0xFF
+                b[3] = (value >> 24) & 0xFF
+                flash_ref.WriteBytes(flash_off, b)
+                writes_applied += 1
+            elif write_idx == fault_at + 1:
+                fault_injected = True
+                fault_address = flash_off + flash_base_addr
+                break
+
+        while erase_idx < len(pending_erases) and pending_erases[erase_idx][0] <= fault_at:
             e_wap, e_off, e_sz = pending_erases[erase_idx]
             erase_buf = System.Array.CreateInstance(System.Byte, e_sz)
             for bi in range(e_sz):
@@ -5417,26 +5811,6 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
             flash_ref.WriteBytes(int(e_off), erase_buf)
             erase_idx += 1
 
-        if write_idx <= fault_at:
-            b = System.Array.CreateInstance(System.Byte, 4)
-            b[0] = value & 0xFF
-            b[1] = (value >> 8) & 0xFF
-            b[2] = (value >> 16) & 0xFF
-            b[3] = (value >> 24) & 0xFF
-            flash_ref.WriteBytes(flash_off, b)
-            writes_applied += 1
-        elif write_idx == fault_at + 1:
-            fault_injected = True
-            fault_address = flash_off + flash_base_addr
-            break
-
-    while erase_idx < len(pending_erases) and pending_erases[erase_idx][0] <= fault_at:
-        e_wap, e_off, e_sz = pending_erases[erase_idx]
-        erase_buf = System.Array.CreateInstance(System.Byte, e_sz)
-        for bi in range(e_sz):
-            erase_buf[bi] = 0xFF
-        flash_ref.WriteBytes(int(e_off), erase_buf)
-        erase_idx += 1
     faulted_flash = flash_ref.ReadBytes(0, int(backend['data'].FlashSize))
     fault_snapshot_bytes = to_py_bytes(faulted_flash)
 
@@ -5619,7 +5993,12 @@ if calibration_mode:
             'total_writes': total_copy_writes,
             'base_writes': get_total_writes(),
             'setup_writes': pre_boot_write_count,
+            'durability_model': durability_model,
         }
+        if writeback_active():
+            result['writeback_capacity'] = writeback_capacity()
+            result['writeback_barriers'] = len(_writeback_barriers)
+            result['writeback_erase_flushes'] = writeback_erase_flushes
     else:
         cpu_ref = monitor.Machine['sysbus.cpu']
         disarm_fault()
@@ -5756,7 +6135,12 @@ if calibration_mode:
             'calibration_emulated_s': float(cal_status.get('emulated_s', 0)),
             'calibration_elapsed_s': float(cal_status.get('elapsed_s', 0)),
             'calibration_pc': cal_status.get('pc', '0x00000000'),
+            'durability_model': durability_model,
         }
+        if writeback_active():
+            result['writeback_capacity'] = writeback_capacity()
+            result['writeback_barriers'] = len(_writeback_barriers)
+            result['writeback_erase_flushes'] = writeback_erase_flushes
         if trace_file:
             result['trace_file'] = trace_file
         if trace_file_bin:
