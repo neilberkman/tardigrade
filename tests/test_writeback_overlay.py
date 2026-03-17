@@ -202,6 +202,7 @@ def test_overlay_overwrite_same_offset():
     d.write(0x00, 0x22)
     assert d.read(0x00, 0xFF) == 0x22
     assert d.pending == 1  # still one entry, not two
+    assert d.write_count == 2  # but write_count tracks all writes (drives buffer-full)
 
 
 def test_capacity_zero_means_no_auto_commit():

@@ -797,7 +797,7 @@ class FaultSweepConfig:
         self.reset_mode = reset_mode if reset_mode in ("warm", "cold") else "warm"
         self.write_order_constraints = write_order_constraints or []
         self.i2c_fault_config = i2c_fault_config
-        self.durability_model = durability_model if durability_model in ("direct", "writeback") else "direct"
+        self.durability_model = durability_model
         self.writeback = writeback
 
 
@@ -2128,6 +2128,11 @@ def _parse_fault_sweep(
         )
 
     durability_model = str(raw.get("durability_model", "direct"))
+    if durability_model not in ("direct", "writeback"):
+        raise ProfileError(
+            "fault_sweep.durability_model: expected 'direct' or 'writeback', "
+            "got '{}'".format(durability_model)
+        )
     writeback = None
     if durability_model == "writeback":
         wb_raw = raw.get("writeback") or {}

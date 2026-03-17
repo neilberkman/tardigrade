@@ -132,6 +132,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             FaultFlashSnapshot = null;
             writeTrace.Clear();
             eraseTrace.Clear();
+            if(WritebackDomains != null)
+            {
+                foreach(var d in WritebackDomains)
+                {
+                    d.Discard();
+                    d.CommittedCount = 0;
+                }
+            }
         }
 
         // --- Static utilities ---
@@ -202,16 +210,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public long BaseAddress;
         public long Size;
         public int Capacity;
+        public bool EraseFlushesDomain;
         public Dictionary<long, uint> Overlay = new Dictionary<long, uint>();
         public bool Dirty;
         public int WriteCount;
         public int CommittedCount;
+        public bool AutoCommitFired;
 
-        public WritebackDomain(long baseAddr, long size, int capacity)
+        public WritebackDomain(long baseAddr, long size, int capacity, bool eraseFlushesDomain = false)
         {
             BaseAddress = baseAddr;
             Size = size;
             Capacity = capacity;
+            EraseFlushesDomain = eraseFlushesDomain;
         }
 
         public bool Write(long offset, uint value)
@@ -223,6 +234,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(Capacity > 0 && WriteCount >= Capacity)
             {
                 Commit("buffer_full");
+                AutoCommitFired = true;
             }
             return true;
         }
@@ -250,6 +262,31 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             Dirty = false;
             WriteCount = 0;
             return lost;
+        }
+
+        /// <summary>
+        /// Clear overlay entries in the erased address range.
+        /// Called when erase_flushes_domain is false — the erase hits
+        /// flash directly but stale overlay entries must be removed
+        /// so reads don't return pre-erase data.
+        /// </summary>
+        public int ClearEraseRange(long eraseOffset, long eraseSize)
+        {
+            var toRemove = new List<long>();
+            foreach(var key in Overlay.Keys)
+            {
+                if(key >= eraseOffset && key < eraseOffset + eraseSize)
+                    toRemove.Add(key);
+            }
+            foreach(var key in toRemove)
+            {
+                Overlay.Remove(key);
+            }
+            if(Overlay.Count == 0)
+            {
+                Dirty = false;
+            }
+            return toRemove.Count;
         }
 
         public int Pending => Overlay.Count;
