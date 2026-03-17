@@ -4400,6 +4400,49 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
     if writeback_active():
         result['durability_model'] = 'writeback'
         result['writeback_capacity'] = writeback_capacity()
+
+        # Per-fault-point writeback diagnostics: dirty domain state, write
+        # counts, and commit ratio.  Uses trace data when available.
+        _wb_diag_trace = trace_data_loaded
+        if _wb_diag_trace is None and trace_file_path:
+            try:
+                _wb_diag_trace = load_trace_data(trace_file_path)
+            except Exception:
+                _wb_diag_trace = None
+        _wb_diag_erase = erase_trace_loaded if erase_trace_loaded is not None else []
+        if _wb_diag_trace:
+            _wb_flash_base, _ = flash_geometry()
+            _wb_ps = effective_page_size()
+            _wb_dirty = writeback_dirty_state_at(
+                _wb_diag_trace, _wb_diag_erase, fault_at,
+                _wb_flash_base, _wb_ps,
+            )
+            _wb_total_issued = fault_at + 1 if fault_injected else actual_writes
+            _wb_cap = writeback_capacity()
+            _wb_total_pending = sum(d['pending'] for d in _wb_dirty.values())
+            _wb_total_committed = max(0, _wb_total_issued - _wb_total_pending)
+            _wb_commit_ratio = (
+                round(float(_wb_total_committed) / _wb_total_issued, 4)
+                if _wb_total_issued > 0 else 1.0
+            )
+            result['writeback_diagnostics'] = {
+                'dirty_domains_at_fault': _wb_dirty,
+                'writeback_stats': {
+                    'writes_issued': _wb_total_issued,
+                    'writes_committed': _wb_total_committed,
+                    'write_differential': _wb_total_pending,
+                    'commit_ratio': _wb_commit_ratio,
+                },
+            }
+            # Tag fault_class when boot failed and overlay had pending data.
+            if (
+                fault_class in ('unrecoverable', 'wrong_image', 'silent_corruption')
+                and _wb_total_pending > 0
+                and fault_injected
+            ):
+                result['writeback_diagnostics']['writeback_buffer_loss'] = True
+                if fault_class == 'unrecoverable':
+                    result['fault_class'] = 'writeback_buffer_loss'
     elif durability_model != 'direct':
         result['durability_model'] = durability_model
     if eff_criteria is not None:
