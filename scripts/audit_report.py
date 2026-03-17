@@ -207,6 +207,10 @@ def summarize_runtime_sweep(
         1 for r in injected
         if _effective_boot_result(r)[0] == "bus_fault"
     )
+    timeout_points = sum(
+        1 for r in injected
+        if _effective_boot_result(r)[0] == "timeout"
+    )
 
     # Categorize failures by outcome type.
     outcome_counts: Dict[str, int] = {}
@@ -267,6 +271,7 @@ def summarize_runtime_sweep(
         "semantic_observation_points": semantic_observation_points,
         "invariant_issue_points": invariant_issue_points,
         "bus_fault_points": bus_fault_points,
+        "timeout_points": timeout_points,
         "recoveries": recoveries,
         "resilient_rollbacks": resilient_rollbacks,
         "brick_rate": (float(len(boot_failures)) / float(total)) if total else 0.0,
@@ -467,6 +472,11 @@ def compute_verdict(
         if invariant_observations > 0:
             parts.append("{} invariant observations".format(invariant_observations))
         verdict = "PASS \u2014 " + ", ".join(parts)
+    timeout_points = int(sweep_summary.get("timeout_points", 0))
+    if timeout_points > 0:
+        verdict += " (WARNING: {} points timed out — consider increasing run_duration)".format(
+            timeout_points
+        )
     return verdict
 
 
