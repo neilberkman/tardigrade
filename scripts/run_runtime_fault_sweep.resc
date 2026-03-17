@@ -121,6 +121,45 @@ def log(msg):
     sys.stderr.write('[resc] {}\n'.format(msg))
     sys.stderr.flush()
 
+try:
+    integer_types = (int, long)
+except NameError:
+    integer_types = (int,)
+
+try:
+    string_types = (basestring,)
+except NameError:
+    string_types = (str,)
+
+
+def _json_safe(value):
+    if value is None or isinstance(value, (bool, float) + string_types):
+        return value
+    if isinstance(value, integer_types):
+        return int(value)
+    if isinstance(value, dict):
+        return {
+            str(k): _json_safe(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, set):
+        return [_json_safe(v) for v in sorted(value)]
+    try:
+        return int(value)
+    except Exception:
+        pass
+    try:
+        return float(value)
+    except Exception:
+        pass
+    return str(value)
+
+
+def _json_dump_text(value):
+    return json.dumps(_json_safe(value), sort_keys=True)
+
 bus = monitor.Machine.SystemBus
 
 # Sentinel value used to disarm fault injection (max uint64).
@@ -579,7 +618,9 @@ _FAULT_CODE_TO_NAME = {
     'f': 'read_bit_flip',
     'k': 'command_drop',
     'i': 'instruction_skip',
-    'h': 'power_loss',  # hook faults are power-loss during hook writes
+    'h': 'hook_fault',
+    'm': 'metadata_fault',
+    'p2': 'phase2_fault',
     'op': 'otp_partial_program',
     'os': 'otp_stuck_bit',
     'od': 'otp_read_disturb',
@@ -792,6 +833,51 @@ def annotate_update_sequence_result(result):
     summary = _update_sequence_summary()
     if summary is not None and isinstance(result, dict):
         result['update_sequence'] = summary
+    return result
+
+
+def annotate_boot_span_result(result):
+    if not isinstance(result, dict):
+        return result
+    if (
+        'boot_outcome' not in result
+        and 'boot_cycles' not in result
+        and 'multi_boot_analysis' not in result
+    ):
+        return result
+
+    boot_cycles = result.get('boot_cycles')
+    first_cycle = boot_cycles[0] if isinstance(boot_cycles, list) and boot_cycles else None
+    last_cycle = boot_cycles[-1] if isinstance(boot_cycles, list) and boot_cycles else None
+
+    initial_outcome = result.get('initial_boot_outcome')
+    initial_slot = result.get('initial_boot_slot')
+    if initial_outcome is None:
+        if isinstance(first_cycle, dict):
+            initial_outcome = first_cycle.get('boot_outcome', result.get('boot_outcome'))
+            initial_slot = first_cycle.get('boot_slot', result.get('boot_slot'))
+        else:
+            initial_outcome = result.get('boot_outcome')
+            initial_slot = result.get('boot_slot')
+
+    final_outcome = result.get('final_boot_outcome')
+    final_slot = result.get('final_boot_slot')
+    if final_outcome is None:
+        mba = result.get('multi_boot_analysis')
+        if isinstance(mba, dict) and mba.get('final_outcome') is not None:
+            final_outcome = mba.get('final_outcome')
+            final_slot = mba.get('final_slot')
+        elif isinstance(last_cycle, dict):
+            final_outcome = last_cycle.get('boot_outcome', result.get('boot_outcome'))
+            final_slot = last_cycle.get('boot_slot', result.get('boot_slot'))
+        else:
+            final_outcome = result.get('boot_outcome')
+            final_slot = result.get('boot_slot')
+
+    result['initial_boot_outcome'] = initial_outcome
+    result['initial_boot_slot'] = initial_slot
+    result['final_boot_outcome'] = final_outcome
+    result['final_boot_slot'] = final_slot
     return result
 
 # Sticky state for VTOR detection during execute runs.
@@ -1387,6 +1473,7 @@ def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_si
 
 
 def run_hook_fault(hook_fault_at, hook_fault_type='w'):
+    eff_criteria = get_effective_criteria('h')
     cpu_ref = monitor.Machine['sysbus.cpu']
     fp_t0 = _time.time()
 
@@ -1533,7 +1620,7 @@ def run_hook_fault(hook_fault_at, hook_fault_type='w'):
             cycle1_record.get('boot_outcome'),
             cycle1_record.get('boot_slot'),
             cycle1_signals,
-            effective_criteria=get_effective_criteria(hook_fault_type),
+            effective_criteria=eff_criteria,
         ),
         'actual_writes': actual_writes,
         'signals': cycle1_signals,
@@ -1550,9 +1637,8 @@ def run_hook_fault(hook_fault_at, hook_fault_type='w'):
             'elapsed_s': round(_time.time() - fp_t0, 1),
         },
     }
-    _hook_eff_criteria = get_effective_criteria(hook_fault_type)
-    if _hook_eff_criteria is not None:
-        result['effective_success_criteria'] = _hook_eff_criteria
+    if eff_criteria is not None:
+        result['effective_success_criteria'] = eff_criteria
     semantic_state = cycle1_record.get('semantic_state')
     if semantic_state is not None:
         result['semantic_state'] = semantic_state
@@ -2320,6 +2406,7 @@ def restore_phase1_baseline():
         ensure_update_sequence_fault_baseline()
         _apply_phase_context(update_sequence_fault_phase)
         restore_flash_and_boot(_cached_update_sequence_fault_flash)
+        _apply_update_phase_pre_boot(update_sequence_fault_phase)
         if _hash_bypass_active:
             apply_hash_bypass()
         return
@@ -2477,9 +2564,16 @@ def _prepare_update_phase_start_state(phase, phase_index):
         reload_images_from_map(phase.get('start_images', {}))
     else:
         _load_images_mapping(phase.get('images', {}))
-    _apply_pre_boot_entries(phase.get('pre_boot_state', []))
+    _apply_update_phase_pre_boot(phase)
     if _hash_bypass_active:
         apply_hash_bypass()
+
+
+def _apply_update_phase_pre_boot(phase):
+    phase_setup_script = str(phase.get('setup_script', '') or '').strip()
+    if phase_setup_script:
+        monitor.Parse('include @' + phase_setup_script)
+    _apply_pre_boot_entries(phase.get('pre_boot_state', []))
 
 
 def _run_clean_update_phase(phase, phase_index):
@@ -2488,6 +2582,7 @@ def _run_clean_update_phase(phase, phase_index):
     phase_name = str(phase.get('name', 'phase_{}'.format(phase_index)))
     phase_start_flash = _snapshot_current_flash()
     restore_flash_and_boot(phase_start_flash)
+    _apply_update_phase_pre_boot(phase)
     if _hash_bypass_active:
         apply_hash_bypass()
     cpu_ref = monitor.Machine['sysbus.cpu']
@@ -2533,7 +2628,8 @@ def _run_clean_update_phase(phase, phase_index):
     # a passing VTOR check.  Re-verify the final flash state with full
     # content criteria to catch this.
     if final_outcome == 'success' and success_image_hash and expected_exec_sha256:
-        actual_hash = compute_exec_slot_hash()
+        hash_slot = success_image_hash_slot if success_image_hash_slot not in ('', 'any') else final_slot
+        actual_hash = compute_slot_hash(hash_slot)
         if actual_hash != expected_exec_sha256:
             log('update_phase {}: content verification FAILED after followup cycles '
                 '(expected={}, actual={})'.format(phase_name, expected_exec_sha256[:16], actual_hash[:16]))
@@ -2624,32 +2720,40 @@ def reload_images_cached():
         apply_pre_boot_state()
         cache_initial_flash()
 
-def compute_exec_slot_hash():
-    # Compute SHA-256 of the exec slot image data (excluding trailer page).
+def compute_slot_hash(slot_name='exec'):
+    # Compute SHA-256 of the selected slot image data (excluding trailer page).
     # Bootloaders modify trailer fields during swap, so the full-slot hash
     # won't match the original binary. Hashing only the data portion
     # (everything except the last page) avoids this problem.
     import hashlib
+    slot_key = str(slot_name or 'exec')
+    if slot_key not in slot_ranges:
+        slot_key = 'exec'
+    slot_base, slot_end = slot_ranges[slot_key]
+    slot_size = slot_end - slot_base
     page_size = 4096
-    data_size = slot_exec_size - page_size
+    data_size = slot_size - page_size
     if data_size <= 0:
-        data_size = slot_exec_size
+        data_size = slot_size
     b = backend
     if b['kind'] == 'mram':
         mram_base, _ = flash_geometry()
-        offset = slot_exec_base - mram_base
+        offset = slot_base - mram_base
         data = bytes(b['data'].ReadBytes(offset, data_size))
     elif b['kind'] == 'fast':
         flash_ref = b['data'].Flash
         flash_base_addr = int(b['data'].FlashBaseAddress)
-        offset = slot_exec_base - flash_base_addr
+        offset = slot_base - flash_base_addr
         data = bytes(flash_ref.ReadBytes(offset, data_size))
     else:
         chunks = []
-        for addr in range(slot_exec_base, slot_exec_base + data_size, 4):
+        for addr in range(slot_base, slot_base + data_size, 4):
             chunks.append(struct.pack('<I', as_int(bus.ReadDoubleWord(addr))))
         data = b''.join(chunks)
     return hashlib.sha256(data).hexdigest()
+
+def compute_exec_slot_hash():
+    return compute_slot_hash('exec')
 
 def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_content_criteria=True, effective_criteria=None):
     # Shared boot outcome evaluation for all execution modes.
@@ -2699,13 +2803,15 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     marker_ok = True
     hash_result = None
     actual_marker_val = 0
+    actual_hash = None
     if enforce_content_criteria:
         if eff_image_hash:
             enforce_hash = True
             if eff_image_hash_slot and eff_image_hash_slot != 'any':
                 enforce_hash = (boot_slot == eff_image_hash_slot)
             if enforce_hash:
-                actual_hash = compute_exec_slot_hash()
+                hash_slot = eff_image_hash_slot if eff_image_hash_slot not in ('', 'any') else boot_slot
+                actual_hash = compute_slot_hash(hash_slot)
                 if actual_hash == image_exec_sha256:
                     hash_result = 'exec_image'
                 elif actual_hash == image_staging_sha256:
@@ -2731,7 +2837,8 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     # image_hash: after upgrade, exec should contain the staging image.
     rollback_ok = True
     if security_anti_rollback and enforce_content_criteria and hash_result is not None:
-        if expected_exec_sha256 and hash_result == 'exec_image':
+        expected_is_exec = bool(expected_exec_sha256) and expected_exec_sha256 == image_exec_sha256
+        if expected_exec_sha256 and (not expected_is_exec) and hash_result == 'exec_image':
             rollback_ok = False
         elif not expected_exec_sha256 and hash_result == 'exec_image' and image_staging_sha256:
             rollback_ok = False
@@ -3723,7 +3830,7 @@ def run_nvs_corruption_fault(variant_idx):
 
 
 def run_metadata_fault(fault_at, fault_type='w'):
-    eff_criteria = get_effective_criteria(fault_type)
+    eff_criteria = get_effective_criteria('m')
     cpu_ref = monitor.Machine['sysbus.cpu']
     fp_t0 = _time.time()
     m_type = fault_type
@@ -4586,7 +4693,7 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
 # Phase 3: boot from double-faulted state, validate recovery
 # ---------------------------------------------------------------------------
 def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type='w'):
-    eff_criteria = get_effective_criteria(p1_fault_type)
+    eff_criteria = get_effective_criteria('p2')
     cpu_ref = monitor.Machine['sysbus.cpu']
     fp_t0 = _time.time()
     is_p1_erase = p1_fault_type in ('e', 'a')
@@ -5658,8 +5765,9 @@ if calibration_mode:
             cal_exec_hash = compute_exec_slot_hash()
             result['calibration_exec_hash'] = cal_exec_hash
             log('calibration: exec slot hash = {}'.format(cal_exec_hash[:16]))
+    result = annotate_boot_span_result(result)
     with open(result_file, 'w') as f:
-        f.write(json.dumps(result, sort_keys=True))
+        f.write(_json_dump_text(result))
     log('calibration done: total_writes={}'.format(result.get('total_writes', '?')))
 
 else:
@@ -5701,7 +5809,9 @@ else:
             ft = fault_type_list[idx]
         if ft == 'f':
             ensure_read_fault_preflight()
-        result = annotate_update_sequence_result(_dispatch_fault_point(fp, ft, run_fn))
+        result = annotate_boot_span_result(
+            annotate_update_sequence_result(_dispatch_fault_point(fp, ft, run_fn))
+        )
         results.append(result)
 
         # Force .NET GC periodically to prevent memory exhaustion.
@@ -5746,10 +5856,10 @@ else:
     # Write results.
     if batch_mode:
         with open(result_file, 'w') as f:
-            f.write(json.dumps(results, sort_keys=True))
+            f.write(_json_dump_text(results))
     else:
         with open(result_file, 'w') as f:
-            f.write(json.dumps(results[0], sort_keys=True))
+            f.write(_json_dump_text(results[0]))
 
     log('sweep done: {} fault points'.format(len(results)))
 

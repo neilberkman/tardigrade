@@ -39,6 +39,43 @@ class CalibrationInputs:
     trace_file: Optional[str] = None
 
 
+def _derive_read_fault_points(
+    profile: ProfileConfig,
+    *,
+    fault_step: int = 1,
+    fault_start: Optional[int] = None,
+    fault_end: Optional[int] = None,
+) -> List[int]:
+    """Derive read-fault indices directly from configured target regions.
+
+    Read-bit-flip points index aligned words in the configured read regions;
+    they do not require calibration's write-count trace.
+    """
+    read_cfg = getattr(profile.fault_sweep, "read_fault_config", None)
+    if read_cfg is None or not read_cfg.target_regions:
+        return []
+
+    granularity = max(1, int(getattr(profile.memory, "write_granularity", 1) or 1))
+    total_region_bytes = sum(
+        max(0, int(end) - int(start))
+        for start, end in read_cfg.target_regions
+    )
+    if total_region_bytes <= 0:
+        return []
+
+    point_count = max(1, (total_region_bytes + granularity - 1) // granularity)
+    step = max(1, fault_step)
+    start = max(0, fault_start or 0)
+    end = point_count if fault_end is None else min(point_count, int(fault_end))
+    if start >= end:
+        return []
+
+    points = list(range(start, end, step))
+    if (point_count - 1) not in points and fault_end is None:
+        points.append(point_count - 1)
+    return points
+
+
 def build_fault_plan(
     profile: ProfileConfig,
     calibration: CalibrationInputs,
@@ -155,12 +192,22 @@ def build_fault_plan(
             file=sys.stderr,
         )
     else:
-        step = max(1, fault_step)
-        fp_start = fault_start if fault_start is not None else 0
-        fp_end = fault_end if fault_end is not None else max_writes
-        fault_points = list(range(fp_start, fp_end, step))
-        if max_writes > 0 and max_writes - 1 not in fault_points and fault_end is None:
-            fault_points.append(max_writes - 1)
+        if max_writes > 0:
+            step = max(1, fault_step)
+            fp_start = fault_start if fault_start is not None else 0
+            fp_end = fault_end if fault_end is not None else max_writes
+            fault_points = list(range(fp_start, fp_end, step))
+            if max_writes - 1 not in fault_points and fault_end is None:
+                fault_points.append(max_writes - 1)
+        elif include_read_bit_flip:
+            fault_points = _derive_read_fault_points(
+                profile,
+                fault_step=fault_step,
+                fault_start=fault_start,
+                fault_end=fault_end,
+            )
+        else:
+            fault_points = []
 
     if quick:
         fault_points = quick_subset(fault_points)

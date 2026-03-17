@@ -65,6 +65,9 @@ KNOWN_FAULT_TYPES = {
     "otp_stuck_bit",
     "otp_read_disturb",
     "otp_overblow",
+    "phase2_fault",
+    "hook_fault",
+    "metadata_fault",
 }
 IMPLEMENTED_FAULT_TYPES = {
     "power_loss",
@@ -97,6 +100,9 @@ IMPLEMENTED_FAULT_TYPES = {
 # sweep planner does not generate fault points for them directly.
 CLASSIFICATION_ONLY_FAULT_TYPES = {
     "bootloader_region_write",
+    "phase2_fault",
+    "hook_fault",
+    "metadata_fault",
 }
 
 # Map OTP fault type names to their OTPMemory BlowFaultMode codes.
@@ -865,6 +871,7 @@ class UpdatePhase:
         "description",
         "images",
         "start_images",
+        "setup_script",
         "pre_boot_state",
         "success_criteria",
         "boot_cycles",
@@ -880,6 +887,7 @@ class UpdatePhase:
         description: str = "",
         images: Optional[Dict[str, str]] = None,
         start_images: Optional[Dict[str, str]] = None,
+        setup_script: Optional[str] = None,
         pre_boot_state: Optional[List["PreBootWrite"]] = None,
         success_criteria: Optional["SuccessCriteria"] = None,
         boot_cycles: int = 1,
@@ -892,6 +900,7 @@ class UpdatePhase:
         self.description = description
         self.images = images or {}
         self.start_images = start_images or {}
+        self.setup_script = str(setup_script).strip() if setup_script else None
         self.pre_boot_state = pre_boot_state or []
         self.success_criteria = success_criteria or SuccessCriteria()
         self.boot_cycles = max(1, int(boot_cycles))
@@ -1191,6 +1200,7 @@ class ProfileConfig:
         data_size = None
         if exec_slot is not None and exec_slot.size > page_size:
             data_size = exec_slot.size - page_size
+        pad_byte = 0x00 if str(self.flash_backend or "").strip().lower() == "mram" else 0xFF
 
         digests: Dict[str, str] = {}
         for img_name, img_path in images.items():
@@ -1201,7 +1211,7 @@ class ProfileConfig:
                 if len(raw) >= data_size:
                     raw = raw[:data_size]
                 else:
-                    raw = raw + (b"\xFF" * (data_size - len(raw)))
+                    raw = raw + (bytes([pad_byte]) * (data_size - len(raw)))
             digests[img_name] = hashlib.sha256(raw).hexdigest()
         return digests
 
@@ -1258,6 +1268,11 @@ class ProfileConfig:
                     "description": phase.description,
                     "images": resolved_delta,
                     "start_images": resolved_start,
+                    "setup_script": (
+                        self.resolve_path(repo_root, phase.setup_script)
+                        if phase.setup_script
+                        else ""
+                    ),
                     "pre_boot_state": [
                         {"address": int(write.address), "u32": int(write.u32)}
                         for write in phase.pre_boot_state
@@ -1453,31 +1468,12 @@ class ProfileConfig:
         # Hash only the data portion (slot_size - page_size), excluding the
         # last page where bootloaders store trailer metadata.
         if sc.image_hash:
-            import hashlib
             vars_list.append("SUCCESS_IMAGE_HASH:true")
             if sc.image_hash_slot:
                 vars_list.append("SUCCESS_IMAGE_HASH_SLOT:{}".format(sc.image_hash_slot))
-            page_size = 4096
-            exec_slot = mem.slots.get("exec")
-            data_size = (exec_slot.size - page_size) if exec_slot and exec_slot.size > page_size else None
-            image_digests: Dict[str, str] = {}
-            for img_name, img_path in self.images.items():
-                resolved = self.resolve_path(repo_root, img_path)
-                try:
-                    with open(resolved, "rb") as fh:
-                        raw = fh.read()
-                    # Normalize to slot data length: truncate oversized images
-                    # and pad short images with erased flash bytes.
-                    if data_size:
-                        if len(raw) >= data_size:
-                            raw = raw[:data_size]
-                        else:
-                            raw = raw + (b"\xFF" * (data_size - len(raw)))
-                    digest = hashlib.sha256(raw).hexdigest()
-                    vars_list.append("IMAGE_{}_SHA256:{}".format(img_name.upper(), digest))
-                    image_digests[img_name] = digest
-                except FileNotFoundError:
-                    pass
+            image_digests = self._compute_image_digests(repo_root, self.images)
+            for img_name, digest in image_digests.items():
+                vars_list.append("IMAGE_{}_SHA256:{}".format(img_name.upper(), digest))
             # expected_image: which image should be in exec after a successful operation.
             expected = sc.expected_image or "staging"
             if expected in image_digests:
@@ -3157,11 +3153,16 @@ def _parse_update_sequence(
         phase_boot_cycles = int(entry.get("boot_cycles", fault_sweep.boot_cycles))
         if phase_boot_cycles < 1:
             raise ProfileError("{}.boot_cycles: expected integer >= 1".format(ctx))
-        phase_hook = entry.get("boot_cycle_hook", fault_sweep.boot_cycle_hook)
-        if phase_hook is not None:
-            phase_hook = str(phase_hook).strip()
-            if not phase_hook:
-                raise ProfileError("{}.boot_cycle_hook: expected non-empty path".format(ctx))
+        if "boot_cycle_hook" in entry:
+            phase_hook_raw = entry.get("boot_cycle_hook")
+            if phase_hook_raw is None:
+                phase_hook = None
+            else:
+                phase_hook = str(phase_hook_raw).strip()
+                if not phase_hook:
+                    phase_hook = None
+        else:
+            phase_hook = fault_sweep.boot_cycle_hook
         expected_rollback_at_cycle = entry.get(
             "expected_rollback_at_cycle",
             fault_sweep.expected_rollback_at_cycle,
@@ -3176,11 +3177,17 @@ def _parse_update_sequence(
             entry.get("fault_types", list(fault_sweep.fault_types)),
             "{}.fault_types".format(ctx),
         )
+        phase_setup_script = entry.get("setup_script")
+        if phase_setup_script is not None:
+            phase_setup_script = str(phase_setup_script).strip()
+            if not phase_setup_script:
+                raise ProfileError("{}.setup_script: expected non-empty path".format(ctx))
         phases.append(
             UpdatePhase(
                 name=name,
                 description=str(entry.get("description", "")),
                 images=phase_images,
+                setup_script=phase_setup_script,
                 pre_boot_state=_parse_pre_boot_state(entry.get("pre_boot_state")),
                 success_criteria=phase_success,
                 boot_cycles=phase_boot_cycles,

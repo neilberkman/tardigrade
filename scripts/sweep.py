@@ -561,15 +561,30 @@ def run_runtime_sweep(
         _BASE_COST_S = 2.0     # overhead per point (setup + Phase 2)
         _PER_WRITE_COST_S = 0.012  # Phase 1 emulation scales with fp value
         _MAX_PER_BATCH = 64    # cap for memory safety
+        _UPDATE_SEQUENCE_BATCH_OVERHEAD_S = (
+            12.0 if getattr(profile, "has_update_sequence", False) else 0.0
+        )
+        _POINT_BUDGET_S = max(30.0, _BATCH_TIME_BUDGET_S - _UPDATE_SEQUENCE_BATCH_OVERHEAD_S)
 
         # Compute variable-sized chunk boundaries.
+        # Fault types where fp is a sequential write index (cost scales with fp).
+        # All others (instruction_skip, read_bit_flip, OTP, I2C) use memory
+        # addresses or absolute values — flat cost to avoid overflow.
+        _SEQUENTIAL_FAULTS = {"w", "b", "e", "a", "s", "d", "l", "r", "k"}
+
+        def _point_cost(idx: int, fp: int) -> float:
+            ft = fault_types_list[idx] if fault_types_list and idx < len(fault_types_list) else None
+            if ft is None or ft in _SEQUENTIAL_FAULTS:
+                return _BASE_COST_S + abs(fp) * _PER_WRITE_COST_S
+            return 5.0
+
         _exe_chunk_boundaries: List[int] = [0]
         _budget_used = 0.0
         for i, fp in enumerate(fault_points):
-            cost = _BASE_COST_S + abs(fp) * _PER_WRITE_COST_S
+            cost = _point_cost(i, fp)
             _budget_used += cost
             pts_in_chunk = i - _exe_chunk_boundaries[-1] + 1
-            if _budget_used > _BATCH_TIME_BUDGET_S or pts_in_chunk >= _MAX_PER_BATCH:
+            if _budget_used > _POINT_BUDGET_S or pts_in_chunk >= _MAX_PER_BATCH:
                 _exe_chunk_boundaries.append(i)
                 _budget_used = cost
         _n_chunks = len(_exe_chunk_boundaries)
@@ -586,7 +601,10 @@ def run_runtime_sweep(
         max_batch_points = max(1, _chunk_sizes[len(_chunk_sizes) // 2])
         # Clamp to [1, 64]
         max_batch_points = max(1, min(_MAX_PER_BATCH, max_batch_points))
-        _total_est = sum(_BASE_COST_S + abs(fp) * _PER_WRITE_COST_S for fp in fault_points)
+        _total_est = (
+            sum(_point_cost(i, fp) for i, fp in enumerate(fault_points))
+            + _n_chunks * _UPDATE_SEQUENCE_BATCH_OVERHEAD_S
+        )
         print(
             "Execute mode without trace replay: ~{} batches, median {} pts/batch "
             "({}s budget, {:.0f}s total est, {} points, max fp={}).".format(

@@ -67,7 +67,7 @@ fault_sweep:
   evaluation_mode: execute
   run_duration: "{run_duration}"
   calibration_time_slice: "{calibration_time_slice}"
-  boot_cycles: {boot_cycles}{fault_types_line}
+  boot_cycles: {boot_cycles}{rollback_line}{fault_types_line}
 state_probe:
   script: targets/nuttx_nxboot/probe.py
 semantic_assertions:
@@ -87,6 +87,10 @@ invariants:
 expect:
   should_find_issues: false
 """.format(
+        rollback_line=(
+            "\n  expected_rollback_at_cycle: 1"
+            if int(boot_cycles) > 1 else ""
+        ),
         fault_types_line=(
             "\n  fault_types: [{}]".format(fault_types)
             if fault_types else ""

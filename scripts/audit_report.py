@@ -296,6 +296,12 @@ def summarize_runtime_sweep(
             "effective_outcome": ctrl_eff_outcome,
             "effective_slot": ctrl_eff_slot,
         }
+        if "initial_boot_outcome" in ctrl:
+            control_summary["initial_boot_outcome"] = ctrl.get("initial_boot_outcome")
+            control_summary["initial_boot_slot"] = ctrl.get("initial_boot_slot")
+        if "final_boot_outcome" in ctrl:
+            control_summary["final_boot_outcome"] = ctrl.get("final_boot_outcome")
+            control_summary["final_boot_slot"] = ctrl.get("final_boot_slot")
         ctrl_signals = ctrl.get("signals") or {}
         control_telemetry = {
             key: ctrl_signals.get(key)

@@ -13,6 +13,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from fault_classification import (
+    _effective_boot_result,
     classify_failure_class,
     result_has_issues,
     result_is_brick,
@@ -195,6 +196,19 @@ class BusFaultClassificationTest(unittest.TestCase):
         }
         self.assertFalse(result_has_issues(r, "success"))
 
+    def test_explicit_final_outcome_overrides_raw_boot_outcome(self):
+        r = {
+            "boot_outcome": "wrong_image",
+            "boot_slot": "staging",
+            "initial_boot_outcome": "wrong_image",
+            "initial_boot_slot": "staging",
+            "final_boot_outcome": "success",
+            "final_boot_slot": "exec",
+        }
+        self.assertEqual(_effective_boot_result(r), ("success", "exec"))
+        self.assertFalse(result_has_issues(r, "success"))
+        self.assertEqual(classify_failure_class(r), "recoverable")
+
 
 class BusFaultSummaryTest(unittest.TestCase):
     """Verify bus_fault is tracked in sweep summary."""
@@ -237,6 +251,28 @@ class BusFaultSummaryTest(unittest.TestCase):
         self.assertEqual(summary["issue_points"], 1)  # only wrong_image
         # bus_fault should NOT be counted as bricks
         self.assertEqual(summary["bricks"], 0)
+
+    def test_control_summary_surfaces_initial_and_final_boot_outcomes(self):
+        from audit_report import summarize_runtime_sweep
+
+        results = [
+            {
+                "is_control": True,
+                "boot_outcome": "wrong_image",
+                "boot_slot": "staging",
+                "initial_boot_outcome": "wrong_image",
+                "initial_boot_slot": "staging",
+                "final_boot_outcome": "success",
+                "final_boot_slot": "exec",
+                "fault_injected": False,
+            }
+        ]
+        summary = summarize_runtime_sweep(results)
+        control = summary["control"]
+        self.assertEqual(control["boot_outcome"], "wrong_image")
+        self.assertEqual(control["initial_boot_outcome"], "wrong_image")
+        self.assertEqual(control["final_boot_outcome"], "success")
+        self.assertEqual(control["effective_outcome"], "success")
 
 
 class IncludeLiteralPoolsConfigTest(unittest.TestCase):

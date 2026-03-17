@@ -60,6 +60,7 @@ from renode_runner import (
     CalibrationResult,
     _progress,
     ensure_tool,
+    merge_robot_vars,
     parse_robot_vars,
     run_calibration,
     run_single_point,
@@ -87,6 +88,42 @@ EXIT_INFRA_FAILURE = 2
 def _trace_replay_eligible_fault_types(fault_types: List[str]) -> bool:
     normalized = {str(ft or "power_loss") for ft in fault_types or ["power_loss"]}
     return not normalized.intersection(EXECUTE_ONLY_FAULT_TYPES)
+
+
+def _can_skip_auto_calibration(profile: ProfileConfig, eval_mode: str) -> bool:
+    """Return whether auto-calibration can be skipped for this execute sweep."""
+    if eval_mode != "execute":
+        return False
+
+    fault_types = {str(ft or "").strip() for ft in profile.fault_sweep.fault_types or []}
+    fault_types.discard("")
+    if not fault_types:
+        return False
+
+    calibration_dependent_faults = {
+        "power_loss",
+        "bit_corruption",
+        "interrupted_erase",
+        "multi_sector_atomicity",
+        "silent_write_failure",
+        "write_disturb",
+        "wear_leveling_corruption",
+        "write_rejection",
+        "reset_at_time",
+        "command_drop",
+    }
+    if fault_types.intersection(calibration_dependent_faults):
+        return False
+    if any(ft.startswith("i2c_") or ft.startswith("otp_") for ft in fault_types):
+        return False
+    if profile.fault_sweep.metadata_fault.enabled:
+        return False
+    if profile.fault_sweep.phase2_fault.enabled:
+        return False
+    if profile.fault_sweep.multi_fault.enabled:
+        return False
+
+    return fault_types.issubset({"instruction_skip", "read_bit_flip", "nvs_corruption"})
 
 
 def parse_args() -> argparse.Namespace:
@@ -668,6 +705,15 @@ def main() -> int:
                 exec_slot = profile.memory.slots["exec"]
                 max_writes = exec_slot.size // profile.memory.write_granularity
                 print("Computed write count from slot geometry: {} writes.".format(max_writes), file=sys.stderr)
+            elif _can_skip_auto_calibration(profile, eval_mode):
+                max_writes = 0
+                print(
+                    "Skipping calibration for '{}' — fault points derive from "
+                    "configured regions/symbols without write-count tracing.".format(
+                        profile.name
+                    ),
+                    file=sys.stderr,
+                )
             else:
                 print("Calibrating write count for '{}'...".format(profile.name), file=sys.stderr)
                 cal = run_calibration(
@@ -690,8 +736,9 @@ def main() -> int:
                 # exec hash as the ground truth for what a successful
                 # operation produces.
                 if cal.calibration_exec_hash:
-                    robot_vars.append(
-                        "EXPECTED_EXEC_SHA256:{}".format(cal.calibration_exec_hash)
+                    robot_vars = merge_robot_vars(
+                        robot_vars,
+                        ["EXPECTED_EXEC_SHA256:{}".format(cal.calibration_exec_hash)],
                     )
                     print(
                         "Calibration: exec slot hash = {}...".format(
@@ -735,8 +782,9 @@ def main() -> int:
                 trace_file_bin = cal.trace_file_bin
                 erase_trace_file_bin = cal.erase_trace_file_bin
                 if cal.calibration_exec_hash:
-                    robot_vars.append(
-                        "EXPECTED_EXEC_SHA256:{}".format(cal.calibration_exec_hash)
+                    robot_vars = merge_robot_vars(
+                        robot_vars,
+                        ["EXPECTED_EXEC_SHA256:{}".format(cal.calibration_exec_hash)],
                     )
                     print(
                         "Calibration: exec slot hash = {}...".format(

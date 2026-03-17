@@ -19,6 +19,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List
 
+from fault_classification import _effective_boot_result
+
 
 class SafeTemplateDict(dict):
     def __missing__(self, key: str) -> str:
@@ -36,8 +38,22 @@ def render(value: Any, variables: Dict[str, str]) -> Any:
 
 
 def is_brick(result: Dict[str, Any]) -> bool:
-    outcome = str(result.get("boot_outcome", "unknown") or "unknown").strip().lower()
+    outcome, _ = _effective_boot_result(result)
+    outcome = str(outcome or "unknown").strip().lower()
     return outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}
+
+
+def _effective_outcome_str(result: Dict[str, Any]) -> str:
+    outcome, _ = _effective_boot_result(result)
+    return str(outcome or "unknown").strip().lower()
+
+
+def _format_outcome_span(result: Dict[str, Any]) -> str:
+    initial = str(
+        result.get("initial_boot_outcome", result.get("boot_outcome", "unknown")) or "unknown"
+    ).strip().lower()
+    final = _effective_outcome_str(result)
+    return final if final == initial else "{} -> {}".format(initial, final)
 
 
 def git_ref_exists(repo: Path, ref: str) -> bool:
@@ -156,9 +172,17 @@ def run_single_fault_point(
                 "error": "rc={} stderr={}".format(proc.returncode, (proc.stderr or "")[-500:])}
 
     data = json.loads(result_file.read_text(encoding="utf-8"))
-    return {"fault_at": fault_at, "is_control": is_control,
-            "boot_outcome": data.get("boot_outcome", "unknown"),
-            "boot_slot": data.get("boot_slot")}
+    return {
+        "fault_at": fault_at,
+        "is_control": is_control,
+        "boot_outcome": data.get("boot_outcome", "unknown"),
+        "boot_slot": data.get("boot_slot"),
+        "initial_boot_outcome": data.get("initial_boot_outcome"),
+        "initial_boot_slot": data.get("initial_boot_slot"),
+        "final_boot_outcome": data.get("final_boot_outcome"),
+        "final_boot_slot": data.get("final_boot_slot"),
+        "multi_boot_analysis": data.get("multi_boot_analysis"),
+    }
 
 
 def run_profile(
@@ -252,8 +276,8 @@ def run_profile(
     control = [r for r in results if r.get("is_control")]
     faulted = [r for r in results if not r.get("is_control")]
     bricks = sum(1 for r in faulted if is_brick(r))
-    issues = sum(1 for r in faulted if r.get("boot_outcome") != "success")
-    errors = sum(1 for r in results if r.get("boot_outcome") == "infra_error")
+    issues = sum(1 for r in faulted if _effective_outcome_str(r) != "success")
+    errors = sum(1 for r in results if _effective_outcome_str(r) == "infra_error")
     brick_rate = (float(bricks) / len(faulted)) if faulted else 0.0
     issue_rate = (float(issues) / len(faulted)) if faulted else 0.0
     failures: List[str] = []
@@ -273,9 +297,9 @@ def run_profile(
         failures.append("issues={} below min {}".format(issues, issues_min))
 
     if expect.get("require_control_success"):
-        bad = [r for r in control if r.get("boot_outcome") != "success"]
+        bad = [r for r in control if _effective_outcome_str(r) != "success"]
         if bad:
-            failures.append("control failed: {}".format(bad[0].get("boot_outcome")))
+            failures.append("control failed: {}".format(_format_outcome_span(bad[0])))
         if not control:
             failures.append("no control run")
 

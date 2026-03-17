@@ -491,7 +491,29 @@ def run_batch(
     # Scale robot test timeout with actual fault point cost, not just count.
     # Execute-mode late points (fp=10000+) need long Phase 1 emulation.
     # 0.012s/fp matches measured ~160s for fp=13000 execute-mode points.
-    robot_test_timeout_s = max(120, 120 + sum(2.0 + fp * 0.012 for fp in fault_points))
+    # Fault types where fp is a sequential write index (cost scales with fp).
+    # All others (instruction_skip, read_bit_flip, OTP, I2C) use memory
+    # addresses or absolute values — flat cost to avoid overflow.
+    _SEQUENTIAL_FAULTS = {"w", "b", "e", "a", "s", "d", "l", "r", "k"}
+    _UPDATE_SEQUENCE_BATCH_OVERHEAD_S = (
+        12.0 if getattr(profile, "has_update_sequence", False) else 0.0
+    )
+
+    def _point_cost(idx: int, fp: int) -> float:
+        ft = fault_types_list[idx] if fault_types_list and idx < len(fault_types_list) else None
+        if ft is None or ft in _SEQUENTIAL_FAULTS:
+            return 2.0 + abs(fp) * 0.012
+        return 5.0
+
+    estimated_s = _UPDATE_SEQUENCE_BATCH_OVERHEAD_S + sum(
+        _point_cost(i, fp) for i, fp in enumerate(fault_points)
+    )
+    robot_test_timeout_s = max(120, 120 + estimated_s)
+    if getattr(profile, "has_update_sequence", False):
+        # Multi-phase clean baselines add significant fixed overhead before the
+        # fault points run. Keep a higher floor so healthy batches do not trip
+        # Robot's per-suite timeout and recursively split.
+        robot_test_timeout_s = max(robot_test_timeout_s, 600.0)
     robot_test_timeout_m = max(2, (int(robot_test_timeout_s) + 59) // 60)
 
     cmd = [
@@ -527,11 +549,13 @@ def run_batch(
     if per_point_timeout is not None:
         # Estimate per-point cost: base 2s + 0.012s per fault_at value.
         # 0.012 matches measured ~160s for fp=13000 execute-mode points.
-        estimated_s = sum(2.0 + fp * 0.012 for fp in fault_points)
-        timeout_s: Optional[float] = max(
-            per_point_timeout,
-            120.0 + estimated_s,
+        # instruction_skip uses flat cost (addresses, not write indices).
+        timeout_s: Optional[float] = min(
+            7200.0,  # 2h hard cap to prevent overflow
+            max(per_point_timeout, 120.0 + estimated_s),
         )
+        if getattr(profile, "has_update_sequence", False):
+            timeout_s = min(7200.0, max(timeout_s, 600.0))
     else:
         timeout_s = None
 

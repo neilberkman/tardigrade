@@ -15,7 +15,9 @@ import sys
 
 sys.path.insert(0, str(SCRIPTS))
 
+from audit_bootloader import _can_skip_auto_calibration  # noqa: E402
 from fault_inject import ReadFaultResult, ReadFaultSpec  # noqa: E402
+from fault_plan import CalibrationInputs, build_fault_plan  # noqa: E402
 from profile_loader import (  # noqa: E402
     IMPLEMENTED_FAULT_TYPES,
     KNOWN_FAULT_TYPES,
@@ -612,6 +614,109 @@ class BackendCompatWarningTest(unittest.TestCase):
             )
         read_warnings = [x for x in w if "read_bit_flip" in str(x.message)]
         self.assertEqual(read_warnings, [])
+
+
+class ReadFaultPlanWithoutCalibrationTest(unittest.TestCase):
+    """Execute-only read faults can derive points without write calibration."""
+
+    def _write_profile(self, tempdir: Path, body: str) -> Path:
+        path = tempdir / "profile.yaml"
+        path.write_text(textwrap.dedent(body), encoding="utf-8")
+        return path
+
+    def test_read_bit_flip_points_derive_from_regions_without_calibration(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = self._write_profile(
+                Path(td),
+                """
+                schema_version: 1
+                name: read_fault_plan_no_cal
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: true
+                fault_sweep:
+                  mode: runtime
+                  evaluation_mode: execute
+                  max_writes: auto
+                  fault_types: [read_bit_flip]
+                  read_fault_config:
+                    target_regions:
+                      - { start: 0x10070000, end: 0x10070010 }
+                    bit_flip_count: 1
+                    fault_probability: 1.0
+                """,
+            )
+            profile = load_profile(profile_path)
+            self.assertTrue(_can_skip_auto_calibration(profile, "execute"))
+
+            plan = build_fault_plan(profile, CalibrationInputs(max_writes=0))
+
+            self.assertEqual(plan.fault_points, [0, 1, 2, 3])
+            self.assertEqual(plan.fault_types_list, ["f", "f", "f", "f"])
+
+    def test_instruction_skip_and_read_flip_mix_builds_without_calibration(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = self._write_profile(
+                Path(td),
+                """
+                schema_version: 1
+                name: mixed_execute_only_no_cal
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: true
+                fault_sweep:
+                  mode: runtime
+                  evaluation_mode: execute
+                  max_writes: auto
+                  fault_types: [instruction_skip, read_bit_flip]
+                  read_fault_config:
+                    target_regions:
+                      - { start: 0x10070000, end: 0x10070010 }
+                    bit_flip_count: 1
+                    fault_probability: 1.0
+                  instruction_skip_config:
+                    include_literal_pools: true
+                    target_addresses:
+                      - { start: 0x10000000, end: 0x10000004 }
+                    skip_count: 1
+                """,
+            )
+            profile = load_profile(profile_path)
+            self.assertTrue(_can_skip_auto_calibration(profile, "execute"))
+
+            plan = build_fault_plan(profile, CalibrationInputs(max_writes=0))
+
+            self.assertEqual(plan.fault_types_list[:4], ["f", "f", "f", "f"])
+            self.assertEqual(
+                plan.fault_types_list[4:],
+                ["i:0x10000000", "i:0x10000002"],
+            )
 
 
 if __name__ == "__main__":

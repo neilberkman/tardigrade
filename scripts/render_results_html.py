@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from fault_classification import _effective_boot_result
+
 
 FAULT_LABELS = {
     "w": "power_loss",
@@ -41,6 +43,18 @@ def score_color(outcome: str, injected: bool) -> str:
     return "#059669" if outcome == "success" else "#dc2626"
 
 
+def _boot_span_outcomes(result: Dict[str, Any]) -> Tuple[str, str]:
+    initial = str(
+        result.get("initial_boot_outcome", result.get("boot_outcome", "unknown")) or "unknown"
+    )
+    final = result.get("final_boot_outcome")
+    if final is None:
+        final = result.get("effective_outcome")
+    if final is None:
+        final, _ = _effective_boot_result(result)
+    return initial, str(final or initial or "unknown")
+
+
 def render_fault_grid(results: List[Dict[str, Any]]) -> str:
     points = [r for r in results if not r.get("is_control", False)]
     if not points:
@@ -53,10 +67,16 @@ def render_fault_grid(results: List[Dict[str, Any]]) -> str:
         ftype = str(p.get("fault_type", "w"))
         label = FAULT_LABELS.get(ftype, ftype)
         at = int(p.get("fault_requested", p.get("fault_at", 0)))
-        outcome = str(p.get("boot_outcome", "unknown"))
+        initial_outcome, final_outcome = _boot_span_outcomes(p)
         injected = bool(p.get("fault_injected", False))
-        color = score_color(outcome, injected)
-        title = f"type={label} fp={at} outcome={outcome} injected={injected}"
+        color = score_color(final_outcome, injected)
+        if initial_outcome == final_outcome:
+            title = f"type={label} fp={at} outcome={final_outcome} injected={injected}"
+        else:
+            title = (
+                f"type={label} fp={at} initial={initial_outcome} "
+                f"final={final_outcome} injected={injected}"
+            )
         cells.append(
             "<div class='cell' style='background:{}' title='{}'></div>".format(
                 color,
@@ -82,14 +102,15 @@ def render_audit_card(path: Path, payload: Dict[str, Any]) -> Tuple[str, Dict[st
     brick_rate = float(sweep.get("brick_rate", 0.0)) * 100.0
     verdict = str(payload.get("verdict", "unknown"))
     control = sweep.get("control", {})
-    control_outcome = control.get("boot_outcome", "n/a")
+    control_initial_outcome, control_final_outcome = _boot_span_outcomes(control)
 
     metrics = (
         "<div class='metrics'>"
         f"<div><b>verdict</b><span>{html.escape(verdict)}</span></div>"
         f"<div><b>bricks</b><span>{bricks}/{total}</span></div>"
         f"<div><b>brick rate</b><span>{brick_rate:.1f}%</span></div>"
-        f"<div><b>control</b><span>{html.escape(str(control_outcome))}</span></div>"
+        f"<div><b>control initial</b><span>{html.escape(control_initial_outcome)}</span></div>"
+        f"<div><b>control final</b><span>{html.escape(control_final_outcome)}</span></div>"
         "</div>"
     )
 
@@ -110,6 +131,8 @@ def render_audit_card(path: Path, payload: Dict[str, Any]) -> Tuple[str, Dict[st
         "total": total,
         "brick_rate": brick_rate,
         "verdict": verdict,
+        "control_initial_outcome": control_initial_outcome,
+        "control_final_outcome": control_final_outcome,
     }
     return card, summary
 

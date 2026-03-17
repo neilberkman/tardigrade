@@ -17,10 +17,10 @@ _MULTI_BOOT_SUCCESS_STATUSES = frozenset({"converged", "rollback_converged"})
 def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     """Return (effective_outcome, effective_slot) accounting for multi-boot.
 
-    If the result has a ``multi_boot_analysis`` whose status indicates the
-    device converged (or rolled back successfully) to a final slot with a
-    successful outcome, use those final values instead of the raw cycle-0
-    ``boot_outcome`` / ``boot_slot``.
+    Prefer explicit top-level ``final_boot_outcome`` / ``final_boot_slot`` when
+    present. Otherwise fall back to ``multi_boot_analysis`` promotion for
+    backwards compatibility, and finally to the raw initial ``boot_outcome`` /
+    ``boot_slot``.
 
     Statuses that are NOT promoted:
       - rollback_missing
@@ -29,8 +29,12 @@ def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
       - stuck_revert
       - oscillating
     """
-    raw_outcome = result.get("boot_outcome", "unknown")
-    raw_slot = result.get("boot_slot")
+    raw_outcome = result.get("initial_boot_outcome", result.get("boot_outcome", "unknown"))
+    raw_slot = result.get("initial_boot_slot", result.get("boot_slot"))
+    final_outcome = result.get("final_boot_outcome")
+    final_slot = result.get("final_boot_slot")
+    if final_outcome is not None:
+        return (final_outcome, final_slot)
     mba = result.get("multi_boot_analysis")
     if not isinstance(mba, dict):
         return (raw_outcome, raw_slot)

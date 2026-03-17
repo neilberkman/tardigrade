@@ -264,22 +264,23 @@ class TestRuntimeDispatchCoverage(unittest.TestCase):
 
     def test_resc_code_to_name_values_match(self):
         """_FAULT_CODE_TO_NAME values must map back to the correct type names."""
-        # 'h' maps to 'power_loss' by design (hook faults are power-loss
-        # during hook writes) -- that's intentional, not a mismatch.
-        INTENTIONAL_OVERRIDES = {"h": "power_loss"}
-
         for name, code in FT_NAME_TO_CODE.items():
             resc_name = RESC_FAULT_CODE_TO_NAME.get(code)
             if not resc_name:
                 continue  # Covered by test_resc_code_to_name_covers_all_wire_codes
-            expected = INTENTIONAL_OVERRIDES.get(code, name)
             self.assertEqual(
                 resc_name,
-                expected,
+                name,
                 ".resc _FAULT_CODE_TO_NAME['{}'] = '{}', expected '{}'".format(
-                    code, resc_name, expected
+                    code, resc_name, name
                 ),
             )
+
+    def test_resc_family_override_codes_map_to_family_names(self):
+        """Composite fault families must resolve to override keys, not subtypes."""
+        self.assertEqual(RESC_FAULT_CODE_TO_NAME.get("m"), "metadata_fault")
+        self.assertEqual(RESC_FAULT_CODE_TO_NAME.get("p2"), "phase2_fault")
+        self.assertEqual(RESC_FAULT_CODE_TO_NAME.get("h"), "hook_fault")
 
     def test_write_mode_types_have_mode_codes(self):
         """Write-mode fault types (b, s, r, d, l) must appear in _WRITE_FAULT_MODE."""
