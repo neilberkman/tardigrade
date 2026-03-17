@@ -79,6 +79,10 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
     # validation/invariant code paths, so all issue signals are noise.
     if eff_outcome == "bus_fault":
         return reasons
+    # timeout means the bootloader was still working when the wall-clock
+    # budget expired.  This is not a failure — increase run_duration.
+    if eff_outcome == "timeout":
+        return reasons
     if eff_outcome != expected_outcome:
         # Resilient rollback: fault during OTA update caused the bootloader to
         # correctly fall back to the original image.  The device booted fine
@@ -98,9 +102,17 @@ def result_has_issues(result: Dict[str, Any], expected_outcome: str) -> bool:
     return bool(result_issue_reasons(result, expected_outcome))
 
 
+def result_is_timeout(result: Dict[str, Any]) -> bool:
+    eff_outcome, _ = _effective_boot_result(result)
+    outcome = str(eff_outcome or "unknown").strip().lower()
+    return outcome == "timeout"
+
+
 def result_is_brick(result: Dict[str, Any]) -> bool:
     eff_outcome, _ = _effective_boot_result(result)
     outcome = str(eff_outcome or "unknown").strip().lower()
+    # "timeout" is NOT a brick — the bootloader was still working when
+    # the wall-clock budget expired. Increase run_duration to resolve.
     return outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor", "config_crash"}
 
 

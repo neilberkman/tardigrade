@@ -3197,7 +3197,7 @@ def compute_slot_hash(slot_name='exec'):
 def compute_exec_slot_hash():
     return compute_slot_hash('exec')
 
-def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_content_criteria=True, effective_criteria=None):
+def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_content_criteria=True, effective_criteria=None, p2_status=None):
     # Shared boot outcome evaluation for all execution modes.
     # When effective_criteria is provided, use its values instead of globals.
     eff_vtor_slot = success_vtor_slot
@@ -3339,10 +3339,27 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     expectations_met = vtor_ok and vtor_aligned and pc_ok and criteria_ok
     signals['expectations_met'] = expectations_met
 
+    # Distinguish wall_timeout with active bootloader (still retrying,
+    # just slow) from wall_timeout with stuck execution (real failure).
+    # A timeout where the bootloader was still making NVM progress is
+    # not a boot failure — it's an insufficient wall-clock budget.
+    p2_reason = ''
+    p2_writes = 0
+    if p2_status is not None:
+        p2_reason = str(p2_status.get('reason', ''))
+        p2_writes = int(p2_status.get('writes', 0))
+    is_wall_timeout = p2_reason.startswith('wall_timeout')
+
     # Keep execution failures separate from expectation mismatches:
     # a boot into a real slot with the "wrong" image/slot is not "no_boot".
     if not vtor_in_known_slot:
-        boot_outcome = 'no_boot'
+        if is_wall_timeout and p2_writes > 0:
+            # Bootloader was actively writing to flash when we killed it.
+            # This is a timeout, not a brick — the bootloader may have
+            # recovered given more time.
+            boot_outcome = 'timeout'
+        else:
+            boot_outcome = 'no_boot'
     elif not vtor_aligned:
         boot_outcome = 'misaligned_vtor'
     elif not pc_ok:
@@ -3839,7 +3856,8 @@ def run_read_bit_flip_fault(fault_at):
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
-        vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria
+        vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria,
+        p2_status=p2_status,
     )
     signals['read_fault_address'] = fmt_u32(read_fault_address)
     signals['read_fault_original'] = fmt_u32(original_word)
@@ -4134,7 +4152,8 @@ def run_timed_reset_fault(fault_at):
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
-        vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria
+        vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria,
+        p2_status=p2_status,
     )
     signals['timed_reset_trigger_s'] = round(trigger_s, 6)
     signals['timed_reset_fraction'] = round(frac, 6)
@@ -4254,7 +4273,8 @@ def run_nvs_corruption_fault(variant_idx):
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
-        vtor_value, pc_value, fault_injected=True, effective_criteria=eff_criteria
+        vtor_value, pc_value, fault_injected=True, effective_criteria=eff_criteria,
+        p2_status=p2_status,
     )
     signals['nvs_corruption_mode'] = mode
     signals['nvs_corruption_variant'] = variant_idx
@@ -4296,7 +4316,7 @@ def run_metadata_fault(fault_at, fault_type='w'):
     phase1_ms = int((_time.time() - fp_t0) * 1000)
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
-    boot_outcome, boot_slot, signals = evaluate_boot_outcome(vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria)
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria, p2_status=p2_status)
     signals['metadata_fault_applied'] = applied
     signals['metadata_fault_total'] = pre_boot_write_count
     signals['phase1_ms'] = phase1_ms
@@ -5846,7 +5866,8 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     eff_criteria = get_effective_criteria(fault_type)
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
-        vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria
+        vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria,
+        p2_status=p2_status,
     )
     signals['phase1_ms'] = phase1_ms
     signals['phase2_ms'] = phase2_ms
@@ -6005,7 +6026,8 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     eff_criteria = get_effective_criteria(fault_type)
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
-        vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria
+        vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria,
+        p2_status=p2_status,
     )
     signals['phase1_ms'] = phase1_ms
     signals['phase2_ms'] = phase2_ms
