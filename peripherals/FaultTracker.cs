@@ -177,8 +177,81 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             data[offset + 3] = (byte)(value >> 24);
         }
 
+        // --- Writeback domain support ---
+        public List<WritebackDomain> WritebackDomains;
+        public bool WritebackEnabled;
+
+        public WritebackDomain FindDomain(long address)
+        {
+            if(WritebackDomains == null) return null;
+            foreach(var d in WritebackDomains)
+            {
+                if(address >= d.BaseAddress && address < d.BaseAddress + d.Size)
+                    return d;
+            }
+            return null;
+        }
+
         // --- Private trace storage ---
         private readonly List<Tuple<ulong, int, uint>> writeTrace = new List<Tuple<ulong, int, uint>>();
         private readonly List<Tuple<ulong, long, ulong, int>> eraseTrace = new List<Tuple<ulong, long, ulong, int>>();
+    }
+
+    public class WritebackDomain
+    {
+        public long BaseAddress;
+        public long Size;
+        public int Capacity;
+        public Dictionary<long, uint> Overlay = new Dictionary<long, uint>();
+        public bool Dirty;
+        public int WriteCount;
+        public int CommittedCount;
+
+        public WritebackDomain(long baseAddr, long size, int capacity)
+        {
+            BaseAddress = baseAddr;
+            Size = size;
+            Capacity = capacity;
+        }
+
+        public bool Write(long offset, uint value)
+        {
+            if(offset < 0 || offset >= Size) return false;
+            Overlay[offset] = value;
+            Dirty = true;
+            WriteCount++;
+            if(Capacity > 0 && WriteCount >= Capacity)
+            {
+                Commit("buffer_full");
+            }
+            return true;
+        }
+
+        public uint Read(long offset, uint flashValue)
+        {
+            if(Overlay.TryGetValue(offset, out uint val)) return val;
+            return flashValue;
+        }
+
+        public Dictionary<long, uint> Commit(string reason)
+        {
+            var committed = new Dictionary<long, uint>(Overlay);
+            CommittedCount += Overlay.Count;
+            Overlay.Clear();
+            Dirty = false;
+            WriteCount = 0;
+            return committed;
+        }
+
+        public int Discard()
+        {
+            int lost = Overlay.Count;
+            Overlay.Clear();
+            Dirty = false;
+            WriteCount = 0;
+            return lost;
+        }
+
+        public int Pending => Overlay.Count;
     }
 }
