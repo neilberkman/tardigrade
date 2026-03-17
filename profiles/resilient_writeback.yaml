@@ -1,0 +1,37 @@
+schema_version: 1
+name: resilient_writeback
+skip_self_test: false
+description: >
+  nxboot-style resilient bootloader under writeback durability mode. The resilient
+  implementation's design handles buffered writes safely, so it should pass even
+  when uncommitted writes can be lost on power failure.
+platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
+bootloader:
+  elf: examples/nxboot_style/bootloader_nxboot_none.elf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x10002000, size: 0x23000 }
+    staging: { base: 0x10025000, size: 0x23000 }
+images:
+  exec: examples/nxboot_style/nxboot_primary.bin
+  staging: examples/nxboot_style/nxboot_update.bin
+success_criteria:
+  vtor_in_slot: exec
+  vector_table_offset: 0x200
+  image_hash: true
+  image_hash_slot: exec
+  expected_image: staging
+fault_sweep:
+  mode: runtime
+  run_duration: "0.5"
+  max_writes: 2048
+  durability_model: writeback
+  writeback:
+    buffer_capacity: auto
+    erase_flushes_domain: false
+expect:
+  should_find_issues: false
