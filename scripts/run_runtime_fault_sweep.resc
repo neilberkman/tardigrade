@@ -1084,6 +1084,7 @@ writeback_domains = {}
 _writeback_barriers = set()
 _writeback_buffer = []  # list of (write_index, flash_offset, old_value_bytes)
 _writeback_committed_up_to = -1  # highest write_index that has been committed
+_writeback_barrier_events = []  # list of dicts recording barrier flush events
 
 if durability_model == 'writeback':
     # Inline erase size calc (effective_page_size not yet defined at this point).
@@ -1146,6 +1147,122 @@ def writeback_committed_write_count(fault_at):
     return max(0, total - buffered)
 
 
+def writeback_domain_for_address(bus_addr):
+    # Return the domain name containing bus_addr, or None.
+    for dname, dinfo in writeback_domains.items():
+        if dinfo['base'] <= bus_addr < dinfo['base'] + dinfo['size']:
+            return dname
+    return None
+
+
+def writeback_record_barrier_event(write_index, trigger, buffer_len, bus_addr=0):
+    # Record a barrier flush event for post-hoc analysis (Tasks 5/6).
+    #   trigger: 'address' (write hit barrier addr), 'erase_flush' (erase
+    #            forced flush), 'capacity' (buffer overflow eviction)
+    domain = writeback_domain_for_address(bus_addr) if bus_addr else None
+    _writeback_barrier_events.append({
+        'write_index': write_index,
+        'trigger': trigger,
+        'domain': domain,
+        'address': bus_addr,
+        'flushed_count': buffer_len,
+    })
+
+
+def writeback_reset_barrier_events():
+    _writeback_barrier_events[:] = []
+
+
+def writeback_simulate_buffer(trace_data, erase_trace, fault_at, flash_base_addr, page_size, record_events=False):
+    # Simulate the writeback buffer over a trace to compute dirty state at
+    # fault_at.  Returns (committed_indices, uncommitted_buffer, events).
+    #
+    # committed_indices: set of write_index values that were flushed.
+    # uncommitted_buffer: list of (write_index, flash_offset, value) still dirty.
+    # events: list of barrier event dicts (only populated when record_events=True).
+    cap = writeback_capacity()
+    has_barriers = len(_writeback_barriers) > 0
+
+    pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace]
+    pending_erases.sort()
+    erase_idx = 0
+
+    buffer = []  # (write_index, flash_offset, value)
+    committed = set()
+    events = []
+
+    def _flush(trigger, wi, addr):
+        for bi, boff, bval in buffer:
+            committed.add(bi)
+        if record_events and buffer:
+            events.append({
+                'write_index': wi,
+                'trigger': trigger,
+                'domain': writeback_domain_for_address(addr) if addr else None,
+                'address': addr,
+                'flushed_count': len(buffer),
+            })
+        buffer[:] = []
+
+    for write_idx, flash_off, value in trace_data:
+        if write_idx > fault_at:
+            break
+
+        # Process erases up to this write.
+        while erase_idx < len(pending_erases) and pending_erases[erase_idx][0] < write_idx:
+            e_wap, e_off, e_sz = pending_erases[erase_idx]
+            if writeback_erase_flushes:
+                _flush('erase_flush', e_wap, flash_base_addr + e_off)
+            else:
+                buffer[:] = [
+                    (bi, boff, bval) for bi, boff, bval in buffer
+                    if not (e_off <= boff < e_off + e_sz)
+                ]
+            erase_idx += 1
+
+        if write_idx <= fault_at:
+            buffer.append((write_idx, flash_off, value))
+            bus_addr = flash_off + flash_base_addr
+            if has_barriers and bus_addr in _writeback_barriers:
+                _flush('address', write_idx, bus_addr)
+            else:
+                while len(buffer) > cap:
+                    bi, boff, bval = buffer.pop(0)
+                    committed.add(bi)
+                    if record_events:
+                        events.append({
+                            'write_index': bi,
+                            'trigger': 'capacity',
+                            'domain': writeback_domain_for_address(flash_base_addr + boff),
+                            'address': flash_base_addr + boff,
+                            'flushed_count': 1,
+                        })
+
+    return committed, list(buffer), events
+
+
+def writeback_dirty_state_at(trace_data, erase_trace, fault_at, flash_base_addr, page_size):
+    # Compute per-domain dirty write info at a given fault point.
+    # Returns a dict: { domain_name: { 'pending': N, 'oldest_wi': int, 'newest_wi': int } }
+    if not trace_data:
+        return {}
+    _, uncommitted, _ = writeback_simulate_buffer(
+        trace_data, erase_trace, fault_at, flash_base_addr, page_size,
+    )
+    per_domain = {}
+    for wi, foff, val in uncommitted:
+        bus_addr = foff + flash_base_addr
+        dname = writeback_domain_for_address(bus_addr) or 'unknown'
+        if dname not in per_domain:
+            per_domain[dname] = {'pending': 0, 'oldest_wi': wi, 'newest_wi': wi}
+        per_domain[dname]['pending'] += 1
+        if wi < per_domain[dname]['oldest_wi']:
+            per_domain[dname]['oldest_wi'] = wi
+        if wi > per_domain[dname]['newest_wi']:
+            per_domain[dname]['newest_wi'] = wi
+    return per_domain
+
+
 def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_at, flash_base_addr, page_size):
     # Trace-replay variant: replay only committed writes to flash.
     #
@@ -1183,17 +1300,21 @@ def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_
         b[3] = (value >> 24) & 0xFF
         flash_ref.WriteBytes(flash_off, b)
 
-    def _wb_flush_buffer():
+    def _wb_flush_buffer(trigger='address', write_index=0, bus_addr=0):
         # Flush all buffered writes to physical flash.
+        cnt = len(buffer)
         for _bi, _boff, _bval in buffer:
             _wb_write_word(_boff, _bval)
             writes_applied[0] += 1
         buffer[:] = []
+        if cnt > 0:
+            writeback_record_barrier_event(write_index, trigger, cnt, bus_addr)
 
-    def _wb_erase_region(e_off, e_sz):
+    def _wb_erase_region(e_off, e_sz, e_wap=0):
         # Apply a single erase to flash, handling buffer interactions.
         if writeback_erase_flushes and buffer:
-            _wb_flush_buffer()
+            _wb_flush_buffer(trigger='erase_flush', write_index=e_wap,
+                             bus_addr=flash_base_addr + e_off)
         else:
             # Clear buffered writes that fall in the erased range.
             buffer[:] = [
@@ -1212,7 +1333,7 @@ def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_
         # Apply pending erases whose write-at-point < this write.
         while erase_idx[0] < len(pending_erases) and pending_erases[erase_idx[0]][0] < write_idx:
             e_wap, e_off, e_sz = pending_erases[erase_idx[0]]
-            _wb_erase_region(e_off, e_sz)
+            _wb_erase_region(e_off, e_sz, e_wap)
             erase_idx[0] += 1
 
         if write_idx <= fault_at:
@@ -1222,13 +1343,16 @@ def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_
             # Check barrier: if the bus address hits a barrier, flush everything.
             bus_addr = flash_off + flash_base_addr
             if has_barriers and bus_addr in _writeback_barriers:
-                _wb_flush_buffer()
+                _wb_flush_buffer(trigger='address', write_index=write_idx,
+                                 bus_addr=bus_addr)
             else:
                 # Evict oldest if buffer exceeds capacity.
                 while len(buffer) > cap:
                     _bi, _boff, _bval = buffer.pop(0)
                     _wb_write_word(_boff, _bval)
                     writes_applied[0] += 1
+                    writeback_record_barrier_event(
+                        _bi, 'capacity', 1, flash_base_addr + _boff)
         elif write_idx == fault_at + 1:
             fault_injected = True
             fault_address = flash_off + flash_base_addr
@@ -1237,7 +1361,7 @@ def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_
     # Apply any remaining erases up to fault_at.
     while erase_idx[0] < len(pending_erases) and pending_erases[erase_idx[0]][0] <= fault_at:
         e_wap, e_off, e_sz = pending_erases[erase_idx[0]]
-        _wb_erase_region(e_off, e_sz)
+        _wb_erase_region(e_off, e_sz, e_wap)
         erase_idx[0] += 1
 
     # Discard remaining buffer contents -- they represent uncommitted writes
