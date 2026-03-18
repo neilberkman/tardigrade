@@ -171,46 +171,6 @@ currently uses `interrupted_erase` coverage instead of write-indexed
 unmangled hash-bypass symbols, so the current profile runs without
 `sweep_hash_bypass_symbols`.
 
-## Estimated work for a working profile
-
-### Phase 1: Bootloader ELF + basic sweep (~2 days)
-
-Build rustBoot for nRF52840, get it running in Renode on the existing
-nRF52840 platform. Create a profile YAML with the partition layout above.
-Run a calibration pass to identify the erase trace during a normal OTA
-swap, then do an erase-fault sweep. The checked-in profile now does this
-and is expected to find issues. Extending this to write-indexed power-loss
-coverage still requires a rustBoot-aware nRF52 fast backend.
-
-Deliverables:
-
-- rustBoot ELF built for nRF52840
-- Profile YAML with partition addresses and probe/invariant paths
-- Calibration erase trace showing swap progress
-- Initial erase-fault sweep results showing brick rate
-
-### Phase 2: Differential validation against known bugs (~1 day)
-
-Build rustBoot at commits before and after each bug fix (#77, #79, #80).
-Run the same sweep on broken vs fixed commits. Confirm tardigrade detects
-the vulnerability on the broken commit and shows 0 bricks on the fixed.
-
-Deliverables:
-
-- Broken/fixed ELF pairs for each bug
-- Differential sweep results
-
-### Phase 3: Nibble corruption and bit-level faults (~1 day)
-
-Enable bit-corruption fault mode against the trailer region. The packed
-nibble layout is a known weak point -- a single bit flip in a flag byte
-can corrupt two sectors' progress tracking simultaneously.
-
-Deliverables:
-
-- Bit-corruption profile variant
-- Results showing packed-nibble vulnerability surface
-
 ## References
 
 - rustBoot repository: https://github.com/AmarTabakovic/rustBoot

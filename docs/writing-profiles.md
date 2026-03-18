@@ -363,6 +363,55 @@ fault_sweep:
 
 `warm` does `machine Reset` (CPU reset, NVM persists). `cold` saves NVM state, resets the entire machine, then restores NVM — models a full power cycle where volatile state (SRAM, peripheral registers) is lost.
 
+### Phase 2 timing
+
+```yaml
+fault_sweep:
+  phase2_time_slice: "0.05" # emulation slice for recovery boot (default: calibration_time_slice)
+  progress_stall_timeout_s: 10.0 # wall-clock timeout for zero-progress stall detection
+```
+
+`phase2_time_slice` controls the emulation time per slice during Phase 2 recovery boot. Defaults to the calibration slice. Larger values mean fewer IPC round-trips but coarser progress detection. `progress_stall_timeout_s` is the wall-clock timeout for detecting a stalled bootloader (zero NVM writes across consecutive slices). When a stall is detected with the PC inside a slot, the outcome is `no_boot` (bricked); with active writes, it's `timeout` (needs more time).
+
+### Write-back durability model
+
+Real storage stacks (FTL, NOR flash with write buffering, eMMC) often buffer writes in RAM before committing to physical storage. A bootloader that assumes write-through durability can have latent bugs invisible to direct fault injection. The NuttX nxboot vulnerability (92/94 failure rate) was caused by exactly this: `CONFIG_FTL_WRITEBUFFER=y` buffered writes that the bootloader assumed were durable.
+
+```yaml
+fault_sweep:
+  durability_model: writeback
+  writeback:
+    buffer_capacity: auto # writes buffered before eviction (default: one erase sector)
+    erase_flushes_domain: false # does an erase force a buffer flush?
+    barriers: # addresses that force a buffer flush
+      - address: "0x10002000"
+```
+
+**`durability_model`**: `"direct"` (default) or `"writeback"`. Direct mode writes go straight to flash. Writeback mode interposes a volatile buffer — writes accumulate and are discarded on power loss unless explicitly flushed by a barrier.
+
+**`buffer_capacity`**: Number of write operations the buffer holds before evicting the oldest. `"auto"` (default) sets it to one erase sector worth of writes (`erase_size / write_granularity`). Set an explicit integer for a known buffer depth.
+
+**`barriers`**: List of addresses that force a complete buffer flush when written. Models explicit `fsync()` / cache-flush instructions. Each entry has an `address` key (hex or decimal).
+
+**`erase_flushes_domain`**: When `true`, erase operations flush the write buffer for the affected domain. Set `true` for storage stacks where erases are synchronous barriers.
+
+The writeback model only affects the faulted flash state used for Phase 2 recovery boot. Phase 1 execution sees all writes (optimistic) — this is conservative: if the bootloader survives writeback mode, it would also survive on real hardware where reads might return stale data.
+
+Diagnostics include a barrier audit (detects missing flush barriers between update phases), per-fault dirty-domain state, and a `commit_ratio` metric.
+
+### Read fault injection
+
+```yaml
+fault_sweep:
+  read_fault_config:
+    target_regions: [exec, staging] # which slots to inject read faults in
+    bit_flip_count: 1 # bits to flip per faulted read
+    fault_probability: 0.01 # probability of fault per read operation
+    seed: 42 # deterministic PRNG seed
+```
+
+Injects bit-flip faults on CPU reads from NVM, modeling read-disturb effects. Requires a backend that intercepts CPU reads (NVMemory or MRAMMemory — fast-path backends like NVMC expose flash via MappedMemory that the CPU reads directly). Execute-mode only.
+
 ## Multi-boot and confirm/rollback
 
 Many bootloaders require the application to confirm a new image within N boots, otherwise they roll back. Model this with `boot_cycles` and `boot_cycle_hook`:
