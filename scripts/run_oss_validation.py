@@ -50,7 +50,7 @@ def _effective_outcome_str(result: Dict[str, Any]) -> str:
 
 def _format_outcome_span(result: Dict[str, Any]) -> str:
     initial = str(
-        result.get("initial_boot_outcome", result.get("boot_outcome", "unknown")) or "unknown"
+        result.get("initial_boot_outcome") or result.get("boot_outcome") or "unknown"
     ).strip().lower()
     final = _effective_outcome_str(result)
     return final if final == initial else "{} -> {}".format(initial, final)

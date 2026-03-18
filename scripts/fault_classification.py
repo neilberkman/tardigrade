@@ -29,8 +29,8 @@ def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
       - stuck_revert
       - oscillating
     """
-    raw_outcome = result.get("initial_boot_outcome", result.get("boot_outcome", "unknown"))
-    raw_slot = result.get("initial_boot_slot", result.get("boot_slot"))
+    raw_outcome = result.get("initial_boot_outcome") or result.get("boot_outcome") or "unknown"
+    raw_slot = result.get("initial_boot_slot") or result.get("boot_slot")
     final_outcome = result.get("final_boot_outcome")
     final_slot = result.get("final_boot_slot")
     if final_outcome is not None:
@@ -62,7 +62,7 @@ def is_resilient_rollback(result: Dict[str, Any]) -> bool:
     """
     if not result.get("fault_injected", False):
         return False
-    raw_outcome = result.get("initial_boot_outcome", result.get("boot_outcome", "unknown"))
+    raw_outcome = result.get("initial_boot_outcome") or result.get("boot_outcome") or "unknown"
     raw_outcome = str(raw_outcome or "unknown").strip().lower()
     if raw_outcome != "success":
         return False

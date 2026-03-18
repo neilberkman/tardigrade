@@ -45,7 +45,7 @@ def score_color(outcome: str, injected: bool) -> str:
 
 def _boot_span_outcomes(result: Dict[str, Any]) -> Tuple[str, str]:
     initial = str(
-        result.get("initial_boot_outcome", result.get("boot_outcome", "unknown")) or "unknown"
+        result.get("initial_boot_outcome") or result.get("boot_outcome") or "unknown"
     )
     final = result.get("final_boot_outcome")
     if final is None:
