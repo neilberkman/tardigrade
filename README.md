@@ -30,26 +30,17 @@ These are retroactive tests against known MCUboot bugs, not discoveries. The poi
 
 Additional differential profiles for PRs [#2205](https://github.com/mcu-tools/mcuboot/pull/2205), [#2206](https://github.com/mcu-tools/mcuboot/pull/2206), and [#2214](https://github.com/mcu-tools/mcuboot/pull/2214).
 
-## Complementary to fuzzers and static analysis
+## Integrations
 
-Fuzzers and static analyzers excel at finding memory-safety bugs in bootloader code -- integer overflows, buffer overflows, unsafe string handling. Tardigrade covers a different surface: what happens when NVM state is corrupted mid-operation, and does the device recover correctly?
+### Fuzzer bridge
 
-| Bug class                               | Fuzzers / static analysis | Tardigrade       |
-| --------------------------------------- | ------------------------- | ---------------- |
-| Integer overflow in allocation          | Primary strength          | Not in scope     |
-| Buffer overflow in parser               | Primary strength          | Not in scope     |
-| Interrupted write corrupts boot state   | Rarely tested             | Primary strength |
-| Partial update leaves device unbootable | Rarely tested             | Primary strength |
-| Rollback stuck after power loss         | Rarely tested             | Primary strength |
-| Timing side-channel in hash compare     | Primary strength          | Not in scope     |
+[`scripts/fuzz_crash_to_profile.py`](scripts/fuzz_crash_to_profile.py) converts libFuzzer/AFL/honggfuzz crash artifacts into tardigrade regression profiles. When a fuzzer finds a crash that corrupts an OTA header or metadata region, the bridge tests whether the corruption actually bricks the device or whether the bootloader recovers. Pipeline: `fuzzer finds crash` → `fuzz_crash_to_profile.py` → `tardigrade sweep from corrupted state`. Supports batch mode, staging-image injection, and auto-detection of fuzzer types.
 
-The **[fuzzer bridge](scripts/fuzz_crash_to_profile.py)** connects these worlds: when a fuzzer finds a crash that corrupts an OTA header or metadata region, the bridge converts the crash artifact into a tardigrade regression profile that tests whether the corruption actually bricks the device or whether the bootloader recovers safely. Pipeline: `libFuzzer/AFL finds crash` → `fuzz_crash_to_profile.py` → `tardigrade sweep from corrupted state`.
+### Formal verification bridge (CBMC)
 
-## How this works under the hood
+[`scripts/cbmc_to_profile.py`](scripts/cbmc_to_profile.py) converts CBMC counterexamples into tardigrade replay profiles. CBMC proves a fault sequence _could_ cause corruption at the source level; tardigrade runs the compiled firmware under that sequence to confirm whether it manifests in practice. The bridge maps source-level state violations to NVM write indices using the counterexample's variable traces and the calibration write log.
 
-### Formal-to-empirical bridge
-
-`scripts/cbmc_to_profile.py` converts CBMC counterexamples into tardigrade replay profiles. CBMC proves a fault sequence _could_ cause corruption at the source level; tardigrade then runs the compiled bootloader firmware under that fault sequence to confirm whether it manifests in practice. The bridge maps source-level state violations to NVM write indices using the counterexample's variable traces and the calibration write log. This requires a CBMC harness that models NVM writes as observable state.
+## How it works
 
 ### Trace replay engine
 
