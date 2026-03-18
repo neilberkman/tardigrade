@@ -4,9 +4,23 @@ High-speed fault-injection testing for embedded OTA bootloaders. Tardigrade syst
 
 Trace replay and write-address heuristics make exhaustive fault sweeps (~15K points) feasible in minutes, not hours -- fast enough for CI gating. An optional CBMC bridge connects formal verification to empirical testing by converting counterexamples into replay profiles.
 
-## Validation
+## Findings
 
-These are retroactive tests against known MCUboot bugs -- not discoveries. The point is showing that tardigrade's generic sweep catches real bug classes without target-specific tuning:
+### NuttX nxboot -- original discovery
+
+Tardigrade's fault sweep against the upstream [NuttX nxboot bootloader](https://github.com/apache/nuttx-apps/tree/master/boot/nxboot) found a power-loss recovery vulnerability: 92 of 94 fault points resulted in the bootloader jumping to partially-written firmware. Three fixes submitted:
+
+| Fix                                                                                         | PR                                                                       |
+| ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| FTL layer ignores `O_DIRECT` flag -- writes buffered in RAM despite explicit bypass request | [apache/nuttx#18552](https://github.com/apache/nuttx/pull/18552)         |
+| Missing flush barriers between critical partition writes in nxboot                          | [apache/nuttx-apps#3428](https://github.com/apache/nuttx-apps/pull/3428) |
+| Boot decision validates header only, not image CRC                                          | [apache/nuttx-apps#3428](https://github.com/apache/nuttx-apps/pull/3428) |
+
+The FTL `O_DIRECT` bug affects all NuttX applications that write to MTD partitions expecting direct access, not just nxboot.
+
+### MCUboot -- retroactive validation
+
+These are retroactive tests against known MCUboot bugs, not discoveries. The point is showing that tardigrade's generic sweep catches real bug classes without target-specific tuning:
 
 | PR                                                      | Bug                                                                 | Broken               | Fixed    |
 | ------------------------------------------------------- | ------------------------------------------------------------------- | -------------------- | -------- |
@@ -203,7 +217,7 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the complete 
 
 **MCUboot** -- narrow canary profiles against MCUboot HEAD, retroactive differential profiles for 6 known bugs (broken/fixed pairs for PRs #2100, #2109, #2199, #2205, #2206, #2214), geometry-variant profiles, and multi-step exploratory scenarios with semantic probes and invariant checking. Platforms include nRF52840 (NVMC) and STM32F4. The MCUboot differentials cover three distinct fault-resilience bug classes (revert-magic corruption, header-reload-after-resume, stuck-revert-trailer) -- each was also checked against the other swap algorithms to test for cross-algorithm variants. See `profiles/mcuboot_*.yaml` and [`targets/mcuboot/`](targets/mcuboot/).
 
-**NuttX nxboot** -- real upstream NuttX firmware built from source. Board configs (defconfigs, linker scripts, Kconfig, progmem) are upstream as of [apache/nuttx#18509](https://github.com/apache/nuttx/pull/18509); the build script auto-detects this and skips local patches. The target adapter (`targets/nuttx_nxboot/`) includes a build script, runtime profile generator, and state probe. CI workflows build fresh from NuttX source and generate profiles at runtime. See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
+**NuttX nxboot** -- real upstream NuttX firmware built from source. Board configs are upstream ([apache/nuttx#18509](https://github.com/apache/nuttx/pull/18509)). Tardigrade found a power-loss recovery vulnerability (92/94 failure rate) that led to fixes in both the NuttX kernel ([#18552](https://github.com/apache/nuttx/pull/18552)) and nxboot itself ([nuttx-apps#3428](https://github.com/apache/nuttx-apps/pull/3428)). The target adapter (`targets/nuttx_nxboot/`) includes a build script, runtime profile generator, and state probe. See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
 
 **rustBoot** -- initial real upstream nRF52840 integration using checked-in public assets, a rustBoot-specific state probe/invariant package, and a first interrupted-erase campaign over the swap-scratch update path. Current limitation: the fast nRF52 backend does not yet recover write-index traces from rustBoot's NVMC usage, so the shipped profile is erase-fault focused and expected to find issues. See [`profiles/rustboot_nrf52840_update.yaml`](profiles/rustboot_nrf52840_update.yaml), [`targets/rustboot/`](targets/rustboot/), and [`docs/rustboot-target.md`](docs/rustboot-target.md).
 
