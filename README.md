@@ -18,6 +18,25 @@ Tardigrade's fault sweep against the upstream [NuttX nxboot bootloader](https://
 
 The FTL `O_DIRECT` bug affects all NuttX applications that write to MTD partitions expecting direct access, not just nxboot.
 
+### U-Boot -- CFI flash redundant environment flag bug
+
+Tardigrade fault injection on U-Boot's CFI flash redundant environment backend found that 253 of 255 possible active-flag byte values cause `env_flash_init()` to fall through without setting `gd->env_addr`, leading to silent data loss (wrong copy selected) and a persistent spurious "recovered successfully" warning on every subsequent boot. Patch submitted upstream:
+
+- [Patch on lore](https://lore.kernel.org/u-boot/20260318211515.35246-1-neil@xuku.com/) -- `env: flash: add catch-all for unrecognized flags in env_flash_init()`
+- [Reproducer gist](https://gist.github.com/neilberkman/4155612a7942d3f510f204eb85e61943)
+
+### MCUboot -- resilience validation
+
+Extensive fault-injection sweeps across MCUboot HEAD (swap-move, swap-scratch, swap-offset) on nRF52840 and STM32F4 confirm that MCUboot's swap algorithms are resilient to both power-loss and write-class faults. Over 5,000 fault points tested including multi-boot cycles, phase-2 recovery faults, and return-code injection (`rc_injection` fault type forcing `flash_area_write` to return `-EIO`). MCUboot's write ordering in `fixup_revert()` self-heals corrupted trailer metadata through subsequent writes.
+
+| Sweep                                          | Points | Result      |
+| ---------------------------------------------- | ------ | ----------- |
+| swap-move revert, rc_injection + 2 boot cycles | 1057   | all success |
+| swap-move revert, 4 write-class fault types    | 4224   | all success |
+| swap-move upgrade, extended                    | 736    | all success |
+| phase2fault (double fault during recovery)     | 2111   | all success |
+| multifault (two sequential faults)             | 984    | all success |
+
 ### MCUboot -- retroactive validation
 
 These are retroactive tests against known MCUboot bugs, not discoveries. The point is showing that tardigrade's generic sweep catches real bug classes without target-specific tuning:
