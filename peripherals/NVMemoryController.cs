@@ -40,6 +40,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             WriteInProgress = false;
             LastFaultInjected = false;
             FaultEverFired = false;
+            DriverErrorFired = false;
             // Read-fault state is intentionally NOT cleared on Reset: the
             // sweep engine re-arms between iterations, and clearing here
             // would hide the fact that a fault was scheduled but the boot
@@ -329,7 +330,8 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         public ulong FaultAtWordWrite { get; set; } = ulong.MaxValue;
 
-        // Fault mode: 0 = power_loss (partial write), 1 = bit_corruption (random bit flips).
+        // Fault mode: 0 = power_loss (partial write), 1 = bit_corruption (random bit flips),
+        // 6 = driver_error (write rejected with sticky error flag).
         public int WriteFaultMode { get; set; }
 
         // Deterministic PRNG seed for bit corruption. Advanced on each corrupted byte.
@@ -345,6 +347,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         // or explicit assignment. Unlike LastFaultInjected (which is cleared at
         // the start of each WriteBytesInternal), this survives subsequent writes.
         public bool FaultEverFired { get; set; }
+        public bool DriverErrorFired { get; set; }
 
         public byte LastFaultPattern { get; private set; }
 
@@ -477,6 +480,13 @@ namespace Antmicro.Renode.Peripherals.Memory
                 // This ensures words before the faulted word are properly written.
                 var fastFirst = AlignDown(offset, WordSize);
                 var fastLast = AlignDown(offset + data.Length - 1, WordSize);
+                byte[] fastPreWrite = null;
+                if(WriteFaultMode == 6)
+                {
+                    var trackedLen = (int)(fastLast - fastFirst + WordSize);
+                    fastPreWrite = new byte[trackedLen];
+                    Array.Copy(storage, fastFirst, fastPreWrite, 0, trackedLen);
+                }
 
                 // Write all data to storage unconditionally first.
                 for(var i = 0; i < data.Length; i++)
@@ -495,6 +505,15 @@ namespace Antmicro.Renode.Peripherals.Memory
                             // Bit corruption: data already written above; flip random bits.
                             corruptionSeed = CorruptionSeed;
                             ApplyBitCorruptionToWord(wordStart);
+                        }
+                        else if(WriteFaultMode == 6)
+                        {
+                            var snapshotOffset = (int)(wordStart - fastFirst);
+                            for(var i = 0; i < (int)WordSize; i++)
+                            {
+                                storage[wordStart + i] = fastPreWrite[snapshotOffset + i];
+                            }
+                            DriverErrorFired = true;
                         }
                         else
                         {
@@ -532,6 +551,8 @@ namespace Antmicro.Renode.Peripherals.Memory
             {
                 for(var wordStart = firstWordStart; wordStart <= lastWordStart; wordStart += WordSize)
                 {
+                    var previousWord = new byte[WordSize];
+                    Array.Copy(storage, wordStart, previousWord, 0, WordSize);
                     var mergedWord = new byte[WordSize];
                     for(var i = 0L; i < WordSize; i++)
                     {
@@ -560,6 +581,14 @@ namespace Antmicro.Renode.Peripherals.Memory
                             ProgramWord(wordStart, mergedWord);
                             corruptionSeed = CorruptionSeed;
                             ApplyBitCorruptionToWord(wordStart);
+                        }
+                        else if(WriteFaultMode == 6)
+                        {
+                            for(var i = 0; i < (int)WordSize; i++)
+                            {
+                                storage[wordStart + i] = previousWord[i];
+                            }
+                            DriverErrorFired = true;
                         }
                         else
                         {

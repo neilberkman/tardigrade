@@ -52,6 +52,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool FaultFired { get => tracker.FaultFired; set => tracker.FaultFired = value; }
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
+        public bool DriverErrorFired { get => tracker.DriverErrorFired; set => tracker.DriverErrorFired = value; }
 
         public bool PerWriteAccurate => true;
 
@@ -77,6 +78,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
 
         public bool AnyFaultFired => tracker.AnyFaultFired;
+        public bool FaultRequiresImmediateStop => tracker.FaultRequiresImmediateStop;
 
         // --- Write trace ---
 
@@ -404,6 +406,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 case 3: // Write rejection: drop the write (keep old word).
                 {
+                    FaultTracker.WriteU32(snap, off, oldWord);
+                    break;
+                }
+                case 6: // Driver error: reject write and raise error status.
+                {
+                    DriverErrorFired = true;
                     FaultTracker.WriteU32(snap, off, oldWord);
                     break;
                 }

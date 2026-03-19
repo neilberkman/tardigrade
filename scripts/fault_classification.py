@@ -31,6 +31,8 @@ def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     """
     raw_outcome = result.get("initial_boot_outcome") or result.get("boot_outcome") or "unknown"
     raw_slot = result.get("initial_boot_slot") or result.get("boot_slot")
+    if result.get("timeout", False):
+        return ("timeout", raw_slot)
     final_outcome = result.get("final_boot_outcome")
     final_slot = result.get("final_boot_slot")
     if final_outcome is not None:

@@ -236,6 +236,30 @@ def quick_subset(points: List[int]) -> List[int]:
     return sorted(set([points[0], points[mid], points[-1]]))
 
 
+def _synthetic_failed_batch_results(
+    fault_points: List[int],
+    fault_types_list: Optional[List[str]],
+    error: str,
+) -> List[Dict[str, Any]]:
+    """Return synthetic timeout results when fallback cannot isolate further."""
+    results: List[Dict[str, Any]] = []
+    for idx, fault_at in enumerate(fault_points):
+        payload: Dict[str, Any] = {
+            "fault_at": fault_at,
+            "fault_requested": fault_at,
+            "fault_injected": True,
+            "fault_address": "0x00000000",
+            "boot_outcome": "no_boot",
+            "boot_slot": None,
+            "timeout": True,
+            "error": error,
+        }
+        if fault_types_list and idx < len(fault_types_list):
+            payload["fault_type"] = fault_types_list[idx]
+        results.append(payload)
+    return results
+
+
 def run_single_point(
     repo_root: Path,
     renode_test: str,
@@ -448,6 +472,7 @@ def run_batch(
     trace_file_bin: Optional[str] = None,
     erase_trace_file_bin: Optional[str] = None,
     fault_types_list: Optional[List[str]] = None,
+    bundle_dir: Optional[Path] = None,
     keep_run_artifacts: bool = False,
 ) -> List[Dict[str, Any]]:
     """Run multiple fault points in a single Renode session (batch mode).
@@ -460,7 +485,7 @@ def run_batch(
     result_file = batch_dir / "result.json"
     rf_results = batch_dir / "robot"
     temp_root = batch_dir / ".tmp"
-    bundle_dir = work_dir / ".dotnet_bundle"
+    bundle_dir = bundle_dir or (work_dir / ".dotnet_bundle")
     renode_config = work_dir / "renode.config"
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
@@ -469,7 +494,7 @@ def run_batch(
 
     # Determine fault_types mode for the .resc.
     erase_types = {'e', 'a'}
-    write_types = {'w', 'b', 's', 'd', 'l', 'r', 't', 'k'}
+    write_types = {'w', 'b', 's', 'g', 'x', 'd', 'l', 'r', 't', 'k'}
 
     def _ft_base(ft: str) -> str:
         """Extract base fault type code (first character before any colon)."""
@@ -494,7 +519,7 @@ def run_batch(
     # Fault types where fp is a sequential write index (cost scales with fp).
     # All others (instruction_skip, read_bit_flip, OTP, I2C) use memory
     # addresses or absolute values — flat cost to avoid overflow.
-    _SEQUENTIAL_FAULTS = {"w", "b", "e", "a", "s", "d", "l", "r", "k"}
+    _SEQUENTIAL_FAULTS = {"w", "b", "e", "a", "s", "g", "x", "d", "l", "r", "k"}
     _UPDATE_SEQUENCE_BATCH_OVERHEAD_S = (
         12.0 if getattr(profile, "has_update_sequence", False) else 0.0
     )
@@ -636,6 +661,7 @@ def _run_batch_with_fallback(
     trace_file_bin: Optional[str] = None,
     erase_trace_file_bin: Optional[str] = None,
     fault_types_list: Optional[List[str]] = None,
+    bundle_dir: Optional[Path] = None,
     keep_run_artifacts: bool = False,
     _depth: int = 0,
     _fallback_root: Optional[Path] = None,
@@ -662,6 +688,7 @@ def _run_batch_with_fallback(
             trace_file_bin=trace_file_bin,
             erase_trace_file_bin=erase_trace_file_bin,
             fault_types_list=fault_types_list,
+            bundle_dir=bundle_dir,
             keep_run_artifacts=keep_run_artifacts,
         )
         if len(fault_points) == 1:
@@ -669,14 +696,26 @@ def _run_batch_with_fallback(
         return results
     except Exception as exc:
         if len(fault_points) <= 1 or _depth >= _MAX_FALLBACK_DEPTH:
-            if _depth >= _MAX_FALLBACK_DEPTH:
+            error_text = str(exc)
+            if len(fault_points) <= 1:
                 _progress(
-                    "Fallback depth limit ({}) reached for {} points (fp {}..{}); skipping.".format(
-                        _MAX_FALLBACK_DEPTH, len(fault_points),
-                        fault_points[0], fault_points[-1],
+                    "Fallback point {} failed after isolation; recording synthetic timeout result. {}".format(
+                        fault_points[0], error_text
                     )
                 )
-            raise
+            if _depth >= _MAX_FALLBACK_DEPTH:
+                _progress(
+                    "Fallback depth limit ({}) reached for {} points (fp {}..{}); recording synthetic timeout results. {}".format(
+                        _MAX_FALLBACK_DEPTH, len(fault_points),
+                        fault_points[0], fault_points[-1],
+                        error_text,
+                    )
+                )
+            return _synthetic_failed_batch_results(
+                fault_points=fault_points,
+                fault_types_list=fault_types_list,
+                error=error_text,
+            )
         mid = max(1, len(fault_points) // 2)
         left_points = fault_points[:mid]
         right_points = fault_points[mid:]
@@ -711,6 +750,7 @@ def _run_batch_with_fallback(
                     trace_file_bin=trace_file_bin,
                     erase_trace_file_bin=erase_trace_file_bin,
                     fault_types_list=left_types,
+                    bundle_dir=bundle_dir,
                     keep_run_artifacts=keep_run_artifacts,
                     _depth=_depth + 1,
                     _fallback_root=_fallback_root,
@@ -734,6 +774,7 @@ def _run_batch_with_fallback(
                     trace_file_bin=trace_file_bin,
                     erase_trace_file_bin=erase_trace_file_bin,
                     fault_types_list=right_types,
+                    bundle_dir=bundle_dir,
                     keep_run_artifacts=keep_run_artifacts,
                     _depth=_depth + 1,
                     _fallback_root=_fallback_root,
@@ -761,6 +802,9 @@ def _run_batches_chunked(
     progress_label: str = "",
 ) -> List[Dict[str, Any]]:
     """Run one or more fault batches with optional fixed-size chunking."""
+    shared_bundle_dir = work_dir / ".dotnet_bundle"
+    shared_bundle_dir.mkdir(parents=True, exist_ok=True)
+
     plan = _split_batch_plan(
         fault_points=fault_points,
         fault_types_list=fault_types_list,
@@ -801,6 +845,7 @@ def _run_batches_chunked(
             trace_file_bin=trace_file_bin,
             erase_trace_file_bin=erase_trace_file_bin,
             fault_types_list=chunk_types,
+            bundle_dir=shared_bundle_dir,
             keep_run_artifacts=keep_run_artifacts,
         )
         combined.extend(chunk_results)

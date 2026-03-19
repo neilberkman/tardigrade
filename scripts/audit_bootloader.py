@@ -106,6 +106,8 @@ def _can_skip_auto_calibration(profile: ProfileConfig, eval_mode: str) -> bool:
         "interrupted_erase",
         "multi_sector_atomicity",
         "silent_write_failure",
+        "driver_error",
+        "rc_injection",
         "write_disturb",
         "wear_leveling_corruption",
         "write_rejection",

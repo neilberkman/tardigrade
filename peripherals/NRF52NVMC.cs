@@ -72,6 +72,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool FaultFired { get => tracker.FaultFired; set => tracker.FaultFired = value; }
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
+        public bool DriverErrorFired { get => tracker.DriverErrorFired; set => tracker.DriverErrorFired = value; }
 
         public ulong TotalPageErases { get => tracker.TotalPageErases; set => tracker.TotalPageErases = value; }
         public ulong FaultAtPageErase { get => tracker.FaultAtPageErase; set => tracker.FaultAtPageErase = value; }
@@ -95,6 +96,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
 
         public bool AnyFaultFired => tracker.AnyFaultFired;
+        public bool FaultRequiresImmediateStop => tracker.FaultRequiresImmediateStop;
 
         public byte EraseFill { get; set; } = 0xFF;
 
@@ -167,6 +169,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 case 3:
                 {
                     // Write rejection: drop the target write (keep old word).
+                    FaultTracker.WriteU32(snap, off, oldWord);
+                    break;
+                }
+                case 6:
+                {
+                    // Driver error: reject the write and raise an error flag.
+                    DriverErrorFired = true;
                     FaultTracker.WriteU32(snap, off, oldWord);
                     break;
                 }
@@ -245,6 +254,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             // READYNEXT at 0x408 — always ready.
             Registers.ReadyNext.Define(this, 1);
+
+            // ERRORSTATUS at 0x410 — sticky driver error flag.
+            Registers.ErrorStatus.Define(this)
+                .WithFlag(0, FieldMode.Read | FieldMode.Set, name: "ERROR",
+                    valueProviderCallback: _ => DriverErrorFired,
+                    writeCallback: (_, val) =>
+                    {
+                        if(val)
+                        {
+                            DriverErrorFired = false;
+                        }
+                    });
 
             // CONFIG at 0x504 — write enable mode.
             // Values: 0=REN (read-only), 1=WEN (write), 2=EEN (erase).
@@ -497,6 +518,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             Ready = 0x400,
             ReadyNext = 0x408,
+            ErrorStatus = 0x410,
             Config = 0x504,
             ErasePage = 0x508,
             EraseAll = 0x50C,

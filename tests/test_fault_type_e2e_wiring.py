@@ -283,9 +283,9 @@ class TestRuntimeDispatchCoverage(unittest.TestCase):
         self.assertEqual(RESC_FAULT_CODE_TO_NAME.get("h"), "hook_fault")
 
     def test_write_mode_types_have_mode_codes(self):
-        """Write-mode fault types (b, s, r, d, l) must appear in _WRITE_FAULT_MODE."""
+        """Write-mode fault types (b, s, r, g, x, d, l) must appear in _WRITE_FAULT_MODE."""
         # 'w' (power_loss) uses mode 0 (the default) -- it's in the map.
-        write_mode_types = {"w", "b", "s", "r", "d", "l"}
+        write_mode_types = {"w", "b", "s", "r", "g", "x", "d", "l"}
         resc_modes = set(RESC_WRITE_FAULT_MODE.keys())
         missing = write_mode_types - resc_modes
         self.assertFalse(

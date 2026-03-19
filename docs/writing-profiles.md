@@ -275,7 +275,7 @@ fault_sweep:
   fault_types: [power_loss, bit_corruption, interrupted_erase]
 ```
 
-Default is `[power_loss]`. Available types (23 total):
+Default is `[power_loss]`. Available types (24 total):
 
 | Fault type                 | What it does                            | Backend requirement  |
 | -------------------------- | --------------------------------------- | -------------------- |
@@ -284,8 +284,10 @@ Default is `[power_loss]`. Available types (23 total):
 | `interrupted_erase`        | Partial page erase                      | NVMC, NVMemory       |
 | `command_drop`             | Silently dropped NVM controller command | GenericNvmController |
 | `silent_write_failure`     | Write accepted but data not stored      | All                  |
+| `driver_error`             | Write rejected and error status raised  | All                  |
+| `rc_injection`             | Write rejected and return code forced non-zero | MCUboot execute |
 | `write_disturb`            | Adjacent cell corruption                | All                  |
-| `write_rejection`          | Write rejected (error returned)         | All                  |
+| `write_rejection`          | Write dropped with no driver-visible error | All               |
 | `multi_sector_atomicity`   | Cross-page partial erase                | All                  |
 | `wear_leveling_corruption` | Wear-leveling metadata corruption       | All                  |
 | `reset_at_time`            | CPU reset at a time offset              | All                  |
@@ -305,6 +307,10 @@ Default is `[power_loss]`. Available types (23 total):
 ### Instruction skip (voltage glitch)
 
 The `instruction_skip` fault type models a voltage-glitch attack that causes the CPU to skip one or more instructions. Each fault point is an instruction address rather than an NVM write index. The harness replaces the instruction at the target address with a Thumb NOP (`0xBF00`), boots the firmware, and checks whether the system still recovers.
+
+`driver_error` is a non-halting write fault. The target write does not land, but the peripheral raises a software-visible error flag/register. On nRF52 NVMC paths this currently behaves like `write_rejection` from the driver's point of view because the Zephyr NVMC driver only polls READY and does not inspect the injected error flag. The distinction is still useful in sweep results because it separates "data dropped silently" from "peripheral reported an error that software ignored."
+
+`rc_injection` is a non-halting MCUboot-specific execute fault. It reuses the write-rejection data path so the target write does not land, then forces the active `flash_area_write()` call to return `-EIO` (`r0 = 0xFFFFFFFB`) when control returns to MCUboot. This directly tests the assert-only error-handling claim even on platforms where the flash driver would otherwise return success.
 
 This requires an `instruction_skip_config` block inside `fault_sweep`:
 

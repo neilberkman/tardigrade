@@ -16,6 +16,8 @@ FAULT_LABELS = {
     "w": "power_loss",
     "b": "bit_corruption",
     "s": "silent_write_failure",
+    "g": "driver_error",
+    "x": "rc_injection",
     "d": "write_disturb",
     "l": "wear_leveling_corruption",
     "e": "interrupted_erase",

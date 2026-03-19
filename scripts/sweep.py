@@ -549,7 +549,7 @@ def run_runtime_sweep(
     # Bit-corruption, erase faults etc. always need execute even when trace
     # files exist (trace files are used for power-loss points only).
     _has_execute_only_points = fault_types_list and any(
-        ft in ('b', 'e', 'a', 's', 'r', 'd', 'l', 'k') for ft in fault_types_list
+        ft in ('b', 'e', 'a', 's', 'g', 'x', 'r', 'd', 'l', 'k') for ft in fault_types_list
     )
     if (
         max_batch_points <= 0
@@ -570,7 +570,7 @@ def run_runtime_sweep(
         # Fault types where fp is a sequential write index (cost scales with fp).
         # All others (instruction_skip, read_bit_flip, OTP, I2C) use memory
         # addresses or absolute values — flat cost to avoid overflow.
-        _SEQUENTIAL_FAULTS = {"w", "b", "e", "a", "s", "d", "l", "r", "k"}
+        _SEQUENTIAL_FAULTS = {"w", "b", "e", "a", "s", "g", "x", "d", "l", "r", "k"}
 
         def _point_cost(idx: int, fp: int) -> float:
             ft = fault_types_list[idx] if fault_types_list and idx < len(fault_types_list) else None

@@ -17,6 +17,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public ulong TotalWordWrites;
         public ulong FaultAtWordWrite = ulong.MaxValue;
         public bool FaultFired;
+        public bool DriverErrorFired;
 
         public ulong TotalPageErases;
         public ulong FaultAtPageErase = ulong.MaxValue;
@@ -32,7 +33,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool WriteTraceEnabled;
         public bool EraseTraceEnabled;
 
-        public bool AnyFaultFired => FaultFired || EraseFaultFired;
+        public bool WriteFaultRequiresImmediateStop => FaultFired && WriteFaultMode == 0;
+        public bool FaultRequiresImmediateStop => EraseFaultFired || WriteFaultRequiresImmediateStop;
+        public bool AnyFaultFired => FaultRequiresImmediateStop;
 
         // --- Write counting ---
 
@@ -127,6 +130,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             TotalWordWrites = 0;
             TotalPageErases = 0;
             FaultFired = false;
+            DriverErrorFired = false;
             EraseFaultFired = false;
             LastFaultAddress = 0;
             FaultFlashSnapshot = null;

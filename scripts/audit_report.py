@@ -17,6 +17,7 @@ from fault_classification import (
     is_resilient_rollback,
     result_has_issues,
     result_is_brick,
+    result_is_timeout,
     result_issue_reasons,
 )
 from fault_inject import (
@@ -196,7 +197,10 @@ def summarize_runtime_sweep(
         )
     boot_failures = [r for r in injected if result_is_brick(r)]
     failures = [r for r in injected if result_has_issues(r, expected_outcome)]
-    recoveries = sum(1 for r in injected if not result_has_issues(r, expected_outcome))
+    recoveries = sum(
+        1 for r in injected
+        if not result_has_issues(r, expected_outcome) and not result_is_timeout(r)
+    )
     resilient_rollbacks = sum(1 for r in injected if is_resilient_rollback(r))
     semantic_issue_points = sum(1 for r in injected if r.get("semantic_assertion_failures"))
     semantic_observation_points = sum(

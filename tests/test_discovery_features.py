@@ -1298,6 +1298,111 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertEqual(calls, [[7, 8], [7], [8]])
             self.assertEqual(len(results), 2)
 
+    def test_run_batch_with_fallback_returns_synthetic_timeout_for_single_point(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: single_timeout_profile
+                description: timeout
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            stderr = StringIO()
+
+            with mock.patch("renode_runner.run_batch", side_effect=RuntimeError("batch timeout")):
+                with redirect_stderr(stderr):
+                    results = _run_batch_with_fallback(
+                        repo_root=ROOT,
+                        renode_test="renode-test",
+                        robot_suite="tests/ota_fault_point.robot",
+                        profile=profile,
+                        fault_points=[99],
+                        robot_vars=[],
+                        work_dir=tempdir / "work",
+                        renode_remote_server_dir="",
+                        fault_types_list=["s"],
+                        keep_run_artifacts=False,
+                    )
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["fault_at"], 99)
+            self.assertEqual(results[0]["fault_type"], "s")
+            self.assertEqual(results[0]["boot_outcome"], "no_boot")
+            self.assertTrue(results[0]["fault_injected"])
+            self.assertTrue(results[0]["timeout"])
+            self.assertIn("batch timeout", results[0]["error"])
+            self.assertIn("recording synthetic timeout result", stderr.getvalue())
+
+    def test_run_batch_with_fallback_returns_synthetic_timeout_at_depth_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: depth_limit_profile
+                description: timeout
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            stderr = StringIO()
+
+            with mock.patch("renode_runner.run_batch", side_effect=RuntimeError("still failing")):
+                with redirect_stderr(stderr):
+                    results = _run_batch_with_fallback(
+                        repo_root=ROOT,
+                        renode_test="renode-test",
+                        robot_suite="tests/ota_fault_point.robot",
+                        profile=profile,
+                        fault_points=[11, 12],
+                        robot_vars=[],
+                        work_dir=tempdir / "work",
+                        renode_remote_server_dir="",
+                        fault_types_list=["w", "e"],
+                        keep_run_artifacts=False,
+                        _depth=10,
+                    )
+
+            self.assertEqual([r["fault_at"] for r in results], [11, 12])
+            self.assertEqual([r["fault_type"] for r in results], ["w", "e"])
+            self.assertTrue(all(r["timeout"] for r in results))
+            self.assertIn("Fallback depth limit (10)", stderr.getvalue())
+
     def test_run_batch_prunes_robot_artifacts_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
@@ -1356,6 +1461,121 @@ class DiscoveryFeaturesTest(unittest.TestCase):
 
             self.assertFalse((tempdir / "work" / "cleanup_batch_profile_batch" / "robot").exists())
             self.assertFalse((tempdir / "work" / "cleanup_batch_profile_batch" / ".tmp").exists())
+
+    def test_run_batch_uses_explicit_bundle_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: shared_bundle_profile
+                description: cleanup
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            shared_bundle = tempdir / "worker_0" / ".dotnet_bundle"
+
+            def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+                self.assertEqual(env["DOTNET_BUNDLE_EXTRACT_BASE_DIR"], str(shared_bundle))
+                rf_results = Path(cmd[cmd.index("--results-dir") + 1])
+                rf_results.mkdir(parents=True, exist_ok=True)
+                result_var = next(
+                    entry for entry in cmd
+                    if isinstance(entry, str) and entry.startswith("RESULT_FILE:")
+                )
+                result_file = Path(result_var.split("RESULT_FILE:", 1)[1])
+                result_file.write_text("[]", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch("renode_runner.subprocess.run", side_effect=fake_run):
+                results = run_batch(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    fault_points=[1, 2],
+                    robot_vars=[],
+                    work_dir=tempdir / "worker_0" / "chunk_0000",
+                    renode_remote_server_dir="",
+                    bundle_dir=shared_bundle,
+                    keep_run_artifacts=False,
+                )
+
+            self.assertEqual(results, [])
+
+    def test_run_batches_chunked_reuses_shared_bundle_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: chunk_bundle_profile
+                description: progress
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            calls = []
+
+            def fake_run_batch(**kwargs):
+                calls.append((kwargs["work_dir"], kwargs["bundle_dir"], list(kwargs["fault_points"])))
+                return [{"fault_at": fp, "boot_outcome": "success"} for fp in kwargs["fault_points"]]
+
+            with mock.patch("renode_runner.run_batch", side_effect=fake_run_batch):
+                results = _run_batches_chunked(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    fault_points=[1, 2, 3, 4],
+                    robot_vars=[],
+                    work_dir=tempdir / "worker_0",
+                    renode_remote_server_dir="",
+                    max_batch_points=2,
+                )
+
+            self.assertEqual(len(results), 4)
+            expected_bundle = tempdir / "worker_0" / ".dotnet_bundle"
+            self.assertEqual([bundle for _work, bundle, _points in calls], [expected_bundle, expected_bundle])
+            self.assertEqual(
+                [work for work, _bundle, _points in calls],
+                [tempdir / "worker_0" / "chunk_0000", tempdir / "worker_0" / "chunk_0001"],
+            )
+            self.assertFalse((tempdir / "worker_0" / "chunk_0000" / ".dotnet_bundle").exists())
+            self.assertFalse((tempdir / "worker_0" / "chunk_0001" / ".dotnet_bundle").exists())
 
     def test_run_batch_scales_robot_timeout_with_batch_size(self) -> None:
         with tempfile.TemporaryDirectory() as td:

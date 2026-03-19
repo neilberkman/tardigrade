@@ -104,6 +104,8 @@ def build_fault_plan(
     include_multi_sector_atomicity = "multi_sector_atomicity" in fault_types
     include_bit_corruption = "bit_corruption" in fault_types
     include_silent_write_failure = "silent_write_failure" in fault_types
+    include_driver_error = "driver_error" in fault_types
+    include_rc_injection = "rc_injection" in fault_types
     include_write_disturb = "write_disturb" in fault_types
     include_wear_leveling = "wear_leveling_corruption" in fault_types
     include_write_rejection = "write_rejection" in fault_types
@@ -220,6 +222,8 @@ def build_fault_plan(
         (include_erases and total_erases > 0)
         or include_bit_corruption
         or include_silent_write_failure
+        or include_driver_error
+        or include_rc_injection
         or include_write_disturb
         or include_wear_leveling
         or include_write_rejection
@@ -305,6 +309,22 @@ def build_fault_plan(
                 silent_fps = quick_subset(silent_fps)
             combined += [(sp, 's') for sp in silent_fps]
             silent_count = len(silent_fps)
+
+        driver_error_count = 0
+        if include_driver_error:
+            driver_error_fps = list(fault_points)
+            if quick:
+                driver_error_fps = quick_subset(driver_error_fps)
+            combined += [(gp, 'g') for gp in driver_error_fps]
+            driver_error_count = len(driver_error_fps)
+
+        rc_injection_count = 0
+        if include_rc_injection:
+            rc_injection_fps = list(fault_points)
+            if quick:
+                rc_injection_fps = quick_subset(rc_injection_fps)
+            combined += [(xp, 'x') for xp in rc_injection_fps]
+            rc_injection_count = len(rc_injection_fps)
 
         disturb_count = 0
         if include_write_disturb:
@@ -539,6 +559,10 @@ def build_fault_plan(
             parts.append(bit_label)
         if silent_count:
             parts.append("{} silent-write".format(silent_count))
+        if driver_error_count:
+            parts.append("{} driver-error".format(driver_error_count))
+        if rc_injection_count:
+            parts.append("{} rc-injection".format(rc_injection_count))
         if disturb_count:
             parts.append("{} disturb".format(disturb_count))
         if wear_count:

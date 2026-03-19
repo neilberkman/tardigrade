@@ -77,6 +77,7 @@ $no_boot_zero_write_slices?="10"
 $no_boot_min_emulated_s?="0.1"
 $sweep_diff_lookahead?="2147483647"
 $hash_bypass_symbols?=""
+$rc_injection_symbols?=""
 $postmortem_dump_no_boot?="true"
 $postmortem_dump_header_bytes?="4096"
 $resume_trace_no_boot?="true"
@@ -120,6 +121,8 @@ import os
 import struct
 import sys
 import time as _time
+
+from Antmicro.Renode.Peripherals.CPU import RegisterValue
 
 def log(msg):
     sys.stderr.write('[resc] {}\n'.format(msg))
@@ -174,7 +177,7 @@ _DISARM_SENTINEL = 18446744073709551615
 # For OTP backends: BlowFaultMode 0=partial_program, 1=stuck_bit, 2=read_disturb, 3=overblow.
 # OTP wire codes map to their BlowFaultMode integers directly.
 _WRITE_FAULT_MODE = {
-    'w': 0, 'b': 1, 's': 2, 'r': 3, 'd': 4, 'l': 5,
+    'w': 0, 'b': 1, 's': 2, 'r': 3, 'd': 4, 'l': 5, 'g': 6, 'x': 3,
     'op': 0, 'os': 1, 'od': 2, 'oo': 3,
 }
 
@@ -615,6 +618,8 @@ _FAULT_CODE_TO_NAME = {
     'a': 'multi_sector_atomicity',
     'b': 'bit_corruption',
     's': 'silent_write_failure',
+    'g': 'driver_error',
+    'x': 'rc_injection',
     'd': 'write_disturb',
     'l': 'wear_leveling_corruption',
     'r': 'write_rejection',
@@ -714,8 +719,8 @@ state_probe = str(monitor.GetVariable('state_probe')).strip()
 # fault_types controls which operations are tracked during calibration.
 # fault_type_csv provides per-fault-point type:
 #   write-based: 'w' power_loss, 'b' bit_corruption, 's' silent_write_failure,
-#                'd' write_disturb, 'l' wear_leveling_corruption,
-#                'r' write_rejection, 't' reset_at_time
+#                'g' driver_error, 'x' rc_injection, 'd' write_disturb,
+#                'l' wear_leveling_corruption, 'r' write_rejection, 't' reset_at_time
 #   erase-based: 'e' interrupted_erase, 'a' multi_sector_atomicity
 #   read-based:  'f' read_bit_flip (transient one-shot read corruption)
 #   cpu-based:   'i' instruction_skip (voltage-glitch NOP, encoded as 'i:0xADDR')
@@ -923,59 +928,60 @@ def disarm_vtor_watchpoint():
 # returns 0 immediately.  Applied after each reload_images_cached() since the
 # image restore overwrites the patch.
 # ---------------------------------------------------------------------------
+_bootloader_elf_path = str(monitor.GetVariable('bootloader_elf')).strip()
+_nm_lines = None
+
+def _load_elf_nm_lines():
+    global _nm_lines
+    if _nm_lines is not None:
+        return _nm_lines
+    _nm_lines = []
+    if not _bootloader_elf_path:
+        return _nm_lines
+    try:
+        import subprocess as _sp
+        _nm_out = _sp.run(['nm', _bootloader_elf_path], capture_output=True, text=True, timeout=5)
+        if _nm_out.returncode == 0:
+            _nm_lines = _nm_out.stdout.splitlines()
+            log('elf_symbols: parsed {} symbols from ELF via nm'.format(len(_nm_lines)))
+        else:
+            log('elf_symbols: nm failed (rc={}), falling back to single-match symbol lookup'.format(_nm_out.returncode))
+    except Exception as _e:
+        log('elf_symbols: nm not available ({}), falling back to single-match symbol lookup'.format(_e))
+    return _nm_lines
+
+def _resolve_elf_symbol_addresses(sym_name):
+    found_addrs = set()
+    nm_lines = _load_elf_nm_lines()
+    for line in nm_lines:
+        if sym_name not in line:
+            continue
+        parts = line.strip().split()
+        if len(parts) < 2:
+            continue
+        try:
+            found_addrs.add(int(parts[0], 16) & ~1)
+        except ValueError:
+            continue
+    if not found_addrs:
+        try:
+            addr = int(bus.GetSymbolAddress(sym_name))
+            found_addrs.add(addr & ~1)
+            if not nm_lines:
+                log('elf_symbols: WARNING: nm unavailable, only single-match for {}'.format(sym_name))
+        except Exception:
+            pass
+    return sorted(found_addrs)
+
 _hash_bypass_symbols_raw = str(monitor.GetVariable('hash_bypass_symbols')).strip()
 _hash_bypass_patches = []
 if _hash_bypass_symbols_raw and backend['kind'] in ('fast', 'mram'):
-    # Rust generics produce multiple monomorphizations (e.g. 4x verify_integrity).
-    # Renode's GetSymbolAddress returns only the first match. Use nm on the
-    # bootloader ELF to find ALL addresses containing each symbol name.
-    _nm_symbols = {}  # cache: sym_name -> set of addresses
-    try:
-        import subprocess as _sp
-        _elf_path = str(monitor.GetVariable('bootloader_elf')).strip()
-        if _elf_path:
-            _nm_out = _sp.run(['nm', _elf_path], capture_output=True, text=True, timeout=5)
-            if _nm_out.returncode == 0:
-                _nm_lines = _nm_out.stdout.splitlines()
-                log('hash_bypass: parsed {} symbols from ELF via nm'.format(len(_nm_lines)))
-            else:
-                _nm_lines = []
-                log('hash_bypass: nm failed (rc={}), falling back to single-match'.format(_nm_out.returncode))
-        else:
-            _nm_lines = []
-    except Exception as _e:
-        _nm_lines = []
-        log('hash_bypass: nm not available ({}), falling back to single-match'.format(_e))
-
     for sym_name in _hash_bypass_symbols_raw.split(','):
         sym_name = sym_name.strip()
         if not sym_name:
             continue
-        found_addrs = set()
-        # Primary: scan nm output for ALL matches (handles Rust monomorphizations).
-        for line in _nm_lines:
-            if sym_name in line:
-                parts = line.strip().split()
-                if len(parts) >= 2:
-                    try:
-                        found_addrs.add(int(parts[0], 16) & ~1)
-                    except ValueError:
-                        pass
-        # Fallback: Renode single-symbol lookup (for hosts without nm).
-        # WARN: this only patches ONE match. If the ELF has multiple
-        # monomorphizations (Rust generics), the others stay unpatched
-        # and the bypass silently fails.
-        if not found_addrs:
-            try:
-                addr = int(bus.GetSymbolAddress(sym_name))
-                found_addrs.add(addr & ~1)
-                if not _nm_lines:
-                    log('hash_bypass: WARNING: nm unavailable, only single-match '
-                        'for {}. If ELF has Rust monomorphizations, bypass is '
-                        'INCOMPLETE — results may be invalid.'.format(sym_name))
-            except Exception:
-                pass
-        for addr in sorted(found_addrs):
+        found_addrs = _resolve_elf_symbol_addresses(sym_name)
+        for addr in found_addrs:
             _hash_bypass_patches.append((addr, sym_name))
             log('hash_bypass: {}=0x{:08X}'.format(sym_name, addr & 0xFFFFFFFF))
         if not found_addrs:
@@ -994,6 +1000,118 @@ def apply_hash_bypass():
 _hash_bypass_active = len(_hash_bypass_patches) > 0
 if _hash_bypass_active:
     log('hash_bypass: {} symbols resolved'.format(len(_hash_bypass_patches)))
+
+# ---------------------------------------------------------------------------
+# RC injection: force flash_area_write()-style wrappers to return -EIO after
+# a targeted write fault without halting the CPU. This is MCUboot-specific.
+# ---------------------------------------------------------------------------
+_rc_injection_symbols_raw = get_optional_var('rc_injection_symbols', 'flash_area_write')
+_rc_injection_symbols = [sym.strip() for sym in _rc_injection_symbols_raw.split(',') if sym.strip()]
+_rc_injection_state = {
+    'checked': False,
+    'supported': False,
+    'reason': '',
+    'enabled': False,
+    'entry_symbol_by_addr': {},
+    'installed_return_hooks': set(),
+    'active_symbol': None,
+    'active_return_addr': None,
+    'injected': False,
+    'injected_symbol': None,
+    'injected_return_addr': None,
+    'return_value': 0xFFFFFFFB,
+}
+
+# Pre-resolve rc_injection symbols at load time (like hash_bypass).
+# bus.GetSymbolAddress works here; it may fail inside ensure_rc_injection_preflight
+# after machine resets.
+_rc_injection_pre_resolved = {}
+for _rci_sym in _rc_injection_symbols:
+    for _rci_addr in _resolve_elf_symbol_addresses(_rci_sym):
+        _rc_injection_pre_resolved[_rci_sym] = _rci_addr
+        log('rc_injection: pre-resolved {}=0x{:08X}'.format(_rci_sym, _rci_addr & 0xFFFFFFFF))
+
+def _rc_injection_return_hook(cpu, addr):
+    current_addr = int(addr) & ~1
+    if not _rc_injection_state.get('enabled'):
+        return
+    if _rc_injection_state.get('active_return_addr') != current_addr:
+        return
+    if not _rc_injection_state.get('injected') and was_fault_injected():
+        cpu.SetRegister(0, RegisterValue.Create(_rc_injection_state['return_value'], 32))
+        _rc_injection_state['injected'] = True
+        _rc_injection_state['injected_symbol'] = _rc_injection_state.get('active_symbol')
+        _rc_injection_state['injected_return_addr'] = current_addr
+        log('rc_injection: forced r0=0x{:08X} at return 0x{:08X} for {}'.format(
+            _rc_injection_state['return_value'] & 0xFFFFFFFF,
+            current_addr & 0xFFFFFFFF,
+            _rc_injection_state.get('active_symbol') or '<unknown>',
+        ))
+    _rc_injection_state['active_symbol'] = None
+    _rc_injection_state['active_return_addr'] = None
+
+def _rc_injection_entry_hook(cpu, addr):
+    if not _rc_injection_state.get('enabled'):
+        return
+    current_addr = int(addr) & ~1
+    return_addr = int(cpu.GetRegister(14).RawValue) & ~1
+    _rc_injection_state['active_symbol'] = _rc_injection_state['entry_symbol_by_addr'].get(current_addr)
+    _rc_injection_state['active_return_addr'] = return_addr if return_addr > 0 else None
+    if return_addr > 0 and return_addr not in _rc_injection_state['installed_return_hooks']:
+        cpu.AddHook(return_addr, _rc_injection_return_hook)
+        _rc_injection_state['installed_return_hooks'].add(return_addr)
+
+def ensure_rc_injection_preflight():
+    if _rc_injection_state['checked']:
+        return {
+            'supported': _rc_injection_state['supported'],
+            'reason': _rc_injection_state['reason'],
+        }
+    _rc_injection_state['checked'] = True
+    if not _bootloader_elf_path:
+        _rc_injection_state['reason'] = 'missing_bootloader_elf'
+        return {
+            'supported': False,
+            'reason': _rc_injection_state['reason'],
+        }
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    resolved = 0
+    # Use pre-resolved addresses, falling back to runtime resolution.
+    sym_addrs = []
+    if _rc_injection_pre_resolved:
+        for sym_name, addr in _rc_injection_pre_resolved.items():
+            sym_addrs.append((sym_name, addr))
+    else:
+        for sym_name in _rc_injection_symbols:
+            for addr in _resolve_elf_symbol_addresses(sym_name):
+                sym_addrs.append((sym_name, addr))
+    for sym_name, addr in sym_addrs:
+        if addr in _rc_injection_state['entry_symbol_by_addr']:
+            continue
+        _rc_injection_state['entry_symbol_by_addr'][addr] = sym_name
+        cpu_ref.AddHook(addr, _rc_injection_entry_hook)
+        resolved += 1
+        log('rc_injection: {}=0x{:08X}'.format(sym_name, addr & 0xFFFFFFFF))
+    if resolved <= 0:
+        _rc_injection_state['reason'] = 'symbol_not_found'
+        return {
+            'supported': False,
+            'reason': _rc_injection_state['reason'],
+        }
+    _rc_injection_state['supported'] = True
+    _rc_injection_state['reason'] = ''
+    return {
+        'supported': True,
+        'reason': '',
+    }
+
+def reset_rc_injection_state(enabled=False):
+    _rc_injection_state['enabled'] = bool(enabled)
+    _rc_injection_state['active_symbol'] = None
+    _rc_injection_state['active_return_addr'] = None
+    _rc_injection_state['injected'] = False
+    _rc_injection_state['injected_symbol'] = None
+    _rc_injection_state['injected_return_addr'] = None
 
 # ---------------------------------------------------------------------------
 # Boot register snapshot: capture configurable registers at VTOR detection.
@@ -2405,17 +2523,21 @@ def arm_fault(absolute_write_index, write_fault_mode=0):
         b['data'].FaultAtBlow = absolute_write_index
         b['data'].BlowFaultFired = False
     elif b['kind'] == 'mram':
+        b['data'].WriteFaultMode = write_fault_mode
         b['data'].FaultAtWordWrite = absolute_write_index
         b['data'].LastFaultInjected = False
         b['data'].FaultEverFired = False
+        b['data'].DriverErrorFired = False
     elif b['kind'] == 'fast':
         b['data'].WriteFaultMode = write_fault_mode
         b['data'].FaultAtWordWrite = absolute_write_index
         b['data'].FaultFired = False
+        b['data'].DriverErrorFired = False
     else:
         b['data'].Nvm.WriteFaultMode = write_fault_mode
         b['data'].Nvm.FaultAtWordWrite = absolute_write_index
         b['data'].Nvm.FaultEverFired = False
+        b['data'].Nvm.DriverErrorFired = False
 
 def arm_controller_fault(absolute_command_index, command_fault_mode=1):
     ctrl = backend['controller']
@@ -2525,6 +2647,21 @@ def was_fault_injected():
         return bool(b['data'].FaultFired) or bool(b['data'].EraseFaultFired) or was_controller_fault_injected()
     return bool(b['data'].Nvm.FaultEverFired) or was_controller_fault_injected()
 
+def fault_requires_immediate_stop():
+    b = backend
+    if b['kind'] == 'otp':
+        return bool(b['data'].BlowFaultFired) or was_controller_fault_injected()
+    if b['kind'] == 'mram':
+        return (bool(b['data'].FaultEverFired) and int(getattr(b['data'], 'WriteFaultMode', 0)) == 0) or was_controller_fault_injected()
+    if b['kind'] == 'fast':
+        try:
+            return bool(b['data'].FaultRequiresImmediateStop) or was_controller_fault_injected()
+        except Exception:
+            write_fault_fired = bool(b['data'].FaultFired)
+            write_fault_mode = int(getattr(b['data'], 'WriteFaultMode', 0))
+            return bool(b['data'].EraseFaultFired) or (write_fault_fired and write_fault_mode == 0) or was_controller_fault_injected()
+    return (bool(b['data'].Nvm.FaultEverFired) and int(getattr(b['data'].Nvm, 'WriteFaultMode', 0)) == 0) or was_controller_fault_injected()
+
 def was_write_fault_injected():
     b = backend
     if b['kind'] == 'otp':
@@ -2534,6 +2671,23 @@ def was_write_fault_injected():
     if b['kind'] == 'fast':
         return bool(b['data'].FaultFired)
     return bool(b['data'].Nvm.FaultEverFired)
+
+def driver_error_flag_set():
+    b = backend
+    if b['kind'] == 'mram':
+        try:
+            return bool(b['data'].DriverErrorFired)
+        except Exception:
+            return False
+    if b['kind'] == 'fast':
+        try:
+            return bool(b['data'].DriverErrorFired)
+        except Exception:
+            return False
+    try:
+        return bool(b['data'].Nvm.DriverErrorFired)
+    except Exception:
+        return False
 
 def was_erase_fault_injected():
     b = backend
@@ -2735,6 +2889,8 @@ def reset_nvmc_for_sweep():
         b['data'].TotalWordWrites = 0
         b['data'].LastFaultInjected = False
         b['data'].FaultEverFired = False
+        b['data'].WriteFaultMode = 0
+        b['data'].DriverErrorFired = False
     elif b['kind'] == 'fast':
         # Keep default as full diff for index precision, but allow profile/CLI
         # overrides for performance experiments.
@@ -2744,6 +2900,7 @@ def reset_nvmc_for_sweep():
         b['data'].WriteFaultMode = 0
         b['data'].EraseFaultMode = 0
         b['data'].FaultFired = False
+        b['data'].DriverErrorFired = False
         b['data'].EraseFaultFired = False
         b['data'].LastFaultAddress = 0
         b['data'].FaultFlashSnapshot = None
@@ -2760,6 +2917,8 @@ def reset_nvmc_for_sweep():
     else:
         b['data'].Nvm.TotalWordWrites = 0
         b['data'].Nvm.FaultEverFired = False
+        b['data'].Nvm.WriteFaultMode = 0
+        b['data'].Nvm.DriverErrorFired = False
     # Reset controller fault state on all backends — command_drop can be
     # used with any backend via the separate nvm_controller field.
     disarm_controller_fault()
@@ -2773,6 +2932,8 @@ def reset_nvmc_for_recovery():
         b['data'].TotalWordWrites = 0
         b['data'].LastFaultInjected = False
         b['data'].FaultEverFired = False
+        b['data'].WriteFaultMode = 0
+        b['data'].DriverErrorFired = False
         disarm_fault()
         return
     if b['kind'] == 'fast':
@@ -2782,6 +2943,7 @@ def reset_nvmc_for_recovery():
         b['data'].WriteFaultMode = 0
         b['data'].EraseFaultMode = 0
         b['data'].FaultFired = False
+        b['data'].DriverErrorFired = False
         b['data'].EraseFaultFired = False
         b['data'].LastFaultAddress = 0
         # Skip shadow scanning during recovery boot — just count PG transitions
@@ -2792,6 +2954,8 @@ def reset_nvmc_for_recovery():
     else:
         b['data'].Nvm.TotalWordWrites = 0
         b['data'].Nvm.FaultEverFired = False
+        b['data'].Nvm.WriteFaultMode = 0
+        b['data'].Nvm.DriverErrorFired = False
         disarm_fault()
     # Reset I2C fault state for recovery boot.
     disarm_i2c_fault()
@@ -3474,7 +3638,7 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
     #   final VTOR value. 0 = stop immediately on capture (default).
     #
     # Termination conditions (checked after each time slice):
-    #   1. FaultFired set by NVMC (fault injection hit target write)
+    #   1. A fault that models immediate execution stop/power loss fired
     #   2. Write count unchanged for 3+ slices after writes started
     #   3. Zero writes after 5+ slices when expect_writes=False (bricked)
     #   4. No forward progress for progress_stall_timeout_s
@@ -3502,7 +3666,7 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
     for iters in range(max_iters):
         monitor.Parse('emulation RunFor "{}"'.format(time_slice))
         emulated_s += slice_s
-        if stop_on_fault and (was_fault_injected() or was_otp_fault_injected()):
+        if stop_on_fault and (fault_requires_immediate_stop() or was_otp_fault_injected()):
             reason = 'fault_fired'
             break
         # Early exit: check if VTOR has been set to a valid slot.
@@ -4605,8 +4769,8 @@ def run_execute_fault(fault_at, fault_type='w'):
     #
     # fault_type:
     #   write: 'w' power_loss, 'b' bit_corruption, 's' silent_write_failure,
-    #          'r' write_rejection, 'd' write_disturb,
-    #          'l' wear_leveling_corruption
+    #          'g' driver_error, 'x' rc_injection, 'r' write_rejection,
+    #          'd' write_disturb, 'l' wear_leveling_corruption
     #   erase: 'e' interrupted_erase, 'a' multi_sector_atomicity
     #   timed: 't' reset_at_time
     #   read:  'f' read_bit_flip (transient one-shot read corruption)
@@ -4617,11 +4781,9 @@ def run_execute_fault(fault_at, fault_type='w'):
     #              dispatched from batch loop, NOT routed here)
     #
     # Fast path (NVMC CONFIG tracking): fault injection works by counting
-    # NVMC CONFIG WEN->REN transitions. When the target write count is
-    # reached, FaultFired is set and run_until_done breaks. The flash
-    # state at this point has writes 1..N completed. We then simulate a
-    # power cycle by resetting the CPU and booting again WITHOUT reloading
-    # images — the flash keeps its interrupted state.
+    # NVMC CONFIG WEN->REN transitions. Power-loss-class faults stop phase 1
+    # immediately. Corruption-class write faults mutate the targeted write but
+    # let execution continue in the same boot attempt.
     #
     # Erase fault: counts ERASEPAGE operations. At the Nth erase, a
     # partial erase (first half only) simulates power loss mid-erase.
@@ -4671,6 +4833,15 @@ def run_execute_fault(fault_at, fault_type='w'):
                 'skip_reason': skip_reason,
             }
 
+    if fault_type == 'x':
+        preflight = ensure_rc_injection_preflight()
+        if not preflight.get('supported'):
+            raise RuntimeError(
+                'rc_injection preflight failed: {}'.format(
+                    preflight.get('reason') or 'symbol_resolution_failed'
+                )
+            )
+
     # Compute effective criteria for this fault type.
     # Control runs (fault_at < 0) always use global criteria.
     eff_criteria = get_effective_criteria(fault_type) if int(fault_at) >= 0 else None
@@ -4683,6 +4854,7 @@ def run_execute_fault(fault_at, fault_type='w'):
 
         log('control phase1_setup')
         restore_phase1_baseline()
+        reset_rc_injection_state(enabled=False)
         cpu_ref = monitor.Machine['sysbus.cpu']
         cpu_ref.IsHalted = False
 
@@ -4733,8 +4905,8 @@ def run_execute_fault(fault_at, fault_type='w'):
     fault_snapshot_bytes = None
     saved_flash = None
     is_erase_fault = fault_type in ('e', 'a')
-    is_power_loss_fault = fault_type in ('w', 'e', 'a', 'b')
-    is_non_power_write_fault = fault_type in ('s', 'r', 'd', 'l', 'k')
+    is_power_loss_fault = fault_type in ('w', 'e', 'a')
+    is_non_power_write_fault = fault_type in ('b', 's', 'g', 'x', 'r', 'd', 'l', 'k')
     is_command_fault = fault_type == 'k'
     is_i2c_fault = fault_type in _I2C_WIRE_CODE_TO_FAULT_TYPE
     is_otp_fault = fault_type in _OTP_WIRE_CODES and backend.get('otp') is not None
@@ -4742,6 +4914,7 @@ def run_execute_fault(fault_at, fault_type='w'):
 
     # Phase 1: Reset and set up for the faulted boot.
     restore_phase1_baseline()
+    reset_rc_injection_state(enabled=(fault_type == 'x'))
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
 
@@ -4789,8 +4962,8 @@ def run_execute_fault(fault_at, fault_type='w'):
         # Write faults:
         #   'w' power_loss (0), 'b' bit_corruption (1),
         #   's' silent_write_failure (2), 'r' write_rejection (3),
-        #   'd' write_disturb (4),
-        #   'l' wear_leveling_corruption (5).
+        #   'd' write_disturb (4), 'l' wear_leveling_corruption (5),
+        #   'g' driver_error (6), 'x' rc_injection (reuses mode 3).
         write_mode = _WRITE_FAULT_MODE.get(fault_type, 0)
         base_writes = get_total_writes()
         arm_at = base_writes + fault_at + 1
@@ -4812,6 +4985,7 @@ def run_execute_fault(fault_at, fault_type='w'):
     )
     disarm_vtor_watchpoint()
     phase1_ms = int((_time.time() - fp_t0) * 1000)
+    phase1_stopped_on_fault = phase1_status is not None and phase1_status.get('reason') == 'fault_fired'
 
     if is_i2c_fault:
         fault_injected = was_i2c_fault_injected()
@@ -4830,9 +5004,11 @@ def run_execute_fault(fault_at, fault_type='w'):
         phase1_ops = get_total_otp_blows()
     else:
         phase1_ops = get_total_writes()
-    if fault_injected and (is_erase_fault or is_otp_fault or fault_type in ('w', 'b', 's', 'r', 'd', 'l', 'k') or is_i2c_fault):
+    if fault_injected and phase1_stopped_on_fault:
         # Unified semantics: successful operations before the faulted operation.
         actual_writes = max(0, phase1_ops - 1)
+    elif fault_injected and int(fault_at) >= 0:
+        actual_writes = max(0, int(fault_at))
     else:
         actual_writes = phase1_ops
     log('fp={} type={} phase1_done injected={} ops_total={} ops_before_fault={}'.format(
@@ -4883,7 +5059,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             else:
                 log('fp={} writeback: WARNING no trace data, using full snapshot (direct-mode fallback)'.format(fault_at))
 
-        if is_power_loss_fault:
+        if phase1_stopped_on_fault and is_power_loss_fault:
             # Power-loss class: simulate a cold reset and recovery boot.
             if success_marker_addr != 0:
                 flash_base_addr, _ = flash_geometry()
@@ -4930,9 +5106,9 @@ def run_execute_fault(fault_at, fault_type='w'):
             recovery_writes = get_total_writes()
             phase2_ms = int((_time.time() - phase2_t0) * 1000)
             log('fp={} phase2_done rec_writes={}'.format(fault_at, recovery_writes))
-        elif is_non_power_write_fault:
-            # Non-power-loss class: apply the faulted flash state, then continue
-            # executing in the same boot attempt (no simulated reset).
+        elif phase1_stopped_on_fault and is_non_power_write_fault:
+            # Legacy fallback: if a non-power-loss fault still halted phase 1,
+            # restore the faulted state and continue the interrupted boot.
             phase2_t0 = _time.time()
             monitor.Parse('machine Pause')
             if backend['kind'] == 'mram':
@@ -4955,7 +5131,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             )
             disarm_vtor_watchpoint()
             phase2_ms = int((_time.time() - phase2_t0) * 1000)
-    elif backend['kind'] == 'slow' and fault_injected and is_power_loss_fault:
+    elif backend['kind'] == 'slow' and fault_injected and is_power_loss_fault and phase1_stopped_on_fault:
         # Slow path power-loss: NVMemory is non-volatile and retains the
         # faulted write across machine Reset.  Reset CPU, reload bootloader
         # ELF and slot images (MappedMemory regions are cleared by reset,
@@ -4987,7 +5163,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         recovery_writes = get_total_writes()
         phase2_ms = int((_time.time() - phase2_t0) * 1000)
         log('fp={} phase2_done rec_writes={}'.format(fault_at, recovery_writes))
-    elif fault_injected and is_non_power_write_fault:
+    elif fault_injected and is_non_power_write_fault and phase1_stopped_on_fault:
         # Slow path non-power-loss: continue in the same boot attempt.
         phase2_t0 = _time.time()
         arm_vtor_watchpoint()
@@ -5017,6 +5193,35 @@ def run_execute_fault(fault_at, fault_type='w'):
         disarm_vtor_watchpoint()
         phase2_ms = int((_time.time() - phase2_t0) * 1000)
 
+    # Multi-boot for continue-after-fault: if the first boot completed
+    # naturally but boot_cycles > 1, reboot to see if corrupted trailer
+    # state causes wrong outcome on subsequent boots.
+    _multiboot_cycles_run = 0
+    if (fault_injected and is_non_power_write_fault
+            and not phase1_stopped_on_fault and boot_cycles > 1):
+        for extra_cycle in range(1, boot_cycles):
+            _multiboot_cycles_run += 1
+            log('fp={} multi-boot cycle {} of {}'.format(fault_at, extra_cycle + 1, boot_cycles))
+            monitor.Parse('machine Pause')
+            monitor.Parse('machine Reset')
+            bus.LoadELF(bootloader_elf)
+            # Do NOT reload slot images — use whatever is on flash after boot 1
+            if _hash_bypass_active:
+                apply_hash_bypass()
+            reset_nvmc_for_recovery()
+            arm_vtor_watchpoint()
+            cycle_status = run_until_done(
+                cpu_ref,
+                label='fp{}_cycle{}'.format(fault_at, extra_cycle + 1),
+                expect_writes=False,
+                zero_writes_is_brick=False,
+                wall_timeout=60,
+                stop_on_fault=False,
+                time_slice=phase2_time_slice,
+            )
+            disarm_vtor_watchpoint()
+            log('fp={} cycle {} done'.format(fault_at, extra_cycle + 1))
+
     # Read final state.
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
@@ -5027,9 +5232,23 @@ def run_execute_fault(fault_at, fault_type='w'):
     signals['phase2_ms'] = phase2_ms
     signals['phase1_ops_total'] = phase1_ops
     signals['trace_replay_mode'] = 'execute'
+    signals['multiboot_cycles_run'] = _multiboot_cycles_run
     if phase1_status is not None:
         signals['phase1_stop_reason'] = phase1_status.get('reason')
         signals['phase1_emulated_s'] = phase1_status.get('emulated_s')
+    if fault_injected and is_non_power_write_fault and not phase1_stopped_on_fault:
+        signals['phase1_continued_after_fault'] = True
+    if fault_injected and fault_type == 'g':
+        signals['driver_error_flag_set'] = driver_error_flag_set()
+        signals['driver_error_model'] = 'peripheral_status_flag'
+    if fault_type == 'x':
+        signals['rc_injection_model'] = 'software_return_code'
+        signals['rc_injection_value'] = fmt_u32(_rc_injection_state['return_value'])
+        signals['rc_injection_applied'] = bool(_rc_injection_state.get('injected'))
+        if _rc_injection_state.get('injected_symbol'):
+            signals['rc_injection_symbol'] = _rc_injection_state.get('injected_symbol')
+        if _rc_injection_state.get('injected_return_addr') is not None:
+            signals['rc_injection_return_addr'] = fmt_u32(_rc_injection_state.get('injected_return_addr'))
     if phase2_status is not None:
         signals['phase2_stop_reason'] = phase2_status.get('reason')
         signals['phase2_emulated_s'] = phase2_status.get('emulated_s')
@@ -6066,7 +6285,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 # Fault types that must always use full execute mode (not trace replay)
 # because they depend on NVMC peripheral state or PRNG.
 _EXECUTE_ONLY_FAULT_TYPES = frozenset(
-    ('e', 'a', 'b', 's', 'd', 'l', 'r', 't', 'f', 'k',
+    ('e', 'a', 'b', 's', 'g', 'x', 'd', 'l', 'r', 't', 'f', 'k',
      'op', 'os', 'od', 'oo',
      'in', 'it', 'ib', 'ic', 'iw')
 )

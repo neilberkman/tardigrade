@@ -28,7 +28,7 @@
 // Fault injection:
 //   FaultAtWordWrite / FaultAtPageErase arm write/erase faults.
 //   Write fault modes: power_loss, bit_corruption, silent_write_failure,
-//   write_rejection, write_disturb, wear_leveling_corruption.
+//   write_rejection, write_disturb, wear_leveling_corruption, driver_error.
 //   Erase fault modes: interrupted_erase, multi_sector_atomicity.
 
 using System;
@@ -68,6 +68,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public ulong TotalWordWrites { get => tracker.TotalWordWrites; set => tracker.TotalWordWrites = value; }
         public ulong FaultAtWordWrite { get => tracker.FaultAtWordWrite; set => tracker.FaultAtWordWrite = value; }
         public bool FaultFired { get => tracker.FaultFired; set => tracker.FaultFired = value; }
+        public bool DriverErrorFired { get => tracker.DriverErrorFired; set => tracker.DriverErrorFired = value; }
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
 
@@ -100,6 +101,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
 
         public bool AnyFaultFired => tracker.AnyFaultFired;
+        public bool FaultRequiresImmediateStop => tracker.FaultRequiresImmediateStop;
 
         // --- Write trace ---
 
@@ -210,6 +212,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     }
                     return false;
                 }
+                else if(WriteFaultMode == 6)
+                {
+                    DriverErrorFired = true;
+                    return false;
+                }
 
                 return false;
             }
@@ -266,6 +273,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const uint SNB_MASK  = 0xFU << 3;
         private const uint STRT_BIT  = 1U << 16;
         private const uint LOCK_BIT  = 1U << 31;
+        private const uint PROGRAM_ERROR_BIT = 1U << 7;
 
         // FLASH unlock keys.
         private const uint KEY1 = 0x45670123U;
@@ -339,7 +347,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     genericStorage.TryGetValue(offset, out acrVal);
                     return acrVal;
                 case 0x404: return 0;         // KEYR: write-only
-                case 0x40C: return 0;         // SR: BSY=0, no errors
+                case 0x40C: return DriverErrorFired ? PROGRAM_ERROR_BIT : 0; // SR
                 case 0x410: return crValue;   // CR
 
                 default:
@@ -371,7 +379,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 case 0x404: // KEYR — unlock sequence
                     HandleKeyr(value);
                     break;
-                case 0x40C: // SR — writes clear error flags (ignored)
+                case 0x40C: // SR — writes clear error flags
+                    if((value & PROGRAM_ERROR_BIT) != 0)
+                    {
+                        DriverErrorFired = false;
+                    }
                     break;
                 case 0x410: // CR
                     HandleCr(value);
@@ -667,6 +679,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 case 3: // Write rejection: undo the write.
                 {
+                    Flash.WriteByte(offset, oldValue);
+                    flashShadow[offset] = oldValue;
+                    FaultFlashSnapshot[offset] = oldValue;
+                    break;
+                }
+                case 6: // Driver error: reject write and set SR error bit.
+                {
+                    DriverErrorFired = true;
                     Flash.WriteByte(offset, oldValue);
                     flashShadow[offset] = oldValue;
                     FaultFlashSnapshot[offset] = oldValue;

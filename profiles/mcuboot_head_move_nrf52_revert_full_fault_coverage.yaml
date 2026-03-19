@@ -53,6 +53,8 @@ fault_sweep:
   - interrupted_erase
   - bit_corruption
   - silent_write_failure
+  - driver_error
+  - rc_injection
   - write_disturb
   - write_rejection
   - multi_sector_atomicity

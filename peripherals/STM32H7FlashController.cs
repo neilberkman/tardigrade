@@ -108,6 +108,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public ulong FaultAtWordWrite { get => tracker.FaultAtWordWrite; set => tracker.FaultAtWordWrite = value; }
 
         public bool FaultFired { get => tracker.FaultFired; set => tracker.FaultFired = value; }
+        public bool DriverErrorFired { get => tracker.DriverErrorFired; set => tracker.DriverErrorFired = value; }
 
         public ulong TotalPageErases { get => tracker.TotalPageErases; set => tracker.TotalPageErases = value; }
 
@@ -116,6 +117,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool EraseFaultFired { get => tracker.EraseFaultFired; set => tracker.EraseFaultFired = value; }
 
         public bool AnyFaultFired => tracker.AnyFaultFired;
+        public bool FaultRequiresImmediateStop => tracker.FaultRequiresImmediateStop;
 
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
 
@@ -489,12 +491,26 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 WriteWordFault(alignedOffset, oldWord, newWord);
                 ApplyWearCorruption(alignedOffset);
                 break;
+            case 6:
+                DriverErrorFired = true;
+                WriteWordFault(alignedOffset, oldWord, oldWord);
+                SetProgrammingErrorForOffset(alignedOffset);
+                break;
             case 3:
             case 0:
             default:
                 WriteWordFault(alignedOffset, oldWord, oldWord);
                 break;
             }
+        }
+
+        private void SetProgrammingErrorForOffset(long alignedOffset)
+        {
+            if(!TryResolveFlashBank(FlashBaseAddress + alignedOffset, out var bank, out _))
+            {
+                return;
+            }
+            bank.SetProgrammingErrorStatus();
         }
 
         private void WriteWordFault(long alignedOffset, uint shadowOldWord, uint value)
@@ -907,6 +923,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             public bool WriteEnabled => bankWriteEnabled.Value;
 
             public MappedMemory Memory => memory;
+
+            public void SetProgrammingErrorStatus()
+            {
+                bankProgrammingErrorStatus.Value = true;
+                parent.UpdateInterrupts();
+            }
 
             private void BankErase()
             {

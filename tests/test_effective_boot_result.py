@@ -116,6 +116,16 @@ class EffectiveBootResultTests(unittest.TestCase):
         self.assertEqual(outcome, "wrong_image")
         self.assertEqual(slot, "staging")
 
+    def test_timeout_flag_promotes_raw_no_boot_to_timeout(self):
+        result = {
+            "boot_outcome": "no_boot",
+            "boot_slot": None,
+            "timeout": True,
+        }
+        outcome, slot = _effective_boot_result(result)
+        self.assertEqual(outcome, "timeout")
+        self.assertIsNone(slot)
+
 
 class RawFieldsPreservedTests(unittest.TestCase):
     """Verify _effective_boot_result does NOT mutate the result dict."""
@@ -287,6 +297,30 @@ class SummarizeRuntimeSweepTests(unittest.TestCase):
         self.assertEqual(summary["issue_points"], 0)
         self.assertEqual(summary["bricks"], 0)
         self.assertEqual(summary["recoveries"], 1)
+
+    def test_timeout_point_is_counted_separately_not_as_brick_or_recovery(self):
+        results = [
+            {
+                "is_control": True,
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "fault_injected": False,
+            },
+            {
+                "is_control": False,
+                "fault_at": 17,
+                "fault_injected": True,
+                "boot_outcome": "no_boot",
+                "boot_slot": None,
+                "timeout": True,
+                "error": "renode-test batch timed out",
+            },
+        ]
+        summary = summarize_runtime_sweep(results)
+        self.assertEqual(summary["timeout_points"], 1)
+        self.assertEqual(summary["bricks"], 0)
+        self.assertEqual(summary["issue_points"], 0)
+        self.assertEqual(summary["recoveries"], 0)
 
 
 if __name__ == "__main__":
