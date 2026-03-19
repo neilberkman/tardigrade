@@ -874,6 +874,7 @@ def main() -> int:
             fault_types_list=fault_types_list,
             keep_run_artifacts=args.keep_run_artifacts,
             no_hash_bypass=args.no_hash_bypass,
+            allow_state_evaluator=not args.quick,
         )
 
         sweep_wall_s = _time_mod.time() - sweep_wall_t0

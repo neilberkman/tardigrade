@@ -962,6 +962,7 @@ def run_runtime_sweep(
     fault_types_list: Optional[List[str]] = None,
     keep_run_artifacts: bool = False,
     no_hash_bypass: bool = False,
+    allow_state_evaluator: bool = True,
 ) -> List[Dict[str, Any]]:
     """Run the full runtime fault sweep.
 
@@ -986,14 +987,16 @@ def run_runtime_sweep(
         enabled=not no_hash_bypass,
     )
     hybrid_eval_results: List[Dict[str, Any]] = []
-    hybrid_selection = _select_mcuboot_state_evaluator_points(
-        repo_root=repo_root,
-        profile=profile,
-        evaluation_mode=evaluation_mode,
-        fault_points=fault_points,
-        fault_types_list=fault_types_list,
-        trace_file=trace_file,
-    )
+    hybrid_selection = None
+    if allow_state_evaluator:
+        hybrid_selection = _select_mcuboot_state_evaluator_points(
+            repo_root=repo_root,
+            profile=profile,
+            evaluation_mode=evaluation_mode,
+            fault_points=fault_points,
+            fault_types_list=fault_types_list,
+            trace_file=trace_file,
+        )
     execute_fault_points = list(fault_points)
     execute_fault_types_list = list(fault_types_list) if fault_types_list is not None else None
     if hybrid_selection is not None:
@@ -1361,6 +1364,7 @@ def run_multi_component_sweep(
             erase_trace_file_bin=erase_trace_file_bin if not no_trace_replay else None,
             keep_run_artifacts=keep_run_artifacts,
             no_hash_bypass=no_hash_bypass,
+            allow_state_evaluator=not quick,
         )
 
         annotate_result_checks(comp_results, comp_profile)

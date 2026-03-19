@@ -197,6 +197,115 @@ class MCUbootStateEvaluatorSweepRoutingTest(unittest.TestCase):
         )
         self.assertTrue(state_eval_result["signals"]["state_evaluator_used"])
 
+    def test_run_runtime_sweep_disables_state_evaluator_when_requested(self) -> None:
+        exec_base = 0x08020000
+        staging_base = 0x08022000
+        slot_size = 0x2000
+
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            exec_image = tempdir / "exec.bin"
+            staging_image = tempdir / "staging.bin"
+            exec_image.write_bytes(_make_slot_image(exec_base, slot_size, 0x11111111, 0x11))
+            staging_image.write_bytes(_make_slot_image(staging_base, slot_size, 0x22222222, 0x22))
+            trace_file = tempdir / "trace.csv"
+            trace_file.write_text(
+                "write_index,flash_offset,value\n"
+                "{},256,305419896\n"
+                "{},{},2271560481\n".format(
+                    1,
+                    2,
+                    (staging_base - exec_base) + slot_size - 4,
+                ),
+                encoding="utf-8",
+            )
+            profile_path = tempdir / "profile.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    schema_version: 1
+                    name: mcuboot_state_eval_disabled
+                    platform: platforms/stm32f4.repl
+                    flash_backend: faultFlash
+                    bootloader:
+                      elf: results/oss_validation/assets/oss_mcuboot_head_move_stm32f4.elf
+                      entry: 0x08000000
+                    memory:
+                      sram: {{ start: 0x20000000, end: 0x20040000 }}
+                      write_granularity: 4
+                      slots:
+                        exec: {{ base: 0x{exec_base:08X}, size: 0x{slot_size:X} }}
+                        staging: {{ base: 0x{staging_base:08X}, size: 0x{slot_size:X} }}
+                    images:
+                      exec: {exec_image}
+                      staging: {staging_image}
+                    pre_boot_state:
+                      - {{ address: 0x{staging_base + slot_size - 16:08X}, u32: 0xF395C277 }}
+                      - {{ address: 0x{staging_base + slot_size - 12:08X}, u32: 0x7FEFD260 }}
+                      - {{ address: 0x{staging_base + slot_size - 8:08X}, u32: 0x0F505235 }}
+                      - {{ address: 0x{staging_base + slot_size - 4:08X}, u32: 0x8079B62C }}
+                    state_probe:
+                      script: targets/mcuboot/probe.py
+                    success_criteria:
+                      vtor_in_slot: exec
+                      marker_address: 0x{exec_base + 0x10:08X}
+                      marker_value: 0x22222222
+                    expect:
+                      should_find_issues: false
+                    fault_sweep:
+                      mode: runtime
+                      evaluation_mode: execute
+                      max_writes: 2
+                      fault_types: [power_loss]
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            profile = load_profile(profile_path)
+
+            with mock.patch(
+                "sweep._run_batches_chunked",
+                return_value=[
+                    {
+                        "fault_at": 0,
+                        "fault_type": "w",
+                        "fault_injected": True,
+                        "boot_outcome": "success",
+                        "boot_slot": "exec",
+                        "signals": {"trace_replay_mode": "python"},
+                    },
+                    {
+                        "fault_at": 1,
+                        "fault_type": "w",
+                        "fault_injected": True,
+                        "boot_outcome": "success",
+                        "boot_slot": "exec",
+                        "signals": {"trace_replay_mode": "python"},
+                    },
+                ],
+            ) as mock_batch:
+                results = run_runtime_sweep(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    fault_points=[0, 1],
+                    robot_vars=[],
+                    work_dir=tempdir / "work",
+                    renode_remote_server_dir="",
+                    include_control=False,
+                    evaluation_mode="execute",
+                    trace_file=str(trace_file),
+                    fault_types_list=["w", "w"],
+                    allow_state_evaluator=False,
+                )
+
+        mock_batch.assert_called_once()
+        self.assertEqual(mock_batch.call_args.kwargs["fault_points"], [0, 1])
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r["signals"]["trace_replay_mode"] == "python" for r in results))
+
     def test_trace_replay_execute_mode_auto_batches_stm32f4_points(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
