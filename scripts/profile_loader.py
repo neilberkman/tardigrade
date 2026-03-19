@@ -720,6 +720,7 @@ class FaultSweepConfig:
         "nvs_corruption",
         "fault_distribution",
         "heuristic_config",
+        "max_heuristic_points",
         "boot_registers",
         "reset_mode",
         "write_order_constraints",
@@ -755,6 +756,7 @@ class FaultSweepConfig:
         nvs_corruption: Optional["NvsCorruptionConfig"] = None,
         fault_distribution: Optional["FaultDistributionConfig"] = None,
         heuristic_config: Optional["HeuristicConfig"] = None,
+        max_heuristic_points: Optional[int] = 2000,
         boot_registers: Optional[List[Dict[str, Any]]] = None,
         reset_mode: str = "warm",
         write_order_constraints: Optional[List[Dict[str, Any]]] = None,
@@ -797,6 +799,15 @@ class FaultSweepConfig:
         self.nvs_corruption = nvs_corruption or NvsCorruptionConfig()
         self.fault_distribution = fault_distribution or FaultDistributionConfig()
         self.heuristic_config = heuristic_config
+        self.max_heuristic_points = (
+            None if max_heuristic_points is None else int(max_heuristic_points)
+        )
+        if self.max_heuristic_points is not None and self.max_heuristic_points < 1:
+            raise ValueError(
+                "fault_sweep.max_heuristic_points must be >= 1 or None, got {}".format(
+                    self.max_heuristic_points
+                )
+            )
         self.boot_registers = boot_registers or []
         self.reset_mode = reset_mode if reset_mode in ("warm", "cold") else "warm"
         self.write_order_constraints = write_order_constraints or []
@@ -2191,6 +2202,15 @@ def _parse_fault_sweep(
         nvs_corruption=_parse_nvs_corruption(raw.get("nvs_corruption")),
         fault_distribution=_parse_fault_distribution(raw.get("fault_distribution")),
         heuristic_config=_parse_heuristic_config(raw.get("heuristic")),
+        max_heuristic_points=(
+            2000
+            if "max_heuristic_points" not in raw
+            else (
+                None
+                if raw.get("max_heuristic_points") is None
+                else int(raw.get("max_heuristic_points"))
+            )
+        ),
         reset_mode=str(raw.get("reset_mode", "warm")),
         i2c_fault_config=_parse_i2c_fault_config(raw.get("i2c_fault_config")),
         durability_model=durability_model,

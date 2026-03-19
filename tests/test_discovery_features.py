@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
 import tempfile
 import textwrap
 import unittest
@@ -26,6 +28,7 @@ from renode_runner import (  # noqa: E402
     _run_batch_with_fallback,
     calibration_completed,
     prepare_renode_command,
+    run_renode_subprocess,
     run_batch,
     run_single_point,
 )
@@ -40,6 +43,27 @@ class DiscoveryFeaturesTest(unittest.TestCase):
         path = tempdir / "profile.yaml"
         path.write_text(textwrap.dedent(body), encoding="utf-8")
         return path
+
+    def test_run_renode_subprocess_kills_process_group_on_timeout(self) -> None:
+        proc = mock.Mock()
+        proc.pid = 4242
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd=["renode-test"], timeout=10.0),
+            ("partial stdout", "partial stderr"),
+        ]
+
+        with mock.patch("renode_runner.subprocess.Popen", return_value=proc):
+            with mock.patch("renode_runner.os.killpg") as mock_killpg:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    run_renode_subprocess(
+                        ["renode-test"],
+                        cwd=str(ROOT),
+                        env={},
+                        timeout_s=10.0,
+                    )
+
+        mock_killpg.assert_called_once_with(4242, signal.SIGKILL)
+        proc.kill.assert_not_called()
 
     def test_profile_loader_parses_discovery_fields(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -964,7 +988,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             )
             profile = load_profile(profile_path)
 
-            def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+            def fake_run(cmd, *, cwd, env, timeout_s):
                 self.assertEqual(
                     env["TMPDIR"],
                     str(tempdir / "work" / "cleanup_profile_fault_7" / ".tmp"),
@@ -987,7 +1011,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 result_file.write_text('{"boot_outcome":"success"}', encoding="utf-8")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-            with mock.patch("renode_runner.subprocess.run", side_effect=fake_run):
+            with mock.patch("renode_runner.run_renode_subprocess", side_effect=fake_run):
                 result = run_single_point(
                     repo_root=ROOT,
                     renode_test="renode-test",
@@ -1033,7 +1057,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             )
             profile = load_profile(profile_path)
 
-            def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+            def fake_run(cmd, *, cwd, env, timeout_s):
                 self.assertEqual(
                     env["TMPDIR"],
                     str(tempdir / "work" / "keep_artifacts_profile_fault_9" / ".tmp"),
@@ -1053,7 +1077,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 result_file.write_text('{"boot_outcome":"success"}', encoding="utf-8")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-            with mock.patch("renode_runner.subprocess.run", side_effect=fake_run):
+            with mock.patch("renode_runner.run_renode_subprocess", side_effect=fake_run):
                 run_single_point(
                     repo_root=ROOT,
                     renode_test="renode-test",
@@ -1099,7 +1123,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             )
             profile = load_profile(profile_path)
 
-            def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+            def fake_run(cmd, *, cwd, env, timeout_s):
                 fault_var = next(
                     cmd[i + 1]
                     for i, token in enumerate(cmd[:-1])
@@ -1116,7 +1140,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 result_file.write_text('{"boot_outcome":"success","fault_injected":false}', encoding="utf-8")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-            with mock.patch("renode_runner.subprocess.run", side_effect=fake_run):
+            with mock.patch("renode_runner.run_renode_subprocess", side_effect=fake_run):
                 result = run_single_point(
                     repo_root=ROOT,
                     renode_test="renode-test",
@@ -1432,7 +1456,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             )
             profile = load_profile(profile_path)
 
-            def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+            def fake_run(cmd, *, cwd, env, timeout_s):
                 self.assertEqual(
                     env["TMPDIR"],
                     str(tempdir / "work" / "cleanup_batch_profile_batch" / ".tmp"),
@@ -1445,7 +1469,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 (rf_results / "snapshots" / "dummy.bin").write_text("x", encoding="utf-8")
                 return SimpleNamespace(returncode=1, stdout="boom", stderr="bad")
 
-            with mock.patch("renode_runner.subprocess.run", side_effect=fake_run):
+            with mock.patch("renode_runner.run_renode_subprocess", side_effect=fake_run):
                 with self.assertRaises(RuntimeError):
                     run_batch(
                         repo_root=ROOT,
@@ -1492,7 +1516,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             profile = load_profile(profile_path)
             shared_bundle = tempdir / "worker_0" / ".dotnet_bundle"
 
-            def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+            def fake_run(cmd, *, cwd, env, timeout_s):
                 self.assertEqual(env["DOTNET_BUNDLE_EXTRACT_BASE_DIR"], str(shared_bundle))
                 rf_results = Path(cmd[cmd.index("--results-dir") + 1])
                 rf_results.mkdir(parents=True, exist_ok=True)
@@ -1504,7 +1528,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 result_file.write_text("[]", encoding="utf-8")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-            with mock.patch("renode_runner.subprocess.run", side_effect=fake_run):
+            with mock.patch("renode_runner.run_renode_subprocess", side_effect=fake_run):
                 results = run_batch(
                     repo_root=ROOT,
                     renode_test="renode-test",
@@ -1609,7 +1633,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             )
             profile = load_profile(profile_path)
 
-            def fake_run(cmd, cwd, capture_output, text, check, env, timeout):
+            def fake_run(cmd, *, cwd, env, timeout_s):
                 # Robot timeout scales with fault point cost (2s + fp*0.003s each).
                 # fps 0-19 = 160s → 3 minutes.
                 self.assertIn("TEST_TIMEOUT:3 minutes", cmd)
@@ -1623,7 +1647,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 result_file.write_text("[]", encoding="utf-8")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-            with mock.patch("renode_runner.subprocess.run", side_effect=fake_run):
+            with mock.patch("renode_runner.run_renode_subprocess", side_effect=fake_run):
                 results = run_batch(
                     repo_root=ROOT,
                     renode_test="renode-test",
@@ -1637,6 +1661,72 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 )
 
             self.assertEqual(results, [])
+
+    def test_run_batch_uses_trace_replay_timeout_model(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = tempdir / "profile.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    """
+                    schema_version: 1
+                    name: trace_replay_timeout_profile
+                    description: timeout
+                    platform: platforms/stm32f4.repl
+                    bootloader:
+                      elf: examples/vulnerable_ota/firmware.elf
+                      entry: 0x10000000
+                    memory:
+                      sram: { start: 0x20000000, end: 0x20020000 }
+                      write_granularity: 4
+                      slots:
+                        exec: { base: 0x10000000, size: 0x1000 }
+                        staging: { base: 0x10001000, size: 0x1000 }
+                    images:
+                      staging: examples/vulnerable_ota/firmware.bin
+                    success_criteria:
+                      vtor_in_slot: exec
+                    expect:
+                      should_find_issues: false
+                    """
+                ),
+                encoding="utf-8",
+            )
+            profile = load_profile(profile_path)
+
+            observed_timeouts = []
+
+            def fake_run(cmd, *, cwd, env, timeout_s):
+                self.assertIn("TEST_TIMEOUT:5 minutes", cmd)
+                observed_timeouts.append(timeout_s)
+                rf_results = Path(cmd[cmd.index("--results-dir") + 1])
+                rf_results.mkdir(parents=True, exist_ok=True)
+                result_var = next(
+                    entry for entry in cmd
+                    if isinstance(entry, str) and entry.startswith("RESULT_FILE:")
+                )
+                result_file = Path(result_var.split("RESULT_FILE:", 1)[1])
+                result_file.write_text("[]", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch("renode_runner.run_renode_subprocess", side_effect=fake_run):
+                results = run_batch(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    fault_points=list(range(1000, 1128)),
+                    robot_vars=[],
+                    work_dir=tempdir / "work",
+                    renode_remote_server_dir="",
+                    trace_file=str(tempdir / "trace.csv"),
+                    fault_types_list=["w"] * 128,
+                    keep_run_artifacts=False,
+                )
+
+            self.assertEqual(results, [])
+            self.assertEqual(len(observed_timeouts), 1)
+            self.assertLess(observed_timeouts[0], 500.0)
 
 
 class Phase2FaultTest(unittest.TestCase):

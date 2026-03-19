@@ -10,6 +10,7 @@ import dataclasses
 import datetime as dt
 import json
 import os
+import signal
 import shlex
 import shutil
 import subprocess
@@ -229,6 +230,115 @@ def prepare_run_environment(
     return env
 
 
+def _renode_process_timeout(timeout_s: Optional[float]) -> Optional[float]:
+    if timeout_s is None:
+        return None
+    return max(float(timeout_s), float(timeout_s) * 1.5)
+
+
+def _base_fault_type_code(fault_type: Optional[str]) -> str:
+    raw = str(fault_type or "")
+    return raw.split(":", 1)[0] if ":" in raw else raw
+
+
+def _is_trace_replay_batch(
+    *,
+    trace_file: Optional[str],
+    trace_file_bin: Optional[str],
+    fault_types_list: Optional[List[str]],
+) -> bool:
+    if not (trace_file or trace_file_bin):
+        return False
+    if not fault_types_list:
+        return True
+    return all(_base_fault_type_code(ft) == "w" for ft in fault_types_list)
+
+
+def _estimate_batch_runtime_seconds(
+    *,
+    profile: ProfileConfig,
+    fault_points: List[int],
+    fault_types_list: Optional[List[str]],
+    trace_replay: bool,
+) -> float:
+    update_sequence_overhead_s = (
+        12.0 if getattr(profile, "has_update_sequence", False) else 0.0
+    )
+    if trace_replay:
+        platform = str(getattr(profile, "platform", "") or "").lower()
+        trace_replay_point_cost_s = 1.25 if "stm32f4" in platform else 0.9
+        return update_sequence_overhead_s + (len(fault_points) * trace_replay_point_cost_s)
+
+    sequential_faults = {"w", "b", "e", "a", "s", "g", "x", "d", "l", "r", "k"}
+
+    def point_cost(idx: int, fp: int) -> float:
+        ft = (
+            fault_types_list[idx]
+            if fault_types_list and idx < len(fault_types_list)
+            else None
+        )
+        if ft is None or _base_fault_type_code(ft) in sequential_faults:
+            return 2.0 + abs(fp) * 0.012
+        return 5.0
+
+    return update_sequence_overhead_s + sum(
+        point_cost(i, fp) for i, fp in enumerate(fault_points)
+    )
+
+
+def _kill_process_group(proc: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def run_renode_subprocess(
+    cmd: List[str],
+    *,
+    cwd: str,
+    env: Dict[str, str],
+    timeout_s: Optional[float],
+) -> subprocess.CompletedProcess[str]:
+    """Run renode-test with a process-group wall timeout.
+
+    `subprocess.run(timeout=...)` only kills the direct child. Renode hangs can
+    leave descendants alive, so launch a fresh session and SIGKILL the process
+    group on timeout.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        stdout, stderr = proc.communicate()
+        raise subprocess.TimeoutExpired(
+            cmd=cmd,
+            timeout=timeout_s,
+            output=stdout,
+            stderr=stderr,
+        )
+    return subprocess.CompletedProcess(
+        args=cmd,
+        returncode=int(proc.returncode or 0),
+        stdout=stdout or "",
+        stderr=stderr or "",
+    )
+
+
 def quick_subset(points: List[int]) -> List[int]:
     if len(points) <= 3:
         return points
@@ -312,17 +422,15 @@ def run_single_point(
     timeout_s = parse_renode_point_timeout(env)
     if calibration and timeout_s is not None:
         timeout_s = max(timeout_s, 900.0)
+    process_timeout_s = _renode_process_timeout(timeout_s)
 
     try:
         try:
-            proc = subprocess.run(
+            proc = run_renode_subprocess(
                 cmd,
                 cwd=str(repo_root),
-                capture_output=True,
-                text=True,
-                check=False,
                 env=env,
-                timeout=timeout_s,
+                timeout_s=process_timeout_s,
             )
         except subprocess.TimeoutExpired as exc:
             out = exc.stdout or ""
@@ -330,7 +438,7 @@ def run_single_point(
             raise RuntimeError(
                 "renode-test timed out for {} fault_at={} after {}s\nSTDOUT:\n{}\nSTDERR:\n{}\n"
                 "Adjust with OTA_RENODE_POINT_TIMEOUT_S (seconds; <=0 disables timeout).".format(
-                    label, fault_at, timeout_s, out, err
+                    label, fault_at, process_timeout_s, out, err
                 )
             )
 
@@ -496,12 +604,14 @@ def run_batch(
     erase_types = {'e', 'a'}
     write_types = {'w', 'b', 's', 'g', 'x', 'd', 'l', 'r', 't', 'k'}
 
-    def _ft_base(ft: str) -> str:
-        """Extract base fault type code (first character before any colon)."""
-        return ft.split(":")[0] if ":" in ft else ft
-
-    has_erase = bool(fault_types_list and any(_ft_base(ft) in erase_types for ft in fault_types_list))
-    has_write = bool(fault_types_list and any(_ft_base(ft) in write_types for ft in fault_types_list))
+    has_erase = bool(
+        fault_types_list
+        and any(_base_fault_type_code(ft) in erase_types for ft in fault_types_list)
+    )
+    has_write = bool(
+        fault_types_list
+        and any(_base_fault_type_code(ft) in write_types for ft in fault_types_list)
+    )
     if has_erase and has_write:
         fault_types_mode = "both"
     elif has_erase:
@@ -509,29 +619,16 @@ def run_batch(
     else:
         fault_types_mode = "write"
 
-    # Scale the Robot Framework per-suite timeout to the batch size. Large
-    # state-mode batches can legitimately exceed the default 2-minute timeout,
-    # which otherwise triggers expensive fallback splits even when the batch is
-    # healthy.
-    # Scale robot test timeout with actual fault point cost, not just count.
-    # Execute-mode late points (fp=10000+) need long Phase 1 emulation.
-    # 0.012s/fp matches measured ~160s for fp=13000 execute-mode points.
-    # Fault types where fp is a sequential write index (cost scales with fp).
-    # All others (instruction_skip, read_bit_flip, OTP, I2C) use memory
-    # addresses or absolute values — flat cost to avoid overflow.
-    _SEQUENTIAL_FAULTS = {"w", "b", "e", "a", "s", "g", "x", "d", "l", "r", "k"}
-    _UPDATE_SEQUENCE_BATCH_OVERHEAD_S = (
-        12.0 if getattr(profile, "has_update_sequence", False) else 0.0
+    trace_replay_batch = _is_trace_replay_batch(
+        trace_file=trace_file,
+        trace_file_bin=trace_file_bin,
+        fault_types_list=fault_types_list,
     )
-
-    def _point_cost(idx: int, fp: int) -> float:
-        ft = fault_types_list[idx] if fault_types_list and idx < len(fault_types_list) else None
-        if ft is None or ft in _SEQUENTIAL_FAULTS:
-            return 2.0 + abs(fp) * 0.012
-        return 5.0
-
-    estimated_s = _UPDATE_SEQUENCE_BATCH_OVERHEAD_S + sum(
-        _point_cost(i, fp) for i, fp in enumerate(fault_points)
+    estimated_s = _estimate_batch_runtime_seconds(
+        profile=profile,
+        fault_points=fault_points,
+        fault_types_list=fault_types_list,
+        trace_replay=trace_replay_batch,
     )
     robot_test_timeout_s = max(120, 120 + estimated_s)
     if getattr(profile, "has_update_sequence", False):
@@ -583,17 +680,15 @@ def run_batch(
             timeout_s = min(7200.0, max(timeout_s, 600.0))
     else:
         timeout_s = None
+    process_timeout_s = _renode_process_timeout(timeout_s)
 
     try:
         try:
-            proc = subprocess.run(
+            proc = run_renode_subprocess(
                 cmd,
                 cwd=str(repo_root),
-                capture_output=True,
-                text=True,
-                check=False,
                 env=env,
-                timeout=timeout_s,
+                timeout_s=process_timeout_s,
             )
         except subprocess.TimeoutExpired as exc:
             out = exc.stdout or ""
@@ -601,7 +696,7 @@ def run_batch(
             raise RuntimeError(
                 "renode-test batch timed out after {}s ({} points)\nSTDOUT:\n{}\nSTDERR:\n{}\n"
                 "Adjust with OTA_RENODE_POINT_TIMEOUT_S (seconds; <=0 disables timeout).".format(
-                    timeout_s, len(fault_points), out, err
+                    process_timeout_s, len(fault_points), out, err
                 )
             )
 

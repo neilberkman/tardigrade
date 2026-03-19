@@ -12,11 +12,13 @@ import pytest
 # Ensure scripts/ is importable.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
+from fault_plan import CalibrationInputs, build_fault_plan
 from profile_loader import (
     FaultSweepConfig,
     HeuristicConfig,
     _parse_fault_sweep,
     _parse_heuristic_config,
+    load_profile,
 )
 
 
@@ -190,6 +192,18 @@ class TestFaultSweepConfigHeuristic:
         assert fsc.heuristic_config is hc
         assert fsc.heuristic_config.tier2_step == 7
 
+    def test_default_max_heuristic_points(self):
+        fsc = FaultSweepConfig()
+        assert fsc.max_heuristic_points == 2000
+
+    def test_explicit_max_heuristic_points(self):
+        fsc = FaultSweepConfig(max_heuristic_points=512)
+        assert fsc.max_heuristic_points == 512
+
+    def test_invalid_max_heuristic_points(self):
+        with pytest.raises(ValueError, match="max_heuristic_points"):
+            FaultSweepConfig(max_heuristic_points=0)
+
 
 class TestParseFaultSweepWithHeuristic:
     """_parse_fault_sweep correctly handles the heuristic sub-key."""
@@ -199,11 +213,13 @@ class TestParseFaultSweepWithHeuristic:
         raw = {"sweep_strategy": "heuristic"}
         fsc = _parse_fault_sweep(raw)
         assert fsc.heuristic_config is None
+        assert fsc.max_heuristic_points == 2000
 
     def test_heuristic_key_present(self):
         """heuristic key present -> parsed into HeuristicConfig."""
         raw = {
             "sweep_strategy": "heuristic",
+            "max_heuristic_points": 750,
             "heuristic": {
                 "tier2_step": 5,
                 "tier3_step": 50,
@@ -214,6 +230,7 @@ class TestParseFaultSweepWithHeuristic:
         assert fsc.heuristic_config.tier2_step == 5
         assert fsc.heuristic_config.tier3_step == 50
         assert fsc.heuristic_config.discontinuity_window == 3  # default
+        assert fsc.max_heuristic_points == 750
 
     def test_heuristic_key_empty_dict(self):
         """heuristic: {} -> HeuristicConfig with all defaults."""
@@ -313,3 +330,108 @@ class TestClassifyTracePassthrough:
         assert "tier2_step" in params
         assert "tier3_step" in params
         assert "discontinuity_window" in params
+
+
+class TestMaxHeuristicPointsPlannerFallback:
+    """Planner uses fault_sweep.max_heuristic_points as the default cap."""
+
+    @staticmethod
+    def _write_profile(tmp_path: Path, extra: str = "") -> Path:
+        nested_extra = textwrap.indent(textwrap.dedent(extra).strip(), "  ")
+        if nested_extra:
+            nested_extra = "\n" + nested_extra
+        profile = tmp_path / "profile.yaml"
+        profile.write_text(
+            textwrap.dedent(
+                """
+                schema_version: 1
+                name: heuristic_cap_profile
+                platform: platforms/stm32f4.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x2000 }
+                    staging: { base: 0x10002000, size: 0x2000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                fault_sweep:
+                  mode: runtime
+                  sweep_strategy: heuristic
+                  max_writes: auto
+                EXTRA
+                """
+            ).replace("EXTRA", nested_extra),
+            encoding="utf-8",
+        )
+        return profile
+
+    @staticmethod
+    def _mock_classification() -> dict:
+        return {
+            "fault_points": [0],
+            "tier0": [],
+            "tier1": [],
+            "tier2_selected": [],
+            "tier3_selected": [],
+            "tier2_total": 0,
+            "tier3_total": 0,
+            "discontinuity_count": 0,
+            "heuristic_config": {"target_points": 1},
+        }
+
+    def test_build_fault_plan_uses_max_heuristic_points_by_default(self, tmp_path: Path):
+        trace_path = tmp_path / "trace.csv"
+        trace_path.write_text("write_index,flash_offset,value\n1,0,0\n", encoding="utf-8")
+        profile = load_profile(self._write_profile(tmp_path))
+
+        with patch(
+            "write_trace_heuristic.classify_trace",
+            return_value=self._mock_classification(),
+        ) as mock_classify, patch(
+            "write_trace_heuristic.summarize_classification",
+            return_value={"selected_fault_points": 1, "total_writes": 1, "reduction_ratio": 1.0, "trailer_writes": 0},
+        ):
+            build_fault_plan(
+                profile,
+                CalibrationInputs(max_writes=1, trace_file=str(trace_path)),
+            )
+
+        assert mock_classify.call_args.kwargs["target_points"] == 2000
+
+    def test_explicit_heuristic_target_points_overrides_fallback(self, tmp_path: Path):
+        trace_path = tmp_path / "trace.csv"
+        trace_path.write_text("write_index,flash_offset,value\n1,0,0\n", encoding="utf-8")
+        profile = load_profile(
+            self._write_profile(
+                tmp_path,
+                extra=textwrap.dedent(
+                    """
+                      max_heuristic_points: 900
+                      heuristic:
+                        target_points: 123
+                    """
+                ),
+            )
+        )
+
+        with patch(
+            "write_trace_heuristic.classify_trace",
+            return_value=self._mock_classification(),
+        ) as mock_classify, patch(
+            "write_trace_heuristic.summarize_classification",
+            return_value={"selected_fault_points": 1, "total_writes": 1, "reduction_ratio": 1.0, "trailer_writes": 0},
+        ):
+            build_fault_plan(
+                profile,
+                CalibrationInputs(max_writes=1, trace_file=str(trace_path)),
+            )
+
+        assert mock_classify.call_args.kwargs["target_points"] == 123

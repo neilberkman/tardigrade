@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import importlib.util
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,12 +40,14 @@ from profile_loader import ProfileConfig, load_profile
 from renode_runner import (
     _progress,
     _run_batches_chunked,
+    _base_fault_type_code,
     merge_robot_vars,
     quick_subset,
     run_calibration,
     run_single_point,
 )
 from result_checks import annotate_result_checks
+from trace_utils import load_clean_erase_trace, load_clean_write_trace
 
 
 def _with_sweep_hash_bypass(
@@ -79,6 +82,450 @@ def _with_sweep_hash_bypass(
     if symbols:
         filtered_vars.append("HASH_BYPASS_SYMBOLS:{}".format(",".join(symbols)))
     return filtered_vars
+
+
+def _fmt_u32(value: int) -> str:
+    return "0x{0:08X}".format(int(value) & 0xFFFFFFFF)
+
+
+def _load_mcuboot_state_evaluator(repo_root: Path) -> Any:
+    module_path = repo_root / "targets" / "mcuboot" / "state_evaluator.py"
+    spec = importlib.util.spec_from_file_location(
+        "__tardigrade_mcuboot_state_evaluator__",
+        module_path,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Failed to load MCUboot state evaluator from {}".format(module_path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _looks_like_mcuboot_profile(profile: ProfileConfig) -> bool:
+    state_probe = getattr(profile, "state_probe", None)
+    script = str(getattr(state_probe, "script", "") or "")
+    if script.replace("\\", "/").endswith("targets/mcuboot/probe.py"):
+        return True
+    name = str(getattr(profile, "name", "") or "").lower()
+    return "mcuboot" in name
+
+
+def _build_mcuboot_state_slot_config(
+    profile: ProfileConfig,
+    repo_root: Path,
+) -> Dict[str, Any]:
+    slots = profile.memory.slots
+    flash_base = min(int(slot.base) for slot in slots.values())
+    flash_end = max(int(slot.base) + int(slot.size) for slot in slots.values())
+    if profile.pre_boot_state:
+        flash_base = min(
+            flash_base,
+            min(int(write.address) for write in profile.pre_boot_state),
+        )
+        flash_end = max(
+            flash_end,
+            max(int(write.address) + 4 for write in profile.pre_boot_state),
+        )
+    criteria_runtime = profile._success_criteria_runtime_dict(  # type: ignore[attr-defined]
+        repo_root,
+        profile.success_criteria,
+        profile.images,
+    )
+    return {
+        "flash_base": int(flash_base),
+        "flash_end": int(flash_end),
+        "slots": {
+            name: {"base": int(slot.base), "size": int(slot.size)}
+            for name, slot in slots.items()
+        },
+        "sram_start": int(profile.memory.sram_start),
+        "sram_end": int(profile.memory.sram_end),
+        "vector_table_offset": int(profile.success_criteria.vector_table_offset),
+        "trailer_align": 8,
+        "trailer_window": int(getattr(profile.memory, "page_size", 4096) or 4096),
+        "page_size": int(getattr(profile.memory, "page_size", 4096) or 4096),
+        "pad_byte": 0x00
+        if str(getattr(profile, "flash_backend", "") or "").strip().lower() == "mram"
+        else 0xFF,
+        "marker_address": profile.success_criteria.marker_address,
+        "marker_value": profile.success_criteria.marker_value,
+        "image_hash": bool(profile.success_criteria.image_hash),
+        "image_hash_slot": profile.success_criteria.image_hash_slot or "",
+        "image_exec_sha256": str(criteria_runtime.get("image_exec_sha256", "") or ""),
+        "image_staging_sha256": str(criteria_runtime.get("image_staging_sha256", "") or ""),
+        "expected_exec_sha256": str(criteria_runtime.get("expected_exec_sha256", "") or ""),
+    }
+
+
+def _build_mcuboot_initial_flash(
+    profile: ProfileConfig,
+    repo_root: Path,
+    slot_config: Dict[str, Any],
+) -> bytearray:
+    flash_base = int(slot_config["flash_base"])
+    flash_end = int(slot_config["flash_end"])
+    fill = int(slot_config.get("pad_byte", 0xFF)) & 0xFF
+    flash = bytearray([fill] * max(0, flash_end - flash_base))
+
+    for slot_name, image_path in profile.images.items():
+        if slot_name not in slot_config["slots"]:
+            continue
+        resolved = Path(profile.resolve_path(repo_root, image_path))
+        if not resolved.exists():
+            continue
+        slot_info = slot_config["slots"][slot_name]
+        slot_offset = int(slot_info["base"]) - flash_base
+        slot_size = int(slot_info["size"])
+        raw = resolved.read_bytes()
+        payload = raw[:slot_size]
+        flash[slot_offset:slot_offset + len(payload)] = payload
+
+    for write in profile.pre_boot_state:
+        offset = int(write.address) - flash_base
+        if offset < 0 or offset + 4 > len(flash):
+            continue
+        flash[offset:offset + 4] = int(write.u32).to_bytes(4, "little")
+
+    return flash
+
+
+class _MCUbootTraceCursor:
+    def __init__(
+        self,
+        base_flash: bytearray,
+        *,
+        flash_base: int,
+        write_entries: List[Dict[str, int]],
+        erase_entries: List[Dict[str, Any]],
+        page_size: int,
+        erase_fill: int = 0xFF,
+    ) -> None:
+        self.flash = bytearray(base_flash)
+        self.flash_base = int(flash_base)
+        self.write_entries = sorted(
+            (
+                {
+                    "write_index": int(entry["write_index"]),
+                    "flash_offset": int(entry["flash_offset"]),
+                    "value": int(entry["value"]),
+                }
+                for entry in write_entries
+            ),
+            key=lambda entry: entry["write_index"],
+        )
+        self.erase_entries = sorted(
+            (
+                {
+                    "flash_offset": int(entry["flash_offset"]),
+                    "writes_at_this_point": (
+                        None
+                        if entry.get("writes_at_this_point") is None
+                        else int(entry["writes_at_this_point"])
+                    ),
+                }
+                for entry in erase_entries
+            ),
+            key=lambda entry: (
+                entry["writes_at_this_point"] is None,
+                entry["writes_at_this_point"]
+                if entry["writes_at_this_point"] is not None
+                else 0,
+            ),
+        )
+        self.page_size = max(1, int(page_size))
+        self.erase_fill = int(erase_fill) & 0xFF
+        self._write_pos = 0
+        self._erase_pos = 0
+        self._committed_writes = 0
+        self._last_fault_at = -1
+
+    def _apply_write(self, entry: Dict[str, int]) -> None:
+        off = int(entry["flash_offset"])
+        self.flash[off:off + 4] = int(entry["value"]).to_bytes(4, "little")
+        self._committed_writes += 1
+
+    def _apply_erase(self, entry: Dict[str, Any]) -> None:
+        off = int(entry["flash_offset"])
+        end = min(len(self.flash), off + self.page_size)
+        if off < 0 or off >= len(self.flash):
+            return
+        self.flash[off:end] = bytes([self.erase_fill]) * (end - off)
+
+    def advance_to_fault_point(self, fault_at: int) -> int:
+        if int(fault_at) < self._last_fault_at:
+            raise RuntimeError("trace cursor fault points must be monotonic")
+
+        while self._write_pos < len(self.write_entries):
+            entry = self.write_entries[self._write_pos]
+            write_index = int(entry["write_index"])
+            if write_index > int(fault_at):
+                break
+            while self._erase_pos < len(self.erase_entries):
+                erase_entry = self.erase_entries[self._erase_pos]
+                writes_at = erase_entry["writes_at_this_point"]
+                if writes_at is None or int(writes_at) >= write_index:
+                    break
+                self._apply_erase(erase_entry)
+                self._erase_pos += 1
+            self._apply_write(entry)
+            self._write_pos += 1
+
+        while self._erase_pos < len(self.erase_entries):
+            erase_entry = self.erase_entries[self._erase_pos]
+            writes_at = erase_entry["writes_at_this_point"]
+            if writes_at is None or int(writes_at) > int(fault_at):
+                break
+            self._apply_erase(erase_entry)
+            self._erase_pos += 1
+
+        self._last_fault_at = int(fault_at)
+        return int(self._committed_writes)
+
+    def target_fault_address(self, fault_at: int) -> Optional[int]:
+        target_write_index = int(fault_at) + 1
+        entry_idx = self._write_pos
+        while entry_idx < len(self.write_entries):
+            entry = self.write_entries[entry_idx]
+            if int(entry["write_index"]) == target_write_index:
+                return self.flash_base + int(entry["flash_offset"])
+            if int(entry["write_index"]) > target_write_index:
+                break
+            entry_idx += 1
+        for entry in self.write_entries:
+            if int(entry["write_index"]) == target_write_index:
+                return self.flash_base + int(entry["flash_offset"])
+        return None
+
+
+def _is_trace_replay_execute_batch(
+    *,
+    trace_file: Optional[str],
+    trace_file_bin: Optional[str],
+    fault_types_list: Optional[List[str]],
+) -> bool:
+    if not (trace_file or trace_file_bin):
+        return False
+    if not fault_types_list:
+        return True
+    return all(_base_fault_type_code(ft) == "w" for ft in fault_types_list)
+
+
+def _auto_execute_batch_points(
+    *,
+    profile: ProfileConfig,
+    evaluation_mode: str,
+    fault_points: List[int],
+    fault_types_list: Optional[List[str]],
+    max_batch_points: int,
+    trace_file: Optional[str],
+    trace_file_bin: Optional[str],
+) -> int:
+    if max_batch_points > 0 or str(evaluation_mode) != "execute" or not fault_points:
+        return max_batch_points
+
+    has_execute_only_points = bool(
+        fault_types_list
+        and any(
+            _base_fault_type_code(ft) in {"b", "e", "a", "s", "g", "x", "r", "d", "l", "k"}
+            for ft in fault_types_list
+        )
+    )
+    update_sequence_overhead_s = (
+        12.0 if getattr(profile, "has_update_sequence", False) else 0.0
+    )
+
+    if _is_trace_replay_execute_batch(
+        trace_file=trace_file,
+        trace_file_bin=trace_file_bin,
+        fault_types_list=fault_types_list,
+    ) and not has_execute_only_points:
+        platform = str(getattr(profile, "platform", "") or "").lower()
+        is_stm32f4 = "stm32f4" in platform
+        batch_budget_s = 180.0
+        point_budget_s = max(30.0, batch_budget_s - update_sequence_overhead_s)
+        point_cost_s = 1.25 if is_stm32f4 else 0.9
+        max_per_batch = 192 if is_stm32f4 else 128
+        computed = max(8, int(point_budget_s // point_cost_s))
+        chosen = max(1, min(max_per_batch, computed, len(fault_points)))
+        est_batches = (len(fault_points) + chosen - 1) // chosen
+        total_est_s = (len(fault_points) * point_cost_s) + (est_batches * update_sequence_overhead_s)
+        _progress(
+            "Execute mode with trace replay: ~{} batches, {} pts/batch "
+            "({}s budget, {:.0f}s total est, {} points).".format(
+                est_batches,
+                chosen,
+                int(batch_budget_s),
+                total_est_s,
+                len(fault_points),
+            )
+        )
+        return chosen
+
+    # Full execute-mode without trace replay is memory-heavy in long single
+    # Renode sessions. Late fault points (high fp value) are much more
+    # expensive than early ones because Phase 1 must emulate up to fp writes.
+    # Use a time-budget approach: pack variable-sized batches so each Renode
+    # session completes within ~180s. Early cheap points get packed densely
+    # (up to 64/batch), late expensive points get packed sparsely (down to 1).
+    if has_execute_only_points or (not trace_file and not trace_file_bin):
+        batch_time_budget_s = 180.0
+        base_cost_s = 2.0
+        per_write_cost_s = 0.012
+        max_per_batch = 64
+        point_budget_s = max(30.0, batch_time_budget_s - update_sequence_overhead_s)
+        sequential_faults = {"w", "b", "e", "a", "s", "g", "x", "d", "l", "r", "k"}
+
+        def point_cost(idx: int, fp: int) -> float:
+            ft = (
+                fault_types_list[idx]
+                if fault_types_list and idx < len(fault_types_list)
+                else None
+            )
+            if ft is None or _base_fault_type_code(ft) in sequential_faults:
+                return base_cost_s + abs(fp) * per_write_cost_s
+            return 5.0
+
+        chunk_boundaries: List[int] = [0]
+        budget_used = 0.0
+        for idx, fault_point in enumerate(fault_points):
+            cost = point_cost(idx, fault_point)
+            budget_used += cost
+            points_in_chunk = idx - chunk_boundaries[-1] + 1
+            if budget_used > point_budget_s or points_in_chunk >= max_per_batch:
+                chunk_boundaries.append(idx)
+                budget_used = cost
+
+        chunk_sizes: List[int] = []
+        for idx, start in enumerate(chunk_boundaries):
+            end = (
+                chunk_boundaries[idx + 1]
+                if idx + 1 < len(chunk_boundaries)
+                else len(fault_points)
+            )
+            chunk_sizes.append(end - start)
+        chunk_sizes.sort()
+        chosen = max(1, chunk_sizes[len(chunk_sizes) // 2])
+        chosen = max(1, min(max_per_batch, chosen))
+        total_est_s = (
+            sum(point_cost(idx, fp) for idx, fp in enumerate(fault_points))
+            + len(chunk_boundaries) * update_sequence_overhead_s
+        )
+        print(
+            "Execute mode without trace replay: ~{} batches, median {} pts/batch "
+            "({}s budget, {:.0f}s total est, {} points, max fp={}).".format(
+                len(chunk_boundaries),
+                chosen,
+                int(batch_time_budget_s),
+                total_est_s,
+                len(fault_points),
+                max(fault_points) if fault_points else 0,
+            ),
+            file=sys.stderr,
+        )
+        return chosen
+
+    return max_batch_points
+
+
+def _select_mcuboot_state_evaluator_points(
+    *,
+    repo_root: Path,
+    profile: ProfileConfig,
+    evaluation_mode: str,
+    fault_points: List[int],
+    fault_types_list: Optional[List[str]],
+    trace_file: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if str(evaluation_mode) != "execute":
+        return None
+    if not _looks_like_mcuboot_profile(profile):
+        return None
+    if not trace_file or not os.path.exists(trace_file):
+        return None
+    if getattr(profile, "has_update_sequence", False):
+        return None
+    if "exec" not in profile.memory.slots or "staging" not in profile.memory.slots:
+        return None
+
+    evaluator = _load_mcuboot_state_evaluator(repo_root)
+    slot_config = _build_mcuboot_state_slot_config(profile, repo_root)
+    write_entries = load_clean_write_trace(trace_file)
+    if not write_entries:
+        return None
+
+    target_addr_by_fault_at: Dict[int, int] = {}
+    for entry in write_entries:
+        target_addr_by_fault_at[int(entry["write_index"]) - 1] = (
+            int(slot_config["flash_base"]) + int(entry["flash_offset"])
+        )
+
+    evaluate_points: List[int] = []
+    execute_points: List[int] = []
+    execute_types: List[str] = []
+
+    for idx, fault_at in enumerate(fault_points):
+        fault_type = fault_types_list[idx] if fault_types_list and idx < len(fault_types_list) else "w"
+        base_fault_type = str(fault_type or "w").split(":", 1)[0]
+        fault_address = target_addr_by_fault_at.get(int(fault_at))
+        if base_fault_type == "w" and fault_address is not None and not evaluator.should_use_execute_mode(
+            fault_address,
+            slot_config,
+        ):
+            evaluate_points.append(int(fault_at))
+            continue
+        execute_points.append(int(fault_at))
+        execute_types.append(str(fault_type))
+
+    if not evaluate_points:
+        return None
+
+    return {
+        "module": evaluator,
+        "slot_config": slot_config,
+        "evaluate_points": evaluate_points,
+        "execute_points": execute_points,
+        "execute_types": execute_types,
+        "write_entries": write_entries,
+    }
+
+
+def _run_mcuboot_state_evaluator_points(
+    *,
+    repo_root: Path,
+    profile: ProfileConfig,
+    trace_file: str,
+    erase_trace_file: Optional[str],
+    selection: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    base_flash = _build_mcuboot_initial_flash(profile, repo_root, selection["slot_config"])
+    cursor = _MCUbootTraceCursor(
+        base_flash,
+        flash_base=int(selection["slot_config"]["flash_base"]),
+        write_entries=selection["write_entries"],
+        erase_entries=load_clean_erase_trace(erase_trace_file),
+        page_size=int(selection["slot_config"].get("page_size", 4096)),
+        erase_fill=int(selection["slot_config"].get("pad_byte", 0xFF)),
+    )
+    evaluator = selection["module"]
+    results: List[Dict[str, Any]] = []
+    for fault_at in sorted(selection["evaluate_points"]):
+        committed_writes = cursor.advance_to_fault_point(fault_at)
+        prediction = evaluator.predict_boot_outcome(cursor.flash, selection["slot_config"])
+        signals = dict(prediction.get("signals", {}) or {})
+        signals["state_evaluator_used"] = True
+        result: Dict[str, Any] = {
+            "fault_at": int(fault_at),
+            "fault_requested": int(fault_at),
+            "fault_type": "w",
+            "fault_injected": True,
+            "fault_address": _fmt_u32(cursor.target_fault_address(fault_at) or 0),
+            "boot_outcome": prediction.get("boot_outcome", "unknown"),
+            "boot_slot": prediction.get("boot_slot"),
+            "actual_writes": int(committed_writes),
+            "signals": signals,
+        }
+        results.append(result)
+    return results
 
 
 def _run_batch_worker(
@@ -538,92 +985,53 @@ def run_runtime_sweep(
         profile,
         enabled=not no_hash_bypass,
     )
-
-    # Full execute-mode without trace replay is memory-heavy in long single
-    # Renode sessions.  Late fault points (high fp value) are much more
-    # expensive than early ones because Phase 1 must emulate up to fp writes.
-    # Use a time-budget approach: pack variable-sized batches so each Renode
-    # session completes within ~180s.  Early cheap points get packed densely
-    # (up to 64/batch), late expensive points get packed sparsely (down to 1).
-    # Check if any fault types in this sweep require full execute mode.
-    # Bit-corruption, erase faults etc. always need execute even when trace
-    # files exist (trace files are used for power-loss points only).
-    _has_execute_only_points = fault_types_list and any(
-        ft in ('b', 'e', 'a', 's', 'g', 'x', 'r', 'd', 'l', 'k') for ft in fault_types_list
+    hybrid_eval_results: List[Dict[str, Any]] = []
+    hybrid_selection = _select_mcuboot_state_evaluator_points(
+        repo_root=repo_root,
+        profile=profile,
+        evaluation_mode=evaluation_mode,
+        fault_points=fault_points,
+        fault_types_list=fault_types_list,
+        trace_file=trace_file,
     )
-    if (
-        max_batch_points <= 0
-        and evaluation_mode == "execute"
-        and (_has_execute_only_points or (not trace_file and not trace_file_bin))
-        and fault_points
-    ):
-        _BATCH_TIME_BUDGET_S = 180.0
-        _BASE_COST_S = 2.0     # overhead per point (setup + Phase 2)
-        _PER_WRITE_COST_S = 0.012  # Phase 1 emulation scales with fp value
-        _MAX_PER_BATCH = 64    # cap for memory safety
-        _UPDATE_SEQUENCE_BATCH_OVERHEAD_S = (
-            12.0 if getattr(profile, "has_update_sequence", False) else 0.0
+    execute_fault_points = list(fault_points)
+    execute_fault_types_list = list(fault_types_list) if fault_types_list is not None else None
+    if hybrid_selection is not None:
+        hybrid_eval_results = _run_mcuboot_state_evaluator_points(
+            repo_root=repo_root,
+            profile=profile,
+            trace_file=str(trace_file),
+            erase_trace_file=erase_trace_file,
+            selection=hybrid_selection,
         )
-        _POINT_BUDGET_S = max(30.0, _BATCH_TIME_BUDGET_S - _UPDATE_SEQUENCE_BATCH_OVERHEAD_S)
-
-        # Compute variable-sized chunk boundaries.
-        # Fault types where fp is a sequential write index (cost scales with fp).
-        # All others (instruction_skip, read_bit_flip, OTP, I2C) use memory
-        # addresses or absolute values — flat cost to avoid overflow.
-        _SEQUENTIAL_FAULTS = {"w", "b", "e", "a", "s", "g", "x", "d", "l", "r", "k"}
-
-        def _point_cost(idx: int, fp: int) -> float:
-            ft = fault_types_list[idx] if fault_types_list and idx < len(fault_types_list) else None
-            if ft is None or ft in _SEQUENTIAL_FAULTS:
-                return _BASE_COST_S + abs(fp) * _PER_WRITE_COST_S
-            return 5.0
-
-        _exe_chunk_boundaries: List[int] = [0]
-        _budget_used = 0.0
-        for i, fp in enumerate(fault_points):
-            cost = _point_cost(i, fp)
-            _budget_used += cost
-            pts_in_chunk = i - _exe_chunk_boundaries[-1] + 1
-            if _budget_used > _POINT_BUDGET_S or pts_in_chunk >= _MAX_PER_BATCH:
-                _exe_chunk_boundaries.append(i)
-                _budget_used = cost
-        _n_chunks = len(_exe_chunk_boundaries)
-        # Derive a representative max_batch_points for the chunking below.
-        # The actual chunk sizes vary, but the downstream chunker uses this
-        # as a uniform cap — set it to the median chunk size so most chunks
-        # are processed in one go, and the few oversized ones get one split.
-        _chunk_sizes = []
-        for j in range(len(_exe_chunk_boundaries)):
-            start = _exe_chunk_boundaries[j]
-            end = _exe_chunk_boundaries[j + 1] if j + 1 < len(_exe_chunk_boundaries) else len(fault_points)
-            _chunk_sizes.append(end - start)
-        _chunk_sizes.sort()
-        max_batch_points = max(1, _chunk_sizes[len(_chunk_sizes) // 2])
-        # Clamp to [1, 64]
-        max_batch_points = max(1, min(_MAX_PER_BATCH, max_batch_points))
-        _total_est = (
-            sum(_point_cost(i, fp) for i, fp in enumerate(fault_points))
-            + _n_chunks * _UPDATE_SEQUENCE_BATCH_OVERHEAD_S
-        )
-        print(
-            "Execute mode without trace replay: ~{} batches, median {} pts/batch "
-            "({}s budget, {:.0f}s total est, {} points, max fp={}).".format(
-                _n_chunks, max_batch_points, int(_BATCH_TIME_BUDGET_S),
-                _total_est, len(fault_points),
-                max(fault_points) if fault_points else 0,
-            ),
-            file=sys.stderr,
+        execute_fault_points = list(hybrid_selection["execute_points"])
+        execute_fault_types_list = list(hybrid_selection["execute_types"])
+        _progress(
+            "MCUboot hybrid sweep: {} fast state-evaluator points, {} execute-mode points.".format(
+                len(hybrid_eval_results),
+                len(execute_fault_points),
+            )
         )
 
-    if fault_points and num_workers > 1:
+    max_batch_points = _auto_execute_batch_points(
+        profile=profile,
+        evaluation_mode=evaluation_mode,
+        fault_points=execute_fault_points,
+        fault_types_list=execute_fault_types_list,
+        max_batch_points=max_batch_points,
+        trace_file=trace_file,
+        trace_file_bin=trace_file_bin,
+    )
+
+    if execute_fault_points and num_workers > 1:
         # Interleave fault points across workers for load balancing.
         # High-index fault points take 10-100x longer (more Phase 2 emulation).
         # Round-robin interleaving gives each worker a mix of fast and slow points.
-        n = min(num_workers, len(fault_points))
-        chunks = [fault_points[i::n] for i in range(n)]
+        n = min(num_workers, len(execute_fault_points))
+        chunks = [execute_fault_points[i::n] for i in range(n)]
         ft_chunks: List[Optional[List[str]]] = []
-        if fault_types_list:
-            ft_chunks = [fault_types_list[i::n] for i in range(n)]
+        if execute_fault_types_list:
+            ft_chunks = [execute_fault_types_list[i::n] for i in range(n)]
         else:
             ft_chunks = [None] * len(chunks)
 
@@ -671,13 +1079,13 @@ def run_runtime_sweep(
                 except Exception as exc:
                     _progress("Worker {} FAILED: {}".format(wid, exc))
                     raise
-    elif fault_points:
+    elif execute_fault_points:
         batch_results = _run_batches_chunked(
             repo_root=repo_root,
             renode_test=renode_test,
             robot_suite=robot_suite,
             profile=profile,
-            fault_points=fault_points,
+            fault_points=execute_fault_points,
             robot_vars=fault_robot_vars,
             work_dir=work_dir,
             renode_remote_server_dir=renode_remote_server_dir,
@@ -685,7 +1093,7 @@ def run_runtime_sweep(
             erase_trace_file=erase_trace_file,
             trace_file_bin=trace_file_bin,
             erase_trace_file_bin=erase_trace_file_bin,
-            fault_types_list=fault_types_list,
+            fault_types_list=execute_fault_types_list,
             max_batch_points=max_batch_points,
             keep_run_artifacts=keep_run_artifacts,
         )
@@ -693,6 +1101,7 @@ def run_runtime_sweep(
         batch_results = []
 
     results: List[Dict[str, Any]] = []
+    results.extend(hybrid_eval_results)
     for data in batch_results:
         data["is_control"] = False
         results.append(data)
@@ -715,6 +1124,24 @@ def run_runtime_sweep(
         )
         data["is_control"] = True
         results.append(data)
+
+    if fault_types_list is not None:
+        original_order = {
+            (int(fp), str(ft)): idx
+            for idx, (fp, ft) in enumerate(zip(fault_points, fault_types_list))
+        }
+        sortable_results = results[:-1] if include_control else list(results)
+        sorted_fault_results = sorted(
+            sortable_results,
+            key=lambda item: original_order.get(
+                (int(item.get("fault_at", -1)), str(item.get("fault_type", "w"))),
+                len(original_order),
+            ),
+        )
+        if include_control:
+            results = sorted_fault_results + [results[-1]]
+        else:
+            results = sorted_fault_results
 
     return results
 

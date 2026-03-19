@@ -165,6 +165,10 @@ def build_fault_plan(
                 heuristic_kwargs["shard_index"] = hc.shard_index
             if hc.random_tail_budget > 0:
                 heuristic_kwargs["random_tail_budget"] = hc.random_tail_budget
+        if "target_points" not in heuristic_kwargs:
+            max_heuristic_points = getattr(profile.fault_sweep, "max_heuristic_points", 2000)
+            if max_heuristic_points is not None:
+                heuristic_kwargs["target_points"] = int(max_heuristic_points)
         classification = classify_trace(
             trace=trace,
             slot_ranges=slot_ranges_for_heuristic,
