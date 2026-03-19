@@ -1,10 +1,10 @@
 schema_version: 1
 name: mcuboot_head_move_stm32f4_revert_driver_error
 description: >
-  ISSUE A PROOF: MCUboot HEAD swap-move revert on nucleo_f429zi with
-  driver_error fault type. STM32F4 flash controller sets PGPERR in SR,
-  Zephyr driver reads SR and returns -EIO, MCUboot's compiled-out
-  assert(rc==0) ignores it, execution continues with torn trailer.
+  Retroactive validation negative control for the old STM32F4 driver_error
+  hypothesis on MCUboot HEAD swap-move revert. This profile remains useful
+  for exercising the driver-error path, but self-test should only pass if
+  no reportable issue survives the validator.
 
 platform: platforms/stm32f4_fast.repl
 flash_backend: faultFlash
@@ -42,4 +42,4 @@ fault_sweep:
   max_step_limit: 400000000
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 expect:
-  should_find_issues: true
+  should_find_issues: false

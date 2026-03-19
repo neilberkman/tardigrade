@@ -1,10 +1,10 @@
 schema_version: 1
 name: mcuboot_head_move_nrf52_seccounter_downgrade_rc_injection
 description: >
-  SECCOUNTER DOWNGRADE TEST: v2 (counter=2) in exec, v1 (counter=1) in staging.
-  MCUboot should reject the downgrade. rc_injection tests whether faulting
-  the security counter check allows the downgrade to proceed.
-  If wrong_image: the counter check was bypassed by the fault.
+  Retroactive validation negative control for the nRF52 security-counter
+  downgrade scenario. rc_injection is kept here as a skeptic-stage check:
+  the downgrade should still be rejected, and no reportable issue should
+  survive validation.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -38,4 +38,4 @@ fault_sweep:
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 expect:
   control_outcome: success
-  should_find_issues: true
+  should_find_issues: false

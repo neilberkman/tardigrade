@@ -6,6 +6,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -26,6 +27,24 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertNotIn("nuttx_nxboot_128.yaml", discovered)
         self.assertNotIn("security_toctou_no_protection.yaml", discovered)
         self.assertNotIn("security_toctou_with_protection.yaml", discovered)
+
+    def test_retroactive_negative_controls_expect_no_issues(self):
+        negative_controls = [
+            "mcuboot_head_move_nrf52_revert_rc_injection.yaml",
+            "mcuboot_head_move_nrf52_revert_rc_injection_multiboot.yaml",
+            "mcuboot_head_move_nrf52_revert_write_faults.yaml",
+            "mcuboot_head_move_nrf52_revert_write_faults_nohashbypass.yaml",
+            "mcuboot_head_move_nrf52_seccounter_downgrade_rc_injection.yaml",
+            "mcuboot_head_move_stm32f4_revert_driver_error.yaml",
+            "mcuboot_head_offset_nrf52_revert_rc_injection_multiboot.yaml",
+            "mcuboot_head_scratch_nrf52_revert_rc_injection_multiboot.yaml",
+            "mcuboot_pr2109_scratch_fixed_silent.yaml",
+        ]
+        for relpath in negative_controls:
+            with self.subTest(profile=relpath):
+                raw = yaml.safe_load((ROOT / "profiles" / relpath).read_text(encoding="utf-8"))
+                expect = raw.get("expect", {}) or {}
+                self.assertFalse(expect.get("should_find_issues", False), relpath)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,10 @@
 schema_version: 1
 name: mcuboot_head_move_nrf52_revert_rc_injection_multiboot
 description: >
-  ISSUE A MULTI-BOOT PROOF: rc_injection on boot 1, then clean reboot.
-  Boot 1: MCUboot ignores -EIO from flash_area_write (assert compiled out),
-  completes swap, boots correct image. But trailer state is corrupted.
-  Boot 2: MCUboot reboots, reads corrupted trailer, makes wrong decision.
-  If boot 2 produces wrong_image, the assert bug causes real harm.
+  Retroactive validation negative control for the old "Issue A" multi-boot
+  hypothesis on MCUboot HEAD swap-move revert. rc_injection is replayed
+  across two boots, but the validator should only count a finding if the
+  bad state survives into a real steady-state failure.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -42,4 +41,4 @@ fault_sweep:
   boot_cycles: 2
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 expect:
-  should_find_issues: true
+  should_find_issues: false

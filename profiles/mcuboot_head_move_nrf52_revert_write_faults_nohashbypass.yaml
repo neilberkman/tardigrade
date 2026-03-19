@@ -1,11 +1,10 @@
 schema_version: 1
 name: mcuboot_head_move_nrf52_revert_write_faults_nohashbypass
 description: >
-  MCUboot HEAD swap-move revert on nrf52840dk.
-  WRITE-CLASS faults WITHOUT hash bypass — full SHA-256 validation
-  enabled in emulation. Tests whether MCUboot's image hash check
-  catches corrupted data-copy writes (it should), while trailer
-  writes still produce wrong_image (hash can't help there).
+  Retroactive validation negative control for the MCUboot HEAD swap-move
+  revert write-fault hypothesis without hash bypass. Full SHA-256
+  validation stays enabled, and the validator should reject any candidate
+  that does not survive as a reportable end-to-end failure.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -41,4 +40,4 @@ fault_sweep:
   max_step_limit: 200000000
   # NO hash bypass — full SHA-256 validation in emulation
 expect:
-  should_find_issues: true
+  should_find_issues: false

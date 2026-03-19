@@ -4,7 +4,9 @@ description: >
   MCUboot swap-scratch AFTER header reload fix (PR #2109, commit c50b332b).
   Fix passes NULL boot_status to boot_read_image_headers() after completed
   swap resume, so headers are read from actual slot locations. Different-
-  sized images no longer cause unwanted revert.
+  sized images no longer cause unwanted revert. Silent write failures here
+  are a negative control for the fixed build and should not produce
+  reportable issues.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -47,5 +49,4 @@ fault_sweep:
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 
 expect:
-  should_find_issues: true
-  allow_semantic_only_issues: true
+  should_find_issues: false
