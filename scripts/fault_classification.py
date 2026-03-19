@@ -12,6 +12,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Multi-boot statuses that represent a successful final state.
 _MULTI_BOOT_SUCCESS_STATUSES = frozenset({"converged", "rollback_converged"})
+_NON_REPORTABLE_VALIDATION_DISPOSITIONS = frozenset(
+    {
+        "harness_artifact",
+        "self_healed",
+        "defense_in_depth",
+        "low_confidence",
+        "model_specific_candidate",
+        "needs_mechanism_confirmation",
+    }
+)
+_NON_REPORTABLE_VALIDATION_STAGES = frozenset({"candidate", "dismissed"})
 
 
 def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
@@ -50,6 +61,46 @@ def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     return (final_outcome, final_slot)
 
 
+def finding_validation_disposition(result: Dict[str, Any]) -> Optional[str]:
+    validation = result.get("finding_validation")
+    if not isinstance(validation, dict):
+        return None
+    raw = validation.get("disposition")
+    if raw is None:
+        return None
+    return str(raw).strip().lower() or None
+
+
+def finding_validation_stage(result: Dict[str, Any]) -> Optional[str]:
+    raw = result.get("finding_stage")
+    if raw is None:
+        validation = result.get("finding_validation")
+        if isinstance(validation, dict):
+            raw = validation.get("stage")
+    if raw is None:
+        return None
+    return str(raw).strip().lower() or None
+
+
+def finding_glitch_realism(result: Dict[str, Any]) -> Optional[str]:
+    raw = result.get("glitch_realism")
+    if raw is None:
+        validation = result.get("finding_validation")
+        if isinstance(validation, dict):
+            raw = validation.get("glitch_realism")
+    if raw is None:
+        return None
+    return str(raw).strip().lower() or None
+
+
+def result_is_invalidated_finding(result: Dict[str, Any]) -> bool:
+    stage = finding_validation_stage(result)
+    if stage in _NON_REPORTABLE_VALIDATION_STAGES:
+        return True
+    disposition = finding_validation_disposition(result)
+    return disposition in _NON_REPORTABLE_VALIDATION_DISPOSITIONS
+
+
 def is_resilient_rollback(result: Dict[str, Any]) -> bool:
     """Return True when the result represents a correct rollback after fault injection.
 
@@ -75,6 +126,8 @@ def is_resilient_rollback(result: Dict[str, Any]) -> bool:
 
 def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[str]:
     reasons: List[str] = []
+    if result_is_invalidated_finding(result):
+        return reasons
     eff_outcome, _ = _effective_boot_result(result)
     # bus_fault is safe denial-of-service (HardFault on real silicon) — not
     # a security finding.  The bootloader crashed before reaching
@@ -111,6 +164,8 @@ def result_is_timeout(result: Dict[str, Any]) -> bool:
 
 
 def result_is_brick(result: Dict[str, Any]) -> bool:
+    if result_is_invalidated_finding(result):
+        return False
     eff_outcome, _ = _effective_boot_result(result)
     outcome = str(eff_outcome or "unknown").strip().lower()
     # "timeout" is NOT a brick — the bootloader was still working when
@@ -132,6 +187,23 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
     raw = str(result.get("fault_class", "") or "").strip().lower()
     if raw:
         return raw
+
+    disposition = finding_validation_disposition(result)
+    stage = finding_validation_stage(result)
+    if stage == "candidate":
+        return "candidate"
+    if disposition == "harness_artifact":
+        return "harness_artifact"
+    if disposition == "self_healed":
+        return "self_healed"
+    if disposition == "defense_in_depth":
+        return "defense_in_depth"
+    if disposition == "low_confidence":
+        return "low_confidence"
+    if disposition == "model_specific_candidate":
+        return "candidate"
+    if disposition == "needs_mechanism_confirmation":
+        return "candidate"
 
     # NVS-specific classifications take precedence when present.
     config_outcome = result.get("config_outcome")

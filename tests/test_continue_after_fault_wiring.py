@@ -57,6 +57,15 @@ class TestContinueAfterFaultWiring(unittest.TestCase):
             source,
         )
 
+    def test_fault_result_records_post_boot_word_change_signal(self) -> None:
+        source = RESC_PATH.read_text(encoding="utf-8")
+        self.assertIn("signals['fault_snapshot_word'] = fmt_u32(_snapshot_word)", source)
+        self.assertIn("signals['fault_final_word'] = fmt_u32(_final_word)", source)
+        self.assertIn(
+            "signals['fault_word_changed_post_boot'] = bool(_final_word != _snapshot_word)",
+            source,
+        )
+
 
 class TestPeripheralImmediateStopContract(unittest.TestCase):
     def test_interface_exposes_immediate_stop_property(self) -> None:

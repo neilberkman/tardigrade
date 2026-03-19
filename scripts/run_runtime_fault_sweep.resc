@@ -4135,7 +4135,70 @@ def ensure_command_fault_preflight():
 _instruction_skip_count = int(str(monitor.GetVariable('instruction_skip_count')).strip() or '1')
 
 
-def run_instruction_skip_fault(skip_addr, skip_count=None):
+def invert_thumb_branch_halfword(halfword):
+    halfword = int(halfword) & 0xFFFF
+    # 16-bit B<cond> T1: 1101 cond imm8, cond 0..13 only.
+    if (halfword & 0xF000) == 0xD000:
+        cond = (halfword >> 8) & 0xF
+        if cond < 0xE:
+            return halfword ^ 0x0100
+        return None
+    # 16-bit CBZ/CBNZ T1.
+    if (halfword & 0xF500) == 0xB100:
+        return halfword ^ 0x0800
+    return None
+
+
+def patch_instruction_halfwords(skip_addr, skip_count, patch_model):
+    original_halfwords = []
+    patched_halfwords = []
+    model = str(patch_model or 'nop').strip().lower() or 'nop'
+    if model not in ('nop', 'branch_invert'):
+        return {
+            'supported': False,
+            'reason': 'unknown_patch_model',
+            'model': model,
+            'original_halfwords': original_halfwords,
+            'patched_halfwords': patched_halfwords,
+        }
+    if model == 'branch_invert' and int(skip_count) != 1:
+        return {
+            'supported': False,
+            'reason': 'branch_invert_requires_single_halfword',
+            'model': model,
+            'original_halfwords': original_halfwords,
+            'patched_halfwords': patched_halfwords,
+        }
+    for i in range(skip_count):
+        addr = skip_addr + i * 2
+        orig = int(bus.ReadWord(addr)) & 0xFFFF
+        if model == 'nop':
+            patched = 0xBF00
+        else:
+            patched = invert_thumb_branch_halfword(orig)
+            if patched is None:
+                return {
+                    'supported': False,
+                    'reason': 'branch_invert_not_supported_for_instruction',
+                    'model': model,
+                    'original_halfwords': original_halfwords + [orig],
+                    'patched_halfwords': patched_halfwords,
+                }
+        original_halfwords.append(orig)
+        patched_halfwords.append(int(patched) & 0xFFFF)
+    for i, patched in enumerate(patched_halfwords):
+        addr = skip_addr + i * 2
+        bus.WriteWord(addr, patched)
+    return {
+        'supported': True,
+        'reason': None,
+        'model': model,
+        'original_halfwords': original_halfwords,
+        'patched_halfwords': patched_halfwords,
+    }
+
+
+def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
     # Run a single instruction-skip fault: NOP the instruction(s) at
     # *skip_addr*, then boot the firmware and check recovery.
     #
@@ -4156,16 +4219,32 @@ def run_instruction_skip_fault(skip_addr, skip_count=None):
     reset_nvmc_for_sweep()
     disarm_fault()
 
-    # Patch: replace skip_count consecutive halfwords with Thumb NOP (0xBF00).
-    # Save original values so we can report them.
-    original_halfwords = []
-    for i in range(skip_count):
-        addr = skip_addr + i * 2
-        orig = int(bus.ReadWord(addr)) & 0xFFFF
-        original_halfwords.append(orig)
-        bus.WriteWord(addr, 0xBF00)
-    log('fp=0x{:X} type=i patched {} halfword(s) at 0x{:08X}'.format(
-        skip_addr, skip_count, skip_addr & 0xFFFFFFFF))
+    patch_meta = patch_instruction_halfwords(skip_addr, skip_count, patch_model)
+    original_halfwords = patch_meta.get('original_halfwords', [])
+    patched_halfwords = patch_meta.get('patched_halfwords', [])
+    if not patch_meta.get('supported'):
+        return {
+            'fault_at': skip_addr,
+            'fault_requested': skip_addr,
+            'fault_type': 'i:0x{:X}:{}'.format(skip_addr & 0xFFFFFFFF, patch_meta.get('model') or patch_model),
+            'fault_injected': False,
+            'fault_address': '0x{:08X}'.format(skip_addr & 0xFFFFFFFF),
+            'boot_outcome': 'skipped',
+            'boot_slot': None,
+            'fault_class': 'skipped',
+            'skip_reason': patch_meta.get('reason') or 'instruction_patch_unsupported',
+            'signals': {
+                'trace_replay_mode': 'execute',
+                'skip_address': '0x{:08X}'.format(skip_addr & 0xFFFFFFFF),
+                'skip_count': skip_count,
+                'instruction_patch_model': patch_meta.get('model') or str(patch_model or 'nop'),
+                'instruction_patch_supported': False,
+                'instruction_patch_reason': patch_meta.get('reason') or 'instruction_patch_unsupported',
+                'original_halfwords': ['0x{:04X}'.format(h) for h in original_halfwords],
+            },
+        }
+    log('fp=0x{:X} type=i model={} patched {} halfword(s) at 0x{:08X}'.format(
+        skip_addr, patch_meta.get('model'), skip_count, skip_addr & 0xFFFFFFFF))
 
     arm_vtor_watchpoint()
     p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
@@ -4241,7 +4320,10 @@ def run_instruction_skip_fault(skip_addr, skip_count=None):
     signals['trace_replay_mode'] = 'execute'
     signals['skip_address'] = '0x{:08X}'.format(skip_addr & 0xFFFFFFFF)
     signals['skip_count'] = skip_count
+    signals['instruction_patch_model'] = patch_meta.get('model') or str(patch_model or 'nop')
+    signals['instruction_patch_supported'] = True
     signals['original_halfwords'] = ['0x{:04X}'.format(h) for h in original_halfwords]
+    signals['patched_halfwords'] = ['0x{:04X}'.format(h) for h in patched_halfwords]
     if phase1_status is not None:
         signals['phase1_stop_reason'] = phase1_status.get('reason')
         signals['phase1_emulated_s'] = phase1_status.get('emulated_s')
@@ -4555,6 +4637,27 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         'fault_injected': bool(fault_injected),
         'stage': 'post_boot',
     })
+
+    _fault_addr_int = None
+    if isinstance(fault_address, int):
+        _fault_addr_int = int(fault_address)
+    elif isinstance(fault_address, str):
+        try:
+            _fault_addr_int = int(fault_address, 0)
+        except Exception:
+            _fault_addr_int = None
+    if fault_snapshot_bytes is not None and _fault_addr_int is not None:
+        try:
+            _flash_base_addr, _flash_size = flash_geometry()
+            _fault_off = _fault_addr_int - _flash_base_addr
+            if 0 <= _fault_off <= len(fault_snapshot_bytes) - 4:
+                _snapshot_word = struct.unpack_from('<I', fault_snapshot_bytes, _fault_off)[0]
+                _final_word = as_int(bus.ReadDoubleWord(_fault_addr_int))
+                signals['fault_snapshot_word'] = fmt_u32(_snapshot_word)
+                signals['fault_final_word'] = fmt_u32(_final_word)
+                signals['fault_word_changed_post_boot'] = bool(_final_word != _snapshot_word)
+        except Exception:
+            pass
 
     result = {
         'fault_at': fault_at,
@@ -6323,7 +6426,8 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
 
     if ft.startswith('i:'):
         skip_addr = int(ft.split(':')[1], 0)
-        return run_instruction_skip_fault(skip_addr)
+        patch_model = parts[2] if len(parts) > 2 else 'nop'
+        return run_instruction_skip_fault(skip_addr, patch_model=patch_model)
 
     if ft.startswith('c:'):
         parts = ft.split(':')

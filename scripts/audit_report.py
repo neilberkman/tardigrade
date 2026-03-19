@@ -14,6 +14,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from fault_classification import (
     _effective_boot_result,
     classify_failure_class,
+    finding_glitch_realism,
+    finding_validation_stage,
+    finding_validation_disposition,
     is_resilient_rollback,
     result_has_issues,
     result_is_brick,
@@ -171,6 +174,24 @@ def categorize_failure(
     window = result.get("fault_window")
     if isinstance(window, dict):
         payload["fault_window"] = window
+    validation = result.get("finding_validation")
+    if isinstance(validation, dict):
+        payload["finding_validation"] = validation
+    finding_stage = finding_validation_stage(result)
+    if finding_stage is not None:
+        payload["finding_stage"] = finding_stage
+    if result.get("glitch_models") is not None:
+        payload["glitch_models"] = result.get("glitch_models")
+    realism = finding_glitch_realism(result)
+    if realism is not None:
+        payload["glitch_realism"] = realism
+    if isinstance(validation, dict):
+        if validation.get("negative_evidence"):
+            payload["negative_evidence"] = validation.get("negative_evidence")
+        if validation.get("counterfactuals"):
+            payload["counterfactuals"] = validation.get("counterfactuals")
+        if validation.get("skeptical_summary"):
+            payload["skeptical_summary"] = validation.get("skeptical_summary")
     return payload
 
 
@@ -223,10 +244,28 @@ def summarize_runtime_sweep(
     fault_type_counts: Dict[str, int] = {}
     fault_type_issue_counts: Dict[str, int] = {}
     fault_type_brick_counts: Dict[str, int] = {}
+    validation_dispositions: Dict[str, int] = {}
+    validation_stages: Dict[str, int] = {}
+    glitch_realism_counts: Dict[str, int] = {}
     categorized_failures: List[Dict[str, Any]] = []
     for r in injected:
         ft_name = _fault_type_label(r.get("fault_type"))
         fault_type_counts[ft_name] = fault_type_counts.get(ft_name, 0) + 1
+        validation_stage = finding_validation_stage(r)
+        if validation_stage:
+            validation_stages[validation_stage] = (
+                validation_stages.get(validation_stage, 0) + 1
+            )
+        validation_disposition = finding_validation_disposition(r)
+        if validation_disposition:
+            validation_dispositions[validation_disposition] = (
+                validation_dispositions.get(validation_disposition, 0) + 1
+            )
+        glitch_realism = finding_glitch_realism(r)
+        if glitch_realism:
+            glitch_realism_counts[glitch_realism] = (
+                glitch_realism_counts.get(glitch_realism, 0) + 1
+            )
         if result_is_brick(r):
             fault_type_brick_counts[ft_name] = fault_type_brick_counts.get(ft_name, 0) + 1
         if result_has_issues(r, expected_outcome):
@@ -295,6 +334,15 @@ def summarize_runtime_sweep(
         summary["hook_skip_reasons"] = hook_skip_reason_counts
     if issue_reason_counts:
         summary["issue_reasons"] = issue_reason_counts
+    if validation_dispositions:
+        summary["validation_dispositions"] = validation_dispositions
+    if validation_stages:
+        summary["finding_stages"] = validation_stages
+        summary["validated_findings"] = validation_stages.get("validated", 0)
+        summary["candidate_findings"] = validation_stages.get("candidate", 0)
+        summary["dismissed_findings"] = validation_stages.get("dismissed", 0)
+    if glitch_realism_counts:
+        summary["glitch_realism"] = glitch_realism_counts
 
     if categorized_failures:
         summary["failures"] = categorized_failures

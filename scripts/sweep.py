@@ -84,6 +84,32 @@ def _with_sweep_hash_bypass(
     return filtered_vars
 
 
+def build_fault_robot_vars(
+    robot_vars: List[str],
+    profile: ProfileConfig,
+    *,
+    no_hash_bypass: bool = False,
+) -> List[str]:
+    """Return the robot vars for faulted runs, including sweep hash-bypass."""
+    return _with_sweep_hash_bypass(
+        robot_vars,
+        profile,
+        enabled=not no_hash_bypass,
+    )
+
+
+def build_control_robot_vars(
+    robot_vars: List[str],
+    profile: ProfileConfig,
+) -> List[str]:
+    """Return the robot vars for clean/control runs with sweep hash-bypass disabled."""
+    return _with_sweep_hash_bypass(
+        robot_vars,
+        profile,
+        enabled=False,
+    )
+
+
 def _fmt_u32(value: int) -> str:
     return "0x{0:08X}".format(int(value) & 0xFFFFFFFF)
 
@@ -976,15 +1002,11 @@ def run_runtime_sweep(
 
     fault_types_list: parallel list of per-point fault type codes.
     """
-    control_robot_vars = _with_sweep_hash_bypass(
+    control_robot_vars = build_control_robot_vars(robot_vars, profile)
+    fault_robot_vars = build_fault_robot_vars(
         robot_vars,
         profile,
-        enabled=False,
-    )
-    fault_robot_vars = _with_sweep_hash_bypass(
-        robot_vars,
-        profile,
-        enabled=not no_hash_bypass,
+        no_hash_bypass=no_hash_bypass,
     )
     hybrid_eval_results: List[Dict[str, Any]] = []
     hybrid_selection = None

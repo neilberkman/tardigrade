@@ -67,6 +67,7 @@ from renode_runner import (
 )
 from fault_plan import CalibrationInputs, FaultPlan, build_fault_plan
 from fault_types import EXECUTE_ONLY_FAULT_TYPES
+from finding_validator import validate_runtime_findings
 from sweep import (
     MultiFaultPhaseResult,
     evaluate_config_checks,
@@ -894,6 +895,19 @@ def main() -> int:
         )
 
         annotate_result_checks(sweep_results, profile)
+        validate_runtime_findings(
+            results=sweep_results,
+            profile=profile,
+            repo_root=repo_root,
+            renode_test=renode_test,
+            robot_suite=robot_suite,
+            robot_vars=robot_vars,
+            work_dir=work_dir,
+            renode_remote_server_dir=args.renode_remote_server_dir,
+            no_hash_bypass=args.no_hash_bypass,
+            keep_run_artifacts=args.keep_run_artifacts,
+            expected_outcome=getattr(profile.expect, "control_outcome", "success") or "success",
+        )
         sweep_summary = summarize_runtime_sweep(
             sweep_results, total_writes=max_writes, profile=profile
         )
