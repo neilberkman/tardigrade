@@ -91,12 +91,9 @@ build_seccounter_assets() {
             -DDTC_OVERLAY_FILE="${boot_overlay}" \
             -DCONFIG_BOOT_SWAP_USING_MOVE=y \
             -DCONFIG_BOOT_PREFER_SWAP_MOVE=y \
-            -DCONFIG_BOOT_PREFER_SWAP_OFFSET=n \
             -DCONFIG_BOOT_SIGNATURE_TYPE_NONE=y \
             -DCONFIG_BOOT_SIGNATURE_TYPE_RSA=n \
-            -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
             -DCONFIG_BOOT_MAX_IMG_SECTORS=1024 \
-            -DCONFIG_BOOTLOADER_SRAM_SIZE=64 \
             -DCONFIG_MCUBOOT_HW_DOWNGRADE_PREVENTION=y \
             "-DCMAKE_GDB:FILEPATH=${gdb_bin}" \
             "-DPython3_EXECUTABLE:FILEPATH=${PYTHON_BIN}"
