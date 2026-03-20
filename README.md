@@ -18,29 +18,6 @@ Tardigrade's fault sweep against the upstream [NuttX nxboot bootloader](https://
 
 The FTL `O_DIRECT` bug affects all NuttX applications that write to MTD partitions expecting direct access, not just nxboot.
 
-### MCUboot -- resilience validation
-
-Extensive fault-injection sweeps across MCUboot HEAD (swap-move, swap-scratch, swap-offset) on nRF52840 and STM32F4 confirm that MCUboot's swap algorithms are resilient to both power-loss and write-class faults. Over 5,000 fault points tested including multi-boot cycles, phase-2 recovery faults, and return-code injection (`rc_injection` fault type forcing `flash_area_write` to return `-EIO`). MCUboot's write ordering in `fixup_revert()` self-heals corrupted trailer metadata through subsequent writes.
-
-| Sweep                                          | Points | Result      |
-| ---------------------------------------------- | ------ | ----------- |
-| swap-move revert, rc_injection + 2 boot cycles | 1057   | all success |
-| swap-move revert, 4 write-class fault types    | 4224   | all success |
-| swap-move upgrade, extended                    | 736    | all success |
-| swap-offset rc_injection, multiboot            | 579    | all success |
-| swap-scratch rc_injection, multiboot           | 579    | all success |
-| instruction_skip (voltage glitch model)        | 184    | all success |
-| phase2fault (double fault during recovery)     | 2111   | all success |
-| multifault (two sequential faults)             | 984    | all success |
-
-### wolfBoot -- resilience validation
-
-Six fault-injection campaigns against wolfBoot (swap, state, finalize phases with power-loss and partial-erase faults). All campaigns pass -- 0 bricks across all tested fault points.
-
-### ESP-IDF OTA -- resilience validation
-
-Instruction-skip fault injection against ESP-IDF's OTA state machine (otadata CRC check, slot selection, state write). 90 fault points, all pass.
-
 ### MCUboot -- retroactive validation
 
 These are retroactive tests against known MCUboot bugs, not discoveries. The point is showing that tardigrade's generic sweep catches real bug classes without target-specific tuning:
