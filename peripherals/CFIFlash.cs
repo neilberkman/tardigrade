@@ -49,6 +49,7 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
         public int FaultAtPageErase { get; set; } = -1;
         public int WriteFaultMode { get; set; } = 0;
         public bool WriteTraceEnabled { get; set; }
+        public bool DebugTrace { get; set; }
         public bool EraseTraceEnabled { get; set; }
         public int CorruptionSeed { get; set; }
         public bool FaultEverFired { get; set; }
@@ -85,13 +86,25 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             }
             if (mode == FlashMode.ReadStatus)
             {
-                return 0x80; // Ready
+                if (DebugTrace)
+                    this.Log(LogLevel.Warning, "CFIFlash: READ_STATUS off=0x{0:X} => 0x80", offset);
+                return 0x80;
+            }
+            if (mode == FlashMode.ReadID)
+            {
+                uint idVal = ReadIDWord(offset);
+                if (DebugTrace)
+                    this.Log(LogLevel.Warning, "CFIFlash: READ_ID off=0x{0:X} => 0x{1:X8}", offset, idVal);
+                return idVal;
             }
             // Normal read from flash
             if (offset >= 0 && offset + 3 < size)
             {
-                return (uint)(flash[offset] | (flash[offset + 1] << 8) |
+                uint val = (uint)(flash[offset] | (flash[offset + 1] << 8) |
                               (flash[offset + 2] << 16) | (flash[offset + 3] << 24));
+                if (DebugTrace && offset >= 0x400000 && offset < 0x500000)
+                    this.Log(LogLevel.Warning, "CFIFlash: READ off=0x{0:X} => 0x{1:X8} mode={2}", offset, val, mode);
+                return val;
             }
             return 0xFFFFFFFF;
         }
@@ -110,7 +123,16 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             }
             if (mode == FlashMode.ReadStatus)
             {
+                if (DebugTrace)
+                    this.Log(LogLevel.Warning, "CFIFlash: READBYTE_STATUS off=0x{0:X} => 0x80", offset);
                 return 0x80;
+            }
+            if (mode == FlashMode.ReadID)
+            {
+                byte idVal = (byte)(ReadIDWord(offset) & 0xFF);
+                if (DebugTrace)
+                    this.Log(LogLevel.Warning, "CFIFlash: READBYTE_ID off=0x{0:X} => 0x{1:X2}", offset, idVal);
+                return idVal;
             }
             if (offset >= 0 && offset < size)
                 return flash[offset];
@@ -131,7 +153,11 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             }
             if (mode == FlashMode.ReadStatus)
             {
-                return 0x80;
+                return 0x0080;
+            }
+            if (mode == FlashMode.ReadID)
+            {
+                return (ushort)(ReadIDWord(offset) & 0xFFFF);
             }
             if (offset >= 0 && offset + 1 < size)
             {
@@ -183,6 +209,22 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
         // --- Command handling ---
         private void HandleCommand(long offset, uint value)
         {
+            if (DebugTrace)
+            {
+                this.Log(LogLevel.Warning, "CFIFlash: WRITE off=0x{0:X} val=0x{1:X8} mode={2}", offset, value, mode);
+            }
+
+            // In WordProgram mode, the next write is DATA, not a command.
+            // Must handle before the command switch or data bytes that
+            // coincidentally match command codes (0xFF, 0x40, 0x20, etc.)
+            // get misinterpreted as commands.
+            if (mode == FlashMode.WordProgram)
+            {
+                ProgramWord(offset, value);
+                mode = FlashMode.ReadStatus;
+                return;
+            }
+
             byte cmd = (byte)(value & 0xFF);
 
             switch (cmd)
@@ -195,6 +237,9 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
                     break;
                 case 0x70: // Read Status Register
                     mode = FlashMode.ReadStatus;
+                    break;
+                case 0x90: // Read ID / Block Lock Status
+                    mode = FlashMode.ReadID;
                     break;
                 case 0x50: // Clear Status Register
                     mode = FlashMode.ReadArray;
@@ -210,14 +255,6 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
                     if (mode == FlashMode.BlockEraseSetup)
                     {
                         EraseSector(offset);
-                        mode = FlashMode.ReadStatus;
-                    }
-                    break;
-                default:
-                    if (mode == FlashMode.WordProgram)
-                    {
-                        // Program the word (NOR flash: can only clear bits, 1->0)
-                        ProgramWord(offset, value);
                         mode = FlashMode.ReadStatus;
                     }
                     break;
@@ -282,6 +319,25 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             }
 
             totalErases++;
+        }
+
+        // --- Read ID / Block Lock Status ---
+        private uint ReadIDWord(long offset)
+        {
+            // Intel CFI Read ID mode (command 0x90)
+            // Byte offset within sector (portwidth=4):
+            //   0: Manufacturer ID (Intel = 0x0089)
+            //   4: Device ID
+            //   8: Block lock config (bit 0: 0=unlocked, 1=locked)
+            long localOffset = offset % sectorSize;
+            long wordIndex = localOffset / 4; // portwidth = 4
+            switch (wordIndex)
+            {
+                case 0: return 0x0089; // Manufacturer: Intel
+                case 1: return 0x0018; // Device ID
+                case 2: return 0x0000; // Block lock: UNLOCKED
+                default: return 0x0000;
+            }
         }
 
         // --- CFI Query Response ---
@@ -395,6 +451,7 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             ReadArray,
             CFIQuery,
             ReadStatus,
+            ReadID,
             WordProgram,
             BlockEraseSetup,
         }
