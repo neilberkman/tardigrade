@@ -71,7 +71,19 @@ def test_qemu_virt_armv7_wrapper_handles_optee_cp15_surface() -> None:
     assert "ReturnMemoryValue32AtRegisterAndJump" in text
     assert "LoadTranslatedMemoryValue32IntoRegisterAndJump" in text
     assert "LoadTranslatedMemoryValue8IntoRegisterAndJump" in text
+    assert "StoreRegister32ToTranslatedMemoryAndJump" in text
+    assert "StoreRegister32ToTranslatedMemoryWithRegisterOffsetAndJump" in text
     assert "CompleteCompatMemmoveFromRegistersIfMmuEnabled" in text
+    assert "ReturnTranslatedMemcpyOrContinue" in text
+    assert "ReturnTranslatedMemmoveOrContinue" in text
+    assert "ReturnTranslatedMemsetOrContinue" in text
+    assert "ReturnTranslatedMemchrOrContinue" in text
+    assert "ReturnTranslatedMemcmpOrContinue" in text
+    assert "ReturnTranslatedStrchrOrContinue" in text
+    assert "ReturnTranslatedStrlenOrContinue" in text
+    assert "ReturnTranslatedStrnlenOrContinue" in text
+    assert "ReturnTranslatedStrcmpOrContinue" in text
+    assert "ReturnTranslatedStrncmpOrContinue" in text
     assert "CompleteFdtOpenIntoHeaderFixupIfMmuEnabled" in text
     assert "ReturnCompatValue64" in text
     assert "ReturnFdt32LoadTranslatedOrContinue" in text
@@ -154,6 +166,21 @@ def test_optee_helper_loads_custom_a9_board() -> None:
     assert "configure_console_from_dt" in text
     assert "fdt_open_into" in text
     assert "fdt_move" in text
+    assert "memcpy" in text
+    assert "memmove" in text
+    assert "memset" in text
+    assert "memchr" in text
+    assert "memcmp" in text
+    assert "strchr" in text
+    assert "strlen" in text
+    assert "strnlen" in text
+    assert "strcmp" in text
+    assert "strncmp" in text
+    assert "fdt_packblocks_" in text
+    assert "fdt_splice_struct_" in text
+    assert "fdt_add_property_" in text
+    assert "fdt_add_subnode_namelen" in text
+    assert "fdt_cells" in text
     assert "fdt_next_tag" in text
     assert "fdt32_ld" in text
     assert "fdt64_ld" in text

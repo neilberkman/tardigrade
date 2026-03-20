@@ -40,6 +40,7 @@ class TestHeuristicConfigDefaults:
         assert hc.shard_count == 1
         assert hc.shard_index == 0
         assert hc.random_tail_budget == 0
+        assert hc.critical_regions == []
 
 
 class TestHeuristicConfigFullParse:
@@ -55,6 +56,7 @@ class TestHeuristicConfigFullParse:
             "shard_count": 4,
             "shard_index": 2,
             "random_tail_budget": 10,
+            "critical_regions": [{"start": "0x1200", "end": "0x1210"}],
         }
         hc = _parse_heuristic_config(raw)
         assert hc is not None
@@ -66,6 +68,7 @@ class TestHeuristicConfigFullParse:
         assert hc.shard_count == 4
         assert hc.shard_index == 2
         assert hc.random_tail_budget == 10
+        assert hc.critical_regions == [(0x1200, 0x1210)]
 
 
 class TestHeuristicConfigPartialParse:
@@ -84,6 +87,21 @@ class TestHeuristicConfigPartialParse:
         assert hc.shard_count == 1
         assert hc.shard_index == 0
         assert hc.random_tail_budget == 0
+        assert hc.critical_regions == []
+
+    def test_symbol_critical_region_resolves(self):
+        elf = (
+            Path(__file__).resolve().parent.parent
+            / "examples"
+            / "vulnerable_ota"
+            / "firmware.elf"
+        )
+        hc = _parse_heuristic_config(
+            {"critical_regions": [{"symbol": "Reset"}]},
+            bootloader_elf=str(elf),
+        )
+        assert hc is not None
+        assert hc.critical_regions == [(0x10000044, 0x100000F8)]
 
 
 class TestHeuristicConfigAbsent:
@@ -161,6 +179,7 @@ class TestHeuristicConfigToDict:
             "shard_count": 1,
             "shard_index": 0,
             "random_tail_budget": 0,
+            "critical_regions": [],
         }
 
     def test_to_dict_custom(self):
@@ -330,6 +349,7 @@ class TestClassifyTracePassthrough:
         assert "tier2_step" in params
         assert "tier3_step" in params
         assert "discontinuity_window" in params
+        assert "critical_regions" in params
 
 
 class TestMaxHeuristicPointsPlannerFallback:

@@ -17,6 +17,7 @@ _NON_REPORTABLE_VALIDATION_DISPOSITIONS = frozenset(
         "harness_artifact",
         "self_healed",
         "defense_in_depth",
+        "no_verification_bypass",
         "low_confidence",
         "model_specific_candidate",
         "needs_mechanism_confirmation",
@@ -197,6 +198,8 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
     if disposition == "self_healed":
         return "self_healed"
     if disposition == "defense_in_depth":
+        return "defense_in_depth"
+    if disposition == "no_verification_bypass":
         return "defense_in_depth"
     if disposition == "low_confidence":
         return "low_confidence"

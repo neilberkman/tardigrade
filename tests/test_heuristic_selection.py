@@ -230,6 +230,26 @@ class TestStructuralSignalPromotion:
         # page_a_end is at trace index 2, write_idx=3, fp=2 (page exit).
         assert 2 in result
 
+    def test_critical_regions_promoted_to_tier0(self):
+        """Explicit critical regions are always selected even under a tight cap."""
+        offsets = [
+            0x22000,
+            0x22004,
+            0x23000,
+        ]
+        trace = _make_trace(offsets)
+
+        result = classify_trace(
+            trace,
+            SLOT_RANGES,
+            page_size=PAGE,
+            critical_regions=[(0x22000, 0x22008)],
+            target_points=1,
+        )
+
+        assert 0 in result
+        assert 1 in result
+
 
 # ---------------------------------------------------------------------------
 # 4. Backward compatibility tests

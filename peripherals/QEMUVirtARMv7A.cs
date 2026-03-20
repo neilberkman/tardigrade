@@ -163,6 +163,42 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             SetCompatRegister32(programCounterRegisterIndex, targetPc);
         }
 
+        public void StoreRegister32ToTranslatedMemoryAndJump(int addressRegister, uint offset, int sourceRegister, uint targetPc)
+        {
+            if(!IsMmuEnabled())
+            {
+                return;
+            }
+
+            var address = GetCompatRegister32(addressRegister) + offset;
+            var translated = TranslateVirtualAddress(address);
+            if(translated == 0x1)
+            {
+                return;
+            }
+
+            machine.SystemBus.WriteDoubleWord(translated, GetCompatRegister32(sourceRegister), this);
+            SetCompatRegister32(programCounterRegisterIndex, targetPc);
+        }
+
+        public void StoreRegister32ToTranslatedMemoryWithRegisterOffsetAndJump(int addressRegister, int offsetRegister, uint immediateOffset, int sourceRegister, uint targetPc)
+        {
+            if(!IsMmuEnabled())
+            {
+                return;
+            }
+
+            var address = GetCompatRegister32(addressRegister) + GetCompatRegister32(offsetRegister) + immediateOffset;
+            var translated = TranslateVirtualAddress(address);
+            if(translated == 0x1)
+            {
+                return;
+            }
+
+            machine.SystemBus.WriteDoubleWord(translated, GetCompatRegister32(sourceRegister), this);
+            SetCompatRegister32(programCounterRegisterIndex, targetPc);
+        }
+
         public void CompleteCompatMemmoveFromRegistersIfMmuEnabled(int destinationRegister, int sourceRegister, int lengthRegister, uint targetPc)
         {
             if(!IsMmuEnabled())
@@ -194,6 +230,301 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             }
 
             SetCompatRegister32(programCounterRegisterIndex, targetPc);
+        }
+
+        public void ReturnTranslatedMemcpyOrContinue(int destinationRegister, int sourceRegister, int lengthRegister)
+        {
+            if(!IsMmuEnabled())
+            {
+                return;
+            }
+
+            var destination = GetCompatRegister32(destinationRegister);
+            var source = GetCompatRegister32(sourceRegister);
+            var translatedDestination = TranslateVirtualAddress(destination);
+            var translatedSource = TranslateVirtualAddress(source);
+            if(translatedDestination == 0x1 || translatedSource == 0x1)
+            {
+                return;
+            }
+
+            var length = GetCompatRegister32(lengthRegister);
+            for(var index = 0u; index < length; index++)
+            {
+                machine.SystemBus.WriteByte(
+                    translatedDestination + index,
+                    machine.SystemBus.ReadByte(translatedSource + index, this),
+                    this
+                );
+            }
+
+            ReturnCompatValue32(destination);
+        }
+
+        public void ReturnTranslatedMemmoveOrContinue(int destinationRegister, int sourceRegister, int lengthRegister)
+        {
+            if(!IsMmuEnabled())
+            {
+                return;
+            }
+
+            var destination = GetCompatRegister32(destinationRegister);
+            var source = GetCompatRegister32(sourceRegister);
+            var translatedDestination = TranslateVirtualAddress(destination);
+            var translatedSource = TranslateVirtualAddress(source);
+            if(translatedDestination == 0x1 || translatedSource == 0x1)
+            {
+                return;
+            }
+
+            var length = GetCompatRegister32(lengthRegister);
+            if(length != 0)
+            {
+                var buffer = new byte[length];
+                for(var index = 0u; index < length; index++)
+                {
+                    buffer[index] = machine.SystemBus.ReadByte(translatedSource + index, this);
+                }
+                for(var index = 0u; index < length; index++)
+                {
+                    machine.SystemBus.WriteByte(translatedDestination + index, buffer[index], this);
+                }
+            }
+
+            ReturnCompatValue32(destination);
+        }
+
+        public void ReturnTranslatedMemsetOrContinue(int destinationRegister, int valueRegister, int lengthRegister)
+        {
+            if(!IsMmuEnabled())
+            {
+                return;
+            }
+
+            var destination = GetCompatRegister32(destinationRegister);
+            var translatedDestination = TranslateVirtualAddress(destination);
+            if(translatedDestination == 0x1)
+            {
+                return;
+            }
+
+            var value = (byte)(GetCompatRegister32(valueRegister) & 0xFF);
+            var length = GetCompatRegister32(lengthRegister);
+            for(var index = 0u; index < length; index++)
+            {
+                machine.SystemBus.WriteByte(translatedDestination + index, value, this);
+            }
+
+            ReturnCompatValue32(destination);
+        }
+
+        public void ReturnTranslatedMemchrOrContinue(int bufferRegister, int valueRegister, int lengthRegister)
+        {
+            if(!IsMmuEnabled())
+            {
+                return;
+            }
+
+            var buffer = GetCompatRegister32(bufferRegister);
+            var translatedBuffer = TranslateVirtualAddress(buffer);
+            if(translatedBuffer == 0x1)
+            {
+                return;
+            }
+
+            var value = (byte)(GetCompatRegister32(valueRegister) & 0xFF);
+            var length = GetCompatRegister32(lengthRegister);
+            uint result = 0;
+
+            for(var index = 0u; index < length; index++)
+            {
+                if(machine.SystemBus.ReadByte(translatedBuffer + index, this) == value)
+                {
+                    result = buffer + index;
+                    break;
+                }
+            }
+
+            ReturnCompatValue32(result);
+        }
+
+        public void ReturnTranslatedMemcmpOrContinue(int leftRegister, int rightRegister, int lengthRegister)
+        {
+            if(!IsMmuEnabled())
+            {
+                return;
+            }
+
+            var left = GetCompatRegister32(leftRegister);
+            var right = GetCompatRegister32(rightRegister);
+            var translatedLeft = TranslateVirtualAddress(left);
+            var translatedRight = TranslateVirtualAddress(right);
+            if(translatedLeft == 0x1 || translatedRight == 0x1)
+            {
+                return;
+            }
+
+            var length = GetCompatRegister32(lengthRegister);
+            var result = 0;
+
+            for(var index = 0u; index < length; index++)
+            {
+                var leftByte = machine.SystemBus.ReadByte(translatedLeft + index, this);
+                var rightByte = machine.SystemBus.ReadByte(translatedRight + index, this);
+                if(leftByte == rightByte)
+                {
+                    continue;
+                }
+
+                result = leftByte - rightByte;
+                break;
+            }
+
+            ReturnCompatValue32(unchecked((uint)result));
+        }
+
+        public void ReturnTranslatedStrchrOrContinue(int bufferRegister, int valueRegister)
+        {
+            if(!IsMmuEnabled())
+            {
+                return;
+            }
+
+            var buffer = GetCompatRegister32(bufferRegister);
+            var translatedBuffer = TranslateVirtualAddress(buffer);
+            if(translatedBuffer == 0x1)
+            {
+                return;
+            }
+
+            var value = (byte)(GetCompatRegister32(valueRegister) & 0xFF);
+            uint offset = 0;
+            while(true)
+            {
+                var current = machine.SystemBus.ReadByte(translatedBuffer + offset, this);
+                if(current == value)
+                {
+                    ReturnCompatValue32(buffer + offset);
+                    return;
+                }
+
+                if(current == 0)
+                {
+                    ReturnCompatValue32(0);
+                    return;
+                }
+
+                offset++;
+            }
+        }
+
+        public void ReturnTranslatedStrlenOrContinue(int register)
+        {
+            if(!IsMmuEnabled())
+            {
+                return;
+            }
+
+            var address = GetCompatRegister32(register);
+            var translated = TranslateVirtualAddress(address);
+            if(translated == 0x1)
+            {
+                return;
+            }
+
+            uint length = 0;
+            while(machine.SystemBus.ReadByte(translated + length, this) != 0)
+            {
+                length++;
+            }
+
+            ReturnCompatValue32(length);
+        }
+
+        public void ReturnTranslatedStrnlenOrContinue(int register, int lengthRegister)
+        {
+            if(!IsMmuEnabled())
+            {
+                return;
+            }
+
+            var address = GetCompatRegister32(register);
+            var translated = TranslateVirtualAddress(address);
+            if(translated == 0x1)
+            {
+                return;
+            }
+
+            var maxLength = GetCompatRegister32(lengthRegister);
+            uint length = 0;
+            while(length < maxLength && machine.SystemBus.ReadByte(translated + length, this) != 0)
+            {
+                length++;
+            }
+
+            ReturnCompatValue32(length);
+        }
+
+        public void ReturnTranslatedStrcmpOrContinue(int leftRegister, int rightRegister)
+        {
+            if(!IsMmuEnabled())
+            {
+                return;
+            }
+
+            var left = GetCompatRegister32(leftRegister);
+            var right = GetCompatRegister32(rightRegister);
+            var translatedLeft = TranslateVirtualAddress(left);
+            var translatedRight = TranslateVirtualAddress(right);
+            if(translatedLeft == 0x1 || translatedRight == 0x1)
+            {
+                return;
+            }
+
+            uint offset = 0;
+            while(true)
+            {
+                var leftByte = machine.SystemBus.ReadByte(translatedLeft + offset, this);
+                var rightByte = machine.SystemBus.ReadByte(translatedRight + offset, this);
+                if(leftByte != rightByte || leftByte == 0)
+                {
+                    ReturnCompatValue32(unchecked((uint)(leftByte - rightByte)));
+                    return;
+                }
+
+                offset++;
+            }
+        }
+
+        public void ReturnTranslatedStrncmpOrContinue(int leftRegister, int rightRegister, int lengthRegister)
+        {
+            if(!IsMmuEnabled())
+            {
+                return;
+            }
+
+            var left = GetCompatRegister32(leftRegister);
+            var right = GetCompatRegister32(rightRegister);
+            var translatedLeft = TranslateVirtualAddress(left);
+            var translatedRight = TranslateVirtualAddress(right);
+            if(translatedLeft == 0x1 || translatedRight == 0x1)
+            {
+                return;
+            }
+
+            var maxLength = GetCompatRegister32(lengthRegister);
+            for(var offset = 0u; offset < maxLength; offset++)
+            {
+                var leftByte = machine.SystemBus.ReadByte(translatedLeft + offset, this);
+                var rightByte = machine.SystemBus.ReadByte(translatedRight + offset, this);
+                if(leftByte != rightByte || leftByte == 0)
+                {
+                    ReturnCompatValue32(unchecked((uint)(leftByte - rightByte)));
+                    return;
+                }
+            }
+
+            ReturnCompatValue32(0);
         }
 
         public void CompleteFdtOpenIntoHeaderFixupIfMmuEnabled(uint targetPc)

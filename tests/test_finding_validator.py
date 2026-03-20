@@ -33,6 +33,48 @@ def _profile_stub():
 
 
 class InstructionSkipValidationTests(unittest.TestCase):
+    def test_probe_shows_later_layer_catch_dismisses_without_rerun(self) -> None:
+        result = {
+            "fault_type": "i:0x1234",
+            "boot_outcome": "no_boot",
+            "boot_slot": None,
+            "fault_injected": True,
+            "signals": {
+                "verification_probe_classification": "first_layer_breached_second_caught",
+                "verification_defense_in_depth": "held",
+                "verification_bypass_detected": True,
+                "verification_bypass_labels": ["hash_validation"],
+                "verification_probes": {
+                    "hash_validation": {
+                        "reached": True,
+                        "return_value": "0x00000000",
+                        "bypassed": True,
+                    },
+                    "slot_validation": {
+                        "reached": True,
+                        "return_value": "0xFFFFFFFF",
+                        "bypassed": False,
+                    },
+                },
+            },
+        }
+
+        validation = _validate_instruction_skip(
+            result,
+            expected_outcome="success",
+            rerun_point=lambda *_args, **_kwargs: self.fail("rerun should not be needed"),
+            annotate_checks=lambda _items: None,
+        )
+
+        self.assertEqual(validation["stage"], "dismissed")
+        self.assertEqual(validation["disposition"], "defense_in_depth")
+        self.assertEqual(validation["glitch_models"]["nop"], "bypass")
+        self.assertEqual(validation["defense_in_depth"], "held")
+        self.assertEqual(
+            validation["counterfactuals"]["defense_chain"],
+            "first_layer_breached_second_caught",
+        )
+
     def test_nop_reproduction_promotes_to_validated(self) -> None:
         result = {
             "fault_type": "i:0x1234",
@@ -274,6 +316,43 @@ class ValidationReportingTests(unittest.TestCase):
         self.assertIn("negative_evidence", failure)
         self.assertIn("counterfactuals", failure)
         self.assertEqual(failure["skeptical_summary"], "Validated after adversarial replay.")
+
+    def test_summary_tracks_verification_probe_outcomes(self) -> None:
+        profile = _profile_stub()
+        result = {
+            "is_control": False,
+            "fault_injected": True,
+            "fault_at": "i:0x5c6",
+            "fault_type": "i:0x5c6",
+            "fault_address": "0x000005C6",
+            "boot_outcome": "no_boot",
+            "boot_slot": None,
+            "finding_stage": "dismissed",
+            "finding_validation": {
+                "stage": "dismissed",
+                "disposition": "defense_in_depth",
+                "glitch_realism": "common",
+            },
+            "signals": {
+                "verification_probe_classification": "first_layer_breached_second_caught",
+                "verification_defense_in_depth": "held",
+                "verification_bypass_detected": True,
+                "verification_full_bypass": False,
+                "verification_bypass_labels": ["hash_validation"],
+                "verification_probes": {
+                    "hash_validation": {"reached": True, "bypassed": True},
+                    "slot_validation": {"reached": True, "bypassed": False},
+                },
+            },
+        }
+
+        summary = summarize_runtime_sweep([result], total_writes=10, profile=profile)
+        self.assertEqual(
+            summary["verification_probe_classes"]["first_layer_breached_second_caught"],
+            1,
+        )
+        self.assertEqual(summary["verification_bypass_points"], ["i:0x5c6"])
+        self.assertEqual(summary["defense_in_depth_held"], 1)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ Usage as CLI (for debugging)::
 
 from __future__ import annotations
 
+import base64
 import json
 import struct
 import sys
@@ -388,6 +389,46 @@ class InstructionSkipConfig:
                 )
 
 
+class VerificationProbeConfig:
+    """Configuration for deterministic verification-layer return probes."""
+
+    __slots__ = (
+        "symbol",
+        "return_register",
+        "return_register_index",
+        "success_value",
+        "label",
+    )
+
+    def __init__(
+        self,
+        *,
+        symbol: str,
+        return_register: str = "r0",
+        return_register_index: int = 0,
+        success_value: int = 0,
+        label: Optional[str] = None,
+    ) -> None:
+        self.symbol = str(symbol).strip()
+        if not self.symbol:
+            raise ProfileError("verification_probes.symbol: expected non-empty string")
+        self.return_register = str(return_register).strip().lower()
+        self.return_register_index = int(return_register_index)
+        self.success_value = int(success_value)
+        self.label = str(label or self.symbol).strip()
+        if not self.label:
+            raise ProfileError("verification_probes.label: expected non-empty string")
+
+    def to_runtime_dict(self) -> Dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "return_register": self.return_register,
+            "return_register_index": self.return_register_index,
+            "success_value": self.success_value,
+            "label": self.label,
+        }
+
+
 class MetadataFaultConfig:
     """Configuration for faulting host-side metadata/setup writes before boot."""
 
@@ -600,6 +641,7 @@ class HeuristicConfig:
         "shard_count",
         "shard_index",
         "random_tail_budget",
+        "critical_regions",
     )
 
     def __init__(
@@ -612,6 +654,7 @@ class HeuristicConfig:
         shard_count: int = 1,
         shard_index: int = 0,
         random_tail_budget: int = 0,
+        critical_regions: Optional[List[Tuple[int, int]]] = None,
     ) -> None:
         self.tier2_step = int(tier2_step)
         self.tier3_step = int(tier3_step)
@@ -621,6 +664,7 @@ class HeuristicConfig:
         self.shard_count = int(shard_count)
         self.shard_index = int(shard_index)
         self.random_tail_budget = int(random_tail_budget)
+        self.critical_regions = critical_regions or []
         self._validate()
 
     def _validate(self) -> None:
@@ -660,6 +704,13 @@ class HeuristicConfig:
                     self.random_tail_budget
                 )
             )
+        for idx, (start, end) in enumerate(self.critical_regions):
+            if end <= start:
+                raise ValueError(
+                    "heuristic.critical_regions[{}]: end (0x{:X}) must be > start (0x{:X})".format(
+                        idx, end, start
+                    )
+                )
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to a JSON-compatible dict."""
@@ -672,6 +723,7 @@ class HeuristicConfig:
             "shard_count": self.shard_count,
             "shard_index": self.shard_index,
             "random_tail_budget": self.random_tail_budget,
+            "critical_regions": list(self.critical_regions),
         }
 
 
@@ -715,6 +767,7 @@ class FaultSweepConfig:
         "multi_fault",
         "read_fault_config",
         "instruction_skip_config",
+        "verification_probes",
         "metadata_fault",
         "partial_staging",
         "nvs_corruption",
@@ -751,6 +804,7 @@ class FaultSweepConfig:
         multi_fault=None,
         read_fault_config: Optional["ReadFaultConfig"] = None,
         instruction_skip_config: Optional["InstructionSkipConfig"] = None,
+        verification_probes: Optional[List["VerificationProbeConfig"]] = None,
         metadata_fault: Optional["MetadataFaultConfig"] = None,
         partial_staging: Optional[Any] = None,
         nvs_corruption: Optional["NvsCorruptionConfig"] = None,
@@ -794,6 +848,7 @@ class FaultSweepConfig:
         self.multi_fault = multi_fault or MultiFaultConfig()
         self.read_fault_config = read_fault_config
         self.instruction_skip_config = instruction_skip_config
+        self.verification_probes = verification_probes or []
         self.metadata_fault = metadata_fault or MetadataFaultConfig()
         self.partial_staging = partial_staging
         self.nvs_corruption = nvs_corruption or NvsCorruptionConfig()
@@ -1607,6 +1662,14 @@ class ProfileConfig:
             vars_list.append(
                 "INSTRUCTION_SKIP_COUNT:{}".format(isc.skip_count)
             )
+        if fs.verification_probes:
+            encoded = base64.b64encode(
+                json.dumps(
+                    [probe.to_runtime_dict() for probe in fs.verification_probes],
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).decode("ascii")
+            vars_list.append("VERIFICATION_PROBES:{}".format(encoded))
 
         # I2C fault config: emit when any i2c_* fault type is active.
         i2c_types_active = [ft for ft in fs.fault_types if ft.startswith("i2c_")]
@@ -1712,7 +1775,6 @@ class ProfileConfig:
         # JSON.  Base64 avoids brace/quote escaping issues in Robot→Renode
         # variable passing.
         if self.success_criteria_overrides:
-            import base64
             raw_json = json.dumps(self.success_criteria_overrides, separators=(",", ":"))
             b64 = base64.b64encode(raw_json.encode()).decode().rstrip("=")
             vars_list.append("SUCCESS_CRITERIA_OVERRIDES:{}".format(b64))
@@ -1892,12 +1954,47 @@ def _parse_success_criteria_overrides(
     return result
 
 
-def _parse_heuristic_config(raw: Optional[Dict[str, Any]]) -> Optional[HeuristicConfig]:
+def _parse_heuristic_config(
+    raw: Optional[Dict[str, Any]],
+    *,
+    bootloader_elf: Optional[str] = None,
+    profile_path: Optional[Path] = None,
+) -> Optional[HeuristicConfig]:
     """Parse the optional heuristic sub-config from fault_sweep."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise ProfileError("fault_sweep.heuristic: expected mapping")
+    critical_regions_raw = raw.get("critical_regions", [])
+    if not isinstance(critical_regions_raw, list):
+        raise ProfileError("fault_sweep.heuristic.critical_regions: expected list")
+    critical_regions: List[Tuple[int, int]] = []
+    for i, region in enumerate(critical_regions_raw):
+        ctx = "fault_sweep.heuristic.critical_regions[{}]".format(i)
+        if not isinstance(region, dict):
+            raise ProfileError("{}: expected mapping with start/end or symbol".format(ctx))
+        has_symbol = "symbol" in region
+        has_start = "start" in region
+        has_end = "end" in region
+        if has_symbol:
+            if has_start or has_end:
+                raise ProfileError("{}: use either symbol or start/end, not both".format(ctx))
+            symbol_query = str(_require(region, "symbol", ctx)).strip()
+            if not symbol_query:
+                raise ProfileError("{}.symbol: expected non-empty string".format(ctx))
+            critical_regions.extend(
+                _resolve_instruction_skip_symbol_targets(
+                    symbol_query,
+                    bootloader_elf=bootloader_elf,
+                    profile_path=profile_path,
+                    skip_count=1,
+                    ctx="{}.symbol".format(ctx),
+                )
+            )
+            continue
+        start = _parse_int(_require(region, "start", ctx), "{}.start".format(ctx))
+        end = _parse_int(_require(region, "end", ctx), "{}.end".format(ctx))
+        critical_regions.append((start, end))
     return HeuristicConfig(
         tier2_step=int(raw.get("tier2_step", 3)),
         tier3_step=int(raw.get("tier3_step", 100)),
@@ -1907,6 +2004,7 @@ def _parse_heuristic_config(raw: Optional[Dict[str, Any]]) -> Optional[Heuristic
         shard_count=int(raw.get("shard_count", 1)),
         shard_index=int(raw.get("shard_index", 0)),
         random_tail_budget=int(raw.get("random_tail_budget", 0)),
+        critical_regions=critical_regions,
     )
 
 
@@ -2037,6 +2135,11 @@ def _warn_fault_backend_compat(
             "fault_type 'instruction_skip' is enabled but no "
             "instruction_skip_config is set. No instruction-skip fault "
             "points will be generated."
+        )
+    if fs.verification_probes and "instruction_skip" not in all_types:
+        warnings.warn(
+            "verification_probes is set but 'instruction_skip' is not in "
+            "fault_types. The verification probes will have no effect."
         )
 
     # OTP fault types require an OTPMemory peripheral on the platform.
@@ -2197,11 +2300,18 @@ def _parse_fault_sweep(
             bootloader_elf=bootloader_elf,
             profile_path=profile_path,
         ),
+        verification_probes=_parse_verification_probes(
+            raw.get("verification_probes")
+        ),
         metadata_fault=_parse_metadata_fault(raw.get("metadata_fault")),
         partial_staging=raw.get("partial_staging"),
         nvs_corruption=_parse_nvs_corruption(raw.get("nvs_corruption")),
         fault_distribution=_parse_fault_distribution(raw.get("fault_distribution")),
-        heuristic_config=_parse_heuristic_config(raw.get("heuristic")),
+        heuristic_config=_parse_heuristic_config(
+            raw.get("heuristic"),
+            bootloader_elf=bootloader_elf,
+            profile_path=profile_path,
+        ),
         max_heuristic_points=(
             2000
             if "max_heuristic_points" not in raw
@@ -2581,6 +2691,66 @@ def _parse_instruction_skip_config(
         include_literal_pools=include_literal_pools,
     )
 
+
+
+def _parse_probe_register(raw: Any, ctx: str) -> Tuple[str, int]:
+    text = str(raw or "r0").strip().lower()
+    if not text:
+        raise ProfileError("{}.return_register: expected non-empty register name".format(ctx))
+    prefix = text[0]
+    if prefix not in ("r", "w", "x"):
+        raise ProfileError(
+            "{}.return_register: expected rN/wN/xN register, got {!r}".format(ctx, text)
+        )
+    try:
+        index = int(text[1:], 10)
+    except Exception:
+        raise ProfileError(
+            "{}.return_register: expected numeric register suffix, got {!r}".format(
+                ctx, text
+            )
+        )
+    if not (0 <= index <= 15):
+        raise ProfileError(
+            "{}.return_register: expected register index 0-15, got {}".format(ctx, index)
+        )
+    return "r{}".format(index), index
+
+
+def _parse_verification_probes(raw: Optional[Any]) -> List[VerificationProbeConfig]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("fault_sweep.verification_probes: expected list")
+    probes: List[VerificationProbeConfig] = []
+    seen_labels = set()
+    for i, entry in enumerate(raw):
+        ctx = "fault_sweep.verification_probes[{}]".format(i)
+        if not isinstance(entry, dict):
+            raise ProfileError("{}: expected mapping".format(ctx))
+        symbol = str(_require(entry, "symbol", ctx)).strip()
+        reg_name, reg_index = _parse_probe_register(
+            entry.get("return_register", "r0"), ctx
+        )
+        success_value = _parse_int(
+            entry.get("success_value", 0), "{}.success_value".format(ctx)
+        )
+        label = str(entry.get("label", symbol)).strip()
+        if label in seen_labels:
+            raise ProfileError(
+                "{}.label: duplicate verification probe label {!r}".format(ctx, label)
+            )
+        seen_labels.add(label)
+        probes.append(
+            VerificationProbeConfig(
+                symbol=symbol,
+                return_register=reg_name,
+                return_register_index=reg_index,
+                success_value=success_value,
+                label=label,
+            )
+        )
+    return probes
 
 
 def _parse_i2c_fault_config(raw):

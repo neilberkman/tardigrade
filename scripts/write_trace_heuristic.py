@@ -178,6 +178,7 @@ def classify_trace(
     shard_count: int = 1,
     shard_index: int = 0,
     random_tail_budget: int = 0,
+    critical_regions: Optional[List[Tuple[int, int]]] = None,
 ) -> Union[List[int], Dict[str, Any]]:
     """
     Classify trace entries into priority tiers and return a sorted list of
@@ -207,6 +208,8 @@ def classify_trace(
         random_tail_budget: Number of additional random points to add from
             the unselected tier3 pool.  Uses a deterministic seed derived
             from shard_index for reproducibility.
+        critical_regions: Optional list of bus-address regions to promote to
+            Tier 0 regardless of normal structural heuristics.
 
     Returns:
         If return_details is False: sorted list of fault point indices.
@@ -233,6 +236,7 @@ def classify_trace(
                     "shard_count": shard_count,
                     "shard_index": shard_index,
                     "random_tail_budget": random_tail_budget,
+                    "critical_regions": [],
                 },
             }
         return []
@@ -244,6 +248,13 @@ def classify_trace(
 
     def in_bootloader_region(offset: int) -> bool:
         return bl_region is not None and bl_region[0] <= offset < bl_region[1]
+
+    critical_regions_rel: List[Tuple[int, int]] = []
+    for start, end in critical_regions or []:
+        critical_regions_rel.append((start - flash_base, end - flash_base))
+
+    def in_critical_region(offset: int) -> bool:
+        return any(start <= offset < end for start, end in critical_regions_rel)
 
     # Build trailer regions: last page of each slot.
     trailer_regions: List[Tuple[int, int]] = []
@@ -321,7 +332,7 @@ def classify_trace(
         # Fault point is 0-based: write_idx is 1-based from NVMC.
         fault_point = write_idx - 1
 
-        if in_bootloader_region(flash_off):
+        if in_bootloader_region(flash_off) or in_critical_region(flash_off):
             tier0.add(fault_point)
         elif in_any_region(flash_off, trailer_regions):
             tier1.add(fault_point)
@@ -465,6 +476,7 @@ def classify_trace(
                 "shard_count": shard_count,
                 "shard_index": shard_index,
                 "random_tail_budget": random_tail_budget,
+                "critical_regions": list(critical_regions or []),
             },
         }
 
@@ -478,6 +490,7 @@ def summarize_classification(
     flash_base: int = 0,
     page_size: int = 4096,
     bootloader_region: Optional[Tuple[int, int]] = None,
+    critical_regions: Optional[List[Tuple[int, int]]] = None,
     tier_details: Optional[Dict[str, Any]] = None,
 ) -> Dict:
     """Return a summary dict for logging/JSON output.
@@ -508,6 +521,12 @@ def summarize_classification(
             for _, off in trace
             if bl_start <= off < bl_end
         )
+    critical_writes = 0
+    if critical_regions:
+        rel_regions = [(start - flash_base, end - flash_base) for start, end in critical_regions]
+        critical_writes = sum(
+            1 for _, off in trace if any(start <= off < end for start, end in rel_regions)
+        )
     result: Dict[str, Any] = {
         "total_writes": len(trace),
         "trailer_writes": trailer_writes,
@@ -518,6 +537,8 @@ def summarize_classification(
     if bl_writes > 0:
         result["bootloader_region_writes"] = bl_writes
         result["bulk_writes"] = max(0, result["bulk_writes"] - bl_writes)
+    if critical_writes > 0:
+        result["critical_region_writes"] = critical_writes
 
     if tier_details is not None:
         result["tier0_count"] = len(tier_details["tier0"])

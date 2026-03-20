@@ -34,6 +34,7 @@ from renode_runner import (  # noqa: E402
 )
 from result_checks import annotate_result_checks  # noqa: E402
 from audit_report import summarize_runtime_sweep  # noqa: E402
+from audit_bootloader import _trace_replay_eligible_fault_types  # noqa: E402
 from profile_loader import load_profile  # noqa: E402
 from self_test import check_verdict  # noqa: E402
 
@@ -64,6 +65,12 @@ class DiscoveryFeaturesTest(unittest.TestCase):
 
         mock_killpg.assert_called_once_with(4242, signal.SIGKILL)
         proc.kill.assert_not_called()
+
+    def test_trace_replay_eligibility_allows_replayable_write_faults(self) -> None:
+        self.assertTrue(_trace_replay_eligible_fault_types(["bit_corruption"]))
+        self.assertTrue(_trace_replay_eligible_fault_types(["write_rejection"]))
+        self.assertTrue(_trace_replay_eligible_fault_types(["instruction_skip", "power_loss"]))
+        self.assertFalse(_trace_replay_eligible_fault_types(["instruction_skip"]))
 
     def test_profile_loader_parses_discovery_fields(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1725,6 +1732,72 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 )
 
             self.assertEqual(results, [])
+
+    def test_run_batch_uses_trace_replay_timeout_model_for_bit_corruption(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = tempdir / "profile.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    """
+                    schema_version: 1
+                    name: trace_replay_timeout_profile_bitflip
+                    description: timeout
+                    platform: platforms/stm32f4.repl
+                    bootloader:
+                      elf: examples/vulnerable_ota/firmware.elf
+                      entry: 0x10000000
+                    memory:
+                      sram: { start: 0x20000000, end: 0x20020000 }
+                      write_granularity: 4
+                      slots:
+                        exec: { base: 0x10000000, size: 0x1000 }
+                        staging: { base: 0x10001000, size: 0x1000 }
+                    images:
+                      staging: examples/vulnerable_ota/firmware.bin
+                    success_criteria:
+                      vtor_in_slot: exec
+                    expect:
+                      should_find_issues: false
+                    """
+                ),
+                encoding="utf-8",
+            )
+            profile = load_profile(profile_path)
+
+            observed_timeouts = []
+
+            def fake_run(cmd, *, cwd, env, timeout_s):
+                self.assertIn("TEST_TIMEOUT:3 minutes", cmd)
+                observed_timeouts.append(timeout_s)
+                rf_results = Path(cmd[cmd.index("--results-dir") + 1])
+                rf_results.mkdir(parents=True, exist_ok=True)
+                result_var = next(
+                    entry for entry in cmd
+                    if isinstance(entry, str) and entry.startswith("RESULT_FILE:")
+                )
+                result_file = Path(result_var.split("RESULT_FILE:", 1)[1])
+                result_file.write_text("[]", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch("renode_runner.run_renode_subprocess", side_effect=fake_run):
+                results = run_batch(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    fault_points=list(range(20)),
+                    robot_vars=[],
+                    work_dir=tempdir / "work",
+                    renode_remote_server_dir="",
+                    trace_file=str(tempdir / "trace.csv"),
+                    fault_types_list=["b"] * 20,
+                    keep_run_artifacts=False,
+                )
+
+            self.assertEqual(results, [])
+            self.assertEqual(len(observed_timeouts), 1)
+            self.assertEqual(observed_timeouts[0], 450.0)
             self.assertEqual(len(observed_timeouts), 1)
             self.assertLess(observed_timeouts[0], 500.0)
 

@@ -37,6 +37,18 @@ EXECUTE_ONLY_FAULT_TYPES = {
     "i2c_wrong_address",
 }
 
+# Fault types that can use trace replay in execute mode. These still remain
+# execute-only relative to the pure Python state evaluator, but they do not
+# require full Phase 1 CPU emulation when a clean write trace is available.
+TRACE_REPLAY_FAULT_TYPES = {
+    "power_loss",
+    "bit_corruption",
+    "silent_write_failure",
+    "write_rejection",
+    "write_disturb",
+    "wear_leveling_corruption",
+}
+
 # Canonical mapping from human-readable fault type names to single-char
 # wire codes used in batch dispatch and result encoding.  Used by metadata
 # fault, hook fault, and phase2 fault point generation.
@@ -66,6 +78,10 @@ FAULT_TYPE_NAME_TO_CODE = {
     "i2c_truncated": "ic",
     "i2c_wrong_address": "iw",
 }
+
+TRACE_REPLAY_WIRE_CODES = frozenset(
+    FAULT_TYPE_NAME_TO_CODE[name] for name in TRACE_REPLAY_FAULT_TYPES
+)
 
 # OTP wire-code to BlowFaultMode mapping (used by sweep planner).
 _OTP_WIRE_CODE_TO_BLOW_MODE = {

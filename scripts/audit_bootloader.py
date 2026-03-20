@@ -66,7 +66,7 @@ from renode_runner import (
     run_single_point,
 )
 from fault_plan import CalibrationInputs, FaultPlan, build_fault_plan
-from fault_types import EXECUTE_ONLY_FAULT_TYPES
+from fault_types import EXECUTE_ONLY_FAULT_TYPES, TRACE_REPLAY_FAULT_TYPES
 from finding_validator import validate_runtime_findings
 from sweep import (
     MultiFaultPhaseResult,
@@ -87,8 +87,11 @@ EXIT_INFRA_FAILURE = 2
 
 
 def _trace_replay_eligible_fault_types(fault_types: List[str]) -> bool:
-    normalized = {str(ft or "power_loss") for ft in fault_types or ["power_loss"]}
-    return not normalized.intersection(EXECUTE_ONLY_FAULT_TYPES)
+    normalized = {
+        str(ft or "power_loss").split(":", 1)[0]
+        for ft in fault_types or ["power_loss"]
+    }
+    return bool(normalized.intersection(TRACE_REPLAY_FAULT_TYPES))
 
 
 def _can_skip_auto_calibration(profile: ProfileConfig, eval_mode: str) -> bool:

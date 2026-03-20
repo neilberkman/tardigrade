@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from fault_types import TRACE_REPLAY_WIRE_CODES
 from profile_loader import HeuristicConfig, ProfileConfig, load_profile
 
 
@@ -251,7 +252,7 @@ def _is_trace_replay_batch(
         return False
     if not fault_types_list:
         return True
-    return all(_base_fault_type_code(ft) == "w" for ft in fault_types_list)
+    return all(_base_fault_type_code(ft) in TRACE_REPLAY_WIRE_CODES for ft in fault_types_list)
 
 
 def _estimate_batch_runtime_seconds(

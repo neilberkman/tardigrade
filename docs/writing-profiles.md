@@ -335,6 +335,43 @@ Instruction-skip fault points are always run in execute mode (full CPU boot) -- 
 
 To find good target ranges, disassemble your bootloader ELF and identify critical code paths: hash validation, signature checks, version comparisons, or metadata parsing. Narrow ranges produce faster sweeps; whole-function ranges give broader coverage.
 
+#### Verification probes
+
+`verification_probes` add deterministic layer-by-layer return-value capture to instruction-skip sweeps. This is useful when a skipped instruction might breach one verification function but a later function still catches the tampered image.
+
+```yaml
+fault_sweep:
+  fault_types: [instruction_skip]
+  instruction_skip_config:
+    target_addresses:
+      - { symbol: bootutil_img_validate }
+  verification_probes:
+    - symbol: bootutil_img_validate
+      return_register: r0
+      success_value: 0
+      label: hash_validation
+    - symbol: "boot_validate_slot.isra.3"
+      return_register: r0
+      success_value: 0
+      label: slot_validation
+```
+
+Each probe attaches to the function symbol, records the return register on the first completed call, and emits structured telemetry in the result JSON:
+
+- `verification_probes`
+- `verification_probe_classification`
+- `verification_defense_in_depth`
+- `verification_bypass_labels`
+- `verification_bypass_detected`
+- `verification_full_bypass`
+
+This lets tardigrade distinguish:
+
+- CPU crash before verification
+- first layer held
+- first layer breached but later layer caught it
+- full end-to-end bypass
+
 ### Sweep strategy
 
 Default is `heuristic` — classifies writes by address and samples densely near trailer/metadata regions, sparsely over bulk data. Override with `sweep_strategy: exhaustive` for full coverage (slower).
@@ -358,7 +395,17 @@ fault_sweep:
     tier2_step: 3 # sample every Nth write in boundary regions
     tier3_step: 100 # sample every Nth write in bulk data
     target_points: 500 # cap total points (overrides step calculations)
+    critical_regions:
+      - { start: 0x00081FE0, end: 0x00082000 } # always Tier 0
+      - { symbol: boot_set_confirmed } # resolve from bootloader ELF
 ```
+
+`critical_regions` promotes matching writes into Tier 0, alongside `memory.bootloader_region`. Use this when you already know that certain metadata writes are security-critical and should never be thinned by the heuristic. Each entry may be either:
+
+- `{ start, end }` explicit bus-address range
+- `{ symbol }` substring query resolved against bootloader ELF function symbols
+
+Symbol resolution uses the same `STT_FUNC` substring matching as `instruction_skip_config`. Matching writes are counted in `critical_region_writes` and included in `tier0_count` in the heuristic summary.
 
 ### Reset mode
 

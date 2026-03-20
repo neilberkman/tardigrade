@@ -185,6 +185,22 @@ def categorize_failure(
     realism = finding_glitch_realism(result)
     if realism is not None:
         payload["glitch_realism"] = realism
+    signals = result.get("signals") or {}
+    if isinstance(signals, dict):
+        if signals.get("verification_probe_classification") is not None:
+            payload["verification_probe_classification"] = signals.get(
+                "verification_probe_classification"
+            )
+        if signals.get("verification_defense_in_depth") is not None:
+            payload["verification_defense_in_depth"] = signals.get(
+                "verification_defense_in_depth"
+            )
+        if signals.get("verification_bypass_labels"):
+            payload["verification_bypass_labels"] = signals.get(
+                "verification_bypass_labels"
+            )
+        if signals.get("verification_probes"):
+            payload["verification_probes"] = signals.get("verification_probes")
     if isinstance(validation, dict):
         if validation.get("negative_evidence"):
             payload["negative_evidence"] = validation.get("negative_evidence")
@@ -247,10 +263,27 @@ def summarize_runtime_sweep(
     validation_dispositions: Dict[str, int] = {}
     validation_stages: Dict[str, int] = {}
     glitch_realism_counts: Dict[str, int] = {}
+    verification_probe_class_counts: Dict[str, int] = {}
+    verification_bypass_points: List[Any] = []
+    full_bypass_points: List[Any] = []
+    defense_in_depth_held = 0
     categorized_failures: List[Dict[str, Any]] = []
     for r in injected:
         ft_name = _fault_type_label(r.get("fault_type"))
         fault_type_counts[ft_name] = fault_type_counts.get(ft_name, 0) + 1
+        signals = r.get("signals") or {}
+        if isinstance(signals, dict):
+            probe_class = str(signals.get("verification_probe_classification") or "").strip()
+            if probe_class:
+                verification_probe_class_counts[probe_class] = (
+                    verification_probe_class_counts.get(probe_class, 0) + 1
+                )
+            if signals.get("verification_bypass_detected"):
+                verification_bypass_points.append(r.get("fault_at"))
+            if signals.get("verification_full_bypass") and result_has_issues(r, expected_outcome):
+                full_bypass_points.append(r.get("fault_at"))
+            if signals.get("verification_defense_in_depth") == "held":
+                defense_in_depth_held += 1
         validation_stage = finding_validation_stage(r)
         if validation_stage:
             validation_stages[validation_stage] = (
@@ -343,6 +376,11 @@ def summarize_runtime_sweep(
         summary["dismissed_findings"] = validation_stages.get("dismissed", 0)
     if glitch_realism_counts:
         summary["glitch_realism"] = glitch_realism_counts
+    if verification_probe_class_counts:
+        summary["verification_probe_classes"] = verification_probe_class_counts
+        summary["verification_bypass_points"] = verification_bypass_points
+        summary["defense_in_depth_held"] = defense_in_depth_held
+        summary["full_bypass_points"] = full_bypass_points
 
     if categorized_failures:
         summary["failures"] = categorized_failures

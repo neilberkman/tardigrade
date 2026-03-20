@@ -1,0 +1,50 @@
+schema_version: 1
+name: mcuboot_head_move_nrf52_upgrade_verify_corrupt_staging_critical
+description: >
+  Critical instruction-skip sweep over the final MCUboot hash comparison and
+  slot-validation acceptance path during upgrade, using a deliberately
+  corrupted staging image. Control boot should reject the tampered upgrade.
+
+platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_head_move_nrf52.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x76000 }
+    staging: { base: 0x00082000, size: 0x76000 }
+images:
+  exec: results/oss_validation/assets/zephyr_head_move_nrf52_slot0.bin
+  staging: results/oss_validation/assets/zephyr_head_move_nrf52_slot1_verify_corrupt.bin
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: staging
+success_criteria:
+  vtor_in_slot: exec
+  image_hash: true
+  expected_image: staging
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [instruction_skip]
+  instruction_skip_config:
+    target_addresses:
+      - { start: 0x000005B4, end: 0x000005D4 }
+      - { start: 0x0000076E, end: 0x0000077A }
+    skip_count: 1
+  verification_probes:
+    - symbol: bootutil_img_validate
+      return_register: r0
+      success_value: 0
+      label: hash_validation
+    - symbol: "boot_validate_slot.isra.3"
+      return_register: r0
+      success_value: 0
+      label: slot_validation
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "20.0"
+  max_step_limit: 200000000

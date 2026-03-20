@@ -28,7 +28,7 @@ from fault_inject import (
     generate_multi_fault_sequences,
     multi_fault_plan_summary,
 )
-from fault_types import EXECUTE_ONLY_FAULT_TYPES
+from fault_types import EXECUTE_ONLY_FAULT_TYPES, TRACE_REPLAY_WIRE_CODES
 from partial_staging import (
     PartialStagingConfig,
     PartialStagingResult,
@@ -333,7 +333,7 @@ def _is_trace_replay_execute_batch(
         return False
     if not fault_types_list:
         return True
-    return all(_base_fault_type_code(ft) == "w" for ft in fault_types_list)
+    return all(_base_fault_type_code(ft) in TRACE_REPLAY_WIRE_CODES for ft in fault_types_list)
 
 
 def _auto_execute_batch_points(
@@ -349,10 +349,10 @@ def _auto_execute_batch_points(
     if max_batch_points > 0 or str(evaluation_mode) != "execute" or not fault_points:
         return max_batch_points
 
-    has_execute_only_points = bool(
+    has_full_execute_only_points = bool(
         fault_types_list
         and any(
-            _base_fault_type_code(ft) in {"b", "e", "a", "s", "g", "x", "r", "d", "l", "k"}
+            _base_fault_type_code(ft) not in TRACE_REPLAY_WIRE_CODES
             for ft in fault_types_list
         )
     )
@@ -364,7 +364,7 @@ def _auto_execute_batch_points(
         trace_file=trace_file,
         trace_file_bin=trace_file_bin,
         fault_types_list=fault_types_list,
-    ) and not has_execute_only_points:
+    ) and not has_full_execute_only_points:
         platform = str(getattr(profile, "platform", "") or "").lower()
         is_stm32f4 = "stm32f4" in platform
         batch_budget_s = 180.0
@@ -393,7 +393,7 @@ def _auto_execute_batch_points(
     # Use a time-budget approach: pack variable-sized batches so each Renode
     # session completes within ~180s. Early cheap points get packed densely
     # (up to 64/batch), late expensive points get packed sparsely (down to 1).
-    if has_execute_only_points or (not trace_file and not trace_file_bin):
+    if has_full_execute_only_points or (not trace_file and not trace_file_bin):
         batch_time_budget_s = 180.0
         base_cost_s = 2.0
         per_write_cost_s = 0.012

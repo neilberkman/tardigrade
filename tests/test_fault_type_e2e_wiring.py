@@ -100,6 +100,7 @@ RESC_FAULT_CODE_TO_NAME = _extract_resc_dict("_FAULT_CODE_TO_NAME")
 RESC_WRITE_FAULT_MODE = _extract_resc_dict("_WRITE_FAULT_MODE")
 RESC_I2C_WIRE_TO_TYPE = _extract_resc_dict("_I2C_WIRE_CODE_TO_FAULT_TYPE")
 RESC_EXECUTE_ONLY = _extract_resc_frozenset("_EXECUTE_ONLY_FAULT_TYPES")
+RESC_TRACE_REPLAY_SUPPORTED = _extract_resc_frozenset("_TRACE_REPLAY_SUPPORTED_FAULT_TYPES")
 
 # ---------------------------------------------------------------------------
 # Fault types that intentionally bypass the standard wire-code dispatch.
@@ -295,6 +296,17 @@ class TestRuntimeDispatchCoverage(unittest.TestCase):
             ),
         )
 
+    def test_trace_replay_supported_codes_are_declared(self):
+        expected = {"w", "b", "s", "r", "d", "l"}
+        self.assertEqual(RESC_TRACE_REPLAY_SUPPORTED, expected)
+        self.assertIn(
+            "default_run_fn == run_trace_replay_fault and ft in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES",
+            _resc_text,
+            "trace-replay dispatch override missing from .resc",
+        )
+        self.assertIn("engine.ReplayWriteFault(", _resc_text)
+        self.assertIn("engine.ReplayWriteFaultWithErases(", _resc_text)
+
     def test_i2c_wire_codes_have_runtime_mapping(self):
         """I2C wire codes must appear in .resc _I2C_WIRE_CODE_TO_FAULT_TYPE."""
         i2c_codes = {
@@ -486,6 +498,19 @@ class TestPlannerReachability(unittest.TestCase):
             "ft.startswith('i:')",
             _resc_text,
             "instruction_skip prefix dispatch 'i:' not found in .resc",
+        )
+
+    def test_instruction_skip_dispatch_parses_split_parts(self):
+        """instruction_skip dispatch must split the encoded fault string first."""
+        self.assertIn(
+            "parts = ft.split(':')",
+            _resc_text,
+            "instruction_skip dispatch does not split the encoded fault type",
+        )
+        self.assertIn(
+            "patch_model = parts[2] if len(parts) > 2 else 'nop'",
+            _resc_text,
+            "instruction_skip patch-model parsing is missing from .resc",
         )
 
     def test_all_dispatch_prefixes_present(self):

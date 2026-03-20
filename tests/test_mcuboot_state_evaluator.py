@@ -376,6 +376,76 @@ class MCUbootStateEvaluatorSweepRoutingTest(unittest.TestCase):
         self.assertEqual(results, [])
         self.assertEqual(mock_batch.call_args.kwargs["max_batch_points"], 144)
 
+    def test_trace_replay_execute_mode_auto_batches_replayable_write_faults(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            exec_image = tempdir / "exec.bin"
+            staging_image = tempdir / "staging.bin"
+            exec_image.write_bytes(b"\xFF" * 0x2000)
+            staging_image.write_bytes(b"\xFF" * 0x2000)
+            trace_file = tempdir / "trace.csv"
+            trace_file.write_text(
+                "write_index,flash_offset,value\n1,0,0\n",
+                encoding="utf-8",
+            )
+            profile_path = tempdir / "profile.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    """
+                    schema_version: 1
+                    name: stm32f4_trace_replay_batch_profile_bitflip
+                    platform: platforms/stm32f4.repl
+                    flash_backend: faultFlash
+                    bootloader:
+                      elf: results/oss_validation/assets/oss_mcuboot_head_move_stm32f4.elf
+                      entry: 0x08000000
+                    memory:
+                      sram: { start: 0x20000000, end: 0x20040000 }
+                      write_granularity: 4
+                      slots:
+                        exec: { base: 0x08020000, size: 0x2000 }
+                        staging: { base: 0x08022000, size: 0x2000 }
+                    images:
+                      exec: EXEC_IMAGE
+                      staging: STAGING_IMAGE
+                    success_criteria:
+                      vtor_in_slot: exec
+                    expect:
+                      should_find_issues: false
+                    fault_sweep:
+                      mode: runtime
+                      evaluation_mode: execute
+                      max_writes: 300
+                      fault_types: [bit_corruption]
+                    """
+                ).strip()
+                .replace("EXEC_IMAGE", str(exec_image))
+                .replace("STAGING_IMAGE", str(staging_image))
+                + "\n",
+                encoding="utf-8",
+            )
+            profile = load_profile(profile_path)
+
+            with mock.patch("sweep._run_batches_chunked", return_value=[]) as mock_batch:
+                results = run_runtime_sweep(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    fault_points=list(range(300)),
+                    robot_vars=[],
+                    work_dir=tempdir / "work",
+                    renode_remote_server_dir="",
+                    include_control=False,
+                    evaluation_mode="execute",
+                    trace_file=str(trace_file),
+                    fault_types_list=["b"] * 300,
+                )
+
+        mock_batch.assert_called_once()
+        self.assertEqual(results, [])
+        self.assertEqual(mock_batch.call_args.kwargs["max_batch_points"], 144)
+
 
 if __name__ == "__main__":
     unittest.main()

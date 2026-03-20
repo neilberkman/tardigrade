@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import sys
 import tempfile
 import textwrap
@@ -14,6 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
+RESC = ROOT / "scripts" / "run_runtime_fault_sweep.resc"
 sys.path.insert(0, str(SCRIPTS))
 
 from fault_types import (  # noqa: E402
@@ -21,13 +24,16 @@ from fault_types import (  # noqa: E402
     FAULT_TYPE_NAME_TO_CODE,
     _fault_type_label,
 )
+from fault_plan import CalibrationInputs, build_fault_plan  # noqa: E402
 from profile_loader import (  # noqa: E402
     IMPLEMENTED_FAULT_TYPES,
     KNOWN_FAULT_TYPES,
     FaultSweepConfig,
     InstructionSkipConfig,
     ProfileError,
+    VerificationProbeConfig,
     _parse_instruction_skip_config,
+    _parse_verification_probes,
     load_profile,
 )
 
@@ -149,6 +155,51 @@ class ParseInstructionSkipConfigTest(unittest.TestCase):
             _parse_instruction_skip_config({"skip_count": -1})
 
 
+class VerificationProbeConfigTest(unittest.TestCase):
+    def test_parse_verification_probes(self) -> None:
+        probes = _parse_verification_probes(
+            [
+                {
+                    "symbol": "bootutil_img_validate",
+                    "return_register": "r0",
+                    "success_value": 0,
+                    "label": "hash_validation",
+                },
+                {
+                    "symbol": "boot_validate_slot.isra.3",
+                    "return_register": "w0",
+                    "success_value": 0,
+                    "label": "slot_validation",
+                },
+            ]
+        )
+        self.assertEqual([p.label for p in probes], ["hash_validation", "slot_validation"])
+        self.assertEqual(probes[0].return_register, "r0")
+        self.assertEqual(probes[1].return_register, "r0")
+        self.assertEqual(probes[1].return_register_index, 0)
+
+    def test_duplicate_labels_raise(self) -> None:
+        with self.assertRaises(ProfileError):
+            _parse_verification_probes(
+                [
+                    {"symbol": "a", "label": "dup"},
+                    {"symbol": "b", "label": "dup"},
+                ]
+            )
+
+    def test_invalid_register_raises(self) -> None:
+        with self.assertRaises(ProfileError):
+            _parse_verification_probes(
+                [{"symbol": "bootutil_img_validate", "return_register": "pc"}]
+            )
+
+    def test_probe_summary_tracks_first_return_for_classification(self) -> None:
+        resc_text = RESC.read_text(encoding="utf-8")
+        self.assertIn("first_return_value", resc_text)
+        self.assertIn("first_bypassed", resc_text)
+        self.assertIn("'bypassed': bool(capture.get('first_bypassed'))", resc_text)
+
+
 class InstructionSkipSymbolResolutionTest(unittest.TestCase):
     EXAMPLE_ELF = ROOT / "examples" / "vulnerable_ota" / "firmware.elf"
     ZERO_SIZE_ELF = (
@@ -258,12 +309,118 @@ class FaultSweepConfigIntegrationTest(unittest.TestCase):
         isc = InstructionSkipConfig(
             target_addresses=[(0x1000, 0x2000)], skip_count=1
         )
+        probe = VerificationProbeConfig(
+            symbol="bootutil_img_validate",
+            return_register="r0",
+            return_register_index=0,
+            success_value=0,
+            label="hash_validation",
+        )
         fs = FaultSweepConfig(
             fault_types=["instruction_skip"],
             instruction_skip_config=isc,
+            verification_probes=[probe],
         )
         self.assertIsNotNone(fs.instruction_skip_config)
         self.assertEqual(fs.instruction_skip_config.target_addresses, [(0x1000, 0x2000)])
+        self.assertEqual(fs.verification_probes[0].label, "hash_validation")
+
+
+class InstructionSkipPlannerRangeFilterTest(unittest.TestCase):
+    """Instruction-skip addresses must honor fault_start/fault_end."""
+
+    EXAMPLE_ELF = ROOT / "examples" / "vulnerable_ota" / "firmware.elf"
+
+    def test_fault_start_end_narrow_symbol_range(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = Path(td) / "profile.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    schema_version: 1
+                    name: instruction_skip_range_filter_profile
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    flash_backend: faultFlash
+                    bootloader:
+                      elf: {self.EXAMPLE_ELF}
+                      entry: 0x10000000
+                    memory:
+                      sram: {{ start: 0x20000000, end: 0x20020000 }}
+                      write_granularity: 4
+                      slots:
+                        primary: {{ base: 0x10000000, size: 0x1000 }}
+                        staging: {{ base: 0x10001000, size: 0x1000 }}
+                    fault_sweep:
+                      fault_types: [instruction_skip]
+                      evaluation_mode: execute
+                      instruction_skip_config:
+                        target_addresses:
+                          - {{ symbol: Reset }}
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            profile = load_profile(profile_path)
+
+        plan = build_fault_plan(
+            profile,
+            CalibrationInputs(max_writes=0),
+            fault_start=0x10000048,
+            fault_end=0x1000004C,
+        )
+
+        self.assertEqual(plan.fault_points, [0x10000048, 0x1000004A])
+        self.assertEqual(plan.fault_types_list, ["i:0x10000048", "i:0x1000004A"])
+
+
+class VerificationProbeRobotVarsTest(unittest.TestCase):
+    EXAMPLE_ELF = ROOT / "examples" / "vulnerable_ota" / "firmware.elf"
+
+    def test_robot_vars_emit_verification_probe_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = Path(td) / "profile.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    schema_version: 1
+                    name: instruction_skip_verification_probe_profile
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    bootloader:
+                      elf: {self.EXAMPLE_ELF}
+                      entry: 0x10000000
+                    memory:
+                      sram: {{ start: 0x20000000, end: 0x20020000 }}
+                      write_granularity: 4
+                      slots:
+                        exec: {{ base: 0x10000000, size: 0x1000 }}
+                        staging: {{ base: 0x10001000, size: 0x1000 }}
+                    fault_sweep:
+                      fault_types: [instruction_skip]
+                      evaluation_mode: execute
+                      instruction_skip_config:
+                        target_addresses:
+                          - {{ symbol: Reset }}
+                      verification_probes:
+                        - symbol: bootutil_img_validate
+                          return_register: r0
+                          success_value: 0
+                          label: hash_validation
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            profile = load_profile(profile_path)
+            robot_vars = profile.robot_vars(ROOT)
+        payload = next(
+            rv.split(":", 1)[1]
+            for rv in robot_vars
+            if rv.startswith("VERIFICATION_PROBES:")
+        )
+        decoded = json.loads(base64.b64decode(payload).decode("utf-8"))
+        self.assertEqual(decoded[0]["label"], "hash_validation")
+        self.assertEqual(decoded[0]["return_register"], "r0")
 
 
 class BackendCompatWarningTest(unittest.TestCase):

@@ -149,6 +149,25 @@ def _summarize_validation_rerun(result: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _verification_probe_summary(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    signals = result.get("signals") or {}
+    if not isinstance(signals, dict):
+        return None
+    probe_class = str(signals.get("verification_probe_classification") or "").strip()
+    if not probe_class:
+        return None
+    return {
+        "classification": probe_class,
+        "defense_in_depth": str(
+            signals.get("verification_defense_in_depth") or "unknown"
+        ).strip(),
+        "bypassed_labels": list(signals.get("verification_bypass_labels") or []),
+        "full_bypass": bool(signals.get("verification_full_bypass")),
+        "bypass_detected": bool(signals.get("verification_bypass_detected")),
+        "probes": signals.get("verification_probes") or {},
+    }
+
+
 def _make_single_point_runner(
     *,
     repo_root: Path,
@@ -259,12 +278,15 @@ def _validate_instruction_skip(
     reruns: Dict[str, Any] = {}
     negative_evidence: List[str] = []
     security_property = _security_property(result, expected_outcome)
+    probe_summary = _verification_probe_summary(result)
     counterfactuals = {
         "clean_firmware": "not_available",
         "tampered_firmware": "profile_defined",
         "adjacent_points": "not_tested",
         "multi_boot_replay": _steady_state_status(result),
     }
+    if probe_summary is not None:
+        counterfactuals["defense_chain"] = probe_summary.get("classification")
     if skip_addr is None:
         return _build_validation(
             stage="candidate",
@@ -280,6 +302,52 @@ def _validate_instruction_skip(
             reasons=["instruction_skip_address_unknown"],
             skeptical_summary="Candidate only: instruction skip address was not resolvable, so the validator could not replay a realistic skip model.",
         )
+
+    if probe_summary is not None:
+        if probe_summary.get("bypass_detected"):
+            glitch_models["nop"] = "bypass"
+        if probe_summary.get("classification") == "first_layer_breached_second_caught":
+            bypassed = probe_summary.get("bypassed_labels") or []
+            negative_evidence.append(
+                "verification probes show {} returned success but a later verification layer still failed".format(
+                    ", ".join(str(x) for x in bypassed) or "the first verification layer"
+                )
+            )
+            return _build_validation(
+                stage="dismissed",
+                disposition="defense_in_depth",
+                fault_type=result.get("fault_type"),
+                expected_outcome=expected_outcome,
+                security_property=security_property,
+                glitch_models=glitch_models,
+                glitch_realism="common",
+                defense_in_depth="held",
+                counterfactuals=counterfactuals,
+                negative_evidence=negative_evidence,
+                reasons=["verification_probe_later_layer_caught_fault"],
+                skeptical_summary="Dismissed: the instruction skip breached an earlier verification layer, but a later verification layer still rejected the faulted path.",
+            )
+        if probe_summary.get("classification") in {
+            "first_layer_held",
+            "first_layer_not_reached",
+        }:
+            negative_evidence.append(
+                "verification probes did not show a successful return from the first targeted verification layer"
+            )
+            return _build_validation(
+                stage="dismissed",
+                disposition="no_verification_bypass",
+                fault_type=result.get("fault_type"),
+                expected_outcome=expected_outcome,
+                security_property=security_property,
+                glitch_models=glitch_models,
+                glitch_realism="common",
+                defense_in_depth=probe_summary.get("defense_in_depth") or "held",
+                counterfactuals=counterfactuals,
+                negative_evidence=negative_evidence,
+                reasons=["verification_probe_no_first_layer_bypass"],
+                skeptical_summary="Dismissed: the instruction skip did not produce a successful return from the targeted first verification layer.",
+            )
 
     model_fault_types = {
         "nop": "i:0x{:X}:nop".format(skip_addr),

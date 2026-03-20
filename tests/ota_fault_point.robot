@@ -91,6 +91,7 @@ ${NVS_CORRUPTION_SEED}         0
 ${I2C_FAULT_PERIPHERAL}        ${EMPTY}
 ${INSTRUCTION_SKIP_REGIONS}    ${EMPTY}
 ${INSTRUCTION_SKIP_COUNT}      1
+${VERIFICATION_PROBES}         ${EMPTY}
 ${READ_FAULT_REGIONS}          ${EMPTY}
 ${READ_FAULT_BIT_FLIPS}        0
 ${READ_FAULT_PROBABILITY}      1.0
@@ -222,6 +223,7 @@ Run Runtime Fault Point
     Run Keyword If    '${I2C_FAULT_PERIPHERAL}' != ''    Execute Command    $i2c_fault_peripheral="${I2C_FAULT_PERIPHERAL}"
     Run Keyword If    '${INSTRUCTION_SKIP_REGIONS}' != ''    Execute Command    $instruction_skip_regions="${INSTRUCTION_SKIP_REGIONS}"
     Run Keyword If    '${INSTRUCTION_SKIP_COUNT}' != '1'    Execute Command    $instruction_skip_count="${INSTRUCTION_SKIP_COUNT}"
+    Run Keyword If    '${VERIFICATION_PROBES}' != ''    Execute Command    $verification_probes="${VERIFICATION_PROBES}"
     Run Keyword If    '${READ_FAULT_REGIONS}' != ''    Execute Command    $read_fault_regions="${READ_FAULT_REGIONS}"
     Run Keyword If    '${READ_FAULT_BIT_FLIPS}' != '0'    Execute Command    $read_fault_bit_flips="${READ_FAULT_BIT_FLIPS}"
     Run Keyword If    '${READ_FAULT_PROBABILITY}' != '1.0'    Execute Command    $read_fault_probability="${READ_FAULT_PROBABILITY}"

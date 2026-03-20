@@ -76,6 +76,26 @@ def _derive_read_fault_points(
     return points
 
 
+def _slice_explicit_points(
+    points: List[int],
+    *,
+    fault_step: int = 1,
+    fault_start: Optional[int] = None,
+    fault_end: Optional[int] = None,
+) -> List[int]:
+    """Filter an explicit point list by value range and stride."""
+    start = 0 if fault_start is None else int(fault_start)
+    end = None if fault_end is None else int(fault_end)
+    filtered = [
+        point for point in points
+        if point >= start and (end is None or point < end)
+    ]
+    step = max(1, int(fault_step))
+    if step > 1:
+        filtered = filtered[::step]
+    return filtered
+
+
 def build_fault_plan(
     profile: ProfileConfig,
     calibration: CalibrationInputs,
@@ -158,6 +178,8 @@ def build_fault_plan(
             heuristic_kwargs["tier2_step"] = hc.tier2_step
             heuristic_kwargs["tier3_step"] = hc.tier3_step
             heuristic_kwargs["discontinuity_window"] = hc.discontinuity_window
+            if hc.critical_regions:
+                heuristic_kwargs["critical_regions"] = hc.critical_regions
             if hc.target_points is not None:
                 heuristic_kwargs["target_points"] = hc.target_points
             if hc.shard_count > 1:
@@ -185,6 +207,7 @@ def build_fault_plan(
             slot_ranges=slot_ranges_for_heuristic,
             flash_base=flash_base,
             bootloader_region=bl_region_for_heuristic,
+            critical_regions=heuristic_kwargs.get("critical_regions"),
             tier_details=classification,
         )
         print(
@@ -259,6 +282,12 @@ def build_fault_plan(
         atomicity_count = 0
         if include_erases and total_erases > 0 and not is_mram_backend:
             erase_fps = list(range(0, total_erases))
+            erase_fps = _slice_explicit_points(
+                erase_fps,
+                fault_step=fault_step,
+                fault_start=fault_start,
+                fault_end=fault_end,
+            )
             if quick:
                 erase_fps = quick_subset(erase_fps)
             if "interrupted_erase" in fault_types:
@@ -384,6 +413,12 @@ def build_fault_plan(
         i2c_fault_count = 0
         if include_i2c_faults and total_i2c_transactions > 0:
             i2c_fps = list(range(total_i2c_transactions))
+            i2c_fps = _slice_explicit_points(
+                i2c_fps,
+                fault_step=fault_step,
+                fault_start=fault_start,
+                fault_end=fault_end,
+            )
             if quick:
                 i2c_fps = quick_subset(i2c_fps)
             for i2c_ft in i2c_fault_types:
@@ -395,6 +430,12 @@ def build_fault_plan(
         otp_fault_count = 0
         if include_otp_faults and total_otp_blows > 0:
             otp_fps = list(range(total_otp_blows))
+            otp_fps = _slice_explicit_points(
+                otp_fps,
+                fault_step=fault_step,
+                fault_start=fault_start,
+                fault_end=fault_end,
+            )
             if quick:
                 otp_fps = quick_subset(otp_fps)
             for otp_ft in otp_fault_types:
@@ -466,6 +507,12 @@ def build_fault_plan(
                             literal_pool_excluded += 1
                             continue
                         skip_addrs.append(addr)
+                skip_addrs = _slice_explicit_points(
+                    skip_addrs,
+                    fault_step=fault_step,
+                    fault_start=fault_start,
+                    fault_end=fault_end,
+                )
                 if quick:
                     skip_addrs = quick_subset(skip_addrs)
                 for addr in skip_addrs:
@@ -481,6 +528,12 @@ def build_fault_plan(
             if _setup_writes > 0:
                 mf_types = profile.fault_sweep.metadata_fault.fault_types
                 mf_fps = list(range(0, _setup_writes))
+                mf_fps = _slice_explicit_points(
+                    mf_fps,
+                    fault_step=fault_step,
+                    fault_start=fault_start,
+                    fault_end=fault_end,
+                )
                 if quick:
                     mf_fps = quick_subset(mf_fps)
                 for mf_fp in mf_fps:
@@ -504,6 +557,12 @@ def build_fault_plan(
             )
             hf_types = [FAULT_TYPE_NAME_TO_CODE.get(ft, "w") for ft in hf_config.fault_types]
             hook_fps = list(range(0, hook_max))
+            hook_fps = _slice_explicit_points(
+                hook_fps,
+                fault_step=fault_step,
+                fault_start=fault_start,
+                fault_end=fault_end,
+            )
             if quick:
                 hook_fps = quick_subset(hook_fps)
             for hf_fp in hook_fps:

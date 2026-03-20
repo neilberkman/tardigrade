@@ -37,6 +37,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             base.Reset();
             LastFaultEncountered = false;
             LastFaultAddress = 0;
+            LastFaultWordValue = 0;
             LastWritesApplied = 0;
             LastEntriesScanned = 0;
         }
@@ -62,6 +63,8 @@ namespace Antmicro.Renode.Peripherals.Memory
         public bool LastFaultEncountered { get; private set; }
 
         public uint LastFaultAddress { get; private set; }
+
+        public uint LastFaultWordValue { get; private set; }
 
         public ulong LastWritesApplied { get; private set; }
 
@@ -104,6 +107,60 @@ namespace Antmicro.Renode.Peripherals.Memory
             );
         }
 
+        public ulong ReplayWriteFault(
+            string writeTracePath,
+            ulong faultAtExclusive,
+            uint pageSize,
+            byte eraseFill,
+            int writeFaultMode,
+            uint corruptionSeed)
+        {
+            if(pageSize == 0)
+            {
+                throw new ArgumentException("pageSize must be > 0", nameof(pageSize));
+            }
+
+            var writes = LoadWriteTrace(writeTracePath);
+            return ReplayWriteFaultCore(
+                writes,
+                Array.Empty<EraseEntry>(),
+                faultAtExclusive,
+                pageSize,
+                eraseFill,
+                useEraseTrace: false,
+                writeFaultMode: writeFaultMode,
+                corruptionSeed: corruptionSeed
+            );
+        }
+
+        public ulong ReplayWriteFaultWithErases(
+            string writeTracePath,
+            string eraseTracePath,
+            ulong faultAtExclusive,
+            uint pageSize,
+            byte eraseFill,
+            int writeFaultMode,
+            uint corruptionSeed)
+        {
+            if(pageSize == 0)
+            {
+                throw new ArgumentException("pageSize must be > 0", nameof(pageSize));
+            }
+
+            var writes = LoadWriteTrace(writeTracePath);
+            var erases = LoadEraseTrace(eraseTracePath);
+            return ReplayWriteFaultCore(
+                writes,
+                erases,
+                faultAtExclusive,
+                pageSize,
+                eraseFill,
+                useEraseTrace: true,
+                writeFaultMode: writeFaultMode,
+                corruptionSeed: corruptionSeed
+            );
+        }
+
         private ulong ReplayCore(
             WriteEntry[] writes,
             EraseEntry[] erases,
@@ -121,6 +178,7 @@ namespace Antmicro.Renode.Peripherals.Memory
 
             LastFaultEncountered = false;
             LastFaultAddress = 0;
+            LastFaultWordValue = 0;
             LastWritesApplied = 0;
             LastEntriesScanned = 0;
 
@@ -166,6 +224,87 @@ namespace Antmicro.Renode.Peripherals.Memory
             return LastWritesApplied;
         }
 
+        private ulong ReplayWriteFaultCore(
+            WriteEntry[] writes,
+            EraseEntry[] erases,
+            ulong faultAtExclusive,
+            uint pageSize,
+            byte eraseFill,
+            bool useEraseTrace,
+            int writeFaultMode,
+            uint corruptionSeed)
+        {
+            if(faultAtExclusive == 0)
+            {
+                throw new ArgumentException("faultAtExclusive must be >= 1", nameof(faultAtExclusive));
+            }
+            if(writeFaultMode <= 0 || writeFaultMode == 6)
+            {
+                throw new ArgumentException("writeFaultMode must be one of 1,2,3,4,5", nameof(writeFaultMode));
+            }
+
+            ResolveTargetAccessors();
+
+            LastFaultEncountered = false;
+            LastFaultAddress = 0;
+            LastFaultWordValue = 0;
+            LastWritesApplied = 0;
+            LastEntriesScanned = 0;
+
+            ulong totalPageErases = 0;
+            var eraseIdx = 0;
+
+            for(var i = 0; i < writes.Length; i++)
+            {
+                var w = writes[i];
+
+                if(useEraseTrace)
+                {
+                    while(eraseIdx < erases.Length && erases[eraseIdx].WritesAt < w.WriteIndex)
+                    {
+                        var es = erases[eraseIdx].EraseSize > 0 ? erases[eraseIdx].EraseSize : pageSize;
+                        ErasePage(erases[eraseIdx].Offset, es, eraseFill);
+                        eraseIdx++;
+                        totalPageErases++;
+                    }
+                }
+
+                if(w.WriteIndex == faultAtExclusive)
+                {
+                    LastFaultEncountered = true;
+                    LastFaultAddress = TargetBaseAddress + w.Offset;
+                    LastFaultWordValue = ApplyWriteFault(
+                        w.Offset,
+                        w.Value,
+                        w.WriteIndex,
+                        totalPageErases,
+                        pageSize,
+                        writeFaultMode,
+                        corruptionSeed
+                    );
+                    LastWritesApplied++;
+                    LastEntriesScanned++;
+                    continue;
+                }
+
+                WriteWord(w.Offset, w.Value);
+                LastWritesApplied++;
+                LastEntriesScanned++;
+            }
+
+            if(useEraseTrace)
+            {
+                while(eraseIdx < erases.Length)
+                {
+                    var es = erases[eraseIdx].EraseSize > 0 ? erases[eraseIdx].EraseSize : pageSize;
+                    ErasePage(erases[eraseIdx].Offset, es, eraseFill);
+                    eraseIdx++;
+                }
+            }
+
+            return LastWritesApplied;
+        }
+
         private void ResolveTargetAccessors()
         {
             if(Target == null)
@@ -196,6 +335,128 @@ namespace Antmicro.Renode.Peripherals.Memory
             wordScratch[2] = (byte)((value >> 16) & 0xFF);
             wordScratch[3] = (byte)((value >> 24) & 0xFF);
             targetAsMemory.WriteBytes(offset, wordScratch, 0, 4, this);
+        }
+
+        private uint ReadWord(uint offset)
+        {
+            if(targetAsDoubleWord != null)
+            {
+                return targetAsDoubleWord.ReadDoubleWord(offset);
+            }
+
+            var bytes = targetAsMemory.ReadBytes(offset, 4);
+            return (uint)(bytes[0]
+                | (bytes[1] << 8)
+                | (bytes[2] << 16)
+                | (bytes[3] << 24));
+        }
+
+        private uint ApplyWriteFault(
+            uint offset,
+            uint newWord,
+            uint writeIndex,
+            ulong totalPageErases,
+            uint pageSize,
+            int writeFaultMode,
+            uint corruptionSeed)
+        {
+            var oldWord = ReadWord(offset);
+
+            switch(writeFaultMode)
+            {
+                case 1:
+                {
+                    var seed = BuildFaultSeed(offset, writeIndex, totalPageErases, corruptionSeed);
+                    var keepMask = NextLcg(ref seed);
+                    var corrupted = KeepOneToZeroTransitions(oldWord, newWord, keepMask);
+                    WriteWord(offset, corrupted);
+                    return corrupted;
+                }
+
+                case 2:
+                {
+                    var silentValue = ((writeIndex & 1U) == 0U) ? 0xFFFFFFFFU : 0x00000000U;
+                    WriteWord(offset, silentValue);
+                    return silentValue;
+                }
+
+                case 3:
+                {
+                    WriteWord(offset, oldWord);
+                    return oldWord;
+                }
+
+                case 4:
+                {
+                    WriteWord(offset, newWord);
+                    var seed = BuildFaultSeed(offset, writeIndex, totalPageErases, corruptionSeed);
+                    foreach(var neighbor in new[] { (int)offset - 4, (int)offset + 4 })
+                    {
+                        if(neighbor < 0)
+                        {
+                            continue;
+                        }
+                        var neighborOffset = (uint)neighbor;
+                        var neighborWord = ReadWord(neighborOffset);
+                        seed = NextLcg(ref seed);
+                        var disturbMask = seed & 0x11111111U;
+                        var disturbed = neighborWord & ~disturbMask;
+                        WriteWord(neighborOffset, disturbed);
+                    }
+                    return newWord;
+                }
+
+                case 5:
+                {
+                    WriteWord(offset, newWord);
+                    var effectivePageSize = Math.Max(4U, pageSize);
+                    var pageStart = (offset / effectivePageSize) * effectivePageSize;
+                    var wordsPerPage = Math.Max(1U, effectivePageSize / 4U);
+                    var errorCount = 2 + (int)Math.Min(10UL, totalPageErases / 8UL);
+                    var seed = BuildFaultSeed(offset, writeIndex, totalPageErases, corruptionSeed);
+                    for(var i = 0; i < errorCount; i++)
+                    {
+                        seed = NextLcg(ref seed);
+                        var idx = seed % wordsPerPage;
+                        var targetOffset = pageStart + idx * 4U;
+                        var word = ReadWord(targetOffset);
+                        seed = NextLcg(ref seed);
+                        var mask = seed & 0x01010101U;
+                        if(mask == 0U)
+                        {
+                            seed = NextLcg(ref seed);
+                            mask = 1U << (int)(seed % 32U);
+                        }
+                        var aged = word & ~mask;
+                        WriteWord(targetOffset, aged);
+                    }
+                    return newWord;
+                }
+
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(writeFaultMode));
+            }
+        }
+
+        private static uint KeepOneToZeroTransitions(uint oldWord, uint newWord, uint keepMask)
+        {
+            var bitsToFlip = oldWord & ~newWord;
+            var actuallyFlipped = bitsToFlip & keepMask;
+            return oldWord & ~actuallyFlipped;
+        }
+
+        private static uint NextLcg(ref uint seed)
+        {
+            seed = seed * 1103515245 + 12345;
+            return seed;
+        }
+
+        private static uint BuildFaultSeed(uint offset, uint writeIndex, ulong totalPageErases, uint corruptionSeed)
+        {
+            var seed = corruptionSeed != 0 ? corruptionSeed : writeIndex;
+            seed ^= offset;
+            seed ^= (uint)((totalPageErases * 2654435761UL) & 0xFFFFFFFFUL);
+            return seed;
         }
 
         private void ErasePage(uint offset, uint pageSize, byte eraseFill)
