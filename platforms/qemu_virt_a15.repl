@@ -12,12 +12,14 @@ timer: Timers.ARM_GenericTimer @ cpu
 
 gic: IRQControllers.ARM_GenericInterruptController @ {
         sysbus new Bus.BusMultiRegistration { address: 0x08000000; size: 0x010000; region: "distributor" };
-        sysbus new Bus.BusMultiRegistration { address: 0x08010000; size: 0x010000; region: "cpuInterface" }
+        sysbus new Bus.BusMultiRegistration { address: 0x08010000; size: 0x010000; region: "cpuInterface" };
+        sysbus new Bus.BusMultiRegistration { address: 0x10E00000; size: 0x010000; region: "distributor" };
+        sysbus new Bus.BusMultiRegistration { address: 0x10E10000; size: 0x010000; region: "cpuInterface" }
     }
     architectureVersion: .GICv2
     supportsTwoSecurityStates: true
 
-secureRam: Memory.MappedMemory @ sysbus 0x0E000000
+secureRam: Memory.MappedMemory @ { sysbus 0x0E000000; sysbus 0x11000000 }
     size: 0x02000000
 
 flash0: Memory.MappedMemory @ sysbus 0x00000000
@@ -31,7 +33,7 @@ ram: Memory.MappedMemory @ sysbus 0x40000000
 uart0: UART.PL011 @ sysbus 0x09000000
     -> gic@33
 
-uart1: UART.PL011 @ sysbus 0x09040000
+uart1: UART.PL011 @ { sysbus 0x09040000; sysbus 0x10F40000 }
     -> gic@40
 
 rtc: Timers.PL031 @ sysbus 0x09010000

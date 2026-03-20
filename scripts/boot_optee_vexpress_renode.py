@@ -7,13 +7,14 @@ import argparse
 import hashlib
 import os
 import re
+import select
 import shutil
 import struct
 import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Sequence
 
 from elftools.elf.constants import SH_FLAGS
 from elftools.elf.elffile import ELFFile
@@ -23,11 +24,44 @@ from elftools.elf.sections import SymbolTableSection
 
 
 DEFAULT_MARKERS = (
-    "Primary CPU initializing",
-    "Primary CPU switching to normal world boot",
+    "OPTEE_STAGE:1",
+    "OPTEE_STAGE:2",
+    "OPTEE_STAGE:3",
+    "OPTEE_STAGE:4",
+    "OPTEE_STAGE:10",
+    "OPTEE_STAGE:11",
+    "OPTEE_STAGE:12",
+    "OPTEE_STAGE:13",
+    "OPTEE_STAGE:14",
+    "OPTEE_STAGE:15",
+    "OPTEE_STAGE:16",
+    "OPTEE_STAGE:17",
+    "OPTEE_STAGE:18",
+    "OPTEE_STAGE:19",
 )
-DEFAULT_DTB_LOAD_ADDR = 0x40000000
+DEFAULT_DTB_LOAD_ADDR = 0x7FE00000
 SMALL_PAGE_SIZE = 4 * 1024
+OPTEE_STAGE_EARLY_INITCALLS = 1
+OPTEE_STAGE_SERVICE_INITCALLS = 2
+OPTEE_STAGE_DRIVER_INITCALLS = 3
+OPTEE_STAGE_BOOT_THREAD = 4
+OPTEE_STAGE_BOOT_EARLY = 10
+OPTEE_STAGE_CONSOLE_INIT = 11
+OPTEE_STAGE_BOOT_RUNTIME = 12
+OPTEE_STAGE_BOOT_FINAL = 13
+OPTEE_STAGE_PL011_INIT = 14
+OPTEE_STAGE_PL011_FLUSH = 15
+OPTEE_STAGE_REGISTER_SERIAL_CONSOLE = 16
+OPTEE_STAGE_PHYS_TO_VIRT_IO = 17
+OPTEE_STAGE_IO_PA_OR_VA_RETURN = 18
+OPTEE_STAGE_PL011_POST_IO = 19
+OPTEE_STAGE_CONFIGURE_CONSOLE_FROM_DT = 20
+OPTEE_STAGE_PL011_PUTC = 21
+OPTEE_STAGE_ARCH_VA2PA = 22
+OPTEE_STAGE_VIRT_TO_PHYS = 23
+OPTEE_STAGE_CORE_MMU_DUPLICATE_MAP = 24
+OPTEE_STAGE_ASSERT_BREAK = 25
+MIN_STARTUP_TIMEOUT = 45.0
 
 
 def repo_root() -> Path:
@@ -103,8 +137,18 @@ def get_name(obj: object) -> str:
 
 
 def get_symbol_value(elffile: ELFFile, name: str) -> int:
-    local_hits = 0
-    found = None
+    values = get_symbol_values(elffile, name)
+    if not values:
+        raise SystemExit(f"unable to resolve unique symbol {name!r} from tee.elf")
+    if len(values) == 1:
+        return values[0]
+    if name in {"fdt32_ld"}:
+        return max(values)
+    raise SystemExit(f"unable to resolve unique symbol {name!r} from tee.elf")
+
+
+def get_symbol_values(elffile: ELFFile, name: str) -> list[int]:
+    local_hits: list[int] = []
     for section in elffile.iter_sections():
         if not isinstance(section, SymbolTableSection):
             continue
@@ -113,14 +157,11 @@ def get_symbol_value(elffile: ELFFile, name: str) -> int:
             if symbol_name != name:
                 continue
             bind = symbol["st_info"]["bind"]
-            if bind == "STB_GLOBAL":
-                return int(symbol["st_value"])
+            if bind in ("STB_GLOBAL", "STB_WEAK"):
+                return [int(symbol["st_value"])]
             if bind == "STB_LOCAL":
-                found = int(symbol["st_value"])
-                local_hits += 1
-    if found is None or local_hits > 1:
-        raise SystemExit(f"unable to resolve unique symbol {name!r} from tee.elf")
-    return found
+                local_hits.append(int(symbol["st_value"]))
+    return sorted(set(local_hits))
 
 
 def resolve_symbol_values(elf_path: Path, names: Sequence[str]) -> dict[str, int]:
@@ -190,6 +231,24 @@ def round_up(value: int, multiple: int) -> int:
     return (((value - 1) // multiple) + 1) * multiple
 
 
+def hook_address(symbol_value: int) -> int:
+    return symbol_value & ~0x1
+
+
+def find_marker_in_output(output: bytes, markers: Sequence[str]) -> str | None:
+    patterns = [
+        (
+            marker,
+            re.compile(rb"(?<![0-9A-Za-z_:])" + re.escape(marker.encode("latin1")) + rb"(?![0-9A-Za-z_])"),
+        )
+        for marker in sorted(markers, key=len, reverse=True)
+    ]
+    for marker, pattern in patterns:
+        if pattern.search(output):
+            return marker
+    return None
+
+
 def build_optee_embdata(elf_path: Path) -> tuple[int, bytes]:
     with elf_path.open("rb") as stream:
         elffile = ELFFile(stream)
@@ -221,49 +280,6 @@ def build_optee_embdata(elf_path: Path) -> tuple[int, bytes]:
         return get_symbol_value(elffile, "__data_end"), bytes(embdata)
 
 
-def make_monitor_string(script: str) -> str:
-    hook = f"exec({script!r})"
-    return hook.replace('"', '\\"')
-
-
-def render_va2pa_compat_hook(symbols: Mapping[str, int]) -> str:
-    static_memory_map = symbols["static_memory_map"]
-    script = "\n".join(
-        [
-            "addr = self.GetRegister(0).RawValue",
-            "out_ptr = self.GetRegister(1).RawValue",
-            f"count = int(machine.SystemBus.ReadDoubleWord(0x{static_memory_map:X}, self))",
-            f"map_ptr = machine.SystemBus.ReadDoubleWord(0x{static_memory_map + 8:X}, self)",
-            "translated = 0",
-            "found = False",
-            "for index in range(count):",
-            "    entry = map_ptr + index * 24",
-            "    pa = machine.SystemBus.ReadDoubleWord(entry + 8, self)",
-            "    va = machine.SystemBus.ReadDoubleWord(entry + 12, self)",
-            "    size = machine.SystemBus.ReadDoubleWord(entry + 16, self)",
-            "    if size == 0:",
-            "        continue",
-            "    if addr >= va and addr < va + size:",
-            "        if pa != 0:",
-            "            translated = (pa + (addr - va)) & 0xFFFFFFFF",
-            "            found = True",
-            "        break",
-            "if not found:",
-            "    registered = machine.SystemBus.WhatIsAt(addr, self)",
-            "    if registered is not None:",
-            "        translated = addr & 0xFFFFFFFF",
-            "        found = True",
-            "if found:",
-            "    machine.SystemBus.WriteDoubleWord(out_ptr, translated, self)",
-            "    self.SetCompatRegister32(0, 1)",
-            "else:",
-            "    self.SetCompatRegister32(0, 0)",
-            "self.PC = self.LR",
-        ]
-    )
-    return make_monitor_string(script)
-
-
 def render_resc(
     elf_path: Path,
     dtb_path: Path,
@@ -272,6 +288,8 @@ def render_resc(
     pty_link: Path,
     dtb_load_addr: int,
     symbols: Mapping[str, int],
+    fdt32_ld_hooks: Sequence[int],
+    fdt64_ld_hooks: Sequence[int],
 ) -> str:
     root = repo_root()
     includes = [
@@ -282,6 +300,14 @@ def render_resc(
         root / "peripherals" / "QEMUVirtARMv7A.cs",
     ]
     lines = [f"include @{path}" for path in includes]
+    fdt32_hook_lines = [
+        f'sysbus.cpu AddHook 0x{hook_address(address):X} "self.ReturnFdt32LoadTranslatedOrContinue(0)"'
+        for address in fdt32_ld_hooks
+    ]
+    fdt64_hook_lines = [
+        f'sysbus.cpu AddHook 0x{hook_address(address):X} "self.ReturnFdt64LoadTranslatedOrContinue(0)"'
+        for address in fdt64_ld_hooks
+    ]
     lines.extend(
         [
             "",
@@ -295,40 +321,87 @@ def render_resc(
             "sysbus.cpu SetRegister 0 0x0",
             "sysbus.cpu SetRegister 1 0x0",
             f"sysbus.cpu SetRegister 2 0x{dtb_load_addr:X}",
-            f'sysbus.cpu AddHook 0x{symbols["arch_va2pa_helper"] & ~1:X} "{render_va2pa_compat_hook(symbols)}"',
+            f'sysbus.cpu OpteeStaticMemoryMapAddress 0x{symbols["static_memory_map"]:X}',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["arch_va2pa_helper"]):X} "self.AnnounceBootStage({OPTEE_STAGE_ARCH_VA2PA}); self.ReturnArchVa2PaHelperResultOrContinue(0, 1)"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["virt_to_phys"]):X} "self.AnnounceBootStage({OPTEE_STAGE_VIRT_TO_PHYS}); self.ReturnTranslatedPhysicalAddressOrContinue(0)"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["core_mmu_map_region"]) + 0xD4:X} "self.AnnounceBootStage({OPTEE_STAGE_CORE_MMU_DUPLICATE_MAP}); self.SkipCoreMmuDuplicateMapOrContinue(0x{hook_address(symbols["core_mmu_map_region"]) + 0x124:X})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["_assert_break"]):X} "self.AnnounceBootStage({OPTEE_STAGE_ASSERT_BREAK}); self.ReturnFromFunctionIfMmuEnabled()"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["boot_init_primary_early"]):X} "self.AnnounceBootStage({OPTEE_STAGE_BOOT_EARLY})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["plat_console_init"]):X} "self.AnnounceBootStage({OPTEE_STAGE_CONSOLE_INIT}); self.ReturnFromFunctionIfMmuEnabled()"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["boot_init_primary_runtime"]):X} "self.AnnounceBootStage({OPTEE_STAGE_BOOT_RUNTIME})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["boot_init_primary_final"]):X} "self.AnnounceBootStage({OPTEE_STAGE_BOOT_FINAL})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["pl011_init"]):X} "self.AnnounceBootStage({OPTEE_STAGE_PL011_INIT})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["pl011_init"]) + 0x18:X} "self.AnnounceBootStage({OPTEE_STAGE_PL011_POST_IO})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["pl011_flush"]):X} "self.AnnounceBootStage({OPTEE_STAGE_PL011_FLUSH}); self.ReturnFromFunctionIfMmuEnabled()"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["pl011_putc"]):X} "self.AnnounceBootStage({OPTEE_STAGE_PL011_PUTC}); self.EmitCompatCharAndReturnIfMmuEnabled(1)"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["register_serial_console"]):X} "self.AnnounceBootStage({OPTEE_STAGE_REGISTER_SERIAL_CONSOLE})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["phys_to_virt_io"]):X} "self.AnnounceBootStage({OPTEE_STAGE_PHYS_TO_VIRT_IO}); self.ReturnVirtualAddressForPhysicalOrContinue(0)"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["io_pa_or_va"]) + 0x30:X} "self.AnnounceBootStage({OPTEE_STAGE_IO_PA_OR_VA_RETURN})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["configure_console_from_dt"]):X} "self.AnnounceBootStage({OPTEE_STAGE_CONFIGURE_CONSOLE_FROM_DT}); self.ReturnCompatValue32IfMmuEnabled(0)"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["fdt_open_into"]):X} "self.TranslateCompatRegister32ToVirtualIfPhysMappedAndMmuEnabled(0); self.TranslateCompatRegister32ToVirtualIfPhysMappedAndMmuEnabled(1)"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["fdt_open_into"]) + 0x6E:X} "self.CompleteFdtOpenIntoHeaderFixupIfMmuEnabled(0x{hook_address(symbols["fdt_open_into"]) + 0x84:X})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["fdt_move"]):X} "self.TranslateCompatRegister32ToVirtualIfPhysMappedAndMmuEnabled(0); self.TranslateCompatRegister32ToVirtualIfPhysMappedAndMmuEnabled(1)"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["fdt_move"]) + 0x20:X} "self.CompleteCompatMemmoveFromRegistersIfMmuEnabled(5, 4, 2, 0x{hook_address(symbols["fdt_move"]) + 0x24:X})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["fdt_next_tag"]) + 0x1A:X} "self.LoadTranslatedMemoryValue32IntoRegisterAndJump(0, 0, 7, 0x{hook_address(symbols["fdt_next_tag"]) + 0x1E:X})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["fdt_next_tag"]) + 0x54:X} "self.LoadTranslatedMemoryValue8IntoRegisterAndJump(0, 0, 3, 0x{hook_address(symbols["fdt_next_tag"]) + 0x56:X})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["call_early_initcalls"]):X} "self.AnnounceBootStage({OPTEE_STAGE_EARLY_INITCALLS})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["call_service_initcalls"]):X} "self.AnnounceBootStage({OPTEE_STAGE_SERVICE_INITCALLS})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["call_driver_initcalls"]):X} "self.AnnounceBootStage({OPTEE_STAGE_DRIVER_INITCALLS})"',
+            f'sysbus.cpu AddHook 0x{hook_address(symbols["thread_init_boot_thread"]):X} "self.AnnounceBootStage({OPTEE_STAGE_BOOT_THREAD})"',
             "start",
         ]
     )
+    insertion_index = lines.index(
+        f'sysbus.cpu AddHook 0x{hook_address(symbols["call_early_initcalls"]):X} "self.AnnounceBootStage({OPTEE_STAGE_EARLY_INITCALLS})"'
+    )
+    lines[insertion_index:insertion_index] = fdt32_hook_lines
+    lines[insertion_index + len(fdt32_hook_lines):insertion_index + len(fdt32_hook_lines)] = fdt64_hook_lines
     return "\n".join(lines) + "\n"
 
 
-def wait_for_path(path: Path, timeout_s: float) -> None:
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if path.exists():
-            return
-        time.sleep(0.05)
-    raise SystemExit(f"timed out waiting for PTY link: {path}")
+def maybe_open_uart_fd(path: Path | None) -> int | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        slave = Path(os.readlink(path))
+    except OSError:
+        return None
+    try:
+        return os.open(slave, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError:
+        return None
 
 
-def read_until_any(fd: int, markers: Sequence[str], timeout_s: float) -> tuple[str, str]:
+def read_until_any_stream(stdout_fd: int, markers: Sequence[str], timeout_s: float, pty_path: Path | None = None) -> tuple[str, str]:
     deadline = time.time() + timeout_s
-    needles = [(marker, marker.encode("latin1")) for marker in markers]
     chunks: list[bytes] = []
+    uart_fd = None
     while time.time() < deadline:
-        try:
-            chunk = os.read(fd, 4096)
-        except BlockingIOError:
-            time.sleep(0.05)
+        if uart_fd is None:
+            uart_fd = maybe_open_uart_fd(pty_path)
+        fds = [stdout_fd]
+        if uart_fd is not None:
+            fds.append(uart_fd)
+        timeout = max(0.0, min(0.25, deadline - time.time()))
+        readable, _, _ = select.select(fds, [], [], timeout)
+        if not readable:
             continue
-        if not chunk:
-            time.sleep(0.05)
-            continue
-        chunks.append(chunk)
-        joined = b"".join(chunks)
-        for marker, needle in needles:
-            if needle in joined:
+        for fd in readable:
+            try:
+                chunk = os.read(fd, 4096)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            joined = b"".join(chunks)
+            marker = find_marker_in_output(joined, markers)
+            if marker is not None:
+                if uart_fd is not None:
+                    os.close(uart_fd)
                 return marker, joined.decode("latin1", "replace")
+    if uart_fd is not None:
+        os.close(uart_fd)
     raise SystemExit(
         "timed out waiting for OP-TEE init marker\n\n"
         + b"".join(chunks).decode("latin1", "replace")
@@ -360,7 +433,42 @@ def run_session(args: argparse.Namespace) -> int:
         dtb_path = temp_root / "optee-qemu-virt.dtb"
         embdata_path = temp_root / "optee-boot-embdata.bin"
         embdata_load_addr, embdata_blob = build_optee_embdata(elf_path)
-        symbols = resolve_symbol_values(elf_path, ("arch_va2pa_helper", "static_memory_map"))
+        symbols = resolve_symbol_values(
+            elf_path,
+            (
+                "arch_va2pa_helper",
+                "virt_to_phys",
+                "core_mmu_map_region",
+                "_assert_break",
+                "static_memory_map",
+                "boot_init_primary_early",
+                "plat_console_init",
+                "boot_init_primary_runtime",
+                "boot_init_primary_final",
+                "pl011_init",
+                "pl011_flush",
+                "pl011_putc",
+                "register_serial_console",
+                "phys_to_virt_io",
+                "io_pa_or_va",
+                "configure_console_from_dt",
+                "fdt_open_into",
+                "fdt_move",
+                "fdt_next_tag",
+                "call_early_initcalls",
+                "call_service_initcalls",
+                "call_driver_initcalls",
+                "thread_init_boot_thread",
+            ),
+        )
+        with elf_path.open("rb") as stream:
+            fdt32_ld_hooks = get_symbol_values(ELFFile(stream), "fdt32_ld")
+        with elf_path.open("rb") as stream:
+            fdt64_ld_hooks = get_symbol_values(ELFFile(stream), "fdt64_ld")
+        if not fdt32_ld_hooks:
+            raise SystemExit("unable to resolve any 'fdt32_ld' symbol from tee.elf")
+        if not fdt64_ld_hooks:
+            raise SystemExit("unable to resolve any 'fdt64_ld' symbol from tee.elf")
         compile_dtb(dtc_bin, dts_path, dtb_path)
         embdata_path.write_bytes(embdata_blob)
         resc_path.write_text(
@@ -372,25 +480,26 @@ def run_session(args: argparse.Namespace) -> int:
                 pty_link,
                 args.dtb_load_addr,
                 symbols,
+                fdt32_ld_hooks,
+                fdt64_ld_hooks,
             ),
             encoding="utf-8",
         )
         proc = subprocess.Popen(
             [str(renode_bin), "--console", "--disable-gui", "--execute", f"i @{resc_path}"],
             stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
         try:
-            wait_for_path(pty_link, args.timeout)
-            time.sleep(1.0)
-            slave = Path(os.readlink(pty_link))
-            fd = os.open(slave, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-            try:
-                marker, output = read_until_any(fd, markers, args.timeout)
-            finally:
-                os.close(fd)
+            if proc.stdout is None:
+                raise SystemExit("failed to capture Renode stdout")
+            marker, output = read_until_any_stream(
+                proc.stdout.fileno(),
+                markers,
+                max(args.timeout, MIN_STARTUP_TIMEOUT),
+                pty_link,
+            )
         finally:
             terminate_process(proc)
 
