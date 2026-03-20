@@ -356,6 +356,21 @@ fault_sweep:
       label: slot_validation
 ```
 
+For compatibility with older prompts and notes, tardigrade also accepts the legacy wrapper form:
+
+```yaml
+fault_sweep:
+  fault_types: [instruction_skip]
+  verification_bypass_probe:
+    enabled: true
+    probe_functions:
+      - symbol: bootutil_img_validate
+        expected_success_value: 0
+        layer: hash_validation
+```
+
+`verification_bypass_probe.probe_functions[*].layer` maps to the probe label, and `expected_success_value` maps to `success_value`. Use either `verification_probes` or `verification_bypass_probe`, not both.
+
 Each probe attaches to the function symbol, records the return register on the first completed call, and emits structured telemetry in the result JSON:
 
 - `verification_probes`

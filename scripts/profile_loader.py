@@ -2300,9 +2300,7 @@ def _parse_fault_sweep(
             bootloader_elf=bootloader_elf,
             profile_path=profile_path,
         ),
-        verification_probes=_parse_verification_probes(
-            raw.get("verification_probes")
-        ),
+        verification_probes=_parse_verification_probe_config(raw),
         metadata_fault=_parse_metadata_fault(raw.get("metadata_fault")),
         partial_staging=raw.get("partial_staging"),
         nvs_corruption=_parse_nvs_corruption(raw.get("nvs_corruption")),
@@ -2751,6 +2749,53 @@ def _parse_verification_probes(raw: Optional[Any]) -> List[VerificationProbeConf
             )
         )
     return probes
+
+
+def _parse_verification_bypass_probe(raw: Optional[Any]) -> List[VerificationProbeConfig]:
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep.verification_bypass_probe: expected mapping")
+    enabled = bool(raw.get("enabled", False))
+    if not enabled:
+        return []
+    probe_functions = raw.get("probe_functions", [])
+    if not isinstance(probe_functions, list):
+        raise ProfileError(
+            "fault_sweep.verification_bypass_probe.probe_functions: expected list"
+        )
+    normalized: List[Dict[str, Any]] = []
+    for i, entry in enumerate(probe_functions):
+        ctx = "fault_sweep.verification_bypass_probe.probe_functions[{}]".format(i)
+        if not isinstance(entry, dict):
+            raise ProfileError("{}: expected mapping".format(ctx))
+        normalized.append(
+            {
+                "symbol": _require(entry, "symbol", ctx),
+                "return_register": entry.get("return_register", "r0"),
+                "success_value": entry.get(
+                    "success_value",
+                    entry.get("expected_success_value", 0),
+                ),
+                "label": entry.get("label", entry.get("layer")),
+            }
+        )
+    return _parse_verification_probes(normalized)
+
+
+def _parse_verification_probe_config(raw: Dict[str, Any]) -> List[VerificationProbeConfig]:
+    has_new = "verification_probes" in raw
+    has_old = "verification_bypass_probe" in raw
+    if has_new and has_old:
+        raise ProfileError(
+            "fault_sweep: use either verification_probes or "
+            "verification_bypass_probe, not both"
+        )
+    if has_new:
+        return _parse_verification_probes(raw.get("verification_probes"))
+    if has_old:
+        return _parse_verification_bypass_probe(raw.get("verification_bypass_probe"))
+    return []
 
 
 def _parse_i2c_fault_config(raw):

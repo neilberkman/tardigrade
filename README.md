@@ -54,6 +54,8 @@ Not all NVM writes are equally interesting. The heuristic classifier (`scripts/w
 
 A device that boots to the wrong slot, confirms a corrupt image, or gets stuck in a revert loop is not "working." Tardigrade's state probes, semantic assertions, and composable invariant providers catch state-correctness bugs that pass a naive boot check. PR #2199 (stuck revert) is an example: the device boots, but it boots the wrong image permanently. Tardigrade catches it.
 
+Instruction-skip sweeps can also attach verification bypass probes that record per-function return values instead of relying only on the final boot outcome. This lets tardigrade separate noisy CPU crashes from defense-in-depth catches and true full verification bypasses, which cuts down the false positives that otherwise show up in glitch-style campaigns.
+
 ### Write-back durability model
 
 Real storage stacks often buffer writes in RAM before committing to flash. A bootloader that assumes write-through durability can have latent bugs invisible to direct fault injection. The optional `durability_model: writeback` mode adds a volatile overlay between the bootloader's writes and physical flash -- writes accumulate in the overlay, explicit barriers commit them, and power-loss discards uncommitted data. This exposes missing flush barriers without requiring the firmware to be built with a specific storage configuration.

@@ -32,6 +32,7 @@ from profile_loader import (  # noqa: E402
     InstructionSkipConfig,
     ProfileError,
     VerificationProbeConfig,
+    _parse_verification_bypass_probe,
     _parse_instruction_skip_config,
     _parse_verification_probes,
     load_profile,
@@ -192,6 +193,40 @@ class VerificationProbeConfigTest(unittest.TestCase):
             _parse_verification_probes(
                 [{"symbol": "bootutil_img_validate", "return_register": "pc"}]
             )
+
+    def test_parse_verification_bypass_probe_alias(self) -> None:
+        probes = _parse_verification_bypass_probe(
+            {
+                "enabled": True,
+                "probe_functions": [
+                    {
+                        "symbol": "bootutil_img_validate",
+                        "expected_success_value": 0,
+                        "layer": "hash_validation",
+                    },
+                    {
+                        "symbol": "boot_validate_slot.isra.3",
+                        "return_register": "w0",
+                        "expected_success_value": 0,
+                        "layer": "slot_validation",
+                    },
+                ],
+            }
+        )
+        self.assertEqual([p.label for p in probes], ["hash_validation", "slot_validation"])
+        self.assertEqual(probes[0].success_value, 0)
+        self.assertEqual(probes[1].return_register, "r0")
+
+    def test_disabled_verification_bypass_probe_alias_returns_empty(self) -> None:
+        probes = _parse_verification_bypass_probe(
+            {
+                "enabled": False,
+                "probe_functions": [
+                    {"symbol": "bootutil_img_validate", "layer": "hash_validation"}
+                ],
+            }
+        )
+        self.assertEqual(probes, [])
 
     def test_probe_summary_tracks_first_return_for_classification(self) -> None:
         resc_text = RESC.read_text(encoding="utf-8")
@@ -421,6 +456,99 @@ class VerificationProbeRobotVarsTest(unittest.TestCase):
         decoded = json.loads(base64.b64decode(payload).decode("utf-8"))
         self.assertEqual(decoded[0]["label"], "hash_validation")
         self.assertEqual(decoded[0]["return_register"], "r0")
+
+    def test_verification_bypass_probe_alias_emits_same_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = Path(td) / "profile.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    schema_version: 1
+                    name: instruction_skip_verification_bypass_probe_alias_profile
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    bootloader:
+                      elf: {self.EXAMPLE_ELF}
+                      entry: 0x10000000
+                    memory:
+                      sram: {{ start: 0x20000000, end: 0x20020000 }}
+                      write_granularity: 4
+                      slots:
+                        exec: {{ base: 0x10000000, size: 0x1000 }}
+                        staging: {{ base: 0x10001000, size: 0x1000 }}
+                    fault_sweep:
+                      fault_types: [instruction_skip]
+                      evaluation_mode: execute
+                      instruction_skip_config:
+                        target_addresses:
+                          - {{ symbol: Reset }}
+                      verification_bypass_probe:
+                        enabled: true
+                        probe_functions:
+                          - symbol: bootutil_img_validate
+                            expected_success_value: 0
+                            layer: hash_validation
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            profile = load_profile(profile_path)
+            robot_vars = profile.robot_vars(ROOT)
+        payload = next(
+            rv.split(":", 1)[1]
+            for rv in robot_vars
+            if rv.startswith("VERIFICATION_PROBES:")
+        )
+        decoded = json.loads(base64.b64decode(payload).decode("utf-8"))
+        self.assertEqual(decoded[0]["label"], "hash_validation")
+        self.assertEqual(decoded[0]["success_value"], 0)
+
+    def test_new_and_old_verification_probe_configs_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = Path(td) / "profile.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    schema_version: 1
+                    name: instruction_skip_verification_probe_conflict_profile
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    bootloader:
+                      elf: {self.EXAMPLE_ELF}
+                      entry: 0x10000000
+                    memory:
+                      sram: {{ start: 0x20000000, end: 0x20020000 }}
+                      write_granularity: 4
+                      slots:
+                        exec: {{ base: 0x10000000, size: 0x1000 }}
+                        staging: {{ base: 0x10001000, size: 0x1000 }}
+                    fault_sweep:
+                      fault_types: [instruction_skip]
+                      evaluation_mode: execute
+                      instruction_skip_config:
+                        target_addresses:
+                          - {{ symbol: Reset }}
+                      verification_probes:
+                        - symbol: bootutil_img_validate
+                          label: hash_validation
+                      verification_bypass_probe:
+                        enabled: true
+                        probe_functions:
+                          - symbol: boot_validate_slot
+                            layer: slot_validation
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ProfileError):
+                load_profile(profile_path)
+
+
+class VerificationProbeProfileFixtureTest(unittest.TestCase):
+    def test_nxboot_probe_profile_loads(self) -> None:
+        profile = load_profile(ROOT / "profiles" / "nxboot_style_instruction_skip_probe.yaml")
+        self.assertEqual(profile.fault_sweep.verification_probes[0].label, "image_validation")
+        self.assertEqual(profile.fault_sweep.verification_probes[0].success_value, 0)
 
 
 class BackendCompatWarningTest(unittest.TestCase):
