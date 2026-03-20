@@ -18,13 +18,6 @@ Tardigrade's fault sweep against the upstream [NuttX nxboot bootloader](https://
 
 The FTL `O_DIRECT` bug affects all NuttX applications that write to MTD partitions expecting direct access, not just nxboot.
 
-### U-Boot -- CFI flash redundant environment flag bug
-
-Tardigrade fault injection on U-Boot's CFI flash redundant environment backend found that 253 of 255 possible active-flag byte values cause `env_flash_init()` to fall through without setting `gd->env_addr`, leading to silent data loss (wrong copy selected) and a persistent spurious "recovered successfully" warning on every subsequent boot. Patch submitted upstream:
-
-- [Patch on lore](https://lore.kernel.org/u-boot/20260318211515.35246-1-neil@xuku.com/) -- `env: flash: add catch-all for unrecognized flags in env_flash_init()`
-- [Reproducer gist](https://gist.github.com/neilberkman/4155612a7942d3f510f204eb85e61943)
-
 ### MCUboot -- resilience validation
 
 Extensive fault-injection sweeps across MCUboot HEAD (swap-move, swap-scratch, swap-offset) on nRF52840 and STM32F4 confirm that MCUboot's swap algorithms are resilient to both power-loss and write-class faults. Over 5,000 fault points tested including multi-boot cycles, phase-2 recovery faults, and return-code injection (`rc_injection` fault type forcing `flash_area_write` to return `-EIO`). MCUboot's write ordering in `fixup_revert()` self-heals corrupted trailer metadata through subsequent writes.
@@ -191,6 +184,7 @@ flowchart TD
 | NVM controller  | `command_drop`                                                                                                                                                        | GenericNvmController |
 | NVM region      | `bootloader_region_write`, `nvs_corruption`                                                                                                                           | All                  |
 | CPU glitch      | `instruction_skip`                                                                                                                                                    | All                  |
+| Driver error    | `driver_error` (peripheral sets error status register), `rc_injection` (forces flash write return code to -EIO at software level)                                     | All                  |
 | I2C bus         | `i2c_nack`, `i2c_timeout`, `i2c_bit_flip`, `i2c_truncated`, `i2c_wrong_address`                                                                                       | I2CFaultProxy        |
 | OTP fuse        | `otp_partial_program`, `otp_stuck_bit`, `otp_read_disturb`, `otp_overblow`                                                                                            | OTPMemory            |
 

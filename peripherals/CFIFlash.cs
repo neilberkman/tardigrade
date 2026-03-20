@@ -17,6 +17,10 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
     public class CFIFlash : IDoubleWordPeripheral, IBytePeripheral, IWordPeripheral, IKnownSize
     {
+        public CFIFlash() : this(0x04000000)
+        {
+        }
+
         public CFIFlash(int size)
         {
             this.size = (long)size;
