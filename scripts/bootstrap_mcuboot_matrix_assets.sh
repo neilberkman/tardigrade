@@ -200,13 +200,24 @@ EOF
 
 ensure_mcuboot_history() {
     local repo="$1"
+    msg "Fetching MCUboot history for differential commit builds"
+    # Unshallow if needed — try origin first (west's remote), then upstream.
     if [[ "$(git -C "${repo}" rev-parse --is-shallow-repository)" == "true" ]]; then
-        msg "Unshallowing MCUboot history for differential commit builds"
-        git -C "${repo}" fetch --quiet --unshallow upstream || \
-            git -C "${repo}" fetch --quiet --depth=5000 upstream
-    else
-        git -C "${repo}" fetch --quiet upstream
+        git -C "${repo}" fetch --quiet --unshallow origin 2>/dev/null || \
+            git -C "${repo}" fetch --quiet --unshallow upstream 2>/dev/null || \
+            git -C "${repo}" fetch --quiet --depth=10000 upstream 2>/dev/null || true
     fi
+    # Always fetch upstream to ensure PR commits are reachable.
+    git -C "${repo}" fetch --quiet upstream 2>/dev/null || true
+    # Last resort: fetch each required SHA individually.
+    for sha in \
+        "${PR2205_BROKEN}" "${PR2205_FIXED}" \
+        "${PR2206_BROKEN}" "${PR2206_FIXED}" \
+        "${PR2214_BROKEN}" "${PR2214_FIXED}"; do
+        if ! git -C "${repo}" rev-parse --verify "${sha}^{commit}" >/dev/null 2>&1; then
+            git -C "${repo}" fetch --quiet upstream "${sha}" 2>/dev/null || true
+        fi
+    done
 }
 
 require_mcuboot_commit() {
