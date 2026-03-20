@@ -110,12 +110,14 @@ $nvs_corruption_seed?="0"
 $i2c_fault_peripheral?=""
 $instruction_skip_regions?=""
 $instruction_skip_count?="1"
+$verification_probes?=""
 $durability_model?="direct"
 $writeback_buffer_capacity?="auto"
 $writeback_barriers?=""
 $writeback_erase_flushes?="false"
 
 python """
+import base64
 import json
 import os
 import struct
@@ -1112,6 +1114,248 @@ def reset_rc_injection_state(enabled=False):
     _rc_injection_state['injected'] = False
     _rc_injection_state['injected_symbol'] = None
     _rc_injection_state['injected_return_addr'] = None
+
+# ---------------------------------------------------------------------------
+# Verification probes: capture return values from verification-layer helpers
+# during instruction-skip runs so we can distinguish "first layer breached"
+# from "later layer caught it" deterministically.
+# ---------------------------------------------------------------------------
+_verification_probes_raw = get_optional_var('verification_probes', '')
+_verification_probe_order = []
+_verification_probe_state = {
+    'entry_templates': {},
+    'entry_hook_addrs': set(),
+    'installed_return_hooks': set(),
+    'active_frames': [],
+    'captures': {},
+}
+
+def _verification_fmt_u32(value):
+    return '0x{:08X}'.format(int(value) & 0xFFFFFFFF)
+
+def _make_verification_probe_capture(cfg):
+    return {
+        'label': cfg.get('label'),
+        'symbol': cfg.get('symbol'),
+        'return_register': cfg.get('return_register'),
+        'success_value': _verification_fmt_u32(int(cfg.get('success_value', 0))),
+        'reached': False,
+        'call_count': 0,
+        'return_value': None,
+        'return_values': [],
+        'bypassed': False,
+    }
+
+def _load_verification_probe_configs(raw_text):
+    if not raw_text:
+        return []
+    try:
+        decoded = base64.b64decode(raw_text).decode('utf-8')
+        payload = json.loads(decoded)
+    except Exception as e:
+        raise RuntimeError('verification_probes: failed to decode payload: {}'.format(e))
+    if not isinstance(payload, list):
+        raise RuntimeError('verification_probes: expected list payload')
+    cfgs = []
+    seen_labels = set()
+    for i, entry in enumerate(payload):
+        if not isinstance(entry, dict):
+            raise RuntimeError('verification_probes[{}]: expected mapping'.format(i))
+        label = str(entry.get('label') or entry.get('symbol') or '').strip()
+        symbol = str(entry.get('symbol') or '').strip()
+        reg_name = str(entry.get('return_register') or 'r0').strip().lower()
+        reg_index = int(entry.get('return_register_index', 0))
+        success_value = int(entry.get('success_value', 0))
+        if not label or not symbol:
+            raise RuntimeError('verification_probes[{}]: label/symbol must be non-empty'.format(i))
+        if label in seen_labels:
+            raise RuntimeError('verification_probes[{}]: duplicate label {}'.format(i, label))
+        seen_labels.add(label)
+        cfgs.append({
+            'label': label,
+            'symbol': symbol,
+            'return_register': reg_name,
+            'return_register_index': reg_index,
+            'success_value': success_value & 0xFFFFFFFF,
+        })
+    return cfgs
+
+def _verification_probe_return_hook(cpu, addr):
+    current_addr = int(addr) & ~1
+    active_frames = _verification_probe_state.get('active_frames') or []
+    matched_index = None
+    matched_frame = None
+    for idx in range(len(active_frames) - 1, -1, -1):
+        frame = active_frames[idx]
+        if frame.get('return_addr') == current_addr:
+            matched_index = idx
+            matched_frame = frame
+            break
+    if matched_frame is None:
+        return
+    try:
+        raw_value = int(cpu.GetRegister(int(matched_frame['return_register_index'])).RawValue) & 0xFFFFFFFF
+    except Exception:
+        raw_value = 0
+    label = matched_frame.get('label')
+    capture = _verification_probe_state['captures'].get(label)
+    if capture is None:
+        capture = _make_verification_probe_capture(matched_frame)
+        _verification_probe_state['captures'][label] = capture
+    capture['reached'] = True
+    capture['call_count'] = int(capture.get('call_count') or 0) + 1
+    formatted_value = _verification_fmt_u32(raw_value)
+    is_success = raw_value == (int(matched_frame.get('success_value', 0)) & 0xFFFFFFFF)
+    if capture.get('first_return_value') is None:
+        capture['first_return_value'] = formatted_value
+        capture['first_bypassed'] = bool(is_success)
+    capture['return_value'] = formatted_value
+    capture.setdefault('return_values', []).append(formatted_value)
+    if is_success:
+        capture['bypassed'] = True
+    log(
+        'verification_probe_return: {} rv={} bypass={}'.format(
+            label,
+            _verification_fmt_u32(raw_value),
+            bool(capture.get('bypassed')),
+        )
+    )
+    try:
+        del active_frames[matched_index]
+    except Exception:
+        pass
+
+def _verification_probe_entry_hook(cpu, addr):
+    current_addr = int(addr) & ~1
+    templates = _verification_probe_state['entry_templates'].get(current_addr) or []
+    if not templates:
+        return
+    return_addr = int(cpu.GetRegister(14).RawValue) & ~1
+    if return_addr <= 0:
+        return
+    if return_addr not in _verification_probe_state['installed_return_hooks']:
+        cpu.AddHook(return_addr, _verification_probe_return_hook)
+        _verification_probe_state['installed_return_hooks'].add(return_addr)
+    for template in templates:
+        frame = {
+            'label': template.get('label'),
+            'symbol': template.get('symbol'),
+            'return_register': template.get('return_register'),
+            'return_register_index': int(template.get('return_register_index', 0)),
+            'success_value': int(template.get('success_value', 0)) & 0xFFFFFFFF,
+            'return_addr': return_addr,
+        }
+        _verification_probe_state['active_frames'].append(frame)
+
+def reset_verification_probes():
+    _verification_probe_state['active_frames'] = []
+    captures = {}
+    for cfg in _load_verification_probe_configs(_verification_probes_raw):
+        captures[cfg['label']] = _make_verification_probe_capture(cfg)
+    _verification_probe_state['captures'] = captures
+
+def capture_verification_probe_summary():
+    if not _verification_probe_order:
+        return None
+    probes = {}
+    for label in _verification_probe_order:
+        capture = _verification_probe_state['captures'].get(label)
+        if capture is None:
+            continue
+        probes[label] = {
+            'label': capture.get('label'),
+            'symbol': capture.get('symbol'),
+            'return_register': capture.get('return_register'),
+            'success_value': capture.get('success_value'),
+            'reached': bool(capture.get('reached')),
+            'call_count': int(capture.get('call_count') or 0),
+            'first_return_value': capture.get('first_return_value'),
+            'first_bypassed': bool(capture.get('first_bypassed')),
+            'return_value': capture.get('return_value'),
+            'return_values': list(capture.get('return_values') or []),
+            'bypassed': bool(capture.get('first_bypassed')),
+            'bypassed_any': bool(capture.get('bypassed')),
+        }
+    if not probes:
+        return None
+    ordered = [probes[label] for label in _verification_probe_order if label in probes]
+    first = ordered[0] if ordered else None
+    later = ordered[1:] if len(ordered) > 1 else []
+    classification = 'not_reached'
+    defense = 'unknown'
+    if first is not None:
+        if not first.get('reached'):
+            classification = 'first_layer_not_reached'
+            defense = 'unknown'
+        elif not first.get('first_bypassed'):
+            classification = 'first_layer_held'
+            defense = 'held'
+        elif not later:
+            classification = 'single_layer_breached'
+            defense = 'defeated'
+        elif any(item.get('reached') and not item.get('first_bypassed') for item in later):
+            classification = 'first_layer_breached_second_caught'
+            defense = 'held'
+        elif later and all(item.get('reached') and item.get('first_bypassed') for item in later):
+            classification = 'all_layers_breached'
+            defense = 'defeated'
+        elif any(item.get('first_bypassed') for item in later):
+            classification = 'partial_multilayer_bypass'
+            defense = 'partial'
+        elif any(item.get('reached') for item in later):
+            classification = 'first_layer_breached_following_held'
+            defense = 'held'
+        else:
+            classification = 'first_layer_breached_following_not_reached'
+            defense = 'unknown'
+    bypassed_labels = [label for label, item in probes.items() if item.get('bypassed')]
+    full_bypass = classification in ('single_layer_breached', 'all_layers_breached')
+    return {
+        'probes': probes,
+        'classification': classification,
+        'defense_in_depth': defense,
+        'bypassed_labels': bypassed_labels,
+        'layer1_breached': bool(first and first.get('bypassed')),
+        'full_bypass': full_bypass,
+    }
+
+def merge_verification_probe_signals(signals):
+    summary = capture_verification_probe_summary()
+    if not summary:
+        return
+    signals['verification_probes'] = summary.get('probes')
+    signals['verification_probe_classification'] = summary.get('classification')
+    signals['verification_defense_in_depth'] = summary.get('defense_in_depth')
+    signals['verification_bypass_labels'] = summary.get('bypassed_labels')
+    signals['verification_bypass_detected'] = bool(summary.get('layer1_breached'))
+    signals['verification_full_bypass'] = bool(summary.get('full_bypass'))
+
+_verification_probe_cfgs = _load_verification_probe_configs(_verification_probes_raw)
+if _verification_probe_cfgs:
+    _verification_probe_order = [cfg['label'] for cfg in _verification_probe_cfgs]
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    for cfg in _verification_probe_cfgs:
+        resolved_addrs = _resolve_elf_symbol_addresses(cfg['symbol'])
+        if not resolved_addrs:
+            raise RuntimeError(
+                'verification_probe: symbol {} not found in ELF'.format(cfg['symbol'])
+            )
+        for resolved_addr in resolved_addrs:
+            templates = _verification_probe_state['entry_templates'].setdefault(resolved_addr, [])
+            templates.append(cfg)
+            if resolved_addr not in _verification_probe_state['entry_hook_addrs']:
+                cpu_ref.AddHook(resolved_addr, _verification_probe_entry_hook)
+                _verification_probe_state['entry_hook_addrs'].add(resolved_addr)
+            log(
+                'verification_probe: {} {}=0x{:08X} {} success={}'.format(
+                    cfg['label'],
+                    cfg['symbol'],
+                    resolved_addr & 0xFFFFFFFF,
+                    cfg['return_register'],
+                    _verification_fmt_u32(cfg['success_value']),
+                )
+            )
+    reset_verification_probes()
 
 # ---------------------------------------------------------------------------
 # Boot register snapshot: capture configurable registers at VTOR detection.
@@ -3884,6 +4128,7 @@ def run_read_bit_flip_fault(fault_at):
     cpu_ref.IsHalted = False
     reset_nvmc_for_sweep()
     disarm_fault()
+    reset_verification_probes()
 
     read_fault_address = 0
     original_word = 0
@@ -4324,6 +4569,7 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
     signals['instruction_patch_supported'] = True
     signals['original_halfwords'] = ['0x{:04X}'.format(h) for h in original_halfwords]
     signals['patched_halfwords'] = ['0x{:04X}'.format(h) for h in patched_halfwords]
+    merge_verification_probe_signals(signals)
     if phase1_status is not None:
         signals['phase1_stop_reason'] = phase1_status.get('reason')
         signals['phase1_emulated_s'] = phase1_status.get('emulated_s')
@@ -4656,6 +4902,14 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
                 signals['fault_snapshot_word'] = fmt_u32(_snapshot_word)
                 signals['fault_final_word'] = fmt_u32(_final_word)
                 signals['fault_word_changed_post_boot'] = bool(_final_word != _snapshot_word)
+        except Exception:
+            pass
+    elif _fault_addr_int is not None and signals.get('fault_snapshot_word') is not None:
+        try:
+            _snapshot_word = int(str(signals.get('fault_snapshot_word')), 0)
+            _final_word = as_int(bus.ReadDoubleWord(_fault_addr_int))
+            signals['fault_final_word'] = fmt_u32(_final_word)
+            signals['fault_word_changed_post_boot'] = bool(_final_word != _snapshot_word)
         except Exception:
             pass
 
@@ -6100,8 +6354,178 @@ def decode_multi_fault_sequence_local(encoded):
         )
     return [int(p) for p in parts[1:]]
 
+_TRACE_REPLAY_WRITE_FAULT_TYPES = frozenset(('b', 's', 'r', 'd', 'l'))
+_TRACE_REPLAY_SUPPORTED_FAULT_TYPES = frozenset(('w', 'b', 's', 'r', 'd', 'l'))
+
+
+def to_clr_bytes(raw):
+    import System
+    if raw is None:
+        return None
+    arr = System.Array.CreateInstance(System.Byte, len(raw))
+    for idx, value in enumerate(raw):
+        arr[idx] = int(value) & 0xFF
+    return arr
+
+
+def _trace_replay_read_u32(image, offset):
+    return struct.unpack_from('<I', image, int(offset))[0]
+
+
+def _trace_replay_write_u32(image, offset, value):
+    struct.pack_into('<I', image, int(offset), int(value) & 0xFFFFFFFF)
+
+
+def _trace_replay_erase_region(image, offset, size, erase_fill):
+    size = max(0, int(size))
+    if size == 0:
+        return
+    start = int(offset)
+    image[start:start + size] = bytes([int(erase_fill) & 0xFF]) * size
+
+
+def _trace_replay_keep_one_to_zero_transitions(old_word, new_word, keep_mask):
+    bits_to_flip = old_word & ~new_word
+    actually_flipped = bits_to_flip & keep_mask
+    return old_word & ~actually_flipped
+
+
+def _trace_replay_next_lcg(seed):
+    return (int(seed) * 1103515245 + 12345) & 0xFFFFFFFF
+
+
+def _trace_replay_build_seed(offset, write_index, total_page_erases, corruption_seed=0):
+    seed = int(corruption_seed) & 0xFFFFFFFF
+    if seed == 0:
+        seed = int(write_index) & 0xFFFFFFFF
+    seed ^= int(offset) & 0xFFFFFFFF
+    seed ^= (int(total_page_erases) * 2654435761) & 0xFFFFFFFF
+    return seed & 0xFFFFFFFF
+
+
+def _trace_replay_apply_write_fault(image, flash_off, value, fault_type, write_index,
+                                    total_page_erases, page_size, corruption_seed=0):
+    flash_off = int(flash_off)
+    page_size = max(4, int(page_size))
+    old_word = _trace_replay_read_u32(image, flash_off)
+    new_word = int(value) & 0xFFFFFFFF
+
+    if fault_type == 'b':
+        seed = _trace_replay_build_seed(flash_off, write_index, total_page_erases, corruption_seed)
+        keep_mask = _trace_replay_next_lcg(seed)
+        corrupted = _trace_replay_keep_one_to_zero_transitions(old_word, new_word, keep_mask)
+        _trace_replay_write_u32(image, flash_off, corrupted)
+        return corrupted
+
+    if fault_type == 's':
+        silent_value = 0xFFFFFFFF if (int(write_index) & 1) == 0 else 0x00000000
+        _trace_replay_write_u32(image, flash_off, silent_value)
+        return silent_value
+
+    if fault_type == 'r':
+        _trace_replay_write_u32(image, flash_off, old_word)
+        return old_word
+
+    if fault_type == 'd':
+        _trace_replay_write_u32(image, flash_off, new_word)
+        seed = _trace_replay_build_seed(flash_off, write_index, total_page_erases, corruption_seed)
+        for neighbor_off in (flash_off - 4, flash_off + 4):
+            if neighbor_off < 0 or neighbor_off > len(image) - 4:
+                continue
+            neighbor_word = _trace_replay_read_u32(image, neighbor_off)
+            seed = _trace_replay_next_lcg(seed)
+            disturb_mask = seed & 0x11111111
+            disturbed = neighbor_word & (~disturb_mask & 0xFFFFFFFF)
+            _trace_replay_write_u32(image, neighbor_off, disturbed)
+        return new_word
+
+    if fault_type == 'l':
+        _trace_replay_write_u32(image, flash_off, new_word)
+        page_start = (flash_off // page_size) * page_size
+        words_per_page = max(1, page_size // 4)
+        error_count = 2 + min(10, int(total_page_erases) // 8)
+        seed = _trace_replay_build_seed(flash_off, write_index, total_page_erases, corruption_seed)
+        for _ in range(error_count):
+            seed = _trace_replay_next_lcg(seed)
+            idx = seed % words_per_page
+            target_off = page_start + idx * 4
+            if target_off < 0 or target_off > len(image) - 4:
+                continue
+            word = _trace_replay_read_u32(image, target_off)
+            seed = _trace_replay_next_lcg(seed)
+            mask = seed & 0x01010101
+            if mask == 0:
+                seed = _trace_replay_next_lcg(seed)
+                mask = 1 << (seed % 32)
+            aged = word & (~mask & 0xFFFFFFFF)
+            _trace_replay_write_u32(image, target_off, aged)
+        return new_word
+
+    raise RuntimeError('trace replay write fault type {} unsupported'.format(fault_type))
+
+
+def _build_trace_replay_write_fault_snapshot(fault_at, fault_type, flash_base_addr, flash_size,
+                                             page_size, erase_fill):
+    flash_ref = backend['data'].Flash
+    flash_bytes = bytearray(to_py_bytes(flash_ref.ReadBytes(0, int(flash_size))))
+    pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace_loaded]
+    pending_erases.sort()
+    erase_idx = 0
+    total_page_erases = 0
+    writes_applied = 0
+    fault_injected = False
+    fault_address = 0
+    fault_snapshot_word = None
+    target_write_index = int(fault_at) + 1
+    corruption_seed = 0
+    try:
+        corruption_seed = int(getattr(backend['data'], 'CorruptionSeed', 0))
+    except Exception:
+        corruption_seed = 0
+
+    for write_idx, flash_off, value in trace_data_loaded:
+        while erase_idx < len(pending_erases) and pending_erases[erase_idx][0] < write_idx:
+            _e_wap, e_off, e_sz = pending_erases[erase_idx]
+            _trace_replay_erase_region(flash_bytes, e_off, e_sz, erase_fill)
+            erase_idx += 1
+            total_page_erases += 1
+
+        if write_idx < target_write_index:
+            _trace_replay_write_u32(flash_bytes, flash_off, value)
+            writes_applied += 1
+            continue
+
+        if write_idx == target_write_index:
+            fault_injected = True
+            fault_address = int(flash_off) + int(flash_base_addr)
+            fault_snapshot_word = _trace_replay_apply_write_fault(
+                flash_bytes,
+                flash_off,
+                value,
+                fault_type,
+                write_idx,
+                total_page_erases,
+                page_size,
+                corruption_seed=corruption_seed,
+            )
+            writes_applied += 1
+            continue
+
+        _trace_replay_write_u32(flash_bytes, flash_off, value)
+        writes_applied += 1
+
+    while erase_idx < len(pending_erases):
+        _e_wap, e_off, e_sz = pending_erases[erase_idx]
+        _trace_replay_erase_region(flash_bytes, e_off, e_sz, erase_fill)
+        erase_idx += 1
+
+    return to_clr_bytes(flash_bytes), fault_injected, fault_address, writes_applied, fault_snapshot_word
+
 def run_trace_replay_fault_native(fault_at, fault_type='w'):
     import os as _os_native
+
+    if fault_type not in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES:
+        return None
 
     # Writeback mode requires Python-level buffer simulation — the native
     # C# TraceReplayEngine doesn't know about the writeback overlay.
@@ -6124,6 +6548,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
 
     fp_t0 = _time.time()
     cpu_ref = monitor.Machine['sysbus.cpu']
+    is_non_power_write_fault = fault_type in _TRACE_REPLAY_WRITE_FAULT_TYPES
 
     # Phase 1: restore flash from cache and replay trace to fault point.
     # No machine Reset needed — reload_images_cached() overwrites full flash,
@@ -6136,19 +6561,48 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
 
     t_replay = _time.time()
     stop_at = int(fault_at) + 1
-    if erase_trace_file_bin_path and _os_native.path.exists(erase_trace_file_bin_path):
+    page_size = int(backend['data'].PageSize)
+    erase_fill = int(backend['data'].EraseFill)
+    corruption_seed = 0
+    try:
+        corruption_seed = int(getattr(backend['data'], 'CorruptionSeed', 0))
+    except Exception:
+        corruption_seed = 0
+
+    if is_non_power_write_fault:
+        if erase_trace_file_bin_path and _os_native.path.exists(erase_trace_file_bin_path):
+            writes_applied = int(engine.ReplayWriteFaultWithErases(
+                trace_file_bin_path,
+                erase_trace_file_bin_path,
+                stop_at,
+                page_size,
+                erase_fill,
+                int(_WRITE_FAULT_MODE.get(fault_type, 0)),
+                corruption_seed
+            ))
+        else:
+            writes_applied = int(engine.ReplayWriteFault(
+                trace_file_bin_path,
+                stop_at,
+                page_size,
+                erase_fill,
+                int(_WRITE_FAULT_MODE.get(fault_type, 0)),
+                corruption_seed
+            ))
+    elif erase_trace_file_bin_path and _os_native.path.exists(erase_trace_file_bin_path):
         writes_applied = int(engine.ReplayWithErases(
             trace_file_bin_path,
             erase_trace_file_bin_path,
             stop_at,
-            int(backend['data'].PageSize),
-            int(backend['data'].EraseFill)
+            page_size,
+            erase_fill
         ))
     else:
         writes_applied = int(engine.Replay(trace_file_bin_path, stop_at))
 
     fault_injected = bool(engine.LastFaultEncountered)
     fault_address = int(engine.LastFaultAddress)
+    actual_writes = max(0, int(fault_at)) if (fault_injected and is_non_power_write_fault) else writes_applied
     faulted_flash = backend['data'].Flash.ReadBytes(0, int(backend['data'].FlashSize))
     fault_snapshot_bytes = to_py_bytes(faulted_flash)
     replay_ms = int((_time.time() - t_replay) * 1000)
@@ -6181,6 +6635,28 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     emulation_ms = int((_time.time() - t_emu) * 1000)
     disarm_vtor_watchpoint()
 
+    _multiboot_cycles_run = 0
+    if fault_injected and is_non_power_write_fault and boot_cycles > 1:
+        for extra_cycle in range(1, boot_cycles):
+            _multiboot_cycles_run += 1
+            monitor.Parse('machine Pause')
+            monitor.Parse('machine Reset')
+            bus.LoadELF(bootloader_elf)
+            if _hash_bypass_active:
+                apply_hash_bypass()
+            reset_nvmc_for_recovery()
+            arm_vtor_watchpoint()
+            p2_status = run_until_done(
+                cpu_ref,
+                label='fp{}_native_replay_cycle{}'.format(fault_at, extra_cycle + 1),
+                expect_writes=False,
+                zero_writes_is_brick=False,
+                wall_timeout=60,
+                stop_on_fault=False,
+                time_slice=phase2_time_slice,
+            )
+            disarm_vtor_watchpoint()
+
     phase2_ms = int((_time.time() - fp_t0) * 1000) - phase1_ms
     total_ms = int((_time.time() - fp_t0) * 1000)
 
@@ -6201,8 +6677,14 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     signals['p2_iters'] = p2_status.get('iters')
     signals['total_ms'] = total_ms
     signals['trace_replay_mode'] = 'native'
+    signals['multiboot_cycles_run'] = _multiboot_cycles_run
     signals['phase2_stop_reason'] = p2_status.get('reason')
     signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    if is_non_power_write_fault:
+        signals['phase1_continued_after_fault'] = bool(fault_injected)
+        signals['phase1_ops_total'] = writes_applied
+        signals['trace_replay_semantics'] = 'persisted_flash_reboot'
+        signals['fault_snapshot_word'] = fmt_u32(int(engine.LastFaultWordValue))
     if fault_at % 50 == 0:
         log('fp={} native writes={} reload={}ms replay={}ms reset={}ms setup={}ms emu={}ms({}iters) total={}ms outcome={}'.format(
             fault_at, writes_applied, reload_ms, replay_ms, reset_ms, setup_ms,
@@ -6210,7 +6692,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
 
     return _build_fault_result(
         fault_at, fault_type, fault_injected, fault_address,
-        writes_applied, signals, boot_outcome=boot_outcome,
+        actual_writes, signals, boot_outcome=boot_outcome,
         boot_slot=boot_slot, eff_criteria=eff_criteria, p2_status=p2_status,
         followup_label='fp{}_native_followup'.format(fault_at),
         saved_flash=faulted_flash, fault_snapshot_bytes=fault_snapshot_bytes,
@@ -6218,6 +6700,12 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
 
 def run_trace_replay_fault(fault_at, fault_type='w'):
     global trace_data_loaded, erase_trace_loaded
+
+    if fault_type not in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES:
+        return run_execute_fault(fault_at, fault_type=fault_type)
+    if writeback_active() and fault_type in _TRACE_REPLAY_WRITE_FAULT_TYPES:
+        log('fp={} trace_replay_fallback writeback active for {}'.format(fault_at, fault_type))
+        return run_execute_fault(fault_at, fault_type=fault_type)
 
     native_result = run_trace_replay_fault_native(fault_at, fault_type=fault_type)
     if native_result is not None:
@@ -6240,8 +6728,9 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 
     fp_t0 = _time.time()
     cpu_ref = monitor.Machine['sysbus.cpu']
+    is_non_power_write_fault = fault_type in _TRACE_REPLAY_WRITE_FAULT_TYPES
 
-    # Phase 1: reconstruct flash state at fault_at from trace.
+    # Phase 1: reconstruct flash state from the clean trace.
     # No machine Reset needed — reload_images_cached() overwrites full flash.
     t_reload = _time.time()
     reload_images_cached()
@@ -6250,23 +6739,42 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     reload_ms = int((_time.time() - t_reload) * 1000)
 
     t_replay = _time.time()
-    import System
     flash_ref = backend['data'].Flash
     flash_base_addr = int(backend['data'].FlashBaseAddress)
+    flash_size = int(backend['data'].FlashSize)
     page_size = int(backend['data'].PageSize)
+    erase_fill = int(backend['data'].EraseFill)
 
-    if writeback_active():
+    fault_snapshot_word = None
+
+    if is_non_power_write_fault:
+        faulted_flash, fault_injected, fault_address, writes_applied, fault_snapshot_word = \
+            _build_trace_replay_write_fault_snapshot(
+                fault_at,
+                fault_type,
+                flash_base_addr,
+                flash_size,
+                page_size,
+                erase_fill,
+            )
+        fault_snapshot_bytes = None
+        actual_writes = max(0, int(fault_at)) if fault_injected else writes_applied
+    elif writeback_active():
         # Writeback mode: only committed writes go to flash.
         writes_applied, fault_injected, fault_address, _wb_discarded = \
             writeback_apply_to_trace_snapshot(
                 flash_ref, trace_data_loaded, erase_trace_loaded,
                 fault_at, flash_base_addr, page_size,
             )
+        actual_writes = writes_applied
         if fault_at % 50 == 0:
             log('fp={} writeback_trace_replay: committed={} discarded={}'.format(
                 fault_at, writes_applied, _wb_discarded))
+        faulted_flash = flash_ref.ReadBytes(0, flash_size)
+        fault_snapshot_bytes = to_py_bytes(faulted_flash)
     else:
         # Direct mode: all writes go to flash (original path).
+        import System
         pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace_loaded]
         pending_erases.sort()
         erase_idx = 0
@@ -6307,9 +6815,9 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
                 erase_buf[bi] = 0xFF
             flash_ref.WriteBytes(int(e_off), erase_buf)
             erase_idx += 1
-
-    faulted_flash = flash_ref.ReadBytes(0, int(backend['data'].FlashSize))
-    fault_snapshot_bytes = to_py_bytes(faulted_flash)
+        actual_writes = writes_applied
+        faulted_flash = flash_ref.ReadBytes(0, flash_size)
+        fault_snapshot_bytes = to_py_bytes(faulted_flash)
 
     replay_ms = int((_time.time() - t_replay) * 1000)
     phase1_ms = int((_time.time() - fp_t0) * 1000)
@@ -6341,6 +6849,28 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     emulation_ms = int((_time.time() - t_emu) * 1000)
     disarm_vtor_watchpoint()
 
+    _multiboot_cycles_run = 0
+    if fault_injected and is_non_power_write_fault and boot_cycles > 1:
+        for extra_cycle in range(1, boot_cycles):
+            _multiboot_cycles_run += 1
+            monitor.Parse('machine Pause')
+            monitor.Parse('machine Reset')
+            bus.LoadELF(bootloader_elf)
+            if _hash_bypass_active:
+                apply_hash_bypass()
+            reset_nvmc_for_recovery()
+            arm_vtor_watchpoint()
+            p2_status = run_until_done(
+                cpu_ref,
+                label='fp{}_replay_cycle{}'.format(fault_at, extra_cycle + 1),
+                expect_writes=False,
+                zero_writes_is_brick=False,
+                wall_timeout=60,
+                stop_on_fault=False,
+                time_slice=phase2_time_slice,
+            )
+            disarm_vtor_watchpoint()
+
     phase2_ms = int((_time.time() - fp_t0) * 1000) - phase1_ms
     total_ms = int((_time.time() - fp_t0) * 1000)
 
@@ -6361,8 +6891,15 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     signals['p2_iters'] = p2_status.get('iters')
     signals['total_ms'] = total_ms
     signals['trace_replay_mode'] = 'python'
+    signals['multiboot_cycles_run'] = _multiboot_cycles_run
     signals['phase2_stop_reason'] = p2_status.get('reason')
     signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    if is_non_power_write_fault:
+        signals['phase1_continued_after_fault'] = bool(fault_injected)
+        signals['phase1_ops_total'] = writes_applied
+        signals['trace_replay_semantics'] = 'persisted_flash_reboot'
+        if fault_snapshot_word is not None:
+            signals['fault_snapshot_word'] = fmt_u32(fault_snapshot_word)
     if fault_at % 50 == 0:
         log('fp={} py_trace_replay writes={} reload={}ms replay={}ms reset={}ms setup={}ms emu={}ms({}iters) total={}ms outcome={}'.format(
             fault_at, writes_applied, reload_ms, replay_ms, reset_ms, setup_ms,
@@ -6370,7 +6907,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 
     return _build_fault_result(
         fault_at, fault_type, fault_injected, fault_address,
-        writes_applied, signals, boot_outcome=boot_outcome,
+        actual_writes, signals, boot_outcome=boot_outcome,
         boot_slot=boot_slot, eff_criteria=eff_criteria, p2_status=p2_status,
         followup_label='fp{}_python_followup'.format(fault_at),
         saved_flash=faulted_flash, fault_snapshot_bytes=fault_snapshot_bytes,
@@ -6398,6 +6935,7 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
     # Dispatch a single fault point to the appropriate runner function.
     #
     # Returns the result dict from the runner.
+    parts = None  # IronPython requires pre-declaration for locals used in multiple if-branches
     # --- Prefix-based compound fault types ---
     if ft.startswith('m:'):
         m_type = ft.split(':')[1] if ':' in ft else 'w'
@@ -6425,7 +6963,8 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
         return run_nvs_corruption_fault(variant_idx)
 
     if ft.startswith('i:'):
-        skip_addr = int(ft.split(':')[1], 0)
+        parts = ft.split(':')
+        skip_addr = int(parts[1], 0)
         patch_model = parts[2] if len(parts) > 2 else 'nop'
         return run_instruction_skip_fault(skip_addr, patch_model=patch_model)
 
@@ -6440,12 +6979,18 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
             backend['data'].CorruptionSeed = cseed
         elif backend['kind'] != 'mram':
             backend['data'].Nvm.CorruptionSeed = cseed
-        result = run_execute_fault(fp, fault_type='b')
+        if default_run_fn == run_trace_replay_fault:
+            result = default_run_fn(fp, fault_type='b')
+        else:
+            result = run_execute_fault(fp, fault_type='b')
         if backend['kind'] == 'fast':
             backend['data'].CorruptionSeed = 0
         elif backend['kind'] != 'mram':
             backend['data'].Nvm.CorruptionSeed = 0
         return result
+
+    if default_run_fn == run_trace_replay_fault and ft in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES:
+        return default_run_fn(fp, fault_type=ft)
 
     # --- Simple fault types that require full execute mode ---
     if ft in _EXECUTE_ONLY_FAULT_TYPES:
