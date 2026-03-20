@@ -209,14 +209,9 @@ ensure_mcuboot_history() {
     fi
     # Always fetch upstream to ensure PR commits are reachable.
     git -C "${repo}" fetch --quiet upstream 2>/dev/null || true
-    # Last resort: fetch each required SHA individually.
-    for sha in \
-        "${PR2205_BROKEN}" "${PR2205_FIXED}" \
-        "${PR2206_BROKEN}" "${PR2206_FIXED}" \
-        "${PR2214_BROKEN}" "${PR2214_FIXED}"; do
-        if ! git -C "${repo}" rev-parse --verify "${sha}^{commit}" >/dev/null 2>&1; then
-            git -C "${repo}" fetch --quiet upstream "${sha}" 2>/dev/null || true
-        fi
+    # Fetch PR branches — topic branch commits aren't on main.
+    for pr in 2205 2206 2214; do
+        git -C "${repo}" fetch --quiet upstream "+refs/pull/${pr}/head:refs/pull/${pr}" 2>/dev/null || true
     done
 }
 
