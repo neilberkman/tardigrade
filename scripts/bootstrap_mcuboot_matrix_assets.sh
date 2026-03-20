@@ -223,8 +223,10 @@ ensure_mcuboot_history() {
 require_mcuboot_commit() {
     local repo="$1"
     local sha="$2"
-    git -C "${repo}" rev-parse --verify "${sha}^{commit}" >/dev/null 2>&1 || \
-        die "required MCUboot commit not available after fetch: ${sha}"
+    if ! git -C "${repo}" rev-parse --verify "${sha}^{commit}" >/dev/null 2>&1; then
+        msg "WARNING: MCUboot commit ${sha} not available — PR differential builds will be skipped"
+        return 1
+    fi
 }
 
 sign_pr_differential_image() {
@@ -337,12 +339,17 @@ build_pr_differential_elfs() {
     write_nrf52_default_overlays
     write_nrf52_pr_differential_overlays
     ensure_mcuboot_history "${MCUBOOT_DIR}"
+    local missing=false
     for sha in \
         "${PR2205_BROKEN}" "${PR2205_FIXED}" \
         "${PR2206_BROKEN}" "${PR2206_FIXED}" \
         "${PR2214_BROKEN}" "${PR2214_FIXED}"; do
-        require_mcuboot_commit "${MCUBOOT_DIR}" "${sha}"
+        require_mcuboot_commit "${MCUBOOT_DIR}" "${sha}" || missing=true
     done
+    if [[ "${missing}" == "true" ]]; then
+        msg "Skipping PR differential ELF builds (missing commits — shallow CI clone)"
+        return 0
+    fi
 
     local wt_root
     wt_root="$(mktemp -d /tmp/mcuboot_pr_diff_wt.XXXXXX)"
