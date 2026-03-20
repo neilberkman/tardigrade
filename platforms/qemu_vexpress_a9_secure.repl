@@ -1,0 +1,91 @@
+cpu: CPU.ARMv7A @ sysbus
+    cpuType: "cortex-a9"
+    genericInterruptController: gic
+
+gic: IRQControllers.ARM_GenericInterruptController @ {
+        sysbus new Bus.BusMultiRegistration { address: 0x1E001000; size: 0x1000; region: "distributor" };
+        sysbus new Bus.BusMultiRegistration { address: 0x1E000100; size: 0x100; region: "cpuInterface" }
+    }
+    architectureVersion: .GICv2
+    supportsTwoSecurityStates: true
+
+uart0: UART.PL011 @ sysbus 0x10009000
+    -> gic@5
+
+timer1: Tardigrade.ARM_SP804PrimeCellTimer @ sysbus 0x10011000
+    -> gic@2
+
+timer2: Tardigrade.ARM_SP804PrimeCellTimer @ sysbus 0x10012000
+    -> gic@3
+
+sysCtl: Miscellaneous.ArmSysCtl @ sysbus <0x10000000, +0x1000>
+    procId: 0x0C000191
+
+sp810: Memory.MappedMemory @ sysbus 0x10001000
+    size: 0x1000
+
+mmci: Memory.MappedMemory @ sysbus 0x10005000
+    size: 0x1000
+
+clcd: Memory.MappedMemory @ sysbus 0x1001F000
+    size: 0x1000
+
+dmc: Memory.MappedMemory @ sysbus 0x100E0000
+    size: 0x1000
+
+smc: Memory.MappedMemory @ sysbus 0x100E1000
+    size: 0x1000
+
+gpio0: Memory.MappedMemory @ sysbus 0x10013000
+    size: 0x1000
+
+gpio1: Memory.MappedMemory @ sysbus 0x10014000
+    size: 0x1000
+
+gpio2: Memory.MappedMemory @ sysbus 0x10015000
+    size: 0x1000
+
+nor0: Tardigrade.CFIFlash @ sysbus 0x40000000
+
+nor1: Tardigrade.CFIFlash @ sysbus 0x44000000
+
+secureRam: Memory.MappedMemory @ sysbus 0x0E000000
+    size: 0x02000000
+
+ram: Memory.MappedMemory @ sysbus 0x60000000
+    size: 0x40000000
+
+sram: Memory.MappedMemory @ sysbus 0x48000000
+    size: 0x02000000
+
+sysid: Memory.MappedMemory @ sysbus 0x10004000
+    size: 0x1000
+
+kmi0: Memory.MappedMemory @ sysbus 0x10006000
+    size: 0x1000
+
+kmi1: Memory.MappedMemory @ sysbus 0x10007000
+    size: 0x1000
+
+pl031: Timers.PL031 @ sysbus 0x10017000
+    -> gic@4
+
+sysreg: Memory.MappedMemory @ sysbus 0x1C010000
+    size: 0x1000
+
+mb_misc: Memory.MappedMemory @ sysbus 0x1C020000
+    size: 0x10000
+
+mb_serial: Memory.MappedMemory @ sysbus 0x1C0F0000
+    size: 0x1000
+
+mb_clcd: Memory.MappedMemory @ sysbus 0x1C1F0000
+    size: 0x10000
+
+sysbus:
+    init:
+        Tag <0x40000000 0x04000000> "flash0"
+        Tag <0x44000000 0x04000000> "flash1"
+        Tag <0x10001000 0x1000> "SP810_sysctl"
+        Tag <0x10004000 0x1000> "sysid"
+        Tag <0x10005000 0x1000> "mmci"

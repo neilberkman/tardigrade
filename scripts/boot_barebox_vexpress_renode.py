@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +15,7 @@ from typing import Sequence
 
 
 PROMPT_MARKER = "barebox@V2P-CA9:/"
+ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 
 def repo_root() -> Path:
@@ -95,8 +97,9 @@ def read_until(fd: int, marker: str, timeout_s: float) -> str:
             continue
         chunks.append(chunk)
         joined = b"".join(chunks)
-        if needle in joined:
-            return joined.decode("latin1", "replace")
+        decoded = joined.decode("latin1", "replace")
+        if needle in joined or marker in ANSI_ESCAPE_RE.sub("", decoded):
+            return decoded
     raise SystemExit(
         f"timed out waiting for UART marker {marker!r}\n\n"
         + b"".join(chunks).decode("latin1", "replace")

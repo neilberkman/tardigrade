@@ -1,0 +1,60 @@
+cpu: Tardigrade.QEMUVirtARMv7A @ sysbus
+    cpuType: "cortex-a15"
+    genericInterruptController: gic
+
+timer: Timers.ARM_GenericTimer @ cpu
+    frequency: 62500000
+    EL3PhysicalTimerIRQ -> gic#0@29
+    EL1PhysicalTimerIRQ -> gic#0@30
+    EL1VirtualTimerIRQ -> gic#0@27
+    NonSecureEL2PhysicalTimerIRQ -> gic#0@26
+    NonSecureEL2VirtualTimerIRQ -> gic#0@28
+
+gic: IRQControllers.ARM_GenericInterruptController @ {
+        sysbus new Bus.BusMultiRegistration { address: 0x08000000; size: 0x010000; region: "distributor" };
+        sysbus new Bus.BusMultiRegistration { address: 0x08010000; size: 0x010000; region: "cpuInterface" }
+    }
+    architectureVersion: .GICv2
+    supportsTwoSecurityStates: true
+
+secureRam: Memory.MappedMemory @ sysbus 0x0E000000
+    size: 0x02000000
+
+flash0: Memory.MappedMemory @ sysbus 0x00000000
+    size: 0x04000000
+
+flash1: Tardigrade.CFIFlash @ sysbus 0x04000000
+
+ram: Memory.MappedMemory @ sysbus 0x40000000
+    size: 0x80000000
+
+uart0: UART.PL011 @ sysbus 0x09000000
+    -> gic@33
+
+uart1: UART.PL011 @ sysbus 0x09040000
+    -> gic@40
+
+rtc: Timers.PL031 @ sysbus 0x09010000
+    -> gic@34
+
+fw_cfg: Tardigrade.QEMUFwCfg @ sysbus 0x09020000
+
+gpio0: Tardigrade.PL061Stub @ sysbus 0x09030000
+    -> gic@39
+
+pcsc: Memory.MappedMemory @ sysbus 0x09100000
+    size: 0x1000
+
+platformBus: Memory.MappedMemory @ sysbus 0x0C000000
+    size: 0x01000000
+
+sysbus:
+    init:
+        Tag <0x0A000000 0x200> "virtio_mmio0"
+        Tag <0x0A000200 0x200> "virtio_mmio1"
+        Tag <0x0A000400 0x200> "virtio_mmio2"
+        Tag <0x0A000600 0x200> "virtio_mmio3"
+        Tag <0x0A000800 0x200> "virtio_mmio4"
+        Tag <0x0A000A00 0x200> "virtio_mmio5"
+        Tag <0x0A000C00 0x200> "virtio_mmio6"
+        Tag <0x0A000E00 0x200> "virtio_mmio7"
