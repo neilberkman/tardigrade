@@ -255,9 +255,9 @@ def render_va2pa_compat_hook(symbols: Mapping[str, int]) -> str:
             "        found = True",
             "if found:",
             "    machine.SystemBus.WriteDoubleWord(out_ptr, translated, self)",
-            "    self.SetRegister(0, 1L)",
+            "    self.SetCompatRegister32(0, 1)",
             "else:",
-            "    self.SetRegister(0, 0L)",
+            "    self.SetCompatRegister32(0, 0)",
             "self.PC = self.LR",
         ]
     )

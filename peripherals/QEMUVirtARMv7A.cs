@@ -34,6 +34,8 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
 
         public uint PhysicalAddressRegister { get; set; }
 
+        public uint OpteeStaticMemoryMapAddress { get; set; }
+
         public void SetCompatRegister32(int register, ulong value)
         {
             SetRegister(register, RegisterValue.Create(value, 32));
@@ -95,6 +97,11 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
 
         private uint TranslateVirtualAddress(uint address)
         {
+            if(TryTranslateUsingOpteeStaticMap(address, out var translated))
+            {
+                return translated;
+            }
+
             var registered = machine.SystemBus.WhatIsAt(address, this);
             if(registered == null)
             {
@@ -102,6 +109,45 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             }
 
             return address & 0xFFFFF000u;
+        }
+
+        private bool TryTranslateUsingOpteeStaticMap(uint address, out uint translated)
+        {
+            translated = 0;
+            if(OpteeStaticMemoryMapAddress == 0)
+            {
+                return false;
+            }
+
+            var count = machine.SystemBus.ReadDoubleWord(OpteeStaticMemoryMapAddress, this);
+            var mapPointer = machine.SystemBus.ReadDoubleWord(OpteeStaticMemoryMapAddress + 8, this);
+            for(var index = 0u; index < count; index++)
+            {
+                var entry = mapPointer + index * teeMmapRegionSize;
+                var physical = machine.SystemBus.ReadDoubleWord(entry + teeMmapRegionPhysicalOffset, this);
+                var virtualAddress = machine.SystemBus.ReadDoubleWord(entry + teeMmapRegionVirtualOffset, this);
+                var size = machine.SystemBus.ReadDoubleWord(entry + teeMmapRegionSizeOffset, this);
+                if(size == 0)
+                {
+                    continue;
+                }
+
+                var upperBound = (ulong)virtualAddress + size;
+                if(address < virtualAddress || (ulong)address >= upperBound)
+                {
+                    continue;
+                }
+
+                if(physical == 0)
+                {
+                    return false;
+                }
+
+                translated = (physical + (address - virtualAddress)) & 0xFFFFF000u;
+                return true;
+            }
+
+            return false;
         }
 
         private readonly Coprocessor32BitMoveInstruction auxiliaryControlRegisterInstruction =
@@ -118,5 +164,10 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
 
         private readonly Coprocessor32BitMoveInstruction physicalAddressRegisterInstruction =
             new Coprocessor32BitMoveInstruction(0, 7, 4, 0);
+
+        private const uint teeMmapRegionSize = 24;
+        private const uint teeMmapRegionPhysicalOffset = 8;
+        private const uint teeMmapRegionVirtualOffset = 12;
+        private const uint teeMmapRegionSizeOffset = 16;
     }
 }

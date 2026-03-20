@@ -46,6 +46,7 @@ def test_qemu_virt_armv7_wrapper_handles_optee_cp15_surface() -> None:
     assert "PrimaryRegionRemapRegister" in text
     assert "NormalMemoryRemapRegister" in text
     assert "PhysicalAddressRegister" in text
+    assert "SetCompatRegister32" in text
     assert "addressTranslationCurrentPrivilegeReadInstruction" in text
 
 
