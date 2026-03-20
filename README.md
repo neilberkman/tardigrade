@@ -27,8 +27,19 @@ Extensive fault-injection sweeps across MCUboot HEAD (swap-move, swap-scratch, s
 | swap-move revert, rc_injection + 2 boot cycles | 1057   | all success |
 | swap-move revert, 4 write-class fault types    | 4224   | all success |
 | swap-move upgrade, extended                    | 736    | all success |
+| swap-offset rc_injection, multiboot            | 579    | all success |
+| swap-scratch rc_injection, multiboot           | 579    | all success |
+| instruction_skip (voltage glitch model)        | 184    | all success |
 | phase2fault (double fault during recovery)     | 2111   | all success |
 | multifault (two sequential faults)             | 984    | all success |
+
+### wolfBoot -- resilience validation
+
+Six fault-injection campaigns against wolfBoot (swap, state, finalize phases with power-loss and partial-erase faults). All campaigns pass -- 0 bricks across all tested fault points.
+
+### ESP-IDF OTA -- resilience validation
+
+Instruction-skip fault injection against ESP-IDF's OTA state machine (otadata CRC check, slot selection, state write). 90 fault points, all pass.
 
 ### MCUboot -- retroactive validation
 
