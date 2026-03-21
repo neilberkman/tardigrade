@@ -3887,11 +3887,13 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
     #   3. Zero writes after 5+ slices when expect_writes=False (bricked)
     #   4. No forward progress for progress_stall_timeout_s
     #   5. (no_boot profiles) no writes + no VTOR for N slices/min emulated time
-    #   6. Iteration limit or wall-clock timeout exhausted
+    #   6. (no_boot profiles) writes settled (>0 but unchanged) + no VTOR
+    #   7. Iteration limit or wall-clock timeout exhausted
     t0 = _time.time()
     prev_writes = -1
     zero_writes_count = 0
     no_boot_zero_write_count = 0
+    no_boot_settled_count = 0
     prev_progress_key = None
     last_progress_t = t0
     last_progress_emulated_s = 0.0
@@ -4043,6 +4045,25 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
             and emulated_s >= no_boot_min_emulated_s
         ):
             reason = 'no_boot_no_writes'
+            break
+        # No-boot with settled writes: bootloader wrote metadata (e.g. marking
+        # a slot invalid) but then entered a recovery loop with no further
+        # writes and no VTOR capture.  Detect by counting consecutive slices
+        # where writes > 0 but unchanged and VTOR not captured.
+        if (
+            expect_control_outcome == 'no_boot'
+            and cur_writes > 0
+            and cur_writes == prev_writes
+            and not sticky_vtor['captured']
+        ):
+            no_boot_settled_count += 1
+        else:
+            no_boot_settled_count = 0
+        if (
+            no_boot_settled_count >= no_boot_zero_write_slices
+            and emulated_s >= no_boot_min_emulated_s
+        ):
+            reason = 'no_boot_settled_writes'
             break
         # Bricked device detection: no writes at all after several slices.
         # Some clean follow-up boots are legitimately read-only and should not

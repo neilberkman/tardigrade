@@ -490,7 +490,7 @@ def calibration_completed(
         return False
     if any(stop_reason.startswith(prefix) for prefix in CALIBRATION_INCOMPLETE_PREFIXES):
         return False
-    if stop_reason in {"no_boot_no_writes", "no_writes_brick", "vtor_captured_hardfault"}:
+    if stop_reason in {"no_boot_no_writes", "no_boot_settled_writes", "no_writes_brick", "vtor_captured_hardfault"}:
         return expected_control_outcome == "no_boot"
     return True
 

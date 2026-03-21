@@ -885,6 +885,23 @@ class DiscoveryFeaturesTest(unittest.TestCase):
         self.assertFalse(calibration_completed("budget"))
         self.assertFalse(calibration_completed("no_progress_stall(20.0s)"))
 
+    def test_calibration_completed_no_boot_settled_writes(self) -> None:
+        # no_boot_settled_writes accepted for no_boot profiles
+        self.assertTrue(
+            calibration_completed("no_boot_settled_writes", expected_control_outcome="no_boot")
+        )
+        # rejected for success profiles (same as no_boot_no_writes)
+        self.assertFalse(
+            calibration_completed("no_boot_settled_writes", expected_control_outcome="success")
+        )
+        # existing no_boot_no_writes still works
+        self.assertTrue(
+            calibration_completed("no_boot_no_writes", expected_control_outcome="no_boot")
+        )
+        self.assertFalse(
+            calibration_completed("no_boot_no_writes", expected_control_outcome="success")
+        )
+
     def test_self_test_rejects_semantic_only_issues_by_default(self) -> None:
         passed, reason = check_verdict(
             ROOT / "profiles" / "dummy.yaml",
