@@ -550,6 +550,15 @@ class VerificationProbeProfileFixtureTest(unittest.TestCase):
         self.assertEqual(profile.fault_sweep.verification_probes[0].label, "image_validation")
         self.assertEqual(profile.fault_sweep.verification_probes[0].success_value, 0)
 
+    def test_mcuboot_probe_profile_loads(self) -> None:
+        profile = load_profile(
+            ROOT / "profiles" / "mcuboot_head_move_nrf52_verify_instruction_skip_probe.yaml"
+        )
+        labels = [p.label for p in profile.fault_sweep.verification_probes]
+        self.assertEqual(labels, ["hash_validation", "slot_validation"])
+        self.assertEqual(profile.fault_sweep.verification_probes[0].success_value, 0)
+        self.assertEqual(profile.fault_sweep.verification_probes[1].success_value, 0)
+
 
 class BackendCompatWarningTest(unittest.TestCase):
     """Verify warnings for instruction_skip config mismatches."""
