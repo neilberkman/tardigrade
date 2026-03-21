@@ -1034,24 +1034,43 @@ def _load_elf_nm_lines():
         log('elf_symbols: nm not available ({}), falling back to single-match symbol lookup'.format(_e))
     return _nm_lines
 
+def _is_glob_pattern(query):
+    for ch in ('*', '?', '['):
+        if ch in query:
+            return True
+    return False
+
 def _resolve_elf_symbol_addresses(sym_name):
     found_addrs = set()
     nm_lines = _load_elf_nm_lines()
-    for line in nm_lines:
-        parts = line.strip().split()
-        if len(parts) >= 3 and parts[2] == sym_name:
+    is_glob = _is_glob_pattern(sym_name)
+    if is_glob:
+        import fnmatch as _fnmatch
+        for line in nm_lines:
+            parts = line.strip().split()
+            if len(parts) >= 3 and _fnmatch.fnmatch(parts[2], sym_name):
+                try:
+                    found_addrs.add(int(parts[0], 16) & ~1)
+                except ValueError:
+                    continue
+        if found_addrs:
+            log('elf_symbols: glob {!r} matched {} address(es)'.format(sym_name, len(found_addrs)))
+    else:
+        for line in nm_lines:
+            parts = line.strip().split()
+            if len(parts) >= 3 and parts[2] == sym_name:
+                try:
+                    found_addrs.add(int(parts[0], 16) & ~1)
+                except ValueError:
+                    continue
+        if not found_addrs:
             try:
-                found_addrs.add(int(parts[0], 16) & ~1)
-            except ValueError:
-                continue
-    if not found_addrs:
-        try:
-            addr = int(bus.GetSymbolAddress(sym_name))
-            found_addrs.add(addr & ~1)
-            if not nm_lines:
-                log('elf_symbols: WARNING: nm unavailable, only single-match for {}'.format(sym_name))
-        except Exception:
-            pass
+                addr = int(bus.GetSymbolAddress(sym_name))
+                found_addrs.add(addr & ~1)
+                if not nm_lines:
+                    log('elf_symbols: WARNING: nm unavailable, only single-match for {}'.format(sym_name))
+            except Exception:
+                pass
     return sorted(found_addrs)
 
 _hash_bypass_symbols_raw = str(monitor.GetVariable('hash_bypass_symbols')).strip()
