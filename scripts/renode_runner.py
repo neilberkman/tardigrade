@@ -670,15 +670,23 @@ def run_batch(
     # emulation — 4s/point is fine for trace replay but way too low
     # for execute-mode where each point must emulate up to fp writes.
     if per_point_timeout is not None:
-        # Estimate per-point cost: base 2s + 0.012s per fault_at value.
-        # 0.012 matches measured ~160s for fp=13000 execute-mode points.
-        # instruction_skip uses flat cost (addresses, not write indices).
-        timeout_s: Optional[float] = min(
-            7200.0,  # 2h hard cap to prevent overflow
-            max(per_point_timeout, 120.0 + estimated_s),
-        )
-        if getattr(profile, "has_update_sequence", False):
-            timeout_s = min(7200.0, max(timeout_s, 600.0))
+        if len(fault_points) == 1:
+            # Once fallback has isolated a batch to one point, use the same
+            # tight wall-time budget as run_single_point() instead of the bulk
+            # batch floor. This keeps isolated instruction-skip retries from
+            # waiting 120s+ when the caller explicitly requested a lower per-
+            # point timeout (e.g. OTA_RENODE_POINT_TIMEOUT_S=40).
+            timeout_s = per_point_timeout
+        else:
+            # Estimate per-point cost: base 2s + 0.012s per fault_at value.
+            # 0.012 matches measured ~160s for fp=13000 execute-mode points.
+            # instruction_skip uses flat cost (addresses, not write indices).
+            timeout_s = min(
+                7200.0,  # 2h hard cap to prevent overflow
+                max(per_point_timeout, 120.0 + estimated_s),
+            )
+            if getattr(profile, "has_update_sequence", False):
+                timeout_s = min(7200.0, max(timeout_s, 600.0))
     else:
         timeout_s = None
     process_timeout_s = _renode_process_timeout(timeout_s)
