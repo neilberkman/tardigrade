@@ -50,4 +50,4 @@ expect:
   # refuses the upgrade ("Not enough free space") when the image fills all
   # sectors.  Control run boots the old exec image = wrong_image.
   control_outcome: wrong_image
-  should_find_issues: false
+  should_find_issues: true

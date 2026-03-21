@@ -51,4 +51,4 @@ expect:
   # Broken: find_last_idx off-by-one causes last_idx >= first_trailer_idx,
   # aborting the upgrade.  Control run boots the old exec image = wrong_image.
   control_outcome: wrong_image
-  should_find_issues: false
+  should_find_issues: true

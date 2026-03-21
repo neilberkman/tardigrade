@@ -48,4 +48,4 @@ fault_sweep:
 # trigger conditions are fully modeled.
 skip_self_test: true
 expect:
-  should_find_issues: false
+  should_find_issues: true

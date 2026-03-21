@@ -54,5 +54,5 @@ expect:
   # This is a state-correctness bug, not a fault-induced brick — detection is
   # via control_outcome mismatch, not brick_rate.
   control_outcome: wrong_image
-  should_find_issues: false
+  should_find_issues: true
 skip_self_test: true
