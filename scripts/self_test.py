@@ -244,7 +244,7 @@ def main() -> int:
             if not report:
                 print("  FAIL: no report produced (exit={})".format(exit_code))
                 if audit_stderr:
-                    for line in audit_stderr.strip().splitlines()[-20:]:
+                    for line in audit_stderr.strip().splitlines()[-80:]:
                         print("    stderr: {}".format(line))
                 results.append((name, False, "no report (exit={})".format(exit_code)))
                 detailed_results.append({
