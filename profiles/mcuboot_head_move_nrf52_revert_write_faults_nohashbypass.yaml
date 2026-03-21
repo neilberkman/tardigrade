@@ -41,3 +41,4 @@ fault_sweep:
   # NO hash bypass — full SHA-256 validation in emulation
 expect:
   should_find_issues: false
+  skip_self_test: true

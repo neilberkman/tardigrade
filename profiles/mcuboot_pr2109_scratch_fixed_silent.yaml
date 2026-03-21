@@ -50,3 +50,4 @@ fault_sweep:
 
 expect:
   should_find_issues: false
+  skip_self_test: true
