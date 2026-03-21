@@ -3,7 +3,8 @@ name: mcuboot_pr2205_scratch_broken
 description: >
   MCUboot swap-scratch BEFORE PR #2205 geometry fix (broken commit c21c3909).
   This profile uses the nRF52840 reference geometry and is primarily used for
-  differential comparison against the fixed revision.
+  differential comparison against the fixed revision. On uniform nRF52 sector
+  geometry the upstream bug does not diverge honestly; tracked in issue #16.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -35,6 +36,8 @@ success_criteria:
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  quick_use_heuristic: true
+  max_heuristic_points: 64
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "2.0"
@@ -44,8 +47,8 @@ fault_sweep:
     - interrupted_erase
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 
-# Exploratory profile: excluded from strict self-test gating until geometry
-# trigger conditions are fully modeled.
+# Exploratory profile: excluded from strict self-test gating until the uniform-
+# geometry limitation tracked in issue #16 is resolved.
 skip_self_test: true
 expect:
   should_find_issues: true

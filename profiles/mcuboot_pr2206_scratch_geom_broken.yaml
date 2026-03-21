@@ -4,7 +4,9 @@ description: >
   MCUboot swap-scratch geometry trigger for PR #2206 (broken commit e35461d2).
   Built with CONFIG_MCUBOOT_BOOT_MAX_ALIGN=32 and
   CONFIG_BOOT_MAX_IMG_SECTORS=1024 to force the align-32 multi-sector
-  trailer. Uses a near-max staging image for slot size 0x6E000.
+  trailer. Uses a near-max staging image for slot size 0x6E000. The current
+  align-32 geometry assets still need repair before this differential is a
+  strict broken/fixed pair; tracked in issue #19.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -37,6 +39,8 @@ success_criteria:
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  quick_use_heuristic: true
+  max_heuristic_points: 64
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "10.0"

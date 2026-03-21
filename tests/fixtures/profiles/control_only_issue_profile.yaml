@@ -1,0 +1,29 @@
+schema_version: 1
+name: control_only_issue_profile
+description: Test fixture for control-only broken differential parsing.
+
+platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_head_move_nrf52.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x76000 }
+    staging: { base: 0x00082000, size: 0x76000 }
+images:
+  exec: results/oss_validation/assets/zephyr_slot0_padded.bin
+success_criteria:
+  vtor_in_slot: exec
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: 1
+  run_duration: "1.0"
+  fault_types: [power_loss]
+expect:
+  control_outcome: wrong_image
+  allow_control_only_issues: true
+  should_find_issues: true

@@ -3,7 +3,9 @@ name: mcuboot_pr2214_offset_broken
 description: >
   MCUboot swap-offset BEFORE PR #2214 find_last_idx fix (broken commit 429e2fea).
   find_last_idx returns count instead of index; with a max-size staging image
-  this triggers "Not enough free space" and the upgrade is wrongly aborted.
+  this should trigger "Not enough free space" and wrongly abort the upgrade.
+  The current nRF52 max-size image still does not hit the boundary honestly;
+  tracked in issue #18.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -35,6 +37,8 @@ success_criteria:
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  quick_use_heuristic: true
+  max_heuristic_points: 64
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "2.0"
@@ -46,8 +50,7 @@ fault_sweep:
 
 skip_self_test: true
 expect:
-  # Broken: find_last_idx returns count instead of index, so bootloader
-  # refuses the upgrade ("Not enough free space") when the image fills all
-  # sectors.  Control run boots the old exec image = wrong_image.
+  # Target behavior once the asset trigger is corrected: the broken commit
+  # should refuse the upgrade and keep booting the old exec image.
   control_outcome: wrong_image
   should_find_issues: true

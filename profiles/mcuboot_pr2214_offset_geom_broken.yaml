@@ -4,7 +4,9 @@ description: >
   MCUboot swap-offset geometry trigger for PR #2214 (broken commit 429e2fea).
   find_last_idx off-by-one: returns count instead of index. Full-slot staging
   image with CONFIG_MCUBOOT_BOOT_MAX_ALIGN=32 forces
-  last_idx >= first_trailer_idx, aborting the upgrade.
+  last_idx >= first_trailer_idx, aborting the upgrade. The current geometry
+  image still does not hit that boundary honestly on this platform; tracked
+  in issue #18.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -37,6 +39,8 @@ success_criteria:
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  quick_use_heuristic: true
+  max_heuristic_points: 64
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "10.0"
@@ -48,7 +52,7 @@ fault_sweep:
 
 skip_self_test: true
 expect:
-  # Broken: find_last_idx off-by-one causes last_idx >= first_trailer_idx,
-  # aborting the upgrade.  Control run boots the old exec image = wrong_image.
+  # Target behavior once the geometry trigger is corrected: the broken commit
+  # should abort the upgrade and keep booting the old exec image.
   control_outcome: wrong_image
   should_find_issues: true

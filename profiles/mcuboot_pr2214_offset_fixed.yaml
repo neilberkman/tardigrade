@@ -2,7 +2,9 @@ schema_version: 1
 name: mcuboot_pr2214_offset_fixed
 description: >
   MCUboot swap-offset AFTER PR #2214 find_last_idx fix (fixed commit 90fd59d2).
-  find_last_idx correctly returns index; max-size upgrade succeeds.
+  find_last_idx correctly returns index; max-size upgrade should succeed.
+  The current nRF52 max-size image still does not hit the broken boundary
+  honestly; tracked in issue #18.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -34,6 +36,8 @@ success_criteria:
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  quick_use_heuristic: true
+  max_heuristic_points: 64
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "2.0"

@@ -982,6 +982,7 @@ class FaultSweepConfig:
         "fault_distribution",
         "heuristic_config",
         "max_heuristic_points",
+        "quick_use_heuristic",
         "boot_registers",
         "reset_mode",
         "write_order_constraints",
@@ -1021,6 +1022,7 @@ class FaultSweepConfig:
         fault_distribution: Optional["FaultDistributionConfig"] = None,
         heuristic_config: Optional["HeuristicConfig"] = None,
         max_heuristic_points: Optional[int] = 2000,
+        quick_use_heuristic: bool = False,
         boot_registers: Optional[List[Dict[str, Any]]] = None,
         reset_mode: str = "warm",
         write_order_constraints: Optional[List[Dict[str, Any]]] = None,
@@ -1069,6 +1071,7 @@ class FaultSweepConfig:
         self.max_heuristic_points = (
             None if max_heuristic_points is None else int(max_heuristic_points)
         )
+        self.quick_use_heuristic = bool(quick_use_heuristic)
         if self.max_heuristic_points is not None and self.max_heuristic_points < 1:
             raise ValueError(
                 "fault_sweep.max_heuristic_points must be >= 1 or None, got {}".format(
@@ -1136,18 +1139,26 @@ class StateProbeConfig:
 
 
 class ExpectConfig:
-    __slots__ = ("should_find_issues", "control_outcome", "allow_semantic_only_issues", "required_issue_reasons")
+    __slots__ = (
+        "should_find_issues",
+        "control_outcome",
+        "allow_semantic_only_issues",
+        "allow_control_only_issues",
+        "required_issue_reasons",
+    )
 
     def __init__(
         self,
         should_find_issues: bool = True,
         control_outcome: str = "success",
         allow_semantic_only_issues: bool = False,
+        allow_control_only_issues: bool = False,
         required_issue_reasons: Optional[List[str]] = None,
     ) -> None:
         self.should_find_issues = should_find_issues
         self.control_outcome = control_outcome
         self.allow_semantic_only_issues = allow_semantic_only_issues
+        self.allow_control_only_issues = allow_control_only_issues
         self.required_issue_reasons = required_issue_reasons or []
 
 
@@ -1459,6 +1470,7 @@ class ProfileConfig:
                 should_find_issues=eo.get("should_find_issues", self.expect.should_find_issues),
                 control_outcome=eo.get("control_outcome", self.expect.control_outcome),
                 allow_semantic_only_issues=eo.get("allow_semantic_only_issues", self.expect.allow_semantic_only_issues),
+                allow_control_only_issues=eo.get("allow_control_only_issues", self.expect.allow_control_only_issues),
                 required_issue_reasons=eo.get("required_issue_reasons", self.expect.required_issue_reasons),
             )
         resolved = ProfileConfig(
@@ -2649,6 +2661,7 @@ def _parse_fault_sweep(
                 else int(raw.get("max_heuristic_points"))
             )
         ),
+        quick_use_heuristic=bool(raw.get("quick_use_heuristic", False)),
         reset_mode=str(raw.get("reset_mode", "warm")),
         i2c_fault_config=_parse_i2c_fault_config(raw.get("i2c_fault_config")),
         durability_model=durability_model,
@@ -3909,6 +3922,7 @@ def _parse_expect(raw: Optional[Dict[str, Any]]) -> ExpectConfig:
         should_find_issues=bool(raw.get("should_find_issues", True)),
         control_outcome=str(raw.get("control_outcome", "success")),
         allow_semantic_only_issues=bool(raw.get("allow_semantic_only_issues", False)),
+        allow_control_only_issues=bool(raw.get("allow_control_only_issues", False)),
         required_issue_reasons=required_issue_reasons,
     )
 

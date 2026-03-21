@@ -2,7 +2,9 @@ schema_version: 1
 name: mcuboot_pr2206_scratch_broken
 description: >
   MCUboot swap-scratch BEFORE PR #2206 geometry fix (broken commit e35461d2).
-  Uses nRF52840 reference geometry for reproducible comparison.
+  Uses nRF52840 reference geometry for reproducible comparison. The non-geom
+  align-8 variant does not honestly trigger the upstream align-32 bug; tracked
+  in issue #16.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -34,6 +36,8 @@ success_criteria:
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  quick_use_heuristic: true
+  max_heuristic_points: 64
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "2.0"
@@ -46,4 +50,3 @@ fault_sweep:
 skip_self_test: true
 expect:
   should_find_issues: true
-

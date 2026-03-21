@@ -3,7 +3,8 @@ name: mcuboot_pr2214_offset_geom_fixed
 description: >
   MCUboot swap-offset geometry trigger for PR #2214 (fixed commit 90fd59d2).
   find_last_idx correctly returns index; full-slot upgrade succeeds with
-  CONFIG_MCUBOOT_BOOT_MAX_ALIGN=32.
+  CONFIG_MCUBOOT_BOOT_MAX_ALIGN=32. The current geometry image still does not
+  hit the broken boundary honestly on this platform; tracked in issue #18.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -36,6 +37,8 @@ success_criteria:
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  quick_use_heuristic: true
+  max_heuristic_points: 64
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "10.0"

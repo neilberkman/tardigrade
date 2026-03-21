@@ -4,7 +4,8 @@ description: >
   MCUboot swap-using-move BEFORE PR #2199 fix (commit 25e2761c).
   Stuck revert: primary has valid image + REVERT trailer state, secondary is
   erased. Broken MCUboot erases secondary trailer but never clears primary
-  trailer — REVERT state persists across every boot.
+  trailer — REVERT state persists across every boot. Tracked as an unresolved
+  modeling gap in tardigrade issue #17.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -50,9 +51,6 @@ fault_sweep:
   max_step_limit: 20000000
   fault_types: [power_loss, interrupted_erase]
 expect:
-  # Broken: control boots fine (VTOR ok) but trailer not cleared = wrong_image.
-  # This is a state-correctness bug, not a fault-induced brick — detection is
-  # via control_outcome mismatch, not brick_rate.
   control_outcome: wrong_image
   should_find_issues: true
 skip_self_test: true

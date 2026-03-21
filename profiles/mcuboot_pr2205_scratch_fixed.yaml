@@ -3,6 +3,8 @@ name: mcuboot_pr2205_scratch_fixed
 description: >
   MCUboot swap-scratch AFTER PR #2205 geometry fix (fixed commit bbd0ee1e).
   Companion profile for differential comparison with the broken revision.
+  Uniform nRF52 sector geometry does not currently exercise the upstream bug
+  honestly; tracked in issue #16.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -34,6 +36,8 @@ success_criteria:
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  quick_use_heuristic: true
+  max_heuristic_points: 64
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "2.0"
@@ -46,4 +50,3 @@ fault_sweep:
 skip_self_test: true
 expect:
   should_find_issues: false
-

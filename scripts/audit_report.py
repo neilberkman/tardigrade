@@ -552,6 +552,24 @@ def compute_verdict(
     partial_staging_summary: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Derive a PASS/FAIL verdict from sweep summaries and profile expectations."""
+    control_summary = sweep_summary.get("control") or {}
+    expected_control_outcome = str(
+        getattr(profile_expect, "control_outcome", "success") or "success"
+    )
+    control_outcome = str(
+        control_summary.get("effective_outcome")
+        or control_summary.get("final_boot_outcome")
+        or control_summary.get("boot_outcome")
+        or ""
+    )
+    allow_control_only_issues = bool(
+        getattr(profile_expect, "allow_control_only_issues", False)
+    )
+    control_only_issue = (
+        allow_control_only_issues
+        and expected_control_outcome != "success"
+        and control_outcome == expected_control_outcome
+    )
     found_issues = int(
         sweep_summary.get("issue_points", sweep_summary["bricks"])
     ) > 0
@@ -569,7 +587,7 @@ def compute_verdict(
             int(partial_staging_summary.get("issue_count", 0)) > 0
         )
     control_issue_count = int(
-        (sweep_summary.get("control") or {}).get("issue_count", 0)
+        control_summary.get("issue_count", 0)
     )
 
     resilient_rollbacks = int(sweep_summary.get("resilient_rollbacks", 0))
@@ -578,6 +596,8 @@ def compute_verdict(
     verdict = "PASS"
     if control_issue_count:
         verdict = "FAIL \u2014 control checks failed"
+    elif control_only_issue and not found_issues:
+        verdict = "PASS \u2014 control exhibits expected {}".format(control_outcome)
     elif profile_expect.should_find_issues and not found_issues:
         verdict = "FAIL \u2014 expected to find issues but found none"
     elif not profile_expect.should_find_issues and found_issues:

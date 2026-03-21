@@ -144,10 +144,13 @@ def build_fault_plan(
     # Heuristic vs exhaustive point selection
     # -------------------------------------------------------------------
     heuristic_summary: Optional[Dict[str, Any]] = None
+    quick_use_heuristic = bool(
+        getattr(profile.fault_sweep, "quick_use_heuristic", False)
+    )
     use_heuristic = (
         trace_file
         and os.path.exists(trace_file)
-        and not quick
+        and (not quick or quick_use_heuristic)
         and fault_start is None
         and fault_end is None
         and fault_step == 1
@@ -238,7 +241,7 @@ def build_fault_plan(
         else:
             fault_points = []
 
-    if quick:
+    if quick and not quick_use_heuristic:
         fault_points = quick_subset(fault_points)
 
     # -------------------------------------------------------------------
@@ -289,7 +292,7 @@ def build_fault_plan(
                 fault_start=fault_start,
                 fault_end=fault_end,
             )
-            if quick:
+            if quick and not quick_use_heuristic:
                 erase_fps = quick_subset(erase_fps)
             if "interrupted_erase" in fault_types:
                 combined += [(ep, 'e') for ep in erase_fps]
@@ -309,7 +312,7 @@ def build_fault_plan(
         clustered_bit_count = 0
         if include_bit_corruption:
             bit_fps = list(fault_points)
-            if quick:
+            if quick and not quick_use_heuristic:
                 bit_fps = quick_subset(bit_fps)
 
             combined += [(bp, 'b') for bp in bit_fps]
@@ -339,7 +342,7 @@ def build_fault_plan(
         silent_count = 0
         if include_silent_write_failure:
             silent_fps = list(fault_points)
-            if quick:
+            if quick and not quick_use_heuristic:
                 silent_fps = quick_subset(silent_fps)
             combined += [(sp, 's') for sp in silent_fps]
             silent_count = len(silent_fps)
@@ -347,7 +350,7 @@ def build_fault_plan(
         driver_error_count = 0
         if include_driver_error:
             driver_error_fps = list(fault_points)
-            if quick:
+            if quick and not quick_use_heuristic:
                 driver_error_fps = quick_subset(driver_error_fps)
             combined += [(gp, 'g') for gp in driver_error_fps]
             driver_error_count = len(driver_error_fps)
@@ -355,7 +358,7 @@ def build_fault_plan(
         rc_injection_count = 0
         if include_rc_injection:
             rc_injection_fps = list(fault_points)
-            if quick:
+            if quick and not quick_use_heuristic:
                 rc_injection_fps = quick_subset(rc_injection_fps)
             combined += [(xp, 'x') for xp in rc_injection_fps]
             rc_injection_count = len(rc_injection_fps)
@@ -363,7 +366,7 @@ def build_fault_plan(
         disturb_count = 0
         if include_write_disturb:
             disturb_fps = list(fault_points)
-            if quick:
+            if quick and not quick_use_heuristic:
                 disturb_fps = quick_subset(disturb_fps)
             combined += [(dp, 'd') for dp in disturb_fps]
             disturb_count = len(disturb_fps)
@@ -371,7 +374,7 @@ def build_fault_plan(
         wear_count = 0
         if include_wear_leveling:
             wear_fps = list(fault_points)
-            if quick:
+            if quick and not quick_use_heuristic:
                 wear_fps = quick_subset(wear_fps)
             combined += [(wp, 'l') for wp in wear_fps]
             wear_count = len(wear_fps)
@@ -379,7 +382,7 @@ def build_fault_plan(
         rejection_count = 0
         if include_write_rejection:
             rejection_fps = list(fault_points)
-            if quick:
+            if quick and not quick_use_heuristic:
                 rejection_fps = quick_subset(rejection_fps)
             combined += [(rp, 'r') for rp in rejection_fps]
             rejection_count = len(rejection_fps)
@@ -389,7 +392,7 @@ def build_fault_plan(
             timed_reset_fps = list(fault_points)
             if not timed_reset_fps:
                 timed_reset_fps = [0]
-            if quick:
+            if quick and not quick_use_heuristic:
                 timed_reset_fps = quick_subset(timed_reset_fps)
             combined += [(tp, 't') for tp in timed_reset_fps]
             timed_reset_count = len(timed_reset_fps)
@@ -397,7 +400,7 @@ def build_fault_plan(
         read_flip_count = 0
         if include_read_bit_flip:
             read_flip_fps = list(fault_points)
-            if quick:
+            if quick and not quick_use_heuristic:
                 read_flip_fps = quick_subset(read_flip_fps)
             combined += [(fp, 'f') for fp in read_flip_fps]
             read_flip_count = len(read_flip_fps)
@@ -405,7 +408,7 @@ def build_fault_plan(
         command_drop_count = 0
         if include_command_drop:
             command_drop_fps = list(fault_points)
-            if quick:
+            if quick and not quick_use_heuristic:
                 command_drop_fps = quick_subset(command_drop_fps)
             combined += [(fp, 'k') for fp in command_drop_fps]
             command_drop_count = len(command_drop_fps)
@@ -420,7 +423,7 @@ def build_fault_plan(
                 fault_start=fault_start,
                 fault_end=fault_end,
             )
-            if quick:
+            if quick and not quick_use_heuristic:
                 i2c_fps = quick_subset(i2c_fps)
             for i2c_ft in i2c_fault_types:
                 i2c_code = FAULT_TYPE_NAME_TO_CODE.get(i2c_ft, "in")
@@ -437,7 +440,7 @@ def build_fault_plan(
                 fault_start=fault_start,
                 fault_end=fault_end,
             )
-            if quick:
+            if quick and not quick_use_heuristic:
                 otp_fps = quick_subset(otp_fps)
             for otp_ft in otp_fault_types:
                 otp_code = FAULT_TYPE_NAME_TO_CODE.get(otp_ft, "op")
@@ -514,7 +517,7 @@ def build_fault_plan(
                     fault_start=fault_start,
                     fault_end=fault_end,
                 )
-                if quick:
+                if quick and not quick_use_heuristic:
                     skip_addrs = quick_subset(skip_addrs)
                 for addr in skip_addrs:
                     combined.append((addr, "i:0x{:X}".format(addr)))
@@ -535,7 +538,7 @@ def build_fault_plan(
                     fault_start=fault_start,
                     fault_end=fault_end,
                 )
-                if quick:
+                if quick and not quick_use_heuristic:
                     mf_fps = quick_subset(mf_fps)
                 for mf_fp in mf_fps:
                     for mf_name in mf_types:
@@ -564,7 +567,7 @@ def build_fault_plan(
                 fault_start=fault_start,
                 fault_end=fault_end,
             )
-            if quick:
+            if quick and not quick_use_heuristic:
                 hook_fps = quick_subset(hook_fps)
             for hf_fp in hook_fps:
                 for hf_code in hf_types:
@@ -588,7 +591,7 @@ def build_fault_plan(
                 fault_start=fault_start,
                 fault_end=fault_end,
             )
-            if quick:
+            if quick and not quick_use_heuristic:
                 cc_fps = quick_subset(cc_fps)
             for cc_fp in cc_fps:
                 for cc_code in cc_types:
@@ -610,9 +613,12 @@ def build_fault_plan(
             p2_write_codes = [c for c in p2_type_codes if c != "t"]
 
             if p2_write_codes and write_fps:
-                p1_representatives = quick_subset([fp for fp, _ in write_fps])
+                if quick_use_heuristic:
+                    p1_representatives = [fp for fp, _ in write_fps]
+                else:
+                    p1_representatives = quick_subset([fp for fp, _ in write_fps])
                 p2_range = list(range(0, p2_max))
-                if quick:
+                if quick and not quick_use_heuristic:
                     p2_range = quick_subset(p2_range)
                 for p1_fp in p1_representatives:
                     for p2_fp in p2_range:
@@ -623,9 +629,12 @@ def build_fault_plan(
 
             if p2_timed_codes:
                 timed_p1_fps = list(fault_points) if fault_points else [0]
-                timed_p1_reps = quick_subset(timed_p1_fps)
+                if quick_use_heuristic:
+                    timed_p1_reps = timed_p1_fps
+                else:
+                    timed_p1_reps = quick_subset(timed_p1_fps)
                 timed_p2_range = list(range(0, p2_max))
-                if quick:
+                if quick and not quick_use_heuristic:
                     timed_p2_range = quick_subset(timed_p2_range)
                 for p1_fp in timed_p1_reps:
                     for p2_fp in timed_p2_range:

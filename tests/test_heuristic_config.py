@@ -214,10 +214,12 @@ class TestFaultSweepConfigHeuristic:
     def test_default_max_heuristic_points(self):
         fsc = FaultSweepConfig()
         assert fsc.max_heuristic_points == 2000
+        assert fsc.quick_use_heuristic is False
 
     def test_explicit_max_heuristic_points(self):
-        fsc = FaultSweepConfig(max_heuristic_points=512)
+        fsc = FaultSweepConfig(max_heuristic_points=512, quick_use_heuristic=True)
         assert fsc.max_heuristic_points == 512
+        assert fsc.quick_use_heuristic is True
 
     def test_invalid_max_heuristic_points(self):
         with pytest.raises(ValueError, match="max_heuristic_points"):
@@ -239,6 +241,7 @@ class TestParseFaultSweepWithHeuristic:
         raw = {
             "sweep_strategy": "heuristic",
             "max_heuristic_points": 750,
+            "quick_use_heuristic": True,
             "heuristic": {
                 "tier2_step": 5,
                 "tier3_step": 50,
@@ -250,6 +253,7 @@ class TestParseFaultSweepWithHeuristic:
         assert fsc.heuristic_config.tier3_step == 50
         assert fsc.heuristic_config.discontinuity_window == 3  # default
         assert fsc.max_heuristic_points == 750
+        assert fsc.quick_use_heuristic is True
 
     def test_heuristic_key_empty_dict(self):
         """heuristic: {} -> HeuristicConfig with all defaults."""
@@ -455,3 +459,51 @@ class TestMaxHeuristicPointsPlannerFallback:
             )
 
         assert mock_classify.call_args.kwargs["target_points"] == 123
+
+    def test_quick_use_heuristic_skips_quick_subset(self, tmp_path: Path):
+        trace_path = tmp_path / "trace.csv"
+        trace_path.write_text(
+            "write_index,flash_offset,value\n1,0,0\n2,4,0\n3,8,0\n",
+            encoding="utf-8",
+        )
+        profile = load_profile(
+            self._write_profile(
+                tmp_path,
+                extra=textwrap.dedent(
+                    """
+                      quick_use_heuristic: true
+                      max_heuristic_points: 3
+                    """
+                ),
+            )
+        )
+
+        with patch(
+            "write_trace_heuristic.classify_trace",
+            return_value={
+                "fault_points": [0, 1, 2],
+                "tier0": [],
+                "tier1": [],
+                "tier2_selected": [],
+                "tier3_selected": [],
+                "tier2_total": 0,
+                "tier3_total": 0,
+                "discontinuity_count": 0,
+                "heuristic_config": {"target_points": 3},
+            },
+        ), patch(
+            "write_trace_heuristic.summarize_classification",
+            return_value={
+                "selected_fault_points": 3,
+                "total_writes": 3,
+                "reduction_ratio": 1.0,
+                "trailer_writes": 0,
+            },
+        ):
+            plan = build_fault_plan(
+                profile,
+                CalibrationInputs(max_writes=3, trace_file=str(trace_path)),
+                quick=True,
+            )
+
+        assert plan.fault_points == [0, 1, 2]

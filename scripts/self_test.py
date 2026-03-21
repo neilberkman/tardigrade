@@ -93,6 +93,8 @@ def check_verdict(
     should_find_issues = expect.get("should_find_issues", True)
     brick_rate_min = float(expect.get("brick_rate_min", 0.0))
     allow_semantic_only_issues = bool(expect.get("allow_semantic_only_issues", False))
+    allow_control_only_issues = bool(expect.get("allow_control_only_issues", False))
+    expected_control_outcome = str(expect.get("control_outcome", "success") or "success")
     required_issue_reasons = {
         str(reason).strip()
         for reason in expect.get("required_issue_reasons", [])
@@ -106,9 +108,25 @@ def check_verdict(
     bricks = int(sweep.get("bricks", 0))
     issue_points = int(sweep.get("issue_points", bricks))
     issue_reasons = sweep.get("issue_reasons", {}) if isinstance(sweep.get("issue_reasons"), dict) else {}
+    control = sweep.get("control", {}) if isinstance(sweep.get("control"), dict) else {}
+    control_outcome = str(
+        control.get("effective_outcome")
+        or control.get("final_boot_outcome")
+        or control.get("boot_outcome")
+        or ""
+    )
+    control_only_issue = (
+        allow_control_only_issues
+        and expected_control_outcome != "success"
+        and control_outcome == expected_control_outcome
+    )
 
     if should_find_issues:
         if issue_points == 0:
+            if control_only_issue:
+                return True, "Control exhibits expected {}, as intended".format(
+                    control_outcome
+                )
             return False, "Expected issues but found none"
         if brick_rate_min > 0 and brick_rate < brick_rate_min:
             return False, "Brick rate {:.1%} below minimum {:.1%}".format(

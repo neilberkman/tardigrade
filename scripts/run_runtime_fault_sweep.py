@@ -54,30 +54,31 @@ bus = monitor.Machine.SystemBus
 
 
 def _bus_load_elf(path):
-    """Load ELF. Fail-closed."""
+    """Load ELF. Re-derives bus from monitor to avoid stale references after machine Reset."""
     _p = str(path)
+    _bus = monitor.Machine.SystemBus
     try:
-        bus.LoadELF(_p)
-        log('_bus_load_elf: direct .NET call succeeded for {}'.format(_p))
+        _bus.LoadELF(_p)
         return
-    except Exception as _e:
-        log('_bus_load_elf: direct .NET call failed ({}), using inline python'.format(_e))
+    except Exception:
+        pass
+    # Extension method not available — use inline python command.
     _pf = _p.replace('\\', '/')
-    monitor.Parse("python \"bus=monitor.Machine.SystemBus; bus.LoadELF(r'{}')\"".format(_pf))
+    monitor.Parse("python \"monitor.Machine.SystemBus.LoadELF(r'{}')\"".format(_pf))
 
 
 def _bus_load_binary(path, addr):
-    """Load binary. Fail-closed."""
+    """Load binary. Re-derives bus from monitor to avoid stale references after machine Reset."""
     _p = str(path)
     _a = int(addr)
+    _bus = monitor.Machine.SystemBus
     try:
-        bus.LoadBinary(_p, _a)
-        log('_bus_load_binary: direct .NET call succeeded for {} at 0x{:X}'.format(_p, _a))
+        _bus.LoadBinary(_p, _a)
         return
-    except Exception as _e:
-        log('_bus_load_binary: direct .NET call failed ({}), using inline python'.format(_e))
+    except Exception:
+        pass
     _pf = _p.replace('\\', '/')
-    monitor.Parse("python \"bus=monitor.Machine.SystemBus; bus.LoadBinary(r'{}', {})\"".format(_pf, _a))
+    monitor.Parse("python \"monitor.Machine.SystemBus.LoadBinary(r'{}', {})\"".format(_pf, _a))
 
 
 # Sentinel value used to disarm fault injection (max uint64).
@@ -2185,6 +2186,24 @@ def analyze_boot_cycles(cycle_records):
     )
 
 
+def _copy_on_boot_vtor_settle_iters():
+    """Allow copy-on-boot profiles to settle past transient VTOR handoff.
+
+    Some bootloaders briefly point VTOR at the final exec slot before the
+    upgrade/copy cleanup has finished. Stopping on the first capture can
+    misclassify the control boot as a completed handoff while trailer/state
+    writes are still in flight.
+    """
+    try:
+        is_exec_handoff = success_vtor_slot == 'exec'
+        expects_staging_image = bool(expected_exec_sha256) and bool(image_staging_sha256) and (
+            expected_exec_sha256 == image_staging_sha256
+        )
+        return 50 if (is_exec_handoff and expects_staging_image) else 0
+    except Exception:
+        return 0
+
+
 def _snapshot_current_flash():
     b = backend
     if b['kind'] == 'otp':
@@ -3859,6 +3878,7 @@ def _run_clean_update_phase(phase, phase_index):
         stop_on_fault=False,
         max_iters=max_iters,
         wall_timeout=wall_timeout,
+        vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
     )
     disarm_vtor_watchpoint()
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
@@ -5122,6 +5142,7 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
         stop_on_fault=False,
         max_iters=p1_max_iters,
         wall_timeout=p1_wall_timeout,
+        vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
     )
     disarm_vtor_watchpoint()
     phase1_ms = int((_time.time() - fp_t0) * 1000)
@@ -5869,6 +5890,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             stop_on_fault=False,
             max_iters=p1_max_iters,
             wall_timeout=p1_wall_timeout,
+            vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
         )
         disarm_vtor_watchpoint()
         phase1_ms = int((_time.time() - fp_t0) * 1000)
@@ -5985,6 +6007,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         stop_on_fault=True,
         max_iters=p1_max_iters,
         wall_timeout=p1_wall_timeout,
+        vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
     )
     disarm_vtor_watchpoint()
     phase1_ms = int((_time.time() - fp_t0) * 1000)
@@ -7735,16 +7758,9 @@ if calibration_mode:
         progress_stall_timeout_s = 0
         cal_wall_timeout = max(600, int(float(run_duration) * 300))
         cal_max_iters = max(500, int(float(run_duration) * 5 / 0.02))
-        # Copy-on-boot bootloaders (vtor_in_slot=exec, expected_image=staging)
-        # briefly set VTOR to staging before copying image to exec.  Use
-        # vtor_settle to capture the final VTOR, not the transient one.
-        # For all other profiles, stop immediately on first VTOR capture
-        # to avoid inflating write/erase counts with post-boot app activity.
-        is_copy_on_boot = (
-            success_vtor_slot == 'exec'
-            and success_image_hash_slot == 'staging'
-        )
-        cal_settle = 50 if is_copy_on_boot else 0
+        # Copy-on-boot upgrades can hit a transient VTOR before the final
+        # cleanup/copy state settles; give those profiles a short settle window.
+        cal_settle = _copy_on_boot_vtor_settle_iters()
         cal_status = run_until_done(cpu_ref, label='calibration',
                                     wall_timeout=cal_wall_timeout,
                                     max_iters=cal_max_iters,
