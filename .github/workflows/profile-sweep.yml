@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     env:
-      RENODE_URL: https://builds.renode.io/renode-latest.linux-portable.tar.gz
+      RENODE_URL: https://builds.renode.io/renode-1.16.1.linux-dotnet.tar.gz
       PYTHONUNBUFFERED: "1"
 
     steps:
