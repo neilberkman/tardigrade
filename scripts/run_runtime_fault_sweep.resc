@@ -3894,6 +3894,7 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
     no_boot_zero_write_count = 0
     prev_progress_key = None
     last_progress_t = t0
+    last_progress_emulated_s = 0.0
     vtor_settle_remaining = -1
     try:
         slice_s = max(0.001, float(time_slice))
@@ -4018,11 +4019,19 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
         if prev_progress_key is None or progress_key != prev_progress_key:
             prev_progress_key = progress_key
             last_progress_t = now
-        elif progress_stall_timeout_s > 0 and (now - last_progress_t) >= progress_stall_timeout_s:
-            if cur_writes == 0:
-                reason = 'no_boot_stall({:.1f}s)'.format(now - last_progress_t)
-            else:
-                reason = 'no_progress_stall({:.1f}s)'.format(now - last_progress_t)
+            last_progress_emulated_s = emulated_s
+        elif progress_stall_timeout_s > 0:
+            # Use EMULATED time for stall detection, not wall clock.
+            # Wall-clock stall detection is non-deterministic: a slow CI
+            # runner fires the stall timeout during CPU-intensive operations
+            # (e.g. SHA-256 hash validation) while a fast runner does not,
+            # producing different flash states and false-positive findings.
+            emulated_stall = emulated_s - last_progress_emulated_s
+            if emulated_stall >= progress_stall_timeout_s:
+                if cur_writes == 0:
+                    reason = 'no_boot_stall({:.2f}s_emulated)'.format(emulated_stall)
+                else:
+                    reason = 'no_progress_stall({:.2f}s_emulated)'.format(emulated_stall)
             break
         if cur_writes == 0 and not sticky_vtor['captured']:
             no_boot_zero_write_count += 1
