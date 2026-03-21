@@ -32,6 +32,8 @@ from profile_loader import (  # noqa: E402
     InstructionSkipConfig,
     ProfileError,
     VerificationProbeConfig,
+    _is_glob_pattern,
+    _match_symbol_query,
     _parse_verification_bypass_probe,
     _parse_instruction_skip_config,
     _parse_verification_probes,
@@ -56,6 +58,65 @@ class InstructionSkipRegistrationTest(unittest.TestCase):
 
     def test_fault_type_label(self) -> None:
         self.assertEqual(_fault_type_label("i"), "instruction_skip")
+
+
+class SymbolGlobMatchingTest(unittest.TestCase):
+    """Unit tests for _is_glob_pattern and _match_symbol_query helpers."""
+
+    def test_is_glob_detects_star(self) -> None:
+        self.assertTrue(_is_glob_pattern("foo*"))
+
+    def test_is_glob_detects_question(self) -> None:
+        self.assertTrue(_is_glob_pattern("foo?bar"))
+
+    def test_is_glob_detects_bracket(self) -> None:
+        self.assertTrue(_is_glob_pattern("foo[ab]"))
+
+    def test_is_glob_plain_string(self) -> None:
+        self.assertFalse(_is_glob_pattern("foo_bar"))
+
+    def test_is_glob_empty(self) -> None:
+        self.assertFalse(_is_glob_pattern(""))
+
+    def test_match_substring_without_glob(self) -> None:
+        self.assertTrue(_match_symbol_query("Validate", "BOOT_META_ValidateSlotImage"))
+        self.assertTrue(_match_symbol_query("Validate", "ValidateHash"))
+
+    def test_match_substring_no_match(self) -> None:
+        self.assertFalse(_match_symbol_query("Zzz", "BOOT_META_ValidateSlotImage"))
+
+    def test_match_glob_star(self) -> None:
+        self.assertTrue(_match_symbol_query("BOOT_META_Validate*", "BOOT_META_ValidateSlotImage"))
+        self.assertTrue(
+            _match_symbol_query(
+                "BOOT_META_Validate*",
+                "BOOT_META_ValidateSlotImage.part.3.constprop.8",
+            )
+        )
+
+    def test_match_glob_star_no_match(self) -> None:
+        self.assertFalse(_match_symbol_query("BOOT_META_Validate*", "Reset_Handler"))
+
+    def test_match_glob_question(self) -> None:
+        self.assertTrue(_match_symbol_query("Reset_Handle?", "Reset_Handler"))
+        self.assertFalse(_match_symbol_query("Reset_Handle?", "Reset_Handler2"))
+
+    def test_match_glob_is_case_sensitive(self) -> None:
+        self.assertFalse(_match_symbol_query("reset*", "Reset_Handler"))
+
+    def test_match_glob_full_wildcard(self) -> None:
+        self.assertTrue(_match_symbol_query("*", "anything"))
+
+    def test_match_glob_anchored(self) -> None:
+        # fnmatch globs are anchored: "Validate*" does NOT match
+        # "BOOT_META_ValidateSlotImage" because the prefix doesn't match.
+        self.assertFalse(
+            _match_symbol_query("Validate*", "BOOT_META_ValidateSlotImage")
+        )
+        # But substring match without glob does:
+        self.assertTrue(
+            _match_symbol_query("Validate", "BOOT_META_ValidateSlotImage")
+        )
 
 
 class InstructionSkipConfigTest(unittest.TestCase):
@@ -331,6 +392,59 @@ class InstructionSkipSymbolResolutionTest(unittest.TestCase):
             bootloader_elf=str(self.ZERO_SIZE_ELF),
         )
         self.assertEqual(cfg.target_addresses, [(0x1F38, 0x1F54)])
+
+    def test_glob_star_matches_multiple_symbols(self) -> None:
+        """A trailing glob ``*_Handler`` should match both Default_Handler and Reset_Handler."""
+        cfg = _parse_instruction_skip_config(
+            {"target_addresses": [{"symbol": "*_Handler"}]},
+            bootloader_elf=str(self.EXAMPLE_ELF),
+        )
+        self.assertEqual(
+            cfg.target_addresses,
+            [(0x10000040, 0x10000042), (0x10000044, 0x100000F8)],
+        )
+
+    def test_glob_prefix_star_matches(self) -> None:
+        """``Reset*`` should match Reset_Handler."""
+        cfg = _parse_instruction_skip_config(
+            {"target_addresses": [{"symbol": "Reset*"}]},
+            bootloader_elf=str(self.EXAMPLE_ELF),
+        )
+        self.assertEqual(
+            cfg.target_addresses,
+            [(0x10000044, 0x100000F8)],
+        )
+
+    def test_glob_question_mark_matches(self) -> None:
+        """``Reset_Handle?`` should match Reset_Handler."""
+        cfg = _parse_instruction_skip_config(
+            {"target_addresses": [{"symbol": "Reset_Handle?"}]},
+            bootloader_elf=str(self.EXAMPLE_ELF),
+        )
+        self.assertEqual(
+            cfg.target_addresses,
+            [(0x10000044, 0x100000F8)],
+        )
+
+    def test_glob_no_match_raises(self) -> None:
+        """A glob that matches nothing should raise with available symbols."""
+        with self.assertRaises(ProfileError) as ctx:
+            _parse_instruction_skip_config(
+                {"target_addresses": [{"symbol": "Zzz*"}]},
+                bootloader_elf=str(self.EXAMPLE_ELF),
+            )
+        self.assertIn("Available function symbols:", str(ctx.exception))
+
+    def test_exact_match_still_works_with_no_glob(self) -> None:
+        """An exact symbol name without glob chars uses substring matching."""
+        cfg = _parse_instruction_skip_config(
+            {"target_addresses": [{"symbol": "Reset_Handler"}]},
+            bootloader_elf=str(self.EXAMPLE_ELF),
+        )
+        self.assertEqual(
+            cfg.target_addresses,
+            [(0x10000044, 0x100000F8)],
+        )
 
 
 class FaultSweepConfigIntegrationTest(unittest.TestCase):

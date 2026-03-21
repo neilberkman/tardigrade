@@ -19,6 +19,7 @@ Usage as CLI (for debugging)::
 from __future__ import annotations
 
 import base64
+import fnmatch
 import json
 import struct
 import sys
@@ -2905,6 +2906,24 @@ def _load_elf_function_symbols(elf_path: str) -> List[Tuple[str, int, Optional[i
     return resolved_symbols
 
 
+def _is_glob_pattern(query: str) -> bool:
+    """Return True if *query* contains glob metacharacters (``*``, ``?``, ``[``)."""
+    return any(ch in query for ch in ("*", "?", "["))
+
+
+def _match_symbol_query(query: str, name: str) -> bool:
+    """Match a symbol query against a symbol name.
+
+    * If *query* contains glob metacharacters it is matched with
+      :func:`fnmatch.fnmatchcase` (case-sensitive).
+    * Otherwise it falls back to a plain substring test (``query in name``),
+      which preserves backward compatibility.
+    """
+    if _is_glob_pattern(query):
+        return fnmatch.fnmatchcase(name, query)
+    return query in name
+
+
 def _resolve_instruction_skip_symbol_targets(
     symbol_query: str,
     *,
@@ -2927,7 +2946,7 @@ def _resolve_instruction_skip_symbol_targets(
     matches = [
         (name, start, end)
         for name, start, end in functions
-        if symbol_query in name
+        if _match_symbol_query(symbol_query, name)
     ]
     if not matches:
         raise ProfileError(
