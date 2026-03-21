@@ -894,12 +894,15 @@ def _load_elf_nm_lines():
         return _nm_lines
     try:
         import subprocess as _sp
-        _nm_out = _sp.run(['nm', _bootloader_elf_path], capture_output=True, text=True, timeout=5)
-        if _nm_out.returncode == 0:
-            _nm_lines = _nm_out.stdout.splitlines()
+        _nm_proc = _sp.Popen(['nm', _bootloader_elf_path], stdout=_sp.PIPE, stderr=_sp.PIPE)
+        _nm_stdout, _ = _nm_proc.communicate()
+        if hasattr(_nm_stdout, 'decode'):
+            _nm_stdout = _nm_stdout.decode('utf-8', errors='replace')
+        if _nm_proc.returncode == 0:
+            _nm_lines = _nm_stdout.splitlines()
             log('elf_symbols: parsed {} symbols from ELF via nm'.format(len(_nm_lines)))
         else:
-            log('elf_symbols: nm failed (rc={}), falling back to single-match symbol lookup'.format(_nm_out.returncode))
+            log('elf_symbols: nm failed (rc={}), falling back to single-match symbol lookup'.format(_nm_proc.returncode))
     except Exception as _e:
         log('elf_symbols: nm not available ({}), falling back to single-match symbol lookup'.format(_e))
     return _nm_lines
@@ -2435,9 +2438,12 @@ def _resolve_confirm_function_address():
     if _firmware_elf:
         try:
             import subprocess as _sp
-            _nm_out = _sp.run(['nm', _firmware_elf], capture_output=True, text=True, timeout=5)
-            if _nm_out.returncode == 0:
-                for line in _nm_out.stdout.splitlines():
+            _nm_proc = _sp.Popen(['nm', _firmware_elf], stdout=_sp.PIPE, stderr=_sp.PIPE)
+            _nm_stdout, _ = _nm_proc.communicate()
+            if hasattr(_nm_stdout, 'decode'):
+                _nm_stdout = _nm_stdout.decode('utf-8', errors='replace')
+            if _nm_proc.returncode == 0:
+                for line in _nm_stdout.splitlines():
                     parts = line.strip().split()
                     if len(parts) >= 3 and parts[2] == func:
                         try:

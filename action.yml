@@ -15,7 +15,7 @@ inputs:
   renode-url:
     description: Renode portable tarball URL
     required: false
-    default: https://builds.renode.io/renode-latest.linux-portable.tar.gz
+    default: https://builds.renode.io/renode-1.16.1.linux-dotnet.tar.gz
   workers:
     description: Number of parallel Renode workers for sweep
     required: false
