@@ -43,6 +43,84 @@ except ImportError:
 
 SUPPORTED_SCHEMA_VERSIONS = {1}
 
+_MAX_INHERITANCE_DEPTH = 10
+
+
+def _deep_merge_profile_data(base: Any, override: Any) -> Any:
+    """Deep-merge two profile data structures.
+
+    Semantics:
+    - dicts merge recursively (override keys win)
+    - lists replace (not append)
+    - scalars replace
+    """
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = dict(base)
+        for key, value in override.items():
+            if key in merged:
+                merged[key] = _deep_merge_profile_data(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+    return override
+
+
+def _resolve_base_profile(data: Dict[str, Any], profile_path: Path,
+                           _seen: Optional[tuple] = None) -> Dict[str, Any]:
+    """Resolve ``base_profile`` inheritance chain.
+
+    If *data* contains a ``base_profile`` key, the referenced profile is loaded,
+    its own ``base_profile`` chain is resolved first, and then *data* is
+    deep-merged on top of the base.
+
+    Cycle detection uses a set of resolved absolute paths.  Chains deeper than
+    ``_MAX_INHERITANCE_DEPTH`` are rejected to catch indirect cycles.
+    """
+    base_rel = data.pop("base_profile", None)
+    if base_rel is None:
+        return data
+
+    if yaml is None:
+        raise ProfileError("PyYAML is required for profile loading.")
+
+    # Resolve the base path relative to the directory of the current profile.
+    base_path = (profile_path.parent / base_rel).resolve()
+    if not base_path.exists():
+        raise ProfileError(
+            "base_profile '{}' not found (resolved to {})".format(base_rel, base_path)
+        )
+
+    seen = set(_seen) if _seen else set()
+    current_resolved = profile_path.resolve()
+    seen.add(current_resolved)
+
+    if base_path in seen:
+        raise ProfileError(
+            "base_profile cycle detected: {} -> {}".format(current_resolved, base_path)
+        )
+
+    if len(seen) >= _MAX_INHERITANCE_DEPTH:
+        raise ProfileError(
+            "base_profile chain too deep (>{} levels)".format(_MAX_INHERITANCE_DEPTH)
+        )
+
+    with open(base_path, "r", encoding="utf-8") as f:
+        base_data = yaml.safe_load(f)
+
+    if not isinstance(base_data, dict):
+        raise ProfileError(
+            "base_profile '{}' must be a YAML mapping, got {}".format(
+                base_rel, type(base_data).__name__
+            )
+        )
+
+    # Recursively resolve the base's own base_profile, passing the growing
+    # set of seen paths.
+    base_data = _resolve_base_profile(base_data, base_path, _seen=tuple(seen))
+
+    # Deep-merge: child overrides base.
+    return _deep_merge_profile_data(base_data, data)
+
 KNOWN_FAULT_TYPES = {
     "power_loss",
     "interrupted_erase",
@@ -4389,6 +4467,9 @@ def load_profile(path: str | Path) -> ProfileConfig:
     if not isinstance(data, dict):
         raise ProfileError("Profile must be a YAML mapping, got {}".format(type(data).__name__))
 
+    # Resolve base_profile inheritance before parsing fields.
+    data = _resolve_base_profile(data, path)
+
     # Schema version validation.
     schema_version = _parse_int(
         _require(data, "schema_version"), "schema_version"
@@ -4605,12 +4686,19 @@ def expand_initial_states(profile: ProfileConfig) -> List[ProfileConfig]:
 
 
 def load_profile_raw(path: str | Path) -> Dict[str, Any]:
-    """Load a profile as raw dict (for self_test.py to read expect section)."""
+    """Load a profile as raw dict (for self_test.py to read expect section).
+
+    Resolves ``base_profile`` inheritance so that the returned dict contains
+    all inherited fields.
+    """
     if yaml is None:
         raise ProfileError("PyYAML is required.")
     path = Path(path)
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        data = yaml.safe_load(f)
+    if isinstance(data, dict):
+        data = _resolve_base_profile(data, path)
+    return data
 
 
 # ---------------------------------------------------------------------------
