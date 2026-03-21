@@ -78,6 +78,8 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
             "pr2206_scratch_geom_fixed",
             "pr2214_offset_broken",
             "pr2214_offset_fixed",
+            "pr2214_offset_geom_broken",
+            "pr2214_offset_geom_fixed",
             "zephyr_slot0_padded.bin",
             "zephyr_slot1_padded.bin",
             "zephyr_slot1_max.bin",
@@ -91,13 +93,20 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertIn("CONFIG_BOOT_SWAP_USING_OFFSET=y", text)
         self.assertIn("CONFIG_BOOT_PREFER_SWAP_OFFSET=y", text)
         self.assertIn("PR_DIFF_GEOM_ALIGN=\"32\"", text)
-        self.assertIn("--align \"${PR_DIFF_GEOM_ALIGN}\"", text)
-        self.assertIn("-DCONFIG_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}", text)
+        self.assertIn("PR_DIFF_GEOM_TRAILER_RESERVE=\"0x30a0\"", text)
+        self.assertIn("PR_DIFF_GEOM_SIGN_OVERHEAD=\"0x400\"", text)
+        self.assertIn("local align=\"${5:-${PR_DIFF_GEOM_ALIGN}}\"", text)
+        self.assertIn("--align \"${align}\"", text)
+        self.assertIn("scratch_with_geom_partition.dts", text)
+        self.assertIn("-DCONFIG_MCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}", text)
+        self.assertIn("\"${ASSETS_DIR}/zephyr_slot1_max.bin\" \"8\"", text)
+        self.assertIn("return (slot_size - 0x200 - geom_trailer_reserve - geom_sign_overhead) & ~0x1F", text)
         self.assertIn("CONFIG_MINIMAL_LIBC=y", text)
         self.assertIn("CONFIG_PICOLIBC=n", text)
         self.assertIn('restore_mcuboot_module_yml', text)
         self.assertIn('patch_mcuboot_module_yml', text)
         self.assertIn('update --narrow -o=--depth=1 zephyr mcuboot hal_nordic cmsis', text)
+        self.assertIn('fetch --quiet mcu-tools "+refs/pull/${pr}/head:refs/pull/${pr}"', text)
 
     def test_pr_differential_profiles_load_and_reference_existing_assets(self) -> None:
         for relpath in PR_DIFFERENTIAL_PROFILES:
@@ -124,6 +133,8 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
             "results/oss_validation/assets/oss_mcuboot_pr2206_scratch_geom_fixed.elf",
             "results/oss_validation/assets/oss_mcuboot_pr2214_offset_broken.elf",
             "results/oss_validation/assets/oss_mcuboot_pr2214_offset_fixed.elf",
+            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_geom_broken.elf",
+            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_geom_fixed.elf",
             "results/oss_validation/assets/zephyr_slot0_padded.bin",
             "results/oss_validation/assets/zephyr_slot1_padded.bin",
             "results/oss_validation/assets/zephyr_slot1_max.bin",
@@ -132,7 +143,7 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         ):
             self.assertIn(relpath, tracked_set)
 
-    def test_pr2214_geom_profiles_intentionally_share_offset_elfs(self) -> None:
+    def test_pr2214_geom_profiles_use_geom_offset_elfs(self) -> None:
         broken = yaml.safe_load(
             (ROOT / "profiles" / "mcuboot_pr2214_offset_geom_broken.yaml").read_text(encoding="utf-8")
         )
@@ -141,11 +152,11 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         )
         self.assertEqual(
             broken["bootloader"]["elf"],
-            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_broken.elf",
+            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_geom_broken.elf",
         )
         self.assertEqual(
             fixed["bootloader"]["elf"],
-            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_fixed.elf",
+            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_geom_fixed.elf",
         )
 
     def test_pr_differential_elfs_are_stripped(self) -> None:
@@ -161,6 +172,8 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
             "oss_mcuboot_pr2206_scratch_geom_fixed.elf",
             "oss_mcuboot_pr2214_offset_broken.elf",
             "oss_mcuboot_pr2214_offset_fixed.elf",
+            "oss_mcuboot_pr2214_offset_geom_broken.elf",
+            "oss_mcuboot_pr2214_offset_geom_fixed.elf",
         ):
             with self.subTest(elf=name):
                 proc = subprocess.run(

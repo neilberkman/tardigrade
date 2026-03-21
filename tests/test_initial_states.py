@@ -499,6 +499,26 @@ class ResolveInitialStateTest(unittest.TestCase):
             magic_base = staging_end - 16
             self.assertIn(magic_base, addresses)
 
+    def test_resolve_expands_update_trigger_with_align32_magic(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile = self._base_profile(tempdir)
+            state = InitialStateConfig(
+                name="geom_pending",
+                update_trigger=UpdateTrigger(
+                    type="mcuboot_trailer_magic",
+                    slot="staging",
+                    fields={"max_align": 32},
+                ),
+            )
+            resolved = profile.resolve_initial_state(state)
+            writes = {w.address: w.u32 for w in resolved.pre_boot_state}
+            staging_end = 0x10001000 + 0x1000
+            self.assertEqual(writes[staging_end - 16], 0xE12D0020)
+            self.assertEqual(writes[staging_end - 12], 0x0B41295D)
+            self.assertEqual(writes[staging_end - 8], 0x9C67778D)
+            self.assertEqual(writes[staging_end - 4], 0x8A1F0F11)
+
 
 class ScenarioExpansionTest(unittest.TestCase):
     """Test that initial_states compose with scenario overrides."""

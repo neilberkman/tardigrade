@@ -127,6 +127,7 @@ def make_profile(
         "update_trigger": {
             "type": "mcuboot_trailer_magic",
             "slot": "staging",
+            "max_align": 32,
         },
         "success_criteria": {
             "vtor_in_slot": "exec",

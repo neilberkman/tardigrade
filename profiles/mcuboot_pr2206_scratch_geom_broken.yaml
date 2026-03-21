@@ -2,9 +2,9 @@ schema_version: 1
 name: mcuboot_pr2206_scratch_geom_broken
 description: >
   MCUboot swap-scratch geometry trigger for PR #2206 (broken commit e35461d2).
-  Built with CONFIG_BOOT_MAX_ALIGN=32 and CONFIG_BOOT_MAX_IMG_SECTORS=1024
-  to force a large multi-sector trailer. Uses a near-max staging image for
-  slot size 0x6E000.
+  Built with CONFIG_MCUBOOT_BOOT_MAX_ALIGN=32 and
+  CONFIG_BOOT_MAX_IMG_SECTORS=1024 to force the align-32 multi-sector
+  trailer. Uses a near-max staging image for slot size 0x6E000.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -27,6 +27,7 @@ images:
 update_trigger:
   type: mcuboot_trailer_magic
   slot: staging
+  max_align: 32
 
 success_criteria:
   vtor_in_slot: exec

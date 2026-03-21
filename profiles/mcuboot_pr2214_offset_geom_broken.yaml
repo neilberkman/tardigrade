@@ -2,14 +2,15 @@ schema_version: 1
 name: mcuboot_pr2214_offset_geom_broken
 description: >
   MCUboot swap-offset geometry trigger for PR #2214 (broken commit 429e2fea).
-  find_last_idx off-by-one: returns count instead of index.  Full-slot staging
-  image forces last_idx >= first_trailer_idx, aborting the upgrade.
+  find_last_idx off-by-one: returns count instead of index. Full-slot staging
+  image with CONFIG_MCUBOOT_BOOT_MAX_ALIGN=32 forces
+  last_idx >= first_trailer_idx, aborting the upgrade.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
 
 bootloader:
-  elf: results/oss_validation/assets/oss_mcuboot_pr2214_offset_broken.elf
+  elf: results/oss_validation/assets/oss_mcuboot_pr2214_offset_geom_broken.elf
   entry: 0x00000000
 
 memory:
@@ -26,6 +27,7 @@ images:
 update_trigger:
   type: mcuboot_trailer_magic
   slot: staging
+  max_align: 32
 
 success_criteria:
   vtor_in_slot: exec

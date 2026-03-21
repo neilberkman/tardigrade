@@ -1067,6 +1067,21 @@ class WriteOrderConstraint:
 
 # MCUboot trailer magic: 4 words written at (slot_end - 16).
 MCUBOOT_GOOD_MAGIC = [0xF395C277, 0x7FEFD260, 0x0F505235, 0x8079B62C]
+MCUBOOT_ALIGNED_MAGIC_SUFFIX = bytes(
+    [0x2D, 0xE1, 0x5D, 0x29, 0x41, 0x0B, 0x8D, 0x77, 0x67, 0x9C, 0x11, 0x0F, 0x1F, 0x8A]
+)
+
+
+def _mcuboot_good_magic_words(max_align: int) -> List[int]:
+    """Return the MCUboot GOOD magic words for a given BOOT_MAX_ALIGN."""
+    if max_align == 8:
+        return list(MCUBOOT_GOOD_MAGIC)
+    if max_align <= 0 or max_align > 0xFFFF:
+        raise ProfileError(
+            "update_trigger.max_align must fit in a 16-bit MCUboot trailer magic field"
+        )
+    magic_bytes = struct.pack("<H", max_align) + MCUBOOT_ALIGNED_MAGIC_SUFFIX
+    return list(struct.unpack("<4I", magic_bytes))
 
 
 def _fletcher32(data: bytes) -> int:
@@ -1423,12 +1438,12 @@ class ProfileConfig:
 
         if trigger.type == "mcuboot_trailer_magic":
             # MCUboot GOOD magic: 4 words at slot_end - 16.
+            align = _parse_int(trigger.fields.get("max_align", 8), "update_trigger.max_align")
             magic_base = slot_end - 16
             writes: List[PreBootWrite] = []
-            for i, val in enumerate(MCUBOOT_GOOD_MAGIC):
+            for i, val in enumerate(_mcuboot_good_magic_words(align)):
                 writes.append(PreBootWrite(address=magic_base + i * 4, u32=val))
             # Optional copy_done field for revert scenarios.
-            align = int(trigger.fields.get("max_align", 8))
             if trigger.fields.get("copy_done") is not None:
                 # MCUboot trailer: magic at -16, image_ok at -16-align,
                 # copy_done at -16-2*align.

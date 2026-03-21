@@ -26,6 +26,8 @@ PR2206_FIXED="08985c96"
 PR2214_BROKEN="429e2fea"
 PR2214_FIXED="90fd59d2"
 PR_DIFF_GEOM_ALIGN="32"
+PR_DIFF_GEOM_TRAILER_RESERVE="0x30a0"
+PR_DIFF_GEOM_SIGN_OVERHEAD="0x400"
 
 msg() { echo ">> $*" >&2; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -159,6 +161,44 @@ write_nrf52_pr_differential_overlays() {
     };
 };
 EOF
+    cat > "${GENERATED_DIR}/scratch_with_geom_partition.dts" <<'EOF'
+&flash0 {
+    /delete-node/ partitions;
+
+    partitions {
+        compatible = "fixed-partitions";
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        boot_partition: partition@0 {
+            label = "mcuboot";
+            reg = <0x0 0xc000>;
+        };
+        slot0_partition: partition@c000 {
+            label = "image-0";
+            reg = <0xc000 0x6e000>;
+        };
+        slot1_partition: partition@7a000 {
+            label = "image-1";
+            reg = <0x7a000 0x6e000>;
+        };
+        scratch_partition: partition@e8000 {
+            label = "image-scratch";
+            reg = <0xe8000 0x10000>;
+        };
+        storage_partition: partition@f8000 {
+            label = "storage";
+            reg = <0xf8000 0x8000>;
+        };
+    };
+};
+
+/ {
+    chosen {
+        zephyr,code-partition = &boot_partition;
+    };
+};
+EOF
     cat > "${GENERATED_DIR}/scratch_app_with_code_partition.dts" <<'EOF'
 &flash0 {
     /delete-node/ partitions;
@@ -202,17 +242,22 @@ EOF
 ensure_mcuboot_history() {
     local repo="$1"
     msg "Fetching MCUboot history for differential commit builds"
-    # Unshallow if needed — try origin first (west's remote), then upstream.
+    # Unshallow if needed — prefer the real MCUboot remote first.
     if [[ "$(git -C "${repo}" rev-parse --is-shallow-repository)" == "true" ]]; then
-        git -C "${repo}" fetch --quiet --unshallow origin 2>/dev/null || \
+        git -C "${repo}" fetch --quiet --unshallow mcu-tools 2>/dev/null || \
+            git -C "${repo}" fetch --quiet --unshallow fork 2>/dev/null || \
+            git -C "${repo}" fetch --quiet --unshallow origin 2>/dev/null || \
             git -C "${repo}" fetch --quiet --unshallow upstream 2>/dev/null || \
-            git -C "${repo}" fetch --quiet --depth=10000 upstream 2>/dev/null || true
+            git -C "${repo}" fetch --quiet --depth=10000 mcu-tools 2>/dev/null || true
     fi
-    # Always fetch upstream to ensure PR commits are reachable.
+    # Always refresh the real MCUboot remotes; "upstream" may point at Zephyr's mirror.
+    git -C "${repo}" fetch --quiet mcu-tools 2>/dev/null || true
+    git -C "${repo}" fetch --quiet fork 2>/dev/null || true
     git -C "${repo}" fetch --quiet upstream 2>/dev/null || true
-    # Fetch PR branches — topic branch commits aren't on main.
+    # Fetch PR branches — topic branch commits aren't on main and live on mcu-tools.
     for pr in 2205 2206 2214; do
-        git -C "${repo}" fetch --quiet upstream "+refs/pull/${pr}/head:refs/pull/${pr}" 2>/dev/null || true
+        git -C "${repo}" fetch --quiet mcu-tools "+refs/pull/${pr}/head:refs/pull/${pr}" 2>/dev/null || \
+            git -C "${repo}" fetch --quiet fork "+refs/pull/${pr}/head:refs/pull/${pr}" 2>/dev/null || true
     done
 }
 
@@ -245,10 +290,11 @@ sign_pr_differential_geom_image() {
     local slot_size="$2"
     local version="$3"
     local out_path="$4"
+    local align="${5:-${PR_DIFF_GEOM_ALIGN}}"
 
     "${PYTHON_BIN}" "${IMGTOOL_PY}" sign \
         --key "${IMGTOOL_KEY}" \
-        --align "${PR_DIFF_GEOM_ALIGN}" \
+        --align "${align}" \
         --header-size 0x200 \
         --slot-size "${slot_size}" \
         --pad-header \
@@ -287,13 +333,22 @@ build_pr_differential_images() {
         "${ASSETS_DIR}/zephyr_slot1_padded.bin"
 
     msg "Generating geometry/max payload variants (CONFIG_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN})"
-    PR_DIFF_APP_BIN="${app_bin}" PR_DIFF_TMP="${BUILD_ROOT}" python3 - <<'PY'
+    PR_DIFF_APP_BIN="${app_bin}" \
+    PR_DIFF_TMP="${BUILD_ROOT}" \
+    PR_DIFF_GEOM_TRAILER_RESERVE="${PR_DIFF_GEOM_TRAILER_RESERVE}" \
+    PR_DIFF_GEOM_SIGN_OVERHEAD="${PR_DIFF_GEOM_SIGN_OVERHEAD}" \
+    python3 - <<'PY'
 from pathlib import Path
 import os
 
 app_bin = Path(os.environ["PR_DIFF_APP_BIN"])
 tmp_root = Path(os.environ["PR_DIFF_TMP"])
 payload = app_bin.read_bytes()
+geom_trailer_reserve = int(os.environ["PR_DIFF_GEOM_TRAILER_RESERVE"], 0)
+geom_sign_overhead = int(os.environ["PR_DIFF_GEOM_SIGN_OVERHEAD"], 0)
+
+def max_payload(slot_size: int) -> int:
+    return (slot_size - 0x200 - geom_trailer_reserve - geom_sign_overhead) & ~0x1F
 
 def make_payload(path: Path, size: int, fill: int) -> None:
     if len(payload) >= size:
@@ -303,13 +358,13 @@ def make_payload(path: Path, size: int, fill: int) -> None:
     path.write_bytes(out)
 
 make_payload(tmp_root / "zephyr_slot1_max_payload.bin", 0x74000, 0x3C)
-make_payload(tmp_root / "zephyr_slot1_scratch_geom_payload.bin", 0x69000, 0xA5)
-make_payload(tmp_root / "zephyr_slot1_offset_geom_payload.bin", 0x75000, 0x5A)
+make_payload(tmp_root / "zephyr_slot1_scratch_geom_payload.bin", max_payload(0x6E000), 0xA5)
+make_payload(tmp_root / "zephyr_slot1_offset_geom_payload.bin", max_payload(0x76000), 0x5A)
 PY
 
     sign_pr_differential_geom_image \
         "${BUILD_ROOT}/zephyr_slot1_max_payload.bin" "0x76000" "1.0.1+0" \
-        "${ASSETS_DIR}/zephyr_slot1_max.bin"
+        "${ASSETS_DIR}/zephyr_slot1_max.bin" "8"
     sign_pr_differential_geom_image \
         "${BUILD_ROOT}/zephyr_slot1_scratch_geom_payload.bin" "0x6e000" "1.0.2+0" \
         "${ASSETS_DIR}/zephyr_slot1_scratch_geom_max.bin"
@@ -404,6 +459,7 @@ build_pr_differential_elfs() {
     }
 
     local scratch_overlay="${GENERATED_DIR}/scratch_with_code_partition.dts"
+    local scratch_geom_overlay="${GENERATED_DIR}/scratch_with_geom_partition.dts"
     local offset_overlay="${GENERATED_DIR}/nrf52_move_bootloader.overlay"
     build_pr_bootloader_variant "pr2205_scratch_broken" "${wt_root}/pr2205_broken" "${scratch_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
@@ -413,14 +469,14 @@ build_pr_differential_elfs() {
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
     build_pr_bootloader_variant "pr2206_scratch_fixed" "${wt_root}/pr2206_fixed" "${scratch_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
-    build_pr_bootloader_variant "pr2206_scratch_geom_broken" "${wt_root}/pr2206_broken" "${scratch_overlay}" \
+    build_pr_bootloader_variant "pr2206_scratch_geom_broken" "${wt_root}/pr2206_broken" "${scratch_geom_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
-        -DCONFIG_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN} \
+        -DCONFIG_MCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN} \
         -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
         -DCONFIG_BOOT_MAX_IMG_SECTORS=1024
-    build_pr_bootloader_variant "pr2206_scratch_geom_fixed" "${wt_root}/pr2206_fixed" "${scratch_overlay}" \
+    build_pr_bootloader_variant "pr2206_scratch_geom_fixed" "${wt_root}/pr2206_fixed" "${scratch_geom_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
-        -DCONFIG_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN} \
+        -DCONFIG_MCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN} \
         -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
         -DCONFIG_BOOT_MAX_IMG_SECTORS=1024
     build_pr_bootloader_variant "pr2214_offset_broken" "${wt_root}/pr2214_broken" "${offset_overlay}" \
@@ -429,6 +485,14 @@ build_pr_differential_elfs() {
     build_pr_bootloader_variant "pr2214_offset_fixed" "${wt_root}/pr2214_fixed" "${offset_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
         -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y
+    build_pr_bootloader_variant "pr2214_offset_geom_broken" "${wt_root}/pr2214_broken" "${offset_overlay}" \
+        -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
+        -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y \
+        -DCONFIG_MCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}
+    build_pr_bootloader_variant "pr2214_offset_geom_fixed" "${wt_root}/pr2214_fixed" "${offset_overlay}" \
+        -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
+        -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y \
+        -DCONFIG_MCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}
 }
 
 build_pr_differential_assets() {

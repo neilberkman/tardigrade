@@ -9,18 +9,63 @@ ZEPHYR_VENV="${REPO_ROOT}/third_party/zephyr-venv"
 MCUBOOT_REPO="${ZEPHYR_WS}/bootloader/mcuboot"
 ASSETS_DIR="${REPO_ROOT}/results/oss_validation/assets"
 BUILD_DIR="${REPO_ROOT}/results/oss_validation/build"
+GENERATED_DIR="${BUILD_DIR}/bootstrap_mcuboot_geometry_assets"
 TOOLCHAIN_PATH="${HOME}/tools/gcc-arm-none-eabi-8-2018-q4-major"
 WEST="${ZEPHYR_VENV}/bin/west"
 IMGTOOL_PY="${MCUBOOT_REPO}/scripts/imgtool.py"
 IMGTOOL_PYTHON="${ZEPHYR_VENV}/bin/python3"
 STRIP_BIN="${TOOLCHAIN_PATH}/bin/arm-none-eabi-strip"
 GEOM_ALIGN="32"
+GEOM_TRAILER_RESERVE="0x30a0"
+GEOM_SIGN_OVERHEAD="0x400"
 
 # PR2206 broken/fixed pair.
 PR2206_BROKEN="e35461d29484f1e11c75c769b066ec2b79b4791c"
 PR2206_FIXED="08985c9679f6877ab593a7ff62ab244ca6fbaae5"
 
 msg() { echo ">> $*" >&2; }
+
+write_geometry_overlay() {
+    mkdir -p "${GENERATED_DIR}"
+    cat > "${GENERATED_DIR}/scratch_with_geom_partition.dts" <<'EOF'
+&flash0 {
+    /delete-node/ partitions;
+
+    partitions {
+        compatible = "fixed-partitions";
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        boot_partition: partition@0 {
+            label = "mcuboot";
+            reg = <0x0 0xc000>;
+        };
+        slot0_partition: partition@c000 {
+            label = "image-0";
+            reg = <0xc000 0x6e000>;
+        };
+        slot1_partition: partition@7a000 {
+            label = "image-1";
+            reg = <0x7a000 0x6e000>;
+        };
+        scratch_partition: partition@e8000 {
+            label = "image-scratch";
+            reg = <0xe8000 0x10000>;
+        };
+        storage_partition: partition@f8000 {
+            label = "storage";
+            reg = <0xf8000 0x8000>;
+        };
+    };
+};
+
+/ {
+    chosen {
+        zephyr,code-partition = &boot_partition;
+    };
+};
+EOF
+}
 
 require_file() {
     local p="$1"
@@ -34,9 +79,9 @@ require_file "${WEST}"
 require_file "${IMGTOOL_PY}"
 require_file "${STRIP_BIN}"
 require_file "${MCUBOOT_REPO}/root-rsa-2048.pem"
-require_file "${BUILD_DIR}/scratch_with_code_partition.dts"
-
-mkdir -p "${ASSETS_DIR}" "${BUILD_DIR}"
+mkdir -p "${ASSETS_DIR}" "${BUILD_DIR}" "${GENERATED_DIR}"
+write_geometry_overlay
+require_file "${GENERATED_DIR}/scratch_with_geom_partition.dts"
 
 WT_ROOT="$(mktemp -d /tmp/mcuboot_geom_wt.XXXXXX)"
 cleanup() {
@@ -70,11 +115,11 @@ build_pr2206_variant() {
           -b nrf52840dk_nrf52840 \
           "${src}/boot/zephyr" \
           -- \
-          -DDTC_OVERLAY_FILE="${BUILD_DIR}/scratch_with_code_partition.dts" \
+          -DDTC_OVERLAY_FILE="${GENERATED_DIR}/scratch_with_geom_partition.dts" \
           -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
+          -DCONFIG_MCUBOOT_BOOT_MAX_ALIGN=${GEOM_ALIGN} \
           -DCONFIG_BOOT_SIGNATURE_TYPE_NONE=y \
           -DCONFIG_BOOT_SIGNATURE_TYPE_RSA=n \
-          -DCONFIG_BOOT_MAX_ALIGN=${GEOM_ALIGN} \
           -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
           -DCONFIG_BOOT_MAX_IMG_SECTORS=1024 \
           -DCMAKE_GDB:FILEPATH="${TOOLCHAIN_PATH}/bin/arm-none-eabi-gdb" \
@@ -90,15 +135,20 @@ build_pr2206_variant "pr2206_scratch_geom_broken" "${WT_ROOT}/pr2206_broken"
 build_pr2206_variant "pr2206_scratch_geom_fixed" "${WT_ROOT}/pr2206_fixed"
 
 msg "Generating geometry-trigger slot images"
-REPO_ROOT="${REPO_ROOT}" python3 - <<'PY'
+REPO_ROOT="${REPO_ROOT}" GEOM_TRAILER_RESERVE="${GEOM_TRAILER_RESERVE}" GEOM_SIGN_OVERHEAD="${GEOM_SIGN_OVERHEAD}" python3 - <<'PY'
 from pathlib import Path
 import struct
 import os
 
 repo = Path(os.environ["REPO_ROOT"])
+geom_trailer_reserve = int(os.environ["GEOM_TRAILER_RESERVE"], 0)
+geom_sign_overhead = int(os.environ["GEOM_SIGN_OVERHEAD"], 0)
 base = (repo / "results/oss_validation/assets/zephyr_slot1_padded.bin").read_bytes()
 ih_size = struct.unpack_from("<I", base, 0x0C)[0]
 payload = base[0x200:0x200 + ih_size]
+
+def max_payload(slot_size: int) -> int:
+    return (slot_size - 0x200 - geom_trailer_reserve - geom_sign_overhead) & ~0x1F
 
 def make_payload(path: Path, size: int, fill: int) -> None:
     if len(payload) >= size:
@@ -107,8 +157,8 @@ def make_payload(path: Path, size: int, fill: int) -> None:
         out = payload + bytes([fill]) * (size - len(payload))
     path.write_bytes(out)
 
-make_payload(Path("/tmp/zephyr_slot1_scratch_geom_payload.bin"), 0x69000, 0xA5)
-make_payload(Path("/tmp/zephyr_slot1_offset_geom_payload.bin"), 0x75000, 0x5A)
+make_payload(Path("/tmp/zephyr_slot1_scratch_geom_payload.bin"), max_payload(0x6E000), 0xA5)
+make_payload(Path("/tmp/zephyr_slot1_offset_geom_payload.bin"), max_payload(0x76000), 0x5A)
 PY
 
 "${IMGTOOL_PYTHON}" "${IMGTOOL_PY}" sign \
