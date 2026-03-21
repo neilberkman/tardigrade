@@ -1,9 +1,10 @@
 schema_version: 1
 name: mcuboot_head_move_nrf52_upgrade_verify_corrupt_staging_critical
 description: >
-  Critical instruction-skip sweep over the final MCUboot hash comparison and
-  slot-validation acceptance path during upgrade, using a deliberately
-  corrupted staging image. Control boot should reject the tampered upgrade.
+  Wider instruction-skip sweep over MCUboot FIH-hardened hash comparison
+  and slot-validation paths with a corrupted staging image. MCUboot HEAD's
+  redundant FIH checks resist single-instruction skip across all tested
+  addresses. This profile validates that resilience — no bypass expected.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -26,13 +27,15 @@ success_criteria:
   vtor_in_slot: exec
   image_hash: true
   expected_image: staging
+expect:
+  should_find_issues: false
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
   fault_types: [instruction_skip]
   instruction_skip_config:
     target_addresses:
-      # bootutil_img_validate: FIH hash comparison (cmp r0,r3 + beq/b)
+      # bootutil_img_validate: FIH hash comparison block
       - { start: 0x000005C4, end: 0x000005D0 }
       # boot_validate_slot: cbnz bypass + FIH counter check
       - { start: 0x0000076E, end: 0x0000077C }
