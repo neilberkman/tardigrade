@@ -65,6 +65,7 @@ from renode_runner import (
     run_calibration,
     run_single_point,
 )
+from calibration_cache import compute_cache_key, load_calibration, save_calibration
 from fault_plan import CalibrationInputs, FaultPlan, build_fault_plan
 from fault_types import EXECUTE_ONLY_FAULT_TYPES, TRACE_REPLAY_FAULT_TYPES
 from finding_validator import validate_runtime_findings
@@ -244,7 +245,39 @@ def parse_args() -> argparse.Namespace:
             "avoid space-in-path issues (e.g. /tmp/tardigrade_repo)."
         ),
     )
+    parser.add_argument(
+        "--reuse-calibration",
+        default="",
+        metavar="PATH",
+        help=(
+            "Path to a calibration cache JSON file. If the file exists and "
+            "the cache key matches, calibration is loaded from it instead of "
+            "running Renode. After a fresh calibration the result is saved "
+            "to this path for future reuse."
+        ),
+    )
     return parser.parse_args()
+
+
+def _compute_calibration_cache_key(
+    profile: ProfileConfig,
+    repo_root: Path,
+) -> str:
+    """Compute a cache key for calibration based on profile inputs."""
+    resolved_images = {
+        name: profile.resolve_path(repo_root, path)
+        for name, path in profile.images.items()
+    }
+    return compute_cache_key(
+        bootloader_elf=profile.resolve_path(repo_root, profile.bootloader_elf),
+        images=resolved_images,
+        fault_types=list(profile.fault_sweep.fault_types or []),
+        flash_backend=profile.flash_backend,
+        memory_slots=profile.memory.slots,
+        pre_boot_state=list(profile.pre_boot_state),
+        hash_bypass_symbols=list(profile.fault_sweep.sweep_hash_bypass_symbols or []),
+        write_granularity=profile.memory.write_granularity,
+    )
 
 
 def _cleanup_generated_robot_files(robot_vars: List[str]) -> None:
@@ -721,17 +754,36 @@ def main() -> int:
                     file=sys.stderr,
                 )
             else:
-                print("Calibrating write count for '{}'...".format(profile.name), file=sys.stderr)
-                cal = run_calibration(
-                    repo_root=repo_root,
-                    renode_test=renode_test,
-                    robot_suite=robot_suite,
-                    profile=profile,
-                    robot_vars=robot_vars,
-                    work_dir=work_dir,
-                    renode_remote_server_dir=args.renode_remote_server_dir,
-                    keep_run_artifacts=args.keep_run_artifacts,
-                )
+                # Try loading from calibration cache.
+                _cal_cache_path = args.reuse_calibration
+                _cal_cache_key = ""
+                if _cal_cache_path:
+                    _cal_cache_key = _compute_calibration_cache_key(profile, repo_root)
+                    cal = load_calibration(_cal_cache_path, _cal_cache_key, work_dir)
+                    if cal is not None:
+                        print(
+                            "Loaded calibration from cache: {}".format(_cal_cache_path),
+                            file=sys.stderr,
+                        )
+
+                if cal is None:
+                    print("Calibrating write count for '{}'...".format(profile.name), file=sys.stderr)
+                    cal = run_calibration(
+                        repo_root=repo_root,
+                        renode_test=renode_test,
+                        robot_suite=robot_suite,
+                        profile=profile,
+                        robot_vars=robot_vars,
+                        work_dir=work_dir,
+                        renode_remote_server_dir=args.renode_remote_server_dir,
+                        keep_run_artifacts=args.keep_run_artifacts,
+                    )
+                    if _cal_cache_path:
+                        save_calibration(_cal_cache_path, cal, _cal_cache_key)
+                        print(
+                            "Saved calibration to cache: {}".format(_cal_cache_path),
+                            file=sys.stderr,
+                        )
                 max_writes = cal.total_writes
                 total_erases = cal.total_erases
                 trace_file = cal.trace_file
@@ -766,22 +818,41 @@ def main() -> int:
         else:
             max_writes = int(max_writes)
             if should_calibrate_for_trace:
-                print(
-                    "Calibrating trace for bounded execute-mode sweep '{}'...".format(
-                        profile.name
-                    ),
-                    file=sys.stderr,
-                )
-                cal = run_calibration(
-                    repo_root=repo_root,
-                    renode_test=renode_test,
-                    robot_suite=robot_suite,
-                    profile=profile,
-                    robot_vars=robot_vars,
-                    work_dir=work_dir,
-                    renode_remote_server_dir=args.renode_remote_server_dir,
-                    keep_run_artifacts=args.keep_run_artifacts,
-                )
+                # Try loading from calibration cache.
+                _cal_cache_path = args.reuse_calibration
+                _cal_cache_key = ""
+                if _cal_cache_path:
+                    _cal_cache_key = _compute_calibration_cache_key(profile, repo_root)
+                    cal = load_calibration(_cal_cache_path, _cal_cache_key, work_dir)
+                    if cal is not None:
+                        print(
+                            "Loaded calibration from cache: {}".format(_cal_cache_path),
+                            file=sys.stderr,
+                        )
+
+                if cal is None:
+                    print(
+                        "Calibrating trace for bounded execute-mode sweep '{}'...".format(
+                            profile.name
+                        ),
+                        file=sys.stderr,
+                    )
+                    cal = run_calibration(
+                        repo_root=repo_root,
+                        renode_test=renode_test,
+                        robot_suite=robot_suite,
+                        profile=profile,
+                        robot_vars=robot_vars,
+                        work_dir=work_dir,
+                        renode_remote_server_dir=args.renode_remote_server_dir,
+                        keep_run_artifacts=args.keep_run_artifacts,
+                    )
+                    if _cal_cache_path:
+                        save_calibration(_cal_cache_path, cal, _cal_cache_key)
+                        print(
+                            "Saved calibration to cache: {}".format(_cal_cache_path),
+                            file=sys.stderr,
+                        )
                 total_erases = cal.total_erases
                 trace_file = cal.trace_file
                 erase_trace_file = cal.erase_trace_file
