@@ -896,13 +896,17 @@ def _load_elf_nm_lines():
         import subprocess as _sp
         _nm_proc = _sp.Popen(['nm', _bootloader_elf_path], stdout=_sp.PIPE, stderr=_sp.PIPE)
         _nm_stdout, _ = _nm_proc.communicate()
+        _nm_proc.wait()
         if hasattr(_nm_stdout, 'decode'):
             _nm_stdout = _nm_stdout.decode('utf-8', errors='replace')
-        if _nm_proc.returncode == 0:
+        _nm_rc = _nm_proc.returncode
+        if _nm_rc is None:
+            _nm_rc = 0 if _nm_stdout else 1
+        if _nm_rc == 0:
             _nm_lines = _nm_stdout.splitlines()
             log('elf_symbols: parsed {} symbols from ELF via nm'.format(len(_nm_lines)))
         else:
-            log('elf_symbols: nm failed (rc={}), falling back to single-match symbol lookup'.format(_nm_proc.returncode))
+            log('elf_symbols: nm failed (rc={}), falling back to single-match symbol lookup'.format(_nm_rc))
     except Exception as _e:
         log('elf_symbols: nm not available ({}), falling back to single-match symbol lookup'.format(_e))
     return _nm_lines
@@ -942,8 +946,19 @@ def _resolve_elf_symbol_addresses(sym_name):
                 found_addrs.add(addr & ~1)
                 if not nm_lines:
                     log('elf_symbols: WARNING: nm unavailable, only single-match for {}'.format(sym_name))
-            except Exception:
-                pass
+            except Exception as _sym_err:
+                # Try monitor command as last resort
+                try:
+                    _resp = monitor.Parse('sysbus FindSymbolAt "{}"'.format(sym_name))
+                    if _resp and '0x' in str(_resp):
+                        import re as _re
+                        _m = _re.search(r'0x([0-9a-fA-F]+)', str(_resp))
+                        if _m:
+                            found_addrs.add(int(_m.group(1), 16) & ~1)
+                except Exception:
+                    pass
+                if not found_addrs:
+                    log('elf_symbols: GetSymbolAddress({}) failed: {}'.format(sym_name, _sym_err))
     return sorted(found_addrs)
 
 _hash_bypass_symbols_raw = str(monitor.GetVariable('hash_bypass_symbols')).strip()
