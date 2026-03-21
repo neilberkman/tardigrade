@@ -72,7 +72,7 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4]
     env:
-      RENODE_URL: https://builds.renode.io/renode-latest.linux-portable.tar.gz
+      RENODE_URL: https://builds.renode.io/renode-1.16.1.linux-dotnet.tar.gz
       PYTHONUNBUFFERED: "1"
 
     steps:
