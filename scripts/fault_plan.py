@@ -265,6 +265,7 @@ def build_fault_plan(
         or profile.fault_sweep.multi_fault.enabled
         or include_metadata_fault
         or profile.fault_sweep.hook_fault.enabled
+        or profile.fault_sweep.confirm_cycle.enabled
     )
     clustered_bit_count = 0
     if has_mixed_types:
@@ -570,6 +571,30 @@ def build_fault_plan(
                     combined.append((hf_fp, "h:{}:{}".format(hf_fp, hf_code)))
                     hook_count += 1
 
+        # Confirm-cycle fault injection.
+        confirm_count = 0
+        cc_config = profile.fault_sweep.confirm_cycle
+        if cc_config.enabled and cc_config.confirm_function:
+            cc_max = (
+                cc_config.max_points
+                if cc_config.max_points > 0
+                else min(50, max(max_writes, 1))
+            )
+            cc_types = [FAULT_TYPE_NAME_TO_CODE.get(ft, "w") for ft in cc_config.fault_types]
+            cc_fps = list(range(0, cc_max))
+            cc_fps = _slice_explicit_points(
+                cc_fps,
+                fault_step=fault_step,
+                fault_start=fault_start,
+                fault_end=fault_end,
+            )
+            if quick:
+                cc_fps = quick_subset(cc_fps)
+            for cc_fp in cc_fps:
+                for cc_code in cc_types:
+                    combined.append((cc_fp, "cc:{}:{}".format(cc_fp, cc_code)))
+                    confirm_count += 1
+
         # Phase 2 recovery fault injection.
         p2_config = profile.fault_sweep.phase2_fault
         phase2_count = 0
@@ -657,6 +682,8 @@ def build_fault_plan(
             parts.append("{} metadata-fault".format(metadata_count))
         if hook_count:
             parts.append("{} hook-fault".format(hook_count))
+        if confirm_count:
+            parts.append("{} confirm-cycle".format(confirm_count))
         print(
             "Running {} fault points ({}) for '{}'...".format(
                 len(fault_points),

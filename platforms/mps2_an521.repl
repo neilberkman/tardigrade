@@ -1,0 +1,61 @@
+// MPS2+ AN521 - SSE-200 Subsystem (Cortex-M33 with TrustZone)
+// For TF-M BL2 (MCUboot) secure boot fault injection
+//
+// Memory map (secure aliases at 0x10000000):
+//   0x10000000: Code SSRAM1 (4MB) — BL2 + firmware images
+//   0x38000000: Data SSRAM2+3 (4MB) — SRAM
+//   Peripherals: 0x50000000 (secure) / 0x40000000 (non-secure)
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m33"
+    nvic: nvic
+    enableTrustZone: true
+    numberOfSAURegions: 8
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    -> cpu@0
+
+// Code SSRAM1 — secure alias (BL2 loads here at 0x10000000)
+ssram1: Memory.MappedMemory @ sysbus 0x10000000
+    size: 0x400000
+
+// Data SSRAM2+3 — secure alias
+ssram2: Memory.MappedMemory @ sysbus 0x38000000
+    size: 0x400000
+
+// UART0 — CMSDK APB UART (secure + non-secure aliases)
+uart0: UART.CMSDK_APB_UART @ {
+        sysbus 0x50200000;
+        sysbus 0x40200000
+    }
+    TxInterrupt -> nvic@33
+    RxInterrupt -> nvic@32
+
+// Tardigrade flash backend — wraps ssram1 for write tracking.
+// AN521 has no real flash controller; this satisfies the profile requirement.
+faultFlash: Miscellaneous.NRF52NVMC @ sysbus 0x5030F000
+    Flash: ssram1
+    FlashBaseAddress: 0x10000000
+    FlashSize: 0x400000
+    EraseFill: 0xFF
+    PageSize: 4096
+
+sysbus:
+    init:
+        // Stub peripherals that BL2 doesn't need for signature verification
+        Tag <0x50000000 0x1000> "TIMER0"
+        Tag <0x50001000 0x1000> "TIMER1"
+        Tag <0x50002000 0x1000> "DTIMER0"
+        Tag <0x50081000 0x1000> "S32K_WATCHDOG"
+        Tag <0x50302000 0x1000> "FPGAIO"
+        Tag <0x50008000 0x1000> "MPC_SSRAM1"
+        Tag <0x50009000 0x1000> "MPC_SSRAM2"
+        Tag <0x5000A000 0x1000> "MPC_SSRAM3"
+        Tag <0x50080000 0x1000> "S32K_TIMER"
+        Tag <0x50100000 0x1000> "GPIO0"
+        Tag <0x50101000 0x1000> "GPIO1"
+        Tag <0x50102000 0x1000> "GPIO2"
+        Tag <0x50103000 0x1000> "GPIO3"
+        // SCC (System Configuration Controller) — BL2 may probe this
+        Tag <0x50301000 0x1000> "SCC"

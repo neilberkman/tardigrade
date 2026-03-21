@@ -124,6 +124,7 @@ def _fault_type_label(code: Any) -> str:
         "iw": "i2c_wrong_address",
         "h": "hook_fault",
         "p2": "phase2",
+        "cc": "confirm_cycle",
     }
     if code.startswith("b:"):
         return "bit_corruption_clustered"
@@ -137,6 +138,10 @@ def _fault_type_label(code: Any) -> str:
         return "phase2_{}".format(_fault_type_label(code.rsplit(":", 1)[-1]))
     if code.startswith("c:"):
         return "cascading_{}".format(_fault_type_label(code.rsplit(":", 1)[-1]))
+    if code.startswith("cc:"):
+        sub_type = code.rsplit(":", 1)[-1]
+        sub_label = _fault_type_label(sub_type)
+        return "confirm_{}".format(sub_label)
     if code.startswith("nv:"):
         return "nvs_corruption_variant"
     if code.startswith("mf:"):

@@ -120,6 +120,12 @@ $residual_image_prior?=""
 $residual_image_fill?=""
 $max_reset_vector_offset?=""
 $metadata_delta_fields?=""
+$confirm_cycle_enabled?="false"
+$confirm_cycle_function?=""
+$confirm_cycle_max_points?="0"
+$confirm_cycle_assertions?=""
+$confirm_cycle_ratchet_version?=""
+$firmware_elf?=""
 
 python """
 import base64
@@ -443,6 +449,19 @@ except Exception:
 if boot_cycles < 1:
     boot_cycles = 1
 
+# Confirm-cycle configuration.
+_confirm_cycle_enabled = get_optional_var('confirm_cycle_enabled', 'false').lower() in ('1', 'true', 'yes')
+_confirm_cycle_function = get_optional_var('confirm_cycle_function', '')
+_confirm_cycle_assertions_raw = get_optional_var('confirm_cycle_assertions', '')
+_confirm_cycle_assertions = []
+if _confirm_cycle_assertions_raw:
+    try:
+        _confirm_cycle_assertions = json.loads(_confirm_cycle_assertions_raw)
+    except Exception:
+        pass
+_confirm_cycle_ratchet_version = get_optional_int_var('confirm_cycle_ratchet_version')
+_firmware_elf = get_optional_var('firmware_elf', '')
+
 # Batch vs single mode.
 fault_points_csv = str(monitor.GetVariable('fault_points_csv')).strip()
 if fault_points_csv:
@@ -692,6 +711,7 @@ _FAULT_CODE_TO_NAME = {
     'k': 'command_drop',
     'i': 'instruction_skip',
     'h': 'hook_fault',
+    'cc': 'confirm_cycle',
     'm': 'metadata_fault',
     'p2': 'phase2_fault',
     'op': 'otp_partial_program',
@@ -1018,15 +1038,12 @@ def _resolve_elf_symbol_addresses(sym_name):
     found_addrs = set()
     nm_lines = _load_elf_nm_lines()
     for line in nm_lines:
-        if sym_name not in line:
-            continue
         parts = line.strip().split()
-        if len(parts) < 2:
-            continue
-        try:
-            found_addrs.add(int(parts[0], 16) & ~1)
-        except ValueError:
-            continue
+        if len(parts) >= 3 and parts[2] == sym_name:
+            try:
+                found_addrs.add(int(parts[0], 16) & ~1)
+            except ValueError:
+                continue
     if not found_addrs:
         try:
             addr = int(bus.GetSymbolAddress(sym_name))
@@ -2509,6 +2526,321 @@ def run_hook_fault(hook_fault_at, hook_fault_type='w'):
     if semantic_state is not None:
         result['semantic_state'] = semantic_state
     return result
+
+
+def _resolve_confirm_function_address():
+    # Resolve the confirm function to an address.
+    #
+    # If the configured value is a hex/integer literal, use it directly.
+    # Otherwise treat it as a symbol name and resolve from the firmware ELF
+    # (if firmware_elf is set) or the bootloader ELF.
+    func = _confirm_cycle_function
+    if not func:
+        return None
+    # Try parsing as integer literal first.
+    try:
+        return int(func, 0) & 0xFFFFFFFF
+    except ValueError:
+        pass
+    # If firmware_elf is set, resolve from it via nm.
+    if _firmware_elf:
+        try:
+            import subprocess as _sp
+            _nm_out = _sp.run(['nm', _firmware_elf], capture_output=True, text=True, timeout=5)
+            if _nm_out.returncode == 0:
+                for line in _nm_out.stdout.splitlines():
+                    parts = line.strip().split()
+                    if len(parts) >= 3 and parts[2] == func:
+                        try:
+                            addr = int(parts[0], 16)
+                            log('confirm_cycle: resolved {} from firmware ELF to 0x{:08X}'.format(func, addr))
+                            return addr & 0xFFFFFFFE
+                        except ValueError:
+                            continue
+        except Exception as e:
+            log('confirm_cycle: nm on firmware ELF failed: {}'.format(e))
+    # Fall back to bootloader ELF symbols.
+    addrs = _resolve_elf_symbol_addresses(func)
+    if addrs:
+        return addrs[0] & 0xFFFFFFFE
+    # Try bus.GetSymbolAddress as last resort.
+    try:
+        return int(bus.GetSymbolAddress(func)) & 0xFFFFFFFE
+    except Exception:
+        return None
+
+
+def _evaluate_confirm_assertions(assertions, ratchet_version):
+    # Check post-confirm assertions and ratchet version.
+    #
+    # Returns a dict with confirm_incomplete, rollback_not_ratcheted,
+    # metadata_inconsistent_after_confirm flags and details.
+    meta = {
+        'confirm_incomplete': False,
+        'rollback_not_ratcheted': False,
+        'metadata_inconsistent_after_confirm': False,
+        'assertion_results': [],
+    }
+    any_failed = False
+    for assertion in assertions:
+        addr = int(assertion.get('address', '0'), 0) if isinstance(assertion.get('address'), str) else int(assertion.get('address', 0))
+        expected = assertion.get('expected')
+        label = assertion.get('label', '0x{:08X}'.format(addr))
+        actual = as_int(bus.ReadDoubleWord(addr))
+        if isinstance(expected, list):
+            passed = actual in [int(str(e), 0) if isinstance(e, str) else int(e) for e in expected]
+        else:
+            expected_int = int(str(expected), 0) if isinstance(expected, str) else int(expected)
+            passed = actual == expected_int
+        entry = {
+            'address': '0x{:08X}'.format(addr),
+            'expected': expected,
+            'actual': '0x{:08X}'.format(actual),
+            'label': label,
+            'passed': passed,
+        }
+        meta['assertion_results'].append(entry)
+        if not passed:
+            any_failed = True
+    if any_failed:
+        meta['metadata_inconsistent_after_confirm'] = True
+    if ratchet_version is not None:
+        # Check the expected_ratchet_version against assertion results.
+        # Compares the configured value directly against each assertion's
+        # actual read-back.  An assertion matches if its label contains
+        # 'version' or 'ratchet' (case-insensitive).  Profiles MUST use
+        # one of these substrings in the label of the ratchet-version
+        # assertion for this check to engage.
+        ratchet_ok = False
+        for ar in meta['assertion_results']:
+            lbl = str(ar.get('label', '')).lower()
+            if 'version' in lbl or 'ratchet' in lbl:
+                actual_int = int(ar['actual'], 16) if isinstance(ar['actual'], str) else int(ar['actual'])
+                if actual_int == ratchet_version:
+                    ratchet_ok = True
+                    break
+        if not ratchet_ok and meta['assertion_results']:
+            meta['rollback_not_ratcheted'] = True
+    return meta
+
+
+def run_confirm_cycle_fault(cc_fault_at, cc_fault_type='w'):
+    # Fault injection during the confirm phase.
+    #
+    # The confirm_function address is resolved as a validation gate (must
+    # exist in the ELF) but is not used as a CPU breakpoint.  Instead,
+    # fault injection targets the boot_cycle_hook's NVM writes.
+    #
+    # 1. Boot normally (no faults) to reach firmware.
+    # 2. Run the boot_cycle_hook with a fault-injecting bus that
+    #    interrupts the write at index cc_fault_at.
+    # 3. Reboot and check metadata assertions.
+    eff_criteria = get_effective_criteria('cc')
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    fp_t0 = _time.time()
+
+    def skipped_result(reason, cycle_records=None, phase1_ms=0):
+        result = {
+            'fault_at': cc_fault_at,
+            'fault_requested': cc_fault_at,
+            'fault_type': 'cc:{}'.format(cc_fault_type),
+            'fault_injected': False,
+            'fault_address': fmt_u32(0),
+            'boot_outcome': 'skipped',
+            'boot_slot': None,
+            'fault_class': 'skipped',
+            'actual_writes': 0,
+            'signals': {
+                'phase1_ms': int(phase1_ms),
+                'phase2_ms': 0,
+                'confirm_ms': 0,
+                'followup_ms': 0,
+            },
+            'confirm_cycle': {
+                'cc_fault_at': int(cc_fault_at),
+                'cc_fault_type': cc_fault_type,
+                'fault_injected': False,
+                'skip_reason': reason,
+                'confirm_incomplete': False,
+                'rollback_not_ratcheted': False,
+                'metadata_inconsistent_after_confirm': False,
+            },
+            'skip_reason': reason,
+        }
+        if cycle_records is not None:
+            result['boot_cycles'] = cycle_records
+            result['multi_boot_analysis'] = analyze_boot_cycles(cycle_records)
+        return result
+
+    if not _confirm_cycle_enabled:
+        return skipped_result('confirm_cycle_not_enabled')
+    if not _confirm_cycle_function:
+        return skipped_result('confirm_function_not_configured')
+    if backend['kind'] == 'slow':
+        return skipped_result('unsupported_fast_path_required')
+
+    confirm_addr = _resolve_confirm_function_address()
+    if confirm_addr is None:
+        return skipped_result('confirm_function_not_resolved')
+
+    log('confirm_cycle at={} type={} confirm_fn=0x{:08X}'.format(
+        cc_fault_at, cc_fault_type, confirm_addr))
+
+    # Phase 1: Normal boot (no faults).
+    restore_phase1_baseline()
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = False
+    reset_nvmc_for_recovery()
+    disarm_fault()
+
+    arm_vtor_watchpoint()
+    phase1_status = run_until_done(
+        cpu_ref,
+        label='cc{}_p1'.format(cc_fault_at),
+        stop_on_fault=False,
+        max_iters=phase1_max_iters(default_s=4.0),
+        wall_timeout=max(120, progress_stall_timeout_s * 3),
+    )
+    disarm_vtor_watchpoint()
+    phase1_ms = int((_time.time() - fp_t0) * 1000)
+
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome0, boot_slot0, signals0 = evaluate_boot_outcome(
+        vtor_value, pc_value, fault_injected=False
+    )
+    signals0['phase1_ms'] = phase1_ms
+    signals0['confirm_ms'] = 0
+
+    cycle_records = [
+        build_cycle_record(0, boot_outcome0, boot_slot0, signals0,
+                           stop_status=phase1_status, fault_injected=False)
+    ]
+
+    if boot_outcome0 != 'success':
+        return skipped_result('phase1_boot_failed', cycle_records=cycle_records,
+                              phase1_ms=phase1_ms)
+
+    # Phase 2: Run confirm function with fault injection.
+    # Use the hook fault bus to intercept writes during confirm.
+    confirm_t0 = _time.time()
+    hook_bus = _FaultInjectingHookBus(bus, cc_fault_at, cc_fault_type)
+
+    # Simulate the confirm function's NVM writes using the hook bus.
+    # If a boot_cycle_hook is configured, run it with the fault-injecting bus.
+    if boot_cycle_hook:
+        hook_path = str(boot_cycle_hook).strip()
+        if hook_path and hook_path.lower().endswith('.py'):
+            _set_monitor_hook_var('boot_cycle_index', 1)
+            _set_monitor_hook_var('boot_cycle_previous_index', 0)
+            _set_monitor_hook_var('boot_cycle_previous_slot', boot_slot0)
+            _set_monitor_hook_var('boot_cycle_previous_outcome', boot_outcome0)
+            hook_globals = {
+                '__name__': '__tardigrade_boot_cycle_hook__',
+                '__file__': hook_path,
+                'monitor': monitor,
+                'bus': hook_bus,
+                'cycle_records': cycle_records,
+                'previous_record': cycle_records[-1],
+                'next_cycle_index': 1,
+                'success_vtor_slot': success_vtor_slot,
+            }
+            with open(hook_path, 'r') as hook_file:
+                source = hook_file.read()
+            try:
+                exec(compile(source, hook_path, 'exec'), hook_globals, hook_globals)
+            except _HookFaultStop:
+                pass
+
+    confirm_ms = int((_time.time() - confirm_t0) * 1000)
+
+    cc_meta = {
+        'cc_fault_at': int(cc_fault_at),
+        'cc_fault_type': cc_fault_type,
+        'fault_injected': bool(hook_bus.fired),
+        'skip_reason': None,
+        'confirm_total_ops': int(hook_bus.ops),
+        'confirm_max_fault_index': (int(hook_bus.ops) - 1) if hook_bus.ops > 0 else -1,
+        'fault_address': fmt_u32(hook_bus.fault_address),
+    }
+
+    if not hook_bus.fired and cc_fault_at >= hook_bus.ops:
+        cc_meta['skip_reason'] = 'no_write_at_index'
+        cc_meta['confirm_incomplete'] = True
+
+    # Phase 3: Reboot and evaluate.
+    current_flash = _snapshot_current_flash()
+    phase3_t0 = _time.time()
+    restore_flash_and_boot(current_flash)
+    if _hash_bypass_active:
+        apply_hash_bypass()
+    cycle1_record = _boot_followup_cycle(
+        1,
+        bool(hook_bus.fired),
+        'cc{}_followup'.format(cc_fault_at),
+    )
+    cycle_records.append(cycle1_record)
+    phase3_ms = int((_time.time() - phase3_t0) * 1000)
+
+    # Additional boot cycles for convergence testing.
+    if int(boot_cycles) > 2:
+        cycle_records, multi_boot_analysis, followup_ms = _continue_followup_boot_cycles(
+            cycle_records,
+            start_cycle_index=2,
+            fault_injected=bool(hook_bus.fired),
+            label='cc{}_followup'.format(cc_fault_at),
+        )
+    else:
+        followup_ms = 0
+        multi_boot_analysis = analyze_boot_cycles(cycle_records)
+
+    # Evaluate post-confirm assertions.
+    confirm_eval = _evaluate_confirm_assertions(
+        _confirm_cycle_assertions,
+        _confirm_cycle_ratchet_version,
+    )
+    cc_meta['confirm_incomplete'] = bool(
+        cc_meta.get('confirm_incomplete')
+        or (hook_bus.fired and confirm_eval.get('metadata_inconsistent_after_confirm'))
+    )
+    cc_meta['rollback_not_ratcheted'] = confirm_eval.get('rollback_not_ratcheted', False)
+    cc_meta['metadata_inconsistent_after_confirm'] = confirm_eval.get(
+        'metadata_inconsistent_after_confirm', False
+    )
+    cc_meta['assertion_results'] = confirm_eval.get('assertion_results', [])
+
+    cycle1_signals = cycle1_record.get('signals', {})
+    cycle1_signals['phase2_ms'] = int(phase3_ms)
+    cycle1_signals['confirm_ms'] = int(confirm_ms)
+    cycle1_signals['followup_ms'] = int(followup_ms)
+
+    result = {
+        'fault_at': cc_fault_at,
+        'fault_requested': cc_fault_at,
+        'fault_type': 'cc:{}'.format(cc_fault_type),
+        'fault_injected': bool(hook_bus.fired),
+        'fault_address': fmt_u32(hook_bus.fault_address),
+        'boot_outcome': cycle1_record.get('boot_outcome'),
+        'boot_slot': cycle1_record.get('boot_slot'),
+        'fault_class': classify_fault_result(
+            cycle1_record.get('boot_outcome'),
+            cycle1_record.get('boot_slot'),
+            cycle1_signals,
+            effective_criteria=eff_criteria,
+        ),
+        'actual_writes': get_total_writes(),
+        'signals': cycle1_signals,
+        'boot_cycles': cycle_records,
+        'multi_boot_analysis': multi_boot_analysis,
+        'confirm_cycle': cc_meta,
+    }
+    if eff_criteria is not None:
+        result['effective_success_criteria'] = eff_criteria
+    semantic_state = cycle1_record.get('semantic_state')
+    if semantic_state is not None:
+        result['semantic_state'] = semantic_state
+    return result
+
 
 def effective_page_size():
     b = backend
@@ -7325,6 +7657,12 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
     if ft.startswith('m:'):
         m_type = ft.split(':')[1] if ':' in ft else 'w'
         return run_metadata_fault(fp, fault_type=m_type)
+
+    if ft.startswith('cc:'):
+        parts = ft.split(':')
+        cc_at = int(parts[1]) if len(parts) > 1 else fp
+        cc_type = parts[2] if len(parts) > 2 else 'w'
+        return run_confirm_cycle_fault(cc_at, cc_fault_type=cc_type)
 
     if ft.startswith('h:'):
         parts = ft.split(':')

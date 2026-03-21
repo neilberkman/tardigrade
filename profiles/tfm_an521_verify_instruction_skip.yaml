@@ -1,0 +1,37 @@
+schema_version: 1
+name: tfm_an521_verify_instruction_skip
+description: >
+  TF-M BL2 (MCUboot with EC-P256 signature verification) on AN521.
+  Instruction-skip fault injection targeting the signature verification
+  path. If any single NOP bypasses EC-P256 signature verification,
+  that's a real secure boot bypass on a $1K-$20K Intigriti target.
+
+platform: platforms/mps2_an521.repl
+flash_backend: faultFlash
+bootloader:
+  elf: targets/tfm_an521/bl2.axf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x38000000, end: 0x383FFFFF }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x10080000, size: 0x100000 }
+images:
+  exec: targets/tfm_an521/tfm_s_signed.bin
+success_criteria:
+  vtor_in_slot: any
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [instruction_skip]
+  instruction_skip_config:
+    target_addresses:
+      - { symbol: bootutil_verify_sig }
+      - { symbol: p256_ecdsa_verify }
+      - { symbol: bootutil_img_validate }
+      - { symbol: boot_validate_slot }
+      - { symbol: bootutil_img_hash }
+    skip_count: 1
+  max_writes: auto
+  run_duration: "5.0"
+  max_step_limit: 500000000

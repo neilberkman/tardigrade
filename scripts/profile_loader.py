@@ -71,6 +71,7 @@ KNOWN_FAULT_TYPES = {
     "phase2_fault",
     "hook_fault",
     "metadata_fault",
+    "confirm_cycle",
 }
 IMPLEMENTED_FAULT_TYPES = {
     "power_loss",
@@ -108,6 +109,7 @@ CLASSIFICATION_ONLY_FAULT_TYPES = {
     "phase2_fault",
     "hook_fault",
     "metadata_fault",
+    "confirm_cycle",
 }
 
 # Map OTP fault type names to their OTPMemory BlowFaultMode codes.
@@ -321,6 +323,41 @@ class HookFaultConfig:
         max_points: int = 0,
     ) -> None:
         self.enabled = enabled
+        self.fault_types = fault_types or ["power_loss"]
+        self.max_points = max(0, int(max_points))
+
+
+class ConfirmCycleConfig:
+    """Configuration for confirm-phase fault injection.
+
+    Models the two-phase update pattern where firmware calls a confirm
+    function after self-test to promote PENDING_TEST to ACCEPTED and
+    ratchet the rollback floor.  Faults are injected during the NVM
+    writes that the confirm function performs.
+    """
+
+    __slots__ = (
+        "enabled",
+        "confirm_function",
+        "post_confirm_assertions",
+        "expected_ratchet_version",
+        "fault_types",
+        "max_points",
+    )
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        confirm_function: Optional[str] = None,
+        post_confirm_assertions: Optional[List[Dict[str, Any]]] = None,
+        expected_ratchet_version: Optional[int] = None,
+        fault_types: Optional[List[str]] = None,
+        max_points: int = 0,
+    ) -> None:
+        self.enabled = enabled
+        self.confirm_function = confirm_function
+        self.post_confirm_assertions = post_confirm_assertions or []
+        self.expected_ratchet_version = expected_ratchet_version
         self.fault_types = fault_types or ["power_loss"]
         self.max_points = max(0, int(max_points))
 
@@ -854,6 +891,7 @@ class FaultSweepConfig:
         "expected_rollback_at_cycle",
         "phase2_fault",
         "hook_fault",
+        "confirm_cycle",
         "multi_fault",
         "read_fault_config",
         "instruction_skip_config",
@@ -892,6 +930,7 @@ class FaultSweepConfig:
         expected_rollback_at_cycle: Optional[int] = None,
         phase2_fault: Optional["Phase2FaultConfig"] = None,
         hook_fault: Optional["HookFaultConfig"] = None,
+        confirm_cycle: Optional["ConfirmCycleConfig"] = None,
         multi_fault=None,
         read_fault_config: Optional["ReadFaultConfig"] = None,
         instruction_skip_config: Optional["InstructionSkipConfig"] = None,
@@ -937,6 +976,7 @@ class FaultSweepConfig:
         )
         self.phase2_fault = phase2_fault or Phase2FaultConfig()
         self.hook_fault = hook_fault or HookFaultConfig()
+        self.confirm_cycle = confirm_cycle or ConfirmCycleConfig()
         self.multi_fault = multi_fault or MultiFaultConfig()
         self.read_fault_config = read_fault_config
         self.instruction_skip_config = instruction_skip_config
@@ -1242,7 +1282,11 @@ class ProfileConfig:
         boot_registers: Optional[List[BootRegisterDef]] = None,
         write_order_constraints: Optional[List[WriteOrderConstraint]] = None,
         fuzz_corpus: Optional[str] = None,
+
         residual_image: Optional["ResidualImageConfig"] = None,
+
+        firmware_elf: Optional[str] = None,
+
     ) -> None:
         self.schema_version = schema_version
         self.name = name
@@ -1282,7 +1326,11 @@ class ProfileConfig:
         self.boot_registers: List[BootRegisterDef] = boot_registers or []
         self.write_order_constraints: List[WriteOrderConstraint] = write_order_constraints or []
         self.fuzz_corpus: Optional[str] = fuzz_corpus
+
         self.residual_image: Optional[ResidualImageConfig] = residual_image
+
+        self.firmware_elf: Optional[str] = firmware_elf
+
 
     @property
     def is_multi_component(self) -> bool:
@@ -1353,7 +1401,11 @@ class ProfileConfig:
             security_policy=self.security_policy,
             success_criteria_overrides=self.success_criteria_overrides,
             fuzz_corpus=self.fuzz_corpus,
+
             residual_image=self.residual_image,
+
+            firmware_elf=self.firmware_elf,
+
         )
         if state.update_trigger is not None and state.pre_boot_state is None:
             resolved.pre_boot_state = resolved.expand_update_trigger()
@@ -1614,6 +1666,41 @@ class ProfileConfig:
             if fs.phase2_fault.max_points > 0:
                 vars_list.append(
                     "PHASE2_FAULT_MAX_POINTS:{}".format(fs.phase2_fault.max_points)
+                )
+
+        if fs.confirm_cycle.enabled:
+            vars_list.append("CONFIRM_CYCLE_ENABLED:true")
+            if fs.confirm_cycle.confirm_function:
+                vars_list.append(
+                    "CONFIRM_CYCLE_FUNCTION:{}".format(
+                        fs.confirm_cycle.confirm_function
+                    )
+                )
+            if fs.confirm_cycle.max_points > 0:
+                vars_list.append(
+                    "CONFIRM_CYCLE_MAX_POINTS:{}".format(
+                        fs.confirm_cycle.max_points
+                    )
+                )
+            if fs.confirm_cycle.post_confirm_assertions:
+                import json as _json
+
+                vars_list.append(
+                    "CONFIRM_CYCLE_ASSERTIONS:{}".format(
+                        _json.dumps(fs.confirm_cycle.post_confirm_assertions)
+                    )
+                )
+            if fs.confirm_cycle.expected_ratchet_version is not None:
+                vars_list.append(
+                    "CONFIRM_CYCLE_RATCHET_VERSION:{}".format(
+                        fs.confirm_cycle.expected_ratchet_version
+                    )
+                )
+            if self.firmware_elf:
+                vars_list.append(
+                    "FIRMWARE_ELF:{}".format(
+                        self.resolve_path(repo_root, self.firmware_elf)
+                    )
                 )
 
         if self.boot_register_pre_writes:
@@ -2373,6 +2460,7 @@ def _parse_fault_sweep(
                 "fault_sweep.expected_rollback_at_cycle: expected integer >= 1"
             )
     hook_fault = _parse_hook_fault(raw.get("hook_fault"))
+    confirm_cycle = _parse_confirm_cycle(raw.get("confirm_cycle"))
 
     # -- Boot-cycle config consistency checks --
     if expected_rollback_at_cycle is not None and boot_cycles <= 1:
@@ -2414,6 +2502,10 @@ def _parse_fault_sweep(
                 expected_rollback_at_cycle, boot_cycles
             )
         )
+    if confirm_cycle.enabled and not boot_cycle_hook:
+        raise ProfileError(
+            "fault_sweep.confirm_cycle.enabled requires boot_cycle_hook to be set"
+        )
 
     durability_model = str(raw.get("durability_model", "direct"))
     if durability_model not in ("direct", "writeback"):
@@ -2450,6 +2542,7 @@ def _parse_fault_sweep(
         expected_rollback_at_cycle=expected_rollback_at_cycle,
         phase2_fault=_parse_phase2_fault(raw.get("phase2_fault")),
         hook_fault=hook_fault,
+        confirm_cycle=confirm_cycle,
         multi_fault=multi_fault_config,
         read_fault_config=_parse_read_fault_config(raw.get("read_fault_config")),
         instruction_skip_config=_parse_instruction_skip_config(
@@ -2549,6 +2642,93 @@ def _parse_hook_fault(raw: Optional[Dict[str, Any]]) -> HookFaultConfig:
         fault_types=parsed_types,
         max_points=max_points,
     )
+
+
+def _parse_confirm_cycle(raw: Optional[Dict[str, Any]]) -> "ConfirmCycleConfig":
+    if raw is None:
+        return ConfirmCycleConfig()
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep.confirm_cycle: expected mapping")
+    enabled = bool(raw.get("enabled", False))
+    confirm_function = raw.get("confirm_function")
+    if confirm_function is not None:
+        confirm_function = str(confirm_function).strip()
+        if not confirm_function:
+            raise ProfileError(
+                "fault_sweep.confirm_cycle.confirm_function: expected non-empty "
+                "symbol name or address"
+            )
+    if enabled and not confirm_function:
+        raise ProfileError(
+            "fault_sweep.confirm_cycle.confirm_function is required when "
+            "confirm_cycle is enabled"
+        )
+    post_confirm_assertions = raw.get("post_confirm_assertions")
+    if post_confirm_assertions is not None:
+        if not isinstance(post_confirm_assertions, list):
+            raise ProfileError(
+                "fault_sweep.confirm_cycle.post_confirm_assertions: expected list"
+            )
+        for idx, assertion in enumerate(post_confirm_assertions):
+            if not isinstance(assertion, dict):
+                raise ProfileError(
+                    "fault_sweep.confirm_cycle.post_confirm_assertions[{}]: "
+                    "expected mapping".format(idx)
+                )
+            if "address" not in assertion:
+                raise ProfileError(
+                    "fault_sweep.confirm_cycle.post_confirm_assertions[{}]: "
+                    "missing 'address'".format(idx)
+                )
+            if "expected" not in assertion:
+                raise ProfileError(
+                    "fault_sweep.confirm_cycle.post_confirm_assertions[{}]: "
+                    "missing 'expected'".format(idx)
+                )
+    expected_ratchet_version = raw.get("expected_ratchet_version")
+    if expected_ratchet_version is not None:
+        expected_ratchet_version = int(expected_ratchet_version)
+        if expected_ratchet_version < 0:
+            raise ProfileError(
+                "fault_sweep.confirm_cycle.expected_ratchet_version: "
+                "expected non-negative integer"
+            )
+    fault_types = raw.get("fault_types", ["power_loss"])
+    if not isinstance(fault_types, list):
+        fault_types = [str(fault_types)]
+    valid_confirm_types = {"power_loss", "bit_corruption", "command_drop"}
+    parsed_types: List[str] = []
+    for ft in fault_types:
+        if ft not in KNOWN_FAULT_TYPES:
+            import warnings
+
+            warnings.warn("Unknown confirm_cycle fault type '{}'; ignoring.".format(ft))
+            continue
+        if ft not in valid_confirm_types:
+            import warnings
+
+            warnings.warn(
+                "Unsupported confirm_cycle fault type '{}'; only {} are "
+                "supported.".format(ft, sorted(valid_confirm_types))
+            )
+            continue
+        parsed_types.append(ft)
+    if not parsed_types:
+        parsed_types = ["power_loss"]
+    max_points = int(raw.get("max_points", 0))
+    if max_points < 0:
+        raise ProfileError(
+            "fault_sweep.confirm_cycle.max_points: expected non-negative integer"
+        )
+    return ConfirmCycleConfig(
+        enabled=enabled,
+        confirm_function=confirm_function,
+        post_confirm_assertions=post_confirm_assertions or [],
+        expected_ratchet_version=expected_ratchet_version,
+        fault_types=parsed_types,
+        max_points=max_points,
+    )
+
 
 def _parse_multi_fault(raw):
     """Parse multi_fault configuration from profile YAML."""
@@ -4268,6 +4448,9 @@ def load_profile(path: str | Path) -> ProfileConfig:
     state_fuzzer = _parse_state_fuzzer(data.get("state_fuzzer"))
     security_policy = _parse_security_policy(data.get("security_policy"))
 
+    firmware_elf_raw = data.get("firmware_elf")
+    firmware_elf: Optional[str] = str(firmware_elf_raw).strip() if firmware_elf_raw is not None else None
+
     fuzz_corpus_raw = data.get("fuzz_corpus")
     fuzz_corpus: Optional[str] = str(fuzz_corpus_raw) if fuzz_corpus_raw is not None else None
     expect = _parse_expect(data.get("expect"))
@@ -4365,7 +4548,11 @@ def load_profile(path: str | Path) -> ProfileConfig:
         boot_registers=boot_registers,
         write_order_constraints=write_order_constraints,
         fuzz_corpus=fuzz_corpus,
+
         residual_image=residual_image,
+
+        firmware_elf=firmware_elf,
+
     )
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.
@@ -4442,6 +4629,12 @@ def main() -> int:
         "hook_fault_enabled": profile.fault_sweep.hook_fault.enabled,
         "hook_fault_max_points": profile.fault_sweep.hook_fault.max_points,
         "hook_fault_types": profile.fault_sweep.hook_fault.fault_types,
+        "confirm_cycle_enabled": profile.fault_sweep.confirm_cycle.enabled,
+        "confirm_cycle_function": profile.fault_sweep.confirm_cycle.confirm_function,
+        "confirm_cycle_max_points": profile.fault_sweep.confirm_cycle.max_points,
+        "confirm_cycle_fault_types": profile.fault_sweep.confirm_cycle.fault_types,
+        "confirm_cycle_expected_ratchet_version": profile.fault_sweep.confirm_cycle.expected_ratchet_version,
+        "firmware_elf": profile.firmware_elf,
         "state_fuzzer_enabled": profile.state_fuzzer.enabled,
         "state_fuzzer_iterations": profile.state_fuzzer.iterations,
         "state_fuzzer_metadata_model": profile.state_fuzzer.metadata_model,

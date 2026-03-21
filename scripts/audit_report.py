@@ -229,6 +229,13 @@ def categorize_failure(
             payload["counterfactuals"] = validation.get("counterfactuals")
         if validation.get("skeptical_summary"):
             payload["skeptical_summary"] = validation.get("skeptical_summary")
+    confirm_meta = result.get("confirm_cycle")
+    if isinstance(confirm_meta, dict):
+        payload["confirm_cycle"] = {
+            k: v for k, v in confirm_meta.items()
+            if k in ("confirm_incomplete", "rollback_not_ratcheted",
+                      "metadata_inconsistent_after_confirm", "assertion_results")
+        }
     return payload
 
 
@@ -342,6 +349,7 @@ def summarize_runtime_sweep(
     skip_reason_counts: Dict[str, int] = {}
     phase2_skip_reason_counts: Dict[str, int] = {}
     hook_skip_reason_counts: Dict[str, int] = {}
+    confirm_skip_reason_counts: Dict[str, int] = {}
     for r in not_injected:
         reason = r.get("skip_reason", "unknown")
         skip_reason_counts[reason] = skip_reason_counts.get(reason, 0) + 1
@@ -359,6 +367,13 @@ def summarize_runtime_sweep(
                 hook_reason = str(hook_fault.get("skip_reason") or "unknown")
                 hook_skip_reason_counts[hook_reason] = (
                     hook_skip_reason_counts.get(hook_reason, 0) + 1
+                )
+        if _ft == "cc" or _ft.startswith("cc:"):
+            confirm_meta = r.get("confirm_cycle")
+            if isinstance(confirm_meta, dict):
+                cc_reason = str(confirm_meta.get("skip_reason") or "unknown")
+                confirm_skip_reason_counts[cc_reason] = (
+                    confirm_skip_reason_counts.get(cc_reason, 0) + 1
                 )
 
     summary: Dict[str, Any] = {
@@ -388,6 +403,8 @@ def summarize_runtime_sweep(
         summary["phase2_skip_reasons"] = phase2_skip_reason_counts
     if hook_skip_reason_counts:
         summary["hook_skip_reasons"] = hook_skip_reason_counts
+    if confirm_skip_reason_counts:
+        summary["confirm_skip_reasons"] = confirm_skip_reason_counts
     if issue_reason_counts:
         summary["issue_reasons"] = issue_reason_counts
     if validation_dispositions:
@@ -613,6 +630,8 @@ def report_skip_reasons(
         ("phase2_skip_reasons", "Phase 2 fault points skipped before injection: {}",
          None),
         ("hook_skip_reasons", "Hook fault points skipped before injection: {}",
+         None),
+        ("confirm_skip_reasons", "Confirm-cycle fault points skipped before injection: {}",
          None),
     ]
     for key, template, count_key in _SKIP_KEYS:
