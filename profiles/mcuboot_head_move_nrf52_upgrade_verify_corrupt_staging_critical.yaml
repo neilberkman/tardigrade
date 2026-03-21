@@ -32,8 +32,10 @@ fault_sweep:
   fault_types: [instruction_skip]
   instruction_skip_config:
     target_addresses:
-      - { start: 0x000005B4, end: 0x000005D4 }
-      - { start: 0x0000076E, end: 0x0000077A }
+      # bootutil_img_validate: FIH hash comparison (cmp r0,r3 + beq/b)
+      - { start: 0x000005C4, end: 0x000005D0 }
+      # boot_validate_slot: cbnz bypass + FIH counter check
+      - { start: 0x0000076E, end: 0x0000077C }
     skip_count: 1
   verification_probes:
     - symbol: bootutil_img_validate

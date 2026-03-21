@@ -33,8 +33,10 @@ fault_sweep:
   fault_types: [instruction_skip]
   instruction_skip_config:
     target_addresses:
-      - { start: 0x000005B4, end: 0x000005B6 }
-      - { start: 0x000005B6, end: 0x000005B8 }
+      # cmp r0, r3 — FIH hash comparison check
+      - { start: 0x000005C6, end: 0x000005C8 }
+      # b.n 524 — reject branch (skip → fall through to next TLV iteration)
+      - { start: 0x000005CE, end: 0x000005D0 }
     skip_count: 1
   verification_probes:
     - symbol: bootutil_img_validate
