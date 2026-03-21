@@ -581,6 +581,9 @@ def _run_batch_worker(
     work_dir = Path(work_dir_str)
     worker_dir = work_dir / "worker_{}".format(worker_id)
     worker_dir.mkdir(parents=True, exist_ok=True)
+    # Share a single .NET bundle dir across all workers to avoid 160MB× N duplication.
+    shared_bundle = work_dir / ".dotnet_bundle"
+    shared_bundle.mkdir(parents=True, exist_ok=True)
     _progress("worker {} starting: {} fault points.".format(worker_id, len(fault_points)))
 
     # Re-create the renode config for this worker's directory.
@@ -626,6 +629,7 @@ def _run_batch_worker(
         max_batch_points=max_batch_points,
         keep_run_artifacts=keep_run_artifacts,
         progress_label="worker {}".format(worker_id),
+        shared_bundle_dir=shared_bundle,
     )
     _progress("worker {} complete: {} results.".format(worker_id, len(results)))
     return results
@@ -1167,6 +1171,30 @@ def run_runtime_sweep(
             results = sorted_fault_results + [results[-1]]
         else:
             results = sorted_fault_results
+
+    # Clean up bulky worker temp artifacts (robot logs, .NET bundles) after
+    # sweep completes.  The result JSON has all the data; per-chunk robot
+    # output and .dotnet_bundle copies waste 2-5GB per sweep.
+    #
+    # When keep_run_artifacts is False, always clean.  When True, still
+    # clean the .dotnet_bundle dirs (pure waste) but keep robot logs.
+    has_findings = any(
+        r.get("fault_class") not in (None, "benign", "skipped")
+        and r.get("boot_outcome") not in ("success", "skipped")
+        for r in results
+        if r.get("fault_at", -1) >= 0
+    )
+    import shutil
+    # Always clean .dotnet_bundle — 160MB per worker, never useful.
+    for pattern in (".dotnet_bundle", "worker_*/.dotnet_bundle"):
+        for target in work_dir.glob(pattern):
+            shutil.rmtree(target, ignore_errors=True)
+    # Clean robot logs and finding_validation unless keeping artifacts
+    # and there are actual findings worth investigating.
+    if not keep_run_artifacts or not has_findings:
+        for pattern in ("worker_*/chunk_*", "finding_validation"):
+            for target in work_dir.glob(pattern):
+                shutil.rmtree(target, ignore_errors=True)
 
     return results
 

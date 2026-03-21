@@ -904,9 +904,11 @@ def _run_batches_chunked(
     max_batch_points: int = 0,
     keep_run_artifacts: bool = False,
     progress_label: str = "",
+    shared_bundle_dir: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """Run one or more fault batches with optional fixed-size chunking."""
-    shared_bundle_dir = work_dir / ".dotnet_bundle"
+    if shared_bundle_dir is None:
+        shared_bundle_dir = work_dir / ".dotnet_bundle"
     shared_bundle_dir.mkdir(parents=True, exist_ok=True)
 
     plan = _split_batch_plan(

@@ -471,12 +471,12 @@ build_pr_differential_elfs() {
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
     build_pr_bootloader_variant "pr2206_scratch_geom_broken" "${wt_root}/pr2206_broken" "${scratch_geom_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
-        -DCONFIG_MCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN} \
+        "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}" \
         -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
         -DCONFIG_BOOT_MAX_IMG_SECTORS=1024
     build_pr_bootloader_variant "pr2206_scratch_geom_fixed" "${wt_root}/pr2206_fixed" "${scratch_geom_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
-        -DCONFIG_MCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN} \
+        "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}" \
         -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
         -DCONFIG_BOOT_MAX_IMG_SECTORS=1024
     build_pr_bootloader_variant "pr2214_offset_broken" "${wt_root}/pr2214_broken" "${offset_overlay}" \
@@ -488,11 +488,11 @@ build_pr_differential_elfs() {
     build_pr_bootloader_variant "pr2214_offset_geom_broken" "${wt_root}/pr2214_broken" "${offset_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
         -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y \
-        -DCONFIG_MCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}
+        "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}"
     build_pr_bootloader_variant "pr2214_offset_geom_fixed" "${wt_root}/pr2214_fixed" "${offset_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
         -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y \
-        -DCONFIG_MCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}
+        "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}"
 }
 
 build_pr_differential_assets() {
