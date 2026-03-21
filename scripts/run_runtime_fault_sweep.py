@@ -54,13 +54,15 @@ bus = monitor.Machine.SystemBus
 
 
 def _bus_load_elf(path):
-    """Load ELF via monitor command (bus.LoadELF is an extension not available in exec context)."""
-    monitor.Parse('sysbus LoadELF @"{}"'.format(str(path).replace('\\', '/')))
+    """Load ELF via inline python command (extension methods only available there)."""
+    _p = str(path).replace("'", "\\'").replace('\\', '/')
+    monitor.Parse("python \"bus=monitor.Machine.SystemBus; bus.LoadELF(r'{}')\"".format(_p))
 
 
 def _bus_load_binary(path, addr):
-    """Load binary via monitor command."""
-    monitor.Parse('sysbus LoadBinary @"{}" 0x{:X}'.format(str(path).replace('\\', '/'), int(addr)))
+    """Load binary via inline python command (extension methods only available there)."""
+    _p = str(path).replace("'", "\\'").replace('\\', '/')
+    monitor.Parse("python \"bus=monitor.Machine.SystemBus; bus.LoadBinary(r'{}', {})\"".format(_p, int(addr)))
 
 
 # Sentinel value used to disarm fault injection (max uint64).
