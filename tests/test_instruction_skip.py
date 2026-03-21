@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
-RESC = ROOT / "scripts" / "run_runtime_fault_sweep.resc"
+RESC = ROOT / "scripts" / "run_runtime_fault_sweep.py"
 sys.path.insert(0, str(SCRIPTS))
 
 from fault_types import (  # noqa: E402

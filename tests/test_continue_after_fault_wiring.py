@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RESC_PATH = ROOT / "scripts" / "run_runtime_fault_sweep.resc"
+RESC_PATH = ROOT / "scripts" / "run_runtime_fault_sweep.py"
 
 
 class TestContinueAfterFaultWiring(unittest.TestCase):

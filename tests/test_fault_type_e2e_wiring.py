@@ -56,7 +56,7 @@ from profile_loader import (  # noqa: E402
 # We parse the Python-in-IronPython source with regex rather than executing
 # it -- these are structural checks, not behavioral ones.
 # ---------------------------------------------------------------------------
-RESC_PATH = ROOT / "scripts" / "run_runtime_fault_sweep.resc"
+RESC_PATH = ROOT / "scripts" / "run_runtime_fault_sweep.py"
 _resc_text = RESC_PATH.read_text(encoding="utf-8")
 
 

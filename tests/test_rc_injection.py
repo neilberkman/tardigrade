@@ -96,7 +96,7 @@ class RcInjectionFaultTypeTest(unittest.TestCase):
                 self.assertIn("rc_injection", profile.fault_sweep.fault_types)
 
     def test_runtime_uses_flash_area_write_hooks(self) -> None:
-        source = (ROOT / "scripts" / "run_runtime_fault_sweep.resc").read_text(
+        source = (ROOT / "scripts" / "run_runtime_fault_sweep.py").read_text(
             encoding="utf-8"
         )
         self.assertIn("_rc_injection_symbols_raw = get_optional_var('rc_injection_symbols', 'flash_area_write')", source)

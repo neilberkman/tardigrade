@@ -35,7 +35,7 @@ class FaultInjectingHookBusCommandDropTest(unittest.TestCase):
         """Build a _FaultInjectingHookBus from the .resc source."""
         # We can't import from .resc directly, so we re-implement the
         # minimal class under test with the same logic as the .resc file.
-        resc_path = ROOT / "scripts" / "run_runtime_fault_sweep.resc"
+        resc_path = ROOT / "scripts" / "run_runtime_fault_sweep.py"
         source = resc_path.read_text(encoding="utf-8")
 
         # Extract just the class definitions we need.
@@ -247,7 +247,7 @@ class HookFaultRescCommandDropWiringTest(unittest.TestCase):
 
     def test_resc_has_command_drop_handler(self):
         """The .resc _handle_write must handle fault_type == 'k'."""
-        resc_path = ROOT / "scripts" / "run_runtime_fault_sweep.resc"
+        resc_path = ROOT / "scripts" / "run_runtime_fault_sweep.py"
         source = resc_path.read_text(encoding="utf-8")
         # Find the _handle_write method and check for 'k' handler
         self.assertIn(
@@ -258,7 +258,7 @@ class HookFaultRescCommandDropWiringTest(unittest.TestCase):
 
     def test_command_drop_returns_without_writer_call(self):
         """The 'k' branch must return (not raise) to let the hook continue."""
-        resc_path = ROOT / "scripts" / "run_runtime_fault_sweep.resc"
+        resc_path = ROOT / "scripts" / "run_runtime_fault_sweep.py"
         source = resc_path.read_text(encoding="utf-8")
 
         # Find the section between 'k' check and 'b' check
