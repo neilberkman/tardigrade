@@ -25,6 +25,7 @@ PR2206_BROKEN="e35461d2"
 PR2206_FIXED="08985c96"
 PR2214_BROKEN="429e2fea"
 PR2214_FIXED="90fd59d2"
+PR_DIFF_GEOM_ALIGN="32"
 
 msg() { echo ">> $*" >&2; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -247,7 +248,7 @@ sign_pr_differential_geom_image() {
 
     "${PYTHON_BIN}" "${IMGTOOL_PY}" sign \
         --key "${IMGTOOL_KEY}" \
-        --align 8 \
+        --align "${PR_DIFF_GEOM_ALIGN}" \
         --header-size 0x200 \
         --slot-size "${slot_size}" \
         --pad-header \
@@ -285,7 +286,7 @@ build_pr_differential_images() {
         "${app_bin}" "0x6e000" "1.0.1+0" \
         "${ASSETS_DIR}/zephyr_slot1_padded.bin"
 
-    msg "Generating geometry/max payload variants"
+    msg "Generating geometry/max payload variants (CONFIG_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN})"
     PR_DIFF_APP_BIN="${app_bin}" PR_DIFF_TMP="${BUILD_ROOT}" python3 - <<'PY'
 from pathlib import Path
 import os
@@ -414,10 +415,12 @@ build_pr_differential_elfs() {
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
     build_pr_bootloader_variant "pr2206_scratch_geom_broken" "${wt_root}/pr2206_broken" "${scratch_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
+        -DCONFIG_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN} \
         -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
         -DCONFIG_BOOT_MAX_IMG_SECTORS=1024
     build_pr_bootloader_variant "pr2206_scratch_geom_fixed" "${wt_root}/pr2206_fixed" "${scratch_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
+        -DCONFIG_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN} \
         -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
         -DCONFIG_BOOT_MAX_IMG_SECTORS=1024
     build_pr_bootloader_variant "pr2214_offset_broken" "${wt_root}/pr2214_broken" "${offset_overlay}" \

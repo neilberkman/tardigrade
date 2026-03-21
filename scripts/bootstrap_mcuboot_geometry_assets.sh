@@ -14,6 +14,7 @@ WEST="${ZEPHYR_VENV}/bin/west"
 IMGTOOL_PY="${MCUBOOT_REPO}/scripts/imgtool.py"
 IMGTOOL_PYTHON="${ZEPHYR_VENV}/bin/python3"
 STRIP_BIN="${TOOLCHAIN_PATH}/bin/arm-none-eabi-strip"
+GEOM_ALIGN="32"
 
 # PR2206 broken/fixed pair.
 PR2206_BROKEN="e35461d29484f1e11c75c769b066ec2b79b4791c"
@@ -73,6 +74,7 @@ build_pr2206_variant() {
           -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
           -DCONFIG_BOOT_SIGNATURE_TYPE_NONE=y \
           -DCONFIG_BOOT_SIGNATURE_TYPE_RSA=n \
+          -DCONFIG_BOOT_MAX_ALIGN=${GEOM_ALIGN} \
           -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
           -DCONFIG_BOOT_MAX_IMG_SECTORS=1024 \
           -DCMAKE_GDB:FILEPATH="${TOOLCHAIN_PATH}/bin/arm-none-eabi-gdb" \
@@ -111,7 +113,7 @@ PY
 
 "${IMGTOOL_PYTHON}" "${IMGTOOL_PY}" sign \
   --key "${MCUBOOT_REPO}/root-rsa-2048.pem" \
-  --align 8 \
+  --align "${GEOM_ALIGN}" \
   --header-size 0x200 \
   --slot-size 0x6e000 \
   --pad-header \
@@ -123,7 +125,7 @@ PY
 
 "${IMGTOOL_PYTHON}" "${IMGTOOL_PY}" sign \
   --key "${MCUBOOT_REPO}/root-rsa-2048.pem" \
-  --align 8 \
+  --align "${GEOM_ALIGN}" \
   --header-size 0x200 \
   --slot-size 0x76000 \
   --pad-header \

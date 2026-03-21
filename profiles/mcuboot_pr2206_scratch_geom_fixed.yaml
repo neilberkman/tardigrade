@@ -2,7 +2,8 @@ schema_version: 1
 name: mcuboot_pr2206_scratch_geom_fixed
 description: >
   MCUboot swap-scratch geometry trigger for PR #2206 (fixed commit 08985c96).
-  Companion profile to the broken geometry-trigger variant.
+  Companion profile to the broken geometry-trigger variant. Expects assets
+  built with CONFIG_BOOT_MAX_ALIGN=32 and CONFIG_BOOT_MAX_IMG_SECTORS=1024.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
