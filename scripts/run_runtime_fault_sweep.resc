@@ -115,6 +115,10 @@ $durability_model?="direct"
 $writeback_buffer_capacity?="auto"
 $writeback_barriers?=""
 $writeback_erase_flushes?="false"
+$residual_image_slot?=""
+$residual_image_prior?=""
+$residual_image_fill?=""
+$max_reset_vector_offset?=""
 
 python """
 import base64
@@ -472,6 +476,29 @@ image_staging_path = str(monitor.GetVariable('image_staging_path')).strip()
 image_exec_path = str(monitor.GetVariable('image_exec_path')).strip()
 image_tertiary_path = get_optional_var('image_tertiary_path', '')
 image_recovery_path = get_optional_var('image_recovery_path', '')
+
+# Residual image: load a prior (larger) image first, then overwrite with
+# the actual image, leaving stale tail bytes from the prior image.
+residual_image_slot = get_optional_var('residual_image_slot', '')
+residual_image_prior = get_optional_var('residual_image_prior', '')
+residual_image_fill_raw = get_optional_var('residual_image_fill', '')
+residual_image_fill = None
+if residual_image_fill_raw:
+    try:
+        residual_image_fill = int(residual_image_fill_raw, 0)
+    except Exception:
+        residual_image_fill = None
+residual_image_enabled = bool(residual_image_slot and (residual_image_prior or residual_image_fill is not None))
+
+# Max reset vector offset: flag if the reset vector points beyond
+# this offset from slot base (authenticated image boundary check).
+max_reset_vector_offset_raw = get_optional_var('max_reset_vector_offset', '')
+max_reset_vector_offset = None
+if max_reset_vector_offset_raw:
+    try:
+        max_reset_vector_offset = int(max_reset_vector_offset_raw, 0)
+    except Exception:
+        max_reset_vector_offset = None
 
 # Success criteria.
 success_vtor_slot = str(monitor.GetVariable('success_vtor_slot')).strip()
@@ -3396,6 +3423,83 @@ def reload_images_from_map(images_map):
     _load_images_mapping(images_map)
 
 
+def _fill_slot_region(base, size, pattern):
+    """Fill a memory region with a byte pattern."""
+    import System
+    fill_arr = System.Array.CreateInstance(System.Byte, size)
+    if pattern != 0:
+        for i in range(size):
+            fill_arr[i] = pattern
+    b = backend
+    if b['kind'] == 'mram':
+        periph_offset = base - nvm_base_address
+        b['data'].WriteBytes(periph_offset, fill_arr, 0, size)
+    elif b['kind'] == 'fast':
+        flash_ref = b['data'].Flash
+        flash_off = base - int(b['data'].FlashBaseAddress)
+        flash_ref.WriteBytes(flash_off, fill_arr)
+    else:
+        word = (pattern << 24) | (pattern << 16) | (pattern << 8) | pattern
+        for off in range(0, size, 4):
+            bus.WriteDoubleWord(base + off, word)
+
+
+def _apply_residual_image():
+    # Simulate residual data in a slot after an in-place update.
+    #
+    # Two modes:
+    #   1. fill_pattern WITHOUT prior_image: fill the full slot with the
+    #      pattern, then load the actual image on top.  Models a full slot
+    #      erase (0xFF for flash, 0x00 for MRAM) before the new write.
+    #   2. prior_image with optional fill_pattern: load the prior (larger)
+    #      image first, then load the actual (smaller) image on top.  Tail
+    #      bytes from the prior image remain beyond the actual image boundary.
+    #      If fill_pattern is also set, fill the residual tail from
+    #      actual_image_size to prior_image_size with the pattern.
+    if not residual_image_enabled:
+        return
+    target_base = slot_load_addresses.get(residual_image_slot)
+    if target_base is None:
+        log('residual_image: unknown slot {}'.format(residual_image_slot))
+        return
+
+    actual_image_path = {
+        'exec': image_exec_path,
+        'staging': image_staging_path,
+        'tertiary': image_tertiary_path,
+        'recovery': image_recovery_path,
+    }.get(residual_image_slot, '')
+
+    if residual_image_prior:
+        # Mode 2: load prior image first, then actual on top.
+        bus.LoadBinary(residual_image_prior, target_base)
+        if actual_image_path:
+            bus.LoadBinary(actual_image_path, target_base)
+        # If fill_pattern is set, fill the residual tail between the actual
+        # image end and the prior image end.
+        if residual_image_fill is not None and actual_image_path:
+            actual_size = os.path.getsize(actual_image_path)
+            prior_size = os.path.getsize(residual_image_prior)
+            if prior_size > actual_size:
+                tail_base = target_base + actual_size
+                tail_size = prior_size - actual_size
+                _fill_slot_region(tail_base, tail_size, residual_image_fill)
+                log('residual_image: filled residual tail 0x{:08X}+0x{:X} with 0x{:02X}'.format(
+                    tail_base, tail_size, residual_image_fill))
+        log('residual_image: loaded prior image at slot {} (0x{:08X}), then overwrote with actual'.format(
+            residual_image_slot, target_base))
+    elif residual_image_fill is not None:
+        # Mode 1: fill full slot, then load actual on top.
+        slot_cfg = slot_ranges.get(residual_image_slot)
+        if slot_cfg:
+            s_lo, s_hi = slot_cfg
+            _fill_slot_region(s_lo, s_hi - s_lo, residual_image_fill)
+        if actual_image_path:
+            bus.LoadBinary(actual_image_path, target_base)
+        log('residual_image: filled slot {} (0x{:08X}) with 0x{:02X}, then loaded actual'.format(
+            residual_image_slot, target_base, residual_image_fill))
+
+
 def reload_images():
     reload_images_from_map({
         'staging': image_staging_path,
@@ -3403,6 +3507,7 @@ def reload_images():
         'tertiary': image_tertiary_path,
         'recovery': image_recovery_path,
     })
+    _apply_residual_image()
 
 
 def _prepare_update_phase_start_state(phase, phase_index):
@@ -3743,7 +3848,32 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     if reg_snapshot is not None:
         signals['boot_register_snapshot'] = reg_snapshot
 
-    criteria_ok = marker_ok and otadata_expect_ok and rollback_ok
+    # Max reset vector offset: check that the reset vector (word at offset 4
+    # from VTOR) does not point beyond the authenticated image boundary.
+    reset_vector_offset_ok = True
+    if max_reset_vector_offset is not None and boot_slot is not None and boot_slot in slot_ranges:
+        s_lo, s_hi = slot_ranges[boot_slot]
+        try:
+            reset_vector_addr = as_int(bus.ReadDoubleWord(actual_vtor + 4))
+            signals['reset_vector_addr'] = fmt_u32(reset_vector_addr)
+            # Reset vector offset relative to slot base.
+            if reset_vector_addr >= s_lo:
+                rv_offset = reset_vector_addr - s_lo
+            else:
+                # Reset vector points below the slot base -- flag as anomaly.
+                rv_offset = 0
+                signals['reset_vector_below_slot'] = True
+                reset_vector_offset_ok = False
+            signals['reset_vector_offset'] = rv_offset
+            if rv_offset > max_reset_vector_offset:
+                reset_vector_offset_ok = False
+                signals['reset_vector_offset_exceeded'] = True
+        except Exception:
+            signals['reset_vector_read_error'] = True
+            reset_vector_offset_ok = False
+    signals['reset_vector_offset_ok'] = reset_vector_offset_ok
+
+    criteria_ok = marker_ok and otadata_expect_ok and rollback_ok and reset_vector_offset_ok
     expectations_met = vtor_ok and vtor_aligned and pc_ok and criteria_ok
     signals['expectations_met'] = expectations_met
 

@@ -126,6 +126,66 @@ No special profile flag is needed -- the size difference comes from the image fi
 
 If your bootloader validates image hashes (MCUboot does), the hash in the image header must match the actual payload. You cannot simply pad an arbitrary binary -- the image must be properly signed/hashed at the new size.
 
+## Residual image testing (direct-XIP)
+
+Direct-XIP bootloaders execute firmware in-place from flash or MRAM. When a new (smaller) image replaces an old (larger) one, stale bytes from the previous image may remain in the slot tail. On MRAM (no erase cycle) this is guaranteed. On flash, it depends on whether the OTA process erases the full slot before writing.
+
+The bootloader typically only hashes `image_size` bytes. The slot tail is executable but unauthenticated -- a crafted small image could branch to known stale code in the tail.
+
+The `residual_image` section simulates this scenario by loading a prior (larger) image first, then overwriting with the actual (smaller) image. Tail bytes from the prior image remain:
+
+```yaml
+residual_image:
+  slot: staging # which slot to contaminate
+  prior_image: path/to/old_large.bin # the prior (larger) image
+  fill_pattern: 0x00 # optional: fill slot before prior image
+```
+
+`slot` must name a slot defined in `memory.slots`. `prior_image` is the path to the larger binary that was previously in the slot. `fill_pattern` optionally fills the entire slot with a byte value before loading the prior image (use `0x00` for MRAM or `0xFF` for flash to simulate a full erase).
+
+### Detecting stale tail execution
+
+Use `max_reset_vector_offset` in `success_criteria` to flag if the reset vector points beyond the authenticated image boundary:
+
+```yaml
+success_criteria:
+  vtor_in_slot: exec
+  max_reset_vector_offset: 0x1000 # image_size of the new (small) image
+```
+
+After boot, tardigrade reads the reset vector (word at VTOR+4) and computes its offset from the slot base. If the offset exceeds `max_reset_vector_offset`, the boot is flagged as `wrong_image` -- the CPU would execute unauthenticated stale code.
+
+### Example: naive vs erased
+
+A naive bootloader that does not erase the slot before writing:
+
+```yaml
+residual_image:
+  slot: staging
+  prior_image: examples/test_image.bin
+
+success_criteria:
+  vtor_in_slot: exec
+  max_reset_vector_offset: 248
+
+expect:
+  should_find_issues: true
+  control_outcome: wrong_image
+```
+
+A safe bootloader that erases the full slot (simulated with `fill_pattern: 0x00`):
+
+```yaml
+residual_image:
+  slot: staging
+  prior_image: examples/test_image.bin
+  fill_pattern: 0x00
+
+success_criteria:
+  vtor_in_slot: exec
+  max_reset_vector_offset: 248
+```
+
 ## Pre-boot state and update triggers
 
 ### Raw writes
@@ -277,32 +337,32 @@ fault_sweep:
 
 Default is `[power_loss]`. Available types (24 total):
 
-| Fault type                 | What it does                            | Backend requirement  |
-| -------------------------- | --------------------------------------- | -------------------- |
-| `power_loss`               | Truncate write at fault point           | All                  |
-| `bit_corruption`           | NOR-physics bit flips (1-to-0)          | All                  |
-| `interrupted_erase`        | Partial page erase                      | NVMC, NVMemory       |
-| `command_drop`             | Silently dropped NVM controller command | GenericNvmController |
-| `silent_write_failure`     | Write accepted but data not stored      | All                  |
-| `driver_error`             | Write rejected and error status raised  | All                  |
-| `rc_injection`             | Write rejected and return code forced non-zero | MCUboot execute |
-| `write_disturb`            | Adjacent cell corruption                | All                  |
-| `write_rejection`          | Write dropped with no driver-visible error | All               |
-| `multi_sector_atomicity`   | Cross-page partial erase                | All                  |
-| `wear_leveling_corruption` | Wear-leveling metadata corruption       | All                  |
-| `reset_at_time`            | CPU reset at a time offset              | All                  |
-| `read_bit_flip`            | Transient read corruption               | NVMemory, MRAM       |
-| `instruction_skip`         | Voltage-glitch instruction skip (NOP)   | All                  |
-| `nvs_corruption`           | NVS/config region corruption            | All                  |
-| `i2c_nack`                 | I2C NACK on secure element transaction  | I2CFaultProxy        |
-| `i2c_timeout`              | I2C bus timeout                         | I2CFaultProxy        |
-| `i2c_bit_flip`             | I2C data bit flip in transit            | I2CFaultProxy        |
-| `i2c_truncated`            | Truncated I2C transaction               | I2CFaultProxy        |
-| `i2c_wrong_address`        | I2C response from wrong address         | I2CFaultProxy        |
-| `otp_partial_program`      | Partial OTP fuse blow                   | OTPMemory            |
-| `otp_stuck_bit`            | OTP bit stuck at 0 or 1                 | OTPMemory            |
-| `otp_read_disturb`         | OTP read returns wrong value            | OTPMemory            |
-| `otp_overblow`             | OTP fuse blown past threshold           | OTPMemory            |
+| Fault type                 | What it does                                   | Backend requirement  |
+| -------------------------- | ---------------------------------------------- | -------------------- |
+| `power_loss`               | Truncate write at fault point                  | All                  |
+| `bit_corruption`           | NOR-physics bit flips (1-to-0)                 | All                  |
+| `interrupted_erase`        | Partial page erase                             | NVMC, NVMemory       |
+| `command_drop`             | Silently dropped NVM controller command        | GenericNvmController |
+| `silent_write_failure`     | Write accepted but data not stored             | All                  |
+| `driver_error`             | Write rejected and error status raised         | All                  |
+| `rc_injection`             | Write rejected and return code forced non-zero | MCUboot execute      |
+| `write_disturb`            | Adjacent cell corruption                       | All                  |
+| `write_rejection`          | Write dropped with no driver-visible error     | All                  |
+| `multi_sector_atomicity`   | Cross-page partial erase                       | All                  |
+| `wear_leveling_corruption` | Wear-leveling metadata corruption              | All                  |
+| `reset_at_time`            | CPU reset at a time offset                     | All                  |
+| `read_bit_flip`            | Transient read corruption                      | NVMemory, MRAM       |
+| `instruction_skip`         | Voltage-glitch instruction skip (NOP)          | All                  |
+| `nvs_corruption`           | NVS/config region corruption                   | All                  |
+| `i2c_nack`                 | I2C NACK on secure element transaction         | I2CFaultProxy        |
+| `i2c_timeout`              | I2C bus timeout                                | I2CFaultProxy        |
+| `i2c_bit_flip`             | I2C data bit flip in transit                   | I2CFaultProxy        |
+| `i2c_truncated`            | Truncated I2C transaction                      | I2CFaultProxy        |
+| `i2c_wrong_address`        | I2C response from wrong address                | I2CFaultProxy        |
+| `otp_partial_program`      | Partial OTP fuse blow                          | OTPMemory            |
+| `otp_stuck_bit`            | OTP bit stuck at 0 or 1                        | OTPMemory            |
+| `otp_read_disturb`         | OTP read returns wrong value                   | OTPMemory            |
+| `otp_overblow`             | OTP fuse blown past threshold                  | OTPMemory            |
 
 ### Instruction skip (voltage glitch)
 
