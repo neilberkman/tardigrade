@@ -151,6 +151,15 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
         reasons.append("semantic_assertion")
     if result.get("invariant_violations"):
         reasons.append("invariant")
+    # Confirm-cycle specific finding categories.
+    confirm_meta = result.get("confirm_cycle")
+    if isinstance(confirm_meta, dict):
+        if confirm_meta.get("confirm_incomplete"):
+            reasons.append("confirm_incomplete")
+        if confirm_meta.get("rollback_not_ratcheted"):
+            reasons.append("rollback_not_ratcheted")
+        if confirm_meta.get("metadata_inconsistent_after_confirm"):
+            reasons.append("metadata_inconsistent_after_confirm")
     return reasons
 
 
