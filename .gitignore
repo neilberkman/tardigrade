@@ -21,6 +21,8 @@ __pycache__/
 !examples/esp_idf_ota/*.bin
 !results/oss_validation/assets/*.elf
 !results/oss_validation/assets/*.bin
+!targets/tfm_an521/*.axf
+!targets/tfm_an521/*.bin
 
 # Robot outputs
 output.xml
