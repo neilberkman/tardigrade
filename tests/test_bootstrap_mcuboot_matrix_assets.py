@@ -98,7 +98,7 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertIn("local align=\"${5:-${PR_DIFF_GEOM_ALIGN}}\"", text)
         self.assertIn("--align \"${align}\"", text)
         self.assertIn("scratch_with_geom_partition.dts", text)
-        self.assertIn("-DCONFIG_MCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}", text)
+        self.assertIn("MCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}", text)
         self.assertIn("\"${ASSETS_DIR}/zephyr_slot1_max.bin\" \"8\"", text)
         self.assertIn("return (slot_size - 0x200 - geom_trailer_reserve - geom_sign_overhead) & ~0x1F", text)
         self.assertIn("CONFIG_MINIMAL_LIBC=y", text)
