@@ -169,6 +169,8 @@ def categorize_failure(
         )
     if result.get("invariant_violations"):
         payload["invariant_violations"] = result.get("invariant_violations")
+    if result.get("metadata_delta_violations"):
+        payload["metadata_delta_violations"] = result.get("metadata_delta_violations")
     if result.get("fault_sequence"):
         payload["fault_sequence"] = result["fault_sequence"]
     window = result.get("fault_window")
@@ -244,6 +246,7 @@ def summarize_runtime_sweep(
         1 for r in injected if r.get("semantic_observation_failures")
     )
     invariant_issue_points = sum(1 for r in injected if r.get("invariant_violations"))
+    metadata_delta_issue_points = sum(1 for r in injected if r.get("metadata_delta_violations"))
     bus_fault_points = sum(
         1 for r in injected
         if _effective_boot_result(r)[0] == "bus_fault"
@@ -346,6 +349,7 @@ def summarize_runtime_sweep(
         "semantic_issue_points": semantic_issue_points,
         "semantic_observation_points": semantic_observation_points,
         "invariant_issue_points": invariant_issue_points,
+        "metadata_delta_issue_points": metadata_delta_issue_points,
         "bus_fault_points": bus_fault_points,
         "timeout_points": timeout_points,
         "recoveries": recoveries,
@@ -547,15 +551,21 @@ def compute_verdict(
             )
         if partial_staging_summary:
             total_issues += int(partial_staging_summary.get("issue_count", 0))
-        verdict = (
-            "FAIL \u2014 found {} issue points "
-            "({} boot mismatches, {} semantic, {} invariant)"
-        ).format(
-            total_issues,
-            sweep_summary.get("bricks", 0),
-            sweep_summary.get("semantic_issue_points", 0),
-            invariant_observations,
+        metadata_delta_observations = int(
+            sweep_summary.get("metadata_delta_issue_points", 0)
         )
+        parts_fmt = [
+            "{} boot mismatches".format(sweep_summary.get("bricks", 0)),
+            "{} semantic".format(sweep_summary.get("semantic_issue_points", 0)),
+            "{} invariant".format(invariant_observations),
+        ]
+        if metadata_delta_observations > 0:
+            parts_fmt.append(
+                "{} metadata_delta".format(metadata_delta_observations)
+            )
+        verdict = (
+            "FAIL \u2014 found {} issue points ({})"
+        ).format(total_issues, ", ".join(parts_fmt))
     elif resilient_rollbacks > 0:
         # All fault points recovered or rolled back correctly — no real issues.
         parts = ["0 bricks", "{} resilient rollbacks".format(resilient_rollbacks)]
