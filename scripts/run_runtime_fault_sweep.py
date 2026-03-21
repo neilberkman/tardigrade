@@ -58,11 +58,10 @@ def _bus_load_elf(path):
     _p = str(path)
     try:
         bus.LoadELF(_p)
+        log('_bus_load_elf: direct .NET call succeeded for {}'.format(_p))
         return
-    except Exception:
-        pass
-    # Direct .NET call unavailable in exec() context.
-    # Use inline python command where extension methods are available.
+    except Exception as _e:
+        log('_bus_load_elf: direct .NET call failed ({}), using inline python'.format(_e))
     _pf = _p.replace('\\', '/')
     monitor.Parse("python \"bus=monitor.Machine.SystemBus; bus.LoadELF(r'{}')\"".format(_pf))
 
@@ -73,9 +72,10 @@ def _bus_load_binary(path, addr):
     _a = int(addr)
     try:
         bus.LoadBinary(_p, _a)
+        log('_bus_load_binary: direct .NET call succeeded for {} at 0x{:X}'.format(_p, _a))
         return
-    except Exception:
-        pass
+    except Exception as _e:
+        log('_bus_load_binary: direct .NET call failed ({}), using inline python'.format(_e))
     _pf = _p.replace('\\', '/')
     monitor.Parse("python \"bus=monitor.Machine.SystemBus; bus.LoadBinary(r'{}', {})\"".format(_pf, _a))
 
