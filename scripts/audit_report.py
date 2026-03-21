@@ -29,6 +29,11 @@ from fault_inject import (
     classify_fault_region,
     validate_bootloader_vector_table,
 )
+from bypass_probe import (
+    CLASSIFICATION_NO_PROBES,
+    build_defense_in_depth_layers,
+    classify_probe_result,
+)
 from fault_types import _fault_type_label
 from profile_loader import ProfileConfig
 
@@ -201,6 +206,20 @@ def categorize_failure(
             )
         if signals.get("verification_probes"):
             payload["verification_probes"] = signals.get("verification_probes")
+        if signals.get("verification_full_bypass") is not None:
+            payload["verification_full_bypass"] = bool(
+                signals.get("verification_full_bypass")
+            )
+    # Per-result defense-in-depth layer breakdown.
+    probe_result = classify_probe_result(result)
+    if probe_result["classification"] != CLASSIFICATION_NO_PROBES:
+        payload["defense_in_depth_layers"] = {
+            "classification": probe_result["classification"],
+            "defense_in_depth": probe_result["defense_in_depth"],
+            "layers": probe_result["layers"],
+            "bypassed_labels": probe_result["bypassed_labels"],
+            "full_bypass": probe_result["full_bypass"],
+        }
     if isinstance(validation, dict):
         if validation.get("negative_evidence"):
             payload["negative_evidence"] = validation.get("negative_evidence")
@@ -381,6 +400,9 @@ def summarize_runtime_sweep(
         summary["verification_bypass_points"] = verification_bypass_points
         summary["defense_in_depth_held"] = defense_in_depth_held
         summary["full_bypass_points"] = full_bypass_points
+    did_layers = build_defense_in_depth_layers(injected)
+    if did_layers is not None:
+        summary["defense_in_depth_layers"] = did_layers
 
     if categorized_failures:
         summary["failures"] = categorized_failures
