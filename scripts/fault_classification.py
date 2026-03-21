@@ -151,6 +151,8 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
         reasons.append("semantic_assertion")
     if result.get("invariant_violations"):
         reasons.append("invariant")
+    if result.get("metadata_delta_violations"):
+        reasons.append("metadata_delta")
     return reasons
 
 
@@ -207,6 +209,20 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
         return "candidate"
     if disposition == "needs_mechanism_confirmation":
         return "candidate"
+
+    # Metadata delta classifications: boot count suppression/exhaustion,
+    # rollback floor regression.
+    md_violations = result.get("metadata_delta_violations")
+    if isinstance(md_violations, list) and md_violations:
+        categories = {v.get("finding_category") for v in md_violations if isinstance(v, dict)}
+        if "boot_count_exhausted" in categories:
+            return "boot_count_exhausted"
+        if "boot_count_suppressed" in categories:
+            return "boot_count_suppressed"
+        if "rollback_floor_decreased" in categories:
+            return "rollback_floor_decreased"
+        # Generic metadata delta violation.
+        return "metadata_delta_violation"
 
     # NVS-specific classifications take precedence when present.
     config_outcome = result.get("config_outcome")

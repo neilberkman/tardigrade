@@ -352,6 +352,129 @@ def _evaluate_invariants(
     return violation_dicts
 
 
+def _marker_actually_written(signals: Dict[str, Any]) -> bool:
+    """Determine if firmware actually wrote its success marker.
+
+    The 'marker_ok' signal defaults to True when no content criterion is
+    configured (no marker address, no image hash).  For metadata_delta
+    'when=marker_written' checks we need to know if the marker was
+    *actually* written, not just whether content criteria were skipped.
+    """
+    # If an image hash was computed, use that as the authoritative signal.
+    hash_match = str(signals.get("image_hash_match", "") or "").strip().lower()
+    if hash_match and hash_match not in ("", "skipped", "unknown"):
+        return True
+    if hash_match == "unknown":
+        return False
+    # If a marker address was configured, check whether the actual marker
+    # value is non-zero (the default/unconfigured state emits '0x00000000').
+    marker_actual = signals.get("marker_actual")
+    if marker_actual is not None:
+        try:
+            val = int(str(marker_actual), 0)
+        except (ValueError, TypeError):
+            val = 0
+        if val != 0:
+            return bool(signals.get("marker_ok", False))
+    # No content criterion was configured.
+    return False
+
+
+def _evaluate_metadata_delta(
+    result: Dict[str, Any],
+    profile: ProfileConfig,
+) -> List[Dict[str, Any]]:
+    """Re-evaluate metadata_delta assertions from result signals.
+
+    The RESC harness attaches metadata_delta_violations during execution,
+    but this function can re-check from signals when post-processing
+    results outside of Renode (e.g. in unit tests or report regeneration).
+
+    Only runs when the profile has metadata_delta.enabled and the result
+    contains metadata_delta signal data.
+
+    Note: metadata_delta is only populated by execute/trace-replay fault
+    runners.  State-mode, instruction-skip, and hook-fault runners do not
+    capture metadata snapshots, so this function will return [] for those
+    result types (no metadata_delta signals present).
+    """
+    fs = getattr(profile, "fault_sweep", None)
+    if fs is None:
+        return []
+    md = getattr(fs, "metadata_delta", None)
+    if md is None or not md.enabled or not md.fields:
+        return []
+    signals = result.get("signals")
+    if not isinstance(signals, dict):
+        return []
+    md_signals = signals.get("metadata_delta")
+    if not isinstance(md_signals, dict):
+        return []
+
+    # Determine if firmware actually wrote its success marker.
+    # marker_ok defaults to True when no content criterion is configured,
+    # which does NOT mean the marker was written.  Check whether a content
+    # criterion was actively verified.
+    marker_written = _marker_actually_written(signals)
+    violations: List[Dict[str, Any]] = []
+    for field in md.fields:
+        name = field.name
+        delta_key = name + "_delta"
+        delta = md_signals.get(delta_key)
+        if delta is None:
+            continue
+
+        when = field.when or "always"
+        if when == "marker_written" and not marker_written:
+            continue
+        if when == "marker_not_written" and marker_written:
+            continue
+
+        # Retrieve pre/post values from signals for schema parity with
+        # the RESC-side evaluate_metadata_delta which includes them.
+        pre_value = md_signals.get(name + "_pre")
+        post_value = md_signals.get(name + "_post")
+
+        violation = None
+        if field.min_delta is not None and delta < field.min_delta:
+            if "boot_count" in name:
+                category = "boot_count_suppressed"
+            elif "rollback" in name or "version" in name:
+                category = "rollback_floor_decreased"
+            else:
+                category = "metadata_delta_below_min"
+            violation = {
+                "field": name,
+                "address": "0x{:08X}".format(field.address),
+                "pre_value": pre_value,
+                "post_value": post_value,
+                "delta": delta,
+                "min_delta": field.min_delta,
+                "max_delta": field.max_delta,
+                "when": when,
+                "finding_category": category,
+            }
+        elif field.max_delta is not None and delta > field.max_delta:
+            if "boot_count" in name:
+                category = "boot_count_exhausted"
+            else:
+                category = "metadata_delta_above_max"
+            violation = {
+                "field": name,
+                "address": "0x{:08X}".format(field.address),
+                "pre_value": pre_value,
+                "post_value": post_value,
+                "delta": delta,
+                "min_delta": field.min_delta,
+                "max_delta": field.max_delta,
+                "when": when,
+                "finding_category": category,
+            }
+        if violation is not None:
+            violations.append(violation)
+    return violations
+
+
 def annotate_result_checks(
     results: List[Dict[str, Any]],
     profile: ProfileConfig,
@@ -376,3 +499,8 @@ def annotate_result_checks(
         invariant_failures = _evaluate_invariants(result, profile, pre_state=pre_state)
         if invariant_failures:
             result["invariant_violations"] = invariant_failures
+        # Metadata delta: only re-evaluate if not already annotated by RESC.
+        if not result.get("metadata_delta_violations"):
+            md_failures = _evaluate_metadata_delta(result, profile)
+            if md_failures:
+                result["metadata_delta_violations"] = md_failures

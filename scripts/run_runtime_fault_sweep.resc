@@ -119,6 +119,7 @@ $residual_image_slot?=""
 $residual_image_prior?=""
 $residual_image_fill?=""
 $max_reset_vector_offset?=""
+$metadata_delta_fields?=""
 
 python """
 import base64
@@ -530,6 +531,40 @@ if success_otadata_expect_scope not in ('always', 'control'):
 
 # Security policy: anti-rollback enforcement.
 security_anti_rollback = str(monitor.GetVariable('security_anti_rollback')).strip().lower() in ('1', 'true', 'yes')
+
+# Metadata delta tracking: parse field specs from robot variable.
+# Format: "0xADDR,name[,min=N][,max=N][,when=COND];..."
+metadata_delta_fields_raw = get_optional_var('metadata_delta_fields', '')
+metadata_delta_fields = []
+if metadata_delta_fields_raw:
+    for spec in metadata_delta_fields_raw.split(';'):
+        spec = spec.strip()
+        if not spec:
+            continue
+        parts = spec.split(',')
+        if len(parts) < 2:
+            continue
+        addr = int(parts[0].strip(), 0)
+        name = parts[1].strip()
+        min_delta = None
+        max_delta = None
+        when = 'always'
+        for p in parts[2:]:
+            p = p.strip()
+            if p.startswith('min='):
+                min_delta = int(p[4:])
+            elif p.startswith('max='):
+                max_delta = int(p[4:])
+            elif p.startswith('when='):
+                when = p[5:]
+        metadata_delta_fields.append({
+            'address': addr,
+            'name': name,
+            'min_delta': min_delta,
+            'max_delta': max_delta,
+            'when': when,
+        })
+metadata_delta_enabled = len(metadata_delta_fields) > 0
 
 _base_phase_context = {
     'boot_cycles': int(boot_cycles),
@@ -3909,8 +3944,165 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
 
     return boot_outcome, boot_slot, signals
 
+
+def capture_metadata_delta_snapshot():
+    """Read all metadata_delta field values from NVM. Returns dict of name->value."""
+    if not metadata_delta_enabled:
+        return None
+    snapshot = {}
+    for field in metadata_delta_fields:
+        try:
+            val = as_int(bus.ReadDoubleWord(field['address']))
+            snapshot[field['name']] = val
+        except Exception:
+            snapshot[field['name']] = None
+    return snapshot
+
+
+def evaluate_metadata_delta(pre_snapshot, post_snapshot, marker_written):
+    """Compare pre-fault and post-boot metadata field values.
+
+    Returns (violations_list, delta_signals_dict).
+    Each violation is a dict with field name, expected delta range, actual delta,
+    and a finding_category string.
+
+    Only supported by fault runners that perform real emulated boot cycles
+    (run_execute_fault, run_trace_replay_fault and their native variants).
+    Not supported by run_state_fault (no bootloader execution),
+    instruction_skip, or hook_fault runners (which build results via
+    _build_fault_result with metadata_delta_pre_snapshot=None).
+    """
+    if not metadata_delta_enabled or pre_snapshot is None or post_snapshot is None:
+        return [], {}
+    violations = []
+    delta_signals = {}
+    for field in metadata_delta_fields:
+        name = field['name']
+        pre_val = pre_snapshot.get(name)
+        post_val = post_snapshot.get(name)
+        if pre_val is None or post_val is None:
+            continue
+        delta = post_val - pre_val
+        delta_signals[name + '_pre'] = fmt_u32(pre_val)
+        delta_signals[name + '_post'] = fmt_u32(post_val)
+        delta_signals[name + '_delta'] = delta
+
+        # Check 'when' condition.
+        when = field.get('when', 'always')
+        if when == 'marker_written' and not marker_written:
+            continue
+        if when == 'marker_not_written' and marker_written:
+            continue
+
+        # Check delta bounds.
+        min_d = field.get('min_delta')
+        max_d = field.get('max_delta')
+        violation = None
+        if min_d is not None and delta < min_d:
+            # Delta below minimum: boot count suppressed (never committed)
+            # or rollback floor decreased.
+            if 'boot_count' in name:
+                category = 'boot_count_suppressed'
+            elif 'rollback' in name or 'version' in name:
+                category = 'rollback_floor_decreased'
+            else:
+                category = 'metadata_delta_below_min'
+            violation = {
+                'field': name,
+                'address': fmt_u32(field['address']),
+                'pre_value': fmt_u32(pre_val),
+                'post_value': fmt_u32(post_val),
+                'delta': delta,
+                'min_delta': min_d,
+                'max_delta': max_d,
+                'when': when,
+                'finding_category': category,
+            }
+        elif max_d is not None and delta > max_d:
+            # Delta above maximum: boot count exhausted (trial burned
+            # without firmware running).
+            if 'boot_count' in name:
+                category = 'boot_count_exhausted'
+            else:
+                category = 'metadata_delta_above_max'
+            violation = {
+                'field': name,
+                'address': fmt_u32(field['address']),
+                'pre_value': fmt_u32(pre_val),
+                'post_value': fmt_u32(post_val),
+                'delta': delta,
+                'min_delta': min_d,
+                'max_delta': max_d,
+                'when': when,
+                'finding_category': category,
+            }
+        if violation is not None:
+            violations.append(violation)
+    return violations, delta_signals
+
+
+def _metadata_delta_marker_written(signals):
+    """Determine if firmware actually wrote its success marker.
+
+    The 'marker_ok' signal defaults to True when no content criterion is
+    configured (no marker address, no image hash).  That default does NOT
+    mean the marker was written -- it means content verification was not
+    performed.  For metadata_delta 'when=marker_written' checks we need
+    to know if the marker was *actually* written, not just whether content
+    criteria were skipped.
+
+    Returns True only when a content criterion was actively checked and
+    passed: either the marker address value matched, or the image hash
+    matched a known image.
+    """
+    if not isinstance(signals, dict):
+        return False
+    # If an image hash was computed, use that as the authoritative signal.
+    hash_match = str(signals.get('image_hash_match', '') or '').strip().lower()
+    if hash_match and hash_match not in ('', 'skipped', 'unknown'):
+        return True
+    if hash_match == 'unknown':
+        return False
+    # If a marker address was configured, check whether the actual marker
+    # value is non-zero (the default/unconfigured state emits '0x00000000').
+    marker_actual = signals.get('marker_actual')
+    if marker_actual is not None:
+        try:
+            val = int(str(marker_actual), 0)
+        except (ValueError, TypeError):
+            val = 0
+        if val != 0:
+            # A non-zero marker_actual means the marker address was
+            # configured and read.  marker_ok tells us if it matched.
+            return bool(signals.get('marker_ok', False))
+    # No content criterion was configured -- we cannot determine if the
+    # marker was written.
+    return False
+
+
+def annotate_result_metadata_delta(result, pre_snapshot, marker_written=False):
+    """Read post-boot metadata, evaluate deltas, and annotate the result dict."""
+    if not metadata_delta_enabled or pre_snapshot is None:
+        return
+    post_snapshot = capture_metadata_delta_snapshot()
+    if post_snapshot is None:
+        return
+    violations, delta_signals = evaluate_metadata_delta(
+        pre_snapshot, post_snapshot, marker_written
+    )
+    if delta_signals:
+        signals = result.get('signals')
+        if isinstance(signals, dict):
+            signals['metadata_delta'] = delta_signals
+    if violations:
+        result['metadata_delta_violations'] = violations
+
+
 def run_state_fault(fault_at):
     # State mode: simulate staging->exec copy, fault at given index.
+    # NOTE: metadata_delta is intentionally not supported in state mode.
+    # State mode does not run the bootloader (no emulated boot cycles),
+    # so there are no NVM metadata writes to track deltas on.
     fault_injected = False
     fault_address = 0
     actual_writes = 0
@@ -5012,7 +5204,7 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
                         boot_slot=None, eff_criteria=None,
                         p2_status=None, followup_label='followup',
                         saved_flash=None, fault_snapshot_bytes=None,
-                        extra_fields=None):
+                        extra_fields=None, metadata_delta_pre_snapshot=None):
     # Shared epilogue for all fault runners.
     #
     # Handles: classify_fault_result, run_followup_boot_cycles, semantic state
@@ -5024,6 +5216,20 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
     fault_class = classify_fault_result(
         boot_outcome, boot_slot, signals, effective_criteria=eff_criteria
     )
+    # Metadata delta: capture post-recovery-boot snapshot BEFORE followup
+    # boot cycles so the delta measures "pre-fault -> first recovery boot",
+    # not "pre-fault -> after N followup boots".  Followup boots may
+    # modify NVM metadata (e.g. incrementing boot counts), which would
+    # pollute the delta if captured afterwards.
+    _md_violations = None
+    _md_delta_signals = None
+    if metadata_delta_pre_snapshot is not None:
+        _md_post_snapshot = capture_metadata_delta_snapshot()
+        if _md_post_snapshot is not None:
+            _md_marker_written = _metadata_delta_marker_written(signals)
+            _md_violations, _md_delta_signals = evaluate_metadata_delta(
+                metadata_delta_pre_snapshot, _md_post_snapshot, _md_marker_written
+            )
     boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
         boot_outcome,
         boot_slot,
@@ -5155,6 +5361,12 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         result['resume_trace'] = run_resume_trace_from_snapshot(
             saved_flash, fault_at, fault_type
         )
+    # Apply deferred metadata delta results (captured before followup boots).
+    if _md_delta_signals:
+        signals['metadata_delta'] = _md_delta_signals
+    if _md_violations:
+        result['metadata_delta_violations'] = _md_violations
+
     if extra_fields:
         result.update(extra_fields)
     return result
@@ -5421,6 +5633,7 @@ def run_execute_fault(fault_at, fault_type='w'):
     phase2_status = None
     fault_snapshot_bytes = None
     saved_flash = None
+    md_pre_snapshot = None
     is_erase_fault = fault_type in ('e', 'a')
     is_power_loss_fault = fault_type in ('w', 'e', 'a')
     is_non_power_write_fault = fault_type in ('b', 's', 'g', 'x', 'r', 'd', 'l', 'k')
@@ -5431,6 +5644,9 @@ def run_execute_fault(fault_at, fault_type='w'):
 
     # Phase 1: Reset and set up for the faulted boot.
     restore_phase1_baseline()
+
+    # Capture metadata fields before fault injection for delta tracking.
+    md_pre_snapshot = capture_metadata_delta_snapshot()
     reset_rc_injection_state(enabled=(fault_type == 'x'))
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
@@ -5788,6 +6004,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         saved_flash=saved_flash if is_power_loss_fault else None,
         fault_snapshot_bytes=fault_snapshot_bytes,
         extra_fields=extras,
+        metadata_delta_pre_snapshot=md_pre_snapshot,
     )
 
     # Release large .NET byte[] to prevent memory exhaustion in batch mode.
@@ -6719,6 +6936,9 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         apply_hash_bypass()
     reload_ms = int((_time.time() - t_reload) * 1000)
 
+    # Capture metadata delta snapshot from clean baseline.
+    md_pre_snapshot = capture_metadata_delta_snapshot()
+
     t_replay = _time.time()
     stop_at = int(fault_at) + 1
     page_size = int(backend['data'].PageSize)
@@ -6856,6 +7076,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         boot_slot=boot_slot, eff_criteria=eff_criteria, p2_status=p2_status,
         followup_label='fp{}_native_followup'.format(fault_at),
         saved_flash=faulted_flash, fault_snapshot_bytes=fault_snapshot_bytes,
+        metadata_delta_pre_snapshot=md_pre_snapshot,
     )
 
 def run_trace_replay_fault(fault_at, fault_type='w'):
@@ -6897,6 +7118,9 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     if _hash_bypass_active:
         apply_hash_bypass()
     reload_ms = int((_time.time() - t_reload) * 1000)
+
+    # Capture metadata delta snapshot from clean baseline.
+    md_pre_snapshot = capture_metadata_delta_snapshot()
 
     t_replay = _time.time()
     flash_ref = backend['data'].Flash
@@ -7071,6 +7295,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         boot_slot=boot_slot, eff_criteria=eff_criteria, p2_status=p2_status,
         followup_label='fp{}_python_followup'.format(fault_at),
         saved_flash=faulted_flash, fault_snapshot_bytes=fault_snapshot_bytes,
+        metadata_delta_pre_snapshot=md_pre_snapshot,
     )
 
 # ---------------------------------------------------------------------------

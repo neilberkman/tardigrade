@@ -493,6 +493,46 @@ class MetadataFaultConfig:
         self.fault_types = fault_types or ["power_loss"]
 
 
+class MetadataDeltaFieldConfig:
+    """A single metadata field to track across boot cycles."""
+
+    __slots__ = ("address", "name", "min_delta", "max_delta", "when")
+
+    def __init__(
+        self,
+        address: int,
+        name: str,
+        min_delta: Optional[int] = None,
+        max_delta: Optional[int] = None,
+        when: Optional[str] = None,
+    ) -> None:
+        self.address = address
+        self.name = name
+        self.min_delta = min_delta
+        self.max_delta = max_delta
+        self.when = when
+
+
+class MetadataDeltaConfig:
+    """Configuration for tracking metadata field changes across fault recovery.
+
+    After each fault point's recovery boot, metadata fields at specified NVM
+    addresses are read and compared against their pre-fault values.  Delta
+    assertions (min_delta, max_delta) detect boot count suppression, boot
+    count exhaustion, and rollback floor regression.
+    """
+
+    __slots__ = ("enabled", "fields")
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        fields: Optional[List["MetadataDeltaFieldConfig"]] = None,
+    ) -> None:
+        self.enabled = enabled
+        self.fields = fields or []
+
+
 class ComponentConfig:
     """Configuration for a single component in a multi-component profile.
 
@@ -819,6 +859,7 @@ class FaultSweepConfig:
         "instruction_skip_config",
         "verification_probes",
         "metadata_fault",
+        "metadata_delta",
         "partial_staging",
         "nvs_corruption",
         "fault_distribution",
@@ -856,6 +897,7 @@ class FaultSweepConfig:
         instruction_skip_config: Optional["InstructionSkipConfig"] = None,
         verification_probes: Optional[List["VerificationProbeConfig"]] = None,
         metadata_fault: Optional["MetadataFaultConfig"] = None,
+        metadata_delta: Optional["MetadataDeltaConfig"] = None,
         partial_staging: Optional[Any] = None,
         nvs_corruption: Optional["NvsCorruptionConfig"] = None,
         fault_distribution: Optional["FaultDistributionConfig"] = None,
@@ -900,6 +942,7 @@ class FaultSweepConfig:
         self.instruction_skip_config = instruction_skip_config
         self.verification_probes = verification_probes or []
         self.metadata_fault = metadata_fault or MetadataFaultConfig()
+        self.metadata_delta = metadata_delta or MetadataDeltaConfig()
         self.partial_staging = partial_staging
         self.nvs_corruption = nvs_corruption or NvsCorruptionConfig()
         self.fault_distribution = fault_distribution or FaultDistributionConfig()
@@ -1771,6 +1814,23 @@ class ProfileConfig:
             )
             vars_list.append("METADATA_FAULT_REGIONS:{}".format(encoded))
 
+        # Metadata delta tracking: semicolon-separated field specs.
+        md = fs.metadata_delta
+        if md.enabled and md.fields:
+            field_specs: List[str] = []
+            for f in md.fields:
+                parts = ["0x{:08X}".format(f.address), f.name]
+                if f.min_delta is not None:
+                    parts.append("min={}".format(f.min_delta))
+                if f.max_delta is not None:
+                    parts.append("max={}".format(f.max_delta))
+                if f.when is not None:
+                    parts.append("when={}".format(f.when))
+                field_specs.append(",".join(parts))
+            vars_list.append(
+                "METADATA_DELTA_FIELDS:{}".format(";".join(field_specs))
+            )
+
         # NVS region config.
         if self.nvs_region:
             vars_list.append(
@@ -2399,6 +2459,7 @@ def _parse_fault_sweep(
         ),
         verification_probes=_parse_verification_probe_config(raw),
         metadata_fault=_parse_metadata_fault(raw.get("metadata_fault")),
+        metadata_delta=_parse_metadata_delta(raw.get("metadata_delta")),
         partial_staging=raw.get("partial_staging"),
         nvs_corruption=_parse_nvs_corruption(raw.get("nvs_corruption")),
         fault_distribution=_parse_fault_distribution(raw.get("fault_distribution")),
@@ -2952,6 +3013,72 @@ def _parse_metadata_fault(raw):
         if not fault_types:
             fault_types = ["power_loss"]
     return MetadataFaultConfig(enabled=enabled, fault_types=fault_types)
+
+
+def _parse_metadata_delta(raw: Optional[Dict[str, Any]]) -> MetadataDeltaConfig:
+    """Parse metadata_delta config from fault_sweep YAML block.
+
+    Example YAML::
+
+        metadata_delta:
+          fields:
+            - address: 0x000FC010
+              name: boot_count
+              min_delta: 1
+              max_delta: 1
+            - address: 0x000FC014
+              name: rollback_min_version
+              min_delta: 0
+              when: "marker_written"
+    """
+    if raw is None:
+        return MetadataDeltaConfig()
+    if isinstance(raw, bool):
+        return MetadataDeltaConfig(enabled=raw)
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep.metadata_delta: expected mapping or bool")
+    raw_fields = raw.get("fields")
+    if raw_fields is None:
+        return MetadataDeltaConfig(enabled=bool(raw.get("enabled", False)))
+    if not isinstance(raw_fields, list):
+        raise ProfileError("fault_sweep.metadata_delta.fields: expected list")
+    fields: List[MetadataDeltaFieldConfig] = []
+    for i, entry in enumerate(raw_fields):
+        if not isinstance(entry, dict):
+            raise ProfileError(
+                "fault_sweep.metadata_delta.fields[{}]: expected mapping".format(i)
+            )
+        address_raw = entry.get("address")
+        if address_raw is None:
+            raise ProfileError(
+                "fault_sweep.metadata_delta.fields[{}]: 'address' is required".format(i)
+            )
+        address = _parse_int(address_raw, "metadata_delta.fields[{}].address".format(i))
+        name = str(entry.get("name", "field_{}".format(i))).strip()
+        min_delta = entry.get("min_delta")
+        max_delta = entry.get("max_delta")
+        when = entry.get("when")
+        if min_delta is not None:
+            min_delta = int(min_delta)
+        if max_delta is not None:
+            max_delta = int(max_delta)
+        if when is not None:
+            when = str(when).strip()
+            valid_when = {"always", "marker_written", "marker_not_written"}
+            if when not in valid_when:
+                raise ProfileError(
+                    "fault_sweep.metadata_delta.fields[{}].when: expected one of {}, "
+                    "got '{}'".format(i, sorted(valid_when), when)
+                )
+        fields.append(MetadataDeltaFieldConfig(
+            address=address,
+            name=name,
+            min_delta=min_delta,
+            max_delta=max_delta,
+            when=when,
+        ))
+    enabled = bool(raw.get("enabled", len(fields) > 0))
+    return MetadataDeltaConfig(enabled=enabled, fields=fields)
 
 
 def _parse_config_checks(raw: Optional[List[Any]]) -> List[ConfigCheck]:
