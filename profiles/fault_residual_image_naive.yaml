@@ -1,0 +1,44 @@
+schema_version: 1
+name: fault_residual_image_naive
+description: >-
+  Direct-XIP bootloader that does NOT erase the full slot before writing a
+  new (smaller) image.  Stale bytes from the prior (larger) image remain in
+  the slot tail.  The bootloader only hashes image_size bytes, so the tail
+  is executable but unauthenticated.  The max_reset_vector_offset criterion
+  flags if the reset vector points beyond the authenticated boundary.
+
+platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 8
+  slots:
+    exec:    { base: 0x10000000, size: 0x38000 }
+    staging: { base: 0x10038000, size: 0x38000 }
+
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+
+residual_image:
+  slot: staging
+  prior_image: examples/test_image.bin
+
+success_criteria:
+  vtor_in_slot: exec
+  max_reset_vector_offset: 248
+
+fault_sweep:
+  mode: runtime
+  max_writes: 28672
+  max_writes_cap: 1000
+  run_duration: "0.01"
+
+expect:
+  should_find_issues: true
+  control_outcome: wrong_image
+
+skip_self_test: true

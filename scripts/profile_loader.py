@@ -162,6 +162,45 @@ class MemoryConfig:
         self.bootloader_region = bootloader_region
 
 
+class ResidualImageConfig:
+    """Configuration for residual-image testing on direct-XIP bootloaders.
+
+    When a smaller image replaces a larger one in-place, stale bytes from the
+    previous image may remain in the slot tail.  On MRAM (no erase cycle) this
+    is guaranteed; on flash it depends on whether the OTA process erases the
+    full slot before writing.
+
+    ``slot`` names the memory slot to contaminate (must exist in memory.slots).
+    ``prior_image`` is the path to the larger (old) image binary (optional if
+    ``fill_pattern`` is set -- the fill alone can model an erased slot).
+    ``fill_pattern`` optionally fills the slot before any image load.  When set
+    WITHOUT ``prior_image``, it fills the full slot then the actual image is
+    loaded on top.  When set WITH ``prior_image``, the prior image is loaded
+    first, then the region from actual_image_size to prior_image_size is filled
+    (the residual tail only).
+    """
+
+    __slots__ = ("slot", "prior_image", "fill_pattern")
+
+    def __init__(
+        self,
+        slot: str,
+        prior_image: Optional[str] = None,
+        fill_pattern: Optional[int] = None,
+    ) -> None:
+        self.slot = slot
+        self.prior_image = prior_image
+        if fill_pattern is not None:
+            fill_pattern = int(fill_pattern)
+            if not (0 <= fill_pattern <= 0xFF):
+                raise ProfileError(
+                    "residual_image.fill_pattern must be 0x00-0xFF, got 0x{:02X}".format(
+                        fill_pattern
+                    )
+                )
+        self.fill_pattern = fill_pattern
+
+
 class SuccessCriteria:
     __slots__ = (
         "vtor_in_slot",
@@ -177,6 +216,7 @@ class SuccessCriteria:
         "bootloader_integrity",
         "config_checks",
         "boot_register_values",
+        "max_reset_vector_offset",
     )
 
     def __init__(
@@ -194,6 +234,7 @@ class SuccessCriteria:
         bootloader_integrity: bool = False,
         config_checks: Optional[List[ConfigCheck]] = None,
         boot_register_values: Optional[Dict[str, int]] = None,
+        max_reset_vector_offset: Optional[int] = None,
     ) -> None:
         self.vtor_in_slot = vtor_in_slot
         self.vector_table_offset = max(0, int(vector_table_offset))
@@ -208,6 +249,15 @@ class SuccessCriteria:
         self.bootloader_integrity = bootloader_integrity
         self.config_checks = config_checks or []
         self.boot_register_values = boot_register_values or {}
+        if max_reset_vector_offset is not None:
+            max_reset_vector_offset = int(max_reset_vector_offset)
+            if max_reset_vector_offset < 0:
+                raise ProfileError(
+                    "success_criteria.max_reset_vector_offset must be >= 0, got {}".format(
+                        max_reset_vector_offset
+                    )
+                )
+        self.max_reset_vector_offset = max_reset_vector_offset
 
 
 
@@ -1149,6 +1199,7 @@ class ProfileConfig:
         boot_registers: Optional[List[BootRegisterDef]] = None,
         write_order_constraints: Optional[List[WriteOrderConstraint]] = None,
         fuzz_corpus: Optional[str] = None,
+        residual_image: Optional["ResidualImageConfig"] = None,
     ) -> None:
         self.schema_version = schema_version
         self.name = name
@@ -1188,6 +1239,7 @@ class ProfileConfig:
         self.boot_registers: List[BootRegisterDef] = boot_registers or []
         self.write_order_constraints: List[WriteOrderConstraint] = write_order_constraints or []
         self.fuzz_corpus: Optional[str] = fuzz_corpus
+        self.residual_image: Optional[ResidualImageConfig] = residual_image
 
     @property
     def is_multi_component(self) -> bool:
@@ -1258,6 +1310,7 @@ class ProfileConfig:
             security_policy=self.security_policy,
             success_criteria_overrides=self.success_criteria_overrides,
             fuzz_corpus=self.fuzz_corpus,
+            residual_image=self.residual_image,
         )
         if state.update_trigger is not None and state.pre_boot_state is None:
             resolved.pre_boot_state = resolved.expand_update_trigger()
@@ -1794,6 +1847,31 @@ class ProfileConfig:
             b64 = base64.b64encode(raw_json.encode()).decode().rstrip("=")
             vars_list.append("SUCCESS_CRITERIA_OVERRIDES:{}".format(b64))
 
+        # Residual image: load a prior (larger) image before the actual image
+        # to simulate stale tail bytes left after an in-place update.
+        if self.residual_image is not None:
+            ri = self.residual_image
+            vars_list.append(
+                "RESIDUAL_IMAGE_SLOT:{}".format(ri.slot)
+            )
+            if ri.prior_image is not None:
+                vars_list.append(
+                    "RESIDUAL_IMAGE_PRIOR:{}".format(
+                        self.resolve_path(repo_root, ri.prior_image)
+                    )
+                )
+            if ri.fill_pattern is not None:
+                vars_list.append(
+                    "RESIDUAL_IMAGE_FILL:0x{:02X}".format(ri.fill_pattern)
+                )
+
+        # Max reset vector offset: flag if the reset vector points beyond the
+        # authenticated image boundary.
+        if sc.max_reset_vector_offset is not None:
+            vars_list.append(
+                "MAX_RESET_VECTOR_OFFSET:0x{:08X}".format(sc.max_reset_vector_offset)
+            )
+
         return vars_list
 # ---------------------------------------------------------------------------
 # Parsing helpers
@@ -1929,6 +2007,10 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         bootloader_integrity=bool(raw.get("bootloader_integrity", False)),
         config_checks=_parse_config_checks(raw.get("config_checks")),
         boot_register_values=_parse_boot_register_values(raw.get("boot_register_values")),
+        max_reset_vector_offset=(
+            _parse_int(raw["max_reset_vector_offset"], "success_criteria.max_reset_vector_offset")
+            if "max_reset_vector_offset" in raw else None
+        ),
     )
 
 
@@ -3129,6 +3211,51 @@ def _parse_security_policy(raw: Optional[Dict[str, Any]]) -> SecurityPolicyConfi
         toctou_protection=toctou_protection,
     )
 
+def _parse_residual_image(
+    raw: Optional[Dict[str, Any]],
+    slots: Dict[str, SlotConfig],
+    images: Optional[Dict[str, str]] = None,
+) -> Optional[ResidualImageConfig]:
+    """Parse the optional residual_image section from profile YAML."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ProfileError("residual_image: expected mapping")
+    slot = str(raw.get("slot", "")).strip()
+    if not slot:
+        raise ProfileError("residual_image.slot: required field")
+    if slot not in slots:
+        raise ProfileError(
+            "residual_image.slot: '{}' not found in memory.slots. "
+            "Available: {}".format(slot, sorted(slots.keys()))
+        )
+    # Validate that the target slot has an image configured.
+    if images is not None and slot not in images:
+        raise ProfileError(
+            "residual_image.slot: '{}' has no image configured in the images "
+            "section. The residual image test requires an actual image in the "
+            "target slot to overwrite the residual data.".format(slot)
+        )
+    prior_image = raw.get("prior_image")
+    if prior_image:
+        prior_image = str(prior_image)
+    else:
+        prior_image = None
+    fill_pattern: Optional[int] = None
+    if "fill_pattern" in raw:
+        fill_pattern = _parse_int(raw["fill_pattern"], "residual_image.fill_pattern")
+    # At least one of prior_image or fill_pattern is required.
+    if not prior_image and fill_pattern is None:
+        raise ProfileError(
+            "residual_image: at least one of prior_image or fill_pattern is required"
+        )
+    return ResidualImageConfig(
+        slot=slot,
+        prior_image=prior_image,
+        fill_pattern=fill_pattern,
+    )
+
+
 def _parse_fault_distribution(raw: Optional[Dict[str, Any]]) -> Optional[FaultDistributionConfig]:
     """Parse fault_distribution config from fault_sweep YAML block."""
     if raw is None:
@@ -4038,6 +4165,9 @@ def load_profile(path: str | Path) -> ProfileConfig:
     write_order_constraints = _parse_write_order_constraints_list(
         data.get("write_order_constraints")
     )
+    residual_image = _parse_residual_image(
+        data.get("residual_image"), memory.slots, images=images
+    )
 
     scenario = str(data.get("scenario", "runtime"))
     if scenario not in VALID_SCENARIOS:
@@ -4108,6 +4238,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         boot_registers=boot_registers,
         write_order_constraints=write_order_constraints,
         fuzz_corpus=fuzz_corpus,
+        residual_image=residual_image,
     )
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.
@@ -4266,6 +4397,24 @@ def main() -> int:
             "minimum_version": profile.security_policy.minimum_version,
             "toctou_protection": profile.security_policy.toctou_protection,
         },
+        "residual_image": (
+            {
+                "slot": profile.residual_image.slot,
+                "prior_image": profile.residual_image.prior_image,
+                "fill_pattern": (
+                    "0x{:02X}".format(profile.residual_image.fill_pattern)
+                    if profile.residual_image.fill_pattern is not None
+                    else None
+                ),
+            }
+            if profile.residual_image is not None
+            else None
+        ),
+        "max_reset_vector_offset": (
+            "0x{:X}".format(profile.success_criteria.max_reset_vector_offset)
+            if profile.success_criteria.max_reset_vector_offset is not None
+            else None
+        ),
     }
     print(json.dumps(info, indent=2, sort_keys=True))
     return 0
