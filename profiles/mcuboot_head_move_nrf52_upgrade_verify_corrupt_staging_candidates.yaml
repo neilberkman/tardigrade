@@ -49,4 +49,3 @@ fault_sweep:
   max_writes_cap: 200000
   run_duration: "20.0"
   max_step_limit: 200000000
-  skip_self_test: true
