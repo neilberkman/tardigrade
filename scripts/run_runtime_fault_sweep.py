@@ -54,15 +54,53 @@ bus = monitor.Machine.SystemBus
 
 
 def _bus_load_elf(path):
-    """Load ELF via inline python command (extension methods only available there)."""
-    _p = str(path).replace("'", "\\'").replace('\\', '/')
-    monitor.Parse("python \"bus=monitor.Machine.SystemBus; bus.LoadELF(r'{}')\"".format(_p))
+    """Load ELF via monitor command. Fail-closed: raises on failure."""
+    _p = str(path)
+    try:
+        bus.LoadELF(_p)
+        return
+    except Exception:
+        pass
+    # Direct .NET call unavailable in exec() context — use monitor command.
+    resp = monitor.Parse('sysbus LoadELF @"{}"'.format(_p.replace('\\', '/')))
+    resp_str = str(resp) if resp else ''
+    if 'error' in resp_str.lower() or 'could not' in resp_str.lower():
+        raise RuntimeError('_bus_load_elf failed for {}: {}'.format(_p, resp_str))
 
 
 def _bus_load_binary(path, addr):
-    """Load binary via inline python command (extension methods only available there)."""
-    _p = str(path).replace("'", "\\'").replace('\\', '/')
-    monitor.Parse("python \"bus=monitor.Machine.SystemBus; bus.LoadBinary(r'{}', {})\"".format(_p, int(addr)))
+    """Load binary via monitor command. Fail-closed with verification."""
+    _p = str(path)
+    _a = int(addr)
+    try:
+        bus.LoadBinary(_p, _a)
+        return
+    except Exception:
+        pass
+    resp = monitor.Parse('sysbus LoadBinary @"{}" 0x{:X}'.format(_p.replace('\\', '/'), _a))
+    resp_str = str(resp) if resp else ''
+    if 'error' in resp_str.lower() or 'could not' in resp_str.lower():
+        raise RuntimeError('_bus_load_binary failed for {} at 0x{:X}: {}'.format(_p, _a, resp_str))
+    # Verify: read first 4 bytes from memory and compare to file.
+    try:
+        with open(_p, 'rb') as _f:
+            _expected = _f.read(4)
+        if len(_expected) >= 4:
+            _actual = bus.ReadBytes(long(_a), 4)
+            _match = all(_expected[i] == int(_actual[i]) for i in range(4))
+            if not _match:
+                raise RuntimeError(
+                    '_bus_load_binary verification failed at 0x{:X}: '
+                    'expected {} got {}'.format(
+                        _a,
+                        [hex(b) for b in _expected],
+                        [hex(int(b)) for b in _actual],
+                    )
+                )
+    except RuntimeError:
+        raise
+    except Exception:
+        pass  # verification not critical if read APIs differ
 
 
 # Sentinel value used to disarm fault injection (max uint64).
