@@ -52,6 +52,17 @@ def _json_dump_text(value):
 
 bus = monitor.Machine.SystemBus
 
+
+def _bus_load_elf(path):
+    """Load ELF via monitor command (bus.LoadELF is an extension not available in exec context)."""
+    monitor.Parse('sysbus LoadELF @"{}"'.format(str(path).replace('\\', '/')))
+
+
+def _bus_load_binary(path, addr):
+    """Load binary via monitor command."""
+    monitor.Parse('sysbus LoadBinary @"{}" 0x{:X}'.format(str(path).replace('\\', '/'), int(addr)))
+
+
 # Sentinel value used to disarm fault injection (max uint64).
 _DISARM_SENTINEL = 18446744073709551615
 
@@ -3581,7 +3592,7 @@ def prepare_recovery_shell_state():
     else:
         monitor.Parse('machine Reset')
     monitor.Parse('machine Pause')
-    bus.LoadELF(bootloader_elf)
+    _bus_load_elf(bootloader_elf)
     restore_hw_init()
     prime_bootloader_entry()
 
@@ -3644,7 +3655,7 @@ def _load_images_mapping(images_map):
         base_addr = slot_load_addresses.get(str(slot_name))
         if base_addr is None:
             raise RuntimeError('unknown slot in update_sequence images: {}'.format(slot_name))
-        bus.LoadBinary(str(image_path), int(base_addr))
+        _bus_load_binary(str(image_path), int(base_addr))
 
 
 def reload_images_from_map(images_map):
@@ -3696,7 +3707,7 @@ def reload_images_from_map(images_map):
         for offset in range(0, nvm_size, sector):
             chunk = min(sector, nvm_size - offset)
             b['data'].Nvm.EraseSector(offset, chunk)
-    bus.LoadELF(bootloader_elf)
+    _bus_load_elf(bootloader_elf)
     _load_images_mapping(images_map)
 
 
@@ -3749,9 +3760,9 @@ def _apply_residual_image():
 
     if residual_image_prior:
         # Mode 2: load prior image first, then actual on top.
-        bus.LoadBinary(residual_image_prior, target_base)
+        _bus_load_binary(residual_image_prior, target_base)
         if actual_image_path:
-            bus.LoadBinary(actual_image_path, target_base)
+            _bus_load_binary(actual_image_path, target_base)
         # If fill_pattern is set, fill the residual tail between the actual
         # image end and the prior image end.
         if residual_image_fill is not None and actual_image_path:
@@ -3772,7 +3783,7 @@ def _apply_residual_image():
             s_lo, s_hi = slot_cfg
             _fill_slot_region(s_lo, s_hi - s_lo, residual_image_fill)
         if actual_image_path:
-            bus.LoadBinary(actual_image_path, target_base)
+            _bus_load_binary(actual_image_path, target_base)
         log('residual_image: filled slot {} (0x{:08X}) with 0x{:02X}, then loaded actual'.format(
             residual_image_slot, target_base, residual_image_fill))
 
@@ -5220,7 +5231,7 @@ def run_timed_reset_fault(fault_at):
         fault_snapshot_bytes = None
         monitor.Parse('machine Reset')
         monitor.Parse('machine Pause')
-        bus.LoadELF(bootloader_elf)
+        _bus_load_elf(bootloader_elf)
         restore_hw_init()
 
     log('fp={} type=t phase2_step'.format(fault_at))
@@ -6114,11 +6125,11 @@ def run_execute_fault(fault_at, fault_type='w'):
         phase2_t0 = _time.time()
         monitor.Parse('machine Reset')
         monitor.Parse('machine Pause')
-        bus.LoadELF(bootloader_elf)
+        _bus_load_elf(bootloader_elf)
         if image_exec_path:
-            bus.LoadBinary(image_exec_path, slot_exec_base)
+            _bus_load_binary(image_exec_path, slot_exec_base)
         if image_staging_path:
-            bus.LoadBinary(image_staging_path, slot_staging_base)
+            _bus_load_binary(image_staging_path, slot_staging_base)
         if _hash_bypass_active:
             apply_hash_bypass()
         reset_nvmc_for_recovery()
@@ -6179,7 +6190,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             log('fp={} multi-boot cycle {} of {}'.format(fault_at, extra_cycle + 1, boot_cycles))
             monitor.Parse('machine Pause')
             monitor.Parse('machine Reset')
-            bus.LoadELF(bootloader_elf)
+            _bus_load_elf(bootloader_elf)
             # Do NOT reload slot images — use whatever is on flash after boot 1
             if _hash_bypass_active:
                 apply_hash_bypass()
@@ -7263,7 +7274,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
             _multiboot_cycles_run += 1
             monitor.Parse('machine Pause')
             monitor.Parse('machine Reset')
-            bus.LoadELF(bootloader_elf)
+            _bus_load_elf(bootloader_elf)
             if _hash_bypass_active:
                 apply_hash_bypass()
             reset_nvmc_for_recovery()
@@ -7481,7 +7492,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
             _multiboot_cycles_run += 1
             monitor.Parse('machine Pause')
             monitor.Parse('machine Reset')
-            bus.LoadELF(bootloader_elf)
+            _bus_load_elf(bootloader_elf)
             if _hash_bypass_active:
                 apply_hash_bypass()
             reset_nvmc_for_recovery()
