@@ -72,20 +72,32 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         public byte ReadByte(long offset)
         {
-            ValidateRange(offset, 1);
+            if(!TryValidateRange(offset, 1))
+            {
+                LogOutOfRangeRead(offset, 1);
+                return 0xFF;
+            }
             return storage[offset];
         }
 
         public ushort ReadWord(long offset)
         {
-            ValidateRange(offset, 2);
+            if(!TryValidateRange(offset, 2))
+            {
+                LogOutOfRangeRead(offset, 2);
+                return 0xFFFF;
+            }
             return (ushort)(storage[offset]
                 | (storage[offset + 1] << 8));
         }
 
         public uint ReadDoubleWord(long offset)
         {
-            ValidateRange(offset, 4);
+            if(!TryValidateRange(offset, 4))
+            {
+                LogOutOfRangeRead(offset, 4);
+                return 0xFFFFFFFF;
+            }
             return (uint)(storage[offset]
                 | (storage[offset + 1] << 8)
                 | (storage[offset + 2] << 16)
@@ -94,7 +106,11 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         public ulong ReadQuadWord(long offset)
         {
-            ValidateRange(offset, 8);
+            if(!TryValidateRange(offset, 8))
+            {
+                LogOutOfRangeRead(offset, 8);
+                return 0xFFFFFFFFFFFFFFFFUL;
+            }
             var lo = (uint)(storage[offset]
                 | (storage[offset + 1] << 8)
                 | (storage[offset + 2] << 16)
@@ -108,7 +124,11 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         public byte[] ReadBytes(long offset, int count, IPeripheral context)
         {
-            ValidateRange(offset, count);
+            if(count < 0 || !TryValidateRange(offset, count))
+            {
+                LogOutOfRangeRead(offset, count);
+                return CreateErasedBytes(Math.Max(0, count));
+            }
             var result = new byte[count];
             Array.Copy(storage, offset, result, 0, count);
             return result;
@@ -163,10 +183,9 @@ namespace Antmicro.Renode.Peripherals.Memory
                 throw new ArgumentNullException(nameof(array));
             }
 
-            if(startingIndex < 0 || count < 0 || startingIndex + count > array.Length)
+            if(startingIndex < 0 || count < 0 || startingIndex > array.Length - count)
             {
-                throw new ArgumentOutOfRangeException(
-                    $"Invalid write window start={startingIndex}, count={count}, arrayLength={array.Length}");
+                return;
             }
 
             var data = new byte[count];
@@ -325,10 +344,9 @@ namespace Antmicro.Renode.Peripherals.Memory
         /// </summary>
         public void SetStuckBitMask(long offset, byte mask)
         {
-            if(offset < 0 || offset >= size)
+            if(!TryValidateRange(offset, 1))
             {
-                throw new ArgumentOutOfRangeException(
-                    $"Stuck bit mask offset {offset} is outside OTP range [0, {size})");
+                return;
             }
             stuckBitMask[offset] = mask;
         }
@@ -352,7 +370,11 @@ namespace Antmicro.Renode.Peripherals.Memory
         /// </summary>
         public void PresetByte(long offset, byte value)
         {
-            ValidateRange(offset, 1);
+            if(!TryValidateRange(offset, 1))
+            {
+                LogOutOfRangeWrite(offset, 1);
+                return;
+            }
             // OTP semantics: can only add 1-bits, never clear.
             storage[offset] |= value;
         }
@@ -362,7 +384,11 @@ namespace Antmicro.Renode.Peripherals.Memory
         /// </summary>
         public void PresetWord(long offset, uint value)
         {
-            ValidateRange(offset, 4);
+            if(!TryValidateRange(offset, 4))
+            {
+                LogOutOfRangeWrite(offset, 4);
+                return;
+            }
             storage[offset] |= (byte)(value & 0xFF);
             storage[offset + 1] |= (byte)((value >> 8) & 0xFF);
             storage[offset + 2] |= (byte)((value >> 16) & 0xFF);
@@ -393,7 +419,11 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return;
             }
 
-            ValidateRange(offset, data.Length);
+            if(!TryValidateRange(offset, data.Length))
+            {
+                LogOutOfRangeWrite(offset, data.Length);
+                return;
+            }
 
             // Determine how many blow operations this write represents.
             // Only count entries that actually have new 0->1 bit transitions.
@@ -750,13 +780,32 @@ namespace Antmicro.Renode.Peripherals.Memory
             return seed * 1103515245u + 12345u;
         }
 
-        private void ValidateRange(long offset, long length)
+        private bool TryValidateRange(long offset, long length)
         {
-            if(offset < 0 || length < 0 || (offset + length) > size)
+            return offset >= 0 && length >= 0 && length <= size && offset <= size - length;
+        }
+
+        private void LogOutOfRangeRead(long offset, long length)
+        {
+        }
+
+        private void LogOutOfRangeWrite(long offset, long length)
+        {
+        }
+
+        private byte[] CreateErasedBytes(int count)
+        {
+            if(count <= 0)
             {
-                throw new ArgumentOutOfRangeException(
-                    $"OTP access out of range: offset={offset}, length={length}, size={size}");
+                return Array.Empty<byte>();
             }
+
+            var result = new byte[count];
+            for(var i = 0; i < count; i++)
+            {
+                result[i] = 0xFF;
+            }
+            return result;
         }
 
         private long size;

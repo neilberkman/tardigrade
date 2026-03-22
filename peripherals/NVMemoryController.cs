@@ -53,7 +53,11 @@ namespace Antmicro.Renode.Peripherals.Memory
             {
                 return AliasTarget.ReadByte(offset);
             }
-            ValidateRange(offset, 1);
+            if(!TryValidateRange(offset, 1))
+            {
+                LogOutOfRangeRead(offset, 1);
+                return 0xFF;
+            }
             var value = storage[offset];
             return (byte)ApplyReadFault(offset, 1, value);
         }
@@ -64,7 +68,11 @@ namespace Antmicro.Renode.Peripherals.Memory
             {
                 return AliasTarget.ReadWord(offset);
             }
-            ValidateRange(offset, 2);
+            if(!TryValidateRange(offset, 2))
+            {
+                LogOutOfRangeRead(offset, 2);
+                return 0xFFFF;
+            }
             var value = (ushort)(storage[offset]
                 | (storage[offset + 1] << 8));
             return (ushort)ApplyReadFault(offset, 2, value);
@@ -76,7 +84,11 @@ namespace Antmicro.Renode.Peripherals.Memory
             {
                 return AliasTarget.ReadDoubleWord(offset);
             }
-            ValidateRange(offset, 4);
+            if(!TryValidateRange(offset, 4))
+            {
+                LogOutOfRangeRead(offset, 4);
+                return 0xFFFFFFFF;
+            }
             var value = (uint)(storage[offset]
                 | (storage[offset + 1] << 8)
                 | (storage[offset + 2] << 16)
@@ -90,7 +102,11 @@ namespace Antmicro.Renode.Peripherals.Memory
             {
                 return AliasTarget.ReadQuadWord(offset);
             }
-            ValidateRange(offset, 8);
+            if(!TryValidateRange(offset, 8))
+            {
+                LogOutOfRangeRead(offset, 8);
+                return 0xFFFFFFFFFFFFFFFFUL;
+            }
             var lo = (uint)(storage[offset]
                 | (storage[offset + 1] << 8)
                 | (storage[offset + 2] << 16)
@@ -151,7 +167,11 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return AliasTarget.ReadBytes(offset, count, context);
             }
 
-            ValidateRange(offset, count);
+            if(count < 0 || !TryValidateRange(offset, count))
+            {
+                LogOutOfRangeRead(offset, count);
+                return CreateErasedBytes(Math.Max(0, count));
+            }
             var result = new byte[count];
             Array.Copy(storage, offset, result, 0, count);
             return result;
@@ -164,9 +184,9 @@ namespace Antmicro.Renode.Peripherals.Memory
                 throw new ArgumentNullException(nameof(array));
             }
 
-            if(startingIndex < 0 || count < 0 || startingIndex + count > array.Length)
+            if(startingIndex < 0 || count < 0 || startingIndex > array.Length - count)
             {
-                throw new ArgumentOutOfRangeException($"Invalid write window start={startingIndex}, count={count}, arrayLength={array.Length}");
+                return;
             }
 
             var data = new byte[count];
@@ -187,7 +207,11 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return;
             }
 
-            ValidateRange(address, length);
+            if(!TryValidateRange(address, length))
+            {
+                LogOutOfRangeWrite(address, length);
+                return;
+            }
             for(var i = 0L; i < length; i++)
             {
                 storage[address + i] = pattern;
@@ -206,7 +230,11 @@ namespace Antmicro.Renode.Peripherals.Memory
             }
 
             var aligned = AlignDown(address, WordSize);
-            ValidateRange(aligned, WordSize);
+            if(!TryValidateRange(aligned, WordSize))
+            {
+                LogOutOfRangeWrite(aligned, WordSize);
+                return;
+            }
 
             var half = WordSize / 2;
             for(var i = half; i < WordSize; i++)
@@ -395,7 +423,11 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return;
             }
 
-            ValidateRange(offset, sectorSize);
+            if(!TryValidateRange(offset, sectorSize))
+            {
+                LogOutOfRangeWrite(offset, sectorSize);
+                return;
+            }
             for(var i = 0; i < sectorSize; i++)
             {
                 storage[offset + i] = EraseFill;
@@ -471,7 +503,11 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return;
             }
 
-            ValidateRange(offset, data.Length);
+            if(!TryValidateRange(offset, data.Length))
+            {
+                LogOutOfRangeWrite(offset, data.Length);
+                return;
+            }
             LastWriteAddress = offset;
 
             if(!EnforceWordWriteSemantics)
@@ -676,12 +712,32 @@ namespace Antmicro.Renode.Peripherals.Memory
             return value & ~(alignment - 1);
         }
 
-        private void ValidateRange(long offset, long length)
+        private bool TryValidateRange(long offset, long length)
         {
-            if(offset < 0 || length < 0 || (offset + length) > size)
+            return offset >= 0 && length >= 0 && length <= size && offset <= size - length;
+        }
+
+        private void LogOutOfRangeRead(long offset, long length)
+        {
+        }
+
+        private void LogOutOfRangeWrite(long offset, long length)
+        {
+        }
+
+        private byte[] CreateErasedBytes(int count)
+        {
+            if(count <= 0)
             {
-                throw new ArgumentOutOfRangeException($"NVM access out of range: offset={offset}, length={length}, size={size}");
+                return Array.Empty<byte>();
             }
+
+            var result = new byte[count];
+            for(var i = 0; i < count; i++)
+            {
+                result[i] = 0xFF;
+            }
+            return result;
         }
 
         private byte eraseFill;
@@ -740,14 +796,12 @@ namespace Antmicro.Renode.Peripherals
                 return;
             }
 
-            try
+            if(!TryNormalizeAddress(address, out var normalized))
             {
-                Nvm.InjectFault(NormalizeAddress(address), length);
+                return;
             }
-            catch(ArgumentOutOfRangeException)
-            {
-                illegalOperation = true;
-            }
+
+            Nvm.InjectFault(normalized, length);
         }
 
         public void InjectPartialWrite(long address)
@@ -758,14 +812,12 @@ namespace Antmicro.Renode.Peripherals
                 return;
             }
 
-            try
+            if(!TryNormalizeAddress(address, out var normalized))
             {
-                Nvm.InjectPartialWrite(NormalizeAddress(address));
+                return;
             }
-            catch(ArgumentOutOfRangeException)
-            {
-                illegalOperation = true;
-            }
+
+            Nvm.InjectPartialWrite(normalized);
         }
 
         public void EraseSector(long address, int sectorSize = 0x1000)
@@ -776,14 +828,12 @@ namespace Antmicro.Renode.Peripherals
                 return;
             }
 
-            try
+            if(!TryNormalizeAddress(address, out var normalized))
             {
-                Nvm.EraseSector(NormalizeAddress(address), sectorSize);
+                return;
             }
-            catch(ArgumentOutOfRangeException)
-            {
-                illegalOperation = true;
-            }
+
+            Nvm.EraseSector(normalized, sectorSize);
         }
 
         public void InjectPartialErase(long address, int sectorSize = 0x1000)
@@ -794,17 +844,14 @@ namespace Antmicro.Renode.Peripherals
                 return;
             }
 
-            try
+            if(!TryNormalizeAddress(address, out var normalized))
             {
-                var normalized = NormalizeAddress(address);
-                var half = sectorSize / 2;
-                // Erase first half of sector, leave second half intact.
-                Nvm.EraseSector(normalized, half);
+                return;
             }
-            catch(ArgumentOutOfRangeException)
-            {
-                illegalOperation = true;
-            }
+
+            var half = sectorSize / 2;
+            // Erase first half of sector, leave second half intact.
+            Nvm.EraseSector(normalized, half);
         }
 
         public bool WriteInProgress
@@ -946,30 +993,35 @@ namespace Antmicro.Renode.Peripherals
             return ctrl;
         }
 
-        private long NormalizeAddress(long address)
+        private bool TryNormalizeAddress(long address, out long normalized)
         {
             if(Nvm == null)
             {
-                return address;
+                normalized = address;
+                return true;
             }
 
             if(address >= 0 && address < Nvm.Size)
             {
-                return address;
+                normalized = address;
+                return true;
             }
 
             if(address >= NvmBaseAddress && address < NvmBaseAddress + Nvm.Size)
             {
-                return address - NvmBaseAddress;
+                normalized = address - NvmBaseAddress;
+                return true;
             }
 
             var nvReadBase = NvmBaseAddress + NvReadOffset;
             if(address >= nvReadBase && address < nvReadBase + Nvm.Size)
             {
-                return address - nvReadBase;
+                normalized = address - nvReadBase;
+                return true;
             }
 
-            throw new ArgumentOutOfRangeException($"Address 0x{address:X} is outside modeled NVM windows");
+            normalized = 0;
+            return false;
         }
 
         private uint efuseSpareValue;

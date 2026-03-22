@@ -12,6 +12,12 @@ Create Flash Machine
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${CURDIR}/../platforms/cortex_m0_nvm_flash.repl
 
+Create OTP Machine
+    Execute Command    include "${CURDIR}/../peripherals/NVMemoryController.cs"
+    Execute Command    include "${CURDIR}/../peripherals/OTPMemory.cs"
+    Execute Command    mach create
+    Execute Command    machine LoadPlatformDescription @${CURDIR}/../platforms/cortex_m0_otp.repl
+
 Read Normalized Bool
     [Arguments]    ${command}
     ${raw}=             Execute Command    ${command}
@@ -108,6 +114,17 @@ Flash Partial Write Uses EraseFill
     ${word}=           Execute Command    sysbus ReadDoubleWord 0x10000000
     # First 2 bytes preserved (0xCCDD), last 2 bytes erased to 0xFFFF
     Should Be Equal As Numbers    ${word}    0xFFFFCCDD
+
+Flash OOB Read Returns Erased Bytes
+    Create Flash Machine
+    ${word}=           Execute Command    nvm ReadDoubleWord 0x80000
+    Should Be Equal As Numbers    ${word}    0xFFFFFFFF
+
+Flash OOB Write Is Dropped
+    Create Flash Machine
+    Execute Command    nvm WriteDoubleWord 0x80000 0x12345678
+    ${word}=           Execute Command    nvm ReadDoubleWord 0x80000
+    Should Be Equal As Numbers    ${word}    0xFFFFFFFF
 
 Read Fault Corrupts First Read
     Create NVM Machine
@@ -208,3 +225,14 @@ Read Fault Total Reads Counter
     Execute Command    sysbus ReadDoubleWord 0x10000000
     ${total}=          Execute Command    nvm ReadFaultTotalReads
     Should Be Equal As Numbers    ${total}    3
+
+OTP OOB Read Returns Erased Bytes
+    Create OTP Machine
+    ${word}=           Execute Command    otp ReadDoubleWord 0x100
+    Should Be Equal As Numbers    ${word}    0xFFFFFFFF
+
+OTP OOB Write Is Dropped
+    Create OTP Machine
+    Execute Command    otp WriteDoubleWord 0x100 0x12345678
+    ${word}=           Execute Command    otp ReadDoubleWord 0x100
+    Should Be Equal As Numbers    ${word}    0xFFFFFFFF

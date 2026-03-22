@@ -106,14 +106,12 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return;
             }
 
-            try
+            if(!TryNormalizeAddress(address, out var normalized))
             {
-                Nvm.InjectFault(NormalizeAddress(address), length);
+                return;
             }
-            catch(ArgumentOutOfRangeException)
-            {
-                illegalOperation = true;
-            }
+
+            Nvm.InjectFault(normalized, length);
         }
 
         public void InjectPartialWrite(long address)
@@ -124,14 +122,12 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return;
             }
 
-            try
+            if(!TryNormalizeAddress(address, out var normalized))
             {
-                Nvm.InjectPartialWrite(NormalizeAddress(address));
+                return;
             }
-            catch(ArgumentOutOfRangeException)
-            {
-                illegalOperation = true;
-            }
+
+            Nvm.InjectPartialWrite(normalized);
         }
 
         public bool WriteInProgress
@@ -246,54 +242,57 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return;
             }
 
-            try
+            if(!TryNormalizeAddress((long)addressRegisterValue, out var nvmOffset))
             {
-                var nvmOffset = NormalizeAddress((long)addressRegisterValue);
-                if(commandFaultMode == 1 && commandExecutions == faultAtCommandExecution)
-                {
-                    commandFaultFired = true;
-                    statusRegisterValue = SuccessStatusValue;
-                    illegalOperation = false;
-                    registers[StatusRegisterOffset] = statusRegisterValue;
-                    return;
-                }
-                Nvm.WriteDoubleWord(nvmOffset, dataRegisterValue);
                 statusRegisterValue = SuccessStatusValue;
                 illegalOperation = false;
+                registers[StatusRegisterOffset] = statusRegisterValue;
+                return;
             }
-            catch(ArgumentOutOfRangeException)
+            if(commandFaultMode == 1 && commandExecutions == faultAtCommandExecution)
             {
-                illegalOperation = true;
+                commandFaultFired = true;
+                statusRegisterValue = SuccessStatusValue;
+                illegalOperation = false;
+                registers[StatusRegisterOffset] = statusRegisterValue;
+                return;
             }
+            Nvm.WriteDoubleWord(nvmOffset, dataRegisterValue);
+            statusRegisterValue = SuccessStatusValue;
+            illegalOperation = false;
 
             registers[StatusRegisterOffset] = statusRegisterValue;
         }
 
-        private long NormalizeAddress(long address)
+        private bool TryNormalizeAddress(long address, out long normalized)
         {
             if(Nvm == null)
             {
-                return address;
+                normalized = address;
+                return true;
             }
 
             if(address >= 0 && address < Nvm.Size)
             {
-                return address;
+                normalized = address;
+                return true;
             }
 
             if(address >= NvmBaseAddress && address < NvmBaseAddress + Nvm.Size)
             {
-                return address - NvmBaseAddress;
+                normalized = address - NvmBaseAddress;
+                return true;
             }
 
             var nvReadBase = NvmBaseAddress + NvReadOffset;
             if(address >= nvReadBase && address < nvReadBase + Nvm.Size)
             {
-                return address - nvReadBase;
+                normalized = address - nvReadBase;
+                return true;
             }
 
-            throw new ArgumentOutOfRangeException(
-                $"Address 0x{address:X} is outside modeled NVM windows");
+            normalized = 0;
+            return false;
         }
 
         private readonly Dictionary<long, uint> registers = new Dictionary<long, uint>();
