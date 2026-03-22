@@ -147,6 +147,25 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
         # issue.
         if not is_resilient_rollback(result):
             reasons.append("boot_outcome")
+    signals = result.get("signals") or {}
+    if isinstance(signals, dict):
+        if signals.get("marker_ok") is False:
+            reasons.append("content_criteria")
+        if signals.get("otadata_expect_ok") is False:
+            reasons.append("otadata_expect")
+        if signals.get("anti_rollback_ok") is False:
+            reasons.append("anti_rollback")
+        if signals.get("reset_vector_offset_ok") is False:
+            reasons.append("reset_vector_offset")
+        # If the boot landed in the expected coarse outcome but still failed
+        # execution checks, preserve that mismatch explicitly.
+        if signals.get("expectations_met") is False:
+            if signals.get("vtor_ok") is False:
+                reasons.append("vtor_expectation")
+            if signals.get("vtor_aligned") is False:
+                reasons.append("vtor_alignment")
+            if signals.get("pc_ok") is False:
+                reasons.append("pc_expectation")
     if result.get("semantic_assertion_failures"):
         reasons.append("semantic_assertion")
     if result.get("invariant_violations"):
@@ -162,7 +181,16 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
             reasons.append("rollback_not_ratcheted")
         if confirm_meta.get("metadata_inconsistent_after_confirm"):
             reasons.append("metadata_inconsistent_after_confirm")
-    return reasons
+    # Preserve stable ordering while dropping duplicates from overlapping
+    # criteria signals.
+    deduped: List[str] = []
+    seen = set()
+    for reason in reasons:
+        if reason in seen:
+            continue
+        seen.add(reason)
+        deduped.append(reason)
+    return deduped
 
 
 def result_has_issues(result: Dict[str, Any], expected_outcome: str) -> bool:

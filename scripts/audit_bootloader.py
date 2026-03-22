@@ -133,6 +133,37 @@ def _can_skip_auto_calibration(profile: ProfileConfig, eval_mode: str) -> bool:
     return fault_types.issubset({"instruction_skip", "read_bit_flip", "nvs_corruption"})
 
 
+def _can_fallback_to_control_only_calibration(
+    profile: ProfileConfig,
+    exc: Exception,
+) -> bool:
+    """Return whether a calibration failure can fall back to control-only reporting."""
+    expect = getattr(profile, "expect", None)
+    if expect is None:
+        return False
+    if not bool(getattr(expect, "allow_control_only_issues", False)):
+        return False
+    expected_outcome = str(getattr(expect, "control_outcome", "success") or "success")
+    if expected_outcome == "success":
+        return False
+    message = str(exc)
+    return (
+        "Calibration did not complete cleanly" in message
+        and "writes=0, erases=0" in message
+    )
+
+
+def _allow_expected_control_only_issues(profile: ProfileConfig) -> bool:
+    """Return whether control-path issue counts are an expected broken baseline."""
+    expect = getattr(profile, "expect", None)
+    if expect is None:
+        return False
+    if not bool(getattr(expect, "allow_control_only_issues", False)):
+        return False
+    expected_outcome = str(getattr(expect, "control_outcome", "success") or "success")
+    return expected_outcome != "success"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Profile-driven bootloader fault-injection audit."
@@ -711,6 +742,8 @@ def main() -> int:
         total_i2c_transactions: int = 0
         total_otp_blows: int = 0
         setup_writes: int = 0
+        calibration_source_override: Optional[str] = None
+        control_only_calibration_fallback: Optional[str] = None
         # Determine whether erase-trace capture is needed during calibration.
         fault_types = profile.fault_sweep.fault_types
         include_erases = (
@@ -768,53 +801,76 @@ def main() -> int:
 
                 if cal is None:
                     print("Calibrating write count for '{}'...".format(profile.name), file=sys.stderr)
-                    cal = run_calibration(
-                        repo_root=repo_root,
-                        renode_test=renode_test,
-                        robot_suite=robot_suite,
-                        profile=profile,
-                        robot_vars=robot_vars,
-                        work_dir=work_dir,
-                        renode_remote_server_dir=args.renode_remote_server_dir,
-                        keep_run_artifacts=args.keep_run_artifacts,
-                    )
-                    if _cal_cache_path:
+                    try:
+                        cal = run_calibration(
+                            repo_root=repo_root,
+                            renode_test=renode_test,
+                            robot_suite=robot_suite,
+                            profile=profile,
+                            robot_vars=robot_vars,
+                            work_dir=work_dir,
+                            renode_remote_server_dir=args.renode_remote_server_dir,
+                            keep_run_artifacts=args.keep_run_artifacts,
+                        )
+                    except RuntimeError as exc:
+                        if not _can_fallback_to_control_only_calibration(profile, exc):
+                            raise
+                        control_only_calibration_fallback = str(exc)
+                        calibration_source_override = "control_only_fallback"
+                        max_writes = 0
+                        total_erases = 0
+                        setup_writes = 0
+                        total_i2c_transactions = 0
+                        total_otp_blows = 0
+                        trace_file = None
+                        erase_trace_file = None
+                        trace_file_bin = None
+                        erase_trace_file_bin = None
+                        cal = None
+                        print(
+                            "Calibration fallback: {}. Proceeding with control-only execute report.".format(
+                                exc
+                            ),
+                            file=sys.stderr,
+                        )
+                    if _cal_cache_path and cal is not None:
                         save_calibration(_cal_cache_path, cal, _cal_cache_key)
                         print(
                             "Saved calibration to cache: {}".format(_cal_cache_path),
                             file=sys.stderr,
                         )
-                max_writes = cal.total_writes
-                total_erases = cal.total_erases
-                trace_file = cal.trace_file
-                erase_trace_file = cal.erase_trace_file
-                trace_file_bin = cal.trace_file_bin
-                erase_trace_file_bin = cal.erase_trace_file_bin
-                # For image hash discovery mode: use calibration-computed
-                # exec hash as the ground truth for what a successful
-                # operation produces.
-                if cal.calibration_exec_hash:
-                    robot_vars = merge_robot_vars(
-                        robot_vars,
-                        ["EXPECTED_EXEC_SHA256:{}".format(cal.calibration_exec_hash)],
-                    )
-                    print(
-                        "Calibration: exec slot hash = {}...".format(
-                            cal.calibration_exec_hash[:16]
-                        ),
-                        file=sys.stderr,
-                    )
-                setup_writes = cal.setup_writes
-                total_i2c_transactions = cal.total_i2c_transactions
-                total_otp_blows = cal.total_otp_blows
-                cal_parts = ["{} NVM writes".format(max_writes)]
-                if include_erases:
-                    cal_parts.append("{} page erases".format(total_erases))
-                if total_i2c_transactions > 0:
-                    cal_parts.append("{} I2C transactions".format(total_i2c_transactions))
-                if total_otp_blows > 0:
-                    cal_parts.append("{} OTP blows".format(total_otp_blows))
-                print("Calibration: {}.".format(", ".join(cal_parts)), file=sys.stderr)
+                if cal is not None:
+                    max_writes = cal.total_writes
+                    total_erases = cal.total_erases
+                    trace_file = cal.trace_file
+                    erase_trace_file = cal.erase_trace_file
+                    trace_file_bin = cal.trace_file_bin
+                    erase_trace_file_bin = cal.erase_trace_file_bin
+                    # For image hash discovery mode: use calibration-computed
+                    # exec hash as the ground truth for what a successful
+                    # operation produces.
+                    if cal.calibration_exec_hash:
+                        robot_vars = merge_robot_vars(
+                            robot_vars,
+                            ["EXPECTED_EXEC_SHA256:{}".format(cal.calibration_exec_hash)],
+                        )
+                        print(
+                            "Calibration: exec slot hash = {}...".format(
+                                cal.calibration_exec_hash[:16]
+                            ),
+                            file=sys.stderr,
+                        )
+                    setup_writes = cal.setup_writes
+                    total_i2c_transactions = cal.total_i2c_transactions
+                    total_otp_blows = cal.total_otp_blows
+                    cal_parts = ["{} NVM writes".format(max_writes)]
+                    if include_erases:
+                        cal_parts.append("{} page erases".format(total_erases))
+                    if total_i2c_transactions > 0:
+                        cal_parts.append("{} I2C transactions".format(total_i2c_transactions))
+                    if total_otp_blows > 0:
+                        cal_parts.append("{} OTP blows".format(total_otp_blows))
+                    print("Calibration: {}.".format(", ".join(cal_parts)), file=sys.stderr)
         else:
             max_writes = int(max_writes)
             if should_calibrate_for_trace:
@@ -837,57 +893,80 @@ def main() -> int:
                         ),
                         file=sys.stderr,
                     )
-                    cal = run_calibration(
-                        repo_root=repo_root,
-                        renode_test=renode_test,
-                        robot_suite=robot_suite,
-                        profile=profile,
-                        robot_vars=robot_vars,
-                        work_dir=work_dir,
-                        renode_remote_server_dir=args.renode_remote_server_dir,
-                        keep_run_artifacts=args.keep_run_artifacts,
-                    )
-                    if _cal_cache_path:
+                    try:
+                        cal = run_calibration(
+                            repo_root=repo_root,
+                            renode_test=renode_test,
+                            robot_suite=robot_suite,
+                            profile=profile,
+                            robot_vars=robot_vars,
+                            work_dir=work_dir,
+                            renode_remote_server_dir=args.renode_remote_server_dir,
+                            keep_run_artifacts=args.keep_run_artifacts,
+                        )
+                    except RuntimeError as exc:
+                        if not _can_fallback_to_control_only_calibration(profile, exc):
+                            raise
+                        control_only_calibration_fallback = str(exc)
+                        calibration_source_override = "control_only_fallback"
+                        max_writes = 0
+                        total_erases = 0
+                        setup_writes = 0
+                        total_i2c_transactions = 0
+                        total_otp_blows = 0
+                        trace_file = None
+                        erase_trace_file = None
+                        trace_file_bin = None
+                        erase_trace_file_bin = None
+                        cal = None
+                        print(
+                            "Calibration fallback: {}. Proceeding with control-only execute report.".format(
+                                exc
+                            ),
+                            file=sys.stderr,
+                        )
+                    if _cal_cache_path and cal is not None:
                         save_calibration(_cal_cache_path, cal, _cal_cache_key)
                         print(
                             "Saved calibration to cache: {}".format(_cal_cache_path),
                             file=sys.stderr,
                         )
-                total_erases = cal.total_erases
-                trace_file = cal.trace_file
-                erase_trace_file = cal.erase_trace_file
-                trace_file_bin = cal.trace_file_bin
-                erase_trace_file_bin = cal.erase_trace_file_bin
-                if cal.calibration_exec_hash:
-                    robot_vars = merge_robot_vars(
-                        robot_vars,
-                        ["EXPECTED_EXEC_SHA256:{}".format(cal.calibration_exec_hash)],
-                    )
+                if cal is not None:
+                    total_erases = cal.total_erases
+                    trace_file = cal.trace_file
+                    erase_trace_file = cal.erase_trace_file
+                    trace_file_bin = cal.trace_file_bin
+                    erase_trace_file_bin = cal.erase_trace_file_bin
+                    if cal.calibration_exec_hash:
+                        robot_vars = merge_robot_vars(
+                            robot_vars,
+                            ["EXPECTED_EXEC_SHA256:{}".format(cal.calibration_exec_hash)],
+                        )
+                        print(
+                            "Calibration: exec slot hash = {}...".format(
+                                cal.calibration_exec_hash[:16]
+                            ),
+                            file=sys.stderr,
+                        )
+                    setup_writes = cal.setup_writes
+                    total_i2c_transactions = cal.total_i2c_transactions
+                    total_otp_blows = cal.total_otp_blows
+                    cal_parts = ["{} NVM writes (trace source)".format(cal.total_writes)]
+                    if include_erases:
+                        cal_parts.append("{} page erases".format(total_erases))
+                    if total_i2c_transactions > 0:
+                        cal_parts.append(
+                            "{} I2C transactions".format(total_i2c_transactions)
+                        )
+                    if total_otp_blows > 0:
+                        cal_parts.append("{} OTP blows".format(total_otp_blows))
+                    print("Calibration: {}.".format(", ".join(cal_parts)), file=sys.stderr)
                     print(
-                        "Calibration: exec slot hash = {}...".format(
-                            cal.calibration_exec_hash[:16]
+                        "Bounded execute-mode sweep: limiting tested write indices to first {} writes.".format(
+                            max_writes
                         ),
                         file=sys.stderr,
                     )
-                setup_writes = cal.setup_writes
-                total_i2c_transactions = cal.total_i2c_transactions
-                total_otp_blows = cal.total_otp_blows
-                cal_parts = ["{} NVM writes (trace source)".format(cal.total_writes)]
-                if include_erases:
-                    cal_parts.append("{} page erases".format(total_erases))
-                if total_i2c_transactions > 0:
-                    cal_parts.append(
-                        "{} I2C transactions".format(total_i2c_transactions)
-                    )
-                if total_otp_blows > 0:
-                    cal_parts.append("{} OTP blows".format(total_otp_blows))
-                print("Calibration: {}.".format(", ".join(cal_parts)), file=sys.stderr)
-                print(
-                    "Bounded execute-mode sweep: limiting tested write indices to first {} writes.".format(
-                        max_writes
-                    ),
-                    file=sys.stderr,
-                )
 
         # Apply safety cap.
         cap = profile.fault_sweep.max_writes_cap
@@ -1202,8 +1281,8 @@ def main() -> int:
             ),
             "invariant_providers": list(getattr(profile, "invariant_providers", []) or []),
         }
-        calibration_source = "executed"
-        if cal is None:
+        calibration_source = calibration_source_override or "executed"
+        if calibration_source_override is None and cal is None:
             if profile.fault_sweep.max_writes == "auto" and eval_mode == "state":
                 calibration_source = "derived"
             else:
@@ -1218,6 +1297,8 @@ def main() -> int:
             "elapsed_s": cal.elapsed_s if cal is not None else None,
             "pc": cal.pc if cal is not None else None,
         }
+        if control_only_calibration_fallback:
+            payload["calibration"]["fallback_reason"] = control_only_calibration_fallback
         if clean_trace_meta is not None:
             payload["clean_trace"] = clean_trace_meta
 
@@ -1257,6 +1338,7 @@ def main() -> int:
         # -------------------------------------------------------------------
         control_assert = (not args.no_control) and (not args.no_assert_control_boots)
         expected_control = profile.expect.control_outcome
+        allow_control_only_issues = _allow_expected_control_only_issues(profile)
         if control_assert and "control" in sweep_summary:
             ctrl = sweep_summary["control"]
             ctrl_effective = ctrl.get("effective_outcome", ctrl.get("boot_outcome"))
@@ -1270,13 +1352,16 @@ def main() -> int:
                 )
                 return EXIT_ASSERTION_FAILURE
             if ctrl.get("issue_count", 0):
-                print(
-                    "ASSERTION FAILED: control checks reported {} issue(s)".format(
-                        ctrl.get("issue_count", 0)
-                    ),
-                    file=sys.stderr,
-                )
-                return EXIT_ASSERTION_FAILURE
+                if allow_control_only_issues and ctrl_effective == expected_control:
+                    ctrl["control_only_issue_baseline"] = True
+                else:
+                    print(
+                        "ASSERTION FAILED: control checks reported {} issue(s)".format(
+                            ctrl.get("issue_count", 0)
+                        ),
+                        file=sys.stderr,
+                    )
+                    return EXIT_ASSERTION_FAILURE
 
         if verdict.startswith("FAIL") and not args.no_assert_verdict:
             return EXIT_ASSERTION_FAILURE

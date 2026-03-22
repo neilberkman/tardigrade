@@ -3646,13 +3646,6 @@ def _parse_residual_image(
             "residual_image.slot: '{}' not found in memory.slots. "
             "Available: {}".format(slot, sorted(slots.keys()))
         )
-    # Validate that the target slot has an image configured.
-    if images is not None and slot not in images:
-        raise ProfileError(
-            "residual_image.slot: '{}' has no image configured in the images "
-            "section. The residual image test requires an actual image in the "
-            "target slot to overwrite the residual data.".format(slot)
-        )
     prior_image = raw.get("prior_image")
     if prior_image:
         prior_image = str(prior_image)
@@ -3665,6 +3658,13 @@ def _parse_residual_image(
     if not prior_image and fill_pattern is None:
         raise ProfileError(
             "residual_image: at least one of prior_image or fill_pattern is required"
+        )
+    # A slot without an actual image is only valid for fill-only modeling.
+    if images is not None and slot not in images and prior_image is not None:
+        raise ProfileError(
+            "residual_image.slot: '{}' has no image configured in the images "
+            "section. prior_image requires an actual image in the target slot "
+            "to overwrite the residual data.".format(slot)
         )
     return ResidualImageConfig(
         slot=slot,

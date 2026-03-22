@@ -30,14 +30,16 @@ def run(cmd: List[str], cwd: Path, check: bool = True) -> subprocess.CompletedPr
     return subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True, check=check)
 
 
-def load_base_payload(base_image: Path) -> bytes:
+def load_base_payload(base_image: Path, header_size: int = 0x200) -> bytes:
     data = base_image.read_bytes()
-    if data[:4] != b"\x3d\xb8\xf3\x96":
-        raise RuntimeError("Unexpected MCUboot header magic in {}".format(base_image))
-    img_size = struct.unpack_from("<I", data, 0x0C)[0]
-    start = 0x200
-    end = start + img_size
-    return data[start:end]
+    if data[:4] == b"\x3d\xb8\xf3\x96":
+        img_size = struct.unpack_from("<I", data, 0x0C)[0]
+        start = header_size
+        end = start + img_size
+        return data[start:end]
+    if len(data) >= header_size and data[:header_size] == (b"\x00" * header_size):
+        return data[header_size:]
+    return data
 
 
 def sign_image(
@@ -60,7 +62,7 @@ def sign_image(
 
     with tempfile.TemporaryDirectory(prefix="pr2206_payload_") as td:
         payload_file = Path(td) / "payload.bin"
-        payload_file.write_bytes(shaped)
+        payload_file.write_bytes((b"\x00" * header_size) + shaped)
         cmd = [
             str(imgtool_python),
             str(imgtool_script),
@@ -73,9 +75,6 @@ def sign_image(
             hex(header_size),
             "--slot-size",
             hex(slot_size),
-            "--pad-header",
-            "--pad",
-            "--confirm",
             "--version",
             version,
             str(payload_file),
@@ -95,19 +94,28 @@ def make_profile(
     bootloader_elf: Path,
     exec_image: Path,
     staging_image: Path,
+    flash_backend: str,
     slot_base_exec: int,
     slot_size_exec: int,
     slot_base_staging: int,
     slot_size_staging: int,
+    update_max_align: Optional[int],
     run_duration: str,
     max_writes_cap: int,
     max_step_limit: int,
 ) -> Dict[str, Any]:
+    update_trigger: Dict[str, Any] = {
+        "type": "mcuboot_trailer_magic",
+        "slot": "staging",
+    }
+    if update_max_align is not None:
+        update_trigger["max_align"] = int(update_max_align)
     return {
         "schema_version": 1,
         "name": profile_name,
-        "description": "Auto-generated PR2206 geometry control probe.",
+        "description": "Auto-generated MCUboot control probe.",
         "platform": "platforms/cortex_m4_flash_fast.repl",
+        "flash_backend": flash_backend,
         "bootloader": {
             "elf": str(bootloader_elf),
             "entry": 0x00000000,
@@ -124,14 +132,11 @@ def make_profile(
             "exec": str(exec_image),
             "staging": str(staging_image),
         },
-        "update_trigger": {
-            "type": "mcuboot_trailer_magic",
-            "slot": "staging",
-            "max_align": 32,
-        },
+        "update_trigger": update_trigger,
         "success_criteria": {
             "vtor_in_slot": "exec",
             "image_hash": True,
+            "image_hash_slot": "exec",
             "expected_image": "staging",
         },
         "fault_sweep": {
@@ -237,6 +242,11 @@ def main() -> int:
         help="Directory for per-run audit JSON files.",
     )
     parser.add_argument(
+        "--base-staging-image",
+        default="results/oss_validation/assets/zephyr_slot1_padded.bin",
+        help="Signed slot image or raw MCUboot-app binary used as the base payload source.",
+    )
+    parser.add_argument(
         "--min-payload",
         type=parse_int,
         default=0x12000,
@@ -311,6 +321,23 @@ def main() -> int:
         help="Lowest payload size to probe when searching for any fixed-bootable point.",
     )
     parser.add_argument(
+        "--flash-backend",
+        default="faultFlash",
+        help="flash_backend value to emit in the temporary profile.",
+    )
+    parser.add_argument(
+        "--sign-align",
+        type=parse_int,
+        default=8,
+        help="Alignment passed to imgtool sign.",
+    )
+    parser.add_argument(
+        "--update-max-align",
+        type=parse_int,
+        default=None,
+        help="Optional update_trigger.max_align override in the temporary profile.",
+    )
+    parser.add_argument(
         "--renode-test",
         default=None,
         help="Path to renode-test.",
@@ -332,8 +359,10 @@ def main() -> int:
     results_dir = (repo_root / args.results_dir).resolve()
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    assets = repo_root / "results" / "oss_validation" / "assets"
-    base_payload = load_base_payload(assets / "zephyr_slot1_padded.bin")
+    base_staging_image = Path(args.base_staging_image)
+    if not base_staging_image.is_absolute():
+        base_staging_image = (repo_root / base_staging_image).resolve()
+    base_payload = load_base_payload(base_staging_image, header_size=0x200)
 
     imgtool_python = repo_root / "third_party" / "zephyr-venv" / "bin" / "python3"
     imgtool_script = repo_root / "third_party" / "zephyr_ws" / "bootloader" / "mcuboot" / "scripts" / "imgtool.py"
@@ -381,7 +410,7 @@ def main() -> int:
                 output_path=image_path,
                 version="1.0.5+{}".format(payload_size),
                 slot_size=slot_size,
-                align=8,
+                align=args.sign_align,
                 header_size=0x200,
                 imgtool_python=imgtool_python,
                 imgtool_script=imgtool_script,
@@ -393,10 +422,12 @@ def main() -> int:
             bootloader_elf=elf,
             exec_image=exec_image,
             staging_image=image_path,
+            flash_backend=args.flash_backend,
             slot_base_exec=slot_exec_base,
             slot_size_exec=slot_size,
             slot_base_staging=slot_staging_base,
             slot_size_staging=slot_size,
+            update_max_align=args.update_max_align,
             run_duration=args.run_duration,
             max_writes_cap=args.max_writes_cap,
             max_step_limit=args.max_step_limit,

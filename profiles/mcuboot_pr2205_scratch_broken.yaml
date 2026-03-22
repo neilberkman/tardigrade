@@ -2,36 +2,37 @@ schema_version: 1
 name: mcuboot_pr2205_scratch_broken
 description: >
   MCUboot swap-scratch BEFORE PR #2205 geometry fix (broken commit c21c3909).
-  This profile uses the nRF52840 reference geometry and is primarily used for
-  differential comparison against the fixed revision. On uniform nRF52 sector
-  geometry the upstream bug does not diverge honestly; tracked in issue #16.
+  Honest trigger on STM32F4 non-uniform flash geometry: slot0 sits on a
+  128 KB sector while slot1 spans 16 KB + 16 KB + 64 KB sectors. The broken
+  find_last_sector_idx logic aborts before any swap writes and never boots an
+  image on this layout.
 
-platform: platforms/cortex_m4_flash_fast.repl
+platform: platforms/stm32f4.repl
 flash_backend: faultFlash
 
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_pr2205_scratch_broken.elf
-  entry: 0x00000000
+  entry: 0x08000000
 
 memory:
   sram: { start: 0x20000000, end: 0x20040000 }
   write_granularity: 4
   slots:
-    exec: { base: 0x0000C000, size: 0x6E000 }
-    staging: { base: 0x0007A000, size: 0x6E000 }
+    exec: { base: 0x08020000, size: 0x20000 }
+    staging: { base: 0x08008000, size: 0x18000 }
 
 images:
-  exec: results/oss_validation/assets/zephyr_slot0_padded.bin
-  staging: results/oss_validation/assets/zephyr_slot1_padded.bin
+  exec: results/oss_validation/assets/zephyr_head_scratch_stm32f4_slot0.bin
+  staging: results/oss_validation/assets/zephyr_head_scratch_stm32f4_slot1.bin
 
 update_trigger:
   type: mcuboot_trailer_magic
   slot: staging
 
-success_criteria:
-  vtor_in_slot: exec
-  image_hash: true
-  expected_image: staging
+# Broken control baseline never reaches a valid image handoff on the honest
+# asymmetric geometry, so boot-outcome classification is the meaningful
+# oracle here rather than VTOR/hash-on-staging success checks.
+success_criteria: {}
 
 fault_sweep:
   mode: runtime
@@ -48,7 +49,11 @@ fault_sweep:
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 
 # Exploratory profile: excluded from strict self-test gating until the uniform-
-# geometry limitation tracked in issue #16 is resolved.
+# geometry limitation tracked in issue #16 was replaced with the STM32F4
+# trigger. Still skipped from local self-test because heavy execute-mode Renode
+# validation belongs on EC2.
 skip_self_test: true
 expect:
+  control_outcome: no_boot
+  allow_control_only_issues: true
   should_find_issues: true

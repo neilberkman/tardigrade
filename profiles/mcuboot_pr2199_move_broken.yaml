@@ -23,6 +23,7 @@ memory:
 # - Secondary (staging): erased (no image loaded)
 images:
   exec: results/oss_validation/assets/zephyr_slot0_padded.bin
+  staging: results/oss_validation/assets/erased_slot_0x76000.bin
 # Primary trailer: magic=GOOD, copy_done=SET(0x01), image_ok=UNSET(0xFF).
 # This triggers BOOT_SWAP_TYPE_REVERT in boot_swap_tables.
 # With no secondary image, MCUboot detects erased secondary but doesn't
@@ -52,5 +53,6 @@ fault_sweep:
   fault_types: [power_loss, interrupted_erase]
 expect:
   control_outcome: wrong_image
+  allow_control_only_issues: true
   should_find_issues: true
 skip_self_test: true

@@ -166,9 +166,6 @@ PY
   --align "${GEOM_ALIGN}" \
   --header-size 0x200 \
   --slot-size 0x6e000 \
-  --pad-header \
-  --pad \
-  --confirm \
   --version 1.0.2+0 \
   /tmp/zephyr_slot1_scratch_geom_payload.bin \
   "${ASSETS_DIR}/zephyr_slot1_scratch_geom_max.bin"
@@ -178,9 +175,6 @@ PY
   --align "${GEOM_ALIGN}" \
   --header-size 0x200 \
   --slot-size 0x76000 \
-  --pad-header \
-  --pad \
-  --confirm \
   --version 1.0.3+0 \
   /tmp/zephyr_slot1_offset_geom_payload.bin \
   "${ASSETS_DIR}/zephyr_slot1_offset_geom_full.bin"

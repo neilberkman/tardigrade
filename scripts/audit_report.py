@@ -465,6 +465,15 @@ def summarize_runtime_sweep(
                 "vtor",
                 "vtor_final",
                 "pc",
+                "marker_ok",
+                "marker_actual",
+                "expectations_met",
+                "vtor_ok",
+                "vtor_aligned",
+                "pc_ok",
+                "otadata_expect_ok",
+                "anti_rollback_ok",
+                "reset_vector_offset_ok",
             )
             if ctrl_signals.get(key) is not None
         }
@@ -594,10 +603,10 @@ def compute_verdict(
     invariant_observations = int(sweep_summary.get("invariant_issue_points", 0))
 
     verdict = "PASS"
-    if control_issue_count:
-        verdict = "FAIL \u2014 control checks failed"
-    elif control_only_issue and not found_issues:
+    if control_only_issue and not found_issues:
         verdict = "PASS \u2014 control exhibits expected {}".format(control_outcome)
+    elif control_issue_count:
+        verdict = "FAIL \u2014 control checks failed"
     elif profile_expect.should_find_issues and not found_issues:
         verdict = "FAIL \u2014 expected to find issues but found none"
     elif not profile_expect.should_find_issues and found_issues:

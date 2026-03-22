@@ -89,6 +89,11 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
             self.assertIn(asset, text)
         self.assertIn("build_pr_differential_assets", text)
         self.assertIn("build_shared_nrf52_test_app", text)
+        self.assertIn("write_stm32f4_pr2205_overlay", text)
+        self.assertIn("stm32f4_pr2205_scratch.dts", text)
+        self.assertIn("nucleo_f429zi", text)
+        self.assertIn("slot1_partition: partition@8000", text)
+        self.assertIn("slot0_partition: partition@20000", text)
         self.assertIn("CONFIG_BOOT_SWAP_USING_SCRATCH=y", text)
         self.assertIn("CONFIG_BOOT_SWAP_USING_OFFSET=y", text)
         self.assertIn("CONFIG_BOOT_PREFER_SWAP_OFFSET=y", text)
@@ -97,6 +102,8 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertIn("PR_DIFF_GEOM_SIGN_OVERHEAD=\"0x400\"", text)
         self.assertIn("local align=\"${5:-${PR_DIFF_GEOM_ALIGN}}\"", text)
         self.assertIn("--align \"${align}\"", text)
+        self.assertNotIn("--pad-header", text)
+        self.assertNotIn("--confirm", text)
         self.assertIn("scratch_with_geom_partition.dts", text)
         self.assertIn("MCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}", text)
         self.assertIn("\"${ASSETS_DIR}/zephyr_slot1_max.bin\" \"8\"", text)
@@ -105,8 +112,16 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertIn("CONFIG_PICOLIBC=n", text)
         self.assertIn('restore_mcuboot_module_yml', text)
         self.assertIn('patch_mcuboot_module_yml', text)
-        self.assertIn('update --narrow -o=--depth=1 zephyr mcuboot hal_nordic cmsis', text)
+        self.assertIn('update --narrow -o=--depth=1 zephyr mcuboot hal_nordic hal_stm32 cmsis', text)
         self.assertIn('fetch --quiet mcu-tools "+refs/pull/${pr}/head:refs/pull/${pr}"', text)
+
+    def test_upgrade_differential_profiles_hash_exec_slot(self) -> None:
+        for relpath in PR_DIFFERENTIAL_PROFILES:
+            with self.subTest(profile=relpath):
+                profile = yaml.safe_load((ROOT / "profiles" / relpath).read_text(encoding="utf-8"))
+                success = profile.get("success_criteria", {})
+                if success.get("expected_image") == "staging":
+                    self.assertEqual(success.get("image_hash_slot"), "exec")
 
     def test_pr_differential_profiles_load_and_reference_existing_assets(self) -> None:
         for relpath in PR_DIFFERENTIAL_PROFILES:

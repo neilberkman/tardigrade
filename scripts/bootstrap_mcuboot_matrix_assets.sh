@@ -239,6 +239,48 @@ EOF
 EOF
 }
 
+write_stm32f4_pr2205_overlay() {
+    mkdir -p "${GENERATED_DIR}"
+    cat > "${GENERATED_DIR}/stm32f4_pr2205_scratch.dts" <<'EOF'
+&flash0 {
+    /delete-node/ partitions;
+
+    partitions {
+        compatible = "fixed-partitions";
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        boot_partition: partition@0 {
+            label = "mcuboot";
+            reg = <0x0 0x08000>;
+        };
+        slot1_partition: partition@8000 {
+            label = "image-1";
+            reg = <0x08000 0x18000>;
+        };
+        slot0_partition: partition@20000 {
+            label = "image-0";
+            reg = <0x20000 0x20000>;
+        };
+        scratch_partition: partition@40000 {
+            label = "image-scratch";
+            reg = <0x40000 0x20000>;
+        };
+        storage_partition: partition@60000 {
+            label = "storage";
+            reg = <0x60000 0xA0000>;
+        };
+    };
+};
+
+/ {
+    chosen {
+        zephyr,code-partition = &boot_partition;
+    };
+};
+EOF
+}
+
 ensure_mcuboot_history() {
     local repo="$1"
     msg "Fetching MCUboot history for differential commit builds"
@@ -297,9 +339,6 @@ sign_pr_differential_geom_image() {
         --align "${align}" \
         --header-size 0x200 \
         --slot-size "${slot_size}" \
-        --pad-header \
-        --pad \
-        --confirm \
         --version "${version}" \
         "${payload_bin}" "${out_path}"
 }
@@ -389,6 +428,7 @@ build_pr_differential_elfs() {
     mkdir -p "${ASSETS_DIR}" "${BUILD_ROOT}" "${GENERATED_DIR}"
     write_nrf52_default_overlays
     write_nrf52_pr_differential_overlays
+    write_stm32f4_pr2205_overlay
     ensure_mcuboot_history "${MCUBOOT_DIR}"
     local missing=false
     for sha in \
@@ -428,8 +468,9 @@ build_pr_differential_elfs() {
     build_pr_bootloader_variant() {
         local name="$1"
         local src="$2"
-        local overlay="$3"
-        shift 3
+        local board="$3"
+        local overlay="$4"
+        shift 4
         local extra_cmake=("$@")
         local out_build="${BUILD_ROOT}/${name}"
         local out_elf="${ASSETS_DIR}/oss_mcuboot_${name}.elf"
@@ -442,7 +483,7 @@ build_pr_differential_elfs() {
             "${WEST}" build \
                 -d "${out_build}" \
                 -p always \
-                -b nrf52840dk/nrf52840 \
+                -b "${board}" \
                 "${src}/boot/zephyr" \
                 -- \
                 -DDTC_OVERLAY_FILE="${overlay}" \
@@ -461,35 +502,36 @@ build_pr_differential_elfs() {
     local scratch_overlay="${GENERATED_DIR}/scratch_with_code_partition.dts"
     local scratch_geom_overlay="${GENERATED_DIR}/scratch_with_geom_partition.dts"
     local offset_overlay="${GENERATED_DIR}/nrf52_move_bootloader.overlay"
-    build_pr_bootloader_variant "pr2205_scratch_broken" "${wt_root}/pr2205_broken" "${scratch_overlay}" \
+    local stm32f4_pr2205_overlay="${GENERATED_DIR}/stm32f4_pr2205_scratch.dts"
+    build_pr_bootloader_variant "pr2205_scratch_broken" "${wt_root}/pr2205_broken" "nucleo_f429zi" "${stm32f4_pr2205_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
-    build_pr_bootloader_variant "pr2205_scratch_fixed" "${wt_root}/pr2205_fixed" "${scratch_overlay}" \
+    build_pr_bootloader_variant "pr2205_scratch_fixed" "${wt_root}/pr2205_fixed" "nucleo_f429zi" "${stm32f4_pr2205_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
-    build_pr_bootloader_variant "pr2206_scratch_broken" "${wt_root}/pr2206_broken" "${scratch_overlay}" \
+    build_pr_bootloader_variant "pr2206_scratch_broken" "${wt_root}/pr2206_broken" "nrf52840dk/nrf52840" "${scratch_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
-    build_pr_bootloader_variant "pr2206_scratch_fixed" "${wt_root}/pr2206_fixed" "${scratch_overlay}" \
+    build_pr_bootloader_variant "pr2206_scratch_fixed" "${wt_root}/pr2206_fixed" "nrf52840dk/nrf52840" "${scratch_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
-    build_pr_bootloader_variant "pr2206_scratch_geom_broken" "${wt_root}/pr2206_broken" "${scratch_geom_overlay}" \
+    build_pr_bootloader_variant "pr2206_scratch_geom_broken" "${wt_root}/pr2206_broken" "nrf52840dk/nrf52840" "${scratch_geom_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
         "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}" \
         -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
         -DCONFIG_BOOT_MAX_IMG_SECTORS=1024
-    build_pr_bootloader_variant "pr2206_scratch_geom_fixed" "${wt_root}/pr2206_fixed" "${scratch_geom_overlay}" \
+    build_pr_bootloader_variant "pr2206_scratch_geom_fixed" "${wt_root}/pr2206_fixed" "nrf52840dk/nrf52840" "${scratch_geom_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
         "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}" \
         -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
         -DCONFIG_BOOT_MAX_IMG_SECTORS=1024
-    build_pr_bootloader_variant "pr2214_offset_broken" "${wt_root}/pr2214_broken" "${offset_overlay}" \
+    build_pr_bootloader_variant "pr2214_offset_broken" "${wt_root}/pr2214_broken" "nrf52840dk/nrf52840" "${offset_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
         -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y
-    build_pr_bootloader_variant "pr2214_offset_fixed" "${wt_root}/pr2214_fixed" "${offset_overlay}" \
+    build_pr_bootloader_variant "pr2214_offset_fixed" "${wt_root}/pr2214_fixed" "nrf52840dk/nrf52840" "${offset_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
         -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y
-    build_pr_bootloader_variant "pr2214_offset_geom_broken" "${wt_root}/pr2214_broken" "${offset_overlay}" \
+    build_pr_bootloader_variant "pr2214_offset_geom_broken" "${wt_root}/pr2214_broken" "nrf52840dk/nrf52840" "${offset_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
         -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y \
         "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}"
-    build_pr_bootloader_variant "pr2214_offset_geom_fixed" "${wt_root}/pr2214_fixed" "${offset_overlay}" \
+    build_pr_bootloader_variant "pr2214_offset_geom_fixed" "${wt_root}/pr2214_fixed" "nrf52840dk/nrf52840" "${offset_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
         -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y \
         "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}"
@@ -596,13 +638,13 @@ else
     msg "Zephyr workspace already initialized"
 fi
 
-# --- 3. Fetch only the Zephyr/MCUboot projects needed for nRF52 builds ---
+# --- 3. Fetch only the Zephyr/MCUboot projects needed for the differential corpus ---
 if [[ -d "${MCUBOOT_DIR}/.git" ]]; then
     restore_mcuboot_module_yml
 fi
-msg "Running targeted west update (zephyr + mcuboot + nrf deps)"
+msg "Running targeted west update (zephyr + mcuboot + nrf/stm32 deps)"
 ( cd "${ZEPHYR_WS}" && \
-  "${WEST}" update --narrow -o=--depth=1 zephyr mcuboot hal_nordic cmsis )
+  "${WEST}" update --narrow -o=--depth=1 zephyr mcuboot hal_nordic hal_stm32 cmsis )
 
 # --- 4. Add upstream MCUboot remote for commit checkouts ---
 if [[ ! -d "${MCUBOOT_DIR}" ]]; then

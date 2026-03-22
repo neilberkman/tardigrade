@@ -142,6 +142,15 @@ class TestParseResidualImage(unittest.TestCase):
         with self.assertRaises(ProfileError):
             _parse_residual_image(raw, self._slots(), images=images)
 
+    def test_fill_only_slot_with_no_image_is_allowed(self):
+        raw = {"slot": "staging", "fill_pattern": "0xFF"}
+        images = {"exec": "firmware.bin"}  # staging has no image
+        result = _parse_residual_image(raw, self._slots(), images=images)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.slot, "staging")
+        self.assertIsNone(result.prior_image)
+        self.assertEqual(result.fill_pattern, 0xFF)
+
     def test_slot_with_image_ok(self):
         raw = {"slot": "staging", "prior_image": "old.bin"}
         images = {"staging": "firmware.bin"}
@@ -233,6 +242,14 @@ class TestResidualImageProfileLoading(unittest.TestCase):
         self.assertEqual(profile.residual_image.slot, "staging")
         self.assertEqual(profile.residual_image.fill_pattern, 0x00)
         self.assertEqual(profile.success_criteria.max_reset_vector_offset, 248)
+
+    def test_load_pr2199_profile_uses_explicit_erased_staging_asset(self):
+        profile_path = ROOT / "profiles" / "mcuboot_pr2199_move_broken.yaml"
+        if not profile_path.exists():
+            self.skipTest("Profile not found")
+        profile = load_profile(profile_path)
+        self.assertIsNone(profile.residual_image)
+        self.assertTrue(profile.images["staging"].endswith("erased_slot_0x76000.bin"))
 
 
 # ---------------------------------------------------------------------------

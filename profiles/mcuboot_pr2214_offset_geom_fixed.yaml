@@ -32,6 +32,7 @@ update_trigger:
 success_criteria:
   vtor_in_slot: exec
   image_hash: true
+  image_hash_slot: exec
   expected_image: staging
 
 fault_sweep:

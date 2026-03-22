@@ -187,6 +187,38 @@ class BusFaultClassificationTest(unittest.TestCase):
         self.assertFalse(result_has_issues(r, "success"))
         self.assertFalse(result_is_brick(r))
 
+    def test_content_criteria_failure_counts_even_when_wrong_image_expected(self):
+        r = {
+            "boot_outcome": "wrong_image",
+            "boot_slot": "exec",
+            "signals": {
+                "marker_ok": False,
+                "marker_actual": "0xF395C277",
+                "expectations_met": False,
+                "vtor_ok": True,
+                "vtor_aligned": True,
+                "pc_ok": True,
+            },
+        }
+        reasons = result_issue_reasons(r, "wrong_image")
+        self.assertIn("content_criteria", reasons)
+        self.assertTrue(result_has_issues(r, "wrong_image"))
+
+    def test_marker_ok_true_does_not_create_spurious_issue(self):
+        r = {
+            "boot_outcome": "wrong_image",
+            "boot_slot": "exec",
+            "signals": {
+                "marker_ok": True,
+                "marker_actual": "0xFFFFFFFF",
+                "expectations_met": True,
+                "vtor_ok": True,
+                "vtor_aligned": True,
+                "pc_ok": True,
+            },
+        }
+        self.assertEqual(result_issue_reasons(r, "wrong_image"), [])
+
     def test_bus_fault_with_invariant_not_counted(self):
         """bus_fault suppresses ALL issue reasons — including invariant."""
         r = {
