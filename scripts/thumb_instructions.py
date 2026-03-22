@@ -1,26 +1,26 @@
 """Helpers for Thumb instruction-width aware instruction-skip planning."""
 
-from __future__ import annotations
+try:
+    from functools import lru_cache
+except ImportError:
+    def lru_cache(maxsize=None):  # type: ignore[override]
+        def decorator(func):
+            return func
+        return decorator
 
-from functools import lru_cache
-from typing import Callable, Dict, List, Tuple
 
-
-HalfwordReader = Callable[[int], int]
-
-
-def is_thumb_32bit_first_halfword(halfword: int) -> bool:
+def is_thumb_32bit_first_halfword(halfword):
     """Return True when *halfword* starts a 32-bit Thumb instruction."""
     top5 = (int(halfword) >> 11) & 0x1F
     return top5 in (0b11101, 0b11110, 0b11111)
 
 
-def thumb_instruction_halfword_width(halfword: int) -> int:
+def thumb_instruction_halfword_width(halfword):
     """Return instruction width in 16-bit halfwords."""
     return 2 if is_thumb_32bit_first_halfword(halfword) else 1
 
 
-def is_thumb_second_halfword(read_halfword: HalfwordReader, addr: int) -> bool:
+def is_thumb_second_halfword(read_halfword, addr):
     """Return True when *addr* points at the second halfword of a 32-bit instruction."""
     if int(addr) < 2:
         return False
@@ -31,12 +31,7 @@ def is_thumb_second_halfword(read_halfword: HalfwordReader, addr: int) -> bool:
     return is_thumb_32bit_first_halfword(prev)
 
 
-def instruction_sequence_fits(
-    read_halfword: HalfwordReader,
-    start_addr: int,
-    region_end: int,
-    instruction_count: int,
-) -> bool:
+def instruction_sequence_fits(read_halfword, start_addr, region_end, instruction_count):
     """Return True when *instruction_count* whole instructions fit before *region_end*."""
     cur = int(start_addr)
     stop = int(region_end)
@@ -54,15 +49,9 @@ def instruction_sequence_fits(
     return True
 
 
-def enumerate_instruction_skip_addresses(
-    read_halfword: HalfwordReader,
-    region_start: int,
-    region_end: int,
-    *,
-    skip_count: int = 1,
-) -> List[int]:
+def enumerate_instruction_skip_addresses(read_halfword, region_start, region_end, skip_count=1):
     """Enumerate valid instruction-skip start addresses for a Thumb code region."""
-    addrs: List[int] = []
+    addrs = []
     start = int(region_start)
     end = int(region_end)
     count = max(1, int(skip_count))
@@ -79,17 +68,16 @@ def enumerate_instruction_skip_addresses(
 
 
 def build_instruction_skip_patch_plan(
-    read_halfword: HalfwordReader,
-    skip_addr: int,
-    skip_count: int,
-    *,
-    patch_model: str = "nop",
-    branch_inverter: Callable[[int], int | None] | None = None,
-) -> Dict[str, object]:
+    read_halfword,
+    skip_addr,
+    skip_count,
+    patch_model="nop",
+    branch_inverter=None,
+):
     """Plan the halfword patch set for an instruction-skip fault."""
-    original_halfwords: List[int] = []
-    patched_halfwords: List[int] = []
-    patched_addresses: List[int] = []
+    original_halfwords = []
+    patched_halfwords = []
+    patched_addresses = []
     model = str(patch_model or "nop").strip().lower() or "nop"
     count = max(1, int(skip_count))
 
@@ -166,10 +154,10 @@ def build_instruction_skip_patch_plan(
 
 
 @lru_cache(maxsize=None)
-def _load_elf_segments(elf_path: str) -> Tuple[Tuple[int, int, bytes], ...]:
+def _load_elf_segments(elf_path):
     from elftools.elf.elffile import ELFFile  # type: ignore[import-untyped]
 
-    segments: List[Tuple[int, int, bytes]] = []
+    segments = []
     with open(elf_path, "rb") as handle:
         elf = ELFFile(handle)
         for seg in elf.iter_segments():
@@ -180,11 +168,11 @@ def _load_elf_segments(elf_path: str) -> Tuple[Tuple[int, int, bytes], ...]:
     return tuple(segments)
 
 
-def make_elf_halfword_reader(elf_path: str) -> HalfwordReader:
+def make_elf_halfword_reader(elf_path):
     """Return a callable that reads little-endian Thumb halfwords from *elf_path*."""
     segments = _load_elf_segments(str(elf_path))
 
-    def read_halfword(addr: int) -> int:
+    def read_halfword(addr):
         target = int(addr)
         for seg_start, seg_end, seg_data in segments:
             if target < seg_start or target + 2 > seg_end:
