@@ -1180,6 +1180,74 @@ class DiscoveryFeaturesTest(unittest.TestCase):
 
             self.assertEqual(result["boot_outcome"], "success")
 
+    def test_run_single_point_control_uses_robot_timeout_as_process_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: control_timeout_profile
+                description: cleanup
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            observed_timeouts = []
+
+            def fake_run(cmd, *, cwd, env, timeout_s):
+                observed_timeouts.append(timeout_s)
+                self.assertIn("TEST_TIMEOUT:45 minutes", cmd)
+                result_token = next(
+                    cmd[i + 1]
+                    for i, token in enumerate(cmd[:-1])
+                    if token == "--variable" and cmd[i + 1].startswith("RESULT_FILE:")
+                )
+                result_file = Path(result_token.split(":", 1)[1])
+                result_file.parent.mkdir(parents=True, exist_ok=True)
+                result_file.write_text(
+                    '{"boot_outcome":"success","fault_injected":false}',
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.dict(
+                os.environ,
+                {"OTA_RENODE_ROBOT_TIMEOUT_MINUTES": "45"},
+                clear=False,
+            ):
+                with mock.patch("renode_runner.run_renode_subprocess", side_effect=fake_run):
+                    result = run_single_point(
+                        repo_root=ROOT,
+                        renode_test="renode-test",
+                        robot_suite="tests/ota_fault_point.robot",
+                        profile=profile,
+                        fault_at=1000000,
+                        robot_vars=[],
+                        work_dir=tempdir / "work",
+                        renode_remote_server_dir="",
+                        is_control=True,
+                        keep_run_artifacts=False,
+                    )
+
+            self.assertEqual(result["boot_outcome"], "success")
+            self.assertEqual(observed_timeouts, [4050.0])
+
     def test_run_batches_chunked_emits_progress(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)

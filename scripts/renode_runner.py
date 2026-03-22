@@ -445,6 +445,13 @@ def run_single_point(
     timeout_s = parse_renode_point_timeout(env)
     if calibration and timeout_s is not None:
         timeout_s = max(timeout_s, 900.0)
+    if robot_timeout_override_m is not None:
+        robot_timeout_s = float(robot_timeout_override_m) * 60.0
+        timeout_s = (
+            robot_timeout_s
+            if timeout_s is None
+            else max(timeout_s, robot_timeout_s)
+        )
     process_timeout_s = _renode_process_timeout(timeout_s)
 
     try:
