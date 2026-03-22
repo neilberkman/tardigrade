@@ -8,6 +8,7 @@ validated findings.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -577,7 +578,12 @@ def validate_runtime_findings(
     def annotate_checks(items: List[Dict[str, Any]]) -> None:
         annotate_result_checks(items, profile)
 
-    for result in results:
+    # Separate instruction-skip findings (need Renode reruns, slow) from
+    # others (instant, no Renode). Instruction-skip validations are
+    # parallelized with ThreadPoolExecutor since each spawns a subprocess
+    # and Python's GIL doesn't block subprocess.Popen I/O.
+    iskip_items = []  # (index_into_results, result_dict)
+    for idx, result in enumerate(results):
         if result.get("is_control", False):
             continue
         if not result.get("fault_injected", False):
@@ -587,17 +593,13 @@ def validate_runtime_findings(
 
         base_code = _base_fault_type_code(result.get("fault_type"))
         if base_code == "i":
-            validation = _validate_instruction_skip(
-                result,
-                expected_outcome=expected_outcome,
-                rerun_point=rerun_point,
-                annotate_checks=annotate_checks,
-            )
+            iskip_items.append((idx, result))
         elif base_code in _NON_POWER_WRITE_FAULT_CODES:
             validation = _validate_write_fault(
                 result,
                 expected_outcome=expected_outcome,
             )
+            _apply_validation(result, validation)
         else:
             security_property = _security_property(result, expected_outcome)
             validation = _build_validation(
@@ -620,4 +622,45 @@ def validate_runtime_findings(
                 },
                 skeptical_summary="Validated: the end-to-end failure already reflects the declared fault model and no specialized skeptic rerun is required for this fault class.",
             )
-        _apply_validation(result, validation)
+            _apply_validation(result, validation)
+
+    if not iskip_items:
+        return
+
+    # Parallelize instruction-skip validation.  Each validation spawns
+    # 2 Renode processes (NOP + branch_invert) via subprocesses, so
+    # threads are fine (GIL released during subprocess I/O).
+    import os
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    max_workers = int(os.environ.get("OTA_VALIDATION_WORKERS", "8"))
+
+    def _validate_one(item):
+        _idx, _result = item
+        return _idx, _validate_instruction_skip(
+            _result,
+            expected_outcome=expected_outcome,
+            rerun_point=rerun_point,
+            annotate_checks=annotate_checks,
+        )
+
+    sys.stderr.write(
+        "[finding_validator] Validating {} instruction-skip findings "
+        "with {} parallel workers\n".format(len(iskip_items), max_workers)
+    )
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_validate_one, item): item
+            for item in iskip_items
+        }
+        done_count = 0
+        for future in as_completed(futures):
+            idx, validation = future.result()
+            _apply_validation(results[idx], validation)
+            done_count += 1
+            if done_count % 10 == 0 or done_count == len(iskip_items):
+                sys.stderr.write(
+                    "[finding_validator] {}/{} validations complete\n".format(
+                        done_count, len(iskip_items)
+                    )
+                )
