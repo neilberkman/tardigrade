@@ -81,6 +81,8 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("resume_trace_time_slice = get_optional_var('resume_trace_time_slice', '0.02')", text)
         self.assertIn("calibration_time_slice = get_optional_var('calibration_time_slice', '0.02')", text)
+        self.assertIn("zero_point_execute_control = get_optional_var(", text)
+        self.assertIn(").strip().lower() in ('1', 'true', 'yes')", text)
         self.assertIn("phase1_time_slice = get_optional_var('phase1_time_slice', '0.02')", text)
         self.assertIn("phase2_time_slice = get_optional_var('phase2_time_slice', '0.05')", text)
 
@@ -123,6 +125,11 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
             "Run Keyword If    '${PHASE1_TIME_SLICE}' != ''    Execute Command    $phase1_time_slice=\"${PHASE1_TIME_SLICE}\"",
             text,
         )
+        self.assertIn("${ZERO_POINT_EXECUTE_CONTROL}  false", text)
+        self.assertIn(
+            'Execute Command    $zero_point_execute_control="${ZERO_POINT_EXECUTE_CONTROL}"',
+            text,
+        )
 
     def test_robot_suite_forwards_platform_repl(self) -> None:
         text = ROBOT_PATH.read_text(encoding="utf-8")
@@ -156,8 +163,9 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
             ),
         )
 
-    def test_control_phase1_uses_default_progress_mode(self) -> None:
+    def test_control_phase1_switches_to_read_only_progress_for_zero_point_execute(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("control_expect_writes = not zero_point_execute_control", text)
         self.assertRegex(
             text,
             re.compile(
@@ -165,9 +173,29 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
                 r"\s+cpu_ref,\n"
                 r"\s+label='control_p1',\n"
                 r"\s+stop_on_fault=False,\n"
+                r"\s+expect_writes=control_expect_writes,\n"
+                r"\s+zero_writes_is_brick=control_expect_writes,\n"
                 r"\s+max_iters=p1_max_iters,\n"
             ),
         )
+
+    def test_zero_point_execute_control_flag_parses_to_boolean(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        match = re.search(
+            r"zero_point_execute_control = get_optional_var\(\n"
+            r"\s+'zero_point_execute_control', 'false'\n"
+            r"\s*\)\.strip\(\)\.lower\(\) in \('1', 'true', 'yes'\)",
+            text,
+        )
+        self.assertIsNotNone(match)
+
+        ns = {"get_optional_var": lambda _name, default="": "true"}
+        exec(match.group(0), ns)
+        self.assertIs(ns["zero_point_execute_control"], True)
+
+        ns = {"get_optional_var": lambda _name, default="": "false"}
+        exec(match.group(0), ns)
+        self.assertIs(ns["zero_point_execute_control"], False)
 
     def test_run_until_done_tracks_pc_progress_for_read_only_control_runs(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
