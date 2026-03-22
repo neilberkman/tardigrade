@@ -410,6 +410,7 @@ fault_sweep:
       - { start: 0x00000100, end: 0x00000400 }
       - { start: 0x00001000, end: 0x00001200 }
     skip_count: 1
+    severity_model: security
 ```
 
 Each `target_addresses` entry may be either an explicit `{ start, end }` range or a `{ symbol }` query. `symbol` specs support two matching modes: plain strings use substring matching (`{ symbol: Validate }` matches every function whose name contains `Validate`), while fnmatch glob patterns use case-sensitive glob matching (`{ symbol: "bootutil_img_validate*" }` matches `bootutil_img_validate` and `bootutil_img_validate_encrypted_uniflash` but not `do_bootutil_img_validate`). A string is treated as a glob if it contains `*`, `?`, or `[`. Mixed lists are supported.
@@ -421,6 +422,28 @@ When a symbol matches multiple functions, tardigrade includes every matching ran
 Instruction-skip fault points are always run in execute mode (full CPU boot) -- trace replay is not applicable since the fault is CPU-level, not NVM-level.
 
 To find good target ranges, disassemble your bootloader ELF and identify critical code paths: hash validation, signature checks, version comparisons, or metadata parsing. Narrow ranges produce faster sweeps; whole-function ranges give broader coverage.
+
+`severity_model` controls whether crash-only instruction skips are treated as informational noise or as findings:
+
+- `security` (default): only `security_bypass` outcomes count as findings. Crash-only results are reported as `dos_crash` / `dos_recovery` advisories and do not fail the verdict.
+- `availability`: crash-only instruction skips remain findings. Use this for safety-critical systems where denial of service is itself unacceptable.
+
+```yaml
+fault_sweep:
+  fault_types: [instruction_skip]
+  instruction_skip_config:
+    target_addresses:
+      - { symbol: bootutil_img_validate }
+    severity_model: availability
+```
+
+With the default `security` model, a hardened bootloader can produce a verdict like:
+
+```text
+PASS — 0 security bypass points (253 DoS crash points, expected for glitch model)
+```
+
+Only true bypasses such as `wrong_image`, `rollback_accepted`, or equivalent verification escapes fail the sweep.
 
 #### Verification probes
 

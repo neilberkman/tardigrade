@@ -1,0 +1,13 @@
+base_profile: nxboot_style_instruction_skip.yaml
+name: nxboot_style_instruction_skip_severity
+description: >
+  Instruction-skip severity example for an nxboot-style bootloader with no
+  defense-in-depth around image validation. This profile keeps the default
+  security-focused severity model, so only wrong-image outcomes count as
+  findings while crash-only skips are advisory noise.
+fault_sweep:
+  instruction_skip_config:
+    severity_model: security
+skip_self_test: true
+expect:
+  should_find_issues: true

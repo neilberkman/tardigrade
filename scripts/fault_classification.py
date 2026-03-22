@@ -18,12 +18,79 @@ _NON_REPORTABLE_VALIDATION_DISPOSITIONS = frozenset(
         "self_healed",
         "defense_in_depth",
         "no_verification_bypass",
+        "dos_only",
         "low_confidence",
         "model_specific_candidate",
         "needs_mechanism_confirmation",
     }
 )
 _NON_REPORTABLE_VALIDATION_STAGES = frozenset({"candidate", "dismissed"})
+_INSTRUCTION_SKIP_DOS_OUTCOMES = frozenset(
+    {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor", "config_crash", "bus_fault"}
+)
+_INSTRUCTION_SKIP_SECURITY_OUTCOMES = frozenset(
+    {"wrong_image", "rollback_accepted", "toctou_corruption"}
+)
+
+
+def _base_fault_type_code(result: Dict[str, Any]) -> str:
+    raw = str(result.get("fault_type") or "").strip().lower()
+    if not raw:
+        return ""
+    return raw.split(":", 1)[0]
+
+
+def instruction_skip_severity_model(result: Dict[str, Any], default: str = "security") -> str:
+    raw = str(result.get("instruction_skip_severity_model") or default or "security").strip().lower()
+    return raw if raw in {"security", "availability"} else "security"
+
+
+def classify_instruction_skip_severity(
+    result: Dict[str, Any],
+    expected_outcome: str = "success",
+) -> Optional[Dict[str, str]]:
+    if _base_fault_type_code(result) != "i":
+        return None
+
+    eff_outcome, _ = _effective_boot_result(result)
+    effective = str(eff_outcome or "unknown").strip().lower()
+    raw_outcome = str(
+        result.get("initial_boot_outcome") or result.get("boot_outcome") or effective
+    ).strip().lower()
+    expected = str(expected_outcome or "success").strip().lower()
+
+    if effective in _INSTRUCTION_SKIP_SECURITY_OUTCOMES or raw_outcome in _INSTRUCTION_SKIP_SECURITY_OUTCOMES:
+        return {
+            "severity": "security_bypass",
+            "severity_rationale": "Bootloader jumped to unvalidated or policy-rejected firmware after a single instruction skip.",
+        }
+    if raw_outcome in _INSTRUCTION_SKIP_DOS_OUTCOMES or effective in _INSTRUCTION_SKIP_DOS_OUTCOMES:
+        if effective == expected and raw_outcome in _INSTRUCTION_SKIP_DOS_OUTCOMES:
+            return {
+                "severity": "dos_recovery",
+                "severity_rationale": "Instruction skip caused a transient denial of service but the device recovered on a later boot.",
+            }
+        return {
+            "severity": "dos_crash",
+            "severity_rationale": "CPU crash or hang from a skipped instruction caused denial of service without booting the wrong firmware.",
+        }
+    return None
+
+
+def annotate_instruction_skip_severity(
+    result: Dict[str, Any],
+    *,
+    expected_outcome: str = "success",
+    default_model: str = "security",
+) -> Optional[Dict[str, str]]:
+    result["instruction_skip_severity_model"] = instruction_skip_severity_model(
+        result, default=default_model
+    )
+    severity_info = classify_instruction_skip_severity(result, expected_outcome=expected_outcome)
+    if severity_info is not None:
+        result["severity"] = severity_info["severity"]
+        result["severity_rationale"] = severity_info["severity_rationale"]
+    return severity_info
 
 
 def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
@@ -129,6 +196,11 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
     reasons: List[str] = []
     if result_is_invalidated_finding(result):
         return reasons
+    iskip = classify_instruction_skip_severity(result, expected_outcome=expected_outcome)
+    if iskip is not None:
+        model = instruction_skip_severity_model(result)
+        if model == "security" and iskip["severity"] in {"dos_crash", "dos_recovery"}:
+            return reasons
     eff_outcome, _ = _effective_boot_result(result)
     # bus_fault is safe denial-of-service (HardFault on real silicon) — not
     # a security finding.  The bootloader crashed before reaching
@@ -206,6 +278,9 @@ def result_is_timeout(result: Dict[str, Any]) -> bool:
 def result_is_brick(result: Dict[str, Any]) -> bool:
     if result_is_invalidated_finding(result):
         return False
+    iskip = classify_instruction_skip_severity(result)
+    if iskip is not None and iskip["severity"] in {"dos_crash", "dos_recovery"}:
+        return False
     eff_outcome, _ = _effective_boot_result(result)
     outcome = str(eff_outcome or "unknown").strip().lower()
     # "timeout" is NOT a brick — the bootloader was still working when
@@ -240,6 +315,8 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
         return "defense_in_depth"
     if disposition == "no_verification_bypass":
         return "defense_in_depth"
+    if disposition == "dos_only":
+        return "safe_dos"
     if disposition == "low_confidence":
         return "low_confidence"
     if disposition == "model_specific_candidate":
@@ -270,6 +347,9 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
 
     eff_outcome, _ = _effective_boot_result(result)
     outcome = str(eff_outcome or "unknown").strip().lower()
+    iskip = classify_instruction_skip_severity(result)
+    if iskip is not None and iskip["severity"] in {"dos_crash", "dos_recovery"}:
+        return "safe_dos"
     if outcome == "config_lost":
         return "config_lost"
     if outcome == "config_crash":

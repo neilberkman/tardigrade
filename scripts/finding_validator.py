@@ -14,6 +14,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 from fault_classification import (
     _effective_boot_result,
+    annotate_instruction_skip_severity,
+    classify_instruction_skip_severity,
+    instruction_skip_severity_model,
     result_has_issues,
     result_is_brick,
 )
@@ -239,6 +242,8 @@ def _build_validation(
     reasons: Optional[List[str]] = None,
     reruns: Optional[Dict[str, Any]] = None,
     skeptical_summary: str = "",
+    severity: Optional[str] = None,
+    severity_rationale: str = "",
 ) -> Dict[str, Any]:
     if stage not in _VALIDATION_STAGES:
         raise ValueError("unknown validation stage {!r}".format(stage))
@@ -259,6 +264,8 @@ def _build_validation(
         "reasons": reasons or [],
         "reruns": reruns or {},
         "skeptical_summary": skeptical_summary,
+        "severity": severity,
+        "severity_rationale": severity_rationale,
     }
 
 
@@ -269,6 +276,8 @@ def _validate_instruction_skip(
     rerun_point: Callable[[int, str, Optional[List[str]]], Dict[str, Any]],
     annotate_checks: Callable[[List[Dict[str, Any]]], None],
 ) -> Dict[str, Any]:
+    severity_info = classify_instruction_skip_severity(result, expected_outcome=expected_outcome)
+    severity_model = instruction_skip_severity_model(result)
     skip_addr = _extract_instruction_skip_addr(result)
     glitch_models: Dict[str, str] = {
         "nop": "not_tested",
@@ -288,25 +297,10 @@ def _validate_instruction_skip(
     }
     if probe_summary is not None:
         counterfactuals["defense_chain"] = probe_summary.get("classification")
-    if skip_addr is None:
-        return _build_validation(
-            stage="candidate",
-            disposition="needs_mechanism_confirmation",
-            fault_type=result.get("fault_type"),
-            expected_outcome=expected_outcome,
-            security_property=security_property,
-            glitch_models=glitch_models,
-            glitch_realism="plausible",
-            defense_in_depth="unknown",
-            counterfactuals=counterfactuals,
-            negative_evidence=["instruction skip address could not be resolved for replay"],
-            reasons=["instruction_skip_address_unknown"],
-            skeptical_summary="Candidate only: instruction skip address was not resolvable, so the validator could not replay a realistic skip model.",
-        )
-
-    if probe_summary is not None:
         if probe_summary.get("bypass_detected"):
             glitch_models["nop"] = "bypass"
+
+    if probe_summary is not None:
         if probe_summary.get("classification") == "first_layer_breached_second_caught":
             bypassed = probe_summary.get("bypassed_labels") or []
             negative_evidence.append(
@@ -327,6 +321,8 @@ def _validate_instruction_skip(
                 negative_evidence=negative_evidence,
                 reasons=["verification_probe_later_layer_caught_fault"],
                 skeptical_summary="Dismissed: the instruction skip breached an earlier verification layer, but a later verification layer still rejected the faulted path.",
+                severity=(severity_info or {}).get("severity"),
+                severity_rationale=(severity_info or {}).get("severity_rationale"),
             )
         if probe_summary.get("classification") in {
             "first_layer_held",
@@ -348,7 +344,73 @@ def _validate_instruction_skip(
                 negative_evidence=negative_evidence,
                 reasons=["verification_probe_no_first_layer_bypass"],
                 skeptical_summary="Dismissed: the instruction skip did not produce a successful return from the targeted first verification layer.",
+                severity=(severity_info or {}).get("severity"),
+                severity_rationale=(severity_info or {}).get("severity_rationale"),
             )
+
+    if severity_info is not None and severity_info["severity"] in {"dos_crash", "dos_recovery"}:
+        if severity_model == "availability":
+            return _build_validation(
+                stage="validated",
+                disposition="confirmed",
+                fault_type=result.get("fault_type"),
+                expected_outcome=expected_outcome,
+                security_property="availability",
+                glitch_models={
+                    "nop": glitch_models["nop"],
+                    "register_zero": "not_available",
+                    "branch_invert": "not_tested",
+                    "arbitrary_patch": "not_available",
+                },
+                glitch_realism="common",
+                defense_in_depth=(
+                    (probe_summary or {}).get("defense_in_depth") or "not_applicable"
+                ),
+                counterfactuals=counterfactuals,
+                negative_evidence=negative_evidence,
+                reasons=[severity_info["severity"]],
+                skeptical_summary="Validated as an availability finding: the instruction skip caused denial of service without needing replay confirmation.",
+                severity=severity_info["severity"],
+                severity_rationale=severity_info["severity_rationale"],
+            )
+        return _build_validation(
+            stage="dismissed",
+            disposition="dos_only",
+            fault_type=result.get("fault_type"),
+            expected_outcome=expected_outcome,
+            security_property="availability",
+            glitch_models={
+                "nop": glitch_models["nop"],
+                "register_zero": "not_available",
+                "branch_invert": "not_tested",
+                "arbitrary_patch": "not_available",
+            },
+            glitch_realism="common",
+            defense_in_depth=((probe_summary or {}).get("defense_in_depth") or "not_applicable"),
+            counterfactuals=counterfactuals,
+            negative_evidence=negative_evidence,
+            reasons=[severity_info["severity"]],
+            skeptical_summary="Dismissed as security noise: the instruction skip caused denial of service but did not boot the wrong firmware.",
+            severity=severity_info["severity"],
+            severity_rationale=severity_info["severity_rationale"],
+        )
+    if skip_addr is None:
+        return _build_validation(
+            stage="candidate",
+            disposition="needs_mechanism_confirmation",
+            fault_type=result.get("fault_type"),
+            expected_outcome=expected_outcome,
+            security_property=security_property,
+            glitch_models=glitch_models,
+            glitch_realism="plausible",
+            defense_in_depth="unknown",
+            counterfactuals=counterfactuals,
+            negative_evidence=["instruction skip address could not be resolved for replay"],
+            reasons=["instruction_skip_address_unknown"],
+            skeptical_summary="Candidate only: instruction skip address was not resolvable, so the validator could not replay a realistic skip model.",
+            severity=(severity_info or {}).get("severity"),
+            severity_rationale=(severity_info or {}).get("severity_rationale"),
+        )
 
     model_fault_types = {
         "nop": "i:0x{:X}:nop".format(skip_addr),
@@ -393,6 +455,8 @@ def _validate_instruction_skip(
             reasons=["primary_nop_model_reproduced"],
             reruns=reruns,
             skeptical_summary="Validated: the primary NOP-style skip model reproduced the end-to-end failure.",
+            severity=(severity_info or {}).get("severity"),
+            severity_rationale=(severity_info or {}).get("severity_rationale"),
         )
 
     if glitch_models["branch_invert"] == "bypass":
@@ -413,6 +477,8 @@ def _validate_instruction_skip(
             ],
             reruns=reruns,
             skeptical_summary="Candidate only: the outcome did not survive the primary NOP skip model, but it did reproduce under a branch-inversion model.",
+            severity=(severity_info or {}).get("severity"),
+            severity_rationale=(severity_info or {}).get("severity_rationale"),
         )
 
     return _build_validation(
@@ -429,6 +495,8 @@ def _validate_instruction_skip(
         reasons=["candidate_did_not_survive_realistic_replay"],
         reruns=reruns,
         skeptical_summary="Dismissed: realistic skip-model replays did not preserve the end-to-end failure, so downstream control flow or later checks held.",
+        severity=(severity_info or {}).get("severity"),
+        severity_rationale=(severity_info or {}).get("severity_rationale"),
     )
 
 
@@ -533,6 +601,8 @@ def _apply_validation(result: Dict[str, Any], validation: Dict[str, Any]) -> Non
     result["defense_in_depth"] = validation.get("defense_in_depth")
     result["inverse_validation"] = validation.get("inverse_validation")
     result["self_healing"] = validation.get("self_healing")
+    result["severity"] = validation.get("severity")
+    result["severity_rationale"] = validation.get("severity_rationale")
 
 
 def validate_runtime_findings(
@@ -559,6 +629,13 @@ def validate_runtime_findings(
             getattr(getattr(profile, "expect", None), "control_outcome", "success")
             or "success"
         )
+    instruction_skip_model = "security"
+    if getattr(profile, "fault_sweep", None) is not None:
+        isc = getattr(profile.fault_sweep, "instruction_skip_config", None)
+        if isc is not None:
+            instruction_skip_model = (
+                getattr(isc, "severity_model", "security") or "security"
+            )
     fault_robot_vars = build_fault_robot_vars(
         robot_vars,
         profile,
@@ -588,10 +665,30 @@ def validate_runtime_findings(
             continue
         if not result.get("fault_injected", False):
             continue
+        base_code = _base_fault_type_code(result.get("fault_type"))
+        if base_code == "i":
+            result["instruction_skip_severity_model"] = instruction_skip_model
+            annotate_instruction_skip_severity(
+                result,
+                expected_outcome=expected_outcome,
+                default_model=instruction_skip_model,
+            )
+            severity_info = classify_instruction_skip_severity(
+                result,
+                expected_outcome=expected_outcome,
+            )
+            if severity_info is not None and severity_info["severity"] in {"dos_crash", "dos_recovery"}:
+                validation = _validate_instruction_skip(
+                    result,
+                    expected_outcome=expected_outcome,
+                    rerun_point=rerun_point,
+                    annotate_checks=annotate_checks,
+                )
+                _apply_validation(result, validation)
+                continue
         if not (result_is_brick(result) or result_has_issues(result, expected_outcome)):
             continue
 
-        base_code = _base_fault_type_code(result.get("fault_type"))
         if base_code == "i":
             iskip_items.append((idx, result))
         elif base_code in _NON_POWER_WRITE_FAULT_CODES:

@@ -1,0 +1,13 @@
+base_profile: mcuboot_head_move_nrf52_verify_instruction_skip_probe.yaml
+name: resilient_instruction_skip_severity
+description: >
+  Instruction-skip severity example for a hardened MCUboot configuration.
+  Verification probes distinguish full bypasses from crash-only skips and
+  defense-in-depth catches. The default security model reports only true
+  bypasses as findings.
+fault_sweep:
+  instruction_skip_config:
+    severity_model: security
+skip_self_test: true
+expect:
+  should_find_issues: false

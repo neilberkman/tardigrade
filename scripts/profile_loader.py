@@ -531,17 +531,23 @@ class InstructionSkipConfig:
     to NOP (default 1, i.e. one 16-bit Thumb instruction).
     """
 
-    __slots__ = ("target_addresses", "skip_count", "include_literal_pools")
+    __slots__ = ("target_addresses", "skip_count", "include_literal_pools", "severity_model")
 
     def __init__(
         self,
         target_addresses: Optional[List[Tuple[int, int]]] = None,
         skip_count: int = 1,
         include_literal_pools: bool = False,
+        severity_model: str = "security",
     ) -> None:
         self.target_addresses: List[Tuple[int, int]] = target_addresses or []
         self.skip_count = max(1, int(skip_count))
         self.include_literal_pools = bool(include_literal_pools)
+        self.severity_model = str(severity_model or "security").strip().lower() or "security"
+        if self.severity_model not in {"security", "availability"}:
+            raise ProfileError(
+                "instruction_skip_config.severity_model: expected 'security' or 'availability'"
+            )
         for i, (start, end) in enumerate(self.target_addresses):
             if end <= start:
                 raise ProfileError(
@@ -3131,10 +3137,12 @@ def _parse_instruction_skip_config(
         end = _parse_int(_require(region, "end", ctx), "{}.end".format(ctx))
         target_addresses.append((start, end))
     include_literal_pools = bool(raw.get("include_literal_pools", False))
+    severity_model = str(raw.get("severity_model", "security") or "security").strip().lower()
     return InstructionSkipConfig(
         target_addresses=target_addresses,
         skip_count=skip_count,
         include_literal_pools=include_literal_pools,
+        severity_model=severity_model,
     )
 
 

@@ -13,10 +13,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fault_classification import (
     _effective_boot_result,
+    annotate_instruction_skip_severity,
     classify_failure_class,
+    classify_instruction_skip_severity,
     finding_glitch_realism,
     finding_validation_stage,
     finding_validation_disposition,
+    instruction_skip_severity_model,
     is_resilient_rollback,
     result_has_issues,
     result_is_brick,
@@ -36,6 +39,13 @@ from bypass_probe import (
 )
 from fault_types import _fault_type_label
 from profile_loader import ProfileConfig
+
+
+def _fault_type_base_code(fault_type: Any) -> str:
+    raw = str(fault_type or "").strip().lower()
+    if not raw:
+        return ""
+    return raw.split(":", 1)[0]
 
 
 def enrich_results_with_fault_regions(
@@ -192,6 +202,10 @@ def categorize_failure(
     realism = finding_glitch_realism(result)
     if realism is not None:
         payload["glitch_realism"] = realism
+    if result.get("severity") is not None:
+        payload["severity"] = result.get("severity")
+    if result.get("severity_rationale"):
+        payload["severity_rationale"] = result.get("severity_rationale")
     signals = result.get("signals") or {}
     if isinstance(signals, dict):
         if signals.get("verification_probe_classification") is not None:
@@ -260,6 +274,17 @@ def summarize_runtime_sweep(
         expected_outcome = (
             getattr(profile.expect, "control_outcome", "success") or "success"
         )
+    instruction_skip_model = "security"
+    if profile and getattr(profile, "fault_sweep", None):
+        isc = getattr(profile.fault_sweep, "instruction_skip_config", None)
+        if isc is not None:
+            instruction_skip_model = getattr(isc, "severity_model", "security") or "security"
+    for r in injected:
+        annotate_instruction_skip_severity(
+            r,
+            expected_outcome=expected_outcome,
+            default_model=instruction_skip_model,
+        )
     boot_failures = [r for r in injected if result_is_brick(r)]
     failures = [r for r in injected if result_has_issues(r, expected_outcome)]
     recoveries = sum(
@@ -296,10 +321,24 @@ def summarize_runtime_sweep(
     verification_bypass_points: List[Any] = []
     full_bypass_points: List[Any] = []
     defense_in_depth_held = 0
+    security_bypass_points = 0
+    dos_crash_points = 0
+    dos_recovery_points = 0
+    instruction_skip_points = 0
     categorized_failures: List[Dict[str, Any]] = []
     for r in injected:
+        if _fault_type_base_code(r.get("fault_type")) == "i":
+            instruction_skip_points += 1
         ft_name = _fault_type_label(r.get("fault_type"))
         fault_type_counts[ft_name] = fault_type_counts.get(ft_name, 0) + 1
+        iskip = classify_instruction_skip_severity(r, expected_outcome=expected_outcome)
+        if iskip is not None:
+            if iskip["severity"] == "security_bypass":
+                security_bypass_points += 1
+            elif iskip["severity"] == "dos_crash":
+                dos_crash_points += 1
+            elif iskip["severity"] == "dos_recovery":
+                dos_recovery_points += 1
         signals = r.get("signals") or {}
         if isinstance(signals, dict):
             probe_class = str(signals.get("verification_probe_classification") or "").strip()
@@ -396,6 +435,10 @@ def summarize_runtime_sweep(
         "fault_type_points": fault_type_counts,
         "fault_type_issue_points": fault_type_issue_counts,
         "fault_type_bricks": fault_type_brick_counts,
+        "instruction_skip_points": instruction_skip_points,
+        "security_bypass_points": security_bypass_points,
+        "dos_crash_points": dos_crash_points,
+        "dos_recovery_points": dos_recovery_points,
     }
     if skip_reason_counts:
         summary["skip_reasons"] = skip_reason_counts
@@ -598,6 +641,15 @@ def compute_verdict(
     control_issue_count = int(
         control_summary.get("issue_count", 0)
     )
+    security_bypass_points = int(sweep_summary.get("security_bypass_points", 0))
+    dos_crash_points = int(sweep_summary.get("dos_crash_points", 0))
+    dos_recovery_points = int(sweep_summary.get("dos_recovery_points", 0))
+    instruction_skip_points = int(
+        sweep_summary.get(
+            "instruction_skip_points",
+            security_bypass_points + dos_crash_points + dos_recovery_points,
+        )
+    )
 
     resilient_rollbacks = int(sweep_summary.get("resilient_rollbacks", 0))
     invariant_observations = int(sweep_summary.get("invariant_issue_points", 0))
@@ -619,6 +671,42 @@ def compute_verdict(
             )
         if partial_staging_summary:
             total_issues += int(partial_staging_summary.get("issue_count", 0))
+        non_instruction_issues = max(0, int(total_issues) - int(security_bypass_points))
+        if security_bypass_points > 0 and non_instruction_issues == 0:
+            verdict = "FAIL \u2014 found {} security bypass points".format(
+                security_bypass_points
+            )
+            if dos_crash_points > 0:
+                verdict += " ({} DoS crash points, expected for glitch model)".format(
+                    dos_crash_points
+                )
+            if dos_recovery_points > 0:
+                verdict += " ({} recovering DoS points)".format(dos_recovery_points)
+            timeout_points = int(sweep_summary.get("timeout_points", 0))
+            if timeout_points > 0:
+                verdict += " (WARNING: {} points timed out — consider increasing run_duration)".format(
+                    timeout_points
+                )
+            return verdict
+        if security_bypass_points > 0:
+            parts = []
+            if non_instruction_issues > 0:
+                parts.append("{} non-instruction issues".format(non_instruction_issues))
+            parts.append("{} security bypasses".format(security_bypass_points))
+            if dos_crash_points > 0:
+                parts.append("{} DoS crashes".format(dos_crash_points))
+            if dos_recovery_points > 0:
+                parts.append("{} recovering DoS".format(dos_recovery_points))
+            verdict = "FAIL \u2014 found {} issue points ({})".format(
+                total_issues,
+                ", ".join(parts),
+            )
+            timeout_points = int(sweep_summary.get("timeout_points", 0))
+            if timeout_points > 0:
+                verdict += " (WARNING: {} points timed out — consider increasing run_duration)".format(
+                    timeout_points
+                )
+            return verdict
         metadata_delta_observations = int(
             sweep_summary.get("metadata_delta_issue_points", 0)
         )
@@ -640,6 +728,19 @@ def compute_verdict(
         if invariant_observations > 0:
             parts.append("{} invariant observations".format(invariant_observations))
         verdict = "PASS \u2014 " + ", ".join(parts)
+    elif (
+        instruction_skip_points > 0
+        and security_bypass_points == 0
+        and (dos_crash_points > 0 or dos_recovery_points > 0)
+    ):
+        verdict = (
+            "PASS \u2014 0 security bypass points "
+            "({} DoS crash points, expected for glitch model)".format(
+                dos_crash_points
+            )
+        )
+        if dos_recovery_points > 0:
+            verdict += " ({} recovering DoS points)".format(dos_recovery_points)
     timeout_points = int(sweep_summary.get("timeout_points", 0))
     if timeout_points > 0:
         verdict += " (WARNING: {} points timed out — consider increasing run_duration)".format(
