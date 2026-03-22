@@ -376,6 +376,9 @@ if not resume_trace_time_slice:
 calibration_time_slice = str(monitor.GetVariable('calibration_time_slice')).strip()
 if not calibration_time_slice:
     calibration_time_slice = '0.02'
+phase1_time_slice = str(monitor.GetVariable('phase1_time_slice')).strip()
+if not phase1_time_slice:
+    phase1_time_slice = '0.02'
 phase2_time_slice = str(monitor.GetVariable('phase2_time_slice')).strip()
 if not phase2_time_slice:
     phase2_time_slice = '0.05'
@@ -4531,7 +4534,7 @@ def run_state_fault(fault_at):
         result['semantic_state'] = semantic_state
     return result
 
-def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, label='',
+def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, label='',
                    expect_writes=True, stop_on_fault=True, op_trace=None, op_trace_limit=0,
                    zero_writes_is_brick=True, vtor_settle_iters=0):
     # Run CPU in continuous mode until it settles or budget exhausted.
@@ -4551,6 +4554,8 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
     #   5. (no_boot profiles) no writes + no VTOR for N slices/min emulated time
     #   6. (no_boot profiles) writes settled (>0 but unchanged) + no VTOR
     #   7. Iteration limit or wall-clock timeout exhausted
+    if time_slice is None:
+        time_slice = phase1_time_slice
     t0 = _time.time()
     prev_writes = -1
     zero_writes_count = 0

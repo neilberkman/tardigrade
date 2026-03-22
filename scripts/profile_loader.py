@@ -965,6 +965,7 @@ class FaultSweepConfig:
         "max_step_limit",
         "run_duration",
         "calibration_time_slice",
+        "phase1_time_slice",
         "phase2_time_slice",
         "fault_types",
         "evaluation_mode",
@@ -1005,6 +1006,7 @@ class FaultSweepConfig:
         max_step_limit: int = 500000,
         run_duration: str = "0.5",
         calibration_time_slice: Optional[str] = None,
+        phase1_time_slice: Optional[str] = None,
         phase2_time_slice: Optional[str] = None,
         fault_types: Optional[List[str]] = None,
         evaluation_mode: Optional[str] = None,
@@ -1045,6 +1047,9 @@ class FaultSweepConfig:
             str(calibration_time_slice).strip()
             if calibration_time_slice
             else None
+        )
+        self.phase1_time_slice = (
+            str(phase1_time_slice).strip() if phase1_time_slice else None
         )
         self.phase2_time_slice = (
             str(phase2_time_slice).strip() if phase2_time_slice else None
@@ -1744,6 +1749,8 @@ class ProfileConfig:
             vars_list.append(
                 "CALIBRATION_TIME_SLICE:{}".format(fs.calibration_time_slice)
             )
+        if fs.phase1_time_slice:
+            vars_list.append("PHASE1_TIME_SLICE:{}".format(fs.phase1_time_slice))
         if fs.phase2_time_slice:
             vars_list.append("PHASE2_TIME_SLICE:{}".format(fs.phase2_time_slice))
         if fs.boot_cycle_hook:
@@ -2628,6 +2635,7 @@ def _parse_fault_sweep(
         max_step_limit=int(raw.get("max_step_limit", 500000)),
         run_duration=str(raw.get("run_duration", "0.5")),
         calibration_time_slice=raw.get("calibration_time_slice"),
+        phase1_time_slice=raw.get("phase1_time_slice"),
         phase2_time_slice=raw.get("phase2_time_slice"),
         fault_types=fault_types,
         evaluation_mode=eval_mode,
@@ -4748,6 +4756,7 @@ def main() -> int:
         "max_writes": profile.fault_sweep.max_writes,
         "boot_cycles": profile.fault_sweep.boot_cycles,
         "calibration_time_slice": profile.fault_sweep.calibration_time_slice,
+        "phase1_time_slice": profile.fault_sweep.phase1_time_slice,
         "phase2_time_slice": profile.fault_sweep.phase2_time_slice,
         "boot_cycle_hook": profile.fault_sweep.boot_cycle_hook,
         "expected_rollback_at_cycle": profile.fault_sweep.expected_rollback_at_cycle,

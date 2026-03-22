@@ -45,6 +45,7 @@ fault_sweep:
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "10.0"
+  phase1_time_slice: "0.10"
   max_step_limit: 20000000
   fault_types:
     - power_loss

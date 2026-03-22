@@ -66,6 +66,14 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertIn("wall_timeout=phase1_wall_timeout(default_s=4.0)", text)
         self.assertIn("p1_wall_timeout = phase1_wall_timeout(default_s=4.0)", text)
 
+    def test_phase1_uses_configurable_time_slice(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("phase1_time_slice = str(monitor.GetVariable('phase1_time_slice')).strip()", text)
+        self.assertIn("if not phase1_time_slice:", text)
+        self.assertIn("def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, label='',", text)
+        self.assertIn("if time_slice is None:", text)
+        self.assertIn("time_slice = phase1_time_slice", text)
+
 
 if __name__ == "__main__":
     unittest.main()
