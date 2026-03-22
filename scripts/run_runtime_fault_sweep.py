@@ -9,6 +9,12 @@ import time as _time
 
 from Antmicro.Renode.Peripherals.CPU import RegisterValue
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.path.join(os.getcwd(), 'scripts')
+if _SCRIPT_DIR and _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from thumb_instructions import build_instruction_skip_patch_plan
+
 def log(msg):
     sys.stderr.write('[resc] {}\n'.format(msg))
     sys.stderr.flush()
@@ -5115,52 +5121,24 @@ def invert_thumb_branch_halfword(halfword):
 
 
 def patch_instruction_halfwords(skip_addr, skip_count, patch_model):
-    original_halfwords = []
-    patched_halfwords = []
-    model = str(patch_model or 'nop').strip().lower() or 'nop'
-    if model not in ('nop', 'branch_invert'):
-        return {
-            'supported': False,
-            'reason': 'unknown_patch_model',
-            'model': model,
-            'original_halfwords': original_halfwords,
-            'patched_halfwords': patched_halfwords,
-        }
-    if model == 'branch_invert' and int(skip_count) != 1:
-        return {
-            'supported': False,
-            'reason': 'branch_invert_requires_single_halfword',
-            'model': model,
-            'original_halfwords': original_halfwords,
-            'patched_halfwords': patched_halfwords,
-        }
-    for i in range(skip_count):
-        addr = skip_addr + i * 2
-        orig = int(bus.ReadWord(addr)) & 0xFFFF
-        if model == 'nop':
-            patched = 0xBF00
-        else:
-            patched = invert_thumb_branch_halfword(orig)
-            if patched is None:
-                return {
-                    'supported': False,
-                    'reason': 'branch_invert_not_supported_for_instruction',
-                    'model': model,
-                    'original_halfwords': original_halfwords + [orig],
-                    'patched_halfwords': patched_halfwords,
-                }
-        original_halfwords.append(orig)
-        patched_halfwords.append(int(patched) & 0xFFFF)
-    for i, patched in enumerate(patched_halfwords):
-        addr = skip_addr + i * 2
-        bus.WriteWord(addr, patched)
-    return {
-        'supported': True,
-        'reason': None,
-        'model': model,
-        'original_halfwords': original_halfwords,
-        'patched_halfwords': patched_halfwords,
-    }
+    def _read_halfword(addr):
+        return int(bus.ReadWord(int(addr))) & 0xFFFF
+
+    patch_meta = build_instruction_skip_patch_plan(
+        _read_halfword,
+        skip_addr,
+        skip_count,
+        patch_model=patch_model,
+        branch_inverter=invert_thumb_branch_halfword,
+    )
+    if not patch_meta.get('supported'):
+        return patch_meta
+    for addr, patched in zip(
+        patch_meta.get('patched_addresses', []),
+        patch_meta.get('patched_halfwords', []),
+    ):
+        bus.WriteWord(int(addr), int(patched) & 0xFFFF)
+    return patch_meta
 
 
 def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
@@ -5208,8 +5186,12 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
                 'original_halfwords': ['0x{:04X}'.format(h) for h in original_halfwords],
             },
         }
-    log('fp=0x{:X} type=i model={} patched {} halfword(s) at 0x{:08X}'.format(
-        skip_addr, patch_meta.get('model'), skip_count, skip_addr & 0xFFFFFFFF))
+    log('fp=0x{:X} type=i model={} patched {} halfword(s) across {} instruction(s) at 0x{:08X}'.format(
+        skip_addr,
+        patch_meta.get('model'),
+        len(patched_halfwords),
+        skip_count,
+        skip_addr & 0xFFFFFFFF))
 
     arm_vtor_watchpoint()
     p1_wall_timeout = phase1_wall_timeout(default_s=4.0)

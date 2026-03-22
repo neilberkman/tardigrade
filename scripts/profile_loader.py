@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fault_inject import BootloaderRegionConfig, FaultDistributionConfig, MetadataFaultRegion
+from thumb_instructions import enumerate_instruction_skip_addresses, make_elf_halfword_reader
 
 try:
     import yaml
@@ -526,9 +527,10 @@ class InstructionSkipConfig:
     and verifies the system still boots correctly.
 
     ``target_addresses`` is a list of ``(start, end)`` address ranges to
-    scan.  Every halfword-aligned address in each range is a potential
-    fault point.  ``skip_count`` controls how many consecutive halfwords
-    to NOP (default 1, i.e. one 16-bit Thumb instruction).
+    scan.  Fault points are instruction addresses, not arbitrary halfword
+    offsets: the planner skips second halfwords of 32-bit Thumb
+    instructions.  ``skip_count`` controls how many consecutive
+    instructions to NOP (default 1).
     """
 
     __slots__ = ("target_addresses", "skip_count", "include_literal_pools", "severity_model")
@@ -2927,7 +2929,26 @@ def _parse_read_fault_config(raw: Optional[Dict[str, Any]]) -> Optional[ReadFaul
     )
 
 
-def _count_instruction_skip_fault_points(start: int, end: int, skip_count: int) -> int:
+def _count_instruction_skip_fault_points(
+    start: int,
+    end: int,
+    skip_count: int,
+    *,
+    elf_path: Optional[str] = None,
+) -> int:
+    if elf_path:
+        try:
+            read_halfword = make_elf_halfword_reader(elf_path)
+            return len(
+                enumerate_instruction_skip_addresses(
+                    read_halfword,
+                    start,
+                    end,
+                    skip_count=skip_count,
+                )
+            )
+        except Exception:
+            pass
     stop = max(end - (max(1, skip_count) - 1) * 2, start)
     return len(range(start, stop, 2))
 
@@ -3081,7 +3102,12 @@ def _resolve_instruction_skip_symbol_targets(
                 start,
                 end,
                 end - start,
-                _count_instruction_skip_fault_points(start, end, skip_count),
+                _count_instruction_skip_fault_points(
+                    start,
+                    end,
+                    skip_count,
+                    elf_path=str(elf_path),
+                ),
             ),
             file=sys.stderr,
         )

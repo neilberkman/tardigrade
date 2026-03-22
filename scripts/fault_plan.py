@@ -15,6 +15,11 @@ from fault_inject import apply_clustered_distribution
 from fault_types import FAULT_TYPE_NAME_TO_CODE
 from profile_loader import ProfileConfig
 from renode_runner import quick_subset
+from thumb_instructions import (
+    build_instruction_skip_patch_plan,
+    enumerate_instruction_skip_addresses,
+    make_elf_halfword_reader,
+)
 
 
 @dataclasses.dataclass
@@ -482,8 +487,19 @@ def build_fault_plan(
             if isc is not None and isc.target_addresses:
                 # Classify halfwords as code vs literal pool data.
                 literal_pools: set = set()
+                read_halfword = None
+                elf_path = profile.bootloader_elf
+                if elf_path:
+                    try:
+                        read_halfword = make_elf_halfword_reader(elf_path)
+                    except Exception as exc:
+                        print(
+                            "WARNING: failed to read bootloader ELF for width-aware "
+                            "instruction_skip planning ({}); falling back to "
+                            "halfword enumeration".format(exc),
+                            file=sys.stderr,
+                        )
                 if not isc.include_literal_pools:
-                    elf_path = profile.bootloader_elf
                     if elf_path:
                         from thumb_classify import find_literal_pools
 
@@ -500,17 +516,36 @@ def build_fault_plan(
                 skip_addrs: List[int] = []
                 sc = isc.skip_count if isc.skip_count > 0 else 1
                 for region_start, region_end in isc.target_addresses:
-                    end = region_end - (sc - 1) * 2
-                    for addr in range(region_start, max(end, region_start), 2):
-                        # Check all halfwords that would be patched
-                        hits_pool = any(
-                            (addr + i * 2) in literal_pools
-                            for i in range(sc)
+                    if read_halfword is not None:
+                        candidate_addrs = enumerate_instruction_skip_addresses(
+                            read_halfword,
+                            region_start,
+                            region_end,
+                            skip_count=sc,
                         )
-                        if hits_pool:
-                            literal_pool_excluded += 1
-                            continue
-                        skip_addrs.append(addr)
+                        for addr in candidate_addrs:
+                            patch_plan = build_instruction_skip_patch_plan(
+                                read_halfword,
+                                addr,
+                                sc,
+                                patch_model="nop",
+                            )
+                            patch_addrs = patch_plan.get("patched_addresses", [])
+                            if any(int(patch_addr) in literal_pools for patch_addr in patch_addrs):
+                                literal_pool_excluded += 1
+                                continue
+                            skip_addrs.append(addr)
+                    else:
+                        end = region_end - (sc - 1) * 2
+                        for addr in range(region_start, max(end, region_start), 2):
+                            hits_pool = any(
+                                (addr + i * 2) in literal_pools
+                                for i in range(sc)
+                            )
+                            if hits_pool:
+                                literal_pool_excluded += 1
+                                continue
+                            skip_addrs.append(addr)
                 skip_addrs = _slice_explicit_points(
                     skip_addrs,
                     fault_step=fault_step,

@@ -393,7 +393,7 @@ Default is `[power_loss]`. Available types (24 total):
 
 ### Instruction skip (voltage glitch)
 
-The `instruction_skip` fault type models a voltage-glitch attack that causes the CPU to skip one or more instructions. Each fault point is an instruction address rather than an NVM write index. The harness replaces the instruction at the target address with a Thumb NOP (`0xBF00`), boots the firmware, and checks whether the system still recovers.
+The `instruction_skip` fault type models a voltage-glitch attack that causes the CPU to skip one or more instructions. Each fault point is an instruction address rather than an NVM write index. The harness replaces the target instruction with Thumb NOPs (`0xBF00`), boots the firmware, and checks whether the system still recovers.
 
 `driver_error` is a non-halting write fault. The target write does not land, but the peripheral raises a software-visible error flag/register. On nRF52 NVMC paths this currently behaves like `write_rejection` from the driver's point of view because the Zephyr NVMC driver only polls READY and does not inspect the injected error flag. The distinction is still useful in sweep results because it separates "data dropped silently" from "peripheral reported an error that software ignored."
 
@@ -417,7 +417,7 @@ Each `target_addresses` entry may be either an explicit `{ start, end }` range o
 
 When a symbol matches multiple functions, tardigrade includes every matching range and logs the resolved addresses at profile-load time. If a query matches nothing, profile loading fails with a clear error that lists the available function symbols. For `STT_FUNC` entries with `st_size: 0`, tardigrade infers the end address from the next function symbol.
 
-`target_addresses` ultimately resolves to address ranges to scan. Every halfword-aligned address in each range becomes a fault point. `start` must be halfword-aligned (Thumb instruction boundary). `skip_count` controls how many consecutive 16-bit halfwords to NOP (default 1). Set it to 2 to model skipping a 32-bit Thumb-2 instruction.
+`target_addresses` ultimately resolves to address ranges to scan. Tardigrade walks those ranges as Thumb instructions, not raw halfwords: second halfwords of 32-bit Thumb instructions are skipped automatically and never become standalone fault points. `start` must be halfword-aligned. `skip_count` controls how many consecutive instructions to NOP (default 1). A single skipped 32-bit instruction automatically patches both halfwords to `0xBF00`.
 
 Instruction-skip fault points are always run in execute mode (full CPU boot) -- trace replay is not applicable since the fault is CPU-level, not NVM-level.
 
