@@ -72,10 +72,24 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertIn("phase1_time_slice = str(monitor.GetVariable('phase1_time_slice')).strip()", text)
         self.assertIn("if not phase1_time_slice:", text)
         self.assertIn("def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, label='',", text)
+        self.assertIn("def phase1_max_iters(default_s=4.0, time_slice_s=None):", text)
         self.assertIn("if time_slice is None:", text)
         self.assertIn("time_slice = phase1_time_slice", text)
         self.assertIn("if time_slice_s is None:", text)
         self.assertIn("time_slice_s = float(phase1_time_slice)", text)
+
+    def test_phase1_max_iters_defaults_to_phase1_time_slice(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        match = re.search(
+            r"(def parse_duration_seconds\(default=2\.0\):.*?"
+            r"def phase1_max_iters\(default_s=4\.0, time_slice_s=None\):.*?)(?=\ndef phase1_wall_timeout)",
+            text,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        ns = {"run_duration": "4.1", "phase1_time_slice": "0.25"}
+        exec(match.group(1), ns)
+        self.assertEqual(ns["phase1_max_iters"](default_s=4.0), 200)
 
     def test_robot_suite_forwards_phase1_time_slice(self) -> None:
         text = ROBOT_PATH.read_text(encoding="utf-8")
@@ -83,6 +97,56 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertIn(
             "Run Keyword If    '${PHASE1_TIME_SLICE}' != ''    Execute Command    $phase1_time_slice=\"${PHASE1_TIME_SLICE}\"",
             text,
+        )
+
+    def test_restore_hw_init_reseeds_uicr_words(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("def restore_hw_init():", text)
+        self.assertIn("bus.WriteDoubleWord(0x10001200, 0x12)", text)
+        self.assertIn("bus.WriteDoubleWord(0x10001204, 0x12)", text)
+
+    def test_prepare_clean_phase1_state_restores_hw_init_after_reset(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertRegex(
+            text,
+            re.compile(
+                r"def prepare_clean_phase1_state\(\):\n"
+                r"\s+_machine_reset\(\)\n"
+                r"\s+monitor.Parse\('machine Pause'\)\n"
+                r"\s+restore_hw_init\(\)\n"
+                r"\s+needs_pre_boot = restore_initial_flash_cache\(\)\n"
+            ),
+        )
+
+    def test_control_phase1_uses_read_only_progress_mode(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertRegex(
+            text,
+            re.compile(
+                r"phase1_status = run_until_done\(\n"
+                r"\s+cpu_ref,\n"
+                r"\s+label='control_p1',\n"
+                r"\s+stop_on_fault=False,\n"
+                r"\s+expect_writes=False,\n"
+                r"\s+zero_writes_is_brick=False,\n"
+            ),
+        )
+
+    def test_run_until_done_tracks_pc_progress_for_read_only_control_runs(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("pc_progress = None", text)
+        self.assertIn("if (not expect_writes) and cur_writes == 0 and not sticky_vtor['captured']:", text)
+        self.assertIn("pc_progress = as_int(cpu_ref.GetRegisterUnsafe(15))", text)
+        self.assertRegex(
+            text,
+            re.compile(
+                r"progress_key = \(\n"
+                r"\s+cur_writes,\n"
+                r"\s+cur_erases,\n"
+                r"\s+bool\(sticky_vtor\['captured'\]\),\n"
+                r"\s+pc_progress,\n"
+                r"\s+\)\n"
+            ),
         )
 
 

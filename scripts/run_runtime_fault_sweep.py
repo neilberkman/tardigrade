@@ -3521,12 +3521,15 @@ def apply_partial_pre_boot_state(max_writes, fault_type='w'):
 
 def restore_hw_init():
     # Restore hardware init values cleared by machine Reset.
-    # These are nRF52 NVMC/FICR registers needed for correct operation.
+    # These are nRF52 FICR/UICR/CLOCK register values needed for correct
+    # bootloader/app startup after a Reset.
     # Skip for MRAM path — these addresses overlap MRAM and would corrupt data.
     if backend['kind'] == 'mram':
         return
     bus.WriteDoubleWord(0x10000010, 0x1000)
     bus.WriteDoubleWord(0x10000014, 0x100)
+    bus.WriteDoubleWord(0x10001200, 0x12)
+    bus.WriteDoubleWord(0x10001204, 0x12)
     bus.WriteDoubleWord(0x40000100, 0x1)
     bus.WriteDoubleWord(0x40000418, 0x10001)
 
@@ -3647,6 +3650,7 @@ def restore_initial_flash_cache():
 def prepare_clean_phase1_state():
     _machine_reset()
     monitor.Parse('machine Pause')
+    restore_hw_init()
     needs_pre_boot = restore_initial_flash_cache()
     if needs_pre_boot:
         apply_pre_boot_state()
@@ -4679,10 +4683,17 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                     break
             if trace_limit_hit:
                 break
+        pc_progress = None
+        if (not expect_writes) and cur_writes == 0 and not sticky_vtor['captured']:
+            try:
+                pc_progress = as_int(cpu_ref.GetRegisterUnsafe(15))
+            except Exception:
+                pc_progress = None
         progress_key = (
             cur_writes,
             cur_erases,
             bool(sticky_vtor['captured']),
+            pc_progress,
         )
         now = _time.time()
         if prev_progress_key is None or progress_key != prev_progress_key:
@@ -4793,7 +4804,7 @@ def parse_duration_seconds(default=2.0):
     except Exception:
         return default
 
-def phase1_max_iters(default_s=4.0, time_slice_s=0.02):
+def phase1_max_iters(default_s=4.0, time_slice_s=None):
     if time_slice_s is None:
         try:
             time_slice_s = float(phase1_time_slice)
@@ -5955,6 +5966,8 @@ def run_execute_fault(fault_at, fault_type='w'):
             cpu_ref,
             label='control_p1',
             stop_on_fault=False,
+            expect_writes=False,
+            zero_writes_is_brick=False,
             max_iters=p1_max_iters,
             wall_timeout=p1_wall_timeout,
             vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
