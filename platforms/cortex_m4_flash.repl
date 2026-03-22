@@ -22,16 +22,16 @@ sram: Memory.MappedMemory @ sysbus 0x20000000
 
 // FICR (Factory Information Configuration Registers) — nRF52840 defaults.
 // MCUboot reads CODEPAGESIZE (0x130) and CODESIZE (0x134) to compute flash geometry.
-ficr: Memory.MappedMemory @ sysbus 0x10000000
+ficr: Memory.ArrayMemory @ sysbus 0x10000000
     size: 0x1000
 
 // UICR (User Information Configuration Registers).
-uicr: Memory.MappedMemory @ sysbus 0x10001000
+uicr: Memory.ArrayMemory @ sysbus 0x10001000
     size: 0x1000
 
 // CLOCK peripheral stub — nRF52840 CLOCK at 0x40000000.
 // MCUboot/Zephyr init waits for HFCLKSTARTED event; without this, CPU spins forever.
-clock: Memory.MappedMemory @ sysbus 0x40000000
+clock: Memory.ArrayMemory @ sysbus 0x40000000
     size: 0x1000
 
 // UARTE0 — nRF52840 UART at 0x40002000.
@@ -45,7 +45,7 @@ rtc1: Timers.NRF52840_RTC @ sysbus 0x40011000
     -> nvic@17
 
 // WDT0 — MCUboot's watchdog feed path writes RR[0..7] at offsets 0x600..0x61C.
-wdt0: Memory.MappedMemory @ sysbus 0x40010000
+wdt0: Memory.ArrayMemory @ sysbus 0x40010000
     size: 0x1000
 
 nvm_ctrl: NVMemoryController @ sysbus 0x40001000

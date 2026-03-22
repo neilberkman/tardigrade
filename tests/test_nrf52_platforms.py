@@ -18,6 +18,10 @@ class NRF52PlatformTests(unittest.TestCase):
         ):
             with self.subTest(platform=relpath):
                 text = (ROOT / relpath).read_text(encoding="utf-8")
+                self.assertIn("ficr: Memory.ArrayMemory @ sysbus 0x10000000", text)
+                self.assertIn("uicr: Memory.ArrayMemory @ sysbus 0x10001000", text)
+                self.assertIn("clock: Memory.ArrayMemory @ sysbus 0x40000000", text)
+                self.assertIn("wdt0: Memory.ArrayMemory @ sysbus 0x40010000", text)
                 self.assertIn("WriteDoubleWord 0x10001200 0x12", text)
                 self.assertIn("WriteDoubleWord 0x10001204 0x12", text)
                 self.assertIn("SystemInit programs them to 0x12", text)
