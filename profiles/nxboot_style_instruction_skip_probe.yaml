@@ -25,6 +25,7 @@ fault_sweep:
   mode: runtime
   evaluation_mode: execute
   run_duration: "0.5"
+  phase1_time_slice: "0.10"
   fault_types: [instruction_skip]
   instruction_skip_config:
     target_addresses:
