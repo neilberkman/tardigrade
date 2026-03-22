@@ -234,6 +234,24 @@ def parse_renode_robot_timeout_minutes(env: Dict[str, str]) -> Optional[int]:
     return int(math.ceil(value))
 
 
+def profile_robot_timeout_minutes(profile: ProfileConfig) -> Optional[int]:
+    """Derive a Robot timeout floor from the profile's execute budget."""
+    fault_sweep = getattr(profile, "fault_sweep", None)
+    if fault_sweep is None:
+        return None
+    raw = str(getattr(fault_sweep, "run_duration", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        duration_s = float(raw)
+    except ValueError:
+        return None
+    if duration_s <= 0:
+        return None
+    robot_timeout_s = max(120.0, max(4.0, duration_s) * 30.0)
+    return int(math.ceil(robot_timeout_s / 60.0))
+
+
 def prepare_run_environment(
     base_env: Dict[str, str],
     bundle_dir: Path,
@@ -421,6 +439,9 @@ def run_single_point(
     # (e.g. MCUboot HEAD 448KB swap-move). Give it 15 minutes.
     single_point_timeout_m = 15 if calibration else 2
     env = prepare_run_environment(os.environ.copy(), bundle_dir, temp_root)
+    profile_timeout_m = profile_robot_timeout_minutes(profile)
+    if profile_timeout_m is not None:
+        single_point_timeout_m = max(single_point_timeout_m, profile_timeout_m)
     robot_timeout_override_m = parse_renode_robot_timeout_minutes(env)
     if robot_timeout_override_m is not None:
         single_point_timeout_m = max(single_point_timeout_m, robot_timeout_override_m)
@@ -445,6 +466,13 @@ def run_single_point(
     timeout_s = parse_renode_point_timeout(env)
     if calibration and timeout_s is not None:
         timeout_s = max(timeout_s, 900.0)
+    if profile_timeout_m is not None:
+        profile_timeout_s = float(profile_timeout_m) * 60.0
+        timeout_s = (
+            profile_timeout_s
+            if timeout_s is None
+            else max(timeout_s, profile_timeout_s)
+        )
     if robot_timeout_override_m is not None:
         robot_timeout_s = float(robot_timeout_override_m) * 60.0
         timeout_s = (
