@@ -146,6 +146,7 @@ Run Runtime Fault Point
     Load Runtime Scenario
 
     Execute Command    $repo_root="${ROOT}"
+    Execute Command    $platform_repl="${PLATFORM_REPL}"
     Execute Command    $fault_at=${FAULT_AT}
     Execute Command    $result_file="${RESULT_FILE}"
     Execute Command    $calibration_mode=${CALIBRATION_MODE}

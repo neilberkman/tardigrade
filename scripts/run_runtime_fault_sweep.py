@@ -376,18 +376,10 @@ except Exception:
     resume_trace_max_ops = 1024
 if resume_trace_max_ops < 1:
     resume_trace_max_ops = 1
-resume_trace_time_slice = str(monitor.GetVariable('resume_trace_time_slice')).strip()
-if not resume_trace_time_slice:
-    resume_trace_time_slice = '0.02'
-calibration_time_slice = str(monitor.GetVariable('calibration_time_slice')).strip()
-if not calibration_time_slice:
-    calibration_time_slice = '0.02'
-phase1_time_slice = str(monitor.GetVariable('phase1_time_slice')).strip()
-if not phase1_time_slice:
-    phase1_time_slice = '0.02'
-phase2_time_slice = str(monitor.GetVariable('phase2_time_slice')).strip()
-if not phase2_time_slice:
-    phase2_time_slice = '0.05'
+resume_trace_time_slice = get_optional_var('resume_trace_time_slice', '0.02')
+calibration_time_slice = get_optional_var('calibration_time_slice', '0.02')
+phase1_time_slice = get_optional_var('phase1_time_slice', '0.02')
+phase2_time_slice = get_optional_var('phase2_time_slice', '0.05')
 resume_trace_wall_timeout_raw = str(monitor.GetVariable('resume_trace_wall_timeout_s')).strip()
 try:
     resume_trace_wall_timeout_s = float(resume_trace_wall_timeout_raw)
@@ -441,6 +433,7 @@ sram_start = int(str(monitor.GetVariable('sram_start')), 0)
 sram_end = int(str(monitor.GetVariable('sram_end')), 0)
 bootloader_entry = int(str(monitor.GetVariable('bootloader_entry')), 0)
 bootloader_elf = str(monitor.GetVariable('bootloader_elf')).strip()
+platform_repl = get_optional_var('platform_repl', '').strip().lower()
 write_granularity = int(str(monitor.GetVariable('write_granularity')).strip())
 
 # NVM base address: the lowest address in the NVM region.  Used for converting
@@ -931,8 +924,9 @@ def annotate_boot_span_result(result):
     result['final_boot_slot'] = final_slot
     return result
 
-# Sticky state for VTOR detection during execute runs.
+# Sticky state for execution-slot detection during execute runs.
 sticky_vtor = {'value': 0, 'slot': None, 'captured': False}
+sticky_pc = {'value': 0, 'slot': None, 'captured': False}
 
 def on_vtor_write(val):
     if sticky_vtor['captured']:
@@ -948,10 +942,23 @@ def on_vtor_write(val):
             log('vtor_sticky: captured {} at {}'.format(sn, fmt_u32(v)))
             break
 
+
+def capture_sticky_pc(pc_value):
+    pc = as_int(pc_value) & ~1
+    for sn, (s_lo, s_hi) in slot_ranges.items():
+        if s_lo <= pc < s_hi:
+            sticky_pc['value'] = pc
+            sticky_pc['slot'] = sn
+            sticky_pc['captured'] = True
+            break
+
 def arm_vtor_watchpoint():
     sticky_vtor['value'] = 0
     sticky_vtor['slot'] = None
     sticky_vtor['captured'] = False
+    sticky_pc['value'] = 0
+    sticky_pc['slot'] = None
+    sticky_pc['captured'] = False
     try:
         # VTOR is at 0xE000ED08.  Watch for writes.
         bus.AddWatchpoint(0xE000ED08, 4, 'on_vtor_write(value)')
@@ -3528,9 +3535,13 @@ def apply_partial_pre_boot_state(max_writes, fault_type='w'):
 def restore_hw_init():
     # Restore hardware init values cleared by machine Reset.
     # These are nRF52 FICR/UICR/CLOCK register values needed for correct
-    # bootloader/app startup after a Reset.
-    # Skip for MRAM path — these addresses overlap MRAM and would corrupt data.
+    # bootloader/app startup after a Reset. Only the nRF52840 platforms
+    # expose and require these register blocks; applying them elsewhere
+    # can clobber non-nRF startup state.
     if backend['kind'] == 'mram':
+        return
+    platform_name = os.path.basename(platform_repl)
+    if platform_name not in ('cortex_m4_flash.repl', 'cortex_m4_flash_fast.repl'):
         return
     bus.WriteDoubleWord(0x10000010, 0x1000)
     bus.WriteDoubleWord(0x10000014, 0x100)
@@ -4125,6 +4136,10 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
             break
 
     vtor_in_known_slot = boot_slot is not None
+    sticky_pc_slot = sticky_pc.get('slot') if sticky_pc.get('captured') else None
+    if boot_slot is None and sticky_pc_slot in slot_ranges:
+        boot_slot = sticky_pc_slot
+    execution_observed = boot_slot is not None
 
     vtor_ok = not bool(eff_vtor_slot)
     if eff_vtor_slot == 'any':
@@ -4138,6 +4153,8 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     if success_pc_slot and success_pc_slot in slot_ranges:
         s_lo, s_hi = slot_ranges[success_pc_slot]
         pc_ok = (s_lo <= (pc_value & ~1) < s_hi)
+        if sticky_pc_slot == success_pc_slot:
+            pc_ok = True
         # If VTOR was captured but PC is now 0 (e.g. crash/reset),
         # treat the VTOR jump as proof of execution attempt.
         if sticky_vtor['captured'] and pc_value == 0:
@@ -4190,7 +4207,10 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
         'vtor': fmt_u32(actual_vtor),
         'vtor_final': fmt_u32(vtor_value),
         'vtor_sticky': sticky_vtor['captured'],
-        'execution_observed': vtor_in_known_slot,
+        'pc_sticky': sticky_pc['captured'],
+        'pc_sticky_value': fmt_u32(sticky_pc['value']),
+        'pc_sticky_slot': sticky_pc['slot'],
+        'execution_observed': execution_observed,
         'vtor_aligned': vtor_aligned,
         'vtor_ok': vtor_ok,
         'pc': fmt_u32(pc_value),
@@ -4278,7 +4298,7 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
 
     # Keep execution failures separate from expectation mismatches:
     # a boot into a real slot with the "wrong" image/slot is not "no_boot".
-    if not vtor_in_known_slot:
+    if not execution_observed:
         if is_wall_timeout and p2_writes > 0:
             # Bootloader was actively writing to flash when we killed it.
             # This is a timeout, not a brick — the bootloader may have
@@ -4585,6 +4605,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     trace_limit_hit = False
     trace_prev_writes = 0
     trace_prev_erases = 0
+    pc_samples = []
     if op_trace is not None and op_trace_limit <= 0:
         op_trace_limit = 1024
     for iters in range(max_iters):
@@ -4593,6 +4614,8 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         if stop_on_fault and (fault_requires_immediate_stop() or was_otp_fault_injected()):
             reason = 'fault_fired'
             break
+        pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
+        capture_sticky_pc(pc_now)
         # Early exit: check if VTOR has been set to a valid slot.
         # Bus watchpoints don't fire for SCB (CPU-private), so we poll.
         # Always poll — even after capture — so vtor_settle can update.
@@ -4653,8 +4676,18 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 break
         cur_writes = get_total_writes()
         cur_erases = get_total_erases()
+        if (
+            (not expect_writes)
+            and cur_writes == 0
+            and not sticky_vtor['captured']
+            and not sticky_pc['captured']
+        ):
+            pc_fmt = fmt_u32(pc_now)
+            if not pc_samples or pc_samples[-1] != pc_fmt:
+                pc_samples.append(pc_fmt)
+                if len(pc_samples) > 32:
+                    pc_samples = pc_samples[-32:]
         if op_trace is not None:
-            pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
             if cur_writes < trace_prev_writes:
                 trace_prev_writes = cur_writes
             while trace_prev_writes < cur_writes:
@@ -4691,10 +4724,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 break
         pc_progress = None
         if (not expect_writes) and cur_writes == 0 and not sticky_vtor['captured']:
-            try:
-                pc_progress = as_int(cpu_ref.GetRegisterUnsafe(15))
-            except Exception:
-                pc_progress = None
+            pc_progress = pc_now
         progress_key = (
             cur_writes,
             cur_erases,
@@ -4800,6 +4830,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         'writes': writes_now,
         'erases': erases_now,
         'pc': fmt_u32(pc_now),
+        'pc_samples': pc_samples,
         'op_trace_events': len(op_trace) if op_trace is not None else 0,
         'op_trace_truncated': bool(trace_limit_hit),
     }
@@ -5948,8 +5979,6 @@ def run_execute_fault(fault_at, fault_type='w'):
             cpu_ref,
             label='control_p1',
             stop_on_fault=False,
-            expect_writes=False,
-            zero_writes_is_brick=False,
             max_iters=p1_max_iters,
             wall_timeout=p1_wall_timeout,
             vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
@@ -5970,6 +5999,8 @@ def run_execute_fault(fault_at, fault_type='w'):
         if phase1_status is not None:
             signals['phase1_stop_reason'] = phase1_status.get('reason')
             signals['phase1_emulated_s'] = phase1_status.get('emulated_s')
+            if phase1_status.get('pc_samples'):
+                signals['phase1_pc_samples'] = phase1_status.get('pc_samples')
 
         return _build_fault_result(
             fault_at, 'control', False, '0x00000000', actual_writes, signals,

@@ -69,14 +69,20 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
 
     def test_phase1_uses_configurable_time_slice(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
-        self.assertIn("phase1_time_slice = str(monitor.GetVariable('phase1_time_slice')).strip()", text)
-        self.assertIn("if not phase1_time_slice:", text)
+        self.assertIn("phase1_time_slice = get_optional_var('phase1_time_slice', '0.02')", text)
         self.assertIn("def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, label='',", text)
         self.assertIn("def phase1_max_iters(default_s=4.0, time_slice_s=None):", text)
         self.assertIn("if time_slice is None:", text)
         self.assertIn("time_slice = phase1_time_slice", text)
         self.assertIn("if time_slice_s is None:", text)
         self.assertIn("time_slice_s = float(phase1_time_slice)", text)
+
+    def test_optional_time_slices_use_safe_monitor_helper(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("resume_trace_time_slice = get_optional_var('resume_trace_time_slice', '0.02')", text)
+        self.assertIn("calibration_time_slice = get_optional_var('calibration_time_slice', '0.02')", text)
+        self.assertIn("phase1_time_slice = get_optional_var('phase1_time_slice', '0.02')", text)
+        self.assertIn("phase2_time_slice = get_optional_var('phase2_time_slice', '0.05')", text)
 
     def test_phase1_max_iters_defaults_to_phase1_time_slice(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
@@ -91,6 +97,25 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         exec(match.group(1), ns)
         self.assertEqual(ns["phase1_max_iters"](default_s=4.0), 200)
 
+    def test_phase1_budget_helpers_scale_control_runs_to_run_duration(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        match = re.search(
+            r"(def parse_duration_seconds\(default=2\.0\):.*?"
+            r"def phase1_max_iters\(default_s=4\.0, time_slice_s=None\):.*?"
+            r"def phase1_wall_timeout\(default_s=4\.0, min_wall_s=120\.0, wall_per_emulated_s=30\.0\):.*?)(?=\ndef run_read_bit_flip_fault)",
+            text,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        ns = {
+            "run_duration": "30.0",
+            "phase1_time_slice": "0.10",
+            "progress_stall_timeout_s": 20.0,
+        }
+        exec(match.group(1), ns)
+        self.assertEqual(ns["phase1_max_iters"](default_s=4.0), 300)
+        self.assertEqual(ns["phase1_wall_timeout"](default_s=4.0), 900)
+
     def test_robot_suite_forwards_phase1_time_slice(self) -> None:
         text = ROBOT_PATH.read_text(encoding="utf-8")
         self.assertIn("${PHASE1_TIME_SLICE}           ${EMPTY}", text)
@@ -99,9 +124,22 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
             text,
         )
 
+    def test_robot_suite_forwards_platform_repl(self) -> None:
+        text = ROBOT_PATH.read_text(encoding="utf-8")
+        self.assertIn('Execute Command    $platform_repl="${PLATFORM_REPL}"', text)
+
     def test_restore_hw_init_reseeds_uicr_words(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("platform_repl = get_optional_var('platform_repl', '').strip().lower()", text)
         self.assertIn("def restore_hw_init():", text)
+        self.assertIn(
+            "platform_name = os.path.basename(platform_repl)",
+            text,
+        )
+        self.assertIn(
+            "if platform_name not in ('cortex_m4_flash.repl', 'cortex_m4_flash_fast.repl'):",
+            text,
+        )
         self.assertIn("bus.WriteDoubleWord(0x10001200, 0x12)", text)
         self.assertIn("bus.WriteDoubleWord(0x10001204, 0x12)", text)
 
@@ -118,7 +156,7 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
             ),
         )
 
-    def test_control_phase1_uses_read_only_progress_mode(self) -> None:
+    def test_control_phase1_uses_default_progress_mode(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertRegex(
             text,
@@ -127,8 +165,7 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
                 r"\s+cpu_ref,\n"
                 r"\s+label='control_p1',\n"
                 r"\s+stop_on_fault=False,\n"
-                r"\s+expect_writes=False,\n"
-                r"\s+zero_writes_is_brick=False,\n"
+                r"\s+max_iters=p1_max_iters,\n"
             ),
         )
 
@@ -136,7 +173,7 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("pc_progress = None", text)
         self.assertIn("if (not expect_writes) and cur_writes == 0 and not sticky_vtor['captured']:", text)
-        self.assertIn("pc_progress = as_int(cpu_ref.GetRegisterUnsafe(15))", text)
+        self.assertIn("pc_progress = pc_now", text)
         self.assertRegex(
             text,
             re.compile(
@@ -148,6 +185,24 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
                 r"\s+\)\n"
             ),
         )
+
+    def test_execute_runner_tracks_sticky_pc_slot_observation(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("sticky_pc = {'value': 0, 'slot': None, 'captured': False}", text)
+        self.assertIn("def capture_sticky_pc(pc_value):", text)
+        self.assertIn("sticky_pc['value'] = pc", text)
+        self.assertIn("sticky_pc['slot'] = sn", text)
+        self.assertIn("sticky_pc['captured'] = True", text)
+        self.assertIn("capture_sticky_pc(pc_now)", text)
+
+    def test_evaluate_boot_outcome_uses_sticky_pc_as_execution_observation(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("sticky_pc_slot = sticky_pc.get('slot') if sticky_pc.get('captured') else None", text)
+        self.assertIn("if boot_slot is None and sticky_pc_slot in slot_ranges:", text)
+        self.assertIn("execution_observed = boot_slot is not None", text)
+        self.assertIn("'pc_sticky': sticky_pc['captured']", text)
+        self.assertIn("'pc_sticky_slot': sticky_pc['slot']", text)
+        self.assertIn("if not execution_observed:", text)
 
 
 if __name__ == "__main__":
