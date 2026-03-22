@@ -84,7 +84,7 @@ class SweepHashBypassProfileTest(unittest.TestCase):
 
 
 class SweepHashBypassRuntimeScopeTest(unittest.TestCase):
-    def test_fault_batches_get_bypass_but_control_does_not(self) -> None:
+    def test_fault_batches_and_control_share_sweep_bypass_symbols(self) -> None:
         profile = SimpleNamespace(
             name="scope_profile",
             fault_sweep=SimpleNamespace(
@@ -125,8 +125,15 @@ class SweepHashBypassRuntimeScopeTest(unittest.TestCase):
 
         control_robot_vars = mock_single.call_args.kwargs["robot_vars"]
         self.assertIn("BASE:1", control_robot_vars)
-        self.assertFalse(
-            any(rv.startswith("HASH_BYPASS_SYMBOLS:") for rv in control_robot_vars)
+        self.assertIn(
+            "HASH_BYPASS_SYMBOLS:bootutil_img_validate,bootutil_sha256",
+            control_robot_vars,
+        )
+        self.assertEqual(
+            [
+                rv for rv in control_robot_vars if rv.startswith("HASH_BYPASS_SYMBOLS:")
+            ],
+            ["HASH_BYPASS_SYMBOLS:bootutil_img_validate,bootutil_sha256"],
         )
 
     def test_no_hash_bypass_disables_fault_batch_injection(self) -> None:

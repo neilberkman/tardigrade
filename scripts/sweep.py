@@ -102,11 +102,11 @@ def build_control_robot_vars(
     robot_vars: List[str],
     profile: ProfileConfig,
 ) -> List[str]:
-    """Return the robot vars for clean/control runs with sweep hash-bypass disabled."""
+    """Return the robot vars for clean/control runs with sweep hash-bypass enabled."""
     return _with_sweep_hash_bypass(
         robot_vars,
         profile,
-        enabled=False,
+        enabled=True,
     )
 
 
