@@ -164,6 +164,15 @@ def _allow_expected_control_only_issues(profile: ProfileConfig) -> bool:
     return expected_outcome != "success"
 
 
+def _requested_zero_fault_points(args: argparse.Namespace) -> bool:
+    """Return whether CLI bounds request a zero-point execute sweep."""
+    if args.fault_end is None:
+        return False
+    start = 0 if args.fault_start is None else int(args.fault_start)
+    end = int(args.fault_end)
+    return end <= start
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Profile-driven bootloader fault-injection audit."
@@ -760,6 +769,9 @@ def main() -> int:
             and not args.no_trace_replay
             and _trace_replay_eligible_fault_types(fault_types)
         )
+        zero_point_execute_request = (
+            eval_mode == "execute" and _requested_zero_fault_points(args)
+        )
 
         # Apply hash bypass during calibration too — hash validation doesn't
         # affect write/erase counts but consumes enormous virtual time on
@@ -772,7 +784,18 @@ def main() -> int:
                 )
 
         if max_writes == "auto":
-            if eval_mode == "state" and "exec" in profile.memory.slots:
+            if zero_point_execute_request:
+                max_writes = int(profile.fault_sweep.max_writes_cap)
+                calibration_source_override = "skipped_control_only"
+                print(
+                    "Skipping calibration for '{}' — zero fault points requested; "
+                    "using control budget {} writes.".format(
+                        profile.name,
+                        max_writes,
+                    ),
+                    file=sys.stderr,
+                )
+            elif eval_mode == "state" and "exec" in profile.memory.slots:
                 # State mode: compute write count from slot geometry.
                 exec_slot = profile.memory.slots["exec"]
                 max_writes = exec_slot.size // profile.memory.write_granularity
@@ -873,7 +896,15 @@ def main() -> int:
                     print("Calibration: {}.".format(", ".join(cal_parts)), file=sys.stderr)
         else:
             max_writes = int(max_writes)
-            if should_calibrate_for_trace:
+            if zero_point_execute_request:
+                calibration_source_override = "skipped_control_only"
+                print(
+                    "Skipping trace calibration for '{}' — zero fault points requested.".format(
+                        profile.name
+                    ),
+                    file=sys.stderr,
+                )
+            elif should_calibrate_for_trace:
                 # Try loading from calibration cache.
                 _cal_cache_path = args.reuse_calibration
                 _cal_cache_key = ""

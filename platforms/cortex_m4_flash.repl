@@ -44,6 +44,10 @@ rtc1: Timers.NRF52840_RTC @ sysbus 0x40011000
     numberOfEvents: 3
     -> nvic@17
 
+// WDT0 — MCUboot's watchdog feed path writes RR[0..7] at offsets 0x600..0x61C.
+wdt0: Memory.MappedMemory @ sysbus 0x40010000
+    size: 0x1000
+
 nvm_ctrl: NVMemoryController @ sysbus 0x40001000
     Nvm: nvm
     NvmBaseAddress: 0x0000C000
@@ -60,6 +64,7 @@ sysbus:
         Tag <0x0000C000 0xF4000> "NVM_FLASH"
         Tag <0x20000000 0x40000> "SRAM"
         Tag <0x40001000 0x100> "NVM_CTRL"
+        Tag <0x40010000 0x1000> "WDT0"
         Tag <0x4001E000 0x1000> "NVMC"
         Tag <0x10000000 0x1000> "FICR"
         Tag <0x10001000 0x1000> "UICR"

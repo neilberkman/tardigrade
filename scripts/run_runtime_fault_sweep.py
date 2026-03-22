@@ -2417,7 +2417,7 @@ def run_hook_fault(hook_fault_at, hook_fault_type='w'):
         label='hook{}_p1'.format(hook_fault_at),
         stop_on_fault=False,
         max_iters=phase1_max_iters(default_s=4.0),
-        wall_timeout=max(120, progress_stall_timeout_s * 3),
+        wall_timeout=phase1_wall_timeout(default_s=4.0),
     )
     disarm_vtor_watchpoint()
     phase1_ms = int((_time.time() - fp_t0) * 1000)
@@ -2706,7 +2706,7 @@ def run_confirm_cycle_fault(cc_fault_at, cc_fault_type='w'):
         label='cc{}_p1'.format(cc_fault_at),
         stop_on_fault=False,
         max_iters=phase1_max_iters(default_s=4.0),
-        wall_timeout=max(120, progress_stall_timeout_s * 3),
+        wall_timeout=phase1_wall_timeout(default_s=4.0),
     )
     disarm_vtor_watchpoint()
     phase1_ms = int((_time.time() - fp_t0) * 1000)
@@ -3920,7 +3920,7 @@ def _run_clean_update_phase(phase, phase_index):
     disarm_fault()
 
     arm_vtor_watchpoint()
-    wall_timeout = max(120, progress_stall_timeout_s * 3)
+    wall_timeout = phase1_wall_timeout(default_s=4.0)
     max_iters = phase1_max_iters(default_s=4.0)
     status = run_until_done(
         cpu_ref,
@@ -4696,7 +4696,7 @@ def run_until_done(cpu_ref, time_slice='0.02', max_iters=200, wall_timeout=120, 
                     reason = 'no_boot_stall({:.2f}s_emulated)'.format(emulated_stall)
                 else:
                     reason = 'no_progress_stall({:.2f}s_emulated)'.format(emulated_stall)
-            break
+                break
         if cur_writes == 0 and not sticky_vtor['captured']:
             no_boot_zero_write_count += 1
         else:
@@ -4792,6 +4792,13 @@ def phase1_max_iters(default_s=4.0, time_slice_s=0.02):
     duration_s = max(float(default_s), parse_duration_seconds(default=default_s))
     slice_s = max(0.001, float(time_slice_s))
     return max(200, int((duration_s / slice_s) + 0.999))
+
+
+def phase1_wall_timeout(default_s=4.0, min_wall_s=120.0, wall_per_emulated_s=30.0):
+    duration_s = max(float(default_s), parse_duration_seconds(default=default_s))
+    stall_floor_s = max(float(min_wall_s), float(progress_stall_timeout_s) * 3.0)
+    duration_budget_s = max(float(min_wall_s), duration_s * float(wall_per_emulated_s))
+    return max(int(stall_floor_s + 0.999), int(duration_budget_s + 0.999))
 
 def run_read_bit_flip_fault(fault_at):
     # read_bit_flip: storage is correct, but a specific word returns
@@ -5184,7 +5191,7 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
         skip_addr, patch_meta.get('model'), skip_count, skip_addr & 0xFFFFFFFF))
 
     arm_vtor_watchpoint()
-    p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
+    p1_wall_timeout = phase1_wall_timeout(default_s=4.0)
     p1_max_iters = phase1_max_iters(default_s=4.0)
     phase1_status = run_until_done(
         cpu_ref,
@@ -5932,7 +5939,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         disarm_fault()
 
         arm_vtor_watchpoint()
-        p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
+        p1_wall_timeout = phase1_wall_timeout(default_s=4.0)
         p1_max_iters = phase1_max_iters(default_s=4.0)
         phase1_status = run_until_done(
             cpu_ref,
@@ -6049,7 +6056,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         disarm_erase_fault()
 
     arm_vtor_watchpoint()
-    p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
+    p1_wall_timeout = phase1_wall_timeout(default_s=4.0)
     p1_max_iters = phase1_max_iters(default_s=4.0)
     phase1_status = run_until_done(
         cpu_ref,
@@ -6562,7 +6569,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         arm_erase_fault(arm_at, erase_fault_mode=erase_mode)
         disarm_write_fault()
 
-        p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
+        p1_wall_timeout = phase1_wall_timeout(default_s=4.0)
         p1_max_iters = phase1_max_iters(default_s=4.0)
         p1_status = run_until_done(
             cpu_ref,
@@ -6583,7 +6590,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         arm_fault(arm_at, write_fault_mode=write_mode)
         disarm_erase_fault()
 
-        p1_wall_timeout = max(120, progress_stall_timeout_s * 3)
+        p1_wall_timeout = phase1_wall_timeout(default_s=4.0)
         p1_max_iters = phase1_max_iters(default_s=4.0)
         p1_status = run_until_done(
             cpu_ref,
@@ -6859,7 +6866,7 @@ def run_multi_fault_sequence(fault_sequence):
             cpu_ref,
             label=stage_label,
             stop_on_fault=True,
-            wall_timeout=60 if idx > 0 else max(120, progress_stall_timeout_s * 3),
+            wall_timeout=60 if idx > 0 else phase1_wall_timeout(default_s=4.0),
             time_slice=phase2_time_slice if idx > 0 else '0.02',
         )
         disarm_fault()

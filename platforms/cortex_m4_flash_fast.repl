@@ -52,6 +52,11 @@ rtc1: Timers.NRF52840_RTC @ sysbus 0x40011000
     numberOfEvents: 3
     -> nvic@17
 
+// WDT0 — Zephyr/MCUboot feed path writes RR[0..7] at offsets 0x600..0x61C.
+// A simple mapped block is enough for the nRF52 watchdog-feed code path.
+wdt0: Memory.MappedMemory @ sysbus 0x40010000
+    size: 0x1000
+
 // NVMC — handles write/erase enable, page erase, and write counting.
 // Flash reference for MappedMemory erase operations.
 faultFlash: Miscellaneous.NRF52NVMC @ sysbus 0x4001E000
@@ -71,6 +76,7 @@ sysbus:
         Tag <0x00000000 0xC000> "BOOT_ROM"
         Tag <0x0000C000 0xF4000> "NVM_FLASH"
         Tag <0x20000000 0x40000> "SRAM"
+        Tag <0x40010000 0x1000> "WDT0"
         Tag <0x4001E000 0x1000> "NVMC"
         Tag <0x4002F000 0x100> "TRACE_REPLAY"
         Tag <0x10000000 0x1000> "FICR"

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +42,29 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
             text,
         )
         self.assertIn("_verify_loaded_binary_samples(path, _a)", text)
+
+    def test_progress_stall_branch_only_breaks_after_threshold(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("elif progress_stall_timeout_s > 0:", text)
+        self.assertIn("if emulated_stall >= progress_stall_timeout_s:", text)
+        self.assertRegex(
+            text,
+            re.compile(
+                r"if emulated_stall >= progress_stall_timeout_s:\n"
+                r"\s+if cur_writes == 0:\n"
+                r"\s+reason = 'no_boot_stall\(\{:\.2f\}s_emulated\)'\.format\(emulated_stall\)\n"
+                r"\s+else:\n"
+                r"\s+reason = 'no_progress_stall\(\{:\.2f\}s_emulated\)'\.format\(emulated_stall\)\n"
+                r"\s+break\n"
+            ),
+        )
+
+    def test_phase1_uses_scaled_wall_timeout_helper(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("def phase1_wall_timeout(default_s=4.0, min_wall_s=120.0, wall_per_emulated_s=30.0):", text)
+        self.assertNotIn("max(120, progress_stall_timeout_s * 3)", text)
+        self.assertIn("wall_timeout=phase1_wall_timeout(default_s=4.0)", text)
+        self.assertIn("p1_wall_timeout = phase1_wall_timeout(default_s=4.0)", text)
 
 
 if __name__ == "__main__":

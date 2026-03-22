@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json
+import math
 import os
 import signal
 import shlex
@@ -215,6 +216,24 @@ def parse_renode_point_timeout(env: Dict[str, str]) -> Optional[float]:
     return value
 
 
+def parse_renode_robot_timeout_minutes(env: Dict[str, str]) -> Optional[int]:
+    """Read optional Robot per-suite timeout override from environment."""
+    raw = str(env.get("OTA_RENODE_ROBOT_TIMEOUT_MINUTES", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        raise RuntimeError(
+            "Invalid OTA_RENODE_ROBOT_TIMEOUT_MINUTES='{}' (must be numeric)".format(
+                raw
+            )
+        )
+    if value <= 0:
+        return None
+    return int(math.ceil(value))
+
+
 def prepare_run_environment(
     base_env: Dict[str, str],
     bundle_dir: Path,
@@ -401,6 +420,10 @@ def run_single_point(
     # Calibration can take much longer than 2 minutes for large swap operations
     # (e.g. MCUboot HEAD 448KB swap-move). Give it 15 minutes.
     single_point_timeout_m = 15 if calibration else 2
+    env = prepare_run_environment(os.environ.copy(), bundle_dir, temp_root)
+    robot_timeout_override_m = parse_renode_robot_timeout_minutes(env)
+    if robot_timeout_override_m is not None:
+        single_point_timeout_m = max(single_point_timeout_m, robot_timeout_override_m)
 
     cmd = [
         renode_test,
@@ -418,7 +441,6 @@ def run_single_point(
     for rv in robot_vars:
         cmd.extend(["--variable", rv])
 
-    env = prepare_run_environment(os.environ.copy(), bundle_dir, temp_root)
     cmd = prepare_renode_command(renode_test, cmd, repo_root, env)
     timeout_s = parse_renode_point_timeout(env)
     if calibration and timeout_s is not None:
@@ -638,6 +660,10 @@ def run_batch(
         # Robot's per-suite timeout and recursively split.
         robot_test_timeout_s = max(robot_test_timeout_s, 600.0)
     robot_test_timeout_m = max(2, (int(robot_test_timeout_s) + 59) // 60)
+    env = prepare_run_environment(os.environ.copy(), bundle_dir, temp_root)
+    robot_timeout_override_m = parse_renode_robot_timeout_minutes(env)
+    if robot_timeout_override_m is not None:
+        robot_test_timeout_m = max(robot_test_timeout_m, robot_timeout_override_m)
 
     cmd = [
         renode_test,
@@ -662,7 +688,6 @@ def run_batch(
     for rv in robot_vars:
         cmd.extend(["--variable", rv])
 
-    env = prepare_run_environment(os.environ.copy(), bundle_dir, temp_root)
     cmd = prepare_renode_command(renode_test, cmd, repo_root, env)
     per_point_timeout = parse_renode_point_timeout(env)
     # Scale batch timeout by fault point values, not just count.
