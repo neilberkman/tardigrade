@@ -90,6 +90,8 @@ See [`action.yml`](action.yml) for all inputs and outputs.
 
 ### Local
 
+For a step-by-step walkthrough, see the [Getting Started guide](docs/getting-started.md).
+
 Prerequisites: `python3`, `python3 -m pip install -r requirements.txt`, and either `renode-test` on PATH or Docker.
 
 ```bash

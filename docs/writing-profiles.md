@@ -49,6 +49,22 @@ python3 scripts/audit_bootloader.py --profile my_profile.yaml --quick
 
 `--quick` runs 3 fault points as a smoke test. If it passes, drop `--quick` for the full heuristic sweep.
 
+## Profile inheritance
+
+A profile can extend a base profile with `base_profile`. The child profile deep-merges on top of the base: dicts merge recursively, lists and scalars in the child replace the base value. The base path is resolved relative to the child profile's directory.
+
+```yaml
+# profiles/mcuboot_pr2100_broken.yaml
+base_profile: mcuboot_head_upgrade.yaml
+name: mcuboot_pr2100_broken
+bootloader:
+  elf: path/to/broken_commit.elf
+expect:
+  should_find_issues: true
+```
+
+This inherits everything from `mcuboot_head_upgrade.yaml` (platform, memory layout, images, fault_sweep, etc.) and overrides only the fields specified. Chains are supported -- a base can itself declare a `base_profile`. Cycles are detected and rejected. Maximum chain depth is 10.
+
 ## Choosing a platform
 
 Tardigrade ships several platform backends. Pick the one that matches your NVM technology:
@@ -214,6 +230,17 @@ update_trigger:
   slot: exec
   copy_done: 1
 ```
+
+MCUboot builds with `BOOT_MAX_ALIGN` larger than 8 use a different trailer magic encoding. Set `max_align` to match your MCUboot configuration:
+
+```yaml
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: staging
+  max_align: 32
+```
+
+Default is 8. The value must fit in a 16-bit field (max 65535). When set, tardigrade generates the align-aware magic bytes (`struct.pack("<H", max_align)` + fixed suffix) instead of the default 4-word GOOD magic.
 
 RIOTboot headers are also supported:
 
@@ -385,7 +412,7 @@ fault_sweep:
     skip_count: 1
 ```
 
-Each `target_addresses` entry may be either an explicit `{ start, end }` range or a `{ symbol }` query. `symbol` uses substring matching against `STT_FUNC` names in the bootloader ELF `.symtab`, so `{ symbol: Validate }` matches every function whose name contains `Validate`. Mixed lists are supported.
+Each `target_addresses` entry may be either an explicit `{ start, end }` range or a `{ symbol }` query. `symbol` specs support two matching modes: plain strings use substring matching (`{ symbol: Validate }` matches every function whose name contains `Validate`), while fnmatch glob patterns use case-sensitive glob matching (`{ symbol: "bootutil_img_validate*" }` matches `bootutil_img_validate` and `bootutil_img_validate_encrypted_uniflash` but not `do_bootutil_img_validate`). A string is treated as a glob if it contains `*`, `?`, or `[`. Mixed lists are supported.
 
 When a symbol matches multiple functions, tardigrade includes every matching range and logs the resolved addresses at profile-load time. If a query matches nothing, profile loading fails with a clear error that lists the available function symbols. For `STT_FUNC` entries with `st_size: 0`, tardigrade infers the end address from the next function symbol.
 
@@ -460,7 +487,7 @@ fault_sweep:
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 ```
 
-Patches the named function to return 0 immediately, but only for faulted sweep runs. Control boots, calibration, and `partial_staging` keep normal validation behavior. Add `--no-hash-bypass` on the CLI to disable the optimization entirely.
+Symbol names support fnmatch glob patterns (e.g., `bootutil_img_validate*`). Plain strings use substring matching as before. Patches the named function to return 0 immediately, but only for faulted sweep runs. Control boots, calibration, and `partial_staging` keep normal validation behavior. Add `--no-hash-bypass` on the CLI to disable the optimization entirely.
 
 ### Heuristic tuning
 
@@ -689,6 +716,19 @@ expect:
 
 For known-vulnerable code (differential testing), set `should_find_issues: true`. The self-test fails if the sweep doesn't find issues.
 
+### Control-only issues
+
+Some bugs manifest in the control path (unfaulted boot) rather than under fault injection. For example, MCUboot PR #2199's stuck-revert bug produces `wrong_image` on the control boot itself, with zero fault-induced issue points. Use `allow_control_only_issues` to tell tardigrade that a broken control outcome counts as a valid finding:
+
+```yaml
+expect:
+  should_find_issues: true
+  control_outcome: wrong_image
+  allow_control_only_issues: true
+```
+
+When `allow_control_only_issues: true` and the control boot matches `control_outcome`, tardigrade treats the profile as having found issues even if the fault sweep itself produces no additional issue points. Without this flag, a sweep with zero fault-induced issues would fail the `should_find_issues: true` assertion.
+
 ## Advanced features
 
 ### Metadata fault injection
@@ -857,7 +897,7 @@ Model the bootloader's own code region for self-update or integrity fault scenar
 
 ```yaml
 bootloader_region:
-  start: 0x00000000
+  base: 0x00000000
   size: 0xC000
 ```
 
@@ -1215,6 +1255,30 @@ python3 scripts/self_test.py \
 ```
 
 Profiles with `skip_self_test: true` are skipped (typically narrow-window or CI-only profiles that need pre-built assets).
+
+### Calibration caching
+
+Calibration (running the firmware once to count NVM writes and build a trace) can be cached across runs. Pass `--reuse-calibration` with a path to a JSON cache file:
+
+```bash
+python3 scripts/audit_bootloader.py \
+    --profile profiles/mcuboot_head_upgrade.yaml \
+    --reuse-calibration /tmp/cal_cache.json
+```
+
+The cache key is derived from the ELF hash, image hashes, fault types, flash backend, and write granularity. If the file exists and the key matches, calibration is loaded from cache (skipping the Renode calibration run entirely). After a fresh calibration, the result is saved to the file for future reuse. This is useful in CI pipelines where the same ELF is swept with different profiles or parameters.
+
+### Quick mode with heuristic points
+
+By default, `--quick` picks 3 representative fault points (first, middle, last). Set `quick_use_heuristic: true` in `fault_sweep` to use heuristic-selected points instead, which gives better coverage of trailer and boundary regions:
+
+```yaml
+fault_sweep:
+  quick_use_heuristic: true
+  max_heuristic_points: 64
+```
+
+`max_heuristic_points` caps the total heuristic output (default 2000 for full sweeps). When combined with `quick_use_heuristic: true`, this controls how many points `--quick` mode runs -- typically set to 64 for a fast but meaningful smoke test. Set to `null` to disable the cap entirely.
 
 ### Heuristic sharding
 
