@@ -37,16 +37,17 @@ EXECUTE_ONLY_FAULT_TYPES = {
     "i2c_wrong_address",
 }
 
-# Fault types that can use trace replay in execute mode. These still remain
-# execute-only relative to the pure Python state evaluator, but they do not
-# require full Phase 1 CPU emulation when a clean write trace is available.
+# Fault types that can use trace replay in execute mode by default.
+#
+# Only power-loss remains enabled here. Mutated non-halting write faults
+# (bit_corruption, silent_write_failure, write_rejection, write_disturb,
+# wear_leveling_corruption) can change Phase-1 control flow after the faulted
+# write, so persisted-flash replay is not faithful enough for CI-default use.
+# The runtime keeps the specialized replay code paths for future explicit
+# opt-in experiments, but the default planner now stays on full execute mode
+# for those fault types.
 TRACE_REPLAY_FAULT_TYPES = {
     "power_loss",
-    "bit_corruption",
-    "silent_write_failure",
-    "write_rejection",
-    "write_disturb",
-    "wear_leveling_corruption",
 }
 
 # Canonical mapping from human-readable fault type names to single-char

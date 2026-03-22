@@ -131,5 +131,15 @@ python """
 import os as _os
 _repo_root = str(monitor.GetVariable('repo_root')).strip()
 _sweep_py = _os.path.join(_repo_root, 'scripts', 'run_runtime_fault_sweep.py')
-exec(open(_sweep_py).read())
+_sweep_globals = globals()
+_sweep_globals['__file__'] = _sweep_py
+_sweep_globals.setdefault('__name__', '__main__')
+try:
+    execfile
+except NameError:
+    with open(_sweep_py, 'rb') as _f:
+        _sweep_src = _f.read()
+    exec(compile(_sweep_src, _sweep_py, 'exec'), _sweep_globals, _sweep_globals)
+else:
+    execfile(_sweep_py, _sweep_globals)
 """

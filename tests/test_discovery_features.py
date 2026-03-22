@@ -66,9 +66,9 @@ class DiscoveryFeaturesTest(unittest.TestCase):
         mock_killpg.assert_called_once_with(4242, signal.SIGKILL)
         proc.kill.assert_not_called()
 
-    def test_trace_replay_eligibility_allows_replayable_write_faults(self) -> None:
-        self.assertTrue(_trace_replay_eligible_fault_types(["bit_corruption"]))
-        self.assertTrue(_trace_replay_eligible_fault_types(["write_rejection"]))
+    def test_trace_replay_eligibility_defaults_to_power_loss_only(self) -> None:
+        self.assertFalse(_trace_replay_eligible_fault_types(["bit_corruption"]))
+        self.assertFalse(_trace_replay_eligible_fault_types(["write_rejection"]))
         self.assertTrue(_trace_replay_eligible_fault_types(["instruction_skip", "power_loss"]))
         self.assertFalse(_trace_replay_eligible_fault_types(["instruction_skip"]))
 

@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 import base64
 import json
 import os
@@ -54,31 +56,74 @@ bus = monitor.Machine.SystemBus
 
 
 def _bus_load_elf(path):
-    """Load ELF. Re-derives bus from monitor to avoid stale references after machine Reset."""
-    _p = str(path)
+    """Load ELF via inline python so post-reset extension lookup stays stable."""
+    _p = str(path).replace("'", "\\'").replace('\\', '/')
+    monitor.Parse("python \"bus=monitor.Machine.SystemBus; bus.LoadELF(r'{}')\"".format(_p))
+
+
+def _to_byte_list(data):
+    if data is None:
+        return None
+    out = []
+    for item in data:
+        try:
+            out.append(ord(item))
+        except TypeError:
+            out.append(int(item) & 0xFF)
+    return out
+
+
+def _read_bus_bytes(addr, size):
     _bus = monitor.Machine.SystemBus
     try:
-        _bus.LoadELF(_p)
-        return
+        return _bus.ReadBytes(int(addr), int(size))
     except Exception:
-        pass
-    # Extension method not available — use inline python command.
-    _pf = _p.replace('\\', '/')
-    monitor.Parse("python \"monitor.Machine.SystemBus.LoadELF(r'{}')\"".format(_pf))
+        out = []
+        for off in range(int(size)):
+            try:
+                out.append(int(_bus.ReadByte(int(addr) + off)) & 0xFF)
+            except Exception:
+                return None
+        return out
+
+
+def _verify_loaded_binary_samples(path, addr):
+    try:
+        with open(str(path), 'rb') as _f:
+            payload = _f.read()
+    except Exception:
+        return
+    payload_len = len(payload)
+    if payload_len <= 0:
+        return
+
+    sample_offsets = [0]
+    if payload_len > 8:
+        sample_offsets.append(max(0, (payload_len // 2) - 2))
+    if payload_len > 4:
+        sample_offsets.append(payload_len - 4)
+
+    for sample_off in sorted(set(int(off) for off in sample_offsets)):
+        expected = payload[sample_off:sample_off + min(4, payload_len - sample_off)]
+        actual = _read_bus_bytes(int(addr) + sample_off, len(expected))
+        if _to_byte_list(actual) != _to_byte_list(expected):
+            raise RuntimeError(
+                '_bus_load_binary verification failed for {} at 0x{:X}+0x{:X}: expected {} got {}'.format(
+                    path,
+                    int(addr),
+                    int(sample_off),
+                    [hex(b) for b in _to_byte_list(expected)],
+                    [hex(b) for b in (_to_byte_list(actual) or [])],
+                )
+            )
 
 
 def _bus_load_binary(path, addr):
-    """Load binary. Re-derives bus from monitor to avoid stale references after machine Reset."""
-    _p = str(path)
+    """Load binary via inline python and verify sampled bytes landed in memory."""
+    _p = str(path).replace("'", "\\'").replace('\\', '/')
     _a = int(addr)
-    _bus = monitor.Machine.SystemBus
-    try:
-        _bus.LoadBinary(_p, _a)
-        return
-    except Exception:
-        pass
-    _pf = _p.replace('\\', '/')
-    monitor.Parse("python \"monitor.Machine.SystemBus.LoadBinary(r'{}', {})\"".format(_pf, _a))
+    monitor.Parse("python \"bus=monitor.Machine.SystemBus; bus.LoadBinary(r'{}', {})\"".format(_p, _a))
+    _verify_loaded_binary_samples(path, _a)
 
 
 # Sentinel value used to disarm fault injection (max uint64).
@@ -263,6 +308,11 @@ def refresh_runtime_handles():
             backend['i2c_proxy'] = monitor.Machine[backend['i2c_sysbus_name']]
         except:
             pass
+
+
+def _machine_reset():
+    monitor.Parse('machine Reset')
+    refresh_runtime_handles()
 
 # Read monitor variables.
 result_file = str(monitor.GetVariable('result_file'))
@@ -3592,7 +3642,7 @@ def restore_initial_flash_cache():
 
 
 def prepare_clean_phase1_state():
-    monitor.Parse('machine Reset')
+    _machine_reset()
     monitor.Parse('machine Pause')
     needs_pre_boot = restore_initial_flash_cache()
     if needs_pre_boot:
@@ -3626,7 +3676,7 @@ def prepare_recovery_shell_state():
     if reset_mode == 'cold':
         prepare_cold_reset()
     else:
-        monitor.Parse('machine Reset')
+        _machine_reset()
     monitor.Parse('machine Pause')
     _bus_load_elf(bootloader_elf)
     restore_hw_init()
@@ -3648,7 +3698,7 @@ def prepare_cold_reset():
     # teardown/recreate (which would invalidate all peripheral references).
     # The NVM save/restore ensures we at least clear any cached peripheral
     # state that survives a normal reset.
-    monitor.Parse('machine Reset')
+    _machine_reset()
     # Restore the NVM contents that were saved before reset.
     if b['kind'] == 'mram':
         b['data'].WriteBytes(0, nvm_snapshot, 0, len(nvm_snapshot))
@@ -5267,7 +5317,7 @@ def run_timed_reset_fault(fault_at):
     else:
         saved_flash = None
         fault_snapshot_bytes = None
-        monitor.Parse('machine Reset')
+        _machine_reset()
         monitor.Parse('machine Pause')
         _bus_load_elf(bootloader_elf)
         restore_hw_init()
@@ -5371,7 +5421,7 @@ def run_nvs_corruption_fault(variant_idx):
         variant_idx, mode, nvs_region_addr, nvs_region_size))
 
     # Reset machine and reload images.
-    monitor.Parse('machine Reset')
+    _machine_reset()
     monitor.Parse('machine Pause')
     reload_images()
     apply_pre_boot_state()
@@ -5432,7 +5482,7 @@ def run_metadata_fault(fault_at, fault_type='w'):
     fp_t0 = _time.time()
     m_type = fault_type
     log('fp={} type=m:{} metadata_fault_setup'.format(fault_at, m_type))
-    monitor.Parse('machine Reset')
+    _machine_reset()
     monitor.Parse('machine Pause')
     reload_images()
     if _hash_bypass_active:
@@ -6163,7 +6213,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         # ELF and slot images (MappedMemory regions are cleared by reset,
         # but NVMemory preserves faulted metadata), then run Phase 2.
         phase2_t0 = _time.time()
-        monitor.Parse('machine Reset')
+        _machine_reset()
         monitor.Parse('machine Pause')
         _bus_load_elf(bootloader_elf)
         if image_exec_path:
@@ -6229,7 +6279,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             _multiboot_cycles_run += 1
             log('fp={} multi-boot cycle {} of {}'.format(fault_at, extra_cycle + 1, boot_cycles))
             monitor.Parse('machine Pause')
-            monitor.Parse('machine Reset')
+            _machine_reset()
             _bus_load_elf(bootloader_elf)
             # Do NOT reload slot images — use whatever is on flash after boot 1
             if _hash_bypass_active:
@@ -6327,7 +6377,7 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
     # --- Phase 1: write fault to create dirty state ---
     monitor.Parse('machine Pause')
     cpu_ref.IsHalted = False
-    monitor.Parse('machine Reset')
+    _machine_reset()
     reload_images_cached()
     apply_pre_boot_state()
 
@@ -7025,7 +7075,7 @@ def decode_multi_fault_sequence_local(encoded):
     return [int(p) for p in parts[1:]]
 
 _TRACE_REPLAY_WRITE_FAULT_TYPES = frozenset(('b', 's', 'r', 'd', 'l'))
-_TRACE_REPLAY_SUPPORTED_FAULT_TYPES = frozenset(('w', 'b', 's', 'r', 'd', 'l'))
+_TRACE_REPLAY_SUPPORTED_FAULT_TYPES = frozenset(('w',))
 
 
 def to_clr_bytes(raw):
@@ -7313,7 +7363,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         for extra_cycle in range(1, boot_cycles):
             _multiboot_cycles_run += 1
             monitor.Parse('machine Pause')
-            monitor.Parse('machine Reset')
+            _machine_reset()
             _bus_load_elf(bootloader_elf)
             if _hash_bypass_active:
                 apply_hash_bypass()
@@ -7531,7 +7581,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         for extra_cycle in range(1, boot_cycles):
             _multiboot_cycles_run += 1
             monitor.Parse('machine Pause')
-            monitor.Parse('machine Reset')
+            _machine_reset()
             _bus_load_elf(bootloader_elf)
             if _hash_bypass_active:
                 apply_hash_bypass()
@@ -7601,14 +7651,13 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 # ---------------------------------------------------------------------------
 
 # Fault types that must always use full execute mode (not trace replay)
-# because they depend on NVMC peripheral state or PRNG.
+# because they depend on NVMC peripheral state, PRNG, or can alter Phase-1
+# control flow after a non-halting mutated write.
 _EXECUTE_ONLY_FAULT_TYPES = frozenset(
     ('e', 'a', 'b', 's', 'g', 'x', 'd', 'l', 'r', 't', 'f', 'k',
      'op', 'os', 'od', 'oo',
      'in', 'it', 'ib', 'ic', 'iw')
 )
-
-
 def _dispatch_fault_point(fp, ft, default_run_fn):
     # Dispatch a single fault point to the appropriate runner function.
     #
@@ -7733,7 +7782,7 @@ if calibration_mode:
         if update_sequence_enabled:
             restore_phase1_baseline()
         else:
-            monitor.Parse('machine Reset')
+            _machine_reset()
             reload_images()
             apply_pre_boot_state()
             if _hash_bypass_active:

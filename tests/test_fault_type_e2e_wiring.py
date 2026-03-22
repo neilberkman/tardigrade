@@ -297,7 +297,7 @@ class TestRuntimeDispatchCoverage(unittest.TestCase):
         )
 
     def test_trace_replay_supported_codes_are_declared(self):
-        expected = {"w", "b", "s", "r", "d", "l"}
+        expected = {"w"}
         self.assertEqual(RESC_TRACE_REPLAY_SUPPORTED, expected)
         self.assertIn(
             "default_run_fn == run_trace_replay_fault and ft in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES",
