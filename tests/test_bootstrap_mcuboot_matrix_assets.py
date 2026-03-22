@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import unittest
+import re
 from pathlib import Path
 
 import yaml
@@ -14,6 +15,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "bootstrap_mcuboot_matrix_assets.sh"
+GEOM_SCRIPT = ROOT / "scripts" / "bootstrap_mcuboot_geometry_assets.sh"
 ASSETS = ROOT / "results" / "oss_validation" / "assets"
 
 SCRIPTS = ROOT / "scripts"
@@ -38,9 +40,15 @@ PR_DIFFERENTIAL_PROFILES = [
 
 
 class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
+    def assert_no_imgtool_pad_header(self, text: str) -> None:
+        self.assertNotRegex(
+            text,
+            re.compile(r"imgtool\.py sign[\s\S]*--pad-header"),
+        )
+
     def test_script_has_valid_bash_syntax(self) -> None:
         proc = subprocess.run(
-            ["bash", "-n", str(SCRIPT)],
+            ["bash", "-n", str(SCRIPT), str(GEOM_SCRIPT)],
             capture_output=True,
             text=True,
             check=False,
@@ -100,9 +108,14 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertIn("PR_DIFF_GEOM_ALIGN=\"32\"", text)
         self.assertIn("PR_DIFF_GEOM_TRAILER_RESERVE=\"0x30a0\"", text)
         self.assertIn("PR_DIFF_GEOM_SIGN_OVERHEAD=\"0x400\"", text)
+        self.assertIn("PR_DIFF_BASE_IMAGE=\"${ASSETS_DIR}/zephyr_slot1_padded.bin\"", text)
+        self.assertIn('ih_size = struct.unpack_from("<I", base, 0x0C)[0]', text)
+        self.assertIn("payload = base[0x200:0x200 + ih_size]", text)
+        self.assertIn('path.write_bytes((b"\\x00" * 0x200) + body)', text)
+        self.assertNotIn('payload = app_bin.read_bytes()', text)
         self.assertIn("local align=\"${5:-${PR_DIFF_GEOM_ALIGN}}\"", text)
         self.assertIn("--align \"${align}\"", text)
-        self.assertNotIn("--pad-header", text)
+        self.assert_no_imgtool_pad_header(text)
         self.assertNotIn("--confirm", text)
         self.assertIn("scratch_with_geom_partition.dts", text)
         self.assertIn("MCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}", text)
@@ -114,6 +127,12 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertIn('patch_mcuboot_module_yml', text)
         self.assertIn('update --narrow -o=--depth=1 zephyr mcuboot hal_nordic hal_stm32 cmsis', text)
         self.assertIn('fetch --quiet mcu-tools "+refs/pull/${pr}/head:refs/pull/${pr}"', text)
+
+    def test_geometry_script_restores_header_gap_for_geom_payloads(self) -> None:
+        text = GEOM_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('payload = base[0x200:0x200 + ih_size]', text)
+        self.assertIn('path.write_bytes((b"\\x00" * 0x200) + body)', text)
+        self.assert_no_imgtool_pad_header(text)
 
     def test_upgrade_differential_profiles_hash_exec_slot(self) -> None:
         for relpath in PR_DIFFERENTIAL_PROFILES:

@@ -152,10 +152,13 @@ def max_payload(slot_size: int) -> int:
 
 def make_payload(path: Path, size: int, fill: int) -> None:
     if len(payload) >= size:
-        out = payload[:size]
+        body = payload[:size]
     else:
-        out = payload + bytes([fill]) * (size - len(payload))
-    path.write_bytes(out)
+        body = payload + bytes([fill]) * (size - len(payload))
+    # imgtool expects the MCUboot header reservation at the start of the
+    # input image when --pad-header is not used. Restore the 0x200-byte
+    # gap so the signed output's vector table lands at 0x200, not 0x400.
+    path.write_bytes((b"\x00" * 0x200) + body)
 
 make_payload(Path("/tmp/zephyr_slot1_scratch_geom_payload.bin"), max_payload(0x6E000), 0xA5)
 make_payload(Path("/tmp/zephyr_slot1_offset_geom_payload.bin"), max_payload(0x76000), 0x5A)

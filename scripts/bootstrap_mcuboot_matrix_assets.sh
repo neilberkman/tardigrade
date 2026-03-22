@@ -372,29 +372,35 @@ build_pr_differential_images() {
         "${ASSETS_DIR}/zephyr_slot1_padded.bin"
 
     msg "Generating geometry/max payload variants (CONFIG_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN})"
-    PR_DIFF_APP_BIN="${app_bin}" \
+    PR_DIFF_BASE_IMAGE="${ASSETS_DIR}/zephyr_slot1_padded.bin" \
     PR_DIFF_TMP="${BUILD_ROOT}" \
     PR_DIFF_GEOM_TRAILER_RESERVE="${PR_DIFF_GEOM_TRAILER_RESERVE}" \
     PR_DIFF_GEOM_SIGN_OVERHEAD="${PR_DIFF_GEOM_SIGN_OVERHEAD}" \
     python3 - <<'PY'
 from pathlib import Path
 import os
+import struct
 
-app_bin = Path(os.environ["PR_DIFF_APP_BIN"])
+base_image = Path(os.environ["PR_DIFF_BASE_IMAGE"])
 tmp_root = Path(os.environ["PR_DIFF_TMP"])
-payload = app_bin.read_bytes()
 geom_trailer_reserve = int(os.environ["PR_DIFF_GEOM_TRAILER_RESERVE"], 0)
 geom_sign_overhead = int(os.environ["PR_DIFF_GEOM_SIGN_OVERHEAD"], 0)
+base = base_image.read_bytes()
+ih_size = struct.unpack_from("<I", base, 0x0C)[0]
+payload = base[0x200:0x200 + ih_size]
 
 def max_payload(slot_size: int) -> int:
     return (slot_size - 0x200 - geom_trailer_reserve - geom_sign_overhead) & ~0x1F
 
 def make_payload(path: Path, size: int, fill: int) -> None:
     if len(payload) >= size:
-        out = payload[:size]
+        body = payload[:size]
     else:
-        out = payload + bytes([fill]) * (size - len(payload))
-    path.write_bytes(out)
+        body = payload + bytes([fill]) * (size - len(payload))
+    # imgtool expects the MCUboot header reservation at the start of the
+    # input image when --pad-header is not used. Restore the 0x200-byte
+    # gap so the signed output's vector table lands at 0x200, not 0x400.
+    path.write_bytes((b"\x00" * 0x200) + body)
 
 make_payload(tmp_root / "zephyr_slot1_max_payload.bin", 0x74000, 0x3C)
 make_payload(tmp_root / "zephyr_slot1_scratch_geom_payload.bin", max_payload(0x6E000), 0xA5)
