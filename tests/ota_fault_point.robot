@@ -50,6 +50,7 @@ ${FAULT_TYPES}                 write
 ${FAULT_TYPE_CSV}              ${EMPTY}
 ${BOOT_CYCLES}                 1
 ${CALIBRATION_TIME_SLICE}      ${EMPTY}
+${PHASE1_TIME_SLICE}           ${EMPTY}
 ${PHASE2_TIME_SLICE}           ${EMPTY}
 ${BOOT_CYCLE_HOOK}            ${EMPTY}
 ${EXPECTED_ROLLBACK_AT_CYCLE}    ${EMPTY}
@@ -188,6 +189,7 @@ Run Runtime Fault Point
     Execute Command    $fault_type_csv="${FAULT_TYPE_CSV}"
     Execute Command    $boot_cycles="${BOOT_CYCLES}"
     Run Keyword If    '${CALIBRATION_TIME_SLICE}' != ''    Execute Command    $calibration_time_slice="${CALIBRATION_TIME_SLICE}"
+    Run Keyword If    '${PHASE1_TIME_SLICE}' != ''    Execute Command    $phase1_time_slice="${PHASE1_TIME_SLICE}"
     Run Keyword If    '${PHASE2_TIME_SLICE}' != ''    Execute Command    $phase2_time_slice="${PHASE2_TIME_SLICE}"
     Run Keyword If    '${BOOT_CYCLE_HOOK}' != ''    Execute Command    $boot_cycle_hook="${BOOT_CYCLE_HOOK}"
     Run Keyword If    '${EXPECTED_ROLLBACK_AT_CYCLE}' != ''    Execute Command    $expected_rollback_at_cycle=${EXPECTED_ROLLBACK_AT_CYCLE}

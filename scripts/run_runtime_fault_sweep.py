@@ -4794,6 +4794,11 @@ def parse_duration_seconds(default=2.0):
         return default
 
 def phase1_max_iters(default_s=4.0, time_slice_s=0.02):
+    if time_slice_s is None:
+        try:
+            time_slice_s = float(phase1_time_slice)
+        except Exception:
+            time_slice_s = 0.02
     duration_s = max(float(default_s), parse_duration_seconds(default=default_s))
     slice_s = max(0.001, float(time_slice_s))
     return max(200, int((duration_s / slice_s) + 0.999))

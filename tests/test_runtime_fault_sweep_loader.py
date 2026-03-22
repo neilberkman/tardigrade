@@ -11,6 +11,7 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 RESC_PATH = ROOT / "scripts" / "run_runtime_fault_sweep.resc"
 PY_PATH = ROOT / "scripts" / "run_runtime_fault_sweep.py"
+ROBOT_PATH = ROOT / "tests" / "ota_fault_point.robot"
 
 
 class RuntimeFaultSweepLoaderTests(unittest.TestCase):
@@ -73,6 +74,16 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertIn("def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, label='',", text)
         self.assertIn("if time_slice is None:", text)
         self.assertIn("time_slice = phase1_time_slice", text)
+        self.assertIn("if time_slice_s is None:", text)
+        self.assertIn("time_slice_s = float(phase1_time_slice)", text)
+
+    def test_robot_suite_forwards_phase1_time_slice(self) -> None:
+        text = ROBOT_PATH.read_text(encoding="utf-8")
+        self.assertIn("${PHASE1_TIME_SLICE}           ${EMPTY}", text)
+        self.assertIn(
+            "Run Keyword If    '${PHASE1_TIME_SLICE}' != ''    Execute Command    $phase1_time_slice=\"${PHASE1_TIME_SLICE}\"",
+            text,
+        )
 
 
 if __name__ == "__main__":
