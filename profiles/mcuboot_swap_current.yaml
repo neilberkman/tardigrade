@@ -45,7 +45,8 @@ fault_sweep:
   evaluation_mode: execute
   max_writes: auto
   max_writes_cap: 200000
-  run_duration: "2.0"
+  run_duration: "20.0"
+  phase1_time_slice: "0.10"
   max_step_limit: 20000000
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 expect:
