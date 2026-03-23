@@ -16,6 +16,7 @@ if str(SCRIPTS) not in sys.path:
 from bypass_probe import (
     CLASSIFICATION_ALL_LAYERS_BREACHED,
     CLASSIFICATION_FIRST_LAYER_BREACHED_FOLLOWING_HELD,
+    CLASSIFICATION_FIRST_LAYER_BREACHED_FOLLOWING_NOT_REACHED,
     CLASSIFICATION_FIRST_LAYER_BREACHED_SECOND_CAUGHT,
     CLASSIFICATION_FIRST_LAYER_HELD,
     CLASSIFICATION_FIRST_LAYER_NOT_REACHED,
@@ -314,7 +315,7 @@ class ClassifyProbeResultTests(unittest.TestCase):
         self.assertFalse(classification["full_bypass"])
 
     def test_offline_fallback_first_layer_breached_following_held(self) -> None:
-        """Multiple breached + multiple held layers triggers following_held."""
+        """Offline fallback mirrors the RESC ordering for held later layers."""
         result = {
             "signals": {
                 "verification_probes": {
@@ -345,14 +346,14 @@ class ClassifyProbeResultTests(unittest.TestCase):
         classification = classify_probe_result(result)
         self.assertEqual(
             classification["classification"],
-            CLASSIFICATION_FIRST_LAYER_BREACHED_FOLLOWING_HELD,
+            CLASSIFICATION_FIRST_LAYER_BREACHED_SECOND_CAUGHT,
         )
         self.assertEqual(classification["defense_in_depth"], DEFENSE_HELD)
         self.assertFalse(classification["full_bypass"])
         self.assertEqual(classification["bypassed_labels"], ["layer_a"])
 
     def test_offline_fallback_breached_plus_not_reached_no_held(self) -> None:
-        """Breached + not_reached with no held layers gives unknown defense."""
+        """Breached + not_reached with no held layers mirrors RESC classification."""
         result = {
             "signals": {
                 "verification_probes": {
@@ -374,7 +375,7 @@ class ClassifyProbeResultTests(unittest.TestCase):
         classification = classify_probe_result(result)
         self.assertEqual(
             classification["classification"],
-            CLASSIFICATION_PARTIAL_MULTILAYER_BYPASS,
+            CLASSIFICATION_FIRST_LAYER_BREACHED_FOLLOWING_NOT_REACHED,
         )
         self.assertEqual(classification["defense_in_depth"], DEFENSE_UNKNOWN)
         self.assertFalse(classification["full_bypass"])
@@ -612,6 +613,51 @@ class BuildDefenseInDepthLayersTests(unittest.TestCase):
         # not held, because the unreached layer can't confirm it would catch.
         self.assertEqual(layers["aggregate_classification"], DEFENSE_UNKNOWN)
         self.assertEqual(layers["full_bypass_count"], 0)
+
+    def test_unknown_point_does_not_promote_aggregate_to_held(self) -> None:
+        results = [
+            self._make_result(
+                0x1000,
+                {
+                    "layer_a": {
+                        "reached": True,
+                        "first_bypassed": True,
+                        "bypassed": True,
+                        "symbol": "func_a",
+                        "call_count": 1,
+                    },
+                    "layer_b": {
+                        "reached": False,
+                        "symbol": "func_b",
+                        "call_count": 0,
+                    },
+                },
+            ),
+            self._make_result(
+                0x1002,
+                {
+                    "layer_a": {
+                        "reached": True,
+                        "first_bypassed": False,
+                        "bypassed": False,
+                        "symbol": "func_a",
+                        "call_count": 1,
+                    },
+                    "layer_b": {
+                        "reached": True,
+                        "first_bypassed": False,
+                        "bypassed": False,
+                        "symbol": "func_b",
+                        "call_count": 1,
+                    },
+                },
+                probe_classification="first_layer_held",
+                probe_defense="held",
+            ),
+        ]
+        layers = build_defense_in_depth_layers(results)
+        self.assertIsNotNone(layers)
+        self.assertEqual(layers["aggregate_classification"], DEFENSE_UNKNOWN)
 
     def test_classification_counts(self) -> None:
         results = [

@@ -36,6 +36,7 @@ CLASSIFICATION_FIRST_LAYER_BREACHED_SECOND_CAUGHT = "first_layer_breached_second
 CLASSIFICATION_FIRST_LAYER_HELD = "first_layer_held"
 CLASSIFICATION_FIRST_LAYER_NOT_REACHED = "first_layer_not_reached"
 CLASSIFICATION_FIRST_LAYER_BREACHED_FOLLOWING_HELD = "first_layer_breached_following_held"
+CLASSIFICATION_FIRST_LAYER_BREACHED_FOLLOWING_NOT_REACHED = "first_layer_breached_following_not_reached"
 CLASSIFICATION_PARTIAL_MULTILAYER_BYPASS = "partial_multilayer_bypass"
 CLASSIFICATION_NOT_REACHED = "not_reached"
 CLASSIFICATION_NO_PROBES = "no_probes"
@@ -142,42 +143,41 @@ def classify_probe_result(result: Dict[str, Any]) -> Dict[str, Any]:
         defense = resc_defense or DEFENSE_UNKNOWN
     else:
         # Offline fallback classification from layer statuses.
-        reached_layers = [l for l in layers if l["status"] != LAYER_NOT_REACHED]
-        breached_layers = [l for l in layers if l["status"] == LAYER_BREACHED]
-        held_layers = [l for l in layers if l["status"] == LAYER_HELD]
-        not_reached_layers = [l for l in layers if l["status"] == LAYER_NOT_REACHED]
+        ordered_probes = [
+            probes[label]
+            for label in probes
+            if isinstance(probes.get(label), dict)
+        ]
+        first = ordered_probes[0] if ordered_probes else None
+        later = ordered_probes[1:] if len(ordered_probes) > 1 else []
 
-        if not reached_layers:
+        if first is None or not any(l["status"] != LAYER_NOT_REACHED for l in layers):
             classification = CLASSIFICATION_NOT_REACHED
             defense = DEFENSE_UNKNOWN
-        elif len(breached_layers) == len(layers):
-            if len(layers) == 1:
-                classification = CLASSIFICATION_SINGLE_LAYER_BREACHED
-            else:
-                classification = CLASSIFICATION_ALL_LAYERS_BREACHED
-            defense = DEFENSE_DEFEATED
-        elif not breached_layers:
-            if not_reached_layers and layers[0]["status"] == LAYER_NOT_REACHED:
-                classification = CLASSIFICATION_FIRST_LAYER_NOT_REACHED
-                defense = DEFENSE_UNKNOWN
-            else:
-                classification = CLASSIFICATION_FIRST_LAYER_HELD
-                defense = DEFENSE_HELD
-        elif held_layers:
-            if len(held_layers) > 1 or len(breached_layers) > 1:
-                classification = CLASSIFICATION_FIRST_LAYER_BREACHED_FOLLOWING_HELD
-            else:
-                classification = CLASSIFICATION_FIRST_LAYER_BREACHED_SECOND_CAUGHT
-            defense = DEFENSE_HELD
-        elif not_reached_layers:
-            # Breached + not_reached but no held: defense status is unknown
-            # because unreached layers cannot confirm they would have caught
-            # the breach.
-            classification = CLASSIFICATION_PARTIAL_MULTILAYER_BYPASS
+        elif not first.get("reached"):
+            classification = CLASSIFICATION_FIRST_LAYER_NOT_REACHED
             defense = DEFENSE_UNKNOWN
-        else:
+        elif not (first.get("first_bypassed") or first.get("bypassed")):
+            classification = CLASSIFICATION_FIRST_LAYER_HELD
+            defense = DEFENSE_HELD
+        elif not later:
+            classification = CLASSIFICATION_SINGLE_LAYER_BREACHED
+            defense = DEFENSE_DEFEATED
+        elif any(item.get("reached") and not item.get("first_bypassed") for item in later):
+            classification = CLASSIFICATION_FIRST_LAYER_BREACHED_SECOND_CAUGHT
+            defense = DEFENSE_HELD
+        elif later and all(item.get("reached") and item.get("first_bypassed") for item in later):
+            classification = CLASSIFICATION_ALL_LAYERS_BREACHED
+            defense = DEFENSE_DEFEATED
+        elif any(item.get("first_bypassed") for item in later):
             classification = CLASSIFICATION_PARTIAL_MULTILAYER_BYPASS
             defense = DEFENSE_PARTIAL
+        elif any(item.get("reached") for item in later):
+            classification = CLASSIFICATION_FIRST_LAYER_BREACHED_FOLLOWING_HELD
+            defense = DEFENSE_HELD
+        else:
+            classification = CLASSIFICATION_FIRST_LAYER_BREACHED_FOLLOWING_NOT_REACHED
+            defense = DEFENSE_UNKNOWN
 
     full_bypass = classification in (
         CLASSIFICATION_SINGLE_LAYER_BREACHED,
@@ -267,30 +267,26 @@ def build_defense_in_depth_layers(
             ),
         })
 
-    # Aggregate verdict: if ANY full bypass exists, defense is partial at best.
-    # When per-result classifications include unknown/not_reached, the
-    # aggregate must not overstate to ``held``.
-    has_unknown = any(
-        c in (CLASSIFICATION_NOT_REACHED, CLASSIFICATION_FIRST_LAYER_NOT_REACHED)
-        for c in classification_counts
-    )
     if full_bypass_count == total_probed:
         aggregate = DEFENSE_DEFEATED
     elif full_bypass_count > 0:
         aggregate = DEFENSE_PARTIAL
-    elif any(s.get("breached", 0) > 0 for s in layer_stats.values()):
-        # Some layers breached but not all -- check if held layers exist.
-        any_held = any(s.get("held", 0) > 0 for s in layer_stats.values())
-        if any_held and not has_unknown:
-            aggregate = DEFENSE_HELD
-        elif any_held:
-            aggregate = DEFENSE_PARTIAL
-        else:
-            aggregate = DEFENSE_UNKNOWN
-    elif has_unknown:
-        aggregate = DEFENSE_UNKNOWN
     else:
-        aggregate = DEFENSE_HELD
+        defense_counts: Dict[str, int] = {}
+        for result in results:
+            if result.get("is_control", False) or not result.get("fault_injected", False):
+                continue
+            probe_result = classify_probe_result(result)
+            if probe_result["classification"] == CLASSIFICATION_NO_PROBES:
+                continue
+            defense = str(probe_result.get("defense_in_depth") or DEFENSE_UNKNOWN)
+            defense_counts[defense] = defense_counts.get(defense, 0) + 1
+        if defense_counts.get(DEFENSE_PARTIAL, 0) > 0:
+            aggregate = DEFENSE_PARTIAL
+        elif defense_counts.get(DEFENSE_UNKNOWN, 0) > 0:
+            aggregate = DEFENSE_UNKNOWN
+        else:
+            aggregate = DEFENSE_HELD
 
     return {
         "layers": layer_summaries,
