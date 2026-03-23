@@ -15,6 +15,7 @@ from fault_inject import apply_clustered_distribution
 from fault_types import FAULT_TYPE_NAME_TO_CODE
 from profile_loader import ProfileConfig
 from renode_runner import quick_subset
+from trace_utils import load_clean_erase_trace, load_clean_write_trace
 from thumb_instructions import (
     build_instruction_skip_patch_plan,
     enumerate_instruction_skip_addresses,
@@ -42,6 +43,80 @@ class CalibrationInputs:
     total_otp_blows: int = 0
     setup_writes: int = 0
     trace_file: Optional[str] = None
+    erase_trace_file: Optional[str] = None
+
+
+def _build_swap_progress_erase_map(
+    profile: ProfileConfig,
+    erase_entries: List[Dict[str, Any]],
+) -> List[Tuple[int, int]]:
+    erase_map: List[Tuple[int, int]] = []
+    seen: set[Tuple[int, int]] = set()
+    page_size = max(1, int(getattr(profile.memory, "page_size", 4096) or 4096))
+    flash_base = min(int(slot.base) for slot in profile.memory.slots.values())
+
+    for entry in erase_entries:
+        start = int(entry.get("flash_offset", 0))
+        size = int(entry.get("erase_size", 0) or 0)
+        if size <= 0:
+            size = page_size
+        end = start + size
+        key = (start, end)
+        if end > start and key not in seen:
+            seen.add(key)
+            erase_map.append(key)
+
+    if erase_map:
+        erase_map.sort()
+        return erase_map
+
+    for slot in profile.memory.slots.values():
+        start = int(slot.base) - flash_base
+        end = start + int(slot.size)
+        cursor = start
+        while cursor < end:
+            sector = (cursor, min(end, cursor + page_size))
+            if sector not in seen:
+                seen.add(sector)
+                erase_map.append(sector)
+            cursor += page_size
+    erase_map.sort()
+    return erase_map
+
+
+def find_swap_progress_boundaries(
+    write_entries: List[Dict[str, int]],
+    erase_map: List[Tuple[int, int]],
+    slot_ranges: List[Tuple[int, int]],
+) -> List[int]:
+    """Return zero-based power-loss points at slot erase-sector transitions."""
+
+    def sector_of(flash_offset: int) -> Optional[int]:
+        for start, end in erase_map:
+            if start <= flash_offset < end:
+                return start
+        return None
+
+    boundaries: List[int] = []
+    current_sectors: Dict[int, int] = {}
+
+    for entry in write_entries:
+        write_index = int(entry.get("write_index", 0))
+        flash_offset = int(entry.get("flash_offset", 0))
+        for slot_start, slot_end in slot_ranges:
+            if slot_start <= flash_offset < slot_end:
+                sector_start = sector_of(flash_offset)
+                if sector_start is None:
+                    break
+                prev = current_sectors.get(slot_start)
+                if prev is not None and sector_start != prev:
+                    boundary = write_index - 1
+                    if boundary >= 0 and (not boundaries or boundaries[-1] != boundary):
+                        boundaries.append(boundary)
+                current_sectors[slot_start] = sector_start
+                break
+
+    return boundaries
 
 
 def _derive_read_fault_points(
@@ -120,9 +195,11 @@ def build_fault_plan(
     total_otp_blows = calibration.total_otp_blows
     setup_writes = calibration.setup_writes
     trace_file = calibration.trace_file
+    erase_trace_file = calibration.erase_trace_file
 
     fault_types = list(getattr(profile.fault_sweep, "fault_types", []) or [])
     include_power_loss = "power_loss" in fault_types or not fault_types
+    include_swap_progress = "swap_progress" in fault_types
     include_erases = (
         "interrupted_erase" in fault_types or "multi_sector_atomicity" in fault_types
     )
@@ -265,6 +342,7 @@ def build_fault_plan(
         or include_reset_at_time
         or include_read_bit_flip
         or include_command_drop
+        or include_swap_progress
         or include_instruction_skip
         or include_i2c_faults
         or include_otp_faults
@@ -281,6 +359,39 @@ def build_fault_plan(
         if include_power_loss:
             write_fps = [(fp, 'w') for fp in fault_points] if max_writes > 0 else []
         combined = list(write_fps)
+        swap_progress_count = 0
+        if include_swap_progress:
+            swap_entries = load_clean_write_trace(trace_file)
+            if swap_entries:
+                flash_base = min(int(slot.base) for slot in profile.memory.slots.values())
+                slot_ranges = sorted(
+                    (
+                        int(slot.base) - flash_base,
+                        int(slot.base) - flash_base + int(slot.size),
+                    )
+                    for slot in profile.memory.slots.values()
+                )
+                erase_entries = load_clean_erase_trace(erase_trace_file)
+                erase_map = _build_swap_progress_erase_map(profile, erase_entries)
+                swap_fps = find_swap_progress_boundaries(swap_entries, erase_map, slot_ranges)
+                swap_fps = _slice_explicit_points(
+                    swap_fps,
+                    fault_step=fault_step,
+                    fault_start=fault_start,
+                    fault_end=fault_end,
+                )
+                if quick and not quick_use_heuristic:
+                    swap_fps = quick_subset(swap_fps)
+                combined += [
+                    (fp, FAULT_TYPE_NAME_TO_CODE["swap_progress"])
+                    for fp in swap_fps
+                ]
+                swap_progress_count = len(swap_fps)
+            else:
+                print(
+                    "Skipping swap_progress fault points: no write trace available.",
+                    file=sys.stderr,
+                )
 
         # Erase-based fault points.
         is_mram_backend = (
@@ -707,6 +818,8 @@ def build_fault_plan(
             parts.append("{} read-flip".format(read_flip_count))
         if command_drop_count:
             parts.append("{} command-drop".format(command_drop_count))
+        if swap_progress_count:
+            parts.append("{} swap-progress".format(swap_progress_count))
         if i2c_fault_count:
             parts.append("{} i2c-fault".format(i2c_fault_count))
         if otp_fault_count:

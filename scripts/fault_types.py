@@ -48,6 +48,7 @@ EXECUTE_ONLY_FAULT_TYPES = {
 # for those fault types.
 TRACE_REPLAY_FAULT_TYPES = {
     "power_loss",
+    "swap_progress",
 }
 
 # Canonical mapping from human-readable fault type names to single-char
@@ -55,6 +56,7 @@ TRACE_REPLAY_FAULT_TYPES = {
 # fault, hook fault, and phase2 fault point generation.
 FAULT_TYPE_NAME_TO_CODE = {
     "power_loss": "w",
+    "swap_progress": "w:sp",
     "bit_corruption": "b",
     "silent_write_failure": "s",
     "driver_error": "g",
@@ -129,6 +131,8 @@ def _fault_type_label(code: Any) -> str:
     }
     if code.startswith("b:"):
         return "bit_corruption_clustered"
+    if code == "w:sp":
+        return "swap_progress"
     if code.startswith("m:"):
         return "metadata_{}".format(_fault_type_label(code.split(":", 1)[1]))
     if code.startswith("h:"):

@@ -300,7 +300,7 @@ class TestRuntimeDispatchCoverage(unittest.TestCase):
         expected = {"w"}
         self.assertEqual(RESC_TRACE_REPLAY_SUPPORTED, expected)
         self.assertIn(
-            "default_run_fn == run_trace_replay_fault and ft in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES",
+            "default_run_fn == run_trace_replay_fault and base_ft in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES",
             _resc_text,
             "trace-replay dispatch override missing from .resc",
         )

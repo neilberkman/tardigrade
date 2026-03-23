@@ -28,6 +28,7 @@ from fault_types import (
     _OTP_WIRE_CODES,
     _fault_type_label,
 )
+from fault_plan import CalibrationInputs, build_fault_plan
 
 # Aliases used by sync tests (historically from audit_bootloader, now canonical in fault_types).
 FT_EXECUTE_ONLY = EXECUTE_ONLY_FAULT_TYPES
@@ -156,6 +157,88 @@ class OTPFaultPointGenerationTest(unittest.TestCase):
                 profile = load_profile(path)
             for ft in self.OTP_TYPES:
                 self.assertIn(ft, profile.fault_sweep.fault_types)
+
+
+class SwapProgressFaultPointGenerationTest(unittest.TestCase):
+    def test_swap_progress_is_implemented(self) -> None:
+        self.assertIn("swap_progress", KNOWN_FAULT_TYPES)
+        self.assertIn("swap_progress", IMPLEMENTED_FAULT_TYPES)
+
+    def test_swap_progress_wire_code_round_trip(self) -> None:
+        self.assertEqual(FAULT_TYPE_NAME_TO_CODE["swap_progress"], "w:sp")
+        self.assertEqual(_fault_type_label("w:sp"), "swap_progress")
+
+    def test_swap_progress_profile_parsing_reads_page_size(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_profile(td, textwrap.dedent("""\
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  page_size: 0x1000
+                  slots:
+                    exec: { base: 0x00000000, size: 0x40000 }
+                    staging: { base: 0x00040000, size: 0x40000 }
+                fault_sweep:
+                  mode: runtime
+                  max_writes: auto
+                  fault_types: [swap_progress]
+            """))
+            profile = load_profile(path)
+            self.assertEqual(profile.memory.page_size, 0x1000)
+            self.assertEqual(profile.fault_sweep.fault_types, ["swap_progress"])
+
+    def test_swap_progress_fault_points_generated_from_sector_transitions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_profile(td, textwrap.dedent("""\
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  page_size: 0x1000
+                  slots:
+                    exec: { base: 0x00000000, size: 0x40000 }
+                    staging: { base: 0x00040000, size: 0x40000 }
+                fault_sweep:
+                  mode: runtime
+                  max_writes: auto
+                  fault_types: [swap_progress]
+            """))
+            trace = Path(td) / "write_trace.csv"
+            trace.write_text(
+                "\n".join(
+                    [
+                        "write_index,flash_offset,value",
+                        "1,262144,1",
+                        "2,262148,2",
+                        "3,266240,3",
+                        "4,266244,4",
+                        "5,270336,5",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            erase_trace = Path(td) / "erase_trace.csv"
+            erase_trace.write_text(
+                "\n".join(
+                    [
+                        "erase_index,flash_offset,writes_at_this_point,erase_size",
+                        "1,262144,0,4096",
+                        "2,266240,2,4096",
+                        "3,270336,4,4096",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            profile = load_profile(path)
+            plan = build_fault_plan(
+                profile=profile,
+                calibration=CalibrationInputs(
+                    max_writes=5,
+                    trace_file=str(trace),
+                    erase_trace_file=str(erase_trace),
+                ),
+            )
+            self.assertEqual(plan.fault_points, [2, 4])
+            self.assertEqual(plan.fault_types_list, ["w:sp", "w:sp"])
 
 
 # ===========================================================================

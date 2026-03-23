@@ -30,9 +30,10 @@ class TestContinueAfterFaultWiring(unittest.TestCase):
 
     def test_bit_corruption_is_not_power_loss(self) -> None:
         source = RESC_PATH.read_text(encoding="utf-8")
-        self.assertIn("is_power_loss_fault = fault_type in ('w', 'e', 'a')", source)
+        self.assertIn("fault_base = _base_fault_type_code(fault_type)", source)
+        self.assertIn("is_power_loss_fault = fault_base in ('w', 'e', 'a')", source)
         self.assertIn(
-            "is_non_power_write_fault = fault_type in ('b', 's', 'g', 'x', 'r', 'd', 'l', 'k')",
+            "is_non_power_write_fault = fault_base in ('b', 's', 'g', 'x', 'r', 'd', 'l', 'k')",
             source,
         )
 
