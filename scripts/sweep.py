@@ -349,6 +349,13 @@ def _auto_execute_batch_points(
     if max_batch_points > 0 or str(evaluation_mode) != "execute" or not fault_points:
         return max_batch_points
 
+    if fault_types_list and all(_base_fault_type_code(ft) == "i" for ft in fault_types_list):
+        _progress(
+            "Execute mode instruction-skip: forcing 1 pt/batch to avoid batch fallback churn "
+            "({} points).".format(len(fault_points))
+        )
+        return 1
+
     has_full_execute_only_points = bool(
         fault_types_list
         and any(
