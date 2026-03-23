@@ -619,7 +619,6 @@ def compute_verdict(
     )
     control_only_issue = (
         allow_control_only_issues
-        and expected_control_outcome != "success"
         and control_outcome == expected_control_outcome
     )
     found_issues = int(

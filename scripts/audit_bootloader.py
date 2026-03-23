@@ -158,10 +158,7 @@ def _allow_expected_control_only_issues(profile: ProfileConfig) -> bool:
     expect = getattr(profile, "expect", None)
     if expect is None:
         return False
-    if not bool(getattr(expect, "allow_control_only_issues", False)):
-        return False
-    expected_outcome = str(getattr(expect, "control_outcome", "success") or "success")
-    return expected_outcome != "success"
+    return bool(getattr(expect, "allow_control_only_issues", False))
 
 
 def _requested_zero_fault_points(args: argparse.Namespace) -> bool:

@@ -83,6 +83,18 @@ def test_compute_verdict_allows_expected_control_issue_count_when_enabled():
     assert verdict == "PASS — control exhibits expected wrong_image"
 
 
+def test_compute_verdict_allows_control_only_issue_with_success_baseline_when_enabled():
+    verdict = compute_verdict(
+        _control_only_summary_with_issue("success"),
+        SimpleNamespace(
+            should_find_issues=True,
+            control_outcome="success",
+            allow_control_only_issues=True,
+        ),
+    )
+    assert verdict == "PASS — control exhibits expected success"
+
+
 def test_compute_verdict_still_fails_without_control_only_opt_in():
     verdict = compute_verdict(
         _control_only_summary("wrong_image"),
@@ -110,6 +122,23 @@ def test_self_test_check_verdict_accepts_control_only_issue_when_enabled():
     )
     assert passed is True
     assert reason == "Control exhibits expected wrong_image, as intended"
+
+
+def test_self_test_check_verdict_accepts_control_issue_with_success_baseline():
+    passed, reason = check_verdict(
+        Path("profiles/pr2206_broken_like.yaml"),
+        {
+            "expect": {
+                "should_find_issues": True,
+                "control_outcome": "success",
+                "allow_control_only_issues": True,
+            }
+        },
+        {"summary": {"runtime_sweep": _control_only_summary_with_issue("success")}},
+        0,
+    )
+    assert passed is True
+    assert reason == "Control exhibits expected success, as intended"
 
 
 def test_pr2199_move_broken_profile_opted_into_control_only_issues():
@@ -144,7 +173,7 @@ def test_allow_expected_control_only_issues_requires_non_success_control():
     assert _allow_expected_control_only_issues(profile) is True
 
 
-def test_allow_expected_control_only_issues_rejects_success_baseline():
+def test_allow_expected_control_only_issues_accepts_success_baseline_when_opted_in():
     profile = load_profile(ROOT / "tests" / "fixtures" / "profiles" / "control_only_issue_profile.yaml")
     profile.expect.control_outcome = "success"
-    assert _allow_expected_control_only_issues(profile) is False
+    assert _allow_expected_control_only_issues(profile) is True
