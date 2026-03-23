@@ -35,6 +35,23 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
             "raw machine Reset should only exist inside _machine_reset()",
         )
 
+    def test_runtime_runner_exposes_console_observations_in_stop_status(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("def capture_console_state(include_recent=False):", text)
+        self.assertIn("console_state = capture_console_state(include_recent=bool(console_fatal))", text)
+        self.assertIn("'console_attached_names': console_state.get('attached_names', [])", text)
+        self.assertIn("'console_last_line': console_state.get('last_line')", text)
+        self.assertIn("'console_fatal_pattern': console_fatal", text)
+
+    def test_runtime_runner_merges_console_status_into_signals(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("def merge_stop_status_signals(signals, prefix, status):", text)
+        self.assertIn("signals[prefix + '_console_attached_names'] = status.get('console_attached_names')", text)
+        self.assertIn("signals[prefix + '_console_last_line'] = status.get('console_last_line')", text)
+        self.assertIn("signals[prefix + '_console_fatal_pattern'] = status.get('console_fatal_pattern')", text)
+        self.assertIn("merge_stop_status_signals(signals, 'phase1', phase1_status)", text)
+        self.assertIn("merge_stop_status_signals(signals, 'phase2', p2_status)", text)
+
     def test_runtime_runner_uses_verified_inline_binary_loads(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("def _verify_loaded_binary_samples(path, addr):", text)
@@ -49,6 +66,12 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertIn("def persist_fault_snapshot(fault_at, fault_type, snapshot_bytes):", text)
         self.assertIn("os.path.join(root, 'robot', 'snapshots')", text)
         self.assertIn("result['fault_snapshot_file'] = _snapshot_path", text)
+        self.assertIn("persist_snapshot=False", text)
+        self.assertIn("if persist_snapshot and fault_snapshot_bytes is not None:", text)
+        self.assertIn("control_snapshot_bytes = None", text)
+        self.assertIn("control_stop_reason = phase1_status.get('reason') if phase1_status is not None else ''", text)
+        self.assertIn("if boot_outcome == 'no_boot' or str(control_stop_reason).startswith('no_boot'):", text)
+        self.assertIn("control_snapshot_bytes = to_py_bytes(_snapshot_current_flash())", text)
 
     def test_progress_stall_branch_only_breaks_after_threshold(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
@@ -185,18 +208,20 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertIn("def run_control_phase1(cpu_ref, label='control_p1', vtor_settle_iters=0):", text)
         self.assertIn("control_budget_s = phase1_budget_duration(", text)
         self.assertIn("prefer_run_duration=zero_point_execute_control", text)
+        self.assertIn("control_time_slice = phase1_time_slice", text)
+        self.assertIn("control_time_slice = str(max(1.0, float(phase1_time_slice)))", text)
         self.assertIn(
             "p1_wall_timeout = phase1_wall_timeout(default_s=control_budget_s, budget_s=control_budget_s)",
             text,
         )
         self.assertIn(
-            "p1_max_iters = phase1_max_iters(default_s=control_budget_s, budget_s=control_budget_s)",
+            "p1_max_iters = phase1_max_iters(",
             text,
         )
         self.assertIn("saved_stall_timeout_s = progress_stall_timeout_s", text)
         self.assertIn("if zero_point_execute_control:", text)
-        self.assertIn("progress_stall_timeout_s = 0", text)
-        self.assertIn("time_slice=phase1_time_slice", text)
+        self.assertIn("progress_stall_timeout_s = max(1.0, float(control_budget_s))", text)
+        self.assertIn("time_slice=control_time_slice", text)
         self.assertIn("progress_stall_timeout_s = saved_stall_timeout_s", text)
 
     def test_robot_suite_forwards_phase1_time_slice(self) -> None:
@@ -247,6 +272,7 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
     def test_control_phase1_switches_to_read_only_progress_for_zero_point_execute(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("control_expect_writes = not zero_point_execute_control", text)
+        self.assertIn("progress_stall_timeout_s = max(1.0, float(control_budget_s))", text)
         self.assertRegex(
             text,
             re.compile(
@@ -260,6 +286,7 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
             ),
         )
         self.assertIn("phase1_status = run_control_phase1(", text)
+        self.assertIn("p2_status=phase1_status", text)
 
     def test_control_runner_captures_offset_slot_header_debug(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
@@ -308,9 +335,20 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
                 r"\s+\)\n"
             ),
         )
+        self.assertIn(
+            "and not sticky_pc['captured']\n"
+            "            and progress_stall_timeout_s > 0\n"
+            "            and emulated_s >= progress_stall_timeout_s",
+            text,
+        )
 
     def test_execute_runner_tracks_sticky_pc_slot_observation(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("console_fatal_patterns = (", text)
+        self.assertIn("def _get_console_peripherals():", text)
+        self.assertIn("def check_console_fatal():", text)
+        self.assertIn("if uart.ContainsLineFragment(pattern):", text)
+        self.assertIn("reason = 'console_fatal({})'.format(console_fatal)", text)
         self.assertIn("sticky_pc = {'value': 0, 'slot': None, 'captured': False}", text)
         self.assertIn("def capture_sticky_pc(pc_value):", text)
         self.assertIn("sticky_pc['value'] = pc", text)
@@ -320,11 +358,13 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
 
     def test_evaluate_boot_outcome_uses_sticky_pc_as_execution_observation(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("no_boot_phase_without_vtor = (", text)
         self.assertIn("sticky_pc_slot = sticky_pc.get('slot') if sticky_pc.get('captured') else None", text)
-        self.assertIn("if boot_slot is None and sticky_pc_slot in slot_ranges:", text)
+        self.assertIn("and not no_boot_phase_without_vtor", text)
         self.assertIn("execution_observed = boot_slot is not None", text)
         self.assertIn("'pc_sticky': sticky_pc['captured']", text)
         self.assertIn("'pc_sticky_slot': sticky_pc['slot']", text)
+        self.assertIn("'pc_sticky_ignored_no_boot_phase': no_boot_phase_without_vtor", text)
         self.assertIn("if not execution_observed:", text)
 
 

@@ -29,6 +29,7 @@ from renode_runner import (  # noqa: E402
     _run_batches_chunked,
     _run_batch_with_fallback,
     calibration_completed,
+    describe_zero_op_calibration,
     profile_robot_timeout_minutes,
     prepare_renode_command,
     run_renode_subprocess,
@@ -1155,6 +1156,30 @@ class DiscoveryFeaturesTest(unittest.TestCase):
         self.assertFalse(
             calibration_completed("no_boot_no_writes", expected_control_outcome="success")
         )
+
+    def test_describe_zero_op_calibration_reports_console_fatal_geometry_failure(self) -> None:
+        msg = describe_zero_op_calibration(
+            data={
+                "signals": {
+                    "phase1_console_fatal_pattern": "Cannot upgrade:",
+                    "phase1_console_last_line": "I: Jumping to the first image slot",
+                }
+            },
+            stop_reason="console_fatal(Cannot upgrade:)",
+            expected_control_outcome="success",
+        )
+        self.assertIn("fatal console-detected stop", msg)
+        self.assertIn("Cannot upgrade:", msg)
+        self.assertIn("geometry/platform mismatch", msg)
+        self.assertNotIn("stateless", msg)
+
+    def test_describe_zero_op_calibration_keeps_stateless_message_for_nonfatal_zero_write_case(self) -> None:
+        msg = describe_zero_op_calibration(
+            data={},
+            stop_reason="vtor_captured",
+            expected_control_outcome="success",
+        )
+        self.assertIn("stateless", msg)
 
     def test_self_test_rejects_semantic_only_issues_by_default(self) -> None:
         passed, reason = check_verdict(

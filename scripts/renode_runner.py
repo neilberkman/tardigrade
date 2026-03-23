@@ -552,6 +552,32 @@ def calibration_completed(
     return True
 
 
+def describe_zero_op_calibration(
+    data: Dict[str, Any],
+    stop_reason: Optional[str],
+    expected_control_outcome: str,
+) -> str:
+    if expected_control_outcome == "no_boot":
+        return "Calibration found 0 NVM operations (expected no_boot baseline)."
+    if stop_reason and stop_reason.startswith("console_fatal("):
+        signals = data.get("signals") if isinstance(data.get("signals"), dict) else {}
+        fatal_pattern = str(signals.get("phase1_console_fatal_pattern") or "").strip()
+        last_line = str(signals.get("phase1_console_last_line") or "").strip()
+        details = fatal_pattern or stop_reason
+        if last_line:
+            details = "{}; last_console_line={!r}".format(details, last_line)
+        return (
+            "WARNING: Calibration found 0 NVM operations because the bootloader "
+            "hit a fatal console-detected stop before any flash activity ({}) . "
+            "Treat this as a control-path failure or geometry/platform mismatch, "
+            "not a stateless/XIP updater."
+        ).format(details)
+    return (
+        "WARNING: Calibration found 0 NVM operations — bootloader is stateless "
+        "(e.g., XIP bootloader). No fault points to test."
+    )
+
+
 def run_calibration(
     repo_root: Path,
     renode_test: str,
@@ -586,17 +612,14 @@ def run_calibration(
             )
         )
     if total_writes <= 0 and total_erases <= 0:
-        if profile.expect.control_outcome == "no_boot":
-            print(
-                "Calibration found 0 NVM operations (expected no_boot baseline).",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                "WARNING: Calibration found 0 NVM operations — bootloader is stateless "
-                "(e.g., XIP bootloader). No fault points to test.".format(),
-                file=sys.stderr,
-            )
+        print(
+            describe_zero_op_calibration(
+                data=data,
+                stop_reason=stop_reason,
+                expected_control_outcome=profile.expect.control_outcome,
+            ),
+            file=sys.stderr,
+        )
     cap = profile.fault_sweep.max_writes_cap
     if total_writes > cap:
         print(

@@ -3,6 +3,7 @@
 // All writes are silently ignored.
 
 using System.Text;
+using System.Collections.Generic;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
@@ -13,6 +14,28 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     public class STM32DummyUSART : IDoubleWordPeripheral, IKnownSize
     {
         public long Size => 0x400;
+        public string LastLine => lastLine;
+        public string RecentLog => string.Join("\n", recentLines.ToArray());
+
+        public bool ContainsLineFragment(string fragment)
+        {
+            if(string.IsNullOrEmpty(fragment))
+            {
+                return false;
+            }
+            if(!string.IsNullOrEmpty(lastLine) && lastLine.Contains(fragment))
+            {
+                return true;
+            }
+            for(var i = 0; i < recentLines.Count; i++)
+            {
+                if(recentLines[i].Contains(fragment))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
 
         public uint ReadDoubleWord(long offset)
         {
@@ -32,7 +55,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     if(lineBuffer.Length > 0)
                     {
-                        this.Log(LogLevel.Info, "UART: {0}", lineBuffer.ToString());
+                        var line = lineBuffer.ToString();
+                        this.Log(LogLevel.Info, "UART: {0}", line);
+                        lastLine = line;
+                        recentLines.Add(line);
+                        if(recentLines.Count > 32)
+                        {
+                            recentLines.RemoveAt(0);
+                        }
                     }
                     lineBuffer.Clear();
                 }
@@ -46,8 +76,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public void Reset()
         {
             lineBuffer.Clear();
+            lastLine = string.Empty;
+            recentLines.Clear();
         }
 
         private readonly StringBuilder lineBuffer = new StringBuilder();
+        private string lastLine = string.Empty;
+        private readonly List<string> recentLines = new List<string>();
     }
 }

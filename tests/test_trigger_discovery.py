@@ -8,10 +8,19 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
+
+try:
+    import yaml  # noqa: F401
+except Exception:  # pragma: no cover - local env may omit pyyaml
+    HAVE_PYYAML = False
+else:
+    HAVE_PYYAML = True
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
+ASSETS = ROOT / "results" / "oss_validation" / "assets"
 
 import sys
 
@@ -24,6 +33,7 @@ from trigger_discovery import (  # noqa: E402
     discover_update_trigger,
     should_auto_discover_trigger,
     validate_compiled_flash_map,
+    validate_swap_sector_geometry,
 )
 
 
@@ -36,12 +46,52 @@ def _write_trace(path: Path, rows: list[dict[str, int]]) -> None:
 
 
 class TriggerDiscoveryTests(unittest.TestCase):
+    def test_validate_swap_sector_geometry_detects_partial_sector_layout(self) -> None:
+        profile = SimpleNamespace(
+            name="mcuboot_geom",
+            bootloader_entry=0x08000000,
+            bootloader_elf="mcuboot.elf",
+            platform="platforms/stm32f4.repl",
+            memory=SimpleNamespace(
+                slots={
+                    "exec": SimpleNamespace(base=0x0800C000, size=0x76000),
+                    "staging": SimpleNamespace(base=0x08082000, size=0x76000),
+                }
+            ),
+        )
+        check = validate_swap_sector_geometry(profile)
+        self.assertEqual(check["status"], "mismatch")
+        self.assertIn("erase-sector layout", check["reason"])
+        self.assertTrue(any(seg["partial"] for seg in check["exec_segments"]))
+        self.assertTrue(any(seg["partial"] for seg in check["staging_segments"]))
+
+    def test_validate_swap_sector_geometry_accepts_uniform_layout(self) -> None:
+        profile = SimpleNamespace(
+            name="mcuboot_uniform",
+            bootloader_entry=0x10000000,
+            bootloader_elf="mcuboot.elf",
+            platform="platforms/cortex_m4_flash_fast.repl",
+            memory=SimpleNamespace(
+                page_size=0x1000,
+                write_granularity=4,
+                slots={
+                    "exec": SimpleNamespace(base=0x10000000, size=0x4000),
+                    "staging": SimpleNamespace(base=0x10004000, size=0x4000),
+                }
+            ),
+        )
+        check = validate_swap_sector_geometry(profile)
+        self.assertEqual(check["status"], "match")
+        self.assertEqual(len(check["exec_segments"]), len(check["staging_segments"]))
+
     def _write_profile(self, tempdir: Path, body: str) -> Path:
         path = tempdir / "profile.yaml"
         path.write_text(textwrap.dedent(body), encoding="utf-8")
         return path
 
     def test_loader_accepts_update_trigger_auto(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
             profile_path = self._write_profile(
@@ -74,19 +124,29 @@ class TriggerDiscoveryTests(unittest.TestCase):
             self.assertTrue(should_auto_discover_trigger(profile, "execute"))
 
     def test_validate_compiled_flash_map_matches_known_profile(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
         profile = load_profile(ROOT / "profiles" / "mcuboot_head_offset_stm32f4_revert.yaml")
         check = validate_compiled_flash_map(profile, ROOT)
+        if check["status"] == "unavailable":
+            self.skipTest(check["reason"])
         self.assertEqual(check["status"], "match")
         self.assertEqual(len(check["checked_slots"]), 2)
 
     def test_validate_compiled_flash_map_detects_mismatch(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
         profile = load_profile(ROOT / "profiles" / "mcuboot_head_offset_stm32f4_revert.yaml")
         profile.memory.slots["staging"].base += 0x2000
         check = validate_compiled_flash_map(profile, ROOT)
+        if check["status"] == "unavailable":
+            self.skipTest(check["reason"])
         self.assertEqual(check["status"], "mismatch")
         self.assertTrue(any("staging" in item for item in check["mismatches"]))
 
     def test_offset_strategy_uses_real_next_erase_boundary(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
         profile = load_profile(ROOT / "profiles" / "mcuboot_pr2214_offset_fixed.yaml")
         strategy = TriggerStrategy(
             name="offset_image_swap_metadata_align8",
@@ -106,6 +166,10 @@ class TriggerDiscoveryTests(unittest.TestCase):
         self.assertTrue(candidate.images["staging"].endswith("zephyr_slot1_offset_geom_full.bin"))
 
     def test_discovery_selects_first_strategy_with_slot_activity(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
+        if not (ASSETS / "zephyr_slot0_padded.bin").exists():
+            self.skipTest("required discovery asset missing")
         profile = load_profile(ROOT / "profiles" / "mcuboot_offset_upgrade.yaml")
         profile.update_trigger = None
         profile.auto_update_trigger = True

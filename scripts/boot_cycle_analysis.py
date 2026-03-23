@@ -50,6 +50,18 @@ def analyze_boot_cycles(
         analysis["status"] = "single_boot"
         return analysis
 
+    initial_signals = cycle_records[0].get("signals") or {}
+    initial_execution_observed = bool(initial_signals.get("execution_observed"))
+    analysis["initial_execution_observed"] = initial_execution_observed
+
+    if (
+        analysis.get("initial_outcome") == "no_boot"
+        and not initial_execution_observed
+        and analysis.get("final_outcome") == "success"
+    ):
+        analysis["status"] = "initial_no_boot_recovered"
+        return analysis
+
     generic_status = "oscillating"
     converged_at_cycle = None
     if all(pair == pairs[0] for pair in pairs):

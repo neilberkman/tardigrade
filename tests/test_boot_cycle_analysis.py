@@ -84,6 +84,33 @@ class BootCycleAnalysisTests(unittest.TestCase):
         self.assertEqual(analysis["status"], "rollback_late")
         self.assertEqual(analysis["rollback_cycle"], 2)
 
+    def test_initial_no_boot_without_execution_is_not_promoted_to_converged(self) -> None:
+        analysis = analyze_boot_cycles(
+            [
+                {
+                    "cycle": 0,
+                    "boot_slot": None,
+                    "boot_outcome": "no_boot",
+                    "signals": {"execution_observed": False},
+                },
+                {
+                    "cycle": 1,
+                    "boot_slot": "exec",
+                    "boot_outcome": "success",
+                    "signals": {"execution_observed": True},
+                },
+                {
+                    "cycle": 2,
+                    "boot_slot": "exec",
+                    "boot_outcome": "success",
+                    "signals": {"execution_observed": True},
+                },
+            ],
+            requested_cycles=3,
+        )
+        self.assertEqual(analysis["status"], "initial_no_boot_recovered")
+        self.assertFalse(analysis["initial_execution_observed"])
+
 
 if __name__ == "__main__":
     unittest.main()

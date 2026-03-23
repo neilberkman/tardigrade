@@ -268,15 +268,21 @@ def validate_compiled_flash_map(
             slot_summary["status"] = "match"
         checked_slots.append(slot_summary)
 
-    if mismatches:
+    sector_geometry = validate_swap_sector_geometry(profile)
+
+    if mismatches or sector_geometry.get("status") == "mismatch":
+        combined_mismatches = list(mismatches)
+        if sector_geometry.get("status") == "mismatch":
+            combined_mismatches.append(str(sector_geometry.get("reason")))
         return {
             "status": "mismatch",
-            "reason": "compiled flash map does not match declared slot layout",
+            "reason": "compiled flash map or erase-sector layout does not match declared slot layout",
             "bootloader_elf": resolved_elf,
             "flash_base": "0x{:08X}".format(flash_base),
             "checked_slots": checked_slots,
             "compiled_entries": entries,
-            "mismatches": mismatches,
+            "mismatches": combined_mismatches,
+            "sector_geometry": sector_geometry,
         }
     return {
         "status": "match",
@@ -285,6 +291,7 @@ def validate_compiled_flash_map(
         "flash_base": "0x{:08X}".format(flash_base),
         "checked_slots": checked_slots,
         "compiled_entries": entries,
+        "sector_geometry": sector_geometry,
     }
 
 
@@ -312,6 +319,71 @@ def _erase_geometry(profile: ProfileConfig) -> List[Tuple[int, int]]:
         geometry.append((cursor, min(region_end, cursor + page_size)))
         cursor += page_size
     return geometry
+
+
+def _slot_erase_segments(profile: ProfileConfig, slot_name: str) -> List[Dict[str, int]]:
+    slot = profile.memory.slots.get(slot_name)
+    if slot is None:
+        return []
+    slot_base = int(slot.base)
+    slot_end = slot_base + int(slot.size)
+    segments: List[Dict[str, int]] = []
+    for start, end in _erase_geometry(profile):
+        overlap_start = max(slot_base, int(start))
+        overlap_end = min(slot_end, int(end))
+        if overlap_end <= overlap_start:
+            continue
+        segments.append(
+            {
+                "erase_start": int(start),
+                "erase_end": int(end),
+                "overlap_start": int(overlap_start),
+                "overlap_end": int(overlap_end),
+                "erase_size": int(end - start),
+                "overlap_size": int(overlap_end - overlap_start),
+                "partial": not (overlap_start == start and overlap_end == end),
+            }
+        )
+    return segments
+
+
+def validate_swap_sector_geometry(profile: ProfileConfig) -> Dict[str, Any]:
+    """Check whether exec/staging share a discovery-friendly sector layout."""
+    family = _detect_bootloader_family(profile)
+    if family != "mcuboot":
+        return {
+            "status": "unavailable",
+            "reason": "sector-geometry preflight is only implemented for MCUboot profiles",
+        }
+
+    exec_segments = _slot_erase_segments(profile, "exec")
+    staging_segments = _slot_erase_segments(profile, "staging")
+    if not exec_segments or not staging_segments:
+        return {
+            "status": "unavailable",
+            "reason": "exec/staging slots are required for sector-geometry preflight",
+        }
+
+    exec_layout = [(seg["erase_size"], seg["overlap_size"]) for seg in exec_segments]
+    staging_layout = [(seg["erase_size"], seg["overlap_size"]) for seg in staging_segments]
+    if (
+        exec_layout != staging_layout
+        or any(seg["partial"] for seg in exec_segments)
+        or any(seg["partial"] for seg in staging_segments)
+    ):
+        return {
+            "status": "mismatch",
+            "reason": "exec/staging slots do not map cleanly onto the same erase-sector layout",
+            "exec_segments": exec_segments,
+            "staging_segments": staging_segments,
+        }
+
+    return {
+        "status": "match",
+        "reason": "exec/staging slots share the same erase-sector layout",
+        "exec_segments": exec_segments,
+        "staging_segments": staging_segments,
+    }
 
 
 def _next_slot_boundary_offset(profile: ProfileConfig, slot_name: str) -> Optional[int]:

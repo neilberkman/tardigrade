@@ -15,6 +15,18 @@ class Stm32f4PlatformTests(unittest.TestCase):
                 self.assertIn('Tag <0x00000000 0x200000> "FLASH_LO"', text)
                 self.assertIn('Tag <0x08000000 0x200000> "FLASH_HI"', text)
 
+    def test_stm32f4_platforms_stub_hot_boot_mmio_ranges(self) -> None:
+        for relpath in ("platforms/stm32f4.repl", "platforms/stm32f4_fast.repl"):
+            with self.subTest(platform=relpath):
+                text = (ROOT / relpath).read_text(encoding="utf-8")
+                self.assertIn("uart6: Miscellaneous.STM32DummyUSART @ sysbus 0x40011400", text)
+                self.assertIn("gpioD: Memory.MappedMemory @ sysbus 0x40020C00", text)
+                self.assertIn("pwr: Memory.MappedMemory @ sysbus 0x40007000", text)
+                self.assertIn("dbgmcu: Memory.MappedMemory @ sysbus 0xE0042000", text)
+                self.assertIn('Tag <0x40007000 0x400> "PWR"', text)
+                self.assertIn('Tag <0x40020000 0x2400> "GPIO"', text)
+                self.assertIn('Tag <0xE0042000 0x400> "DBGMCU"', text)
+
     def test_stm32f4_peripherals_model_second_bank_sector_geometry(self) -> None:
         for relpath in (
             "peripherals/STM32F4FlashController.cs",

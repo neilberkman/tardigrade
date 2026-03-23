@@ -538,6 +538,8 @@ def summarize_runtime_sweep(
             control_summary["invariant_violations"] = ctrl.get("invariant_violations")
         if ctrl.get("multi_boot_analysis"):
             control_summary["multi_boot_analysis"] = ctrl.get("multi_boot_analysis")
+        if ctrl.get("fault_snapshot_file"):
+            control_summary["fault_snapshot_file"] = ctrl.get("fault_snapshot_file")
         summary["control"] = control_summary
 
     # Aggregate per-step timing from signals.

@@ -208,6 +208,19 @@ class IssueDetectionIntegrationTests(unittest.TestCase):
         }
         self.assertFalse(result_is_brick(result))
 
+    def test_no_boot_without_execution_recovery_stays_brick(self):
+        result = {
+            "boot_outcome": "no_boot",
+            "boot_slot": None,
+            "signals": {"execution_observed": False},
+            "multi_boot_analysis": {
+                "status": "initial_no_boot_recovered",
+                "final_outcome": "success",
+                "final_slot": "exec",
+            },
+        }
+        self.assertTrue(result_is_brick(result))
+
     def test_no_boot_without_multi_boot_is_brick(self):
         result = {"boot_outcome": "no_boot", "boot_slot": None}
         self.assertTrue(result_is_brick(result))
@@ -269,6 +282,20 @@ class SummarizeRuntimeSweepTests(unittest.TestCase):
         ctrl_summary = summary["control"]
         self.assertEqual(ctrl_summary["effective_outcome"], "wrong_image")
         self.assertGreater(ctrl_summary["issue_count"], 0)
+
+    def test_control_summary_preserves_fault_snapshot_file(self):
+        control = {
+            "is_control": True,
+            "boot_outcome": "success",
+            "boot_slot": "exec",
+            "fault_injected": False,
+            "fault_snapshot_file": "/tmp/control_snapshot.bin",
+        }
+        summary = summarize_runtime_sweep([control])
+        self.assertEqual(
+            summary["control"]["fault_snapshot_file"],
+            "/tmp/control_snapshot.bin",
+        )
 
     def test_sweep_rollback_converged_not_counted_as_failure(self):
         """A fault point with raw wrong_image but rollback_converged final

@@ -340,7 +340,7 @@ _machine_selector = '0'
 
 
 def refresh_runtime_handles():
-    global backend, bus
+    global backend, bus, console_peripherals, console_peripheral_names
     bus = monitor.Machine.SystemBus
     backend['data'] = monitor.Machine[backend['backend_sysbus_name']]
     if backend['ctrl_sysbus_name']:
@@ -355,6 +355,8 @@ def refresh_runtime_handles():
             backend['i2c_proxy'] = monitor.Machine[backend['i2c_sysbus_name']]
         except:
             pass
+    console_peripherals, console_peripheral_names = _get_console_peripherals()
+    log('console_peripherals_refresh: {}'.format(','.join(console_peripheral_names) if console_peripheral_names else 'none'))
 
 
 def _machine_reset():
@@ -976,6 +978,89 @@ def annotate_boot_span_result(result):
 # Sticky state for execution-slot detection during execute runs.
 sticky_vtor = {'value': 0, 'slot': None, 'captured': False}
 sticky_pc = {'value': 0, 'slot': None, 'captured': False}
+console_fatal_patterns = (
+    'Cannot upgrade:',
+)
+
+
+def _get_console_peripherals():
+    names = (
+        'uart1',
+        'uart2',
+        'uart3',
+        'uart6',
+        'sysbus.uart1',
+        'sysbus.uart2',
+        'sysbus.uart3',
+        'sysbus.uart6',
+    )
+    found = []
+    found_names = []
+    for name in names:
+        try:
+            uart = monitor.Machine[name]
+            if uart not in found:
+                found.append(uart)
+                found_names.append(name)
+        except Exception:
+            pass
+    return found, found_names
+
+
+console_peripherals, console_peripheral_names = _get_console_peripherals()
+log('console_peripherals: {}'.format(','.join(console_peripheral_names) if console_peripheral_names else 'none'))
+
+
+def capture_console_state(include_recent=False):
+    state = {
+        'attached_names': list(console_peripheral_names),
+        'attached_count': len(console_peripheral_names),
+    }
+    last_lines = []
+    recent_logs = []
+    for uart in console_peripherals:
+        try:
+            last_line = str(uart.LastLine)
+        except Exception:
+            last_line = ''
+        if last_line:
+            last_lines.append(last_line)
+        if include_recent:
+            try:
+                recent_log = str(uart.RecentLog)
+            except Exception:
+                recent_log = ''
+            if recent_log:
+                recent_logs.append(recent_log)
+    if last_lines:
+        state['last_lines'] = last_lines
+        state['last_line'] = last_lines[-1]
+    if include_recent and recent_logs:
+        state['recent_logs'] = recent_logs
+    return state
+
+
+def check_console_fatal():
+    for uart in console_peripherals:
+        try:
+            for pattern in console_fatal_patterns:
+                if uart.ContainsLineFragment(pattern):
+                    return pattern
+                try:
+                    last_line = str(uart.LastLine)
+                except Exception:
+                    last_line = ''
+                if pattern in last_line:
+                    return pattern
+                try:
+                    recent_log = str(uart.RecentLog)
+                except Exception:
+                    recent_log = ''
+                if pattern in recent_log:
+                    return pattern
+        except Exception:
+            pass
+    return None
 
 def on_vtor_write(val):
     if sticky_vtor['captured']:
@@ -2108,6 +2193,27 @@ def build_cycle_record(cycle_index, boot_outcome, boot_slot, signals, stop_statu
     return record
 
 
+def merge_stop_status_signals(signals, prefix, status):
+    if not isinstance(signals, dict) or not isinstance(status, dict):
+        return
+    signals[prefix + '_stop_reason'] = status.get('reason')
+    signals[prefix + '_emulated_s'] = status.get('emulated_s')
+    if status.get('pc_samples'):
+        signals[prefix + '_pc_samples'] = status.get('pc_samples')
+    if status.get('console_attached_names'):
+        signals[prefix + '_console_attached_names'] = status.get('console_attached_names')
+    if status.get('console_attached_count') is not None:
+        signals[prefix + '_console_attached_count'] = status.get('console_attached_count')
+    if status.get('console_last_line'):
+        signals[prefix + '_console_last_line'] = status.get('console_last_line')
+    if status.get('console_last_lines'):
+        signals[prefix + '_console_last_lines'] = status.get('console_last_lines')
+    if status.get('console_recent_logs'):
+        signals[prefix + '_console_recent_logs'] = status.get('console_recent_logs')
+    if status.get('console_fatal_pattern'):
+        signals[prefix + '_console_fatal_pattern'] = status.get('console_fatal_pattern')
+
+
 def _set_monitor_hook_var(name, value):
     if value is None:
         monitor.Parse('${}=""'.format(name))
@@ -2499,8 +2605,7 @@ def run_hook_fault(hook_fault_at, hook_fault_type='w'):
     signals0['phase1_ops_total'] = actual_writes
     signals0['trace_replay_mode'] = 'hook_fault'
     if phase1_status is not None:
-        signals0['phase1_stop_reason'] = phase1_status.get('reason')
-        signals0['phase1_emulated_s'] = phase1_status.get('emulated_s')
+        merge_stop_status_signals(signals0, 'phase1', phase1_status)
 
     cycle_records = [
         build_cycle_record(
@@ -4284,6 +4389,15 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     # Minimum alignment is 128 bytes (2^7).
     vtor_aligned = (actual_vtor % 128 == 0)
 
+    p2_reason = ''
+    p2_writes = 0
+    if p2_status is not None:
+        p2_reason = str(p2_status.get('reason', ''))
+        p2_writes = int(p2_status.get('writes', 0))
+    no_boot_phase_without_vtor = (
+        p2_reason.startswith('no_boot') and not bool(sticky_vtor['captured'])
+    )
+
     boot_slot = None
     for sn, (s_lo, s_hi) in slot_ranges.items():
         if s_lo <= actual_vtor < s_hi:
@@ -4292,7 +4406,11 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
 
     vtor_in_known_slot = boot_slot is not None
     sticky_pc_slot = sticky_pc.get('slot') if sticky_pc.get('captured') else None
-    if boot_slot is None and sticky_pc_slot in slot_ranges:
+    if (
+        boot_slot is None
+        and sticky_pc_slot in slot_ranges
+        and not no_boot_phase_without_vtor
+    ):
         boot_slot = sticky_pc_slot
     execution_observed = boot_slot is not None
 
@@ -4308,7 +4426,7 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     if success_pc_slot and success_pc_slot in slot_ranges:
         s_lo, s_hi = slot_ranges[success_pc_slot]
         pc_ok = (s_lo <= (pc_value & ~1) < s_hi)
-        if sticky_pc_slot == success_pc_slot:
+        if sticky_pc_slot == success_pc_slot and not no_boot_phase_without_vtor:
             pc_ok = True
         # If VTOR was captured but PC is now 0 (e.g. crash/reset),
         # treat the VTOR jump as proof of execution attempt.
@@ -4365,6 +4483,7 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
         'pc_sticky': sticky_pc['captured'],
         'pc_sticky_value': fmt_u32(sticky_pc['value']),
         'pc_sticky_slot': sticky_pc['slot'],
+        'pc_sticky_ignored_no_boot_phase': no_boot_phase_without_vtor,
         'execution_observed': execution_observed,
         'vtor_aligned': vtor_aligned,
         'vtor_ok': vtor_ok,
@@ -4445,11 +4564,6 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     # just slow) from wall_timeout with stuck execution (real failure).
     # A timeout where the bootloader was still making NVM progress is
     # not a boot failure — it's an insufficient wall-clock budget.
-    p2_reason = ''
-    p2_writes = 0
-    if p2_status is not None:
-        p2_reason = str(p2_status.get('reason', ''))
-        p2_writes = int(p2_status.get('writes', 0))
     is_wall_timeout = p2_reason.startswith('wall_timeout')
 
     # Keep execution failures separate from expectation mismatches:
@@ -4757,6 +4871,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         slice_s = 0.02
     emulated_s = 0.0
     reason = 'budget'
+    console_fatal = None
     iters = 0
     trace_limit_hit = False
     trace_prev_writes = 0
@@ -4767,6 +4882,10 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     for iters in range(max_iters):
         monitor.Parse('emulation RunFor "{}"'.format(time_slice))
         emulated_s += slice_s
+        console_fatal = check_console_fatal()
+        if console_fatal:
+            reason = 'console_fatal({})'.format(console_fatal)
+            break
         if stop_on_fault and (fault_requires_immediate_stop() or was_otp_fault_injected()):
             reason = 'fault_fired'
             break
@@ -4910,6 +5029,16 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         else:
             no_boot_zero_write_count = 0
         if (
+            (not expect_writes)
+            and cur_writes == 0
+            and not sticky_vtor['captured']
+            and not sticky_pc['captured']
+            and progress_stall_timeout_s > 0
+            and emulated_s >= progress_stall_timeout_s
+        ):
+            reason = 'no_boot_stall({:.2f}s_emulated)'.format(emulated_s)
+            break
+        if (
             expect_control_outcome == 'no_boot'
             and no_boot_zero_write_count >= no_boot_zero_write_slices
             and emulated_s >= no_boot_min_emulated_s
@@ -4978,6 +5107,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     log('run_done [{}]: reason={} iters={} writes={} pc={} elapsed={:.1f}s'.format(
         label, reason, iters + 1, writes_now,
         fmt_u32(pc_now), elapsed))
+    console_state = capture_console_state(include_recent=bool(console_fatal))
     return {
         'iters': iters + 1,
         'reason': reason,
@@ -4989,6 +5119,12 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         'pc_samples': pc_samples,
         'op_trace_events': len(op_trace) if op_trace is not None else 0,
         'op_trace_truncated': bool(trace_limit_hit),
+        'console_attached_names': console_state.get('attached_names', []),
+        'console_attached_count': console_state.get('attached_count', 0),
+        'console_last_line': console_state.get('last_line'),
+        'console_last_lines': console_state.get('last_lines', []),
+        'console_recent_logs': console_state.get('recent_logs', []),
+        'console_fatal_pattern': console_fatal,
     }
 
 def parse_duration_seconds(default=2.0):
@@ -5036,21 +5172,32 @@ def run_control_phase1(cpu_ref, label='control_p1', vtor_settle_iters=0):
         default_s=4.0,
         prefer_run_duration=zero_point_execute_control,
     )
+    control_time_slice = phase1_time_slice
+    if zero_point_execute_control:
+        try:
+            control_time_slice = str(max(1.0, float(phase1_time_slice)))
+        except Exception:
+            control_time_slice = '1.0'
     p1_wall_timeout = phase1_wall_timeout(default_s=control_budget_s, budget_s=control_budget_s)
-    p1_max_iters = phase1_max_iters(default_s=control_budget_s, budget_s=control_budget_s)
+    p1_max_iters = phase1_max_iters(
+        default_s=control_budget_s,
+        time_slice_s=control_time_slice,
+        budget_s=control_budget_s,
+    )
     control_expect_writes = not zero_point_execute_control
     saved_stall_timeout_s = progress_stall_timeout_s
     if zero_point_execute_control:
         # Zero-point execute controls can spend long stretches in read-only
-        # boot code before handoff. Bound them by the configured runtime
-        # budget instead of the generic progress-stall heuristic.
-        progress_stall_timeout_s = 0
+        # boot code before handoff, but disabling stall detection entirely
+        # lets a permanent no-VTOR loop burn until Robot's outer timeout.
+        # Use the profile's control budget as the stall budget instead.
+        progress_stall_timeout_s = max(1.0, float(control_budget_s))
     log(
         'control phase1 budget: zero_point_execute_control={} '
         'budget_s={:.3f} time_slice={} max_iters={} wall_timeout={}'.format(
             bool(zero_point_execute_control),
             float(control_budget_s),
-            phase1_time_slice,
+            control_time_slice,
             int(p1_max_iters),
             int(p1_wall_timeout),
         )
@@ -5064,7 +5211,7 @@ def run_control_phase1(cpu_ref, label='control_p1', vtor_settle_iters=0):
             zero_writes_is_brick=control_expect_writes,
             max_iters=p1_max_iters,
             wall_timeout=p1_wall_timeout,
-            time_slice=phase1_time_slice,
+            time_slice=control_time_slice,
             vtor_settle_iters=vtor_settle_iters,
         )
     finally:
@@ -5243,8 +5390,7 @@ def run_read_bit_flip_fault(fault_at):
     signals['read_fault_fired'] = read_fault_actually_fired
     signals['phase1_ms'] = phase1_ms
     signals['phase2_ms'] = 0
-    signals['phase2_stop_reason'] = p2_status.get('reason')
-    signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    merge_stop_status_signals(signals, 'phase2', p2_status)
 
     return _build_fault_result(
         fault_at, 'f', fault_injected, read_fault_address, 0, signals,
@@ -5517,8 +5663,7 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
     signals['patched_halfwords'] = ['0x{:04X}'.format(h) for h in patched_halfwords]
     merge_verification_probe_signals(signals)
     if phase1_status is not None:
-        signals['phase1_stop_reason'] = phase1_status.get('reason')
-        signals['phase1_emulated_s'] = phase1_status.get('emulated_s')
+        merge_stop_status_signals(signals, 'phase1', phase1_status)
 
     return _build_fault_result(
         skip_addr, 'i', True,
@@ -5596,8 +5741,7 @@ def run_timed_reset_fault(fault_at):
     signals['timed_reset_trigger_s'] = round(trigger_s, 6)
     signals['timed_reset_fraction'] = round(frac, 6)
     signals['timed_reset_elapsed_s'] = round(_time.time() - fp_t0, 6)
-    signals['phase2_stop_reason'] = p2_status.get('reason')
-    signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    merge_stop_status_signals(signals, 'phase2', p2_status)
     return _build_fault_result(
         fault_at, 't', fault_injected, fault_address, actual_writes, signals,
         boot_outcome=boot_outcome, boot_slot=boot_slot,
@@ -5718,8 +5862,7 @@ def run_nvs_corruption_fault(variant_idx):
     signals['nvs_corruption_variant'] = variant_idx
     signals['phase1_ms'] = phase1_ms
     signals['phase2_ms'] = 0
-    signals['phase2_stop_reason'] = p2_status.get('reason')
-    signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    merge_stop_status_signals(signals, 'phase2', p2_status)
     return _build_fault_result(
         variant_idx, 'nv:{}'.format(variant_idx), True,
         '0x{:08X}'.format(nvs_region_addr),
@@ -5759,8 +5902,7 @@ def run_metadata_fault(fault_at, fault_type='w'):
     signals['metadata_fault_total'] = pre_boot_write_count
     signals['phase1_ms'] = phase1_ms
     signals['phase2_ms'] = 0
-    signals['phase2_stop_reason'] = p2_status.get('reason')
-    signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    merge_stop_status_signals(signals, 'phase2', p2_status)
     return _build_fault_result(
         fault_at, 'm:{}'.format(m_type), fault_injected, fault_address,
         applied, signals, boot_outcome=boot_outcome, boot_slot=boot_slot,
@@ -5798,7 +5940,8 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
                         boot_slot=None, eff_criteria=None,
                         p2_status=None, followup_label='followup',
                         saved_flash=None, fault_snapshot_bytes=None,
-                        extra_fields=None, metadata_delta_pre_snapshot=None):
+                        extra_fields=None, metadata_delta_pre_snapshot=None,
+                        persist_snapshot=False):
     # Shared epilogue for all fault runners.
     #
     # Handles: classify_fault_result, run_followup_boot_cycles, semantic state
@@ -5885,7 +6028,7 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         'actual_writes': actual_writes,
         'signals': signals,
     }
-    if fault_injected and fault_snapshot_bytes is not None:
+    if persist_snapshot and fault_snapshot_bytes is not None:
         _snapshot_path = persist_fault_snapshot(fault_at, fault_type, fault_snapshot_bytes)
         if _snapshot_path:
             result['fault_snapshot_file'] = _snapshot_path
@@ -6209,7 +6352,11 @@ def run_execute_fault(fault_at, fault_type='w'):
         vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
         pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
         boot_outcome, boot_slot, signals = evaluate_boot_outcome(
-            vtor_value, pc_value, fault_injected=False, effective_criteria=eff_criteria
+            vtor_value,
+            pc_value,
+            fault_injected=False,
+            effective_criteria=eff_criteria,
+            p2_status=phase1_status,
         )
         signals['phase1_ms'] = phase1_ms
         signals['phase2_ms'] = 0
@@ -6224,17 +6371,24 @@ def run_execute_fault(fault_at, fault_type='w'):
             signals['staging_offset_header_debug'] = staging_offset_header_debug
         merge_verification_probe_signals(signals)
         if phase1_status is not None:
-            signals['phase1_stop_reason'] = phase1_status.get('reason')
-            signals['phase1_emulated_s'] = phase1_status.get('emulated_s')
+            merge_stop_status_signals(signals, 'phase1', phase1_status)
             signals['zero_point_execute_control'] = zero_point_execute_control
-            if phase1_status.get('pc_samples'):
-                signals['phase1_pc_samples'] = phase1_status.get('pc_samples')
+
+        control_snapshot_bytes = None
+        control_stop_reason = phase1_status.get('reason') if phase1_status is not None else ''
+        if boot_outcome == 'no_boot' or str(control_stop_reason).startswith('no_boot'):
+            try:
+                control_snapshot_bytes = to_py_bytes(_snapshot_current_flash())
+            except Exception as exc:
+                log('control snapshot capture failed: {}'.format(exc))
 
         return _build_fault_result(
             fault_at, 'control', False, '0x00000000', actual_writes, signals,
             boot_outcome=boot_outcome, boot_slot=boot_slot,
             eff_criteria=eff_criteria, p2_status=phase1_status,
             followup_label='control_followup',
+            fault_snapshot_bytes=control_snapshot_bytes,
+            persist_snapshot=(control_snapshot_bytes is not None),
         )
 
     fp_t0 = _time.time()
@@ -6582,8 +6736,7 @@ def run_execute_fault(fault_at, fault_type='w'):
     signals['trace_replay_mode'] = 'execute'
     signals['multiboot_cycles_run'] = _multiboot_cycles_run
     if phase1_status is not None:
-        signals['phase1_stop_reason'] = phase1_status.get('reason')
-        signals['phase1_emulated_s'] = phase1_status.get('emulated_s')
+        merge_stop_status_signals(signals, 'phase1', phase1_status)
     if fault_injected and is_non_power_write_fault and not phase1_stopped_on_fault:
         signals['phase1_continued_after_fault'] = True
     if fault_injected and fault_type == 'g':
@@ -6598,8 +6751,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         if _rc_injection_state.get('injected_return_addr') is not None:
             signals['rc_injection_return_addr'] = fmt_u32(_rc_injection_state.get('injected_return_addr'))
     if phase2_status is not None:
-        signals['phase2_stop_reason'] = phase2_status.get('reason')
-        signals['phase2_emulated_s'] = phase2_status.get('emulated_s')
+        merge_stop_status_signals(signals, 'phase2', phase2_status)
 
     # Build extra fields specific to run_execute_fault.
     extras = {}
@@ -7028,9 +7180,9 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     signals['phase3_ms'] = phase3_ms
     signals['trace_replay_mode'] = 'execute'
     if p1_status is not None:
-        signals['phase1_stop_reason'] = p1_status.get('reason')
+        merge_stop_status_signals(signals, 'phase1', p1_status)
     if p2_status is not None:
-        signals['phase2_stop_reason'] = p2_status.get('reason')
+        merge_stop_status_signals(signals, 'phase2', p2_status)
     if p3_status is not None:
         signals['phase3_stop_reason'] = p3_status.get('reason')
 
@@ -7225,8 +7377,7 @@ def run_multi_fault_sequence(fault_sequence):
     signals['multi_fault_recovery_ms'] = recovery_ms
     signals['trace_replay_mode'] = 'execute'
     if final_status is not None:
-        signals['phase2_stop_reason'] = final_status.get('reason')
-        signals['phase2_emulated_s'] = final_status.get('emulated_s')
+        merge_stop_status_signals(signals, 'phase2', final_status)
 
     semantic_state = collect_semantic_state({
         'cycle': 0,
@@ -7674,8 +7825,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     signals['total_ms'] = total_ms
     signals['trace_replay_mode'] = 'native'
     signals['multiboot_cycles_run'] = _multiboot_cycles_run
-    signals['phase2_stop_reason'] = p2_status.get('reason')
-    signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    merge_stop_status_signals(signals, 'phase2', p2_status)
     if is_non_power_write_fault:
         signals['phase1_continued_after_fault'] = bool(fault_injected)
         signals['phase1_ops_total'] = writes_applied
@@ -7893,8 +8043,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     signals['total_ms'] = total_ms
     signals['trace_replay_mode'] = 'python'
     signals['multiboot_cycles_run'] = _multiboot_cycles_run
-    signals['phase2_stop_reason'] = p2_status.get('reason')
-    signals['phase2_emulated_s'] = p2_status.get('emulated_s')
+    merge_stop_status_signals(signals, 'phase2', p2_status)
     if is_non_power_write_fault:
         signals['phase1_continued_after_fault'] = bool(fault_injected)
         signals['phase1_ops_total'] = writes_applied
