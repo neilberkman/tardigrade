@@ -58,4 +58,5 @@ invariants:
 expect:
   control_outcome: success
   allow_control_only_issues: true
+  allow_semantic_only_issues: true
   should_find_issues: true
