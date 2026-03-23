@@ -323,6 +323,20 @@ class ConfirmCycleIssueReasonsTest(unittest.TestCase):
         self.assertNotIn("rollback_not_ratcheted", reasons)
         self.assertNotIn("metadata_inconsistent_after_confirm", reasons)
 
+    def test_no_write_skip_is_not_reported_as_confirm_incomplete(self):
+        result = {
+            "boot_outcome": "skipped",
+            "fault_injected": False,
+            "confirm_cycle": {
+                "skip_reason": "no_write_at_index",
+                "confirm_incomplete": False,
+                "rollback_not_ratcheted": False,
+                "metadata_inconsistent_after_confirm": False,
+            },
+        }
+        reasons = result_issue_reasons(result, "success")
+        self.assertNotIn("confirm_incomplete", reasons)
+
     def test_multiple_findings(self):
         result = {
             "boot_outcome": "success",

@@ -142,20 +142,23 @@ class TestParseResidualImage(unittest.TestCase):
         with self.assertRaises(ProfileError):
             _parse_residual_image(raw, self._slots(), images=images)
 
-    def test_fill_only_slot_with_no_image_is_allowed(self):
+    def test_fill_only_slot_with_no_image_raises(self):
         raw = {"slot": "staging", "fill_pattern": "0xFF"}
         images = {"exec": "firmware.bin"}  # staging has no image
-        result = _parse_residual_image(raw, self._slots(), images=images)
-        self.assertIsNotNone(result)
-        self.assertEqual(result.slot, "staging")
-        self.assertIsNone(result.prior_image)
-        self.assertEqual(result.fill_pattern, 0xFF)
+        with self.assertRaises(ProfileError):
+            _parse_residual_image(raw, self._slots(), images=images)
 
     def test_slot_with_image_ok(self):
         raw = {"slot": "staging", "prior_image": "old.bin"}
         images = {"staging": "firmware.bin"}
         result = _parse_residual_image(raw, self._slots(), images=images)
         self.assertIsNotNone(result)
+
+    def test_empty_image_path_raises(self):
+        raw = {"slot": "staging", "prior_image": "old.bin"}
+        images = {"staging": ""}
+        with self.assertRaises(ProfileError):
+            _parse_residual_image(raw, self._slots(), images=images)
 
     def test_no_images_dict_skips_validation(self):
         """When images dict is not provided, skip the slot-image validation."""

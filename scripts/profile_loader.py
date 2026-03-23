@@ -124,6 +124,7 @@ def _resolve_base_profile(data: Dict[str, Any], profile_path: Path,
 
 KNOWN_FAULT_TYPES = {
     "power_loss",
+    "swap_progress",
     "interrupted_erase",
     "bit_corruption",
     "silent_write_failure",
@@ -155,6 +156,7 @@ KNOWN_FAULT_TYPES = {
 }
 IMPLEMENTED_FAULT_TYPES = {
     "power_loss",
+    "swap_progress",
     "interrupted_erase",
     "bit_corruption",
     "silent_write_failure",
@@ -227,7 +229,14 @@ class SlotConfig:
 
 
 class MemoryConfig:
-    __slots__ = ("sram_start", "sram_end", "write_granularity", "slots", "bootloader_region")
+    __slots__ = (
+        "sram_start",
+        "sram_end",
+        "write_granularity",
+        "page_size",
+        "slots",
+        "bootloader_region",
+    )
 
     def __init__(
         self,
@@ -235,11 +244,13 @@ class MemoryConfig:
         sram_end: int,
         write_granularity: int,
         slots: Dict[str, SlotConfig],
+        page_size: int = 4096,
         bootloader_region: Optional[BootloaderRegionConfig] = None,
     ) -> None:
         self.sram_start = sram_start
         self.sram_end = sram_end
         self.write_granularity = write_granularity
+        self.page_size = page_size
         self.slots = slots
         self.bootloader_region = bootloader_region
 
@@ -1320,6 +1331,12 @@ def _mcuboot_good_magic_words(max_align: int) -> List[int]:
     return list(struct.unpack("<4I", magic_bytes))
 
 
+def _align_down(value: int, align: int) -> int:
+    if align <= 0:
+        raise ProfileError("alignment must be > 0")
+    return value - (value % align)
+
+
 def _fletcher32(data: bytes) -> int:
     """Fletcher32 checksum (RIOT OS compatible)."""
     assert len(data) % 2 == 0
@@ -1409,6 +1426,8 @@ class ProfileConfig:
         self.profile_path = profile_path
         self.scenario = scenario
         self.update_trigger = update_trigger
+        self.auto_update_trigger = False
+        self.image_load_addresses: Dict[str, int] = {}
         self.update_sequence: List[UpdatePhase] = update_sequence or []
         self.state_probe = state_probe
         self.semantic_assertions = semantic_assertions or {}
@@ -1513,7 +1532,19 @@ class ProfileConfig:
         )
         if state.update_trigger is not None and state.pre_boot_state is None:
             resolved.pre_boot_state = resolved.expand_update_trigger()
+        resolved.auto_update_trigger = bool(getattr(self, "auto_update_trigger", False))
+        resolved.image_load_addresses = dict(
+            getattr(self, "image_load_addresses", {}) or {}
+        )
         return resolved
+
+    def effective_image_load_addresses(self) -> Dict[str, int]:
+        """Return the runtime image load base for each declared slot."""
+        overrides = dict(getattr(self, "image_load_addresses", {}) or {})
+        return {
+            slot_name: int(overrides.get(slot_name, slot_cfg.base))
+            for slot_name, slot_cfg in self.memory.slots.items()
+        }
 
     def resolve_path(self, repo_root: Path, value: str) -> str:
         """Resolve a path relative to the repo root."""
@@ -1692,17 +1723,58 @@ class ProfileConfig:
             # MCUboot GOOD magic: 4 words at slot_end - 16.
             align = _parse_int(trigger.fields.get("max_align", 8), "update_trigger.max_align")
             magic_base = slot_end - 16
+            image_ok_addr = _align_down(magic_base - align, align)
+            copy_done_addr = image_ok_addr - align
+            swap_info_addr = copy_done_addr - align
+            unprotected_tlv_sizes_addr = swap_info_addr - align
+            swap_size_addr = swap_info_addr - align
+            if trigger.fields.get("unprotected_tlv_sizes") is not None:
+                # Swap-offset stores unprotected TLV sizes between swap_info and
+                # swap_size in the trailer metadata area.
+                swap_size_addr = unprotected_tlv_sizes_addr - align
             writes: List[PreBootWrite] = []
             for i, val in enumerate(_mcuboot_good_magic_words(align)):
                 writes.append(PreBootWrite(address=magic_base + i * 4, u32=val))
-            # Optional copy_done field for revert scenarios.
+            if trigger.fields.get("image_ok") is not None:
+                writes.append(PreBootWrite(
+                    address=image_ok_addr,
+                    u32=_parse_int(trigger.fields["image_ok"], "update_trigger.image_ok"),
+                ))
+            # Optional copy_done field for revert / resume scenarios.
             if trigger.fields.get("copy_done") is not None:
-                # MCUboot trailer: magic at -16, image_ok at -16-align,
-                # copy_done at -16-2*align.
-                copy_done_addr = slot_end - 16 - 2 * align
                 writes.append(PreBootWrite(
                     address=copy_done_addr,
                     u32=_parse_int(trigger.fields["copy_done"], "update_trigger.copy_done"),
+                ))
+            if trigger.fields.get("swap_info") is not None and trigger.fields.get("swap_type") is not None:
+                raise ProfileError(
+                    "update_trigger may specify either swap_info or swap_type, not both"
+                )
+            swap_info = None
+            if trigger.fields.get("swap_info") is not None:
+                swap_info = _parse_int(trigger.fields["swap_info"], "update_trigger.swap_info")
+            elif trigger.fields.get("swap_type") is not None:
+                swap_type = _parse_int(trigger.fields["swap_type"], "update_trigger.swap_type")
+                image_num = _parse_int(trigger.fields.get("image_num", 0), "update_trigger.image_num")
+                if swap_type < 0 or swap_type > 0xF:
+                    raise ProfileError("update_trigger.swap_type must fit in 4 bits")
+                if image_num < 0 or image_num > 0xF:
+                    raise ProfileError("update_trigger.image_num must fit in 4 bits")
+                swap_info = (image_num << 4) | swap_type
+            if swap_info is not None:
+                writes.append(PreBootWrite(address=swap_info_addr, u32=swap_info))
+            if trigger.fields.get("unprotected_tlv_sizes") is not None:
+                writes.append(PreBootWrite(
+                    address=unprotected_tlv_sizes_addr,
+                    u32=_parse_int(
+                        trigger.fields["unprotected_tlv_sizes"],
+                        "update_trigger.unprotected_tlv_sizes",
+                    ),
+                ))
+            if trigger.fields.get("swap_size") is not None:
+                writes.append(PreBootWrite(
+                    address=swap_size_addr,
+                    u32=_parse_int(trigger.fields["swap_size"], "update_trigger.swap_size"),
                 ))
             return writes
 
@@ -1827,6 +1899,12 @@ class ProfileConfig:
             prefix = "SLOT_{}_".format(slot_name.upper())
             vars_list.append("{}BASE:0x{:08X}".format(prefix, slot_cfg.base))
             vars_list.append("{}SIZE:0x{:08X}".format(prefix, slot_cfg.size))
+
+        load_addresses = self.effective_image_load_addresses()
+        for slot_name, load_addr in load_addresses.items():
+            vars_list.append(
+                "IMAGE_{}_LOAD_ADDR:0x{:08X}".format(slot_name.upper(), int(load_addr))
+            )
 
         # Images (robot variables for Load Runtime Scenario + paths for batch reload).
         for img_name, img_path in self.images.items():
@@ -2227,12 +2305,16 @@ def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
     sram_start = _parse_int(_require(sram, "start", "memory.sram"), "memory.sram.start")
     sram_end = _parse_int(_require(sram, "end", "memory.sram"), "memory.sram.end")
     write_granularity = _parse_int(raw.get("write_granularity", 8), "memory.write_granularity")
+    page_size = _parse_int(raw.get("page_size", 4096), "memory.page_size")
+    if page_size <= 0:
+        raise ProfileError("memory.page_size must be > 0")
     slots = _parse_slots(_require(raw, "slots", "memory"))
     bootloader_region = _parse_bootloader_region(raw.get("bootloader_region"))
     return MemoryConfig(
         sram_start=sram_start,
         sram_end=sram_end,
         write_granularity=write_granularity,
+        page_size=page_size,
         slots=slots,
         bootloader_region=bootloader_region,
     )
@@ -2491,6 +2573,24 @@ def _warn_fault_backend_compat(
             "verification_probes is set but 'instruction_skip' is not in "
             "fault_types. The verification probes will have no effect."
         )
+    if fs.metadata_delta and fs.metadata_delta.enabled and fs.metadata_delta.fields:
+        metadata_delta_unsupported = []
+        if getattr(fs, "mode", "runtime") != "runtime":
+            metadata_delta_unsupported.append("fault_sweep.mode={!r}".format(fs.mode))
+        if getattr(fs, "evaluation_mode", None) == "state":
+            metadata_delta_unsupported.append("evaluation_mode='state'")
+        if "instruction_skip" in all_types:
+            metadata_delta_unsupported.append("instruction_skip fault type")
+        if fs.hook_fault and fs.hook_fault.enabled:
+            metadata_delta_unsupported.append("hook_fault")
+        if metadata_delta_unsupported:
+            warnings.warn(
+                "metadata_delta only records execute/trace-replay boot cycles and "
+                "will not run for {}. Remove metadata_delta or switch to a "
+                "supported runtime execute/trace-replay configuration.".format(
+                    ", ".join(metadata_delta_unsupported)
+                )
+            )
 
     # OTP fault types require an OTPMemory peripheral on the platform.
     otp_types = {"otp_partial_program", "otp_stuck_bit", "otp_read_disturb", "otp_overblow"}
@@ -3701,12 +3801,16 @@ def _parse_residual_image(
         raise ProfileError(
             "residual_image: at least one of prior_image or fill_pattern is required"
         )
-    # A slot without an actual image is only valid for fill-only modeling.
-    if images is not None and slot not in images and prior_image is not None:
+    actual_image = None
+    if images is not None:
+        actual_image = images.get(slot)
+        if actual_image is not None:
+            actual_image = str(actual_image).strip()
+    if images is not None and not actual_image:
         raise ProfileError(
             "residual_image.slot: '{}' has no image configured in the images "
-            "section. prior_image requires an actual image in the target slot "
-            "to overwrite the residual data.".format(slot)
+            "section. residual_image requires an actual image in the target "
+            "slot to overwrite the residual data.".format(slot)
         )
     return ResidualImageConfig(
         slot=slot,
@@ -3969,16 +4073,34 @@ def _parse_expect(raw: Optional[Dict[str, Any]]) -> ExpectConfig:
     )
 
 
-def _parse_update_trigger(raw: Optional[Dict[str, Any]]) -> Optional[UpdateTrigger]:
+def _parse_update_trigger_config(raw: Optional[Any]) -> Tuple[Optional[UpdateTrigger], bool]:
     if raw is None:
-        return None
+        return None, False
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value == "auto":
+            return None, True
+        raise ProfileError(
+            "update_trigger: expected mapping or 'auto', got {!r}".format(raw)
+        )
+    if not isinstance(raw, dict):
+        raise ProfileError(
+            "update_trigger: expected mapping or 'auto', got {}".format(
+                type(raw).__name__
+            )
+        )
     trigger_type = str(_require(raw, "type", "update_trigger"))
     slot = str(_require(raw, "slot", "update_trigger"))
     fields: Dict[str, Any] = {}
     for k, v in raw.items():
         if k not in ("type", "slot"):
             fields[k] = v
-    return UpdateTrigger(type=trigger_type, slot=slot, fields=fields)
+    return UpdateTrigger(type=trigger_type, slot=slot, fields=fields), False
+
+
+def _parse_update_trigger(raw: Optional[Any]) -> Optional[UpdateTrigger]:
+    trigger, _auto = _parse_update_trigger_config(raw)
+    return trigger
 
 
 def _normalize_fault_types(raw: Any, field_name: str) -> List[str]:
@@ -4555,7 +4677,9 @@ def load_profile(path: str | Path) -> ProfileConfig:
         images = {str(k): str(v) for k, v in raw_images.items()}
 
     pre_boot_state = _parse_pre_boot_state(data.get("pre_boot_state"))
-    update_trigger = _parse_update_trigger(data.get("update_trigger"))
+    update_trigger, auto_update_trigger = _parse_update_trigger_config(
+        data.get("update_trigger")
+    )
     setup_script = data.get("setup_script")
     if setup_script is not None:
         setup_script = str(setup_script)
@@ -4710,6 +4834,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         firmware_elf=firmware_elf,
 
     )
+    profile.auto_update_trigger = auto_update_trigger
 
     # If update_trigger is set and pre_boot_state is empty, expand the trigger.
     if update_trigger and not profile.pre_boot_state:

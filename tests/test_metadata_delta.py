@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,9 +26,12 @@ from fault_classification import (
 )
 from profile_loader import (
     FaultSweepConfig,
+    HookFaultConfig,
+    InstructionSkipConfig,
     MetadataDeltaConfig,
     MetadataDeltaFieldConfig,
     ProfileError,
+    _warn_fault_backend_compat,
     _parse_metadata_delta,
 )
 from result_checks import _evaluate_metadata_delta, _marker_actually_written
@@ -577,6 +581,38 @@ class SummaryIntegrationTests(unittest.TestCase):
         summary = summarize_runtime_sweep(results)
         self.assertEqual(summary["metadata_delta_issue_points"], 1)
         self.assertEqual(summary["issue_points"], 1)
+
+
+class MetadataDeltaCompatibilityWarningTests(unittest.TestCase):
+    def test_instruction_skip_warns_metadata_delta_unsupported(self):
+        md = MetadataDeltaConfig(
+            enabled=True,
+            fields=[
+                MetadataDeltaFieldConfig(
+                    address=0x100,
+                    name="boot_count",
+                    min_delta=1,
+                    max_delta=1,
+                )
+            ],
+        )
+        fs = FaultSweepConfig(
+            mode="runtime",
+            evaluation_mode="execute",
+            fault_types=["instruction_skip"],
+            instruction_skip_config=InstructionSkipConfig(target_addresses=[(0x1000, 0x1002)]),
+            metadata_delta=md,
+            hook_fault=HookFaultConfig(enabled=False),
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _warn_fault_backend_compat(fs, "platforms/cortex_m0_nvm.repl", None)
+        self.assertTrue(
+            any(
+                "metadata_delta only records execute/trace-replay boot cycles" in str(w.message)
+                for w in caught
+            )
+        )
 
 
 if __name__ == "__main__":

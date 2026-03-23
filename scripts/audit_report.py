@@ -258,6 +258,7 @@ def summarize_runtime_sweep(
     total_writes: int = 0,
     profile: Optional[ProfileConfig] = None,
     metadata_regions: Optional[List[MetadataFaultRegion]] = None,
+    calibration_coverage: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Compute summary statistics from runtime sweep results."""
     non_control = [r for r in results if not r.get("is_control", False)]
@@ -464,6 +465,8 @@ def summarize_runtime_sweep(
         summary["verification_bypass_points"] = verification_bypass_points
         summary["defense_in_depth_held"] = defense_in_depth_held
         summary["full_bypass_points"] = full_bypass_points
+    if calibration_coverage is not None:
+        summary["calibration_coverage"] = calibration_coverage
     did_layers = build_defense_in_depth_layers(injected)
     if did_layers is not None:
         summary["defense_in_depth_layers"] = did_layers
@@ -575,6 +578,24 @@ def summarize_runtime_sweep(
     return summary
 
 
+def _coverage_gate_reason(sweep_summary: Dict[str, Any]) -> Optional[str]:
+    """Return a clean-verdict coverage failure reason, if any."""
+    coverage = sweep_summary.get("calibration_coverage")
+    if not isinstance(coverage, dict):
+        return None
+    status = str(coverage.get("status") or "").strip()
+    if status in {"metadata_only", "outside_slots_only", "no_nvm_activity"}:
+        reason = str(coverage.get("reason") or "").strip()
+        if reason:
+            return reason
+        if status == "metadata_only":
+            return "Calibration touched slot trailers/metadata but never moved slot data."
+        if status == "outside_slots_only":
+            return "Calibration touched flash but never touched declared slots."
+        return "Calibration produced no NVM writes or erases."
+    return None
+
+
 def git_metadata(repo_root: Path) -> Dict[str, str]:
     def run_git(*args: str) -> str:
         proc = subprocess.run(
@@ -652,12 +673,15 @@ def compute_verdict(
 
     resilient_rollbacks = int(sweep_summary.get("resilient_rollbacks", 0))
     invariant_observations = int(sweep_summary.get("invariant_issue_points", 0))
+    coverage_gate_reason = _coverage_gate_reason(sweep_summary)
 
     verdict = "PASS"
     if control_only_issue and not found_issues:
         verdict = "PASS \u2014 control exhibits expected {}".format(control_outcome)
     elif control_issue_count:
         verdict = "FAIL \u2014 control checks failed"
+    elif coverage_gate_reason and not found_issues:
+        verdict = "FAIL \u2014 {}".format(coverage_gate_reason)
     elif profile_expect.should_find_issues and not found_issues:
         verdict = "FAIL \u2014 expected to find issues but found none"
     elif not profile_expect.should_find_issues and found_issues:

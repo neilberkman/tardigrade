@@ -59,6 +59,43 @@ def _json_dump_text(value):
     return json.dumps(_json_safe(value), sort_keys=True)
 
 bus = monitor.Machine.SystemBus
+_pre_boot_state_debug = []
+
+
+def _snapshot_artifact_path(fault_at, fault_type):
+    try:
+        root = os.path.dirname(result_file)
+    except Exception:
+        return None
+    if not root:
+        return None
+    try:
+        snap_dir = os.path.join(root, 'robot', 'snapshots')
+        if not os.path.isdir(snap_dir):
+            os.makedirs(snap_dir)
+    except Exception:
+        return None
+    safe_type = ''.join(
+        ch if ch.isalnum() or ch in ('_', '-') else '_'
+        for ch in str(fault_type or 'unknown')
+    )
+    return os.path.join(snap_dir, 'fault_{:08d}_{}.bin'.format(int(fault_at), safe_type))
+
+
+def persist_fault_snapshot(fault_at, fault_type, snapshot_bytes):
+    if snapshot_bytes is None:
+        return None
+    path = _snapshot_artifact_path(fault_at, fault_type)
+    if not path:
+        return None
+    try:
+        with open(path, 'wb') as f:
+            f.write(bytes(snapshot_bytes))
+        log('persisted fault snapshot: {}'.format(path))
+        return path
+    except Exception as exc:
+        log('failed to persist fault snapshot: {}'.format(exc))
+        return None
 
 
 def _bus_load_elf(path):
@@ -143,6 +180,10 @@ _WRITE_FAULT_MODE = {
     'w': 0, 'b': 1, 's': 2, 'r': 3, 'd': 4, 'l': 5, 'g': 6, 'x': 3,
     'op': 0, 'os': 1, 'od': 2, 'oo': 3,
 }
+
+def _base_fault_type_code(fault_type):
+    raw = str(fault_type or '').strip()
+    return raw.split(':', 1)[0] if ':' in raw else raw
 
 def get_optional_var(name, default=''):
     try:
@@ -378,6 +419,9 @@ if resume_trace_max_ops < 1:
     resume_trace_max_ops = 1
 resume_trace_time_slice = get_optional_var('resume_trace_time_slice', '0.02')
 calibration_time_slice = get_optional_var('calibration_time_slice', '0.02')
+zero_point_execute_control = get_optional_var(
+    'zero_point_execute_control', 'false'
+).strip().lower() in ('1', 'true', 'yes')
 phase1_time_slice = get_optional_var('phase1_time_slice', '0.02')
 phase2_time_slice = get_optional_var('phase2_time_slice', '0.05')
 resume_trace_wall_timeout_raw = str(monitor.GetVariable('resume_trace_wall_timeout_s')).strip()
@@ -447,6 +491,10 @@ image_staging_path = str(monitor.GetVariable('image_staging_path')).strip()
 image_exec_path = str(monitor.GetVariable('image_exec_path')).strip()
 image_tertiary_path = get_optional_var('image_tertiary_path', '')
 image_recovery_path = get_optional_var('image_recovery_path', '')
+image_exec_load_addr = get_optional_int_var('image_exec_load_addr', slot_exec_base)
+image_staging_load_addr = get_optional_int_var('image_staging_load_addr', slot_staging_base)
+image_tertiary_load_addr = get_optional_int_var('image_tertiary_load_addr', slot_tertiary_base)
+image_recovery_load_addr = get_optional_int_var('image_recovery_load_addr', slot_recovery_base)
 
 # Residual image: load a prior (larger) image first, then overwrite with
 # the actual image, leaving stale tail bytes from the prior image.
@@ -648,6 +696,7 @@ else:
 # Map single-char fault type codes to full fault type names for override lookup.
 _FAULT_CODE_TO_NAME = {
     'w': 'power_loss',
+    'w:sp': 'swap_progress',
     'e': 'interrupted_erase',
     'a': 'multi_sector_atomicity',
     'b': 'bit_corruption',
@@ -844,13 +893,13 @@ if slot_recovery_base is not None and slot_recovery_size is not None:
     )
 
 slot_load_addresses = {
-    'exec': slot_exec_base,
-    'staging': slot_staging_base,
+    'exec': image_exec_load_addr,
+    'staging': image_staging_load_addr,
 }
-if slot_tertiary_base is not None:
-    slot_load_addresses['tertiary'] = slot_tertiary_base
-if slot_recovery_base is not None:
-    slot_load_addresses['recovery'] = slot_recovery_base
+if image_tertiary_load_addr is not None:
+    slot_load_addresses['tertiary'] = image_tertiary_load_addr
+if image_recovery_load_addr is not None:
+    slot_load_addresses['recovery'] = image_recovery_load_addr
 
 _cached_update_sequence_fault_flash = None
 
@@ -2754,6 +2803,7 @@ def run_confirm_cycle_fault(cc_fault_at, cc_fault_type='w'):
     if boot_cycle_hook:
         hook_path = str(boot_cycle_hook).strip()
         if hook_path and hook_path.lower().endswith('.py'):
+            _set_monitor_hook_var('confirm_function_address', fmt_u32(confirm_addr))
             _set_monitor_hook_var('boot_cycle_index', 1)
             _set_monitor_hook_var('boot_cycle_previous_index', 0)
             _set_monitor_hook_var('boot_cycle_previous_slot', boot_slot0)
@@ -2767,6 +2817,8 @@ def run_confirm_cycle_fault(cc_fault_at, cc_fault_type='w'):
                 'previous_record': cycle_records[-1],
                 'next_cycle_index': 1,
                 'success_vtor_slot': success_vtor_slot,
+                'confirm_function_address': confirm_addr,
+                'confirm_function_name': _confirm_cycle_function,
             }
             with open(hook_path, 'r') as hook_file:
                 source = hook_file.read()
@@ -2789,7 +2841,6 @@ def run_confirm_cycle_fault(cc_fault_at, cc_fault_type='w'):
 
     if not hook_bus.fired and cc_fault_at >= hook_bus.ops:
         cc_meta['skip_reason'] = 'no_write_at_index'
-        cc_meta['confirm_incomplete'] = True
 
     # Phase 3: Reboot and evaluate.
     current_flash = _snapshot_current_flash()
@@ -3485,15 +3536,95 @@ def prime_bootloader_entry():
         pass
 
 def apply_pre_boot_state():
+    global _pre_boot_state_debug
+    _pre_boot_state_debug = []
     if pre_boot_bin:
         with open(pre_boot_bin, 'rb') as f:
             pbs_data = f.read()
         for i in range(0, len(pbs_data), 8):
             addr, val = struct.unpack_from('<II', pbs_data, i)
             bus.WriteDoubleWord(addr, val)
+            try:
+                readback = as_int(bus.ReadDoubleWord(addr))
+                _pre_boot_state_debug.append({
+                    'index': i // 8,
+                    'address': fmt_u32(addr),
+                    'wrote': fmt_u32(val),
+                    'readback': fmt_u32(readback),
+                })
+                log('pre_boot_state[{}]: addr={} wrote={} readback={}'.format(
+                    i // 8, fmt_u32(addr), fmt_u32(val), fmt_u32(readback)
+                ))
+            except Exception as exc:
+                _pre_boot_state_debug.append({
+                    'index': i // 8,
+                    'address': fmt_u32(addr),
+                    'wrote': fmt_u32(val),
+                    'readback_error': str(exc),
+                })
     if setup_script:
         monitor.Parse('include @' + setup_script)
     prime_bootloader_entry()
+
+
+def capture_pre_boot_state_debug():
+    entries = []
+    if not pre_boot_bin:
+        return entries
+    with open(pre_boot_bin, 'rb') as f:
+        pbs_data = f.read()
+    for i in range(0, len(pbs_data), 8):
+        addr, val = struct.unpack_from('<II', pbs_data, i)
+        entry = {
+            'index': i // 8,
+            'address': fmt_u32(addr),
+            'expected': fmt_u32(val),
+        }
+        try:
+            entry['readback'] = fmt_u32(as_int(bus.ReadDoubleWord(addr)))
+        except Exception as exc:
+            entry['readback_error'] = str(exc)
+        entries.append(entry)
+    return entries
+
+
+def capture_slot_header_debug(slot_base):
+    try:
+        base = int(slot_base)
+    except Exception:
+        return None
+    try:
+        magic = as_int(bus.ReadDoubleWord(base + 0x0))
+        load_addr = as_int(bus.ReadDoubleWord(base + 0x4))
+        hdr_plus_prot = as_int(bus.ReadDoubleWord(base + 0x8))
+        img_size = as_int(bus.ReadDoubleWord(base + 0xC))
+        flags = as_int(bus.ReadDoubleWord(base + 0x10))
+        ver_lo = as_int(bus.ReadDoubleWord(base + 0x14))
+        ver_hi = as_int(bus.ReadDoubleWord(base + 0x18))
+        hdr_size = hdr_plus_prot & 0xFFFF
+        prot_tlv_size = (hdr_plus_prot >> 16) & 0xFFFF
+        version = {
+            'major': ver_lo & 0xFF,
+            'minor': (ver_lo >> 8) & 0xFF,
+            'revision': (ver_lo >> 16) & 0xFFFF,
+            'build_num': ver_hi & 0xFFFFFFFF,
+        }
+        debug = {
+            'base': fmt_u32(base),
+            'magic': fmt_u32(magic),
+            'load_addr': fmt_u32(load_addr),
+            'hdr_size': hdr_size,
+            'protected_tlv_size': prot_tlv_size,
+            'img_size': fmt_u32(img_size),
+            'flags': fmt_u32(flags),
+            'version': version,
+        }
+        tlv_magic_addr = base + hdr_size + (img_size & 0xFFFFFFFF)
+        debug['tlv_magic_addr'] = fmt_u32(tlv_magic_addr)
+        debug['tlv_magic'] = fmt_u32(as_int(bus.ReadDoubleWord(tlv_magic_addr)))
+        return debug
+    except Exception as exc:
+        return {'base': fmt_u32(base), 'error': str(exc)}
 
 
 def _apply_pre_boot_entries(entries):
@@ -3507,6 +3638,8 @@ def _apply_pre_boot_entries(entries):
     prime_bootloader_entry()
 
 def apply_partial_pre_boot_state(max_writes, fault_type='w'):
+    global _pre_boot_state_debug
+    _pre_boot_state_debug = []
     if not pre_boot_bin:
         return (0, 0, False)
     with open(pre_boot_bin, 'rb') as f:
@@ -3519,6 +3652,24 @@ def apply_partial_pre_boot_state(max_writes, fault_type='w'):
         addr, val = struct.unpack_from('<II', pbs_data, i * 8)
         if i < max_writes:
             bus.WriteDoubleWord(addr, val)
+            try:
+                readback = as_int(bus.ReadDoubleWord(addr))
+                _pre_boot_state_debug.append({
+                    'index': i,
+                    'address': fmt_u32(addr),
+                    'wrote': fmt_u32(val),
+                    'readback': fmt_u32(readback),
+                })
+                log('partial_pre_boot[{}]: addr={} wrote={} readback={}'.format(
+                    i, fmt_u32(addr), fmt_u32(val), fmt_u32(readback)
+                ))
+            except Exception as exc:
+                _pre_boot_state_debug.append({
+                    'index': i,
+                    'address': fmt_u32(addr),
+                    'wrote': fmt_u32(val),
+                    'readback_error': str(exc),
+                })
             applied += 1
         elif i == max_writes:
             fault_address = addr
@@ -3867,15 +4018,20 @@ def _apply_residual_image():
         'tertiary': image_tertiary_path,
         'recovery': image_recovery_path,
     }.get(residual_image_slot, '')
+    if not actual_image_path:
+        raise RuntimeError(
+            'residual_image requires an actual image path for slot {}'.format(
+                residual_image_slot
+            )
+        )
 
     if residual_image_prior:
         # Mode 2: load prior image first, then actual on top.
         _bus_load_binary(residual_image_prior, target_base)
-        if actual_image_path:
-            _bus_load_binary(actual_image_path, target_base)
+        _bus_load_binary(actual_image_path, target_base)
         # If fill_pattern is set, fill the residual tail between the actual
         # image end and the prior image end.
-        if residual_image_fill is not None and actual_image_path:
+        if residual_image_fill is not None:
             actual_size = os.path.getsize(actual_image_path)
             prior_size = os.path.getsize(residual_image_prior)
             if prior_size > actual_size:
@@ -3892,8 +4048,7 @@ def _apply_residual_image():
         if slot_cfg:
             s_lo, s_hi = slot_cfg
             _fill_slot_region(s_lo, s_hi - s_lo, residual_image_fill)
-        if actual_image_path:
-            _bus_load_binary(actual_image_path, target_base)
+        _bus_load_binary(actual_image_path, target_base)
         log('residual_image: filled slot {} (0x{:08X}) with 0x{:02X}, then loaded actual'.format(
             residual_image_slot, target_base, residual_image_fill))
 
@@ -4269,8 +4424,9 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
                 rv_offset = reset_vector_addr - s_lo
             else:
                 # Reset vector points below the slot base -- flag as anomaly.
-                rv_offset = 0
+                rv_offset = reset_vector_addr - s_lo
                 signals['reset_vector_below_slot'] = True
+                signals['reset_vector_offset_exceeded'] = True
                 reset_vector_offset_ok = False
             signals['reset_vector_offset'] = rv_offset
             if rv_offset > max_reset_vector_offset:
@@ -4841,22 +4997,78 @@ def parse_duration_seconds(default=2.0):
     except Exception:
         return default
 
-def phase1_max_iters(default_s=4.0, time_slice_s=None):
+def phase1_budget_duration(default_s=4.0, prefer_run_duration=False):
+    duration_s = parse_duration_seconds(default=default_s)
+    if prefer_run_duration:
+        # Zero-point execute controls should use the profile runtime budget when
+        # it extends the control floor, but never collapse below that floor if
+        # a tiny run_duration leaks through.
+        return max(float(default_s), float(duration_s))
+    return max(float(default_s), float(duration_s))
+
+def phase1_max_iters(default_s=4.0, time_slice_s=None, budget_s=None):
     if time_slice_s is None:
         try:
             time_slice_s = float(phase1_time_slice)
         except Exception:
             time_slice_s = 0.02
-    duration_s = max(float(default_s), parse_duration_seconds(default=default_s))
+    if budget_s is None:
+        duration_s = phase1_budget_duration(default_s=default_s)
+    else:
+        duration_s = max(0.02, float(budget_s))
     slice_s = max(0.001, float(time_slice_s))
     return max(200, int((duration_s / slice_s) + 0.999))
 
 
-def phase1_wall_timeout(default_s=4.0, min_wall_s=120.0, wall_per_emulated_s=30.0):
-    duration_s = max(float(default_s), parse_duration_seconds(default=default_s))
+def phase1_wall_timeout(default_s=4.0, min_wall_s=120.0, wall_per_emulated_s=30.0, budget_s=None):
+    if budget_s is None:
+        duration_s = phase1_budget_duration(default_s=default_s)
+    else:
+        duration_s = max(0.02, float(budget_s))
     stall_floor_s = max(float(min_wall_s), float(progress_stall_timeout_s) * 3.0)
     duration_budget_s = max(float(min_wall_s), duration_s * float(wall_per_emulated_s))
     return max(int(stall_floor_s + 0.999), int(duration_budget_s + 0.999))
+
+
+def run_control_phase1(cpu_ref, label='control_p1', vtor_settle_iters=0):
+    global progress_stall_timeout_s
+    control_budget_s = phase1_budget_duration(
+        default_s=4.0,
+        prefer_run_duration=zero_point_execute_control,
+    )
+    p1_wall_timeout = phase1_wall_timeout(default_s=control_budget_s, budget_s=control_budget_s)
+    p1_max_iters = phase1_max_iters(default_s=control_budget_s, budget_s=control_budget_s)
+    control_expect_writes = not zero_point_execute_control
+    saved_stall_timeout_s = progress_stall_timeout_s
+    if zero_point_execute_control:
+        # Zero-point execute controls can spend long stretches in read-only
+        # boot code before handoff. Bound them by the configured runtime
+        # budget instead of the generic progress-stall heuristic.
+        progress_stall_timeout_s = 0
+    log(
+        'control phase1 budget: zero_point_execute_control={} '
+        'budget_s={:.3f} time_slice={} max_iters={} wall_timeout={}'.format(
+            bool(zero_point_execute_control),
+            float(control_budget_s),
+            phase1_time_slice,
+            int(p1_max_iters),
+            int(p1_wall_timeout),
+        )
+    )
+    try:
+        return run_until_done(
+            cpu_ref,
+            label=label,
+            stop_on_fault=False,
+            expect_writes=control_expect_writes,
+            zero_writes_is_brick=control_expect_writes,
+            max_iters=p1_max_iters,
+            wall_timeout=p1_wall_timeout,
+            time_slice=phase1_time_slice,
+            vtor_settle_iters=vtor_settle_iters,
+        )
+    finally:
+        progress_stall_timeout_s = saved_stall_timeout_s
 
 def run_read_bit_flip_fault(fault_at):
     # read_bit_flip: storage is correct, but a specific word returns
@@ -5673,6 +5885,10 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         'actual_writes': actual_writes,
         'signals': signals,
     }
+    if fault_injected and fault_snapshot_bytes is not None:
+        _snapshot_path = persist_fault_snapshot(fault_at, fault_type, fault_snapshot_bytes)
+        if _snapshot_path:
+            result['fault_snapshot_file'] = _snapshot_path
     if writeback_active():
         result['durability_model'] = 'writeback'
         result['writeback_capacity'] = writeback_capacity()
@@ -5965,6 +6181,14 @@ def run_execute_fault(fault_at, fault_type='w'):
 
         log('control phase1_setup')
         restore_phase1_baseline()
+        pre_boot_debug = capture_pre_boot_state_debug()
+        staging_header_debug = capture_slot_header_debug(slot_staging_base)
+        staging_offset_header_debug = None
+        staging_offset = effective_page_size()
+        if 0 < staging_offset < slot_staging_size:
+            staging_offset_header_debug = capture_slot_header_debug(
+                slot_staging_base + staging_offset
+            )
         reset_rc_injection_state(enabled=False)
         cpu_ref = monitor.Machine['sysbus.cpu']
         cpu_ref.IsHalted = False
@@ -5973,14 +6197,9 @@ def run_execute_fault(fault_at, fault_type='w'):
         disarm_fault()
 
         arm_vtor_watchpoint()
-        p1_wall_timeout = phase1_wall_timeout(default_s=4.0)
-        p1_max_iters = phase1_max_iters(default_s=4.0)
-        phase1_status = run_until_done(
+        phase1_status = run_control_phase1(
             cpu_ref,
             label='control_p1',
-            stop_on_fault=False,
-            max_iters=p1_max_iters,
-            wall_timeout=p1_wall_timeout,
             vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
         )
         disarm_vtor_watchpoint()
@@ -5996,9 +6215,18 @@ def run_execute_fault(fault_at, fault_type='w'):
         signals['phase2_ms'] = 0
         signals['phase1_ops_total'] = actual_writes
         signals['trace_replay_mode'] = 'execute'
+        if pre_boot_debug:
+            signals['pre_boot_state_debug'] = pre_boot_debug
+        if staging_header_debug is not None:
+            signals['staging_header_debug'] = staging_header_debug
+        if staging_offset_header_debug is not None:
+            signals['staging_offset_header_offset'] = fmt_u32(staging_offset)
+            signals['staging_offset_header_debug'] = staging_offset_header_debug
+        merge_verification_probe_signals(signals)
         if phase1_status is not None:
             signals['phase1_stop_reason'] = phase1_status.get('reason')
             signals['phase1_emulated_s'] = phase1_status.get('emulated_s')
+            signals['zero_point_execute_control'] = zero_point_execute_control
             if phase1_status.get('pc_samples'):
                 signals['phase1_pc_samples'] = phase1_status.get('pc_samples')
 
@@ -6019,12 +6247,13 @@ def run_execute_fault(fault_at, fault_type='w'):
     fault_snapshot_bytes = None
     saved_flash = None
     md_pre_snapshot = None
-    is_erase_fault = fault_type in ('e', 'a')
-    is_power_loss_fault = fault_type in ('w', 'e', 'a')
-    is_non_power_write_fault = fault_type in ('b', 's', 'g', 'x', 'r', 'd', 'l', 'k')
-    is_command_fault = fault_type == 'k'
-    is_i2c_fault = fault_type in _I2C_WIRE_CODE_TO_FAULT_TYPE
-    is_otp_fault = fault_type in _OTP_WIRE_CODES and backend.get('otp') is not None
+    fault_base = _base_fault_type_code(fault_type)
+    is_erase_fault = fault_base in ('e', 'a')
+    is_power_loss_fault = fault_base in ('w', 'e', 'a')
+    is_non_power_write_fault = fault_base in ('b', 's', 'g', 'x', 'r', 'd', 'l', 'k')
+    is_command_fault = fault_base == 'k'
+    is_i2c_fault = fault_base in _I2C_WIRE_CODE_TO_FAULT_TYPE
+    is_otp_fault = fault_base in _OTP_WIRE_CODES and backend.get('otp') is not None
     log('fp={} type={} phase1_setup'.format(fault_at, fault_type))
 
     # Phase 1: Reset and set up for the faulted boot.
@@ -6032,7 +6261,7 @@ def run_execute_fault(fault_at, fault_type='w'):
 
     # Capture metadata fields before fault injection for delta tracking.
     md_pre_snapshot = capture_metadata_delta_snapshot()
-    reset_rc_injection_state(enabled=(fault_type == 'x'))
+    reset_rc_injection_state(enabled=(fault_base == 'x'))
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
 
@@ -6067,7 +6296,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         disarm_write_fault()
         disarm_erase_fault()
     elif is_otp_fault:
-        blow_mode = _WRITE_FAULT_MODE.get(fault_type, 0)
+        blow_mode = _WRITE_FAULT_MODE.get(fault_base, 0)
         base_blows = get_total_otp_blows()
         arm_at = base_blows + fault_at + 1
         if arm_at > base_blows + max_writes_cap:
@@ -6082,7 +6311,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         #   's' silent_write_failure (2), 'r' write_rejection (3),
         #   'd' write_disturb (4), 'l' wear_leveling_corruption (5),
         #   'g' driver_error (6), 'x' rc_injection (reuses mode 3).
-        write_mode = _WRITE_FAULT_MODE.get(fault_type, 0)
+        write_mode = _WRITE_FAULT_MODE.get(fault_base, 0)
         base_writes = get_total_writes()
         arm_at = base_writes + fault_at + 1
         if arm_at > base_writes + max_writes_cap:
@@ -6260,9 +6489,9 @@ def run_execute_fault(fault_at, fault_type='w'):
         monitor.Parse('machine Pause')
         _bus_load_elf(bootloader_elf)
         if image_exec_path:
-            _bus_load_binary(image_exec_path, slot_exec_base)
+            _bus_load_binary(image_exec_path, slot_load_addresses.get('exec', slot_exec_base))
         if image_staging_path:
-            _bus_load_binary(image_staging_path, slot_staging_base)
+            _bus_load_binary(image_staging_path, slot_load_addresses.get('staging', slot_staging_base))
         if _hash_bypass_active:
             apply_hash_bypass()
         reset_nvmc_for_recovery()
@@ -7287,7 +7516,8 @@ def _build_trace_replay_write_fault_snapshot(fault_at, fault_type, flash_base_ad
 def run_trace_replay_fault_native(fault_at, fault_type='w'):
     import os as _os_native
 
-    if fault_type not in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES:
+    fault_base = _base_fault_type_code(fault_type)
+    if fault_base not in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES:
         return None
 
     # Writeback mode requires Python-level buffer simulation — the native
@@ -7311,7 +7541,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
 
     fp_t0 = _time.time()
     cpu_ref = monitor.Machine['sysbus.cpu']
-    is_non_power_write_fault = fault_type in _TRACE_REPLAY_WRITE_FAULT_TYPES
+    is_non_power_write_fault = fault_base in _TRACE_REPLAY_WRITE_FAULT_TYPES
 
     # Phase 1: restore flash from cache and replay trace to fault point.
     # No machine Reset needed — reload_images_cached() overwrites full flash,
@@ -7343,7 +7573,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
                 stop_at,
                 page_size,
                 erase_fill,
-                int(_WRITE_FAULT_MODE.get(fault_type, 0)),
+                int(_WRITE_FAULT_MODE.get(fault_base, 0)),
                 corruption_seed
             ))
         else:
@@ -7352,7 +7582,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
                 stop_at,
                 page_size,
                 erase_fill,
-                int(_WRITE_FAULT_MODE.get(fault_type, 0)),
+                int(_WRITE_FAULT_MODE.get(fault_base, 0)),
                 corruption_seed
             ))
     elif erase_trace_file_bin_path and _os_native.path.exists(erase_trace_file_bin_path):
@@ -7468,9 +7698,10 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
 def run_trace_replay_fault(fault_at, fault_type='w'):
     global trace_data_loaded, erase_trace_loaded
 
-    if fault_type not in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES:
+    fault_base = _base_fault_type_code(fault_type)
+    if fault_base not in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES:
         return run_execute_fault(fault_at, fault_type=fault_type)
-    if writeback_active() and fault_type in _TRACE_REPLAY_WRITE_FAULT_TYPES:
+    if writeback_active() and fault_base in _TRACE_REPLAY_WRITE_FAULT_TYPES:
         log('fp={} trace_replay_fallback writeback active for {}'.format(fault_at, fault_type))
         return run_execute_fault(fault_at, fault_type=fault_type)
 
@@ -7495,7 +7726,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 
     fp_t0 = _time.time()
     cpu_ref = monitor.Machine['sysbus.cpu']
-    is_non_power_write_fault = fault_type in _TRACE_REPLAY_WRITE_FAULT_TYPES
+    is_non_power_write_fault = fault_base in _TRACE_REPLAY_WRITE_FAULT_TYPES
 
     # Phase 1: reconstruct flash state from the clean trace.
     # No machine Reset needed — reload_images_cached() overwrites full flash.
@@ -7706,6 +7937,7 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
     #
     # Returns the result dict from the runner.
     parts = None  # IronPython requires pre-declaration for locals used in multiple if-branches
+    base_ft = _base_fault_type_code(ft)
     # --- Prefix-based compound fault types ---
     if ft.startswith('m:'):
         m_type = ft.split(':')[1] if ':' in ft else 'w'
@@ -7765,11 +7997,11 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
             backend['data'].Nvm.CorruptionSeed = 0
         return result
 
-    if default_run_fn == run_trace_replay_fault and ft in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES:
+    if default_run_fn == run_trace_replay_fault and base_ft in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES:
         return default_run_fn(fp, fault_type=ft)
 
     # --- Simple fault types that require full execute mode ---
-    if ft in _EXECUTE_ONLY_FAULT_TYPES:
+    if base_ft in _EXECUTE_ONLY_FAULT_TYPES:
         return run_execute_fault(fp, fault_type=ft)
 
     # --- Default: use the pre-selected run function (trace replay or execute) ---
@@ -7935,6 +8167,8 @@ if calibration_mode:
 
         total_i2c_transactions = get_total_i2c_transactions()
         total_otp_blows = get_total_otp_blows()
+        calibration_sp = as_int(cpu_ref.GetRegisterUnsafe(13))
+        calibration_lr = as_int(cpu_ref.GetRegisterUnsafe(14))
 
         result = {
             'calibration': True,
@@ -7948,8 +8182,22 @@ if calibration_mode:
             'calibration_emulated_s': float(cal_status.get('emulated_s', 0)),
             'calibration_elapsed_s': float(cal_status.get('elapsed_s', 0)),
             'calibration_pc': cal_status.get('pc', '0x00000000'),
+            'calibration_lr': fmt_u32(calibration_lr),
+            'calibration_sp': fmt_u32(calibration_sp),
+            'calibration_backend_kind': backend['kind'],
+            'hash_bypass_active': bool(_hash_bypass_active),
+            'hash_bypass_symbols_raw': _hash_bypass_symbols_raw,
+            'hash_bypass_symbols_resolved': list(dict.fromkeys(sym for _addr, sym in _hash_bypass_patches)),
             'durability_model': durability_model,
         }
+        if 0x20000000 <= calibration_sp < 0x30000000:
+            try:
+                result['calibration_stack_words'] = [
+                    fmt_u32(as_int(bus.ReadDoubleWord(calibration_sp + (idx * 4))))
+                    for idx in range(4)
+                ]
+            except Exception:
+                pass
         if writeback_active():
             result['writeback_capacity'] = writeback_capacity()
             result['writeback_barriers'] = len(_writeback_barriers)
