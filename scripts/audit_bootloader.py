@@ -45,6 +45,7 @@ from trigger_discovery import (
     TriggerDiscoveryResult,
     discover_update_trigger,
     should_auto_discover_trigger,
+    validate_compiled_flash_map,
 )
 from audit_report import (
     compute_verdict,
@@ -833,6 +834,7 @@ def main() -> int:
             report_artifacts_dir = "temporary"
 
         discovery: Optional[TriggerDiscoveryResult] = None
+        geometry_preflight: Optional[Dict[str, Any]] = None
         if should_auto_discover_trigger(profile, eval_mode):
             discovery = discover_update_trigger(
                 profile,
@@ -870,6 +872,16 @@ def main() -> int:
                 ),
                 file=sys.stderr,
             )
+        else:
+            geometry_preflight = validate_compiled_flash_map(profile, repo_root)
+            if geometry_preflight.get("status") == "mismatch":
+                print(
+                    "WARNING: geometry preflight mismatch for '{}': {}".format(
+                        profile.name,
+                        geometry_preflight.get("reason"),
+                    ),
+                    file=sys.stderr,
+                )
 
         # -------------------------------------------------------------------
         # Calibration
@@ -1467,6 +1479,8 @@ def main() -> int:
                 "seed": dist.seed,
                 "clustered_bit_corruption_points": clustered_bit_count,
             }
+        if geometry_preflight is not None:
+            payload["summary"]["geometry_preflight"] = geometry_preflight
         payload["contracts"] = {
             "state_probe": (
                 {

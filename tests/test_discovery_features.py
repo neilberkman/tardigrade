@@ -1181,6 +1181,13 @@ class DiscoveryFeaturesTest(unittest.TestCase):
         )
         self.assertIn("stateless", msg)
 
+    def test_audit_runner_records_geometry_preflight_for_manual_profiles(self) -> None:
+        text = (SCRIPTS / "audit_bootloader.py").read_text(encoding="utf-8")
+        self.assertIn("validate_compiled_flash_map", text)
+        self.assertIn("geometry_preflight: Optional[Dict[str, Any]] = None", text)
+        self.assertIn("geometry_preflight = validate_compiled_flash_map(profile, repo_root)", text)
+        self.assertIn('payload["summary"]["geometry_preflight"] = geometry_preflight', text)
+
     def test_self_test_rejects_semantic_only_issues_by_default(self) -> None:
         passed, reason = check_verdict(
             ROOT / "profiles" / "dummy.yaml",
