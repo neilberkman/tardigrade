@@ -21,6 +21,7 @@ bootloader:
 memory:
   sram: { start: 0x20000000, end: 0x20040000 }
   write_granularity: 4
+  page_size: 0x1000
   slots:
     exec: { base: 0x0000C000, size: 0x76000 }
     staging: { base: 0x00082000, size: 0x76000 }
@@ -107,6 +108,8 @@ memory:
 ```
 
 `write_granularity` is the minimum write unit in bytes (4 for typical NOR flash, 8 for MRAM).
+
+`page_size` is the effective erase unit used by state evaluation and as a fallback geometry hint for semantic cutpoints like `swap_progress`. On uniform flash, this is usually the real sector size. On non-uniform flash, calibration erase traces are preferred because they provide the actual per-sector map; `page_size` is only a fallback.
 
 ### How to find your slot addresses
 
@@ -251,6 +254,28 @@ update_trigger:
   version: 2
 ```
 
+### Automatic trigger discovery
+
+If you do not want to hand-seed trailer bytes, omit `update_trigger` or set it to `auto`:
+
+```yaml
+update_trigger: auto
+```
+
+When `pre_boot_state` is empty, tardigrade treats `update_trigger: auto` and a missing `update_trigger` the same way. Before the real calibration run, it tries a short trigger cascade until one strategy produces real slot data movement:
+
+1. No trigger
+2. Trailer magic only
+3. Trailer magic + swap metadata
+4. Offset image placement + trailer magic
+5. Offset image placement + trailer metadata
+
+MCUboot profiles also get a compiled flash-map preflight first. If the ELF's built-in slot layout does not match the profile's declared slots, tardigrade stops early instead of brute-forcing triggers against the wrong geometry.
+
+This is coverage-gated. Trailer-only writes are not enough: a strategy only succeeds if calibration reaches slot data movement. If every strategy fails, tardigrade reports `INCONCLUSIVE -- could not trigger firmware update` rather than claiming a clean run.
+
+Use explicit `pre_boot_state` or an explicit `update_trigger:` mapping when you need a specific seeded state (for example, a resume-from-interrupted-swap scenario). Those explicit seeds disable auto-discovery.
+
 ## Success criteria
 
 How tardigrade decides if the device recovered after a fault.
@@ -362,11 +387,12 @@ fault_sweep:
   fault_types: [power_loss, bit_corruption, interrupted_erase]
 ```
 
-Default is `[power_loss]`. Available types (24 total):
+Default is `[power_loss]`. Available types (25 total):
 
 | Fault type                 | What it does                                   | Backend requirement  |
 | -------------------------- | ---------------------------------------------- | -------------------- |
 | `power_loss`               | Truncate write at fault point                  | All                  |
+| `swap_progress`            | Cut power at swap-iteration boundary           | All                  |
 | `bit_corruption`           | NOR-physics bit flips (1-to-0)                 | All                  |
 | `interrupted_erase`        | Partial page erase                             | NVMC, NVMemory       |
 | `command_drop`             | Silently dropped NVM controller command        | GenericNvmController |
@@ -390,6 +416,28 @@ Default is `[power_loss]`. Available types (24 total):
 | `otp_stuck_bit`            | OTP bit stuck at 0 or 1                        | OTPMemory            |
 | `otp_read_disturb`         | OTP read returns wrong value                   | OTPMemory            |
 | `otp_overblow`             | OTP fuse blown past threshold                  | OTPMemory            |
+
+### Swap progress (semantic cutpoints)
+
+`swap_progress` is the first semantic fault selector beyond raw write indices. Instead of "cut power at write N", it means "let the bootloader make real swap progress, interrupt it at the next slot-sector boundary, then reboot and observe resume behavior."
+
+```yaml
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [swap_progress]
+  max_writes: auto
+```
+
+This is aimed at resume-path bugs: off-by-one sector indexing, wrong-slot resume, stale trailer cleanup, rollback loops, and similar state-machine failures that only appear on the boot after interruption.
+
+Implementation details:
+
+- Calibration must run, because `swap_progress` is derived from the clean write/erase trace.
+- Tardigrade prefers calibration erase data to detect real sector boundaries.
+- If no erase trace is available, tardigrade falls back to uniform `memory.page_size` buckets.
+- On non-uniform flash such as STM32F4, the erase trace is the important source of truth; `page_size` fallback is only approximate.
+- A clean result also requires coverage. If calibration only touches slot trailers/metadata, only touches flash outside the declared slots, or performs no NVM activity at all, tardigrade fails the run instead of reporting a clean `PASS`.
 
 ### Instruction skip (voltage glitch)
 
@@ -1012,6 +1060,8 @@ The top-level verdict is `PASS` or `FAIL`. This is what CI gates on.
 - **PASS + `should_find_issues: false`**: No bricks, no wrong-image, no invariant violations. The bootloader survived all faults.
 - **PASS + `should_find_issues: true`**: Issues were found (expected for known-vulnerable code).
 - **FAIL**: Unexpected result — either issues found when none expected, or no issues found when expected.
+
+For write/erase-style campaigns, a clean `PASS` also requires calibration coverage. If calibration never shows slot data movement, tardigrade treats the run as a failed setup rather than evidence that the bootloader is clean.
 
 ### Boot outcomes
 

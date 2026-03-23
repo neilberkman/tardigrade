@@ -118,21 +118,23 @@ python3 scripts/audit_bootloader.py \
 ```mermaid
 flowchart TD
     subgraph setup["Setup"]
-        A["Load profile YAML"] --> B["Calibration: run firmware,<br/>record NVM write trace"]
-        B --> C["Heuristic: classify writes<br/>by address (~15K → ~1K)"]
-        C --> D["Fault point list"]
+        A["Load profile YAML"] --> B["Calibration: run firmware,<br/>record NVM write + erase trace"]
+        B --> C["Selector: choose cutpoints<br/>(writes, erases, swap progress)"]
+        C --> D["Heuristic / planner:<br/>build fault point list"]
     end
 
     D --> E
 
     subgraph pf["Per fault point"]
-        E["Phase 1: replay trace<br/>to write N (~20ms)"] --> F{"Fault type"}
+        E["Phase 1: replay trace<br/>to selected cutpoint (~20ms)"] --> F{"Fault type"}
         F -->|power_loss| G["Truncate write N<br/>(partial word)"]
+        F -->|swap_progress| G2["Cut power at swap iteration N<br/>(sector-boundary transition)"]
         F -->|bit_corruption| H["Flip random bits<br/>(NOR physics model)"]
         F -->|interrupted_erase| I["Partial page erase"]
         F -->|"20 others<br/>(I2C, OTP, NVM,<br/>instruction_skip, ...)"| J["Backend-specific<br/>fault injection"]
 
         G --> K["Faulted NVM state"]
+        G2 --> K
         H --> K
         I --> K
         J --> K
@@ -158,20 +160,22 @@ flowchart TD
     U["Classify outcome + failure class"] --> V["Aggregate into results JSON"]
 ```
 
-1. **Calibration** -- run the firmware once, count total NVM writes, record a write trace.
-2. **Heuristic pruning** -- classify writes by address into tiers, reduce sweep points ~10x.
-3. **Phase 1** -- replay the write trace up to write N and inject the fault (trace replay eliminates O(N^2) prefix re-emulation).
-4. **Phase 2** -- `execute` mode resets the CPU and performs a full recovery boot from faulted NVM; `state` mode infers the outcome from NVM contents alone.
-5. **Follow-up cycles / hooks** -- optional repeated boots and between-cycle hook actions model confirm-or-rollback flows and staged recovery.
-6. **Classification** -- boot outcomes (`success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`) and failure classes (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`). A `timeout` means the bootloader was still actively working when the wall-clock budget expired -- this is not counted as a failure.
+1. **Trigger discovery** -- if the profile does not already seed a `pre_boot_state`, tardigrade can try a short trigger cascade (`no_trigger`, trailer magic, trailer metadata, offset placement) until calibration reaches real slot data movement. MCUboot profiles also get a compiled flash-map preflight so bad slot geometry fails fast instead of looking "clean."
+2. **Calibration** -- run the firmware once, count total NVM writes, and record write/erase traces.
+3. **Cutpoint selection** -- choose candidate fault points from the clean trace. Today this includes raw write indices, erase indices, and semantic `swap_progress` boundaries.
+4. **Heuristic pruning** -- classify write-indexed points by address into tiers, reducing routine sweeps ~10x.
+5. **Phase 1** -- replay the clean trace up to the selected cutpoint and inject the fault (trace replay eliminates O(N^2) prefix re-emulation).
+6. **Phase 2** -- `execute` mode resets the CPU and performs a full recovery boot from faulted NVM; `state` mode infers the outcome from NVM contents alone.
+7. **Follow-up cycles / hooks** -- optional repeated boots and between-cycle hook actions model confirm-or-rollback flows and staged recovery.
+8. **Classification** -- boot outcomes (`success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`) and failure classes (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`). A `timeout` means the bootloader was still actively working when the wall-clock budget expired -- this is not counted as a failure.
 
 ### Fault types
 
-23 fault types across 7 backend categories:
+25 fault types across 8 backend categories:
 
 | Category        | Fault types                                                                                                                                                           | Backend              |
 | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| NVM write/erase | `power_loss`, `bit_corruption`, `interrupted_erase`, `silent_write_failure`, `write_disturb`, `write_rejection`, `multi_sector_atomicity`, `wear_leveling_corruption` | All                  |
+| NVM write/erase | `power_loss`, `swap_progress`, `bit_corruption`, `interrupted_erase`, `silent_write_failure`, `write_disturb`, `write_rejection`, `multi_sector_atomicity`, `wear_leveling_corruption` | All                  |
 | NVM read/time   | `read_bit_flip`, `reset_at_time`                                                                                                                                      | NVMemory, MRAM / All |
 | NVM controller  | `command_drop`                                                                                                                                                        | GenericNvmController |
 | NVM region      | `bootloader_region_write`, `nvs_corruption`                                                                                                                           | All                  |
@@ -181,6 +185,12 @@ flowchart TD
 | OTP fuse        | `otp_partial_program`, `otp_stuck_bit`, `otp_read_disturb`, `otp_overblow`                                                                                            | OTPMemory            |
 
 Faults can be injected at different lifecycle stages: during the initial update write path, during pre-boot metadata/setup writes (`metadata_fault`), during between-boot confirm/accept hooks (`hook_fault`), during the recovery write path itself (`phase2_fault`), or as compound sequences (`multi_fault`). The optional `durability_model: writeback` composes with any fault type to simulate write-buffering storage stacks.
+
+`swap_progress` is the first semantic cutpoint selector beyond raw write indices. It uses calibration erase data to find real sector-boundary transitions in slot traffic, then reuses the normal power-cut replay path at those boundaries. On platforms where an erase trace is unavailable, tardigrade falls back to uniform `memory.page_size` buckets, which is usable on uniform flash and only approximate on non-uniform layouts.
+
+Clean verdicts are coverage-gated. If calibration shows trailer-only activity, flash traffic outside the declared slots, or no NVM activity at all, tardigrade reports that as a failed/inconclusive setup instead of a clean `PASS`.
+
+Trigger discovery is coverage-gated too. A strategy only "wins" if calibration reaches slot data movement. Trailer-only writes mean the bootloader noticed the trigger but rejected the image; zero writes mean the update path never ran. If every strategy fails, tardigrade returns `INCONCLUSIVE -- could not trigger firmware update` instead of pretending the bootloader is clean.
 
 ### Execute-mode hardening
 
@@ -204,6 +214,8 @@ In `execute` mode, Phase 2 performs a full CPU recovery boot from faulted NVM:
 ## Profile-driven architecture
 
 Sweeps are purely declarative YAML -- describe the memory layout, slots, images, and success criteria. Advanced semantic checking (state probes, custom invariants, boot register capture, write-order constraints) requires small Python hooks. A `security_policy` block models anti-rollback floors, minimum version enforcement, and TOCTOU protection for adversarial fault scenarios.
+
+For upgrade-style profiles, the preferred starting point is minimal: ELF, slot layout, images, and success criteria. If you omit `pre_boot_state` and either omit `update_trigger` or set `update_trigger: auto`, tardigrade will try to discover the update trigger automatically before the real sweep.
 
 See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the complete profile-writing guide: field-by-field reference, platform selection, success criteria options, invariant configuration, and result interpretation.
 
@@ -233,7 +245,7 @@ The `examples/` directory contains standalone bootloader firmware for engine val
 
 ## Report structure
 
-Top-level verdict is `PASS` or `FAIL` -- use this as the CI gate signal. `bricks` counts unrecoverable failures (device didn't boot). `issue_points` includes broader mismatches (wrong slot, semantic assertions, invariant violations). `timeout_points` counts fault points where the bootloader was still actively working when the wall-clock budget expired -- these are not failures (increase `run_duration` to resolve). Boot outcomes: `success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`.
+Top-level verdict is `PASS` or `FAIL` -- use this as the CI gate signal. `bricks` counts unrecoverable failures (device didn't boot). `issue_points` includes broader mismatches (wrong slot, semantic assertions, invariant violations). `timeout_points` counts fault points where the bootloader was still actively working when the wall-clock budget expired -- these are not failures (increase `run_duration` to resolve). Boot outcomes: `success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`. A clean `PASS` also requires calibration coverage: if the bootloader never moves slot data during calibration, tardigrade fails the run instead of claiming the bootloader is clean.
 
 See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the full report JSON structure and how to interpret results.
 
