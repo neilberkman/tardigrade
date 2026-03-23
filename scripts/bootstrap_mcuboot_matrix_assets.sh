@@ -28,6 +28,14 @@ PR2214_FIXED="90fd59d2"
 PR_DIFF_GEOM_ALIGN="32"
 PR_DIFF_GEOM_TRAILER_RESERVE="0x30a0"
 PR_DIFF_GEOM_SIGN_OVERHEAD="0x400"
+# Zephyr's STM32F4 flash binding only permits write-block-size values up to 8.
+# This is the minimal sector budget that still pushes boot_trailer_sz(write_sz=8)
+# past a 64 KiB tail sector on the PR2206 geometry:
+# (2725 * 3 * 8) + (5 * 32) = 0x10018.
+PR2206_GEOM_WRITE_BLOCK_SIZE="8"
+PR2206_BOOT_MAX_IMG_SECTORS="2725"
+printf -v PR2206_GEOM_TRAILER_RESERVE '0x%x' \
+    $(( (PR2206_BOOT_MAX_IMG_SECTORS * 3 * PR2206_GEOM_WRITE_BLOCK_SIZE) + (PR_DIFF_GEOM_ALIGN * 5) ))
 
 msg() { echo ">> $*" >&2; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -99,6 +107,22 @@ detect_toolchain_path() {
     if [[ -d "${HOME}/tools/gcc-arm-none-eabi-8-2018-q4-major" ]]; then
         echo "${HOME}/tools/gcc-arm-none-eabi-8-2018-q4-major"
         return
+    fi
+    local candidate
+    for candidate in "${HOME}"/arm-gnu-toolchain-*; do
+        if [[ -x "${candidate}/bin/arm-none-eabi-gcc" && -x "${candidate}/bin/arm-none-eabi-gdb" ]]; then
+            echo "${candidate}"
+            return
+        fi
+    done
+    if command -v arm-none-eabi-gcc >/dev/null 2>&1; then
+        local compiler_bin toolchain_root
+        compiler_bin="$(readlink -f "$(command -v arm-none-eabi-gcc)")"
+        toolchain_root="$(cd "$(dirname "${compiler_bin}")/.." && pwd)"
+        if [[ -x "${toolchain_root}/bin/arm-none-eabi-gcc" && -x "${toolchain_root}/bin/arm-none-eabi-gdb" ]]; then
+            echo "${toolchain_root}"
+            return
+        fi
     fi
     die "set GNUARMEMB_TOOLCHAIN_PATH to an ARM GCC toolchain root"
 }
@@ -172,23 +196,57 @@ EOF
 
         boot_partition: partition@0 {
             label = "mcuboot";
-            reg = <0x0 0xc000>;
+            reg = <0x0 0x20000>;
+        };
+        slot0_partition: partition@20000 {
+            label = "image-0";
+            reg = <0x20000 0x58000>;
+        };
+        slot1_partition: partition@78000 {
+            label = "image-1";
+            reg = <0x78000 0x58000>;
+        };
+        scratch_partition: partition@d0000 {
+            label = "image-scratch";
+            reg = <0xd0000 0x10000>;
+        };
+        storage_partition: partition@e0000 {
+            label = "storage";
+            reg = <0xe0000 0x20000>;
+        };
+    };
+};
+
+/ {
+    chosen {
+        zephyr,code-partition = &boot_partition;
+    };
+};
+EOF
+    cat > "${GENERATED_DIR}/offset_with_geom_partition.dts" <<'EOF'
+&flash0 {
+    /delete-node/ partitions;
+
+    partitions {
+        compatible = "fixed-partitions";
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        boot_partition: partition@0 {
+            label = "mcuboot";
+            reg = <0x0 0x0c000>;
         };
         slot0_partition: partition@c000 {
             label = "image-0";
-            reg = <0xc000 0x6e000>;
+            reg = <0x0c000 0x76000>;
         };
-        slot1_partition: partition@7a000 {
+        slot1_partition: partition@82000 {
             label = "image-1";
-            reg = <0x7a000 0x6e000>;
-        };
-        scratch_partition: partition@e8000 {
-            label = "image-scratch";
-            reg = <0xe8000 0x10000>;
+            reg = <0x82000 0x76000>;
         };
         storage_partition: partition@f8000 {
             label = "storage";
-            reg = <0xf8000 0x8000>;
+            reg = <0xf8000 0x08000>;
         };
     };
 };
@@ -254,12 +312,12 @@ write_stm32f4_pr2205_overlay() {
             label = "mcuboot";
             reg = <0x0 0x08000>;
         };
-        slot1_partition: partition@8000 {
-            label = "image-1";
+        slot0_partition: partition@8000 {
+            label = "image-0";
             reg = <0x08000 0x18000>;
         };
-        slot0_partition: partition@20000 {
-            label = "image-0";
+        slot1_partition: partition@20000 {
+            label = "image-1";
             reg = <0x20000 0x20000>;
         };
         scratch_partition: partition@40000 {
@@ -269,6 +327,49 @@ write_stm32f4_pr2205_overlay() {
         storage_partition: partition@60000 {
             label = "storage";
             reg = <0x60000 0xA0000>;
+        };
+    };
+};
+
+/ {
+    chosen {
+        zephyr,code-partition = &boot_partition;
+    };
+};
+EOF
+}
+
+write_stm32f4_pr2206_overlay() {
+    mkdir -p "${GENERATED_DIR}"
+    cat > "${GENERATED_DIR}/stm32f4_pr2206_scratch.dts" <<'EOF'
+&flash0 {
+    write-block-size = <8>;
+    /delete-node/ partitions;
+
+    partitions {
+        compatible = "fixed-partitions";
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        boot_partition: partition@0 {
+            label = "mcuboot";
+            reg = <0x0 0x08000>;
+        };
+        slot0_partition: partition@8000 {
+            label = "image-0";
+            reg = <0x08000 0x18000>;
+        };
+        slot1_partition: partition@108000 {
+            label = "image-1";
+            reg = <0x108000 0x18000>;
+        };
+        scratch_partition: partition@120000 {
+            label = "image-scratch";
+            reg = <0x120000 0x20000>;
+        };
+        storage_partition: partition@140000 {
+            label = "storage";
+            reg = <0x140000 0xC0000>;
         };
     };
 };
@@ -341,6 +442,23 @@ sign_pr_differential_geom_image() {
         --slot-size "${slot_size}" \
         --version "${version}" \
         "${payload_bin}" "${out_path}"
+}
+
+make_offset_slot_image() {
+    local input_path="$1"
+    local output_path="$2"
+    local offset_bytes="$3"
+
+    "${PYTHON_BIN}" - "$input_path" "$output_path" "$offset_bytes" <<'PY'
+from pathlib import Path
+import sys
+
+input_path = Path(sys.argv[1])
+output_path = Path(sys.argv[2])
+offset_bytes = int(sys.argv[3], 0)
+
+output_path.write_bytes((b"\xFF" * offset_bytes) + input_path.read_bytes())
+PY
 }
 
 build_pr_differential_images() {
@@ -416,6 +534,75 @@ PY
     sign_pr_differential_geom_image \
         "${BUILD_ROOT}/zephyr_slot1_offset_geom_payload.bin" "0x76000" "1.0.3+0" \
         "${ASSETS_DIR}/zephyr_slot1_offset_geom_full.bin"
+
+    msg "Generating STM32F4 geometry boundary payload variants (CONFIG_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN})"
+    PR_DIFF_STM32F4_OFFSET_BASE="${ASSETS_DIR}/zephyr_head_offset_stm32f4_slot1.bin" \
+    PR_DIFF_STM32F4_SCRATCH_BASE="${ASSETS_DIR}/zephyr_head_scratch_stm32f4_pr2206_slot1.bin" \
+    PR_DIFF_STM32F4_PR2206_PRIMARY_SLOT_SIZE="0x18000" \
+    PR_DIFF_STM32F4_PR2206_STAGING_SLOT_SIZE="0x18000" \
+    PR2206_GEOM_TRAILER_RESERVE="${PR2206_GEOM_TRAILER_RESERVE}" \
+    PR_DIFF_TMP="${BUILD_ROOT}" \
+    python3 - <<'PY'
+from pathlib import Path
+import os
+import struct
+
+tmp_root = Path(os.environ["PR_DIFF_TMP"])
+
+geom_trailer_reserve = int(os.environ["PR2206_GEOM_TRAILER_RESERVE"], 0)
+geom_sign_overhead = int("0x400", 0)
+
+
+def max_payload(slot_size: int) -> int:
+    return (slot_size - 0x200 - geom_trailer_reserve - geom_sign_overhead) & ~0x1F
+
+def load_payload(base_image: Path) -> bytes:
+    base = base_image.read_bytes()
+    ih_size = struct.unpack_from("<I", base, 0x0C)[0]
+    return base[0x200:0x200 + ih_size]
+
+def make_payload(path: Path, payload: bytes, size: int, fill: int) -> None:
+    if len(payload) >= size:
+        body = payload[:size]
+    else:
+        body = payload + bytes([fill]) * (size - len(payload))
+    # imgtool expects the MCUboot header reservation at the start of the
+    # input image when --pad-header is not used. Restore the 0x200-byte
+    # gap so the signed output's vector table lands at 0x200, not 0x400.
+    path.write_bytes((b"\x00" * 0x200) + body)
+
+scratch_payload = load_payload(Path(os.environ["PR_DIFF_STM32F4_SCRATCH_BASE"]))
+offset_payload = load_payload(Path(os.environ["PR_DIFF_STM32F4_OFFSET_BASE"]))
+scratch_primary_slot_size = int(os.environ["PR_DIFF_STM32F4_PR2206_PRIMARY_SLOT_SIZE"], 0)
+
+make_payload(
+    tmp_root / "zephyr_slot1_scratch_geom_stm32f4_payload.bin",
+    scratch_payload,
+    max_payload(scratch_primary_slot_size),
+    0xA5,
+)
+make_payload(
+    tmp_root / "zephyr_slot1_scratch_geom_pr2206_boundary_payload.bin",
+    scratch_payload,
+    0x7C80,
+    0xA5,
+)
+make_payload(tmp_root / "zephyr_slot1_offset_geom_stm32f4_payload.bin", offset_payload, 0x40000, 0x5A)
+PY
+
+    sign_pr_differential_geom_image \
+        "${BUILD_ROOT}/zephyr_slot1_scratch_geom_stm32f4_payload.bin" "0x18000" "2.0.0+0" \
+        "${ASSETS_DIR}/zephyr_slot1_scratch_geom_max.bin"
+    sign_pr_differential_geom_image \
+        "${BUILD_ROOT}/zephyr_slot1_scratch_geom_pr2206_boundary_payload.bin" "0x18000" "2.0.1+0" \
+        "${ASSETS_DIR}/zephyr_slot1_scratch_geom_pr2206_boundary.bin"
+    sign_pr_differential_geom_image \
+        "${BUILD_ROOT}/zephyr_slot1_offset_geom_stm32f4_payload.bin" "0x76000" "2.1.0+0" \
+        "${ASSETS_DIR}/zephyr_slot1_offset_geom_full.bin"
+    make_offset_slot_image \
+        "${ASSETS_DIR}/zephyr_slot1_offset_geom_full.bin" \
+        "${ASSETS_DIR}/zephyr_slot1_offset_geom_full_offsetslot.bin" \
+        "0x1E000"
 }
 
 build_pr_differential_elfs() {
@@ -435,6 +622,7 @@ build_pr_differential_elfs() {
     write_nrf52_default_overlays
     write_nrf52_pr_differential_overlays
     write_stm32f4_pr2205_overlay
+    write_stm32f4_pr2206_overlay
     ensure_mcuboot_history "${MCUBOOT_DIR}"
     local missing=false
     for sha in \
@@ -507,37 +695,47 @@ build_pr_differential_elfs() {
 
     local scratch_overlay="${GENERATED_DIR}/scratch_with_code_partition.dts"
     local scratch_geom_overlay="${GENERATED_DIR}/scratch_with_geom_partition.dts"
+    local offset_geom_overlay="${GENERATED_DIR}/offset_with_geom_partition.dts"
     local offset_overlay="${GENERATED_DIR}/nrf52_move_bootloader.overlay"
     local stm32f4_pr2205_overlay="${GENERATED_DIR}/stm32f4_pr2205_scratch.dts"
+    local stm32f4_pr2206_overlay="${GENERATED_DIR}/stm32f4_pr2206_scratch.dts"
     build_pr_bootloader_variant "pr2205_scratch_broken" "${wt_root}/pr2205_broken" "nucleo_f429zi" "${stm32f4_pr2205_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
     build_pr_bootloader_variant "pr2205_scratch_fixed" "${wt_root}/pr2205_fixed" "nucleo_f429zi" "${stm32f4_pr2205_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
-    build_pr_bootloader_variant "pr2206_scratch_broken" "${wt_root}/pr2206_broken" "nrf52840dk/nrf52840" "${scratch_overlay}" \
-        -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
-    build_pr_bootloader_variant "pr2206_scratch_fixed" "${wt_root}/pr2206_fixed" "nrf52840dk/nrf52840" "${scratch_overlay}" \
-        -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
-    build_pr_bootloader_variant "pr2206_scratch_geom_broken" "${wt_root}/pr2206_broken" "nrf52840dk/nrf52840" "${scratch_geom_overlay}" \
+    build_pr_bootloader_variant "pr2206_scratch_broken" "${wt_root}/pr2206_broken" "nucleo_f429zi" "${stm32f4_pr2206_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
         "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}" \
         -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
-        -DCONFIG_BOOT_MAX_IMG_SECTORS=1024
-    build_pr_bootloader_variant "pr2206_scratch_geom_fixed" "${wt_root}/pr2206_fixed" "nrf52840dk/nrf52840" "${scratch_geom_overlay}" \
+        -DCONFIG_BOOT_MAX_IMG_SECTORS="${PR2206_BOOT_MAX_IMG_SECTORS}"
+    build_pr_bootloader_variant "pr2206_scratch_fixed" "${wt_root}/pr2206_fixed" "nucleo_f429zi" "${stm32f4_pr2206_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
         "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}" \
         -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
-        -DCONFIG_BOOT_MAX_IMG_SECTORS=1024
-    build_pr_bootloader_variant "pr2214_offset_broken" "${wt_root}/pr2214_broken" "nrf52840dk/nrf52840" "${offset_overlay}" \
-        -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
-        -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y
-    build_pr_bootloader_variant "pr2214_offset_fixed" "${wt_root}/pr2214_fixed" "nrf52840dk/nrf52840" "${offset_overlay}" \
-        -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
-        -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y
-    build_pr_bootloader_variant "pr2214_offset_geom_broken" "${wt_root}/pr2214_broken" "nrf52840dk/nrf52840" "${offset_overlay}" \
+        -DCONFIG_BOOT_MAX_IMG_SECTORS="${PR2206_BOOT_MAX_IMG_SECTORS}"
+    build_pr_bootloader_variant "pr2206_scratch_geom_broken" "${wt_root}/pr2206_broken" "nucleo_f429zi" "${stm32f4_pr2206_overlay}" \
+        -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
+        "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}" \
+        -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
+        -DCONFIG_BOOT_MAX_IMG_SECTORS="${PR2206_BOOT_MAX_IMG_SECTORS}"
+    build_pr_bootloader_variant "pr2206_scratch_geom_fixed" "${wt_root}/pr2206_fixed" "nucleo_f429zi" "${stm32f4_pr2206_overlay}" \
+        -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
+        "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}" \
+        -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
+        -DCONFIG_BOOT_MAX_IMG_SECTORS="${PR2206_BOOT_MAX_IMG_SECTORS}"
+    build_pr_bootloader_variant "pr2214_offset_broken" "${wt_root}/pr2214_broken" "nucleo_f429zi" "${offset_geom_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
         -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y \
         "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}"
-    build_pr_bootloader_variant "pr2214_offset_geom_fixed" "${wt_root}/pr2214_fixed" "nrf52840dk/nrf52840" "${offset_overlay}" \
+    build_pr_bootloader_variant "pr2214_offset_fixed" "${wt_root}/pr2214_fixed" "nucleo_f429zi" "${offset_geom_overlay}" \
+        -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
+        -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y \
+        "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}"
+    build_pr_bootloader_variant "pr2214_offset_geom_broken" "${wt_root}/pr2214_broken" "nucleo_f429zi" "${offset_geom_overlay}" \
+        -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
+        -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y \
+        "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}"
+    build_pr_bootloader_variant "pr2214_offset_geom_fixed" "${wt_root}/pr2214_fixed" "nucleo_f429zi" "${offset_geom_overlay}" \
         -DCONFIG_BOOT_SWAP_USING_OFFSET=y \
         -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y \
         "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}"

@@ -519,6 +519,62 @@ class ResolveInitialStateTest(unittest.TestCase):
             self.assertEqual(writes[staging_end - 8], 0x9C67778D)
             self.assertEqual(writes[staging_end - 4], 0x8A1F0F11)
 
+    def test_resolve_expands_update_trigger_with_align32_trailer_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile = self._base_profile(tempdir)
+            state = InitialStateConfig(
+                name="geom_resume",
+                update_trigger=UpdateTrigger(
+                    type="mcuboot_trailer_magic",
+                    slot="staging",
+                    fields={
+                        "max_align": 32,
+                        "image_ok": 0x01,
+                        "copy_done": 0x01,
+                        "swap_type": 0x02,
+                        "image_num": 0x00,
+                        "swap_size": 0x00040000,
+                    },
+                ),
+            )
+            resolved = profile.resolve_initial_state(state)
+            writes = {w.address: w.u32 for w in resolved.pre_boot_state}
+            staging_end = 0x10001000 + 0x1000
+            self.assertEqual(writes[staging_end - 64], 0x00000001)
+            self.assertEqual(writes[staging_end - 96], 0x00000001)
+            self.assertEqual(writes[staging_end - 128], 0x00000002)
+            self.assertEqual(writes[staging_end - 160], 0x00040000)
+
+    def test_resolve_expands_update_trigger_with_align32_offset_trailer_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile = self._base_profile(tempdir)
+            state = InitialStateConfig(
+                name="offset_resume",
+                update_trigger=UpdateTrigger(
+                    type="mcuboot_trailer_magic",
+                    slot="staging",
+                    fields={
+                        "max_align": 32,
+                        "image_ok": 0x01,
+                        "copy_done": 0x01,
+                        "swap_type": 0x02,
+                        "image_num": 0x00,
+                        "unprotected_tlv_sizes": 0x01500150,
+                        "swap_size": 0x00009150,
+                    },
+                ),
+            )
+            resolved = profile.resolve_initial_state(state)
+            writes = {w.address: w.u32 for w in resolved.pre_boot_state}
+            staging_end = 0x10001000 + 0x1000
+            self.assertEqual(writes[staging_end - 64], 0x00000001)
+            self.assertEqual(writes[staging_end - 96], 0x00000001)
+            self.assertEqual(writes[staging_end - 128], 0x00000002)
+            self.assertEqual(writes[staging_end - 160], 0x01500150)
+            self.assertEqual(writes[staging_end - 192], 0x00009150)
+
 
 class ScenarioExpansionTest(unittest.TestCase):
     """Test that initial_states compose with scenario overrides."""

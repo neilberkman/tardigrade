@@ -51,9 +51,11 @@ BUILD_TMP="$(mktemp -d /tmp/mcuboot_head_builds.XXXXXX)"
 WEST="${ZEPHYR_VENV}/bin/west"
 IMGTOOL_PYTHON="${ZEPHYR_VENV}/bin/python3"
 
-# Auto-detect toolchain: prefer External SSD copy, fall back to ~/tools.
-# Symlink to /tmp if path has spaces.
-if [[ -d "/Volumes/External SSD/tardigrade/tools/arm-gnu-toolchain" ]]; then
+# Auto-detect toolchain: honor explicit override first, then prefer External
+# SSD copy, then fall back to common local install paths.
+if [[ -n "${GNUARMEMB_TOOLCHAIN_PATH:-}" ]]; then
+    TOOLCHAIN_PATH="${GNUARMEMB_TOOLCHAIN_PATH}"
+elif [[ -d "/Volumes/External SSD/tardigrade/tools/arm-gnu-toolchain" ]]; then
     ln -sfn "/Volumes/External SSD/tardigrade/tools/arm-gnu-toolchain" /tmp/arm-toolchain
     TOOLCHAIN_PATH="/tmp/arm-toolchain"
 elif [[ -d "${HOME}/tools/gcc-arm-none-eabi-8-2018-q4-major" ]]; then
@@ -274,6 +276,86 @@ cat > "${OVERLAY_DIR}/stm32f4_scratch.dts" <<'DTS'
 };
 DTS
 
+# STM32F4 (nucleo_f429zi) swap-offset overlay on the tracked 1 MiB layout.
+cat > "${OVERLAY_DIR}/stm32f4_offset.dts" <<'DTS'
+&flash0 {
+    /delete-node/ partitions;
+
+    partitions {
+        compatible = "fixed-partitions";
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        boot_partition: partition@0 {
+            label = "mcuboot";
+            reg = <0x0 0x20000>;
+        };
+        slot0_partition: partition@20000 {
+            label = "image-0";
+            reg = <0x20000 0x60000>;
+        };
+        slot1_partition: partition@80000 {
+            label = "image-1";
+            reg = <0x80000 0x60000>;
+        };
+        storage_partition: partition@e0000 {
+            label = "storage";
+            reg = <0xe0000 0x20000>;
+        };
+    };
+};
+
+/ {
+    chosen {
+        zephyr,code-partition = &boot_partition;
+    };
+};
+DTS
+
+# STM32F4 (nucleo_f429zi) PR2206-specific swap-scratch overlay.
+# Mirror the low-bank 16K/16K/64K sector pattern into bank 2 so scratch swap
+# can match cumulative primary/secondary sizes while BOOT_MAX_IMG_SECTORS
+# still pushes the trailer past the primary tail sector boundary.
+cat > "${OVERLAY_DIR}/stm32f4_pr2206_scratch.dts" <<'DTS'
+&flash0 {
+    write-block-size = <8>;
+    /delete-node/ partitions;
+
+    partitions {
+        compatible = "fixed-partitions";
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        boot_partition: partition@0 {
+            label = "mcuboot";
+            reg = <0x0 0x08000>;
+        };
+        slot0_partition: partition@8000 {
+            label = "image-0";
+            reg = <0x08000 0x18000>;
+        };
+        slot1_partition: partition@108000 {
+            label = "image-1";
+            reg = <0x108000 0x18000>;
+        };
+        scratch_partition: partition@120000 {
+            label = "image-scratch";
+            reg = <0x120000 0x20000>;
+        };
+        storage_partition: partition@140000 {
+            label = "storage";
+            reg = <0x140000 0xC0000>;
+        };
+    };
+};
+
+/ {
+    chosen {
+        zephyr,code-partition = &boot_partition;
+    };
+};
+DTS
+
 # --- Build functions ---
 
 build_mcuboot() {
@@ -352,6 +434,7 @@ sign_image() {
     local version="$3"
     local out_name="$4"
     local payload_size="${5:-}"
+    local align="${6:-8}"
 
     local hex="${BUILD_TMP}/hello_${name}/zephyr/zephyr.hex"
     local bin="${BUILD_TMP}/hello_${name}/zephyr/zephyr.bin"
@@ -376,13 +459,30 @@ sign_image() {
     # Profile system handles update_trigger (trailer magic) separately.
     "${IMGTOOL_PYTHON}" "${IMGTOOL_PY}" sign \
       --key "${MCUBOOT_REPO}/root-rsa-2048.pem" \
-      --align 8 \
+      --align "${align}" \
       --header-size 0x200 \
       --slot-size "${slot_size}" \
       --version "${version}" \
       "${sign_input}" "${out}"
 
-    msg "Signed image: ${out} (slot=${slot_size})"
+    msg "Signed image: ${out} (slot=${slot_size}, align=${align})"
+}
+
+make_offset_slot_image() {
+    local input_path="$1"
+    local output_path="$2"
+    local offset_bytes="$3"
+
+    "${IMGTOOL_PYTHON}" - "$input_path" "$output_path" "$offset_bytes" <<'PY'
+from pathlib import Path
+import sys
+
+input_path = Path(sys.argv[1])
+output_path = Path(sys.argv[2])
+offset_bytes = int(sys.argv[3], 0)
+
+output_path.write_bytes((b"\xFF" * offset_bytes) + input_path.read_bytes())
+PY
 }
 
 # --- 1. head_move_nrf52: swap-move, nrf52840dk, default geometry ---
@@ -429,6 +529,13 @@ build_test_app "scratch_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_scratch
 sign_image "scratch_stm32f4" "0x58000" "1.0.0+0" "zephyr_head_scratch_stm32f4_slot0.bin"
 sign_image "scratch_stm32f4" "0x58000" "1.1.0+0" "zephyr_head_scratch_stm32f4_slot1.bin" "36864"
 
+# --- 4b. head_scratch_stm32f4_pr2206: swap-scratch, PR2206 trigger geometry ---
+# Mirror the 0x18000 low-bank sector pattern into bank 2 so scratch swap can
+# terminate, while the primary tail still lands on a 64 KiB sector.
+build_test_app "scratch_stm32f4_pr2206" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_pr2206_scratch.dts"
+sign_image "scratch_stm32f4_pr2206" "0x18000" "1.0.0+0" "zephyr_head_scratch_stm32f4_pr2206_slot0.bin" "" "32"
+sign_image "scratch_stm32f4_pr2206" "0x18000" "1.1.0+0" "zephyr_head_scratch_stm32f4_pr2206_slot1.bin" "36864" "32"
+
 # --- 5. head_move_small: swap-move, nrf52840dk, 128KB slots ---
 # Slots: 0x20000 (128KB) each
 build_mcuboot "move_small" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_small_move.dts" \
@@ -457,12 +564,17 @@ sign_image "offset_nrf52" "0x76000" "1.0.0+0" "zephyr_head_offset_nrf52_slot0.bi
 sign_image "offset_nrf52" "0x76000" "1.1.0+0" "zephyr_head_offset_nrf52_slot1.bin" "36864"
 
 # --- 8. head_offset_stm32f4: swap-offset, nucleo_f429zi, non-uniform sectors ---
-build_mcuboot "offset_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_move.dts" \
+# Slots: 0x60000 (384KB) each on the tracked 1 MiB layout.
+build_mcuboot "offset_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_offset.dts" \
     -DCONFIG_BOOT_SWAP_USING_OFFSET=y -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y
 
-build_test_app "offset_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_move.dts"
+build_test_app "offset_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_offset.dts"
 sign_image "offset_stm32f4" "0x60000" "1.0.0+0" "zephyr_head_offset_stm32f4_slot0.bin"
 sign_image "offset_stm32f4" "0x60000" "1.1.0+0" "zephyr_head_offset_stm32f4_slot1.bin" "36864"
+make_offset_slot_image \
+    "${ASSETS_DIR}/zephyr_head_offset_stm32f4_slot1.bin" \
+    "${ASSETS_DIR}/zephyr_head_offset_stm32f4_slot1_offsetslot.bin" \
+    "0x20000"
 
 # --- 9. head_offset_small: swap-offset, nrf52840dk, 128KB slots ---
 build_mcuboot "offset_small" "nrf52840dk/nrf52840" "${OVERLAY_DIR}/nrf52_small_move.dts" \

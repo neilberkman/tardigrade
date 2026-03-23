@@ -6,12 +6,17 @@ This script automates:
 2) running control-only audits for the fixed build to find the largest
    payload size that still boots,
 3) evaluating broken/fixed at the threshold neighborhood.
+
+The current defaults target the STM32F4 scratch geometry used by the
+PR2206 differential profiles.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -21,6 +26,22 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+PR2206_PRIMARY_SLOT_SIZE = 0x18000
+PR2206_STAGING_SLOT_SIZE = 0x18000
+PR2206_GEOM_WRITE_BLOCK_SIZE = 8
+PR2206_BOOT_MAX_IMG_SECTORS = 2725
+PR2206_GEOM_ALIGN = 32
+PR2206_GEOM_TRAILER_RESERVE = (
+    PR2206_BOOT_MAX_IMG_SECTORS * 3 * PR2206_GEOM_WRITE_BLOCK_SIZE
+) + (PR2206_GEOM_ALIGN * 5)
+# payload_size in this helper maps to MCUboot's ih_img_size, not the full signed
+# file size, so the search bound should stop at the trailer boundary rather than
+# subtracting signing/header overhead a second time.
+PR2206_MAX_PAYLOAD = (
+    PR2206_PRIMARY_SLOT_SIZE
+    - PR2206_GEOM_TRAILER_RESERVE
+) & ~0x1F
+
 
 def parse_int(value: str) -> int:
     return int(value, 0)
@@ -28,6 +49,34 @@ def parse_int(value: str) -> int:
 
 def run(cmd: List[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True, check=check)
+
+
+def resolve_renode_test(explicit: Optional[str]) -> Path:
+    if explicit:
+        return Path(explicit)
+
+    env_value = os.environ.get("RENODE_TEST")
+    if env_value:
+        return Path(env_value)
+
+    which_value = shutil.which("renode-test")
+    if which_value:
+        return Path(which_value)
+
+    raise RuntimeError(
+        "No renode-test path provided. Pass --renode-test or set RENODE_TEST."
+    )
+
+
+def resolve_renode_server_dir(explicit: Optional[str], renode_test: Path) -> Path:
+    if explicit:
+        return Path(explicit)
+
+    env_value = os.environ.get("RENODE_REMOTE_SERVER_DIR")
+    if env_value:
+        return Path(env_value)
+
+    return renode_test.resolve().parent
 
 
 def load_base_payload(base_image: Path, header_size: int = 0x200) -> bytes:
@@ -114,11 +163,11 @@ def make_profile(
         "schema_version": 1,
         "name": profile_name,
         "description": "Auto-generated MCUboot control probe.",
-        "platform": "platforms/cortex_m4_flash_fast.repl",
+        "platform": "platforms/stm32f4.repl",
         "flash_backend": flash_backend,
         "bootloader": {
             "elf": str(bootloader_elf),
-            "entry": 0x00000000,
+            "entry": 0x08000000,
         },
         "memory": {
             "sram": {"start": 0x20000000, "end": 0x20040000},
@@ -243,25 +292,25 @@ def main() -> int:
     )
     parser.add_argument(
         "--base-staging-image",
-        default="results/oss_validation/assets/zephyr_slot1_padded.bin",
+        default="results/oss_validation/assets/zephyr_head_scratch_stm32f4_pr2206_slot1.bin",
         help="Signed slot image or raw MCUboot-app binary used as the base payload source.",
     )
     parser.add_argument(
         "--min-payload",
         type=parse_int,
-        default=0x12000,
+        default=0x4000,
         help="Minimum payload size to consider (hex or decimal).",
     )
     parser.add_argument(
         "--max-payload",
         type=parse_int,
-        default=0x69000,
+        default=PR2206_MAX_PAYLOAD,
         help="Maximum payload size to consider (hex or decimal).",
     )
     parser.add_argument(
         "--quantum",
         type=parse_int,
-        default=0x2000,
+        default=0x20,
         help="Payload size increment quantum.",
     )
     parser.add_argument(
@@ -293,25 +342,31 @@ def main() -> int:
     )
     parser.add_argument(
         "--exec-image",
-        default="results/oss_validation/assets/zephyr_slot0_padded.bin",
+        default="results/oss_validation/assets/zephyr_head_scratch_stm32f4_pr2206_slot0.bin",
         help="Exec slot image path (relative to repo root unless absolute).",
     )
     parser.add_argument(
         "--slot-size",
         type=parse_int,
-        default=0x6E000,
+        default=PR2206_STAGING_SLOT_SIZE,
         help="Slot size used for signing and profile memory layout.",
+    )
+    parser.add_argument(
+        "--slot-exec-size",
+        type=parse_int,
+        default=PR2206_PRIMARY_SLOT_SIZE,
+        help="Exec slot size used in the temporary profile memory layout.",
     )
     parser.add_argument(
         "--slot-exec-base",
         type=parse_int,
-        default=0x0000C000,
+        default=0x08008000,
         help="Exec slot base address.",
     )
     parser.add_argument(
         "--slot-staging-base",
         type=parse_int,
-        default=0x0007A000,
+        default=0x08108000,
         help="Staging slot base address.",
     )
     parser.add_argument(
@@ -328,14 +383,14 @@ def main() -> int:
     parser.add_argument(
         "--sign-align",
         type=parse_int,
-        default=8,
+        default=32,
         help="Alignment passed to imgtool sign.",
     )
     parser.add_argument(
         "--update-max-align",
         type=parse_int,
-        default=None,
-        help="Optional update_trigger.max_align override in the temporary profile.",
+        default=32,
+        help="update_trigger.max_align override in the temporary profile.",
     )
     parser.add_argument(
         "--renode-test",
@@ -344,7 +399,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--renode-remote-server-dir",
-        default="/tmp/renode-server",
+        default=None,
         help="Path to renode remote-server directory.",
     )
     parser.add_argument(
@@ -378,10 +433,11 @@ def main() -> int:
     if not exec_image.is_absolute():
         exec_image = (repo_root / exec_image).resolve()
 
-    renode_test = Path(args.renode_test)
-    renode_server = Path(args.renode_remote_server_dir)
+    renode_test = resolve_renode_test(args.renode_test)
+    renode_server = resolve_renode_server_dir(args.renode_remote_server_dir, renode_test)
 
     slot_size = args.slot_size
+    slot_exec_size = args.slot_exec_size
     slot_exec_base = args.slot_exec_base
     slot_staging_base = args.slot_staging_base
 
@@ -424,7 +480,7 @@ def main() -> int:
             staging_image=image_path,
             flash_backend=args.flash_backend,
             slot_base_exec=slot_exec_base,
-            slot_size_exec=slot_size,
+            slot_size_exec=slot_exec_size,
             slot_base_staging=slot_staging_base,
             slot_size_staging=slot_size,
             update_max_align=args.update_max_align,
