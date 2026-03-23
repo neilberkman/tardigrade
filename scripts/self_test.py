@@ -115,6 +115,16 @@ def check_verdict(
         or control.get("boot_outcome")
         or ""
     )
+    coverage = sweep.get("calibration_coverage", {})
+    if not isinstance(coverage, dict):
+        coverage = {}
+    coverage_status = str(coverage.get("status", "") or "")
+    coverage_reason = str(coverage.get("reason", "") or "")
+    coverage_blocks_clean = coverage_status in {
+        "metadata_only",
+        "outside_slots_only",
+        "no_nvm_activity",
+    }
     control_only_issue = (
         allow_control_only_issues
         and control_outcome == expected_control_outcome
@@ -126,6 +136,8 @@ def check_verdict(
                 return True, "Control exhibits expected {}, as intended".format(
                     control_outcome
                 )
+            if coverage_blocks_clean:
+                return False, coverage_reason or "Calibration did not exercise slot data movement"
             return False, "Expected issues but found none"
         if brick_rate_min > 0 and brick_rate < brick_rate_min:
             return False, "Brick rate {:.1%} below minimum {:.1%}".format(
@@ -148,6 +160,8 @@ def check_verdict(
             issue_points
         )
     else:
+        if coverage_blocks_clean:
+            return False, coverage_reason or "Calibration did not exercise slot data movement"
         if issue_points > 0:
             return False, "Expected no issues but found {} point(s)".format(issue_points)
         return True, "No issues found, as expected"

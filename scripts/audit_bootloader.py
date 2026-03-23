@@ -40,7 +40,12 @@ from partial_staging import (
     parse_partial_staging_config,
     summarize_partial_staging,
 )
-from trace_utils import annotate_clean_trace
+from trace_utils import annotate_clean_trace, summarize_calibration_coverage
+from trigger_discovery import (
+    TriggerDiscoveryResult,
+    discover_update_trigger,
+    should_auto_discover_trigger,
+)
 from audit_report import (
     compute_verdict,
     git_metadata,
@@ -107,6 +112,7 @@ def _can_skip_auto_calibration(profile: ProfileConfig, eval_mode: str) -> bool:
 
     calibration_dependent_faults = {
         "power_loss",
+        "swap_progress",
         "bit_corruption",
         "interrupted_erase",
         "multi_sector_atomicity",
@@ -161,6 +167,23 @@ def _allow_expected_control_only_issues(profile: ProfileConfig) -> bool:
     return bool(getattr(expect, "allow_control_only_issues", False))
 
 
+def _merge_calibration_expected_exec_hash(
+    robot_vars: List[str],
+    calibration_exec_hash: str,
+) -> Tuple[List[str], bool]:
+    """Use discovered exec hash only when the profile did not declare one."""
+    if not calibration_exec_hash:
+        return robot_vars, False
+    for var in robot_vars:
+        key, sep, value = var.partition(":")
+        if key == "EXPECTED_EXEC_SHA256" and sep and value:
+            return robot_vars, False
+    return merge_robot_vars(
+        robot_vars,
+        ["EXPECTED_EXEC_SHA256:{}".format(calibration_exec_hash)],
+    ), True
+
+
 def _requested_zero_fault_points(args: argparse.Namespace) -> bool:
     """Return whether CLI bounds request a zero-point execute sweep."""
     if args.fault_end is None:
@@ -183,6 +206,67 @@ def _profile_requests_zero_fault_points(max_writes: object) -> bool:
         return int(max_writes) <= 0
     except (TypeError, ValueError):
         return False
+
+
+def _write_trigger_discovery_failure(
+    *,
+    args: argparse.Namespace,
+    profile: ProfileConfig,
+    repo_root: Path,
+    report_artifacts_dir: str,
+    discovery: TriggerDiscoveryResult,
+) -> None:
+    verdict = "INCONCLUSIVE -- could not trigger firmware update."
+    checks = [
+        "Is the staging image valid for this bootloader? (header, signature, version)",
+        "Does the slot layout match the bootloader's compiled flash map?",
+        "Does the bootloader require a different trigger mechanism?",
+    ]
+    payload: Dict[str, Any] = {
+        "engine": "renode-test",
+        "profile": profile.name,
+        "profile_path": str(profile.profile_path) if profile.profile_path else None,
+        "schema_version": profile.schema_version,
+        "verdict": verdict,
+        "summary": {
+            "trigger_discovery": discovery.to_summary(),
+        },
+        "expect": {
+            "should_find_issues": profile.expect.should_find_issues,
+        },
+        "calibration": {
+            "performed": False,
+            "source": "trigger_discovery_failed",
+            "writes": 0,
+            "erases": 0,
+            "coverage": None,
+        },
+        "trigger_discovery": {
+            **discovery.to_summary(),
+            "checks": checks,
+        },
+        "execution": {
+            "run_utc": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "campaign_command": " ".join(shlex.quote(a) for a in (["python3"] + sys.argv)),
+            "artifacts_dir": report_artifacts_dir,
+            "workers": args.workers,
+        },
+        "git": git_metadata(repo_root),
+    }
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "profile": profile.name,
+                "verdict": verdict,
+                "summary": payload["summary"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -597,10 +681,6 @@ def main() -> int:
         validate_runtime_fault_mode_compat(profile, eval_mode)
         renode_test = ensure_tool(args.renode_test)
 
-        # Build robot vars from profile + CLI extras.
-        extra_robot_vars = parse_robot_vars(args.robot_var)
-        robot_vars = profile.robot_vars(repo_root) + extra_robot_vars
-        robot_vars.append("EVALUATION_MODE:{}".format(eval_mode))
         # Stall timeout: CLI overrides profile, profile overrides default.
         stall_timeout = args.progress_stall_timeout_s
         cli_explicitly_set = any(
@@ -608,11 +688,13 @@ def main() -> int:
         )
         if not cli_explicitly_set and profile.fault_sweep.progress_stall_timeout_s is not None:
             stall_timeout = profile.fault_sweep.progress_stall_timeout_s
-        robot_vars.append(
-            "PROGRESS_STALL_TIMEOUT_S:{:.6f}".format(stall_timeout)
-        )
-        robot_vars.append(
-            "EXPECT_CONTROL_OUTCOME:{}".format(profile.expect.control_outcome)
+        extra_robot_vars = parse_robot_vars(args.robot_var)
+        robot_vars = _common_robot_vars(
+            profile,
+            repo_root,
+            evaluation_mode=eval_mode,
+            stall_timeout=stall_timeout,
+            extra_robot_vars=extra_robot_vars,
         )
 
         # Write success_criteria_overrides to a temp file so the .resc can
@@ -750,10 +832,51 @@ def main() -> int:
             work_dir = Path(temp_ctx.name)
             report_artifacts_dir = "temporary"
 
+        discovery: Optional[TriggerDiscoveryResult] = None
+        if should_auto_discover_trigger(profile, eval_mode):
+            discovery = discover_update_trigger(
+                profile,
+                repo_root=repo_root,
+                renode_test=renode_test,
+                robot_suite=robot_suite,
+                work_dir=work_dir,
+                renode_remote_server_dir=args.renode_remote_server_dir,
+                keep_run_artifacts=args.keep_run_artifacts,
+                robot_vars_factory=lambda candidate: _common_robot_vars(
+                    candidate,
+                    repo_root,
+                    evaluation_mode=eval_mode,
+                    stall_timeout=min(float(stall_timeout), 10.0),
+                    extra_robot_vars=extra_robot_vars,
+                ),
+            )
+            if not discovery.succeeded:
+                _write_trigger_discovery_failure(
+                    args=args,
+                    profile=profile,
+                    repo_root=repo_root,
+                    report_artifacts_dir=report_artifacts_dir,
+                    discovery=discovery,
+                )
+                if args.no_assert_verdict:
+                    return 0
+                return EXIT_ASSERTION_FAILURE
+            profile = discovery.selected_profile or profile
+            robot_vars = discovery.selected_robot_vars or robot_vars
+            print(
+                "Trigger discovery selected '{}' for '{}'.".format(
+                    discovery.selected_strategy,
+                    profile.name,
+                ),
+                file=sys.stderr,
+            )
+
         # -------------------------------------------------------------------
         # Calibration
         # -------------------------------------------------------------------
-        cal: Optional[CalibrationResult] = None
+        cal: Optional[CalibrationResult] = (
+            discovery.selected_calibration if discovery is not None else None
+        )
         max_writes = profile.fault_sweep.max_writes
         trace_file: Optional[str] = None
         erase_trace_file: Optional[str] = None
@@ -763,7 +886,9 @@ def main() -> int:
         total_i2c_transactions: int = 0
         total_otp_blows: int = 0
         setup_writes: int = 0
-        calibration_source_override: Optional[str] = None
+        calibration_source_override: Optional[str] = (
+            "trigger_discovery" if cal is not None else None
+        )
         control_only_calibration_fallback: Optional[str] = None
         # Determine whether erase-trace capture is needed during calibration.
         fault_types = profile.fault_sweep.fault_types
@@ -771,9 +896,10 @@ def main() -> int:
             "interrupted_erase" in fault_types
             or "multi_sector_atomicity" in fault_types
         )
+        include_erase_trace = include_erases or "swap_progress" in fault_types
 
         # Pass fault_types to calibration so erase trace is captured.
-        if include_erases:
+        if include_erase_trace:
             robot_vars.append("FAULT_TYPES:both")
 
         should_calibrate_for_trace = (
@@ -891,21 +1017,24 @@ def main() -> int:
                     # exec hash as the ground truth for what a successful
                     # operation produces.
                     if cal.calibration_exec_hash:
-                        robot_vars = merge_robot_vars(
+                        robot_vars, discovered_hash_used = _merge_calibration_expected_exec_hash(
                             robot_vars,
-                            ["EXPECTED_EXEC_SHA256:{}".format(cal.calibration_exec_hash)],
+                            cal.calibration_exec_hash,
+                        )
+                        message = (
+                            "Calibration: exec slot hash = {}..."
+                            if discovered_hash_used
+                            else "Calibration: preserving profile EXPECTED_EXEC_SHA256; exec slot hash = {}..."
                         )
                         print(
-                            "Calibration: exec slot hash = {}...".format(
-                                cal.calibration_exec_hash[:16]
-                            ),
+                            message.format(cal.calibration_exec_hash[:16]),
                             file=sys.stderr,
                         )
                     setup_writes = cal.setup_writes
                     total_i2c_transactions = cal.total_i2c_transactions
                     total_otp_blows = cal.total_otp_blows
                     cal_parts = ["{} NVM writes".format(max_writes)]
-                    if include_erases:
+                    if include_erase_trace:
                         cal_parts.append("{} page erases".format(total_erases))
                     if total_i2c_transactions > 0:
                         cal_parts.append("{} I2C transactions".format(total_i2c_transactions))
@@ -987,14 +1116,17 @@ def main() -> int:
                     trace_file_bin = cal.trace_file_bin
                     erase_trace_file_bin = cal.erase_trace_file_bin
                     if cal.calibration_exec_hash:
-                        robot_vars = merge_robot_vars(
+                        robot_vars, discovered_hash_used = _merge_calibration_expected_exec_hash(
                             robot_vars,
-                            ["EXPECTED_EXEC_SHA256:{}".format(cal.calibration_exec_hash)],
+                            cal.calibration_exec_hash,
+                        )
+                        message = (
+                            "Calibration: exec slot hash = {}..."
+                            if discovered_hash_used
+                            else "Calibration: preserving profile EXPECTED_EXEC_SHA256; exec slot hash = {}..."
                         )
                         print(
-                            "Calibration: exec slot hash = {}...".format(
-                                cal.calibration_exec_hash[:16]
-                            ),
+                            message.format(cal.calibration_exec_hash[:16]),
                             file=sys.stderr,
                         )
                     setup_writes = cal.setup_writes
@@ -1044,6 +1176,7 @@ def main() -> int:
                 total_otp_blows=total_otp_blows,
                 setup_writes=setup_writes,
                 trace_file=trace_file,
+                erase_trace_file=erase_trace_file,
             ),
             quick=args.quick,
             fault_step=args.fault_step,
@@ -1100,6 +1233,15 @@ def main() -> int:
         clean_trace_meta = annotate_clean_trace(
             sweep_results, trace_file, erase_trace_file, flash_base,
         )
+        calibration_coverage = summarize_calibration_coverage(
+            trace_file=trace_file,
+            erase_trace_file=erase_trace_file,
+            flash_base=flash_base,
+            slots=profile.memory.slots,
+            page_size=getattr(profile.memory, "page_size", 4096),
+        )
+        if clean_trace_meta is not None:
+            clean_trace_meta["coverage"] = calibration_coverage
 
         annotate_result_checks(sweep_results, profile)
         validate_runtime_findings(
@@ -1116,7 +1258,10 @@ def main() -> int:
             expected_outcome=getattr(profile.expect, "control_outcome", "success") or "success",
         )
         sweep_summary = summarize_runtime_sweep(
-            sweep_results, total_writes=max_writes, profile=profile
+            sweep_results,
+            total_writes=max_writes,
+            profile=profile,
+            calibration_coverage=calibration_coverage,
         )
         sweep_summary["wall_time_s"] = round(sweep_wall_s, 1)
 
@@ -1346,6 +1491,7 @@ def main() -> int:
             "source": calibration_source,
             "writes": max_writes,
             "erases": total_erases,
+            "coverage": calibration_coverage,
             "stop_reason": cal.stop_reason if cal is not None else None,
             "emulated_s": cal.emulated_s if cal is not None else None,
             "elapsed_s": cal.elapsed_s if cal is not None else None,
@@ -1355,6 +1501,12 @@ def main() -> int:
             payload["calibration"]["fallback_reason"] = control_only_calibration_fallback
         if clean_trace_meta is not None:
             payload["clean_trace"] = clean_trace_meta
+        if discovery is not None:
+            payload["trigger_discovery"] = discovery.to_summary()
+            payload["summary"]["trigger_discovery"] = {
+                "selected_strategy": discovery.selected_strategy,
+                "flash_map_check": discovery.flash_map_check,
+            }
 
         if state_fuzz_results is not None:
             payload["state_fuzz_results"] = state_fuzz_results

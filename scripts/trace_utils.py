@@ -26,6 +26,24 @@ def _fmt_u32(value: int) -> str:
     return "0x{0:08X}".format(int(value) & 0xFFFFFFFF)
 
 
+def _classify_slot_region(
+    address: int,
+    slots: Dict[str, Any],
+    page_size: int,
+) -> str:
+    """Classify an absolute flash address relative to declared slots."""
+    if page_size <= 0:
+        page_size = 4096
+    for slot_name, slot_info in slots.items():
+        slot_base = int(slot_info.base)
+        slot_end = slot_base + int(slot_info.size)
+        if slot_end - page_size <= address < slot_end:
+            return "{}_trailer".format(slot_name)
+        if slot_base <= address < slot_end:
+            return "{}_data".format(slot_name)
+    return "outside"
+
+
 def load_clean_write_trace(trace_file: Optional[str]) -> List[Dict[str, int]]:
     """Load calibration write trace CSV."""
     if not trace_file or not os.path.exists(trace_file):
@@ -102,6 +120,7 @@ def load_clean_erase_trace(erase_trace_file: Optional[str]) -> List[Dict[str, An
                     "erase_index": erase_index,
                     "flash_offset": flash_offset,
                     "writes_at_this_point": writes_at,
+                    "erase_size": _parse_optional_int(row.get("erase_size", "")) or 0,
                     "source_order": idx,
                 }
             )
@@ -114,6 +133,90 @@ def load_clean_erase_trace(erase_trace_file: Optional[str]) -> List[Dict[str, An
         )
     )
     return entries
+
+
+def summarize_calibration_coverage(
+    trace_file: Optional[str],
+    erase_trace_file: Optional[str],
+    flash_base: int,
+    slots: Dict[str, Any],
+    page_size: int = 4096,
+) -> Dict[str, Any]:
+    """Summarize whether calibration exercised slot data movement."""
+    if not trace_file or not os.path.exists(trace_file):
+        return {
+            "status": "unavailable",
+            "reason": "No calibration trace available.",
+        }
+    if not slots:
+        return {
+            "status": "unavailable",
+            "reason": "No memory slots declared; slot coverage cannot be classified.",
+        }
+
+    write_entries = load_clean_write_trace(trace_file)
+    erase_entries = load_clean_erase_trace(erase_trace_file)
+    counts = {
+        "slot_data_writes": 0,
+        "slot_data_erases": 0,
+        "slot_trailer_writes": 0,
+        "slot_trailer_erases": 0,
+        "outside_slot_writes": 0,
+        "outside_slot_erases": 0,
+    }
+
+    for entry in write_entries:
+        address = int(flash_base) + int(entry["flash_offset"])
+        region = _classify_slot_region(address, slots, page_size)
+        if region.endswith("_data"):
+            counts["slot_data_writes"] += 1
+        elif region.endswith("_trailer"):
+            counts["slot_trailer_writes"] += 1
+        else:
+            counts["outside_slot_writes"] += 1
+
+    for entry in erase_entries:
+        address = int(flash_base) + int(entry["flash_offset"])
+        region = _classify_slot_region(address, slots, page_size)
+        if region.endswith("_data"):
+            counts["slot_data_erases"] += 1
+        elif region.endswith("_trailer"):
+            counts["slot_trailer_erases"] += 1
+        else:
+            counts["outside_slot_erases"] += 1
+
+    slot_data_ops = counts["slot_data_writes"] + counts["slot_data_erases"]
+    trailer_ops = counts["slot_trailer_writes"] + counts["slot_trailer_erases"]
+    outside_ops = counts["outside_slot_writes"] + counts["outside_slot_erases"]
+
+    if slot_data_ops > 0:
+        status = "slot_activity"
+        reason = "Calibration observed slot data movement."
+    elif trailer_ops > 0:
+        status = "metadata_only"
+        reason = "Calibration touched slot trailers/metadata but never moved slot data."
+    elif outside_ops > 0:
+        status = "outside_slots_only"
+        reason = "Calibration touched flash but never touched declared slots."
+    else:
+        status = "no_nvm_activity"
+        reason = "Calibration produced no NVM writes or erases."
+
+    return {
+        "status": status,
+        "reason": reason,
+        "writes": len(write_entries),
+        "erases": len(erase_entries),
+        "slot_data_ops": slot_data_ops,
+        "slot_trailer_ops": trailer_ops,
+        "outside_slot_ops": outside_ops,
+        "slot_data_writes": counts["slot_data_writes"],
+        "slot_data_erases": counts["slot_data_erases"],
+        "slot_trailer_writes": counts["slot_trailer_writes"],
+        "slot_trailer_erases": counts["slot_trailer_erases"],
+        "outside_slot_writes": counts["outside_slot_writes"],
+        "outside_slot_erases": counts["outside_slot_erases"],
+    }
 
 
 def build_clean_operation_trace(
