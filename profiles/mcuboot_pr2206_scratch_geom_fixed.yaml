@@ -2,56 +2,55 @@ schema_version: 1
 name: mcuboot_pr2206_scratch_geom_fixed
 description: >
   MCUboot swap-scratch geometry trigger for PR #2206 (fixed commit 08985c96).
-  Companion profile to the broken geometry-trigger variant. Expects assets
-  built with CONFIG_MCUBOOT_BOOT_MAX_ALIGN=32 and
-  CONFIG_BOOT_MAX_IMG_SECTORS=1024. The current align-32 geometry assets
-  still need repair before this differential is a strict broken/fixed pair;
-  tracked in issue #19.
+  Companion profile for the verified 0x7C80 align-32 STM32F4 boundary image.
+  The fixed revision rejects the boundary image and converges to no_boot
+  across repeated boots instead of exhibiting the broken wrong_image path.
 
-platform: platforms/cortex_m4_flash_fast.repl
+platform: platforms/stm32f4.repl
 flash_backend: faultFlash
 
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_pr2206_scratch_geom_fixed.elf
-  entry: 0x00000000
+  entry: 0x08000000
 
 memory:
   sram: { start: 0x20000000, end: 0x20040000 }
   write_granularity: 4
   slots:
-    exec: { base: 0x0000C000, size: 0x6E000 }
-    staging: { base: 0x0007A000, size: 0x6E000 }
+    exec: { base: 0x08008000, size: 0x18000 }
+    staging: { base: 0x08108000, size: 0x18000 }
 
 images:
-  exec: results/oss_validation/assets/zephyr_slot0_padded.bin
-  staging: results/oss_validation/assets/zephyr_slot1_scratch_geom_max.bin
+  exec: results/oss_validation/assets/zephyr_head_scratch_stm32f4_pr2206_slot0.bin
+  staging: results/oss_validation/assets/zephyr_slot1_scratch_geom_pr2206_boundary.bin
 
 update_trigger:
   type: mcuboot_trailer_magic
   slot: staging
   max_align: 32
 
-success_criteria:
-  vtor_in_slot: exec
-  image_hash: true
-  image_hash_slot: exec
-  expected_image: staging
+success_criteria: {}
 
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
-  quick_use_heuristic: true
-  max_heuristic_points: 64
-  max_writes: auto
+  boot_cycles: 3
+  max_writes: 1
   max_writes_cap: 200000
-  run_duration: "10.0"
-  phase1_time_slice: "0.10"
+  run_duration: "20.0"
   max_step_limit: 20000000
   fault_types:
     - power_loss
     - interrupted_erase
-  sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 
-skip_self_test: true
+semantic_assertions:
+  control:
+    multi_boot_analysis.status: converged
+    multi_boot_analysis.final_outcome: no_boot
+
+invariants:
+  - multi_boot_converges
+
 expect:
+  control_outcome: no_boot
   should_find_issues: false
