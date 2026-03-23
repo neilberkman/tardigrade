@@ -270,7 +270,7 @@ When `pre_boot_state` is empty, tardigrade treats `update_trigger: auto` and a m
 4. Offset image placement + trailer magic
 5. Offset image placement + trailer metadata
 
-MCUboot profiles also get a compiled flash-map preflight first. If the ELF's built-in slot layout does not match the profile's declared slots, tardigrade stops early instead of brute-forcing triggers against the wrong geometry.
+MCUboot profiles also get a compiled flash-map and erase-sector-layout preflight first. If the ELF's built-in slot layout or the sector geometry does not match the profile's declared slots, tardigrade stops early instead of brute-forcing triggers against the wrong geometry.
 
 This is coverage-gated. Trailer-only writes are not enough: a strategy only succeeds if calibration reaches slot data movement. If every strategy fails, tardigrade reports `INCONCLUSIVE -- could not trigger firmware update` rather than claiming a clean run.
 

@@ -220,7 +220,7 @@ def _write_trigger_discovery_failure(
     verdict = "INCONCLUSIVE -- could not trigger firmware update."
     checks = [
         "Is the staging image valid for this bootloader? (header, signature, version)",
-        "Does the slot layout match the bootloader's compiled flash map?",
+        "Do the declared slots match the bootloader's compiled flash map and erase-sector layout?",
         "Does the bootloader require a different trigger mechanism?",
     ]
     payload: Dict[str, Any] = {
