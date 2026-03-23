@@ -29,6 +29,10 @@ ${IMAGE_EXEC}                  ${EMPTY}
 ${IMAGE_STAGING}               ${ROOT}/examples/vulnerable_ota/firmware.bin
 ${IMAGE_TERTIARY}              ${EMPTY}
 ${IMAGE_RECOVERY}              ${EMPTY}
+${IMAGE_EXEC_LOAD_ADDR}        ${SLOT_EXEC_BASE}
+${IMAGE_STAGING_LOAD_ADDR}     ${SLOT_STAGING_BASE}
+${IMAGE_TERTIARY_LOAD_ADDR}    ${SLOT_TERTIARY_BASE}
+${IMAGE_RECOVERY_LOAD_ADDR}    ${SLOT_RECOVERY_BASE}
 ${PRE_BOOT_STATE_BIN}          ${EMPTY}
 ${UPDATE_SEQUENCE_FILE}        ${EMPTY}
 ${SETUP_SCRIPT}                ${EMPTY}
@@ -52,6 +56,7 @@ ${BOOT_CYCLES}                 1
 ${CALIBRATION_TIME_SLICE}      ${EMPTY}
 ${PHASE1_TIME_SLICE}           ${EMPTY}
 ${PHASE2_TIME_SLICE}           ${EMPTY}
+${ZERO_POINT_EXECUTE_CONTROL}  false
 ${BOOT_CYCLE_HOOK}            ${EMPTY}
 ${EXPECTED_ROLLBACK_AT_CYCLE}    ${EMPTY}
 ${SUCCESS_IMAGE_HASH}          false
@@ -128,10 +133,10 @@ Load Runtime Scenario
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${PLATFORM_REPL}
     ${load_cmds}=    Set Variable    bus=monitor.Machine.SystemBus; bus.LoadELF(r'${BOOTLOADER_ELF}')
-    Run Keyword If    '${IMAGE_EXEC}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_EXEC}', ${SLOT_EXEC_BASE})"
-    Run Keyword If    '${IMAGE_STAGING}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_STAGING}', ${SLOT_STAGING_BASE})"
-    Run Keyword If    '${IMAGE_TERTIARY}' != '' and '${SLOT_TERTIARY_BASE}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_TERTIARY}', ${SLOT_TERTIARY_BASE})"
-    Run Keyword If    '${IMAGE_RECOVERY}' != '' and '${SLOT_RECOVERY_BASE}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_RECOVERY}', ${SLOT_RECOVERY_BASE})"
+    Run Keyword If    '${IMAGE_EXEC}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_EXEC}', ${IMAGE_EXEC_LOAD_ADDR})"
+    Run Keyword If    '${IMAGE_STAGING}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_STAGING}', ${IMAGE_STAGING_LOAD_ADDR})"
+    Run Keyword If    '${IMAGE_TERTIARY}' != '' and '${IMAGE_TERTIARY_LOAD_ADDR}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_TERTIARY}', ${IMAGE_TERTIARY_LOAD_ADDR})"
+    Run Keyword If    '${IMAGE_RECOVERY}' != '' and '${IMAGE_RECOVERY_LOAD_ADDR}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_RECOVERY}', ${IMAGE_RECOVERY_LOAD_ADDR})"
     Execute Command    python "${load_cmds}"
 
 Load Extra Peripherals
@@ -180,6 +185,10 @@ Run Runtime Fault Point
     Execute Command    $fault_points_csv="${FAULT_POINTS_CSV}"
     Execute Command    $image_staging_path="${IMAGE_STAGING_PATH}"
     Execute Command    $image_exec_path="${IMAGE_EXEC_PATH}"
+    Execute Command    $image_exec_load_addr="${IMAGE_EXEC_LOAD_ADDR}"
+    Execute Command    $image_staging_load_addr="${IMAGE_STAGING_LOAD_ADDR}"
+    Run Keyword If    '${IMAGE_TERTIARY_LOAD_ADDR}' != ''    Execute Command    $image_tertiary_load_addr="${IMAGE_TERTIARY_LOAD_ADDR}"
+    Run Keyword If    '${IMAGE_RECOVERY_LOAD_ADDR}' != ''    Execute Command    $image_recovery_load_addr="${IMAGE_RECOVERY_LOAD_ADDR}"
     Run Keyword If    '${IMAGE_TERTIARY_PATH}' != ''    Execute Command    $image_tertiary_path="${IMAGE_TERTIARY_PATH}"
     Run Keyword If    '${IMAGE_RECOVERY_PATH}' != ''    Execute Command    $image_recovery_path="${IMAGE_RECOVERY_PATH}"
     Execute Command    $trace_file="${TRACE_FILE}"
@@ -192,6 +201,7 @@ Run Runtime Fault Point
     Run Keyword If    '${CALIBRATION_TIME_SLICE}' != ''    Execute Command    $calibration_time_slice="${CALIBRATION_TIME_SLICE}"
     Run Keyword If    '${PHASE1_TIME_SLICE}' != ''    Execute Command    $phase1_time_slice="${PHASE1_TIME_SLICE}"
     Run Keyword If    '${PHASE2_TIME_SLICE}' != ''    Execute Command    $phase2_time_slice="${PHASE2_TIME_SLICE}"
+    Execute Command    $zero_point_execute_control="${ZERO_POINT_EXECUTE_CONTROL}"
     Run Keyword If    '${BOOT_CYCLE_HOOK}' != ''    Execute Command    $boot_cycle_hook="${BOOT_CYCLE_HOOK}"
     Run Keyword If    '${EXPECTED_ROLLBACK_AT_CYCLE}' != ''    Execute Command    $expected_rollback_at_cycle=${EXPECTED_ROLLBACK_AT_CYCLE}
     Execute Command    $success_image_hash="${SUCCESS_IMAGE_HASH}"

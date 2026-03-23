@@ -44,6 +44,12 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         )
         self.assertIn("_verify_loaded_binary_samples(path, _a)", text)
 
+    def test_runtime_runner_persists_fault_snapshots_under_robot_artifacts(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("def persist_fault_snapshot(fault_at, fault_type, snapshot_bytes):", text)
+        self.assertIn("os.path.join(root, 'robot', 'snapshots')", text)
+        self.assertIn("result['fault_snapshot_file'] = _snapshot_path", text)
+
     def test_progress_stall_branch_only_breaks_after_threshold(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("elif progress_stall_timeout_s > 0:", text)
@@ -62,7 +68,10 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
 
     def test_phase1_uses_scaled_wall_timeout_helper(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
-        self.assertIn("def phase1_wall_timeout(default_s=4.0, min_wall_s=120.0, wall_per_emulated_s=30.0):", text)
+        self.assertIn(
+            "def phase1_wall_timeout(default_s=4.0, min_wall_s=120.0, wall_per_emulated_s=30.0, budget_s=None):",
+            text,
+        )
         self.assertNotIn("max(120, progress_stall_timeout_s * 3)", text)
         self.assertIn("wall_timeout=phase1_wall_timeout(default_s=4.0)", text)
         self.assertIn("p1_wall_timeout = phase1_wall_timeout(default_s=4.0)", text)
@@ -71,7 +80,7 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("phase1_time_slice = get_optional_var('phase1_time_slice', '0.02')", text)
         self.assertIn("def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, label='',", text)
-        self.assertIn("def phase1_max_iters(default_s=4.0, time_slice_s=None):", text)
+        self.assertIn("def phase1_max_iters(default_s=4.0, time_slice_s=None, budget_s=None):", text)
         self.assertIn("if time_slice is None:", text)
         self.assertIn("time_slice = phase1_time_slice", text)
         self.assertIn("if time_slice_s is None:", text)
@@ -90,7 +99,8 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         text = PY_PATH.read_text(encoding="utf-8")
         match = re.search(
             r"(def parse_duration_seconds\(default=2\.0\):.*?"
-            r"def phase1_max_iters\(default_s=4\.0, time_slice_s=None\):.*?)(?=\ndef phase1_wall_timeout)",
+            r"def phase1_budget_duration\(default_s=4\.0, prefer_run_duration=False\):.*?"
+            r"def phase1_max_iters\(default_s=4\.0, time_slice_s=None, budget_s=None\):.*?)(?=\ndef phase1_wall_timeout)",
             text,
             re.DOTALL,
         )
@@ -103,8 +113,9 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         text = PY_PATH.read_text(encoding="utf-8")
         match = re.search(
             r"(def parse_duration_seconds\(default=2\.0\):.*?"
-            r"def phase1_max_iters\(default_s=4\.0, time_slice_s=None\):.*?"
-            r"def phase1_wall_timeout\(default_s=4\.0, min_wall_s=120\.0, wall_per_emulated_s=30\.0\):.*?)(?=\ndef run_read_bit_flip_fault)",
+            r"def phase1_budget_duration\(default_s=4\.0, prefer_run_duration=False\):.*?"
+            r"def phase1_max_iters\(default_s=4\.0, time_slice_s=None, budget_s=None\):.*?"
+            r"def phase1_wall_timeout\(default_s=4\.0, min_wall_s=120\.0, wall_per_emulated_s=30\.0, budget_s=None\):.*?)(?=\ndef run_read_bit_flip_fault)",
             text,
             re.DOTALL,
         )
@@ -117,6 +128,76 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         exec(match.group(1), ns)
         self.assertEqual(ns["phase1_max_iters"](default_s=4.0), 300)
         self.assertEqual(ns["phase1_wall_timeout"](default_s=4.0), 900)
+
+    def test_phase1_budget_helpers_honor_explicit_resolved_budget(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        match = re.search(
+            r"(def parse_duration_seconds\(default=2\.0\):.*?"
+            r"def phase1_budget_duration\(default_s=4\.0, prefer_run_duration=False\):.*?"
+            r"def phase1_max_iters\(default_s=4\.0, time_slice_s=None, budget_s=None\):.*?"
+            r"def phase1_wall_timeout\(default_s=4\.0, min_wall_s=120\.0, wall_per_emulated_s=30\.0, budget_s=None\):.*?)(?=\ndef run_read_bit_flip_fault)",
+            text,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        ns = {
+            "run_duration": "0.04",
+            "phase1_time_slice": "0.02",
+            "progress_stall_timeout_s": 20.0,
+        }
+        exec(match.group(1), ns)
+        self.assertEqual(
+            ns["phase1_max_iters"](default_s=0.04, budget_s=10.0),
+            500,
+        )
+        self.assertEqual(
+            ns["phase1_wall_timeout"](default_s=0.04, budget_s=10.0),
+            300,
+        )
+
+    def test_phase1_budget_duration_keeps_control_floor_for_zero_point_execute(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        match = re.search(
+            r"(def parse_duration_seconds\(default=2\.0\):.*?"
+            r"def phase1_budget_duration\(default_s=4\.0, prefer_run_duration=False\):.*?)(?=\ndef phase1_max_iters)",
+            text,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        ns = {"run_duration": "10.0"}
+        exec(match.group(1), ns)
+        self.assertEqual(ns["phase1_budget_duration"](default_s=4.0), 10.0)
+        self.assertEqual(
+            ns["phase1_budget_duration"](default_s=4.0, prefer_run_duration=True),
+            10.0,
+        )
+
+        ns = {"run_duration": "0.04"}
+        exec(match.group(1), ns)
+        self.assertEqual(ns["phase1_budget_duration"](default_s=4.0), 4.0)
+        self.assertEqual(
+            ns["phase1_budget_duration"](default_s=4.0, prefer_run_duration=True),
+            4.0,
+        )
+
+    def test_zero_point_execute_control_uses_dedicated_control_phase1_helper(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("def run_control_phase1(cpu_ref, label='control_p1', vtor_settle_iters=0):", text)
+        self.assertIn("control_budget_s = phase1_budget_duration(", text)
+        self.assertIn("prefer_run_duration=zero_point_execute_control", text)
+        self.assertIn(
+            "p1_wall_timeout = phase1_wall_timeout(default_s=control_budget_s, budget_s=control_budget_s)",
+            text,
+        )
+        self.assertIn(
+            "p1_max_iters = phase1_max_iters(default_s=control_budget_s, budget_s=control_budget_s)",
+            text,
+        )
+        self.assertIn("saved_stall_timeout_s = progress_stall_timeout_s", text)
+        self.assertIn("if zero_point_execute_control:", text)
+        self.assertIn("progress_stall_timeout_s = 0", text)
+        self.assertIn("time_slice=phase1_time_slice", text)
+        self.assertIn("progress_stall_timeout_s = saved_stall_timeout_s", text)
 
     def test_robot_suite_forwards_phase1_time_slice(self) -> None:
         text = ROBOT_PATH.read_text(encoding="utf-8")
@@ -169,15 +250,29 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertRegex(
             text,
             re.compile(
-                r"phase1_status = run_until_done\(\n"
+                r"return run_until_done\(\n"
                 r"\s+cpu_ref,\n"
-                r"\s+label='control_p1',\n"
+                r"\s+label=label,\n"
                 r"\s+stop_on_fault=False,\n"
                 r"\s+expect_writes=control_expect_writes,\n"
                 r"\s+zero_writes_is_brick=control_expect_writes,\n"
                 r"\s+max_iters=p1_max_iters,\n"
             ),
         )
+        self.assertIn("phase1_status = run_control_phase1(", text)
+
+    def test_control_runner_captures_offset_slot_header_debug(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("staging_offset_header_debug = None", text)
+        self.assertIn("staging_offset = effective_page_size()", text)
+        self.assertIn("if 0 < staging_offset < slot_staging_size:", text)
+        self.assertIn(
+            "staging_offset_header_debug = capture_slot_header_debug(",
+            text,
+        )
+        self.assertIn("slot_staging_base + staging_offset", text)
+        self.assertIn("signals['staging_offset_header_offset'] = fmt_u32(staging_offset)", text)
+        self.assertIn("signals['staging_offset_header_debug'] = staging_offset_header_debug", text)
 
     def test_zero_point_execute_control_flag_parses_to_boolean(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")

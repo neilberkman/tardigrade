@@ -16,7 +16,7 @@ nvic: IRQControllers.NVIC @ sysbus 0xE000E000
     -> cpu@0
 
 flash: Memory.MappedMemory @ { sysbus 0x00000000; sysbus 0x08000000 }
-    size: 0x100000
+    size: 0x200000
 
 sram: Memory.MappedMemory @ sysbus 0x20000000
     size: 0x40000
@@ -26,7 +26,7 @@ rcc: Miscellaneous.STM32F4RCCStub @ sysbus 0x40023800
 faultFlash: Miscellaneous.STM32F4FastFlash @ sysbus 0x40023C00
     Flash: flash
     FlashBaseAddress: 0x08000000
-    FlashSize: 0x100000
+    FlashSize: 0x200000
     PageSize: 0x20000
     EraseFill: 0xFF
 
@@ -36,6 +36,6 @@ uart3: Miscellaneous.STM32DummyUSART @ sysbus 0x40004800
 
 sysbus:
     init:
-        Tag <0x00000000 0x100000> "FLASH_LO"
-        Tag <0x08000000 0x100000> "FLASH_HI"
+        Tag <0x00000000 0x200000> "FLASH_LO"
+        Tag <0x08000000 0x200000> "FLASH_HI"
         Tag <0x20000000 0x40000> "SRAM"

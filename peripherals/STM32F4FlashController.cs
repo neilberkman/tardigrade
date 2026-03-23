@@ -293,7 +293,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const uint RCC_LSION  = 1U << 0;
         private const uint RCC_LSIRDY = 1U << 1;
 
-        // STM32F407 sector geometry (offset from flash base, size).
+        // STM32F429 2 MiB dual-bank sector geometry (offset from flash base, size).
+        // Bank 1 (sectors 0-11) and bank 2 (sectors 12-23) both use:
+        //   4 x 16 KiB, 1 x 64 KiB, 7 x 128 KiB.
         private static readonly (long offset, int size)[] Sectors = new[]
         {
             (0x00000L, 0x04000),   // Sector  0: 16 KB
@@ -308,6 +310,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             (0xA0000L, 0x20000),   // Sector  9: 128 KB
             (0xC0000L, 0x20000),   // Sector 10: 128 KB
             (0xE0000L, 0x20000),   // Sector 11: 128 KB
+            (0x100000L, 0x04000),  // Sector 12: 16 KB
+            (0x104000L, 0x04000),  // Sector 13: 16 KB
+            (0x108000L, 0x04000),  // Sector 14: 16 KB
+            (0x10C000L, 0x04000),  // Sector 15: 16 KB
+            (0x110000L, 0x10000),  // Sector 16: 64 KB
+            (0x120000L, 0x20000),  // Sector 17: 128 KB
+            (0x140000L, 0x20000),  // Sector 18: 128 KB
+            (0x160000L, 0x20000),  // Sector 19: 128 KB
+            (0x180000L, 0x20000),  // Sector 20: 128 KB
+            (0x1A0000L, 0x20000),  // Sector 21: 128 KB
+            (0x1C0000L, 0x20000),  // Sector 22: 128 KB
+            (0x1E0000L, 0x20000),  // Sector 23: 128 KB
         };
 
         // ---------------------------------------------------------------
