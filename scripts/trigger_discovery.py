@@ -658,12 +658,15 @@ def discover_update_trigger(
             flash_base=_flash_base(candidate),
             slots=candidate.memory.slots,
             page_size=getattr(candidate.memory, "page_size", 4096),
+            metadata_regions=getattr(candidate, "metadata_fault_regions", None),
         )
         completed = calibration_completed(
             data.get("calibration_stop_reason"),
             candidate.expect.control_outcome,
         )
-        selected = bool(completed and coverage.get("status") == "slot_activity")
+        selected = bool(
+            completed and coverage.get("status") in {"slot_activity", "named_metadata_only"}
+        )
         attempt = TriggerDiscoveryAttempt(
             name=strategy.name,
             update_trigger=(

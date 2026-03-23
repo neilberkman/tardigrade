@@ -11,6 +11,8 @@ import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
+from fault_inject import MetadataFaultRegion
+
 
 def _parse_optional_int(value: Any) -> Optional[int]:
     text = str(value).strip()
@@ -141,6 +143,7 @@ def summarize_calibration_coverage(
     flash_base: int,
     slots: Dict[str, Any],
     page_size: int = 4096,
+    metadata_regions: Optional[List[MetadataFaultRegion]] = None,
 ) -> Dict[str, Any]:
     """Summarize whether calibration exercised slot data movement."""
     if not trace_file or not os.path.exists(trace_file):
@@ -161,9 +164,12 @@ def summarize_calibration_coverage(
         "slot_data_erases": 0,
         "slot_trailer_writes": 0,
         "slot_trailer_erases": 0,
+        "metadata_region_writes": 0,
+        "metadata_region_erases": 0,
         "outside_slot_writes": 0,
         "outside_slot_erases": 0,
     }
+    named_region_ops: Dict[str, int] = {}
 
     for entry in write_entries:
         address = int(flash_base) + int(entry["flash_offset"])
@@ -172,6 +178,13 @@ def summarize_calibration_coverage(
             counts["slot_data_writes"] += 1
         elif region.endswith("_trailer"):
             counts["slot_trailer_writes"] += 1
+        elif metadata_regions:
+            matched = next((r for r in metadata_regions if r.contains(address)), None)
+            if matched is not None:
+                counts["metadata_region_writes"] += 1
+                named_region_ops[matched.name] = named_region_ops.get(matched.name, 0) + 1
+            else:
+                counts["outside_slot_writes"] += 1
         else:
             counts["outside_slot_writes"] += 1
 
@@ -182,11 +195,19 @@ def summarize_calibration_coverage(
             counts["slot_data_erases"] += 1
         elif region.endswith("_trailer"):
             counts["slot_trailer_erases"] += 1
+        elif metadata_regions:
+            matched = next((r for r in metadata_regions if r.contains(address)), None)
+            if matched is not None:
+                counts["metadata_region_erases"] += 1
+                named_region_ops[matched.name] = named_region_ops.get(matched.name, 0) + 1
+            else:
+                counts["outside_slot_erases"] += 1
         else:
             counts["outside_slot_erases"] += 1
 
     slot_data_ops = counts["slot_data_writes"] + counts["slot_data_erases"]
     trailer_ops = counts["slot_trailer_writes"] + counts["slot_trailer_erases"]
+    metadata_region_ops = counts["metadata_region_writes"] + counts["metadata_region_erases"]
     outside_ops = counts["outside_slot_writes"] + counts["outside_slot_erases"]
 
     if slot_data_ops > 0:
@@ -195,6 +216,14 @@ def summarize_calibration_coverage(
     elif trailer_ops > 0:
         status = "metadata_only"
         reason = "Calibration touched slot trailers/metadata but never moved slot data."
+    elif metadata_region_ops > 0:
+        status = "named_metadata_only"
+        if named_region_ops:
+            reason = "Calibration touched declared metadata regions ({}) but never moved slot data.".format(
+                ", ".join(sorted(named_region_ops))
+            )
+        else:
+            reason = "Calibration touched declared metadata regions but never moved slot data."
     elif outside_ops > 0:
         status = "outside_slots_only"
         reason = "Calibration touched flash but never touched declared slots."
@@ -209,13 +238,19 @@ def summarize_calibration_coverage(
         "erases": len(erase_entries),
         "slot_data_ops": slot_data_ops,
         "slot_trailer_ops": trailer_ops,
+        "metadata_region_ops": metadata_region_ops,
         "outside_slot_ops": outside_ops,
         "slot_data_writes": counts["slot_data_writes"],
         "slot_data_erases": counts["slot_data_erases"],
         "slot_trailer_writes": counts["slot_trailer_writes"],
         "slot_trailer_erases": counts["slot_trailer_erases"],
+        "metadata_region_writes": counts["metadata_region_writes"],
+        "metadata_region_erases": counts["metadata_region_erases"],
         "outside_slot_writes": counts["outside_slot_writes"],
         "outside_slot_erases": counts["outside_slot_erases"],
+        "metadata_region_breakdown": {
+            name: named_region_ops[name] for name in sorted(named_region_ops)
+        },
     }
 
 

@@ -237,6 +237,55 @@ class TriggerDiscoveryTests(unittest.TestCase):
         self.assertEqual(result.attempts[0].coverage["status"], "no_nvm_activity")
         self.assertEqual(result.attempts[1].coverage["status"], "slot_activity")
 
+    def test_discovery_selects_named_metadata_activity(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
+        profile = load_profile(ROOT / "profiles" / "esp_idf_fault_single_sector.yaml")
+        profile.update_trigger = None
+        profile.auto_update_trigger = True
+
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            metadata_trace = tempdir / "metadata.csv"
+            _write_trace(
+                metadata_trace,
+                [{"write_index": 1, "flash_offset": 0xF8000, "value": 0x12345678}],
+            )
+
+            def fake_run_single_point(*args, **kwargs):
+                return {
+                    "total_writes": 1,
+                    "total_erases": 0,
+                    "trace_file": str(metadata_trace),
+                    "erase_trace_file": None,
+                    "trace_file_bin": None,
+                    "erase_trace_file_bin": None,
+                    "calibration_stop_reason": "vtor_captured",
+                    "calibration_exec_hash": "deadbeef",
+                    "calibration_elapsed_s": 1.0,
+                    "calibration_emulated_s": 1.0,
+                    "calibration_pc": "0x00000000",
+                    "setup_writes": 0,
+                    "total_i2c_transactions": 0,
+                    "total_otp_blows": 0,
+                }
+
+            with mock.patch("trigger_discovery.run_single_point", side_effect=fake_run_single_point):
+                result = discover_update_trigger(
+                    profile,
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    work_dir=tempdir,
+                    renode_remote_server_dir="",
+                    keep_run_artifacts=False,
+                    robot_vars_factory=lambda candidate: candidate.robot_vars(ROOT),
+                )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(result.attempts[0].coverage["status"], "named_metadata_only")
+        self.assertTrue(result.attempts[0].selected)
+
 
 if __name__ == "__main__":
     unittest.main()

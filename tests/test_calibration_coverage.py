@@ -18,6 +18,7 @@ if str(SCRIPTS) not in sys.path:
 from audit_report import compute_verdict  # noqa: E402
 from self_test import check_verdict  # noqa: E402
 from trace_utils import summarize_calibration_coverage  # noqa: E402
+from fault_inject import MetadataFaultRegion  # noqa: E402
 
 
 def _slot(name_base: int, size: int = 0x1000) -> SimpleNamespace:
@@ -97,6 +98,24 @@ def test_summarize_calibration_coverage_detects_no_activity() -> None:
     assert coverage["erases"] == 0
 
 
+def test_summarize_calibration_coverage_detects_named_metadata_activity() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        trace_file = Path(td) / "trace.csv"
+        _write_trace(trace_file, ["1,61440,305419896"])
+        coverage = summarize_calibration_coverage(
+            trace_file=str(trace_file),
+            erase_trace_file=None,
+            flash_base=0,
+            slots={"exec": _slot(0x1000), "staging": _slot(0x2000)},
+            page_size=0x100,
+            metadata_regions=[MetadataFaultRegion(name="otadata0", start=0xF000, end=0xF100)],
+        )
+    assert coverage["status"] == "named_metadata_only"
+    assert coverage["metadata_region_writes"] == 1
+    assert coverage["outside_slot_writes"] == 0
+    assert coverage["metadata_region_breakdown"] == {"otadata0": 1}
+
+
 def test_compute_verdict_fails_clean_profile_when_calibration_only_touches_metadata() -> None:
     summary = _base_summary()
     summary["calibration_coverage"] = {
@@ -112,6 +131,23 @@ def test_compute_verdict_fails_clean_profile_when_calibration_only_touches_metad
         ),
     )
     assert verdict == "FAIL — Calibration touched slot trailers/metadata but never moved slot data."
+
+
+def test_compute_verdict_allows_clean_profile_when_named_metadata_was_exercised() -> None:
+    summary = _base_summary()
+    summary["calibration_coverage"] = {
+        "status": "named_metadata_only",
+        "reason": "Calibration touched declared metadata regions (otadata0) but never moved slot data.",
+    }
+    verdict = compute_verdict(
+        summary,
+        SimpleNamespace(
+            should_find_issues=False,
+            control_outcome="success",
+            allow_control_only_issues=False,
+        ),
+    )
+    assert verdict == "PASS — No issues found, as expected"
 
 
 def test_compute_verdict_preserves_control_only_opt_in() -> None:
@@ -156,3 +192,24 @@ def test_self_test_rejects_clean_profile_when_calibration_never_exercised_slot_d
     )
     assert passed is False
     assert reason == "Calibration produced no NVM writes or erases."
+
+
+def test_self_test_accepts_named_metadata_only_calibration_for_clean_profile() -> None:
+    passed, reason = check_verdict(
+        Path("profiles/clean.yaml"),
+        {"expect": {"should_find_issues": False, "control_outcome": "success"}},
+        {
+            "summary": {
+                "runtime_sweep": {
+                    **_base_summary(),
+                    "calibration_coverage": {
+                        "status": "named_metadata_only",
+                        "reason": "Calibration touched declared metadata regions (otadata0) but never moved slot data.",
+                    },
+                }
+            }
+        },
+        1,
+    )
+    assert passed is True
+    assert reason == "No issues found, as expected"

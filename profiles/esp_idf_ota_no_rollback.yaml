@@ -23,6 +23,11 @@ images:
   exec: examples/esp_idf_ota/slot0.bin
   staging: examples/esp_idf_ota/slot1.bin
 
+metadata_fault_regions:
+  - { name: otadata0, start: 0x000F8000, end: 0x000F9000 }
+  - { name: otadata1, start: 0x000F9000, end: 0x000FA000 }
+
+
 # Same upgrade scenario: entry 0 = seq 1/VALID, entry 1 = seq 2/NEW
 # Without rollback, bootloader just picks highest valid seq and boots.
 pre_boot_state:

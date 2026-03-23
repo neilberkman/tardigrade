@@ -19,6 +19,11 @@ memory:
 images:
   exec: examples/esp_idf_ota/slot0.bin
   staging: examples/esp_idf_ota/slot1.bin
+
+metadata_fault_regions:
+  - { name: otadata0, start: 0x000F8000, end: 0x000F9000 }
+  - { name: otadata1, start: 0x000F9000, end: 0x000FA000 }
+
 pre_boot_state:
   - { address: 0x000F8000, u32: 0x00000001 }
   - { address: 0x000F8018, u32: 0x00000002 }

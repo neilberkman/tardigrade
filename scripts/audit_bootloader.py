@@ -1251,6 +1251,7 @@ def main() -> int:
             flash_base=flash_base,
             slots=profile.memory.slots,
             page_size=getattr(profile.memory, "page_size", 4096),
+            metadata_regions=getattr(profile, "metadata_fault_regions", None),
         )
         if clean_trace_meta is not None:
             clean_trace_meta["coverage"] = calibration_coverage
