@@ -170,6 +170,21 @@ def _requested_zero_fault_points(args: argparse.Namespace) -> bool:
     return end <= start
 
 
+def _profile_requests_zero_fault_points(max_writes: object) -> bool:
+    """Return whether the profile explicitly requests a control-only execute run."""
+    if isinstance(max_writes, str):
+        if max_writes.strip().lower() == "auto":
+            return False
+        try:
+            return int(max_writes, 0) <= 0
+        except ValueError:
+            return False
+    try:
+        return int(max_writes) <= 0
+    except (TypeError, ValueError):
+        return False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Profile-driven bootloader fault-injection audit."
@@ -766,9 +781,15 @@ def main() -> int:
             and not args.no_trace_replay
             and _trace_replay_eligible_fault_types(fault_types)
         )
-        zero_point_execute_request = (
-            eval_mode == "execute" and _requested_zero_fault_points(args)
+        zero_point_execute_request = eval_mode == "execute" and (
+            _requested_zero_fault_points(args)
+            or _profile_requests_zero_fault_points(max_writes)
         )
+        if zero_point_execute_request:
+            robot_vars = merge_robot_vars(
+                robot_vars,
+                ["ZERO_POINT_EXECUTE_CONTROL:true"],
+            )
 
         # Apply hash bypass during calibration too — hash validation doesn't
         # affect write/erase counts but consumes enormous virtual time on
@@ -1005,6 +1026,11 @@ def main() -> int:
             )
             max_writes = cap
 
+        fault_start = args.fault_start
+        fault_end = args.fault_end
+        if zero_point_execute_request:
+            fault_start = 0
+            fault_end = 0
 
         # -------------------------------------------------------------------
         # Build fault point list
@@ -1021,8 +1047,8 @@ def main() -> int:
             ),
             quick=args.quick,
             fault_step=args.fault_step,
-            fault_start=args.fault_start,
-            fault_end=args.fault_end,
+            fault_start=fault_start,
+            fault_end=fault_end,
         )
         fault_points = plan.fault_points
         fault_types_list = plan.fault_types_list
