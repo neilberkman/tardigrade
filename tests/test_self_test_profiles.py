@@ -17,7 +17,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from self_test import discover_profiles, run_audit
+from self_test import discover_profiles, run_audit, write_summary
 
 
 class SelfTestProfileDiscoveryTests(unittest.TestCase):
@@ -92,6 +92,25 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         cmd = mock_run.call_args.kwargs["args"] if "args" in mock_run.call_args.kwargs else mock_run.call_args.args[0]
         self.assertIn("--workers", cmd)
         self.assertIn("8", cmd)
+
+    def test_write_summary_records_partial_progress(self):
+        output_path = ROOT / "tmp_self_test_summary.json"
+        try:
+            write_summary(
+                str(output_path),
+                total=5,
+                detailed_results=[
+                    {"profile": "one", "passed": True},
+                    {"profile": "two", "passed": False},
+                ],
+            )
+            payload = yaml.safe_load(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["total_profiles"], 5)
+            self.assertEqual(payload["completed_profiles"], 2)
+            self.assertEqual(payload["passed"], 1)
+            self.assertEqual(payload["failed"], 1)
+        finally:
+            output_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

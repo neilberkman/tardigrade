@@ -53,6 +53,25 @@ def discover_profiles(repo_root: Path) -> List[Path]:
     return profiles
 
 
+def write_summary(output_path: Optional[str], total: int, detailed_results: List[Dict[str, Any]]) -> None:
+    """Persist a partial or final self-test summary, if requested."""
+    if not output_path:
+        return
+    passed_count = sum(1 for item in detailed_results if item.get("passed"))
+    failed_count = len(detailed_results) - passed_count
+    payload = {
+        "run_utc": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "total_profiles": total,
+        "completed_profiles": len(detailed_results),
+        "passed": passed_count,
+        "failed": failed_count,
+        "results": detailed_results,
+    }
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
 def run_audit(
     repo_root: Path,
     profile_path: Path,
@@ -252,9 +271,12 @@ def main() -> int:
     detailed_results: List[Dict[str, Any]] = []
 
     with tempfile.TemporaryDirectory(prefix="self_test_") as tmp:
+        tmp_path = Path(tmp)
+        current_profile_path = tmp_path / "current_profile.txt"
         for profile_path in profiles:
             name = profile_path.stem
-            output_path = Path(tmp) / "{}_result.json".format(name)
+            output_path = tmp_path / "{}_result.json".format(name)
+            current_profile_path.write_text(str(profile_path), encoding="utf-8")
 
             print("\n--- {} ---".format(name))
 
@@ -273,6 +295,7 @@ def main() -> int:
                     "bricks": None,
                     "brick_rate": None,
                 })
+                write_summary(args.output, len(profiles), detailed_results)
                 continue
 
             extra_args: List[str] = []
@@ -304,6 +327,7 @@ def main() -> int:
                     "bricks": None,
                     "brick_rate": None,
                 })
+                write_summary(args.output, len(profiles), detailed_results)
                 continue
 
             if not report:
@@ -321,6 +345,7 @@ def main() -> int:
                     "bricks": None,
                     "brick_rate": None,
                 })
+                write_summary(args.output, len(profiles), detailed_results)
                 continue
 
             passed, reason = check_verdict(profile_path, profile_raw, report, exit_code)
@@ -337,6 +362,12 @@ def main() -> int:
                 "bricks": sweep.get("bricks"),
                 "brick_rate": sweep.get("brick_rate"),
             })
+            write_summary(args.output, len(profiles), detailed_results)
+
+        try:
+            current_profile_path.unlink()
+        except FileNotFoundError:
+            pass
 
     # Summary.
     print("\n" + "=" * 60)
@@ -351,17 +382,8 @@ def main() -> int:
     print("\n{}/{} passed, {} failed".format(passed_count, total, failed_count))
 
     if args.output:
-        payload = {
-            "run_utc": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-            "total_profiles": total,
-            "passed": passed_count,
-            "failed": failed_count,
-            "results": detailed_results,
-        }
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        print("wrote {}".format(output_path))
+        write_summary(args.output, total, detailed_results)
+        print("wrote {}".format(Path(args.output)))
 
     return 0 if failed_count == 0 else 1
 
