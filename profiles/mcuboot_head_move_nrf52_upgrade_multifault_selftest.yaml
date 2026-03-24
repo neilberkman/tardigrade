@@ -19,9 +19,7 @@ memory:
 images:
   exec: results/oss_validation/assets/zephyr_head_move_nrf52_slot0.bin
   staging: results/oss_validation/assets/zephyr_head_move_nrf52_slot1.bin
-update_trigger:
-  type: mcuboot_trailer_magic
-  slot: staging
+update_trigger: auto
 # image_hash requires max_writes:auto (full swap during calibration).
 # With max_writes:256, use marker to verify the staging image landed in exec.
 # staging image has 0x00000101 at offset 0x14; exec base is 0xC000.
@@ -32,6 +30,7 @@ success_criteria:
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  fault_types: [power_loss, swap_progress]
   max_writes: 256
   max_writes_cap: 256
   run_duration: "20.0"

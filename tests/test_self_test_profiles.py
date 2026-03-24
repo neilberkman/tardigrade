@@ -121,6 +121,7 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         for name in [
             "mcuboot_head_move_nrf52_upgrade_phase2fault.yaml",
             "mcuboot_head_move_nrf52_upgrade_multifault.yaml",
+            "mcuboot_head_move_nrf52_upgrade_multifault_selftest.yaml",
         ]:
             with self.subTest(profile=name):
                 raw = yaml.safe_load((ROOT / "profiles" / name).read_text(encoding="utf-8"))
