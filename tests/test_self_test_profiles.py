@@ -105,6 +105,7 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         )
         self.assertEqual(raw.get("success_criteria", {}).get("marker_address"), 0x0000C014)
         self.assertEqual(raw.get("success_criteria", {}).get("marker_value"), 0x00000101)
+        self.assertTrue(raw.get("expect", {}).get("should_find_issues"))
         self.assertNotIn("page_size", raw.get("memory", {}))
 
     def test_extended_nrf52_move_profile_stays_discovery_driven(self):

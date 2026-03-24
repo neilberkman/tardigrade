@@ -49,4 +49,4 @@ fault_sweep:
   fault_types: [power_loss, swap_progress]
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 expect:
-  should_find_issues: false
+  should_find_issues: true
