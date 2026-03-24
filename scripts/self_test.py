@@ -187,6 +187,10 @@ def main() -> int:
         help="Pass --fault-step to audit runs.",
     )
     parser.add_argument(
+        "--workers", type=int, default=None,
+        help="Pass --workers to each audit run.",
+    )
+    parser.add_argument(
         "--output", default=None,
         help="Optional JSON summary output path.",
     )
@@ -248,6 +252,8 @@ def main() -> int:
                 extra_args.extend(["--renode-remote-server-dir", args.renode_remote_server_dir])
             if args.fault_step is not None:
                 extra_args.extend(["--fault-step", str(args.fault_step)])
+            if args.workers is not None:
+                extra_args.extend(["--workers", str(args.workers)])
 
             try:
                 exit_code, report, audit_stderr = run_audit(
