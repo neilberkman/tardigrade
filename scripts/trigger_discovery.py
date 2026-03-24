@@ -91,6 +91,7 @@ class TriggerDiscoveryResult:
     attempts: List[TriggerDiscoveryAttempt] = field(default_factory=list)
     flash_map_check: Optional[Dict[str, Any]] = None
     swap_algorithm: Optional[Dict[str, Any]] = None
+    geometry_override: Optional[Dict[str, Any]] = None
     failure_reason: Optional[str] = None
 
     @property
@@ -103,6 +104,7 @@ class TriggerDiscoveryResult:
             "failure_reason": self.failure_reason,
             "flash_map_check": self.flash_map_check,
             "swap_algorithm": self.swap_algorithm,
+            "geometry_override": self.geometry_override,
             "attempts": [
                 {
                     "name": attempt.name,
@@ -373,6 +375,67 @@ def validate_compiled_flash_map(
         "compiled_entries": entries,
         "sector_geometry": sector_geometry,
     }
+
+
+def _clone_with_compiled_flash_map(
+    profile: ProfileConfig,
+    flash_map_check: Optional[Dict[str, Any]],
+) -> Tuple[Optional[ProfileConfig], Optional[Dict[str, Any]], Optional[str]]:
+    """Return a profile copy rewritten to the ELF's compiled flash map."""
+    if not isinstance(flash_map_check, dict):
+        return None, None, "no compiled flash-map data available"
+    compiled_entries = flash_map_check.get("compiled_entries")
+    flash_base_raw = flash_map_check.get("flash_base")
+    if not isinstance(compiled_entries, list) or not flash_base_raw:
+        return None, None, "compiled flash-map data is incomplete"
+
+    try:
+        flash_base = int(str(flash_base_raw), 16)
+    except Exception:
+        return None, None, "compiled flash-map base is invalid"
+
+    by_id = {
+        int(entry["area_id"]): entry
+        for entry in compiled_entries
+        if isinstance(entry, dict) and "area_id" in entry
+    }
+    candidate = copy.deepcopy(profile)
+    changed_slots: List[Dict[str, str]] = []
+
+    for slot_name, area_id in (("exec", 1), ("staging", 2), ("scratch", 3)):
+        slot = candidate.memory.slots.get(slot_name)
+        compiled = by_id.get(area_id)
+        if slot is None or compiled is None:
+            continue
+        old_base = int(slot.base)
+        old_size = int(slot.size)
+        new_base = flash_base + int(compiled["off"])
+        new_size = int(compiled["size"])
+        if old_base == new_base and old_size == new_size:
+            continue
+        slot.base = new_base
+        slot.size = new_size
+        changed_slots.append(
+            {
+                "slot": slot_name,
+                "old_base": "0x{:08X}".format(old_base),
+                "old_size": "0x{:X}".format(old_size),
+                "new_base": "0x{:08X}".format(new_base),
+                "new_size": "0x{:X}".format(new_size),
+            }
+        )
+
+    if not changed_slots:
+        return candidate, None, None
+    return (
+        candidate,
+        {
+            "status": "applied",
+            "reason": "using compiled flash map for trigger discovery",
+            "changed_slots": changed_slots,
+        },
+        None,
+    )
 
 
 def _erase_geometry(profile: ProfileConfig) -> List[Tuple[int, int]]:
@@ -692,31 +755,43 @@ def discover_update_trigger(
     """Try a family-specific trigger cascade and return the first viable strategy."""
     flash_map_check = validate_compiled_flash_map(profile, repo_root)
     swap_algorithm = _detect_mcuboot_swap_algorithm(profile, repo_root)
+    discovery_profile = profile
+    geometry_override: Optional[Dict[str, Any]] = None
     if flash_map_check.get("status") == "mismatch":
-        return TriggerDiscoveryResult(
-            selected_profile=None,
-            selected_robot_vars=None,
-            selected_calibration=None,
-            selected_strategy=None,
-            attempts=[],
-            flash_map_check=flash_map_check,
-            swap_algorithm=swap_algorithm,
-            failure_reason=flash_map_check.get("reason"),
+        overridden_profile, geometry_override, override_error = _clone_with_compiled_flash_map(
+            profile,
+            flash_map_check,
         )
+        if overridden_profile is None:
+            return TriggerDiscoveryResult(
+                selected_profile=None,
+                selected_robot_vars=None,
+                selected_calibration=None,
+                selected_strategy=None,
+                attempts=[],
+                flash_map_check=flash_map_check,
+                swap_algorithm=swap_algorithm,
+                geometry_override={
+                    "status": "failed",
+                    "reason": override_error or flash_map_check.get("reason"),
+                },
+                failure_reason=flash_map_check.get("reason"),
+            )
+        discovery_profile = overridden_profile
 
     attempts: List[TriggerDiscoveryAttempt] = []
-    family = _detect_bootloader_family(profile)
+    family = _detect_bootloader_family(discovery_profile)
     if family == "mcuboot":
         strategies = _build_mcuboot_strategies(
-            profile,
+            discovery_profile,
             repo_root,
             swap_algorithm=swap_algorithm,
         )
     else:
-        strategies = _build_strategies(profile, repo_root)
+        strategies = _build_strategies(discovery_profile, repo_root)
 
     for strategy in strategies:
-        candidate, skipped_reason = _clone_for_strategy(profile, repo_root, strategy)
+        candidate, skipped_reason = _clone_for_strategy(discovery_profile, repo_root, strategy)
         if candidate is None:
             attempts.append(
                 TriggerDiscoveryAttempt(
@@ -816,6 +891,7 @@ def discover_update_trigger(
                 attempts=attempts,
                 flash_map_check=flash_map_check,
                 swap_algorithm=swap_algorithm,
+                geometry_override=geometry_override,
                 failure_reason=None,
             )
         _cleanup_generated_robot_files(robot_vars)
@@ -828,5 +904,6 @@ def discover_update_trigger(
         attempts=attempts,
         flash_map_check=flash_map_check,
         swap_algorithm=swap_algorithm,
+        geometry_override=geometry_override,
         failure_reason="could not trigger firmware update",
     )

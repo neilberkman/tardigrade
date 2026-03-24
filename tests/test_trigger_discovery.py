@@ -198,6 +198,68 @@ class TriggerDiscoveryTests(unittest.TestCase):
         self.assertEqual(check["status"], "mismatch")
         self.assertTrue(any("staging" in item for item in check["mismatches"]))
 
+    def test_discovery_uses_compiled_flash_map_when_profile_geometry_mismatches(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
+        profile = load_profile(ROOT / "profiles" / "mcuboot_head_offset_stm32f4_revert.yaml")
+        profile.update_trigger = None
+        profile.auto_update_trigger = True
+        profile.pre_boot_state = []
+        original_staging_base = int(profile.memory.slots["staging"].base)
+        profile.memory.slots["staging"].base += 0x2000
+
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            slot_trace = tempdir / "slot.csv"
+            _write_trace(
+                slot_trace,
+                [
+                    {
+                        "write_index": 0,
+                        "flash_offset": (original_staging_base - int(profile.bootloader_entry)) + 4,
+                        "value": 0x12345678,
+                    }
+                ],
+            )
+
+            def fake_run_single_point(*, profile, **_kwargs):
+                self.assertEqual(
+                    int(profile.memory.slots["staging"].base),
+                    original_staging_base,
+                )
+                return {
+                    "total_writes": 1,
+                    "total_erases": 0,
+                    "trace_file": str(slot_trace),
+                    "erase_trace_file": None,
+                    "trace_file_bin": None,
+                    "erase_trace_file_bin": None,
+                    "calibration_stop_reason": "vtor_captured",
+                }
+
+            with mock.patch(
+                "trigger_discovery.run_single_point",
+                side_effect=fake_run_single_point,
+            ):
+                result = discover_update_trigger(
+                    profile,
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/audit.robot",
+                    work_dir=tempdir,
+                    renode_remote_server_dir="",
+                    keep_run_artifacts=False,
+                    robot_vars_factory=lambda _candidate: [],
+                )
+
+        self.assertTrue(result.succeeded)
+        self.assertIsNotNone(result.geometry_override)
+        self.assertEqual(result.geometry_override["status"], "applied")
+        self.assertEqual(
+            int(result.selected_profile.memory.slots["staging"].base),
+            original_staging_base,
+        )
+
     def test_offset_strategy_uses_real_next_erase_boundary(self) -> None:
         if not HAVE_PYYAML:
             self.skipTest("PyYAML not installed")
