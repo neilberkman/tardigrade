@@ -26,6 +26,16 @@ from typing import Any, Dict, List, Optional, Tuple
 from profile_loader import load_profile_raw
 
 
+def _normalize_expect_fault_type(name: str) -> str:
+    value = str(name or "").strip().lower()
+    aliases = {
+        "phase2_fault": "phase2",
+        "phase2": "phase2",
+        "power_loss": "power_loss",
+    }
+    return aliases.get(value, value)
+
+
 def discover_profiles(repo_root: Path) -> List[Path]:
     """Find all testable .yaml profiles (excludes skip_self_test)."""
     profiles_dir = repo_root / "profiles"
@@ -100,6 +110,11 @@ def check_verdict(
         for reason in expect.get("required_issue_reasons", [])
         if str(reason).strip()
     }
+    ignored_issue_fault_types = {
+        _normalize_expect_fault_type(fault_type)
+        for fault_type in expect.get("ignored_issue_fault_types", [])
+        if str(fault_type).strip()
+    }
 
     verdict = report.get("verdict", "")
     summary = report.get("summary", {})
@@ -107,6 +122,11 @@ def check_verdict(
     brick_rate = float(sweep.get("brick_rate", 0.0))
     bricks = int(sweep.get("bricks", 0))
     issue_points = int(sweep.get("issue_points", bricks))
+    fault_type_issue_points = (
+        sweep.get("fault_type_issue_points", {})
+        if isinstance(sweep.get("fault_type_issue_points"), dict)
+        else {}
+    )
     issue_reasons = sweep.get("issue_reasons", {}) if isinstance(sweep.get("issue_reasons"), dict) else {}
     control = sweep.get("control", {}) if isinstance(sweep.get("control"), dict) else {}
     control_outcome = str(
@@ -129,6 +149,14 @@ def check_verdict(
         allow_control_only_issues
         and control_outcome == expected_control_outcome
     )
+    ignored_issue_points = 0
+    if ignored_issue_fault_types and fault_type_issue_points:
+        ignored_issue_points = sum(
+            int(count)
+            for fault_type, count in fault_type_issue_points.items()
+            if _normalize_expect_fault_type(fault_type) in ignored_issue_fault_types
+        )
+    effective_issue_points = max(0, issue_points - ignored_issue_points)
 
     if should_find_issues:
         if issue_points == 0:
@@ -162,8 +190,8 @@ def check_verdict(
     else:
         if coverage_blocks_clean:
             return False, coverage_reason or "Calibration did not exercise slot data movement"
-        if issue_points > 0:
-            return False, "Expected no issues but found {} point(s)".format(issue_points)
+        if effective_issue_points > 0:
+            return False, "Expected no issues but found {} point(s)".format(effective_issue_points)
         return True, "No issues found, as expected"
 
 

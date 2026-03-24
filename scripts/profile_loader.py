@@ -1169,6 +1169,7 @@ class ExpectConfig:
         "allow_semantic_only_issues",
         "allow_control_only_issues",
         "required_issue_reasons",
+        "ignored_issue_fault_types",
     )
 
     def __init__(
@@ -1178,12 +1179,14 @@ class ExpectConfig:
         allow_semantic_only_issues: bool = False,
         allow_control_only_issues: bool = False,
         required_issue_reasons: Optional[List[str]] = None,
+        ignored_issue_fault_types: Optional[List[str]] = None,
     ) -> None:
         self.should_find_issues = should_find_issues
         self.control_outcome = control_outcome
         self.allow_semantic_only_issues = allow_semantic_only_issues
         self.allow_control_only_issues = allow_control_only_issues
         self.required_issue_reasons = required_issue_reasons or []
+        self.ignored_issue_fault_types = ignored_issue_fault_types or []
 
 
 class PreBootWrite:
@@ -4064,12 +4067,18 @@ def _parse_expect(raw: Optional[Dict[str, Any]]) -> ExpectConfig:
         for reason in raw.get("required_issue_reasons", [])
         if str(reason).strip()
     ]
+    ignored_issue_fault_types = [
+        str(fault_type).strip()
+        for fault_type in raw.get("ignored_issue_fault_types", [])
+        if str(fault_type).strip()
+    ]
     return ExpectConfig(
         should_find_issues=bool(raw.get("should_find_issues", True)),
         control_outcome=str(raw.get("control_outcome", "success")),
         allow_semantic_only_issues=bool(raw.get("allow_semantic_only_issues", False)),
         allow_control_only_issues=bool(raw.get("allow_control_only_issues", False)),
         required_issue_reasons=required_issue_reasons,
+        ignored_issue_fault_types=ignored_issue_fault_types,
     )
 
 

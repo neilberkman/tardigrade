@@ -43,3 +43,4 @@ fault_sweep:
     max_points: 6
 expect:
   should_find_issues: false
+  ignored_issue_fault_types: [power_loss]

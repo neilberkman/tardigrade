@@ -55,6 +55,11 @@ class WS3ProfileConfigTests(unittest.TestCase):
         self.assertIn(MOVE_MF_SELFTEST.name, discovered)
         self.assertNotIn(MOVE_P2.name, discovered)
         self.assertNotIn(MOVE_MF.name, discovered)
+        raw = load_profile_raw(MOVE_P2_SELFTEST)
+        self.assertEqual(
+            raw.get("expect", {}).get("ignored_issue_fault_types"),
+            ["power_loss"],
+        )
 
     def test_phase2fault_selftest_generates_phase2_entries(self) -> None:
         profile = load_profile(MOVE_P2_SELFTEST)

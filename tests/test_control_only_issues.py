@@ -141,6 +141,65 @@ def test_self_test_check_verdict_accepts_control_issue_with_success_baseline():
     assert reason == "Control exhibits expected success, as intended"
 
 
+def test_self_test_check_verdict_ignores_opted_out_fault_types():
+    passed, reason = check_verdict(
+        Path("profiles/mcuboot_head_move_nrf52_revert_phase2fault_selftest.yaml"),
+        {
+            "expect": {
+                "should_find_issues": False,
+                "ignored_issue_fault_types": ["power_loss"],
+            }
+        },
+        {
+            "summary": {
+                "runtime_sweep": {
+                    "issue_points": 7,
+                    "fault_type_issue_points": {
+                        "power_loss": 7,
+                    },
+                    "calibration_coverage": {"status": "full"},
+                    "control": {
+                        "effective_outcome": "success",
+                    },
+                }
+            }
+        },
+        0,
+    )
+    assert passed is True
+    assert reason == "No issues found, as expected"
+
+
+def test_self_test_check_verdict_keeps_non_ignored_fault_type_failures():
+    passed, reason = check_verdict(
+        Path("profiles/mcuboot_head_move_nrf52_revert_phase2fault_selftest.yaml"),
+        {
+            "expect": {
+                "should_find_issues": False,
+                "ignored_issue_fault_types": ["power_loss"],
+            }
+        },
+        {
+            "summary": {
+                "runtime_sweep": {
+                    "issue_points": 8,
+                    "fault_type_issue_points": {
+                        "power_loss": 7,
+                        "phase2": 1,
+                    },
+                    "calibration_coverage": {"status": "full"},
+                    "control": {
+                        "effective_outcome": "success",
+                    },
+                }
+            }
+        },
+        0,
+    )
+    assert passed is False
+    assert reason == "Expected no issues but found 1 point(s)"
+
+
 def test_pr2199_move_broken_profile_opted_into_control_only_issues():
     profile = load_profile(ROOT / "tests" / "fixtures" / "profiles" / "control_only_issue_profile.yaml")
     assert profile.expect.allow_control_only_issues is True
