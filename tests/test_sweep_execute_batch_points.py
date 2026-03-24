@@ -50,3 +50,16 @@ def test_large_execute_write_indices_use_safe_small_batches() -> None:
         trace_file_bin=None,
     )
     assert chosen == 1
+
+
+def test_large_state_write_indices_on_nvm_use_safe_small_batches() -> None:
+    chosen = _auto_execute_batch_points(
+        profile=_profile(platform="platforms/cortex_m0_nvm.repl"),
+        evaluation_mode="state",
+        fault_points=list(range(28672)),
+        fault_types_list=["w"] * 28672,
+        max_batch_points=0,
+        trace_file=None,
+        trace_file_bin=None,
+    )
+    assert chosen == 1

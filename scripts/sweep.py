@@ -346,10 +346,16 @@ def _auto_execute_batch_points(
     trace_file: Optional[str],
     trace_file_bin: Optional[str],
 ) -> int:
-    if max_batch_points > 0 or str(evaluation_mode) != "execute" or not fault_points:
+    if max_batch_points > 0 or not fault_points:
         return max_batch_points
 
-    if fault_types_list and all(_base_fault_type_code(ft) == "i" for ft in fault_types_list):
+    eval_mode = str(evaluation_mode)
+    if eval_mode not in {"execute", "state"}:
+        return max_batch_points
+
+    if eval_mode == "execute" and fault_types_list and all(
+        _base_fault_type_code(ft) == "i" for ft in fault_types_list
+    ):
         _progress(
             "Execute mode instruction-skip: forcing 1 pt/batch to avoid batch fallback churn "
             "({} points).".format(len(fault_points))
@@ -367,7 +373,7 @@ def _auto_execute_batch_points(
         12.0 if getattr(profile, "has_update_sequence", False) else 0.0
     )
 
-    if _is_trace_replay_execute_batch(
+    if eval_mode == "execute" and _is_trace_replay_execute_batch(
         trace_file=trace_file,
         trace_file_bin=trace_file_bin,
         fault_types_list=fault_types_list,
@@ -394,12 +400,10 @@ def _auto_execute_batch_points(
         )
         return chosen
 
-    # Full execute-mode without trace replay is memory-heavy in long single
-    # Renode sessions. Late fault points (high fp value) are much more
-    # expensive than early ones because Phase 1 must emulate up to fp writes.
-    # Use a time-budget approach: pack variable-sized batches so each Renode
-    # session completes within ~180s. Early cheap points get packed densely
-    # (up to 64/batch), late expensive points get packed sparsely (down to 1).
+    # Full sweeps without trace replay are memory-heavy in long single Renode
+    # sessions. Late fault points (high fp value) are much more expensive than
+    # early ones because Phase 1 must emulate up to fp writes. Use a
+    # time-budget approach so each Renode session completes within ~180s.
     if has_full_execute_only_points or (not trace_file and not trace_file_bin):
         batch_time_budget_s = 180.0
         base_cost_s = 2.0
@@ -437,9 +441,15 @@ def _auto_execute_batch_points(
             sum(point_cost(idx, fp) for idx, fp in enumerate(fault_points))
             + len(chunk_boundaries) * update_sequence_overhead_s
         )
+        mode_label = (
+            "Execute mode without trace replay"
+            if eval_mode == "execute"
+            else "State mode without trace replay"
+        )
         print(
-            "Execute mode without trace replay: ~{} batches, safe {} pts/batch "
+            "{}: ~{} batches, safe {} pts/batch "
             "({}s budget, {:.0f}s total est, {} points, max fp={}).".format(
+                mode_label,
                 len(chunk_boundaries),
                 chosen,
                 int(batch_time_budget_s),
