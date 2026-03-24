@@ -1190,7 +1190,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
 
     def test_audit_runner_records_swap_progress_inference_summary(self) -> None:
         text = (SCRIPTS / "audit_bootloader.py").read_text(encoding="utf-8")
-        self.assertIn("swap_progress_summary = plan.swap_progress_summary", text)
+        self.assertIn('swap_progress_summary = getattr(plan, "swap_progress_summary", None)', text)
         self.assertIn('payload["summary"]["swap_progress_inference"] = swap_progress_summary', text)
 
     def test_self_test_rejects_semantic_only_issues_by_default(self) -> None:

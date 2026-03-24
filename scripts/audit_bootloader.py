@@ -835,7 +835,18 @@ def main() -> int:
 
         discovery: Optional[TriggerDiscoveryResult] = None
         geometry_preflight: Optional[Dict[str, Any]] = None
-        if should_auto_discover_trigger(profile, eval_mode):
+        max_writes = profile.fault_sweep.max_writes
+        zero_point_execute_request = eval_mode == "execute" and (
+            _requested_zero_fault_points(args)
+            or _profile_requests_zero_fault_points(max_writes)
+        )
+        if zero_point_execute_request:
+            robot_vars = merge_robot_vars(
+                robot_vars,
+                ["ZERO_POINT_EXECUTE_CONTROL:true"],
+            )
+
+        if should_auto_discover_trigger(profile, eval_mode) and not zero_point_execute_request:
             discovery = discover_update_trigger(
                 profile,
                 repo_root=repo_root,
@@ -889,7 +900,6 @@ def main() -> int:
         cal: Optional[CalibrationResult] = (
             discovery.selected_calibration if discovery is not None else None
         )
-        max_writes = profile.fault_sweep.max_writes
         trace_file: Optional[str] = None
         erase_trace_file: Optional[str] = None
         trace_file_bin: Optional[str] = None
@@ -919,16 +929,6 @@ def main() -> int:
             and not args.no_trace_replay
             and _trace_replay_eligible_fault_types(fault_types)
         )
-        zero_point_execute_request = eval_mode == "execute" and (
-            _requested_zero_fault_points(args)
-            or _profile_requests_zero_fault_points(max_writes)
-        )
-        if zero_point_execute_request:
-            robot_vars = merge_robot_vars(
-                robot_vars,
-                ["ZERO_POINT_EXECUTE_CONTROL:true"],
-            )
-
         # Apply hash bypass during calibration too — hash validation doesn't
         # affect write/erase counts but consumes enormous virtual time on
         # large images (MCUboot SHA-256 on 448KB in emulation).
@@ -1198,7 +1198,7 @@ def main() -> int:
         fault_points = plan.fault_points
         fault_types_list = plan.fault_types_list
         heuristic_summary = plan.heuristic_summary
-        swap_progress_summary = plan.swap_progress_summary
+        swap_progress_summary = getattr(plan, "swap_progress_summary", None)
         clustered_bit_count = plan.clustered_bit_count
         multi_fault_plan: Optional[MultiFaultPlan] = None
 
