@@ -91,6 +91,54 @@ def find_swap_progress_boundaries(
 ) -> List[int]:
     """Return zero-based power-loss points at slot erase-sector transitions."""
 
+    def _infer_boundaries_from_write_pattern() -> List[int]:
+        if not write_entries:
+            return []
+        granularity = 4
+        deltas: List[int] = []
+        for prev, curr in zip(write_entries, write_entries[1:]):
+            prev_off = int(prev.get("flash_offset", 0))
+            curr_off = int(curr.get("flash_offset", 0))
+            for slot_start, slot_end in slot_ranges:
+                if (
+                    slot_start <= prev_off < slot_end
+                    and slot_start <= curr_off < slot_end
+                    and curr_off > prev_off
+                ):
+                    delta = curr_off - prev_off
+                    if delta > granularity:
+                        deltas.append(delta)
+                    break
+        if not deltas:
+            return []
+        jump_threshold = max(granularity * 8, min(deltas))
+        boundaries: List[int] = []
+        prev_entry = None
+        prev_slot = None
+        for entry in write_entries:
+            flash_offset = int(entry.get("flash_offset", 0))
+            write_index = int(entry.get("write_index", 0))
+            slot_key = None
+            for slot_start, slot_end in slot_ranges:
+                if slot_start <= flash_offset < slot_end:
+                    slot_key = slot_start
+                    break
+            if slot_key is None:
+                continue
+            if prev_entry is not None and prev_slot == slot_key:
+                prev_off = int(prev_entry.get("flash_offset", 0))
+                delta = flash_offset - prev_off
+                if delta < 0 or delta >= jump_threshold:
+                    boundary = write_index - 1
+                    if boundary >= 0 and (not boundaries or boundaries[-1] != boundary):
+                        boundaries.append(boundary)
+            prev_entry = entry
+            prev_slot = slot_key
+        return boundaries
+
+    if not erase_map:
+        return _infer_boundaries_from_write_pattern()
+
     def sector_of(flash_offset: int) -> Optional[int]:
         for start, end in erase_map:
             if start <= flash_offset < end:
@@ -116,7 +164,9 @@ def find_swap_progress_boundaries(
                 current_sectors[slot_start] = sector_start
                 break
 
-    return boundaries
+    if boundaries:
+        return boundaries
+    return _infer_boundaries_from_write_pattern()
 
 
 def _derive_read_fault_points(

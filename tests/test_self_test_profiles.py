@@ -31,6 +31,7 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertNotIn("fault_copy_before_validate.yaml", discovered)
         self.assertNotIn("fault_staging_overlap.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_nrf52_revert_extended.yaml", discovered)
+        self.assertNotIn("mcuboot_head_move_nrf52_revert_write_faults_long.yaml", discovered)
         self.assertNotIn("fault_no_crc.yaml", discovered)
         self.assertNotIn("fault_single_replica.yaml", discovered)
         self.assertNotIn("fault_wrong_slot_order.yaml", discovered)

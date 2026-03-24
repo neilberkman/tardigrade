@@ -41,4 +41,4 @@ fault_sweep:
   run_duration: "20.0"
   max_step_limit: 200000000
 expect:
-  should_find_issues: false
+  should_find_issues: true

@@ -29,7 +29,9 @@ sys.path.insert(0, str(SCRIPTS))
 from profile_loader import load_profile  # noqa: E402
 from trigger_discovery import (  # noqa: E402
     TriggerStrategy,
+    _build_mcuboot_strategies,
     _clone_for_strategy,
+    _detect_mcuboot_swap_algorithm,
     discover_update_trigger,
     should_auto_discover_trigger,
     validate_compiled_flash_map,
@@ -46,6 +48,47 @@ def _write_trace(path: Path, rows: list[dict[str, int]]) -> None:
 
 
 class TriggerDiscoveryTests(unittest.TestCase):
+    def test_detect_mcuboot_swap_algorithm_from_elf_symbols(self) -> None:
+        profile = SimpleNamespace(
+            name="mcuboot_auto",
+            bootloader_elf="dummy.elf",
+            resolve_path=lambda _root, path: path,
+        )
+        with mock.patch(
+            "trigger_discovery._read_elf_symbol_names",
+            return_value=({"boot_swap_offset", "boot_status_source"}, None),
+        ):
+            detected = _detect_mcuboot_swap_algorithm(profile, ROOT)
+        self.assertEqual(detected["status"], "detected")
+        self.assertEqual(detected["algorithm"], "offset")
+        self.assertIn("boot_swap_offset", detected["symbols"])
+
+    def test_offset_swap_symbols_prioritize_offset_trigger_strategies(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            staging = tempdir / "staging.bin"
+            staging.write_bytes(b"\xAA" * 256)
+            profile = SimpleNamespace(
+                images={"staging": str(staging)},
+                memory=SimpleNamespace(
+                    slots={
+                        "exec": SimpleNamespace(base=0x0800C000, size=0x76000),
+                        "staging": SimpleNamespace(base=0x08082000, size=0x76000),
+                    }
+                ),
+                resolve_path=lambda _root, path: path,
+                update_trigger=None,
+            )
+            strategies = _build_mcuboot_strategies(
+                profile,
+                tempdir,
+                swap_algorithm={"algorithm": "offset"},
+            )
+        names = [strategy.name for strategy in strategies[:3]]
+        self.assertEqual(names[0], "no_trigger")
+        self.assertTrue(names[1].startswith("offset_image_swap_metadata_align"))
+        self.assertTrue(names[2].startswith("offset_image_align"))
+
     def test_validate_swap_sector_geometry_detects_partial_sector_layout(self) -> None:
         profile = SimpleNamespace(
             name="mcuboot_geom",
@@ -233,7 +276,7 @@ class TriggerDiscoveryTests(unittest.TestCase):
                 )
 
         self.assertTrue(result.succeeded)
-        self.assertEqual(result.selected_strategy, "trailer_magic_align8")
+        self.assertEqual(result.selected_strategy, "trailer_magic_swap_metadata_align8")
         self.assertEqual(result.attempts[0].coverage["status"], "no_nvm_activity")
         self.assertEqual(result.attempts[1].coverage["status"], "slot_activity")
 

@@ -15,7 +15,7 @@ import os
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from trace_utils import summarize_calibration_coverage
 from renode_runner import (
@@ -90,6 +90,7 @@ class TriggerDiscoveryResult:
     selected_strategy: Optional[str]
     attempts: List[TriggerDiscoveryAttempt] = field(default_factory=list)
     flash_map_check: Optional[Dict[str, Any]] = None
+    swap_algorithm: Optional[Dict[str, Any]] = None
     failure_reason: Optional[str] = None
 
     @property
@@ -101,6 +102,7 @@ class TriggerDiscoveryResult:
             "selected_strategy": self.selected_strategy,
             "failure_reason": self.failure_reason,
             "flash_map_check": self.flash_map_check,
+            "swap_algorithm": self.swap_algorithm,
             "attempts": [
                 {
                     "name": attempt.name,
@@ -202,6 +204,84 @@ def _resolve_mcuboot_flash_map(elf_path: str) -> Tuple[Optional[List[Dict[str, i
             }
         )
     return entries, None
+
+
+def _read_elf_symbol_names(elf_path: str) -> Tuple[Optional[Set[str]], Optional[str]]:
+    if ELFFile is None:
+        return None, "pyelftools not available"
+    path = Path(elf_path)
+    try:
+        with path.open("rb") as handle:
+            elf = ELFFile(handle)
+            symtab = elf.get_section_by_name(".symtab")
+            if symtab is None:
+                return None, "ELF has no .symtab"
+            names = {
+                str(symbol.name or "").strip()
+                for symbol in symtab.iter_symbols()
+                if str(symbol.name or "").strip()
+            }
+            return names, None
+    except Exception as exc:
+        return None, "failed to read ELF symbols: {}".format(exc)
+
+
+def _detect_mcuboot_swap_algorithm(
+    profile: ProfileConfig,
+    repo_root: Path,
+) -> Dict[str, Any]:
+    family = _detect_bootloader_family(profile)
+    if family != "mcuboot":
+        return {
+            "status": "unavailable",
+            "reason": "swap-algorithm detection is only implemented for MCUboot profiles",
+        }
+
+    resolved_elf = profile.resolve_path(repo_root, profile.bootloader_elf)
+    symbols, error = _read_elf_symbol_names(resolved_elf)
+    if symbols is None:
+        return {
+            "status": "unavailable",
+            "reason": error,
+            "bootloader_elf": resolved_elf,
+        }
+
+    candidates = [
+        ("offset", ["boot_swap_offset", "swap_offset"]),
+        ("scratch", ["boot_swap_scratch", "swap_scratch"]),
+        ("move", ["boot_swap_move", "swap_move"]),
+    ]
+    matched: List[Dict[str, Any]] = []
+    lowered = {name.lower(): name for name in symbols}
+    for algorithm, needles in candidates:
+        hits = [
+            lowered[name]
+            for name in lowered
+            if any(needle in name for needle in needles)
+        ]
+        if hits:
+            matched.append(
+                {
+                    "algorithm": algorithm,
+                    "symbols": sorted(set(hits)),
+                }
+            )
+
+    if not matched:
+        return {
+            "status": "unknown",
+            "reason": "ELF does not expose recognizable MCUboot swap symbols",
+            "bootloader_elf": resolved_elf,
+        }
+
+    selected = matched[0]
+    return {
+        "status": "detected",
+        "algorithm": selected["algorithm"],
+        "symbols": selected["symbols"],
+        "all_matches": matched,
+        "bootloader_elf": resolved_elf,
+    }
 
 
 def validate_compiled_flash_map(
@@ -439,23 +519,27 @@ def _max_align_candidates(profile: ProfileConfig) -> List[int]:
     return [8, 32]
 
 
-def _build_mcuboot_strategies(profile: ProfileConfig, repo_root: Path) -> List[TriggerStrategy]:
+def _build_mcuboot_strategies(
+    profile: ProfileConfig,
+    repo_root: Path,
+    swap_algorithm: Optional[Dict[str, Any]] = None,
+) -> List[TriggerStrategy]:
     slot_name = _default_update_slot(profile)
     if slot_name is None:
         return [TriggerStrategy(name="no_trigger")]
 
     staging_path = profile.resolve_path(repo_root, profile.images[slot_name])
     staging_size = os.path.getsize(staging_path) if os.path.exists(staging_path) else 0
-    strategies: List[TriggerStrategy] = [TriggerStrategy(name="no_trigger")]
+    strategies_by_name: Dict[str, TriggerStrategy] = {"no_trigger": TriggerStrategy(name="no_trigger")}
     for max_align in _max_align_candidates(profile):
-        strategies.append(
+        strategies_by_name["trailer_magic_align{}".format(max_align)] = (
             TriggerStrategy(
                 name="trailer_magic_align{}".format(max_align),
                 trigger_fields={"max_align": max_align},
                 max_align=max_align,
             )
         )
-        strategies.append(
+        strategies_by_name["trailer_magic_swap_metadata_align{}".format(max_align)] = (
             TriggerStrategy(
                 name="trailer_magic_swap_metadata_align{}".format(max_align),
                 trigger_fields={
@@ -467,7 +551,7 @@ def _build_mcuboot_strategies(profile: ProfileConfig, repo_root: Path) -> List[T
                 max_align=max_align,
             )
         )
-        strategies.append(
+        strategies_by_name["offset_image_align{}".format(max_align)] = (
             TriggerStrategy(
                 name="offset_image_align{}".format(max_align),
                 trigger_fields={"max_align": max_align},
@@ -475,7 +559,7 @@ def _build_mcuboot_strategies(profile: ProfileConfig, repo_root: Path) -> List[T
                 max_align=max_align,
             )
         )
-        strategies.append(
+        strategies_by_name["offset_image_swap_metadata_align{}".format(max_align)] = (
             TriggerStrategy(
                 name="offset_image_swap_metadata_align{}".format(max_align),
                 trigger_fields={
@@ -488,13 +572,38 @@ def _build_mcuboot_strategies(profile: ProfileConfig, repo_root: Path) -> List[T
                 max_align=max_align,
             )
         )
-    return strategies
+    algorithm = str((swap_algorithm or {}).get("algorithm") or "").strip().lower()
+    ordered_names: List[str] = ["no_trigger"]
+    for max_align in _max_align_candidates(profile):
+        if algorithm == "offset":
+            ordered_names.extend(
+                [
+                    "offset_image_swap_metadata_align{}".format(max_align),
+                    "offset_image_align{}".format(max_align),
+                    "trailer_magic_swap_metadata_align{}".format(max_align),
+                    "trailer_magic_align{}".format(max_align),
+                ]
+            )
+        else:
+            ordered_names.extend(
+                [
+                    "trailer_magic_swap_metadata_align{}".format(max_align),
+                    "trailer_magic_align{}".format(max_align),
+                    "offset_image_swap_metadata_align{}".format(max_align),
+                    "offset_image_align{}".format(max_align),
+                ]
+            )
+    return [strategies_by_name[name] for name in ordered_names if name in strategies_by_name]
 
 
 def _build_strategies(profile: ProfileConfig, repo_root: Path) -> List[TriggerStrategy]:
     family = _detect_bootloader_family(profile)
     if family == "mcuboot":
-        return _build_mcuboot_strategies(profile, repo_root)
+        return _build_mcuboot_strategies(
+            profile,
+            repo_root,
+            swap_algorithm=_detect_mcuboot_swap_algorithm(profile, repo_root),
+        )
     return [TriggerStrategy(name="no_trigger")]
 
 
@@ -582,6 +691,7 @@ def discover_update_trigger(
 ) -> TriggerDiscoveryResult:
     """Try a family-specific trigger cascade and return the first viable strategy."""
     flash_map_check = validate_compiled_flash_map(profile, repo_root)
+    swap_algorithm = _detect_mcuboot_swap_algorithm(profile, repo_root)
     if flash_map_check.get("status") == "mismatch":
         return TriggerDiscoveryResult(
             selected_profile=None,
@@ -590,11 +700,20 @@ def discover_update_trigger(
             selected_strategy=None,
             attempts=[],
             flash_map_check=flash_map_check,
+            swap_algorithm=swap_algorithm,
             failure_reason=flash_map_check.get("reason"),
         )
 
     attempts: List[TriggerDiscoveryAttempt] = []
-    strategies = _build_strategies(profile, repo_root)
+    family = _detect_bootloader_family(profile)
+    if family == "mcuboot":
+        strategies = _build_mcuboot_strategies(
+            profile,
+            repo_root,
+            swap_algorithm=swap_algorithm,
+        )
+    else:
+        strategies = _build_strategies(profile, repo_root)
 
     for strategy in strategies:
         candidate, skipped_reason = _clone_for_strategy(profile, repo_root, strategy)
@@ -696,6 +815,7 @@ def discover_update_trigger(
                 selected_strategy=strategy.name,
                 attempts=attempts,
                 flash_map_check=flash_map_check,
+                swap_algorithm=swap_algorithm,
                 failure_reason=None,
             )
         _cleanup_generated_robot_files(robot_vars)
@@ -707,5 +827,6 @@ def discover_update_trigger(
         selected_strategy=None,
         attempts=attempts,
         flash_map_check=flash_map_check,
+        swap_algorithm=swap_algorithm,
         failure_reason="could not trigger firmware update",
     )
