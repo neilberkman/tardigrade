@@ -47,6 +47,17 @@ def _write_trace(path: Path, rows: list[dict[str, int]]) -> None:
             writer.writerow(row)
 
 
+def _write_erase_trace(path: Path, rows: list[dict[str, int]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["erase_index", "flash_offset", "writes_at_this_point", "erase_size"],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 class TriggerDiscoveryTests(unittest.TestCase):
     def test_detect_mcuboot_swap_algorithm_from_elf_symbols(self) -> None:
         profile = SimpleNamespace(
@@ -328,6 +339,67 @@ class TriggerDiscoveryTests(unittest.TestCase):
         self.assertTrue(result.succeeded)
         self.assertEqual(result.attempts[0].coverage["status"], "named_metadata_only")
         self.assertTrue(result.attempts[0].selected)
+
+    def test_discovery_accepts_erase_only_slot_activity(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
+        profile = load_profile(ROOT / "profiles" / "mcuboot_head_offset_stm32f4_upgrade.yaml")
+        profile.update_trigger = None
+        profile.auto_update_trigger = True
+
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            erase_trace = tempdir / "erase.csv"
+            flash_base = profile.bootloader_entry
+            staging_base = profile.memory.slots["staging"].base - flash_base
+            _write_erase_trace(
+                erase_trace,
+                [
+                    {
+                        "erase_index": 1,
+                        "flash_offset": staging_base,
+                        "writes_at_this_point": 0,
+                        "erase_size": 0x20000,
+                    }
+                ],
+            )
+
+            def fake_run_single_point(*args, **kwargs):
+                return {
+                    "total_writes": 0,
+                    "total_erases": 1,
+                    "trace_file": None,
+                    "erase_trace_file": str(erase_trace),
+                    "trace_file_bin": None,
+                    "erase_trace_file_bin": None,
+                    "calibration_stop_reason": "vtor_captured",
+                    "calibration_exec_hash": "deadbeef",
+                    "calibration_elapsed_s": 1.0,
+                    "calibration_emulated_s": 1.0,
+                    "calibration_pc": "0x08022C94",
+                    "setup_writes": 0,
+                    "total_i2c_transactions": 0,
+                    "total_otp_blows": 0,
+                }
+
+            with mock.patch(
+                "trigger_discovery.run_single_point",
+                side_effect=fake_run_single_point,
+            ):
+                result = discover_update_trigger(
+                    profile,
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    work_dir=tempdir,
+                    renode_remote_server_dir="",
+                    keep_run_artifacts=False,
+                    robot_vars_factory=lambda candidate: candidate.robot_vars(ROOT),
+                )
+
+        self.assertTrue(result.succeeded)
+        selected = next(attempt for attempt in result.attempts if attempt.selected)
+        self.assertEqual(selected.coverage["status"], "slot_activity")
 
 
 if __name__ == "__main__":

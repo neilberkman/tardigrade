@@ -146,10 +146,12 @@ def summarize_calibration_coverage(
     metadata_regions: Optional[List[MetadataFaultRegion]] = None,
 ) -> Dict[str, Any]:
     """Summarize whether calibration exercised slot data movement."""
-    if not trace_file or not os.path.exists(trace_file):
+    has_write_trace = bool(trace_file and os.path.exists(trace_file))
+    has_erase_trace = bool(erase_trace_file and os.path.exists(erase_trace_file))
+    if not has_write_trace and not has_erase_trace:
         return {
             "status": "unavailable",
-            "reason": "No calibration trace available.",
+            "reason": "No calibration write or erase trace available.",
         }
     if not slots:
         return {
@@ -157,8 +159,8 @@ def summarize_calibration_coverage(
             "reason": "No memory slots declared; slot coverage cannot be classified.",
         }
 
-    write_entries = load_clean_write_trace(trace_file)
-    erase_entries = load_clean_erase_trace(erase_trace_file)
+    write_entries = load_clean_write_trace(trace_file) if has_write_trace else []
+    erase_entries = load_clean_erase_trace(erase_trace_file) if has_erase_trace else []
     counts = {
         "slot_data_writes": 0,
         "slot_data_erases": 0,
