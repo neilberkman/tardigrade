@@ -1,5 +1,6 @@
 schema_version: 1
 name: fault_single_replica
+skip_self_test: true
 description: >-
   Vulnerable OTA with only a single metadata replica. Even if the bootloader
   uses A/B slots, a torn write to the sole metadata struct loses the record

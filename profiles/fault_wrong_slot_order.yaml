@@ -1,5 +1,6 @@
 schema_version: 1
 name: fault_wrong_slot_order
+skip_self_test: true
 description: >-
   Vulnerable OTA that updates the active-slot metadata pointer before the
   new image is fully written to the staging slot. If power is lost after

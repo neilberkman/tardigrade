@@ -31,9 +31,21 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertNotIn("fault_copy_before_validate.yaml", discovered)
         self.assertNotIn("fault_staging_overlap.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_nrf52_revert_extended.yaml", discovered)
+        self.assertNotIn("fault_no_crc.yaml", discovered)
+        self.assertNotIn("fault_single_replica.yaml", discovered)
+        self.assertNotIn("fault_wrong_slot_order.yaml", discovered)
+        self.assertNotIn("fault_no_fallback.yaml", discovered)
+        self.assertNotIn("fault_no_meta_replication.yaml", discovered)
+        self.assertNotIn("fault_no_vector_check.yaml", discovered)
         self.assertIn("fault_copy_before_validate_selftest.yaml", discovered)
         self.assertIn("fault_staging_overlap_selftest.yaml", discovered)
         self.assertIn("mcuboot_head_move_nrf52_revert_extended_selftest.yaml", discovered)
+        self.assertIn("fault_no_crc_selftest.yaml", discovered)
+        self.assertIn("fault_single_replica_selftest.yaml", discovered)
+        self.assertIn("fault_wrong_slot_order_selftest.yaml", discovered)
+        self.assertIn("fault_no_fallback_selftest.yaml", discovered)
+        self.assertIn("fault_no_meta_replication_selftest.yaml", discovered)
+        self.assertIn("fault_no_vector_check_selftest.yaml", discovered)
 
     def test_retroactive_negative_controls_expect_no_issues(self):
         negative_controls = [

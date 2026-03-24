@@ -1,5 +1,6 @@
 schema_version: 1
 name: fault_no_meta_replication
+skip_self_test: true
 description: >-
   Vulnerable OTA with no metadata replication. A single metadata struct
   controls which slot is active. If power is lost while updating that

@@ -1,5 +1,6 @@
 schema_version: 1
 name: fault_no_crc
+skip_self_test: true
 description: >-
   Vulnerable OTA that copies staging over the active slot with no CRC or
   integrity check before or after the copy. A partial write leaves the

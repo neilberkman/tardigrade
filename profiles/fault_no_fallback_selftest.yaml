@@ -1,13 +1,9 @@
 schema_version: 1
-name: fault_no_vector_check
-skip_self_test: true
+name: fault_no_fallback_selftest
 description: >-
-  Vulnerable OTA with no vector-table validation before booting a slot.
-  After a partial copy corrupts the active image, the bootloader blindly
-  jumps to the corrupted vector table. Without checking that the initial SP
-  points to SRAM and the reset vector points into the slot, the CPU takes
-  a hard fault or executes garbage. Uses the vulnerable copy-in-place
-  firmware which performs no vector sanity checks.
+  Self-test smoke profile for the no-fallback vulnerable OTA. Uses a bounded
+  write window so generic self-test validates the brick-prone behavior
+  without sweeping the entire copy operation.
 
 platform: platforms/cortex_m0_nvm.repl
 flash_backend: nvm_ctrl
@@ -25,14 +21,13 @@ memory:
 images:
   staging: examples/vulnerable_ota/firmware.bin
 
-
 success_criteria:
   vtor_in_slot: exec
 
 fault_sweep:
   mode: runtime
-  max_writes: 28672
-  max_writes_cap: 100000
+  max_writes: 512
+  max_writes_cap: 4096
   run_duration: "0.01"
 
 expect:
