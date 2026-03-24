@@ -19,16 +19,15 @@ memory:
 images:
   exec: results/oss_validation/assets/zephyr_head_scratch_small_slot0.bin
   staging: results/oss_validation/assets/zephyr_head_scratch_small_slot1.bin
-update_trigger:
-  type: mcuboot_trailer_magic
-  slot: staging
+update_trigger: auto
 success_criteria:
   vtor_in_slot: exec
-  image_hash: true
-  expected_image: staging
+  marker_address: 0x0000C014
+  marker_value: 0x00000101
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  fault_types: [power_loss, swap_progress]
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "20.0"

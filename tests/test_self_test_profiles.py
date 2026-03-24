@@ -156,6 +156,29 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
                 self.assertEqual(raw.get("success_criteria", {}).get("marker_value"), 0x00000101)
                 self.assertIn("swap_progress", raw.get("fault_sweep", {}).get("fault_types", []))
 
+    def test_remaining_generic_mcuboot_upgrades_use_discovery(self):
+        expected = {
+            "mcuboot_head_upgrade.yaml": (0x0000C014, 0x00010001),
+            "mcuboot_head_move_small_upgrade.yaml": (0x0000C014, 0x00000101),
+            "mcuboot_head_offset_small_upgrade.yaml": (0x0000C014, 0x00000101),
+            "mcuboot_head_scratch_small_upgrade.yaml": (0x0000C014, 0x00000101),
+            "mcuboot_head_move_stm32f4_upgrade.yaml": (0x08020014, 0x00000101),
+            "mcuboot_head_move_stm32f4_fast_upgrade.yaml": (0x08020014, 0x00000101),
+            "mcuboot_head_offset_stm32f4_fast_upgrade.yaml": (0x08020014, 0x00000101),
+            "mcuboot_head_scratch_stm32f4_upgrade.yaml": (0x08020014, 0x00000101),
+            "mcuboot_head_scratch_stm32f4_fast_upgrade.yaml": (0x08020014, 0x00000101),
+        }
+        for name, (marker_address, marker_value) in expected.items():
+            with self.subTest(profile=name):
+                raw = yaml.safe_load((ROOT / "profiles" / name).read_text(encoding="utf-8"))
+                self.assertEqual(raw.get("update_trigger"), "auto")
+                self.assertEqual(raw.get("success_criteria", {}).get("marker_address"), marker_address)
+                self.assertEqual(raw.get("success_criteria", {}).get("marker_value"), marker_value)
+                self.assertEqual(
+                    raw.get("fault_sweep", {}).get("fault_types"),
+                    ["power_loss", "swap_progress"],
+                )
+
     def test_run_audit_forwards_extra_args(self):
         repo_root = ROOT
         profile_path = ROOT / "profiles" / "fault_no_crc.yaml"
