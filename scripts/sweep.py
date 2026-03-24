@@ -428,23 +428,17 @@ def _auto_execute_batch_points(
                 chunk_boundaries.append(idx)
                 budget_used = cost
 
-        chunk_sizes: List[int] = []
-        for idx, start in enumerate(chunk_boundaries):
-            end = (
-                chunk_boundaries[idx + 1]
-                if idx + 1 < len(chunk_boundaries)
-                else len(fault_points)
-            )
-            chunk_sizes.append(end - start)
-        chunk_sizes.sort()
-        chosen = max(1, chunk_sizes[len(chunk_sizes) // 2])
-        chosen = max(1, min(max_per_batch, chosen))
+        max_point_cost_s = max(
+            point_cost(idx, fp) for idx, fp in enumerate(fault_points)
+        )
+        chosen = max(1, int(point_budget_s // max(1.0, max_point_cost_s)))
+        chosen = max(1, min(max_per_batch, chosen, len(fault_points)))
         total_est_s = (
             sum(point_cost(idx, fp) for idx, fp in enumerate(fault_points))
             + len(chunk_boundaries) * update_sequence_overhead_s
         )
         print(
-            "Execute mode without trace replay: ~{} batches, median {} pts/batch "
+            "Execute mode without trace replay: ~{} batches, safe {} pts/batch "
             "({}s budget, {:.0f}s total est, {} points, max fp={}).".format(
                 len(chunk_boundaries),
                 chosen,

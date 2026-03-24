@@ -444,7 +444,7 @@ class MCUbootStateEvaluatorSweepRoutingTest(unittest.TestCase):
 
         mock_batch.assert_called_once()
         self.assertEqual(results, [])
-        self.assertEqual(mock_batch.call_args.kwargs["max_batch_points"], 42)
+        self.assertEqual(mock_batch.call_args.kwargs["max_batch_points"], 32)
 
 
 if __name__ == "__main__":
