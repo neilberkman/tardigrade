@@ -87,6 +87,8 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
             raw.get("fault_sweep", {}).get("fault_types"),
             ["power_loss", "swap_progress"],
         )
+        self.assertEqual(raw.get("success_criteria", {}).get("marker_address"), 0x08020014)
+        self.assertEqual(raw.get("success_criteria", {}).get("marker_value"), 0x00000101)
         self.assertNotIn("page_size", raw.get("memory", {}))
 
     def test_generic_nrf52_move_profile_stays_discovery_driven(self):
@@ -165,6 +167,7 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
             "mcuboot_head_offset_small_upgrade.yaml": (0x0000C014, 0x00000101),
             "mcuboot_head_scratch_small_upgrade.yaml": (0x0000C014, 0x00000101),
             "mcuboot_head_move_stm32f4_upgrade.yaml": (0x08020014, 0x00000101),
+            "mcuboot_head_offset_stm32f4_upgrade.yaml": (0x08020014, 0x00000101),
             "mcuboot_head_move_stm32f4_fast_upgrade.yaml": (0x08020014, 0x00000101),
             "mcuboot_head_offset_stm32f4_fast_upgrade.yaml": (0x08020014, 0x00000101),
             "mcuboot_head_scratch_stm32f4_upgrade.yaml": (0x08020014, 0x00000101),

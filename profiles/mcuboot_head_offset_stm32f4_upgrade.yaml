@@ -22,8 +22,8 @@ images:
 update_trigger: auto
 success_criteria:
   vtor_in_slot: exec
-  image_hash: true
-  expected_image: staging
+  marker_address: 0x08020014
+  marker_value: 0x00000101
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
