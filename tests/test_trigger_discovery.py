@@ -105,8 +105,10 @@ class TriggerDiscoveryTests(unittest.TestCase):
             tempdir = Path(td)
             staging = tempdir / "staging.bin"
             staging.write_bytes(b"\xAA" * 256)
+            exec_image = tempdir / "exec.bin"
+            exec_image.write_bytes(b"\x00" * 256)
             profile = SimpleNamespace(
-                images={"staging": str(staging)},
+                images={"exec": str(exec_image), "staging": str(staging)},
                 memory=SimpleNamespace(
                     slots={
                         "exec": SimpleNamespace(base=0x0800C000, size=0x76000),
@@ -115,6 +117,7 @@ class TriggerDiscoveryTests(unittest.TestCase):
                 ),
                 resolve_path=lambda _root, path: path,
                 update_trigger=None,
+                success_criteria=SimpleNamespace(expected_image=None, marker_address=None, marker_value=None),
             )
             strategies = _build_mcuboot_strategies(
                 profile,
@@ -127,6 +130,43 @@ class TriggerDiscoveryTests(unittest.TestCase):
         self.assertTrue(names[2].startswith("trailer_magic_align"))
         self.assertTrue(names[3].startswith("offset_image_swap_metadata_align"))
         self.assertTrue(names[4].startswith("offset_image_align"))
+
+    def test_upgrade_marker_prefers_triggered_strategies_before_no_trigger(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            exec_image = tempdir / "exec.bin"
+            staging = tempdir / "staging.bin"
+            exec_data = bytearray(256)
+            staging_data = bytearray(256)
+            exec_data[0x14:0x18] = (0x00000001).to_bytes(4, "little")
+            staging_data[0x14:0x18] = (0x00000101).to_bytes(4, "little")
+            exec_image.write_bytes(exec_data)
+            staging.write_bytes(staging_data)
+            profile = SimpleNamespace(
+                images={"exec": str(exec_image), "staging": str(staging)},
+                memory=SimpleNamespace(
+                    slots={
+                        "exec": SimpleNamespace(base=0x0000C000, size=0x76000),
+                        "staging": SimpleNamespace(base=0x00082000, size=0x76000),
+                    }
+                ),
+                resolve_path=lambda _root, path: path,
+                update_trigger=None,
+                success_criteria=SimpleNamespace(
+                    expected_image=None,
+                    marker_address=0x0000C014,
+                    marker_value=0x00000101,
+                ),
+            )
+            strategies = _build_mcuboot_strategies(
+                profile,
+                tempdir,
+                swap_algorithm={"algorithm": "move"},
+            )
+        names = [strategy.name for strategy in strategies]
+        self.assertTrue(names[0].startswith("trailer_magic_swap_metadata_align"))
+        self.assertTrue(names[1].startswith("trailer_magic_align"))
+        self.assertEqual(names[-1], "no_trigger")
 
     def test_validate_swap_sector_geometry_detects_partial_sector_layout(self) -> None:
         profile = SimpleNamespace(
@@ -381,8 +421,8 @@ class TriggerDiscoveryTests(unittest.TestCase):
 
         self.assertTrue(result.succeeded)
         self.assertEqual(result.selected_strategy, "trailer_magic_swap_metadata_align8")
-        self.assertEqual(result.attempts[0].coverage["status"], "no_nvm_activity")
-        self.assertEqual(result.attempts[1].coverage["status"], "slot_activity")
+        self.assertEqual(result.attempts[0].name, "trailer_magic_swap_metadata_align8")
+        self.assertEqual(result.attempts[0].coverage["status"], "slot_activity")
 
     def test_discovery_selects_named_metadata_activity(self) -> None:
         if not HAVE_PYYAML:

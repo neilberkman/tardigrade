@@ -582,6 +582,41 @@ def _max_align_candidates(profile: ProfileConfig) -> List[int]:
     return [8, 32]
 
 
+def _prefers_triggered_upgrade(profile: ProfileConfig, repo_root: Path) -> bool:
+    criteria = getattr(profile, "success_criteria", None)
+    if criteria is None:
+        return False
+    expected_image = str(getattr(criteria, "expected_image", "") or "").strip().lower()
+    if expected_image == "staging":
+        return True
+    marker_address = getattr(criteria, "marker_address", None)
+    marker_value = getattr(criteria, "marker_value", None)
+    if marker_address is None or marker_value is None:
+        return False
+    exec_slot = profile.memory.slots.get("exec")
+    if exec_slot is None:
+        return False
+    offset = int(marker_address) - int(exec_slot.base)
+    if offset < 0:
+        return False
+    exec_image = profile.images.get("exec")
+    staging_image = profile.images.get("staging")
+    if not exec_image or not staging_image:
+        return False
+    try:
+        exec_path = profile.resolve_path(repo_root, exec_image)
+        staging_path = profile.resolve_path(repo_root, staging_image)
+        with open(exec_path, "rb") as handle:
+            handle.seek(offset)
+            exec_word = int.from_bytes(handle.read(4), "little")
+        with open(staging_path, "rb") as handle:
+            handle.seek(offset)
+            staging_word = int.from_bytes(handle.read(4), "little")
+    except Exception:
+        return False
+    return exec_word != staging_word and staging_word == int(marker_value)
+
+
 def _build_mcuboot_strategies(
     profile: ProfileConfig,
     repo_root: Path,
@@ -636,7 +671,8 @@ def _build_mcuboot_strategies(
             )
         )
     algorithm = str((swap_algorithm or {}).get("algorithm") or "").strip().lower()
-    ordered_names: List[str] = ["no_trigger"]
+    prefer_triggered = _prefers_triggered_upgrade(profile, repo_root)
+    ordered_names: List[str] = []
     for max_align in _max_align_candidates(profile):
         if algorithm == "offset":
             ordered_names.extend(
@@ -656,6 +692,10 @@ def _build_mcuboot_strategies(
                     "offset_image_align{}".format(max_align),
                 ]
             )
+    if prefer_triggered:
+        ordered_names.append("no_trigger")
+    else:
+        ordered_names.insert(0, "no_trigger")
     return [strategies_by_name[name] for name in ordered_names if name in strategies_by_name]
 
 

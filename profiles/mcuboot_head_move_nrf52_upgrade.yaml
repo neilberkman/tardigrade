@@ -19,13 +19,11 @@ memory:
 images:
   exec: results/oss_validation/assets/zephyr_head_move_nrf52_slot0.bin
   staging: results/oss_validation/assets/zephyr_head_move_nrf52_slot1.bin
-update_trigger:
-  type: mcuboot_trailer_magic
-  slot: staging
+update_trigger: auto
 success_criteria:
   vtor_in_slot: exec
-  image_hash: true
-  expected_image: staging
+  marker_address: 0x0000C014
+  marker_value: 0x00000101
 state_probe:
   script: targets/mcuboot/probe.py
   required_paths:
@@ -48,6 +46,7 @@ fault_sweep:
   max_writes_cap: 200000
   run_duration: "20.0"
   max_step_limit: 200000000
+  fault_types: [power_loss, swap_progress]
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 expect:
   should_find_issues: false

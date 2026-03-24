@@ -89,6 +89,22 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         )
         self.assertNotIn("page_size", raw.get("memory", {}))
 
+    def test_generic_nrf52_move_profile_stays_discovery_driven(self):
+        raw = yaml.safe_load(
+            (
+                ROOT / "profiles" / "mcuboot_head_move_nrf52_upgrade.yaml"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(raw.get("update_trigger"), "auto")
+        self.assertNotIn("pre_boot_state", raw)
+        self.assertEqual(
+            raw.get("fault_sweep", {}).get("fault_types"),
+            ["power_loss", "swap_progress"],
+        )
+        self.assertEqual(raw.get("success_criteria", {}).get("marker_address"), 0x0000C014)
+        self.assertEqual(raw.get("success_criteria", {}).get("marker_value"), 0x00000101)
+        self.assertNotIn("page_size", raw.get("memory", {}))
+
     def test_run_audit_forwards_extra_args(self):
         repo_root = ROOT
         profile_path = ROOT / "profiles" / "fault_no_crc.yaml"
