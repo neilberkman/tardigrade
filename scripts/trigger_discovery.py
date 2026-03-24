@@ -741,6 +741,18 @@ def _attempt_calibration_dict(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _calibration_matches_expected_boot(data: Dict[str, Any]) -> bool:
+    """Return whether the calibration control run reached the expected boot state."""
+    signals = data.get("signals")
+    if not isinstance(signals, dict):
+        return True
+    if signals.get("expectations_met") is False:
+        return False
+    if str(data.get("boot_outcome") or "").strip().lower() == "wrong_image":
+        return False
+    return True
+
+
 def discover_update_trigger(
     profile: ProfileConfig,
     *,
@@ -859,7 +871,9 @@ def discover_update_trigger(
             candidate.expect.control_outcome,
         )
         selected = bool(
-            completed and coverage.get("status") in {"slot_activity", "named_metadata_only"}
+            completed
+            and coverage.get("status") in {"slot_activity", "named_metadata_only"}
+            and _calibration_matches_expected_boot(data)
         )
         attempt = TriggerDiscoveryAttempt(
             name=strategy.name,

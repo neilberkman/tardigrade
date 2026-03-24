@@ -19,9 +19,7 @@ memory:
 images:
   exec: results/oss_validation/assets/zephyr_head_offset_stm32f4_slot0.bin
   staging: results/oss_validation/assets/zephyr_head_offset_stm32f4_slot1.bin
-update_trigger:
-  type: mcuboot_trailer_magic
-  slot: staging
+update_trigger: auto
 success_criteria:
   vtor_in_slot: exec
   image_hash: true
@@ -29,6 +27,7 @@ success_criteria:
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  fault_types: [power_loss, swap_progress]
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "20.0"
