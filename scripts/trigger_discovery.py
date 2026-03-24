@@ -240,19 +240,40 @@ def _detect_mcuboot_swap_algorithm(
         }
 
     resolved_elf = profile.resolve_path(repo_root, profile.bootloader_elf)
-    symbols, error = _read_elf_symbol_names(resolved_elf)
-    if symbols is None:
-        return {
-            "status": "unavailable",
-            "reason": error,
-            "bootloader_elf": resolved_elf,
-        }
-
     candidates = [
         ("offset", ["boot_swap_offset", "swap_offset"]),
         ("scratch", ["boot_swap_scratch", "swap_scratch"]),
         ("move", ["boot_swap_move", "swap_move"]),
     ]
+
+    symbols, error = _read_elf_symbol_names(resolved_elf)
+    if symbols is None:
+        heuristic_tokens = " ".join(
+            [
+                str(getattr(profile, "name", "") or ""),
+                str(getattr(profile, "bootloader_elf", "") or ""),
+                str(resolved_elf),
+            ]
+        ).lower()
+        heuristic_needles = {
+            "offset": ["swap_offset", "boot_swap_offset", " offset", "_offset", "offset_"],
+            "scratch": ["swap_scratch", "boot_swap_scratch", " scratch", "_scratch", "scratch_"],
+            "move": ["swap_move", "boot_swap_move", " move", "_move", "move_"],
+        }
+        for algorithm, needles in heuristic_needles.items():
+            if any(needle in heuristic_tokens for needle in needles):
+                return {
+                    "status": "heuristic",
+                    "algorithm": algorithm,
+                    "reason": error,
+                    "bootloader_elf": resolved_elf,
+                    "source": "profile_name_or_path",
+                }
+        return {
+            "status": "unavailable",
+            "reason": error,
+            "bootloader_elf": resolved_elf,
+        }
     matched: List[Dict[str, Any]] = []
     lowered = {name.lower(): name for name in symbols}
     for algorithm, needles in candidates:

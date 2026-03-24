@@ -74,6 +74,21 @@ class TriggerDiscoveryTests(unittest.TestCase):
         self.assertEqual(detected["algorithm"], "offset")
         self.assertIn("boot_swap_offset", detected["symbols"])
 
+    def test_detect_mcuboot_swap_algorithm_from_profile_when_elf_is_stripped(self) -> None:
+        profile = SimpleNamespace(
+            name="mcuboot_offset_upgrade",
+            bootloader_elf="results/oss_validation/assets/oss_mcuboot_head_offset.elf",
+            resolve_path=lambda _root, path: path,
+        )
+        with mock.patch(
+            "trigger_discovery._read_elf_symbol_names",
+            return_value=(None, "ELF has no .symtab"),
+        ):
+            detected = _detect_mcuboot_swap_algorithm(profile, ROOT)
+        self.assertEqual(detected["status"], "heuristic")
+        self.assertEqual(detected["algorithm"], "offset")
+        self.assertEqual(detected["source"], "profile_name_or_path")
+
     def test_offset_swap_symbols_prioritize_offset_trigger_strategies(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
@@ -420,8 +435,8 @@ class TriggerDiscoveryTests(unittest.TestCase):
                 )
 
         self.assertTrue(result.succeeded)
-        self.assertEqual(result.selected_strategy, "trailer_magic_swap_metadata_align8")
-        self.assertEqual(result.attempts[0].name, "trailer_magic_swap_metadata_align8")
+        self.assertEqual(result.selected_strategy, "offset_image_swap_metadata_align8")
+        self.assertEqual(result.attempts[0].name, "offset_image_swap_metadata_align8")
         self.assertEqual(result.attempts[0].coverage["status"], "slot_activity")
 
     def test_discovery_selects_named_metadata_activity(self) -> None:
