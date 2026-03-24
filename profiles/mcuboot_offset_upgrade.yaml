@@ -19,13 +19,11 @@ memory:
 images:
   exec: results/oss_validation/assets/zephyr_slot0_padded.bin
   staging: results/oss_validation/assets/zephyr_slot1_padded.bin
-update_trigger:
-  type: mcuboot_trailer_magic
-  slot: staging
+update_trigger: auto
 success_criteria:
   vtor_in_slot: exec
-  image_hash: true
-  expected_image: staging
+  marker_address: 0x0000C014
+  marker_value: 0x00010001
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
@@ -33,6 +31,6 @@ fault_sweep:
   max_writes_cap: 200000
   run_duration: "2.0"
   max_step_limit: 20000000
-  fault_types: [power_loss, interrupted_erase]
+  fault_types: [power_loss, swap_progress, interrupted_erase]
 expect:
   should_find_issues: false

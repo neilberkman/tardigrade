@@ -159,6 +159,7 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
     def test_remaining_generic_mcuboot_upgrades_use_discovery(self):
         expected = {
             "mcuboot_head_upgrade.yaml": (0x0000C014, 0x00010001),
+            "mcuboot_offset_upgrade.yaml": (0x0000C014, 0x00010001),
             "mcuboot_head_move_small_upgrade.yaml": (0x0000C014, 0x00000101),
             "mcuboot_head_offset_small_upgrade.yaml": (0x0000C014, 0x00000101),
             "mcuboot_head_scratch_small_upgrade.yaml": (0x0000C014, 0x00000101),
@@ -174,10 +175,9 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
                 self.assertEqual(raw.get("update_trigger"), "auto")
                 self.assertEqual(raw.get("success_criteria", {}).get("marker_address"), marker_address)
                 self.assertEqual(raw.get("success_criteria", {}).get("marker_value"), marker_value)
-                self.assertEqual(
-                    raw.get("fault_sweep", {}).get("fault_types"),
-                    ["power_loss", "swap_progress"],
-                )
+                fault_types = raw.get("fault_sweep", {}).get("fault_types", [])
+                self.assertIn("power_loss", fault_types)
+                self.assertIn("swap_progress", fault_types)
 
     def test_run_audit_forwards_extra_args(self):
         repo_root = ROOT
