@@ -179,6 +179,8 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
                 self.assertEqual(raw.get("update_trigger"), "auto")
                 self.assertEqual(raw.get("success_criteria", {}).get("marker_address"), marker_address)
                 self.assertEqual(raw.get("success_criteria", {}).get("marker_value"), marker_value)
+                self.assertNotIn("image_hash", raw.get("success_criteria", {}))
+                self.assertNotIn("expected_image", raw.get("success_criteria", {}))
                 fault_types = raw.get("fault_sweep", {}).get("fault_types", [])
                 self.assertIn("power_loss", fault_types)
                 self.assertIn("swap_progress", fault_types)
