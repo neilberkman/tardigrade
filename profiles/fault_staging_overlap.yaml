@@ -1,5 +1,6 @@
 schema_version: 1
 name: fault_staging_overlap
+skip_self_test: true
 description: >-
   Vulnerable OTA where the staging and active regions overlap. The copy
   overwrites both the source and destination simultaneously, so even a

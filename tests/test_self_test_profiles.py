@@ -28,6 +28,12 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertNotIn("nuttx_nxboot_128.yaml", discovered)
         self.assertNotIn("security_toctou_no_protection.yaml", discovered)
         self.assertNotIn("security_toctou_with_protection.yaml", discovered)
+        self.assertNotIn("fault_copy_before_validate.yaml", discovered)
+        self.assertNotIn("fault_staging_overlap.yaml", discovered)
+        self.assertNotIn("mcuboot_head_move_nrf52_revert_extended.yaml", discovered)
+        self.assertIn("fault_copy_before_validate_selftest.yaml", discovered)
+        self.assertIn("fault_staging_overlap_selftest.yaml", discovered)
+        self.assertIn("mcuboot_head_move_nrf52_revert_extended_selftest.yaml", discovered)
 
     def test_retroactive_negative_controls_expect_no_issues(self):
         negative_controls = [

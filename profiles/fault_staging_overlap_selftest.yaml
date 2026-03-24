@@ -1,12 +1,9 @@
 schema_version: 1
-name: fault_copy_before_validate
-skip_self_test: true
+name: fault_staging_overlap_selftest
 description: >-
-  Vulnerable OTA that begins copying the staging image before validating it.
-  If the staging image is corrupt or incomplete, the copy overwrites the
-  active slot with garbage. Combined with power-loss, even a partially-
-  received staging image gets copied, destroying the known-good active slot.
-  Uses the vulnerable copy-in-place firmware which performs zero validation.
+  Self-test smoke profile for staging-overlap. Uses a bounded write window so
+  generic self-test covers the overlapping-region regression without running
+  the full coverage sweep.
 
 platform: platforms/cortex_m0_nvm.repl
 flash_backend: nvm_ctrl
@@ -24,14 +21,13 @@ memory:
 images:
   staging: examples/vulnerable_ota/firmware.bin
 
-
 success_criteria:
   vtor_in_slot: exec
 
 fault_sweep:
   mode: runtime
-  max_writes: 28672
-  max_writes_cap: 100000
+  max_writes: 512
+  max_writes_cap: 4096
   run_duration: "0.01"
 
 expect:
