@@ -100,6 +100,34 @@ class TriggerDiscoveryTests(unittest.TestCase):
         self.assertTrue(names[1].startswith("offset_image_swap_metadata_align"))
         self.assertTrue(names[2].startswith("offset_image_align"))
 
+    def test_move_swap_symbols_prioritize_trailer_trigger_strategies(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            staging = tempdir / "staging.bin"
+            staging.write_bytes(b"\xAA" * 256)
+            profile = SimpleNamespace(
+                images={"staging": str(staging)},
+                memory=SimpleNamespace(
+                    slots={
+                        "exec": SimpleNamespace(base=0x0800C000, size=0x76000),
+                        "staging": SimpleNamespace(base=0x08082000, size=0x76000),
+                    }
+                ),
+                resolve_path=lambda _root, path: path,
+                update_trigger=None,
+            )
+            strategies = _build_mcuboot_strategies(
+                profile,
+                tempdir,
+                swap_algorithm={"algorithm": "move"},
+            )
+        names = [strategy.name for strategy in strategies[:5]]
+        self.assertEqual(names[0], "no_trigger")
+        self.assertTrue(names[1].startswith("trailer_magic_swap_metadata_align"))
+        self.assertTrue(names[2].startswith("trailer_magic_align"))
+        self.assertTrue(names[3].startswith("offset_image_swap_metadata_align"))
+        self.assertTrue(names[4].startswith("offset_image_align"))
+
     def test_validate_swap_sector_geometry_detects_partial_sector_layout(self) -> None:
         profile = SimpleNamespace(
             name="mcuboot_geom",
