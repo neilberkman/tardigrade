@@ -1,11 +1,9 @@
 schema_version: 1
-name: mcuboot_head_move_nrf52_revert_rc_injection
+name: mcuboot_head_move_nrf52_revert_write_faults_selftest
 description: >
-  Retroactive validation negative control for the old "Issue A" hypothesis
-  on MCUboot HEAD swap-move revert (nrf52840dk). rc_injection makes the
-  write miss and forces flash_area_write() to return -EIO, but the current
-  validator should treat any resulting anomaly as non-reportable unless it
-  persists end-to-end.
+  Self-test smoke profile for swap-move write-fault negative-control coverage.
+  Keeps the write fault classes but bounds the sweep so generic self-test
+  validates the execute planner without running the full revert hunt.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -34,12 +32,11 @@ success_criteria:
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
-  fault_types: ["rc_injection"]
-  max_writes: auto
-  max_writes_cap: 200000
-  run_duration: "60.0"
-  max_step_limit: 400000000
+  fault_types: ["write_rejection", "silent_write_failure", "write_disturb", "wear_leveling_corruption"]
+  max_writes: 256
+  max_writes_cap: 512
+  run_duration: "20.0"
+  max_step_limit: 200000000
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 expect:
   should_find_issues: false
-skip_self_test: true

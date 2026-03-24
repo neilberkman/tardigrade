@@ -39,3 +39,4 @@ fault_sweep:
 expect:
   control_outcome: success
   should_find_issues: false
+skip_self_test: true
