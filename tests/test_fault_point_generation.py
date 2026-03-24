@@ -288,6 +288,49 @@ class SwapProgressFaultPointGenerationTest(unittest.TestCase):
             self.assertEqual(plan.swap_progress_summary["source"], "write_pattern")
             self.assertEqual(plan.swap_progress_summary["inferred_sector_sizes"], ["0x1000"])
 
+    def test_swap_progress_fault_points_inferred_from_erase_trace_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_profile(td, textwrap.dedent("""\
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  page_size: 0x1000
+                  slots:
+                    exec: { base: 0x00000000, size: 0x40000 }
+                    staging: { base: 0x00040000, size: 0x40000 }
+                fault_sweep:
+                  mode: runtime
+                  max_writes: auto
+                  fault_types: [swap_progress]
+            """))
+            erase_trace = Path(td) / "erase_trace.csv"
+            erase_trace.write_text(
+                "\n".join(
+                    [
+                        "erase_index,flash_offset,writes_at_this_point,erase_size",
+                        "1,262144,0,4096",
+                        "2,266240,2,4096",
+                        "3,270336,4,4096",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            profile = load_profile(path)
+            plan = build_fault_plan(
+                profile=profile,
+                calibration=CalibrationInputs(
+                    max_writes=5,
+                    trace_file=None,
+                    erase_trace_file=str(erase_trace),
+                ),
+            )
+            self.assertEqual(plan.fault_points, [2, 4])
+            self.assertEqual(plan.fault_types_list, ["w:sp", "w:sp"])
+            self.assertIsNotNone(plan.swap_progress_summary)
+            self.assertEqual(plan.swap_progress_summary["status"], "inferred")
+            self.assertEqual(plan.swap_progress_summary["source"], "erase_trace")
+            self.assertEqual(plan.swap_progress_summary["inferred_sector_sizes"], ["0x1000"])
+
 
 # ===========================================================================
 # NVS corruption: wire code, variant generation, include-flag

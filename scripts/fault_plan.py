@@ -170,9 +170,35 @@ def find_swap_progress_boundaries(
     return _infer_boundaries_from_write_pattern()
 
 
+def find_swap_progress_boundaries_from_erases(
+    erase_entries: List[Dict[str, Any]],
+    slot_ranges: List[Tuple[int, int]],
+) -> List[int]:
+    """Return zero-based power-loss points inferred from erase transitions."""
+    boundaries: List[int] = []
+    current_sectors: Dict[int, int] = {}
+
+    for entry in erase_entries:
+        writes_at = entry.get("writes_at_this_point")
+        if writes_at is None:
+            continue
+        flash_offset = int(entry.get("flash_offset", 0))
+        for slot_start, slot_end in slot_ranges:
+            if slot_start <= flash_offset < slot_end:
+                prev = current_sectors.get(slot_start)
+                if prev is not None and prev != flash_offset:
+                    boundary = int(writes_at)
+                    if boundary >= 0 and (not boundaries or boundaries[-1] != boundary):
+                        boundaries.append(boundary)
+                current_sectors[slot_start] = flash_offset
+                break
+    return boundaries
+
+
 def summarize_swap_progress_inference(
     profile: ProfileConfig,
     write_entries: List[Dict[str, Any]],
+    erase_entries: List[Dict[str, Any]],
     erase_map: List[Tuple[int, int]],
     slot_ranges: List[Tuple[int, int]],
     boundary_points: List[int],
@@ -180,10 +206,10 @@ def summarize_swap_progress_inference(
     source: str,
 ) -> Dict[str, Any]:
     """Describe geometry inferred for swap-progress planning."""
-    if not write_entries:
+    if not write_entries and not erase_entries:
         return {
             "status": "unavailable",
-            "reason": "no write trace available",
+            "reason": "no calibration trace available",
         }
 
     page_size = max(1, int(getattr(profile.memory, "page_size", 4096) or 4096))
@@ -197,18 +223,23 @@ def summarize_swap_progress_inference(
         return None
 
     for slot_start, slot_end in slot_ranges:
-        entries_in_slot = [
+        write_offsets_in_slot = [
             int(entry.get("flash_offset", 0))
             for entry in write_entries
             if slot_start <= int(entry.get("flash_offset", 0)) < slot_end
         ]
-        if not entries_in_slot:
+        erase_offsets_in_slot = [
+            int(entry.get("flash_offset", 0))
+            for entry in erase_entries
+            if slot_start <= int(entry.get("flash_offset", 0)) < slot_end
+        ]
+        if not write_offsets_in_slot and not erase_offsets_in_slot:
             continue
 
         sector_starts: List[int] = []
         inferred_sizes: List[int] = []
         if source == "erase_trace":
-            for offset in entries_in_slot:
+            for offset in erase_offsets_in_slot or write_offsets_in_slot:
                 sector = sector_for(offset)
                 if sector is None:
                     continue
@@ -217,7 +248,7 @@ def summarize_swap_progress_inference(
                     sector_starts.append(start)
                     inferred_sizes.append(end - start)
         else:
-            aligned = sorted({(offset // page_size) * page_size for offset in entries_in_slot})
+            aligned = sorted({(offset // page_size) * page_size for offset in write_offsets_in_slot})
             sector_starts = aligned
             inferred_sizes = [page_size] * len(aligned)
 
@@ -500,6 +531,7 @@ def build_fault_plan(
         swap_progress_count = 0
         if include_swap_progress:
             swap_entries = load_clean_write_trace(trace_file)
+            erase_entries = load_clean_erase_trace(erase_trace_file)
             if swap_entries:
                 flash_base = min(int(slot.base) for slot in profile.memory.slots.values())
                 slot_ranges = sorted(
@@ -509,7 +541,6 @@ def build_fault_plan(
                     )
                     for slot in profile.memory.slots.values()
                 )
-                erase_entries = load_clean_erase_trace(erase_trace_file)
                 erase_map = _build_swap_progress_erase_map(profile, erase_entries)
                 summary_source = "erase_trace" if erase_entries else "write_pattern"
                 swap_fps = find_swap_progress_boundaries(swap_entries, erase_map, slot_ranges)
@@ -522,6 +553,7 @@ def build_fault_plan(
                 swap_progress_summary = summarize_swap_progress_inference(
                     profile,
                     swap_entries,
+                    erase_entries,
                     erase_map,
                     slot_ranges,
                     swap_fps,
@@ -534,13 +566,49 @@ def build_fault_plan(
                     for fp in swap_fps
                 ]
                 swap_progress_count = len(swap_fps)
+            elif erase_entries:
+                flash_base = min(int(slot.base) for slot in profile.memory.slots.values())
+                slot_ranges = sorted(
+                    (
+                        int(slot.base) - flash_base,
+                        int(slot.base) - flash_base + int(slot.size),
+                    )
+                    for slot in profile.memory.slots.values()
+                )
+                erase_map = _build_swap_progress_erase_map(profile, erase_entries)
+                swap_fps = find_swap_progress_boundaries_from_erases(
+                    erase_entries,
+                    slot_ranges,
+                )
+                swap_fps = _slice_explicit_points(
+                    swap_fps,
+                    fault_step=fault_step,
+                    fault_start=fault_start,
+                    fault_end=fault_end,
+                )
+                swap_progress_summary = summarize_swap_progress_inference(
+                    profile,
+                    [],
+                    erase_entries,
+                    erase_map,
+                    slot_ranges,
+                    swap_fps,
+                    source="erase_trace",
+                )
+                if quick and not quick_use_heuristic:
+                    swap_fps = quick_subset(swap_fps)
+                combined += [
+                    (fp, FAULT_TYPE_NAME_TO_CODE["swap_progress"])
+                    for fp in swap_fps
+                ]
+                swap_progress_count = len(swap_fps)
             else:
                 swap_progress_summary = {
                     "status": "unavailable",
-                    "reason": "no write trace available",
+                    "reason": "no calibration trace available",
                 }
                 print(
-                    "Skipping swap_progress fault points: no write trace available.",
+                    "Skipping swap_progress fault points: no calibration trace available.",
                     file=sys.stderr,
                 )
 
