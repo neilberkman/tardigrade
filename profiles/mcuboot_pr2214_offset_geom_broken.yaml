@@ -57,3 +57,4 @@ expect:
   control_outcome: no_boot
   allow_control_only_issues: true
   should_find_issues: true
+skip_self_test: true
