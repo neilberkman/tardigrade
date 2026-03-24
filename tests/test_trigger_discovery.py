@@ -202,6 +202,9 @@ class TriggerDiscoveryTests(unittest.TestCase):
         if not HAVE_PYYAML:
             self.skipTest("PyYAML not installed")
         profile = load_profile(ROOT / "profiles" / "mcuboot_head_offset_stm32f4_revert.yaml")
+        preflight = validate_compiled_flash_map(profile, ROOT)
+        if preflight["status"] == "unavailable":
+            self.skipTest(preflight["reason"])
         profile.update_trigger = None
         profile.auto_update_trigger = True
         profile.pre_boot_state = []

@@ -75,6 +75,20 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
                 expect = raw.get("expect", {}) or {}
                 self.assertFalse(expect.get("should_find_issues", False), relpath)
 
+    def test_generic_stm32f4_offset_profile_stays_discovery_driven(self):
+        raw = yaml.safe_load(
+            (
+                ROOT / "profiles" / "mcuboot_head_offset_stm32f4_upgrade.yaml"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(raw.get("update_trigger"), "auto")
+        self.assertNotIn("pre_boot_state", raw)
+        self.assertEqual(
+            raw.get("fault_sweep", {}).get("fault_types"),
+            ["power_loss", "swap_progress"],
+        )
+        self.assertNotIn("page_size", raw.get("memory", {}))
+
     def test_run_audit_forwards_extra_args(self):
         repo_root = ROOT
         profile_path = ROOT / "profiles" / "fault_no_crc.yaml"
