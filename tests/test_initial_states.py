@@ -674,6 +674,44 @@ class ScenarioExpansionTest(unittest.TestCase):
             self.assertEqual(len(r2.pre_boot_state), 1)
             self.assertEqual(r2.pre_boot_state[0].address, 0x10070000)
 
+    def test_initial_state_expect_overrides_preserve_ignored_fault_types(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: matrix_test
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                  ignored_issue_fault_types: [power_loss]
+                initial_states:
+                  - name: child
+                    expect:
+                      control_outcome: success
+                """,
+            )
+            profile = load_profile(profile_path)
+            resolved = profile.resolve_initial_state(profile.initial_states[0])
+            self.assertEqual(
+                resolved.expect.ignored_issue_fault_types,
+                ["power_loss"],
+            )
+
     def test_robot_vars_differ_per_resolved_state(self) -> None:
         """Each resolved profile should produce different robot vars."""
         with tempfile.TemporaryDirectory() as td:

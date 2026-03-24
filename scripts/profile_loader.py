@@ -1507,6 +1507,10 @@ class ProfileConfig:
                 allow_semantic_only_issues=eo.get("allow_semantic_only_issues", self.expect.allow_semantic_only_issues),
                 allow_control_only_issues=eo.get("allow_control_only_issues", self.expect.allow_control_only_issues),
                 required_issue_reasons=eo.get("required_issue_reasons", self.expect.required_issue_reasons),
+                ignored_issue_fault_types=eo.get(
+                    "ignored_issue_fault_types",
+                    self.expect.ignored_issue_fault_types,
+                ),
             )
         resolved = ProfileConfig(
             schema_version=self.schema_version, name="{}/{}".format(self.name, state.name),
@@ -4939,7 +4943,9 @@ def main() -> int:
         "expect_should_find_issues": profile.expect.should_find_issues,
         "expect_control_outcome": profile.expect.control_outcome,
         "expect_allow_semantic_only_issues": profile.expect.allow_semantic_only_issues,
+        "expect_allow_control_only_issues": profile.expect.allow_control_only_issues,
         "expect_required_issue_reasons": profile.expect.required_issue_reasons,
+        "expect_ignored_issue_fault_types": profile.expect.ignored_issue_fault_types,
         "image_hash": profile.success_criteria.image_hash,
         "image_hash_slot": profile.success_criteria.image_hash_slot,
         "otadata_expect": profile.success_criteria.otadata_expect,
