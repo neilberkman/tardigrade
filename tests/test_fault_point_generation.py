@@ -239,6 +239,10 @@ class SwapProgressFaultPointGenerationTest(unittest.TestCase):
             )
             self.assertEqual(plan.fault_points, [2, 4])
             self.assertEqual(plan.fault_types_list, ["w:sp", "w:sp"])
+            self.assertIsNotNone(plan.swap_progress_summary)
+            self.assertEqual(plan.swap_progress_summary["status"], "inferred")
+            self.assertEqual(plan.swap_progress_summary["source"], "erase_trace")
+            self.assertEqual(plan.swap_progress_summary["inferred_sector_sizes"], ["0x1000"])
 
     def test_swap_progress_fault_points_inferred_without_erase_trace(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -279,6 +283,10 @@ class SwapProgressFaultPointGenerationTest(unittest.TestCase):
             )
             self.assertEqual(plan.fault_points, [2, 4])
             self.assertEqual(plan.fault_types_list, ["w:sp", "w:sp"])
+            self.assertIsNotNone(plan.swap_progress_summary)
+            self.assertEqual(plan.swap_progress_summary["status"], "inferred")
+            self.assertEqual(plan.swap_progress_summary["source"], "write_pattern")
+            self.assertEqual(plan.swap_progress_summary["inferred_sector_sizes"], ["0x1000"])
 
 
 # ===========================================================================

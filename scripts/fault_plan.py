@@ -30,6 +30,7 @@ class FaultPlan:
     fault_points: List[int]
     fault_types_list: Optional[List[str]]
     heuristic_summary: Optional[Dict[str, Any]]
+    swap_progress_summary: Optional[Dict[str, Any]] = None
     clustered_bit_count: int = 0
 
 
@@ -167,6 +168,92 @@ def find_swap_progress_boundaries(
     if boundaries:
         return boundaries
     return _infer_boundaries_from_write_pattern()
+
+
+def summarize_swap_progress_inference(
+    profile: ProfileConfig,
+    write_entries: List[Dict[str, Any]],
+    erase_map: List[Tuple[int, int]],
+    slot_ranges: List[Tuple[int, int]],
+    boundary_points: List[int],
+    *,
+    source: str,
+) -> Dict[str, Any]:
+    """Describe geometry inferred for swap-progress planning."""
+    if not write_entries:
+        return {
+            "status": "unavailable",
+            "reason": "no write trace available",
+        }
+
+    page_size = max(1, int(getattr(profile.memory, "page_size", 4096) or 4096))
+    slot_summaries: List[Dict[str, Any]] = []
+    sector_sizes_seen: List[int] = []
+
+    def sector_for(flash_offset: int) -> Optional[Tuple[int, int]]:
+        for start, end in erase_map:
+            if start <= flash_offset < end:
+                return (start, end)
+        return None
+
+    for slot_start, slot_end in slot_ranges:
+        entries_in_slot = [
+            int(entry.get("flash_offset", 0))
+            for entry in write_entries
+            if slot_start <= int(entry.get("flash_offset", 0)) < slot_end
+        ]
+        if not entries_in_slot:
+            continue
+
+        sector_starts: List[int] = []
+        inferred_sizes: List[int] = []
+        if source == "erase_trace":
+            for offset in entries_in_slot:
+                sector = sector_for(offset)
+                if sector is None:
+                    continue
+                start, end = sector
+                if not sector_starts or sector_starts[-1] != start:
+                    sector_starts.append(start)
+                    inferred_sizes.append(end - start)
+        else:
+            aligned = sorted({(offset // page_size) * page_size for offset in entries_in_slot})
+            sector_starts = aligned
+            inferred_sizes = [page_size] * len(aligned)
+
+        if not sector_starts:
+            continue
+
+        sector_sizes_seen.extend(inferred_sizes)
+        slot_summaries.append(
+            {
+                "slot_offset": "0x{:X}".format(slot_start),
+                "slot_size": "0x{:X}".format(slot_end - slot_start),
+                "touched_sectors": len(sector_starts),
+                "first_sector": "0x{:X}".format(sector_starts[0]),
+                "last_sector": "0x{:X}".format(sector_starts[-1]),
+                "inferred_sector_sizes": [
+                    "0x{:X}".format(size) for size in sorted(set(inferred_sizes))
+                ],
+            }
+        )
+
+    if not slot_summaries:
+        return {
+            "status": "unavailable",
+            "reason": "write trace did not touch configured slots",
+        }
+
+    return {
+        "status": "inferred",
+        "source": source,
+        "boundary_count": len(boundary_points),
+        "boundary_points": list(boundary_points[:32]),
+        "inferred_sector_sizes": [
+            "0x{:X}".format(size) for size in sorted(set(sector_sizes_seen))
+        ],
+        "slots": slot_summaries,
+    }
 
 
 def _derive_read_fault_points(
@@ -404,6 +491,7 @@ def build_fault_plan(
         or profile.fault_sweep.confirm_cycle.enabled
     )
     clustered_bit_count = 0
+    swap_progress_summary: Optional[Dict[str, Any]] = None
     if has_mixed_types:
         write_fps: List[Tuple[int, str]] = []
         if include_power_loss:
@@ -423,12 +511,21 @@ def build_fault_plan(
                 )
                 erase_entries = load_clean_erase_trace(erase_trace_file)
                 erase_map = _build_swap_progress_erase_map(profile, erase_entries)
+                summary_source = "erase_trace" if erase_entries else "write_pattern"
                 swap_fps = find_swap_progress_boundaries(swap_entries, erase_map, slot_ranges)
                 swap_fps = _slice_explicit_points(
                     swap_fps,
                     fault_step=fault_step,
                     fault_start=fault_start,
                     fault_end=fault_end,
+                )
+                swap_progress_summary = summarize_swap_progress_inference(
+                    profile,
+                    swap_entries,
+                    erase_map,
+                    slot_ranges,
+                    swap_fps,
+                    source=summary_source,
                 )
                 if quick and not quick_use_heuristic:
                     swap_fps = quick_subset(swap_fps)
@@ -438,6 +535,10 @@ def build_fault_plan(
                 ]
                 swap_progress_count = len(swap_fps)
             else:
+                swap_progress_summary = {
+                    "status": "unavailable",
+                    "reason": "no write trace available",
+                }
                 print(
                     "Skipping swap_progress fault points: no write trace available.",
                     file=sys.stderr,
@@ -909,5 +1010,6 @@ def build_fault_plan(
         fault_points=fault_points,
         fault_types_list=fault_types_list,
         heuristic_summary=heuristic_summary,
+        swap_progress_summary=swap_progress_summary,
         clustered_bit_count=clustered_bit_count,
     )

@@ -1198,6 +1198,7 @@ def main() -> int:
         fault_points = plan.fault_points
         fault_types_list = plan.fault_types_list
         heuristic_summary = plan.heuristic_summary
+        swap_progress_summary = plan.swap_progress_summary
         clustered_bit_count = plan.clustered_bit_count
         multi_fault_plan: Optional[MultiFaultPlan] = None
 
@@ -1482,6 +1483,8 @@ def main() -> int:
             }
         if geometry_preflight is not None:
             payload["summary"]["geometry_preflight"] = geometry_preflight
+        if swap_progress_summary is not None:
+            payload["summary"]["swap_progress_inference"] = swap_progress_summary
         payload["contracts"] = {
             "state_probe": (
                 {
