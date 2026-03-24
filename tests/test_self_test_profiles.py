@@ -17,7 +17,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from self_test import discover_profiles, run_audit, write_summary
+from self_test import build_detailed_result, discover_profiles, run_audit, write_summary
 
 
 class SelfTestProfileDiscoveryTests(unittest.TestCase):
@@ -223,6 +223,23 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
             self.assertEqual(payload["failed"], 1)
         finally:
             output_path.unlink(missing_ok=True)
+
+    def test_build_detailed_result_keeps_raw_audit_verdict_separate(self):
+        result = build_detailed_result(
+            profile="mcuboot_head_move_nrf52_revert_phase2fault_selftest",
+            passed=True,
+            reason="No issues found, as expected",
+            exit_code=1,
+            report={
+                "verdict": "FAIL — found 1042 issue points",
+                "summary": {"runtime_sweep": {"bricks": 1042, "brick_rate": 0.97}},
+            },
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["audit_verdict"], "FAIL — found 1042 issue points")
+        self.assertEqual(result["bricks"], 1042)
+        self.assertEqual(result["brick_rate"], 0.97)
 
 
 if __name__ == "__main__":

@@ -72,6 +72,32 @@ def write_summary(output_path: Optional[str], total: int, detailed_results: List
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def build_detailed_result(
+    profile: str,
+    passed: bool,
+    reason: str,
+    exit_code: Optional[int],
+    report: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build a normalized self-test result entry.
+
+    `verdict` reflects the self-test outcome, while `audit_verdict` preserves the
+    raw audit report verdict for debugging.
+    """
+    report = report or {}
+    sweep = report.get("summary", {}).get("runtime_sweep", {})
+    return {
+        "profile": profile,
+        "passed": passed,
+        "reason": reason,
+        "exit_code": exit_code,
+        "verdict": "PASS" if passed else "FAIL",
+        "audit_verdict": report.get("verdict"),
+        "bricks": sweep.get("bricks"),
+        "brick_rate": sweep.get("brick_rate"),
+    }
+
+
 def run_audit(
     repo_root: Path,
     profile_path: Path,
@@ -286,15 +312,12 @@ def main() -> int:
             except Exception as exc:
                 print("  SKIP: failed to load profile: {}".format(exc))
                 results.append((name, False, "profile load error: {}".format(exc)))
-                detailed_results.append({
-                    "profile": name,
-                    "passed": False,
-                    "reason": "profile load error: {}".format(exc),
-                    "exit_code": None,
-                    "verdict": None,
-                    "bricks": None,
-                    "brick_rate": None,
-                })
+                detailed_results.append(build_detailed_result(
+                    profile=name,
+                    passed=False,
+                    reason="profile load error: {}".format(exc),
+                    exit_code=None,
+                ))
                 write_summary(args.output, len(profiles), detailed_results)
                 continue
 
@@ -318,15 +341,12 @@ def main() -> int:
             except Exception as exc:
                 print("  FAIL: audit crashed: {}".format(exc))
                 results.append((name, False, "audit crash: {}".format(exc)))
-                detailed_results.append({
-                    "profile": name,
-                    "passed": False,
-                    "reason": "audit crash: {}".format(exc),
-                    "exit_code": None,
-                    "verdict": None,
-                    "bricks": None,
-                    "brick_rate": None,
-                })
+                detailed_results.append(build_detailed_result(
+                    profile=name,
+                    passed=False,
+                    reason="audit crash: {}".format(exc),
+                    exit_code=None,
+                ))
                 write_summary(args.output, len(profiles), detailed_results)
                 continue
 
@@ -336,15 +356,12 @@ def main() -> int:
                     for line in audit_stderr.strip().splitlines()[-80:]:
                         print("    stderr: {}".format(line))
                 results.append((name, False, "no report (exit={})".format(exit_code)))
-                detailed_results.append({
-                    "profile": name,
-                    "passed": False,
-                    "reason": "no report (exit={})".format(exit_code),
-                    "exit_code": exit_code,
-                    "verdict": None,
-                    "bricks": None,
-                    "brick_rate": None,
-                })
+                detailed_results.append(build_detailed_result(
+                    profile=name,
+                    passed=False,
+                    reason="no report (exit={})".format(exit_code),
+                    exit_code=exit_code,
+                ))
                 write_summary(args.output, len(profiles), detailed_results)
                 continue
 
@@ -352,16 +369,13 @@ def main() -> int:
             status = "PASS" if passed else "FAIL"
             print("  {}: {}".format(status, reason))
             results.append((name, passed, reason))
-            sweep = report.get("summary", {}).get("runtime_sweep", {})
-            detailed_results.append({
-                "profile": name,
-                "passed": passed,
-                "reason": reason,
-                "exit_code": exit_code,
-                "verdict": report.get("verdict"),
-                "bricks": sweep.get("bricks"),
-                "brick_rate": sweep.get("brick_rate"),
-            })
+            detailed_results.append(build_detailed_result(
+                profile=name,
+                passed=passed,
+                reason=reason,
+                exit_code=exit_code,
+                report=report,
+            ))
             write_summary(args.output, len(profiles), detailed_results)
 
         try:
