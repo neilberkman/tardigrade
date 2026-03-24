@@ -434,6 +434,10 @@ def run_single_point(
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
     point_fault_at = -1 if is_control else fault_at
+    trace_file = point_dir / "trace.csv" if calibration else None
+    erase_trace_file = point_dir / "erase_trace.csv" if calibration else None
+    trace_file_bin = point_dir / "trace.bin" if calibration else None
+    erase_trace_file_bin = point_dir / "erase_trace.bin" if calibration else None
 
     # Calibration can take much longer than 2 minutes for large swap operations
     # (e.g. MCUboot HEAD 448KB swap-move). Give it 15 minutes.
@@ -454,6 +458,10 @@ def run_single_point(
         "--variable", "FAULT_AT:{}".format(point_fault_at),
         "--variable", "RESULT_FILE:{}".format(result_file),
         "--variable", "CALIBRATION_MODE:{}".format("true" if calibration else "false"),
+        "--variable", "TRACE_FILE:{}".format(trace_file or ""),
+        "--variable", "ERASE_TRACE_FILE:{}".format(erase_trace_file or ""),
+        "--variable", "TRACE_FILE_BIN:{}".format(trace_file_bin or ""),
+        "--variable", "ERASE_TRACE_FILE_BIN:{}".format(erase_trace_file_bin or ""),
         "--variable", "TEST_TIMEOUT:{} minutes".format(single_point_timeout_m),
     ]
     if renode_remote_server_dir:
