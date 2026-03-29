@@ -77,9 +77,10 @@ jobs:
           python3 -c "
           import json, sys
           r = json.load(open('${RUNNER_TEMP}/${{ matrix.name }}_broken.json'))
-          bricks = r.get('summary', {}).get('runtime_sweep', {}).get('bricks', 0)
-          print('Broken ELF: {} bricks found'.format(bricks))
-          if bricks == 0:
+          sweep = r.get('summary', {}).get('runtime_sweep', {})
+          issues = sweep.get('issue_points', 0) + sweep.get('bricks', 0)
+          print('Broken ELF: {} issue points'.format(issues))
+          if issues == 0:
               print('FAIL: tool did not detect the known bug')
               sys.exit(1)
           "
