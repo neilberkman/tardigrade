@@ -136,7 +136,7 @@ class SweepHashBypassRuntimeScopeTest(unittest.TestCase):
             ["HASH_BYPASS_SYMBOLS:bootutil_img_validate,bootutil_sha256"],
         )
 
-    def test_no_hash_bypass_disables_fault_batch_injection(self) -> None:
+    def test_no_hash_bypass_disables_fault_batch_and_control_injection(self) -> None:
         profile = SimpleNamespace(
             name="scope_profile",
             fault_sweep=SimpleNamespace(
@@ -146,21 +146,24 @@ class SweepHashBypassRuntimeScopeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
             with mock.patch("sweep._run_batches_chunked", return_value=[]) as mock_batch:
-                run_runtime_sweep(
-                    repo_root=work_dir,
-                    renode_test="renode-test",
-                    robot_suite="tests/ota_fault_point.robot",
-                    profile=profile,
-                    fault_points=[11],
-                    robot_vars=["BASE:1"],
-                    work_dir=work_dir,
-                    renode_remote_server_dir="",
-                    include_control=False,
-                    no_hash_bypass=True,
-                )
+                with mock.patch("sweep.run_single_point", return_value={}) as mock_single:
+                    run_runtime_sweep(
+                        repo_root=work_dir,
+                        renode_test="renode-test",
+                        robot_suite="tests/ota_fault_point.robot",
+                        profile=profile,
+                        fault_points=[11],
+                        robot_vars=["BASE:1"],
+                        work_dir=work_dir,
+                        renode_remote_server_dir="",
+                        include_control=True,
+                        no_hash_bypass=True,
+                    )
 
         batch_robot_vars = mock_batch.call_args.kwargs["robot_vars"]
         self.assertEqual(batch_robot_vars, ["BASE:1"])
+        control_robot_vars = mock_single.call_args.kwargs["robot_vars"]
+        self.assertEqual(control_robot_vars, ["BASE:1"])
 
 
 if __name__ == "__main__":

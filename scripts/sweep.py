@@ -101,12 +101,14 @@ def build_fault_robot_vars(
 def build_control_robot_vars(
     robot_vars: List[str],
     profile: ProfileConfig,
+    *,
+    no_hash_bypass: bool = False,
 ) -> List[str]:
-    """Return the robot vars for clean/control runs with sweep hash-bypass enabled."""
+    """Return the robot vars for clean/control runs."""
     return _with_sweep_hash_bypass(
         robot_vars,
         profile,
-        enabled=True,
+        enabled=not no_hash_bypass,
     )
 
 
@@ -1017,7 +1019,11 @@ def run_runtime_sweep(
 
     fault_types_list: parallel list of per-point fault type codes.
     """
-    control_robot_vars = build_control_robot_vars(robot_vars, profile)
+    control_robot_vars = build_control_robot_vars(
+        robot_vars,
+        profile,
+        no_hash_bypass=no_hash_bypass,
+    )
     fault_robot_vars = build_fault_robot_vars(
         robot_vars,
         profile,

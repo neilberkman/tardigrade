@@ -998,7 +998,8 @@ def main() -> int:
         # Auto-disable when instruction_skip is a fault type — hash bypass
         # patches SHA-256 to return 0, which breaks image validation and
         # makes instruction_skip findings meaningless.
-        if not args.no_hash_bypass:
+        effective_no_hash_bypass = bool(args.no_hash_bypass)
+        if not effective_no_hash_bypass:
             bypass_syms = list(profile.fault_sweep.sweep_hash_bypass_symbols or [])
             if bypass_syms and "instruction_skip" in fault_types:
                 print(
@@ -1007,6 +1008,7 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 bypass_syms = []
+                effective_no_hash_bypass = True
             if bypass_syms:
                 robot_vars.append(
                     "HASH_BYPASS_SYMBOLS:{}".format(",".join(bypass_syms))
@@ -1314,7 +1316,7 @@ def main() -> int:
             erase_trace_file_bin=erase_trace_file_bin if not args.no_trace_replay else None,
             fault_types_list=fault_types_list,
             keep_run_artifacts=args.keep_run_artifacts,
-            no_hash_bypass=args.no_hash_bypass,
+            no_hash_bypass=effective_no_hash_bypass,
             allow_state_evaluator=not args.quick,
         )
 
@@ -1354,7 +1356,7 @@ def main() -> int:
             robot_vars=robot_vars,
             work_dir=work_dir,
             renode_remote_server_dir=args.renode_remote_server_dir,
-            no_hash_bypass=args.no_hash_bypass,
+            no_hash_bypass=effective_no_hash_bypass,
             keep_run_artifacts=args.keep_run_artifacts,
             expected_outcome=getattr(profile.expect, "control_outcome", "success") or "success",
         )
@@ -1383,7 +1385,7 @@ def main() -> int:
             num_workers=args.workers,
             max_batch_points=args.max_batch_points,
             max_writes=max_writes,
-            no_hash_bypass=args.no_hash_bypass,
+            no_hash_bypass=effective_no_hash_bypass,
             explain_only=args.explain_multi_fault_plan,
             keep_run_artifacts=args.keep_run_artifacts,
         )
