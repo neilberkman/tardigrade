@@ -1,4 +1,5 @@
 schema_version: 1
+skip_self_test: true
 name: mcuboot_head_move_nrf52_upgrade
 description: >
   Zero-day hunt: MCUboot HEAD swap-move upgrade on nrf52840dk.

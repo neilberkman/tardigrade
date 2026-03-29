@@ -384,6 +384,14 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertIn("return to_py_bytes(b['data'].Nvm.ReadBytes(rel, max_len, None))", text)
         self.assertIn("data = read_flash_bytes(slot_base, data_size)", text)
 
+    def test_elf_symbol_loader_falls_back_when_shutil_which_is_missing(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("_which = getattr(_shutil, 'which', None)", text)
+        self.assertIn("for _name in ('arm-none-eabi-nm', 'nm'):", text)
+        self.assertIn("if _name not in _nm_candidates:", text)
+        self.assertIn("log('elf_symbols: could not launch {} ({})'.format(_nm_bin, _launch_err))", text)
+        self.assertIn("log('elf_symbols: {} failed (rc={}), trying next symbol resolver'.format(_nm_bin, _nm_rc))", text)
+
 
 if __name__ == "__main__":
     unittest.main()

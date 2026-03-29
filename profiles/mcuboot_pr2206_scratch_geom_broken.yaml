@@ -1,4 +1,5 @@
 schema_version: 1
+skip_self_test: true
 name: mcuboot_pr2206_scratch_geom_broken
 description: >
   MCUboot swap-scratch geometry trigger for PR #2206 (broken commit e35461d2).

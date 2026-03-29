@@ -1124,20 +1124,36 @@ def _load_elf_nm_lines():
     try:
         import subprocess as _sp
         import shutil as _shutil
-        _nm_bin = _shutil.which('arm-none-eabi-nm') or _shutil.which('nm') or 'nm'
-        _nm_proc = _sp.Popen([_nm_bin, _bootloader_elf_path], stdout=_sp.PIPE, stderr=_sp.PIPE)
-        _nm_stdout, _ = _nm_proc.communicate()
-        _nm_proc.wait()
-        if hasattr(_nm_stdout, 'decode'):
-            _nm_stdout = _nm_stdout.decode('utf-8', errors='replace')
-        _nm_rc = _nm_proc.returncode
-        if _nm_rc is None:
-            _nm_rc = 0 if _nm_stdout else 1
-        if _nm_rc == 0:
-            _nm_lines = _nm_stdout.splitlines()
-            log('elf_symbols: parsed {} symbols from ELF via nm'.format(len(_nm_lines)))
-        else:
-            log('elf_symbols: nm failed (rc={}), falling back to single-match symbol lookup'.format(_nm_rc))
+        _which = getattr(_shutil, 'which', None)
+        _nm_candidates = []
+        for _name in ('arm-none-eabi-nm', 'nm'):
+            if _which is not None:
+                try:
+                    _resolved = _which(_name)
+                except Exception:
+                    _resolved = None
+                if _resolved and _resolved not in _nm_candidates:
+                    _nm_candidates.append(_resolved)
+            if _name not in _nm_candidates:
+                _nm_candidates.append(_name)
+        for _nm_bin in _nm_candidates:
+            try:
+                _nm_proc = _sp.Popen([_nm_bin, _bootloader_elf_path], stdout=_sp.PIPE, stderr=_sp.PIPE)
+            except Exception as _launch_err:
+                log('elf_symbols: could not launch {} ({})'.format(_nm_bin, _launch_err))
+                continue
+            _nm_stdout, _ = _nm_proc.communicate()
+            _nm_proc.wait()
+            if hasattr(_nm_stdout, 'decode'):
+                _nm_stdout = _nm_stdout.decode('utf-8', errors='replace')
+            _nm_rc = _nm_proc.returncode
+            if _nm_rc is None:
+                _nm_rc = 0 if _nm_stdout else 1
+            if _nm_rc == 0:
+                _nm_lines = _nm_stdout.splitlines()
+                log('elf_symbols: parsed {} symbols from ELF via {}'.format(len(_nm_lines), _nm_bin))
+                break
+            log('elf_symbols: {} failed (rc={}), trying next symbol resolver'.format(_nm_bin, _nm_rc))
     except Exception as _e:
         log('elf_symbols: nm not available ({}), falling back to single-match symbol lookup'.format(_e))
     return _nm_lines

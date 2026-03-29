@@ -99,6 +99,53 @@ build_shared_nrf52_test_app() {
     echo "${app_bin}"
 }
 
+build_shared_stm32f4_pr2206_test_app() {
+    local toolchain_path gdb_bin
+    toolchain_path="$(detect_toolchain_path)"
+    gdb_bin="${toolchain_path}/bin/arm-none-eabi-gdb"
+
+    require_file "${WEST}"
+    require_file "${PYTHON_BIN}"
+    require_file "${gdb_bin}"
+
+    mkdir -p "${BUILD_ROOT}" "${GENERATED_DIR}"
+    write_stm32f4_pr2206_overlay
+
+    local app_build="${BUILD_ROOT}/hello_scratch_stm32f4_pr2206"
+    local mcuboot_overlay="${GENERATED_DIR}/stm32f4_pr2206_scratch.dts"
+    local app_overlay="${GENERATED_DIR}/app_scratch_stm32f4_pr2206.dts"
+    local app_bin="${app_build}/zephyr/zephyr.bin"
+    if [[ -f "${app_bin}" ]]; then
+        echo "${app_bin}"
+        return
+    fi
+
+    sed 's/zephyr,code-partition = &boot_partition/zephyr,code-partition = \&slot0_partition/' \
+        "${mcuboot_overlay}" > "${app_overlay}"
+
+    msg "Building shared Zephyr hello_world app for STM32F4 PR2206 scratch assets"
+    (
+        cd "${ZEPHYR_WS}"
+        ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb \
+        GNUARMEMB_TOOLCHAIN_PATH="${toolchain_path}" \
+        "${WEST}" build \
+            -d "${app_build}" \
+            -p always \
+            -b nucleo_f429zi \
+            "${ZEPHYR_WS}/zephyr/samples/hello_world" \
+            -- \
+            -DDTC_OVERLAY_FILE="${app_overlay}" \
+            -DCONFIG_BOOTLOADER_MCUBOOT=y \
+            -DCONFIG_MINIMAL_LIBC=y \
+            -DCONFIG_PICOLIBC=n \
+            "-DCMAKE_GDB:FILEPATH=${gdb_bin}" \
+            "-DPython3_EXECUTABLE:FILEPATH=${PYTHON_BIN}"
+    ) >&2
+
+    require_file "${app_bin}"
+    echo "${app_bin}"
+}
+
 detect_toolchain_path() {
     if [[ -n "${GNUARMEMB_TOOLCHAIN_PATH:-}" ]]; then
         echo "${GNUARMEMB_TOOLCHAIN_PATH}"
@@ -418,14 +465,28 @@ sign_pr_differential_image() {
     local slot_size="$2"
     local version="$3"
     local out_path="$4"
+    local payload_size="${5:-}"
+    local align="${6:-8}"
+
+    local sign_input="${app_bin}"
+    if [[ -n "${payload_size}" ]]; then
+        local tmp="${BUILD_ROOT}/$(basename "${out_path}" .bin)_payload.bin"
+        dd if="${app_bin}" of="${tmp}" bs=1 count="${payload_size}" 2>/dev/null
+        local actual
+        actual=$(wc -c < "${tmp}" | tr -d ' ')
+        if (( actual < payload_size )); then
+            dd if=/dev/zero bs=1 count=$((payload_size - actual)) >> "${tmp}" 2>/dev/null
+        fi
+        sign_input="${tmp}"
+    fi
 
     "${PYTHON_BIN}" "${IMGTOOL_PY}" sign \
         --key "${IMGTOOL_KEY}" \
-        --align 8 \
+        --align "${align}" \
         --header-size 0x200 \
         --slot-size "${slot_size}" \
         --version "${version}" \
-        "${app_bin}" "${out_path}"
+        "${sign_input}" "${out_path}"
 }
 
 sign_pr_differential_geom_image() {
@@ -463,6 +524,7 @@ PY
 
 build_pr_differential_images() {
     local toolchain_path strip_bin gdb_bin
+    local app_bin stm32f4_pr2206_app_bin
     toolchain_path="$(detect_toolchain_path)"
     strip_bin="${toolchain_path}/bin/arm-none-eabi-strip"
     gdb_bin="${toolchain_path}/bin/arm-none-eabi-gdb"
@@ -478,8 +540,8 @@ build_pr_differential_images() {
     write_nrf52_default_overlays
     write_nrf52_pr_differential_overlays
 
-    local app_bin
     app_bin="$(build_shared_nrf52_test_app)"
+    stm32f4_pr2206_app_bin="$(build_shared_stm32f4_pr2206_test_app)"
 
     msg "Signing base PR differential slot images"
     sign_pr_differential_image \
@@ -488,6 +550,12 @@ build_pr_differential_images() {
     sign_pr_differential_image \
         "${app_bin}" "0x6e000" "1.0.1+0" \
         "${ASSETS_DIR}/zephyr_slot1_padded.bin"
+    sign_pr_differential_image \
+        "${stm32f4_pr2206_app_bin}" "0x18000" "1.0.0+0" \
+        "${ASSETS_DIR}/zephyr_head_scratch_stm32f4_pr2206_slot0.bin" "" "32"
+    sign_pr_differential_image \
+        "${stm32f4_pr2206_app_bin}" "0x18000" "1.1.0+0" \
+        "${ASSETS_DIR}/zephyr_head_scratch_stm32f4_pr2206_slot1.bin" "36864" "32"
 
     msg "Generating geometry/max payload variants (CONFIG_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN})"
     PR_DIFF_BASE_IMAGE="${ASSETS_DIR}/zephyr_slot1_padded.bin" \

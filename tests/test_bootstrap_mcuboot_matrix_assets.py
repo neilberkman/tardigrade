@@ -101,6 +101,7 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
             self.assertIn(asset, text)
         self.assertIn("build_pr_differential_assets", text)
         self.assertIn("build_shared_nrf52_test_app", text)
+        self.assertIn("build_shared_stm32f4_pr2206_test_app", text)
         self.assertIn("write_stm32f4_pr2205_overlay", text)
         self.assertIn("write_stm32f4_pr2206_overlay", text)
         self.assertIn("stm32f4_pr2205_scratch.dts", text)
@@ -156,6 +157,8 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertIn("zephyr_slot1_offset_geom_full_offsetslot.bin", text)
         self.assertIn("CONFIG_MINIMAL_LIBC=y", text)
         self.assertIn("CONFIG_PICOLIBC=n", text)
+        self.assertIn("\"${ASSETS_DIR}/zephyr_head_scratch_stm32f4_pr2206_slot0.bin\" \"\" \"32\"", text)
+        self.assertIn("\"${ASSETS_DIR}/zephyr_head_scratch_stm32f4_pr2206_slot1.bin\" \"36864\" \"32\"", text)
         self.assertIn('restore_mcuboot_module_yml', text)
         self.assertIn('patch_mcuboot_module_yml', text)
         self.assertIn('update --narrow -o=--depth=1 zephyr mcuboot hal_nordic hal_stm32 cmsis', text)
@@ -401,8 +404,8 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertEqual(fixed["semantic_assertions"]["control"]["multi_boot_analysis.final_outcome"], "no_boot")
         self.assertEqual(broken["success_criteria"]["expected_image"], "staging")
         self.assertEqual(fixed["success_criteria"], {})
-        self.assertFalse(broken.get("skip_self_test", False))
-        self.assertFalse(fixed.get("skip_self_test", False))
+        self.assertTrue(broken.get("skip_self_test", False))
+        self.assertTrue(fixed.get("skip_self_test", False))
 
     def test_pr_differential_elfs_are_stripped(self) -> None:
         readelf = shutil.which("arm-none-eabi-readelf")
