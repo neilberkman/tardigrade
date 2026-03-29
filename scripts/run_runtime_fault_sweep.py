@@ -5621,7 +5621,7 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
     # unmapped addresses → Renode emits a WARNING per access → gigabytes
     # of useless log.  These are expected DoS outcomes, not diagnostic data.
     try:
-        monitor.Parse('logLevel 4 sysbus')
+        monitor.Parse('logLevel 3 sysbus')
     except Exception:
         pass
 
