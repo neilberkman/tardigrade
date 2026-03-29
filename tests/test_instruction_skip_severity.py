@@ -19,6 +19,7 @@ from audit_report import compute_verdict, summarize_runtime_sweep
 from fault_classification import (
     classify_failure_class,
     classify_instruction_skip_severity,
+    is_instruction_skip_nonsecurity_wrong_image,
     result_has_issues,
     result_is_brick,
 )
@@ -119,6 +120,91 @@ class SeverityClassificationTests(unittest.TestCase):
             "boot_slot": "staging",
             "fault_injected": True,
         }
+        severity = classify_instruction_skip_severity(result, expected_outcome="success")
+        self.assertEqual(severity["severity"], "security_bypass")
+        self.assertTrue(result_has_issues(result, "success"))
+
+    def test_known_good_exec_hash_is_not_security_bypass(self) -> None:
+        result = {
+            "fault_type": "i:0x0056:nop",
+            "fault_injected": True,
+            "boot_outcome": "wrong_image",
+            "boot_slot": "exec",
+            "signals": {
+                "execution_observed": True,
+                "marker_ok": False,
+                "image_hash_match": "exec_image",
+                "image_hash_slot": "exec",
+                "otadata_expect_ok": True,
+                "pc_ok": True,
+                "reset_vector_offset_ok": True,
+                "vtor_ok": True,
+            },
+        }
+        self.assertTrue(is_instruction_skip_nonsecurity_wrong_image(result))
+        self.assertIsNone(
+            classify_instruction_skip_severity(result, expected_outcome="success")
+        )
+        self.assertFalse(result_has_issues(result, "success"))
+
+    def test_vtor_handoff_skip_is_not_security_bypass_in_security_model(self) -> None:
+        result = {
+            "fault_type": "i:0x00ce:nop",
+            "fault_injected": True,
+            "boot_outcome": "wrong_image",
+            "boot_slot": "staging",
+            "signals": {
+                "execution_observed": True,
+                "marker_ok": True,
+                "otadata_expect_ok": True,
+                "pc_ok": True,
+                "reset_vector_offset_ok": True,
+                "vtor_ok": False,
+            },
+        }
+        self.assertTrue(is_instruction_skip_nonsecurity_wrong_image(result))
+        self.assertIsNone(
+            classify_instruction_skip_severity(result, expected_outcome="success")
+        )
+        self.assertFalse(result_has_issues(result, "success"))
+
+    def test_nonsecurity_wrong_image_still_counts_in_availability_model(self) -> None:
+        result = {
+            "fault_type": "i:0x00ce:nop",
+            "fault_injected": True,
+            "boot_outcome": "wrong_image",
+            "boot_slot": "staging",
+            "instruction_skip_severity_model": "availability",
+            "signals": {
+                "execution_observed": True,
+                "marker_ok": True,
+                "otadata_expect_ok": True,
+                "pc_ok": True,
+                "reset_vector_offset_ok": True,
+                "vtor_ok": False,
+            },
+        }
+        self.assertTrue(is_instruction_skip_nonsecurity_wrong_image(result))
+        self.assertTrue(result_has_issues(result, "success"))
+
+    def test_anti_rollback_failure_is_not_suppressed(self) -> None:
+        result = {
+            "fault_type": "i:0x1234:nop",
+            "fault_injected": True,
+            "boot_outcome": "wrong_image",
+            "boot_slot": "exec",
+            "signals": {
+                "anti_rollback_ok": False,
+                "execution_observed": True,
+                "image_hash_match": "exec_image",
+                "marker_ok": False,
+                "otadata_expect_ok": True,
+                "pc_ok": True,
+                "reset_vector_offset_ok": True,
+                "vtor_ok": True,
+            },
+        }
+        self.assertFalse(is_instruction_skip_nonsecurity_wrong_image(result))
         severity = classify_instruction_skip_severity(result, expected_outcome="success")
         self.assertEqual(severity["severity"], "security_bypass")
         self.assertTrue(result_has_issues(result, "success"))

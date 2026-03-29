@@ -31,6 +31,9 @@ _INSTRUCTION_SKIP_DOS_OUTCOMES = frozenset(
 _INSTRUCTION_SKIP_SECURITY_OUTCOMES = frozenset(
     {"wrong_image", "rollback_accepted", "toctou_corruption"}
 )
+_KNOWN_GOOD_IMAGE_HASH_MATCHES = frozenset(
+    {"exec_image", "staging_image", "expected_image"}
+)
 
 
 def _base_fault_type_code(result: Dict[str, Any]) -> str:
@@ -43,6 +46,47 @@ def _base_fault_type_code(result: Dict[str, Any]) -> str:
 def instruction_skip_severity_model(result: Dict[str, Any], default: str = "security") -> str:
     raw = str(result.get("instruction_skip_severity_model") or default or "security").strip().lower()
     return raw if raw in {"security", "availability"} else "security"
+
+
+def is_instruction_skip_nonsecurity_wrong_image(result: Dict[str, Any]) -> bool:
+    """Return True for instruction-skip wrong-image results that are not bypasses.
+
+    Two patterns are treated as non-security:
+    - the boot reached a known-good image hash, but not the post-update image
+      that the profile expected in exec; this is a rollback/update-block event,
+      not unvalidated code execution
+    - the app PC landed in a valid slot and all content checks passed, but the
+      VTOR handoff instruction itself was skipped; that is a handoff anomaly,
+      not a validation bypass
+    """
+
+    if _base_fault_type_code(result) != "i":
+        return False
+    eff_outcome, _ = _effective_boot_result(result)
+    if str(eff_outcome or "unknown").strip().lower() != "wrong_image":
+        return False
+
+    signals = result.get("signals")
+    if not isinstance(signals, dict):
+        return False
+    if signals.get("anti_rollback_ok") is False:
+        return False
+
+    hash_match = str(signals.get("image_hash_match", "") or "").strip().lower()
+    if hash_match in _KNOWN_GOOD_IMAGE_HASH_MATCHES:
+        return True
+
+    if (
+        signals.get("execution_observed") is True
+        and signals.get("pc_ok") is True
+        and signals.get("marker_ok") is True
+        and signals.get("otadata_expect_ok") is not False
+        and signals.get("reset_vector_offset_ok") is not False
+        and signals.get("vtor_ok") is False
+    ):
+        return True
+
+    return False
 
 
 def classify_instruction_skip_severity(
@@ -59,6 +103,8 @@ def classify_instruction_skip_severity(
     ).strip().lower()
     expected = str(expected_outcome or "success").strip().lower()
 
+    if is_instruction_skip_nonsecurity_wrong_image(result):
+        return None
     if effective in _INSTRUCTION_SKIP_SECURITY_OUTCOMES or raw_outcome in _INSTRUCTION_SKIP_SECURITY_OUTCOMES:
         return {
             "severity": "security_bypass",
@@ -197,8 +243,11 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
     if result_is_invalidated_finding(result):
         return reasons
     iskip = classify_instruction_skip_severity(result, expected_outcome=expected_outcome)
+    model = instruction_skip_severity_model(result)
+    safe_instruction_skip_divergence = (
+        model == "security" and is_instruction_skip_nonsecurity_wrong_image(result)
+    )
     if iskip is not None:
-        model = instruction_skip_severity_model(result)
         if model == "security" and iskip["severity"] in {"dos_crash", "dos_recovery"}:
             return reasons
     eff_outcome, _ = _effective_boot_result(result)
@@ -217,11 +266,11 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
         # (raw outcome = success) but not into the expected post-update image
         # (effective outcome = wrong_image).  This is correct behavior, not an
         # issue.
-        if not is_resilient_rollback(result):
+        if not is_resilient_rollback(result) and not safe_instruction_skip_divergence:
             reasons.append("boot_outcome")
     signals = result.get("signals") or {}
     if isinstance(signals, dict):
-        if signals.get("marker_ok") is False:
+        if signals.get("marker_ok") is False and not safe_instruction_skip_divergence:
             reasons.append("content_criteria")
         if signals.get("otadata_expect_ok") is False:
             reasons.append("otadata_expect")
@@ -232,7 +281,7 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
         # If the boot landed in the expected coarse outcome but still failed
         # execution checks, preserve that mismatch explicitly.
         if signals.get("expectations_met") is False:
-            if signals.get("vtor_ok") is False:
+            if signals.get("vtor_ok") is False and not safe_instruction_skip_divergence:
                 reasons.append("vtor_expectation")
             if signals.get("vtor_aligned") is False:
                 reasons.append("vtor_alignment")
