@@ -89,6 +89,49 @@ from profile_loader import HeuristicConfig, PreBootWrite, ProfileConfig, load_pr
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RENODE_TEST = os.environ.get("RENODE_TEST", "renode-test")
 DEFAULT_ROBOT_SUITE = "tests/ota_fault_point.robot"
+
+
+def _resolve_hash_bypass_addresses(
+    elf_path: str,
+    symbols: List[str],
+) -> Dict[str, List[int]]:
+    """Resolve hash bypass symbol names to addresses on the HOST side via nm.
+
+    Returns {symbol_name: [addr, ...]} for each symbol found.
+    IronPython's subprocess support inside Renode is unreliable for nm,
+    so we resolve here and pass addresses directly.
+    """
+    import shutil
+    nm_bin = shutil.which("arm-none-eabi-nm") or shutil.which("nm")
+    if not nm_bin or not elf_path or not symbols:
+        return {}
+    try:
+        result = subprocess.run(
+            [nm_bin, str(elf_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return {}
+    except Exception:
+        return {}
+
+    # Build lookup from nm output
+    nm_entries: Dict[str, List[int]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            try:
+                addr = int(parts[0], 16) & ~1  # clear Thumb bit
+            except ValueError:
+                continue
+            name = parts[2]
+            nm_entries.setdefault(name, []).append(addr)
+
+    resolved: Dict[str, List[int]] = {}
+    for sym in symbols:
+        if sym in nm_entries:
+            resolved[sym] = sorted(nm_entries[sym])
+    return resolved
 EXIT_ASSERTION_FAILURE = 1
 EXIT_INFRA_FAILURE = 2
 
@@ -171,18 +214,38 @@ def _allow_expected_control_only_issues(profile: ProfileConfig) -> bool:
 def _merge_calibration_expected_exec_hash(
     robot_vars: List[str],
     calibration_exec_hash: str,
+    calibration_boot_outcome: Optional[str] = None,
 ) -> Tuple[List[str], bool]:
-    """Use discovered exec hash only when the profile did not declare one."""
+    """Use calibration ground-truth exec hash as the expected hash.
+
+    The calibration runs the bootloader cleanly (no faults) and hashes
+    the exec slot after boot.  This is the empirical ground truth for
+    what a correct operation produces — bootloaders legitimately modify
+    the data region during swap (headers, TLVs, status bytes), so the
+    file-based hash from ``expected_image`` will not match.
+
+    Only override when the calibration control boot actually succeeded
+    (``boot_outcome == 'success'``).  If the calibration boot itself
+    was broken (wrong_image, no_boot), the hash reflects incorrect
+    behavior and must NOT replace the profile's expected hash.
+    """
     if not calibration_exec_hash:
         return robot_vars, False
+    # Only trust the calibration hash when the control boot succeeded.
+    if calibration_boot_outcome and calibration_boot_outcome != "success":
+        return robot_vars, False
+    # Check whether the profile already declared an expected hash.
+    profile_declared = False
     for var in robot_vars:
         key, sep, value = var.partition(":")
         if key == "EXPECTED_EXEC_SHA256" and sep and value:
-            return robot_vars, False
+            profile_declared = True
+            break
+    # Override with calibration ground truth.
     return merge_robot_vars(
         robot_vars,
         ["EXPECTED_EXEC_SHA256:{}".format(calibration_exec_hash)],
-    ), True
+    ), not profile_declared
 
 
 def _requested_zero_fault_points(args: argparse.Namespace) -> bool:
@@ -932,12 +995,34 @@ def main() -> int:
         # Apply hash bypass during calibration too — hash validation doesn't
         # affect write/erase counts but consumes enormous virtual time on
         # large images (MCUboot SHA-256 on 448KB in emulation).
+        # Auto-disable when instruction_skip is a fault type — hash bypass
+        # patches SHA-256 to return 0, which breaks image validation and
+        # makes instruction_skip findings meaningless.
         if not args.no_hash_bypass:
-            bypass_syms = profile.fault_sweep.sweep_hash_bypass_symbols
+            bypass_syms = list(profile.fault_sweep.sweep_hash_bypass_symbols or [])
+            if bypass_syms and "instruction_skip" in fault_types:
+                print(
+                    "WARNING: sweep_hash_bypass_symbols disabled — "
+                    "incompatible with instruction_skip fault type",
+                    file=sys.stderr,
+                )
+                bypass_syms = []
             if bypass_syms:
                 robot_vars.append(
                     "HASH_BYPASS_SYMBOLS:{}".format(",".join(bypass_syms))
                 )
+                # Pre-resolve symbol addresses on the host side so the
+                # Renode-embedded IronPython doesn't need to call nm.
+                elf_path = profile.resolve_path(repo_root, profile.bootloader_elf)
+                pre_resolved = _resolve_hash_bypass_addresses(elf_path, bypass_syms)
+                if pre_resolved:
+                    addr_parts = []
+                    for sym, addrs in pre_resolved.items():
+                        for addr in addrs:
+                            addr_parts.append("{}=0x{:08X}".format(sym, addr))
+                    robot_vars.append(
+                        "HASH_BYPASS_ADDRS:{}".format(",".join(addr_parts))
+                    )
 
         if max_writes == "auto":
             if zero_point_execute_request:
@@ -1032,11 +1117,12 @@ def main() -> int:
                         robot_vars, discovered_hash_used = _merge_calibration_expected_exec_hash(
                             robot_vars,
                             cal.calibration_exec_hash,
+                            cal.calibration_boot_outcome,
                         )
                         message = (
                             "Calibration: exec slot hash = {}..."
                             if discovered_hash_used
-                            else "Calibration: preserving profile EXPECTED_EXEC_SHA256; exec slot hash = {}..."
+                            else "Calibration: overriding profile EXPECTED_EXEC_SHA256 with ground-truth; exec slot hash = {}..."
                         )
                         print(
                             message.format(cal.calibration_exec_hash[:16]),
@@ -1131,11 +1217,12 @@ def main() -> int:
                         robot_vars, discovered_hash_used = _merge_calibration_expected_exec_hash(
                             robot_vars,
                             cal.calibration_exec_hash,
+                            cal.calibration_boot_outcome,
                         )
                         message = (
                             "Calibration: exec slot hash = {}..."
                             if discovered_hash_used
-                            else "Calibration: preserving profile EXPECTED_EXEC_SHA256; exec slot hash = {}..."
+                            else "Calibration: overriding profile EXPECTED_EXEC_SHA256 with ground-truth; exec slot hash = {}..."
                         )
                         print(
                             message.format(cal.calibration_exec_hash[:16]),

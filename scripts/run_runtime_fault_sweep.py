@@ -1123,7 +1123,9 @@ def _load_elf_nm_lines():
         return _nm_lines
     try:
         import subprocess as _sp
-        _nm_proc = _sp.Popen(['nm', _bootloader_elf_path], stdout=_sp.PIPE, stderr=_sp.PIPE)
+        import shutil as _shutil
+        _nm_bin = _shutil.which('arm-none-eabi-nm') or _shutil.which('nm') or 'nm'
+        _nm_proc = _sp.Popen([_nm_bin, _bootloader_elf_path], stdout=_sp.PIPE, stderr=_sp.PIPE)
         _nm_stdout, _ = _nm_proc.communicate()
         _nm_proc.wait()
         if hasattr(_nm_stdout, 'decode'):
@@ -1191,8 +1193,28 @@ def _resolve_elf_symbol_addresses(sym_name):
     return sorted(found_addrs)
 
 _hash_bypass_symbols_raw = str(monitor.GetVariable('hash_bypass_symbols')).strip()
+_hash_bypass_addrs_raw = str(monitor.GetVariable('hash_bypass_addrs')).strip()
 _hash_bypass_patches = []
-if _hash_bypass_symbols_raw and backend['kind'] in ('fast', 'mram'):
+_hash_bypass_pre_resolved = False
+if _hash_bypass_addrs_raw and backend['kind'] in ('fast', 'mram'):
+    # Prefer pre-resolved addresses from the host side (avoids IronPython
+    # subprocess issues with nm and handles local symbols that
+    # bus.GetSymbolAddress cannot find).
+    for entry in _hash_bypass_addrs_raw.split(','):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if '=' in entry:
+            sym_name, addr_str = entry.split('=', 1)
+        else:
+            sym_name, addr_str = 'pre-resolved', entry
+        addr = int(addr_str, 0) & ~1
+        _hash_bypass_patches.append((addr, sym_name.strip()))
+        log('hash_bypass: {}=0x{:08X} (host-resolved)'.format(sym_name.strip(), addr & 0xFFFFFFFF))
+    _hash_bypass_pre_resolved = True
+if not _hash_bypass_pre_resolved and _hash_bypass_symbols_raw and backend['kind'] in ('fast', 'mram'):
+    # Fallback: resolve inside Renode (works when nm is available in the
+    # Renode process environment and symbol is global).
     for sym_name in _hash_bypass_symbols_raw.split(','):
         sym_name = sym_name.strip()
         if not sym_name:
@@ -3075,12 +3097,28 @@ def read_flash_span(start_addr, size, snapshot_bytes=None):
         return b''
     if snapshot_bytes is not None:
         return bytes(snapshot_bytes[rel:rel + max_len])
+    return read_flash_bytes(start_addr, max_len)
+
+
+def read_flash_bytes(start_addr, size):
+    if size <= 0:
+        return b''
+    flash_base, flash_size = flash_geometry()
+    rel = int(start_addr) - int(flash_base)
+    if rel < 0 or rel >= flash_size:
+        return b''
+    max_len = min(int(size), flash_size - rel)
+    if max_len <= 0:
+        return b''
     b = backend
     if b['kind'] == 'mram':
         return to_py_bytes(b['data'].ReadBytes(rel, max_len))
     if b['kind'] == 'fast':
         return to_py_bytes(b['data'].Flash.ReadBytes(rel, max_len))
-    return bytes([as_int(bus.ReadByte(start_addr + i)) & 0xFF for i in range(max_len)])
+    try:
+        return to_py_bytes(b['data'].Nvm.ReadBytes(rel, max_len, None))
+    except Exception:
+        return bytes([as_int(bus.ReadByte(start_addr + i)) & 0xFF for i in range(max_len)])
 
 def region_dump(region_bytes, region_addr):
     import base64
@@ -4349,21 +4387,7 @@ def compute_slot_hash(slot_name='exec'):
     data_size = slot_size - page_size
     if data_size <= 0:
         data_size = slot_size
-    b = backend
-    if b['kind'] == 'mram':
-        mram_base, _ = flash_geometry()
-        offset = slot_base - mram_base
-        data = bytes(b['data'].ReadBytes(offset, data_size))
-    elif b['kind'] == 'fast':
-        flash_ref = b['data'].Flash
-        flash_base_addr = int(b['data'].FlashBaseAddress)
-        offset = slot_base - flash_base_addr
-        data = bytes(flash_ref.ReadBytes(offset, data_size))
-    else:
-        chunks = []
-        for addr in range(slot_base, slot_base + data_size, 4):
-            chunks.append(struct.pack('<I', as_int(bus.ReadDoubleWord(addr))))
-        data = b''.join(chunks)
+    data = read_flash_bytes(slot_base, data_size)
     return hashlib.sha256(data).hexdigest()
 
 def compute_exec_slot_hash():
@@ -4848,12 +4872,13 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     #
     # Termination conditions (checked after each time slice):
     #   1. A fault that models immediate execution stop/power loss fired
-    #   2. Write count unchanged for 3+ slices after writes started
-    #   3. Zero writes after 5+ slices when expect_writes=False (bricked)
-    #   4. No forward progress for progress_stall_timeout_s
-    #   5. (no_boot profiles) no writes + no VTOR for N slices/min emulated time
-    #   6. (no_boot profiles) writes settled (>0 but unchanged) + no VTOR
-    #   7. Iteration limit or wall-clock timeout exhausted
+    #   2. A configured success PC slot is observed when VTOR handoff is absent
+    #   3. Write count unchanged for 3+ slices after writes started
+    #   4. Zero writes after 5+ slices when expect_writes=False (bricked)
+    #   5. No forward progress for progress_stall_timeout_s
+    #   6. (no_boot profiles) no writes + no VTOR for N slices/min emulated time
+    #   7. (no_boot profiles) writes settled (>0 but unchanged) + no VTOR
+    #   8. Iteration limit or wall-clock timeout exhausted
     if time_slice is None:
         time_slice = phase1_time_slice
     t0 = _time.time()
@@ -4877,6 +4902,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     trace_prev_writes = 0
     trace_prev_erases = 0
     pc_samples = []
+    pc_handoff_slot = success_pc_slot if success_pc_slot in slot_ranges else None
     if op_trace is not None and op_trace_limit <= 0:
         op_trace_limit = 1024
     for iters in range(max_iters):
@@ -4949,6 +4975,14 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 else:
                     reason = 'vtor_captured'
                 break
+        if (
+            pc_handoff_slot is not None
+            and sticky_pc['captured']
+            and sticky_pc.get('slot') == pc_handoff_slot
+            and not sticky_vtor['captured']
+        ):
+            reason = 'pc_captured'
+            break
         cur_writes = get_total_writes()
         cur_erases = get_total_erases()
         if (
@@ -5582,6 +5616,15 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
         skip_count,
         skip_addr & 0xFFFFFFFF))
 
+    # Suppress sysbus WARNING logs during instruction_skip boot.  NOP'd
+    # crypto/math instructions cause wild-pointer dereferences that hit
+    # unmapped addresses → Renode emits a WARNING per access → gigabytes
+    # of useless log.  These are expected DoS outcomes, not diagnostic data.
+    try:
+        monitor.Parse('logLevel 4 sysbus')
+    except Exception:
+        pass
+
     arm_vtor_watchpoint()
     p1_wall_timeout = phase1_wall_timeout(default_s=4.0)
     p1_max_iters = phase1_max_iters(default_s=4.0)
@@ -5594,6 +5637,13 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
         vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
     )
     disarm_vtor_watchpoint()
+
+    # Restore default sysbus log level.
+    try:
+        monitor.Parse('logLevel -1 sysbus')
+    except Exception:
+        pass
+
     phase1_ms = int((_time.time() - fp_t0) * 1000)
 
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
@@ -8212,14 +8262,10 @@ if calibration_mode:
             if _hash_bypass_active:
                 apply_hash_bypass()
         # Force word-level diff for calibration so the count matches sweep.
-        # Enable write trace to record (writeIndex, flashOffset) for heuristic.
+        # NOTE: Write/erase trace is NOT enabled in phase 1 (coarse detection).
+        # It's enabled in phase 2 only if trace replay is needed. The write
+        # count from get_total_writes() uses the peripheral counter, not trace.
         reset_nvmc_for_sweep()
-        if backend['kind'] == 'fast':
-            backend['data'].WriteTraceClear()
-            backend['data'].WriteTraceEnabled = True
-            # Always capture erase trace — needed for trace replay correctness.
-            backend['data'].EraseTraceClear()
-            backend['data'].EraseTraceEnabled = True
         log('calibration: starting step (fault_types={})'.format(fault_types_mode))
         base_writes = get_total_writes()
         base_erases = get_total_erases()
@@ -8229,16 +8275,66 @@ if calibration_mode:
         # write/erase progress, causing premature exit.
         saved_stall = progress_stall_timeout_s
         progress_stall_timeout_s = 0
-        cal_wall_timeout = max(600, int(float(run_duration) * 300))
-        cal_max_iters = max(500, int(float(run_duration) * 5 / 0.02))
-        # Copy-on-boot upgrades can hit a transient VTOR before the final
-        # cleanup/copy state settles; give those profiles a short settle window.
+
+        # --- Two-phase adaptive calibration ---
+        # Phase 1: Fast boot-completion detection with coarse time slices.
+        # This finds WHEN the boot completes without wasting time on 20ms
+        # precision. For bootloaders that boot in <1 emulated second, this
+        # takes ~5 iterations instead of 1,500.
+        coarse_slice_s = 1.0
+        coarse_budget_s = float(run_duration)
+        coarse_max_iters = max(3, int(coarse_budget_s / coarse_slice_s) + 1)
+        coarse_wall_timeout = max(300, int(coarse_budget_s * 60))
         cal_settle = _copy_on_boot_vtor_settle_iters()
-        cal_status = run_until_done(cpu_ref, label='calibration',
-                                    wall_timeout=cal_wall_timeout,
-                                    max_iters=cal_max_iters,
-                                    time_slice=calibration_time_slice,
-                                    vtor_settle_iters=cal_settle)
+        log('calibration phase 1: coarse detection (slice={}s, max_iters={})'.format(
+            coarse_slice_s, coarse_max_iters))
+        phase1_status = run_until_done(cpu_ref, label='calibration_p1',
+                                       wall_timeout=coarse_wall_timeout,
+                                       max_iters=coarse_max_iters,
+                                       time_slice=str(coarse_slice_s),
+                                       vtor_settle_iters=cal_settle)
+        phase1_reason = phase1_status.get('reason', 'unknown')
+        phase1_emulated_s = phase1_status.get('emulated_time_s', coarse_budget_s)
+        log('calibration phase 1: reason={}, emulated={}s, writes={}'.format(
+            phase1_reason, phase1_emulated_s, get_total_writes() - base_writes))
+
+        # If boot completed in phase 1, re-run with fine slices bounded to the
+        # known boot time. This gives write-level trace precision for trace
+        # replay while keeping calibration fast. For targets where phase 1
+        # already takes the full budget (slow swap), this is a no-op.
+        # Only skip phase 2 for backends that don't support write trace (mram).
+        trace_capable = backend['kind'] == 'fast'
+
+        if phase1_reason in ('vtor', 'vtor_settled', 'pc_captured') and trace_capable:
+            # Phase 2: Reset and re-run with fine slices, bounded by phase 1 time.
+            fine_margin_s = max(1.0, phase1_emulated_s * 0.2)
+            fine_budget_s = phase1_emulated_s + fine_margin_s
+            fine_max_iters = max(200, int(fine_budget_s / float(calibration_time_slice)) + 1)
+            fine_wall_timeout = max(600, int(fine_budget_s * 300))
+            log('calibration phase 2: fine trace (slice={}s, budget={}s, max_iters={})'.format(
+                calibration_time_slice, fine_budget_s, fine_max_iters))
+            _machine_reset()
+            reload_images()
+            apply_pre_boot_state()
+            if _hash_bypass_active:
+                apply_hash_bypass()
+            reset_nvmc_for_sweep()
+            if backend['kind'] == 'fast':
+                backend['data'].WriteTraceClear()
+                backend['data'].WriteTraceEnabled = True
+                backend['data'].EraseTraceClear()
+                backend['data'].EraseTraceEnabled = True
+            base_writes = get_total_writes()
+            base_erases = get_total_erases()
+            cal_status = run_until_done(cpu_ref, label='calibration_p2',
+                                        wall_timeout=fine_wall_timeout,
+                                        max_iters=fine_max_iters,
+                                        time_slice=calibration_time_slice,
+                                        vtor_settle_iters=cal_settle)
+        else:
+            # No trace needed or boot didn't complete — use phase 1 result as-is.
+            cal_status = phase1_status
+
         progress_stall_timeout_s = saved_stall
         log('calibration: stop_reason={}'.format(cal_status.get('reason', '?')))
         total_writes = get_total_writes() - base_writes
@@ -8441,6 +8537,7 @@ if calibration_mode:
         if success_image_hash:
             cal_exec_hash = compute_exec_slot_hash()
             result['calibration_exec_hash'] = cal_exec_hash
+            result['calibration_boot_outcome'] = result.get('final_boot_outcome') or result.get('boot_outcome')
             log('calibration: exec slot hash = {}'.format(cal_exec_hash[:16]))
     result = annotate_boot_span_result(result)
     with open(result_file, 'w') as f:

@@ -137,20 +137,25 @@ def _cleanup_generated_robot_files(robot_vars: List[str]) -> None:
 
 
 def should_auto_discover_trigger(profile: ProfileConfig, eval_mode: str) -> bool:
-    """Return whether the profile should run trigger discovery."""
+    """Return whether the profile should run trigger discovery.
+
+    Only profiles that explicitly opt in via ``update_trigger: auto``
+    (which sets ``auto_update_trigger=True``) enter discovery.  Profiles
+    that simply omit ``update_trigger`` (direct-XIP, bare-metal, etc.)
+    go straight to calibration and sweep — their metadata-only writes
+    are the intended fault targets.
+    """
     if eval_mode != "execute":
         return False
     if getattr(profile, "has_update_sequence", False):
         return False
     if profile.pre_boot_state:
         return False
-    if getattr(profile, "update_trigger", None) is not None and not bool(
-        getattr(profile, "auto_update_trigger", False)
-    ):
+    if not bool(getattr(profile, "auto_update_trigger", False)):
         return False
     if _default_update_slot(profile) is None:
         return False
-    return bool(getattr(profile, "auto_update_trigger", False) or profile.update_trigger is None)
+    return True
 
 
 def _flash_base(profile: ProfileConfig) -> int:
@@ -167,7 +172,27 @@ def _detect_bootloader_family(profile: ProfileConfig) -> str:
     return "unknown"
 
 
-def _resolve_mcuboot_flash_map(elf_path: str) -> Tuple[Optional[List[Dict[str, int]]], Optional[str]]:
+def _parse_flash_map_entries(raw: bytes) -> Tuple[Optional[List[Dict[str, int]]], Optional[str]]:
+    """Parse a packed default_flash_map array (4×uint32 per entry)."""
+    if not raw or len(raw) % 16 != 0:
+        return None, "default_flash_map has unexpected size {}".format(len(raw))
+    entries: List[Dict[str, int]] = []
+    for idx in range(0, len(raw), 16):
+        area_id, off, area_size, device_ptr = struct.unpack("<IIII", raw[idx:idx + 16])
+        entries.append(
+            {
+                "index": idx // 16,
+                "area_id": int(area_id),
+                "off": int(off),
+                "size": int(area_size),
+                "device_ptr": int(device_ptr),
+            }
+        )
+    return entries, None
+
+
+def _resolve_mcuboot_flash_map_pyelftools(elf_path: str) -> Tuple[Optional[bytes], Optional[str]]:
+    """Read default_flash_map raw bytes via pyelftools."""
     if ELFFile is None:
         return None, "pyelftools not available"
     path = Path(elf_path)
@@ -186,46 +211,167 @@ def _resolve_mcuboot_flash_map(elf_path: str) -> Tuple[Optional[List[Dict[str, i
                 return None, "default_flash_map symbol has no backing section"
             offset = int(symbol["st_value"]) - int(section["sh_addr"])
             size = int(symbol["st_size"])
-            raw = section.data()[offset:offset + size]
+            return bytes(section.data()[offset:offset + size]), None
     except Exception as exc:
         return None, "failed to read default_flash_map: {}".format(exc)
 
-    if not raw or len(raw) % 16 != 0:
-        return None, "default_flash_map has unexpected size {}".format(len(raw))
 
-    entries: List[Dict[str, int]] = []
-    for idx in range(0, len(raw), 16):
-        area_id, off, area_size, device_ptr = struct.unpack("<IIII", raw[idx:idx + 16])
-        entries.append(
-            {
-                "index": idx // 16,
-                "area_id": int(area_id),
-                "off": int(off),
-                "size": int(area_size),
-                "device_ptr": int(device_ptr),
-            }
+def _resolve_mcuboot_flash_map_toolchain(elf_path: str) -> Tuple[Optional[bytes], Optional[str]]:
+    """Read default_flash_map raw bytes by parsing the ELF binary directly.
+
+    Uses ``nm`` to locate the symbol address and size, then parses the ELF
+    section headers to find which loadable section contains that address and
+    reads the raw bytes directly from the file.  No pyelftools or objcopy
+    needed — just ``nm`` and Python's ``struct``.
+    """
+    import subprocess as _sp
+    import shutil
+
+    nm_bin = shutil.which("arm-none-eabi-nm") or shutil.which("nm")
+    if nm_bin is None:
+        return None, "nm not found"
+
+    # Step 1: get symbol address and size from nm --print-size
+    try:
+        result = _sp.run(
+            [nm_bin, "--print-size", elf_path],
+            capture_output=True, text=True, timeout=30,
         )
-    return entries, None
+    except Exception as exc:
+        return None, "nm failed: {}".format(exc)
+    if result.returncode != 0:
+        return None, "nm returned exit code {}".format(result.returncode)
+
+    sym_addr = None
+    sym_size = None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[3] == "default_flash_map":
+            sym_addr = int(parts[0], 16)
+            sym_size = int(parts[1], 16)
+            break
+    if sym_addr is None:
+        return None, "ELF has no default_flash_map symbol"
+    if sym_size is None or sym_size == 0:
+        sym_size = 16 * 6  # conservative estimate
+
+    # Step 2: parse ELF section headers to find the containing section
+    path = Path(elf_path)
+    try:
+        with path.open("rb") as f:
+            ident = f.read(16)
+            if ident[:4] != b"\x7fELF":
+                return None, "not a valid ELF file"
+            ei_class = ident[4]  # 1 = 32-bit, 2 = 64-bit
+            ei_data = ident[5]   # 1 = little-endian, 2 = big-endian
+            endian = "<" if ei_data == 1 else ">"
+
+            if ei_class == 1:
+                # 32-bit ELF header
+                f.seek(0)
+                ehdr = f.read(52)
+                e_shoff = struct.unpack(endian + "I", ehdr[32:36])[0]
+                e_shentsize = struct.unpack(endian + "H", ehdr[46:48])[0]
+                e_shnum = struct.unpack(endian + "H", ehdr[48:50])[0]
+                # Read section headers
+                f.seek(e_shoff)
+                for _ in range(e_shnum):
+                    shdr = f.read(e_shentsize)
+                    if len(shdr) < 40:
+                        break
+                    sh_addr = struct.unpack(endian + "I", shdr[12:16])[0]
+                    sh_offset = struct.unpack(endian + "I", shdr[16:20])[0]
+                    sh_size = struct.unpack(endian + "I", shdr[20:24])[0]
+                    sh_flags = struct.unpack(endian + "I", shdr[8:12])[0]
+                    # Check if this section contains our symbol (SHF_ALLOC = 0x2)
+                    if sh_flags & 0x2 and sh_addr <= sym_addr < sh_addr + sh_size:
+                        file_offset = sh_offset + (sym_addr - sh_addr)
+                        f.seek(file_offset)
+                        raw = f.read(sym_size)
+                        if len(raw) == sym_size:
+                            return raw, None
+                        return None, "short read: got {} expected {}".format(len(raw), sym_size)
+            else:
+                # 64-bit ELF header
+                f.seek(0)
+                ehdr = f.read(64)
+                e_shoff = struct.unpack(endian + "Q", ehdr[40:48])[0]
+                e_shentsize = struct.unpack(endian + "H", ehdr[58:60])[0]
+                e_shnum = struct.unpack(endian + "H", ehdr[60:62])[0]
+                f.seek(e_shoff)
+                for _ in range(e_shnum):
+                    shdr = f.read(e_shentsize)
+                    if len(shdr) < 64:
+                        break
+                    sh_addr = struct.unpack(endian + "Q", shdr[16:24])[0]
+                    sh_offset = struct.unpack(endian + "Q", shdr[24:32])[0]
+                    sh_size = struct.unpack(endian + "Q", shdr[32:40])[0]
+                    sh_flags = struct.unpack(endian + "Q", shdr[8:16])[0]
+                    if sh_flags & 0x2 and sh_addr <= sym_addr < sh_addr + sh_size:
+                        file_offset = sh_offset + (sym_addr - sh_addr)
+                        f.seek(file_offset)
+                        raw = f.read(sym_size)
+                        if len(raw) == sym_size:
+                            return raw, None
+                        return None, "short read: got {} expected {}".format(len(raw), sym_size)
+
+            return None, "no loadable section contains default_flash_map at 0x{:X}".format(sym_addr)
+    except Exception as exc:
+        return None, "ELF parsing failed: {}".format(exc)
+
+
+def _resolve_mcuboot_flash_map(elf_path: str) -> Tuple[Optional[List[Dict[str, int]]], Optional[str]]:
+    # Try pyelftools first, then fall back to nm + direct ELF parsing.
+    raw, error = _resolve_mcuboot_flash_map_pyelftools(elf_path)
+    if not raw:
+        raw, error = _resolve_mcuboot_flash_map_toolchain(elf_path)
+    if not raw:
+        return None, error
+    return _parse_flash_map_entries(raw)
 
 
 def _read_elf_symbol_names(elf_path: str) -> Tuple[Optional[Set[str]], Optional[str]]:
-    if ELFFile is None:
-        return None, "pyelftools not available"
     path = Path(elf_path)
+    if ELFFile is not None:
+        try:
+            with path.open("rb") as handle:
+                elf = ELFFile(handle)
+                symtab = elf.get_section_by_name(".symtab")
+                if symtab is None:
+                    return None, "ELF has no .symtab"
+                names = {
+                    str(symbol.name or "").strip()
+                    for symbol in symtab.iter_symbols()
+                    if str(symbol.name or "").strip()
+                }
+                return names, None
+        except Exception as exc:
+            return None, "failed to read ELF symbols: {}".format(exc)
+    # Fallback: use nm(1) which is available on virtually all toolchains.
+    import subprocess as _sp
+    import shutil
+    nm_bin = shutil.which("arm-none-eabi-nm") or shutil.which("nm")
+    if nm_bin is None:
+        return None, "pyelftools not available and nm not found"
     try:
-        with path.open("rb") as handle:
-            elf = ELFFile(handle)
-            symtab = elf.get_section_by_name(".symtab")
-            if symtab is None:
-                return None, "ELF has no .symtab"
-            names = {
-                str(symbol.name or "").strip()
-                for symbol in symtab.iter_symbols()
-                if str(symbol.name or "").strip()
-            }
-            return names, None
+        result = _sp.run(
+            [nm_bin, str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return None, "nm returned exit code {}".format(result.returncode)
+        names: Set[str] = set()
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                names.add(parts[2])
+            elif len(parts) == 2:
+                names.add(parts[1])
+        if not names:
+            return None, "nm produced no symbols"
+        return names, None
     except Exception as exc:
-        return None, "failed to read ELF symbols: {}".format(exc)
+        return None, "nm fallback failed: {}".format(exc)
 
 
 def _detect_mcuboot_swap_algorithm(
@@ -241,9 +387,9 @@ def _detect_mcuboot_swap_algorithm(
 
     resolved_elf = profile.resolve_path(repo_root, profile.bootloader_elf)
     candidates = [
-        ("offset", ["boot_swap_offset", "swap_offset"]),
-        ("scratch", ["boot_swap_scratch", "swap_scratch"]),
-        ("move", ["boot_swap_move", "swap_move"]),
+        ("offset", ["boot_swap_offset", "swap_offset", "swap_using_offset", "prefer_swap_offset"]),
+        ("scratch", ["boot_swap_scratch", "swap_scratch", "swap_using_scratch", "prefer_swap_scratch"]),
+        ("move", ["boot_swap_move", "swap_move", "swap_using_move", "prefer_swap_move"]),
     ]
 
     symbols, error = _read_elf_symbol_names(resolved_elf)
@@ -781,6 +927,7 @@ def _calibration_from_raw_data(profile: ProfileConfig, data: Dict[str, Any]) -> 
         trace_file_bin=data.get("trace_file_bin"),
         erase_trace_file_bin=data.get("erase_trace_file_bin"),
         calibration_exec_hash=data.get("calibration_exec_hash"),
+        calibration_boot_outcome=data.get("calibration_boot_outcome"),
         stop_reason=data.get("calibration_stop_reason"),
         emulated_s=data.get("calibration_emulated_s"),
         elapsed_s=data.get("calibration_elapsed_s"),
@@ -930,6 +1077,8 @@ def discover_update_trigger(
         completed = calibration_completed(
             data.get("calibration_stop_reason"),
             candidate.expect.control_outcome,
+            total_writes=int(data.get("total_writes", 0)),
+            total_erases=int(data.get("total_erases", 0)),
         )
         selected = bool(
             completed

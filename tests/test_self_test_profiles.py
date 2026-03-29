@@ -31,12 +31,15 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertNotIn("fault_copy_before_validate.yaml", discovered)
         self.assertNotIn("fault_staging_overlap.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_nrf52_revert_extended.yaml", discovered)
+        self.assertNotIn("mcuboot_head_move_nrf52_upgrade_extended.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_nrf52_revert_write_faults_long.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_nrf52_revert_rc_injection.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_nrf52_revert_rc_injection_multiboot.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_nrf52_revert_write_faults.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_nrf52_revert_write_faults_nohashbypass.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_nrf52_seccounter_downgrade_rc_injection.yaml", discovered)
+        self.assertNotIn("mcuboot_head_move_stm32f4_revert.yaml", discovered)
+        self.assertNotIn("mcuboot_head_move_stm32f4_revert_driver_error.yaml", discovered)
         self.assertNotIn("mcuboot_pr2214_offset_geom_broken.yaml", discovered)
         self.assertNotIn("mcuboot_pr2214_offset_geom_fixed.yaml", discovered)
         self.assertNotIn("fault_no_crc.yaml", discovered)
@@ -51,7 +54,10 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertIn("fault_copy_before_validate_selftest.yaml", discovered)
         self.assertIn("fault_staging_overlap_selftest.yaml", discovered)
         self.assertIn("mcuboot_head_move_nrf52_revert_extended_selftest.yaml", discovered)
+        self.assertIn("mcuboot_head_move_nrf52_upgrade_extended_selftest.yaml", discovered)
         self.assertIn("mcuboot_head_move_nrf52_revert_rc_injection_selftest.yaml", discovered)
+        self.assertIn("mcuboot_head_move_stm32f4_revert_selftest.yaml", discovered)
+        self.assertIn("mcuboot_head_move_stm32f4_revert_driver_error_selftest.yaml", discovered)
         self.assertIn("mcuboot_head_move_nrf52_revert_write_faults_selftest.yaml", discovered)
         self.assertIn("fault_no_crc_selftest.yaml", discovered)
         self.assertIn("fault_single_replica_selftest.yaml", discovered)
@@ -111,6 +117,17 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertTrue(raw.get("expect", {}).get("should_find_issues"))
         self.assertNotIn("page_size", raw.get("memory", {}))
 
+    def test_move_family_smoke_profiles_keep_expected_issue_semantics(self):
+        expected_true = [
+            "mcuboot_head_move_nrf52_upgrade_extended_selftest.yaml",
+            "mcuboot_head_move_nrf52_upgrade_multifault_selftest.yaml",
+            "mcuboot_head_move_nrf52_revert_extended_selftest.yaml",
+        ]
+        for name in expected_true:
+            with self.subTest(profile=name):
+                raw = yaml.safe_load((ROOT / "profiles" / name).read_text(encoding="utf-8"))
+                self.assertTrue(raw.get("expect", {}).get("should_find_issues"))
+
     def test_extended_nrf52_move_profile_stays_discovery_driven(self):
         raw = yaml.safe_load(
             (
@@ -122,6 +139,22 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertEqual(raw.get("success_criteria", {}).get("marker_address"), 0x0000C014)
         self.assertEqual(raw.get("success_criteria", {}).get("marker_value"), 0x00000101)
         self.assertIn("swap_progress", raw.get("fault_sweep", {}).get("fault_types", []))
+
+    def test_bounded_smoke_profiles_stay_bounded(self):
+        expected = {
+            "mcuboot_head_move_nrf52_upgrade_extended_selftest.yaml": ["power_loss", "interrupted_erase", "bit_corruption", "swap_progress"],
+            "mcuboot_head_move_nrf52_revert_extended_selftest.yaml": ["power_loss", "interrupted_erase", "bit_corruption"],
+            "mcuboot_head_move_nrf52_revert_rc_injection_selftest.yaml": ["rc_injection"],
+            "mcuboot_head_move_stm32f4_revert_driver_error_selftest.yaml": ["driver_error"],
+        }
+        for name, fault_types in expected.items():
+            with self.subTest(profile=name):
+                raw = yaml.safe_load((ROOT / "profiles" / name).read_text(encoding="utf-8"))
+                sweep = raw.get("fault_sweep", {})
+                self.assertEqual(sweep.get("fault_types"), fault_types)
+                self.assertEqual(sweep.get("max_writes"), 128)
+                self.assertEqual(sweep.get("max_writes_cap"), 256)
+                self.assertEqual(sweep.get("fault_step"), 32)
 
     def test_move_upgrade_followon_profiles_use_marker_based_discovery(self):
         for name in [

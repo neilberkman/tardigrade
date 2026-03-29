@@ -342,6 +342,16 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
             text,
         )
 
+    def test_run_until_done_can_stop_on_configured_pc_handoff(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "pc_handoff_slot = success_pc_slot if success_pc_slot in slot_ranges else None",
+            text,
+        )
+        self.assertIn("and sticky_pc.get('slot') == pc_handoff_slot", text)
+        self.assertIn("and not sticky_vtor['captured']", text)
+        self.assertIn("reason = 'pc_captured'", text)
+
     def test_execute_runner_tracks_sticky_pc_slot_observation(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("console_fatal_patterns = (", text)
@@ -366,6 +376,13 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertIn("'pc_sticky_slot': sticky_pc['slot']", text)
         self.assertIn("'pc_sticky_ignored_no_boot_phase': no_boot_phase_without_vtor", text)
         self.assertIn("if not execution_observed:", text)
+
+    def test_slow_backend_flash_reads_use_bulk_nvm_reads(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("def read_flash_bytes(start_addr, size):", text)
+        self.assertIn("return read_flash_bytes(start_addr, max_len)", text)
+        self.assertIn("return to_py_bytes(b['data'].Nvm.ReadBytes(rel, max_len, None))", text)
+        self.assertIn("data = read_flash_bytes(slot_base, data_size)", text)
 
 
 if __name__ == "__main__":

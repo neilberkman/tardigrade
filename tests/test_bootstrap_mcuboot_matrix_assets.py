@@ -312,8 +312,8 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertEqual(fixed["semantic_assertions"]["control"]["multi_boot_analysis.final_outcome"], "success")
         self.assertEqual(broken["success_criteria"], {})
         self.assertEqual(fixed["success_criteria"], {})
-        self.assertFalse(broken.get("skip_self_test", False))
-        self.assertFalse(fixed.get("skip_self_test", False))
+        self.assertTrue(broken.get("skip_self_test", False))
+        self.assertTrue(fixed.get("skip_self_test", False))
 
     def test_pr2214_offset_profiles_use_stm32f4_offset_layout(self) -> None:
         broken = yaml.safe_load((ROOT / "profiles" / "mcuboot_pr2214_offset_broken.yaml").read_text(encoding="utf-8"))

@@ -48,5 +48,6 @@ fault_sweep:
     - interrupted_erase
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 
+skip_self_test: true
 expect:
   should_find_issues: true

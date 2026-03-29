@@ -41,4 +41,4 @@ fault_sweep:
   max_step_limit: 200000000
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 expect:
-  should_find_issues: false
+  should_find_issues: true

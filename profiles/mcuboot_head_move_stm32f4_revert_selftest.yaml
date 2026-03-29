@@ -1,12 +1,12 @@
 schema_version: 1
-name: mcuboot_head_move_stm32f4_revert_driver_error
+name: mcuboot_head_move_stm32f4_revert_selftest
 description: >
-  Retroactive validation negative control for the old STM32F4 driver_error
-  hypothesis on MCUboot HEAD swap-move revert. This profile remains useful
-  for exercising the driver-error path, but self-test should only pass if
-  no reportable issue survives the validator.
+  Self-test smoke profile for MCUboot HEAD swap-move revert on nucleo_f429zi.
+  Keeps the same generic geometry and revert setup, but bounds the execute
+  sweep so generic self-test validates the discovery path without replaying
+  the full hunt.
 
-platform: platforms/stm32f4_fast.repl
+platform: platforms/stm32f4.repl
 flash_backend: faultFlash
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_head_move_stm32f4.elf
@@ -14,8 +14,6 @@ bootloader:
 memory:
   sram: { start: 0x20000000, end: 0x20040000 }
   write_granularity: 4
-  page_size: 0x20000
-  flash_base_address: 0x08000000
   slots:
     exec: { base: 0x08020000, size: 0x60000 }
     staging: { base: 0x08080000, size: 0x60000 }
@@ -35,12 +33,11 @@ success_criteria:
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
-  fault_types: ["driver_error"]
-  max_writes: auto
-  max_writes_cap: 200000
-  run_duration: "60.0"
-  max_step_limit: 400000000
+  max_writes: 256
+  max_writes_cap: 512
+  fault_step: 8
+  run_duration: "20.0"
+  max_step_limit: 200000000
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 expect:
   should_find_issues: false
-skip_self_test: true

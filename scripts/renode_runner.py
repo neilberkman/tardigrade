@@ -535,6 +535,7 @@ class CalibrationResult:
     trace_file_bin: Optional[str]
     erase_trace_file_bin: Optional[str]
     calibration_exec_hash: Optional[str] = None
+    calibration_boot_outcome: Optional[str] = None
     stop_reason: Optional[str] = None
     emulated_s: Optional[float] = None
     elapsed_s: Optional[float] = None
@@ -547,11 +548,20 @@ class CalibrationResult:
 def calibration_completed(
     stop_reason: Optional[str],
     expected_control_outcome: str = "success",
+    total_writes: int = 0,
+    total_erases: int = 0,
 ) -> bool:
     """Return whether a calibration stop reason represents a complete pass."""
     if not stop_reason:
         return False
     if stop_reason == "budget":
+        # Budget exhaustion with NVM activity means the bootloader ran and
+        # wrote metadata/data before the step or time limit was reached.
+        # For direct-XIP bootloaders this IS the complete boot — there is
+        # no swap phase, so metadata writes are the only NVM activity.
+        # Treat as complete when writes or erases were observed.
+        if total_writes > 0 or total_erases > 0:
+            return True
         return False
     if any(stop_reason.startswith(prefix) for prefix in CALIBRATION_INCOMPLETE_PREFIXES):
         return False
@@ -612,7 +622,7 @@ def run_calibration(
     total_writes = int(data.get("total_writes", 0))
     total_erases = int(data.get("total_erases", 0))
     stop_reason = data.get("calibration_stop_reason")
-    if not calibration_completed(stop_reason, profile.expect.control_outcome):
+    if not calibration_completed(stop_reason, profile.expect.control_outcome, total_writes, total_erases):
         raise RuntimeError(
             "Calibration did not complete cleanly (reason={!r}, writes={}, erases={}). "
             "Refusing to run a partial sweep.".format(
@@ -645,6 +655,7 @@ def run_calibration(
         trace_file_bin=data.get("trace_file_bin"),
         erase_trace_file_bin=data.get("erase_trace_file_bin"),
         calibration_exec_hash=data.get("calibration_exec_hash"),
+        calibration_boot_outcome=data.get("calibration_boot_outcome"),
         stop_reason=stop_reason,
         emulated_s=data.get("calibration_emulated_s"),
         elapsed_s=data.get("calibration_elapsed_s"),

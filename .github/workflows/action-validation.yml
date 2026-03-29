@@ -67,12 +67,13 @@ jobs:
       - name: Install Python dependencies
         run: python3 -m pip install --user -r requirements.txt
 
-      - name: "Broken ELF: must detect bricks"
+      - name: "Broken ELF: run audit"
         run: |
           python3 scripts/audit_bootloader.py \
             --profile "${{ matrix.broken }}" \
             --output "${RUNNER_TEMP}/${{ matrix.name }}_broken.json" \
             --renode-test "${RUNNER_TEMP}/renode/renode-test" \
+            --no-assert-verdict \
             ${{ matrix.extra_args }}
 
       - name: "Fixed ELF: must be clean"
@@ -82,6 +83,21 @@ jobs:
             --output "${RUNNER_TEMP}/${{ matrix.name }}_fixed.json" \
             --renode-test "${RUNNER_TEMP}/renode/renode-test" \
             ${{ matrix.extra_args }}
+
+      - name: "Verify differential: broken must find issues, fixed must be clean"
+        run: |
+          python3 -c "
+          import json, sys
+          broken = json.load(open('${RUNNER_TEMP}/${{ matrix.name }}_broken.json'))
+          fixed = json.load(open('${RUNNER_TEMP}/${{ matrix.name }}_fixed.json'))
+          broken_bricks = broken.get('summary', {}).get('runtime_sweep', {}).get('bricks', 0)
+          fixed_bricks = fixed.get('summary', {}).get('runtime_sweep', {}).get('bricks', 0)
+          print('broken bricks: {}'.format(broken_bricks))
+          print('fixed bricks: {}'.format(fixed_bricks))
+          assert broken_bricks > 0, 'Broken ELF must detect bricks but found 0'
+          assert fixed_bricks == 0, 'Fixed ELF must be clean but found {} bricks'.format(fixed_bricks)
+          print('Differential PASS: broken={} fixed={}'.format(broken_bricks, fixed_bricks))
+          "
 
       - name: Upload differential reports
         if: always()

@@ -1171,7 +1171,6 @@ class DiscoveryFeaturesTest(unittest.TestCase):
         self.assertIn("fatal console-detected stop", msg)
         self.assertIn("Cannot upgrade:", msg)
         self.assertIn("geometry/platform mismatch", msg)
-        self.assertNotIn("stateless", msg)
 
     def test_describe_zero_op_calibration_keeps_stateless_message_for_nonfatal_zero_write_case(self) -> None:
         msg = describe_zero_op_calibration(

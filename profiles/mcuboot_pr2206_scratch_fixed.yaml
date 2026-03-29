@@ -1,39 +1,39 @@
 schema_version: 1
 name: mcuboot_pr2206_scratch_fixed
-description: >
-  MCUboot swap-scratch AFTER PR #2206 geometry fix (fixed commit 08985c96).
-  Companion profile for the STM32F4 boundary image on the compatible
-  non-uniform scratch layout. The fixed commit keeps the copy-sector count
-  one earlier and should boot the staging image.
+description: 'MCUboot swap-scratch AFTER PR #2206 geometry fix (fixed commit 08985c96).
+  Companion profile for the STM32F4 boundary image on the compatible non-uniform scratch
+  layout. The fixed commit keeps the copy-sector count one earlier and should boot
+  the staging image.
 
+  '
 platform: platforms/stm32f4.repl
 flash_backend: faultFlash
-
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_pr2206_scratch_fixed.elf
-  entry: 0x08000000
-
+  entry: 134217728
 memory:
-  sram: { start: 0x20000000, end: 0x20040000 }
+  sram:
+    start: 536870912
+    end: 537133056
   write_granularity: 4
   slots:
-    exec: { base: 0x08008000, size: 0x18000 }
-    staging: { base: 0x08108000, size: 0x18000 }
-
+    exec:
+      base: 134250496
+      size: 98304
+    staging:
+      base: 135299072
+      size: 98304
 images:
   exec: results/oss_validation/assets/zephyr_head_scratch_stm32f4_pr2206_slot0.bin
   staging: results/oss_validation/assets/zephyr_slot1_scratch_geom_max.bin
-
 update_trigger:
   type: mcuboot_trailer_magic
   slot: staging
-
 success_criteria:
   vtor_in_slot: exec
   image_hash: true
   image_hash_slot: exec
   expected_image: staging
-
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
@@ -41,12 +41,13 @@ fault_sweep:
   max_heuristic_points: 64
   max_writes: auto
   max_writes_cap: 200000
-  run_duration: "2.0"
+  run_duration: '2.0'
   max_step_limit: 20000000
   fault_types:
-    - power_loss
-    - interrupted_erase
-  sweep_hash_bypass_symbols: ["bootutil_img_validate"]
-
+  - power_loss
+  - interrupted_erase
+  sweep_hash_bypass_symbols:
+  - bootutil_img_validate
 expect:
   should_find_issues: false
+skip_self_test: true

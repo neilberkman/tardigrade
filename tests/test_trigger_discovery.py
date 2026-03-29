@@ -32,6 +32,7 @@ from trigger_discovery import (  # noqa: E402
     _build_mcuboot_strategies,
     _clone_for_strategy,
     _detect_mcuboot_swap_algorithm,
+    _read_elf_symbol_names,
     discover_update_trigger,
     should_auto_discover_trigger,
     validate_compiled_flash_map,
@@ -612,6 +613,79 @@ class TriggerDiscoveryTests(unittest.TestCase):
 
         self.assertFalse(result.succeeded)
         self.assertTrue(all(not attempt.selected for attempt in result.attempts))
+
+
+    def test_detect_swap_algorithm_config_boot_swap_using_symbols(self) -> None:
+        """CONFIG_BOOT_SWAP_USING_* symbols should be recognized."""
+        profile = SimpleNamespace(
+            name="mcuboot_auto",
+            bootloader_elf="dummy.elf",
+            resolve_path=lambda _root, path: path,
+        )
+        for algorithm, symbol in [
+            ("move", "CONFIG_BOOT_SWAP_USING_MOVE"),
+            ("offset", "CONFIG_BOOT_SWAP_USING_OFFSET"),
+            ("scratch", "CONFIG_BOOT_SWAP_USING_SCRATCH"),
+        ]:
+            with self.subTest(algorithm=algorithm):
+                with mock.patch(
+                    "trigger_discovery._read_elf_symbol_names",
+                    return_value=({symbol, "main"}, None),
+                ):
+                    detected = _detect_mcuboot_swap_algorithm(profile, ROOT)
+                self.assertEqual(detected["status"], "detected")
+                self.assertEqual(detected["algorithm"], algorithm)
+
+    def test_detect_swap_algorithm_prefer_swap_symbols(self) -> None:
+        """CONFIG_BOOT_PREFER_SWAP_* symbols should be recognized."""
+        profile = SimpleNamespace(
+            name="mcuboot_auto",
+            bootloader_elf="dummy.elf",
+            resolve_path=lambda _root, path: path,
+        )
+        with mock.patch(
+            "trigger_discovery._read_elf_symbol_names",
+            return_value=({"CONFIG_BOOT_PREFER_SWAP_MOVE", "main"}, None),
+        ):
+            detected = _detect_mcuboot_swap_algorithm(profile, ROOT)
+        self.assertEqual(detected["status"], "detected")
+        self.assertEqual(detected["algorithm"], "move")
+
+    def test_read_elf_symbol_names_nm_fallback(self) -> None:
+        """nm fallback produces symbol names from real ELF."""
+        elf_path = str(ROOT / "results" / "oss_validation" / "assets" / "oss_mcuboot_head_move_nrf52.elf")
+        if not Path(elf_path).exists():
+            self.skipTest("test ELF not available")
+        # Force the nm fallback by disabling pyelftools
+        with mock.patch("trigger_discovery.ELFFile", None):
+            symbols, error = _read_elf_symbol_names(elf_path)
+        self.assertIsNotNone(symbols)
+        self.assertIn("main", symbols)
+        # Should contain MCUboot swap config symbols
+        self.assertTrue(
+            any("SWAP_USING_MOVE" in s for s in symbols),
+            "Expected CONFIG_BOOT_SWAP_USING_MOVE in symbols",
+        )
+
+    def test_resolve_flash_map_from_real_elf(self) -> None:
+        """Flash map extraction works on real MCUboot ELF without pyelftools."""
+        from trigger_discovery import _resolve_mcuboot_flash_map
+        elf_path = str(ROOT / "results" / "oss_validation" / "assets" / "oss_mcuboot_head_move_nrf52.elf")
+        if not Path(elf_path).exists():
+            self.skipTest("test ELF not available")
+        # Force the toolchain fallback by disabling pyelftools
+        with mock.patch("trigger_discovery.ELFFile", None):
+            entries, error = _resolve_mcuboot_flash_map(elf_path)
+        self.assertIsNotNone(entries, "flash map extraction failed: {}".format(error))
+        self.assertEqual(len(entries), 4)
+        by_id = {e["area_id"]: e for e in entries}
+        # exec slot should be area_id 1, starting at 0xC000
+        self.assertIn(1, by_id)
+        self.assertEqual(by_id[1]["off"], 0xC000)
+        self.assertEqual(by_id[1]["size"], 0x76000)
+        # staging slot should be area_id 2
+        self.assertIn(2, by_id)
+        self.assertEqual(by_id[2]["off"], 0x82000)
 
 
 if __name__ == "__main__":

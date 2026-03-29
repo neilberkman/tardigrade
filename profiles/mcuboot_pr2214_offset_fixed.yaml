@@ -1,58 +1,64 @@
 schema_version: 1
 name: mcuboot_pr2214_offset_fixed
-description: >
-  MCUboot swap-offset AFTER PR #2214 find_last_idx fix (fixed commit 90fd59d2).
-  Companion seeded STM32F4 resume-state profile for the interrupted
-  swap-offset upgrade. The fixed revision resumes cleanly and converges back
-  to success across repeated boots.
+description: 'MCUboot swap-offset AFTER PR #2214 find_last_idx fix (fixed commit 90fd59d2).
+  Companion seeded STM32F4 resume-state profile for the interrupted swap-offset upgrade.
+  The fixed revision resumes cleanly and converges back to success across repeated
+  boots.
 
+  '
 platform: platforms/stm32f4.repl
 flash_backend: faultFlash
-
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_pr2214_offset_fixed.elf
-  entry: 0x08000000
-
+  entry: 134217728
 memory:
-  sram: { start: 0x20000000, end: 0x20040000 }
+  sram:
+    start: 536870912
+    end: 537133056
   write_granularity: 4
   slots:
-    exec: { base: 0x0800C000, size: 0x76000 }
-    staging: { base: 0x08082000, size: 0x76000 }
-
+    exec:
+      base: 134266880
+      size: 483328
+    staging:
+      base: 134750208
+      size: 483328
 images:
   exec: results/oss_validation/assets/zephyr_head_offset_stm32f4_slot0.bin
   staging: results/oss_validation/assets/zephyr_slot1_offset_geom_full_offsetslot.bin
-
 pre_boot_state:
-  - { address: 0x08081FF0, u32: 0x676523FB }
-  - { address: 0x08081FF4, u32: 0x27388D84 }
-  - { address: 0x08081FF8, u32: 0xF6CB3E6C }
-  - { address: 0x08081FFC, u32: 0xC702C279 }
-  - { address: 0x08081F80, u32: 0x00000002 }
-  - { address: 0x08081F60, u32: 20532 }
-  - { address: 0x08081BD4, u32: 0x00000001 }
-
+- address: 134750192
+  u32: 1734681595
+- address: 134750196
+  u32: 658017668
+- address: 134750200
+  u32: 4140514924
+- address: 134750204
+  u32: 3338846841
+- address: 134750080
+  u32: 2
+- address: 134750048
+  u32: 20532
+- address: 134749140
+  u32: 1
 success_criteria: {}
-
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
   boot_cycles: 3
   max_writes: auto
   max_writes_cap: 200000
-  run_duration: "10.0"
+  run_duration: '10.0'
   max_step_limit: 20000000
-  fault_types: [power_loss]
-
+  fault_types:
+  - power_loss
 semantic_assertions:
   control:
     multi_boot_analysis.status: converged
     multi_boot_analysis.final_outcome: success
-
 invariants:
-  - multi_boot_converges
-
+- multi_boot_converges
 expect:
   control_outcome: success
   should_find_issues: false
+skip_self_test: true

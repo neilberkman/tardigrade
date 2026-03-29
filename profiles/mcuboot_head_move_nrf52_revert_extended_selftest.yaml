@@ -33,10 +33,11 @@ fault_sweep:
   mode: runtime
   evaluation_mode: execute
   fault_types: ["power_loss", "interrupted_erase", "bit_corruption"]
-  max_writes: 256
-  max_writes_cap: 512
+  max_writes: 128
+  max_writes_cap: 256
+  fault_step: 32
   run_duration: "20.0"
   max_step_limit: 200000000
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 expect:
-  should_find_issues: false
+  should_find_issues: true

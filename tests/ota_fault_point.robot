@@ -69,6 +69,7 @@ ${SUCCESS_OTADATA_EXPECT_SCOPE}    always
 ${SECURITY_ANTI_ROLLBACK}      false
 ${STATE_PROBE}                 ${EMPTY}
 ${HASH_BYPASS_SYMBOLS}         ${EMPTY}
+${HASH_BYPASS_ADDRS}           ${EMPTY}
 ${PROGRESS_STALL_TIMEOUT_S}    5
 ${EXPECT_CONTROL_OUTCOME}      ${EMPTY}
 ${POSTMORTEM_DUMP_NO_BOOT}     true
@@ -214,6 +215,7 @@ Run Runtime Fault Point
     Execute Command    $security_anti_rollback="${SECURITY_ANTI_ROLLBACK}"
     Execute Command    $state_probe="${STATE_PROBE}"
     Execute Command    $hash_bypass_symbols="${HASH_BYPASS_SYMBOLS}"
+    Execute Command    $hash_bypass_addrs="${HASH_BYPASS_ADDRS}"
     Execute Command    $progress_stall_timeout_s="${PROGRESS_STALL_TIMEOUT_S}"
     Execute Command    $expect_control_outcome="${EXPECT_CONTROL_OUTCOME}"
     Execute Command    $postmortem_dump_no_boot="${POSTMORTEM_DUMP_NO_BOOT}"

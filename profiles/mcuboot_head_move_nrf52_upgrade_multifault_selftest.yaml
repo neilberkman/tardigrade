@@ -43,4 +43,4 @@ fault_sweep:
     max_pairs: 12
     fallback_strategy: boundary_pairs
 expect:
-  should_find_issues: false
+  should_find_issues: true
