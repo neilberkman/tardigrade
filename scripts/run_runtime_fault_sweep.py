@@ -8537,9 +8537,10 @@ if calibration_mode:
         if success_image_hash:
             cal_exec_hash = compute_exec_slot_hash()
             result['calibration_exec_hash'] = cal_exec_hash
-            result['calibration_boot_outcome'] = result.get('final_boot_outcome') or result.get('boot_outcome')
             log('calibration: exec slot hash = {}'.format(cal_exec_hash[:16]))
     result = annotate_boot_span_result(result)
+    if success_image_hash:
+        result['calibration_boot_outcome'] = result.get('final_boot_outcome') or result.get('boot_outcome')
     with open(result_file, 'w') as f:
         f.write(_json_dump_text(result))
     log('calibration done: total_writes={}'.format(result.get('total_writes', '?')))

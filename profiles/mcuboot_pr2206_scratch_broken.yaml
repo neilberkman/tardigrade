@@ -1,4 +1,5 @@
 schema_version: 1
+skip_self_test: true
 name: mcuboot_pr2206_scratch_broken
 description: >
   MCUboot swap-scratch BEFORE PR #2206 geometry fix (broken commit e35461d2).

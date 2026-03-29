@@ -69,17 +69,20 @@ jobs:
 
       - name: "Broken ELF: must detect bricks"
         run: |
-          rc=0
           python3 scripts/audit_bootloader.py \
             --profile "${{ matrix.broken }}" \
             --output "${RUNNER_TEMP}/${{ matrix.name }}_broken.json" \
             --renode-test "${RUNNER_TEMP}/renode/renode-test" \
-            ${{ matrix.extra_args }} || rc=$?
-          if [ "$rc" -eq 0 ]; then
-            echo "FAIL: audit exited 0 — tool did not detect the known bug"
-            exit 1
-          fi
-          echo "Broken ELF correctly detected issues (exit $rc)"
+            ${{ matrix.extra_args }}
+          python3 -c "
+          import json, sys
+          r = json.load(open('${RUNNER_TEMP}/${{ matrix.name }}_broken.json'))
+          bricks = r.get('summary', {}).get('runtime_sweep', {}).get('bricks', 0)
+          print('Broken ELF: {} bricks found'.format(bricks))
+          if bricks == 0:
+              print('FAIL: tool did not detect the known bug')
+              sys.exit(1)
+          "
 
       - name: "Fixed ELF: must be clean"
         run: |
