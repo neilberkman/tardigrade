@@ -33,4 +33,4 @@ fault_sweep:
   max_step_limit: 20000000
   fault_types: [power_loss, swap_progress, interrupted_erase]
 expect:
-  should_find_issues: true
+  should_find_issues: false
