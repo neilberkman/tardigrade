@@ -70,7 +70,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5]
     env:
       RENODE_URL: https://builds.renode.io/renode-1.16.1.linux-dotnet.tar.gz
       PYTHONUNBUFFERED: "1"
@@ -95,10 +95,10 @@ jobs:
       - name: Run discovery feature unit tests
         run: python3 tests/test_discovery_features.py
 
-      - name: Run self-test shard ${{ matrix.shard }}/4
+      - name: Run self-test shard ${{ matrix.shard }}/5
         run: |
           python3 scripts/self_test.py --quick \
-            --shard "${{ matrix.shard }}/4" \
+            --shard "${{ matrix.shard }}/5" \
             --renode-test "${RUNNER_TEMP}/renode/renode-test" \
             --output results/self_test_shard_${{ matrix.shard }}.json
 

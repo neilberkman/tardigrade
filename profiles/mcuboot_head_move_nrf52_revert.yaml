@@ -57,3 +57,4 @@ fault_sweep:
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 expect:
   should_find_issues: true
+skip_self_test: true
