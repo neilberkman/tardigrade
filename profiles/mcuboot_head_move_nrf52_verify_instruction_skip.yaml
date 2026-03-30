@@ -1,5 +1,4 @@
 schema_version: 1
-skip_self_test: true
 name: mcuboot_head_move_nrf52_verify_instruction_skip
 description: >
   Instruction-skip (voltage glitch) targeting MCUboot image verification.
@@ -41,3 +40,5 @@ fault_sweep:
   max_writes: auto
   run_duration: "20.0"
   max_step_limit: 200000000
+expect:
+  should_find_issues: false

@@ -36,3 +36,5 @@ fault_sweep:
   max_writes: auto
   run_duration: "5.0"
   max_step_limit: 500000000
+expect:
+  should_find_issues: false

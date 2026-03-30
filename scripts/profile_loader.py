@@ -1174,7 +1174,7 @@ class ExpectConfig:
 
     def __init__(
         self,
-        should_find_issues: bool = True,
+        should_find_issues: bool = False,
         control_outcome: str = "success",
         allow_semantic_only_issues: bool = False,
         allow_control_only_issues: bool = False,
@@ -4065,7 +4065,7 @@ def _parse_state_probe(raw: Optional[Any]) -> Optional[StateProbeConfig]:
 
 def _parse_expect(raw: Optional[Dict[str, Any]]) -> ExpectConfig:
     if raw is None:
-        return ExpectConfig()
+        return ExpectConfig(should_find_issues=False)
     required_issue_reasons = [
         str(reason).strip()
         for reason in raw.get("required_issue_reasons", [])
@@ -4077,7 +4077,7 @@ def _parse_expect(raw: Optional[Dict[str, Any]]) -> ExpectConfig:
         if str(fault_type).strip()
     ]
     return ExpectConfig(
-        should_find_issues=bool(raw.get("should_find_issues", True)),
+        should_find_issues=bool(raw.get("should_find_issues", False)),
         control_outcome=str(raw.get("control_outcome", "success")),
         allow_semantic_only_issues=bool(raw.get("allow_semantic_only_issues", False)),
         allow_control_only_issues=bool(raw.get("allow_control_only_issues", False)),

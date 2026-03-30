@@ -254,7 +254,7 @@ def check_verdict(
     Returns (passed, reason).
     """
     expect = profile_raw.get("expect", {})
-    should_find_issues = expect.get("should_find_issues", True)
+    should_find_issues = expect.get("should_find_issues", False)
     brick_rate_min = float(expect.get("brick_rate_min", 0.0))
     allow_semantic_only_issues = bool(expect.get("allow_semantic_only_issues", False))
     allow_control_only_issues = bool(expect.get("allow_control_only_issues", False))

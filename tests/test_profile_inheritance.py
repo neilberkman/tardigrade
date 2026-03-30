@@ -140,6 +140,15 @@ class SimpleInheritanceTests(unittest.TestCase):
             # mode inherited from base via deep merge
             self.assertEqual(profile.fault_sweep.mode, "runtime")
 
+    def test_missing_expect_defaults_to_no_issues(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "profile.yaml"
+            path.write_text(_BASE_YAML.replace("expect:\n  should_find_issues: true\n", ""), encoding="utf-8")
+
+            profile = load_profile(path)
+
+            self.assertFalse(profile.expect.should_find_issues)
+
 
 class DeepMergeInheritanceTests(unittest.TestCase):
     """Child adds to a nested dict without clobbering sibling keys."""
