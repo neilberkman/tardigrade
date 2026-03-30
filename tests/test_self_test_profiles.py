@@ -17,10 +17,51 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from self_test import build_detailed_result, discover_profiles, run_audit, write_summary
+from self_test import (
+    build_detailed_result,
+    discover_profiles,
+    load_runtime_manifest,
+    partition_profiles_by_estimated_cost,
+    partition_profiles_round_robin,
+    run_audit,
+    shard_costs_s,
+    write_summary,
+)
 
 
 class SelfTestProfileDiscoveryTests(unittest.TestCase):
+    def test_runtime_manifest_assigns_known_outlier_costs(self):
+        default_cost_s, profile_costs = load_runtime_manifest(ROOT)
+
+        self.assertGreater(default_cost_s, 0)
+        self.assertIn("fault_no_crc_selftest.yaml", profile_costs)
+        self.assertIn("mcuboot_head_scratch_nrf52_revert_extended.yaml", profile_costs)
+        self.assertGreater(
+            profile_costs["mcuboot_head_scratch_nrf52_revert_extended.yaml"],
+            profile_costs["fault_no_crc_selftest.yaml"],
+        )
+
+    def test_weighted_sharding_reduces_ci_peak_cost(self):
+        profiles = discover_profiles(ROOT)
+        default_cost_s, profile_costs = load_runtime_manifest(ROOT)
+
+        round_robin = partition_profiles_round_robin(profiles, 5)
+        weighted = partition_profiles_by_estimated_cost(
+            profiles,
+            5,
+            profile_costs,
+            default_cost_s,
+        )
+
+        round_robin_costs = shard_costs_s(round_robin, profile_costs, default_cost_s)
+        weighted_costs = shard_costs_s(weighted, profile_costs, default_cost_s)
+
+        self.assertLess(max(weighted_costs), max(round_robin_costs))
+        self.assertLessEqual(
+            max(weighted_costs) - min(weighted_costs),
+            max(round_robin_costs) - min(round_robin_costs),
+        )
+
     def test_benchmark_and_execute_only_profiles_are_skipped(self):
         repo_root = ROOT
         discovered = {p.name for p in discover_profiles(repo_root)}

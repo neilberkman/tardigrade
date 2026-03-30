@@ -25,6 +25,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from profile_loader import load_profile_raw
 
+DEFAULT_SELF_TEST_RUNTIME_MANIFEST = "scripts/self_test_runtime_manifest.json"
+DEFAULT_SELF_TEST_PROFILE_COST_S = 60.0
+
 
 def _normalize_expect_fault_type(name: str) -> str:
     value = str(name or "").strip().lower()
@@ -34,6 +37,112 @@ def _normalize_expect_fault_type(name: str) -> str:
         "power_loss": "power_loss",
     }
     return aliases.get(value, value)
+
+
+def load_runtime_manifest(
+    repo_root: Path,
+    manifest_path: Optional[str] = None,
+) -> Tuple[float, Dict[str, float]]:
+    """Load per-profile runtime estimates used for self-test sharding."""
+    path = Path(manifest_path or DEFAULT_SELF_TEST_RUNTIME_MANIFEST)
+    if not path.is_absolute():
+        path = (repo_root / path).resolve()
+    if not path.exists():
+        return DEFAULT_SELF_TEST_PROFILE_COST_S, {}
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    default_cost_s = float(payload.get("default_cost_s", DEFAULT_SELF_TEST_PROFILE_COST_S))
+    if default_cost_s <= 0:
+        raise ValueError("self-test runtime manifest default_cost_s must be > 0")
+
+    raw_profiles = payload.get("profiles", {})
+    if not isinstance(raw_profiles, dict):
+        raise ValueError("self-test runtime manifest profiles must be an object")
+
+    profile_costs: Dict[str, float] = {}
+    for profile_name, raw_cost in raw_profiles.items():
+        if isinstance(raw_cost, dict):
+            raw_cost = raw_cost.get("estimated_runtime_s")
+        cost_s = float(raw_cost)
+        if cost_s <= 0:
+            raise ValueError(
+                "self-test runtime manifest cost for {} must be > 0".format(profile_name)
+            )
+        profile_costs[str(profile_name)] = cost_s
+    return default_cost_s, profile_costs
+
+
+def estimate_profile_cost(
+    profile_path: Path,
+    profile_costs: Dict[str, float],
+    default_cost_s: float,
+) -> float:
+    """Return the estimated runtime cost for a self-test profile."""
+    return float(profile_costs.get(profile_path.name, default_cost_s))
+
+
+def partition_profiles_round_robin(
+    profiles: List[Path],
+    shard_total: int,
+) -> List[List[Path]]:
+    """Partition profiles using the legacy round-robin strategy."""
+    if shard_total < 1:
+        raise ValueError("shard_total must be >= 1")
+    return [profiles[idx::shard_total] for idx in range(shard_total)]
+
+
+def partition_profiles_by_estimated_cost(
+    profiles: List[Path],
+    shard_total: int,
+    profile_costs: Dict[str, float],
+    default_cost_s: float,
+) -> List[List[Path]]:
+    """Partition profiles into shards by estimated runtime cost.
+
+    Uses a longest-processing-time-first greedy assignment so the heaviest
+    profiles spread across shards instead of clustering by filename order.
+    """
+    if shard_total < 1:
+        raise ValueError("shard_total must be >= 1")
+    if shard_total == 1:
+        return [list(profiles)]
+
+    original_order = {profile.name: idx for idx, profile in enumerate(profiles)}
+    sorted_profiles = sorted(
+        profiles,
+        key=lambda profile: (
+            -estimate_profile_cost(profile, profile_costs, default_cost_s),
+            original_order[profile.name],
+            profile.name,
+        ),
+    )
+    shard_profiles: List[List[Path]] = [[] for _ in range(shard_total)]
+    shard_costs = [0.0] * shard_total
+    for profile in sorted_profiles:
+        target_idx = min(
+            range(shard_total),
+            key=lambda idx: (shard_costs[idx], len(shard_profiles[idx]), idx),
+        )
+        shard_profiles[target_idx].append(profile)
+        shard_costs[target_idx] += estimate_profile_cost(
+            profile, profile_costs, default_cost_s
+        )
+
+    for idx, items in enumerate(shard_profiles):
+        shard_profiles[idx] = sorted(items, key=lambda profile: original_order[profile.name])
+    return shard_profiles
+
+
+def shard_costs_s(
+    shards: List[List[Path]],
+    profile_costs: Dict[str, float],
+    default_cost_s: float,
+) -> List[float]:
+    """Compute the estimated cost of each shard."""
+    return [
+        sum(estimate_profile_cost(profile, profile_costs, default_cost_s) for profile in shard)
+        for shard in shards
+    ]
 
 
 def discover_profiles(repo_root: Path) -> List[Path]:
@@ -271,9 +380,15 @@ def main() -> int:
         "--shard", default=None,
         help="Run shard N of M total (e.g. '1/4' runs the first quarter).",
     )
+    parser.add_argument(
+        "--runtime-manifest",
+        default=DEFAULT_SELF_TEST_RUNTIME_MANIFEST,
+        help="Path to the self-test runtime cost manifest used for weighted sharding.",
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
+    default_cost_s, profile_costs = load_runtime_manifest(repo_root, args.runtime_manifest)
 
     # Discover profiles.
     if args.profile:
@@ -281,16 +396,26 @@ def main() -> int:
     else:
         profiles = discover_profiles(repo_root)
 
-    # Apply sharding (round-robin so slow profiles spread evenly).
+    shard_estimate_s: Optional[float] = None
     if args.shard:
         shard_idx, shard_total = (int(x) for x in args.shard.split("/"))
-        profiles = profiles[shard_idx - 1::shard_total]
+        shards = partition_profiles_by_estimated_cost(
+            profiles, shard_total, profile_costs, default_cost_s
+        )
+        profiles = shards[shard_idx - 1]
+        shard_estimate_s = shard_costs_s(shards, profile_costs, default_cost_s)[shard_idx - 1]
 
     if not profiles:
         print("No profiles found.", file=sys.stderr)
         return 1
 
     print("Self-test: {} profiles".format(len(profiles)))
+    if shard_estimate_s is not None:
+        print(
+            "Shard {} estimated runtime: {:.1f}m".format(
+                args.shard, shard_estimate_s / 60.0
+            )
+        )
     print("=" * 60)
 
     results: List[Tuple[str, bool, str]] = []
