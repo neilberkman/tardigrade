@@ -39,6 +39,7 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertNotIn("mcuboot_head_move_nrf52_revert_nohashbypass.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_nrf52_seccounter_downgrade_rc_injection.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_nrf52_upgrade.yaml", discovered)
+        self.assertNotIn("mcuboot_head_move_nrf52_upgrade_extended_selftest.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_nrf52_verify_instruction_skip.yaml", discovered)
         self.assertNotIn("mcuboot_pr2214_offset_geom_broken.yaml", discovered)
         self.assertNotIn("mcuboot_pr2214_offset_geom_fixed.yaml", discovered)
