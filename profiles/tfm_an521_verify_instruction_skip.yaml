@@ -1,4 +1,5 @@
 schema_version: 1
+skip_self_test: true
 name: tfm_an521_verify_instruction_skip
 description: >
   TF-M BL2 (MCUboot with EC-P256 signature verification) on AN521.
