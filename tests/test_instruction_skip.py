@@ -13,6 +13,7 @@ import warnings
 from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -526,6 +527,206 @@ class InstructionSkipPlannerRangeFilterTest(unittest.TestCase):
 
         self.assertEqual(plan.fault_points, [0x10000048, 0x1000004A])
         self.assertEqual(plan.fault_types_list, ["i:0x10000048", "i:0x1000004A"])
+
+
+class InstructionSkipQuickSamplingTest(unittest.TestCase):
+    EXAMPLE_ELF = ROOT / "examples" / "vulnerable_ota" / "firmware.elf"
+
+    def test_quick_samples_each_target_range(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = Path(td) / "profile.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    schema_version: 1
+                    name: instruction_skip_quick_sampling_profile
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    flash_backend: faultFlash
+                    bootloader:
+                      elf: {self.EXAMPLE_ELF}
+                      entry: 0x10000000
+                    memory:
+                      sram: {{ start: 0x20000000, end: 0x20020000 }}
+                      write_granularity: 4
+                      slots:
+                        exec: {{ base: 0x10000000, size: 0x1000 }}
+                        staging: {{ base: 0x10001000, size: 0x1000 }}
+                    fault_sweep:
+                      fault_types: [instruction_skip]
+                      evaluation_mode: execute
+                      instruction_skip_config:
+                        target_addresses:
+                          - {{ start: 0x1000, end: 0x1014 }}
+                          - {{ start: 0x2000, end: 0x2014 }}
+                          - {{ start: 0x3000, end: 0x3006 }}
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            profile = load_profile(profile_path)
+
+        with mock.patch("fault_plan.make_elf_halfword_reader", return_value=None):
+            plan = build_fault_plan(
+                profile,
+                CalibrationInputs(max_writes=0),
+                quick=True,
+            )
+
+        self.assertEqual(
+            plan.fault_points,
+            [
+                0x1000,
+                0x1004,
+                0x1008,
+                0x100C,
+                0x1012,
+                0x2000,
+                0x2004,
+                0x2008,
+                0x200C,
+                0x2012,
+                0x3000,
+                0x3002,
+                0x3004,
+            ],
+        )
+        self.assertEqual(
+            plan.fault_types_list,
+            [
+                "i:0x1000",
+                "i:0x1004",
+                "i:0x1008",
+                "i:0x100C",
+                "i:0x1012",
+                "i:0x2000",
+                "i:0x2004",
+                "i:0x2008",
+                "i:0x200C",
+                "i:0x2012",
+                "i:0x3000",
+                "i:0x3002",
+                "i:0x3004",
+            ],
+        )
+
+    def test_quick_prioritizes_branch_and_compare_sites(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = Path(td) / "profile.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    schema_version: 1
+                    name: instruction_skip_quick_priority_profile
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    flash_backend: faultFlash
+                    bootloader:
+                      elf: {self.EXAMPLE_ELF}
+                      entry: 0x10000000
+                    memory:
+                      sram: {{ start: 0x20000000, end: 0x20020000 }}
+                      write_granularity: 4
+                      slots:
+                        exec: {{ base: 0x10000000, size: 0x1000 }}
+                        staging: {{ base: 0x10001000, size: 0x1000 }}
+                    fault_sweep:
+                      fault_types: [instruction_skip]
+                      evaluation_mode: execute
+                      instruction_skip_config:
+                        target_addresses:
+                          - {{ start: 0x1000, end: 0x1014 }}
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            profile = load_profile(profile_path)
+
+        mapping = {
+            0x1000: 0x6800,
+            0x1002: 0x6801,
+            0x1004: 0x6802,
+            0x1006: 0xE001,
+            0x1008: 0x6804,
+            0x100A: 0x2C01,
+            0x100C: 0x6806,
+            0x100E: 0x6807,
+            0x1010: 0x6808,
+            0x1012: 0x6809,
+        }
+
+        def read_halfword(addr: int) -> int:
+            return mapping[int(addr)]
+
+        with mock.patch("fault_plan.make_elf_halfword_reader", return_value=read_halfword):
+            plan = build_fault_plan(
+                profile,
+                CalibrationInputs(max_writes=0),
+                quick=True,
+            )
+
+        self.assertEqual(len(plan.fault_points), 5)
+        self.assertIn(0x1006, plan.fault_points)
+        self.assertIn(0x100A, plan.fault_points)
+
+    def test_quick_keeps_tail_branch_and_compare_sites(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = Path(td) / "profile.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    schema_version: 1
+                    name: instruction_skip_quick_tail_priority_profile
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    flash_backend: faultFlash
+                    bootloader:
+                      elf: {self.EXAMPLE_ELF}
+                      entry: 0x10000000
+                    memory:
+                      sram: {{ start: 0x20000000, end: 0x20020000 }}
+                      write_granularity: 4
+                      slots:
+                        exec: {{ base: 0x10000000, size: 0x1000 }}
+                        staging: {{ base: 0x10001000, size: 0x1000 }}
+                    fault_sweep:
+                      fault_types: [instruction_skip]
+                      evaluation_mode: execute
+                      instruction_skip_config:
+                        target_addresses:
+                          - {{ start: 0x1000, end: 0x1016 }}
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            profile = load_profile(profile_path)
+
+        mapping = {
+            0x1000: 0x6800,
+            0x1002: 0xE001,
+            0x1004: 0x6802,
+            0x1006: 0x2801,
+            0x1008: 0x6804,
+            0x100A: 0x6805,
+            0x100C: 0xB108,
+            0x100E: 0x6807,
+            0x1010: 0x4283,
+            0x1012: 0x6809,
+            0x1014: 0x680A,
+        }
+
+        def read_halfword(addr: int) -> int:
+            return mapping[int(addr)]
+
+        with mock.patch("fault_plan.make_elf_halfword_reader", return_value=read_halfword):
+            plan = build_fault_plan(
+                profile,
+                CalibrationInputs(max_writes=0),
+                quick=True,
+            )
+
+        self.assertIn(0x100C, plan.fault_points)
+        self.assertIn(0x1010, plan.fault_points)
 
 
 class VerificationProbeRobotVarsTest(unittest.TestCase):

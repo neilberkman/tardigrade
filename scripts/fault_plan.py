@@ -22,6 +22,8 @@ from thumb_instructions import (
     make_elf_halfword_reader,
 )
 
+INSTRUCTION_SKIP_QUICK_POINTS_PER_RANGE = 5
+
 
 @dataclasses.dataclass
 class FaultPlan:
@@ -342,6 +344,138 @@ def _slice_explicit_points(
     if step > 1:
         filtered = filtered[::step]
     return filtered
+
+
+def _sample_evenly_spaced_points(points: List[int], *, sample_count: int) -> List[int]:
+    """Return up to ``sample_count`` representatives across an ordered point list."""
+    if len(points) <= sample_count:
+        return list(points)
+    if sample_count <= 1:
+        return [points[0]]
+    last_index = len(points) - 1
+    indices: List[int] = []
+    for sample_index in range(sample_count):
+        idx = (sample_index * last_index) // (sample_count - 1)
+        if not indices or indices[-1] != idx:
+            indices.append(idx)
+    return [points[idx] for idx in indices]
+
+
+def _sample_edge_points(points: List[int], *, sample_count: int) -> List[int]:
+    """Return first/last-biased samples from an ordered point list."""
+    if len(points) <= sample_count:
+        return list(points)
+    if sample_count <= 1:
+        return [points[-1]]
+    if sample_count == 2:
+        return [points[0], points[-1]]
+    middle = _sample_evenly_spaced_points(points[1:-1], sample_count=sample_count - 2)
+    return [points[0], *middle, points[-1]]
+
+
+def _looks_like_thumb_branch_check(halfword: int) -> bool:
+    """Return True for common 16-bit branch/check opcodes worth prioritizing."""
+    opcode = int(halfword) & 0xFFFF
+    if (opcode & 0xF500) == 0xB100:  # CBZ / CBNZ
+        return True
+    if (opcode & 0xF000) == 0xD000 and ((opcode >> 8) & 0xF) < 0xE:  # B<cond>
+        return True
+    if (opcode & 0xF800) == 0xE000:  # B (T2, 16-bit unconditional)
+        return True
+    return False
+
+
+def _looks_like_thumb_compare_check(halfword: int) -> bool:
+    """Return True for common 16-bit compare/test opcodes."""
+    opcode = int(halfword) & 0xFFFF
+    if (opcode & 0xF800) == 0x2800:  # CMP (immediate)
+        return True
+    if (opcode & 0xFFC0) == 0x4280:  # CMP (register)
+        return True
+    if (opcode & 0xFF00) == 0x4500:  # CMP (high register)
+        return True
+    if (opcode & 0xFFC0) == 0x4200:  # TST (register)
+        return True
+    return False
+
+
+def _sample_instruction_skip_range_points(
+    range_points: List[int],
+    *,
+    read_halfword,
+    sample_count: int,
+) -> List[int]:
+    """Bias quick instruction-skip sampling toward control-flow checks."""
+    if len(range_points) <= sample_count:
+        return list(range_points)
+
+    branch_points: List[int] = []
+    compare_points: List[int] = []
+    for point in range_points:
+        if read_halfword is None:
+            break
+        try:
+            halfword = int(read_halfword(point)) & 0xFFFF
+        except Exception:
+            continue
+        if _looks_like_thumb_branch_check(halfword):
+            branch_points.append(point)
+        elif _looks_like_thumb_compare_check(halfword):
+            compare_points.append(point)
+
+    selected: List[int] = []
+    seen: set[int] = set()
+
+    def _add_priority_points(points: List[int], count: int) -> None:
+        if count <= 0 or not points:
+            return
+        for point in _sample_edge_points(
+            points,
+            sample_count=min(count, len(points)),
+        ):
+            if point not in seen:
+                selected.append(point)
+                seen.add(point)
+
+    def _add_fallback_points(points: List[int], count: int) -> None:
+        if count <= 0 or not points:
+            return
+        for point in _sample_evenly_spaced_points(
+            points,
+            sample_count=min(count, len(points)),
+        ):
+            if point not in seen:
+                selected.append(point)
+                seen.add(point)
+
+    remaining = sample_count
+    _add_priority_points(branch_points, min(2, remaining))
+    remaining = sample_count - len(selected)
+    _add_priority_points(compare_points, min(2, remaining))
+    remaining = sample_count - len(selected)
+    _add_fallback_points(range_points, remaining)
+    return [point for point in range_points if point in seen]
+
+
+def _quick_subset_instruction_skip_ranges(
+    points_by_range: List[List[int]],
+    *,
+    read_halfword=None,
+    sample_count: int = INSTRUCTION_SKIP_QUICK_POINTS_PER_RANGE,
+) -> List[int]:
+    """Sample instruction-skip targets per configured range instead of globally."""
+    sampled: List[int] = []
+    seen: set[int] = set()
+    for range_points in points_by_range:
+        for point in _sample_instruction_skip_range_points(
+            range_points,
+            read_halfword=read_halfword,
+            sample_count=sample_count,
+        ):
+            if point not in seen:
+                sampled.append(point)
+                seen.add(point)
+    return sampled
 
 
 def build_fault_plan(
@@ -843,9 +977,10 @@ def build_fault_plan(
                             file=sys.stderr,
                         )
 
-                skip_addrs: List[int] = []
+                skip_ranges: List[List[int]] = []
                 sc = isc.skip_count if isc.skip_count > 0 else 1
                 for region_start, region_end in isc.target_addresses:
+                    region_skip_addrs: List[int] = []
                     if read_halfword is not None:
                         candidate_addrs = enumerate_instruction_skip_addresses(
                             read_halfword,
@@ -864,7 +999,7 @@ def build_fault_plan(
                             if any(int(patch_addr) in literal_pools for patch_addr in patch_addrs):
                                 literal_pool_excluded += 1
                                 continue
-                            skip_addrs.append(addr)
+                            region_skip_addrs.append(addr)
                     else:
                         end = region_end - (sc - 1) * 2
                         for addr in range(region_start, max(end, region_start), 2):
@@ -875,15 +1010,33 @@ def build_fault_plan(
                             if hits_pool:
                                 literal_pool_excluded += 1
                                 continue
-                            skip_addrs.append(addr)
-                skip_addrs = _slice_explicit_points(
-                    skip_addrs,
-                    fault_step=fault_step,
-                    fault_start=fault_start,
-                    fault_end=fault_end,
-                )
-                if quick and not quick_use_heuristic:
-                    skip_addrs = quick_subset(skip_addrs)
+                            region_skip_addrs.append(addr)
+                    skip_ranges.append(region_skip_addrs)
+                if (
+                    quick
+                    and not quick_use_heuristic
+                    and fault_step == 1
+                    and fault_start is None
+                    and fault_end is None
+                ):
+                    skip_addrs = _quick_subset_instruction_skip_ranges(
+                        skip_ranges,
+                        read_halfword=read_halfword,
+                    )
+                else:
+                    skip_addrs = [
+                        addr
+                        for region_skip_addrs in skip_ranges
+                        for addr in region_skip_addrs
+                    ]
+                    skip_addrs = _slice_explicit_points(
+                        skip_addrs,
+                        fault_step=fault_step,
+                        fault_start=fault_start,
+                        fault_end=fault_end,
+                    )
+                    if quick and not quick_use_heuristic:
+                        skip_addrs = quick_subset(skip_addrs)
                 for addr in skip_addrs:
                     combined.append((addr, "i:0x{:X}".format(addr)))
                 instruction_skip_count = len(skip_addrs)
