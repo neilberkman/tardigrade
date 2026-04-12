@@ -149,6 +149,7 @@ KNOWN_FAULT_TYPES = {
     "otp_stuck_bit",
     "otp_read_disturb",
     "otp_overblow",
+    "otp_blow_nop",
     "phase2_fault",
     "hook_fault",
     "metadata_fault",
@@ -180,6 +181,7 @@ IMPLEMENTED_FAULT_TYPES = {
     "otp_stuck_bit",
     "otp_read_disturb",
     "otp_overblow",
+    "otp_blow_nop",
 }
 
 # Fault types that are classification/heuristic labels, not injectable fault
@@ -200,6 +202,7 @@ OTP_FAULT_TYPE_CODES = {
     "otp_stuck_bit": 1,
     "otp_read_disturb": 2,
     "otp_overblow": 3,
+    "otp_blow_nop": 4,
 }
 
 # Map I2C fault type names to their I2CFaultProxy FaultType codes.
@@ -2600,7 +2603,7 @@ def _warn_fault_backend_compat(
             )
 
     # OTP fault types require an OTPMemory peripheral on the platform.
-    otp_types = {"otp_partial_program", "otp_stuck_bit", "otp_read_disturb", "otp_overblow"}
+    otp_types = {"otp_partial_program", "otp_stuck_bit", "otp_read_disturb", "otp_overblow", "otp_blow_nop"}
     if all_types & otp_types:
         has_otp = (
             otp_peripheral is not None

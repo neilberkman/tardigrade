@@ -19,6 +19,7 @@
 //   1 = stuck_bit        — a specific bit fails to program permanently
 //   2 = read_disturb     — adjacent bits get unintended 0->1 flips on blow
 //   3 = overblow         — target bits flip plus extra neighboring bits
+//   4 = blow_nop         — programming executes but fuse state unchanged
 //
 // Write tracking:
 //   TotalBlows           — total fuse blow operations attempted
@@ -631,6 +632,14 @@ namespace Antmicro.Renode.Peripherals.Memory
                             storage[extraOffset] |= extraBit;
                         }
                     }
+                    break;
+
+                case 4:
+                    // Blow no-op: the programming operation executes but has
+                    // zero effect on fuse state.  Models a silicon defect or
+                    // insufficient programming pulse where the fuse physically
+                    // fails to blow.  Catches firmware that retries in an
+                    // unbounded loop without checking for forward progress.
                     break;
 
                 default:

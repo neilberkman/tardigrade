@@ -30,6 +30,7 @@ These are retroactive tests against known MCUboot bugs, not discoveries. The poi
 
 Additional differential profiles for PRs [#2205](https://github.com/mcu-tools/mcuboot/pull/2205), [#2206](https://github.com/mcu-tools/mcuboot/pull/2206), and [#2214](https://github.com/mcu-tools/mcuboot/pull/2214).
 
+
 ## Integrations
 
 ### Fuzzer bridge
@@ -171,7 +172,7 @@ flowchart TD
 
 ### Fault types
 
-25 fault types across 8 backend categories:
+26 fault types across 8 backend categories:
 
 | Category        | Fault types                                                                                                                                                           | Backend              |
 | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
@@ -182,7 +183,7 @@ flowchart TD
 | CPU glitch      | `instruction_skip`                                                                                                                                                    | All                  |
 | Driver error    | `driver_error` (peripheral sets error status register), `rc_injection` (forces flash write return code to -EIO at software level)                                     | All                  |
 | I2C bus         | `i2c_nack`, `i2c_timeout`, `i2c_bit_flip`, `i2c_truncated`, `i2c_wrong_address`                                                                                       | I2CFaultProxy        |
-| OTP fuse        | `otp_partial_program`, `otp_stuck_bit`, `otp_read_disturb`, `otp_overblow`                                                                                            | OTPMemory            |
+| OTP fuse        | `otp_partial_program`, `otp_stuck_bit`, `otp_read_disturb`, `otp_overblow`, `otp_blow_nop`                                                                            | OTPMemory            |
 
 Faults can be injected at different lifecycle stages: during the initial update write path, during pre-boot metadata/setup writes (`metadata_fault`), during between-boot confirm/accept hooks (`hook_fault`), during the recovery write path itself (`phase2_fault`), or as compound sequences (`multi_fault`). The optional `durability_model: writeback` composes with any fault type to simulate write-buffering storage stacks.
 

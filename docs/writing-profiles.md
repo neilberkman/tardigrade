@@ -416,6 +416,7 @@ Default is `[power_loss]`. Available types (25 total):
 | `otp_stuck_bit`            | OTP bit stuck at 0 or 1                        | OTPMemory            |
 | `otp_read_disturb`         | OTP read returns wrong value                   | OTPMemory            |
 | `otp_overblow`             | OTP fuse blown past threshold                  | OTPMemory            |
+| `otp_blow_nop`             | OTP blow executes but fuse unchanged           | OTPMemory            |
 
 ### Swap progress (semantic cutpoints)
 
@@ -907,7 +908,7 @@ For platforms with one-time-programmable fuse memory (anti-rollback counters, se
 otp_peripheral: sysbus.otp
 ```
 
-Enables the OTP fault types (`otp_partial_program`, `otp_stuck_bit`, `otp_read_disturb`, `otp_overblow`). Requires the `OTPMemory.cs` peripheral on the platform. See [`docs/otp-backend.md`](otp-backend.md) for the OTP fault model.
+Enables the OTP fault types (`otp_partial_program`, `otp_stuck_bit`, `otp_read_disturb`, `otp_overblow`, `otp_blow_nop`). Requires the `OTPMemory.cs` peripheral on the platform. See [`docs/otp-backend.md`](otp-backend.md) for the OTP fault model.
 
 ### I2C fault injection
 

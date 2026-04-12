@@ -115,7 +115,7 @@ class OTPFaultPointGenerationTest(unittest.TestCase):
         self.assertEqual(_OTP_WIRE_CODE_TO_BLOW_MODE["oo"], 3)
 
     def test_otp_wire_codes_set(self) -> None:
-        self.assertEqual(_OTP_WIRE_CODES, frozenset({"op", "os", "od", "oo"}))
+        self.assertEqual(_OTP_WIRE_CODES, frozenset({"op", "os", "od", "oo", "on"}))
 
     def test_otp_include_flag_derived_from_fault_types(self) -> None:
         """Simulate the include_otp_faults flag logic from audit_bootloader."""

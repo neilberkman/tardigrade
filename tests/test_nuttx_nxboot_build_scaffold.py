@@ -117,7 +117,7 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             self.assertEqual(profile.fault_sweep.calibration_time_slice, "0.1")
             self.assertEqual(
                 profile.semantic_assertions["control"]["semantic_state.roles.next_boot"],
-                "revert",
+                "none",
             )
             robot_vars = profile.robot_vars(ROOT)
             self.assertIn(

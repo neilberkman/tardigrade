@@ -37,6 +37,7 @@ Set `BlowFaultMode` to select the fault model when `FaultAtBlow` triggers:
 | 1    | `stuck_bit`       | Specific bits (per `SetStuckBitMask`) never program        |
 | 2    | `read_disturb`    | Target bits blow, but adjacent byte gets unintended 1-bits |
 | 3    | `overblow`        | Target bits blow plus extra random neighboring bits        |
+| 4    | `blow_nop`        | Programming executes but fuse state is unchanged           |
 
 ### Properties
 
@@ -73,7 +74,7 @@ otp_peripheral: otp # Sysbus name of OTPMemory peripheral
 
 ### OTP-specific fault types
 
-Four fault types target OTP programming:
+Five fault types target OTP programming:
 
 | Fault Type            | Wire Code | Description                                                  |
 | --------------------- | --------- | ------------------------------------------------------------ |
@@ -81,6 +82,7 @@ Four fault types target OTP programming:
 | `otp_stuck_bit`       | `os`      | Manufacturing defect prevents specific bits from programming |
 | `otp_read_disturb`    | `od`      | Programming disturbs adjacent fuse bits                      |
 | `otp_overblow`        | `oo`      | Fuse blown past threshold, extra neighboring bits affected   |
+| `otp_blow_nop`        | `on`      | Programming executes but fuse unchanged (catches retry loops)|
 
 These are execute-only fault types (require full CPU emulation, not state mode).
 

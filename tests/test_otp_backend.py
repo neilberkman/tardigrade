@@ -31,7 +31,7 @@ from profile_loader import (
 class OTPFaultTypeRegistrationTest(unittest.TestCase):
     """Verify OTP fault types are registered in all the right places."""
 
-    OTP_TYPES = {"otp_partial_program", "otp_stuck_bit", "otp_read_disturb", "otp_overblow"}
+    OTP_TYPES = {"otp_partial_program", "otp_stuck_bit", "otp_read_disturb", "otp_overblow", "otp_blow_nop"}
 
     def test_otp_types_in_known(self) -> None:
         for ft in self.OTP_TYPES:
@@ -136,6 +136,62 @@ class OTPOverblowProfileParsingTest(unittest.TestCase):
         code = FAULT_TYPE_NAME_TO_CODE["otp_overblow"]
         self.assertEqual(code, "oo")
         self.assertEqual(_fault_type_label(code), "otp_overblow")
+
+
+class OTPBlowNopRegistrationTest(unittest.TestCase):
+    """Verify otp_blow_nop is registered and wired correctly."""
+
+    def test_blow_nop_in_known_fault_types(self):
+        self.assertIn("otp_blow_nop", KNOWN_FAULT_TYPES)
+
+    def test_blow_nop_code_is_4(self):
+        self.assertEqual(OTP_FAULT_TYPE_CODES["otp_blow_nop"], 4)
+
+    def test_blow_nop_wire_code_round_trip(self):
+        code = FAULT_TYPE_NAME_TO_CODE["otp_blow_nop"]
+        self.assertEqual(code, "on")
+        self.assertEqual(_fault_type_label(code), "otp_blow_nop")
+
+    def test_blow_nop_in_execute_only(self):
+        from scripts.fault_types import EXECUTE_ONLY_FAULT_TYPES
+        self.assertIn("otp_blow_nop", EXECUTE_ONLY_FAULT_TYPES)
+
+    def test_blow_nop_accepted_in_profile(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "profile.yaml"
+            path.write_text(
+                textwrap.dedent("""\
+                    schema_version: 1
+                    name: test_otp_blow_nop
+                    description: test blow-nop fault mode
+                    platform: platforms/cortex_m0_otp.repl
+                    flash_backend: nvm_ctrl
+                    otp_peripheral: otp
+                    bootloader:
+                      elf: examples/vulnerable_ota/firmware.elf
+                      entry: 0x10000000
+                    memory:
+                      sram: { start: 0x20000000, end: 0x20020000 }
+                      write_granularity: 8
+                      slots:
+                        exec: { base: 0x10000000, size: 0x38000 }
+                        staging: { base: 0x10038000, size: 0x38000 }
+                    images:
+                      staging: examples/vulnerable_ota/firmware.bin
+                    success_criteria:
+                      vtor_in_slot: exec
+                    fault_sweep:
+                      mode: runtime
+                      max_writes: 100
+                      fault_types:
+                        - otp_blow_nop
+                    expect:
+                      should_find_issues: false
+                """),
+                encoding="utf-8",
+            )
+            profile = load_profile(path)
+            self.assertIn("otp_blow_nop", profile.fault_sweep.fault_types)
 
 
 # ---------------------------------------------------------------------------

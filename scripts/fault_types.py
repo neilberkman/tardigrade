@@ -29,6 +29,7 @@ EXECUTE_ONLY_FAULT_TYPES = {
     "otp_stuck_bit",
     "otp_read_disturb",
     "otp_overblow",
+    "otp_blow_nop",
     "nvs_corruption",
     "i2c_nack",
     "i2c_timeout",
@@ -74,6 +75,7 @@ FAULT_TYPE_NAME_TO_CODE = {
     "otp_stuck_bit": "os",
     "otp_read_disturb": "od",
     "otp_overblow": "oo",
+    "otp_blow_nop": "on",
     "nvs_corruption": "nv",
     "i2c_nack": "in",
     "i2c_timeout": "it",
@@ -92,6 +94,7 @@ _OTP_WIRE_CODE_TO_BLOW_MODE = {
     "os": 1,  # otp_stuck_bit
     "od": 2,  # otp_read_disturb
     "oo": 3,  # otp_overblow
+    "on": 4,  # otp_blow_nop
 }
 
 _OTP_WIRE_CODES = frozenset(_OTP_WIRE_CODE_TO_BLOW_MODE.keys())
@@ -119,6 +122,7 @@ def _fault_type_label(code: Any) -> str:
         "os": "otp_stuck_bit",
         "od": "otp_read_disturb",
         "oo": "otp_overblow",
+        "on": "otp_blow_nop",
         "nv": "nvs_corruption",
         "in": "i2c_nack",
         "it": "i2c_timeout",

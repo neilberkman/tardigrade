@@ -326,7 +326,7 @@ class TestRuntimeDispatchCoverage(unittest.TestCase):
         through ``run_execute_fault`` via the simple-code path.  Types
         that take different dispatch routes are excluded:
 
-        - OTP codes (op, os, od, oo): dispatched through OTP backend kind
+        - OTP codes (op, os, od, oo, on): dispatched through OTP backend kind
         - instruction_skip (i): always dispatched via 'i:<addr>' prefix
         """
         # Codes that take alternative dispatch paths in the .resc and are
@@ -334,7 +334,7 @@ class TestRuntimeDispatchCoverage(unittest.TestCase):
         ALTERNATIVE_DISPATCH_CODES = {
             # OTP faults: dispatched through the OTP backend kind, not the
             # simple-code path.
-            "op", "os", "od", "oo",
+            "op", "os", "od", "oo", "on",
             # instruction_skip: always dispatched via 'i:<addr>' prefix,
             # never as bare 'i'.
             "i",

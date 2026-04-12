@@ -178,7 +178,7 @@ _DISARM_SENTINEL = 18446744073709551615
 # OTP wire codes map to their BlowFaultMode integers directly.
 _WRITE_FAULT_MODE = {
     'w': 0, 'b': 1, 's': 2, 'r': 3, 'd': 4, 'l': 5, 'g': 6, 'x': 3,
-    'op': 0, 'os': 1, 'od': 2, 'oo': 3,
+    'op': 0, 'os': 1, 'od': 2, 'oo': 3, 'on': 4,
 }
 
 def _base_fault_type_code(fault_type):
@@ -720,6 +720,7 @@ _FAULT_CODE_TO_NAME = {
     'os': 'otp_stuck_bit',
     'od': 'otp_read_disturb',
     'oo': 'otp_overblow',
+    'on': 'otp_blow_nop',
     'nv': 'nvs_corruption',
     'in': 'i2c_nack',
     'it': 'i2c_timeout',
@@ -8321,7 +8322,7 @@ if calibration_mode:
         # Only skip phase 2 for backends that don't support write trace (mram).
         trace_capable = backend['kind'] == 'fast'
 
-        if phase1_reason in ('vtor', 'vtor_settled', 'pc_captured') and trace_capable:
+        if phase1_reason in ('vtor', 'vtor_captured', 'vtor_settled', 'pc_captured') and trace_capable:
             # Phase 2: Reset and re-run with fine slices, bounded by phase 1 time.
             fine_margin_s = max(1.0, phase1_emulated_s * 0.2)
             fine_budget_s = phase1_emulated_s + fine_margin_s
