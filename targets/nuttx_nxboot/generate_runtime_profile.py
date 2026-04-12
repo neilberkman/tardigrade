@@ -67,7 +67,7 @@ fault_sweep:
   evaluation_mode: execute
   run_duration: "{run_duration}"
   calibration_time_slice: "{calibration_time_slice}"
-  boot_cycles: {boot_cycles}{rollback_line}{fault_types_line}
+  boot_cycles: {boot_cycles}{rollback_line}{fault_types_line}{instruction_skip_block}
 state_probe:
   script: targets/nuttx_nxboot/probe.py
 semantic_assertions:
@@ -94,6 +94,16 @@ expect:
         fault_types_line=(
             "\n  fault_types: [{}]".format(fault_types)
             if fault_types else ""
+        ),
+        instruction_skip_block=(
+            "\n  instruction_skip_config:"
+            "\n    target_addresses:"
+            "\n      - { symbol: validate_image }"
+            "\n      - { symbol: copy_partition }"
+            "\n      - { symbol: perform_update }"
+            "\n      - { symbol: get_update_type }"
+            "\n    skip_count: 1"
+            if "instruction_skip" in fault_types else ""
         ),
         name=name,
         loader_elf=loader_elf,
