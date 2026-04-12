@@ -150,6 +150,7 @@ KNOWN_FAULT_TYPES = {
     "otp_read_disturb",
     "otp_overblow",
     "otp_blow_nop",
+    "timed_bit_corruption",
     "phase2_fault",
     "hook_fault",
     "metadata_fault",
@@ -182,6 +183,7 @@ IMPLEMENTED_FAULT_TYPES = {
     "otp_read_disturb",
     "otp_overblow",
     "otp_blow_nop",
+    "timed_bit_corruption",
 }
 
 # Fault types that are classification/heuristic labels, not injectable fault
@@ -574,6 +576,30 @@ class InstructionSkipConfig:
                 raise ProfileError(
                     "instruction_skip_config.target_addresses[{}]: "
                     "start (0x{:X}) must be halfword-aligned".format(i, start)
+                )
+
+
+class TimedBitCorruptionConfig:
+    """Configuration for timed bit-corruption (TOCTOU) fault injection.
+
+    Models time-of-check-to-time-of-use vulnerabilities where memory is
+    re-read after validation.  Each pair specifies a trigger address
+    (code point where the read-fault is armed) and a corrupt address
+    (memory address that returns corrupted data on next read).
+    """
+
+    __slots__ = ("pairs",)
+
+    def __init__(self, pairs=None):
+        self.pairs = pairs or []
+        for i, pair in enumerate(self.pairs):
+            if "trigger" not in pair:
+                raise ProfileError(
+                    "timed_bit_corruption_config.pairs[{}]: missing 'trigger'".format(i)
+                )
+            if "corrupt_address" not in pair:
+                raise ProfileError(
+                    "timed_bit_corruption_config.pairs[{}]: missing 'corrupt_address'".format(i)
                 )
 
 
@@ -997,6 +1023,7 @@ class FaultSweepConfig:
         "multi_fault",
         "read_fault_config",
         "instruction_skip_config",
+        "timed_bit_corruption_config",
         "verification_probes",
         "metadata_fault",
         "metadata_delta",
@@ -1038,6 +1065,7 @@ class FaultSweepConfig:
         multi_fault=None,
         read_fault_config: Optional["ReadFaultConfig"] = None,
         instruction_skip_config: Optional["InstructionSkipConfig"] = None,
+        timed_bit_corruption_config: Optional["TimedBitCorruptionConfig"] = None,
         verification_probes: Optional[List["VerificationProbeConfig"]] = None,
         metadata_fault: Optional["MetadataFaultConfig"] = None,
         metadata_delta: Optional["MetadataDeltaConfig"] = None,
@@ -1088,6 +1116,7 @@ class FaultSweepConfig:
         self.multi_fault = multi_fault or MultiFaultConfig()
         self.read_fault_config = read_fault_config
         self.instruction_skip_config = instruction_skip_config
+        self.timed_bit_corruption_config = timed_bit_corruption_config
         self.verification_probes = verification_probes or []
         self.metadata_fault = metadata_fault or MetadataFaultConfig()
         self.metadata_delta = metadata_delta or MetadataDeltaConfig()
@@ -2767,6 +2796,9 @@ def _parse_fault_sweep(
             bootloader_elf=bootloader_elf,
             profile_path=profile_path,
         ),
+        timed_bit_corruption_config=_parse_timed_bit_corruption_config(
+            raw.get("timed_bit_corruption_config"),
+        ),
         verification_probes=_parse_verification_probe_config(raw),
         metadata_fault=_parse_metadata_fault(raw.get("metadata_fault")),
         metadata_delta=_parse_metadata_delta(raw.get("metadata_delta")),
@@ -3230,6 +3262,26 @@ def _resolve_instruction_skip_symbol_targets(
             )
         )
     return resolved_ranges
+
+
+def _parse_timed_bit_corruption_config(
+    raw: Optional[Dict[str, Any]],
+) -> Optional[TimedBitCorruptionConfig]:
+    """Parse timed_bit_corruption_config from profile YAML."""
+    if raw is None:
+        return None
+    pairs_raw = raw.get("pairs", [])
+    pairs = []
+    for entry in pairs_raw:
+        trigger = entry.get("trigger", {})
+        if isinstance(trigger, int):
+            trigger = {"address": trigger}
+        pairs.append({
+            "trigger": trigger,
+            "corrupt_address": int(str(entry.get("corrupt_address", "0")), 0),
+            "bit_flips": int(entry.get("bit_flips", 1)),
+        })
+    return TimedBitCorruptionConfig(pairs=pairs)
 
 
 def _parse_instruction_skip_config(

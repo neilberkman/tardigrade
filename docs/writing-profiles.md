@@ -405,6 +405,7 @@ Default is `[power_loss]`. Available types (25 total):
 | `wear_leveling_corruption` | Wear-leveling metadata corruption              | All                  |
 | `reset_at_time`            | CPU reset at a time offset                     | All                  |
 | `read_bit_flip`            | Transient read corruption                      | NVMemory, MRAM       |
+| `timed_bit_corruption`     | TOCTOU: bit flip armed at specific code point  | NVMemory, MRAM       |
 | `instruction_skip`         | Voltage-glitch instruction skip (NOP)          | All                  |
 | `nvs_corruption`           | NVS/config region corruption                   | All                  |
 | `i2c_nack`                 | I2C NACK on secure element transaction         | I2CFaultProxy        |

@@ -721,6 +721,7 @@ _FAULT_CODE_TO_NAME = {
     'od': 'otp_read_disturb',
     'oo': 'otp_overblow',
     'on': 'otp_blow_nop',
+    'tb': 'timed_bit_corruption',
     'nv': 'nvs_corruption',
     'in': 'i2c_nack',
     'it': 'i2c_timeout',
@@ -5471,6 +5472,96 @@ def _compute_read_bit_flip(value, seed, bit_flips=0):
     return value & 0xFFFFFFFF
 
 
+def run_timed_bit_corruption_fault(fault_at, trigger_addr, corrupt_addr, bit_flips=1):
+    """Timed bit-corruption: arm a read-fault when the CPU reaches trigger_addr.
+
+    Models TOCTOU vulnerabilities where memory is re-read after validation.
+    When the CPU executes trigger_addr, a read-fault is armed on corrupt_addr.
+    The next read of corrupt_addr returns corrupted data (bit-flipped).
+    """
+    eff_criteria = get_effective_criteria('tb')
+    fp_t0 = _time.time()
+    log('fp={} type=tb trigger=0x{:X} corrupt=0x{:X} flips={}'.format(
+        fault_at, trigger_addr, corrupt_addr, bit_flips))
+
+    restore_phase1_baseline()
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = False
+    reset_nvmc_for_sweep()
+    disarm_fault()
+    reset_verification_probes()
+
+    # State for the trigger hook.
+    _tb_state = {'armed': False, 'fired': False}
+
+    def _timed_corruption_trigger(cpu, addr):
+        if _tb_state['armed']:
+            return
+        _tb_state['armed'] = True
+        nvm_offset = corrupt_addr - nvm_base_address
+        if backend['kind'] == 'mram':
+            rf = backend['data']
+        elif hasattr(backend['data'], 'Nvm'):
+            rf = backend['data'].Nvm
+        else:
+            rf = backend['data']
+        rf.ReadFaultEnabled = True
+        rf.ReadFaultAddress = nvm_offset
+        rf.ReadFaultSeed = (fault_at * 2654435761) & 0xFFFFFFFF
+        rf.ReadFaultFired = False
+        if hasattr(rf, 'ReadFaultBitFlips'):
+            rf.ReadFaultBitFlips = bit_flips
+
+    # Install the trigger hook.
+    cpu_ref.AddHook(trigger_addr & ~1, _timed_corruption_trigger)
+
+    # Boot.
+    arm_vtor_watchpoint()
+    p2_status = run_until_done(
+        cpu_ref,
+        label='fp{}_tb'.format(fault_at),
+        expect_writes=False,
+        zero_writes_is_brick=False,
+        wall_timeout=30,
+        time_slice=phase2_time_slice,
+    )
+    disarm_vtor_watchpoint()
+
+    # Check if the read fault actually fired.
+    if backend['kind'] == 'mram':
+        rf = backend['data']
+    elif hasattr(backend['data'], 'Nvm'):
+        rf = backend['data'].Nvm
+    else:
+        rf = backend['data']
+    fault_injected = _tb_state['armed'] and bool(rf.ReadFaultFired)
+    rf.ReadFaultEnabled = False
+
+    phase1_ms = int((_time.time() - fp_t0) * 1000)
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value, pc_value, fault_injected=fault_injected,
+        effective_criteria=eff_criteria, p2_status=p2_status,
+    )
+    signals['trigger_address'] = '0x{:08X}'.format(trigger_addr)
+    signals['corrupt_address'] = '0x{:08X}'.format(corrupt_addr)
+    signals['trigger_armed'] = _tb_state['armed']
+    signals['read_fault_fired'] = fault_injected
+    signals['phase1_ms'] = phase1_ms
+    signals['phase2_ms'] = 0
+    merge_stop_status_signals(signals, 'phase2', p2_status)
+
+    return _build_fault_result(
+        fault_at,
+        'tb:0x{:X}:0x{:X}'.format(trigger_addr, corrupt_addr),
+        fault_injected, corrupt_addr, 0, signals,
+        boot_outcome=boot_outcome, boot_slot=boot_slot,
+        eff_criteria=eff_criteria, p2_status=p2_status,
+        followup_label='fp{}_timed_bit_corruption_followup'.format(fault_at),
+    )
+
+
 def _read_fault_should_arm(seed, probability):
     if probability <= 0.0:
         return False
@@ -8191,6 +8282,13 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
         skip_addr = int(parts[1], 0)
         patch_model = parts[2] if len(parts) > 2 else 'nop'
         return run_instruction_skip_fault(skip_addr, patch_model=patch_model)
+
+    if ft.startswith('tb:'):
+        parts = ft.split(':')
+        trigger_addr = int(parts[1], 0)
+        corrupt_addr = int(parts[2], 0) if len(parts) > 2 else 0
+        bit_flips = int(parts[3]) if len(parts) > 3 else 1
+        return run_timed_bit_corruption_fault(fp, trigger_addr, corrupt_addr, bit_flips)
 
     if ft.startswith('c:'):
         parts = ft.split(':')

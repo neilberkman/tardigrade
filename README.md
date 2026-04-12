@@ -172,12 +172,12 @@ flowchart TD
 
 ### Fault types
 
-26 fault types across 8 backend categories:
+27 fault types across 8 backend categories:
 
 | Category        | Fault types                                                                                                                                                           | Backend              |
 | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
 | NVM write/erase | `power_loss`, `swap_progress`, `bit_corruption`, `interrupted_erase`, `silent_write_failure`, `write_disturb`, `write_rejection`, `multi_sector_atomicity`, `wear_leveling_corruption` | All                  |
-| NVM read/time   | `read_bit_flip`, `reset_at_time`                                                                                                                                      | NVMemory, MRAM / All |
+| NVM read/time   | `read_bit_flip`, `reset_at_time`, `timed_bit_corruption`                                                                                                              | NVMemory, MRAM / All |
 | NVM controller  | `command_drop`                                                                                                                                                        | GenericNvmController |
 | NVM region      | `bootloader_region_write`, `nvs_corruption`                                                                                                                           | All                  |
 | CPU glitch      | `instruction_skip`                                                                                                                                                    | All                  |
