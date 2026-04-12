@@ -5472,6 +5472,46 @@ def _compute_read_bit_flip(value, seed, bit_flips=0):
     return value & 0xFFFFFFFF
 
 
+_tb_active = {'enabled': False, 'armed': False}
+_tb_installed_hooks = set()  # trigger addresses with hooks already installed
+
+
+def _tb_get_read_fault_obj():
+    """Return the object with ReadFault* properties, or None."""
+    if backend['kind'] == 'mram':
+        return backend['data']
+    elif hasattr(backend['data'], 'Nvm'):
+        return backend['data'].Nvm
+    elif hasattr(backend['data'], 'ReadFaultEnabled'):
+        return backend['data']
+    return None
+
+
+def _tb_install_hook_if_needed(cpu_ref, trigger_addr):
+    """Install the timed-bit-corruption hook at trigger_addr (idempotent)."""
+    masked = trigger_addr & ~1
+    if masked in _tb_installed_hooks:
+        return
+    _tb_installed_hooks.add(masked)
+
+    def _timed_corruption_trigger(cpu, addr):
+        if not _tb_active.get('enabled') or _tb_active.get('armed'):
+            return
+        _tb_active['armed'] = True
+        rf_obj = _tb_get_read_fault_obj()
+        if rf_obj is None:
+            return
+        nvm_offset = _tb_active['corrupt_addr'] - nvm_base_address
+        rf_obj.ReadFaultEnabled = True
+        rf_obj.ReadFaultAddress = nvm_offset
+        rf_obj.ReadFaultSeed = (_tb_active['fault_at'] * 2654435761) & 0xFFFFFFFF
+        rf_obj.ReadFaultFired = False
+        if hasattr(rf_obj, 'ReadFaultBitFlips'):
+            rf_obj.ReadFaultBitFlips = _tb_active.get('bit_flips', 1)
+
+    cpu_ref.AddHook(masked, _timed_corruption_trigger)
+
+
 def run_timed_bit_corruption_fault(fault_at, trigger_addr, corrupt_addr, bit_flips=1):
     """Timed bit-corruption: arm a read-fault when the CPU reaches trigger_addr.
 
@@ -5484,6 +5524,19 @@ def run_timed_bit_corruption_fault(fault_at, trigger_addr, corrupt_addr, bit_fli
     log('fp={} type=tb trigger=0x{:X} corrupt=0x{:X} flips={}'.format(
         fault_at, trigger_addr, corrupt_addr, bit_flips))
 
+    # Preflight: verify the backend supports read-fault injection.
+    rf_obj = _tb_get_read_fault_obj()
+    if rf_obj is None or not hasattr(rf_obj, 'ReadFaultEnabled'):
+        log('fp={} type=tb SKIPPED: backend does not support ReadFault'.format(fault_at))
+        return {
+            'fault_at': fault_at,
+            'fault_type': 'tb:0x{:X}:0x{:X}'.format(trigger_addr, corrupt_addr),
+            'fault_injected': False,
+            'boot_outcome': 'skipped',
+            'skip_reason': 'backend_no_read_fault',
+            'signals': {},
+        }
+
     restore_phase1_baseline()
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
@@ -5491,29 +5544,15 @@ def run_timed_bit_corruption_fault(fault_at, trigger_addr, corrupt_addr, bit_fli
     disarm_fault()
     reset_verification_probes()
 
-    # State for the trigger hook.
-    _tb_state = {'armed': False, 'fired': False}
+    # Gate the hook: only arm when this point is active.
+    _tb_active['enabled'] = True
+    _tb_active['armed'] = False
+    _tb_active['corrupt_addr'] = corrupt_addr
+    _tb_active['fault_at'] = fault_at
+    _tb_active['bit_flips'] = bit_flips
 
-    def _timed_corruption_trigger(cpu, addr):
-        if _tb_state['armed']:
-            return
-        _tb_state['armed'] = True
-        nvm_offset = corrupt_addr - nvm_base_address
-        if backend['kind'] == 'mram':
-            rf = backend['data']
-        elif hasattr(backend['data'], 'Nvm'):
-            rf = backend['data'].Nvm
-        else:
-            rf = backend['data']
-        rf.ReadFaultEnabled = True
-        rf.ReadFaultAddress = nvm_offset
-        rf.ReadFaultSeed = (fault_at * 2654435761) & 0xFFFFFFFF
-        rf.ReadFaultFired = False
-        if hasattr(rf, 'ReadFaultBitFlips'):
-            rf.ReadFaultBitFlips = bit_flips
-
-    # Install the trigger hook.
-    cpu_ref.AddHook(trigger_addr & ~1, _timed_corruption_trigger)
+    # Install hook once; it checks _tb_active['enabled'] each time.
+    _tb_install_hook_if_needed(cpu_ref, trigger_addr)
 
     # Boot.
     arm_vtor_watchpoint()
@@ -5527,15 +5566,13 @@ def run_timed_bit_corruption_fault(fault_at, trigger_addr, corrupt_addr, bit_fli
     )
     disarm_vtor_watchpoint()
 
+    # Disarm: prevent hook from firing on subsequent points.
+    _tb_active['enabled'] = False
+
     # Check if the read fault actually fired.
-    if backend['kind'] == 'mram':
-        rf = backend['data']
-    elif hasattr(backend['data'], 'Nvm'):
-        rf = backend['data'].Nvm
-    else:
-        rf = backend['data']
-    fault_injected = _tb_state['armed'] and bool(rf.ReadFaultFired)
-    rf.ReadFaultEnabled = False
+    rf_obj = _tb_get_read_fault_obj()
+    fault_injected = _tb_active['armed'] and bool(rf_obj.ReadFaultFired)
+    rf_obj.ReadFaultEnabled = False
 
     phase1_ms = int((_time.time() - fp_t0) * 1000)
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))

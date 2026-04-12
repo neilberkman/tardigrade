@@ -387,7 +387,7 @@ fault_sweep:
   fault_types: [power_loss, bit_corruption, interrupted_erase]
 ```
 
-Default is `[power_loss]`. Available types (25 total):
+Default is `[power_loss]`. Available types (27 total):
 
 | Fault type                 | What it does                                   | Backend requirement  |
 | -------------------------- | ---------------------------------------------- | -------------------- |

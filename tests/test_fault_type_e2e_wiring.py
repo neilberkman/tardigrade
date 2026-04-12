@@ -416,9 +416,6 @@ class TestPlannerReachability(unittest.TestCase):
         # instruction_skip: points are 'i:<addr>' with address ranges
         # from instruction_skip_config.target_addresses.
         "instruction_skip",
-        # timed_bit_corruption: points are 'tb:<trigger_addr>:<corrupt_addr>'
-        # from timed_bit_corruption_config.pairs.
-        "timed_bit_corruption",
     }
 
     # OTP faults use the write-fault mechanism but go through the OTP

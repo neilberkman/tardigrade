@@ -522,6 +522,7 @@ def build_fault_plan(
     include_otp_faults = any(ft.startswith("otp_") for ft in fault_types)
     otp_fault_types = [ft for ft in fault_types if ft.startswith("otp_")]
     include_nvs_corruption = "nvs_corruption" in fault_types
+    include_timed_bit_corruption = "timed_bit_corruption" in fault_types
     include_metadata_fault = getattr(profile.fault_sweep, "metadata_fault", None) is not None and profile.fault_sweep.metadata_fault.enabled
 
     # -------------------------------------------------------------------
@@ -1040,6 +1041,27 @@ def build_fault_plan(
                 for addr in skip_addrs:
                     combined.append((addr, "i:0x{:X}".format(addr)))
                 instruction_skip_count = len(skip_addrs)
+
+        # Timed bit-corruption (TOCTOU) fault injection.
+        timed_bit_corruption_count = 0
+        if include_timed_bit_corruption:
+            tbc = getattr(profile.fault_sweep, "timed_bit_corruption_config", None)
+            if tbc is not None and tbc.pairs:
+                for pair in tbc.pairs:
+                    trigger = pair.get("trigger", {})
+                    corrupt_addr = pair.get("corrupt_address", 0)
+                    bit_flips = pair.get("bit_flips", 1)
+                    # If trigger has a symbol, resolve it the same way
+                    # instruction_skip does.  Otherwise use the address directly.
+                    trigger_addr = trigger.get("address", 0)
+                    if trigger_addr:
+                        combined.append((
+                            trigger_addr,
+                            "tb:0x{:X}:0x{:X}:{}".format(
+                                trigger_addr, corrupt_addr, bit_flips
+                            ),
+                        ))
+                        timed_bit_corruption_count += 1
 
         # Metadata fault injection.
         metadata_count = 0
