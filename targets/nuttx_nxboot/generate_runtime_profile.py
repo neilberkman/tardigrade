@@ -72,10 +72,10 @@ state_probe:
   script: targets/nuttx_nxboot/probe.py
 semantic_assertions:
   control:
-    semantic_state.roles.primary_confirmed: false
+    semantic_state.roles.primary_confirmed: true
     semantic_state.roles.recovery_valid: true
-    semantic_state.roles.next_boot: revert
-    semantic_state.slots.primary.magic_kind: internal
+    semantic_state.roles.next_boot: none
+    semantic_state.slots.primary.magic_kind: external
 invariant_providers:
   - targets/nxboot/invariants.py
 invariants:
