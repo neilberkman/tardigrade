@@ -86,7 +86,7 @@ jobs:
         fault_type:
           - power_loss
           - bit_corruption
-          - command_drop
+          - instruction_skip
     env:
       RENODE_URL: ${{ inputs.renode_url || 'https://builds.renode.io/renode-1.16.1.linux-dotnet.tar.gz' }}
       OTA_RENODE_POINT_TIMEOUT_S: "900"
