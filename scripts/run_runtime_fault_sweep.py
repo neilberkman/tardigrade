@@ -8457,7 +8457,7 @@ if calibration_mode:
         # Only skip phase 2 for backends that don't support write trace (mram).
         trace_capable = backend['kind'] == 'fast'
 
-        if phase1_reason in ('vtor', 'vtor_captured', 'vtor_settled', 'pc_captured') and trace_capable:
+        if phase1_reason in ('vtor', 'vtor_settled', 'pc_captured') and trace_capable:
             # Phase 2: Reset and re-run with fine slices, bounded by phase 1 time.
             fine_margin_s = max(1.0, phase1_emulated_s * 0.2)
             fine_budget_s = phase1_emulated_s + fine_margin_s
