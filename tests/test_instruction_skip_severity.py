@@ -22,6 +22,7 @@ from fault_classification import (
     is_instruction_skip_nonsecurity_wrong_image,
     result_has_issues,
     result_is_brick,
+    selected_unexpected_boot_slot,
 )
 from finding_validator import _validate_instruction_skip
 from profile_loader import ProfileError, _parse_instruction_skip_config
@@ -123,6 +124,53 @@ class SeverityClassificationTests(unittest.TestCase):
         severity = classify_instruction_skip_severity(result, expected_outcome="success")
         self.assertEqual(severity["severity"], "security_bypass")
         self.assertTrue(result_has_issues(result, "success"))
+
+    def test_unexpected_slot_with_bus_fault_is_security_bypass(self) -> None:
+        result = {
+            "fault_type": "i:0x1234:nop",
+            "boot_outcome": "bus_fault",
+            "boot_slot": "staging",
+            "fault_injected": True,
+            "effective_success_criteria": {"vtor_slot": "exec", "image_hash_slot": ""},
+            "signals": {"vtor_ok": False, "expectations_met": False},
+        }
+        self.assertTrue(selected_unexpected_boot_slot(result))
+        severity = classify_instruction_skip_severity(result, expected_outcome="success")
+        self.assertEqual(severity["severity"], "security_bypass")
+        self.assertTrue(result_has_issues(result, "success"))
+        self.assertFalse(result_is_brick(result))
+        self.assertEqual(classify_failure_class(result), "wrong_image")
+
+    def test_unexpected_slot_with_timeout_is_security_bypass(self) -> None:
+        result = {
+            "fault_type": "i:0x1234:nop",
+            "boot_outcome": "success",
+            "boot_slot": "staging",
+            "timeout": True,
+            "fault_injected": True,
+            "effective_success_criteria": {"vtor_slot": "exec", "image_hash_slot": ""},
+            "signals": {"vtor_ok": False, "expectations_met": False},
+        }
+        self.assertTrue(selected_unexpected_boot_slot(result))
+        severity = classify_instruction_skip_severity(result, expected_outcome="success")
+        self.assertEqual(severity["severity"], "security_bypass")
+        self.assertTrue(result_has_issues(result, "success"))
+        self.assertEqual(classify_failure_class(result), "wrong_image")
+
+    def test_correct_slot_with_bus_fault_stays_dos_only(self) -> None:
+        result = {
+            "fault_type": "i:0x1234:nop",
+            "boot_outcome": "bus_fault",
+            "boot_slot": "exec",
+            "fault_injected": True,
+            "effective_success_criteria": {"vtor_slot": "exec", "image_hash_slot": ""},
+            "signals": {"vtor_ok": True},
+        }
+        self.assertFalse(selected_unexpected_boot_slot(result))
+        severity = classify_instruction_skip_severity(result, expected_outcome="success")
+        self.assertEqual(severity["severity"], "dos_crash")
+        self.assertFalse(result_has_issues(result, "success"))
+        self.assertEqual(classify_failure_class(result), "safe_dos")
 
     def test_known_good_exec_hash_is_not_security_bypass(self) -> None:
         result = {
@@ -260,6 +308,27 @@ class SeveritySummaryTests(unittest.TestCase):
         verdict = compute_verdict(summary, profile.expect)
         self.assertEqual(verdict, "FAIL — found 1 security bypass points")
 
+    def test_unexpected_slot_bus_fault_counts_as_security_bypass(self) -> None:
+        profile = _profile_stub("security")
+        results = [
+            {
+                "is_control": False,
+                "fault_injected": True,
+                "fault_at": 1,
+                "fault_type": "i:0x1234:nop",
+                "fault_address": "0x00001234",
+                "boot_outcome": "bus_fault",
+                "boot_slot": "staging",
+                "effective_success_criteria": {"vtor_slot": "exec", "image_hash_slot": ""},
+                "signals": {"vtor_ok": False, "expectations_met": False},
+            }
+        ]
+        summary = summarize_runtime_sweep(results, total_writes=10, profile=profile)
+        self.assertEqual(summary["issue_points"], 1)
+        self.assertEqual(summary["security_bypass_points"], 1)
+        self.assertEqual(summary["dos_crash_points"], 0)
+        self.assertEqual(summary["failures"][0]["severity"], "security_bypass")
+
     def test_availability_mode_counts_dos_as_issue(self) -> None:
         profile = _profile_stub("availability")
         results = [
@@ -313,6 +382,36 @@ class SeverityValidatorTests(unittest.TestCase):
         self.assertEqual(validation["stage"], "validated")
         self.assertEqual(validation["disposition"], "confirmed")
         self.assertEqual(validation["severity"], "dos_crash")
+
+    def test_wrong_slot_bus_fault_requires_replay_and_can_validate(self) -> None:
+        result = {
+            "fault_type": "i:0x1234:nop",
+            "boot_outcome": "bus_fault",
+            "boot_slot": "staging",
+            "fault_injected": True,
+            "effective_success_criteria": {"vtor_slot": "exec", "image_hash_slot": ""},
+            "signals": {"vtor_ok": False, "expectations_met": False},
+        }
+
+        def rerun_point(_fault_at, fault_type, _extra_robot_vars=None):
+            return {
+                "fault_type": fault_type,
+                "boot_outcome": "bus_fault",
+                "boot_slot": "staging",
+                "fault_injected": True,
+                "effective_success_criteria": {"vtor_slot": "exec", "image_hash_slot": ""},
+                "signals": {"vtor_ok": False, "expectations_met": False},
+            }
+
+        validation = _validate_instruction_skip(
+            result,
+            expected_outcome="success",
+            rerun_point=rerun_point,
+            annotate_checks=lambda _items: None,
+        )
+        self.assertEqual(validation["stage"], "validated")
+        self.assertEqual(validation["disposition"], "confirmed")
+        self.assertEqual(validation["severity"], "security_bypass")
 
 
 if __name__ == "__main__":

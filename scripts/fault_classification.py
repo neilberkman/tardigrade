@@ -36,6 +36,49 @@ _KNOWN_GOOD_IMAGE_HASH_MATCHES = frozenset(
 )
 
 
+def _normalize_slot_name(raw: Any) -> Optional[str]:
+    token = str(raw or "").strip().lower()
+    return token or None
+
+
+def _expected_boot_slot(result: Dict[str, Any]) -> Optional[str]:
+    criteria = result.get("effective_success_criteria")
+    if isinstance(criteria, dict):
+        hash_slot = _normalize_slot_name(criteria.get("image_hash_slot"))
+        if hash_slot not in {None, "any"}:
+            return hash_slot
+        vtor_slot = _normalize_slot_name(
+            criteria.get("vtor_slot") or criteria.get("vtor_in_slot")
+        )
+        if vtor_slot not in {None, "any"}:
+            return vtor_slot
+
+    signals = result.get("signals")
+    if isinstance(signals, dict):
+        hash_slot = _normalize_slot_name(signals.get("image_hash_slot"))
+        if hash_slot not in {None, "any"}:
+            return hash_slot
+
+    return None
+
+
+def selected_unexpected_boot_slot(result: Dict[str, Any]) -> bool:
+    _, observed_slot = _effective_boot_result(result)
+    observed = _normalize_slot_name(observed_slot)
+    if observed is None:
+        return False
+
+    expected = _expected_boot_slot(result)
+    if expected is not None:
+        return observed != expected
+
+    signals = result.get("signals")
+    if isinstance(signals, dict):
+        return signals.get("vtor_ok") is False
+
+    return False
+
+
 def _base_fault_type_code(result: Dict[str, Any]) -> str:
     raw = str(result.get("fault_type") or "").strip().lower()
     if not raw:
@@ -105,6 +148,11 @@ def classify_instruction_skip_severity(
 
     if is_instruction_skip_nonsecurity_wrong_image(result):
         return None
+    if selected_unexpected_boot_slot(result):
+        return {
+            "severity": "security_bypass",
+            "severity_rationale": "Fault changed boot-slot selection to a slot that does not match the declared success criteria.",
+        }
     if effective in _INSTRUCTION_SKIP_SECURITY_OUTCOMES or raw_outcome in _INSTRUCTION_SKIP_SECURITY_OUTCOMES:
         return {
             "severity": "security_bypass",
@@ -251,15 +299,18 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
         if model == "security" and iskip["severity"] in {"dos_crash", "dos_recovery"}:
             return reasons
     eff_outcome, _ = _effective_boot_result(result)
+    unexpected_slot = selected_unexpected_boot_slot(result)
     # bus_fault is safe denial-of-service (HardFault on real silicon) — not
     # a security finding.  The bootloader crashed before reaching
     # validation/invariant code paths, so all issue signals are noise.
-    if eff_outcome == "bus_fault":
+    if eff_outcome == "bus_fault" and not unexpected_slot:
         return reasons
     # timeout means the bootloader was still working when the wall-clock
     # budget expired.  This is not a failure — increase run_duration.
-    if eff_outcome == "timeout":
+    if eff_outcome == "timeout" and not unexpected_slot:
         return reasons
+    if unexpected_slot and not safe_instruction_skip_divergence:
+        reasons.append("boot_outcome")
     if eff_outcome != expected_outcome:
         # Resilient rollback: fault during OTA update caused the bootloader to
         # correctly fall back to the original image.  The device booted fine
@@ -403,14 +454,16 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
         return "config_lost"
     if outcome == "config_crash":
         return "config_crash"
-    if outcome == "success":
-        return "recoverable"
-    if outcome == "bus_fault":
-        return "safe_dos"
     if outcome == "rollback_accepted":
         return "rollback_accepted"
     if outcome == "toctou_corruption":
         return "toctou_corruption"
+    if selected_unexpected_boot_slot(result):
+        return "wrong_image"
+    if outcome == "success":
+        return "recoverable"
+    if outcome == "bus_fault":
+        return "safe_dos"
     if outcome == "wrong_image":
         if is_resilient_rollback(result):
             return "resilient_rollback"

@@ -171,6 +171,18 @@ class BusFaultClassificationTest(unittest.TestCase):
         r = {"boot_outcome": "bus_fault", "boot_slot": None}
         self.assertEqual(classify_failure_class(r), "safe_dos")
 
+    def test_bus_fault_with_unexpected_slot_counts_as_issue(self):
+        r = {
+            "fault_type": "i:0x1234:nop",
+            "boot_outcome": "bus_fault",
+            "boot_slot": "staging",
+            "effective_success_criteria": {"vtor_slot": "exec", "image_hash_slot": ""},
+            "signals": {"vtor_ok": False, "expectations_met": False},
+        }
+        self.assertIn("boot_outcome", result_issue_reasons(r, "success"))
+        self.assertTrue(result_has_issues(r, "success"))
+        self.assertEqual(classify_failure_class(r), "wrong_image")
+
     def test_no_boot_still_brick(self):
         """Ensure no_boot is not affected by bus_fault changes."""
         r = {"boot_outcome": "no_boot", "boot_slot": None}
@@ -271,16 +283,19 @@ class BusFaultSummaryTest(unittest.TestCase):
             },
             {
                 "is_control": False,
-                "boot_outcome": "wrong_image",
+                "boot_outcome": "bus_fault",
                 "boot_slot": "staging",
                 "fault_injected": True,
                 "fault_at": 3,
+                "fault_type": "i:0x1234:nop",
+                "effective_success_criteria": {"vtor_slot": "exec", "image_hash_slot": ""},
+                "signals": {"vtor_ok": False, "expectations_met": False},
             },
         ]
         summary = summarize_runtime_sweep(results)
-        self.assertEqual(summary["bus_fault_points"], 2)
-        # bus_fault should NOT be counted as issues
-        self.assertEqual(summary["issue_points"], 1)  # only wrong_image
+        self.assertEqual(summary["bus_fault_points"], 3)
+        # bus_fault without an unexpected slot is ignored; unexpected-slot bus_fault is an issue
+        self.assertEqual(summary["issue_points"], 1)
         # bus_fault should NOT be counted as bricks
         self.assertEqual(summary["bricks"], 0)
 
