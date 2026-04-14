@@ -128,6 +128,15 @@ const void *vector_table[] = {
     Reset_Handler,
     Default_Handler,  /* NMI */
     Default_Handler,  /* HardFault */
+    Default_Handler,  /* MemManage */
+    Default_Handler,  /* BusFault */
+    Default_Handler,  /* UsageFault */
+    0, 0, 0, 0,
+    Default_Handler,  /* SVCall */
+    Default_Handler,  /* Debug */
+    0,
+    Default_Handler,  /* PendSV */
+    Default_Handler,  /* SysTick */
 };
 
 void Default_Handler(void) { while (1); }

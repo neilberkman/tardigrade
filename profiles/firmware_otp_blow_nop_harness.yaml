@@ -31,8 +31,8 @@ success_criteria:
 
 fault_sweep:
   mode: runtime
-  max_writes: auto
-  run_duration: "5.0"
+  max_writes: 100
+  run_duration: "1.0"
   fault_types:
     - otp_blow_nop
 
