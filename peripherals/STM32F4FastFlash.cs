@@ -130,35 +130,44 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const uint KEY1 = 0x45670123U;
         private const uint KEY2 = 0xCDEF89ABU;
 
+        // Sector geometry entry.  Uses an explicit struct instead of C# value
+        // tuples to avoid mono/mscorlib assembly mismatch on Linux portable Renode.
+        private struct FlashSector
+        {
+            public long Offset;
+            public int Size;
+            public FlashSector(long offset, int size) { Offset = offset; Size = size; }
+        }
+
         // STM32F429 2 MiB dual-bank sector geometry (offset from flash base, size).
         // Bank 1 (sectors 0-11) and bank 2 (sectors 12-23) both use:
         //   4 x 16 KiB, 1 x 64 KiB, 7 x 128 KiB.
-        private static readonly (long offset, int size)[] Sectors = new[]
+        private static readonly FlashSector[] Sectors = new[]
         {
-            (0x00000L, 0x04000),   // Sector  0: 16 KB
-            (0x04000L, 0x04000),   // Sector  1: 16 KB
-            (0x08000L, 0x04000),   // Sector  2: 16 KB
-            (0x0C000L, 0x04000),   // Sector  3: 16 KB
-            (0x10000L, 0x10000),   // Sector  4: 64 KB
-            (0x20000L, 0x20000),   // Sector  5: 128 KB
-            (0x40000L, 0x20000),   // Sector  6: 128 KB
-            (0x60000L, 0x20000),   // Sector  7: 128 KB
-            (0x80000L, 0x20000),   // Sector  8: 128 KB
-            (0xA0000L, 0x20000),   // Sector  9: 128 KB
-            (0xC0000L, 0x20000),   // Sector 10: 128 KB
-            (0xE0000L, 0x20000),   // Sector 11: 128 KB
-            (0x100000L, 0x04000),  // Sector 12: 16 KB
-            (0x104000L, 0x04000),  // Sector 13: 16 KB
-            (0x108000L, 0x04000),  // Sector 14: 16 KB
-            (0x10C000L, 0x04000),  // Sector 15: 16 KB
-            (0x110000L, 0x10000),  // Sector 16: 64 KB
-            (0x120000L, 0x20000),  // Sector 17: 128 KB
-            (0x140000L, 0x20000),  // Sector 18: 128 KB
-            (0x160000L, 0x20000),  // Sector 19: 128 KB
-            (0x180000L, 0x20000),  // Sector 20: 128 KB
-            (0x1A0000L, 0x20000),  // Sector 21: 128 KB
-            (0x1C0000L, 0x20000),  // Sector 22: 128 KB
-            (0x1E0000L, 0x20000),  // Sector 23: 128 KB
+            new FlashSector(0x00000L, 0x04000),   // Sector  0: 16 KB
+            new FlashSector(0x04000L, 0x04000),   // Sector  1: 16 KB
+            new FlashSector(0x08000L, 0x04000),   // Sector  2: 16 KB
+            new FlashSector(0x0C000L, 0x04000),   // Sector  3: 16 KB
+            new FlashSector(0x10000L, 0x10000),   // Sector  4: 64 KB
+            new FlashSector(0x20000L, 0x20000),   // Sector  5: 128 KB
+            new FlashSector(0x40000L, 0x20000),   // Sector  6: 128 KB
+            new FlashSector(0x60000L, 0x20000),   // Sector  7: 128 KB
+            new FlashSector(0x80000L, 0x20000),   // Sector  8: 128 KB
+            new FlashSector(0xA0000L, 0x20000),   // Sector  9: 128 KB
+            new FlashSector(0xC0000L, 0x20000),   // Sector 10: 128 KB
+            new FlashSector(0xE0000L, 0x20000),   // Sector 11: 128 KB
+            new FlashSector(0x100000L, 0x04000),  // Sector 12: 16 KB
+            new FlashSector(0x104000L, 0x04000),  // Sector 13: 16 KB
+            new FlashSector(0x108000L, 0x04000),  // Sector 14: 16 KB
+            new FlashSector(0x10C000L, 0x04000),  // Sector 15: 16 KB
+            new FlashSector(0x110000L, 0x10000),  // Sector 16: 64 KB
+            new FlashSector(0x120000L, 0x20000),  // Sector 17: 128 KB
+            new FlashSector(0x140000L, 0x20000),  // Sector 18: 128 KB
+            new FlashSector(0x160000L, 0x20000),  // Sector 19: 128 KB
+            new FlashSector(0x180000L, 0x20000),  // Sector 20: 128 KB
+            new FlashSector(0x1A0000L, 0x20000),  // Sector 21: 128 KB
+            new FlashSector(0x1C0000L, 0x20000),  // Sector 22: 128 KB
+            new FlashSector(0x1E0000L, 0x20000),  // Sector 23: 128 KB
         };
 
         // ---------------------------------------------------------------
@@ -494,44 +503,44 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
-            var (offset, size) = Sectors[sectorNum];
-            if(Flash == null || offset + size > FlashSize)
+            var sector = Sectors[sectorNum];
+            if(Flash == null || sector.Offset + sector.Size > FlashSize)
             {
                 return;
             }
 
-            if(tracker.RecordEraseAndCheckFault(offset, size))
+            if(tracker.RecordEraseAndCheckFault(sector.Offset, sector.Size))
             {
                 EraseFaultFired = true;
-                LastFaultAddress = (uint)(FlashBaseAddress + offset);
-                int halfSize = size / 2;
+                LastFaultAddress = (uint)(FlashBaseAddress + sector.Offset);
+                int halfSize = sector.Size / 2;
 
                 if(EraseFaultMode == 1)
                 {
                     // Multi-sector atomicity: partial target + neighbor bleed.
-                    int quarterSize = Math.Max(1, size / 4);
-                    EraseWithFill(Flash, offset, halfSize);
+                    int quarterSize = Math.Max(1, sector.Size / 4);
+                    EraseWithFill(Flash, sector.Offset, halfSize);
                     if(sectorNum + 1 < Sectors.Length)
                     {
-                        var (nOffset, nSize) = Sectors[sectorNum + 1];
-                        int neighborChunk = Math.Min(quarterSize, nSize);
-                        if(nOffset + neighborChunk <= FlashSize)
+                        var neighbor = Sectors[sectorNum + 1];
+                        int neighborChunk = Math.Min(quarterSize, neighbor.Size);
+                        if(neighbor.Offset + neighborChunk <= FlashSize)
                         {
-                            EraseWithFill(Flash, nOffset, neighborChunk);
+                            EraseWithFill(Flash, neighbor.Offset, neighborChunk);
                         }
                     }
                 }
                 else
                 {
                     // Interrupted erase: first half erased, second half untouched.
-                    EraseWithFill(Flash, offset, halfSize);
+                    EraseWithFill(Flash, sector.Offset, halfSize);
                 }
 
                 FaultFlashSnapshot = Flash.ReadBytes(0, checked((int)FlashSize));
             }
             else
             {
-                EraseWithFill(Flash, offset, size);
+                EraseWithFill(Flash, sector.Offset, sector.Size);
             }
         }
 
