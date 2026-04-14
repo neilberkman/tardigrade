@@ -19,6 +19,8 @@ __pycache__/
 !examples/riotboot_standalone/*.bin
 !examples/esp_idf_ota/*.elf
 !examples/esp_idf_ota/*.bin
+!examples/firmware_otp_harness/*.elf
+!examples/firmware_otp_harness/*.bin
 !results/oss_validation/assets/*.elf
 !results/oss_validation/assets/*.bin
 !targets/tfm_an521/*.axf
