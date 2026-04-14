@@ -800,10 +800,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // Update shadow after erase.
             if(flashShadow != null)
             {
-                int eraseLen = (TotalPageErases == FaultAtPageErase) ? size / 2 : size;
-                for(int i = 0; i < eraseLen && offset + i < flashShadow.Length; i++)
+                int eraseLen = (TotalPageErases == FaultAtPageErase) ? sector.Size / 2 : sector.Size;
+                for(int i = 0; i < eraseLen && sector.Offset + i < flashShadow.Length; i++)
                 {
-                    flashShadow[offset + i] = EraseFill;
+                    flashShadow[sector.Offset + i] = EraseFill;
                 }
             }
         }
