@@ -299,6 +299,28 @@ class ResidualImageConfig:
         self.fill_pattern = fill_pattern
 
 
+class MemoryCheck:
+    """Post-execution memory assertion."""
+
+    __slots__ = ("address", "expected_value", "mask", "op")
+
+    def __init__(
+        self,
+        address: int,
+        expected_value: Optional[int] = None,
+        mask: int = 0xFFFFFFFF,
+        op: str = "eq",
+    ) -> None:
+        self.address = int(address)
+        self.expected_value = int(expected_value) if expected_value is not None else None
+        self.mask = int(mask)
+        if op not in ("eq", "ne", "ge", "le", "nonzero"):
+            raise ProfileError(
+                "memory_check: op must be one of eq, ne, ge, le, nonzero; got '{}'".format(op)
+            )
+        self.op = op
+
+
 class SuccessCriteria:
     __slots__ = (
         "vtor_in_slot",
@@ -315,6 +337,7 @@ class SuccessCriteria:
         "config_checks",
         "boot_register_values",
         "max_reset_vector_offset",
+        "memory_checks",
     )
 
     def __init__(
@@ -333,6 +356,7 @@ class SuccessCriteria:
         config_checks: Optional[List[ConfigCheck]] = None,
         boot_register_values: Optional[Dict[str, int]] = None,
         max_reset_vector_offset: Optional[int] = None,
+        memory_checks: Optional[List["MemoryCheck"]] = None,
     ) -> None:
         self.vtor_in_slot = vtor_in_slot
         self.vector_table_offset = max(0, int(vector_table_offset))
@@ -356,6 +380,7 @@ class SuccessCriteria:
                     )
                 )
         self.max_reset_vector_offset = max_reset_vector_offset
+        self.memory_checks = memory_checks or []
 
 
 
@@ -2385,7 +2410,27 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
             _parse_int(raw["max_reset_vector_offset"], "success_criteria.max_reset_vector_offset")
             if "max_reset_vector_offset" in raw else None
         ),
+        memory_checks=_parse_memory_checks(raw.get("memory_checks")),
     )
+
+
+def _parse_memory_checks(raw: Optional[list]) -> List[MemoryCheck]:
+    if not raw:
+        return []
+    checks = []
+    for i, entry in enumerate(raw):
+        if "address" not in entry:
+            raise ProfileError("memory_checks[{}]: missing 'address'".format(i))
+        checks.append(MemoryCheck(
+            address=_parse_int(entry["address"], "memory_checks[{}].address".format(i)),
+            expected_value=(
+                _parse_int(entry["expected_value"], "memory_checks[{}].expected_value".format(i))
+                if "expected_value" in entry else None
+            ),
+            mask=_parse_int(entry.get("mask", 0xFFFFFFFF), "memory_checks[{}].mask".format(i)),
+            op=str(entry.get("op", "eq")),
+        ))
+    return checks
 
 
 def _parse_success_criteria_overrides(

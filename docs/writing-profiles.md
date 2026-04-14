@@ -307,6 +307,25 @@ success_criteria:
   marker_value: 0x00000001
 ```
 
+### Memory checks
+
+Verify multiple memory locations after execution. Useful for firmware-level harnesses that report results through SRAM:
+
+```yaml
+success_criteria:
+  memory_checks:
+    - address: 0x20010000
+      expected_value: 0x00000001
+      op: eq
+    - address: 0x40002000
+      op: nonzero           # OTP region should have fuses blown
+    - address: 0x20010004
+      expected_value: 5
+      op: ge                 # popcount >= 5
+```
+
+Supported `op` values: `eq` (default), `ne`, `ge`, `le`, `nonzero`. An optional `mask` field (default `0xFFFFFFFF`) is ANDed with the read value before comparison.
+
 ### Image hash
 
 Verify the correct image ended up in the slot (catches wrong-image bugs like PR #2199):

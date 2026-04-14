@@ -1,0 +1,41 @@
+schema_version: 1
+name: firmware_otp_blow_nop_harness
+description: >-
+  Firmware-level fault injection: tests an anti-rollback floor
+  advancement function that programs OTP fuses. The otp_blow_nop
+  fault model simulates a fuse that physically fails to blow.
+  The function under test must detect the failure and abort
+  gracefully instead of looping forever.
+
+  This demonstrates testing firmware application code (not
+  bootloader code) using a minimal harness ELF that calls one
+  function and writes a result marker.
+
+platform: platforms/cortex_m0_otp.repl
+flash_backend: nvm_ctrl
+otp_peripheral: otp
+bootloader:
+  elf: examples/firmware_otp_harness/harness.elf
+  entry: 0x10000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  write_granularity: 8
+  slots:
+    exec: { base: 0x10000000, size: 0x38000 }
+    staging: { base: 0x10038000, size: 0x38000 }
+
+success_criteria:
+  marker_address: 0x20010000
+  marker_value: 0x00000001
+
+fault_sweep:
+  mode: runtime
+  max_writes: auto
+  run_duration: "5.0"
+  fault_types:
+    - otp_blow_nop
+
+expect:
+  should_find_issues: false
+skip_self_test: true
