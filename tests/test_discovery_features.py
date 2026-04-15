@@ -454,6 +454,57 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertEqual(summary["semantic_issue_points"], 1)
             self.assertEqual(summary["invariant_issue_points"], 1)
 
+    def test_semantic_assertions_use_final_boot_cycle_state(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: settled_state_profile
+                description: discovery
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                semantic_assertions:
+                  control:
+                    semantic_state.confirmed: false
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            results = [
+                {
+                    "fault_at": 9,
+                    "fault_injected": False,
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "semantic_state": {"confirmed": True},
+                    "boot_cycles": [
+                        {"cycle": 0, "semantic_state": {"confirmed": True}},
+                        {"cycle": 1, "semantic_state": {"confirmed": False}},
+                    ],
+                    "multi_boot_analysis": {"status": "converged", "final_slot": "exec"},
+                    "is_control": True,
+                }
+            ]
+            annotate_result_checks(results, profile)
+            result = results[0]
+            self.assertNotIn("semantic_assertion_failures", result)
+            self.assertNotIn("semantic_observation_failures", result)
+
     def test_missing_semantic_path_records_observation_gap_not_issue(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)

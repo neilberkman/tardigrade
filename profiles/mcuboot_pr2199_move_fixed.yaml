@@ -4,8 +4,7 @@ description: >
   MCUboot swap-using-move AFTER PR #2199 fix (commit 33094fc5).
   Stuck revert: primary has valid image + REVERT trailer state, secondary is
   erased. Fixed MCUboot detects the stuck state and erases BOTH secondary
-  AND primary trailer — clears REVERT state, boots primary cleanly. Tracked as
-  an unresolved modeling gap in tardigrade issue #17.
+  AND primary trailer — clears REVERT state, boots primary cleanly.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -33,18 +32,30 @@ pre_boot_state:
   # Primary image_ok stays 0xFF (erased/UNSET) — triggers REVERT row
 success_criteria:
   vtor_in_slot: exec
-  # After fix: primary trailer magic should be cleared (erased = 0xFFFFFFFF).
-  marker_address: 0x00081FF0
-  marker_value: 0xFFFFFFFF
+state_probe:
+  script: targets/mcuboot/probe.py
+  required_paths:
+    - semantic_state.target
+    - semantic_state.slots.exec.magic_state
+    - semantic_state.slots.staging.magic_state
+semantic_assertions:
+  control:
+    semantic_state.target: mcuboot
+    semantic_state.slots.exec.magic_state: unset
+    semantic_state.slots.staging.magic_state: unset
+    multi_boot_analysis.status: converged
+    multi_boot_analysis.final_outcome: success
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  boot_cycles: 3
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "2.0"
   max_step_limit: 20000000
   fault_types: [power_loss, interrupted_erase]
 expect:
+  control_outcome: success
   # Fixed MCUboot clears the stuck state — 0 failures expected.
   should_find_issues: false
 skip_self_test: true

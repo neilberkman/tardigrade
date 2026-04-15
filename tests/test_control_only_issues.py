@@ -109,7 +109,7 @@ def test_compute_verdict_still_fails_without_control_only_opt_in():
 
 def test_self_test_check_verdict_accepts_control_only_issue_when_enabled():
     passed, reason = check_verdict(
-        Path("profiles/mcuboot_pr2199_move_broken.yaml"),
+        Path("tests/fixtures/profiles/control_only_issue_profile.yaml"),
         {
             "expect": {
                 "should_find_issues": True,
@@ -139,6 +139,35 @@ def test_self_test_check_verdict_accepts_control_issue_with_success_baseline():
     )
     assert passed is True
     assert reason == "Control exhibits expected success, as intended"
+
+
+def test_self_test_check_verdict_requires_declared_issue_reason():
+    passed, reason = check_verdict(
+        Path("profiles/mcuboot_pr2206_scratch_geom_broken.yaml"),
+        {
+            "expect": {
+                "should_find_issues": True,
+                "control_outcome": "success",
+                "allow_semantic_only_issues": True,
+                "required_issue_reasons": ["boot_outcome"],
+            }
+        },
+        {
+            "summary": {
+                "runtime_sweep": {
+                    "issue_points": 1,
+                    "issue_reasons": {"semantic_assertion": 1},
+                    "control": {
+                        "effective_outcome": "success",
+                    },
+                    "calibration_coverage": {"status": "full"},
+                }
+            }
+        },
+        0,
+    )
+    assert passed is False
+    assert reason == "Missing expected issue reason(s): boot_outcome"
 
 
 def test_self_test_check_verdict_ignores_opted_out_fault_types():
@@ -200,10 +229,26 @@ def test_self_test_check_verdict_keeps_non_ignored_fault_type_failures():
     assert reason == "Expected no issues but found 1 point(s)"
 
 
-def test_pr2199_move_broken_profile_opted_into_control_only_issues():
-    profile = load_profile(ROOT / "tests" / "fixtures" / "profiles" / "control_only_issue_profile.yaml")
-    assert profile.expect.allow_control_only_issues is True
-    assert profile.expect.control_outcome == "wrong_image"
+def test_pr2199_move_profiles_use_post_boot_state_probe_oracle():
+    broken = load_profile(ROOT / "profiles" / "mcuboot_pr2199_move_broken.yaml")
+    fixed = load_profile(ROOT / "profiles" / "mcuboot_pr2199_move_fixed.yaml")
+
+    assert broken.expect.control_outcome == "success"
+    assert broken.expect.allow_semantic_only_issues is True
+    assert broken.expect.allow_control_only_issues is False
+    assert broken.fault_sweep.boot_cycles == 3
+    assert broken.state_probe is not None
+    assert broken.state_probe.script == "targets/mcuboot/probe.py"
+    assert broken.semantic_assertions["control"]["semantic_state.slots.exec.magic_state"] == "unset"
+    assert broken.semantic_assertions["control"]["multi_boot_analysis.final_outcome"] == "success"
+
+    assert fixed.expect.control_outcome == "success"
+    assert fixed.expect.allow_semantic_only_issues is False
+    assert fixed.fault_sweep.boot_cycles == 3
+    assert fixed.state_probe is not None
+    assert fixed.state_probe.script == "targets/mcuboot/probe.py"
+    assert fixed.semantic_assertions["control"]["semantic_state.slots.exec.magic_state"] == "unset"
+    assert fixed.semantic_assertions["control"]["multi_boot_analysis.final_outcome"] == "success"
 
 
 def test_calibration_fallback_allows_control_only_no_boot_profiles():

@@ -58,6 +58,7 @@ invariants:
 
 expect:
   control_outcome: success
-  allow_control_only_issues: true
   allow_semantic_only_issues: true
+  required_issue_reasons:
+    - boot_outcome
   should_find_issues: true

@@ -95,6 +95,30 @@ def _result_state_payload(result: Dict[str, Any]) -> Any:
     return result.get("nvm_state") or result.get("semantic_state")
 
 
+def _lookup_result_path(result: Dict[str, Any], path: str) -> Any:
+    semantic_state = _result_state_payload(result)
+    if path == "semantic_state":
+        if semantic_state is not None:
+            return semantic_state
+    elif path.startswith("semantic_state."):
+        if isinstance(semantic_state, dict):
+            resolved = _lookup_path(semantic_state, path[len("semantic_state."):])
+            if resolved is not _MISSING:
+                return resolved
+
+    nvm_state = result.get("nvm_state")
+    if path == "nvm_state":
+        if nvm_state is not None:
+            return nvm_state
+    elif path.startswith("nvm_state."):
+        if isinstance(nvm_state, dict):
+            resolved = _lookup_path(nvm_state, path[len("nvm_state."):])
+            if resolved is not _MISSING:
+                return resolved
+
+    return _lookup_path(result, path)
+
+
 def _profile_partition_ranges(profile: ProfileConfig) -> List[Tuple[int, int]]:
     return [
         (slot.base, slot.base + slot.size)
@@ -112,7 +136,7 @@ def _evaluate_semantic_assertions(
     for scope in scopes:
         expectations = profile.semantic_assertions.get(scope, {})
         for path, expected in expectations.items():
-            actual = _lookup_path(result, path)
+            actual = _lookup_result_path(result, path)
             if actual is _MISSING:
                 observation_failures.append(
                     {
@@ -146,7 +170,7 @@ def _evaluate_state_probe_contract(
         return []
     failures: List[Dict[str, Any]] = []
     for path in required_paths:
-        actual = _lookup_path(result, path)
+        actual = _lookup_result_path(result, path)
         if actual is _MISSING:
             failures.append(
                 {

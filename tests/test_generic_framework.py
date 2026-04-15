@@ -449,6 +449,61 @@ class GenericFrameworkTest(unittest.TestCase):
                 "state_probe.required_paths",
             )
 
+    def test_state_probe_required_paths_use_final_boot_cycle_semantic_state(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            probe = tempdir / "probe.py"
+            probe.write_text(
+                "def collect_state(bus=None, monitor=None, context=None):\n"
+                "    return {'confirmed': False}\n",
+                encoding="utf-8",
+            )
+            profile_path = self._write_profile(
+                tempdir,
+                f"""
+                schema_version: 1
+                name: settled_probe_contract_profile
+                description: probe contract
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: {{ start: 0x20000000, end: 0x20020000 }}
+                  write_granularity: 4
+                  slots:
+                    exec: {{ base: 0x10000000, size: 0x1000 }}
+                    staging: {{ base: 0x10001000, size: 0x1000 }}
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                state_probe:
+                  script: {probe.as_posix()}
+                  required_paths:
+                    - semantic_state.confirmed
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            results = [
+                {
+                    "fault_at": 4,
+                    "fault_injected": False,
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "semantic_state": {},
+                    "boot_cycles": [
+                        {"cycle": 0, "semantic_state": {}},
+                        {"cycle": 1, "semantic_state": {"confirmed": False}},
+                    ],
+                    "is_control": True,
+                }
+            ]
+            annotate_result_checks(results, profile)
+            self.assertNotIn("semantic_observation_failures", results[0])
+
     def test_replay_spec_merges_profile_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
