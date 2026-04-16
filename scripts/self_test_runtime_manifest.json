@@ -61,6 +61,8 @@
     "mcuboot_pr2109_scratch_fixed.yaml": 188,
     "mcuboot_pr2109_scratch_fixed_bit_corruption.yaml": 238,
     "mcuboot_pr2109_scratch_fixed_silent.yaml": 233,
+    "mcuboot_pr2199_move_broken.yaml": 35,
+    "mcuboot_pr2199_move_fixed.yaml": 32,
     "mcuboot_pr2214_offset_broken.yaml": 56,
     "mcuboot_swap_current.yaml": 111,
     "naive_bare_copy.yaml": 43,

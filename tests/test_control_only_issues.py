@@ -234,12 +234,14 @@ def test_pr2199_move_profiles_use_post_boot_state_probe_oracle():
     fixed = load_profile(ROOT / "profiles" / "mcuboot_pr2199_move_fixed.yaml")
 
     assert broken.expect.control_outcome == "success"
-    assert broken.expect.allow_semantic_only_issues is True
-    assert broken.expect.allow_control_only_issues is False
+    assert broken.expect.allow_semantic_only_issues is False
+    assert broken.expect.allow_control_only_issues is True
     assert broken.fault_sweep.boot_cycles == 3
     assert broken.state_probe is not None
     assert broken.state_probe.script == "targets/mcuboot/probe.py"
-    assert broken.semantic_assertions["control"]["semantic_state.slots.exec.magic_state"] == "unset"
+    assert broken.semantic_assertions["control"]["semantic_state.slots.exec.magic_state"] == "good"
+    assert broken.semantic_assertions["control"]["semantic_state.slots.exec.copy_done.state"] == "set"
+    assert broken.semantic_assertions["control"]["semantic_state.slots.exec.image_ok.state"] == "unset"
     assert broken.semantic_assertions["control"]["multi_boot_analysis.final_outcome"] == "success"
 
     assert fixed.expect.control_outcome == "success"
@@ -248,6 +250,8 @@ def test_pr2199_move_profiles_use_post_boot_state_probe_oracle():
     assert fixed.state_probe is not None
     assert fixed.state_probe.script == "targets/mcuboot/probe.py"
     assert fixed.semantic_assertions["control"]["semantic_state.slots.exec.magic_state"] == "unset"
+    assert fixed.semantic_assertions["control"]["semantic_state.slots.exec.copy_done.state"] == "unset"
+    assert fixed.semantic_assertions["control"]["semantic_state.slots.exec.image_ok.state"] == "unset"
     assert fixed.semantic_assertions["control"]["multi_boot_analysis.final_outcome"] == "success"
 
 

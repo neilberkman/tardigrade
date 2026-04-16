@@ -43,11 +43,15 @@ state_probe:
   required_paths:
     - semantic_state.target
     - semantic_state.slots.exec.magic_state
+    - semantic_state.slots.exec.copy_done.state
+    - semantic_state.slots.exec.image_ok.state
     - semantic_state.slots.staging.magic_state
 semantic_assertions:
   control:
     semantic_state.target: mcuboot
-    semantic_state.slots.exec.magic_state: unset
+    semantic_state.slots.exec.magic_state: good
+    semantic_state.slots.exec.copy_done.state: set
+    semantic_state.slots.exec.image_ok.state: unset
     semantic_state.slots.staging.magic_state: unset
     multi_boot_analysis.status: converged
     multi_boot_analysis.final_outcome: success
@@ -62,6 +66,6 @@ fault_sweep:
   fault_types: [power_loss, interrupted_erase]
 expect:
   control_outcome: success
-  allow_semantic_only_issues: true
+  allow_control_only_issues: true
   should_find_issues: true
-skip_self_test: true
+skip_self_test: false
