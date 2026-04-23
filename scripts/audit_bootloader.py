@@ -583,15 +583,15 @@ def run_state_fuzz_campaign(
             )
         )
 
-    return (
+    summary = summarize_state_campaign(
         results,
-        summarize_state_campaign(
-            results,
-            expected_outcome=profile.expect.control_outcome,
-            metadata_model=profile.state_fuzzer.metadata_model,
-            iterations=profile.state_fuzzer.iterations,
-        ),
+        expected_outcome=profile.expect.control_outcome,
+        metadata_model=profile.state_fuzzer.metadata_model,
+        iterations=profile.state_fuzzer.iterations,
     )
+    for warning in summary.get("warnings") or []:
+        _progress("state_fuzz WARNING: {}".format(warning))
+    return results, summary
 
 
 def _build_fuzz_audit_command(

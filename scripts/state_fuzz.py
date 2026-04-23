@@ -316,6 +316,7 @@ def summarize_state_campaign(
     boot_outcomes: Dict[str, int] = {}
     issue_reasons_total: Dict[str, int] = {}
     findings = 0
+    effective_tuples: set = set()
 
     for entry in results:
         outcome = str(entry.get("boot_outcome", "unknown"))
@@ -324,8 +325,34 @@ def summarize_state_campaign(
             issue_reasons_total[str(reason)] = issue_reasons_total.get(str(reason), 0) + int(count)
         if entry.get("finding"):
             findings += 1
+        effective_tuples.add(
+            (
+                str(entry.get("effective_outcome") or entry.get("boot_outcome") or "unknown"),
+                entry.get("effective_slot") if entry.get("effective_slot") is not None
+                else entry.get("boot_slot"),
+            )
+        )
 
-    return {
+    warnings: List[str] = []
+    # A state-fuzz campaign that forces many different scenarios but
+    # collapses to a single observable boot result means the input
+    # distribution went through a funnel somewhere (typical cause: the
+    # model's ``magic`` value does not match what the firmware expects, so
+    # every scenario is rejected at the same point).  Surface this loudly
+    # instead of letting a "50/50 scenarios passed" line imply coverage
+    # that does not exist.  We floor at 10 to avoid spurious warnings on
+    # smoke runs where a small sample landing on a single tuple is not
+    # yet evidence of a misconfiguration.
+    if len(results) >= 10 and len(effective_tuples) == 1:
+        only_tuple = next(iter(effective_tuples))
+        warnings.append(
+            "state_fuzz produced a single effective (outcome, slot) across all "
+            "{} scenarios: {}. The metadata model may be misconfigured for this "
+            "firmware (e.g. wrong ``magic`` constant) so every scenario collapses "
+            "to the same path.".format(len(results), only_tuple)
+        )
+
+    summary = {
         "status": "completed",
         "iterations_requested": int(iterations),
         "iterations_completed": len(results),
@@ -335,6 +362,9 @@ def summarize_state_campaign(
         "issue_reasons": issue_reasons_total,
         "metadata_model": metadata_model,
     }
+    if warnings:
+        summary["warnings"] = warnings
+    return summary
 
 
 def extract_state_fuzz_result(

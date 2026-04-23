@@ -13,7 +13,11 @@ sys.path.insert(0, str(SCRIPTS))
 
 import audit_bootloader  # noqa: E402
 from profile_loader import load_profile  # noqa: E402
-from state_fuzz import generate_state_scenarios, resolve_metadata_model  # noqa: E402
+from state_fuzz import (  # noqa: E402
+    generate_state_scenarios,
+    resolve_metadata_model,
+    summarize_state_campaign,
+)
 
 
 BASE_PROFILE_YAML = textwrap.dedent(
@@ -141,6 +145,97 @@ def test_state_fuzzer_rejects_non_terminal_crc_field(tmp_path: Path) -> None:
     )
     with pytest.raises(Exception, match="computed_crc32 field must be the final field"):
         load_profile(_write_profile(tmp_path, body))
+
+
+def _dummy_result(
+    index: int, *, outcome: str, slot: str, finding: bool = False
+) -> dict:
+    return {
+        "scenario_index": index,
+        "boot_outcome": outcome,
+        "boot_slot": slot,
+        "effective_outcome": outcome,
+        "effective_slot": slot,
+        "issue_count": 1 if finding else 0,
+        "issue_reasons": {"wrong_image": 1} if finding else {},
+        "finding": finding,
+    }
+
+
+def test_summary_warns_when_all_scenarios_collapse_to_one_outcome() -> None:
+    results = [
+        _dummy_result(i, outcome="recovery", slot="exec") for i in range(50)
+    ]
+    summary = summarize_state_campaign(
+        results,
+        expected_outcome="success",
+        metadata_model={"magic": 0xDEADBEEF},
+        iterations=50,
+    )
+    assert "warnings" in summary
+    assert any(
+        "single effective" in w and "misconfigured" in w
+        for w in summary["warnings"]
+    )
+    assert summary["iterations_completed"] == 50
+
+
+def test_summary_has_no_warning_when_outcomes_diverge() -> None:
+    results = [
+        _dummy_result(i, outcome="success", slot="staging")
+        for i in range(10)
+    ] + [
+        _dummy_result(10, outcome="recovery", slot="exec"),
+    ]
+    summary = summarize_state_campaign(
+        results,
+        expected_outcome="success",
+        metadata_model={},
+        iterations=11,
+    )
+    assert "warnings" not in summary
+
+
+def test_summary_has_no_warning_below_diversity_floor() -> None:
+    # Small smoke runs can legitimately land on a single effective tuple;
+    # do not warn until we have enough samples to claim a funnel collapse.
+    summary0 = summarize_state_campaign([], "success", {}, iterations=0)
+    summary1 = summarize_state_campaign(
+        [_dummy_result(0, outcome="success", slot="staging")],
+        "success",
+        {},
+        iterations=1,
+    )
+    summary_under_floor = summarize_state_campaign(
+        [
+            _dummy_result(i, outcome="recovery", slot="exec")
+            for i in range(9)
+        ],
+        "success",
+        {},
+        iterations=9,
+    )
+    assert "warnings" not in summary0
+    assert "warnings" not in summary1
+    assert "warnings" not in summary_under_floor
+
+
+def test_summary_distinguishes_effective_from_raw_slot() -> None:
+    # effective_outcome/slot can differ from boot_outcome when a fault is
+    # classified as a "recovery" convergence; the diversity check must use
+    # the effective pair so it doesn't false-positive on raw noise.
+    results = [
+        {"boot_outcome": raw, "boot_slot": None,
+         "effective_outcome": "recovery", "effective_slot": "exec",
+         "issue_reasons": {}, "finding": False}
+        for raw in (
+            ["bus_fault"] * 5 + ["timeout"] * 5
+        )
+    ]
+    summary = summarize_state_campaign(
+        results, "success", {}, iterations=len(results)
+    )
+    assert "warnings" in summary
 
 
 def test_run_state_fuzz_campaign_builds_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
