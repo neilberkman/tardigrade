@@ -8,12 +8,12 @@
 #   $evaluation_mode ("execute" or "state")
 #   $boot_mode ("direct" or "swap", default: "direct")
 #   $write_granularity (default: 8)
-#   $slot_a_base (default: 0x10002000)
+#   $slot_a_base (default: 0x0 — must be set by caller)
 #   $slot_a_image_file (default: "" - optional image file seeded into slot A)
-#   $slot_b_base (default: 0x10039000)
+#   $slot_b_base (default: 0x0 — must be set by caller)
 #   $slot_b_image_file (default: "" - path to pre-built image written to slot B.
 #                      If empty, script copies from slot A as before.)
-#   $slot_size (default: 0x37000)
+#   $slot_size (default: 0x0 — must be set by caller)
 #   $ota_header_size (default: 0 - vector table offset from slot base)
 #   $meta_base_0 (default: 0x10070000)
 #   $meta_base_1 (default: 0x10070100)
@@ -31,11 +31,11 @@ $include_metadata_faults?=false
 $evaluation_mode?="execute"
 $boot_mode?="direct"
 $write_granularity?=8
-$slot_a_base?=0x10002000
+$slot_a_base?=0x00000000
 $slot_a_image_file?=""
-$slot_b_base?=0x10039000
+$slot_b_base?=0x00000000
 $slot_b_image_file?=""
-$slot_size?=0x37000
+$slot_size?=0x00000000
 $ota_header_size?=0
 $meta_base_0?=0x10070000
 $meta_base_1?=0x10070100

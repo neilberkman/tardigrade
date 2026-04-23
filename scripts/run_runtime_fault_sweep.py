@@ -3106,6 +3106,8 @@ def flash_geometry():
 def read_flash_span(start_addr, size, snapshot_bytes=None):
     if size <= 0:
         return b''
+    if snapshot_bytes is None:
+        return read_flash_bytes(start_addr, size)
     flash_base, flash_size = flash_geometry()
     rel = int(start_addr) - int(flash_base)
     if rel < 0 or rel >= flash_size:
@@ -3121,6 +3123,22 @@ def read_flash_span(start_addr, size, snapshot_bytes=None):
 def read_flash_bytes(start_addr, size):
     if size <= 0:
         return b''
+    b = backend
+    if b['kind'] == 'mram':
+        flash_base, flash_size = flash_geometry()
+        rel = int(start_addr) - int(flash_base)
+        max_len = int(size)
+        if 0 <= rel < flash_size:
+            max_len = min(max_len, flash_size - rel)
+            if max_len > 0:
+                try:
+                    return to_py_bytes(b['data'].ReadBytes(rel, max_len))
+                except Exception:
+                    pass
+        # Split-layout platforms map slots as MappedMemory and keep only the
+        # persistence window behind the MRAM backend. Fall back to bus reads
+        # when hashing or dumping slot/code regions outside that backend.
+        return to_py_bytes(_read_bus_bytes(start_addr, size))
     flash_base, flash_size = flash_geometry()
     rel = int(start_addr) - int(flash_base)
     if rel < 0 or rel >= flash_size:
@@ -3128,9 +3146,6 @@ def read_flash_bytes(start_addr, size):
     max_len = min(int(size), flash_size - rel)
     if max_len <= 0:
         return b''
-    b = backend
-    if b['kind'] == 'mram':
-        return to_py_bytes(b['data'].ReadBytes(rel, max_len))
     if b['kind'] == 'fast':
         return to_py_bytes(b['data'].Flash.ReadBytes(rel, max_len))
     try:
