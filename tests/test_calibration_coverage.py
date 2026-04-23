@@ -147,7 +147,7 @@ def test_compute_verdict_allows_clean_profile_when_named_metadata_was_exercised(
             allow_control_only_issues=False,
         ),
     )
-    assert verdict == "PASS — No issues found, as expected"
+    assert verdict == "PASS"
 
 
 def test_compute_verdict_preserves_control_only_opt_in() -> None:

@@ -1317,7 +1317,13 @@ def main() -> int:
             fault_types_list=fault_types_list,
             keep_run_artifacts=args.keep_run_artifacts,
             no_hash_bypass=effective_no_hash_bypass,
-            allow_state_evaluator=not args.quick,
+            # Allow the state evaluator in --quick runs only when the
+            # fault planner actually selected the heuristic path.  The
+            # profile opt-in (``quick_use_heuristic``) is necessary but
+            # not sufficient; ``build_fault_plan`` has several other
+            # preconditions (trace available, no explicit bounds, step 1,
+            # non-exhaustive strategy) that must also hold.
+            allow_state_evaluator=(not args.quick) or bool(heuristic_summary),
         )
 
         sweep_wall_s = _time_mod.time() - sweep_wall_t0
