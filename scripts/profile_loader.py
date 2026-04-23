@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import fnmatch
 import json
+import re
 import struct
 import sys
 import tempfile
@@ -45,6 +46,29 @@ except ImportError:
 SUPPORTED_SCHEMA_VERSIONS = {1}
 
 _MAX_INHERITANCE_DEPTH = 10
+
+# GCC clone suffixes, in the order the compiler appends them.
+# A single symbol may chain multiple suffixes (e.g. ``foo.constprop.0.isra.1``),
+# so stripping is applied iteratively.  Keep this list in sync with GCC's
+# ``cgraph_node::create_clone`` and ``symtab_node::clone_alias_target``.
+_GCC_CLONE_SUFFIX_TAGS = (
+    "constprop",
+    "part",
+    "isra",
+    "cold",
+    "localalias",
+    "lto_priv",
+)
+
+# ``cold`` is emitted both numbered (``foo.cold.0``) and unnumbered
+# (``foo.cold``) depending on GCC version; everything else is always
+# followed by a decimal counter.
+_CLONE_SUFFIX_PATTERN = re.compile(
+    r"(?:"
+    r"\.(?:constprop|part|isra|localalias|lto_priv)\.\d+"
+    r"|\.cold(?:\.\d+)?"
+    r")$"
+)
 
 
 def _deep_merge_profile_data(base: Any, override: Any) -> Any:
@@ -3237,6 +3261,48 @@ def _match_symbol_query(query: str, name: str) -> bool:
     return query in name
 
 
+def _strip_gcc_clone_suffixes(name: str) -> str:
+    """Return *name* with any trailing GCC clone suffixes removed.
+
+    GCC appends suffixes such as ``.constprop.0`` or ``.isra.1`` to clones
+    of a base function.  Multiple suffixes may chain
+    (``foo.constprop.0.isra.1``), so we strip iteratively until no
+    recognised suffix remains.
+    """
+    stripped = name
+    while True:
+        next_name = _CLONE_SUFFIX_PATTERN.sub("", stripped)
+        if next_name == stripped:
+            return stripped
+        stripped = next_name
+
+
+def _find_clone_siblings(
+    base_name: str,
+    symbols: List[Tuple[str, int, Optional[int]]],
+    already_matched: set,
+) -> List[Tuple[str, int, Optional[int]]]:
+    """Return symbols whose name strips to *base_name* and are not yet matched.
+
+    Used to auto-include compiler-generated clones (``<base>.constprop.N``,
+    ``<base>.part.N``, ``<base>.isra.N``, ``<base>.cold.N``, ...) whenever
+    the user's query resolves to a base function.  Without this, the
+    ``-Os -ffunction-sections`` compiler pass can silently move a portion
+    of the target function into a sibling clone that the sweep never
+    touches.
+    """
+    if not base_name:
+        return []
+    out: List[Tuple[str, int, Optional[int]]] = []
+    for sym_name, start, end in symbols:
+        if sym_name in already_matched:
+            continue
+        if _strip_gcc_clone_suffixes(sym_name) != base_name:
+            continue
+        out.append((sym_name, start, end))
+    return out
+
+
 def _resolve_instruction_skip_symbol_targets(
     symbol_query: str,
     *,
@@ -3256,12 +3322,12 @@ def _resolve_instruction_skip_symbol_targets(
     )
     functions = _load_elf_function_symbols(str(elf_path))
     available_symbols = sorted({name for name, _, _ in functions})
-    matches = [
+    query_matches = [
         (name, start, end)
         for name, start, end in functions
         if _match_symbol_query(symbol_query, name)
     ]
-    if not matches:
+    if not query_matches:
         raise ProfileError(
             "{}: no function symbols matching {!r} in {}. "
             "Available function symbols: {}".format(
@@ -3272,29 +3338,60 @@ def _resolve_instruction_skip_symbol_targets(
             )
         )
 
+    # Auto-include compiler-generated clone siblings so -Os/-ffunction-sections
+    # cannot silently move part of a target function into a clone that the
+    # sweep never touches.  For every function the query matches, find all
+    # symbols whose name strips down to the same base and include them.
+    matched_names: set = {name for name, _, _ in query_matches}
+    clone_additions: List[Tuple[str, int, Optional[int]]] = []
+    clone_base_to_adds: Dict[str, List[str]] = {}
+    seen_bases: set = set()
+    for name, _, _ in query_matches:
+        base = _strip_gcc_clone_suffixes(name)
+        if base in seen_bases:
+            continue
+        seen_bases.add(base)
+        siblings = _find_clone_siblings(base, functions, matched_names)
+        if not siblings:
+            continue
+        clone_additions.extend(siblings)
+        matched_names.update(s[0] for s in siblings)
+        clone_base_to_adds[base] = [s[0] for s in siblings]
+
+    matches = list(query_matches) + clone_additions
+
     resolved_ranges: List[Tuple[int, int]] = []
-    seen_ranges: set[Tuple[int, int]] = set()
+    seen_ranges: set = set()
     unresolved_symbols: List[str] = []
+    total_bytes = 0
+    total_points = 0
+    query_match_names = {n for n, _, _ in query_matches}
     for name, start, end in matches:
         if end is None or end <= start:
             unresolved_symbols.append(name)
             continue
-        if (start, end) not in seen_ranges:
-            seen_ranges.add((start, end))
-            resolved_ranges.append((start, end))
+        if (start, end) in seen_ranges:
+            continue
+        seen_ranges.add((start, end))
+        resolved_ranges.append((start, end))
+        is_clone = name not in query_match_names
+        points = _count_instruction_skip_fault_points(
+            start,
+            end,
+            skip_count,
+            elf_path=str(elf_path),
+        )
+        total_bytes += end - start
+        total_points += points
         print(
-            "Resolved {!r} -> {} [0x{:x}, 0x{:x}) ({} bytes, {} fault points)".format(
+            "Resolved {!r} -> {}{} [0x{:x}, 0x{:x}) ({} bytes, {} fault points)".format(
                 symbol_query,
                 name,
+                " (clone sibling)" if is_clone else "",
                 start,
                 end,
                 end - start,
-                _count_instruction_skip_fault_points(
-                    start,
-                    end,
-                    skip_count,
-                    elf_path=str(elf_path),
-                ),
+                points,
             ),
             file=sys.stderr,
         )
@@ -3306,6 +3403,21 @@ def _resolve_instruction_skip_symbol_targets(
                 ", ".join(unresolved_symbols),
             )
         )
+    # Summary line makes coverage totals visible in audit logs so a
+    # run-over-run comparison catches silent coverage shrinkage.
+    print(
+        "Resolved {!r} -> {} symbol range(s), {} bytes, {} fault points total{}".format(
+            symbol_query,
+            len(resolved_ranges),
+            total_bytes,
+            total_points,
+            " (incl. {} clone sibling(s): {})".format(
+                sum(len(v) for v in clone_base_to_adds.values()),
+                ", ".join(sorted(s for v in clone_base_to_adds.values() for s in v)),
+            ) if clone_base_to_adds else "",
+        ),
+        file=sys.stderr,
+    )
     return resolved_ranges
 
 

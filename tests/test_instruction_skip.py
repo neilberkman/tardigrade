@@ -33,11 +33,13 @@ from profile_loader import (  # noqa: E402
     InstructionSkipConfig,
     ProfileError,
     VerificationProbeConfig,
+    _find_clone_siblings,
     _is_glob_pattern,
     _match_symbol_query,
     _parse_verification_bypass_probe,
     _parse_instruction_skip_config,
     _parse_verification_probes,
+    _strip_gcc_clone_suffixes,
     load_profile,
 )
 from thumb_instructions import (  # noqa: E402
@@ -123,6 +125,93 @@ class SymbolGlobMatchingTest(unittest.TestCase):
         self.assertTrue(
             _match_symbol_query("Validate", "BOOT_META_ValidateSlotImage")
         )
+
+
+class GccCloneSuffixTest(unittest.TestCase):
+    """Unit tests for compiler-clone-sibling symbol handling."""
+
+    def test_strip_passthrough_for_plain_name(self) -> None:
+        self.assertEqual(_strip_gcc_clone_suffixes("bootloader_main"), "bootloader_main")
+
+    def test_strip_constprop(self) -> None:
+        self.assertEqual(
+            _strip_gcc_clone_suffixes("bootloader_main.constprop.0"),
+            "bootloader_main",
+        )
+
+    def test_strip_part(self) -> None:
+        self.assertEqual(_strip_gcc_clone_suffixes("helper.part.1"), "helper")
+
+    def test_strip_isra(self) -> None:
+        self.assertEqual(_strip_gcc_clone_suffixes("helper.isra.0"), "helper")
+
+    def test_strip_cold(self) -> None:
+        self.assertEqual(_strip_gcc_clone_suffixes("helper.cold.0"), "helper")
+
+    def test_strip_cold_without_counter(self) -> None:
+        # Some GCC versions emit bare ``.cold`` with no numeric suffix.
+        self.assertEqual(_strip_gcc_clone_suffixes("helper.cold"), "helper")
+
+    def test_strip_localalias(self) -> None:
+        self.assertEqual(
+            _strip_gcc_clone_suffixes("helper.localalias.0"),
+            "helper",
+        )
+
+    def test_strip_lto_priv(self) -> None:
+        self.assertEqual(_strip_gcc_clone_suffixes("helper.lto_priv.2"), "helper")
+
+    def test_strip_chained_suffixes(self) -> None:
+        self.assertEqual(
+            _strip_gcc_clone_suffixes("helper.constprop.0.isra.1"),
+            "helper",
+        )
+
+    def test_strip_does_not_eat_unrelated_dot_name(self) -> None:
+        # ".data" style suffixes or user-defined dotted names must not be
+        # stripped.  Only recognised GCC clone tags are removed.
+        self.assertEqual(_strip_gcc_clone_suffixes("foo.bar.0"), "foo.bar.0")
+        self.assertEqual(_strip_gcc_clone_suffixes("foo.section.0"), "foo.section.0")
+
+    def test_strip_requires_trailing_digits(self) -> None:
+        self.assertEqual(
+            _strip_gcc_clone_suffixes("foo.constprop"),
+            "foo.constprop",
+        )
+
+    def test_find_siblings_returns_clones_of_same_base(self) -> None:
+        functions = [
+            ("bootloader_main", 0x1000, 0x1200),
+            ("bootloader_main.constprop.0", 0x1200, 0x1300),
+            ("bootloader_main.part.1", 0x1300, 0x1380),
+            ("unrelated_fn", 0x2000, 0x2100),
+        ]
+        siblings = _find_clone_siblings(
+            "bootloader_main", functions, {"bootloader_main"}
+        )
+        sibling_names = [s[0] for s in siblings]
+        self.assertEqual(
+            sibling_names,
+            ["bootloader_main.constprop.0", "bootloader_main.part.1"],
+        )
+
+    def test_find_siblings_skips_already_matched(self) -> None:
+        functions = [
+            ("helper", 0x1000, 0x1100),
+            ("helper.constprop.0", 0x1100, 0x1180),
+        ]
+        siblings = _find_clone_siblings(
+            "helper", functions, {"helper", "helper.constprop.0"}
+        )
+        self.assertEqual(siblings, [])
+
+    def test_find_siblings_ignores_other_bases(self) -> None:
+        functions = [
+            ("helper", 0x1000, 0x1100),
+            ("other_helper.constprop.0", 0x1100, 0x1180),
+        ]
+        siblings = _find_clone_siblings("helper", functions, {"helper"})
+        self.assertEqual(siblings, [])
 
 
 class InstructionSkipConfigTest(unittest.TestCase):
