@@ -5819,12 +5819,13 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
 
     arm_vtor_watchpoint()
     p1_max_iters = phase1_max_iters(default_s=4.0)
-    # Instruction-skip phase 1: cap wall time to 3 real seconds.  Normal
+    # Instruction-skip phase 1: cap wall time to 2 real seconds.  Normal
     # boots complete in < 0.5s (VTOR captured early); stuck boots (HardFault,
     # long loop from NOP'd instruction) would otherwise burn 120-150s via
-    # the default phase1_wall_timeout floor.  With 36 fault points per batch
-    # and a 3-minute Robot timeout, each phase must stay under ~5s.
-    _skip_p1_wall_s = 3.0
+    # the default phase1_wall_timeout floor.  With 36 fault points per batch,
+    # ~2s overhead per point (cold reset + ELF reload), and a 3-minute Robot
+    # timeout, the boot phase must stay under ~3s (targets ~4s/fault, 144s/batch).
+    _skip_p1_wall_s = 2.0
     # Tighten stall detection to 1 emulated second: no write + no VTOR for
     # 1s emulated is a reliable bricked-boot indicator; exits at ~2.5s real.
     saved_stall_s = progress_stall_timeout_s
