@@ -2545,7 +2545,8 @@ def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injec
 
 def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_signals,
                              initial_status=None, fault_injected=False, label='followup',
-                             effective_criteria=None, cycle_wall_timeout=10):
+                             effective_criteria=None, cycle_wall_timeout=10,
+                             skip_if_initial_failed=False):
     cycle_records = [
         build_cycle_record(
             0,
@@ -2560,6 +2561,13 @@ def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_si
 
     if boot_cycles <= 1:
         return None, None, 0
+
+    # Skip followup cycles when the initial boot already failed and the
+    # caller says follow-up cycles would produce no new information.
+    # Typical case: instruction-skip faults where the NOP patch persists
+    # in flash — every follow-up cycle will fault identically.
+    if skip_if_initial_failed and initial_boot_outcome not in ('success', 'success_wrong_slot'):
+        return cycle_records, analyze_boot_cycles(cycle_records), 0
 
     return _continue_followup_boot_cycles(
         cycle_records,
@@ -5811,16 +5819,17 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
 
     arm_vtor_watchpoint()
     p1_max_iters = phase1_max_iters(default_s=4.0)
-    # Instruction-skip phase 1: cap wall time to 6 real seconds.  Normal
-    # boots complete in < 1s (VTOR captured early); stuck boots (HardFault,
+    # Instruction-skip phase 1: cap wall time to 3 real seconds.  Normal
+    # boots complete in < 0.5s (VTOR captured early); stuck boots (HardFault,
     # long loop from NOP'd instruction) would otherwise burn 120-150s via
-    # the default phase1_wall_timeout floor.
-    _skip_p1_wall_s = 6.0
-    # Tighten stall detection: 2 emulated seconds of zero-write no-VTOR state
-    # reliably indicates a bricked boot.
+    # the default phase1_wall_timeout floor.  With 36 fault points per batch
+    # and a 3-minute Robot timeout, each phase must stay under ~5s.
+    _skip_p1_wall_s = 3.0
+    # Tighten stall detection to 1 emulated second: no write + no VTOR for
+    # 1s emulated is a reliable bricked-boot indicator; exits at ~2.5s real.
     saved_stall_s = progress_stall_timeout_s
-    if progress_stall_timeout_s <= 0 or progress_stall_timeout_s > 2.0:
-        progress_stall_timeout_s = 2.0
+    if progress_stall_timeout_s <= 0 or progress_stall_timeout_s > 1.0:
+        progress_stall_timeout_s = 1.0
     phase1_status = run_until_done(
         cpu_ref,
         label='fp0x{:X}_p1'.format(skip_addr),
@@ -5915,7 +5924,8 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
         0, signals, boot_outcome=boot_outcome, boot_slot=boot_slot,
         eff_criteria=eff_criteria, p2_status=phase1_status,
         followup_label='fp0x{:X}_followup'.format(skip_addr),
-        cycle_wall_timeout=6,
+        cycle_wall_timeout=3,
+        skip_followup_if_failed=True,
     )
 
 
@@ -6186,7 +6196,8 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
                         p2_status=None, followup_label='followup',
                         saved_flash=None, fault_snapshot_bytes=None,
                         extra_fields=None, metadata_delta_pre_snapshot=None,
-                        persist_snapshot=False, cycle_wall_timeout=10):
+                        persist_snapshot=False, cycle_wall_timeout=10,
+                        skip_followup_if_failed=False):
     # Shared epilogue for all fault runners.
     #
     # Handles: classify_fault_result, run_followup_boot_cycles, semantic state
@@ -6221,6 +6232,7 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         label=followup_label,
         effective_criteria=eff_criteria,
         cycle_wall_timeout=cycle_wall_timeout,
+        skip_if_initial_failed=skip_followup_if_failed,
     )
     signals['followup_ms'] = int(followup_ms)
 
