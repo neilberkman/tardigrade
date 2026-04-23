@@ -392,6 +392,23 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertIn("log('elf_symbols: could not launch {} ({})'.format(_nm_bin, _launch_err))", text)
         self.assertIn("log('elf_symbols: {} failed (rc={}), trying next symbol resolver'.format(_nm_bin, _nm_rc))", text)
 
+    def test_pathological_aborts_are_opt_in_for_instruction_skip_only(self) -> None:
+        # write-storm / step-slowdown aborts in run_until_done fire only
+        # when ``enable_pathological_aborts=True``. MCUboot swap/revert
+        # scenarios do thousands of legitimate writes per slice and would
+        # be mis-classified as faults otherwise. Only run_instruction_skip_fault
+        # passes the flag.
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("enable_pathological_aborts=False", text)
+        self.assertIn("if enable_pathological_aborts and _step_elapsed > max(0.01, slice_s) * 100", text)
+        self.assertIn("if enable_pathological_aborts:\n            _write_storm_threshold = 2000", text)
+        # The only opt-in call is inside run_instruction_skip_fault's phase 1.
+        self.assertEqual(
+            text.count("enable_pathological_aborts=True"),
+            1,
+            "only run_instruction_skip_fault should enable pathological aborts",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
