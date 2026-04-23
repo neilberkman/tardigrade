@@ -2476,7 +2476,7 @@ def _snapshot_current_flash():
     return None
 
 
-def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=None):
+def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=None, wall_timeout=10):
     cpu_ref = monitor.Machine['sysbus.cpu']
     reset_nvmc_for_recovery()
     arm_vtor_watchpoint()
@@ -2485,7 +2485,7 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
         label='{}_{}'.format(label, cycle_index),
         expect_writes=False,
         zero_writes_is_brick=False,
-        wall_timeout=30,
+        wall_timeout=wall_timeout,
         stop_on_fault=False,
         time_slice=phase2_time_slice,
     )
@@ -2512,7 +2512,7 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
     )
 
 
-def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injected, label, effective_criteria=None):
+def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injected, label, effective_criteria=None, cycle_wall_timeout=10):
     b = backend
     if b['kind'] == 'slow':
         return cycle_records, {
@@ -2537,7 +2537,7 @@ def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injec
         restore_flash_and_boot(current_flash)
         if _hash_bypass_active:
             apply_hash_bypass()
-        cycle_records.append(_boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=effective_criteria))
+        cycle_records.append(_boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=effective_criteria, wall_timeout=cycle_wall_timeout))
 
     followup_ms = int((_time.time() - followup_t0) * 1000)
     return cycle_records, analyze_boot_cycles(cycle_records), followup_ms
@@ -2545,7 +2545,7 @@ def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injec
 
 def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_signals,
                              initial_status=None, fault_injected=False, label='followup',
-                             effective_criteria=None):
+                             effective_criteria=None, cycle_wall_timeout=10):
     cycle_records = [
         build_cycle_record(
             0,
@@ -2567,6 +2567,7 @@ def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_si
         fault_injected=fault_injected,
         label=label,
         effective_criteria=effective_criteria,
+        cycle_wall_timeout=cycle_wall_timeout,
     )
 
 
@@ -4939,8 +4940,18 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     if op_trace is not None and op_trace_limit <= 0:
         op_trace_limit = 1024
     for iters in range(max_iters):
+        _step_t0 = _time.time()
         monitor.Parse('emulation RunFor "{}"'.format(time_slice))
+        _step_elapsed = _time.time() - _step_t0
         emulated_s += slice_s
+        # Step-slowdown abort: if a single time slice takes more than 100x
+        # the expected wall time AND more than 3 real seconds, the emulation
+        # hit a pathological state (unmapped access storm, write storm).
+        # Abort early rather than burning the full wall_timeout budget.
+        if _step_elapsed > max(0.01, slice_s) * 100 and _step_elapsed > 3.0:
+            reason = 'step_slowdown({:.1f}s_for_{:.3f}s_emulated)'.format(
+                _step_elapsed, slice_s)
+            break
         console_fatal = check_console_fatal()
         if console_fatal:
             reason = 'console_fatal({})'.format(console_fatal)
@@ -5141,6 +5152,18 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 break
         else:
             zero_writes_count = 0
+        # Write-storm abort: a single time slice that produces an extreme
+        # number of word writes indicates a patched instruction sent the
+        # bootloader into a pathological write loop.  This also causes the
+        # emulation to slow to a crawl (~1ms per MRAM word write through
+        # .NET interop), so aborting early here prevents each affected fault
+        # point from burning the full wall_timeout budget.
+        # Threshold: 2000 word writes per slice is ~100x any normal boot.
+        _write_storm_threshold = 2000
+        _prev_w = max(0, prev_writes)
+        if cur_writes - _prev_w > _write_storm_threshold:
+            reason = 'write_storm({:d}_writes_in_slice)'.format(cur_writes - _prev_w)
+            break
         prev_writes = cur_writes
         # Wall-clock timeout.
         elapsed = now - t0
@@ -5731,6 +5754,7 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
     # The address is patched AFTER images and pre-boot state are loaded,
     # so the patch applies to the code the bootloader will execute.
     # After the test, images are reloaded to restore original code.
+    global progress_stall_timeout_s
     if skip_count is None:
         skip_count = _instruction_skip_count
     skip_addr = int(skip_addr)
@@ -5786,16 +5810,26 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
         pass
 
     arm_vtor_watchpoint()
-    p1_wall_timeout = phase1_wall_timeout(default_s=4.0)
     p1_max_iters = phase1_max_iters(default_s=4.0)
+    # Instruction-skip phase 1: cap wall time to 6 real seconds.  Normal
+    # boots complete in < 1s (VTOR captured early); stuck boots (HardFault,
+    # long loop from NOP'd instruction) would otherwise burn 120-150s via
+    # the default phase1_wall_timeout floor.
+    _skip_p1_wall_s = 6.0
+    # Tighten stall detection: 2 emulated seconds of zero-write no-VTOR state
+    # reliably indicates a bricked boot.
+    saved_stall_s = progress_stall_timeout_s
+    if progress_stall_timeout_s <= 0 or progress_stall_timeout_s > 2.0:
+        progress_stall_timeout_s = 2.0
     phase1_status = run_until_done(
         cpu_ref,
         label='fp0x{:X}_p1'.format(skip_addr),
         stop_on_fault=False,
         max_iters=p1_max_iters,
-        wall_timeout=p1_wall_timeout,
+        wall_timeout=_skip_p1_wall_s,
         vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
     )
+    progress_stall_timeout_s = saved_stall_s
     disarm_vtor_watchpoint()
 
     # Restore default sysbus log level.
@@ -5881,6 +5915,7 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
         0, signals, boot_outcome=boot_outcome, boot_slot=boot_slot,
         eff_criteria=eff_criteria, p2_status=phase1_status,
         followup_label='fp0x{:X}_followup'.format(skip_addr),
+        cycle_wall_timeout=6,
     )
 
 
@@ -6151,7 +6186,7 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
                         p2_status=None, followup_label='followup',
                         saved_flash=None, fault_snapshot_bytes=None,
                         extra_fields=None, metadata_delta_pre_snapshot=None,
-                        persist_snapshot=False):
+                        persist_snapshot=False, cycle_wall_timeout=10):
     # Shared epilogue for all fault runners.
     #
     # Handles: classify_fault_result, run_followup_boot_cycles, semantic state
@@ -6185,6 +6220,7 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         fault_injected=fault_injected,
         label=followup_label,
         effective_criteria=eff_criteria,
+        cycle_wall_timeout=cycle_wall_timeout,
     )
     signals['followup_ms'] = int(followup_ms)
 
