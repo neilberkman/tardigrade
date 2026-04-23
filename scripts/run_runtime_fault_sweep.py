@@ -4902,8 +4902,7 @@ def run_state_fault(fault_at):
 
 def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, label='',
                    expect_writes=True, stop_on_fault=True, op_trace=None, op_trace_limit=0,
-                   zero_writes_is_brick=True, vtor_settle_iters=0,
-                   enable_pathological_aborts=False):
+                   zero_writes_is_brick=True, vtor_settle_iters=0):
     # Run CPU in continuous mode until it settles or budget exhausted.
     #
     # Uses `emulation RunFor` which runs in continuous mode — much faster
@@ -4949,21 +4948,8 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     if op_trace is not None and op_trace_limit <= 0:
         op_trace_limit = 1024
     for iters in range(max_iters):
-        _step_t0 = _time.time()
         monitor.Parse('emulation RunFor "{}"'.format(time_slice))
-        _step_elapsed = _time.time() - _step_t0
         emulated_s += slice_s
-        # Step-slowdown abort: if a single time slice takes more than 100x
-        # the expected wall time AND more than 3 real seconds, the emulation
-        # hit a pathological state (unmapped access storm, write storm).
-        # Abort early rather than burning the full wall_timeout budget.
-        # Only enabled for instruction-skip sweeps; legitimate bootloader
-        # swap/revert operations push large write bursts through the same
-        # slice accounting and must not be aborted.
-        if enable_pathological_aborts and _step_elapsed > max(0.01, slice_s) * 100 and _step_elapsed > 3.0:
-            reason = 'step_slowdown({:.1f}s_for_{:.3f}s_emulated)'.format(
-                _step_elapsed, slice_s)
-            break
         console_fatal = check_console_fatal()
         if console_fatal:
             reason = 'console_fatal({})'.format(console_fatal)
@@ -5164,21 +5150,6 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 break
         else:
             zero_writes_count = 0
-        # Write-storm abort: a single time slice that produces an extreme
-        # number of word writes indicates a patched instruction sent the
-        # bootloader into a pathological write loop.  This also causes the
-        # emulation to slow to a crawl (~1ms per MRAM word write through
-        # .NET interop), so aborting early here prevents each affected fault
-        # point from burning the full wall_timeout budget.
-        # Threshold: 2000 word writes per slice is ~100x any normal boot.
-        # Only enabled for instruction-skip sweeps — MCUboot swap/revert
-        # scenarios legitimately write many thousands of words in a slice.
-        if enable_pathological_aborts:
-            _write_storm_threshold = 2000
-            _prev_w = max(0, prev_writes)
-            if cur_writes - _prev_w > _write_storm_threshold:
-                reason = 'write_storm({:d}_writes_in_slice)'.format(cur_writes - _prev_w)
-                break
         prev_writes = cur_writes
         # Wall-clock timeout.
         elapsed = now - t0
@@ -5845,7 +5816,6 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
         max_iters=p1_max_iters,
         wall_timeout=_skip_p1_wall_s,
         vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
-        enable_pathological_aborts=True,
     )
     progress_stall_timeout_s = saved_stall_s
     disarm_vtor_watchpoint()
