@@ -388,8 +388,10 @@ def _synthetic_failed_batch_results(
     fault_points: List[int],
     fault_types_list: Optional[List[str]],
     error: str,
+    *,
+    timeout: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Return synthetic timeout results when fallback cannot isolate further."""
+    """Return synthetic results when fallback cannot isolate further."""
     results: List[Dict[str, Any]] = []
     for idx, fault_at in enumerate(fault_points):
         payload: Dict[str, Any] = {
@@ -399,13 +401,17 @@ def _synthetic_failed_batch_results(
             "fault_address": "0x00000000",
             "boot_outcome": "no_boot",
             "boot_slot": None,
-            "timeout": True,
+            "timeout": timeout,
             "error": error,
         }
         if fault_types_list and idx < len(fault_types_list):
             payload["fault_type"] = fault_types_list[idx]
         results.append(payload)
     return results
+
+
+def _is_process_timeout_error(error: str) -> bool:
+    return "renode-test batch timed out after" in str(error or "")
 
 
 def run_single_point(
@@ -743,13 +749,14 @@ def run_batch(
         robot_test_timeout_m = max(robot_test_timeout_m, robot_timeout_override_m)
     per_point_timeout = parse_renode_point_timeout(env)
     if per_point_timeout is not None and len(fault_points) == 1:
-        # Fallback-isolated one-point batches use the per-point subprocess
-        # budget below. Keep Robot's in-suite timeout at least that long, or
-        # Robot can abort first and force a synthetic timeout even though the
-        # execute-mode harness still had runner budget remaining.
+        # Fallback-isolated one-point batches use the subprocess guard below.
+        # Keep Robot's in-suite timeout at least that long, or Robot can abort
+        # first and force a synthetic timeout even though the execute-mode
+        # harness still had runner budget remaining.
+        process_guard_s = _renode_process_timeout(per_point_timeout)
         robot_test_timeout_m = max(
             robot_test_timeout_m,
-            int(math.ceil(float(per_point_timeout) / 60.0)),
+            int(math.ceil(float(process_guard_s) / 60.0)),
         )
 
     cmd = [
@@ -912,12 +919,25 @@ def _run_batch_with_fallback(
     except Exception as exc:
         if len(fault_points) <= 1 or _depth >= _MAX_FALLBACK_DEPTH:
             error_text = str(exc)
+            isolated_instruction_skip_timeout = (
+                len(fault_points) == 1
+                and bool(fault_types_list)
+                and _base_fault_type_code(fault_types_list[0]) == "i"
+                and _is_process_timeout_error(error_text)
+            )
             if len(fault_points) <= 1:
-                _progress(
-                    "Fallback point {} failed after isolation; recording synthetic timeout result. {}".format(
-                        fault_points[0], error_text
+                if isolated_instruction_skip_timeout:
+                    _progress(
+                        "Fallback point {} hit the isolated execute timeout; recording synthetic no-boot result. {}".format(
+                            fault_points[0], error_text
+                        )
                     )
-                )
+                else:
+                    _progress(
+                        "Fallback point {} failed after isolation; recording synthetic timeout result. {}".format(
+                            fault_points[0], error_text
+                        )
+                    )
             if _depth >= _MAX_FALLBACK_DEPTH:
                 _progress(
                     "Fallback depth limit ({}) reached for {} points (fp {}..{}); recording synthetic timeout results. {}".format(
@@ -930,6 +950,7 @@ def _run_batch_with_fallback(
                 fault_points=fault_points,
                 fault_types_list=fault_types_list,
                 error=error_text,
+                timeout=not isolated_instruction_skip_timeout,
             )
         mid = max(1, len(fault_points) // 2)
         left_points = fault_points[:mid]

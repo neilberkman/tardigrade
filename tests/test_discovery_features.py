@@ -1907,6 +1907,67 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertIn("batch timeout", results[0]["error"])
             self.assertIn("recording synthetic timeout result", stderr.getvalue())
 
+    def test_run_batch_with_fallback_classifies_isolated_instruction_skip_timeout_as_no_boot(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: isolated_instruction_skip_timeout_profile
+                description: timeout
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            stderr = StringIO()
+            error = "renode-test batch timed out after 450.0s (1 points)"
+
+            with mock.patch("renode_runner.run_batch", side_effect=RuntimeError(error)):
+                with redirect_stderr(stderr):
+                    results = _run_batch_with_fallback(
+                        repo_root=ROOT,
+                        renode_test="renode-test",
+                        robot_suite="tests/ota_fault_point.robot",
+                        profile=profile,
+                        fault_points=[99],
+                        robot_vars=[],
+                        work_dir=tempdir / "work",
+                        renode_remote_server_dir="",
+                        fault_types_list=["i"],
+                        keep_run_artifacts=False,
+                    )
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["fault_at"], 99)
+            self.assertEqual(results[0]["fault_type"], "i")
+            self.assertEqual(results[0]["boot_outcome"], "no_boot")
+            self.assertTrue(results[0]["fault_injected"])
+            self.assertFalse(results[0]["timeout"])
+            self.assertIn("recording synthetic no-boot result", stderr.getvalue())
+
+            summary = summarize_runtime_sweep([results[0]], total_writes=1, profile=profile)
+            self.assertEqual(summary["timeout_points"], 0)
+            self.assertEqual(summary["issue_points"], 0)
+            self.assertEqual(summary["security_bypass_points"], 0)
+            self.assertEqual(summary.get("validated_findings", 0), 0)
+            self.assertEqual(summary["dos_crash_points"], 1)
+
     def test_run_batch_with_fallback_returns_synthetic_timeout_at_depth_limit(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
@@ -2389,7 +2450,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertEqual(results, [])
             self.assertEqual(observed_timeouts, [60.0])
 
-    def test_run_batch_single_point_robot_timeout_matches_default_point_budget(self) -> None:
+    def test_run_batch_single_point_robot_timeout_matches_process_guard(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
             profile_path = tempdir / "profile.yaml"
@@ -2424,7 +2485,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             observed_timeouts = []
 
             def fake_run(cmd, *, cwd, env, timeout_s):
-                self.assertIn("TEST_TIMEOUT:5 minutes", cmd)
+                self.assertIn("TEST_TIMEOUT:8 minutes", cmd)
                 observed_timeouts.append(timeout_s)
                 rf_results = Path(cmd[cmd.index("--results-dir") + 1])
                 rf_results.mkdir(parents=True, exist_ok=True)
