@@ -5644,8 +5644,10 @@ def run_read_bit_flip_fault(fault_at):
     if cpu_path_outcome in ('fired', 'armed_but_not_triggered'):
         read_fault_stats.record_cpu_path_validated()
     elif cpu_path_outcome == 'cpu_path_not_interceptable':
+        # The point armed, so it is NOT a skip: counting it in `skipped`
+        # too would break the planned == armed + skipped partition. The
+        # dedicated cpu_path_unsupported counter is what surfaces it.
         read_fault_stats.record_cpu_path_unsupported()
-        read_fault_stats.record_skipped('cpu_path_not_interceptable')
         # Try a generic remediation if the backend exposes a way to
         # disable a fast/direct mapping for the duration of read-fault
         # arming. Backends that do not implement this are left alone.
@@ -9028,9 +9030,22 @@ else:
 
     # Per-batch read-fault accounting. Written as a sidecar so the
     # primary result file keeps its existing list/dict shape.
+    # `requested` must reflect whether the sweep plan actually asked for
+    # read faults, NOT whether read_fault_regions happened to be configured.
+    # Deriving it from the region config hides the exact failure the warning
+    # exists to catch: a profile that enables read_bit_flip but supplies no
+    # regions plans 'f' points that all skip with no_regions_configured, yet
+    # read_fault_regions is empty so the old flag reported not-requested and
+    # suppressed the warning. Use the dispatched plan ('f' in the type list)
+    # and the planned counter (incremented per dispatched 'f' point) instead.
+    _read_fault_requested = (
+        bool(read_fault_requested)
+        or ('f' in fault_type_list)
+        or read_fault_stats.planned > 0
+    )
     _read_fault_payload = {
         'stats': read_fault_stats.as_dict(),
-        'requested': bool(read_fault_requested),
+        'requested': bool(_read_fault_requested),
     }
     try:
         _sidecar_path = result_file + '.read_fault_summary.json' if isinstance(

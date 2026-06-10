@@ -697,6 +697,13 @@ def run_batch(
     batch_dir.mkdir(parents=True, exist_ok=True)
 
     result_file = batch_dir / "result.json"
+    # The batch dir is reused across batches and the harness only (re)writes
+    # the read-fault sidecar on a successful run. Remove any stale sidecar up
+    # front so a failed run cannot leave the previous batch's accounting to be
+    # picked up and double-counted against this batch's results.
+    stale_sidecar = Path(str(result_file) + ".read_fault_summary.json")
+    if stale_sidecar.exists():
+        stale_sidecar.unlink()
     rf_results = batch_dir / "robot"
     temp_root = batch_dir / ".tmp"
     bundle_dir = bundle_dir or (work_dir / ".dotnet_bundle")

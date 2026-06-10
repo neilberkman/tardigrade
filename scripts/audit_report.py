@@ -39,6 +39,11 @@ from bypass_probe import (
 )
 from fault_types import _fault_type_label
 from profile_loader import ProfileConfig
+from read_fault_translation import (
+    ReadFaultStats,
+    cpu_path_capability_warning,
+    read_fault_warning,
+)
 
 
 def _fault_type_base_code(fault_type: Any) -> str:
@@ -582,9 +587,11 @@ def summarize_runtime_sweep(
     if rf_aggregate is not None:
         summary["read_fault"] = rf_aggregate
 
-    # Separate raw observations from validated/reportable findings.
-    # The verdict only consumes validated_findings; raw counts stay
-    # visible but are clearly labelled as non-validated observations.
+    # Surface the raw per-class point counts under one clearly-labelled key
+    # so reports can distinguish raw observations from validated findings.
+    # NOTE: compute_verdict still reads several of these counts from their
+    # top-level summary keys; this block mirrors them for visibility and does
+    # not (yet) change what the verdict consumes.
     summary["raw_observations"] = {
         "instruction_skip_points": instruction_skip_points,
         "security_bypass_points": security_bypass_points,
@@ -601,18 +608,16 @@ def summarize_runtime_sweep(
 def _aggregate_read_fault_summaries(
     results: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    """Combine per-batch read-fault sidecars into a single counter set."""
+    """Combine per-batch read-fault sidecars into a single counter set.
+
+    The per-batch counting, partition invariants, and warning text all live
+    in read_fault_translation (the same module the harness writes the
+    sidecars with), so this only merges the sidecars and asks that module for
+    the verdict warning rather than re-deriving either.
+    """
     requested = False
     seen_any = False
-    totals = {
-        "planned": 0,
-        "armed": 0,
-        "fired": 0,
-        "skipped": 0,
-        "cpu_path_validated": 0,
-        "cpu_path_unsupported": 0,
-    }
-    skip_reasons: Dict[str, int] = {}
+    merged = ReadFaultStats()
     for r in results:
         payload = r.get("read_fault_summary") if isinstance(r, dict) else None
         if not payload:
@@ -620,50 +625,29 @@ def _aggregate_read_fault_summaries(
         seen_any = True
         if payload.get("requested"):
             requested = True
-        stats = payload.get("stats") or {}
-        for key in totals:
-            totals[key] += int(stats.get(key, 0))
-        for reason, count in (stats.get("skip_reasons") or {}).items():
-            skip_reasons[str(reason)] = skip_reasons.get(str(reason), 0) + int(count)
+        merged.merge(ReadFaultStats.from_dict(payload.get("stats") or {}))
     if not seen_any:
         return None
-    aggregate: Dict[str, Any] = dict(totals)
+
+    aggregate: Dict[str, Any] = dict(merged.as_dict())
+    skip_reasons = aggregate.pop("skip_reasons", {})
     aggregate["requested"] = requested
     if skip_reasons:
         aggregate["skip_reasons"] = skip_reasons
     aggregate["coverage_validated"] = (
-        totals["armed"] > 0
-        and totals["cpu_path_validated"] > 0
-        and totals["cpu_path_unsupported"] == 0
+        merged.armed > 0
+        and merged.cpu_path_validated > 0
+        and merged.cpu_path_unsupported == 0
     )
-    if requested:
-        if totals["planned"] <= 0:
-            aggregate["warning"] = (
-                "read_bit_flip requested but no fault was planned"
-            )
-        elif totals["armed"] <= 0:
-            aggregate["warning"] = (
-                "read_bit_flip planned {} fault(s) but none armed".format(
-                    totals["planned"]
-                )
-            )
-        elif (
-            totals["cpu_path_unsupported"] > 0
-            and totals["cpu_path_validated"] <= 0
-        ):
-            aggregate["warning"] = (
-                "read_bit_flip armed {} fault(s) but the CPU mapping appears "
-                "to bypass the read hook ({} non-interceptable observations); "
-                "read-fault coverage is not validated.".format(
-                    totals["armed"], totals["cpu_path_unsupported"],
-                )
-            )
-        elif totals["fired"] <= 0:
-            aggregate["warning"] = (
-                "read_bit_flip armed {} fault(s) but none fired".format(
-                    totals["armed"]
-                )
-            )
+    # Warning precedence matches the original inline order: not-planned and
+    # not-armed first, then armed-but-CPU-bypassed-the-hook, then the generic
+    # "armed but none fired". cpu_path_capability_warning only returns non-None
+    # when armed > 0 with nothing validated (so nothing fired), which is
+    # exactly the case where read_fault_warning would otherwise say "none
+    # fired"; the CPU-bypass diagnosis is the more actionable one, so it wins.
+    warning = cpu_path_capability_warning(merged) or read_fault_warning(merged, requested)
+    if warning is not None:
+        aggregate["warning"] = warning
     return aggregate
 
 
