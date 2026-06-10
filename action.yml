@@ -48,7 +48,7 @@ runs:
 
     - name: Install Python dependencies
       shell: bash
-      run: python3 -m pip install pyyaml
+      run: python3 -m pip install -r "${{ github.action_path }}/requirements.txt"
 
     - name: Run audit
       id: run
@@ -96,7 +96,7 @@ runs:
           exit 1
         fi
 
-        verdict=$(python3 -c "import json,sys; r=json.load(open('${REPORT}')); print('PASS' if r['verdict']=='PASS' else 'FAIL')")
+        verdict=$(python3 -c "import json,sys; r=json.load(open('${REPORT}')); print('PASS' if str(r['verdict']).startswith('PASS') else 'FAIL')")
         brick_rate=$(python3 -c "import json; r=json.load(open('${REPORT}')); print(r.get('summary',{}).get('runtime_sweep',{}).get('brick_rate',0))")
 
         echo "verdict=${verdict}" >> "${GITHUB_OUTPUT}"

@@ -31,9 +31,9 @@ any GPL U-Boot artifacts into tardigrade.
 Example:
 
 ```bash
-python3 /Users/neil/source/tardigrade/scripts/boot_uboot_qemu_arm64_renode.py \
-  --u-boot-elf /Users/neil/source/uboot-fault-lab/u-boot/u-boot \
-  --renode-repo /Users/neil/source/renode
+python3 scripts/boot_uboot_qemu_arm64_renode.py \
+  --u-boot-elf /path/to/uboot-fault-lab/u-boot/u-boot \
+  --renode-repo /path/to/renode
 ```
 
 If your environment follows the local lab layout, these also work:

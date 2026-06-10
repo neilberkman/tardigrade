@@ -108,3 +108,25 @@ jobs:
         with:
           name: self-test-shard-${{ matrix.shard }}
           path: results/
+
+  pytest:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          set -euxo pipefail
+          python3 -m pip install -r requirements.txt
+          python3 -m pip install pytest pytest-subtests
+
+      - name: Run pytest suite
+        run: python3 -m pytest tests/ -q

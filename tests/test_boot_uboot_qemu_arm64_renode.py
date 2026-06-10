@@ -20,9 +20,10 @@ def test_render_resc_includes_fw_cfg_and_external_elf() -> None:
         elf_path=Path("/tmp/u-boot"),
         pty_link=Path("/tmp/uart0.pty"),
     )
-    assert "include @/Users/neil/source/tardigrade/peripherals/CFIFlash.cs" in resc
+    repo_root = harness.repo_root()
+    assert "include @{}/peripherals/CFIFlash.cs".format(repo_root) in resc
     assert 'include @/tmp/QEMUFwCfg.cs' in resc
-    assert "include @/Users/neil/source/tardigrade/peripherals/PL061Stub.cs" in resc
+    assert "include @{}/peripherals/PL061Stub.cs".format(repo_root) in resc
     assert 'machine LoadPlatformDescription @/tmp/platform.repl' in resc
     assert 'sysbus LoadELF @/tmp/u-boot' in resc
     assert 'sysbus LoadBinary @/tmp/board.dtb 0x40000000' in resc

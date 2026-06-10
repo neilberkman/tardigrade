@@ -3,9 +3,11 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
+
 
 def _load_optee_helper():
-    path = Path("/Users/neil/source/tardigrade/scripts/boot_optee_vexpress_renode.py")
+    path = ROOT / "scripts/boot_optee_vexpress_renode.py"
     spec = importlib.util.spec_from_file_location("boot_optee_vexpress_renode", path)
     assert spec is not None
     assert spec.loader is not None
@@ -14,12 +16,12 @@ def _load_optee_helper():
     return module
 
 
-def _read(path: str) -> str:
-    return Path(path).read_text(encoding="utf-8")
+def _read(rel_path: str) -> str:
+    return (ROOT / rel_path).read_text(encoding="utf-8")
 
 
 def test_qemu_virt_a53_platform_has_expected_peripherals() -> None:
-    text = _read("/Users/neil/source/tardigrade/platforms/qemu_virt_a53.repl")
+    text = _read("platforms/qemu_virt_a53.repl")
     assert "cpu: CPU.ARMv8A" in text
     assert "flash0: Memory.MappedMemory @ sysbus 0x00000000" in text
     assert "flash1: Tardigrade.CFIFlash @ sysbus 0x04000000" in text
@@ -28,7 +30,7 @@ def test_qemu_virt_a53_platform_has_expected_peripherals() -> None:
 
 
 def test_qemu_vexpress_a9_platform_has_expected_peripherals() -> None:
-    text = _read("/Users/neil/source/tardigrade/platforms/qemu_vexpress_a9.repl")
+    text = _read("platforms/qemu_vexpress_a9.repl")
     assert "cpu: CPU.ARMv7A" in text
     assert "timer1: Tardigrade.ARM_SP804PrimeCellTimer @ sysbus 0x10011000" in text
     assert "timer2: Tardigrade.ARM_SP804PrimeCellTimer @ sysbus 0x10012000" in text
@@ -38,13 +40,13 @@ def test_qemu_vexpress_a9_platform_has_expected_peripherals() -> None:
 
 
 def test_qemu_vexpress_a9_secure_platform_enables_security_states() -> None:
-    text = _read("/Users/neil/source/tardigrade/platforms/qemu_vexpress_a9_secure.repl")
+    text = _read("platforms/qemu_vexpress_a9_secure.repl")
     assert "supportsTwoSecurityStates: true" in text
     assert "ram: Memory.MappedMemory @ sysbus 0x60000000" in text
 
 
 def test_qemu_virt_a15_platform_matches_optee_qemu_virt_layout() -> None:
-    text = _read("/Users/neil/source/tardigrade/platforms/qemu_virt_a15.repl")
+    text = _read("platforms/qemu_virt_a15.repl")
     assert "cpu: Tardigrade.QEMUVirtARMv7A" in text
     assert 'cpuType: "cortex-a15"' in text
     assert 'address: 0x10E00000; size: 0x010000; region: "distributor"' in text
@@ -54,7 +56,7 @@ def test_qemu_virt_a15_platform_matches_optee_qemu_virt_layout() -> None:
 
 
 def test_qemu_virt_armv7_wrapper_handles_optee_cp15_surface() -> None:
-    text = _read("/Users/neil/source/tardigrade/peripherals/QEMUVirtARMv7A.cs")
+    text = _read("peripherals/QEMUVirtARMv7A.cs")
     assert "PrimaryRegionRemapRegister" in text
     assert "NormalMemoryRemapRegister" in text
     assert "PhysicalAddressRegister" in text
@@ -105,21 +107,21 @@ def test_qemu_virt_armv7_wrapper_handles_optee_cp15_surface() -> None:
 
 
 def test_optee_qemu_virt_dts_has_console_and_memory() -> None:
-    text = _read("/Users/neil/source/tardigrade/scripts/optee_qemu_virt_arm32_renode.dts")
+    text = _read("scripts/optee_qemu_virt_arm32_renode.dts")
     assert 'stdout-path = "serial1:115200n8"' in text
     assert "memory@40000000" in text
     assert "pl011@9040000" in text
 
 
 def test_barebox_helper_loads_custom_a9_board() -> None:
-    text = _read("/Users/neil/source/tardigrade/scripts/boot_barebox_vexpress_renode.py")
+    text = _read("scripts/boot_barebox_vexpress_renode.py")
     assert "qemu_vexpress_a9.repl" in text
     assert "ARM_SP804PrimeCellTimer.cs" in text
     assert "CFIFlash.cs" in text
 
 
 def test_optee_helper_loads_custom_a9_board() -> None:
-    text = _read("/Users/neil/source/tardigrade/scripts/boot_optee_vexpress_renode.py")
+    text = _read("scripts/boot_optee_vexpress_renode.py")
     assert "qemu_virt_a15.repl" in text
     assert "QEMUVirtARMv7A.cs" in text
     assert "connector Connect sysbus.uart1 u0" in text
