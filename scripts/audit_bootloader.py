@@ -580,6 +580,7 @@ def run_state_fuzz_campaign(
                 scenario=scenario,
                 result=data,
                 expected_outcome=profile.expect.control_outcome,
+                metadata_model=model,
             )
         )
 

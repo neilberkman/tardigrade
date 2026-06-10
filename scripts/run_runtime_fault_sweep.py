@@ -14,6 +14,49 @@ if _SCRIPT_DIR and _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 from thumb_instructions import build_instruction_skip_patch_plan
+from read_fault_translation import (
+    ReadFaultStats,
+    classify_cpu_path_outcome as _classify_cpu_path_outcome,
+    cpu_path_capability_warning,
+    pick_target_address_in_regions,
+    translate_bus_address_to_backend_offset,
+)
+
+
+def _try_disable_backend_fast_path(periph):
+    """Generic remediation: ask a backend to disable a direct/fast
+    mapping that bypasses its read hook. Returns True if a remediation
+    method was found and accepted; False otherwise. Backends without
+    any such capability are simply left alone.
+    """
+    candidate_methods = (
+        'DisableFastMapping',
+        'DisableDirectMapping',
+        'DisableFastPath',
+        'ForceSlowReads',
+    )
+    for name in candidate_methods:
+        fn = getattr(periph, name, None)
+        if fn is None:
+            continue
+        try:
+            fn()
+            return True
+        except Exception:
+            continue
+    candidate_flags = (
+        'FastMappingEnabled',
+        'DirectMappingEnabled',
+        'FastPathEnabled',
+    )
+    for name in candidate_flags:
+        if hasattr(periph, name):
+            try:
+                setattr(periph, name, False)
+                return True
+            except Exception:
+                continue
+    return False
 
 def log(msg):
     sys.stderr.write('[resc] {}\n'.format(msg))
@@ -99,9 +142,45 @@ def persist_fault_snapshot(fault_at, fault_type, snapshot_bytes):
 
 
 def _bus_load_elf(path):
-    """Load ELF via inline python so post-reset extension lookup stays stable."""
-    _p = str(path).replace("'", "\\'").replace('\\', '/')
-    monitor.Parse("python \"bus=monitor.Machine.SystemBus; bus.LoadELF(r'{}')\"".format(_p))
+    """Load PT_LOAD ELF segments through sysbus.
+
+    Embedded ELFs can have split execution/load addresses, for example
+    .ramfunc with VMA in SRAM and LMA in MRAM. Startup copies from LMA to
+    VMA, so a runtime reload must seed both addresses when they differ.
+    """
+    with open(str(path), 'rb') as _f:
+        _elf = _f.read()
+    if len(_elf) < 52 or _elf[:4] != b'\x7fELF':
+        raise RuntimeError('invalid ELF: {}'.format(path))
+
+    _bus = monitor.Machine.SystemBus
+    _e_phoff = struct.unpack_from('<I', _elf, 28)[0]
+    _e_phentsize = struct.unpack_from('<H', _elf, 42)[0]
+    _e_phnum = struct.unpack_from('<H', _elf, 44)[0]
+
+    def _write_segment(_addr, _seg):
+        _seg = bytearray(_seg)
+        while len(_seg) % 4:
+            _seg.append(0)
+        for _j in range(0, len(_seg), 4):
+            _val = struct.unpack_from('<I', _seg, _j)[0]
+            _bus.WriteDoubleWord(int(_addr) + _j, _val)
+
+    for _i in range(_e_phnum):
+        _off = _e_phoff + _i * _e_phentsize
+        _p_type = struct.unpack_from('<I', _elf, _off)[0]
+        if _p_type != 1:
+            continue
+        _p_file_off = struct.unpack_from('<I', _elf, _off + 4)[0]
+        _p_vaddr = struct.unpack_from('<I', _elf, _off + 8)[0]
+        _p_paddr = struct.unpack_from('<I', _elf, _off + 12)[0]
+        _p_filesz = struct.unpack_from('<I', _elf, _off + 16)[0]
+        if _p_filesz == 0:
+            continue
+        _seg = _elf[_p_file_off:_p_file_off + _p_filesz]
+        _write_segment(_p_vaddr, _seg)
+        if _p_paddr != _p_vaddr:
+            _write_segment(_p_paddr, _seg)
 
 
 def _to_byte_list(data):
@@ -482,11 +561,58 @@ bootloader_elf = str(monitor.GetVariable('bootloader_elf')).strip()
 platform_repl = get_optional_var('platform_repl', '').strip().lower()
 write_granularity = int(str(monitor.GetVariable('write_granularity')).strip())
 
-# NVM base address: the lowest address in the NVM region.  Used for converting
-# absolute bus addresses to peripheral-relative offsets (e.g. read fault
-# injection).  For MRAM the bootloader sits at MRAM offset 0, so
-# bootloader_entry == MRAM base.  For NRF52 flash starts at 0x0.
-nvm_base_address = min(bootloader_entry, slot_exec_base, slot_staging_base)
+def _discover_backend_bus_base(backend_obj):
+    """Return the bus base address the emulator has the backend mapped at.
+
+    Tries the explicit monitor variable first, then asks the sysbus for
+    the peripheral's registration points. Returns ``(base, size)`` or
+    ``(None, None)`` if neither path yields a definitive answer.
+    """
+    explicit = get_optional_int_var('backend_bus_base', None)
+    explicit_size = get_optional_int_var('backend_bus_size', None)
+    if explicit is not None and explicit_size is not None:
+        return int(explicit), int(explicit_size)
+    try:
+        regs = monitor.Machine.SystemBus.GetRegistrationPoints(backend_obj)
+    except Exception:
+        regs = None
+    discovered_base = None
+    discovered_end = None
+    if regs is not None:
+        try:
+            for reg in regs:
+                rng = getattr(reg, 'Range', None)
+                if rng is None:
+                    continue
+                start = int(getattr(rng, 'StartAddress', 0))
+                end_addr = int(getattr(rng, 'EndAddress', 0))
+                if discovered_base is None or start < discovered_base:
+                    discovered_base = start
+                if discovered_end is None or end_addr > discovered_end:
+                    discovered_end = end_addr
+        except Exception:
+            discovered_base = None
+            discovered_end = None
+    if discovered_base is not None and discovered_end is not None:
+        size = max(0, discovered_end - discovered_base + 1)
+        if explicit is not None:
+            return int(explicit), size
+        return int(discovered_base), size
+    if explicit is not None:
+        return int(explicit), None
+    return None, None
+
+
+backend_bus_base, backend_bus_size = _discover_backend_bus_base(backend['data'])
+if backend_bus_base is None:
+    log('WARNING: backend bus base not discovered; read_bit_flip will skip with backend_unsupported')
+backend['bus_base'] = backend_bus_base
+backend['bus_size'] = backend_bus_size
+
+# Legacy alias retained for non-read-fault call sites; do not use for
+# read-fault address translation. New code uses backend['bus_base'].
+nvm_base_address = backend_bus_base if backend_bus_base is not None else min(
+    bootloader_entry, slot_exec_base, slot_staging_base)
 
 # Image paths for reload between batch iterations.
 image_staging_path = str(monitor.GetVariable('image_staging_path')).strip()
@@ -848,6 +974,8 @@ read_fault_preflight = {
     'reason': '',
     'backend': '',
 }
+read_fault_stats = ReadFaultStats()
+read_fault_requested = bool(read_fault_regions) or read_fault_bit_flips > 0
 
 # NVS region config for nvs_corruption fault type.
 _nvs_region_addr_raw = get_optional_var('nvs_region_addr', '')
@@ -3693,27 +3821,53 @@ def prime_bootloader_entry():
         initial_sp = as_int(bus.ReadDoubleWord(int(bootloader_entry)))
         initial_pc = as_int(bus.ReadDoubleWord(int(bootloader_entry) + 4))
         cpu_ref = monitor.Machine['sysbus.cpu']
-        for cpu_name in ('cpu', 'sysbus.cpu'):
-            try:
-                monitor.Parse('{} VectorTableOffset 0x{:08X}'.format(cpu_name, int(bootloader_entry)))
-                if initial_sp != 0:
-                    monitor.Parse('{} SP 0x{:08X}'.format(cpu_name, initial_sp))
-                if initial_pc != 0:
-                    monitor.Parse('{} PC 0x{:08X}'.format(cpu_name, initial_pc))
-                break
-            except Exception:
-                continue
+        prime_method = 'none'
+
+        # Prefer direct register assignment. Some monitor/device combinations
+        # report command failures to the console without raising exceptions,
+        # which makes a failed `cpu PC ...` prime look successful.
+        try:
+            if initial_sp != 0:
+                cpu_ref.SP = RegisterValue.Create(initial_sp, 32)
+            if initial_pc != 0:
+                cpu_ref.PC = RegisterValue.Create(initial_pc, 32)
+
+            sp_ok = (initial_sp == 0) or (as_int(cpu_ref.SP.RawValue) == initial_sp)
+            pc_ok = (initial_pc == 0) or ((as_int(cpu_ref.PC.RawValue) & ~1) == (initial_pc & ~1))
+            if sp_ok and pc_ok:
+                prime_method = 'direct_registers'
+        except Exception:
+            pass
+
+        if prime_method == 'none':
+            for cpu_name in ('cpu', 'sysbus.cpu'):
+                try:
+                    monitor.Parse('{} VectorTableOffset 0x{:08X}'.format(cpu_name, int(bootloader_entry)))
+                    if initial_sp != 0:
+                        monitor.Parse('{} SP 0x{:08X}'.format(cpu_name, initial_sp))
+                    if initial_pc != 0:
+                        monitor.Parse('{} PC 0x{:08X}'.format(cpu_name, initial_pc))
+
+                    sp_ok = (initial_sp == 0) or (as_int(cpu_ref.SP.RawValue) == initial_sp)
+                    pc_ok = (initial_pc == 0) or ((as_int(cpu_ref.PC.RawValue) & ~1) == (initial_pc & ~1))
+                    if sp_ok and pc_ok:
+                        prime_method = 'monitor:{}'.format(cpu_name)
+                        break
+                except Exception:
+                    continue
         try:
             cpu_ref.IsHalted = False
         except Exception:
             pass
         try:
-            log('prime_boot: entry={} sp={} pc={} cpu_pc={} vtor={}'.format(
+            log('prime_boot: entry={} sp={} pc={} cpu_pc={} cpu_sp={} vtor={} method={}'.format(
                 fmt_u32(int(bootloader_entry)),
                 fmt_u32(initial_sp),
                 fmt_u32(initial_pc),
                 fmt_u32(as_int(cpu_ref.GetRegisterUnsafe(15))),
+                fmt_u32(as_int(cpu_ref.SP.RawValue)),
                 fmt_u32(as_int(bus.ReadDoubleWord(0xE000ED08))),
+                prime_method,
             ))
         except Exception:
             pass
@@ -3723,6 +3877,8 @@ def prime_bootloader_entry():
 def apply_pre_boot_state():
     global _pre_boot_state_debug
     _pre_boot_state_debug = []
+    if setup_script:
+        monitor.Parse('include @' + setup_script)
     if pre_boot_bin:
         with open(pre_boot_bin, 'rb') as f:
             pbs_data = f.read()
@@ -3747,8 +3903,6 @@ def apply_pre_boot_state():
                     'wrote': fmt_u32(val),
                     'readback_error': str(exc),
                 })
-    if setup_script:
-        monitor.Parse('include @' + setup_script)
     prime_bootloader_entry()
 
 
@@ -4009,6 +4163,11 @@ def prepare_clean_phase1_state():
         apply_pre_boot_state()
     if _hash_bypass_active:
         apply_hash_bypass()
+    # Some platforms do not reload SP/PC from the bootloader vector table
+    # after machine reset. Recovery-shell prep already re-primes those
+    # registers; phase-1 baseline prep must do the same or control boots can
+    # start at PC=0 and look like a target failure.
+    prime_bootloader_entry()
 
 
 def restore_phase1_baseline():
@@ -5330,39 +5489,40 @@ def run_read_bit_flip_fault(fault_at):
     skip_reason = None
     preflight = ensure_read_fault_preflight()
 
-    # Compute target address: if read_fault_regions is configured, map
-    # fault_at into the configured region space; otherwise use staging slot.
-    if read_fault_regions:
-        # Flatten regions into a total byte span, index into it.
-        total_region_bytes = sum(e - s for s, e in read_fault_regions)
-        byte_offset = (fault_word_offset) % total_region_bytes if total_region_bytes else 0
-        accum = 0
-        target_address = 0
-        for rg_start, rg_end in read_fault_regions:
-            rg_size = rg_end - rg_start
-            if accum + rg_size > byte_offset:
-                target_address = rg_start + (byte_offset - accum)
-                # Align to write_granularity
-                target_address = target_address & ~(write_granularity - 1)
-                target_address = max(target_address, rg_start)
-                break
-            accum += rg_size
-        else:
-            target_address = read_fault_regions[0][0]
-    else:
-        target_address = slot_staging_base + fault_word_offset
+    read_fault_stats.record_planned()
 
-    if not preflight.get('supported'):
-        skip_reason = preflight.get('reason') or 'read_fault_backend_unsupported'
-    elif not should_arm:
+    # Map fault_at into the configured read-fault regions (an absolute
+    # bus-address span) and then translate to a backend-relative offset
+    # using the bus base discovered from the emulator's peripheral
+    # registration. No fallback to firmware-derived addresses.
+    target_address, region_skip = pick_target_address_in_regions(
+        read_fault_regions, fault_at, write_granularity)
+    if region_skip is not None:
+        skip_reason = region_skip
+        log('fp={} type=f SKIP: {} (no read_fault_regions configured)'.format(
+            fault_at, region_skip))
+        target_address = 0
+
+    if skip_reason is None and not preflight.get('supported'):
+        skip_reason = preflight.get('reason') or 'backend_unsupported'
+    elif skip_reason is None and not should_arm:
         skip_reason = 'probability_gate'
         log('fp={} type=f SKIP: probability gate did not arm fault (p={})'.format(
             fault_at, read_fault_probability))
-    elif backend['kind'] == 'mram':
+    elif skip_reason is None and backend['kind'] == 'mram':
         read_fault_address = target_address
-        nvm_offset = read_fault_address - nvm_base_address
         _rf_data = backend['data']
-        if 0 <= nvm_offset < int(_rf_data.Size):
+        backend_size_runtime = backend.get('bus_size') or int(_rf_data.Size)
+        nvm_offset, addr_skip = translate_bus_address_to_backend_offset(
+            read_fault_address,
+            backend.get('bus_base'),
+            backend_size_runtime)
+        if addr_skip is not None:
+            skip_reason = addr_skip
+            log('fp={} type=f SKIP: {} address=0x{:X} backend_base={} backend_size={}'.format(
+                fault_at, addr_skip, read_fault_address,
+                backend.get('bus_base'), backend_size_runtime))
+        elif 0 <= nvm_offset < int(_rf_data.Size):
             original_word = as_int(bus.ReadDoubleWord(read_fault_address))
             _rf_data.ReadFaultEnabled = True
             _rf_data.ReadFaultAddress = nvm_offset
@@ -5379,11 +5539,20 @@ def run_read_bit_flip_fault(fault_at):
             skip_reason = 'address_out_of_range'
             log('fp={} type=f WARNING: fault address 0x{:X} outside NVM'.format(
                 fault_at, read_fault_address))
-    else:
+    elif skip_reason is None:
         read_fault_address = target_address
-        nvm_offset = read_fault_address - nvm_base_address
         nvm_ref = backend['data'].Nvm
-        if 0 <= nvm_offset < int(nvm_ref.Size):
+        backend_size_runtime = backend.get('bus_size') or int(nvm_ref.Size)
+        nvm_offset, addr_skip = translate_bus_address_to_backend_offset(
+            read_fault_address,
+            backend.get('bus_base'),
+            backend_size_runtime)
+        if addr_skip is not None:
+            skip_reason = addr_skip
+            log('fp={} type=f SKIP: {} address=0x{:X} backend_base={} backend_size={}'.format(
+                fault_at, addr_skip, read_fault_address,
+                backend.get('bus_base'), backend_size_runtime))
+        elif 0 <= nvm_offset < int(nvm_ref.Size):
             original_word = as_int(bus.ReadDoubleWord(read_fault_address))
             nvm_ref.ReadFaultEnabled = True
             nvm_ref.ReadFaultAddress = nvm_offset
@@ -5397,9 +5566,12 @@ def run_read_bit_flip_fault(fault_at):
             log('fp={} type=f armed nvm_offset=0x{:X} orig=0x{:08X} expected_corrupt=0x{:08X}'.format(
                 fault_at, nvm_offset, original_word, corrupted_word))
         else:
-            skip_reason = 'address_out_of_range'
+            skip_reason = 'address_outside_backend_mapping'
             log('fp={} type=f WARNING: fault address 0x{:X} outside NVM'.format(
                 fault_at, read_fault_address))
+
+    if skip_reason is None:
+        read_fault_stats.record_armed()
 
     if skip_reason is not None:
         # Backend unsupported, probability gate, or address out of range --
@@ -5428,6 +5600,7 @@ def run_read_bit_flip_fault(fault_at):
         }
         if skip_reason:
             result['skip_reason'] = skip_reason
+            read_fault_stats.record_skipped(skip_reason)
         return result
 
     log('fp={} type=f phase2_step'.format(fault_at))
@@ -5445,14 +5618,45 @@ def run_read_bit_flip_fault(fault_at):
     phase1_ms = int((_time.time() - fp_t0) * 1000)
 
     # Disarm and check whether the fault actually fired (one-shot semantics).
+    # Also collect the peripheral's read counter so we can tell whether
+    # any CPU read hit the hook at all. Zero observed reads while armed
+    # implies the CPU mapping bypassed the hook (e.g. via a direct fast
+    # mapping) and arming alone does not give us read-fault coverage.
     if backend['kind'] == 'mram':
-        backend['data'].ReadFaultEnabled = False
-        read_fault_actually_fired = bool(backend['data'].ReadFaultFired)
+        rf_periph = backend['data']
     else:
-        nvm_ref = backend['data'].Nvm
-        nvm_ref.ReadFaultEnabled = False
-        read_fault_actually_fired = bool(nvm_ref.ReadFaultFired)
+        rf_periph = backend['data'].Nvm
+    rf_periph.ReadFaultEnabled = False
+    read_fault_actually_fired = bool(rf_periph.ReadFaultFired)
+    try:
+        read_fault_total_reads = int(rf_periph.ReadFaultTotalReads)
+    except Exception:
+        read_fault_total_reads = 0
+
     fault_injected = read_fault_actually_fired
+    if read_fault_actually_fired:
+        read_fault_stats.record_fired()
+
+    cpu_path_outcome = _classify_cpu_path_outcome(
+        armed=True, fired=read_fault_actually_fired,
+        total_reads=read_fault_total_reads,
+    )
+    if cpu_path_outcome in ('fired', 'armed_but_not_triggered'):
+        read_fault_stats.record_cpu_path_validated()
+    elif cpu_path_outcome == 'cpu_path_not_interceptable':
+        read_fault_stats.record_cpu_path_unsupported()
+        read_fault_stats.record_skipped('cpu_path_not_interceptable')
+        # Try a generic remediation if the backend exposes a way to
+        # disable a fast/direct mapping for the duration of read-fault
+        # arming. Backends that do not implement this are left alone.
+        remediated = _try_disable_backend_fast_path(rf_periph)
+        if remediated:
+            log('fp={} type=f WARNING: cpu_path_not_interceptable; '
+                'fast-path disabled for next attempts'.format(fault_at))
+        else:
+            log('fp={} type=f WARNING: cpu_path_not_interceptable '
+                '(armed but no peripheral reads observed; CPU may be '
+                'bypassing the hook via a direct mapping).'.format(fault_at))
 
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
@@ -8821,6 +9025,20 @@ else:
                     label + ':', sums.get(key, 0), sums.get(key, 0) // count, maxes.get(key, 0)))
             log('  {:<10s} sum={}    avg={}    max={}'.format(
                 'p2_iters:', sums.get('p2_iters', 0), sums.get('p2_iters', 0) // count, maxes.get('p2_iters', 0)))
+
+    # Per-batch read-fault accounting. Written as a sidecar so the
+    # primary result file keeps its existing list/dict shape.
+    _read_fault_payload = {
+        'stats': read_fault_stats.as_dict(),
+        'requested': bool(read_fault_requested),
+    }
+    try:
+        _sidecar_path = result_file + '.read_fault_summary.json' if isinstance(
+            result_file, str) else str(result_file) + '.read_fault_summary.json'
+        with open(_sidecar_path, 'w') as f:
+            f.write(_json_dump_text(_read_fault_payload))
+    except Exception as _sidecar_exc:
+        log('WARNING: could not write read-fault sidecar: {}'.format(_sidecar_exc))
 
     # Write results.
     if batch_mode:

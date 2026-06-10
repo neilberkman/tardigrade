@@ -838,9 +838,20 @@ def run_batch(
             raise RuntimeError("Batch run did not produce {}".format(result_file))
 
         data = json.loads(result_file.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return data
-        return [data]
+        results_list = data if isinstance(data, list) else [data]
+
+        # Pick up the per-batch read-fault sidecar and stamp the
+        # accounting onto the first result entry so downstream summary
+        # builders can aggregate it without rereading the sidecar.
+        sidecar = Path(str(result_file) + ".read_fault_summary.json")
+        if sidecar.exists() and results_list:
+            try:
+                payload = json.loads(sidecar.read_text(encoding="utf-8"))
+            except Exception:
+                payload = None
+            if payload and isinstance(results_list[0], dict):
+                results_list[0].setdefault("read_fault_summary", payload)
+        return results_list
     finally:
         if not keep_run_artifacts and rf_results.exists():
             shutil.rmtree(rf_results, ignore_errors=True)

@@ -120,6 +120,29 @@ def _is_valid(field: MetadataField, value: int) -> bool:
     return True
 
 
+def _scenario_matches_model(
+    scenario: Dict[str, Any],
+    model: Optional[MetadataModel],
+) -> Optional[bool]:
+    if model is None:
+        return None
+    if str(scenario.get("crc_mode") or "").strip().lower() == "invalid":
+        return False
+
+    field_values = scenario.get("field_values")
+    if not isinstance(field_values, dict):
+        return None
+
+    for field in model.fields:
+        if field.field_type == "computed_crc32":
+            continue
+        if field.name not in field_values:
+            continue
+        if not _is_valid(field, int(field_values[field.name])):
+            return False
+    return True
+
+
 def _random_valid_value(field: MetadataField, rng: random.Random) -> int:
     if field.valid:
         return int(rng.choice(field.valid))
@@ -371,9 +394,16 @@ def extract_state_fuzz_result(
     scenario: Dict[str, Any],
     result: Dict[str, Any],
     expected_outcome: str,
+    metadata_model: Optional[MetadataModel] = None,
 ) -> Dict[str, Any]:
     effective_outcome, effective_slot = _effective_boot_result(result)
     issue_reason_list = result_issue_reasons(result, expected_outcome)
+    scenario_matches_model = _scenario_matches_model(scenario, metadata_model)
+    if scenario_matches_model is False:
+        issue_reason_list = [
+            reason for reason in issue_reason_list
+            if reason not in {"boot_outcome", "pc_expectation", "vtor_expectation"}
+        ]
     issue_reasons = {reason: 1 for reason in issue_reason_list}
     finding = bool(issue_reason_list)
     return {
@@ -382,6 +412,7 @@ def extract_state_fuzz_result(
         "crc_mode": scenario["crc_mode"],
         "blob_sha256": scenario["blob_sha256"],
         "field_values": dict(scenario["field_values"]),
+        "scenario_matches_model": scenario_matches_model,
         "boot_outcome": str(result.get("boot_outcome", "unknown")),
         "boot_slot": result.get("boot_slot"),
         "effective_outcome": effective_outcome,

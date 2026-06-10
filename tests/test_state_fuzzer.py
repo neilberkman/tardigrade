@@ -14,6 +14,7 @@ sys.path.insert(0, str(SCRIPTS))
 import audit_bootloader  # noqa: E402
 from profile_loader import load_profile  # noqa: E402
 from state_fuzz import (  # noqa: E402
+    extract_state_fuzz_result,
     generate_state_scenarios,
     resolve_metadata_model,
     summarize_state_campaign,
@@ -238,6 +239,102 @@ def test_summary_distinguishes_effective_from_raw_slot() -> None:
     assert "warnings" in summary
 
 
+def test_extract_state_fuzz_result_suppresses_baseline_slot_mismatch_for_invalid_scenario() -> None:
+    model = resolve_metadata_model(
+        {
+            "base_address": 0x00080000,
+            "fields": [
+                {"name": "active_slot", "offset": 0, "size": 1, "valid": [1]},
+                {"name": "seq", "offset": 4, "size": 4, "type": "uint32"},
+                {"name": "boot_count", "offset": 8, "size": 1, "valid_range": [0, 2]},
+                {"name": "crc", "offset": 12, "size": 4, "type": "computed_crc32"},
+            ],
+        },
+        default_base=0x00080000,
+    )
+    scenario = {
+        "index": 2,
+        "mode": "boundary",
+        "crc_mode": "valid",
+        "blob_sha256": "deadbeef",
+        "field_values": {
+            "active_slot": 0,
+            "seq": 1,
+            "boot_count": 1,
+            "crc": 0,
+        },
+    }
+    result = {
+        "boot_outcome": "wrong_pc",
+        "boot_slot": "exec",
+        "effective_outcome": "wrong_pc",
+        "effective_slot": "exec",
+        "effective_success_criteria": {"vtor_slot": "staging"},
+        "signals": {"expectations_met": False, "vtor_ok": False, "pc_ok": False},
+    }
+
+    extracted = extract_state_fuzz_result(
+        scenario=scenario,
+        result=result,
+        expected_outcome="success",
+        metadata_model=model,
+    )
+
+    assert extracted["scenario_matches_model"] is False
+    assert extracted["finding"] is False
+    assert extracted["issue_reasons"] == {}
+
+
+def test_extract_state_fuzz_result_keeps_slot_mismatch_for_valid_scenario() -> None:
+    model = resolve_metadata_model(
+        {
+            "base_address": 0x00080000,
+            "fields": [
+                {"name": "active_slot", "offset": 0, "size": 1, "valid": [1]},
+                {"name": "seq", "offset": 4, "size": 4, "type": "uint32"},
+                {"name": "boot_count", "offset": 8, "size": 1, "valid_range": [0, 2]},
+                {"name": "crc", "offset": 12, "size": 4, "type": "computed_crc32"},
+            ],
+        },
+        default_base=0x00080000,
+    )
+    scenario = {
+        "index": 3,
+        "mode": "structured_random",
+        "crc_mode": "valid",
+        "blob_sha256": "feedface",
+        "field_values": {
+            "active_slot": 1,
+            "seq": 1,
+            "boot_count": 1,
+            "crc": 0,
+        },
+    }
+    result = {
+        "boot_outcome": "wrong_pc",
+        "boot_slot": "exec",
+        "effective_outcome": "wrong_pc",
+        "effective_slot": "exec",
+        "effective_success_criteria": {"vtor_slot": "staging"},
+        "signals": {"expectations_met": False, "vtor_ok": False, "pc_ok": False},
+    }
+
+    extracted = extract_state_fuzz_result(
+        scenario=scenario,
+        result=result,
+        expected_outcome="success",
+        metadata_model=model,
+    )
+
+    assert extracted["scenario_matches_model"] is True
+    assert extracted["finding"] is True
+    assert extracted["issue_reasons"] == {
+        "boot_outcome": 1,
+        "pc_expectation": 1,
+        "vtor_expectation": 1,
+    }
+
+
 def test_run_state_fuzz_campaign_builds_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     profile = load_profile(_write_profile(tmp_path))
     captured_robot_vars = []
@@ -247,6 +344,7 @@ def test_run_state_fuzz_campaign_builds_results(tmp_path: Path, monkeypatch: pyt
         return {
             "boot_outcome": "wrong_image",
             "boot_slot": "staging",
+            "signals": {"marker_ok": False},
         }
 
     monkeypatch.setattr(audit_bootloader, "run_single_point", fake_run_single_point)

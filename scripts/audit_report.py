@@ -577,7 +577,94 @@ def summarize_runtime_sweep(
         if region_breakdown:
             summary["region_breakdown"] = region_breakdown
 
+    # Read-fault accounting aggregated across batches.
+    rf_aggregate = _aggregate_read_fault_summaries(results)
+    if rf_aggregate is not None:
+        summary["read_fault"] = rf_aggregate
+
+    # Separate raw observations from validated/reportable findings.
+    # The verdict only consumes validated_findings; raw counts stay
+    # visible but are clearly labelled as non-validated observations.
+    summary["raw_observations"] = {
+        "instruction_skip_points": instruction_skip_points,
+        "security_bypass_points": security_bypass_points,
+        "dos_crash_points": dos_crash_points,
+        "dos_recovery_points": dos_recovery_points,
+        "bus_fault_points": bus_fault_points,
+        "timeout_points": timeout_points,
+        "semantic_observation_points": semantic_observation_points,
+    }
+
     return summary
+
+
+def _aggregate_read_fault_summaries(
+    results: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Combine per-batch read-fault sidecars into a single counter set."""
+    requested = False
+    seen_any = False
+    totals = {
+        "planned": 0,
+        "armed": 0,
+        "fired": 0,
+        "skipped": 0,
+        "cpu_path_validated": 0,
+        "cpu_path_unsupported": 0,
+    }
+    skip_reasons: Dict[str, int] = {}
+    for r in results:
+        payload = r.get("read_fault_summary") if isinstance(r, dict) else None
+        if not payload:
+            continue
+        seen_any = True
+        if payload.get("requested"):
+            requested = True
+        stats = payload.get("stats") or {}
+        for key in totals:
+            totals[key] += int(stats.get(key, 0))
+        for reason, count in (stats.get("skip_reasons") or {}).items():
+            skip_reasons[str(reason)] = skip_reasons.get(str(reason), 0) + int(count)
+    if not seen_any:
+        return None
+    aggregate: Dict[str, Any] = dict(totals)
+    aggregate["requested"] = requested
+    if skip_reasons:
+        aggregate["skip_reasons"] = skip_reasons
+    aggregate["coverage_validated"] = (
+        totals["armed"] > 0
+        and totals["cpu_path_validated"] > 0
+        and totals["cpu_path_unsupported"] == 0
+    )
+    if requested:
+        if totals["planned"] <= 0:
+            aggregate["warning"] = (
+                "read_bit_flip requested but no fault was planned"
+            )
+        elif totals["armed"] <= 0:
+            aggregate["warning"] = (
+                "read_bit_flip planned {} fault(s) but none armed".format(
+                    totals["planned"]
+                )
+            )
+        elif (
+            totals["cpu_path_unsupported"] > 0
+            and totals["cpu_path_validated"] <= 0
+        ):
+            aggregate["warning"] = (
+                "read_bit_flip armed {} fault(s) but the CPU mapping appears "
+                "to bypass the read hook ({} non-interceptable observations); "
+                "read-fault coverage is not validated.".format(
+                    totals["armed"], totals["cpu_path_unsupported"],
+                )
+            )
+        elif totals["fired"] <= 0:
+            aggregate["warning"] = (
+                "read_bit_flip armed {} fault(s) but none fired".format(
+                    totals["armed"]
+                )
+            )
+    return aggregate
 
 
 def _coverage_gate_reason(sweep_summary: Dict[str, Any]) -> Optional[str]:
@@ -771,6 +858,10 @@ def compute_verdict(
         verdict += " (WARNING: {} points timed out — consider increasing run_duration)".format(
             timeout_points
         )
+    rf_summary = sweep_summary.get("read_fault") or {}
+    rf_warning = rf_summary.get("warning")
+    if rf_warning:
+        verdict += " (WARNING: {})".format(rf_warning)
     return verdict
 
 
