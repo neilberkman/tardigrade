@@ -433,6 +433,12 @@ def run_single_point(
     point_dir.mkdir(parents=True, exist_ok=True)
 
     result_file = point_dir / "result.json"
+    # point_dir is reused across calls with the same label; drop any stale
+    # read-fault sidecar so a failed run can't leave the previous run's
+    # accounting to be picked up (mirrors run_batch).
+    stale_sidecar = Path(str(result_file) + ".read_fault_summary.json")
+    if stale_sidecar.exists():
+        stale_sidecar.unlink()
     rf_results = point_dir / "robot"
     temp_root = point_dir / ".tmp"
     bundle_dir = work_dir / ".dotnet_bundle"
@@ -524,7 +530,18 @@ def run_single_point(
         if not result_file.exists():
             raise RuntimeError("Run did not produce {}".format(result_file))
 
-        return json.loads(result_file.read_text(encoding="utf-8"))
+        result = json.loads(result_file.read_text(encoding="utf-8"))
+        # Stamp the per-run read-fault sidecar onto the result so the audit
+        # summary can aggregate single-point runs the same as batch runs.
+        sidecar = Path(str(result_file) + ".read_fault_summary.json")
+        if sidecar.exists() and isinstance(result, dict):
+            try:
+                payload = json.loads(sidecar.read_text(encoding="utf-8"))
+            except Exception:
+                payload = None
+            if payload:
+                result.setdefault("read_fault_summary", payload)
+        return result
     finally:
         if not keep_run_artifacts and rf_results.exists():
             shutil.rmtree(rf_results, ignore_errors=True)

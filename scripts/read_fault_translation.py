@@ -168,6 +168,19 @@ class ReadFaultStats(object):
             "skip_reasons": {str(k): int(v) for k, v in self.skip_reasons.items()},
         }
 
+    def coverage_validated(self):
+        """True iff read-fault coverage was actually exercised.
+
+        Requires at least one armed fault, at least one CPU-path-validated
+        read, and zero faults whose CPU read bypassed the hook. A single
+        non-interceptable observation invalidates coverage.
+        """
+        return (
+            self.armed > 0
+            and self.cpu_path_validated > 0
+            and self.cpu_path_unsupported == 0
+        )
+
     @classmethod
     def from_dict(cls, data):
         instance = cls()
@@ -220,24 +233,28 @@ def classify_cpu_path_outcome(armed, fired, total_reads):
 
 
 def cpu_path_capability_warning(stats):
-    """Return a warning if armed read faults never saw a CPU read.
+    """Return a warning if any armed read fault bypassed the CPU read hook.
 
-    Specifically: armed > 0 AND cpu_path_validated == 0 AND
-    cpu_path_unsupported > 0. In that case arming succeeded but the
-    fault hook was never reached by CPU reads, so read-fault coverage
-    is not validated.
+    Fires whenever armed > 0 AND cpu_path_unsupported > 0, regardless of how
+    many other faults validated. A run where some points validate and others
+    bypass the hook (a mixed batch) still has invalid coverage for the
+    bypassed points, so the warning must not be suppressed just because some
+    coverage was exercised.
     """
     if stats.armed <= 0:
         return None
-    if stats.cpu_path_validated > 0:
-        return None
     if stats.cpu_path_unsupported <= 0:
         return None
+    coverage_note = (
+        "coverage is not validated"
+        if stats.cpu_path_validated <= 0
+        else "coverage is incomplete"
+    )
     return (
         "read_bit_flip armed {} fault(s) but the CPU mapping appears to "
         "bypass the read hook ({} non-interceptable observations); "
-        "read-fault coverage is not validated.".format(
-            stats.armed, stats.cpu_path_unsupported,
+        "read-fault {}.".format(
+            stats.armed, stats.cpu_path_unsupported, coverage_note,
         )
     )
 

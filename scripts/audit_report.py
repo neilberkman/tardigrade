@@ -587,21 +587,6 @@ def summarize_runtime_sweep(
     if rf_aggregate is not None:
         summary["read_fault"] = rf_aggregate
 
-    # Surface the raw per-class point counts under one clearly-labelled key
-    # so reports can distinguish raw observations from validated findings.
-    # NOTE: compute_verdict still reads several of these counts from their
-    # top-level summary keys; this block mirrors them for visibility and does
-    # not (yet) change what the verdict consumes.
-    summary["raw_observations"] = {
-        "instruction_skip_points": instruction_skip_points,
-        "security_bypass_points": security_bypass_points,
-        "dos_crash_points": dos_crash_points,
-        "dos_recovery_points": dos_recovery_points,
-        "bus_fault_points": bus_fault_points,
-        "timeout_points": timeout_points,
-        "semantic_observation_points": semantic_observation_points,
-    }
-
     return summary
 
 
@@ -634,11 +619,7 @@ def _aggregate_read_fault_summaries(
     aggregate["requested"] = requested
     if skip_reasons:
         aggregate["skip_reasons"] = skip_reasons
-    aggregate["coverage_validated"] = (
-        merged.armed > 0
-        and merged.cpu_path_validated > 0
-        and merged.cpu_path_unsupported == 0
-    )
+    aggregate["coverage_validated"] = merged.coverage_validated()
     # Warning precedence matches the original inline order: not-planned and
     # not-armed first, then armed-but-CPU-bypassed-the-hook, then the generic
     # "armed but none fired". cpu_path_capability_warning only returns non-None
@@ -748,6 +729,26 @@ def compute_verdict(
     invariant_observations = int(sweep_summary.get("invariant_issue_points", 0))
     coverage_gate_reason = _coverage_gate_reason(sweep_summary)
 
+    def _append_warnings(text):
+        """Append timeout + read-fault coverage warnings to a verdict string.
+
+        compute_verdict has several early returns; routing them all through
+        here keeps the read-fault coverage warning from being silently
+        dropped on the security-bypass FAIL paths (which return before the
+        tail), matching how the timeout warning is surfaced everywhere.
+        """
+        out = text
+        timeouts = int(sweep_summary.get("timeout_points", 0))
+        if timeouts > 0:
+            out += (
+                " (WARNING: {} points timed out — consider increasing "
+                "run_duration)".format(timeouts)
+            )
+        rf_warning = (sweep_summary.get("read_fault") or {}).get("warning")
+        if rf_warning:
+            out += " (WARNING: {})".format(rf_warning)
+        return out
+
     verdict = "PASS"
     if control_only_issue and not found_issues:
         verdict = "PASS \u2014 control exhibits expected {}".format(control_outcome)
@@ -778,12 +779,7 @@ def compute_verdict(
                 )
             if dos_recovery_points > 0:
                 verdict += " ({} recovering DoS points)".format(dos_recovery_points)
-            timeout_points = int(sweep_summary.get("timeout_points", 0))
-            if timeout_points > 0:
-                verdict += " (WARNING: {} points timed out — consider increasing run_duration)".format(
-                    timeout_points
-                )
-            return verdict
+            return _append_warnings(verdict)
         if security_bypass_points > 0:
             parts = []
             if non_instruction_issues > 0:
@@ -797,12 +793,7 @@ def compute_verdict(
                 total_issues,
                 ", ".join(parts),
             )
-            timeout_points = int(sweep_summary.get("timeout_points", 0))
-            if timeout_points > 0:
-                verdict += " (WARNING: {} points timed out — consider increasing run_duration)".format(
-                    timeout_points
-                )
-            return verdict
+            return _append_warnings(verdict)
         metadata_delta_observations = int(
             sweep_summary.get("metadata_delta_issue_points", 0)
         )
@@ -837,16 +828,7 @@ def compute_verdict(
         )
         if dos_recovery_points > 0:
             verdict += " ({} recovering DoS points)".format(dos_recovery_points)
-    timeout_points = int(sweep_summary.get("timeout_points", 0))
-    if timeout_points > 0:
-        verdict += " (WARNING: {} points timed out — consider increasing run_duration)".format(
-            timeout_points
-        )
-    rf_summary = sweep_summary.get("read_fault") or {}
-    rf_warning = rf_summary.get("warning")
-    if rf_warning:
-        verdict += " (WARNING: {})".format(rf_warning)
-    return verdict
+    return _append_warnings(verdict)
 
 
 def report_skip_reasons(

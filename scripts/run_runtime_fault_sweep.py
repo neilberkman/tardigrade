@@ -609,9 +609,13 @@ if backend_bus_base is None:
 backend['bus_base'] = backend_bus_base
 backend['bus_size'] = backend_bus_size
 
-# Legacy alias retained for non-read-fault call sites; do not use for
-# read-fault address translation. New code uses backend['bus_base'].
-nvm_base_address = backend_bus_base if backend_bus_base is not None else min(
+# Legacy alias retained for non-read-fault call sites (slot-fill residual
+# writes, timed_bit_corruption); do not use for read-fault address
+# translation. Read faults use backend['bus_base'] +
+# translate_bus_address_to_backend_offset. Keep this as the original
+# min()-of-entries so those call sites' offset math is unchanged by the
+# read-fault bus-base discovery.
+nvm_base_address = min(
     bootloader_entry, slot_exec_base, slot_staging_base)
 
 # Image paths for reload between batch iterations.
@@ -5536,7 +5540,7 @@ def run_read_bit_flip_fault(fault_at):
             log('fp={} type=f armed nvm_offset=0x{:X} orig=0x{:08X} expected_corrupt=0x{:08X}'.format(
                 fault_at, nvm_offset, original_word, corrupted_word))
         else:
-            skip_reason = 'address_out_of_range'
+            skip_reason = 'address_outside_backend_mapping'
             log('fp={} type=f WARNING: fault address 0x{:X} outside NVM'.format(
                 fault_at, read_fault_address))
     elif skip_reason is None:
@@ -9036,12 +9040,12 @@ else:
     # exists to catch: a profile that enables read_bit_flip but supplies no
     # regions plans 'f' points that all skip with no_regions_configured, yet
     # read_fault_regions is empty so the old flag reported not-requested and
-    # suppressed the warning. Use the dispatched plan ('f' in the type list)
-    # and the planned counter (incremented per dispatched 'f' point) instead.
+    # suppressed the warning. Use the dispatched plan ('f' in the type list);
+    # planned > 0 is strictly implied by that ('f' is the only path that calls
+    # record_planned), so it adds nothing.
     _read_fault_requested = (
         bool(read_fault_requested)
         or ('f' in fault_type_list)
-        or read_fault_stats.planned > 0
     )
     _read_fault_payload = {
         'stats': read_fault_stats.as_dict(),

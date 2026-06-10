@@ -475,6 +475,40 @@ class ReadFaultStatsCpuPathTest(unittest.TestCase):
         stats.record_planned()
         self.assertIsNone(cpu_path_capability_warning(stats))
 
+    def test_warning_fires_on_mixed_batch_partial_bypass(self):
+        # Some points validated, others bypassed the hook: the bypass must
+        # still be surfaced, not suppressed by the validated points.
+        stats = ReadFaultStats()
+        for _ in range(2):
+            stats.record_planned()
+            stats.record_armed()
+        stats.record_cpu_path_validated()
+        stats.record_fired()
+        stats.record_cpu_path_unsupported()
+        warning = cpu_path_capability_warning(stats)
+        self.assertIsNotNone(warning)
+        self.assertIn("non-interceptable", warning)
+        self.assertIn("incomplete", warning)
+        self.assertFalse(stats.coverage_validated())
+
+    def test_coverage_validated_predicate(self):
+        clean = ReadFaultStats()
+        clean.record_planned()
+        clean.record_armed()
+        clean.record_cpu_path_validated()
+        clean.record_fired()
+        self.assertTrue(clean.coverage_validated())
+
+        bypassed = ReadFaultStats()
+        bypassed.record_planned()
+        bypassed.record_armed()
+        bypassed.record_cpu_path_unsupported()
+        self.assertFalse(bypassed.coverage_validated())
+
+        unarmed = ReadFaultStats()
+        unarmed.record_planned()
+        self.assertFalse(unarmed.coverage_validated())
+
     def test_round_trip_includes_cpu_path_counters(self):
         stats = ReadFaultStats()
         stats.record_planned()

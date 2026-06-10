@@ -69,6 +69,26 @@ def test_cpu_path_not_interceptable_is_armed_not_skipped():
     assert "bypass the read hook" in agg["warning"]
 
 
+def test_mixed_batches_surface_partial_bypass_warning():
+    # Batch A validated cleanly; batch B had every armed point bypass the
+    # hook. The merged aggregate must still report the bypass (coverage
+    # invalid) rather than letting batch A's success suppress the warning.
+    clean = {
+        "planned": 4, "armed": 4, "fired": 4, "skipped": 0,
+        "cpu_path_validated": 4, "cpu_path_unsupported": 0,
+    }
+    bypassed = {
+        "planned": 3, "armed": 3, "fired": 0, "skipped": 0,
+        "cpu_path_validated": 0, "cpu_path_unsupported": 3,
+    }
+    agg = _aggregate_read_fault_summaries(
+        [_result(clean, requested=True), _result(bypassed, requested=True)]
+    )
+    assert agg["coverage_validated"] is False
+    assert "warning" in agg
+    assert "bypass the read hook" in agg["warning"]
+
+
 def test_merges_counters_across_batches():
     a = {
         "planned": 3, "armed": 3, "fired": 2, "skipped": 0,
