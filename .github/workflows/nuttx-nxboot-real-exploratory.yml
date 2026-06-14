@@ -44,6 +44,11 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y kconfig-frontends || sudo apt-get install -y kconfig-frontends-nox
+          # Current NuttX master uses cross-file Kconfig menu/if structures
+          # (arch/arm/src/common/stm32/Kconfig.i2c) that the legacy
+          # kconfig-frontends parser rejects; NuttX prefers kconfiglib when its
+          # scripts are on PATH, so install it for olddefconfig/menuconfig.
+          sudo python3 -m pip install kconfiglib
 
       - name: Install pinned Arm GNU toolchain
         run: |
