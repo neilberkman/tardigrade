@@ -379,6 +379,23 @@ def check_successful_rollback(
     # needed), this is not a failure -- rollback is simply N/A.
     if multi_boot_analysis.get("rollback_skipped"):
         return
+    # A missed/no-boot first cycle that recovers to a successful boot on the
+    # rollback target slot, by the expected cycle, is preserved availability,
+    # not a rollback failure. The cycle-0 "no_boot" here comes from the
+    # execute-mode probe not observing execution (vtor/pc unset). Only treat it
+    # as a pass when the recovery landed on the expected rollback target and did
+    # so on time -- a recovery into another slot, or one that arrived later than
+    # expected, is still a genuine rollback failure.
+    if (
+        multi_boot_analysis.get("status") == "initial_no_boot_recovered"
+        and multi_boot_analysis.get("final_outcome") == "success"
+        and multi_boot_analysis.get("rollback_target_slot") is not None
+        and multi_boot_analysis.get("final_slot")
+        == multi_boot_analysis.get("rollback_target_slot")
+        and multi_boot_analysis.get("rollback_cycle") is not None
+        and int(multi_boot_analysis.get("rollback_cycle")) <= int(expected_cycle)
+    ):
+        return
     raise InvariantViolation(
         invariant_name="successful_rollback",
         description=(

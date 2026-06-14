@@ -60,6 +60,17 @@ def analyze_boot_cycles(
         and analysis.get("final_outcome") == "success"
     ):
         analysis["status"] = "initial_no_boot_recovered"
+        # Record the first cycle that reached the rollback target slot so the
+        # successful_rollback invariant can tell an on-time recovery from a
+        # late one (the normal rollback scan below is skipped for this status).
+        if target_slot is not None:
+            for record in cycle_records[1:]:
+                if (
+                    record.get("boot_outcome") == "success"
+                    and record.get("boot_slot") == target_slot
+                ):
+                    analysis["rollback_cycle"] = int(record.get("cycle", 0))
+                    break
         return analysis
 
     generic_status = "oscillating"

@@ -18,6 +18,7 @@ from invariants import (  # noqa: E402
     InvariantViolation,
     check_boot_target_matches_metadata,
     check_last_known_good_preserved,
+    check_successful_rollback,
     _ALL_INVARIANTS,
     _INVARIANT_REGISTRY,
 )
@@ -230,6 +231,122 @@ class TestRegistration(unittest.TestCase):
             _INVARIANT_REGISTRY["last_known_good_preserved"],
             check_last_known_good_preserved,
         )
+
+
+class SuccessfulRollbackTests(unittest.TestCase):
+    def _result(self):
+        return _make_result(boot_outcome="success", boot_slot="exec")
+
+    def test_recovery_onto_rollback_target_passes(self):
+        # Cycle-0 no_boot (probe miss) that recovers to a successful boot on the
+        # expected rollback target, on time, is preserved availability.
+        mba = {
+            "status": "initial_no_boot_recovered",
+            "expected_rollback_at_cycle": 1,
+            "rollback_target_slot": "exec",
+            "final_slot": "exec",
+            "final_outcome": "success",
+            "rollback_cycle": 1,
+        }
+        check_successful_rollback(self._result(), multi_boot_analysis=mba)
+
+    def test_recovery_onto_wrong_slot_still_fails(self):
+        # Recovering into a slot other than the rollback target is a real
+        # rollback failure and must still raise.
+        mba = {
+            "status": "initial_no_boot_recovered",
+            "expected_rollback_at_cycle": 1,
+            "rollback_target_slot": "exec",
+            "final_slot": "staging",
+            "final_outcome": "success",
+            "rollback_cycle": 1,
+        }
+        with self.assertRaises(InvariantViolation):
+            check_successful_rollback(self._result(), multi_boot_analysis=mba)
+
+    def test_recovery_late_still_fails(self):
+        # Recovery that reached the target slot but later than expected is a
+        # genuine late-rollback failure and must still raise.
+        mba = {
+            "status": "initial_no_boot_recovered",
+            "expected_rollback_at_cycle": 1,
+            "rollback_target_slot": "exec",
+            "final_slot": "exec",
+            "final_outcome": "success",
+            "rollback_cycle": 2,
+        }
+        with self.assertRaises(InvariantViolation):
+            check_successful_rollback(self._result(), multi_boot_analysis=mba)
+
+    def test_recovery_without_known_target_still_fails(self):
+        # Without a recorded rollback target we cannot confirm the recovery
+        # landed correctly, so do not blanket-pass.
+        mba = {
+            "status": "initial_no_boot_recovered",
+            "expected_rollback_at_cycle": 1,
+            "final_slot": "exec",
+            "final_outcome": "success",
+            "rollback_cycle": 1,
+        }
+        with self.assertRaises(InvariantViolation):
+            check_successful_rollback(self._result(), multi_boot_analysis=mba)
+
+    def test_rollback_missing_still_fails(self):
+        mba = {
+            "status": "rollback_missing",
+            "expected_rollback_at_cycle": 1,
+            "rollback_target_slot": "exec",
+            "final_slot": "staging",
+            "final_outcome": "wrong_image",
+        }
+        with self.assertRaises(InvariantViolation):
+            check_successful_rollback(self._result(), multi_boot_analysis=mba)
+
+    def test_converged_passes(self):
+        mba = {
+            "status": "rollback_converged",
+            "expected_rollback_at_cycle": 1,
+            "rollback_target_slot": "exec",
+            "final_slot": "exec",
+            "final_outcome": "success",
+        }
+        check_successful_rollback(self._result(), multi_boot_analysis=mba)
+
+    def test_analyze_boot_cycles_late_recovery_fails_end_to_end(self):
+        # Drive the real analyzer: cycle-0 probe miss, recovers to the target
+        # slot but at cycle 2 when rollback was expected by cycle 1.
+        from boot_cycle_analysis import analyze_boot_cycles
+
+        cycle_records = [
+            {"cycle": 0, "boot_slot": None, "boot_outcome": "no_boot",
+             "signals": {"execution_observed": False}},
+            {"cycle": 1, "boot_slot": "staging", "boot_outcome": "success"},
+            {"cycle": 2, "boot_slot": "exec", "boot_outcome": "success"},
+        ]
+        mba = analyze_boot_cycles(
+            cycle_records, requested_cycles=3,
+            target_slot="exec", expected_rollback_at_cycle=1,
+        )
+        self.assertEqual(mba["status"], "initial_no_boot_recovered")
+        self.assertEqual(mba["rollback_cycle"], 2)
+        with self.assertRaises(InvariantViolation):
+            check_successful_rollback(self._result(), multi_boot_analysis=mba)
+
+    def test_analyze_boot_cycles_ontime_recovery_passes_end_to_end(self):
+        from boot_cycle_analysis import analyze_boot_cycles
+
+        cycle_records = [
+            {"cycle": 0, "boot_slot": None, "boot_outcome": "no_boot",
+             "signals": {"execution_observed": False}},
+            {"cycle": 1, "boot_slot": "exec", "boot_outcome": "success"},
+        ]
+        mba = analyze_boot_cycles(
+            cycle_records, requested_cycles=2,
+            target_slot="exec", expected_rollback_at_cycle=1,
+        )
+        self.assertEqual(mba["status"], "initial_no_boot_recovered")
+        self.assertEqual(mba["rollback_cycle"], 1)
+        check_successful_rollback(self._result(), multi_boot_analysis=mba)
 
 
 if __name__ == "__main__":
