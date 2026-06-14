@@ -7142,36 +7142,17 @@ def run_execute_fault(fault_at, fault_type='w'):
         disarm_vtor_watchpoint()
         phase2_ms = int((_time.time() - phase2_t0) * 1000)
 
-    # Multi-boot for continue-after-fault: if the first boot completed
-    # naturally but boot_cycles > 1, reboot to see if corrupted trailer
-    # state causes wrong outcome on subsequent boots.
+    # Evaluate the cycle-0 (first boot) outcome NOW, while the sticky VTOR/PC
+    # captured during phase 1 (and phase 2 continuation) still reflects this
+    # boot.  Follow-up boot cycles are owned exclusively by
+    # run_followup_boot_cycles() in _build_fault_result(); we must not run
+    # extra reboots here, because arm_vtor_watchpoint() resets sticky_vtor and
+    # would wipe the proof-of-execution for cycle 0 before it is read, yielding
+    # a phantom no_boot (pc=0/vtor=0/execution_observed=false) that contradicts
+    # phase1_stop_reason=vtor_captured.
     _multiboot_cycles_run = 0
-    if (fault_injected and is_non_power_write_fault
-            and not phase1_stopped_on_fault and boot_cycles > 1):
-        for extra_cycle in range(1, boot_cycles):
-            _multiboot_cycles_run += 1
-            log('fp={} multi-boot cycle {} of {}'.format(fault_at, extra_cycle + 1, boot_cycles))
-            monitor.Parse('machine Pause')
-            _machine_reset()
-            _bus_load_elf(bootloader_elf)
-            # Do NOT reload slot images — use whatever is on flash after boot 1
-            if _hash_bypass_active:
-                apply_hash_bypass()
-            reset_nvmc_for_recovery()
-            arm_vtor_watchpoint()
-            cycle_status = run_until_done(
-                cpu_ref,
-                label='fp{}_cycle{}'.format(fault_at, extra_cycle + 1),
-                expect_writes=False,
-                zero_writes_is_brick=False,
-                wall_timeout=60,
-                stop_on_fault=False,
-                time_slice=phase2_time_slice,
-            )
-            disarm_vtor_watchpoint()
-            log('fp={} cycle {} done'.format(fault_at, extra_cycle + 1))
 
-    # Read final state.
+    # Read final state of the first boot.
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
@@ -8229,27 +8210,14 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     emulation_ms = int((_time.time() - t_emu) * 1000)
     disarm_vtor_watchpoint()
 
+    # Cycle-0 outcome is evaluated below from the sticky VTOR/PC captured
+    # during the first boot.  Follow-up boot cycles are owned exclusively by
+    # run_followup_boot_cycles() in _build_fault_result(); we must not reboot
+    # here, because arm_vtor_watchpoint() resets sticky_vtor and would wipe
+    # the cycle-0 proof-of-execution before it is read, yielding a phantom
+    # no_boot (pc=0/vtor=0/execution_observed=false) that contradicts
+    # phase1_stop_reason=vtor_captured.
     _multiboot_cycles_run = 0
-    if fault_injected and is_non_power_write_fault and boot_cycles > 1:
-        for extra_cycle in range(1, boot_cycles):
-            _multiboot_cycles_run += 1
-            monitor.Parse('machine Pause')
-            _machine_reset()
-            _bus_load_elf(bootloader_elf)
-            if _hash_bypass_active:
-                apply_hash_bypass()
-            reset_nvmc_for_recovery()
-            arm_vtor_watchpoint()
-            p2_status = run_until_done(
-                cpu_ref,
-                label='fp{}_native_replay_cycle{}'.format(fault_at, extra_cycle + 1),
-                expect_writes=False,
-                zero_writes_is_brick=False,
-                wall_timeout=60,
-                stop_on_fault=False,
-                time_slice=phase2_time_slice,
-            )
-            disarm_vtor_watchpoint()
 
     phase2_ms = int((_time.time() - fp_t0) * 1000) - phase1_ms
     total_ms = int((_time.time() - fp_t0) * 1000)
@@ -8447,27 +8415,14 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     emulation_ms = int((_time.time() - t_emu) * 1000)
     disarm_vtor_watchpoint()
 
+    # Cycle-0 outcome is evaluated below from the sticky VTOR/PC captured
+    # during the first boot.  Follow-up boot cycles are owned exclusively by
+    # run_followup_boot_cycles() in _build_fault_result(); we must not reboot
+    # here, because arm_vtor_watchpoint() resets sticky_vtor and would wipe
+    # the cycle-0 proof-of-execution before it is read, yielding a phantom
+    # no_boot (pc=0/vtor=0/execution_observed=false) that contradicts
+    # phase1_stop_reason=vtor_captured.
     _multiboot_cycles_run = 0
-    if fault_injected and is_non_power_write_fault and boot_cycles > 1:
-        for extra_cycle in range(1, boot_cycles):
-            _multiboot_cycles_run += 1
-            monitor.Parse('machine Pause')
-            _machine_reset()
-            _bus_load_elf(bootloader_elf)
-            if _hash_bypass_active:
-                apply_hash_bypass()
-            reset_nvmc_for_recovery()
-            arm_vtor_watchpoint()
-            p2_status = run_until_done(
-                cpu_ref,
-                label='fp{}_replay_cycle{}'.format(fault_at, extra_cycle + 1),
-                expect_writes=False,
-                zero_writes_is_brick=False,
-                wall_timeout=60,
-                stop_on_fault=False,
-                time_slice=phase2_time_slice,
-            )
-            disarm_vtor_watchpoint()
 
     phase2_ms = int((_time.time() - fp_t0) * 1000) - phase1_ms
     total_ms = int((_time.time() - fp_t0) * 1000)
