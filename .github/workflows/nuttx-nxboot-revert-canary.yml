@@ -70,6 +70,10 @@ jobs:
           set -euxo pipefail
           git clone --depth 1 --branch "${NUTTX_REF}" https://github.com/apache/nuttx.git "${RUNNER_TEMP}/nuttx"
           git clone --depth 1 --branch "${NUTTX_APPS_REF}" https://github.com/apache/nuttx-apps.git "${RUNNER_TEMP}/nuttx-apps"
+          # The canary tracks upstream master; record the exact SHAs so a failure
+          # is reproducible/diffable without freezing what it builds against.
+          echo "NUTTX_SHA=$(git -C "${RUNNER_TEMP}/nuttx" rev-parse HEAD)" >> "${GITHUB_ENV}"
+          echo "NUTTX_APPS_SHA=$(git -C "${RUNNER_TEMP}/nuttx-apps" rev-parse HEAD)" >> "${GITHUB_ENV}"
 
       - name: Build real NuttX nxboot target
         run: |
@@ -145,6 +149,7 @@ jobs:
           bricks = int(summary.get("bricks") or 0)
           cal = payload.get("calibration", {})
           print("Profile:", payload.get("profile"))
+          print("NuttX:", os.environ.get("NUTTX_SHA"), "apps:", os.environ.get("NUTTX_APPS_SHA"))
           print("Verdict:", payload.get("verdict"))
           print("Calibrated writes:", cal.get("writes"))
           print("Points:", summary.get("total_fault_points"))
@@ -165,6 +170,7 @@ jobs:
               with open(summary_path, "a") as fh:
                   fh.write("## Real NuttX nxboot revert canary summary\n")
                   fh.write(f"- Profile: `{payload.get('profile')}`\n")
+                  fh.write(f"- NuttX: `{os.environ.get('NUTTX_SHA','?')}` apps: `{os.environ.get('NUTTX_APPS_SHA','?')}`\n")
                   fh.write(f"- Verdict: `{payload.get('verdict')}`\n")
                   fh.write(f"- Calibrated writes: `{cal.get('writes')}`\n")
                   fh.write(f"- Fault points: `{summary.get('total_fault_points')}`\n")
