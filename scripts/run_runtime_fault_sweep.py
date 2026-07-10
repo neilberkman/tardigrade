@@ -679,6 +679,29 @@ success_otadata_expect_scope = str(monitor.GetVariable('success_otadata_expect_s
 if success_otadata_expect_scope not in ('always', 'control'):
     success_otadata_expect_scope = 'always'
 
+success_checks_config = {}
+success_checks_parse_error = None
+success_checks_b64 = get_optional_var('success_checks_b64', '')
+if success_checks_b64:
+    try:
+        success_checks_config = json.loads(
+            base64.b64decode(success_checks_b64).decode('utf-8')
+        )
+        if not isinstance(success_checks_config, dict):
+            raise ValueError('decoded value is not a mapping')
+        if int(success_checks_config.get('contract_version', 0)) != 1:
+            raise ValueError(
+                'unsupported contract_version {}'.format(
+                    success_checks_config.get('contract_version')
+                )
+            )
+    except Exception as exc:
+        success_checks_parse_error = str(exc)
+        success_checks_config = {
+            'contract_version': 1,
+            'transport_error': success_checks_parse_error,
+        }
+
 # Security policy: anti-rollback enforcement.
 security_anti_rollback = str(monitor.GetVariable('security_anti_rollback')).strip().lower() in ('1', 'true', 'yes')
 
@@ -733,6 +756,7 @@ _base_phase_context = {
         'expected_exec_sha256': expected_exec_sha256,
         'otadata_expect': {},
         'otadata_expect_scope': success_otadata_expect_scope,
+        'success_checks': success_checks_config,
     },
 }
 
@@ -744,6 +768,7 @@ def _apply_phase_context(phase=None):
     global success_image_hash, success_image_hash_slot
     global image_exec_sha256, image_staging_sha256, expected_exec_sha256
     global success_otadata_expect, success_otadata_expect_scope
+    global success_checks_config, success_checks_parse_error
 
     context = _base_phase_context if phase is None else phase
     criteria = context.get('success_criteria', {}) if isinstance(context, dict) else {}
@@ -798,6 +823,11 @@ def _apply_phase_context(phase=None):
     ).strip().lower()
     if success_otadata_expect_scope not in ('always', 'control'):
         success_otadata_expect_scope = 'always'
+    success_checks_config = criteria.get(
+        'success_checks',
+        _base_phase_context['success_criteria']['success_checks'],
+    ) or {}
+    success_checks_parse_error = success_checks_config.get('transport_error')
 
 # Per-fault-type success criteria overrides.
 # Prefer file-based transport (avoids Robot->Renode variable escaping).
@@ -990,6 +1020,60 @@ nvs_snapshot_path = get_optional_var('nvs_region_snapshot', '')
 _nvs_modes_raw = get_optional_var('nvs_corruption_modes', '')
 nvs_corruption_modes = [m.strip() for m in _nvs_modes_raw.split(',') if m.strip()] if _nvs_modes_raw else []
 nvs_corruption_seed = int(get_optional_var('nvs_corruption_seed', '0') or '0')
+_nvs_variants_b64 = get_optional_var('nvs_corruption_variants_b64', '')
+nvs_corruption_variant_parse_error = None
+nvs_corruption_variants = []
+if _nvs_variants_b64:
+    try:
+        nvs_corruption_variants = json.loads(
+            base64.b64decode(_nvs_variants_b64).decode('utf-8')
+        )
+        if not isinstance(nvs_corruption_variants, list):
+            raise ValueError('decoded value is not a list')
+        _valid_nvs_modes = ('bit_flip', 'partial_erase', 'truncate', 'scramble')
+        for _variant_index, _variant in enumerate(nvs_corruption_variants):
+            if not isinstance(_variant, dict):
+                raise ValueError('variant {} is not a mapping'.format(_variant_index))
+            _mode = str(_variant.get('mode', '')).strip()
+            if _mode not in _valid_nvs_modes:
+                raise ValueError(
+                    'variant {} has unsupported mode {!r}'.format(
+                        _variant_index, _mode
+                    )
+                )
+            if _mode == 'bit_flip':
+                _count = int(_variant.get('bit_flip_count', 0))
+                if _count < 1:
+                    raise ValueError(
+                        'variant {} bit_flip_count must be positive'.format(
+                            _variant_index
+                        )
+                    )
+            elif _mode == 'partial_erase':
+                _fraction = float(_variant.get('erase_fraction', 0.0))
+                if not (0.0 < _fraction <= 1.0):
+                    raise ValueError(
+                        'variant {} erase_fraction must be in (0, 1]'.format(
+                            _variant_index
+                        )
+                    )
+            elif _mode == 'truncate':
+                _offset = _variant.get('truncate_offset')
+                if _offset is not None and int(_offset) < 0:
+                    raise ValueError(
+                        'variant {} truncate_offset must be non-negative or null'.format(
+                            _variant_index
+                        )
+                    )
+    except Exception as exc:
+        nvs_corruption_variant_parse_error = str(exc)
+        nvs_corruption_variants = []
+else:
+    # Compatibility for callers that predate the structured variant contract.
+    nvs_corruption_variants = [
+        {'mode': mode}
+        for mode in nvs_corruption_modes
+    ]
 _nvs_clean_data = None
 
 def _load_nvs_clean_data():
@@ -1107,6 +1191,15 @@ def annotate_boot_span_result(result):
     result['initial_boot_slot'] = initial_slot
     result['final_boot_outcome'] = final_outcome
     result['final_boot_slot'] = final_slot
+    signals = result.get('signals')
+    if isinstance(signals, dict):
+        observations = signals.get('success_checks')
+        if isinstance(observations, dict):
+            result['criteria_observations'] = observations
+            result['config_values'] = dict(
+                observations.get('config_values', {}) or {}
+            )
+            result['success_checks_ok'] = bool(observations.get('all_ok'))
     return result
 
 # Sticky state for execution-slot detection during execute runs.
@@ -3625,7 +3718,7 @@ def disarm_erase_fault():
     elif b['kind'] == 'fast':
         b['data'].FaultAtPageErase = _DISARM_SENTINEL
 
-_OTP_WIRE_CODES = frozenset(('op', 'os', 'od', 'oo'))
+_OTP_WIRE_CODES = frozenset(('op', 'os', 'od', 'oo', 'on'))
 
 def arm_otp_fault(absolute_blow_index, blow_fault_mode=0):
     otp_dev = backend.get('otp')
@@ -4598,6 +4691,190 @@ def compute_slot_hash(slot_name='exec'):
 def compute_exec_slot_hash():
     return compute_slot_hash('exec')
 
+
+def evaluate_structured_success_checks():
+    """Read and evaluate configured memory/config/integrity observations."""
+    config = success_checks_config if isinstance(success_checks_config, dict) else {}
+    memory_specs = config.get('memory_checks', [])
+    config_specs = config.get('config_checks', [])
+    integrity_enabled = bool(config.get('bootloader_integrity', False))
+    requested = bool(
+        memory_specs
+        or config_specs
+        or integrity_enabled
+        or success_checks_parse_error
+    )
+    observations = {
+        'contract_version': 1,
+        'requested': requested,
+        'all_ok': True,
+        'memory_checks_ok': True,
+        'config_checks_ok': True,
+        'bootloader_integrity_ok': True,
+        'memory_checks': [],
+        'config_checks': [],
+        'config_values': {},
+    }
+    if success_checks_parse_error:
+        observations['transport_error'] = success_checks_parse_error
+        observations['all_ok'] = False
+
+    if not isinstance(memory_specs, list):
+        observations['memory_checks_error'] = 'memory_checks is not a list'
+        observations['memory_checks_ok'] = False
+        memory_specs = []
+    for index, spec in enumerate(memory_specs):
+        detail = {'index': index, 'ok': False}
+        try:
+            if not isinstance(spec, dict):
+                raise ValueError('check is not a mapping')
+            address = int(spec['address'])
+            mask = int(spec.get('mask', 0xFFFFFFFF)) & 0xFFFFFFFF
+            op = str(spec.get('op', 'eq')).strip().lower()
+            actual = as_int(bus.ReadDoubleWord(address)) & 0xFFFFFFFF
+            masked_actual = actual & mask
+            expected = spec.get('expected_value')
+            if op == 'nonzero':
+                ok = masked_actual != 0
+            else:
+                if expected is None:
+                    raise ValueError('expected_value is missing for op {}'.format(op))
+                masked_expected = int(expected) & mask & 0xFFFFFFFF
+                if op == 'eq':
+                    ok = masked_actual == masked_expected
+                elif op == 'ne':
+                    ok = masked_actual != masked_expected
+                elif op == 'ge':
+                    ok = masked_actual >= masked_expected
+                elif op == 'le':
+                    ok = masked_actual <= masked_expected
+                else:
+                    raise ValueError('unsupported op {}'.format(op))
+                detail['expected'] = int(expected) & 0xFFFFFFFF
+                detail['expected_masked'] = masked_expected
+            detail.update({
+                'address': '0x{:X}'.format(address),
+                'actual': actual,
+                'actual_hex': fmt_u32(actual),
+                'actual_masked': masked_actual,
+                'mask': mask,
+                'op': op,
+                'ok': bool(ok),
+            })
+        except Exception as exc:
+            detail['error'] = str(exc)
+            ok = False
+        if not ok:
+            observations['memory_checks_ok'] = False
+        observations['memory_checks'].append(detail)
+
+    if not isinstance(config_specs, list):
+        observations['config_checks_error'] = 'config_checks is not a list'
+        observations['config_checks_ok'] = False
+        config_specs = []
+    for index, spec in enumerate(config_specs):
+        detail = {'index': index, 'ok': False}
+        try:
+            if not isinstance(spec, dict):
+                raise ValueError('check is not a mapping')
+            address = int(spec['address'])
+            actual = as_int(bus.ReadDoubleWord(address)) & 0xFFFFFFFF
+            ok = True
+            failures = []
+            expected = spec.get('expected')
+            if expected is not None and actual != (int(expected) & 0xFFFFFFFF):
+                ok = False
+                failures.append('expected')
+            if bool(spec.get('nonzero', False)) and actual == 0:
+                ok = False
+                failures.append('nonzero')
+            range_min = spec.get('range_min')
+            range_max = spec.get('range_max')
+            if range_min is not None and actual < int(range_min):
+                ok = False
+                failures.append('range_min')
+            if range_max is not None and actual > int(range_max):
+                ok = False
+                failures.append('range_max')
+            mask = spec.get('mask')
+            expected_masked = spec.get('expected_masked')
+            if mask is not None or expected_masked is not None:
+                if mask is None or expected_masked is None:
+                    raise ValueError('mask and expected_masked must be configured together')
+                if (actual & int(mask)) != (int(expected_masked) & int(mask)):
+                    ok = False
+                    failures.append('expected_masked')
+            address_key = '0x{:X}'.format(address)
+            observations['config_values'][address_key] = actual
+            detail.update({
+                'address': address_key,
+                'actual': actual,
+                'actual_hex': fmt_u32(actual),
+                'expected': expected,
+                'nonzero': bool(spec.get('nonzero', False)),
+                'range_min': range_min,
+                'range_max': range_max,
+                'mask': mask,
+                'expected_masked': expected_masked,
+                'failed_constraints': failures,
+                'ok': bool(ok),
+            })
+        except Exception as exc:
+            detail['error'] = str(exc)
+            ok = False
+        if not ok:
+            observations['config_checks_ok'] = False
+        observations['config_checks'].append(detail)
+
+    if integrity_enabled:
+        integrity = {'enabled': True, 'ok': False}
+        try:
+            region = config.get('bootloader_region')
+            if not isinstance(region, dict):
+                raise ValueError('bootloader_region is missing')
+            base = int(region['base'])
+            size = int(region['size'])
+            if size < 8:
+                raise ValueError('bootloader_region is smaller than 8 bytes')
+            initial_sp = as_int(bus.ReadDoubleWord(base)) & 0xFFFFFFFF
+            reset_vector = as_int(bus.ReadDoubleWord(base + 4)) & 0xFFFFFFFF
+            reset_pc = reset_vector & ~1
+            sp_ok = sram_start <= initial_sp <= sram_end
+            reset_thumb_ok = (reset_vector & 1) == 1
+            reset_ok = reset_thumb_ok and base <= reset_pc < (base + size)
+            integrity.update({
+                'region_base': '0x{:X}'.format(base),
+                'region_size': size,
+                'initial_sp': initial_sp,
+                'initial_sp_hex': fmt_u32(initial_sp),
+                'initial_sp_ok': sp_ok,
+                'reset_vector': reset_vector,
+                'reset_vector_hex': fmt_u32(reset_vector),
+                'reset_pc': reset_pc,
+                'reset_pc_hex': fmt_u32(reset_pc),
+                'reset_thumb_ok': reset_thumb_ok,
+                'reset_vector_ok': reset_ok,
+                'ok': bool(sp_ok and reset_ok),
+                'reason': (
+                    'ok'
+                    if sp_ok and reset_ok
+                    else 'invalid initial SP or reset vector'
+                ),
+            })
+        except Exception as exc:
+            integrity['error'] = str(exc)
+        observations['bootloader_integrity'] = integrity
+        observations['bootloader_integrity_ok'] = bool(integrity.get('ok'))
+
+    observations['all_ok'] = bool(
+        observations['all_ok']
+        and observations['memory_checks_ok']
+        and observations['config_checks_ok']
+        and observations['bootloader_integrity_ok']
+    )
+    return observations
+
+
 def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_content_criteria=True, effective_criteria=None, p2_status=None):
     # Shared boot outcome evaluation for all execution modes.
     # When effective_criteria is provided, use its values instead of globals.
@@ -4729,6 +5006,18 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
         signals['anti_rollback_ok'] = rollback_ok
     signals.update(collect_otadata_signals())
 
+    structured_checks_ok = True
+    if enforce_content_criteria:
+        structured_observations = evaluate_structured_success_checks()
+        if structured_observations.get('requested'):
+            signals['success_checks'] = structured_observations
+            signals['memory_checks_ok'] = structured_observations.get('memory_checks_ok')
+            signals['config_checks_ok'] = structured_observations.get('config_checks_ok')
+            signals['bootloader_integrity_ok'] = structured_observations.get(
+                'bootloader_integrity_ok'
+            )
+            structured_checks_ok = bool(structured_observations.get('all_ok'))
+
     otadata_expect_ok = True
     otadata_mismatches = []
     enforce_otadata_expect = False
@@ -4785,7 +5074,13 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
             reset_vector_offset_ok = False
     signals['reset_vector_offset_ok'] = reset_vector_offset_ok
 
-    criteria_ok = marker_ok and otadata_expect_ok and rollback_ok and reset_vector_offset_ok
+    criteria_ok = (
+        marker_ok
+        and otadata_expect_ok
+        and rollback_ok
+        and reset_vector_offset_ok
+        and structured_checks_ok
+    )
     expectations_met = vtor_ok and vtor_aligned and pc_ok and criteria_ok
     signals['expectations_met'] = expectations_met
 
@@ -5034,6 +5329,16 @@ def run_state_fault(fault_at):
         'vector_base': fmt_u32(vector_base),
         'copy_completed': copy_completed,
     }
+    structured_observations = evaluate_structured_success_checks()
+    if structured_observations.get('requested'):
+        signals['success_checks'] = structured_observations
+        signals['memory_checks_ok'] = structured_observations.get('memory_checks_ok')
+        signals['config_checks_ok'] = structured_observations.get('config_checks_ok')
+        signals['bootloader_integrity_ok'] = structured_observations.get(
+            'bootloader_integrity_ok'
+        )
+        if not structured_observations.get('all_ok'):
+            boot_outcome = 'wrong_image'
     semantic_state = collect_semantic_state({
         'cycle': 0,
         'boot_outcome': boot_outcome,
@@ -5768,7 +6073,11 @@ def run_timed_bit_corruption_fault(fault_at, trigger_addr, corrupt_addr, bit_fli
             'fault_injected': False,
             'boot_outcome': 'skipped',
             'skip_reason': 'backend_no_read_fault',
-            'signals': {},
+            'signals': {
+                'trigger_address': '0x{:08X}'.format(trigger_addr),
+                'corrupt_address': '0x{:08X}'.format(corrupt_addr),
+                'timed_bit_flip_count': int(bit_flips),
+            },
         }
 
     restore_phase1_baseline()
@@ -5817,7 +6126,8 @@ def run_timed_bit_corruption_fault(fault_at, trigger_addr, corrupt_addr, bit_fli
     )
     signals['trigger_address'] = '0x{:08X}'.format(trigger_addr)
     signals['corrupt_address'] = '0x{:08X}'.format(corrupt_addr)
-    signals['trigger_armed'] = _tb_state['armed']
+    signals['timed_bit_flip_count'] = int(bit_flips)
+    signals['trigger_armed'] = _tb_active['armed']
     signals['read_fault_fired'] = fault_injected
     signals['phase1_ms'] = phase1_ms
     signals['phase2_ms'] = 0
@@ -6194,25 +6504,44 @@ def run_timed_reset_fault(fault_at):
         saved_flash=saved_flash, fault_snapshot_bytes=fault_snapshot_bytes,
     )
 
-def _generate_nvs_corruption(clean_data, mode, seed=0):
+def _generate_nvs_corruption(clean_data, variant, seed=0):
     # Generate a single corrupted NVS variant in-process.
-    # Modes: bit_flip, partial_erase, truncate, scramble.
+    # Modes: bit_flip, partial_erase, truncate, scramble. Structured variants
+    # carry the exact profile tuning value selected by the planner.
     # Returns corrupted bytes of same length as clean_data.
     import random as _rng_mod
     rng = _rng_mod.Random(seed)
     data = bytearray(clean_data)
+    if isinstance(variant, dict):
+        mode = str(variant.get('mode', '')).strip()
+    else:
+        mode = str(variant).strip()
+        variant = {'mode': mode}
     if mode == 'bit_flip':
-        num_flips = max(1, min(8, len(data) // 256))
-        for _ in range(num_flips):
-            idx = rng.randint(0, len(data) - 1)
-            bit = rng.randint(0, 7)
+        requested_flips = int(
+            variant.get('bit_flip_count', max(1, min(8, len(data) // 256)))
+        )
+        # Each physical bit can be flipped at most once, preventing duplicate
+        # random selections from cancelling one another.
+        target_flips = min(requested_flips, len(data) * 8)
+        selected_bits = set()
+        while len(selected_bits) < target_flips:
+            selected_bits.add(rng.randint(0, len(data) * 8 - 1))
+        for bit_position in selected_bits:
+            idx = bit_position // 8
+            bit = bit_position % 8
             data[idx] ^= (1 << bit)
     elif mode == 'partial_erase':
-        half = len(data) // 2
-        data[half:] = b'\xFF' * (len(data) - half)
+        erase_fraction = float(variant.get('erase_fraction', 0.5))
+        erase_length = max(1, min(len(data), int(len(data) * erase_fraction)))
+        erase_start = len(data) - erase_length
+        data[erase_start:] = b'\xFF' * erase_length
     elif mode == 'truncate':
-        if len(data) > 16:
-            data[16:] = b'\x00' * (len(data) - 16)
+        truncate_offset = variant.get('truncate_offset', 16)
+        if truncate_offset is None:
+            truncate_offset = len(data) // 2
+        truncate_offset = max(0, min(len(data), int(truncate_offset)))
+        data[truncate_offset:] = b'\x00' * (len(data) - truncate_offset)
     elif mode == 'scramble':
         for i in range(len(data)):
             data[i] = rng.randint(0, 255)
@@ -6236,7 +6565,7 @@ def run_nvs_corruption_fault(variant_idx):
             'skip_reason': 'no_nvs_region_configured',
         }
 
-    if variant_idx >= len(nvs_corruption_modes):
+    if variant_idx >= len(nvs_corruption_variants):
         return {
             'fault_at': variant_idx,
             'fault_requested': variant_idx,
@@ -6247,13 +6576,27 @@ def run_nvs_corruption_fault(variant_idx):
             'boot_slot': None,
             'fault_class': 'skipped',
             'actual_writes': 0,
-            'signals': {'phase1_ms': 0, 'phase2_ms': 0, 'followup_ms': 0},
-            'skip_reason': 'nvs_variant_index_out_of_range',
+            'signals': {
+                'phase1_ms': 0,
+                'phase2_ms': 0,
+                'followup_ms': 0,
+                'nvs_variant_parse_error': nvs_corruption_variant_parse_error,
+            },
+            'skip_reason': (
+                'nvs_variant_contract_error'
+                if nvs_corruption_variant_parse_error
+                else 'nvs_variant_index_out_of_range'
+            ),
         }
 
-    mode = nvs_corruption_modes[variant_idx]
+    variant = nvs_corruption_variants[variant_idx]
+    mode = str(variant.get('mode', '')).strip()
     clean_data = _load_nvs_clean_data()
-    corrupted = _generate_nvs_corruption(clean_data, mode, seed=nvs_corruption_seed + variant_idx)
+    corrupted = _generate_nvs_corruption(
+        clean_data,
+        variant,
+        seed=nvs_corruption_seed + variant_idx,
+    )
 
     eff_criteria = get_effective_criteria('nv')
     cpu_ref = monitor.Machine['sysbus.cpu']
@@ -6304,6 +6647,7 @@ def run_nvs_corruption_fault(variant_idx):
     )
     signals['nvs_corruption_mode'] = mode
     signals['nvs_corruption_variant'] = variant_idx
+    signals['nvs_corruption_spec'] = variant
     signals['phase1_ms'] = phase1_ms
     signals['phase2_ms'] = 0
     merge_stop_status_signals(signals, 'phase2', p2_status)
@@ -8480,7 +8824,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 # control flow after a non-halting mutated write.
 _EXECUTE_ONLY_FAULT_TYPES = frozenset(
     ('e', 'a', 'b', 's', 'g', 'x', 'd', 'l', 'r', 't', 'f', 'k',
-     'op', 'os', 'od', 'oo',
+     'op', 'os', 'od', 'oo', 'on',
      'in', 'it', 'ib', 'ic', 'iw')
 )
 def _dispatch_fault_point(fp, ft, default_run_fn):
@@ -8549,6 +8893,11 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
             result = default_run_fn(fp, fault_type='b')
         else:
             result = run_execute_fault(fp, fault_type='b')
+        result_signals = result.get('signals')
+        if not isinstance(result_signals, dict):
+            result_signals = {}
+            result['signals'] = result_signals
+        result_signals['corruption_seed'] = int(cseed)
         if backend['kind'] == 'fast':
             backend['data'].CorruptionSeed = 0
         elif backend['kind'] != 'mram':

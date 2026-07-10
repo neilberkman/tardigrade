@@ -329,6 +329,12 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
             reasons.append("anti_rollback")
         if signals.get("reset_vector_offset_ok") is False:
             reasons.append("reset_vector_offset")
+        if signals.get("memory_checks_ok") is False:
+            reasons.append("memory_check")
+        if signals.get("config_checks_ok") is False:
+            reasons.append("config_check")
+        if signals.get("bootloader_integrity_ok") is False:
+            reasons.append("bootloader_integrity")
         # If the boot landed in the expected coarse outcome but still failed
         # execution checks, preserve that mismatch explicitly.
         if signals.get("expectations_met") is False:

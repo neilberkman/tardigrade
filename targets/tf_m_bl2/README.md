@@ -21,16 +21,13 @@ optional Fault Injection Hardening (FIH).
   boot path. Tardigrade can test whether these countermeasures actually
   survive storage-level faults during the update process.
 
-## Status
-
-Scaffolding only. The probe and invariants are implemented but no working
-profile or Renode platform exists yet. See `docs/tf-m-bl2-target.md` for the
-full design document and implementation plan.
+This package contains reusable state probes and invariants. It does not bundle
+TF-M firmware, a profile, or a Renode platform.
 
 ## Files
 
 - `probe.py` -- state collection from MCUboot trailers, extended for
-  multi-image TF-M layouts (4 slots) and SAU/MPC probing (stubbed)
+  multi-image TF-M layouts (4 slots)
 - `invariants.py` -- TF-M-specific postcondition checks:
   - `tfm_multi_image_consistency` -- S and NS swap state must match
   - `tfm_no_partial_magic` -- no partially-written trailer magic in any slot

@@ -1,2 +1,3 @@
-pyyaml
-pyelftools
+PyYAML==6.0.3
+pyelftools==0.32
+capstone==5.0.7

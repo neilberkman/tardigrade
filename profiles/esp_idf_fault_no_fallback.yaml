@@ -33,7 +33,8 @@ pre_boot_state:
   - { address: 0x000F901C, u32: 0x55F63774 }
   # Trigger one-shot copy-on-boot path (magic at UPDATE_REQ_ADDR).
   - { address: 0x000FC040, u32: 0x55445021 }
-success_criteria: {}
+success_criteria:
+  vtor_in_slot: any
 fault_sweep:
   mode: runtime
   evaluation_mode: execute

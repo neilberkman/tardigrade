@@ -4,7 +4,7 @@ This guide walks you through running your first tardigrade fault sweep in about 
 
 ## Prerequisites
 
-- **Python 3.9+**
+- **Python 3.10+**
 - **pip** (for installing dependencies)
 - **Renode** -- the emulation framework that tardigrade runs firmware under. Download the portable release from [renode.io/downloads](https://renode.io/downloads/) or install via your package manager. You need the `renode-test` binary on PATH or a known path to it.
 
@@ -163,7 +163,7 @@ Tardigrade can run in CI via a reusable GitHub Action:
 
 ```yaml
 - id: tardigrade
-  uses: neilberkman/tardigrade@v1
+  uses: neilberkman/tardigrade@<reviewed-commit-sha>
   with:
     profile: profiles/your_profile.yaml
     quick: false
@@ -171,6 +171,22 @@ Tardigrade can run in CI via a reusable GitHub Action:
 ```
 
 The action outputs `verdict`, `brick-rate`, and `report-path`. See [`action.yml`](../action.yml) and the [README](../README.md#quick-start) for all inputs and outputs.
+
+Profile assets are resolved against the caller workspace by default. If the
+profile's relative paths start from a subdirectory, pass that directory as
+`asset-root`. When overriding `renode-url`, also provide the archive's exact
+`renode-sha256`; the action verifies it before extraction. The Action enables
+strict profile validation, rejecting unknown keys and missing observable
+success criteria.
+
+The bundled runtime supports Linux x86-64 runners. It uses Renode's verified
+portable .NET archive and a temporary virtual environment, so its pinned
+Python packages do not alter later caller steps.
+
+Treat every profile and referenced asset as trusted executable input. Platform
+definitions, setup scripts, boot hooks, and invariant providers can execute
+Renode commands or host Python. Use reviewed, open-source revisions rather than
+untrusted pull-request files or artifacts.
 
 ## Common issues
 

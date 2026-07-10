@@ -66,6 +66,7 @@ ${IMAGE_STAGING_SHA256}        ${EMPTY}
 ${EXPECTED_EXEC_SHA256}        ${EMPTY}
 ${SUCCESS_OTADATA_EXPECT}      ${EMPTY}
 ${SUCCESS_OTADATA_EXPECT_SCOPE}    always
+${SUCCESS_CHECKS_B64}         ${EMPTY}
 ${SECURITY_ANTI_ROLLBACK}      false
 ${STATE_PROBE}                 ${EMPTY}
 ${HASH_BYPASS_SYMBOLS}         ${EMPTY}
@@ -95,6 +96,7 @@ ${NVS_REGION_SIZE}             ${EMPTY}
 ${NVS_REGION_SNAPSHOT}         ${EMPTY}
 ${NVS_CORRUPTION_MODES}        ${EMPTY}
 ${NVS_CORRUPTION_SEED}         0
+${NVS_CORRUPTION_VARIANTS_B64}    ${EMPTY}
 ${I2C_FAULT_PERIPHERAL}        ${EMPTY}
 ${INSTRUCTION_SKIP_REGIONS}    ${EMPTY}
 ${INSTRUCTION_SKIP_COUNT}      1
@@ -212,6 +214,7 @@ Run Runtime Fault Point
     Execute Command    $expected_exec_sha256="${EXPECTED_EXEC_SHA256}"
     Execute Command    $success_otadata_expect="${SUCCESS_OTADATA_EXPECT}"
     Execute Command    $success_otadata_expect_scope="${SUCCESS_OTADATA_EXPECT_SCOPE}"
+    Execute Command    $success_checks_b64="${SUCCESS_CHECKS_B64}"
     Execute Command    $security_anti_rollback="${SECURITY_ANTI_ROLLBACK}"
     Execute Command    $state_probe="${STATE_PROBE}"
     Execute Command    $hash_bypass_symbols="${HASH_BYPASS_SYMBOLS}"
@@ -235,6 +238,7 @@ Run Runtime Fault Point
     Run Keyword If    '${NVS_REGION_SNAPSHOT}' != ''    Execute Command    $nvs_region_snapshot="${NVS_REGION_SNAPSHOT}"
     Run Keyword If    '${NVS_CORRUPTION_MODES}' != ''    Execute Command    $nvs_corruption_modes="${NVS_CORRUPTION_MODES}"
     Run Keyword If    '${NVS_CORRUPTION_SEED}' != '0'    Execute Command    $nvs_corruption_seed="${NVS_CORRUPTION_SEED}"
+    Run Keyword If    '${NVS_CORRUPTION_VARIANTS_B64}' != ''    Execute Command    $nvs_corruption_variants_b64="${NVS_CORRUPTION_VARIANTS_B64}"
     Run Keyword If    '${I2C_FAULT_PERIPHERAL}' != ''    Execute Command    $i2c_fault_peripheral="${I2C_FAULT_PERIPHERAL}"
     Run Keyword If    '${INSTRUCTION_SKIP_REGIONS}' != ''    Execute Command    $instruction_skip_regions="${INSTRUCTION_SKIP_REGIONS}"
     Run Keyword If    '${INSTRUCTION_SKIP_COUNT}' != '1'    Execute Command    $instruction_skip_count="${INSTRUCTION_SKIP_COUNT}"

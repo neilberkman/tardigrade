@@ -3,6 +3,10 @@
 rustBoot is an MIT-licensed Rust bootloader for embedded systems. It uses a
 swap-scratch algorithm with 3 flash partitions: BOOT, UPDATE, and SWAP.
 
+This directory is a clean-room protocol adapter; it does not contain rustBoot
+source or prebuilt firmware. See `docs/rustboot-target.md` for layout and probe
+configuration.
+
 ## Trailer Layout
 
 Each of BOOT and UPDATE has a trailer at the end of the partition:

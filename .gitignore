@@ -15,16 +15,12 @@ __pycache__/
 !examples/naive_copy/*.bin
 !examples/nxboot_style/*.elf
 !examples/nxboot_style/*.bin
-!examples/riotboot_standalone/*.elf
-!examples/riotboot_standalone/*.bin
 !examples/esp_idf_ota/*.elf
 !examples/esp_idf_ota/*.bin
 !examples/firmware_otp_harness/*.elf
 !examples/firmware_otp_harness/*.bin
 !results/oss_validation/assets/*.elf
 !results/oss_validation/assets/*.bin
-!targets/tfm_an521/*.axf
-!targets/tfm_an521/*.bin
 
 # Robot outputs
 output.xml

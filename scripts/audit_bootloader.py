@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as dt
+import hashlib
 import json
 import os
 import shlex
@@ -85,6 +86,7 @@ from sweep import (
     validate_runtime_fault_mode_compat,
 )
 from profile_loader import HeuristicConfig, PreBootWrite, ProfileConfig, load_profile, load_profile_raw
+from verdicts import is_pass_verdict
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RENODE_TEST = os.environ.get("RENODE_TEST", "renode-test")
@@ -211,6 +213,189 @@ def _allow_expected_control_only_issues(profile: ProfileConfig) -> bool:
     return bool(getattr(expect, "allow_control_only_issues", False))
 
 
+def _multi_component_verdict(
+    result: Dict[str, Any],
+    profile: ProfileConfig,
+) -> str:
+    """Derive one fail-closed verdict from every observed component run."""
+    per_component = result.get("per_component") or {}
+    combined = result.get("combined_summary") or {}
+    if not isinstance(per_component, dict) or not per_component:
+        return "INCONCLUSIVE -- multi-component campaign produced no component results"
+
+    issue_points = 0
+    unreliable_points = 0
+    control_failures: List[str] = []
+    total_planned = 0
+    component_profiles = {
+        component.name: component.to_profile_config(profile)
+        for component in profile.multi_component.components
+    }
+    configured_names = set(component_profiles)
+    observed_names = set(per_component)
+    if observed_names != configured_names:
+        differences: List[str] = []
+        missing = sorted(configured_names - observed_names)
+        unexpected = sorted(observed_names - configured_names)
+        if missing:
+            differences.append("missing {}".format(", ".join(missing)))
+        if unexpected:
+            differences.append("unexpected {}".format(", ".join(unexpected)))
+        return (
+            "INCONCLUSIVE -- multi-component results did not match configured "
+            "components ({})".format("; ".join(differences))
+        )
+    for name, data in per_component.items():
+        if not isinstance(data, dict):
+            return "INCONCLUSIVE -- component '{}' result was malformed".format(
+                name
+            )
+        summary = data.get("summary") or {}
+        if not isinstance(summary, dict) or summary.get("campaign_complete") is not True:
+            return "INCONCLUSIVE -- component '{}' campaign was incomplete".format(
+                name
+            )
+        component_planned = int(data.get("fault_points_tested", 0) or 0)
+        if component_planned <= 0:
+            return "INCONCLUSIVE -- component '{}' planned no fault points".format(
+                name
+            )
+        total_planned += component_planned
+        issue_points += int(summary.get("issue_points", summary.get("bricks", 0)) or 0)
+        unreliable_points += sum(
+            int(summary.get(key, 0) or 0)
+            for key in (
+                "infrastructure_error_points",
+                "timeout_points",
+                "discarded_no_fault_fired",
+                "missing_result_points",
+                "extra_result_points",
+            )
+        )
+        control = summary.get("control") or {}
+        expected = component_profiles[name].expect.control_outcome
+        actual = (
+            control.get("effective_outcome")
+            or control.get("final_boot_outcome")
+            or control.get("boot_outcome")
+        )
+        if actual != expected or int(control.get("issue_count", 0) or 0) > 0:
+            control_failures.append(
+                "{} expected {} but observed {}".format(name, expected, actual or "missing")
+            )
+
+    adverse_combined = sum(
+        int(combined.get(key, 0) or 0)
+        for key in ("split_brain", "all_failed", "degraded")
+    )
+    found_issues = issue_points + adverse_combined > 0
+    if control_failures:
+        return "FAIL -- component control checks failed: {}".format(
+            "; ".join(control_failures)
+        )
+    if total_planned <= 0:
+        return "INCONCLUSIVE -- multi-component campaign planned no fault points"
+    if unreliable_points:
+        return "INCONCLUSIVE -- {} component fault results were incomplete".format(
+            unreliable_points
+        )
+    if profile.expect.should_find_issues and not found_issues:
+        return "FAIL -- expected to find multi-component issues but found none"
+    if not profile.expect.should_find_issues and found_issues:
+        return "FAIL -- found {} component issues".format(
+            issue_points + adverse_combined
+        )
+    return "PASS"
+
+
+def _aggregate_auxiliary_verdict(
+    base_verdict: str,
+    profile: ProfileConfig,
+    *,
+    state_fuzz_results: Optional[List[Dict[str, Any]]],
+    state_fuzz_summary: Optional[Dict[str, Any]],
+    fuzz_crash_results: Optional[List[Dict[str, Any]]],
+    fuzz_crash_summary: Optional[Dict[str, Any]],
+    geometry_preflight: Optional[Dict[str, Any]],
+) -> str:
+    """Fold every enabled campaign and preflight into the top verdict."""
+    if geometry_preflight and geometry_preflight.get("status") == "mismatch":
+        return "INCONCLUSIVE -- geometry preflight mismatch: {}".format(
+            geometry_preflight.get("reason") or "compiled map differs from profile"
+        )
+
+    auxiliary_findings = 0
+    if state_fuzz_summary is not None:
+        requested = int(state_fuzz_summary.get("iterations_requested", 0) or 0)
+        completed = int(state_fuzz_summary.get("iterations_completed", 0) or 0)
+        if requested <= 0:
+            return "INCONCLUSIVE -- state-fuzz campaign planned no scenarios"
+        if completed != requested:
+            return "INCONCLUSIVE -- state-fuzz completed {}/{} scenarios".format(
+                completed, requested
+            )
+        if int(state_fuzz_summary.get("infrastructure_errors", 0) or 0):
+            return "INCONCLUSIVE -- state-fuzz produced infrastructure errors"
+        if int(state_fuzz_summary.get("timeouts", 0) or 0):
+            return "INCONCLUSIVE -- state-fuzz produced timeouts"
+        for entry in state_fuzz_results or []:
+            outcome = str(entry.get("boot_outcome") or "unknown")
+            if entry.get("infrastructure_error"):
+                return "INCONCLUSIVE -- state-fuzz produced an infrastructure error"
+            if entry.get("timeout"):
+                return "INCONCLUSIVE -- state-fuzz produced a timeout"
+            if outcome in {"infra_error", "timeout", "unknown"}:
+                return "INCONCLUSIVE -- state-fuzz produced {}".format(outcome)
+        reported_findings = int(state_fuzz_summary.get("findings", 0) or 0)
+        observed_findings = sum(
+            1 for entry in state_fuzz_results or [] if entry.get("finding")
+        )
+        if observed_findings != reported_findings:
+            return "INCONCLUSIVE -- state-fuzz finding count is inconsistent"
+        auxiliary_findings += reported_findings
+
+    if fuzz_crash_summary is not None:
+        expected_results = int(fuzz_crash_summary.get("generated_profiles", 0) or 0)
+        completed_results = int(fuzz_crash_summary.get("results", 0) or 0)
+        if expected_results <= 0:
+            return "INCONCLUSIVE -- fuzz-crash campaign generated no regressions"
+        if completed_results != expected_results:
+            return "INCONCLUSIVE -- fuzz-crash completed {}/{} regressions".format(
+                completed_results, expected_results
+            )
+        for entry in fuzz_crash_results or []:
+            returncode = int(entry.get("returncode", -1))
+            if returncode != 0:
+                return "INCONCLUSIVE -- fuzz-crash child exited with status {}".format(
+                    returncode
+                )
+            child_verdict = str(entry.get("verdict") or "")
+            if not child_verdict:
+                return "INCONCLUSIVE -- fuzz-crash regression produced no verdict"
+            if not is_pass_verdict(child_verdict):
+                return "FAIL -- fuzz-crash regression failed: {}".format(
+                    child_verdict
+                )
+        reported_security_findings = int(
+            fuzz_crash_summary.get("security_findings", 0) or 0
+        )
+        observed_security_findings = sum(
+            1 for entry in fuzz_crash_results or [] if entry.get("security_finding")
+        )
+        if observed_security_findings != reported_security_findings:
+            return "INCONCLUSIVE -- fuzz-crash finding count is inconsistent"
+        auxiliary_findings += reported_security_findings
+
+    if auxiliary_findings:
+        if not profile.expect.should_find_issues:
+            return "FAIL -- auxiliary campaigns found {} issues".format(
+                auxiliary_findings
+            )
+        if "expected to find issues but found none" in base_verdict:
+            return "PASS"
+    return base_verdict
+
+
 def _merge_calibration_expected_exec_hash(
     robot_vars: List[str],
     calibration_exec_hash: str,
@@ -231,8 +416,9 @@ def _merge_calibration_expected_exec_hash(
     """
     if not calibration_exec_hash:
         return robot_vars, False
-    # Only trust the calibration hash when the control boot succeeded.
-    if calibration_boot_outcome and calibration_boot_outcome != "success":
+    # Only trust the calibration hash when the control boot explicitly
+    # succeeded.  Missing outcome data is not evidence of a clean baseline.
+    if calibration_boot_outcome != "success":
         return robot_vars, False
     # Check whether the profile already declared an expected hash.
     profile_declared = False
@@ -241,11 +427,92 @@ def _merge_calibration_expected_exec_hash(
         if key == "EXPECTED_EXEC_SHA256" and sep and value:
             profile_declared = True
             break
-    # Override with calibration ground truth.
+    if profile_declared:
+        return robot_vars, False
+    # Populate only an otherwise-undeclared expectation.
     return merge_robot_vars(
         robot_vars,
         ["EXPECTED_EXEC_SHA256:{}".format(calibration_exec_hash)],
-    ), not profile_declared
+    ), True
+
+
+def _without_hash_bypass(robot_vars: List[str]) -> List[str]:
+    """Return clean-control variables with all bypass inputs removed."""
+    return [
+        value
+        for value in robot_vars
+        if not value.startswith("HASH_BYPASS_SYMBOLS:")
+        and not value.startswith("HASH_BYPASS_ADDRS:")
+    ]
+
+
+def _validate_profile_asset_containment(
+    profile: ProfileConfig,
+    repo_root: Path,
+) -> None:
+    """Require every strict-profile runtime asset to stay under repo_root."""
+    root = repo_root.resolve(strict=True)
+
+    def validate(raw_path: Optional[str], label: str) -> None:
+        if not raw_path:
+            return
+        candidate = Path(profile.resolve_path(root, raw_path)).resolve(strict=True)
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError(
+                "strict profile asset escapes repository root: {}={}".format(
+                    label, raw_path
+                )
+            ) from exc
+        if not candidate.is_file():
+            raise RuntimeError(
+                "strict profile asset is not a file: {}={}".format(label, raw_path)
+            )
+
+    def validate_one(current: ProfileConfig, prefix: str) -> None:
+        validate(current.platform, prefix + "platform")
+        validate(current.bootloader_elf, prefix + "bootloader.elf")
+        validate(current.firmware_elf, prefix + "firmware_elf")
+        validate(current.setup_script, prefix + "setup_script")
+        for name, path in current.images.items():
+            validate(path, prefix + "images." + name)
+        for index, path in enumerate(current.extra_peripherals):
+            validate(path, prefix + "extra_peripherals[{}]".format(index))
+        if current.state_probe is not None:
+            validate(current.state_probe.script, prefix + "state_probe.script")
+        for index, path in enumerate(current.invariant_providers):
+            validate(path, prefix + "invariant_providers[{}]".format(index))
+        validate(current.fuzz_corpus, prefix + "fuzz_corpus")
+        if current.residual_image is not None:
+            validate(
+                current.residual_image.prior_image,
+                prefix + "residual_image.prior_image",
+            )
+        if current.nvs_region is not None:
+            validate(current.nvs_region.snapshot, prefix + "nvs_region.snapshot")
+        validate(
+            current.fault_sweep.boot_cycle_hook,
+            prefix + "fault_sweep.boot_cycle_hook",
+        )
+        partial_staging = current.fault_sweep.partial_staging
+        if isinstance(partial_staging, dict):
+            validate(
+                partial_staging.get("staging_image"),
+                prefix + "fault_sweep.partial_staging.staging_image",
+            )
+        for phase_index, phase in enumerate(current.update_sequence):
+            phase_prefix = prefix + "update_sequence[{}].".format(phase_index)
+            validate(phase.setup_script, phase_prefix + "setup_script")
+            validate(phase.boot_cycle_hook, phase_prefix + "boot_cycle_hook")
+            for name, path in phase.images.items():
+                validate(path, phase_prefix + "images." + name)
+            for name, path in phase.start_images.items():
+                validate(path, phase_prefix + "start_images." + name)
+
+    validate_one(profile, "")
+    for index, component in enumerate(profile.component_profiles()):
+        validate_one(component, "multi_component[{}].".format(index))
 
 
 def _requested_zero_fault_points(args: argparse.Namespace) -> bool:
@@ -320,6 +587,48 @@ def _write_trigger_discovery_failure(
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "profile": profile.name,
+                "verdict": verdict,
+                "summary": payload["summary"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def _write_geometry_preflight_failure(
+    *,
+    args: argparse.Namespace,
+    profile: ProfileConfig,
+    repo_root: Path,
+    geometry: Dict[str, Any],
+) -> None:
+    verdict = "INCONCLUSIVE -- geometry preflight mismatch: {}".format(
+        geometry.get("reason") or "compiled map differs from profile"
+    )
+    payload = {
+        "engine": "renode-test",
+        "profile": profile.name,
+        "profile_path": str(profile.profile_path) if profile.profile_path else None,
+        "schema_version": profile.schema_version,
+        "verdict": verdict,
+        "summary": {"geometry_preflight": geometry},
+        "expect": {"should_find_issues": profile.expect.should_find_issues},
+        "execution": {
+            "run_utc": dt.datetime.now(dt.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        },
+        "git": git_metadata(repo_root),
+    }
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     print(
         json.dumps(
             {
@@ -446,6 +755,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--strict-profile",
+        action="store_true",
+        help="Reject unknown profile fields and missing observable success criteria.",
+    )
+    parser.add_argument(
         "--reuse-calibration",
         default="",
         metavar="PATH",
@@ -456,18 +770,121 @@ def parse_args() -> argparse.Namespace:
             "to this path for future reuse."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--initial-state",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    args = parser.parse_args()
+    if args.workers < 1 or args.workers > 64:
+        parser.error("--workers must be between 1 and 64")
+    if args.fault_step < 1:
+        parser.error("--fault-step must be at least 1")
+    if args.max_batch_points < 0 or args.max_batch_points > 100000:
+        parser.error("--max-batch-points must be between 0 and 100000")
+    if args.fault_start is not None and args.fault_start < 0:
+        parser.error("--fault-start must be non-negative")
+    if args.fault_end is not None and args.fault_end < 0:
+        parser.error("--fault-end must be non-negative")
+    return args
 
 
 def _compute_calibration_cache_key(
     profile: ProfileConfig,
     repo_root: Path,
+    renode_test: str = "",
+    robot_suite: str = "",
+    robot_vars: Optional[List[str]] = None,
+    renode_remote_server_dir: str = "",
 ) -> str:
     """Compute a cache key for calibration based on profile inputs."""
     resolved_images = {
         name: profile.resolve_path(repo_root, path)
         for name, path in profile.images.items()
     }
+    if profile.firmware_elf:
+        resolved_images["firmware_elf"] = profile.resolve_path(
+            repo_root, profile.firmware_elf
+        )
+    if profile.nvs_region is not None and profile.nvs_region.snapshot:
+        resolved_images["nvs_region_snapshot"] = profile.resolve_path(
+            repo_root, profile.nvs_region.snapshot
+        )
+    if (
+        profile.residual_image is not None
+        and profile.residual_image.prior_image
+    ):
+        resolved_images["residual_image_prior"] = profile.resolve_path(
+            repo_root, profile.residual_image.prior_image
+        )
+    setup_files: Dict[str, str] = {}
+    hook_files: Dict[str, str] = {}
+    if profile.setup_script:
+        setup_files["profile"] = profile.resolve_path(repo_root, profile.setup_script)
+    boot_cycle_hook = profile.fault_sweep.boot_cycle_hook
+    if boot_cycle_hook:
+        candidate = profile.resolve_path(repo_root, boot_cycle_hook)
+        if os.path.isfile(candidate):
+            hook_files["profile"] = candidate
+    if profile.state_probe is not None and profile.state_probe.script:
+        candidate = profile.resolve_path(repo_root, profile.state_probe.script)
+        if os.path.isfile(candidate):
+            hook_files["state_probe"] = candidate
+    for index, provider in enumerate(profile.invariant_providers):
+        candidate = profile.resolve_path(repo_root, provider)
+        if os.path.isfile(candidate):
+            hook_files["invariant_provider{}".format(index)] = candidate
+    for index, phase in enumerate(profile.update_sequence):
+        for name, path in sorted(phase.images.items()):
+            resolved_images["phase{}:{}".format(index, name)] = profile.resolve_path(
+                repo_root, path
+            )
+        for name, path in sorted(phase.start_images.items()):
+            resolved_images["phase{}:start:{}".format(index, name)] = profile.resolve_path(
+                repo_root, path
+            )
+        if phase.setup_script:
+            setup_files["phase{}".format(index)] = profile.resolve_path(
+                repo_root, phase.setup_script
+            )
+        if phase.boot_cycle_hook:
+            candidate = profile.resolve_path(repo_root, phase.boot_cycle_hook)
+            if os.path.isfile(candidate):
+                hook_files["phase{}".format(index)] = candidate
+
+    platform_files = {
+        "platform": profile.resolve_path(repo_root, profile.platform),
+        "runtime_fault_sweep": str(
+            (REPO_ROOT / "scripts" / "run_runtime_fault_sweep.py").resolve()
+        ),
+    }
+    # Platform descriptions and setup scripts can include other repo-native
+    # files.  Hash the full public platform/RESC surface conservatively so an
+    # indirect include can never leave a stale trace cache valid.
+    for pattern in ("platforms/**/*.repl", "scripts/**/*.resc"):
+        for candidate in sorted(repo_root.glob(pattern)):
+            if candidate.is_file():
+                platform_files["repo:{}".format(candidate.relative_to(repo_root))] = str(
+                    candidate.resolve()
+                )
+    robot_suite_path = Path(robot_suite)
+    if robot_suite and not robot_suite_path.is_absolute():
+        robot_suite_path = repo_root / robot_suite_path
+    if robot_suite and robot_suite_path.is_file():
+        platform_files["robot_suite"] = str(robot_suite_path.resolve())
+    for peripheral_path in sorted((REPO_ROOT / "peripherals").glob("*.cs")):
+        platform_files["builtin:{}".format(peripheral_path.name)] = str(
+            peripheral_path.resolve()
+        )
+    for index, peripheral in enumerate(profile.extra_peripherals):
+        candidate = profile.resolve_path(repo_root, peripheral)
+        if os.path.isfile(candidate):
+            platform_files["peripheral{}".format(index)] = candidate
+
+    renode_identity = _renode_cache_identity(
+        renode_test,
+        renode_remote_server_dir=renode_remote_server_dir,
+    )
     return compute_cache_key(
         bootloader_elf=profile.resolve_path(repo_root, profile.bootloader_elf),
         images=resolved_images,
@@ -477,11 +894,169 @@ def _compute_calibration_cache_key(
         pre_boot_state=list(profile.pre_boot_state),
         hash_bypass_symbols=list(profile.fault_sweep.sweep_hash_bypass_symbols or []),
         write_granularity=profile.memory.write_granularity,
+        platform_files=platform_files,
+        setup_files=setup_files,
+        hook_files=hook_files,
+        entry_point=profile.bootloader_entry,
+        image_load_addresses=profile.effective_image_load_addresses(),
+        tool_versions={"renode": renode_identity},
+        runtime_config={
+            "robot_suite": robot_suite,
+            "fault_sweep": profile.fault_sweep,
+            "memory": profile.memory,
+            "success_criteria": profile.success_criteria,
+            "success_criteria_overrides": profile.success_criteria_overrides,
+            "security_policy": profile.security_policy,
+            "state_probe": profile.state_probe,
+            "semantic_assertions": profile.semantic_assertions,
+            "invariants": profile.invariants,
+            "invariant_config": profile.invariant_config,
+            "expect_control_outcome": profile.expect.control_outcome,
+            "bootloader_region": profile.bootloader_region,
+            "update_trigger": profile.update_trigger,
+            "update_sequence": profile.update_sequence,
+            "extra_peripherals": profile.extra_peripherals,
+            "nvm_controller": profile.nvm_controller,
+            "otp_peripheral": profile.otp_peripheral,
+            "boot_register_pre_writes": profile.boot_register_pre_writes,
+            "residual_image": profile.residual_image,
+            "nvs_region": profile.nvs_region,
+            "effective_calibration_robot_vars": _cache_robot_var_material(
+                robot_vars or []
+            ),
+        },
     )
 
 
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _cache_robot_var_material(robot_vars: List[str]) -> List[Dict[str, str]]:
+    """Normalize effective Robot variables, hashing every file-valued input."""
+    generated_file_keys = {
+        "PRE_BOOT_STATE_BIN",
+        "UPDATE_SEQUENCE_FILE",
+        "SUCCESS_CRITERIA_OVERRIDES_FILE",
+    }
+    material: List[Dict[str, str]] = []
+    for raw in robot_vars:
+        key, separator, value = str(raw).partition(":")
+        entry = {
+            "key": key,
+            "value": value if separator else "",
+        }
+        if not separator:
+            entry["raw"] = str(raw)
+            material.append(entry)
+            continue
+        try:
+            candidate = Path(value)
+            if value and candidate.is_file():
+                entry["file_sha256"] = _sha256_path(candidate.resolve())
+                # Generated temp names vary on every invocation; their bytes
+                # are the semantic input and therefore the stable identity.
+                if key in generated_file_keys:
+                    entry["value"] = "<generated-file>"
+        except OSError:
+            # The raw value remains in the key and runtime will report an
+            # unreadable input if it is intended to be a file.
+            pass
+        material.append(entry)
+    return material
+
+
+def _renode_cache_identity(
+    renode_test: str,
+    *,
+    renode_remote_server_dir: str = "",
+) -> str:
+    """Return a fail-closed identity for the Renode implementation in use."""
+    spec = str(renode_test or "unspecified")
+    if spec.startswith("docker://"):
+        image = spec[len("docker://"):]
+        if not image:
+            raise RuntimeError("Docker Renode runner is missing an image reference")
+        if "@sha256:" in image:
+            return "docker:{}".format(image)
+        try:
+            inspected = subprocess.run(
+                ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                "calibration reuse with a mutable Docker tag requires a locally "
+                "inspectable image ID or an @sha256 digest"
+            ) from exc
+        image_id = inspected.stdout.strip() if inspected.returncode == 0 else ""
+        if not image_id.startswith("sha256:"):
+            raise RuntimeError(
+                "calibration reuse with Docker tag {!r} requires a locally "
+                "inspectable image ID or an @sha256 digest".format(image)
+            )
+        return "docker:{}@{}".format(image, image_id)
+
+    identity: Dict[str, Any] = {"command": spec}
+    runner = Path(spec)
+    if runner.is_file():
+        resolved_runner = runner.resolve()
+        identity["runner_sha256"] = _sha256_path(resolved_runner)
+        candidate_roots = [
+            resolved_runner.parent,
+            resolved_runner.parent / "bin",
+            resolved_runner.parent.parent / "bin",
+            resolved_runner.parent / "lib" / "renode",
+        ]
+        if renode_remote_server_dir:
+            candidate_roots.append(Path(renode_remote_server_dir))
+        core_digests: Dict[str, str] = {}
+        seen_paths: set[Path] = set()
+        for root in candidate_roots:
+            for name in ("Renode.dll", "Renode.exe"):
+                candidate = root / name
+                try:
+                    resolved = candidate.resolve(strict=True)
+                except (OSError, FileNotFoundError):
+                    continue
+                if resolved in seen_paths or not resolved.is_file():
+                    continue
+                seen_paths.add(resolved)
+                core_digests["{}:{}".format(name, len(core_digests))] = _sha256_path(
+                    resolved
+                )
+        if core_digests:
+            identity["core_sha256"] = core_digests
+
+    if spec != "unspecified":
+        try:
+            version_proc = subprocess.run(
+                [spec, "--version"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            version_text = (version_proc.stdout or version_proc.stderr).strip()
+            if version_proc.returncode == 0 and version_text:
+                identity["version"] = version_text.splitlines()[0]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return json.dumps(identity, sort_keys=True, separators=(",", ":"))
+
+
 def _cleanup_generated_robot_files(robot_vars: List[str]) -> None:
-    for prefix in ("PRE_BOOT_STATE_BIN:", "UPDATE_SEQUENCE_FILE:"):
+    for prefix in (
+        "PRE_BOOT_STATE_BIN:",
+        "UPDATE_SEQUENCE_FILE:",
+    ):
         for entry in robot_vars:
             if not entry.startswith(prefix):
                 continue
@@ -508,6 +1083,17 @@ def _common_robot_vars(
         "EXPECT_CONTROL_OUTCOME:{}".format(profile.expect.control_outcome)
     )
     return robot_vars
+
+
+def _multi_component_campaign_robot_vars(
+    extra_robot_vars: List[str],
+    stall_timeout: float,
+) -> List[str]:
+    """Return only profile-independent variables for component overlays."""
+    return merge_robot_vars(
+        extra_robot_vars,
+        ["PROGRESS_STALL_TIMEOUT_S:{:.6f}".format(stall_timeout)],
+    )
 
 
 def run_state_fuzz_campaign(
@@ -574,7 +1160,7 @@ def run_state_fuzz_campaign(
         finally:
             _cleanup_generated_robot_files(robot_vars)
         data["is_control"] = True
-        annotate_result_checks([data], scenario_profile)
+        annotate_result_checks([data], scenario_profile, repo_root=repo_root)
         results.append(
             extract_state_fuzz_result(
                 scenario=scenario,
@@ -635,6 +1221,8 @@ def _build_fuzz_audit_command(
         cmd.append("--no-hash-bypass")
     if args.renode_remote_server_dir:
         cmd.extend(["--renode-remote-server-dir", args.renode_remote_server_dir])
+    if args.repo_root:
+        cmd.extend(["--repo-root", args.repo_root])
     if args.fault_start is not None:
         cmd.extend(["--fault-start", str(args.fault_start)])
     if args.fault_end is not None:
@@ -687,9 +1275,12 @@ def run_fuzz_crash_campaign(
                 )
             else:
                 audit_payload = {}
+            child_verdict = str(audit_payload.get("verdict", ""))
+            child_passed = is_pass_verdict(child_verdict)
             security_finding = bool(
-                audit_payload.get("expect", {}).get("should_find_issues")
-                and str(audit_payload.get("verdict", "")).startswith("PASS")
+                proc.returncode == 0
+                and audit_payload.get("expect", {}).get("should_find_issues")
+                and child_passed
             )
             result_entry: Dict[str, Any] = {
                 "crash_file": generated["crash_file"],
@@ -701,7 +1292,7 @@ def run_fuzz_crash_campaign(
             }
             if audit_payload:
                 result_entry["summary"] = audit_payload.get("summary", {})
-            if proc.returncode != 0 and not audit_payload:
+            if proc.returncode != 0:
                 result_entry["error"] = proc.stderr.strip() or proc.stdout.strip()
             results.append(result_entry)
 
@@ -716,13 +1307,28 @@ def run_fuzz_crash_campaign(
 
 
 
-def main() -> int:
+def _main_single() -> int:
     args = parse_args()
     repo_root = Path(args.repo_root) if args.repo_root else REPO_ROOT
     temp_ctx: Optional[tempfile.TemporaryDirectory[str]] = None
 
     try:
-        profile = load_profile(args.profile)
+        profile = load_profile(args.profile, strict=args.strict_profile)
+        if args.initial_state:
+            matches = [
+                state
+                for state in profile.initial_states
+                if state.name == args.initial_state
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    "initial state {!r} was not declared exactly once by {}".format(
+                        args.initial_state, args.profile
+                    )
+                )
+            profile = profile.resolve_initial_state(matches[0])
+        if args.strict_profile:
+            _validate_profile_asset_containment(profile, repo_root)
         robot_suite = args.robot_suite
 
         if profile.success_criteria.image_hash:
@@ -813,7 +1419,15 @@ def main() -> int:
                 renode_test=renode_test,
                 robot_suite=robot_suite,
                 profile=profile,
-                robot_vars_base=robot_vars,
+                # Only campaign-level CLI values belong in the base layer.
+                # Passing the parent's fully rendered profile variables here
+                # lets conditional settings (for example image hashing or a
+                # structured success-check contract) leak into components that
+                # intentionally omit them.
+                robot_vars_base=_multi_component_campaign_robot_vars(
+                    extra_robot_vars,
+                    stall_timeout,
+                ),
                 work_dir=work_dir,
                 renode_remote_server_dir=args.renode_remote_server_dir,
                 evaluation_mode=eval_mode,
@@ -829,16 +1443,10 @@ def main() -> int:
                 no_control=args.no_control,
             )
 
-            # Determine verdict for multi-component.
+            # Determine a verdict from all per-component controls, fault
+            # results, and combined outcomes.
             combined_summary = mc_result["combined_summary"]
-            split_brain_count = combined_summary["split_brain"]
-            mc_verdict = "PASS"
-            if profile.expect.should_find_issues and split_brain_count == 0:
-                mc_verdict = "FAIL -- expected to find split-brain issues but found none"
-            elif not profile.expect.should_find_issues and split_brain_count > 0:
-                mc_verdict = "FAIL -- found {} split-brain points".format(
-                    split_brain_count
-                )
+            mc_verdict = _multi_component_verdict(mc_result, profile)
 
             payload: Dict[str, Any] = {
                 "engine": "renode-test",
@@ -879,7 +1487,7 @@ def main() -> int:
                 "summary": payload["summary"],
             }, indent=2, sort_keys=True))
 
-            if mc_verdict.startswith("FAIL") and not args.no_assert_verdict:
+            if not is_pass_verdict(mc_verdict) and not args.no_assert_verdict:
                 return EXIT_ASSERTION_FAILURE
             return 0
 
@@ -950,13 +1558,13 @@ def main() -> int:
         else:
             geometry_preflight = validate_compiled_flash_map(profile, repo_root)
             if geometry_preflight.get("status") == "mismatch":
-                print(
-                    "WARNING: geometry preflight mismatch for '{}': {}".format(
-                        profile.name,
-                        geometry_preflight.get("reason"),
-                    ),
-                    file=sys.stderr,
+                _write_geometry_preflight_failure(
+                    args=args,
+                    profile=profile,
+                    repo_root=repo_root,
+                    geometry=geometry_preflight,
                 )
+                return 0 if args.no_assert_verdict else EXIT_ASSERTION_FAILURE
 
         # -------------------------------------------------------------------
         # Calibration
@@ -993,9 +1601,9 @@ def main() -> int:
             and not args.no_trace_replay
             and _trace_replay_eligible_fault_types(fault_types)
         )
-        # Apply hash bypass during calibration too — hash validation doesn't
-        # affect write/erase counts but consumes enormous virtual time on
-        # large images (MCUboot SHA-256 on 448KB in emulation).
+        # Prepare hash bypass for faulted sweep runs only.  Calibration and
+        # clean controls always execute without bypass so they remain a
+        # trustworthy baseline.
         # Auto-disable when instruction_skip is a fault type — hash bypass
         # patches SHA-256 to return 0, which breaks image validation and
         # makes instruction_skip findings meaningless.
@@ -1058,7 +1666,14 @@ def main() -> int:
                 _cal_cache_path = args.reuse_calibration
                 _cal_cache_key = ""
                 if _cal_cache_path:
-                    _cal_cache_key = _compute_calibration_cache_key(profile, repo_root)
+                    _cal_cache_key = _compute_calibration_cache_key(
+                        profile,
+                        repo_root,
+                        renode_test=renode_test,
+                        robot_suite=robot_suite,
+                        robot_vars=_without_hash_bypass(robot_vars),
+                        renode_remote_server_dir=args.renode_remote_server_dir,
+                    )
                     cal = load_calibration(_cal_cache_path, _cal_cache_key, work_dir)
                     if cal is not None:
                         print(
@@ -1074,7 +1689,7 @@ def main() -> int:
                             renode_test=renode_test,
                             robot_suite=robot_suite,
                             profile=profile,
-                            robot_vars=robot_vars,
+                            robot_vars=_without_hash_bypass(robot_vars),
                             work_dir=work_dir,
                             renode_remote_server_dir=args.renode_remote_server_dir,
                             keep_run_artifacts=args.keep_run_artifacts,
@@ -1123,9 +1738,9 @@ def main() -> int:
                             cal.calibration_boot_outcome,
                         )
                         message = (
-                            "Calibration: exec slot hash = {}..."
+                            "Calibration: populated undeclared exec slot hash = {}..."
                             if discovered_hash_used
-                            else "Calibration: overriding profile EXPECTED_EXEC_SHA256 with ground-truth; exec slot hash = {}..."
+                            else "Calibration: retained declared exec slot hash; observed {}..."
                         )
                         print(
                             message.format(cal.calibration_exec_hash[:16]),
@@ -1157,7 +1772,14 @@ def main() -> int:
                 _cal_cache_path = args.reuse_calibration
                 _cal_cache_key = ""
                 if _cal_cache_path:
-                    _cal_cache_key = _compute_calibration_cache_key(profile, repo_root)
+                    _cal_cache_key = _compute_calibration_cache_key(
+                        profile,
+                        repo_root,
+                        renode_test=renode_test,
+                        robot_suite=robot_suite,
+                        robot_vars=_without_hash_bypass(robot_vars),
+                        renode_remote_server_dir=args.renode_remote_server_dir,
+                    )
                     cal = load_calibration(_cal_cache_path, _cal_cache_key, work_dir)
                     if cal is not None:
                         print(
@@ -1178,7 +1800,7 @@ def main() -> int:
                             renode_test=renode_test,
                             robot_suite=robot_suite,
                             profile=profile,
-                            robot_vars=robot_vars,
+                            robot_vars=_without_hash_bypass(robot_vars),
                             work_dir=work_dir,
                             renode_remote_server_dir=args.renode_remote_server_dir,
                             keep_run_artifacts=args.keep_run_artifacts,
@@ -1325,6 +1947,7 @@ def main() -> int:
             # preconditions (trace available, no explicit bounds, step 1,
             # non-exhaustive strategy) that must also hold.
             allow_state_evaluator=(not args.quick) or bool(heuristic_summary),
+            profile_initial_state_name=args.initial_state or None,
         )
 
         sweep_wall_s = _time_mod.time() - sweep_wall_t0
@@ -1353,7 +1976,7 @@ def main() -> int:
         if clean_trace_meta is not None:
             clean_trace_meta["coverage"] = calibration_coverage
 
-        annotate_result_checks(sweep_results, profile)
+        annotate_result_checks(sweep_results, profile, repo_root=repo_root)
         validate_runtime_findings(
             results=sweep_results,
             profile=profile,
@@ -1372,6 +1995,7 @@ def main() -> int:
             total_writes=max_writes,
             profile=profile,
             calibration_coverage=calibration_coverage,
+            expected_fault_points=len(fault_points),
         )
         sweep_summary["wall_time_s"] = round(sweep_wall_s, 1)
 
@@ -1395,6 +2019,7 @@ def main() -> int:
             no_hash_bypass=effective_no_hash_bypass,
             explain_only=args.explain_multi_fault_plan,
             keep_run_artifacts=args.keep_run_artifacts,
+            profile_initial_state_name=args.initial_state or None,
         )
         multi_fault_plan: Optional[MultiFaultPlan] = mf_phase.plan
         multi_fault_plan_data = mf_phase.plan_data
@@ -1442,8 +2067,8 @@ def main() -> int:
                     repo_root, ps_config.staging_image_path
                 )
                 if not os.path.exists(staging_image_path):
-                    _progress(
-                        "WARNING: partial_staging image not found: {}".format(
+                    raise RuntimeError(
+                        "configured partial_staging image not found: {}".format(
                             staging_image_path
                         )
                     )
@@ -1461,6 +2086,10 @@ def main() -> int:
                         explicit_offsets=ps_config.explicit_offsets,
                         max_points=ps_config.max_points,
                     )
+                    if not trunc_points:
+                        raise RuntimeError(
+                            "configured partial_staging campaign produced no truncation points"
+                        )
                     _progress(
                         "Partial staging: {} truncation points for {}-byte image".format(
                             len(trunc_points), image_size
@@ -1481,11 +2110,14 @@ def main() -> int:
                             renode_remote_server_dir=args.renode_remote_server_dir,
                             num_workers=args.workers,
                             keep_run_artifacts=args.keep_run_artifacts,
+                            profile_initial_state_name=args.initial_state or None,
                         )
                     )
 
                     partial_staging_summary = summarize_partial_staging(
-                        ps_results_typed
+                        ps_results_typed,
+                        image_size=image_size,
+                        expected_points=len(trunc_points),
                     )
 
                     _progress(
@@ -1518,6 +2150,15 @@ def main() -> int:
             profile.expect,
             multi_fault_summary=multi_fault_summary,
             partial_staging_summary=partial_staging_summary,
+        )
+        verdict = _aggregate_auxiliary_verdict(
+            verdict,
+            profile,
+            state_fuzz_results=state_fuzz_results,
+            state_fuzz_summary=state_fuzz_summary,
+            fuzz_crash_results=fuzz_crash_results,
+            fuzz_crash_summary=fuzz_crash_summary,
+            geometry_preflight=geometry_preflight,
         )
 
         # -------------------------------------------------------------------
@@ -1683,7 +2324,7 @@ def main() -> int:
                     )
                     return EXIT_ASSERTION_FAILURE
 
-        if verdict.startswith("FAIL") and not args.no_assert_verdict:
+        if not is_pass_verdict(verdict) and not args.no_assert_verdict:
             return EXIT_ASSERTION_FAILURE
 
         return 0
@@ -1694,8 +2335,185 @@ def main() -> int:
         traceback.print_exc(file=sys.stderr)
         return EXIT_INFRA_FAILURE
     finally:
+        generated_robot_vars = locals().get("robot_vars")
+        if isinstance(generated_robot_vars, list):
+            _cleanup_generated_robot_files(generated_robot_vars)
+        generated_overrides = locals().get("_overrides_file")
+        generated_overrides_name = getattr(generated_overrides, "name", "")
+        if generated_overrides_name:
+            try:
+                os.unlink(generated_overrides_name)
+            except FileNotFoundError:
+                pass
         if temp_ctx is not None:
             temp_ctx.cleanup()
+
+
+def _initial_state_child_command(
+    state_name: str,
+    output_path: Path,
+) -> List[str]:
+    """Rebuild the current CLI for one resolved initial-state child run."""
+    filtered: List[str] = []
+    argv = list(sys.argv[1:])
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in {"--output", "--initial-state"}:
+            index += 2
+            continue
+        if token.startswith("--output=") or token.startswith("--initial-state="):
+            index += 1
+            continue
+        filtered.append(token)
+        index += 1
+    filtered.extend(["--output", str(output_path), "--initial-state", state_name])
+    if "--no-assert-verdict" not in filtered:
+        filtered.append("--no-assert-verdict")
+    if "--no-assert-control-boots" not in filtered:
+        filtered.append("--no-assert-control-boots")
+    return [sys.executable, str(Path(__file__).resolve())] + filtered
+
+
+def _is_pass_verdict(value: Any) -> bool:
+    """Accept only the report protocol's PASS token or PASS plus details."""
+    return is_pass_verdict(value)
+
+
+def _run_initial_state_matrix(
+    args: argparse.Namespace,
+    profile: ProfileConfig,
+) -> int:
+    """Run and aggregate every declared initial state through the real CLI."""
+    repo_root = Path(args.repo_root).resolve() if args.repo_root else REPO_ROOT
+    entries: List[Dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="tardigrade_initial_states_") as td:
+        temp_root = Path(td)
+        for index, state in enumerate(profile.initial_states):
+            child_output = temp_root / "state_{:04d}.json".format(index)
+            command = _initial_state_child_command(state.name, child_output)
+            proc = subprocess.run(
+                command,
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            child_payload: Dict[str, Any] = {}
+            parse_error = ""
+            if child_output.exists():
+                try:
+                    loaded = json.loads(child_output.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        child_payload = loaded
+                    else:
+                        parse_error = "child report was not a JSON object"
+                except (OSError, ValueError) as exc:
+                    parse_error = str(exc)
+            else:
+                parse_error = "child report was not created"
+            entry: Dict[str, Any] = {
+                "state": state.name,
+                "description": state.description,
+                "returncode": proc.returncode,
+                "verdict": child_payload.get("verdict"),
+                "summary": child_payload.get("summary", {}),
+                "profile": child_payload.get("profile"),
+            }
+            if parse_error:
+                entry["error"] = parse_error
+            if proc.returncode != 0:
+                entry["stderr"] = (proc.stderr or proc.stdout).strip()[-4000:]
+            entries.append(entry)
+
+    missing_or_infra = [
+        entry
+        for entry in entries
+        if (
+            entry.get("returncode") != 0
+            or not isinstance(entry.get("verdict"), str)
+            or not entry["verdict"].strip()
+        )
+    ]
+    nonpassing = [
+        entry
+        for entry in entries
+        if (
+            isinstance(entry.get("verdict"), str)
+            and entry["verdict"].strip()
+            and not _is_pass_verdict(entry["verdict"])
+        )
+    ]
+    if missing_or_infra:
+        verdict = "INCONCLUSIVE -- {}/{} initial-state runs failed infrastructure checks".format(
+            len(missing_or_infra), len(entries)
+        )
+    elif nonpassing:
+        verdict = "FAIL -- {}/{} initial-state runs did not pass".format(
+            len(nonpassing), len(entries)
+        )
+    else:
+        verdict = "PASS"
+
+    payload: Dict[str, Any] = {
+        "engine": "renode-test",
+        "profile": profile.name,
+        "profile_path": str(profile.profile_path) if profile.profile_path else None,
+        "schema_version": profile.schema_version,
+        "initial_states": True,
+        "verdict": verdict,
+        "summary": {
+            "initial_states": {
+                "requested": len(profile.initial_states),
+                "completed": len(entries) - len(missing_or_infra),
+                "passed": sum(
+                    1
+                    for entry in entries
+                    if _is_pass_verdict(entry.get("verdict"))
+                ),
+            }
+        },
+        "initial_state_results": entries,
+        "execution": {
+            "run_utc": dt.datetime.now(dt.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        },
+        "git": git_metadata(repo_root),
+    }
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "profile": profile.name,
+                "verdict": verdict,
+                "summary": payload["summary"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    if missing_or_infra:
+        return EXIT_INFRA_FAILURE
+    if nonpassing and not args.no_assert_verdict:
+        return EXIT_ASSERTION_FAILURE
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+    if args.initial_state:
+        return _main_single()
+    try:
+        profile = load_profile(args.profile, strict=args.strict_profile)
+    except Exception:
+        return _main_single()
+    if not getattr(profile, "initial_states", None):
+        return _main_single()
+    return _run_initial_state_matrix(args, profile)
 
 
 if __name__ == "__main__":

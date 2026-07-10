@@ -335,6 +335,43 @@ def test_extract_state_fuzz_result_keeps_slot_mismatch_for_valid_scenario() -> N
     }
 
 
+def test_state_fuzz_preserves_infrastructure_error_without_counting_finding() -> None:
+    scenario = {
+        "index": 4,
+        "mode": "structured_random",
+        "crc_mode": "valid",
+        "blob_sha256": "infra",
+        "field_values": {},
+    }
+    result = {
+        "boot_outcome": "success",
+        "boot_slot": "exec",
+        "infrastructure_error": True,
+        "error_kind": "invariant_evaluation_error",
+        "invariant_violations": [{"name": "invariant_evaluation_error"}],
+        "signals": {},
+    }
+
+    extracted = extract_state_fuzz_result(
+        scenario=scenario,
+        result=result,
+        expected_outcome="success",
+        metadata_model=None,
+    )
+    summary = summarize_state_campaign(
+        [extracted],
+        expected_outcome="success",
+        metadata_model={},
+        iterations=1,
+    )
+
+    assert extracted["infrastructure_error"] is True
+    assert extracted["error_kind"] == "invariant_evaluation_error"
+    assert extracted["finding"] is False
+    assert summary["infrastructure_errors"] == 1
+    assert summary["findings"] == 0
+
+
 def test_run_state_fuzz_campaign_builds_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     profile = load_profile(_write_profile(tmp_path))
     captured_robot_vars = []

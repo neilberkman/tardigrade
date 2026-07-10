@@ -1,5 +1,8 @@
 name: oss-validation
 
+permissions:
+  contents: read
+
 on:
   push:
     branches:
@@ -7,9 +10,11 @@ on:
     paths:
       - .github/workflows/oss-validation.yml
       - action.yml
+      - docker/oss-validation.Dockerfile
       - docs/oss_validation_profiles.json
       - platforms/**
       - profiles/**
+      - 'requirements*.txt'
       - scripts/**
       - tests/**
   schedule:
@@ -27,8 +32,9 @@ jobs:
       should_run: ${{ steps.decide.outputs.should_run }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - id: decide
@@ -47,9 +53,11 @@ jobs:
               -- \
               .github/workflows/oss-validation.yml \
               action.yml \
+              docker/oss-validation.Dockerfile \
               docs/oss_validation_profiles.json \
               platforms \
               profiles \
+              'requirements*.txt' \
               scripts \
               tests \
             | sed '/^$/d' \
@@ -74,10 +82,13 @@ jobs:
       TOOLCHAIN_VERSION: 13.2.1-1.1
       TOOLCHAIN_URL: https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v13.2.1-1.1/xpack-arm-none-eabi-gcc-13.2.1-1.1-linux-x64.tar.gz
       TOOLCHAIN_SHA256: 1252a8cafe9237de27a765376697230368eec21db44dc3f1edeb8d838dabd530
-      RENODE_URL: https://builds.renode.io/renode-1.16.1.linux-dotnet.tar.gz
+      RENODE_URL: https://github.com/renode/renode/releases/download/v1.16.1/renode-1.16.1.linux-dotnet.tar.gz
+      RENODE_SHA256: 62629caa331ed4bd4eb7abe13ee2e4834fbcaa70de492db3965fafa4edc5694f
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install host dependencies
         run: |
@@ -100,7 +111,8 @@ jobs:
         run: |
           set -euxo pipefail
           tarball="${RUNNER_TEMP}/arm-toolchain.tar.gz"
-          curl -L "${TOOLCHAIN_URL}" -o "${tarball}"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            "${TOOLCHAIN_URL}" -o "${tarball}"
           echo "${TOOLCHAIN_SHA256}  ${tarball}" | sha256sum -c -
           tar -xzf "${tarball}" -C "${RUNNER_TEMP}"
           mkdir -p "$HOME/tools"
@@ -112,15 +124,18 @@ jobs:
         run: |
           set -euxo pipefail
           tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
-          curl -L "${RENODE_URL}" -o "${tarball}"
+          python3 scripts/action_helpers.py download-renode \
+            --url "${RENODE_URL}" --sha256 "${RENODE_SHA256}" --output "${tarball}"
           mkdir -p "${RUNNER_TEMP}/renode"
           tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
-          python3 -m pip install --user -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+          python3 -m pip install --user \
+            -c requirements-renode-constraints.txt \
+            -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
           echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
           "${RUNNER_TEMP}/renode/renode-test" --help >/dev/null
 
       - name: Install Python dependencies
-        run: python3 -m pip install --user -r requirements.txt intelhex cbor2 click cryptography
+        run: python3 -m pip install --user -r requirements.txt -r requirements-oss-build.txt
 
       - name: Run MCUboot current guard (must pass)
         run: |
@@ -153,7 +168,7 @@ jobs:
 
       - name: Upload OSS validation artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: oss-validation-artifacts
           path: |

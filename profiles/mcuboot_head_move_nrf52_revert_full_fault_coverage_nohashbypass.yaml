@@ -1,7 +1,9 @@
 schema_version: 1
 name: mcuboot_head_move_nrf52_revert_full_fault_coverage_nohashbypass
 description: >
-  Full NVM fault coverage with no sweep-time hash bypass.
+  Fast-backend NVM fault coverage with no sweep-time hash bypass.
+  Exercises injectable write, erase, and controller faults supported by
+  MappedMemory; transient read faults require a native read-intercept backend.
   Uses full SHA-256 validation in emulation so data-copy and trailer-copy
   findings can be replayed without bypassing bootutil_img_validate.
   Zero-day hunt: MCUboot HEAD swap-move revert on nrf52840dk.
@@ -50,7 +52,6 @@ fault_sweep:
     - write_rejection
     - multi_sector_atomicity
     - wear_leveling_corruption
-    - read_bit_flip
 expect:
   should_find_issues: false
 skip_self_test: true

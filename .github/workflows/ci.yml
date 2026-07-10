@@ -1,5 +1,8 @@
 name: ci
 
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
@@ -19,13 +22,16 @@ jobs:
       RENODE_REVISION: d66b0c2aa3d420408eccecfd1d3bab0fd702a6db
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install pinned Arm GNU toolchain
         run: |
           set -euxo pipefail
           tarball="${RUNNER_TEMP}/arm-toolchain.tar.gz"
-          curl -L "${TOOLCHAIN_URL}" -o "${tarball}"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            "${TOOLCHAIN_URL}" -o "${tarball}"
           echo "${TOOLCHAIN_SHA256}  ${tarball}" | sha256sum -c -
           tar -xzf "${tarball}" -C "${RUNNER_TEMP}"
           echo "${RUNNER_TEMP}/xpack-arm-none-eabi-gcc-${TOOLCHAIN_VERSION}/bin" >> "${GITHUB_PATH}"
@@ -38,7 +44,6 @@ jobs:
           make -C examples/naive_copy
           make -C examples/nxboot_style
           make -C examples/esp_idf_ota
-          make -C examples/riotboot_standalone
           python3 examples/nxboot_style/gen_nxboot_images.py --output-dir examples/nxboot_style
 
       - name: Run Robot suites in pinned Renode
@@ -55,11 +60,12 @@ jobs:
             --keep-renode-output
           tests-to-run: |
             tests/nvm_peripheral.robot
+            tests/generic_nvm_controller.robot
           artifacts-path: results/ci_artifacts
 
       - name: Upload Renode artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: renode-artifacts
           path: results/ci_artifacts
@@ -72,20 +78,26 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5]
     env:
-      RENODE_URL: https://builds.renode.io/renode-1.16.1.linux-dotnet.tar.gz
+      RENODE_URL: https://github.com/renode/renode/releases/download/v1.16.1/renode-1.16.1.linux-dotnet.tar.gz
+      RENODE_SHA256: 62629caa331ed4bd4eb7abe13ee2e4834fbcaa70de492db3965fafa4edc5694f
       PYTHONUNBUFFERED: "1"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install Renode portable
         run: |
           set -euxo pipefail
           tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
-          curl -L "${RENODE_URL}" -o "${tarball}"
+          python3 scripts/action_helpers.py download-renode \
+            --url "${RENODE_URL}" --sha256 "${RENODE_SHA256}" --output "${tarball}"
           mkdir -p "${RUNNER_TEMP}/renode"
           tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
-          python3 -m pip install --user -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+          python3 -m pip install --user \
+            -c requirements-renode-constraints.txt \
+            -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
           echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
           "${RUNNER_TEMP}/renode/renode-test" --help >/dev/null
 
@@ -104,7 +116,7 @@ jobs:
 
       - name: Upload self-test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: self-test-shard-${{ matrix.shard }}
           path: results/
@@ -116,17 +128,18 @@ jobs:
       PYTHONUNBUFFERED: "1"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
 
       - name: Install Python dependencies
         run: |
           set -euxo pipefail
-          python3 -m pip install -r requirements.txt
-          python3 -m pip install pytest pytest-subtests
+          python3 -m pip install -r requirements-test.txt
 
       - name: Run pytest suite
-        run: python3 -m pytest tests/ -q
+        run: python3 -m pytest -q

@@ -309,11 +309,13 @@ def _evaluate_invariants(
     result: Dict[str, Any],
     profile: ProfileConfig,
     pre_state: Optional[Dict[str, Any]] = None,
+    repo_root: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     if not profile.invariants:
         return []
+    effective_root = repo_root or REPO_ROOT
     provider_paths = [
-        profile.resolve_path(REPO_ROOT, provider_path)
+        profile.resolve_path(effective_root, provider_path)
         for provider_path in getattr(profile, "invariant_providers", []) or []
     ]
     invariant_fns = resolve_invariants(
@@ -502,6 +504,7 @@ def _evaluate_metadata_delta(
 def annotate_result_checks(
     results: List[Dict[str, Any]],
     profile: ProfileConfig,
+    repo_root: Optional[Path] = None,
 ) -> None:
     control_result: Optional[Dict[str, Any]] = None
     for candidate in results:
@@ -520,9 +523,23 @@ def annotate_result_checks(
         pre_state = _derive_runtime_pre_state(result, control_result, profile)
         if pre_state is not None:
             result["pre_state"] = pre_state
-        invariant_failures = _evaluate_invariants(result, profile, pre_state=pre_state)
+        invariant_failures = _evaluate_invariants(
+            result,
+            profile,
+            pre_state=pre_state,
+            repo_root=repo_root,
+        )
         if invariant_failures:
             result["invariant_violations"] = invariant_failures
+            evaluation_errors = [
+                failure
+                for failure in invariant_failures
+                if failure.get("name") == "invariant_evaluation_error"
+            ]
+            if evaluation_errors:
+                result["invariant_evaluation_errors"] = evaluation_errors
+                result["infrastructure_error"] = True
+                result["error_kind"] = "invariant_evaluation_error"
         # Metadata delta: only re-evaluate if not already annotated by RESC.
         if not result.get("metadata_delta_violations"):
             md_failures = _evaluate_metadata_delta(result, profile)

@@ -220,6 +220,7 @@ def _make_single_point_runner(
             work_dir=point_dir,
             renode_remote_server_dir=renode_remote_server_dir,
             keep_run_artifacts=keep_run_artifacts,
+            expected_fault_type=fault_type,
         )
 
     return rerun
@@ -653,7 +654,7 @@ def validate_runtime_findings(
     )
 
     def annotate_checks(items: List[Dict[str, Any]]) -> None:
-        annotate_result_checks(items, profile)
+        annotate_result_checks(items, profile, repo_root=repo_root)
 
     # Separate instruction-skip findings (need Renode reruns, slow) from
     # others (instant, no Renode). Instruction-skip validations are

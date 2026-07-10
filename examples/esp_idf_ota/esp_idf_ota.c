@@ -31,7 +31,7 @@
  *   0x000FC000 - 0x000FFFFF  Marker / reserved (16KB)
  *
  * Reference: ESP-IDF bootloader_utility.c
- *   https://github.com/espressif/esp-idf/blob/master/components/bootloader_support/src/bootloader_utility.c
+ *   https://github.com/espressif/esp-idf/blob/b8c527a87c1930a2446a5148ec16892b14f99c8e/components/bootloader_support/src/bootloader_utility.c
  *
  * This is a clean-room model of the algorithm, not ESP-IDF code.
  * Licensed under Apache 2.0 (same as ESP-IDF).

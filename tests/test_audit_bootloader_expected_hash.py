@@ -20,17 +20,15 @@ def test_merge_calibration_expected_exec_hash_injects_when_missing():
     merged, used = _merge_calibration_expected_exec_hash(
         ["SUCCESS_IMAGE_HASH:true"],
         "deadbeef",
+        "success",
     )
     assert used is True
     assert "EXPECTED_EXEC_SHA256:deadbeef" in merged
 
 
-def test_merge_calibration_expected_exec_hash_overrides_profile_with_ground_truth():
-    # When the profile already declared an EXPECTED_EXEC_SHA256, the
-    # calibration ground-truth hash still wins: the file-based expectation
-    # is stale for bootloaders that legitimately rewrite the slot during
-    # copy/swap.  ``used`` reports False because the calibration hash
-    # replaced (did not freshly inject into) the profile expectation.
+def test_merge_calibration_expected_exec_hash_preserves_declared_expectation():
+    # A calibration observation must not replace an independently declared
+    # expectation, even when the calibration control succeeded.
     merged, used = _merge_calibration_expected_exec_hash(
         [
             "SUCCESS_IMAGE_HASH:true",
@@ -39,8 +37,17 @@ def test_merge_calibration_expected_exec_hash_overrides_profile_with_ground_trut
         "calibrationhash",
     )
     assert used is False
-    assert "EXPECTED_EXEC_SHA256:calibrationhash" in merged
-    assert "EXPECTED_EXEC_SHA256:staginghash" not in merged
+    assert "EXPECTED_EXEC_SHA256:staginghash" in merged
+    assert "EXPECTED_EXEC_SHA256:calibrationhash" not in merged
+
+
+def test_merge_calibration_expected_exec_hash_rejects_missing_outcome():
+    merged, used = _merge_calibration_expected_exec_hash(
+        ["SUCCESS_IMAGE_HASH:true"],
+        "deadbeef",
+    )
+    assert used is False
+    assert "EXPECTED_EXEC_SHA256:deadbeef" not in merged
 
 
 def test_merge_calibration_expected_exec_hash_preserves_profile_when_calibration_failed():

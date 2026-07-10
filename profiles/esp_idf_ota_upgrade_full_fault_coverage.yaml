@@ -1,7 +1,7 @@
 schema_version: 1
 name: esp_idf_ota_upgrade_full_fault_coverage
-description: "Full NVM fault coverage: exercises all general fault types the engine\
-  \ supports. ESP-IDF OTA bootloader model \u2014 upgrade scenario with rollback enabled.\
+description: "Fast-backend NVM fault coverage: exercises the injectable write and erase\
+  \ faults supported by MappedMemory. ESP-IDF OTA bootloader model \u2014 upgrade scenario with rollback enabled.\
   \ Implements the exact otadata dual-sector format and state machine from ESP-IDF\
   \ (Apache 2.0). Slot 0 has current image (ota_seq=1, VALID). Slot 1 has new image\
   \ (ota_seq=2, NEW). Bootloader transitions slot 1 to PENDING_VERIFY and boots it.\
@@ -46,7 +46,8 @@ pre_boot_state:
   u32: 1442199412
 - address: 1032256
   u32: 1430540321
-success_criteria: {}
+success_criteria:
+  vtor_in_slot: any
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
@@ -63,7 +64,6 @@ fault_sweep:
   - write_rejection
   - multi_sector_atomicity
   - wear_leveling_corruption
-  - read_bit_flip
 expect:
   should_find_issues: false
 skip_self_test: true

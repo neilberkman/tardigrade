@@ -15,7 +15,6 @@ memory:
   sram: { start: 0x20000000, end: 0x20040000 }
   write_granularity: 4
   page_size: 0x20000
-  flash_base_address: 0x08000000
   slots:
     exec: { base: 0x08020000, size: 0x60000 }
     staging: { base: 0x08080000, size: 0x60000 }

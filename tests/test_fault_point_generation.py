@@ -365,15 +365,22 @@ class NVSCorruptionFaultPointGenerationTest(unittest.TestCase):
         include_nvs = "nvs_corruption" in fault_types
         self.assertTrue(include_nvs)
 
-    def test_nvs_fault_points_generated_per_mode(self) -> None:
-        """Simulate the combined-list builder for nvs_corruption."""
-        nvs_modes = ["bit_flip", "partial_erase", "truncate", "scramble"]
-        combined = []
-        for vi, mode in enumerate(nvs_modes):
-            combined.append((vi, "nv:{}".format(vi)))
-        self.assertEqual(len(combined), 4)
+    def test_nvs_fault_points_generated_per_tuned_variant(self) -> None:
+        """Every configured tuning value receives its own wire index."""
+        cfg = NvsCorruptionConfig(
+            enabled=True,
+            modes=["bit_flip", "partial_erase", "truncate", "scramble"],
+            bit_flip_counts=[1, 8],
+            erase_fractions=[0.25, 1.0],
+            truncate_offsets=[16, None],
+        )
+        combined = [
+            (vi, "nv:{}".format(vi))
+            for vi, _variant in enumerate(cfg.variant_specs())
+        ]
+        self.assertEqual(len(combined), 7)
         self.assertEqual(combined[0], (0, "nv:0"))
-        self.assertEqual(combined[3], (3, "nv:3"))
+        self.assertEqual(combined[-1], (6, "nv:6"))
 
     def test_nvs_corruption_config_defaults(self) -> None:
         cfg = NvsCorruptionConfig()
@@ -491,7 +498,7 @@ class BootloaderRegionWriteClassificationTest(unittest.TestCase):
     def test_bootloader_region_write_not_execute_only(self) -> None:
         self.assertNotIn("bootloader_region_write", EXECUTE_ONLY_FAULT_TYPES)
 
-    def test_profile_warns_on_bootloader_region_write(self) -> None:
+    def test_profile_rejects_bootloader_region_write(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = _write_profile(td, textwrap.dedent("""\
                 fault_sweep:
@@ -501,19 +508,11 @@ class BootloaderRegionWriteClassificationTest(unittest.TestCase):
                     - power_loss
                     - bootloader_region_write
             """))
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
+            with self.assertRaisesRegex(
+                Exception,
+                "classification label",
+            ):
                 load_profile(path)
-            classification_warnings = [
-                x for x in w if "classification" in str(x.message).lower()
-            ]
-            self.assertGreater(
-                len(classification_warnings), 0,
-                "Expected a warning about bootloader_region_write being "
-                "classification-only, got: {}".format(
-                    [str(x.message) for x in w]
-                ),
-            )
 
 
 # ===========================================================================

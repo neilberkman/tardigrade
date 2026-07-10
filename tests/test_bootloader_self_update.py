@@ -75,7 +75,7 @@ class TestValidateBootloaderVectorTable(unittest.TestCase):
         return struct.pack("<II", sp, reset_vector)
 
     def test_valid_vector_table(self):
-        data = self._make_vector_table(0x20004000, 0x00000100)
+        data = self._make_vector_table(0x20004000, 0x00000101)
         valid, reason = validate_bootloader_vector_table(
             data, region_base=0x0, region_size=0x10000
         )
@@ -84,7 +84,7 @@ class TestValidateBootloaderVectorTable(unittest.TestCase):
 
     def test_sp_outside_sram(self):
         # SP points to flash, not SRAM
-        data = self._make_vector_table(0x08000000, 0x00000100)
+        data = self._make_vector_table(0x08000000, 0x00000101)
         valid, reason = validate_bootloader_vector_table(
             data, region_base=0x0, region_size=0x10000
         )
@@ -110,7 +110,7 @@ class TestValidateBootloaderVectorTable(unittest.TestCase):
         self.assertIn("region too small", reason)
 
     def test_custom_sram_range(self):
-        data = self._make_vector_table(0x40001000, 0x00000100)
+        data = self._make_vector_table(0x40001000, 0x00000101)
         # Default SRAM range doesn't include 0x4xxxxxxx
         valid, _ = validate_bootloader_vector_table(
             data, region_base=0x0, region_size=0x10000
@@ -126,6 +126,26 @@ class TestValidateBootloaderVectorTable(unittest.TestCase):
             sram_end=0x40010000,
         )
         self.assertTrue(valid)
+
+    def test_initial_sp_at_sram_end_is_valid(self):
+        data = self._make_vector_table(0x20010000, 0x00000101)
+        valid, reason = validate_bootloader_vector_table(
+            data,
+            region_base=0x0,
+            region_size=0x10000,
+            sram_start=0x20000000,
+            sram_end=0x20010000,
+        )
+        self.assertTrue(valid)
+        self.assertEqual(reason, "ok")
+
+    def test_even_reset_vector_is_rejected(self):
+        data = self._make_vector_table(0x20004000, 0x00000100)
+        valid, reason = validate_bootloader_vector_table(
+            data, region_base=0x0, region_size=0x10000
+        )
+        self.assertFalse(valid)
+        self.assertIn("Thumb bit", reason)
 
     def test_erased_flash_detected(self):
         """Erased flash (all 0xFF) should fail validation."""
@@ -465,7 +485,7 @@ class TestCheckBootloaderIntegrity(unittest.TestCase):
         from audit_report import check_bootloader_integrity
 
         bl_region = BootloaderRegionConfig(base=0x0, size=0x10000)
-        data = struct.pack("<II", 0x20004000, 0x00000100)
+        data = struct.pack("<II", 0x20004000, 0x00000101)
         data += b"\x00" * (0x10000 - 8)
         valid, reason = check_bootloader_integrity(
             data, bl_region, sram_start=0x20000000, sram_end=0x30000000

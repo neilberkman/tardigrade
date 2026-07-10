@@ -177,6 +177,13 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
 
     def test_head_matrix_script_signs_pr2206_head_images_with_align_32(self) -> None:
         text = HEAD_MATRIX_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("f84b9d3fd019fb1945e532924bee7a9c03c77373", text)
+        self.assertIn("git -C \"${MCUBOOT_REPO}\" restore --worktree", text)
+        self.assertIn("-DCONFIG_BOOTLOADER_SRAM_SIZE=64", text)
+        self.assertIn("-DCONFIG_WARN_DEPRECATED=n", text)
+        self.assertIn("-DCONFIG_USE_SEGGER_RTT=n", text)
+        self.assertIn("-DCONFIG_MINIMAL_LIBC=y", text)
+        self.assertIn("-DCONFIG_PICOLIBC=n", text)
         self.assertIn('local align="${6:-8}"', text)
         self.assertIn('--align "${align}"', text)
         self.assertIn('slot1_partition: partition@80000', text)
@@ -313,8 +320,8 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertEqual(fixed["expect"]["control_outcome"], "success")
         self.assertEqual(broken["semantic_assertions"]["control"]["multi_boot_analysis.final_outcome"], "no_boot")
         self.assertEqual(fixed["semantic_assertions"]["control"]["multi_boot_analysis.final_outcome"], "success")
-        self.assertEqual(broken["success_criteria"], {})
-        self.assertEqual(fixed["success_criteria"], {})
+        self.assertEqual(broken["success_criteria"], {"vtor_in_slot": "exec"})
+        self.assertEqual(fixed["success_criteria"], {"vtor_in_slot": "exec"})
         self.assertTrue(broken.get("skip_self_test", False))
         self.assertTrue(fixed.get("skip_self_test", False))
 
@@ -347,8 +354,8 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertEqual(broken["expect"]["control_outcome"], "no_boot")
         self.assertTrue(broken["expect"]["allow_control_only_issues"])
         self.assertEqual(fixed["expect"]["control_outcome"], "success")
-        self.assertEqual(broken["success_criteria"], {})
-        self.assertEqual(fixed["success_criteria"], {})
+        self.assertEqual(broken["success_criteria"], {"vtor_in_slot": "exec"})
+        self.assertEqual(fixed["success_criteria"], {"vtor_in_slot": "exec"})
 
     def test_pr2206_geom_profiles_use_geom_scratch_elfs(self) -> None:
         broken = yaml.safe_load(
@@ -405,7 +412,7 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertEqual(broken["semantic_assertions"]["control"]["multi_boot_analysis.final_outcome"], "success")
         self.assertEqual(fixed["semantic_assertions"]["control"]["multi_boot_analysis.final_outcome"], "no_boot")
         self.assertEqual(broken["success_criteria"]["expected_image"], "staging")
-        self.assertEqual(fixed["success_criteria"], {})
+        self.assertEqual(fixed["success_criteria"], {"vtor_in_slot": "exec"})
         self.assertTrue(broken.get("skip_self_test", False))
         self.assertTrue(fixed.get("skip_self_test", False))
 

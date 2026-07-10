@@ -253,6 +253,16 @@ def check_verdict(
 
     Returns (passed, reason).
     """
+    # audit_bootloader uses 1 for an assertion/verdict mismatch, which some
+    # known-defect self-test profiles intentionally reinterpret below.  Any
+    # other non-zero status is an infrastructure/process failure and must not
+    # be accepted merely because a partial report happens to contain matching
+    # counters.
+    if exit_code < 0 or exit_code >= 2:
+        return False, "Audit infrastructure failure (exit code {})".format(
+            exit_code
+        )
+
     expect = profile_raw.get("expect", {})
     should_find_issues = expect.get("should_find_issues", False)
     brick_rate_min = float(expect.get("brick_rate_min", 0.0))

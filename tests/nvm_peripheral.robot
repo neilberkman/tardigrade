@@ -48,6 +48,17 @@ NVM Partial Write Leaves Corruption
     ${word}=           Execute Command    sysbus ReadQuadWord 0x10000000
     Should Not Be Equal As Numbers    ${word}    0xA1A2A3A4A5A6A7A8
 
+Power Loss Does Not Persist Later Words
+    Create Flash Machine
+    Execute Command    nvm EnforceWordWriteSemantics false
+    Execute Command    nvm FaultAtWordWrite 1
+    Execute Command    sysbus WriteQuadWord 0x10000000 0x1122334455667788
+    ${first}=          Execute Command    sysbus ReadDoubleWord 0x10000000
+    ${later}=          Execute Command    sysbus ReadDoubleWord 0x10000004
+    # The targeted word is partially committed; the later word was never reached.
+    Should Be Equal As Numbers    ${first}    0xFFFF7788
+    Should Be Equal As Numbers    ${later}    0xFFFFFFFF
+
 NV Read Port Returns Same Data
     Create NVM Machine
     Execute Command    sysbus WriteDoubleWord 0x10000020 0xDEADBEEF

@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fault_inject import apply_clustered_distribution
 from fault_types import FAULT_TYPE_NAME_TO_CODE
-from profile_loader import ProfileConfig
+from profile_loader import MAX_PROFILE_FAULT_POINTS, ProfileConfig, ProfileError
 from renode_runner import quick_subset
 from trace_utils import load_clean_erase_trace, load_clean_write_trace
 from thumb_instructions import (
@@ -23,6 +23,37 @@ from thumb_instructions import (
 )
 
 INSTRUCTION_SKIP_QUICK_POINTS_PER_RANGE = 5
+
+
+class _BoundedFaultPointList(list):
+    """List that enforces the profile-wide total fault-plan ceiling."""
+
+    def __init__(self, values=(), *, limit: Optional[int] = None):
+        self.limit = int(
+            MAX_PROFILE_FAULT_POINTS if limit is None else limit
+        )
+        super().__init__()
+        self.extend(values)
+
+    def _reserve_one(self) -> None:
+        if len(self) >= self.limit:
+            raise ProfileError(
+                "fault plan exceeds safety limit {} total points".format(
+                    self.limit
+                )
+            )
+
+    def append(self, value) -> None:
+        self._reserve_one()
+        super().append(value)
+
+    def extend(self, values) -> None:
+        for value in values:
+            self.append(value)
+
+    def __iadd__(self, values):
+        self.extend(values)
+        return self
 
 
 @dataclasses.dataclass
@@ -320,6 +351,16 @@ def _derive_read_fault_points(
     if start >= end:
         return []
 
+    selected_count = (end - start + step - 1) // step
+    if fault_end is None and (point_count - 1 - start) % step != 0:
+        selected_count += 1
+    if selected_count > MAX_PROFILE_FAULT_POINTS:
+        raise ProfileError(
+            "read fault plan exceeds safety limit {} total points".format(
+                MAX_PROFILE_FAULT_POINTS
+            )
+        )
+
     points = list(range(start, end, step))
     if (point_count - 1) not in points and fault_end is None:
         points.append(point_count - 1)
@@ -491,11 +532,33 @@ def build_fault_plan(
     Returns a FaultPlan with fault_points, fault_types_list, and
     optional heuristic_summary.
     """
-    max_writes = calibration.max_writes
-    total_erases = calibration.total_erases
-    total_i2c_transactions = calibration.total_i2c_transactions
-    total_otp_blows = calibration.total_otp_blows
-    setup_writes = calibration.setup_writes
+    max_writes = int(calibration.max_writes)
+    total_erases = int(calibration.total_erases)
+    total_i2c_transactions = int(calibration.total_i2c_transactions)
+    total_otp_blows = int(calibration.total_otp_blows)
+    setup_writes = int(calibration.setup_writes)
+    for field_name, value in (
+        ("max_writes", max_writes),
+        ("total_erases", total_erases),
+        ("total_i2c_transactions", total_i2c_transactions),
+        ("total_otp_blows", total_otp_blows),
+        ("setup_writes", setup_writes),
+    ):
+        if value < 0 or value > MAX_PROFILE_FAULT_POINTS:
+            raise ProfileError(
+                "calibration.{} must be between 0 and {}".format(
+                    field_name,
+                    MAX_PROFILE_FAULT_POINTS,
+                )
+            )
+    configured_otp_bound = getattr(profile.fault_sweep, "max_otp_blows", None)
+    if configured_otp_bound is not None:
+        configured_otp_bound = int(configured_otp_bound)
+        total_otp_blows = (
+            min(total_otp_blows, configured_otp_bound)
+            if total_otp_blows > 0
+            else configured_otp_bound
+        )
     trace_file = calibration.trace_file
     erase_trace_file = calibration.erase_trace_file
 
@@ -556,8 +619,8 @@ def build_fault_plan(
         flash_base = min(s.base for s in profile.memory.slots.values())
 
         bl_region_for_heuristic = None
-        if profile.memory.bootloader_region is not None:
-            bl = profile.memory.bootloader_region
+        if profile.bootloader_region is not None:
+            bl = profile.bootloader_region
             bl_region_for_heuristic = (bl.base, bl.base + bl.size)
 
         heuristic_kwargs: Dict[str, Any] = {}
@@ -612,9 +675,19 @@ def build_fault_plan(
         if max_writes > 0:
             step = max(1, fault_step)
             fp_start = fault_start if fault_start is not None else 0
-            fp_end = fault_end if fault_end is not None else max_writes
+            # CLI slicing selects from the calibrated write domain; it must
+            # never expand that bounded domain and allocate unplanned points.
+            fp_end = (
+                min(fault_end, max_writes)
+                if fault_end is not None
+                else max_writes
+            )
             fault_points = list(range(fp_start, fp_end, step))
-            if max_writes - 1 not in fault_points and fault_end is None:
+            if (
+                max_writes - 1 not in fault_points
+                and fault_end is None
+                and fp_start < max_writes
+            ):
                 fault_points.append(max_writes - 1)
         elif include_read_bit_flip:
             fault_points = _derive_read_fault_points(
@@ -628,6 +701,12 @@ def build_fault_plan(
 
     if quick and not quick_use_heuristic:
         fault_points = quick_subset(fault_points)
+    if len(fault_points) > MAX_PROFILE_FAULT_POINTS:
+        raise ProfileError(
+            "fault plan exceeds safety limit {} base points".format(
+                MAX_PROFILE_FAULT_POINTS
+            )
+        )
 
     # -------------------------------------------------------------------
     # Build combined fault point list
@@ -650,6 +729,7 @@ def build_fault_plan(
         or include_i2c_faults
         or include_otp_faults
         or include_nvs_corruption
+        or include_timed_bit_corruption
         or profile.fault_sweep.phase2_fault.enabled
         or profile.fault_sweep.multi_fault.enabled
         or include_metadata_fault
@@ -662,7 +742,7 @@ def build_fault_plan(
         write_fps: List[Tuple[int, str]] = []
         if include_power_loss:
             write_fps = [(fp, 'w') for fp in fault_points] if max_writes > 0 else []
-        combined = list(write_fps)
+        combined = _BoundedFaultPointList(write_fps)
         swap_progress_count = 0
         if include_swap_progress:
             swap_entries = load_clean_write_trace(trace_file)
@@ -696,10 +776,10 @@ def build_fault_plan(
                 )
                 if quick and not quick_use_heuristic:
                     swap_fps = quick_subset(swap_fps)
-                combined += [
+                combined.extend(
                     (fp, FAULT_TYPE_NAME_TO_CODE["swap_progress"])
                     for fp in swap_fps
-                ]
+                )
                 swap_progress_count = len(swap_fps)
             elif erase_entries:
                 flash_base = min(int(slot.base) for slot in profile.memory.slots.values())
@@ -732,10 +812,10 @@ def build_fault_plan(
                 )
                 if quick and not quick_use_heuristic:
                     swap_fps = quick_subset(swap_fps)
-                combined += [
+                combined.extend(
                     (fp, FAULT_TYPE_NAME_TO_CODE["swap_progress"])
                     for fp in swap_fps
-                ]
+                )
                 swap_progress_count = len(swap_fps)
             else:
                 swap_progress_summary = {
@@ -765,10 +845,10 @@ def build_fault_plan(
             if quick and not quick_use_heuristic:
                 erase_fps = quick_subset(erase_fps)
             if "interrupted_erase" in fault_types:
-                combined += [(ep, 'e') for ep in erase_fps]
+                combined.extend((ep, 'e') for ep in erase_fps)
                 erase_count = len(erase_fps)
             if include_multi_sector_atomicity:
-                combined += [(ep, 'a') for ep in erase_fps]
+                combined.extend((ep, 'a') for ep in erase_fps)
                 atomicity_count = len(erase_fps)
         elif include_erases and is_mram_backend:
             print(
@@ -785,7 +865,7 @@ def build_fault_plan(
             if quick and not quick_use_heuristic:
                 bit_fps = quick_subset(bit_fps)
 
-            combined += [(bp, 'b') for bp in bit_fps]
+            combined.extend((bp, 'b') for bp in bit_fps)
             bit_count = len(bit_fps)
 
             dist = profile.fault_sweep.fault_distribution
@@ -814,7 +894,7 @@ def build_fault_plan(
             silent_fps = list(fault_points)
             if quick and not quick_use_heuristic:
                 silent_fps = quick_subset(silent_fps)
-            combined += [(sp, 's') for sp in silent_fps]
+            combined.extend((sp, 's') for sp in silent_fps)
             silent_count = len(silent_fps)
 
         driver_error_count = 0
@@ -822,7 +902,7 @@ def build_fault_plan(
             driver_error_fps = list(fault_points)
             if quick and not quick_use_heuristic:
                 driver_error_fps = quick_subset(driver_error_fps)
-            combined += [(gp, 'g') for gp in driver_error_fps]
+            combined.extend((gp, 'g') for gp in driver_error_fps)
             driver_error_count = len(driver_error_fps)
 
         rc_injection_count = 0
@@ -830,7 +910,7 @@ def build_fault_plan(
             rc_injection_fps = list(fault_points)
             if quick and not quick_use_heuristic:
                 rc_injection_fps = quick_subset(rc_injection_fps)
-            combined += [(xp, 'x') for xp in rc_injection_fps]
+            combined.extend((xp, 'x') for xp in rc_injection_fps)
             rc_injection_count = len(rc_injection_fps)
 
         disturb_count = 0
@@ -838,7 +918,7 @@ def build_fault_plan(
             disturb_fps = list(fault_points)
             if quick and not quick_use_heuristic:
                 disturb_fps = quick_subset(disturb_fps)
-            combined += [(dp, 'd') for dp in disturb_fps]
+            combined.extend((dp, 'd') for dp in disturb_fps)
             disturb_count = len(disturb_fps)
 
         wear_count = 0
@@ -846,7 +926,7 @@ def build_fault_plan(
             wear_fps = list(fault_points)
             if quick and not quick_use_heuristic:
                 wear_fps = quick_subset(wear_fps)
-            combined += [(wp, 'l') for wp in wear_fps]
+            combined.extend((wp, 'l') for wp in wear_fps)
             wear_count = len(wear_fps)
 
         rejection_count = 0
@@ -854,7 +934,7 @@ def build_fault_plan(
             rejection_fps = list(fault_points)
             if quick and not quick_use_heuristic:
                 rejection_fps = quick_subset(rejection_fps)
-            combined += [(rp, 'r') for rp in rejection_fps]
+            combined.extend((rp, 'r') for rp in rejection_fps)
             rejection_count = len(rejection_fps)
 
         timed_reset_count = 0
@@ -864,7 +944,7 @@ def build_fault_plan(
                 timed_reset_fps = [0]
             if quick and not quick_use_heuristic:
                 timed_reset_fps = quick_subset(timed_reset_fps)
-            combined += [(tp, 't') for tp in timed_reset_fps]
+            combined.extend((tp, 't') for tp in timed_reset_fps)
             timed_reset_count = len(timed_reset_fps)
 
         read_flip_count = 0
@@ -872,7 +952,7 @@ def build_fault_plan(
             read_flip_fps = list(fault_points)
             if quick and not quick_use_heuristic:
                 read_flip_fps = quick_subset(read_flip_fps)
-            combined += [(fp, 'f') for fp in read_flip_fps]
+            combined.extend((fp, 'f') for fp in read_flip_fps)
             read_flip_count = len(read_flip_fps)
 
         command_drop_count = 0
@@ -880,7 +960,7 @@ def build_fault_plan(
             command_drop_fps = list(fault_points)
             if quick and not quick_use_heuristic:
                 command_drop_fps = quick_subset(command_drop_fps)
-            combined += [(fp, 'k') for fp in command_drop_fps]
+            combined.extend((fp, 'k') for fp in command_drop_fps)
             command_drop_count = len(command_drop_fps)
 
         # I2C bus fault injection.
@@ -896,8 +976,8 @@ def build_fault_plan(
             if quick and not quick_use_heuristic:
                 i2c_fps = quick_subset(i2c_fps)
             for i2c_ft in i2c_fault_types:
-                i2c_code = FAULT_TYPE_NAME_TO_CODE.get(i2c_ft, "in")
-                combined += [(fp, i2c_code) for fp in i2c_fps]
+                i2c_code = FAULT_TYPE_NAME_TO_CODE[i2c_ft]
+                combined.extend((fp, i2c_code) for fp in i2c_fps)
                 i2c_fault_count += len(i2c_fps)
 
         # OTP fault injection.
@@ -913,8 +993,8 @@ def build_fault_plan(
             if quick and not quick_use_heuristic:
                 otp_fps = quick_subset(otp_fps)
             for otp_ft in otp_fault_types:
-                otp_code = FAULT_TYPE_NAME_TO_CODE.get(otp_ft, "op")
-                combined += [(fp, otp_code) for fp in otp_fps]
+                otp_code = FAULT_TYPE_NAME_TO_CODE[otp_ft]
+                combined.extend((fp, otp_code) for fp in otp_fps)
                 otp_fault_count += len(otp_fps)
         elif include_otp_faults and total_otp_blows == 0:
             print(
@@ -926,9 +1006,9 @@ def build_fault_plan(
         nvs_fault_count = 0
         if include_nvs_corruption:
             nvs_cfg = profile.fault_sweep.nvs_corruption
-            if nvs_cfg.enabled and profile.memory.nvs_region is not None:
-                nvs_modes = nvs_cfg.modes
-                for vi, mode in enumerate(nvs_modes):
+            if nvs_cfg.enabled and profile.nvs_region is not None:
+                nvs_variants = nvs_cfg.variant_specs()
+                for vi, _variant in enumerate(nvs_variants):
                     combined.append((vi, "nv:{}".format(vi)))
                     nvs_fault_count += 1
             elif not nvs_cfg.enabled:
@@ -937,7 +1017,7 @@ def build_fault_plan(
                     "config not enabled; skipping.",
                     file=sys.stderr,
                 )
-            elif profile.memory.nvs_region is None:
+            elif profile.nvs_region is None:
                 print(
                     "nvs_corruption in fault_types but no nvs_region "
                     "configured; skipping.",
@@ -980,7 +1060,18 @@ def build_fault_plan(
 
                 skip_ranges: List[List[int]] = []
                 sc = isc.skip_count if isc.skip_count > 0 else 1
+                instruction_candidate_total = 0
                 for region_start, region_end in isc.target_addresses:
+                    region_point_upper_bound = max(
+                        0,
+                        (int(region_end) - int(region_start) + 1) // 2,
+                    )
+                    instruction_candidate_total += region_point_upper_bound
+                    if instruction_candidate_total > MAX_PROFILE_FAULT_POINTS:
+                        raise ProfileError(
+                            "instruction-skip regions exceed safety limit {} "
+                            "candidate points".format(MAX_PROFILE_FAULT_POINTS)
+                        )
                     region_skip_addrs: List[int] = []
                     if read_halfword is not None:
                         candidate_addrs = enumerate_instruction_skip_addresses(
@@ -1069,6 +1160,12 @@ def build_fault_plan(
             _setup_writes = setup_writes
             if _setup_writes == 0:
                 _setup_writes = len(profile.pre_boot_state)
+            if _setup_writes > MAX_PROFILE_FAULT_POINTS:
+                raise ProfileError(
+                    "metadata fault plan exceeds safety limit {} points".format(
+                        MAX_PROFILE_FAULT_POINTS
+                    )
+                )
             if _setup_writes > 0:
                 mf_types = profile.fault_sweep.metadata_fault.fault_types
                 mf_fps = list(range(0, _setup_writes))
@@ -1082,7 +1179,7 @@ def build_fault_plan(
                     mf_fps = quick_subset(mf_fps)
                 for mf_fp in mf_fps:
                     for mf_name in mf_types:
-                        mf_code = FAULT_TYPE_NAME_TO_CODE.get(mf_name, "w")
+                        mf_code = FAULT_TYPE_NAME_TO_CODE[mf_name]
                         combined.append((mf_fp, "m:{}".format(mf_code)))
                         metadata_count += 1
 
@@ -1099,7 +1196,7 @@ def build_fault_plan(
                 if hf_config.max_points > 0
                 else min(50, max(max_writes, 1))
             )
-            hf_types = [FAULT_TYPE_NAME_TO_CODE.get(ft, "w") for ft in hf_config.fault_types]
+            hf_types = [FAULT_TYPE_NAME_TO_CODE[ft] for ft in hf_config.fault_types]
             hook_fps = list(range(0, hook_max))
             hook_fps = _slice_explicit_points(
                 hook_fps,
@@ -1123,7 +1220,7 @@ def build_fault_plan(
                 if cc_config.max_points > 0
                 else min(50, max(max_writes, 1))
             )
-            cc_types = [FAULT_TYPE_NAME_TO_CODE.get(ft, "w") for ft in cc_config.fault_types]
+            cc_types = [FAULT_TYPE_NAME_TO_CODE[ft] for ft in cc_config.fault_types]
             cc_fps = list(range(0, cc_max))
             cc_fps = _slice_explicit_points(
                 cc_fps,
@@ -1144,10 +1241,8 @@ def build_fault_plan(
         if p2_config.enabled and (write_fps or include_reset_at_time):
             p2_max = p2_config.max_points if p2_config.max_points > 0 else min(50, max(max_writes, 1))
             p2_type_codes = [
-                FAULT_TYPE_NAME_TO_CODE.get(ft, "w") for ft in p2_config.fault_types
+                FAULT_TYPE_NAME_TO_CODE[ft] for ft in p2_config.fault_types
             ]
-            if not p2_type_codes:
-                p2_type_codes = ["w"]
 
             p2_timed_codes = [c for c in p2_type_codes if c == "t"]
             p2_write_codes = [c for c in p2_type_codes if c != "t"]
@@ -1220,6 +1315,10 @@ def build_fault_plan(
             parts.append("{} otp-fault".format(otp_fault_count))
         if nvs_fault_count:
             parts.append("{} nvs-corruption".format(nvs_fault_count))
+        if timed_bit_corruption_count:
+            parts.append(
+                "{} timed-bit-corruption".format(timed_bit_corruption_count)
+            )
         if instruction_skip_count:
             isc_label = "{} instruction-skip".format(instruction_skip_count)
             if literal_pool_excluded:

@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from boot_outcomes import SUPPORTED_BOOT_OUTCOMES, is_canonical_boot_outcome
 from fault_types import TRACE_REPLAY_WIRE_CODES
 from profile_loader import HeuristicConfig, ProfileConfig, load_profile
 
@@ -377,6 +378,18 @@ def run_renode_subprocess(
     )
 
 
+class RenodeRunnerError(RuntimeError):
+    """Base class for failures produced by the Renode execution boundary."""
+
+
+class RenodeTimeoutError(RenodeRunnerError):
+    """The Renode process exceeded a wall-clock deadline enforced here."""
+
+
+class RenodeProtocolError(RenodeRunnerError):
+    """Renode returned a malformed or incomplete result payload."""
+
+
 def quick_subset(points: List[int]) -> List[int]:
     if len(points) <= 3:
         return points
@@ -389,19 +402,27 @@ def _synthetic_failed_batch_results(
     fault_types_list: Optional[List[str]],
     error: str,
     *,
-    timeout: bool = True,
+    timeout: bool,
+    error_kind: str,
 ) -> List[Dict[str, Any]]:
-    """Return synthetic results when fallback cannot isolate further."""
+    """Return explicit incomplete results when fallback cannot recover.
+
+    Synthetic results never claim that a fault fired.  They exist solely to
+    preserve one-result-per-request accounting so report generation can fail
+    closed with a useful diagnostic instead of dropping a point.
+    """
     results: List[Dict[str, Any]] = []
     for idx, fault_at in enumerate(fault_points):
         payload: Dict[str, Any] = {
             "fault_at": fault_at,
             "fault_requested": fault_at,
-            "fault_injected": True,
+            "fault_injected": False,
             "fault_address": "0x00000000",
-            "boot_outcome": "no_boot",
+            "boot_outcome": "timeout" if timeout else "infra_error",
             "boot_slot": None,
             "timeout": timeout,
+            "infrastructure_error": not timeout,
+            "error_kind": error_kind,
             "error": error,
         }
         if fault_types_list and idx < len(fault_types_list):
@@ -410,8 +431,301 @@ def _synthetic_failed_batch_results(
     return results
 
 
-def _is_process_timeout_error(error: str) -> bool:
-    return "renode-test batch timed out after" in str(error or "")
+def _wire_int(value: Any) -> Optional[int]:
+    """Parse a decimal/hex wire value, returning ``None`` when malformed."""
+    try:
+        return int(str(value), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fault_type_semantically_matches(
+    expected_type: str,
+    observed_type: Any,
+    result: Dict[str, Any],
+) -> bool:
+    """Match canonical planner wire types to normalized runtime results.
+
+    Compound runners intentionally expose structured metadata and often return
+    a shorter classification label.  Validate that metadata instead of
+    requiring byte-for-byte equality with the dispatch encoding.
+    """
+    expected = str(expected_type)
+    observed = str(observed_type or "")
+    if observed == expected:
+        return True
+
+    expected_parts = expected.split(":")
+    observed_parts = observed.split(":") if observed else []
+    signals = result.get("signals")
+    if not isinstance(signals, dict):
+        signals = {}
+
+    # Clustered bit corruption stores the seed in the peripheral for the run,
+    # while the result classification remains the base bit-corruption code.
+    if len(expected_parts) == 2 and expected_parts[0] == "b":
+        expected_seed = _wire_int(expected_parts[1])
+        return bool(
+            observed == "b"
+            and expected_seed is not None
+            and _wire_int(signals.get("corruption_seed")) == expected_seed
+        )
+
+    # Metadata faults report the underlying operation code and explicit
+    # metadata-run telemetry.
+    if len(expected_parts) == 2 and expected_parts[0] == "m":
+        return (
+            observed == expected_parts[1]
+            and "metadata_fault_applied" in signals
+            and "metadata_fault_total" in signals
+        )
+
+    if len(expected_parts) == 3 and expected_parts[0] == "h":
+        metadata = result.get("hook_fault")
+        return bool(
+            observed == "h:{}".format(expected_parts[2])
+            and isinstance(metadata, dict)
+            and _wire_int(metadata.get("hook_fault_at")) == _wire_int(expected_parts[1])
+            and str(metadata.get("hook_fault_type")) == expected_parts[2]
+        )
+
+    if len(expected_parts) == 3 and expected_parts[0] == "cc":
+        metadata = result.get("confirm_cycle")
+        return bool(
+            observed == "cc:{}".format(expected_parts[2])
+            and isinstance(metadata, dict)
+            and _wire_int(metadata.get("cc_fault_at")) == _wire_int(expected_parts[1])
+            and str(metadata.get("cc_fault_type")) == expected_parts[2]
+        )
+
+    if len(expected_parts) >= 5 and expected_parts[0] == "p2":
+        metadata = result.get("phase2_fault")
+        return bool(
+            observed == "p2"
+            and isinstance(metadata, dict)
+            and _wire_int(metadata.get("p1_fault_at")) == _wire_int(expected_parts[1])
+            and _wire_int(metadata.get("p2_fault_at")) == _wire_int(expected_parts[2])
+            and str(metadata.get("p1_fault_type")) == expected_parts[3]
+            and str(metadata.get("p2_fault_type")) == expected_parts[4]
+        )
+
+    if len(expected_parts) >= 3 and expected_parts[0] == "mf":
+        sequence = result.get("fault_sequence")
+        expected_sequence = [_wire_int(value) for value in expected_parts[1:]]
+        try:
+            observed_sequence = [int(value) for value in sequence]
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            observed == "mf"
+            and all(value is not None for value in expected_sequence)
+            and observed_sequence == expected_sequence
+        )
+
+    if len(expected_parts) >= 2 and expected_parts[0] == "i":
+        expected_address = _wire_int(expected_parts[1])
+        if expected_address is None:
+            return False
+        signal_address = _wire_int(signals.get("skip_address"))
+        if observed == "i":
+            return signal_address == expected_address
+        if len(observed_parts) >= 2 and observed_parts[0] == "i":
+            if _wire_int(observed_parts[1]) != expected_address:
+                return False
+            if len(expected_parts) >= 3:
+                observed_model = (
+                    observed_parts[2]
+                    if len(observed_parts) >= 3
+                    else signals.get("instruction_patch_model")
+                )
+                return str(observed_model) == expected_parts[2]
+            return True
+        return False
+
+    if len(expected_parts) >= 3 and expected_parts[0] == "tb":
+        addresses_match = bool(
+            len(observed_parts) >= 3
+            and observed_parts[0] == "tb"
+            and _wire_int(observed_parts[1]) == _wire_int(expected_parts[1])
+            and _wire_int(observed_parts[2]) == _wire_int(expected_parts[2])
+        )
+        if not addresses_match:
+            return False
+        if len(expected_parts) >= 4:
+            return _wire_int(signals.get("timed_bit_flip_count")) == _wire_int(
+                expected_parts[3]
+            )
+        return True
+
+    if len(expected_parts) == 3 and expected_parts[0] == "c":
+        metadata = result.get("cascade")
+        return bool(
+            observed == "cascade"
+            and isinstance(metadata, dict)
+            and _wire_int(metadata.get("write_fault_at")) == _wire_int(expected_parts[1])
+            and _wire_int(metadata.get("erase_fault_at")) == _wire_int(expected_parts[2])
+        )
+
+    return False
+
+
+def _validate_result_identity(
+    result: Any,
+    *,
+    expected_point: int,
+    expected_type: Optional[str] = None,
+    expected_control: bool = False,
+    result_label: str,
+) -> Dict[str, Any]:
+    """Validate one runtime result and restore its canonical request identity."""
+    if not isinstance(result, dict):
+        raise RenodeProtocolError(
+            "{} result must be an object, got {}".format(
+                result_label, type(result).__name__
+            )
+        )
+    observed_point = result.get("fault_requested", result.get("fault_at"))
+    observed_int = _wire_int(observed_point)
+    if observed_int is None:
+        raise RenodeProtocolError(
+            "{} result has no valid fault request identifier".format(result_label)
+        )
+    if observed_int != int(expected_point):
+        raise RenodeProtocolError(
+            "{} request mismatch: expected {}, received {}".format(
+                result_label, expected_point, observed_point
+            )
+        )
+
+    if "fault_injected" not in result or type(result.get("fault_injected")) is not bool:
+        raise RenodeProtocolError(
+            "{} result fault_injected must be a boolean".format(result_label)
+        )
+    if expected_control and result["fault_injected"]:
+        raise RenodeProtocolError(
+            "{} result claims a fault fired during a clean control".format(
+                result_label
+            )
+        )
+    for field_name in ("timeout", "infrastructure_error"):
+        if field_name in result and type(result[field_name]) is not bool:
+            raise RenodeProtocolError(
+                "{} result {} must be a boolean".format(
+                    result_label, field_name
+                )
+            )
+
+    def validate_outcome(value: Any, field_name: str) -> None:
+        if is_canonical_boot_outcome(value):
+            return
+        raise RenodeProtocolError(
+            "{} result {} must be one of {}, got {!r}".format(
+                result_label,
+                field_name,
+                ", ".join(sorted(SUPPORTED_BOOT_OUTCOMES)),
+                value,
+            )
+        )
+
+    validate_outcome(result.get("boot_outcome"), "boot_outcome")
+    for field_name in ("initial_boot_outcome", "final_boot_outcome"):
+        if field_name in result:
+            validate_outcome(result[field_name], field_name)
+
+    if "boot_cycles" in result:
+        boot_cycles = result["boot_cycles"]
+        if not isinstance(boot_cycles, list):
+            raise RenodeProtocolError(
+                "{} result boot_cycles must be a list".format(result_label)
+            )
+        for index, cycle in enumerate(boot_cycles):
+            if not isinstance(cycle, dict):
+                raise RenodeProtocolError(
+                    "{} result boot_cycles[{}] must be an object".format(
+                        result_label,
+                        index,
+                    )
+                )
+            validate_outcome(
+                cycle.get("boot_outcome"),
+                "boot_cycles[{}].boot_outcome".format(index),
+            )
+
+    if "multi_boot_analysis" in result and result["multi_boot_analysis"] is not None:
+        analysis = result["multi_boot_analysis"]
+        if not isinstance(analysis, dict):
+            raise RenodeProtocolError(
+                "{} result multi_boot_analysis must be an object".format(
+                    result_label
+                )
+            )
+        for field_name in ("initial_outcome", "final_outcome"):
+            if field_name in analysis:
+                validate_outcome(
+                    analysis[field_name],
+                    "multi_boot_analysis.{}".format(field_name),
+                )
+        if "outcomes_observed" in analysis:
+            observed = analysis["outcomes_observed"]
+            if not isinstance(observed, list):
+                raise RenodeProtocolError(
+                    "{} result multi_boot_analysis.outcomes_observed must be a list".format(
+                        result_label
+                    )
+                )
+            for index, outcome in enumerate(observed):
+                validate_outcome(
+                    outcome,
+                    "multi_boot_analysis.outcomes_observed[{}]".format(index),
+                )
+
+    result.setdefault("fault_requested", int(expected_point))
+    if expected_type is not None:
+        expected = str(expected_type)
+        observed_type = result.get("fault_type")
+        if not _fault_type_semantically_matches(expected, observed_type, result):
+            raise RenodeProtocolError(
+                "{} fault type mismatch: expected {!r}, received {!r}".format(
+                    result_label, expected, observed_type
+                )
+            )
+        if str(observed_type) != expected:
+            result.setdefault("fault_observed_type", observed_type)
+        result["fault_requested_type"] = expected
+        result["fault_type"] = expected
+    return result
+
+
+def _validate_batch_results(
+    results: Any,
+    fault_points: List[int],
+    fault_types_list: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Validate result cardinality and positional request identity."""
+    if not isinstance(results, list):
+        raise RenodeProtocolError(
+            "batch result must be a list, got {}".format(type(results).__name__)
+        )
+    if len(results) != len(fault_points):
+        raise RenodeProtocolError(
+            "batch result cardinality mismatch: requested {} point(s), received {}"
+            .format(len(fault_points), len(results))
+        )
+
+    validated: List[Dict[str, Any]] = []
+    for idx, (result, expected_point) in enumerate(zip(results, fault_points)):
+        expected_type = (
+            str(fault_types_list[idx]) if fault_types_list is not None else "w"
+        )
+        validated.append(
+            _validate_result_identity(
+                result,
+                expected_point=expected_point,
+                expected_type=expected_type,
+                result_label="batch result {}".format(idx),
+            )
+        )
+    return validated
 
 
 def run_single_point(
@@ -426,6 +740,7 @@ def run_single_point(
     is_control: bool = False,
     calibration: bool = False,
     keep_run_artifacts: bool = False,
+    expected_fault_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run a single fault point (or calibration) via renode-test."""
     label = "calibration" if calibration else ("control" if is_control else "fault_{}".format(fault_at))
@@ -437,8 +752,11 @@ def run_single_point(
     # read-fault sidecar so a failed run can't leave the previous run's
     # accounting to be picked up (mirrors run_batch).
     stale_sidecar = Path(str(result_file) + ".read_fault_summary.json")
-    if stale_sidecar.exists():
-        stale_sidecar.unlink()
+    for stale_path in (result_file, stale_sidecar):
+        try:
+            stale_path.unlink()
+        except FileNotFoundError:
+            pass
     rf_results = point_dir / "robot"
     temp_root = point_dir / ".tmp"
     bundle_dir = work_dir / ".dotnet_bundle"
@@ -513,7 +831,7 @@ def run_single_point(
         except subprocess.TimeoutExpired as exc:
             out = exc.stdout or ""
             err = exc.stderr or ""
-            raise RuntimeError(
+            raise RenodeTimeoutError(
                 "renode-test timed out for {} fault_at={} after {}s\nSTDOUT:\n{}\nSTDERR:\n{}\n"
                 "Adjust with OTA_RENODE_POINT_TIMEOUT_S (seconds; <=0 disables timeout).".format(
                     label, fault_at, process_timeout_s, out, err
@@ -531,6 +849,23 @@ def run_single_point(
             raise RuntimeError("Run did not produce {}".format(result_file))
 
         result = json.loads(result_file.read_text(encoding="utf-8"))
+        if calibration:
+            if not isinstance(result, dict):
+                raise RenodeProtocolError(
+                    "calibration result must be an object, got {}".format(
+                        type(result).__name__
+                    )
+                )
+        else:
+            result = _validate_result_identity(
+                result,
+                expected_point=point_fault_at,
+                expected_type=(
+                    "control" if is_control else expected_fault_type
+                ),
+                expected_control=is_control,
+                result_label=label,
+            )
         # Stamp the per-run read-fault sidecar onto the result so the audit
         # summary can aggregate single-point runs the same as batch runs.
         sidecar = Path(str(result_file) + ".read_fault_summary.json")
@@ -719,8 +1054,11 @@ def run_batch(
     # front so a failed run cannot leave the previous batch's accounting to be
     # picked up and double-counted against this batch's results.
     stale_sidecar = Path(str(result_file) + ".read_fault_summary.json")
-    if stale_sidecar.exists():
-        stale_sidecar.unlink()
+    for stale_path in (result_file, stale_sidecar):
+        try:
+            stale_path.unlink()
+        except FileNotFoundError:
+            pass
     rf_results = batch_dir / "robot"
     temp_root = batch_dir / ".tmp"
     bundle_dir = bundle_dir or (work_dir / ".dotnet_bundle")
@@ -844,7 +1182,7 @@ def run_batch(
         except subprocess.TimeoutExpired as exc:
             out = exc.stdout or ""
             err = exc.stderr or ""
-            raise RuntimeError(
+            raise RenodeTimeoutError(
                 "renode-test batch timed out after {}s ({} points)\nSTDOUT:\n{}\nSTDERR:\n{}\n"
                 "Adjust with OTA_RENODE_POINT_TIMEOUT_S (seconds; <=0 disables timeout).".format(
                     process_timeout_s, len(fault_points), out, err
@@ -931,6 +1269,15 @@ def _run_batch_with_fallback(
     """
     _MAX_FALLBACK_DEPTH = 10
     try:
+        if (
+            fault_types_list is not None
+            and len(fault_types_list) != len(fault_points)
+        ):
+            raise RenodeProtocolError(
+                "fault type cardinality mismatch: {} point(s), {} type(s)".format(
+                    len(fault_points), len(fault_types_list)
+                )
+            )
         results = run_batch(
             repo_root=repo_root,
             renode_test=renode_test,
@@ -948,34 +1295,41 @@ def _run_batch_with_fallback(
             bundle_dir=bundle_dir,
             keep_run_artifacts=keep_run_artifacts,
         )
+        results = _validate_batch_results(
+            results,
+            fault_points,
+            fault_types_list=fault_types_list,
+        )
         if len(fault_points) == 1:
             _progress("Fallback point {} complete.".format(fault_points[0]))
         return results
     except Exception as exc:
         if len(fault_points) <= 1 or _depth >= _MAX_FALLBACK_DEPTH:
             error_text = str(exc)
-            isolated_instruction_skip_timeout = (
-                len(fault_points) == 1
-                and bool(fault_types_list)
-                and _base_fault_type_code(fault_types_list[0]) == "i"
-                and _is_process_timeout_error(error_text)
+            verified_timeout = isinstance(exc, RenodeTimeoutError)
+            error_kind = (
+                "wall_timeout"
+                if verified_timeout
+                else "protocol_error"
+                if isinstance(exc, RenodeProtocolError)
+                else "runner_error"
             )
             if len(fault_points) <= 1:
-                if isolated_instruction_skip_timeout:
+                if verified_timeout:
                     _progress(
-                        "Fallback point {} hit the isolated execute timeout; recording synthetic no-boot result. {}".format(
+                        "Fallback point {} exceeded the verified wall timeout; recording an incomplete result. {}".format(
                             fault_points[0], error_text
                         )
                     )
                 else:
                     _progress(
-                        "Fallback point {} failed after isolation; recording synthetic timeout result. {}".format(
+                        "Fallback point {} failed after isolation; recording an infrastructure error. {}".format(
                             fault_points[0], error_text
                         )
                     )
             if _depth >= _MAX_FALLBACK_DEPTH:
                 _progress(
-                    "Fallback depth limit ({}) reached for {} points (fp {}..{}); recording synthetic timeout results. {}".format(
+                    "Fallback depth limit ({}) reached for {} points (fp {}..{}); recording incomplete results. {}".format(
                         _MAX_FALLBACK_DEPTH, len(fault_points),
                         fault_points[0], fault_points[-1],
                         error_text,
@@ -985,7 +1339,8 @@ def _run_batch_with_fallback(
                 fault_points=fault_points,
                 fault_types_list=fault_types_list,
                 error=error_text,
-                timeout=not isolated_instruction_skip_timeout,
+                timeout=verified_timeout,
+                error_kind=error_kind,
             )
         mid = max(1, len(fault_points) // 2)
         left_points = fault_points[:mid]

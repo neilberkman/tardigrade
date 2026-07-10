@@ -58,6 +58,9 @@ success_criteria:
 fault_sweep:
   mode: runtime
   fault_types: [power_loss, nvs_corruption]
+  nvs_corruption:
+    enabled: true
+    modes: [bit_flip, partial_erase, truncate, scramble]
   max_writes: auto
   run_duration: "1.0"
 

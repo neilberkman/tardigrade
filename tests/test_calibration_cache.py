@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # Ensure scripts/ is on sys.path for imports.
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
@@ -83,10 +84,19 @@ class TestComputeCacheKey(unittest.TestCase):
         self.td = tempfile.mkdtemp()
         self.elf_path = os.path.join(self.td, "boot.elf")
         self.img_path = os.path.join(self.td, "update.bin")
+        self.platform_path = os.path.join(self.td, "platform.repl")
+        self.setup_path = os.path.join(self.td, "setup.resc")
+        self.hook_path = os.path.join(self.td, "boot-hook.resc")
         with open(self.elf_path, "wb") as f:
             f.write(b"ELF_CONTENT")
         with open(self.img_path, "wb") as f:
             f.write(b"IMAGE_CONTENT")
+        with open(self.platform_path, "wb") as f:
+            f.write(b"PLATFORM_CONTENT")
+        with open(self.setup_path, "wb") as f:
+            f.write(b"SETUP_CONTENT")
+        with open(self.hook_path, "wb") as f:
+            f.write(b"HOOK_CONTENT")
 
     def tearDown(self):
         import shutil
@@ -102,6 +112,13 @@ class TestComputeCacheKey(unittest.TestCase):
             pre_boot_state=[],
             hash_bypass_symbols=[],
             write_granularity=4,
+            platform_files={"main": self.platform_path},
+            setup_files={"main": self.setup_path},
+            hook_files={"boot_cycle": self.hook_path},
+            entry_point=0x10000,
+            image_load_addresses={"update": 0x30000},
+            tool_versions={"renode": "1.16.1"},
+            runtime_config={"run_duration": "0.5", "reset_mode": "warm"},
         )
 
     def test_deterministic(self):
@@ -166,6 +183,48 @@ class TestComputeCacheKey(unittest.TestCase):
         kw["pre_boot_state"] = [{"address": 0x1000, "u32": 0xDEAD}]
         k2 = compute_cache_key(**kw)
         self.assertNotEqual(k1, k2)
+
+    def test_platform_setup_and_hook_contents_affect_key(self):
+        for key, path in (
+            ("platform_files", self.platform_path),
+            ("setup_files", self.setup_path),
+            ("hook_files", self.hook_path),
+        ):
+            with self.subTest(key=key):
+                with open(path, "rb") as stream:
+                    original = stream.read()
+                k1 = compute_cache_key(**self._default_kwargs())
+                with open(path, "wb") as stream:
+                    stream.write(original + b"_CHANGED")
+                try:
+                    k2 = compute_cache_key(**self._default_kwargs())
+                    self.assertNotEqual(k1, k2)
+                finally:
+                    with open(path, "wb") as stream:
+                        stream.write(original)
+
+    def test_entry_image_address_tool_and_runtime_inputs_affect_key(self):
+        changes = {
+            "entry_point": 0x20000,
+            "image_load_addresses": {"update": 0x40000},
+            "tool_versions": {"renode": "1.17.0"},
+            "runtime_config": {"run_duration": "1.0", "reset_mode": "cold"},
+        }
+        baseline = compute_cache_key(**self._default_kwargs())
+        for key, value in changes.items():
+            with self.subTest(key=key):
+                kwargs = self._default_kwargs()
+                kwargs[key] = value
+                self.assertNotEqual(baseline, compute_cache_key(**kwargs))
+
+    def test_checkout_location_does_not_affect_file_content_key(self):
+        copied_platform = os.path.join(self.td, "same-platform-elsewhere.repl")
+        with open(self.platform_path, "rb") as source, open(copied_platform, "wb") as dest:
+            dest.write(source.read())
+        baseline = compute_cache_key(**self._default_kwargs())
+        kwargs = self._default_kwargs()
+        kwargs["platform_files"] = {"main": copied_platform}
+        self.assertEqual(baseline, compute_cache_key(**kwargs))
 
 
 class TestSaveLoadCalibration(unittest.TestCase):
@@ -280,6 +339,19 @@ class TestSaveLoadCalibration(unittest.TestCase):
         cal = self._make_cal()
         save_calibration(nested_path, cal, "k")
         self.assertTrue(os.path.exists(nested_path))
+
+    def test_failed_atomic_replace_preserves_existing_cache(self):
+        original = b'{"old": true}\n'
+        Path(self.cache_path).write_bytes(original)
+        cal = self._make_cal()
+
+        with mock.patch("calibration_cache.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                save_calibration(self.cache_path, cal, "new-key")
+
+        self.assertEqual(Path(self.cache_path).read_bytes(), original)
+        leftovers = list(Path(self.td).glob(".cal_cache.json-*.tmp"))
+        self.assertEqual(leftovers, [])
 
 
 if __name__ == "__main__":

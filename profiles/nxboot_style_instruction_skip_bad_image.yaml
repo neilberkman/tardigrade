@@ -34,7 +34,6 @@ fault_sweep:
     target_addresses:
       - { symbol: validate_image }
       - { symbol: copy_partition }
-      - { symbol: get_state }
     skip_count: 1
 skip_self_test: true
 expect:

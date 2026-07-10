@@ -1,5 +1,8 @@
 name: renode-latest-canary
 
+permissions:
+  contents: read
+
 on:
   schedule:
     - cron: '0 10 * * *'
@@ -17,16 +20,18 @@ jobs:
       TOOLCHAIN_VERSION: 13.2.1-1.1
       TOOLCHAIN_URL: https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v13.2.1-1.1/xpack-arm-none-eabi-gcc-13.2.1-1.1-linux-x64.tar.gz
       TOOLCHAIN_SHA256: 1252a8cafe9237de27a765376697230368eec21db44dc3f1edeb8d838dabd530
-      RENODE_URL: https://builds.renode.io/renode-latest.linux-portable.tar.gz
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install pinned Arm GNU toolchain
         run: |
           set -euxo pipefail
           tarball="${RUNNER_TEMP}/arm-toolchain.tar.gz"
-          curl -L "${TOOLCHAIN_URL}" -o "${tarball}"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            "${TOOLCHAIN_URL}" -o "${tarball}"
           echo "${TOOLCHAIN_SHA256}  ${tarball}" | sha256sum -c -
           tar -xzf "${tarball}" -C "${RUNNER_TEMP}"
           echo "${RUNNER_TEMP}/xpack-arm-none-eabi-gcc-${TOOLCHAIN_VERSION}/bin" >> "${GITHUB_PATH}"
@@ -39,17 +44,21 @@ jobs:
           make -C examples/naive_copy
           make -C examples/nxboot_style
           make -C examples/esp_idf_ota
-          make -C examples/riotboot_standalone
           python3 examples/nxboot_style/gen_nxboot_images.py --output-dir examples/nxboot_style
 
       - name: Install latest Renode portable
         run: |
           set -euxo pipefail
           tarball="${RUNNER_TEMP}/renode-latest.tar.gz"
-          curl -L "${RENODE_URL}" -o "${tarball}"
+          python3 scripts/action_helpers.py download-latest-github-release \
+            --repository renode/renode \
+            --asset-suffix .linux-portable.tar.gz \
+            --output "${tarball}"
           mkdir -p "${RUNNER_TEMP}/renode"
           tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
-          python3 -m pip install -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+          python3 -m pip install \
+            -c requirements-renode-constraints.txt \
+            -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
           echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
           "${RUNNER_TEMP}/renode/renode-test" --help >/dev/null
 
@@ -74,7 +83,7 @@ jobs:
 
       - name: Upload canary artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: renode-latest-canary
           path: |

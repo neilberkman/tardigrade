@@ -1,5 +1,8 @@
 name: profile-sweep
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:
@@ -26,34 +29,44 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     env:
-      RENODE_URL: https://builds.renode.io/renode-1.16.1.linux-dotnet.tar.gz
+      RENODE_URL: https://github.com/renode/renode/releases/download/v1.16.1/renode-1.16.1.linux-dotnet.tar.gz
+      RENODE_SHA256: 62629caa331ed4bd4eb7abe13ee2e4834fbcaa70de492db3965fafa4edc5694f
       PYTHONUNBUFFERED: "1"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install Renode portable
         run: |
           set -euxo pipefail
           tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
-          curl -L "${RENODE_URL}" -o "${tarball}"
+          python3 scripts/action_helpers.py download-renode \
+            --url "${RENODE_URL}" --sha256 "${RENODE_SHA256}" --output "${tarball}"
           mkdir -p "${RUNNER_TEMP}/renode"
           tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
-          python3 -m pip install --user -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+          python3 -m pip install --user \
+            -c requirements-renode-constraints.txt \
+            -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
           echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
 
       - name: Install Python dependencies
         run: python3 -m pip install --user -r requirements.txt
 
       - name: Run profile sweep
+        env:
+          PROFILE_INPUT: ${{ inputs.profile }}
+          WORKERS_INPUT: ${{ inputs.workers }}
+          EXHAUSTIVE_INPUT: ${{ inputs.exhaustive }}
         run: |
           args=(
-            --profile "${{ inputs.profile }}"
+            --profile "${PROFILE_INPUT}"
             --renode-test "${RUNNER_TEMP}/renode/renode-test"
             --output results/profile_sweep.json
-            --workers "${{ inputs.workers }}"
+            --workers "${WORKERS_INPUT}"
           )
-          if [ "${{ inputs.exhaustive }}" = "true" ]; then
+          if [ "${EXHAUSTIVE_INPUT}" = "true" ]; then
             args+=(--fault-start 0)
           fi
           # Don't fail on verdict assertions — this workflow is for data collection.
@@ -82,7 +95,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: profile-sweep-results
           path: results/profile_sweep.json

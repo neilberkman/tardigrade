@@ -15,7 +15,16 @@ inputs:
   renode-url:
     description: Renode portable tarball URL
     required: false
-    default: https://builds.renode.io/renode-1.16.1.linux-dotnet.tar.gz
+    default: https://github.com/renode/renode/releases/download/v1.16.1/renode-1.16.1.linux-portable-dotnet.tar.gz
+  renode-sha256:
+    description: SHA-256 of the Renode portable tarball
+    required: false
+    # Published by renode/renode release metadata for v1.16.1.
+    default: 00e113cdbd0f5354cf2f64bbe3f5a070d8958409542fca66e45ac97d982938c0
+  asset-root:
+    description: Directory, relative to the caller workspace, used to resolve profile assets
+    required: false
+    default: "."
   workers:
     description: Number of parallel Renode workers for sweep
     required: false
@@ -35,36 +44,79 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Install Renode portable
+    - name: Prepare isolated open-source runtime
+      id: runtime
       shell: bash
+      env:
+        TARDIGRADE_ACTION_PATH: ${{ github.action_path }}
+        RENODE_URL_INPUT: ${{ inputs.renode-url }}
+        RENODE_SHA256_INPUT: ${{ inputs.renode-sha256 }}
+        RUNNER_OS_INPUT: ${{ runner.os }}
+        RUNNER_ARCH_INPUT: ${{ runner.arch }}
       run: |
         set -euo pipefail
-        tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
-        python3 -c "import urllib.request; urllib.request.urlretrieve('${{ inputs.renode-url }}', '${tarball}')"
-        mkdir -p "${RUNNER_TEMP}/renode"
-        tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
-        python3 -m pip install -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
-        echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
+        TARDIGRADE="${TARDIGRADE_ACTION_PATH}"
+        if [ ! -d "${TARDIGRADE}" ] && [ -d "/__w${TARDIGRADE#/home/runner/work}" ]; then
+          TARDIGRADE="/__w${TARDIGRADE#/home/runner/work}"
+        fi
+        helper="${TARDIGRADE}/scripts/action_helpers.py"
+        python3 "${helper}" validate-runner \
+          --os "${RUNNER_OS_INPUT}" --arch "${RUNNER_ARCH_INPUT}" >/dev/null
 
-    - name: Install Python dependencies
-      shell: bash
-      run: python3 -m pip install -r "${{ github.action_path }}/requirements.txt"
+        runtime_root="$(mktemp -d "${RUNNER_TEMP}/tardigrade-runtime.XXXXXX")"
+        renode_dir="${runtime_root}/renode"
+        venv_dir="${runtime_root}/venv"
+        tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
+        python3 "${helper}" download-renode \
+          --url "${RENODE_URL_INPUT}" \
+          --sha256 "${RENODE_SHA256_INPUT}" \
+          --output "${tarball}"
+        mkdir -p "${renode_dir}"
+        tar -xzf "${tarball}" -C "${renode_dir}" --strip-components=1
+        python3 -m venv "${venv_dir}"
+        "${venv_dir}/bin/python" -m pip install \
+          -c "${TARDIGRADE}/requirements-renode-constraints.txt" \
+          -r "${renode_dir}/tests/requirements.txt"
+        "${venv_dir}/bin/python" -m pip install \
+          -r "${TARDIGRADE}/requirements.txt"
+        "${venv_dir}/bin/python" -m pip check
+        echo "renode_dir=${renode_dir}" >> "${GITHUB_OUTPUT}"
+        echo "venv_python=${venv_dir}/bin/python" >> "${GITHUB_OUTPUT}"
 
     - name: Run audit
       id: run
       shell: bash
+      env:
+        TARDIGRADE_ACTION_PATH: ${{ github.action_path }}
+        PROFILE_INPUT: ${{ inputs.profile }}
+        ASSET_ROOT_INPUT: ${{ inputs.asset-root }}
+        QUICK_INPUT: ${{ inputs.quick }}
+        WORKERS_INPUT: ${{ inputs.workers }}
+        TARDIGRADE_RENODE_DIR: ${{ steps.runtime.outputs.renode_dir }}
+        TARDIGRADE_VENV_PYTHON: ${{ steps.runtime.outputs.venv_python }}
       run: |
         set -euo pipefail
-        TARDIGRADE="${{ github.action_path }}"
+        TARDIGRADE="${TARDIGRADE_ACTION_PATH}"
         # Fix path inside Docker containers: host /home/runner/work maps to /__w
         if [ ! -d "${TARDIGRADE}" ] && [ -d "/__w${TARDIGRADE#/home/runner/work}" ]; then
           TARDIGRADE="/__w${TARDIGRADE#/home/runner/work}"
         fi
+        helper="${TARDIGRADE}/scripts/action_helpers.py"
         REPORT="${RUNNER_TEMP}/tardigrade_report.json"
-        QUICK="${{ inputs.quick }}"
+        export PATH="$(dirname "${TARDIGRADE_VENV_PYTHON}"):${TARDIGRADE_RENODE_DIR}:${PATH}"
 
-        # Resolve profile to absolute path before cd'ing into the action dir.
-        PROFILE="$(cd "${GITHUB_WORKSPACE}" && realpath "${{ inputs.profile }}")"
+        QUICK="$("${TARDIGRADE_VENV_PYTHON}" "${helper}" normalize-bool \
+          --name quick --value "${QUICK_INPUT}")"
+        WORKERS="$("${TARDIGRADE_VENV_PYTHON}" "${helper}" normalize-positive-int \
+          --name workers --value "${WORKERS_INPUT}" --maximum 64)"
+        PROFILE="$("${TARDIGRADE_VENV_PYTHON}" "${helper}" resolve \
+          --workspace "${GITHUB_WORKSPACE}" \
+          --path "${PROFILE_INPUT}" \
+          --kind file)"
+        ASSET_ROOT="$("${TARDIGRADE_VENV_PYTHON}" "${helper}" resolve \
+          --workspace "${GITHUB_WORKSPACE}" \
+          --path "${ASSET_ROOT_INPUT}" \
+          --kind directory)"
 
         # Remove stale report from prior invocation.
         rm -f "${REPORT}"
@@ -72,19 +124,20 @@ runs:
         args=(
           --profile "${PROFILE}"
           --output "${REPORT}"
-          --renode-test "${RUNNER_TEMP}/renode/renode-test"
+          --renode-test "${TARDIGRADE_RENODE_DIR}/renode-test"
+          --repo-root "${ASSET_ROOT}"
+          --robot-suite "${TARDIGRADE}/tests/ota_fault_point.robot"
+          --strict-profile
         )
         if [ "${QUICK}" = "true" ]; then
           args+=(--quick)
         fi
-        WORKERS="${{ inputs.workers }}"
-        if [ -n "${WORKERS}" ] && [ "${WORKERS}" != "1" ]; then
+        if [ "${WORKERS}" != "1" ]; then
           args+=(--workers "${WORKERS}")
         fi
 
-        cd "${TARDIGRADE}"
         set +e
-        python3 scripts/audit_bootloader.py "${args[@]}"
+        "${TARDIGRADE_VENV_PYTHON}" "${TARDIGRADE}/scripts/audit_bootloader.py" "${args[@]}"
         audit_exit=$?
         set -e
 
@@ -96,19 +149,10 @@ runs:
           exit 1
         fi
 
-        verdict=$(python3 -c "import json,sys; r=json.load(open('${REPORT}')); print('PASS' if str(r['verdict']).startswith('PASS') else 'FAIL')")
-        brick_rate=$(python3 -c "import json; r=json.load(open('${REPORT}')); print(r.get('summary',{}).get('runtime_sweep',{}).get('brick_rate',0))")
-
-        echo "verdict=${verdict}" >> "${GITHUB_OUTPUT}"
-        echo "brick_rate=${brick_rate}" >> "${GITHUB_OUTPUT}"
-        echo "report_path=${REPORT}" >> "${GITHUB_OUTPUT}"
-
-        if [ "${verdict}" = "FAIL" ]; then
-          echo "::error::Tardigrade verdict: FAIL (brick rate: ${brick_rate})"
+        if ! "${TARDIGRADE_VENV_PYTHON}" "${helper}" publish-report \
+          --report "${REPORT}" \
+          --github-output "${GITHUB_OUTPUT}" \
+          --audit-exit "${audit_exit}"; then
+          echo "::error::Tardigrade audit failed or returned a non-PASS verdict"
           exit 1
-        fi
-
-        # Non-zero audit exit with PASS verdict indicates infrastructure issue.
-        if [ "${audit_exit}" -ne 0 ]; then
-          echo "::warning::Audit exited ${audit_exit} but verdict was PASS"
         fi

@@ -3,8 +3,9 @@
  *
  * This reimplements the nxboot data structures and constants from
  * nuttx-apps/boot/nxboot/include/nxboot.h for bare-metal use without
- * any NuttX dependencies.  The algorithm is identical; only the flash
- * I/O layer is replaced with direct memory-mapped access.
+ * any NuttX dependencies. The model preserves the core three-partition
+ * decision flow while reducing the state/header representation and replacing
+ * the flash I/O layer with direct memory-mapped access.
  *
  * Three-partition copy-based bootloader:
  *   - Primary  (slot 0): where firmware executes from
@@ -17,7 +18,12 @@
  *   - Confirmation = recovery copy exists with matching CRC
  *   - Revert = copy recovery -> primary if primary is unconfirmed
  *
- * Reference: https://github.com/apache/nuttx-apps/tree/master/boot/nxboot
+ * Public protocol/content baseline:
+ * https://github.com/apache/nuttx-apps/tree/45d4c7098bb3a7a6d9b5642efc47df5998c048d5/boot/nxboot
+ *
+ * Modified for Tardigrade in 2026: reduced the upstream header and state
+ * structures for a standalone bare-metal model and added defect controls.
+ * See LICENSES/NUTTX-NOTICE.txt.
  * License of this standalone reimplementation: Apache-2.0
  */
 

@@ -1,0 +1,4 @@
+# Open-source PyPI constraints for the two ranged dependencies in the
+# verified Renode 1.16.1 tests/requirements.txt archive.
+PyYAML==6.0.3
+telnetlib3==2.0.8

@@ -30,7 +30,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fault_inject import BootloaderRegionConfig, FaultDistributionConfig, MetadataFaultRegion
+from fault_types import (
+    CLASSIFICATION_ONLY_FAULT_TYPES,
+    I2C_FAULT_TYPE_CODES,
+    IMPLEMENTED_FAULT_TYPES,
+    KNOWN_FAULT_TYPES,
+    OTP_FAULT_TYPE_CODES,
+    PHASE2_FAULT_TYPES,
+)
 from thumb_instructions import enumerate_instruction_skip_addresses, make_elf_halfword_reader
+from boot_outcomes import DEVICE_BOOT_OUTCOMES
 
 try:
     import yaml
@@ -44,6 +53,13 @@ except ImportError:
 
 
 SUPPORTED_SCHEMA_VERSIONS = {1}
+
+MAX_PROFILE_FAULT_POINTS = 1_000_000
+MAX_PROFILE_STEP_LIMIT = 2_000_000_000
+MAX_STATE_FUZZ_ITERATIONS = 100_000
+MAX_MULTI_FAULT_PAIRS = 100_000
+MAX_MULTI_FAULTS_PER_RUN = 64
+MAX_BOOT_CYCLES = 1_000
 
 _MAX_INHERITANCE_DEPTH = 10
 
@@ -90,8 +106,14 @@ def _deep_merge_profile_data(base: Any, override: Any) -> Any:
     return override
 
 
-def _resolve_base_profile(data: Dict[str, Any], profile_path: Path,
-                           _seen: Optional[tuple] = None) -> Dict[str, Any]:
+def _resolve_base_profile(
+    data: Dict[str, Any],
+    profile_path: Path,
+    _seen: Optional[tuple] = None,
+    *,
+    _strict_root: Optional[Path] = None,
+    _base_chain: Optional[List[Tuple[str, Path]]] = None,
+) -> Dict[str, Any]:
     """Resolve ``base_profile`` inheritance chain.
 
     If *data* contains a ``base_profile`` key, the referenced profile is loaded,
@@ -108,8 +130,22 @@ def _resolve_base_profile(data: Dict[str, Any], profile_path: Path,
     if yaml is None:
         raise ProfileError("PyYAML is required for profile loading.")
 
+    if _strict_root is not None:
+        _validate_strict_relative_path(base_rel, "base_profile")
+
     # Resolve the base path relative to the directory of the current profile.
     base_path = (profile_path.parent / base_rel).resolve()
+    if _strict_root is not None:
+        strict_root = _strict_root.resolve()
+        try:
+            base_path.relative_to(strict_root)
+        except ValueError as exc:
+            raise ProfileError(
+                "base_profile {!r} escapes strict profile boundary {} "
+                "(resolved to {})".format(base_rel, strict_root, base_path)
+            ) from exc
+    if _base_chain is not None:
+        _base_chain.append((str(base_rel), base_path))
     if not base_path.exists():
         raise ProfileError(
             "base_profile '{}' not found (resolved to {})".format(base_rel, base_path)
@@ -141,105 +177,16 @@ def _resolve_base_profile(data: Dict[str, Any], profile_path: Path,
 
     # Recursively resolve the base's own base_profile, passing the growing
     # set of seen paths.
-    base_data = _resolve_base_profile(base_data, base_path, _seen=tuple(seen))
+    base_data = _resolve_base_profile(
+        base_data,
+        base_path,
+        _seen=tuple(seen),
+        _strict_root=_strict_root,
+        _base_chain=_base_chain,
+    )
 
     # Deep-merge: child overrides base.
     return _deep_merge_profile_data(base_data, data)
-
-KNOWN_FAULT_TYPES = {
-    "power_loss",
-    "swap_progress",
-    "interrupted_erase",
-    "bit_corruption",
-    "silent_write_failure",
-    "driver_error",
-    "rc_injection",
-    "write_disturb",
-    "multi_sector_atomicity",
-    "wear_leveling_corruption",
-    "write_rejection",
-    "reset_at_time",
-    "read_bit_flip",
-    "command_drop",
-    "bootloader_region_write",
-    "nvs_corruption",
-    "instruction_skip",
-    "i2c_nack",
-    "i2c_timeout",
-    "i2c_bit_flip",
-    "i2c_truncated",
-    "i2c_wrong_address",
-    "otp_partial_program",
-    "otp_stuck_bit",
-    "otp_read_disturb",
-    "otp_overblow",
-    "otp_blow_nop",
-    "timed_bit_corruption",
-    "phase2_fault",
-    "hook_fault",
-    "metadata_fault",
-    "confirm_cycle",
-}
-IMPLEMENTED_FAULT_TYPES = {
-    "power_loss",
-    "swap_progress",
-    "interrupted_erase",
-    "bit_corruption",
-    "silent_write_failure",
-    "driver_error",
-    "rc_injection",
-    "write_disturb",
-    "multi_sector_atomicity",
-    "wear_leveling_corruption",
-    "write_rejection",
-    "reset_at_time",
-    "read_bit_flip",
-    "command_drop",
-    "nvs_corruption",
-    "instruction_skip",
-    "i2c_nack",
-    "i2c_timeout",
-    "i2c_bit_flip",
-    "i2c_truncated",
-    "i2c_wrong_address",
-    "otp_partial_program",
-    "otp_stuck_bit",
-    "otp_read_disturb",
-    "otp_overblow",
-    "otp_blow_nop",
-    "timed_bit_corruption",
-}
-
-# Fault types that are classification/heuristic labels, not injectable fault
-# mechanisms.  They appear in KNOWN_FAULT_TYPES (so profiles can reference them
-# for heuristic tuning) but are NOT in IMPLEMENTED_FAULT_TYPES because the
-# sweep planner does not generate fault points for them directly.
-CLASSIFICATION_ONLY_FAULT_TYPES = {
-    "bootloader_region_write",
-    "phase2_fault",
-    "hook_fault",
-    "metadata_fault",
-    "confirm_cycle",
-}
-
-# Map OTP fault type names to their OTPMemory BlowFaultMode codes.
-OTP_FAULT_TYPE_CODES = {
-    "otp_partial_program": 0,
-    "otp_stuck_bit": 1,
-    "otp_read_disturb": 2,
-    "otp_overblow": 3,
-    "otp_blow_nop": 4,
-}
-
-# Map I2C fault type names to their I2CFaultProxy FaultType codes.
-I2C_FAULT_TYPE_CODES = {
-    "i2c_nack": 1,
-    "i2c_timeout": 2,
-    "i2c_bit_flip": 3,
-    "i2c_truncated": 4,
-    "i2c_wrong_address": 5,
-}
-
 
 class ProfileError(Exception):
     """Raised when a profile is invalid or unsupported."""
@@ -433,9 +380,20 @@ class MultiFaultConfig:
     ) -> None:
         self.enabled = enabled
         self.max_faults_per_run = max(2, int(max_faults_per_run))
+        if self.max_faults_per_run > MAX_MULTI_FAULTS_PER_RUN:
+            raise ProfileError(
+                "fault_sweep.multi_fault.max_faults_per_run exceeds safety "
+                "limit {}".format(MAX_MULTI_FAULTS_PER_RUN)
+            )
         self.strategy = strategy
         self.fallback_strategy = fallback_strategy
         self.max_pairs = max(1, int(max_pairs))
+        if self.max_pairs > MAX_MULTI_FAULT_PAIRS:
+            raise ProfileError(
+                "fault_sweep.multi_fault.max_pairs exceeds safety limit {}".format(
+                    MAX_MULTI_FAULT_PAIRS
+                )
+            )
         self.seed = seed
         self.sequences = sequences or []
 
@@ -454,6 +412,12 @@ class Phase2FaultConfig:
         self.enabled = enabled
         self.fault_types = fault_types or ["power_loss"]
         self.max_points = max(0, int(max_points))
+        if self.max_points > MAX_PROFILE_FAULT_POINTS:
+            raise ProfileError(
+                "fault_sweep.phase2_fault.max_points exceeds safety limit {}".format(
+                    MAX_PROFILE_FAULT_POINTS
+                )
+            )
 
 
 class HookFaultConfig:
@@ -470,6 +434,12 @@ class HookFaultConfig:
         self.enabled = enabled
         self.fault_types = fault_types or ["power_loss"]
         self.max_points = max(0, int(max_points))
+        if self.max_points > MAX_PROFILE_FAULT_POINTS:
+            raise ProfileError(
+                "fault_sweep.hook_fault.max_points exceeds safety limit {}".format(
+                    MAX_PROFILE_FAULT_POINTS
+                )
+            )
 
 
 class ConfirmCycleConfig:
@@ -505,6 +475,12 @@ class ConfirmCycleConfig:
         self.expected_ratchet_version = expected_ratchet_version
         self.fault_types = fault_types or ["power_loss"]
         self.max_points = max(0, int(max_points))
+        if self.max_points > MAX_PROFILE_FAULT_POINTS:
+            raise ProfileError(
+                "fault_sweep.confirm_cycle.max_points exceeds safety limit {}".format(
+                    MAX_PROFILE_FAULT_POINTS
+                )
+            )
 
 
 class ReadFaultConfig:
@@ -806,7 +782,36 @@ class ComponentConfig:
         Inherits expect, invariants, and other top-level settings from
         the parent multi-component profile.
         """
-        return ProfileConfig(
+        # Component-local execution inputs win when present.  Otherwise carry
+        # the fully resolved parent contract (including a selected initial
+        # state) into the standalone component campaign.
+        has_resolved_initial_state = bool(
+            getattr(parent, "resolved_initial_state_name", None)
+        )
+        component_pre_boot_state = (
+            list(parent.pre_boot_state)
+            if has_resolved_initial_state
+            else (
+                list(self.pre_boot_state)
+                if self.pre_boot_state
+                else list(parent.pre_boot_state)
+            )
+        )
+        component_setup_script = (
+            parent.setup_script
+            if has_resolved_initial_state
+            else (self.setup_script or parent.setup_script)
+        )
+        component_extra_peripherals = list(parent.extra_peripherals)
+        for peripheral in self.extra_peripherals:
+            if peripheral not in component_extra_peripherals:
+                component_extra_peripherals.append(peripheral)
+        component_bootloader_region = (
+            getattr(self.memory, "bootloader_region", None)
+            or parent.bootloader_region
+        )
+
+        resolved = ProfileConfig(
             schema_version=parent.schema_version,
             name="{}/{}".format(parent.name, self.name),
             description="Component '{}' of {}".format(self.name, parent.name),
@@ -815,19 +820,50 @@ class ComponentConfig:
             bootloader_entry=self.bootloader_entry,
             memory=self.memory,
             images=self.images,
-            pre_boot_state=list(self.pre_boot_state),
-            setup_script=self.setup_script,
-            extra_peripherals=self.extra_peripherals,
+            pre_boot_state=component_pre_boot_state,
+            setup_script=component_setup_script,
+            extra_peripherals=component_extra_peripherals,
             success_criteria=self.success_criteria,
             fault_sweep=self.fault_sweep or parent.fault_sweep,
             state_fuzzer=parent.state_fuzzer,
             expect=parent.expect,
             profile_path=parent.profile_path,
             scenario=parent.scenario,
+            update_trigger=parent.update_trigger,
             update_sequence=parent.update_sequence,
-            flash_backend=self.flash_backend,
+            state_probe=parent.state_probe,
+            semantic_assertions=parent.semantic_assertions,
+            invariants=parent.invariants,
+            invariant_providers=parent.invariant_providers,
+            invariant_config=parent.invariant_config,
+            flash_backend=self.flash_backend or parent.flash_backend,
+            nvm_controller=parent.nvm_controller,
+            otp_peripheral=parent.otp_peripheral,
+            initial_states=[],
+            metadata_fault_regions=parent.metadata_fault_regions,
+            nvs_region=parent.nvs_region,
+            security_policy=parent.security_policy,
+            bootloader_region=component_bootloader_region,
             success_criteria_overrides=parent.success_criteria_overrides,
+            boot_register_pre_writes=parent.boot_register_pre_writes,
+            boot_registers=parent.boot_registers,
+            write_order_constraints=parent.write_order_constraints,
+            fuzz_corpus=parent.fuzz_corpus,
+            residual_image=parent.residual_image,
+            firmware_elf=parent.firmware_elf,
         )
+        resolved.auto_update_trigger = bool(
+            getattr(parent, "auto_update_trigger", False)
+        )
+        resolved.image_load_addresses = dict(
+            getattr(parent, "image_load_addresses", {}) or {}
+        )
+        resolved.resolved_initial_state_name = getattr(
+            parent,
+            "resolved_initial_state_name",
+            None,
+        )
+        return resolved
 
 
 class MultiComponentConfig:
@@ -930,6 +966,41 @@ class NvsCorruptionConfig:
         self.erase_fractions = erase_fractions or [0.25, 0.5, 1.0]
         self.truncate_offsets = truncate_offsets
         self.seed = seed
+
+    def variant_specs(self) -> List[Dict[str, Any]]:
+        """Expand configured NVS tuning values into runtime fault variants."""
+        variants: List[Dict[str, Any]] = []
+        for mode in self.modes:
+            if mode == "bit_flip":
+                variants.extend(
+                    {"mode": mode, "bit_flip_count": int(count)}
+                    for count in self.bit_flip_counts
+                )
+            elif mode == "partial_erase":
+                variants.extend(
+                    {"mode": mode, "erase_fraction": float(fraction)}
+                    for fraction in self.erase_fractions
+                )
+            elif mode == "truncate":
+                offsets = (
+                    self.truncate_offsets
+                    if self.truncate_offsets is not None
+                    else [16]
+                )
+                variants.extend(
+                    {"mode": mode, "truncate_offset": offset}
+                    for offset in offsets
+                )
+            elif mode == "scramble":
+                variants.append({"mode": mode})
+
+        if len(variants) > MAX_PROFILE_FAULT_POINTS:
+            raise ProfileError(
+                "fault_sweep.nvs_corruption expands beyond safety limit {}".format(
+                    MAX_PROFILE_FAULT_POINTS
+                )
+            )
+        return variants
 
 
 class HeuristicConfig:
@@ -1052,6 +1123,7 @@ class FaultSweepConfig:
     __slots__ = (
         "mode",
         "max_writes",
+        "max_otp_blows",
         "max_writes_cap",
         "max_step_limit",
         "run_duration",
@@ -1094,6 +1166,7 @@ class FaultSweepConfig:
         self,
         mode: str = "runtime",
         max_writes: Any = "auto",
+        max_otp_blows: Optional[int] = None,
         max_writes_cap: int = 100000,
         max_step_limit: int = 500000,
         run_duration: str = "0.5",
@@ -1133,8 +1206,52 @@ class FaultSweepConfig:
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
-        self.max_writes_cap = max_writes_cap
-        self.max_step_limit = max_step_limit
+        if not (
+            isinstance(max_writes, str)
+            and max_writes.strip().lower() == "auto"
+        ):
+            try:
+                fixed_writes = int(max_writes)
+            except (TypeError, ValueError) as exc:
+                raise ProfileError(
+                    "fault_sweep.max_writes must be 'auto' or an integer"
+                ) from exc
+            if fixed_writes < 0 or fixed_writes > MAX_PROFILE_FAULT_POINTS:
+                raise ProfileError(
+                    "fault_sweep.max_writes must be between 0 and {}".format(
+                        MAX_PROFILE_FAULT_POINTS
+                    )
+                )
+        self.max_otp_blows = (
+            None if max_otp_blows is None else int(max_otp_blows)
+        )
+        if self.max_otp_blows is not None and self.max_otp_blows < 1:
+            raise ProfileError(
+                "fault_sweep.max_otp_blows must be >= 1 when configured"
+            )
+        if (
+            self.max_otp_blows is not None
+            and self.max_otp_blows > MAX_PROFILE_FAULT_POINTS
+        ):
+            raise ProfileError(
+                "fault_sweep.max_otp_blows exceeds safety limit {}".format(
+                    MAX_PROFILE_FAULT_POINTS
+                )
+            )
+        self.max_writes_cap = int(max_writes_cap)
+        if self.max_writes_cap < 1 or self.max_writes_cap > MAX_PROFILE_FAULT_POINTS:
+            raise ProfileError(
+                "fault_sweep.max_writes_cap must be between 1 and {}".format(
+                    MAX_PROFILE_FAULT_POINTS
+                )
+            )
+        self.max_step_limit = int(max_step_limit)
+        if self.max_step_limit < 1 or self.max_step_limit > MAX_PROFILE_STEP_LIMIT:
+            raise ProfileError(
+                "fault_sweep.max_step_limit must be between 1 and {}".format(
+                    MAX_PROFILE_STEP_LIMIT
+                )
+            )
         self.run_duration = run_duration
         self.calibration_time_slice = (
             str(calibration_time_slice).strip()
@@ -1153,6 +1270,12 @@ class FaultSweepConfig:
         self.sweep_hash_bypass_symbols = sweep_hash_bypass_symbols or []
         self.progress_stall_timeout_s = progress_stall_timeout_s
         self.boot_cycles = max(1, int(boot_cycles))
+        if self.boot_cycles > MAX_BOOT_CYCLES:
+            raise ProfileError(
+                "fault_sweep.boot_cycles exceeds safety limit {}".format(
+                    MAX_BOOT_CYCLES
+                )
+            )
         self.boot_cycle_hook = str(boot_cycle_hook).strip() if boot_cycle_hook else None
         self.expected_rollback_at_cycle = (
             None
@@ -1183,6 +1306,15 @@ class FaultSweepConfig:
                     self.max_heuristic_points
                 )
             )
+        if (
+            self.max_heuristic_points is not None
+            and self.max_heuristic_points > MAX_PROFILE_FAULT_POINTS
+        ):
+            raise ProfileError(
+                "fault_sweep.max_heuristic_points exceeds safety limit {}".format(
+                    MAX_PROFILE_FAULT_POINTS
+                )
+            )
         self.boot_registers = boot_registers or []
         self.reset_mode = reset_mode if reset_mode in ("warm", "cold") else "warm"
         self.write_order_constraints = write_order_constraints or []
@@ -1204,6 +1336,12 @@ class StateFuzzerConfig:
         self.enabled = bool(enabled)
         self.metadata_model = metadata_model
         self.iterations = max(1, int(iterations))
+        if self.iterations > MAX_STATE_FUZZ_ITERATIONS:
+            raise ProfileError(
+                "state_fuzzer.iterations exceeds safety limit {}".format(
+                    MAX_STATE_FUZZ_ITERATIONS
+                )
+            )
         self.seed = int(seed)
 
 
@@ -1262,6 +1400,17 @@ class ExpectConfig:
         required_issue_reasons: Optional[List[str]] = None,
         ignored_issue_fault_types: Optional[List[str]] = None,
     ) -> None:
+        for field_name, value in (
+            ("should_find_issues", should_find_issues),
+            ("allow_semantic_only_issues", allow_semantic_only_issues),
+            ("allow_control_only_issues", allow_control_only_issues),
+        ):
+            if type(value) is not bool:
+                raise ProfileError(
+                    "expect.{}: expected boolean, got {}".format(
+                        field_name, type(value).__name__
+                    )
+                )
         self.should_find_issues = should_find_issues
         self.control_outcome = control_outcome
         self.allow_semantic_only_issues = allow_semantic_only_issues
@@ -1329,6 +1478,12 @@ class UpdatePhase:
         self.pre_boot_state = pre_boot_state or []
         self.success_criteria = success_criteria or SuccessCriteria()
         self.boot_cycles = max(1, int(boot_cycles))
+        if self.boot_cycles > MAX_BOOT_CYCLES:
+            raise ProfileError(
+                "update_sequence.boot_cycles exceeds safety limit {}".format(
+                    MAX_BOOT_CYCLES
+                )
+            )
         self.boot_cycle_hook = str(boot_cycle_hook).strip() if boot_cycle_hook else None
         self.expected_rollback_at_cycle = (
             None
@@ -1421,25 +1576,6 @@ def _align_down(value: int, align: int) -> int:
     return value - (value % align)
 
 
-def _fletcher32(data: bytes) -> int:
-    """Fletcher32 checksum (RIOT OS compatible)."""
-    assert len(data) % 2 == 0
-    words = struct.unpack("<{}H".format(len(data) // 2), data)
-    sum1, sum2 = 0xFFFF, 0xFFFF
-    i = 0
-    while i < len(words):
-        batch = min(359, len(words) - i)
-        for j in range(batch):
-            sum1 += words[i + j]
-            sum2 += sum1
-        sum1 = (sum1 & 0xFFFF) + (sum1 >> 16)
-        sum2 = (sum2 & 0xFFFF) + (sum2 >> 16)
-        i += batch
-    sum1 = (sum1 & 0xFFFF) + (sum1 >> 16)
-    sum2 = (sum2 & 0xFFFF) + (sum2 >> 16)
-    return (sum2 << 16) | sum1
-
-
 VALID_SCENARIOS = {"runtime"}
 
 
@@ -1511,6 +1647,7 @@ class ProfileConfig:
         self.scenario = scenario
         self.update_trigger = update_trigger
         self.auto_update_trigger = False
+        self.resolved_initial_state_name: Optional[str] = None
         self.image_load_addresses: Dict[str, int] = {}
         self.update_sequence: List[UpdatePhase] = update_sequence or []
         self.state_probe = state_probe
@@ -1526,7 +1663,32 @@ class ProfileConfig:
         self.metadata_fault_regions: List[MetadataFaultRegion] = metadata_fault_regions or []
         self.multi_component: Optional[MultiComponentConfig] = multi_component
         self.nvs_region = nvs_region
-        self.bootloader_region: Optional[BootloaderRegionConfig] = bootloader_region
+        memory_bootloader_region = getattr(memory, "bootloader_region", None)
+        if bootloader_region is not None and memory_bootloader_region is not None:
+            top_level_range = (bootloader_region.base, bootloader_region.size)
+            memory_range = (
+                memory_bootloader_region.base,
+                memory_bootloader_region.size,
+            )
+            if top_level_range != memory_range:
+                raise ProfileError(
+                    "bootloader_region conflicts with memory.bootloader_region: "
+                    "top-level is base=0x{:X}, size=0x{:X}; memory is "
+                    "base=0x{:X}, size=0x{:X}".format(
+                        bootloader_region.base,
+                        bootloader_region.size,
+                        memory_bootloader_region.base,
+                        memory_bootloader_region.size,
+                    )
+                )
+        canonical_bootloader_region = bootloader_region or memory_bootloader_region
+        self.bootloader_region: Optional[BootloaderRegionConfig] = (
+            canonical_bootloader_region
+        )
+        # ``memory.bootloader_region`` was the original spelling.  Preserve it
+        # as a compatibility alias while all production consumers use the
+        # canonical top-level property.
+        self.memory.bootloader_region = canonical_bootloader_region
         self.success_criteria_overrides: Dict[str, Dict[str, Any]] = success_criteria_overrides or {}
         self.boot_register_pre_writes: List[BootRegisterPreWrite] = boot_register_pre_writes or []
         self.boot_registers: List[BootRegisterDef] = boot_registers or []
@@ -1606,11 +1768,19 @@ class ProfileConfig:
             semantic_assertions=self.semantic_assertions,
             invariants=self.invariants, invariant_providers=self.invariant_providers,
             invariant_config=self.invariant_config,
-            flash_backend=self.flash_backend, initial_states=[],
+            flash_backend=self.flash_backend,
+            nvm_controller=self.nvm_controller,
+            otp_peripheral=self.otp_peripheral,
+            initial_states=[],
             metadata_fault_regions=self.metadata_fault_regions,
+            multi_component=self.multi_component,
             nvs_region=self.nvs_region,
             security_policy=self.security_policy,
+            bootloader_region=self.bootloader_region,
             success_criteria_overrides=self.success_criteria_overrides,
+            boot_register_pre_writes=self.boot_register_pre_writes,
+            boot_registers=self.boot_registers,
+            write_order_constraints=self.write_order_constraints,
             fuzz_corpus=self.fuzz_corpus,
 
             residual_image=self.residual_image,
@@ -1621,6 +1791,7 @@ class ProfileConfig:
         if state.update_trigger is not None and state.pre_boot_state is None:
             resolved.pre_boot_state = resolved.expand_update_trigger()
         resolved.auto_update_trigger = bool(getattr(self, "auto_update_trigger", False))
+        resolved.resolved_initial_state_name = state.name
         resolved.image_load_addresses = dict(
             getattr(self, "image_load_addresses", {}) or {}
         )
@@ -1721,6 +1892,46 @@ class ProfileConfig:
             "expected_exec_sha256": expected_exec_sha256,
             "otadata_expect": criteria.otadata_expect,
             "otadata_expect_scope": criteria.otadata_expect_scope or "always",
+            "success_checks": self._success_checks_runtime_dict(criteria),
+        }
+
+    def _success_checks_runtime_dict(
+        self,
+        criteria: "SuccessCriteria",
+    ) -> Dict[str, Any]:
+        """Return the versioned structured post-boot check contract."""
+        return {
+            "contract_version": 1,
+            "memory_checks": [
+                {
+                    "address": check.address,
+                    "expected_value": check.expected_value,
+                    "mask": check.mask,
+                    "op": check.op,
+                }
+                for check in criteria.memory_checks
+            ],
+            "config_checks": [
+                {
+                    "address": check.address,
+                    "expected": check.expected,
+                    "nonzero": check.nonzero,
+                    "range_min": check.range_min,
+                    "range_max": check.range_max,
+                    "mask": check.mask,
+                    "expected_masked": check.expected_masked,
+                }
+                for check in criteria.config_checks
+            ],
+            "bootloader_integrity": bool(criteria.bootloader_integrity),
+            "bootloader_region": (
+                {
+                    "base": self.bootloader_region.base,
+                    "size": self.bootloader_region.size,
+                }
+                if self.bootloader_region is not None
+                else None
+            ),
         }
 
     def update_sequence_runtime_payload(self, repo_root: Path) -> Optional[Dict[str, Any]]:
@@ -1864,24 +2075,6 @@ class ProfileConfig:
                     address=swap_size_addr,
                     u32=_parse_int(trigger.fields["swap_size"], "update_trigger.swap_size"),
                 ))
-            return writes
-
-        if trigger.type == "riotboot_header":
-            # riotboot header: 16-byte struct at slot base.
-            # Fields: magic (0x544F4952), version, start_addr, fletcher32 checksum.
-            # start_addr = slot.base + hdr_len (default 0x100 = 256).
-            hdr_len = int(trigger.fields.get("hdr_len", 0x100))
-            version = _parse_int(trigger.fields.get("version", 2), "update_trigger.version")
-            start_addr = slot.base + hdr_len
-            # Build the 12-byte payload for Fletcher32.
-            payload = struct.pack("<III", 0x544F4952, version, start_addr)
-            chksum = _fletcher32(payload)
-            writes = [
-                PreBootWrite(address=slot.base + 0, u32=0x544F4952),
-                PreBootWrite(address=slot.base + 4, u32=version),
-                PreBootWrite(address=slot.base + 8, u32=start_addr),
-                PreBootWrite(address=slot.base + 12, u32=chksum),
-            ]
             return writes
 
         raise ProfileError(
@@ -2070,13 +2263,34 @@ class ProfileConfig:
             vars_list.append("SUCCESS_BOOTLOADER_INTEGRITY:true")
 
         # Bootloader region.
-        if mem.bootloader_region is not None:
+        if self.bootloader_region is not None:
             vars_list.append(
-                "BOOTLOADER_REGION_BASE:0x{:08X}".format(mem.bootloader_region.base)
+                "BOOTLOADER_REGION_BASE:0x{:08X}".format(
+                    self.bootloader_region.base
+                )
             )
             vars_list.append(
-                "BOOTLOADER_REGION_SIZE:0x{:08X}".format(mem.bootloader_region.size)
+                "BOOTLOADER_REGION_SIZE:0x{:08X}".format(
+                    self.bootloader_region.size
+                )
             )
+
+        # Structured post-boot observations.  Base64-encoded JSON avoids Robot
+        # and Renode quoting ambiguities while retaining a versioned contract.
+        success_checks = self._success_checks_runtime_dict(sc)
+        if (
+            success_checks["memory_checks"]
+            or success_checks["config_checks"]
+            or success_checks["bootloader_integrity"]
+        ):
+            encoded_success_checks = base64.b64encode(
+                json.dumps(
+                    success_checks,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).decode("ascii")
+            vars_list.append("SUCCESS_CHECKS_B64:{}".format(encoded_success_checks))
 
         # Flash backend: explicit sysbus name for the fault-injectable controller.
         if self.flash_backend:
@@ -2208,11 +2422,22 @@ class ProfileConfig:
         # NVS corruption config (modes + seed for runtime dispatch).
         nvs_cfg = self.fault_sweep.nvs_corruption
         if nvs_cfg.enabled and self.nvs_region:
+            variant_specs = nvs_cfg.variant_specs()
             vars_list.append(
                 "NVS_CORRUPTION_MODES:{}".format(",".join(nvs_cfg.modes))
             )
             vars_list.append(
                 "NVS_CORRUPTION_SEED:{}".format(nvs_cfg.seed)
+            )
+            encoded_variants = base64.b64encode(
+                json.dumps(
+                    variant_specs,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).decode("ascii")
+            vars_list.append(
+                "NVS_CORRUPTION_VARIANTS_B64:{}".format(encoded_variants)
             )
 
         # Writeback durability model.
@@ -2306,6 +2531,33 @@ def _parse_int(value: Any, field_name: str) -> int:
         except ValueError:
             pass
     raise ProfileError("{}: expected integer, got {!r}".format(field_name, value))
+
+
+def _parse_bool(value: Any, field_name: str) -> bool:
+    """Parse a YAML boolean without accepting truthy strings or integers."""
+    if type(value) is not bool:
+        raise ProfileError(
+            "{}: expected boolean, got {}".format(
+                field_name, type(value).__name__
+            )
+        )
+    return value
+
+
+_PROFILE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _parse_profile_identifier(value: Any, field_name: str) -> str:
+    """Parse a profile-controlled identifier that is safe in path names."""
+    if not isinstance(value, str) or not _PROFILE_IDENTIFIER_RE.fullmatch(value):
+        raise ProfileError(
+            "{}: expected safe identifier matching {}, got {!r}".format(
+                field_name,
+                _PROFILE_IDENTIFIER_RE.pattern,
+                value,
+            )
+        )
+    return value
 
 
 def _normalize_criterion_token(value: Any) -> str:
@@ -2411,6 +2663,8 @@ def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
 def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
     if raw is None:
         return SuccessCriteria()
+    if not isinstance(raw, dict):
+        raise ProfileError("success_criteria: expected mapping")
     otadata_expect_scope = str(raw.get("otadata_expect_scope", "always")).strip().lower()
     if otadata_expect_scope not in ("always", "control"):
         raise ProfileError(
@@ -2422,12 +2676,17 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         pc_in_slot=raw.get("pc_in_slot"),
         marker_address=_parse_int(raw["marker_address"], "success_criteria.marker_address") if "marker_address" in raw else None,
         marker_value=_parse_int(raw["marker_value"], "success_criteria.marker_value") if "marker_value" in raw else None,
-        image_hash=bool(raw.get("image_hash", False)),
+        image_hash=_parse_bool(
+            raw.get("image_hash", False), "success_criteria.image_hash"
+        ),
         expected_image=raw.get("expected_image"),
         image_hash_slot=raw.get("image_hash_slot"),
         otadata_expect=_parse_otadata_expect(raw.get("otadata_expect")),
         otadata_expect_scope=otadata_expect_scope,
-        bootloader_integrity=bool(raw.get("bootloader_integrity", False)),
+        bootloader_integrity=_parse_bool(
+            raw.get("bootloader_integrity", False),
+            "success_criteria.bootloader_integrity",
+        ),
         config_checks=_parse_config_checks(raw.get("config_checks")),
         boot_register_values=_parse_boot_register_values(raw.get("boot_register_values")),
         max_reset_vector_offset=(
@@ -2439,12 +2698,32 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
 
 
 def _parse_memory_checks(raw: Optional[list]) -> List[MemoryCheck]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("success_criteria.memory_checks: expected list")
     if not raw:
         return []
     checks = []
     for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ProfileError(
+                "memory_checks[{}]: expected mapping".format(i)
+            )
         if "address" not in entry:
             raise ProfileError("memory_checks[{}]: missing 'address'".format(i))
+        op = str(entry.get("op", "eq")).strip().lower()
+        if op not in {"eq", "ne", "ge", "le", "nonzero"}:
+            raise ProfileError(
+                "memory_checks[{}].op: expected one of eq, ne, ge, le, "
+                "nonzero; got '{}'".format(i, op)
+            )
+        if op != "nonzero" and "expected_value" not in entry:
+            raise ProfileError(
+                "memory_checks[{}].expected_value is required for op '{}'".format(
+                    i, op
+                )
+            )
         checks.append(MemoryCheck(
             address=_parse_int(entry["address"], "memory_checks[{}].address".format(i)),
             expected_value=(
@@ -2452,7 +2731,7 @@ def _parse_memory_checks(raw: Optional[list]) -> List[MemoryCheck]:
                 if "expected_value" in entry else None
             ),
             mask=_parse_int(entry.get("mask", 0xFFFFFFFF), "memory_checks[{}].mask".format(i)),
-            op=str(entry.get("op", "eq")),
+            op=op,
         ))
     return checks
 
@@ -2540,7 +2819,10 @@ def _parse_heuristic_config(
         tier3_step=int(raw.get("tier3_step", 100)),
         discontinuity_window=int(raw.get("discontinuity_window", 3)),
         target_points=int(raw["target_points"]) if "target_points" in raw else None,
-        preserve_critical_tiers=bool(raw.get("preserve_critical_tiers", True)),
+        preserve_critical_tiers=_parse_bool(
+            raw.get("preserve_critical_tiers", True),
+            "fault_sweep.heuristic.preserve_critical_tiers",
+        ),
         shard_count=int(raw.get("shard_count", 1)),
         shard_index=int(raw.get("shard_index", 0)),
         random_tail_budget=int(raw.get("random_tail_budget", 0)),
@@ -2729,21 +3011,22 @@ def _parse_fault_sweep(
 ) -> FaultSweepConfig:
     if raw is None:
         return FaultSweepConfig()
-    fault_types = raw.get("fault_types", ["power_loss"])
-    for ft in fault_types:
-        if ft not in KNOWN_FAULT_TYPES:
-            import warnings
-            warnings.warn("Unknown fault type '{}' in profile; ignoring.".format(ft))
-        elif ft in CLASSIFICATION_ONLY_FAULT_TYPES:
-            import warnings
-            warnings.warn(
-                "Fault type '{}' is a classification/heuristic label, not an "
-                "injectable fault type. It does not generate fault points in "
-                "the sweep planner. Remove it from fault_types.".format(ft)
-            )
-        elif ft not in IMPLEMENTED_FAULT_TYPES:
-            import warnings
-            warnings.warn("Fault type '{}' is not yet implemented; skipping.".format(ft))
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep: expected mapping")
+    partial_staging = raw.get("partial_staging")
+    if partial_staging is not None:
+        if not isinstance(partial_staging, dict):
+            raise ProfileError("fault_sweep.partial_staging: expected mapping")
+        partial_staging_enabled = _parse_bool(
+            partial_staging.get("enabled", True),
+            "fault_sweep.partial_staging.enabled",
+        )
+        if not partial_staging_enabled:
+            partial_staging = None
+    fault_types = _normalize_fault_types(
+        raw.get("fault_types", ["power_loss"]),
+        "fault_sweep.fault_types",
+    )
     eval_mode = raw.get("evaluation_mode")
     if eval_mode is not None:
         eval_mode = str(eval_mode)
@@ -2835,12 +3118,20 @@ def _parse_fault_sweep(
             buffer_capacity=wb_raw.get("buffer_capacity", "auto"),
             domains=wb_raw.get("domains", "auto"),
             barriers=barriers,
-            erase_flushes_domain=wb_raw.get("erase_flushes_domain", False),
+            erase_flushes_domain=_parse_bool(
+                wb_raw.get("erase_flushes_domain", False),
+                "fault_sweep.writeback.erase_flushes_domain",
+            ),
         )
 
     return FaultSweepConfig(
         mode=raw.get("mode", "runtime"),
         max_writes=raw.get("max_writes", "auto"),
+        max_otp_blows=(
+            None
+            if raw.get("max_otp_blows") is None
+            else int(raw.get("max_otp_blows"))
+        ),
         max_writes_cap=int(raw.get("max_writes_cap", 100000)),
         max_step_limit=int(raw.get("max_step_limit", 500000)),
         run_duration=str(raw.get("run_duration", "0.5")),
@@ -2871,7 +3162,7 @@ def _parse_fault_sweep(
         verification_probes=_parse_verification_probe_config(raw),
         metadata_fault=_parse_metadata_fault(raw.get("metadata_fault")),
         metadata_delta=_parse_metadata_delta(raw.get("metadata_delta")),
-        partial_staging=raw.get("partial_staging"),
+        partial_staging=partial_staging,
         nvs_corruption=_parse_nvs_corruption(raw.get("nvs_corruption")),
         fault_distribution=_parse_fault_distribution(raw.get("fault_distribution")),
         heuristic_config=_parse_heuristic_config(
@@ -2888,7 +3179,10 @@ def _parse_fault_sweep(
                 else int(raw.get("max_heuristic_points"))
             )
         ),
-        quick_use_heuristic=bool(raw.get("quick_use_heuristic", False)),
+        quick_use_heuristic=_parse_bool(
+            raw.get("quick_use_heuristic", False),
+            "fault_sweep.quick_use_heuristic",
+        ),
         reset_mode=str(raw.get("reset_mode", "warm")),
         i2c_fault_config=_parse_i2c_fault_config(raw.get("i2c_fault_config")),
         durability_model=durability_model,
@@ -2901,15 +3195,20 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
         return Phase2FaultConfig()
     if not isinstance(raw, dict):
         raise ProfileError("fault_sweep.phase2_fault: expected mapping")
-    enabled = bool(raw.get("enabled", False))
-    fault_types = raw.get("fault_types", ["power_loss"])
-    if not isinstance(fault_types, list):
-        fault_types = [str(fault_types)]
-    for ft in fault_types:
-        if ft not in KNOWN_FAULT_TYPES:
-            import warnings
-
-            warnings.warn("Unknown phase2_fault type '{}'; ignoring.".format(ft))
+    enabled = _parse_bool(raw.get("enabled", False), "fault_sweep.phase2_fault.enabled")
+    fault_types = _normalize_fault_types(
+        raw.get("fault_types", ["power_loss"]),
+        "fault_sweep.phase2_fault.fault_types",
+    )
+    unsupported = sorted(set(fault_types) - PHASE2_FAULT_TYPES)
+    if unsupported:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.fault_types: unsupported recovery-phase "
+            "fault type(s) {}. Supported: {}".format(
+                unsupported,
+                sorted(PHASE2_FAULT_TYPES),
+            )
+        )
     max_points = int(raw.get("max_points", 0))
     if max_points < 0:
         raise ProfileError(
@@ -2927,30 +3226,22 @@ def _parse_hook_fault(raw: Optional[Dict[str, Any]]) -> HookFaultConfig:
         return HookFaultConfig()
     if not isinstance(raw, dict):
         raise ProfileError("fault_sweep.hook_fault: expected mapping")
-    enabled = bool(raw.get("enabled", False))
-    fault_types = raw.get("fault_types", ["power_loss"])
-    if not isinstance(fault_types, list):
-        fault_types = [str(fault_types)]
+    enabled = _parse_bool(raw.get("enabled", False), "fault_sweep.hook_fault.enabled")
+    fault_types = _normalize_fault_types(
+        raw.get("fault_types", ["power_loss"]),
+        "fault_sweep.hook_fault.fault_types",
+    )
     valid_hook_types = {"power_loss", "bit_corruption", "command_drop"}
     parsed_types: List[str] = []
     for ft in fault_types:
-        if ft not in KNOWN_FAULT_TYPES:
-            import warnings
-
-            warnings.warn("Unknown hook_fault type '{}'; ignoring.".format(ft))
-            continue
         if ft not in valid_hook_types:
-            import warnings
-
-            warnings.warn(
-                "Unsupported hook_fault type '{}'; only {} are supported.".format(
+            raise ProfileError(
+                "fault_sweep.hook_fault.fault_types: unsupported type '{}'; "
+                "only {} are supported.".format(
                     ft, sorted(valid_hook_types)
                 )
             )
-            continue
         parsed_types.append(ft)
-    if not parsed_types:
-        parsed_types = ["power_loss"]
     max_points = int(raw.get("max_points", 0))
     if max_points < 0:
         raise ProfileError(
@@ -2968,7 +3259,7 @@ def _parse_confirm_cycle(raw: Optional[Dict[str, Any]]) -> "ConfirmCycleConfig":
         return ConfirmCycleConfig()
     if not isinstance(raw, dict):
         raise ProfileError("fault_sweep.confirm_cycle: expected mapping")
-    enabled = bool(raw.get("enabled", False))
+    enabled = _parse_bool(raw.get("enabled", False), "fault_sweep.confirm_cycle.enabled")
     confirm_function = raw.get("confirm_function")
     if confirm_function is not None:
         confirm_function = str(confirm_function).strip()
@@ -3012,28 +3303,20 @@ def _parse_confirm_cycle(raw: Optional[Dict[str, Any]]) -> "ConfirmCycleConfig":
                 "fault_sweep.confirm_cycle.expected_ratchet_version: "
                 "expected non-negative integer"
             )
-    fault_types = raw.get("fault_types", ["power_loss"])
-    if not isinstance(fault_types, list):
-        fault_types = [str(fault_types)]
+    fault_types = _normalize_fault_types(
+        raw.get("fault_types", ["power_loss"]),
+        "fault_sweep.confirm_cycle.fault_types",
+    )
     valid_confirm_types = {"power_loss", "bit_corruption", "command_drop"}
     parsed_types: List[str] = []
     for ft in fault_types:
-        if ft not in KNOWN_FAULT_TYPES:
-            import warnings
-
-            warnings.warn("Unknown confirm_cycle fault type '{}'; ignoring.".format(ft))
-            continue
         if ft not in valid_confirm_types:
-            import warnings
-
-            warnings.warn(
-                "Unsupported confirm_cycle fault type '{}'; only {} are "
+            raise ProfileError(
+                "fault_sweep.confirm_cycle.fault_types: unsupported type '{}'; "
+                "only {} are "
                 "supported.".format(ft, sorted(valid_confirm_types))
             )
-            continue
         parsed_types.append(ft)
-    if not parsed_types:
-        parsed_types = ["power_loss"]
     max_points = int(raw.get("max_points", 0))
     if max_points < 0:
         raise ProfileError(
@@ -3055,11 +3338,17 @@ def _parse_multi_fault(raw):
         return MultiFaultConfig()
     if not isinstance(raw, dict):
         raise ProfileError("fault_sweep.multi_fault: expected mapping")
-    enabled = bool(raw.get("enabled", False))
+    enabled = _parse_bool(raw.get("enabled", False), "fault_sweep.multi_fault.enabled")
     max_faults_per_run = int(raw.get("max_faults_per_run", 2))
     if max_faults_per_run < 2:
         raise ProfileError(
             "fault_sweep.multi_fault.max_faults_per_run: expected integer >= 2"
+        )
+    if max_faults_per_run > MAX_MULTI_FAULTS_PER_RUN:
+        raise ProfileError(
+            "fault_sweep.multi_fault.max_faults_per_run exceeds safety limit {}".format(
+                MAX_MULTI_FAULTS_PER_RUN
+            )
         )
     strategy = str(raw.get("strategy", "pairwise_interesting"))
     known_strategies = {"explicit", "pairwise_interesting", "random_sample"}
@@ -3091,13 +3380,29 @@ def _parse_multi_fault(raw):
             raise ProfileError(
                 "fault_sweep.multi_fault.sequences: expected list of lists"
             )
+        if len(sequences_raw) > max_pairs:
+            raise ProfileError(
+                "fault_sweep.multi_fault.sequences contains {} entries, exceeding "
+                "max_pairs={}".format(len(sequences_raw), max_pairs)
+            )
         sequences = []
         for i, seq in enumerate(sequences_raw):
             if not isinstance(seq, list) or len(seq) < 2:
                 raise ProfileError(
                     "fault_sweep.multi_fault.sequences[{}]: expected list of >= 2 integers".format(i)
                 )
-            sequences.append([int(x) for x in seq])
+            if len(seq) > max_faults_per_run:
+                raise ProfileError(
+                    "fault_sweep.multi_fault.sequences[{}] exceeds "
+                    "max_faults_per_run={}".format(i, max_faults_per_run)
+                )
+            parsed_sequence = [int(x) for x in seq]
+            if any(point < 0 for point in parsed_sequence):
+                raise ProfileError(
+                    "fault_sweep.multi_fault.sequences[{}] contains a negative "
+                    "fault point".format(i)
+                )
+            sequences.append(parsed_sequence)
     return MultiFaultConfig(
         enabled=enabled,
         max_faults_per_run=max_faults_per_run,
@@ -3427,16 +3732,52 @@ def _parse_timed_bit_corruption_config(
     """Parse timed_bit_corruption_config from profile YAML."""
     if raw is None:
         return None
+    if not isinstance(raw, dict):
+        raise ProfileError(
+            "fault_sweep.timed_bit_corruption_config: expected mapping"
+        )
     pairs_raw = raw.get("pairs", [])
+    if not isinstance(pairs_raw, list):
+        raise ProfileError(
+            "fault_sweep.timed_bit_corruption_config.pairs: expected list"
+        )
     pairs = []
-    for entry in pairs_raw:
+    for index, entry in enumerate(pairs_raw):
+        context = "fault_sweep.timed_bit_corruption_config.pairs[{}]".format(
+            index
+        )
+        if not isinstance(entry, dict):
+            raise ProfileError("{}: expected mapping".format(context))
         trigger = entry.get("trigger", {})
         if isinstance(trigger, int):
             trigger = {"address": trigger}
+        if not isinstance(trigger, dict):
+            raise ProfileError("{}.trigger: expected mapping".format(context))
+        if "symbol" in trigger:
+            raise ProfileError(
+                "{}.trigger.symbol is not supported; use an explicit address".format(
+                    context
+                )
+            )
+        if "address" not in trigger:
+            raise ProfileError("{}.trigger.address is required".format(context))
+        if "corrupt_address" not in entry:
+            raise ProfileError("{}.corrupt_address is required".format(context))
+        bit_flips = int(entry.get("bit_flips", 1))
+        if bit_flips < 1:
+            raise ProfileError("{}.bit_flips must be >= 1".format(context))
         pairs.append({
-            "trigger": trigger,
-            "corrupt_address": int(str(entry.get("corrupt_address", "0")), 0),
-            "bit_flips": int(entry.get("bit_flips", 1)),
+            "trigger": {
+                "address": _parse_int(
+                    trigger["address"],
+                    "{}.trigger.address".format(context),
+                )
+            },
+            "corrupt_address": _parse_int(
+                entry["corrupt_address"],
+                "{}.corrupt_address".format(context),
+            ),
+            "bit_flips": bit_flips,
         })
     return TimedBitCorruptionConfig(pairs=pairs)
 
@@ -3489,7 +3830,10 @@ def _parse_instruction_skip_config(
         start = _parse_int(_require(region, "start", ctx), "{}.start".format(ctx))
         end = _parse_int(_require(region, "end", ctx), "{}.end".format(ctx))
         target_addresses.append((start, end))
-    include_literal_pools = bool(raw.get("include_literal_pools", False))
+    include_literal_pools = _parse_bool(
+        raw.get("include_literal_pools", False),
+        "fault_sweep.instruction_skip.include_literal_pools",
+    )
     severity_model = str(raw.get("severity_model", "security") or "security").strip().lower()
     return InstructionSkipConfig(
         target_addresses=target_addresses,
@@ -3565,7 +3909,10 @@ def _parse_verification_bypass_probe(raw: Optional[Any]) -> List[VerificationPro
         return []
     if not isinstance(raw, dict):
         raise ProfileError("fault_sweep.verification_bypass_probe: expected mapping")
-    enabled = bool(raw.get("enabled", False))
+    enabled = _parse_bool(
+        raw.get("enabled", False),
+        "fault_sweep.verification_bypass_probe.enabled",
+    )
     if not enabled:
         return []
     probe_functions = raw.get("probe_functions", [])
@@ -3642,7 +3989,7 @@ def _parse_metadata_fault(raw):
         return MetadataFaultConfig(enabled=raw)
     if not isinstance(raw, dict):
         raise ProfileError("fault_sweep.metadata_fault: expected mapping or bool")
-    enabled = bool(raw.get("enabled", False))
+    enabled = _parse_bool(raw.get("enabled", False), "fault_sweep.metadata_fault.enabled")
     raw_types = raw.get("fault_types")
     fault_types = None
     if raw_types is not None:
@@ -3655,14 +4002,18 @@ def _parse_metadata_fault(raw):
         for ft in raw_types:
             ft_str = str(ft).strip()
             if ft_str not in valid_mf_types:
-                import warnings
-                warnings.warn(
-                    "metadata_fault.fault_types: unknown type '{}', ignoring".format(ft_str)
+                raise ProfileError(
+                    "fault_sweep.metadata_fault.fault_types: unsupported type "
+                    "'{}'; only {} are supported".format(
+                        ft_str,
+                        sorted(valid_mf_types),
+                    )
                 )
-                continue
             fault_types.append(ft_str)
         if not fault_types:
-            fault_types = ["power_loss"]
+            raise ProfileError(
+                "fault_sweep.metadata_fault.fault_types: expected non-empty list"
+            )
     return MetadataFaultConfig(enabled=enabled, fault_types=fault_types)
 
 
@@ -3690,7 +4041,11 @@ def _parse_metadata_delta(raw: Optional[Dict[str, Any]]) -> MetadataDeltaConfig:
         raise ProfileError("fault_sweep.metadata_delta: expected mapping or bool")
     raw_fields = raw.get("fields")
     if raw_fields is None:
-        return MetadataDeltaConfig(enabled=bool(raw.get("enabled", False)))
+        return MetadataDeltaConfig(
+            enabled=_parse_bool(
+                raw.get("enabled", False), "fault_sweep.metadata_delta.enabled"
+            )
+        )
     if not isinstance(raw_fields, list):
         raise ProfileError("fault_sweep.metadata_delta.fields: expected list")
     fields: List[MetadataDeltaFieldConfig] = []
@@ -3728,7 +4083,10 @@ def _parse_metadata_delta(raw: Optional[Dict[str, Any]]) -> MetadataDeltaConfig:
             max_delta=max_delta,
             when=when,
         ))
-    enabled = bool(raw.get("enabled", len(fields) > 0))
+    enabled = _parse_bool(
+        raw.get("enabled", len(fields) > 0),
+        "fault_sweep.metadata_delta.enabled",
+    )
     return MetadataDeltaConfig(enabled=enabled, fields=fields)
 
 
@@ -3749,7 +4107,9 @@ def _parse_config_checks(raw: Optional[List[Any]]) -> List[ConfigCheck]:
         expected: Optional[int] = None
         if "expected" in entry:
             expected = _parse_int(entry["expected"], "{}.expected".format(ctx))
-        nonzero = bool(entry.get("nonzero", False))
+        nonzero = _parse_bool(
+            entry.get("nonzero", False), "{}.nonzero".format(ctx)
+        )
         mask: Optional[int] = None
         if "mask" in entry:
             mask = _parse_int(entry["mask"], "{}.mask".format(ctx))
@@ -3764,9 +4124,17 @@ def _parse_config_checks(raw: Optional[List[Any]]) -> List[ConfigCheck]:
             rng = entry["range"]
             if isinstance(rng, dict):
                 if "min" in rng:
-                    range_min = int(rng["min"])
+                    range_min = _parse_int(rng["min"], "{}.range.min".format(ctx))
                 if "max" in rng:
-                    range_max = int(rng["max"])
+                    range_max = _parse_int(rng["max"], "{}.range.max".format(ctx))
+            else:
+                raise ProfileError("{}.range: expected mapping".format(ctx))
+        if range_min is not None and range_max is not None and range_min > range_max:
+            raise ProfileError("{}.range: min must be <= max".format(ctx))
+        if (mask is None) != (expected_masked is None):
+            raise ProfileError(
+                "{}: mask and expected_masked must be configured together".format(ctx)
+            )
         if expected is None and not nonzero and mask is None and range_min is None and range_max is None:
             raise ProfileError(
                 "{}: must specify at least one of expected, nonzero, mask+expected_masked, or range".format(
@@ -3870,7 +4238,10 @@ def _parse_write_order_constraints_list(
                 _require(then, "size", ctx + ".then"), ctx + ".then.size"
             ),
             label=str(entry.get("label", "")),
-            bidirectional=bool(entry.get("bidirectional", False)),
+            bidirectional=_parse_bool(
+                entry.get("bidirectional", False),
+                "{}.bidirectional".format(ctx),
+            ),
         ))
     return constraints
 
@@ -3903,7 +4274,7 @@ def _parse_nvs_corruption(raw: Optional[Dict[str, Any]]) -> NvsCorruptionConfig:
         return NvsCorruptionConfig(enabled=raw)
     if not isinstance(raw, dict):
         raise ProfileError("fault_sweep.nvs_corruption: expected mapping or bool")
-    enabled = bool(raw.get("enabled", False))
+    enabled = _parse_bool(raw.get("enabled", False), "fault_sweep.nvs_corruption.enabled")
     modes = raw.get("modes")
     if modes is not None:
         if isinstance(modes, str):
@@ -3955,6 +4326,12 @@ def _parse_nvs_corruption(raw: Optional[Dict[str, Any]]) -> NvsCorruptionConfig:
         truncate_offsets = [
             int(x) if x is not None else None for x in truncate_offsets
         ]
+        for offset in truncate_offsets:
+            if offset is not None and offset < 0:
+                raise ProfileError(
+                    "nvs_corruption.truncate_offsets: values must be "
+                    "non-negative integers or null"
+                )
     seed = int(raw.get("seed", 0))
     return NvsCorruptionConfig(
         enabled=enabled,
@@ -3971,7 +4348,9 @@ def _parse_security_policy(raw: Optional[Dict[str, Any]]) -> SecurityPolicyConfi
         return SecurityPolicyConfig()
     if not isinstance(raw, dict):
         raise ProfileError("security_policy: expected mapping")
-    anti_rollback = bool(raw.get("anti_rollback", False))
+    anti_rollback = _parse_bool(
+        raw.get("anti_rollback", False), "security_policy.anti_rollback"
+    )
     minimum_version_raw = raw.get("minimum_version")
     minimum_version: Optional[int] = None
     if minimum_version_raw is not None:
@@ -3982,7 +4361,10 @@ def _parse_security_policy(raw: Optional[Dict[str, Any]]) -> SecurityPolicyConfi
                     minimum_version
                 )
             )
-    toctou_protection = bool(raw.get("toctou_protection", False))
+    toctou_protection = _parse_bool(
+        raw.get("toctou_protection", False),
+        "security_policy.toctou_protection",
+    )
     return SecurityPolicyConfig(
         anti_rollback=anti_rollback,
         minimum_version=minimum_version,
@@ -4229,7 +4611,7 @@ def _parse_state_fuzzer(raw: Optional[Dict[str, Any]]) -> StateFuzzerConfig:
     if iterations <= 0:
         raise ProfileError("state_fuzzer.iterations: expected integer > 0")
     return StateFuzzerConfig(
-        enabled=bool(raw.get("enabled", False)),
+        enabled=_parse_bool(raw.get("enabled", False), "state_fuzzer.enabled"),
         metadata_model=_normalize_state_fuzzer_metadata_model(raw.get("metadata_model")),
         iterations=iterations,
         seed=_parse_int(raw.get("seed", 0), "state_fuzzer.seed"),
@@ -4275,27 +4657,95 @@ def _parse_state_probe(raw: Optional[Any]) -> Optional[StateProbeConfig]:
     )
 
 
-def _parse_expect(raw: Optional[Dict[str, Any]]) -> ExpectConfig:
+_EXPECT_BOOLEAN_FIELDS = frozenset(
+    {
+        "should_find_issues",
+        "allow_semantic_only_issues",
+        "allow_control_only_issues",
+    }
+)
+_EXPECT_LIST_FIELDS = frozenset(
+    {"required_issue_reasons", "ignored_issue_fault_types"}
+)
+_EXPECT_KEYS = frozenset(
+    set(_EXPECT_BOOLEAN_FIELDS) | set(_EXPECT_LIST_FIELDS) | {"control_outcome"}
+)
+
+
+def _parse_expect_values(
+    raw: Any,
+    *,
+    context: str,
+    partial: bool,
+) -> Dict[str, Any]:
+    """Validate and normalize an expect mapping.
+
+    ``partial`` preserves omission for initial-state overrides; the top-level
+    mapping instead receives the documented defaults.
+    """
     if raw is None:
-        return ExpectConfig(should_find_issues=False)
-    required_issue_reasons = [
-        str(reason).strip()
-        for reason in raw.get("required_issue_reasons", [])
-        if str(reason).strip()
-    ]
-    ignored_issue_fault_types = [
-        str(fault_type).strip()
-        for fault_type in raw.get("ignored_issue_fault_types", [])
-        if str(fault_type).strip()
-    ]
-    return ExpectConfig(
-        should_find_issues=bool(raw.get("should_find_issues", False)),
-        control_outcome=str(raw.get("control_outcome", "success")),
-        allow_semantic_only_issues=bool(raw.get("allow_semantic_only_issues", False)),
-        allow_control_only_issues=bool(raw.get("allow_control_only_issues", False)),
-        required_issue_reasons=required_issue_reasons,
-        ignored_issue_fault_types=ignored_issue_fault_types,
-    )
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ProfileError("{}: expected mapping".format(context))
+
+    parsed: Dict[str, Any] = {}
+    for field_name in sorted(_EXPECT_BOOLEAN_FIELDS):
+        if field_name not in raw:
+            if not partial:
+                parsed[field_name] = False
+            continue
+        value = raw[field_name]
+        if type(value) is not bool:
+            raise ProfileError(
+                "{}.{}: expected boolean, got {}".format(
+                    context, field_name, type(value).__name__
+                )
+            )
+        parsed[field_name] = value
+
+    if "control_outcome" in raw:
+        control_outcome = raw["control_outcome"]
+        if not isinstance(control_outcome, str) or control_outcome not in DEVICE_BOOT_OUTCOMES:
+            raise ProfileError(
+                "{}.control_outcome: expected one of {}, got {!r}".format(
+                    context,
+                    ", ".join(sorted(DEVICE_BOOT_OUTCOMES)),
+                    control_outcome,
+                )
+            )
+        parsed["control_outcome"] = control_outcome
+    elif not partial:
+        parsed["control_outcome"] = "success"
+
+    for field_name in sorted(_EXPECT_LIST_FIELDS):
+        if field_name not in raw:
+            if not partial:
+                parsed[field_name] = []
+            continue
+        values = raw[field_name]
+        if not isinstance(values, list):
+            raise ProfileError(
+                "{}.{}: expected list of non-empty strings".format(
+                    context, field_name
+                )
+            )
+        normalized: List[str] = []
+        for index, value in enumerate(values):
+            if not isinstance(value, str) or not value.strip():
+                raise ProfileError(
+                    "{}.{}[{}]: expected non-empty string".format(
+                        context, field_name, index
+                    )
+                )
+            normalized.append(value.strip())
+        parsed[field_name] = normalized
+
+    return parsed
+
+
+def _parse_expect(raw: Optional[Dict[str, Any]]) -> ExpectConfig:
+    parsed = _parse_expect_values(raw, context="expect", partial=False)
+    return ExpectConfig(**parsed)
 
 
 def _parse_update_trigger_config(raw: Optional[Any]) -> Tuple[Optional[UpdateTrigger], bool]:
@@ -4332,29 +4782,38 @@ def _normalize_fault_types(raw: Any, field_name: str) -> List[str]:
     if raw is None:
         fault_types = ["power_loss"]
     elif isinstance(raw, list):
+        if not raw:
+            raise ProfileError("{}: expected non-empty list".format(field_name))
         fault_types = [str(ft) for ft in raw]
     else:
         fault_types = [str(raw)]
 
-    import warnings
-
     normalized: List[str] = []
     for ft in fault_types:
         if ft not in KNOWN_FAULT_TYPES:
-            warnings.warn("Unknown fault type '{}' in {}; ignoring.".format(ft, field_name))
-            continue
-        if ft in CLASSIFICATION_ONLY_FAULT_TYPES:
-            warnings.warn(
-                "Fault type '{}' in {} is a classification label only and "
-                "does not generate runtime fault points.".format(ft, field_name)
+            raise ProfileError(
+                "{}: unknown fault type '{}'. Known injectable types: {}".format(
+                    field_name,
+                    ft,
+                    sorted(IMPLEMENTED_FAULT_TYPES),
+                )
             )
-            continue
+        if ft in CLASSIFICATION_ONLY_FAULT_TYPES:
+            raise ProfileError(
+                "{}: fault type '{}' is a classification label, not an "
+                "injectable mechanism".format(field_name, ft)
+            )
         if ft not in IMPLEMENTED_FAULT_TYPES:
-            warnings.warn("Fault type '{}' in {} is not yet implemented; skipping.".format(ft, field_name))
-            continue
+            raise ProfileError(
+                "{}: fault type '{}' is not implemented".format(field_name, ft)
+            )
+        if ft in normalized:
+            raise ProfileError(
+                "{}: duplicate fault type '{}'".format(field_name, ft)
+            )
         normalized.append(ft)
 
-    return normalized or ["power_loss"]
+    return normalized
 
 
 def _parse_update_sequence(
@@ -4437,7 +4896,10 @@ def _parse_update_sequence(
                 boot_cycles=phase_boot_cycles,
                 boot_cycle_hook=phase_hook,
                 expected_rollback_at_cycle=expected_rollback_at_cycle,
-                fault_injection=bool(entry.get("fault_injection", False)),
+                fault_injection=_parse_bool(
+                    entry.get("fault_injection", False),
+                    "{}.fault_injection".format(ctx),
+                ),
                 fault_types=phase_fault_types,
             )
         )
@@ -4582,9 +5044,10 @@ def _parse_initial_states(raw: Optional[List[Any]]) -> List[InitialStateConfig]:
     for idx, entry in enumerate(raw):
         if not isinstance(entry, dict):
             raise ProfileError("initial_states[{}]: expected mapping".format(idx))
-        name = str(entry.get("name", "")).strip()
-        if not name:
-            raise ProfileError("initial_states[{}].name: expected non-empty string".format(idx))
+        name = _parse_profile_identifier(
+            entry.get("name"),
+            "initial_states[{}].name".format(idx),
+        )
         if name in seen_names:
             raise ProfileError("initial_states: duplicate name '{}'".format(name))
         seen_names.add(name)
@@ -4594,15 +5057,17 @@ def _parse_initial_states(raw: Optional[List[Any]]) -> List[InitialStateConfig]:
         if setup_script is not None:
             setup_script = str(setup_script)
         trigger = _parse_update_trigger(entry.get("update_trigger"))
-        expect_overrides = entry.get("expect")
-        if expect_overrides is not None and not isinstance(expect_overrides, dict):
-            raise ProfileError("initial_states[{}].expect: expected mapping".format(idx))
+        expect_overrides = _parse_expect_values(
+            entry.get("expect"),
+            context="initial_states[{}].expect".format(idx),
+            partial=True,
+        )
         parsed_pre_boot: Optional[List[PreBootWrite]] = None
         if "pre_boot_state" in entry:
             parsed_pre_boot = pre_boot
         states.append(InitialStateConfig(name=name, description=description,
             pre_boot_state=parsed_pre_boot, setup_script=setup_script,
-            update_trigger=trigger, expect_overrides=expect_overrides or {}))
+            update_trigger=trigger, expect_overrides=expect_overrides))
     return states
 
 
@@ -4613,10 +5078,11 @@ def _parse_component(
     profile_path: Optional[Path] = None,
 ) -> ComponentConfig:
     """Parse a single component definition from the components list."""
-    ctx = "components[{}]".format(idx)
-    name = str(_require(raw, "name", ctx)).strip()
-    if not name:
-        raise ProfileError("{}.name: expected non-empty string".format(ctx))
+    ctx = "multi_component.components[{}]".format(idx)
+    name = _parse_profile_identifier(
+        _require(raw, "name", ctx),
+        "{}.name".format(ctx),
+    )
 
     platform = str(_require(raw, "platform", ctx))
 
@@ -4842,11 +5308,711 @@ def _parse_metadata_fault_regions(raw, slots=None):
 # Main loader
 # ---------------------------------------------------------------------------
 
-def load_profile(path: str | Path) -> ProfileConfig:
+_STRICT_TOP_LEVEL_KEYS = frozenset(
+    {
+        "schema_version", "name", "description", "platform", "bootloader",
+        "memory", "images", "pre_boot_state", "update_trigger", "setup_script",
+        "flash_backend", "nvm_controller", "otp_peripheral", "extra_peripherals",
+        "state_probe", "success_criteria", "success_criteria_overrides",
+        "fault_sweep", "update_sequence", "state_fuzzer", "security_policy",
+        "firmware_elf", "fuzz_corpus", "expect", "semantic_assertions",
+        "invariants", "invariant_providers", "invariant_config", "initial_states",
+        "metadata_fault_regions", "multi_component", "nvs_region",
+        "bootloader_region", "boot_register_pre_writes", "boot_registers",
+        "write_order_constraints", "residual_image", "scenario",
+        "skip_self_test", "strict_validation",
+    }
+)
+
+_STRICT_SUCCESS_CRITERIA_KEYS = frozenset(
+    {
+        "vtor_in_slot", "vector_table_offset", "pc_in_slot", "marker_address",
+        "marker_value", "image_hash", "expected_image", "image_hash_slot",
+        "otadata_expect", "otadata_expect_scope", "bootloader_integrity",
+        "config_checks", "boot_register_values", "max_reset_vector_offset",
+        "memory_checks",
+    }
+)
+
+_STRICT_FAULT_SWEEP_KEYS = frozenset(
+    {
+        "mode", "max_writes", "max_otp_blows", "max_writes_cap",
+        "max_step_limit", "run_duration", "calibration_time_slice",
+        "phase1_time_slice", "phase2_time_slice", "fault_types",
+        "evaluation_mode", "sweep_strategy", "sweep_hash_bypass_symbols",
+        "progress_stall_timeout_s", "boot_cycles", "boot_cycle_hook",
+        "expected_rollback_at_cycle", "phase2_fault", "hook_fault",
+        "confirm_cycle", "multi_fault", "read_fault_config",
+        "instruction_skip_config", "timed_bit_corruption_config",
+        "verification_probes", "verification_bypass_probe", "metadata_fault",
+        "metadata_delta", "partial_staging", "nvs_corruption",
+        "fault_distribution", "heuristic", "max_heuristic_points",
+        "quick_use_heuristic", "reset_mode", "i2c_fault_config",
+        "durability_model", "writeback",
+    }
+)
+
+_STRICT_UPDATE_TRIGGER_KEYS = frozenset(
+    {
+        "type", "slot", "max_align", "unprotected_tlv_sizes", "image_ok",
+        "copy_done", "swap_info", "swap_type", "image_num", "swap_size",
+        "hdr_len", "version",
+    }
+)
+
+_STRICT_UPDATE_PHASE_KEYS = frozenset(
+    {
+        "name", "description", "images", "setup_script", "pre_boot_state",
+        "success_criteria", "boot_cycles", "boot_cycle_hook",
+        "expected_rollback_at_cycle", "fault_injection", "fault_types",
+    }
+)
+
+_STRICT_COMPONENT_KEYS = frozenset(
+    {
+        "name", "platform", "bootloader", "memory", "images",
+        "pre_boot_state", "setup_script", "extra_peripherals",
+        "success_criteria", "fault_sweep", "flash_backend",
+    }
+)
+
+
+def _reject_unknown_keys(
+    value: Any,
+    allowed: frozenset[str],
+    context: str,
+) -> None:
+    if not isinstance(value, dict):
+        raise ProfileError("{}: expected mapping".format(context))
+    unknown = sorted(str(key) for key in set(value) - allowed)
+    if unknown:
+        raise ProfileError(
+            "{}: unknown field(s): {}".format(context, ", ".join(unknown))
+        )
+
+
+def _validate_strict_bootloader(raw: Any, context: str) -> None:
+    _reject_unknown_keys(raw, frozenset({"elf", "entry"}), context)
+
+
+def _validate_strict_memory(raw: Any, context: str) -> None:
+    _reject_unknown_keys(
+        raw,
+        frozenset(
+            {"sram", "write_granularity", "page_size", "slots", "bootloader_region"}
+        ),
+        context,
+    )
+    _reject_unknown_keys(
+        raw.get("sram"),
+        frozenset({"start", "end"}),
+        "{}.sram".format(context),
+    )
+    slots = raw.get("slots")
+    if not isinstance(slots, dict):
+        raise ProfileError("{}.slots: expected mapping".format(context))
+    for slot_name, slot in slots.items():
+        _reject_unknown_keys(
+            slot,
+            frozenset({"base", "size"}),
+            "{}.slots.{}".format(context, slot_name),
+        )
+    if "bootloader_region" in raw:
+        _reject_unknown_keys(
+            raw.get("bootloader_region"),
+            frozenset({"base", "size"}),
+            "{}.bootloader_region".format(context),
+        )
+
+
+def _validate_strict_pre_boot_state(raw: Any, context: str) -> None:
+    if raw is None:
+        return
+    if not isinstance(raw, list):
+        raise ProfileError("{}: expected list".format(context))
+    for index, write in enumerate(raw):
+        _reject_unknown_keys(
+            write,
+            frozenset({"address", "u32"}),
+            "{}[{}]".format(context, index),
+        )
+
+
+def _validate_strict_update_trigger(raw: Any, context: str) -> None:
+    if raw is None or isinstance(raw, str):
+        return
+    _reject_unknown_keys(raw, _STRICT_UPDATE_TRIGGER_KEYS, context)
+
+
+def _validate_strict_success_criteria(
+    raw: Any,
+    context: str,
+    *,
+    require_meaningful: bool = True,
+) -> None:
+    _reject_unknown_keys(raw, _STRICT_SUCCESS_CRITERIA_KEYS, context)
+    if require_meaningful and not _strict_success_criteria_is_meaningful(raw):
+        raise ProfileError(
+            "{}: strict validation requires at least one observable success "
+            "check".format(context)
+        )
+
+    for check_name, allowed in (
+        ("memory_checks", {"address", "expected_value", "mask", "op"}),
+        (
+            "config_checks",
+            {"address", "expected", "nonzero", "range", "mask", "expected_masked"},
+        ),
+    ):
+        checks = raw.get(check_name) or []
+        if not isinstance(checks, list):
+            raise ProfileError("{}.{}: expected list".format(context, check_name))
+        for index, check in enumerate(checks):
+            _reject_unknown_keys(
+                check,
+                frozenset(allowed),
+                "{}.{}[{}]".format(context, check_name, index),
+            )
+            if check_name == "config_checks" and "range" in check:
+                _reject_unknown_keys(
+                    check.get("range"),
+                    frozenset({"min", "max"}),
+                    "{}.config_checks[{}].range".format(context, index),
+                )
+
+
+def _validate_strict_relative_path(value: Any, context: str) -> None:
+    text = str(value or "").strip()
+    normalized = text.replace("\\", "/")
+    if (
+        not text
+        or normalized.startswith("/")
+        or re.match(r"^[A-Za-z]:/", normalized)
+        or ".." in normalized.split("/")
+    ):
+        raise ProfileError(
+            "{}: strict validation requires a non-empty relative path "
+            "without '..'; got {!r}".format(context, text)
+        )
+
+
+def _validate_strict_path_list(raw: Any, context: str) -> None:
+    if raw is None:
+        return
+    values = raw if isinstance(raw, list) else [raw]
+    for index, value in enumerate(values):
+        _validate_strict_relative_path(
+            value,
+            "{}[{}]".format(context, index),
+        )
+
+
+def _strict_success_criteria_is_meaningful(raw: Dict[str, Any]) -> bool:
+    marker_pair = "marker_address" in raw and "marker_value" in raw
+    return bool(
+        raw.get("vtor_in_slot")
+        or raw.get("pc_in_slot")
+        or marker_pair
+        or raw.get("image_hash")
+        or raw.get("otadata_expect")
+        or raw.get("bootloader_integrity")
+        or raw.get("config_checks")
+        or raw.get("boot_register_values")
+        or raw.get("memory_checks")
+        or raw.get("max_reset_vector_offset") is not None
+    )
+
+
+def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
+    """Reject ignored fields and profiles with no observable success check."""
+    _reject_unknown_keys(data, _STRICT_TOP_LEVEL_KEYS, "profile")
+    _validate_strict_bootloader(data.get("bootloader"), "bootloader")
+
+    memory = data.get("memory")
+    _validate_strict_memory(memory, "memory")
+
+    criteria = data.get("success_criteria")
+    _validate_strict_success_criteria(criteria, "success_criteria")
+
+    if "fault_sweep" in data:
+        _reject_unknown_keys(
+            data.get("fault_sweep"),
+            _STRICT_FAULT_SWEEP_KEYS,
+            "fault_sweep",
+        )
+        fault_sweep = data.get("fault_sweep")
+        nested_fault_schemas = {
+            "phase2_fault": {"enabled", "fault_types", "max_points"},
+            "hook_fault": {"enabled", "fault_types", "max_points"},
+            "confirm_cycle": {
+                "enabled", "confirm_function", "post_confirm_assertions",
+                "expected_ratchet_version", "fault_types", "max_points",
+            },
+            "multi_fault": {
+                "enabled", "max_faults_per_run", "strategy",
+                "fallback_strategy", "max_pairs", "seed", "sequences",
+            },
+            "read_fault_config": {
+                "target_regions", "bit_flip_count", "fault_probability", "seed",
+            },
+            "instruction_skip_config": {
+                "skip_count", "target_addresses", "include_literal_pools",
+                "severity_model",
+            },
+            "timed_bit_corruption_config": {"pairs"},
+            "verification_bypass_probe": {"enabled", "probe_functions"},
+            "metadata_fault": {"enabled", "fault_types"},
+            "metadata_delta": {"enabled", "fields"},
+            "partial_staging": {
+                "enabled", "staging_slot", "staging_image", "fill_pattern", "header_size",
+                "trailer_size", "truncation_points", "offsets", "max_points",
+                "sector_size",
+            },
+            "nvs_corruption": {
+                "enabled", "modes", "bit_flip_counts", "erase_fractions",
+                "truncate_offsets", "seed",
+            },
+            "fault_distribution": {
+                "mode", "cluster_sectors", "cluster_start", "cluster_end",
+                "flip_probability_in_cluster", "flip_probability_outside", "seed",
+            },
+            "heuristic": {
+                "tier2_step", "tier3_step", "discontinuity_window",
+                "target_points", "preserve_critical_tiers", "shard_count",
+                "shard_index", "random_tail_budget", "critical_regions",
+            },
+            "i2c_fault_config": {
+                "peripheral_name", "target_address", "fault_types",
+                "fault_at_transaction", "fault_seed",
+            },
+            "writeback": {
+                "buffer_capacity", "domains", "barriers", "erase_flushes_domain",
+            },
+        }
+        for field_name, allowed in nested_fault_schemas.items():
+            nested = fault_sweep.get(field_name)
+            if nested is None or isinstance(nested, bool):
+                continue
+            _reject_unknown_keys(
+                nested,
+                frozenset(allowed),
+                "fault_sweep.{}".format(field_name),
+            )
+
+        probes = fault_sweep.get("verification_probes") or []
+        if not isinstance(probes, list):
+            raise ProfileError("fault_sweep.verification_probes: expected list")
+        for index, probe in enumerate(probes):
+            _reject_unknown_keys(
+                probe,
+                frozenset({"symbol", "return_register", "success_value", "label"}),
+                "fault_sweep.verification_probes[{}]".format(index),
+            )
+
+        bypass_probe = fault_sweep.get("verification_bypass_probe")
+        if isinstance(bypass_probe, dict):
+            probe_functions = bypass_probe.get("probe_functions") or []
+            if not isinstance(probe_functions, list):
+                raise ProfileError(
+                    "fault_sweep.verification_bypass_probe.probe_functions: "
+                    "expected list"
+                )
+            for index, probe in enumerate(probe_functions):
+                _reject_unknown_keys(
+                    probe,
+                    frozenset(
+                        {
+                            "symbol", "return_register",
+                            "expected_success_value", "layer",
+                        }
+                    ),
+                    "fault_sweep.verification_bypass_probe.probe_functions[{}]".format(
+                        index
+                    ),
+                )
+
+        confirm_cycle = fault_sweep.get("confirm_cycle")
+        if isinstance(confirm_cycle, dict):
+            assertions = confirm_cycle.get("post_confirm_assertions") or []
+            if not isinstance(assertions, list):
+                raise ProfileError(
+                    "fault_sweep.confirm_cycle.post_confirm_assertions: expected list"
+                )
+            for index, assertion in enumerate(assertions):
+                _reject_unknown_keys(
+                    assertion,
+                    frozenset({"address", "expected", "label"}),
+                    "fault_sweep.confirm_cycle.post_confirm_assertions[{}]".format(
+                        index
+                    ),
+                )
+
+        timed_config = fault_sweep.get("timed_bit_corruption_config")
+        if isinstance(timed_config, dict):
+            pairs = timed_config.get("pairs") or []
+            if not isinstance(pairs, list):
+                raise ProfileError(
+                    "fault_sweep.timed_bit_corruption_config.pairs: expected list"
+                )
+            for index, pair in enumerate(pairs):
+                context = "fault_sweep.timed_bit_corruption_config.pairs[{}]".format(
+                    index
+                )
+                _reject_unknown_keys(
+                    pair,
+                    frozenset({"trigger", "corrupt_address", "bit_flips"}),
+                    context,
+                )
+                trigger = pair.get("trigger")
+                if isinstance(trigger, dict):
+                    _reject_unknown_keys(
+                        trigger,
+                        frozenset({"address"}),
+                        "{}.trigger".format(context),
+                    )
+
+        for config_name, region_key, allowed_region_keys in (
+            ("read_fault_config", "target_regions", {"start", "end"}),
+            ("instruction_skip_config", "target_addresses", {"start", "end", "symbol"}),
+            ("heuristic", "critical_regions", {"start", "end", "symbol"}),
+        ):
+            nested = fault_sweep.get(config_name)
+            if not isinstance(nested, dict):
+                continue
+            regions = nested.get(region_key) or []
+            if not isinstance(regions, list):
+                raise ProfileError(
+                    "fault_sweep.{}.{}: expected list".format(config_name, region_key)
+                )
+            for index, region in enumerate(regions):
+                _reject_unknown_keys(
+                    region,
+                    frozenset(allowed_region_keys),
+                    "fault_sweep.{}.{}[{}]".format(config_name, region_key, index),
+                )
+
+        metadata_delta = fault_sweep.get("metadata_delta")
+        if isinstance(metadata_delta, dict):
+            fields = metadata_delta.get("fields") or []
+            if not isinstance(fields, list):
+                raise ProfileError("fault_sweep.metadata_delta.fields: expected list")
+            for index, field in enumerate(fields):
+                _reject_unknown_keys(
+                    field,
+                    frozenset({"address", "name", "min_delta", "max_delta", "when"}),
+                    "fault_sweep.metadata_delta.fields[{}]".format(index),
+                )
+
+    if "bootloader_region" in data:
+        _reject_unknown_keys(
+            data.get("bootloader_region"),
+            frozenset({"base", "size"}),
+            "bootloader_region",
+        )
+    if "nvs_region" in data:
+        _reject_unknown_keys(
+            data.get("nvs_region"),
+            frozenset({"address", "size", "snapshot"}),
+            "nvs_region",
+        )
+
+    for field_name, allowed in (
+        ("expect", _EXPECT_KEYS),
+        ("security_policy", {"anti_rollback", "minimum_version", "toctou_protection"}),
+        ("state_fuzzer", {"enabled", "metadata_model", "iterations", "seed"}),
+        ("residual_image", {"slot", "prior_image", "fill_pattern"}),
+    ):
+        nested = data.get(field_name)
+        if nested is not None:
+            _reject_unknown_keys(nested, frozenset(allowed), field_name)
+
+    state_fuzzer = data.get("state_fuzzer")
+    if isinstance(state_fuzzer, dict) and isinstance(
+        state_fuzzer.get("metadata_model"), dict
+    ):
+        metadata_model = state_fuzzer.get("metadata_model")
+        _reject_unknown_keys(
+            metadata_model,
+            frozenset({"base_address", "fields", "fill"}),
+            "state_fuzzer.metadata_model",
+        )
+        fields = metadata_model.get("fields") or []
+        if not isinstance(fields, list):
+            raise ProfileError("state_fuzzer.metadata_model.fields: expected list")
+        for index, field in enumerate(fields):
+            _reject_unknown_keys(
+                field,
+                frozenset({"name", "offset", "size", "type", "valid", "valid_range"}),
+                "state_fuzzer.metadata_model.fields[{}]".format(index),
+            )
+
+    criteria_overrides = data.get("success_criteria_overrides") or {}
+    if not isinstance(criteria_overrides, dict):
+        raise ProfileError("success_criteria_overrides: expected mapping")
+    for fault_type, overrides in criteria_overrides.items():
+        _reject_unknown_keys(
+            overrides,
+            frozenset({"vtor_in_slot", "image_hash", "image_hash_slot"}),
+            "success_criteria_overrides.{}".format(fault_type),
+        )
+
+    metadata_regions = data.get("metadata_fault_regions") or []
+    if not isinstance(metadata_regions, list):
+        raise ProfileError("metadata_fault_regions: expected list")
+    for index, region in enumerate(metadata_regions):
+        _reject_unknown_keys(
+            region,
+            frozenset({"name", "start", "end", "slot", "offset", "size", "end_offset"}),
+            "metadata_fault_regions[{}]".format(index),
+        )
+
+    _validate_strict_pre_boot_state(data.get("pre_boot_state"), "pre_boot_state")
+    _validate_strict_update_trigger(data.get("update_trigger"), "update_trigger")
+
+    for field_name, allowed in (
+        ("boot_register_pre_writes", {"address", "value"}),
+        ("boot_registers", {"address", "name"}),
+    ):
+        entries = data.get(field_name) or []
+        if not isinstance(entries, list):
+            raise ProfileError("{}: expected list".format(field_name))
+        for index, entry in enumerate(entries):
+            _reject_unknown_keys(
+                entry,
+                frozenset(allowed),
+                "{}[{}]".format(field_name, index),
+            )
+
+    write_constraints = data.get("write_order_constraints") or []
+    if not isinstance(write_constraints, list):
+        raise ProfileError("write_order_constraints: expected list")
+    for index, constraint in enumerate(write_constraints):
+        context = "write_order_constraints[{}]".format(index)
+        _reject_unknown_keys(
+            constraint,
+            frozenset({"first", "then", "label", "bidirectional"}),
+            context,
+        )
+        for relation in ("first", "then"):
+            _reject_unknown_keys(
+                constraint.get(relation),
+                frozenset({"start", "size"}),
+                "{}.{}".format(context, relation),
+            )
+
+    state_probe_value = data.get("state_probe")
+    if isinstance(state_probe_value, dict):
+        _reject_unknown_keys(
+            state_probe_value,
+            frozenset({"script", "required_paths", "contract_version", "format"}),
+            "state_probe",
+        )
+
+    _validate_strict_relative_path(data.get("platform"), "platform")
+    _validate_strict_relative_path(data.get("bootloader", {}).get("elf"), "bootloader.elf")
+    images = data.get("images") or {}
+    if not isinstance(images, dict):
+        raise ProfileError("images: expected mapping")
+    for slot_name, image_path in images.items():
+        _validate_strict_relative_path(
+            image_path,
+            "images.{}".format(slot_name),
+        )
+    for field_name in ("setup_script", "firmware_elf", "fuzz_corpus"):
+        if data.get(field_name):
+            _validate_strict_relative_path(data.get(field_name), field_name)
+    _validate_strict_path_list(data.get("extra_peripherals"), "extra_peripherals")
+    _validate_strict_path_list(data.get("invariant_providers"), "invariant_providers")
+
+    state_probe = data.get("state_probe")
+    if isinstance(state_probe, dict) and state_probe.get("script"):
+        _validate_strict_relative_path(state_probe.get("script"), "state_probe.script")
+    nvs_region = data.get("nvs_region")
+    if isinstance(nvs_region, dict) and nvs_region.get("snapshot"):
+        _validate_strict_relative_path(nvs_region.get("snapshot"), "nvs_region.snapshot")
+    residual = data.get("residual_image")
+    if isinstance(residual, dict) and residual.get("prior_image"):
+        _validate_strict_relative_path(
+            residual.get("prior_image"),
+            "residual_image.prior_image",
+        )
+
+    fault_sweep = data.get("fault_sweep") or {}
+    if fault_sweep.get("boot_cycle_hook"):
+        _validate_strict_relative_path(
+            fault_sweep.get("boot_cycle_hook"),
+            "fault_sweep.boot_cycle_hook",
+        )
+    partial_staging = fault_sweep.get("partial_staging")
+    partial_staging_enabled = True
+    if isinstance(partial_staging, dict):
+        partial_staging_enabled = _parse_bool(
+            partial_staging.get("enabled", True),
+            "fault_sweep.partial_staging.enabled",
+        )
+    if (
+        partial_staging_enabled
+        and isinstance(partial_staging, dict)
+        and partial_staging.get("staging_image")
+    ):
+        _validate_strict_relative_path(
+            partial_staging.get("staging_image"),
+            "fault_sweep.partial_staging.staging_image",
+        )
+
+    initial_states = data.get("initial_states") or []
+    if not isinstance(initial_states, list):
+        raise ProfileError("initial_states: expected list")
+    for index, state in enumerate(initial_states):
+        context = "initial_states[{}]".format(index)
+        _reject_unknown_keys(
+            state,
+            frozenset(
+                {
+                    "name", "description", "pre_boot_state", "setup_script",
+                    "update_trigger", "expect",
+                }
+            ),
+            context,
+        )
+        _validate_strict_pre_boot_state(
+            state.get("pre_boot_state"),
+            "{}.pre_boot_state".format(context),
+        )
+        _validate_strict_update_trigger(
+            state.get("update_trigger"),
+            "{}.update_trigger".format(context),
+        )
+        if state.get("expect") is not None:
+            _reject_unknown_keys(
+                state.get("expect"),
+                _EXPECT_KEYS,
+                "{}.expect".format(context),
+            )
+        if state.get("setup_script"):
+            _validate_strict_relative_path(
+                state.get("setup_script"),
+                "{}.setup_script".format(context),
+            )
+
+    update_sequence = data.get("update_sequence") or []
+    if not isinstance(update_sequence, list):
+        raise ProfileError("update_sequence: expected list")
+    for index, phase in enumerate(update_sequence):
+        context = "update_sequence[{}]".format(index)
+        _reject_unknown_keys(phase, _STRICT_UPDATE_PHASE_KEYS, context)
+        phase_images = phase.get("images") or {}
+        if not isinstance(phase_images, dict):
+            raise ProfileError("{}.images: expected mapping".format(context))
+        for slot_name, image_path in phase_images.items():
+            _validate_strict_relative_path(
+                image_path,
+                "{}.images.{}".format(context, slot_name),
+            )
+        _validate_strict_pre_boot_state(
+            phase.get("pre_boot_state"),
+            "{}.pre_boot_state".format(context),
+        )
+        if phase.get("success_criteria") is not None:
+            _validate_strict_success_criteria(
+                phase.get("success_criteria"),
+                "{}.success_criteria".format(context),
+            )
+        for field_name in ("setup_script", "boot_cycle_hook"):
+            if phase.get(field_name):
+                _validate_strict_relative_path(
+                    phase.get(field_name),
+                    "{}.{}".format(context, field_name),
+                )
+
+    multi_component = data.get("multi_component") or {}
+    if not isinstance(multi_component, dict):
+        raise ProfileError("multi_component: expected mapping")
+    if multi_component:
+        _reject_unknown_keys(
+            multi_component,
+            frozenset({"components", "fault_matrix"}),
+            "multi_component",
+        )
+    components = multi_component.get("components", []) or []
+    if not isinstance(components, list):
+        raise ProfileError("multi_component.components: expected list")
+    for index, component in enumerate(components):
+        context = "multi_component.components[{}]".format(index)
+        _reject_unknown_keys(component, _STRICT_COMPONENT_KEYS, context)
+        _validate_strict_bootloader(
+            component.get("bootloader"),
+            "{}.bootloader".format(context),
+        )
+        _validate_strict_memory(
+            component.get("memory"),
+            "{}.memory".format(context),
+        )
+        component_criteria = component.get("success_criteria")
+        _validate_strict_success_criteria(
+            component_criteria,
+            "{}.success_criteria".format(context),
+        )
+        _validate_strict_pre_boot_state(
+            component.get("pre_boot_state"),
+            "{}.pre_boot_state".format(context),
+        )
+        if component.get("fault_sweep") is not None:
+            # Reuse the complete strict validator on a standalone component
+            # view so every nested fault block receives the same recursive
+            # checks as the parent profile.
+            component_view = {
+                "schema_version": data.get("schema_version", 1),
+                "name": component.get("name"),
+                "platform": component.get("platform"),
+                "bootloader": component.get("bootloader"),
+                "memory": component.get("memory"),
+                "images": component.get("images", {}),
+                "pre_boot_state": component.get("pre_boot_state"),
+                "setup_script": component.get("setup_script"),
+                "extra_peripherals": component.get("extra_peripherals"),
+                "success_criteria": component.get("success_criteria"),
+                "fault_sweep": component.get("fault_sweep"),
+            }
+            try:
+                _validate_strict_profile_data(component_view)
+            except ProfileError as exc:
+                raise ProfileError("{}: {}".format(context, exc)) from exc
+        _validate_strict_relative_path(
+            component.get("platform"),
+            "{}.platform".format(context),
+        )
+        _validate_strict_relative_path(
+            (component.get("bootloader") or {}).get("elf"),
+            "{}.bootloader.elf".format(context),
+        )
+        component_images = component.get("images") or {}
+        if not isinstance(component_images, dict):
+            raise ProfileError("{}.images: expected mapping".format(context))
+        for slot_name, image_path in component_images.items():
+            _validate_strict_relative_path(
+                image_path,
+                "{}.images.{}".format(context, slot_name),
+            )
+        if component.get("setup_script"):
+            _validate_strict_relative_path(
+                component.get("setup_script"),
+                "{}.setup_script".format(context),
+            )
+        _validate_strict_path_list(
+            component.get("extra_peripherals"),
+            "{}.extra_peripherals".format(context),
+        )
+
+
+def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
     """Load and validate a YAML profile.
 
     Args:
         path: Path to the .yaml profile file.
+        strict: Reject unknown fields and profiles without an observable
+            success check. A profile may also opt in with
+            ``strict_validation: true``.
 
     Returns:
         A validated ProfileConfig.
@@ -4870,8 +6036,38 @@ def load_profile(path: str | Path) -> ProfileConfig:
     if not isinstance(data, dict):
         raise ProfileError("Profile must be a YAML mapping, got {}".format(type(data).__name__))
 
+    raw_strict_value = data.get("strict_validation", False)
+    if not isinstance(raw_strict_value, bool):
+        raise ProfileError("strict_validation: expected boolean")
+    strict_requested = strict or raw_strict_value
+    strict_root = path.parent.resolve()
+
     # Resolve base_profile inheritance before parsing fields.
-    data = _resolve_base_profile(data, path)
+    base_chain: List[Tuple[str, Path]] = []
+    data = _resolve_base_profile(
+        data,
+        path,
+        _strict_root=strict_root if strict_requested else None,
+        _base_chain=base_chain,
+    )
+
+    strict_value = data.get("strict_validation", False)
+    if not isinstance(strict_value, bool):
+        raise ProfileError("strict_validation: expected boolean")
+    if strict or strict_value:
+        # A profile can inherit strict_validation from a base.  Recheck the
+        # complete resolved chain here so inherited strict mode cannot use a
+        # symlink or an earlier reference to leave the caller's profile tree.
+        for base_rel, base_path in base_chain:
+            _validate_strict_relative_path(base_rel, "base_profile")
+            try:
+                base_path.relative_to(strict_root)
+            except ValueError as exc:
+                raise ProfileError(
+                    "base_profile {!r} escapes strict profile boundary {} "
+                    "(resolved to {})".format(base_rel, strict_root, base_path)
+                ) from exc
+        _validate_strict_profile_data(data)
 
     # Schema version validation.
     schema_version = _parse_int(
@@ -4885,7 +6081,7 @@ def load_profile(path: str | Path) -> ProfileConfig:
         )
 
     # Required fields.
-    name = str(_require(data, "name"))
+    name = _parse_profile_identifier(_require(data, "name"), "name")
     description = str(data.get("description", ""))
     platform = str(_require(data, "platform"))
 
@@ -5080,6 +6276,26 @@ def load_profile(path: str | Path) -> ProfileConfig:
             faulted_phase.expected_rollback_at_cycle
         )
         profile.fault_sweep.fault_types = list(faulted_phase.fault_types)
+
+    if "nvs_corruption" in profile.fault_sweep.fault_types:
+        if profile.nvs_region is None:
+            raise ProfileError(
+                "fault_sweep.fault_types includes nvs_corruption but no "
+                "top-level nvs_region is configured"
+            )
+        if not profile.fault_sweep.nvs_corruption.enabled:
+            raise ProfileError(
+                "fault_sweep.fault_types includes nvs_corruption but "
+                "fault_sweep.nvs_corruption.enabled is not true"
+            )
+
+    if (
+        profile.success_criteria.bootloader_integrity
+        and profile.bootloader_region is None
+    ):
+        raise ProfileError(
+            "success_criteria.bootloader_integrity requires bootloader_region"
+        )
 
     return profile
 

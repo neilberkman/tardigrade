@@ -34,6 +34,9 @@ success_criteria:
 fault_sweep:
   mode: runtime
   max_writes: 28672
+  # Explicit operation bound keeps this OTP-only campaign independent of
+  # NVM write-trace calibration.
+  max_otp_blows: 5
   max_writes_cap: 100000
   run_duration: "0.01"
   fault_types:

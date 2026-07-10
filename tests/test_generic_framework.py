@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from pathlib import Path
 import sys as pysys
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 
@@ -23,6 +25,7 @@ from profile_loader import load_profile  # noqa: E402
 from invariants import resolve_invariants  # noqa: E402
 from run_scenario import (  # noqa: E402
     _deep_merge,
+    _scenario_asserts_step_verdict,
     apply_replay_to_profile,
     evaluate_assertions,
     load_replay_spec,
@@ -570,6 +573,146 @@ class GenericFrameworkTest(unittest.TestCase):
         )
         self.assertEqual(failures, [])
 
+    def test_audit_step_honors_failed_json_verdict_with_zero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            base_profile = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: scenario_verdict_fixture
+                """,
+            )
+
+            def fake_run(cmd, cwd):
+                output_path = Path(cmd[cmd.index("--output") + 1])
+                output_path.write_text('{"verdict":"FAIL"}', encoding="utf-8")
+                return 0, "", ""
+
+            with mock.patch("run_scenario._run_command_streamed", side_effect=fake_run):
+                step_result = run_audit_step(
+                    repo_root=ROOT,
+                    scenario_dir=tempdir,
+                    default_base_profile_path=base_profile,
+                    step={"id": "failed_audit", "kind": "audit"},
+                    tempdir=tempdir,
+                    args=SimpleNamespace(
+                        renode_test="",
+                        renode_remote_server_dir="",
+                        robot_var=[],
+                        keep_run_artifacts=False,
+                        workers=0,
+                    ),
+                )
+
+        self.assertEqual(step_result["exit_code"], 0)
+        self.assertEqual(step_result["status"], "FAIL")
+        self.assertEqual(step_result["verdict_policy"], "require_pass")
+
+    def test_explicit_scenario_verdict_assertion_owns_expected_failure(self) -> None:
+        steps = [
+            {"id": "audit_case", "kind": "audit"},
+            {
+                "id": "verdict_policy",
+                "kind": "assert",
+                "assertions": [
+                    {
+                        "path": "steps.audit_case.report.verdict",
+                        "op": "equals",
+                        "value": "FAIL",
+                    }
+                ],
+            },
+        ]
+        self.assertTrue(_scenario_asserts_step_verdict(steps, "audit_case"))
+        self.assertFalse(
+            _scenario_asserts_step_verdict(
+                [
+                    {
+                        "id": "weak_policy",
+                        "kind": "assert",
+                        "assertions": [
+                            {
+                                "path": "steps.audit_case.report.verdict",
+                                "op": "exists",
+                            }
+                        ],
+                    }
+                ],
+                "audit_case",
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            base_profile = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: expected_failure_fixture
+                """,
+            )
+
+            def fake_run(cmd, cwd):
+                output_path = Path(cmd[cmd.index("--output") + 1])
+                output_path.write_text('{"verdict":"FAIL"}', encoding="utf-8")
+                return 0, "", ""
+
+            with mock.patch("run_scenario._run_command_streamed", side_effect=fake_run):
+                step_result = run_audit_step(
+                    repo_root=ROOT,
+                    scenario_dir=tempdir,
+                    default_base_profile_path=base_profile,
+                    step=steps[0],
+                    tempdir=tempdir,
+                    args=SimpleNamespace(
+                        renode_test="",
+                        renode_remote_server_dir="",
+                        robot_var=[],
+                        keep_run_artifacts=False,
+                        workers=0,
+                    ),
+                    defer_verdict_to_assertion=True,
+                )
+
+        self.assertEqual(step_result["status"], "PASS")
+        self.assertEqual(step_result["verdict_policy"], "scenario_assertion")
+
+    def test_scenario_assertion_cannot_accept_missing_child_report(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            base_profile = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: missing_report_fixture
+                """,
+            )
+
+            with mock.patch(
+                "run_scenario._run_command_streamed",
+                return_value=(0, "", ""),
+            ):
+                step_result = run_audit_step(
+                    repo_root=ROOT,
+                    scenario_dir=tempdir,
+                    default_base_profile_path=base_profile,
+                    step={"id": "missing_report", "kind": "audit"},
+                    tempdir=tempdir,
+                    args=SimpleNamespace(
+                        renode_test="",
+                        renode_remote_server_dir="",
+                        robot_var=[],
+                        keep_run_artifacts=False,
+                        workers=0,
+                    ),
+                    defer_verdict_to_assertion=True,
+                )
+
+        self.assertEqual(step_result["exit_code"], 0)
+        self.assertEqual(step_result["status"], "FAIL")
+        self.assertIsNone(step_result["report"])
+
     def test_deep_merge_keeps_unrelated_nested_keys(self) -> None:
         merged = _deep_merge(
             {"expect": {"should_find_issues": False, "control_outcome": "success"}},
@@ -656,6 +799,68 @@ class GenericFrameworkTest(unittest.TestCase):
                     ),
                 )
             self.assertEqual(step_result["base_profile"], str(base2.resolve()))
+
+    def test_run_audit_step_materializes_inherited_profile_before_temp_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            profiles = root / "profiles"
+            run_temp = root / "run"
+            profiles.mkdir()
+            run_temp.mkdir()
+            base = profiles / "base.yaml"
+            child = profiles / "child.yaml"
+            base.write_text(
+                textwrap.dedent(
+                    """
+                    schema_version: 1
+                    name: inherited_base
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    bootloader: { elf: examples/vulnerable_ota/firmware.elf, entry: 0x10000000 }
+                    memory:
+                      sram: { start: 0x20000000, end: 0x20020000 }
+                      write_granularity: 4
+                      slots:
+                        exec: { base: 0x10000000, size: 0x1000 }
+                        staging: { base: 0x10001000, size: 0x1000 }
+                    images: { staging: examples/vulnerable_ota/firmware.bin }
+                    success_criteria: { vtor_in_slot: exec }
+                    fault_sweep: { mode: runtime, max_writes: 1 }
+                    expect: { should_find_issues: false }
+                    """
+                ),
+                encoding="utf-8",
+            )
+            child.write_text(
+                "base_profile: base.yaml\nname: inherited_child\n",
+                encoding="utf-8",
+            )
+
+            def fake_run(cmd, cwd):
+                rendered_path = Path(cmd[cmd.index("--profile") + 1])
+                rendered = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))
+                self.assertNotIn("base_profile", rendered)
+                self.assertEqual(rendered["name"], "inherited_child")
+                self.assertIn("memory", rendered)
+                output_path = Path(cmd[cmd.index("--output") + 1])
+                output_path.write_text('{"verdict":"PASS"}', encoding="utf-8")
+                return 0, "", ""
+
+            with mock.patch("run_scenario._run_command_streamed", side_effect=fake_run):
+                step_result = run_audit_step(
+                    repo_root=ROOT,
+                    scenario_dir=profiles,
+                    default_base_profile_path=child,
+                    step={"id": "inherited", "kind": "audit"},
+                    tempdir=run_temp,
+                    args=SimpleNamespace(
+                        renode_test="",
+                        renode_remote_server_dir="",
+                        robot_var=[],
+                        keep_run_artifacts=False,
+                        workers=0,
+                    ),
+                )
+            self.assertEqual(step_result["status"], "PASS")
 
     def test_run_audit_step_resolves_repo_root_relative_base_profile(self) -> None:
         with tempfile.TemporaryDirectory() as td:

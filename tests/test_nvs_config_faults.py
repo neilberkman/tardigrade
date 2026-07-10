@@ -374,8 +374,13 @@ class TestNvsRegionProfileParsing(unittest.TestCase):
           staging: examples/vulnerable_ota/firmware.bin
         success_criteria:
           vtor_in_slot: exec
+        nvs_region:
+          address: 0x10002000
+          size: 0x1000
         fault_sweep:
           fault_types: [power_loss, nvs_corruption]
+          nvs_corruption:
+            enabled: true
         """
         with tempfile.TemporaryDirectory() as td:
             p = self._write_profile(Path(td), body)

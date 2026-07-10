@@ -18,6 +18,7 @@ import json
 import time as _time_mod
 
 from audit_report import summarize_runtime_sweep
+from fault_plan import CalibrationInputs, build_fault_plan
 from fault_classification import _effective_boot_result, _interesting_multi_fault_points
 from fault_inject import (
     AnnotatedSequence,
@@ -38,6 +39,7 @@ from partial_staging import (
 )
 from profile_loader import ProfileConfig, load_profile
 from renode_runner import (
+    RenodeTimeoutError,
     _progress,
     _run_batches_chunked,
     _base_fault_type_code,
@@ -50,6 +52,20 @@ from result_checks import annotate_result_checks
 from trace_utils import load_clean_erase_trace, load_clean_write_trace
 
 
+def _cleanup_generated_robot_vars(robot_vars: List[str]) -> None:
+    """Remove temp files created by ProfileConfig.robot_vars()."""
+    for entry in robot_vars:
+        if not entry.startswith(("PRE_BOOT_STATE_BIN:", "UPDATE_SEQUENCE_FILE:")):
+            continue
+        path = entry.split(":", 1)[1]
+        if not path:
+            continue
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
 def _with_sweep_hash_bypass(
     robot_vars: List[str],
     profile: ProfileConfig,
@@ -58,10 +74,19 @@ def _with_sweep_hash_bypass(
 ) -> List[str]:
     """Scope hash-bypass patches to faulted sweep runs only."""
     filtered_vars = [
-        rv for rv in robot_vars if not rv.startswith("HASH_BYPASS_SYMBOLS:")
+        rv
+        for rv in robot_vars
+        if not rv.startswith("HASH_BYPASS_SYMBOLS:")
+        and not rv.startswith("HASH_BYPASS_ADDRS:")
     ]
     if not enabled:
         return filtered_vars
+
+    # Pre-resolved addresses are an optimization for faulted runs only.  They
+    # activate the bypass independently of the symbol list in the runtime.
+    filtered_vars.extend(
+        rv for rv in robot_vars if rv.startswith("HASH_BYPASS_ADDRS:")
+    )
 
     symbols: List[str] = []
     seen: set[str] = set()
@@ -108,7 +133,7 @@ def build_control_robot_vars(
     return _with_sweep_hash_bypass(
         robot_vars,
         profile,
-        enabled=not no_hash_bypass,
+        enabled=False,
     )
 
 
@@ -584,6 +609,8 @@ def _run_batch_worker(
     fault_types_list: Optional[List[str]] = None,
     max_batch_points: int = 0,
     keep_run_artifacts: bool = False,
+    profile_component_name: Optional[str] = None,
+    profile_initial_state_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Worker function for parallel batch execution.
 
@@ -624,6 +651,32 @@ def _run_batch_worker(
     )
 
     profile = load_profile(profile_path)
+    if profile_initial_state_name:
+        state_matches = [
+            state
+            for state in profile.initial_states
+            if state.name == profile_initial_state_name
+        ]
+        if len(state_matches) != 1:
+            raise RuntimeError(
+                "parallel worker could not resolve initial state {!r} from {}".format(
+                    profile_initial_state_name, profile_path
+                )
+            )
+        profile = profile.resolve_initial_state(state_matches[0])
+    if profile_component_name:
+        matches = [
+            component
+            for component in profile.multi_component.components
+            if component.name == profile_component_name
+        ] if profile.multi_component is not None else []
+        if len(matches) != 1:
+            raise RuntimeError(
+                "parallel worker could not resolve component {!r} from {}".format(
+                    profile_component_name, profile_path
+                )
+            )
+        profile = matches[0].to_profile_config(profile)
 
     results = _run_batches_chunked(
         repo_root=repo_root,
@@ -664,6 +717,7 @@ def _run_partial_staging_worker(
     renode_remote_server_dir: str,
     worker_id: int,
     keep_run_artifacts: bool = False,
+    profile_initial_state_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Worker function for parallel partial staging execution.
 
@@ -701,6 +755,19 @@ def _run_partial_staging_worker(
     )
 
     profile = load_profile(profile_path)
+    if profile_initial_state_name:
+        state_matches = [
+            state
+            for state in profile.initial_states
+            if state.name == profile_initial_state_name
+        ]
+        if len(state_matches) != 1:
+            raise RuntimeError(
+                "partial-staging worker could not resolve initial state {!r}".format(
+                    profile_initial_state_name
+                )
+            )
+        profile = profile.resolve_initial_state(state_matches[0])
     staging_key = "IMAGE_{}_PATH".format(staging_slot_name.upper())
     staging_var = "IMAGE_{}".format(staging_slot_name.upper())
 
@@ -729,6 +796,7 @@ def _run_partial_staging_worker(
             if not rv.startswith(staging_key + ":")
             and not rv.startswith(staging_var + ":")
             and not rv.startswith("HASH_BYPASS_SYMBOLS:")
+            and not rv.startswith("HASH_BYPASS_ADDRS:")
         ]
         ps_robot_vars.append("{}:{}".format(staging_var, temp_path))
         ps_robot_vars.append("{}:{}".format(staging_key, temp_path))
@@ -754,7 +822,9 @@ def _run_partial_staging_worker(
                     worker_id, tp.label, tp.offset, exc
                 )
             )
-            boot_outcome = "infra_error"
+            boot_outcome = (
+                "timeout" if isinstance(exc, RenodeTimeoutError) else "infra_error"
+            )
             boot_slot = None
             data = None
 
@@ -802,6 +872,7 @@ def run_partial_staging_sweep(
     renode_remote_server_dir: str,
     num_workers: int = 1,
     keep_run_artifacts: bool = False,
+    profile_initial_state_name: Optional[str] = None,
 ) -> Tuple[List[PartialStagingResult], List[Dict[str, Any]]]:
     """Run the partial staging sweep, optionally in parallel.
 
@@ -851,6 +922,7 @@ def run_partial_staging_sweep(
                     renode_remote_server_dir=renode_remote_server_dir,
                     worker_id=wid,
                     keep_run_artifacts=keep_run_artifacts,
+                    profile_initial_state_name=profile_initial_state_name,
                 )
                 futures[f] = wid
 
@@ -912,6 +984,7 @@ def run_partial_staging_sweep(
             if not rv.startswith(staging_key + ":")
             and not rv.startswith(staging_var + ":")
             and not rv.startswith("HASH_BYPASS_SYMBOLS:")
+            and not rv.startswith("HASH_BYPASS_ADDRS:")
         ]
         ps_robot_vars.append("{}:{}".format(staging_var, temp_path))
         ps_robot_vars.append("{}:{}".format(staging_key, temp_path))
@@ -937,7 +1010,9 @@ def run_partial_staging_sweep(
                     tp.label, tp.offset, exc
                 )
             )
-            boot_outcome = "infra_error"
+            boot_outcome = (
+                "timeout" if isinstance(exc, RenodeTimeoutError) else "infra_error"
+            )
             boot_slot = None
             data = None
 
@@ -1006,6 +1081,8 @@ def run_runtime_sweep(
     keep_run_artifacts: bool = False,
     no_hash_bypass: bool = False,
     allow_state_evaluator: bool = True,
+    profile_component_name: Optional[str] = None,
+    profile_initial_state_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Run the full runtime fault sweep.
 
@@ -1109,6 +1186,8 @@ def run_runtime_sweep(
                     fault_types_list=ft_chunks[wid] if wid < len(ft_chunks) else None,
                     max_batch_points=max_batch_points,
                     keep_run_artifacts=keep_run_artifacts,
+                    profile_component_name=profile_component_name,
+                    profile_initial_state_name=profile_initial_state_name,
                 )
                 futures[f] = wid
 
@@ -1283,6 +1362,14 @@ def validate_runtime_fault_mode_compat(profile: "ProfileConfig", eval_mode: str)
     )
 
 
+def _bounded_component_write_count(
+    profile: ProfileConfig,
+    write_count: int,
+) -> int:
+    """Apply the component profile's campaign ceiling to a derived count."""
+    return min(int(write_count), int(profile.fault_sweep.max_writes_cap))
+
+
 def run_multi_component_sweep(
     repo_root: Path,
     renode_test: str,
@@ -1315,6 +1402,10 @@ def run_multi_component_sweep(
     mc = profile.multi_component
     if mc is None:
         raise RuntimeError("run_multi_component_sweep called on single-component profile")
+    if no_control:
+        raise RuntimeError(
+            "multi-component sweeps require observed clean controls for every component"
+        )
 
     component_profiles = profile.component_profiles()
     _progress(
@@ -1337,20 +1428,28 @@ def run_multi_component_sweep(
             )
         )
 
-        # Build robot vars for this component.  Start from caller-supplied
-        # base vars (CLI overrides, stall timeouts, etc.) and layer the
-        # component-specific profile vars on top so that component-local
-        # settings win on conflict.
-        comp_robot_vars = merge_robot_vars(robot_vars_base, comp_profile.robot_vars(repo_root))
-        comp_robot_vars.append("EVALUATION_MODE:{}".format(evaluation_mode))
-        comp_robot_vars.append(
-            "EXPECT_CONTROL_OUTCOME:{}".format(comp_profile.expect.control_outcome)
-        )
-
+        # Build robot vars for this component.  ``robot_vars_base`` contains
+        # campaign-only values (CLI additions and stall timeouts), never the
+        # parent profile's rendered variables.  Layer the component-specific
+        # profile vars on top so optional parent settings cannot bleed into a
+        # component that omitted them.
         # Determine eval mode from component or parent.
         comp_eval_mode = evaluation_mode
         if comp_profile.fault_sweep.evaluation_mode:
             comp_eval_mode = comp_profile.fault_sweep.evaluation_mode
+        component_owned_robot_vars = comp_profile.robot_vars(repo_root)
+        comp_robot_vars = merge_robot_vars(
+            merge_robot_vars(
+                robot_vars_base,
+                component_owned_robot_vars,
+            ),
+            [
+                "EVALUATION_MODE:{}".format(comp_eval_mode),
+                "EXPECT_CONTROL_OUTCOME:{}".format(
+                    comp_profile.expect.control_outcome
+                ),
+            ],
+        )
 
         # Calibrate this component.
         comp_max_writes = comp_profile.fault_sweep.max_writes
@@ -1358,6 +1457,10 @@ def run_multi_component_sweep(
         erase_trace_file: Optional[str] = None
         trace_file_bin: Optional[str] = None
         erase_trace_file_bin: Optional[str] = None
+        total_erases = 0
+        total_i2c_transactions = 0
+        total_otp_blows = 0
+        setup_writes = 0
 
         if comp_max_writes == "auto":
             if comp_eval_mode == "state" and "exec" in comp_profile.memory.slots:
@@ -1383,6 +1486,10 @@ def run_multi_component_sweep(
                     keep_run_artifacts=keep_run_artifacts,
                 )
                 comp_max_writes = cal.total_writes
+                total_erases = cal.total_erases
+                total_i2c_transactions = cal.total_i2c_transactions
+                total_otp_blows = cal.total_otp_blows
+                setup_writes = cal.setup_writes
                 trace_file = cal.trace_file
                 erase_trace_file = cal.erase_trace_file
                 trace_file_bin = cal.trace_file_bin
@@ -1395,15 +1502,42 @@ def run_multi_component_sweep(
         else:
             comp_max_writes = int(comp_max_writes)
 
-        # Build fault points for this component.
-        step = max(1, fault_step)
-        fp_start = fault_start if fault_start is not None else 0
-        fp_end = fault_end if fault_end is not None else comp_max_writes
-        fault_points = list(range(fp_start, fp_end, step))
-        if comp_max_writes > 0 and comp_max_writes - 1 not in fault_points and fault_end is None:
-            fault_points.append(comp_max_writes - 1)
-        if quick:
-            fault_points = quick_subset(fault_points)
+        comp_max_writes = int(comp_max_writes)
+        bounded_write_count = _bounded_component_write_count(
+            comp_profile,
+            comp_max_writes,
+        )
+        if bounded_write_count < comp_max_writes:
+            _progress(
+                "Component '{}': capping writes from {} to {}.".format(
+                    comp_name,
+                    comp_max_writes,
+                    bounded_write_count,
+                )
+            )
+            comp_max_writes = bounded_write_count
+
+        # Use the canonical planner so component-local erase, OTP, I2C,
+        # instruction, metadata, and other declared fault types retain their
+        # runtime wire encodings.
+        component_plan = build_fault_plan(
+            comp_profile,
+            CalibrationInputs(
+                max_writes=int(comp_max_writes),
+                total_erases=total_erases,
+                total_i2c_transactions=total_i2c_transactions,
+                total_otp_blows=total_otp_blows,
+                setup_writes=setup_writes,
+                trace_file=trace_file,
+                erase_trace_file=erase_trace_file,
+            ),
+            quick=quick,
+            fault_step=max(1, fault_step),
+            fault_start=fault_start,
+            fault_end=fault_end,
+        )
+        fault_points = component_plan.fault_points
+        fault_types_list = component_plan.fault_types_list
 
         _progress(
             "Component '{}': sweeping {} fault points.".format(
@@ -1429,69 +1563,80 @@ def run_multi_component_sweep(
             erase_trace_file=erase_trace_file if not no_trace_replay else None,
             trace_file_bin=trace_file_bin if not no_trace_replay else None,
             erase_trace_file_bin=erase_trace_file_bin if not no_trace_replay else None,
+            fault_types_list=fault_types_list,
             keep_run_artifacts=keep_run_artifacts,
             no_hash_bypass=no_hash_bypass,
             allow_state_evaluator=not quick,
+            profile_component_name=comp_name,
         )
 
-        annotate_result_checks(comp_results, comp_profile)
-
-        # For cross_product: classify each faulted result against clean
-        # outcomes of other components.  Since each component is swept
-        # independently in separate Renode instances, we use the control
-        # result of other components as their "clean" outcome.
-        other_control_outcomes: Dict[str, str] = {}
-        for other_idx, other_profile in enumerate(component_profiles):
-            if other_idx == comp_idx:
-                continue
-            other_name = mc.components[other_idx].name
-            # Other components are assumed to boot successfully when not faulted.
-            other_control_outcomes[other_name] = other_profile.expect.control_outcome
-
-        for result in comp_results:
-            if result.get("is_control", False):
-                continue
-            if not result.get("fault_injected", False):
-                continue
-
-            faulted_outcome, _ = _effective_boot_result(result)
-            per_comp_outcomes: Dict[str, Dict[str, Any]] = {
-                comp_name: {
-                    "boot_outcome": faulted_outcome,
-                    "boot_slot": result.get("boot_slot"),
-                    "fault_at": result.get("fault_at"),
-                    "faulted": True,
-                },
-            }
-            for other_name, other_expected in other_control_outcomes.items():
-                per_comp_outcomes[other_name] = {
-                    "boot_outcome": other_expected,
-                    "boot_slot": None,
-                    "faulted": False,
-                }
-
-            combined_outcome = classify_multi_component_outcome(per_comp_outcomes)
-
-            combined_result = {
-                "faulted_component": comp_name,
-                "fault_at": result.get("fault_at"),
-                "fault_type": result.get("fault_type"),
-                "combined_outcome": combined_outcome,
-                "per_component": per_comp_outcomes,
-                "is_control": False,
-            }
-            combined_results.append(combined_result)
+        annotate_result_checks(comp_results, comp_profile, repo_root=repo_root)
 
         # Store per-component summary.
         comp_summary = summarize_runtime_sweep(
-            comp_results, total_writes=comp_max_writes, profile=comp_profile
+            comp_results,
+            total_writes=comp_max_writes,
+            profile=comp_profile,
+            expected_fault_points=len(fault_points),
         )
         per_component_data[comp_name] = {
             "calibrated_writes": comp_max_writes,
             "fault_points_tested": len(fault_points),
+            "fault_types_list": fault_types_list,
+            "heuristic": component_plan.heuristic_summary,
             "summary": comp_summary,
             "results": comp_results,
         }
+        _cleanup_generated_robot_vars(component_owned_robot_vars)
+
+    # Combine each faulted component with independently observed clean
+    # controls from every other component.  This remains a cross-run model,
+    # but no outcome is fabricated from profile expectations.
+    observed_controls: Dict[str, Dict[str, Any]] = {}
+    for comp_name, data in per_component_data.items():
+        controls = [r for r in data["results"] if r.get("is_control")]
+        if len(controls) != 1:
+            raise RuntimeError(
+                "component '{}' produced {} clean controls; exactly one is required".format(
+                    comp_name, len(controls)
+                )
+            )
+        outcome, slot = _effective_boot_result(controls[0])
+        observed_controls[comp_name] = {
+            "boot_outcome": outcome,
+            "boot_slot": slot,
+            "faulted": False,
+            "observed_control": True,
+        }
+
+    for comp_name, data in per_component_data.items():
+        for result in data["results"]:
+            if result.get("is_control") or not result.get("fault_injected", False):
+                continue
+            faulted_outcome, faulted_slot = _effective_boot_result(result)
+            per_comp_outcomes = {
+                name: dict(control)
+                for name, control in observed_controls.items()
+            }
+            per_comp_outcomes[comp_name] = {
+                "boot_outcome": faulted_outcome,
+                "boot_slot": faulted_slot,
+                "fault_at": result.get("fault_at"),
+                "faulted": True,
+                "observed_control": False,
+            }
+            combined_results.append(
+                {
+                    "faulted_component": comp_name,
+                    "fault_at": result.get("fault_at"),
+                    "fault_type": result.get("fault_type"),
+                    "combined_outcome": classify_multi_component_outcome(
+                        per_comp_outcomes
+                    ),
+                    "per_component": per_comp_outcomes,
+                    "is_control": False,
+                }
+            )
 
     # Compute multi-component combined summary.
     total_combined = len(combined_results)
@@ -1562,6 +1707,7 @@ def run_multi_fault_phase(
     no_hash_bypass: bool = False,
     explain_only: bool = False,
     keep_run_artifacts: bool = False,
+    profile_initial_state_name: Optional[str] = None,
 ) -> MultiFaultPhaseResult:
     """Plan and optionally execute multi-fault sequences.
 
@@ -1637,6 +1783,20 @@ def run_multi_fault_phase(
         return out
 
     if not mf_plan.sequences:
+        out.results = []
+        out.summary = summarize_runtime_sweep(
+            [],
+            total_writes=max_writes,
+            profile=profile,
+            expected_fault_points=0,
+            expected_control_points=0,
+        )
+        out.summary["plan_empty"] = True
+        out.summary["plan_empty_reason"] = (
+            mf_plan.diagnostics.get("reason")
+            or mf_plan.diagnostics.get("primary_reason")
+            or "multi-fault planner generated no sequences"
+        )
         return out
 
     multi_fault_points = [seq[0] for seq in mf_plan.sequences]
@@ -1670,6 +1830,7 @@ def run_multi_fault_phase(
         fault_types_list=multi_fault_types,
         keep_run_artifacts=keep_run_artifacts,
         no_hash_bypass=no_hash_bypass,
+        profile_initial_state_name=profile_initial_state_name,
     )
     mf_wall_s = _time_mod.time() - mf_wall_t0
 
@@ -1684,9 +1845,13 @@ def run_multi_fault_phase(
             if _rat:
                 mf_r["sequence_rationale"] = _rat
 
-    annotate_result_checks(out.results, profile)
+    annotate_result_checks(out.results, profile, repo_root=repo_root)
     out.summary = summarize_runtime_sweep(
-        out.results, total_writes=max_writes, profile=profile,
+        out.results,
+        total_writes=max_writes,
+        profile=profile,
+        expected_fault_points=len(multi_fault_points),
+        expected_control_points=0,
     )
     out.summary["wall_time_s"] = round(mf_wall_s, 1)
     print(

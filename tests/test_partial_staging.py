@@ -9,6 +9,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -25,6 +26,8 @@ from partial_staging import (  # noqa: E402
     summarize_partial_staging,
     write_partial_image_to_temp,
 )
+from audit_report import compute_verdict  # noqa: E402
+from profile_loader import MAX_PROFILE_FAULT_POINTS  # noqa: E402
 
 
 class TestTruncationPoints(unittest.TestCase):
@@ -52,6 +55,22 @@ class TestTruncationPoints(unittest.TestCase):
         self.assertIn("half", labels)
         self.assertIn("complete", labels)
         self.assertIn("last_byte_missing", labels)
+
+    def test_unknown_strategy_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown truncation strategy"):
+            generate_truncation_points(
+                image_size=4096,
+                strategy="exhuastive",
+                sector_size=256,
+            )
+
+    def test_exhaustive_candidate_count_has_resource_ceiling(self):
+        with self.assertRaisesRegex(ValueError, "candidates exceed safety limit"):
+            generate_truncation_points(
+                image_size=MAX_PROFILE_FAULT_POINTS + 2,
+                strategy="exhaustive",
+                sector_size=1,
+            )
 
     def test_heuristic_points_sorted(self):
         points = generate_truncation_points(
@@ -227,14 +246,41 @@ class TestClassifyOutcome(unittest.TestCase):
         )
         self.assertEqual(result, "complete_image_ok")
 
-    def test_complete_image_brick(self):
+    def test_complete_image_no_boot_is_failed_control(self):
         result = classify_partial_staging_outcome(
             boot_outcome="no_boot",
             boot_slot=None,
             truncation_offset=1000,
             image_size=1000,
         )
-        self.assertEqual(result, "brick")
+        self.assertEqual(result, "complete_image_failed")
+
+    def test_complete_image_wrong_image_is_failed_control(self):
+        result = classify_partial_staging_outcome(
+            boot_outcome="wrong_image",
+            boot_slot="exec",
+            truncation_offset=1000,
+            image_size=1000,
+        )
+        self.assertEqual(result, "complete_image_failed")
+
+    def test_complete_image_timeout_is_incomplete(self):
+        result = classify_partial_staging_outcome(
+            boot_outcome="timeout",
+            boot_slot=None,
+            truncation_offset=1000,
+            image_size=1000,
+        )
+        self.assertEqual(result, "timeout")
+
+    def test_complete_image_infrastructure_error_is_incomplete(self):
+        result = classify_partial_staging_outcome(
+            boot_outcome="infra_error",
+            boot_slot=None,
+            truncation_offset=1000,
+            image_size=1000,
+        )
+        self.assertEqual(result, "infrastructure_error")
 
     def test_partial_boots_exec_is_safe(self):
         result = classify_partial_staging_outcome(
@@ -271,6 +317,15 @@ class TestClassifyOutcome(unittest.TestCase):
             image_size=1000,
         )
         self.assertEqual(result, "brick")
+
+    def test_partial_wrong_image_is_an_issue(self):
+        result = classify_partial_staging_outcome(
+            boot_outcome="wrong_image",
+            boot_slot="exec",
+            truncation_offset=500,
+            image_size=1000,
+        )
+        self.assertEqual(result, "wrong_image")
 
     def test_partial_boots_staging_is_bad(self):
         result = classify_partial_staging_outcome(
@@ -395,6 +450,91 @@ class TestSummarize(unittest.TestCase):
         ]
         summary = summarize_partial_staging(results)
         self.assertAlmostEqual(summary["issue_rate"], 0.5)
+
+    def test_infrastructure_error_is_counted_as_an_issue(self):
+        results = [
+            self._make_result(
+                500,
+                "half",
+                "infrastructure_error",
+                outcome="infra_error",
+            ),
+            self._make_result(1000, "complete", "complete_image_ok"),
+        ]
+        summary = summarize_partial_staging(results)
+        self.assertEqual(summary["infrastructure_error"], 1)
+        self.assertEqual(summary["issue_count"], 1)
+
+    def test_missing_complete_control_fails_verdict_even_when_issues_expected(self):
+        summary = summarize_partial_staging(
+            [self._make_result(500, "half", "safe_fallback")]
+        )
+        runtime_summary = {
+            "bricks": 0,
+            "issue_points": 1,
+            "semantic_issue_points": 0,
+            "invariant_issue_points": 0,
+            "metadata_delta_issue_points": 0,
+            "timeout_points": 0,
+            "resilient_rollbacks": 0,
+        }
+        verdict = compute_verdict(
+            runtime_summary,
+            SimpleNamespace(
+                should_find_issues=True,
+                control_outcome="success",
+                allow_control_only_issues=False,
+            ),
+            partial_staging_summary=summary,
+        )
+        self.assertEqual(
+            verdict,
+            "FAIL \u2014 partial-staging complete-image control did not succeed",
+        )
+
+    def test_complete_image_only_is_not_a_meaningful_staging_campaign(self):
+        summary = summarize_partial_staging(
+            [self._make_result(1000, "complete", "complete_image_ok")],
+            image_size=1000,
+            expected_points=1,
+        )
+        runtime_summary = {
+            "bricks": 0,
+            "issue_points": 0,
+            "semantic_issue_points": 0,
+            "invariant_issue_points": 0,
+            "metadata_delta_issue_points": 0,
+            "timeout_points": 0,
+            "resilient_rollbacks": 0,
+        }
+
+        self.assertEqual(summary["partial_image_points"], 0)
+        self.assertFalse(summary["campaign_complete"])
+        verdict = compute_verdict(
+            runtime_summary,
+            SimpleNamespace(
+                should_find_issues=False,
+                control_outcome="success",
+                allow_control_only_issues=False,
+            ),
+            partial_staging_summary=summary,
+        )
+        self.assertEqual(
+            verdict,
+            "FAIL \u2014 partial-staging campaign executed no partial-image points",
+        )
+
+    def test_missing_planned_staging_result_fails_closed(self):
+        summary = summarize_partial_staging(
+            [
+                self._make_result(500, "half", "safe_fallback"),
+                self._make_result(1000, "complete", "complete_image_ok"),
+            ],
+            image_size=1000,
+            expected_points=3,
+        )
+        self.assertEqual(summary["missing_result_points"], 1)
+        self.assertFalse(summary["campaign_complete"])
 
 
 class TestParseConfig(unittest.TestCase):

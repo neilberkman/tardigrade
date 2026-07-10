@@ -1,5 +1,8 @@
 name: nuttx-nxboot-real-exploratory
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:
@@ -12,13 +15,17 @@ on:
         required: true
         default: master
       fault_budget:
-        description: Target number of fault points to test across the full write range
+        description: Target fault points across the full write range (1-4096)
         required: true
         default: "16"
       renode_url:
         description: Renode archive URL
         required: true
-        default: https://builds.renode.io/renode-1.16.1.linux-dotnet.tar.gz
+        default: https://github.com/renode/renode/releases/download/v1.16.1/renode-1.16.1.linux-dotnet.tar.gz
+      renode_sha256:
+        description: SHA-256 of the Renode archive
+        required: true
+        default: 62629caa331ed4bd4eb7abe13ee2e4834fbcaa70de492db3965fafa4edc5694f
 
 concurrency:
   group: nuttx-nxboot-real-exploratory-${{ github.event.inputs.nuttx_ref }}-${{ github.event.inputs.nuttx_apps_ref }}-${{ github.event.inputs.fault_budget }}-${{ github.event.inputs.renode_url }}
@@ -33,11 +40,14 @@ jobs:
       TOOLCHAIN_URL: https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v13.2.1-1.1/xpack-arm-none-eabi-gcc-13.2.1-1.1-linux-x64.tar.gz
       TOOLCHAIN_SHA256: 1252a8cafe9237de27a765376697230368eec21db44dc3f1edeb8d838dabd530
       RENODE_URL: ${{ inputs.renode_url }}
+      RENODE_SHA256: ${{ inputs.renode_sha256 }}
       OTA_RENODE_POINT_TIMEOUT_S: "900"
       PYTHONUNBUFFERED: "1"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install NuttX host dependencies
         run: |
@@ -48,23 +58,36 @@ jobs:
           # (arch/arm/src/common/stm32/Kconfig.i2c) that the legacy
           # kconfig-frontends parser rejects; NuttX prefers kconfiglib when its
           # scripts are on PATH, so install it for olddefconfig/menuconfig.
-          sudo python3 -m pip install kconfiglib
+          sudo python3 -m pip install -r requirements-nuttx-build.txt
 
       - name: Install pinned Arm GNU toolchain
         run: |
           set -euxo pipefail
           tarball="${RUNNER_TEMP}/arm-toolchain.tar.gz"
-          curl -L "${TOOLCHAIN_URL}" -o "${tarball}"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            "${TOOLCHAIN_URL}" -o "${tarball}"
           echo "${TOOLCHAIN_SHA256}  ${tarball}" | sha256sum -c -
           tar -xzf "${tarball}" -C "${RUNNER_TEMP}"
           echo "${RUNNER_TEMP}/xpack-arm-none-eabi-gcc-${TOOLCHAIN_VERSION}/bin" >> "${GITHUB_PATH}"
           "${RUNNER_TEMP}/xpack-arm-none-eabi-gcc-${TOOLCHAIN_VERSION}/bin/arm-none-eabi-gcc" --version
 
       - name: Clone upstream NuttX sources
+        env:
+          NUTTX_REF: ${{ inputs.nuttx_ref }}
+          NUTTX_APPS_REF: ${{ inputs.nuttx_apps_ref }}
         run: |
           set -euxo pipefail
-          git clone --depth 1 --branch "${{ inputs.nuttx_ref }}" https://github.com/apache/nuttx.git "${RUNNER_TEMP}/nuttx"
-          git clone --depth 1 --branch "${{ inputs.nuttx_apps_ref }}" https://github.com/apache/nuttx-apps.git "${RUNNER_TEMP}/nuttx-apps"
+          NUTTX_REF="$(python3 scripts/action_helpers.py normalize-git-ref --name nuttx_ref --value "${NUTTX_REF}")"
+          NUTTX_APPS_REF="$(python3 scripts/action_helpers.py normalize-git-ref --name nuttx_apps_ref --value "${NUTTX_APPS_REF}")"
+          checkout_public_ref() {
+            local url="$1" ref="$2" destination="$3"
+            git init --quiet "${destination}"
+            git -C "${destination}" remote add origin "${url}"
+            git -C "${destination}" fetch --quiet --depth 1 origin "${ref}"
+            git -C "${destination}" checkout --quiet --detach FETCH_HEAD
+          }
+          checkout_public_ref https://github.com/apache/nuttx.git "${NUTTX_REF}" "${RUNNER_TEMP}/nuttx"
+          checkout_public_ref https://github.com/apache/nuttx-apps.git "${NUTTX_APPS_REF}" "${RUNNER_TEMP}/nuttx-apps"
           # Tracks upstream master; record exact SHAs for reproducible diagnosis.
           echo "NUTTX_SHA=$(git -C "${RUNNER_TEMP}/nuttx" rev-parse HEAD)" >> "${GITHUB_ENV}"
           echo "NUTTX_APPS_SHA=$(git -C "${RUNNER_TEMP}/nuttx-apps" rev-parse HEAD)" >> "${GITHUB_ENV}"
@@ -98,10 +121,13 @@ jobs:
         run: |
           set -euxo pipefail
           tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
-          curl -L "${RENODE_URL}" -o "${tarball}"
+          python3 scripts/action_helpers.py download-renode \
+            --url "${RENODE_URL}" --sha256 "${RENODE_SHA256}" --output "${tarball}"
           mkdir -p "${RUNNER_TEMP}/renode"
           tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
-          python3 -m pip install --user -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+          python3 -m pip install --user \
+            -c requirements-renode-constraints.txt \
+            -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
           echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
 
       - name: Install Python dependencies
@@ -111,14 +137,14 @@ jobs:
         env:
           FAULT_BUDGET: ${{ inputs.fault_budget }}
         run: |
-          budget="${FAULT_BUDGET:-16}"
-          step_flag=""
-          if [ "$budget" -gt 0 ] 2>/dev/null; then
-            estimated_writes=196608
-            step=$(( (estimated_writes + budget - 1) / budget ))
-            if [ "$step" -gt 1 ]; then
-              step_flag="--fault-step $step"
-            fi
+          set -euo pipefail
+          budget="$(python3 scripts/action_helpers.py normalize-positive-int \
+            --name fault_budget --value "${FAULT_BUDGET:-16}" --maximum 4096)"
+          estimated_writes=196608
+          step=$(( (estimated_writes + budget - 1) / budget ))
+          step_args=()
+          if [ "$step" -gt 1 ]; then
+            step_args+=(--fault-step "$step")
           fi
           python3 scripts/audit_bootloader.py \
             --profile "${RUNNER_TEMP}/nuttx-runtime-profile.yaml" \
@@ -126,7 +152,7 @@ jobs:
             --workers 2 \
             --max-batch-points 16 \
             --robot-var "TEST_TIMEOUT:10 minutes" \
-            $step_flag \
+            "${step_args[@]}" \
             --output results/nuttx_nxboot_real_exploratory.json \
             --no-assert-verdict
 
@@ -182,7 +208,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: nuttx-nxboot-real-exploratory-results
           path: |

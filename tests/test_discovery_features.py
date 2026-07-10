@@ -26,6 +26,7 @@ sys.path.insert(0, str(SCRIPTS))
 import audit_bootloader  # noqa: E402
 from renode_runner import (  # noqa: E402
     CalibrationResult,
+    RenodeTimeoutError,
     _run_batches_chunked,
     _run_batch_with_fallback,
     calibration_completed,
@@ -1373,7 +1374,10 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 )
                 result_file = Path(result_token.split(":", 1)[1])
                 result_file.parent.mkdir(parents=True, exist_ok=True)
-                result_file.write_text('{"boot_outcome":"success"}', encoding="utf-8")
+                result_file.write_text(
+                    '{"fault_at":7,"fault_requested":7,"fault_type":"w","fault_injected":true,"boot_outcome":"success"}',
+                    encoding="utf-8",
+                )
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
             with mock.patch("renode_runner.run_renode_subprocess", side_effect=fake_run):
@@ -1439,7 +1443,10 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 )
                 result_file = Path(result_token.split(":", 1)[1])
                 result_file.parent.mkdir(parents=True, exist_ok=True)
-                result_file.write_text('{"boot_outcome":"success"}', encoding="utf-8")
+                result_file.write_text(
+                    '{"fault_at":9,"fault_requested":9,"fault_type":"w","fault_injected":true,"boot_outcome":"success"}',
+                    encoding="utf-8",
+                )
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
             with mock.patch("renode_runner.run_renode_subprocess", side_effect=fake_run):
@@ -1502,7 +1509,10 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 )
                 result_file = Path(result_token.split(":", 1)[1])
                 result_file.parent.mkdir(parents=True, exist_ok=True)
-                result_file.write_text('{"boot_outcome":"success","fault_injected":false}', encoding="utf-8")
+                result_file.write_text(
+                    '{"fault_at":-1,"fault_requested":-1,"fault_type":"control","boot_outcome":"success","fault_injected":false}',
+                    encoding="utf-8",
+                )
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
             with mock.patch("renode_runner.run_renode_subprocess", side_effect=fake_run):
@@ -1562,7 +1572,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 result_file = Path(result_token.split(":", 1)[1])
                 result_file.parent.mkdir(parents=True, exist_ok=True)
                 result_file.write_text(
-                    '{"boot_outcome":"success","fault_injected":false}',
+                    '{"fault_at":-1,"fault_requested":-1,"fault_type":"control","boot_outcome":"success","fault_injected":false}',
                     encoding="utf-8",
                 )
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -1665,7 +1675,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 result_file = Path(result_token.split(":", 1)[1])
                 result_file.parent.mkdir(parents=True, exist_ok=True)
                 result_file.write_text(
-                    '{"boot_outcome":"success","fault_injected":false}',
+                    '{"fault_at":-1,"fault_requested":-1,"fault_type":"control","boot_outcome":"success","fault_injected":false}',
                     encoding="utf-8",
                 )
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -1719,7 +1729,16 @@ class DiscoveryFeaturesTest(unittest.TestCase):
 
             def fake_batch(*args, **kwargs):
                 points = kwargs["fault_points"]
-                return [{"fault_at": fp, "boot_outcome": "success"} for fp in points]
+                return [
+                    {
+                        "fault_at": fp,
+                        "fault_requested": fp,
+                        "fault_type": "w",
+                        "fault_injected": True,
+                        "boot_outcome": "success",
+                    }
+                    for fp in points
+                ]
 
             with mock.patch(
                 "renode_runner._run_batch_with_fallback",
@@ -1781,7 +1800,16 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 calls.append(list(points))
                 if len(points) > 2:
                     raise RuntimeError("batch timeout")
-                return [{"fault_at": fp, "boot_outcome": "success"} for fp in points]
+                return [
+                    {
+                        "fault_at": fp,
+                        "fault_requested": fp,
+                        "fault_type": "w",
+                        "fault_injected": True,
+                        "boot_outcome": "success",
+                    }
+                    for fp in points
+                ]
 
             with mock.patch("renode_runner.run_batch", side_effect=fake_run_batch):
                 results = _run_batch_with_fallback(
@@ -1835,7 +1863,13 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 calls.append(list(points))
                 if len(points) > 1:
                     raise RuntimeError("batch timeout")
-                return [{"fault_at": points[0], "boot_outcome": "success"}]
+                return [{
+                    "fault_at": points[0],
+                    "fault_requested": points[0],
+                    "fault_type": "w",
+                    "fault_injected": True,
+                    "boot_outcome": "success",
+                }]
 
             with mock.patch("renode_runner.run_batch", side_effect=fake_run_batch):
                 results = _run_batch_with_fallback(
@@ -1853,7 +1887,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertEqual(calls, [[7, 8], [7], [8]])
             self.assertEqual(len(results), 2)
 
-    def test_run_batch_with_fallback_returns_synthetic_timeout_for_single_point(self) -> None:
+    def test_run_batch_with_fallback_records_arbitrary_failure_as_infrastructure_error(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
             profile_path = self._write_profile(
@@ -1901,13 +1935,15 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0]["fault_at"], 99)
             self.assertEqual(results[0]["fault_type"], "s")
-            self.assertEqual(results[0]["boot_outcome"], "no_boot")
-            self.assertTrue(results[0]["fault_injected"])
-            self.assertTrue(results[0]["timeout"])
+            self.assertEqual(results[0]["boot_outcome"], "infra_error")
+            self.assertFalse(results[0]["fault_injected"])
+            self.assertFalse(results[0]["timeout"])
+            self.assertTrue(results[0]["infrastructure_error"])
+            self.assertEqual(results[0]["error_kind"], "runner_error")
             self.assertIn("batch timeout", results[0]["error"])
-            self.assertIn("recording synthetic timeout result", stderr.getvalue())
+            self.assertIn("recording an infrastructure error", stderr.getvalue())
 
-    def test_run_batch_with_fallback_classifies_isolated_instruction_skip_timeout_as_no_boot(self) -> None:
+    def test_run_batch_with_fallback_keeps_verified_instruction_timeout_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
             profile_path = self._write_profile(
@@ -1938,7 +1974,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             stderr = StringIO()
             error = "renode-test batch timed out after 450.0s (1 points)"
 
-            with mock.patch("renode_runner.run_batch", side_effect=RuntimeError(error)):
+            with mock.patch("renode_runner.run_batch", side_effect=RenodeTimeoutError(error)):
                 with redirect_stderr(stderr):
                     results = _run_batch_with_fallback(
                         repo_root=ROOT,
@@ -1956,17 +1992,20 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0]["fault_at"], 99)
             self.assertEqual(results[0]["fault_type"], "i")
-            self.assertEqual(results[0]["boot_outcome"], "no_boot")
-            self.assertTrue(results[0]["fault_injected"])
-            self.assertFalse(results[0]["timeout"])
-            self.assertIn("recording synthetic no-boot result", stderr.getvalue())
+            self.assertEqual(results[0]["boot_outcome"], "timeout")
+            self.assertFalse(results[0]["fault_injected"])
+            self.assertTrue(results[0]["timeout"])
+            self.assertFalse(results[0]["infrastructure_error"])
+            self.assertEqual(results[0]["error_kind"], "wall_timeout")
+            self.assertIn("verified wall timeout", stderr.getvalue())
 
             summary = summarize_runtime_sweep([results[0]], total_writes=1, profile=profile)
-            self.assertEqual(summary["timeout_points"], 0)
+            self.assertEqual(summary["timeout_points"], 1)
+            self.assertEqual(summary["incomplete_fault_points"], 1)
             self.assertEqual(summary["issue_points"], 0)
             self.assertEqual(summary["security_bypass_points"], 0)
             self.assertEqual(summary.get("validated_findings", 0), 0)
-            self.assertEqual(summary["dos_crash_points"], 1)
+            self.assertEqual(summary["dos_crash_points"], 0)
 
     def test_run_batch_with_fallback_returns_synthetic_timeout_at_depth_limit(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -2016,7 +2055,9 @@ class DiscoveryFeaturesTest(unittest.TestCase):
 
             self.assertEqual([r["fault_at"] for r in results], [11, 12])
             self.assertEqual([r["fault_type"] for r in results], ["w", "e"])
-            self.assertTrue(all(r["timeout"] for r in results))
+            self.assertTrue(all(r["infrastructure_error"] for r in results))
+            self.assertTrue(all(not r["timeout"] for r in results))
+            self.assertTrue(all(not r["fault_injected"] for r in results))
             self.assertIn("Fallback depth limit (10)", stderr.getvalue())
 
     def test_run_batch_prunes_robot_artifacts_on_failure(self) -> None:
@@ -2168,7 +2209,16 @@ class DiscoveryFeaturesTest(unittest.TestCase):
 
             def fake_run_batch(**kwargs):
                 calls.append((kwargs["work_dir"], kwargs["bundle_dir"], list(kwargs["fault_points"])))
-                return [{"fault_at": fp, "boot_outcome": "success"} for fp in kwargs["fault_points"]]
+                return [
+                    {
+                        "fault_at": fp,
+                        "fault_requested": fp,
+                        "fault_type": "w",
+                        "fault_injected": True,
+                        "boot_outcome": "success",
+                    }
+                    for fp in kwargs["fault_points"]
+                ]
 
             with mock.patch("renode_runner.run_batch", side_effect=fake_run_batch):
                 results = _run_batches_chunked(
@@ -2681,9 +2731,9 @@ class Phase2FaultTest(unittest.TestCase):
             with self.assertRaises(ProfileError):
                 load_profile(profile_path)
 
-    def test_phase2_fault_invalid_type_warns(self) -> None:
-        """Unknown fault type in phase2_fault emits a warning."""
-        import warnings
+    def test_phase2_fault_invalid_type_rejected(self) -> None:
+        """Unknown recovery-phase fault types are rejected."""
+        from profile_loader import ProfileError
 
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
@@ -2716,16 +2766,8 @@ class Phase2FaultTest(unittest.TestCase):
                       - unknown_type_xyz
                 """,
             )
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                profile = load_profile(profile_path)
-                warning_msgs = [str(warning.message) for warning in w]
-                has_unknown_warning = any(
-                    "unknown_type_xyz" in msg.lower()
-                    for msg in warning_msgs
-                )
-                self.assertTrue(has_unknown_warning, "Expected warning about unknown_type_xyz")
-            self.assertTrue(profile.fault_sweep.phase2_fault.enabled)
+            with self.assertRaisesRegex(ProfileError, "unknown_type_xyz"):
+                load_profile(profile_path)
 
     def test_phase2_fault_cli_output(self) -> None:
         """CLI debug output includes phase2_fault fields."""
@@ -2975,8 +3017,8 @@ class HookFaultTest(unittest.TestCase):
             with self.assertRaises(ProfileError):
                 load_profile(profile_path)
 
-    def test_hook_fault_invalid_type_warns(self) -> None:
-        import warnings
+    def test_hook_fault_invalid_type_rejected(self) -> None:
+        from profile_loader import ProfileError
 
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
@@ -3011,11 +3053,8 @@ class HookFaultTest(unittest.TestCase):
                       - nonsense_type
                 """,
             )
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                profile = load_profile(profile_path)
-            self.assertTrue(any("nonsense_type" in str(x.message) for x in w))
-            self.assertEqual(profile.fault_sweep.hook_fault.fault_types, ["power_loss"])
+            with self.assertRaisesRegex(ProfileError, "nonsense_type"):
+                load_profile(profile_path)
 
     def test_hook_fault_cli_output(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -3208,18 +3247,15 @@ class MetadataFaultTest(unittest.TestCase):
         cal = CalibrationResult(total_writes=100, total_erases=5, trace_file=None, erase_trace_file=None, trace_file_bin=None, erase_trace_file_bin=None)
         self.assertEqual(cal.setup_writes, 0)
 
-    def test_metadata_fault_invalid_type_warns(self):
+    def test_metadata_fault_invalid_type_rejected(self):
         yaml_str = self._make_profile_yaml("metadata_fault:\n  enabled: true\n  fault_types:\n    - power_loss\n    - bogus_type\n")
-        import warnings
+        from profile_loader import ProfileError
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(yaml_str)
             f.flush()
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                profile = load_profile(f.name)
+            with self.assertRaisesRegex(ProfileError, "bogus_type"):
+                load_profile(f.name)
         os.unlink(f.name)
-        self.assertTrue(any("bogus_type" in str(x.message) for x in w), "Expected warning about bogus_type")
-        self.assertIn("power_loss", profile.fault_sweep.metadata_fault.fault_types)
 
     def test_metadata_fault_type_encoding(self):
         self.assertEqual("m:w".split(":")[0], "m")

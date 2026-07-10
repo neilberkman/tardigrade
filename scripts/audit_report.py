@@ -264,14 +264,98 @@ def summarize_runtime_sweep(
     profile: Optional[ProfileConfig] = None,
     metadata_regions: Optional[List[MetadataFaultRegion]] = None,
     calibration_coverage: Optional[Dict[str, Any]] = None,
+    expected_fault_points: Optional[int] = None,
+    expected_control_points: int = 1,
 ) -> Dict[str, Any]:
     """Compute summary statistics from runtime sweep results."""
     non_control = [r for r in results if not r.get("is_control", False)]
     control = [r for r in results if r.get("is_control", False)]
+    returned_fault_points = len(non_control)
+    if expected_fault_points is None:
+        planned_fault_points = returned_fault_points
+        planner_count_supplied = False
+    else:
+        planned_fault_points = int(expected_fault_points)
+        if planned_fault_points < 0:
+            raise ValueError("expected_fault_points must be non-negative")
+        planner_count_supplied = True
+    missing_result_points = max(0, planned_fault_points - returned_fault_points)
+    extra_result_points = max(0, returned_fault_points - planned_fault_points)
+    result_cardinality_mismatch = missing_result_points + extra_result_points
 
-    # Fail-closed: exclude points where fault didn't actually fire.
-    injected = [r for r in non_control if r.get("fault_injected", False)]
-    not_injected = [r for r in non_control if not r.get("fault_injected", False)]
+    # Fail-closed: a wire value such as the string ``"false"`` must never be
+    # interpreted as a fired fault merely because it is truthy in Python.
+    malformed_fault_injection_results = [
+        r for r in non_control if type(r.get("fault_injected")) is not bool
+    ]
+    injected = [r for r in non_control if r.get("fault_injected") is True]
+    timeout_results = [
+        r for r in non_control
+        if bool(r.get("timeout")) or _effective_boot_result(r)[0] == "timeout"
+    ]
+    infrastructure_errors = [
+        r for r in non_control
+        if bool(r.get("infrastructure_error"))
+        or _effective_boot_result(r)[0] == "infra_error"
+    ]
+    skipped_results = [
+        r for r in non_control if _effective_boot_result(r)[0] == "skipped"
+    ]
+    control_timeouts = [
+        r for r in control
+        if bool(r.get("timeout")) or _effective_boot_result(r)[0] == "timeout"
+    ]
+    control_infrastructure_errors = [
+        r for r in control
+        if bool(r.get("infrastructure_error"))
+        or _effective_boot_result(r)[0] == "infra_error"
+    ]
+    control_skipped_results = [
+        r for r in control if _effective_boot_result(r)[0] == "skipped"
+    ]
+    malformed_control_results = [
+        r for r in control if type(r.get("fault_injected")) is not bool
+    ]
+    faulted_control_results = [
+        r for r in control if r.get("fault_injected") is True
+    ]
+    timeout_result_ids = {id(r) for r in timeout_results}
+    infrastructure_error_ids = {id(r) for r in infrastructure_errors}
+    skipped_result_ids = {id(r) for r in skipped_results}
+    intentionally_skipped = [
+        r for r in non_control
+        if r.get("fault_injected") is False
+        and str(r.get("skip_reason") or "").strip() == "probability_gate"
+        and id(r) not in timeout_result_ids
+        and id(r) not in infrastructure_error_ids
+    ]
+    intentionally_skipped_ids = {id(r) for r in intentionally_skipped}
+    skipped_results = [
+        r for r in skipped_results if id(r) not in intentionally_skipped_ids
+    ]
+    incomplete_result_ids = {
+        id(r) for r in non_control
+        if (
+            type(r.get("fault_injected")) is not bool
+            or (
+                r.get("fault_injected") is not True
+                and id(r) not in intentionally_skipped_ids
+            )
+            or id(r) in timeout_result_ids
+            or id(r) in infrastructure_error_ids
+            or (
+                id(r) in skipped_result_ids
+                and id(r) not in intentionally_skipped_ids
+            )
+        )
+    }
+    not_injected = [
+        r for r in non_control
+        if r.get("fault_injected") is False
+        and id(r) not in intentionally_skipped_ids
+        and id(r) not in timeout_result_ids
+        and id(r) not in infrastructure_error_ids
+    ]
 
     total = len(injected)
     # Treat the profile's control outcome as the expected successful outcome.
@@ -308,9 +392,74 @@ def summarize_runtime_sweep(
         1 for r in injected
         if _effective_boot_result(r)[0] == "bus_fault"
     )
-    timeout_points = sum(
-        1 for r in injected
-        if _effective_boot_result(r)[0] == "timeout"
+    timeout_points = len(timeout_results)
+    protocol_error_points = sum(
+        1 for r in infrastructure_errors
+        if str(r.get("error_kind") or "") == "protocol_error"
+    )
+    runner_error_points = sum(
+        1 for r in infrastructure_errors
+        if str(r.get("error_kind") or "") == "runner_error"
+    )
+
+    control_signals = control[-1].get("signals") if control else None
+    explicit_zero_point_control = bool(
+        isinstance(control_signals, dict)
+        and control_signals.get("zero_point_execute_control") is True
+    )
+    allow_control_only = bool(
+        profile is not None
+        and getattr(profile, "expect", None) is not None
+        and getattr(profile.expect, "allow_control_only_issues", False)
+    )
+    profile_requests_zero_points = False
+    if profile is not None and getattr(profile, "fault_sweep", None) is not None:
+        configured_max_writes = getattr(profile.fault_sweep, "max_writes", None)
+        if not (
+            isinstance(configured_max_writes, str)
+            and configured_max_writes.strip().lower() == "auto"
+        ):
+            try:
+                configured_limit = (
+                    int(configured_max_writes, 0)
+                    if isinstance(configured_max_writes, str)
+                    else int(configured_max_writes)
+                )
+                profile_requests_zero_points = configured_limit <= 0
+            except (TypeError, ValueError):
+                profile_requests_zero_points = False
+    control_cardinality_ok = len(control) == int(expected_control_points)
+    intentional_control_only = bool(
+        planned_fault_points == 0
+        and not non_control
+        and control_cardinality_ok
+        and bool(control)
+        and not control_timeouts
+        and not control_infrastructure_errors
+        and not control_skipped_results
+        and not malformed_control_results
+        and not faulted_control_results
+        and (
+            explicit_zero_point_control
+            or profile_requests_zero_points
+            or allow_control_only
+        )
+    )
+    campaign_complete = bool(
+        intentional_control_only
+        if planned_fault_points == 0 and not non_control
+        else (
+            bool(injected)
+            and
+            not incomplete_result_ids
+            and result_cardinality_mismatch == 0
+            and control_cardinality_ok
+            and not control_timeouts
+            and not control_infrastructure_errors
+            and not control_skipped_results
+            and not malformed_control_results
+            and not faulted_control_results
+        )
     )
 
     # Categorize failures by outcome type.
@@ -395,7 +544,7 @@ def summarize_runtime_sweep(
     phase2_skip_reason_counts: Dict[str, int] = {}
     hook_skip_reason_counts: Dict[str, int] = {}
     confirm_skip_reason_counts: Dict[str, int] = {}
-    for r in not_injected:
+    for r in not_injected + intentionally_skipped:
         reason = r.get("skip_reason", "unknown")
         skip_reason_counts[reason] = skip_reason_counts.get(reason, 0) + 1
         if r.get("fault_type") == "p2":
@@ -422,6 +571,11 @@ def summarize_runtime_sweep(
                 )
 
     summary: Dict[str, Any] = {
+        "requested_fault_points": planned_fault_points,
+        "returned_fault_points": returned_fault_points,
+        "missing_result_points": missing_result_points,
+        "extra_result_points": extra_result_points,
+        "injected_fault_points": total,
         "total_fault_points": total,
         "bricks": len(boot_failures),
         "issue_points": len(failures),
@@ -431,11 +585,27 @@ def summarize_runtime_sweep(
         "metadata_delta_issue_points": metadata_delta_issue_points,
         "bus_fault_points": bus_fault_points,
         "timeout_points": timeout_points,
+        "infrastructure_error_points": len(infrastructure_errors),
+        "skipped_fault_points": len(skipped_results),
+        "protocol_error_points": protocol_error_points,
+        "runner_error_points": runner_error_points,
+        "control_timeout_points": len(control_timeouts),
+        "control_infrastructure_error_points": len(control_infrastructure_errors),
+        "control_skipped_points": len(control_skipped_results),
+        "malformed_result_points": len(malformed_fault_injection_results),
+        "malformed_control_points": len(malformed_control_results),
+        "faulted_control_points": len(faulted_control_results),
+        "incomplete_fault_points": (
+            len(incomplete_result_ids) + result_cardinality_mismatch
+        ),
+        "campaign_complete": campaign_complete,
+        "campaign_intentionally_control_only": intentional_control_only,
         "recoveries": recoveries,
         "resilient_rollbacks": resilient_rollbacks,
         "brick_rate": (float(len(boot_failures)) / float(total)) if total else 0.0,
         "issue_rate": (float(len(failures)) / float(total)) if total else 0.0,
-        "discarded_no_fault_fired": len(not_injected),
+        "discarded_no_fault_fired": len(not_injected) + len(intentionally_skipped),
+        "intentionally_skipped_fault_points": len(intentionally_skipped),
         "failure_outcomes": outcome_counts,
         "failure_classes": class_counts,
         "fault_type_points": fault_type_counts,
@@ -445,6 +615,32 @@ def summarize_runtime_sweep(
         "security_bypass_points": security_bypass_points,
         "dos_crash_points": dos_crash_points,
         "dos_recovery_points": dos_recovery_points,
+        "campaign_integrity": {
+            "requested": planned_fault_points,
+            "returned": returned_fault_points,
+            "planner_count_supplied": planner_count_supplied,
+            "missing_results": missing_result_points,
+            "extra_results": extra_result_points,
+            "injected": total,
+            "not_injected": len(not_injected),
+            "intentionally_skipped": len(intentionally_skipped),
+            "timeouts": timeout_points,
+            "infrastructure_errors": len(infrastructure_errors),
+            "skipped_results": len(skipped_results),
+            "protocol_errors": protocol_error_points,
+            "runner_errors": runner_error_points,
+            "control_timeouts": len(control_timeouts),
+            "control_infrastructure_errors": len(control_infrastructure_errors),
+            "control_skipped": len(control_skipped_results),
+            "malformed_results": len(malformed_fault_injection_results),
+            "malformed_controls": len(malformed_control_results),
+            "faulted_controls": len(faulted_control_results),
+            "incomplete": len(incomplete_result_ids) + result_cardinality_mismatch,
+            "control_points": len(control),
+            "expected_control_points": int(expected_control_points),
+            "intentional_control_only": intentional_control_only,
+            "complete": campaign_complete,
+        },
     }
     if skip_reason_counts:
         summary["skip_reasons"] = skip_reason_counts
@@ -513,6 +709,7 @@ def summarize_runtime_sweep(
                 "followup_ms",
                 "total_ms",
                 "p2_iters",
+                "zero_point_execute_control",
                 "vtor",
                 "vtor_final",
                 "pc",
@@ -650,6 +847,140 @@ def _coverage_gate_reason(sweep_summary: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _campaign_integrity_gate_reason(
+    sweep_summary: Dict[str, Any],
+    *,
+    allow_control_only: bool = False,
+) -> Optional[str]:
+    """Return a fail-closed reason for an incomplete runtime campaign.
+
+    Older imported summaries do not contain ``campaign_integrity`` and keep
+    their historical verdict behavior.  Every summary produced by
+    ``summarize_runtime_sweep`` includes the block, which lets current runs
+    distinguish an explicitly requested control-only run from an empty plan.
+    """
+    integrity = sweep_summary.get("campaign_integrity")
+    if not isinstance(integrity, dict):
+        return None
+
+    requested = int(integrity.get("requested", 0) or 0)
+    returned = int(integrity.get("returned", requested) or 0)
+    missing_results = int(integrity.get("missing_results", 0) or 0)
+    extra_results = int(integrity.get("extra_results", 0) or 0)
+    injected = int(integrity.get("injected", 0) or 0)
+    not_injected = int(integrity.get("not_injected", 0) or 0)
+    timeouts = int(integrity.get("timeouts", 0) or 0)
+    infra_errors = int(integrity.get("infrastructure_errors", 0) or 0)
+    skipped_results = int(integrity.get("skipped_results", 0) or 0)
+    protocol_errors = int(integrity.get("protocol_errors", 0) or 0)
+    control_points = int(integrity.get("control_points", 0) or 0)
+    expected_control_points = int(
+        integrity.get("expected_control_points", 1) or 0
+    )
+    control_timeouts = int(integrity.get("control_timeouts", 0) or 0)
+    control_infra_errors = int(
+        integrity.get("control_infrastructure_errors", 0) or 0
+    )
+    control_skipped = int(integrity.get("control_skipped", 0) or 0)
+    malformed_results = int(integrity.get("malformed_results", 0) or 0)
+    malformed_controls = int(integrity.get("malformed_controls", 0) or 0)
+    faulted_controls = int(integrity.get("faulted_controls", 0) or 0)
+    intentional_control_only = bool(integrity.get("intentional_control_only"))
+
+    if malformed_controls:
+        return "control run returned malformed fault-injection telemetry"
+    if faulted_controls:
+        return "control run reported that fault injection fired"
+    if control_infra_errors:
+        return "control run failed with an infrastructure error"
+    if control_timeouts:
+        return "control run timed out"
+    if control_skipped:
+        return "control run was skipped"
+    if control_points != expected_control_points:
+        return "campaign requires {} clean control point(s), observed {}".format(
+            expected_control_points, control_points
+        )
+    if missing_results or extra_results:
+        return (
+            "campaign incomplete: planner/result cardinality mismatch "
+            "(requested {}, returned {}; {} missing, {} extra)"
+        ).format(requested, returned, missing_results, extra_results)
+    if protocol_errors:
+        return "campaign incomplete: {} runner protocol/cardinality error(s)".format(
+            protocol_errors
+        )
+    if malformed_results:
+        return "campaign incomplete: {} malformed fault result(s)".format(
+            malformed_results
+        )
+    if infra_errors:
+        return "campaign incomplete: {} infrastructure error(s)".format(infra_errors)
+    if timeouts:
+        return "campaign incomplete: {} fault point(s) timed out".format(timeouts)
+    if skipped_results:
+        return "campaign incomplete: {} fault point(s) were skipped".format(
+            skipped_results
+        )
+    if requested == 0:
+        if control_points and (intentional_control_only or allow_control_only):
+            return None
+        return "campaign executed no fault points"
+    if injected == 0:
+        return "campaign injected none of {} requested fault point(s)".format(requested)
+    if not_injected:
+        return "campaign incomplete: {} of {} requested fault(s) did not fire".format(
+            not_injected, requested
+        )
+    if not bool(integrity.get("complete", False)):
+        return "campaign result coverage is incomplete"
+    return None
+
+
+def _partial_staging_integrity_gate_reason(
+    partial_staging_summary: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Require a complete-image control and conclusive staging results."""
+    if partial_staging_summary is None:
+        return None
+    total = int(partial_staging_summary.get("total_points", 0) or 0)
+    missing_results = int(
+        partial_staging_summary.get("missing_result_points", 0) or 0
+    )
+    extra_results = int(
+        partial_staging_summary.get("extra_result_points", 0) or 0
+    )
+    partial_points_raw = partial_staging_summary.get("partial_image_points")
+    complete_points_raw = partial_staging_summary.get("complete_image_points")
+    infra_errors = int(
+        partial_staging_summary.get("infrastructure_error", 0) or 0
+    )
+    timeouts = int(partial_staging_summary.get("timeout", 0) or 0)
+    control_ok = int(partial_staging_summary.get("complete_image_ok", 0) or 0)
+    control_failed = int(
+        partial_staging_summary.get("complete_image_failed", 0) or 0
+    )
+    if total == 0:
+        return "partial-staging campaign executed no points"
+    if missing_results or extra_results:
+        return (
+            "partial-staging campaign incomplete: {} missing and {} extra result(s)"
+        ).format(missing_results, extra_results)
+    if partial_points_raw is not None and int(partial_points_raw or 0) < 1:
+        return "partial-staging campaign executed no partial-image points"
+    if infra_errors:
+        return "partial-staging campaign incomplete: {} infrastructure error(s)".format(
+            infra_errors
+        )
+    if timeouts:
+        return "partial-staging campaign incomplete: {} timeout(s)".format(timeouts)
+    if control_failed or control_ok < 1:
+        return "partial-staging complete-image control did not succeed"
+    if complete_points_raw is not None and int(complete_points_raw or 0) != 1:
+        return "partial-staging campaign requires exactly one complete-image control"
+    return None
+
+
 def git_metadata(repo_root: Path) -> Dict[str, str]:
     def run_git(*args: str) -> str:
         proc = subprocess.run(
@@ -728,6 +1059,23 @@ def compute_verdict(
     resilient_rollbacks = int(sweep_summary.get("resilient_rollbacks", 0))
     invariant_observations = int(sweep_summary.get("invariant_issue_points", 0))
     coverage_gate_reason = _coverage_gate_reason(sweep_summary)
+    campaign_integrity_reason = _campaign_integrity_gate_reason(
+        sweep_summary,
+        allow_control_only=allow_control_only_issues,
+    )
+    multi_fault_integrity_reason = (
+        _campaign_integrity_gate_reason(multi_fault_summary)
+        if multi_fault_summary is not None
+        else None
+    )
+    partial_staging_integrity_reason = _partial_staging_integrity_gate_reason(
+        partial_staging_summary
+    )
+    campaign_integrity = sweep_summary.get("campaign_integrity") or {}
+    intentional_control_only_campaign = bool(
+        isinstance(campaign_integrity, dict)
+        and campaign_integrity.get("intentional_control_only")
+    )
 
     def _append_warnings(text):
         """Append timeout + read-fault coverage warnings to a verdict string.
@@ -750,11 +1098,23 @@ def compute_verdict(
         return out
 
     verdict = "PASS"
-    if control_only_issue and not found_issues:
+    if campaign_integrity_reason:
+        verdict = "FAIL \u2014 {}".format(campaign_integrity_reason)
+    elif multi_fault_integrity_reason:
+        verdict = "FAIL \u2014 multi-fault {}".format(
+            multi_fault_integrity_reason
+        )
+    elif partial_staging_integrity_reason:
+        verdict = "FAIL \u2014 {}".format(partial_staging_integrity_reason)
+    elif control_only_issue and not found_issues:
         verdict = "PASS \u2014 control exhibits expected {}".format(control_outcome)
     elif control_issue_count:
         verdict = "FAIL \u2014 control checks failed"
-    elif coverage_gate_reason and not found_issues:
+    elif (
+        coverage_gate_reason
+        and not found_issues
+        and not intentional_control_only_campaign
+    ):
         verdict = "FAIL \u2014 {}".format(coverage_gate_reason)
     elif profile_expect.should_find_issues and not found_issues:
         verdict = "FAIL \u2014 expected to find issues but found none"

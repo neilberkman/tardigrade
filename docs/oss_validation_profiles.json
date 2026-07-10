@@ -7,7 +7,7 @@
       "robot_suite": "tests/generic_fault_point.robot",
       "evaluation_mode": "execute",
       "boot_mode": "swap",
-      "fault_range": "0:1888",
+      "fault_range": "0:1887",
       "fault_step": 400,
       "total_writes": 1888,
       "expect": {

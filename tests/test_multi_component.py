@@ -7,6 +7,9 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -22,11 +25,14 @@ from fault_inject import (
 )
 from profile_loader import (
     ComponentConfig,
+    InitialStateConfig,
     MultiComponentConfig,
+    PreBootWrite,
     ProfileConfig,
     ProfileError,
     load_profile,
 )
+from sweep import _bounded_component_write_count, _run_batch_worker
 
 
 class TestClassifyMultiComponentOutcome(unittest.TestCase):
@@ -183,6 +189,23 @@ class TestComponentConfigParsing(unittest.TestCase):
         self.assertEqual(profile.multi_component.components[1].name, "mcu_b")
         self.assertEqual(profile.multi_component.fault_matrix, "cross_product")
 
+    def test_component_names_reject_path_tokens(self) -> None:
+        source = (
+            ROOT / "profiles" / "examples" / "multi_component_dual_mcu.yaml"
+        )
+        baseline = yaml.safe_load(source.read_text(encoding="utf-8"))
+        for value in ("../radio", "nested/radio", "nested\\radio"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
+                data = yaml.safe_load(yaml.safe_dump(baseline))
+                data["multi_component"]["components"][0]["name"] = value
+                profile_path = Path(td) / "profile.yaml"
+                profile_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    ProfileError,
+                    r"multi_component\.components\[0\]\.name: expected safe identifier",
+                ):
+                    load_profile(profile_path)
+
     def test_component_profiles_generated(self) -> None:
         path = self._write_profile("""\
             schema_version: 1
@@ -243,6 +266,65 @@ class TestComponentConfigParsing(unittest.TestCase):
         self.assertEqual(comp_profiles[1].name, "test_comp_profiles/comp_y")
         # Components inherit parent fault_sweep when they don't define one.
         self.assertEqual(comp_profiles[0].fault_sweep.max_writes, 100)
+
+    def test_resolved_parent_contract_reaches_each_component(self) -> None:
+        profile = load_profile(
+            ROOT / "profiles" / "examples" / "multi_component_dual_mcu.yaml"
+        )
+        profile.invariants = ["at_least_one_bootable"]
+        profile.semantic_assertions = {"always": {"boot.version": 2}}
+        profile.invariant_config = {"allowed": ["exec"]}
+        profile.nvm_controller = "nvmController"
+        profile.otp_peripheral = "otp"
+        profile.multi_component.components[0].pre_boot_state = [
+            PreBootWrite(address=0x20000004, u32=0xDEAD)
+        ]
+        profile.multi_component.components[0].setup_script = "component_setup.py"
+        state = InitialStateConfig(
+            name="seeded",
+            pre_boot_state=[PreBootWrite(address=0x20000000, u32=0xA5)],
+            setup_script="hooks/mcuboot_mark_image_ok.py",
+        )
+
+        resolved_parent = profile.resolve_initial_state(state)
+        component_profiles = resolved_parent.component_profiles()
+        self.assertEqual(len(component_profiles), 2)
+        for component in component_profiles:
+            with self.subTest(component=component.name):
+                self.assertEqual(
+                    [(write.address, write.u32) for write in component.pre_boot_state],
+                    [(0x20000000, 0xA5)],
+                )
+                self.assertEqual(
+                    component.setup_script,
+                    "hooks/mcuboot_mark_image_ok.py",
+                )
+                self.assertEqual(component.invariants, ["at_least_one_bootable"])
+                self.assertEqual(component.semantic_assertions, profile.semantic_assertions)
+                self.assertEqual(component.invariant_config, profile.invariant_config)
+                self.assertEqual(component.nvm_controller, "nvmController")
+                self.assertEqual(component.otp_peripheral, "otp")
+
+    def test_component_auto_write_count_uses_profile_cap(self) -> None:
+        profile = load_profile(
+            ROOT / "profiles" / "examples" / "multi_component_dual_mcu.yaml"
+        ).component_profiles()[0]
+        profile.fault_sweep.max_writes_cap = 17
+        self.assertEqual(_bounded_component_write_count(profile, 1000000), 17)
+
+    def test_strict_component_fault_config_rejects_nested_typo(self) -> None:
+        source = (
+            ROOT / "profiles" / "examples" / "multi_component_dual_mcu.yaml"
+        )
+        data = yaml.safe_load(source.read_text(encoding="utf-8"))
+        data["multi_component"]["components"][0]["fault_sweep"][
+            "phase2_fault"
+        ] = {"enabled": False, "max_pionts": 99}
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = Path(td) / "profile.yaml"
+            profile_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+            with self.assertRaisesRegex(ProfileError, "max_pionts"):
+                load_profile(profile_path, strict=True)
 
     def test_single_component_profile_not_multi(self) -> None:
         path = self._write_profile("""\
@@ -504,6 +586,28 @@ class TestComponentConfigParsing(unittest.TestCase):
                 len(profile.multi_component.components), 2,
                 "{} should have >= 2 components".format(yaml_file.name),
             )
+
+
+class TestParallelComponentWorker(unittest.TestCase):
+    def test_worker_reloads_selected_component_not_parent(self) -> None:
+        profile_path = ROOT / "profiles" / "examples" / "multi_component_dual_mcu.yaml"
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("sweep._run_batches_chunked", return_value=[]) as run_batches:
+                _run_batch_worker(
+                    repo_root_str=str(ROOT),
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile_path=str(profile_path),
+                    fault_points=[],
+                    robot_vars=[],
+                    work_dir_str=td,
+                    renode_remote_server_dir="",
+                    worker_id=0,
+                    profile_component_name="secondary_mcu",
+                )
+        selected = run_batches.call_args.kwargs["profile"]
+        self.assertEqual(selected.name, "multi_component_dual_mcu/secondary_mcu")
+        self.assertFalse(selected.is_multi_component)
 
 
 class TestMergeRobotVars(unittest.TestCase):

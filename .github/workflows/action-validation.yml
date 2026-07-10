@@ -1,5 +1,8 @@
 name: action-validation
 
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
@@ -14,13 +17,45 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          path: tardigrade-action
+
+      - name: Prepare isolated public consumer workspace
+        run: |
+          set -euo pipefail
+          mkdir -p consumer/consumer-platforms consumer/consumer-assets
+          cp tardigrade-action/profiles/mcuboot_swap_current.yaml consumer/profile.yaml
+          cp tardigrade-action/platforms/cortex_m4_flash_fast.repl consumer/consumer-platforms/caller-only.repl
+          cp tardigrade-action/results/oss_validation/assets/oss_mcuboot_mcuboot_swap_current_guard.elf consumer/consumer-assets/caller-only.elf
+          cp tardigrade-action/results/oss_validation/assets/zephyr_slot0_padded.bin consumer/consumer-assets/caller-slot0.bin
+          cp tardigrade-action/results/oss_validation/assets/zephyr_slot1_padded.bin consumer/consumer-assets/caller-slot1.bin
+          python3 - <<'PY'
+          from pathlib import Path
+          profile = Path("consumer/profile.yaml")
+          text = profile.read_text(encoding="utf-8")
+          replacements = {
+              "platforms/cortex_m4_flash_fast.repl": "consumer-platforms/caller-only.repl",
+              "results/oss_validation/assets/oss_mcuboot_mcuboot_swap_current_guard.elf": "consumer-assets/caller-only.elf",
+              "results/oss_validation/assets/zephyr_slot0_padded.bin": "consumer-assets/caller-slot0.bin",
+              "results/oss_validation/assets/zephyr_slot1_padded.bin": "consumer-assets/caller-slot1.bin",
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit("profile fixture is missing expected path: " + old)
+              text = text.replace(old, new)
+          profile.write_text(text, encoding="utf-8")
+          PY
+          test ! -e tardigrade-action/consumer-platforms/caller-only.repl
+          test ! -e tardigrade-action/consumer-assets/caller-only.elf
 
       - name: Run action against public MCUboot profile (expect PASS)
-        uses: ./
+        uses: ./tardigrade-action
         id: mcuboot
         with:
-          profile: profiles/mcuboot_swap_current.yaml
+          profile: consumer/profile.yaml
+          asset-root: consumer
           quick: "true"
 
       - name: Verify outputs
@@ -48,20 +83,26 @@ jobs:
             fixed: profiles/mcuboot_pr2100_fixed_discovery.yaml
             extra_args: "--fault-end 10"
     env:
-      RENODE_URL: https://builds.renode.io/renode-1.16.1.linux-dotnet.tar.gz
+      RENODE_URL: https://github.com/renode/renode/releases/download/v1.16.1/renode-1.16.1.linux-dotnet.tar.gz
+      RENODE_SHA256: 62629caa331ed4bd4eb7abe13ee2e4834fbcaa70de492db3965fafa4edc5694f
       PYTHONUNBUFFERED: "1"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install Renode portable
         run: |
           set -euxo pipefail
           tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
-          curl -L "${RENODE_URL}" -o "${tarball}"
+          python3 scripts/action_helpers.py download-renode \
+            --url "${RENODE_URL}" --sha256 "${RENODE_SHA256}" --output "${tarball}"
           mkdir -p "${RUNNER_TEMP}/renode"
           tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
-          python3 -m pip install --user -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+          python3 -m pip install --user \
+            -c requirements-renode-constraints.txt \
+            -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
           echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
 
       - name: Install Python dependencies
@@ -95,7 +136,7 @@ jobs:
 
       - name: Upload differential reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: differential-${{ matrix.name }}
           path: ${{ runner.temp }}/${{ matrix.name }}_*.json

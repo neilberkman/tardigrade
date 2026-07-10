@@ -6,7 +6,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-ZEPHYR_REF="${ZEPHYR_REF:-v3.7.0}"
+# Public Zephyr v3.7.0 commit. Keep this immutable for reproducible assets.
+ZEPHYR_REF="${ZEPHYR_REF:-36940db938a8f4a1e919496793ed439850a221c2}"
 ZEPHYR_WS="${REPO_ROOT}/third_party/zephyr_ws"
 ZEPHYR_VENV="${REPO_ROOT}/third_party/zephyr-venv"
 MCUBOOT_DIR="${ZEPHYR_WS}/bootloader/mcuboot"
@@ -19,12 +20,12 @@ IMGTOOL_PY="${MCUBOOT_DIR}/scripts/imgtool.py"
 IMGTOOL_KEY="${MCUBOOT_DIR}/root-rsa-2048.pem"
 MODULE_YML="${MCUBOOT_DIR}/zephyr/module.yml"
 
-PR2205_BROKEN="c21c3909"
-PR2205_FIXED="bbd0ee1e"
-PR2206_BROKEN="e35461d2"
-PR2206_FIXED="08985c96"
-PR2214_BROKEN="429e2fea"
-PR2214_FIXED="90fd59d2"
+PR2205_BROKEN="c21c3909eafff152a5527fb794ba7be7695d202e"
+PR2205_FIXED="bbd0ee1ecce3d7e7be6baf606027710052dd4e13"
+PR2206_BROKEN="e35461d29484f1e11c75c769b066ec2b79b4791c"
+PR2206_FIXED="08985c9679f6877ab593a7ff62ab244ca6fbaae5"
+PR2214_BROKEN="429e2fea24518f178cd4d33928cb66fcb0205803"
+PR2214_FIXED="90fd59d2f9e45c24d0833dd391dcdc932b3b1908"
 PR_DIFF_GEOM_ALIGN="32"
 PR_DIFF_GEOM_TRAILER_RESERVE="0x30a0"
 PR_DIFF_GEOM_SIGN_OVERHEAD="0x400"
@@ -707,17 +708,18 @@ build_pr_differential_elfs() {
     local wt_root
     wt_root="$(mktemp -d /tmp/mcuboot_pr_diff_wt.XXXXXX)"
     cleanup_pr_worktrees() {
+        local cleanup_root="$1"
         for d in \
-            "${wt_root}/pr2205_broken" "${wt_root}/pr2205_fixed" \
-            "${wt_root}/pr2206_broken" "${wt_root}/pr2206_fixed" \
-            "${wt_root}/pr2214_broken" "${wt_root}/pr2214_fixed"; do
+            "${cleanup_root}/pr2205_broken" "${cleanup_root}/pr2205_fixed" \
+            "${cleanup_root}/pr2206_broken" "${cleanup_root}/pr2206_fixed" \
+            "${cleanup_root}/pr2214_broken" "${cleanup_root}/pr2214_fixed"; do
             if [[ -d "${d}" ]]; then
                 git -C "${MCUBOOT_DIR}" worktree remove --force "${d}" >/dev/null 2>&1 || true
             fi
         done
-        rm -rf "${wt_root}" >/dev/null 2>&1 || true
+        rm -rf "${cleanup_root}" >/dev/null 2>&1 || true
     }
-    trap cleanup_pr_worktrees EXIT
+    trap "cleanup_pr_worktrees '${wt_root}'" EXIT
 
     msg "Creating detached worktrees for PR differential builds"
     git -C "${MCUBOOT_DIR}" worktree add --detach "${wt_root}/pr2205_broken" "${PR2205_BROKEN}" >/dev/null
@@ -893,12 +895,11 @@ build_seccounter_assets() {
 if [[ ! -x "${ZEPHYR_VENV}/bin/west" ]]; then
     msg "Creating Python venv at ${ZEPHYR_VENV}"
     python3 -m venv "${ZEPHYR_VENV}"
-    "${ZEPHYR_VENV}/bin/pip" install --quiet --upgrade pip
-    "${ZEPHYR_VENV}/bin/pip" install --quiet \
-        west intelhex cbor2 cryptography pyyaml
 else
-    msg "Venv already exists, skipping creation"
+    msg "Venv already exists, reconciling exact public dependencies"
 fi
+"${ZEPHYR_VENV}/bin/pip" install --quiet \
+    -r "${REPO_ROOT}/requirements-oss-build.txt"
 
 # --- 2. Initialize Zephyr workspace ---
 if [[ ! -d "${ZEPHYR_WS}/.west" ]]; then
@@ -931,15 +932,8 @@ fi
 git -C "${MCUBOOT_DIR}" fetch --quiet upstream
 patch_mcuboot_module_yml
 
-# --- 5. Install Zephyr + MCUboot Python requirements ---
-for req in \
-    "${ZEPHYR_WS}/zephyr/scripts/requirements.txt" \
-    "${MCUBOOT_DIR}/scripts/requirements.txt"; do
-    if [[ -f "${req}" ]]; then
-        msg "Installing requirements from ${req##*/}"
-        "${ZEPHYR_VENV}/bin/pip" install --quiet -r "${req}"
-    fi
-done
+# --- 5. Verify the pinned build environment ---
+"${ZEPHYR_VENV}/bin/pip" check
 
 # --- 6. Configure build generator ---
 ( cd "${ZEPHYR_WS}"

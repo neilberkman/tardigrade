@@ -32,7 +32,8 @@ update_trigger:
 # Broken control baseline never reaches a valid image handoff on the honest
 # asymmetric geometry, so boot-outcome classification is the meaningful
 # oracle here rather than VTOR/hash-on-staging success checks.
-success_criteria: {}
+success_criteria:
+  vtor_in_slot: exec
 
 fault_sweep:
   mode: runtime

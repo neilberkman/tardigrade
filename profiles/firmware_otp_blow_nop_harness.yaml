@@ -32,6 +32,8 @@ success_criteria:
 fault_sweep:
   mode: runtime
   max_writes: 100
+  # The public harness advances an empty rollback floor to five bits.
+  max_otp_blows: 5
   run_duration: "1.0"
   fault_types:
     - otp_blow_nop

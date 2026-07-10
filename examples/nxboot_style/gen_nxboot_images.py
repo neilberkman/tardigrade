@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Generate test firmware images with nxboot headers for Renode testing.
 
+The public protocol baseline is apache/nuttx-apps at immutable revision
+45d4c7098bb3a7a6d9b5642efc47df5998c048d5. This 2026 Tardigrade utility is a
+standalone synthetic-image generator, not a copy of NuttX build tooling.
+
 Creates properly headerized firmware images that the nxboot-style bootloader
 can validate (magic, CRC, version, platform ID).  These are synthetic test
 images with valid ARM Cortex-M0+ vector tables.

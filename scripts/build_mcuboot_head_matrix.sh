@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build MCUboot HEAD for zero-day hunt matrix.
-# Produces ELFs and test images for 6 configurations:
+# Produces ELFs and test images for 9 MCUboot configurations:
 #   1. head_move_nrf52      - swap-move, nrf52840dk, default geometry
 #   2. head_scratch_nrf52   - swap-scratch, nrf52840dk, default geometry
 #   3. head_move_stm32f4    - swap-move, nucleo_f429zi, non-uniform sectors
@@ -50,6 +50,23 @@ OVERLAY_DIR="$(mktemp -d /tmp/mcuboot_head_overlays.XXXXXX)"
 BUILD_TMP="$(mktemp -d /tmp/mcuboot_head_builds.XXXXXX)"
 WEST="${ZEPHYR_VENV}/bin/west"
 IMGTOOL_PYTHON="${ZEPHYR_VENV}/bin/python3"
+MCUBOOT_REMOTE="${MCUBOOT_REMOTE:-mcu-tools}"
+# Public revision used by the checked-in HEAD corpus. Override MCUBOOT_REF to
+# test another revision against the pinned Zephyr workspace.
+MCUBOOT_REF="${MCUBOOT_REF:-f84b9d3fd019fb1945e532924bee7a9c03c77373}"
+ORIGINAL_MCUBOOT_HEAD="$(git -C "${MCUBOOT_REPO}" rev-parse HEAD)"
+MCUBOOT_CHECKED_OUT=false
+
+cleanup() {
+    if [[ "${MCUBOOT_CHECKED_OUT}" == "true" ]]; then
+        git -C "${MCUBOOT_REPO}" restore --worktree -- \
+            zephyr/module.yml boot/zephyr/Kconfig >/dev/null 2>&1 || true
+        git -C "${MCUBOOT_REPO}" checkout --quiet --detach "${ORIGINAL_MCUBOOT_HEAD}" || true
+    fi
+    rm -f "${MCUBOOT_REPO}/zephyr/module.yml.bak"
+    rm -rf "${OVERLAY_DIR}" "${BUILD_TMP}"
+}
+trap cleanup EXIT
 
 # Auto-detect toolchain: honor explicit override first, then prefer External
 # SSD copy, then fall back to common local install paths.
@@ -70,7 +87,22 @@ require_file "${STRIP_BIN}"
 
 mkdir -p "${ASSETS_DIR}" "${BUILD_DIR}"
 
-# Record MCUboot HEAD commit for reproducibility.
+# Resolve and check out the current public MCUboot head, then record the exact
+# commit for reproducibility. The original west-managed revision is restored
+# by the EXIT trap.
+if ! git -C "${MCUBOOT_REPO}" diff --quiet || \
+   ! git -C "${MCUBOOT_REPO}" diff --cached --quiet; then
+    echo "ERROR: MCUboot workspace has local changes" >&2
+    exit 1
+fi
+MCUBOOT_FETCH_REF="${MCUBOOT_REF}"
+if [[ "${MCUBOOT_FETCH_REF}" == "${MCUBOOT_REMOTE}/"* ]]; then
+    MCUBOOT_FETCH_REF="${MCUBOOT_FETCH_REF#${MCUBOOT_REMOTE}/}"
+fi
+git -C "${MCUBOOT_REPO}" fetch --quiet "${MCUBOOT_REMOTE}" "${MCUBOOT_FETCH_REF}"
+git -C "${MCUBOOT_REPO}" checkout --quiet --detach "${MCUBOOT_REF}"
+MCUBOOT_CHECKED_OUT=true
+
 MCUBOOT_HEAD="$(git -C "${MCUBOOT_REPO}" rev-parse HEAD)"
 msg "MCUboot HEAD: ${MCUBOOT_HEAD}"
 echo "${MCUBOOT_HEAD}" > "${ASSETS_DIR}/mcuboot_head_commit.txt"
@@ -80,6 +112,25 @@ MODULE_YML="${MCUBOOT_REPO}/zephyr/module.yml"
 if grep -q 'package-managers' "${MODULE_YML}" 2>/dev/null; then
     msg "Stripping unsupported 'package-managers' from module.yml"
     sed -i.bak '/^package-managers:/,/^[^ ]/{ /^package-managers:/d; /^  /d; }' "${MODULE_YML}"
+fi
+
+# MCUboot main extends this symbol from newer Zephyr releases. Zephyr 3.7,
+# which this repository pins for reproducible builds, predates that symbol and
+# therefore needs a local type declaration while configuring the dependency.
+MCUBOOT_KCONFIG="${MCUBOOT_REPO}/boot/zephyr/Kconfig"
+if grep -q '^config MBEDTLS_CONFIG_FILE$' "${MCUBOOT_KCONFIG}" && \
+   ! awk '
+       /^config MBEDTLS_CONFIG_FILE$/ { in_symbol = 1; next }
+       in_symbol && /^config / { exit }
+       in_symbol && /^[[:space:]]*(bool|string|int|hex|tristate)([[:space:]]|$)/ {
+           found = 1; exit
+       }
+       END { exit found ? 0 : 1 }
+   ' "${MCUBOOT_KCONFIG}"; then
+    msg "Adding Zephyr 3.7 type compatibility for MBEDTLS_CONFIG_FILE"
+    sed -i.bak '/^config MBEDTLS_CONFIG_FILE$/a\
+    string "Mbed TLS configuration header"' "${MCUBOOT_KCONFIG}"
+    rm -f "${MCUBOOT_KCONFIG}.bak"
 fi
 
 # --- DTS overlays ---
@@ -385,6 +436,10 @@ build_mcuboot() {
           -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
           -DCONFIG_BOOT_MAX_IMG_SECTORS=1024 \
           -DCONFIG_BOOTLOADER_SRAM_SIZE=64 \
+          -DCONFIG_WARN_DEPRECATED=n \
+          -DCONFIG_USE_SEGGER_RTT=n \
+          -DCONFIG_MINIMAL_LIBC=y \
+          -DCONFIG_PICOLIBC=n \
           -DCMAKE_GDB:FILEPATH="${TOOLCHAIN_PATH}/bin/arm-none-eabi-gdb" \
           "-DPython3_EXECUTABLE:FILEPATH=${IMGTOOL_PYTHON}" \
           "${extra_cmake[@]}"
@@ -423,6 +478,9 @@ build_test_app() {
           -- \
           -DDTC_OVERLAY_FILE="${app_overlay}" \
           -DCONFIG_BOOTLOADER_MCUBOOT=y \
+          -DCONFIG_USE_SEGGER_RTT=n \
+          -DCONFIG_MINIMAL_LIBC=y \
+          -DCONFIG_PICOLIBC=n \
           -DCMAKE_GDB:FILEPATH="${TOOLCHAIN_PATH}/bin/arm-none-eabi-gdb" \
           "-DPython3_EXECUTABLE:FILEPATH=${IMGTOOL_PYTHON}"
     )

@@ -35,7 +35,6 @@ fault_sweep:
   evaluation_mode: execute
   max_writes: 256
   max_writes_cap: 512
-  fault_step: 8
   run_duration: "20.0"
   max_step_limit: 200000000
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]

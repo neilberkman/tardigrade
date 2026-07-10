@@ -86,6 +86,62 @@ FAULT_TYPE_NAME_TO_CODE = {
     "i2c_wrong_address": "iw",
 }
 
+# Labels used only when classifying or grouping results.  These are deliberately
+# absent from ``FAULT_TYPE_NAME_TO_CODE`` because they are not injectable
+# mechanisms and must never be accepted as sweep inputs.
+CLASSIFICATION_ONLY_FAULT_TYPES = frozenset(
+    {
+        "bootloader_region_write",
+        "phase2_fault",
+        "hook_fault",
+        "metadata_fault",
+        "confirm_cycle",
+    }
+)
+
+# Keep the public registry derived from the wire-code table.  A fault type
+# cannot be advertised as implemented unless the planner can encode it.
+IMPLEMENTED_FAULT_TYPES = frozenset(FAULT_TYPE_NAME_TO_CODE)
+KNOWN_FAULT_TYPES = IMPLEMENTED_FAULT_TYPES | CLASSIFICATION_ONLY_FAULT_TYPES
+
+# Fault types supported by the recovery-phase fault runner.  Keeping this
+# narrower than the main registry prevents a known-but-unsupported type from
+# falling through to the power-loss write mode.
+PHASE2_FAULT_TYPES = frozenset(
+    {
+        "power_loss",
+        "bit_corruption",
+        "silent_write_failure",
+        "driver_error",
+        "rc_injection",
+        "write_disturb",
+        "wear_leveling_corruption",
+        "write_rejection",
+        "interrupted_erase",
+        "multi_sector_atomicity",
+        "reset_at_time",
+    }
+)
+
+# Public peripheral mode registries.  These values mirror the open-source
+# peripheral implementations and are re-exported by profile_loader for
+# compatibility with existing callers.
+OTP_FAULT_TYPE_CODES = {
+    "otp_partial_program": 0,
+    "otp_stuck_bit": 1,
+    "otp_read_disturb": 2,
+    "otp_overblow": 3,
+    "otp_blow_nop": 4,
+}
+
+I2C_FAULT_TYPE_CODES = {
+    "i2c_nack": 1,
+    "i2c_timeout": 2,
+    "i2c_bit_flip": 3,
+    "i2c_truncated": 4,
+    "i2c_wrong_address": 5,
+}
+
 TRACE_REPLAY_WIRE_CODES = frozenset(
     FAULT_TYPE_NAME_TO_CODE[name] for name in TRACE_REPLAY_FAULT_TYPES
 )

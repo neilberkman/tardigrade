@@ -27,7 +27,12 @@
  *   NXBOOT_DEFECT=2  (no_revert)      Skip revert when unconfirmed
  *   NXBOOT_DEFECT=3  (no_crc)         Skip CRC validation entirely
  *
- * Reference: https://github.com/apache/nuttx-apps/tree/master/boot/nxboot
+ * Public protocol/content baseline:
+ * https://github.com/apache/nuttx-apps/tree/45d4c7098bb3a7a6d9b5642efc47df5998c048d5/boot/nxboot
+ *
+ * Modified for Tardigrade in 2026: replaced NuttX/MTD integration with
+ * bare-metal memory I/O, reduced the state/header model, and added explicit
+ * defect variants for fault-injection controls. See LICENSES/NUTTX-NOTICE.txt.
  */
 
 #include <stdint.h>

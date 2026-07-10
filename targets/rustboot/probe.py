@@ -55,7 +55,7 @@ RUSTBOOT_MAGIC = 0x544F4F42
 # Flag nibble ordering for monotonicity checks
 _FLAG_ORDER = {0x0F: 0, 0x07: 1, 0x03: 2, 0x00: 3}
 
-# Default partition layout for the checked-in nRF52840 rustBoot build.
+# Default reference partition layout for an nRF52840 rustBoot integration.
 # These defaults match the public assets under results/oss_validation/assets/.
 _DEFAULT_BOOT_BASE = 0x0002F000
 _DEFAULT_BOOT_SIZE = 0x00028000    # 160KB

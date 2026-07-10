@@ -245,15 +245,6 @@ update_trigger:
 
 Default is 8. The value must fit in a 16-bit field (max 65535). When set, tardigrade generates the align-aware magic bytes (`struct.pack("<H", max_align)` + fixed suffix) instead of the default 4-word GOOD magic.
 
-RIOTboot headers are also supported:
-
-```yaml
-update_trigger:
-  type: riotboot_header
-  slot: staging
-  version: 2
-```
-
 ### Automatic trigger discovery
 
 If you do not want to hand-seed trailer bytes, omit `update_trigger` or set it to `auto`:
@@ -398,6 +389,27 @@ fault_sweep:
 ```
 
 `max_writes: auto` runs the firmware once and counts NVM writes. Set a fixed number if you know it. `max_writes_cap` (default 100000) is a safety limit.
+
+OTP-only campaigns can declare an independent operation bound:
+
+```yaml
+fault_sweep:
+  max_writes: 100
+  max_otp_blows: 5
+  fault_types: [otp_blow_nop]
+```
+
+`max_otp_blows` is required when the intended OTP operation count cannot be
+learned from calibration. It prevents a fixed-write campaign from silently
+planning zero OTP points.
+
+### Strict profile validation
+
+Use `audit_bootloader.py --strict-profile` or set `strict_validation: true` in
+the YAML for CI-facing profiles. Strict validation rejects unknown core fields,
+requires at least one observable success criterion, and requires platform,
+firmware, image, setup, probe, provider, hook, component, and phase asset paths
+to be relative and remain beneath the selected repository root.
 
 ### Fault types
 
@@ -1021,7 +1033,12 @@ multi_component:
       images: { ... }
 ```
 
-Each component is swept independently; `fault_matrix: cross_product` tests fault combinations across components.
+Each component is swept with the canonical planner and runner.
+`fault_matrix: cross_product` currently combines each observed fault result with
+independently observed clean controls from the other components. It does not
+co-emulate communicating processors; profiles that depend on live inter-component
+traffic need a combined Renode platform and should use a normal single-platform
+campaign instead.
 
 ### Security policy
 
@@ -1338,8 +1355,11 @@ If you don't have `renode-test` installed locally, use the Docker backend:
 ```bash
 python3 scripts/audit_bootloader.py \
     --profile profiles/mcuboot_head_upgrade.yaml \
-    --renode-test docker://renode-patched:test
+    --renode-test docker://tardigrade-oss-validation
 ```
+
+Build the public, digest-pinned image from the repository root with
+`docker build -f docker/oss-validation.Dockerfile -t tardigrade-oss-validation .`.
 
 ### Self-test
 
@@ -1484,7 +1504,7 @@ Guard profiles (e.g., `esp_idf_ota_crc_guard.yaml`) test that the correct implem
 | `profiles/fault_no_crc.yaml`                     | Minimal vulnerable-OTA profile                                          |
 | `profiles/mcuboot_head_upgrade.yaml`             | MCUboot upgrade with image hash, update trigger, sweep-only hash bypass |
 | `profiles/mcuboot_pr2100_broken_discovery.yaml`  | Differential testing (known bug, broken commit)                         |
-| `profiles/nuttx_nxboot_128.yaml`                 | State probe, semantic assertions, custom invariants, multi-boot         |
+| `profiles/nxboot_style_update.yaml`              | Public nxboot-style update and recovery campaign                        |
 | `profiles/esp_idf_ota_upgrade.yaml`              | ESP-IDF upgrade with state probe and otadata invariants                 |
 | `profiles/esp_idf_ota_rollback.yaml`             | ESP-IDF rollback with semantic assertions on otadata state              |
 | `profiles/esp_idf_ota_upgrade_confirm_hook.yaml` | Boot-cycle hook for confirm-or-rollback                                 |

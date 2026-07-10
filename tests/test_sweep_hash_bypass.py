@@ -16,7 +16,8 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from profile_loader import ProfileError, load_profile  # noqa: E402
-from sweep import run_runtime_sweep  # noqa: E402
+from partial_staging import TruncationPoint  # noqa: E402
+from sweep import run_partial_staging_sweep, run_runtime_sweep  # noqa: E402
 
 
 class SweepHashBypassProfileTest(unittest.TestCase):
@@ -84,7 +85,7 @@ class SweepHashBypassProfileTest(unittest.TestCase):
 
 
 class SweepHashBypassRuntimeScopeTest(unittest.TestCase):
-    def test_fault_batches_and_control_share_sweep_bypass_symbols(self) -> None:
+    def test_bypass_is_scoped_to_fault_batches_not_clean_control(self) -> None:
         profile = SimpleNamespace(
             name="scope_profile",
             fault_sweep=SimpleNamespace(
@@ -104,6 +105,7 @@ class SweepHashBypassRuntimeScopeTest(unittest.TestCase):
                         robot_vars=[
                             "BASE:1",
                             "HASH_BYPASS_SYMBOLS:bootutil_img_validate",
+                            "HASH_BYPASS_ADDRS:bootutil_img_validate=0x1000",
                         ],
                         work_dir=work_dir,
                         renode_remote_server_dir="",
@@ -122,18 +124,21 @@ class SweepHashBypassRuntimeScopeTest(unittest.TestCase):
             ],
             ["HASH_BYPASS_SYMBOLS:bootutil_img_validate,bootutil_sha256"],
         )
+        self.assertIn(
+            "HASH_BYPASS_ADDRS:bootutil_img_validate=0x1000",
+            batch_robot_vars,
+        )
 
         control_robot_vars = mock_single.call_args.kwargs["robot_vars"]
         self.assertIn("BASE:1", control_robot_vars)
-        self.assertIn(
-            "HASH_BYPASS_SYMBOLS:bootutil_img_validate,bootutil_sha256",
-            control_robot_vars,
+        self.assertFalse(
+            any(
+                rv.startswith("HASH_BYPASS_SYMBOLS:")
+                for rv in control_robot_vars
+            )
         )
-        self.assertEqual(
-            [
-                rv for rv in control_robot_vars if rv.startswith("HASH_BYPASS_SYMBOLS:")
-            ],
-            ["HASH_BYPASS_SYMBOLS:bootutil_img_validate,bootutil_sha256"],
+        self.assertFalse(
+            any(rv.startswith("HASH_BYPASS_ADDRS:") for rv in control_robot_vars)
         )
 
     def test_no_hash_bypass_disables_fault_batch_and_control_injection(self) -> None:
@@ -153,7 +158,11 @@ class SweepHashBypassRuntimeScopeTest(unittest.TestCase):
                         robot_suite="tests/ota_fault_point.robot",
                         profile=profile,
                         fault_points=[11],
-                        robot_vars=["BASE:1"],
+                        robot_vars=[
+                            "BASE:1",
+                            "HASH_BYPASS_SYMBOLS:bootutil_img_validate",
+                            "HASH_BYPASS_ADDRS:bootutil_img_validate=0x1000",
+                        ],
                         work_dir=work_dir,
                         renode_remote_server_dir="",
                         include_control=True,
@@ -164,6 +173,52 @@ class SweepHashBypassRuntimeScopeTest(unittest.TestCase):
         self.assertEqual(batch_robot_vars, ["BASE:1"])
         control_robot_vars = mock_single.call_args.kwargs["robot_vars"]
         self.assertEqual(control_robot_vars, ["BASE:1"])
+
+    def test_partial_staging_strips_symbol_and_address_bypasses(self) -> None:
+        profile = SimpleNamespace(
+            name="partial_scope",
+            profile_path=ROOT / "profiles" / "naive_partial_staging.yaml",
+            memory=SimpleNamespace(slots={"exec": object(), "staging": object()}),
+        )
+        config = SimpleNamespace(
+            staging_slot_name="staging",
+            fill_pattern=0xFF,
+        )
+        points = [
+            TruncationPoint(1, "partial", "partial"),
+            TruncationPoint(4, "complete", "complete"),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch(
+                "sweep.run_single_point",
+                return_value={"boot_outcome": "success", "boot_slot": "exec"},
+            ) as mock_single:
+                run_partial_staging_sweep(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    ps_config=config,
+                    original_image=b"ABCD",
+                    trunc_points=points,
+                    robot_vars=[
+                        "BASE:1",
+                        "HASH_BYPASS_SYMBOLS:verify",
+                        "HASH_BYPASS_ADDRS:verify=0x1000",
+                    ],
+                    work_dir=Path(td),
+                    renode_remote_server_dir="",
+                )
+
+        self.assertEqual(mock_single.call_count, 2)
+        for call in mock_single.call_args_list:
+            forwarded = call.kwargs["robot_vars"]
+            self.assertFalse(
+                any(rv.startswith("HASH_BYPASS_SYMBOLS:") for rv in forwarded)
+            )
+            self.assertFalse(
+                any(rv.startswith("HASH_BYPASS_ADDRS:") for rv in forwarded)
+            )
 
 
 if __name__ == "__main__":

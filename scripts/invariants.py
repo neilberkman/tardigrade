@@ -970,11 +970,22 @@ def run_invariants(
             check_fn(result, **context)
         except InvariantViolation as v:
             violations.append(v)
-        except (ValueError, TypeError):
-            # Don't crash the entire invariant run if a state probe returns
-            # unparseable values (e.g. hex strings, unexpected types).
-            # The individual invariant is simply skipped.
-            pass
+        except (ValueError, TypeError) as exc:
+            # A configured invariant that cannot evaluate is not evidence
+            # that the invariant held.  Preserve the error as a violation so
+            # the campaign cannot silently pass with a broken observation.
+            check_name = getattr(check_fn, "__name__", "unknown_invariant")
+            violations.append(
+                InvariantViolation(
+                    "invariant_evaluation_error",
+                    "{} could not evaluate: {}".format(check_name, exc),
+                    result,
+                    details={
+                        "check": check_name,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+            )
     return violations
 
 

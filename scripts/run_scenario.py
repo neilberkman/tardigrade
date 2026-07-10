@@ -21,6 +21,9 @@ try:
 except ImportError as exc:  # pragma: no cover - runtime dependency check
     raise SystemExit("PyYAML is required for run_scenario.py (pip install pyyaml).") from exc
 
+from profile_loader import load_profile_raw
+from verdicts import is_pass_verdict
+
 
 SUPPORTED_SCHEMA_VERSIONS = {1}
 SUPPORTED_REPLAY_KINDS = {"replay"}
@@ -82,6 +85,45 @@ def _summarize_step_report(step_id: str, report: Optional[Dict[str, Any]]) -> No
         details.append("control={}".format(control_outcome))
     if details:
         _progress("step {} {}".format(step_id, " ".join(details)))
+
+
+def _report_verdict_passes(report: Optional[Dict[str, Any]]) -> bool:
+    """Return True only for an explicit top-level PASS verdict."""
+    if not isinstance(report, dict):
+        return False
+    return is_pass_verdict(report.get("verdict"))
+
+
+def _report_has_explicit_verdict(report: Optional[Dict[str, Any]]) -> bool:
+    """Return whether a child report contains a non-empty string verdict."""
+    return bool(
+        isinstance(report, dict)
+        and isinstance(report.get("verdict"), str)
+        and report["verdict"].strip()
+    )
+
+
+def _scenario_asserts_step_verdict(
+    steps: Sequence[Dict[str, Any]],
+    audit_step_id: str,
+) -> bool:
+    """Return whether a scenario assertion explicitly owns this verdict."""
+    expected_path = "steps.{}.report.verdict".format(audit_step_id)
+    for step in steps:
+        if str(step.get("kind", "audit")).strip().lower() != "assert":
+            continue
+        assertions = step.get("assertions")
+        if not isinstance(assertions, list):
+            continue
+        for assertion in assertions:
+            if (
+                isinstance(assertion, dict)
+                and str(assertion.get("path") or "").strip() == expected_path
+                and str(assertion.get("op", "equals")).strip().lower()
+                in {"equals", "not_equals", "in"}
+            ):
+                return True
+    return False
 
 
 def parse_args() -> argparse.Namespace:
@@ -339,6 +381,7 @@ def run_audit_step(
     step: Dict[str, Any],
     tempdir: Path,
     args: argparse.Namespace,
+    defer_verdict_to_assertion: bool = False,
 ) -> Dict[str, Any]:
     step_id = str(step.get("id") or "step")
     step_kind = str(step.get("kind", "audit")).strip().lower()
@@ -360,7 +403,19 @@ def run_audit_step(
         )
     else:
         base_profile_path = default_base_profile_path
-    profile_raw = dict(_load_data(base_profile_path))
+    # Materialize inheritance while the profile still lives beside its base
+    # files.  The per-step profile is written to a temporary directory, where
+    # an unresolved relative ``base_profile`` reference would point at the
+    # wrong location and make otherwise valid scenarios fail to load.
+    loaded_profile = load_profile_raw(base_profile_path)
+    if not isinstance(loaded_profile, dict):
+        raise ScenarioError(
+            "base profile {} did not resolve to a mapping".format(
+                base_profile_path
+            )
+        )
+    profile_raw = dict(loaded_profile)
+    profile_raw.pop("base_profile", None)
     replay_meta: Optional[Dict[str, Any]] = None
     if step_kind == "replay":
         replay_file = step.get("replay_file")
@@ -402,10 +457,18 @@ def run_audit_step(
             )
         )
     _summarize_step_report(step_id, report)
+    audit_status = "PASS" if (
+        proc_returncode == 0
+        and _report_has_explicit_verdict(report)
+        and (
+            defer_verdict_to_assertion
+            or _report_verdict_passes(report)
+        )
+    ) else "FAIL"
     _progress(
         "completed step {} status={} exit={}".format(
             step_id,
-            "PASS" if proc_returncode == 0 else "FAIL",
+            audit_status,
             proc_returncode,
         )
     )
@@ -415,7 +478,10 @@ def run_audit_step(
         "kind": step_kind,
         "base_profile": str(base_profile_path),
         "exit_code": proc_returncode,
-        "status": "PASS" if proc_returncode == 0 else "FAIL",
+        "status": audit_status,
+        "verdict_policy": (
+            "scenario_assertion" if defer_verdict_to_assertion else "require_pass"
+        ),
         "command": cmd,
         "report": report,
         "stdout": proc_stdout,
@@ -487,8 +553,11 @@ def main() -> int:
                     step=step,
                     tempdir=tempdir,
                     args=args,
+                    defer_verdict_to_assertion=_scenario_asserts_step_verdict(
+                        scenario["steps"], step_id
+                    ),
                 )
-                if step_result["exit_code"] != 0:
+                if step_result["status"] != "PASS":
                     results["status"] = "FAIL"
                 results["steps"][step_id] = step_result
                 continue

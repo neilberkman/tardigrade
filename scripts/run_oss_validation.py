@@ -12,6 +12,7 @@ import concurrent.futures
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,104 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from fault_classification import _effective_boot_result
+
+
+PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def validate_profile_name(value: Any) -> str:
+    """Return a safe profile identifier suitable for result path names."""
+    if not isinstance(value, str) or not PROFILE_NAME_RE.fullmatch(value):
+        raise ValueError(
+            "OSS profile name must match {}: {!r}".format(
+                PROFILE_NAME_RE.pattern,
+                value,
+            )
+        )
+    return value
+
+
+def _require_contained(root: Path, candidate: Path, *, label: str) -> Path:
+    root = root.resolve()
+    candidate = candidate.resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("{} escapes {}: {}".format(label, root, candidate)) from exc
+    return candidate
+
+
+def source_worktree_path(repo_root: Path, profile_name: str) -> Path:
+    """Return the contained worktree path for a validated profile name."""
+    name = validate_profile_name(profile_name)
+    worktree_root = (repo_root / "results" / "oss_validation" / "worktrees").resolve()
+    return _require_contained(
+        worktree_root,
+        worktree_root / name,
+        label="source worktree",
+    )
+
+
+def _worktree_marker_path(source_worktree: Path) -> Path:
+    return source_worktree.parent / ".{}.tardigrade-worktree.json".format(
+        source_worktree.name
+    )
+
+
+def _read_worktree_marker(source_worktree: Path) -> Dict[str, Any] | None:
+    marker = _worktree_marker_path(source_worktree)
+    if not marker.is_file():
+        return None
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("invalid managed-worktree marker: {}".format(marker)) from exc
+    return payload if isinstance(payload, dict) else None
+
+
+def _write_worktree_marker(source_worktree: Path, source_repo: Path) -> None:
+    marker = _worktree_marker_path(source_worktree)
+    payload = {
+        "version": 1,
+        "source_repo": str(source_repo.resolve()),
+        "source_worktree": str(source_worktree.resolve()),
+    }
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=".{}-".format(marker.name),
+        suffix=".tmp",
+        dir=str(marker.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, marker)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+
+
+def _is_registered_worktree(source_repo: Path, source_worktree: Path) -> bool:
+    proc = subprocess.run(
+        ["git", "-C", str(source_repo), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return False
+    expected = source_worktree.resolve()
+    for line in proc.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        if Path(line[len("worktree "):]).resolve() == expected:
+            return True
+    return False
 
 
 class SafeTemplateDict(dict):
@@ -72,7 +171,20 @@ def ensure_source_worktree(
     source_checkout: Dict[str, Any],
     source_worktree: Path,
 ) -> None:
-    source_repo = repo_root / str(source_checkout["repo"])
+    profile_name = validate_profile_name(profile_name)
+    expected_worktree = source_worktree_path(repo_root, profile_name)
+    if source_worktree.resolve() != expected_worktree:
+        raise ValueError(
+            "source worktree must be the managed profile path {}".format(
+                expected_worktree
+            )
+        )
+    source_worktree = expected_worktree
+    source_repo = _require_contained(
+        repo_root,
+        repo_root / str(source_checkout["repo"]),
+        label="source checkout repo",
+    )
     ref = str(source_checkout["ref"])
     fetch_remote = str(source_checkout.get("fetch_remote", "")).strip()
 
@@ -104,14 +216,35 @@ def ensure_source_worktree(
     source_worktree.parent.mkdir(parents=True, exist_ok=True)
 
     if source_worktree.exists():
+        marker = _read_worktree_marker(source_worktree)
+        expected_marker = {
+            "version": 1,
+            "source_repo": str(source_repo.resolve()),
+            "source_worktree": str(source_worktree.resolve()),
+        }
+        if marker != expected_marker:
+            raise RuntimeError(
+                "refusing to remove unowned worktree path: {}".format(source_worktree)
+            )
+        if not _is_registered_worktree(source_repo, source_worktree):
+            raise RuntimeError(
+                "refusing to remove path not registered as a git worktree: {}".format(
+                    source_worktree
+                )
+            )
         proc = subprocess.run(
             ["git", "-C", str(source_repo), "worktree", "remove", "--force", str(source_worktree)],
             capture_output=True,
             text=True,
             check=False,
         )
-        if proc.returncode != 0 and source_worktree.exists():
-            shutil.rmtree(source_worktree)
+        if proc.returncode != 0 or source_worktree.exists():
+            raise RuntimeError(
+                "git refused to remove managed worktree {}:\n{}".format(
+                    source_worktree,
+                    proc.stderr,
+                )
+            )
 
     proc = subprocess.run(
         [
@@ -128,6 +261,16 @@ def ensure_source_worktree(
                 profile_name, ref, proc.stdout, proc.stderr
             )
         )
+    try:
+        _write_worktree_marker(source_worktree, source_repo)
+    except Exception:
+        subprocess.run(
+            ["git", "-C", str(source_repo), "worktree", "remove", "--force", str(source_worktree)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        raise
 
 
 def run_single_fault_point(
@@ -172,9 +315,15 @@ def run_single_fault_point(
                 "error": "rc={} stderr={}".format(proc.returncode, (proc.stderr or "")[-500:])}
 
     data = json.loads(result_file.read_text(encoding="utf-8"))
+    fault_injected = data.get("fault_injected")
+    if type(fault_injected) is not bool:
+        nvm_state = data.get("nvm_state")
+        if isinstance(nvm_state, dict):
+            fault_injected = nvm_state.get("faulted")
     return {
         "fault_at": fault_at,
         "is_control": is_control,
+        "fault_injected": fault_injected,
         "boot_outcome": data.get("boot_outcome", "unknown"),
         "boot_slot": data.get("boot_slot"),
         "initial_boot_outcome": data.get("initial_boot_outcome"),
@@ -189,19 +338,19 @@ def run_profile(
     repo_root: Path, renode_test: str, profile: Dict[str, Any],
     variables: Dict[str, str], workers: int, skip_setup: bool,
 ) -> Dict[str, Any]:
-    name = profile["name"]
+    name = validate_profile_name(profile["name"])
     variables = dict(variables)
     source_checkout = render(profile.get("source_checkout"), variables)
     source_worktree: Path | None = None
     if source_checkout:
-        source_worktree = (
-            repo_root / "results" / "oss_validation" / "worktrees" / name
-        ).resolve()
+        source_worktree = source_worktree_path(repo_root, name)
         variables["source_worktree"] = str(source_worktree)
     rendered = render(profile, variables)
     robot_suite = str(rendered.get("robot_suite", "tests/generic_fault_point.robot"))
     robot_vars = [str(rv) for rv in rendered.get("robot_vars", [])]
     total_writes = int(rendered.get("total_writes", 28672))
+    if total_writes <= 0:
+        raise ValueError("total_writes must be positive")
 
     for key in ("slot_a_image_file", "slot_b_image_file", "ota_header_size",
                 "evaluation_mode", "boot_mode"):
@@ -229,10 +378,19 @@ def run_profile(
         ensure_source_worktree(repo_root, name, source_checkout, source_worktree)
 
     # Build fault point list from profile range/step.
-    fault_range = str(rendered.get("fault_range", "0:28672"))
+    fault_range = str(rendered.get("fault_range", "0:{}".format(total_writes - 1)))
     fault_step = int(rendered.get("fault_step", 4000))
+    if fault_step <= 0:
+        raise ValueError("fault_step must be positive")
     start_s, end_s = fault_range.split(":", 1)
     start, end = int(start_s), int(end_s)
+    if start < 0 or end < start or end >= total_writes:
+        raise ValueError(
+            "fault_range must be an inclusive subset of 0:{}; got {}".format(
+                total_writes - 1,
+                fault_range,
+            )
+        )
     fault_points = list(range(start, end + 1, fault_step))
     if end not in fault_points:
         fault_points.append(end)
@@ -277,10 +435,42 @@ def run_profile(
     faulted = [r for r in results if not r.get("is_control")]
     bricks = sum(1 for r in faulted if is_brick(r))
     issues = sum(1 for r in faulted if _effective_outcome_str(r) != "success")
-    errors = sum(1 for r in results if _effective_outcome_str(r) == "infra_error")
+    incomplete_outcomes = {
+        "",
+        "unknown",
+        "infra_error",
+        "infrastructure_error",
+        "timeout",
+        "skipped",
+    }
+    incomplete_results = [
+        r
+        for r in results
+        if (
+            _effective_outcome_str(r) in incomplete_outcomes
+            or r.get("error")
+            or type(r.get("fault_injected")) is not bool
+            or (
+                not r.get("is_control")
+                and r.get("fault_injected") is not True
+            )
+            or (
+                r.get("is_control")
+                and r.get("fault_injected") is not False
+            )
+        )
+    ]
+    errors = len(incomplete_results)
     brick_rate = (float(bricks) / len(faulted)) if faulted else 0.0
     issue_rate = (float(issues) / len(faulted)) if faulted else 0.0
     failures: List[str] = []
+
+    if incomplete_results:
+        failures.append(
+            "{} run(s) produced incomplete or infrastructure results".format(
+                len(incomplete_results)
+            )
+        )
 
     bricks_max = expect.get("bricks_max")
     if bricks_max is not None and bricks > int(bricks_max):
@@ -329,6 +519,9 @@ def main() -> int:
         manifest_path = (repo_root / manifest_path).resolve()
 
     profiles = json.loads(manifest_path.read_text(encoding="utf-8"))["profiles"]
+    profile_names = [validate_profile_name(profile.get("name")) for profile in profiles]
+    if len(set(profile_names)) != len(profile_names):
+        raise ValueError("OSS validation manifest contains duplicate profile names")
 
     if args.list_profiles:
         for prof in profiles:

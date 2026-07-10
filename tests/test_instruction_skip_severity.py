@@ -292,6 +292,12 @@ class SeveritySummaryTests(unittest.TestCase):
         profile = _profile_stub("security")
         results = [
             {
+                "is_control": True,
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "fault_injected": False,
+            },
+            {
                 "is_control": False,
                 "fault_injected": True,
                 "fault_at": 1,

@@ -76,12 +76,11 @@ class CapstoneClassifyTest(unittest.TestCase):
     def setUp(self):
         if not MCUBOOT_ELF.exists():
             self.skipTest("MCUboot ELF fixture not present")
-        try:
-            from thumb_classify import _capstone_classify
+        import thumb_classify
 
-            self.classify = _capstone_classify
-        except ImportError:
+        if not thumb_classify.HAS_CAPSTONE:
             self.skipTest("capstone not installed")
+        self.classify = thumb_classify._capstone_classify
 
     def test_finds_literal_pools(self):
         """Capstone should find literal pools in context_boot_go."""

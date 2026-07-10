@@ -34,7 +34,8 @@ pre_boot_state:
   - { address: 0x08081F60, u32: 20532 }
   - { address: 0x08081BD4, u32: 0x00000001 }
 
-success_criteria: {}
+success_criteria:
+  vtor_in_slot: exec
 
 fault_sweep:
   mode: runtime

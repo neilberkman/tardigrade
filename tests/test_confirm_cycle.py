@@ -136,17 +136,13 @@ class ParseConfirmCycleTest(unittest.TestCase):
                 "expected_ratchet_version": -1,
             })
 
-    def test_unsupported_fault_type_filtered(self):
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            cfg = _parse_confirm_cycle({
+    def test_unsupported_fault_type_rejected(self):
+        with self.assertRaises(ProfileError):
+            _parse_confirm_cycle({
                 "enabled": True,
                 "confirm_function": "foo",
                 "fault_types": ["power_loss", "interrupted_erase"],
             })
-        # interrupted_erase is filtered out
-        self.assertEqual(cfg.fault_types, ["power_loss"])
 
     def test_not_dict_raises(self):
         with self.assertRaises(ProfileError):

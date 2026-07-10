@@ -30,7 +30,8 @@ update_trigger:
   slot: staging
   max_align: 32
 
-success_criteria: {}
+success_criteria:
+  vtor_in_slot: exec
 
 fault_sweep:
   mode: runtime

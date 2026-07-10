@@ -9,9 +9,12 @@ calibrations can be skipped.
 from __future__ import annotations
 
 import base64
+import dataclasses
+import enum
 import hashlib
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -46,6 +49,57 @@ def _write_binary_b64(b64_data: Optional[str], dest: str) -> Optional[str]:
     return dest
 
 
+def _normalize_cache_value(value: Any) -> Any:
+    """Convert configuration objects to deterministic JSON-compatible data."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, enum.Enum):
+        return _normalize_cache_value(value.value)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _normalize_cache_value(dataclasses.asdict(value))
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_cache_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_cache_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        normalized = [_normalize_cache_value(item) for item in value]
+        return sorted(
+            normalized,
+            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
+        )
+    if hasattr(value, "__dict__"):
+        return _normalize_cache_value({
+            key: item
+            for key, item in vars(value).items()
+            if not key.startswith("_") and not callable(item)
+        })
+    slots = getattr(type(value), "__slots__", ())
+    if isinstance(slots, str):
+        slots = (slots,)
+    if slots:
+        return _normalize_cache_value({
+            slot: getattr(value, slot)
+            for slot in slots
+            if not slot.startswith("_") and hasattr(value, slot)
+        })
+    raise TypeError(
+        "unsupported calibration cache value type: {}".format(type(value).__name__)
+    )
+
+
+def _content_digests(files: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Hash named referenced files without coupling the key to checkout paths."""
+    return {
+        str(name): _file_sha256(path)
+        for name, path in sorted((files or {}).items())
+    }
+
+
 def compute_cache_key(
     *,
     bootloader_elf: str,
@@ -56,55 +110,43 @@ def compute_cache_key(
     pre_boot_state: List[Any],
     hash_bypass_symbols: List[str],
     write_granularity: int,
+    platform_files: Optional[Dict[str, str]] = None,
+    setup_files: Optional[Dict[str, str]] = None,
+    hook_files: Optional[Dict[str, str]] = None,
+    entry_point: Optional[int] = None,
+    image_load_addresses: Optional[Dict[str, int]] = None,
+    tool_versions: Optional[Dict[str, str]] = None,
+    runtime_config: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Compute a deterministic cache key from calibration inputs.
 
     Returns a hex SHA-256 digest.
     """
-    h = hashlib.sha256()
-
-    # ELF file content
-    h.update(b"elf:")
-    h.update(_file_sha256(bootloader_elf).encode())
-
-    # Image file contents (sorted by key for determinism)
-    for key in sorted(images):
-        h.update("image:{}:".format(key).encode())
-        h.update(_file_sha256(images[key]).encode())
-
-    # Fault types
-    h.update(b"fault_types:")
-    h.update(",".join(sorted(fault_types)).encode())
-
-    # Flash backend
-    h.update(b"flash_backend:")
-    h.update((flash_backend or "").encode())
-
-    # Memory slot geometry (sorted by slot name)
-    h.update(b"memory_slots:")
-    for name in sorted(memory_slots):
-        slot = memory_slots[name]
-        base = slot.get("base", 0) if isinstance(slot, dict) else getattr(slot, "base", 0)
-        size = slot.get("size", 0) if isinstance(slot, dict) else getattr(slot, "size", 0)
-        h.update("{}:{}:{}".format(name, base, size).encode())
-
-    # Pre-boot state
-    h.update(b"pre_boot_state:")
-    for pbs in pre_boot_state:
-        if hasattr(pbs, "address") and hasattr(pbs, "u32"):
-            h.update("{}:{}".format(pbs.address, pbs.u32).encode())
-        elif isinstance(pbs, dict):
-            h.update("{}:{}".format(pbs.get("address", 0), pbs.get("u32", 0)).encode())
-
-    # Hash bypass symbols
-    h.update(b"hash_bypass:")
-    h.update(",".join(sorted(hash_bypass_symbols)).encode())
-
-    # Write granularity
-    h.update(b"write_gran:")
-    h.update(str(write_granularity).encode())
-
-    return h.hexdigest()
+    payload = {
+        "key_format": 2,
+        "bootloader_elf_sha256": _file_sha256(bootloader_elf),
+        "image_sha256": _content_digests(images),
+        "fault_types": sorted(fault_types),
+        "flash_backend": flash_backend,
+        "memory_slots": _normalize_cache_value(memory_slots),
+        "pre_boot_state": _normalize_cache_value(pre_boot_state),
+        "hash_bypass_symbols": sorted(hash_bypass_symbols),
+        "write_granularity": write_granularity,
+        "platform_file_sha256": _content_digests(platform_files),
+        "setup_file_sha256": _content_digests(setup_files),
+        "hook_file_sha256": _content_digests(hook_files),
+        "entry_point": entry_point,
+        "image_load_addresses": _normalize_cache_value(image_load_addresses or {}),
+        "tool_versions": _normalize_cache_value(tool_versions or {}),
+        "runtime_config": _normalize_cache_value(runtime_config or {}),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def save_calibration(
@@ -132,9 +174,31 @@ def save_calibration(
         "trace_file_bin_b64": _read_binary_b64(cal.trace_file_bin),
         "erase_trace_file_bin_b64": _read_binary_b64(cal.erase_trace_file_bin),
     }
-    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
+    destination = Path(path).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_name: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=".{}-".format(destination.name),
+            suffix=".tmp",
+            dir=str(destination.parent),
+            delete=False,
+        ) as stream:
+            temp_name = stream.name
+            json.dump(payload, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, destination)
+        temp_name = None
+    finally:
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
 
 
 def load_calibration(

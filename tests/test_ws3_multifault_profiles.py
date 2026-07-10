@@ -189,6 +189,30 @@ class WS3MultiFaultPhaseTests(unittest.TestCase):
         self.assertIn("fault_sequence", out.results[0])
         self.assertIn("sequence_rationale", out.results[0])
 
+    def test_enabled_multifault_empty_plan_is_incomplete(self) -> None:
+        profile = load_profile(MOVE_MF_SELFTEST)
+        control_only = [self._interesting_sweep_results()[-1]]
+        with tempfile.TemporaryDirectory(prefix="ws3_mf_empty_") as td:
+            out = run_multi_fault_phase(
+                profile=profile,
+                sweep_results=control_only,
+                repo_root=ROOT,
+                renode_test="renode-test",
+                robot_suite="tests/ota_fault_point.robot",
+                robot_vars=[],
+                work_dir=Path(td),
+                renode_remote_server_dir="",
+                num_workers=1,
+                max_batch_points=0,
+                max_writes=256,
+                explain_only=False,
+            )
+
+        self.assertEqual(out.results, [])
+        self.assertIsNotNone(out.summary)
+        self.assertTrue(out.summary["plan_empty"])
+        self.assertFalse(out.summary["campaign_integrity"]["complete"])
+
 
 if __name__ == "__main__":
     unittest.main()

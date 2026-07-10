@@ -512,27 +512,26 @@ namespace Antmicro.Renode.Peripherals.Memory
 
             if(!EnforceWordWriteSemantics)
             {
-                // Fast path: write all data first, then check for fault injection.
-                // This ensures words before the faulted word are properly written.
+                // Fast path: commit one word at a time.  A simulated power
+                // loss must preserve preceding words but must never persist
+                // bytes from words that occur after the targeted write.
                 var fastFirst = AlignDown(offset, WordSize);
                 var fastLast = AlignDown(offset + data.Length - 1, WordSize);
-                byte[] fastPreWrite = null;
-                if(WriteFaultMode == 6)
-                {
-                    var trackedLen = (int)(fastLast - fastFirst + WordSize);
-                    fastPreWrite = new byte[trackedLen];
-                    Array.Copy(storage, fastFirst, fastPreWrite, 0, trackedLen);
-                }
-
-                // Write all data to storage unconditionally first.
-                for(var i = 0; i < data.Length; i++)
-                {
-                    storage[offset + i] = data[i];
-                }
-
-                // Now count word writes and check for fault injection.
                 for(var wordStart = fastFirst; wordStart <= fastLast; wordStart += WordSize)
                 {
+                    var previousWord = new byte[WordSize];
+                    if(WriteFaultMode == 6)
+                    {
+                        Array.Copy(storage, wordStart, previousWord, 0, WordSize);
+                    }
+
+                    var writeStart = Math.Max(offset, wordStart);
+                    var writeEnd = Math.Min(offset + data.Length, wordStart + WordSize);
+                    for(var address = writeStart; address < writeEnd; address++)
+                    {
+                        storage[address] = data[(int)(address - offset)];
+                    }
+
                     var currentWriteIndex = TotalWordWrites + 1;
                     if(currentWriteIndex == FaultAtWordWrite)
                     {
@@ -544,10 +543,9 @@ namespace Antmicro.Renode.Peripherals.Memory
                         }
                         else if(WriteFaultMode == 6)
                         {
-                            var snapshotOffset = (int)(wordStart - fastFirst);
                             for(var i = 0; i < (int)WordSize; i++)
                             {
-                                storage[wordStart + i] = fastPreWrite[snapshotOffset + i];
+                                storage[wordStart + i] = previousWord[i];
                             }
                             DriverErrorFired = true;
                         }

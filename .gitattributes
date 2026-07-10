@@ -1,0 +1,5 @@
+*.axf -text -diff
+*.bin -text -diff
+*.elf -text -diff
+/LICENSES/*.txt -whitespace
+/THIRD_PARTY_NOTICES.md whitespace=-trailing-space

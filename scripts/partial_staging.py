@@ -32,6 +32,8 @@ import dataclasses
 import tempfile
 from typing import Any, Dict, List, Optional
 
+from profile_loader import MAX_PROFILE_FAULT_POINTS
+
 
 @dataclasses.dataclass
 class TruncationPoint:
@@ -87,6 +89,15 @@ class PartialStagingConfig:
             raise ValueError(
                 "max_points must be positive or None, got {}".format(self.max_points)
             )
+        if (
+            self.max_points is not None
+            and self.max_points > MAX_PROFILE_FAULT_POINTS
+        ):
+            raise ValueError(
+                "max_points exceeds safety limit {}".format(
+                    MAX_PROFILE_FAULT_POINTS
+                )
+            )
 
 
 def generate_truncation_points(
@@ -122,9 +133,27 @@ def generate_truncation_points(
     if image_size < 1:
         return []
 
+    if strategy not in {"heuristic", "exhaustive", "explicit"}:
+        raise ValueError(
+            "unknown truncation strategy {!r}".format(strategy)
+        )
+
+    if max_points is not None and max_points > MAX_PROFILE_FAULT_POINTS:
+        raise ValueError(
+            "max_points exceeds safety limit {}".format(
+                MAX_PROFILE_FAULT_POINTS
+            )
+        )
+
     if strategy == "explicit":
         if not explicit_offsets:
             return []
+        if len(explicit_offsets) > MAX_PROFILE_FAULT_POINTS:
+            raise ValueError(
+                "explicit truncation offsets exceed safety limit {}".format(
+                    MAX_PROFILE_FAULT_POINTS
+                )
+            )
         points = []
         for offset in explicit_offsets:
             clamped = max(0, min(offset, image_size))
@@ -295,6 +324,12 @@ def generate_truncation_points(
 
     # --- Exhaustive: add every sector boundary ---
     if strategy == "exhaustive" and sector_size > 0:
+        boundary_count = max(0, (image_size - 1) // sector_size)
+        if boundary_count > MAX_PROFILE_FAULT_POINTS:
+            raise ValueError(
+                "exhaustive truncation candidates exceed safety limit {}; "
+                "increase sector_size".format(MAX_PROFILE_FAULT_POINTS)
+            )
         for boundary in range(sector_size, image_size, sector_size):
             points.append(
                 TruncationPoint(
@@ -436,6 +471,10 @@ PARTIAL_STAGING_OUTCOMES = {
     "partial_image_booted",  # BAD: bootloader booted the partial/corrupt image.
     "brick",               # VERY BAD: device did not boot at all.
     "complete_image_ok",   # Control: complete image booted successfully.
+    "complete_image_failed",  # Control returned a conclusive non-success outcome.
+    "wrong_image",         # Content validation selected an unexpected image.
+    "timeout",             # The point did not complete within its wall deadline.
+    "infrastructure_error",  # The harness did not produce a trustworthy result.
 }
 
 
@@ -461,19 +500,26 @@ def classify_partial_staging_outcome(
     outcome = str(boot_outcome or "unknown").strip().lower()
     slot = str(boot_slot or "").strip().lower()
 
+    # Harness failures and wall-clock expiry are never device behavior.
+    if outcome == "infra_error":
+        return "infrastructure_error"
+    if outcome == "timeout":
+        return "timeout"
+
     # Complete image is the control case.
     if truncation_offset >= image_size:
         if outcome == "success":
             return "complete_image_ok"
-        # Even the complete image failed — this is a brick (or config error).
-        if outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}:
-            return "brick"
-        return "safe_fallback"
+        # A failed control invalidates the campaign; do not mix it with
+        # fault-induced bricks from genuinely partial images.
+        return "complete_image_failed"
 
     # Partial image cases:
     # If the device didn't boot at all, it's a brick.
     if outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}:
         return "brick"
+    if outcome == "wrong_image":
+        return "wrong_image"
 
     # If it booted and landed in the exec/safe slot, that's correct behavior.
     exec_names = {"exec", "primary", "slot_a", "slot0", "a"}
@@ -515,17 +561,26 @@ class PartialStagingResult:
 
 def summarize_partial_staging(
     results: List[PartialStagingResult],
+    *,
+    image_size: Optional[int] = None,
+    expected_points: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Compute summary statistics from partial staging sweep results."""
     total = len(results)
+    planned = total if expected_points is None else int(expected_points)
+    if planned < 0:
+        raise ValueError("expected_points must be non-negative")
+    missing_results = max(0, planned - total)
+    extra_results = max(0, total - planned)
     classification_counts: Dict[str, int] = {}
     issues: List[Dict[str, Any]] = []
 
+    successful_classes = {"safe_fallback", "complete_image_ok"}
     for r in results:
         classification_counts[r.classification] = (
             classification_counts.get(r.classification, 0) + 1
         )
-        if r.classification in {"partial_image_booted", "brick"}:
+        if r.classification not in successful_classes:
             issues.append(
                 {
                     "offset": r.truncation_point.offset,
@@ -540,16 +595,54 @@ def summarize_partial_staging(
     partial_booted = classification_counts.get("partial_image_booted", 0)
     safe = classification_counts.get("safe_fallback", 0)
     control_ok = classification_counts.get("complete_image_ok", 0)
+    issue_count = len(issues)
+    if image_size is not None:
+        complete_points = sum(
+            1
+            for result in results
+            if int(result.truncation_point.offset) >= int(image_size)
+        )
+    else:
+        complete_points = sum(
+            1
+            for result in results
+            if result.classification
+            in {"complete_image_ok", "complete_image_failed"}
+        )
+    partial_image_points = max(0, total - complete_points)
+    infrastructure_errors = classification_counts.get("infrastructure_error", 0)
+    timeouts = classification_counts.get("timeout", 0)
+    complete_failures = classification_counts.get("complete_image_failed", 0)
 
     return {
+        "planned_points": planned,
         "total_points": total,
+        "returned_points": total,
+        "missing_result_points": missing_results,
+        "extra_result_points": extra_results,
+        "partial_image_points": partial_image_points,
+        "complete_image_points": complete_points,
         "safe_fallback": safe,
         "partial_image_booted": partial_booted,
         "brick": bricks,
         "complete_image_ok": control_ok,
-        "issue_count": partial_booted + bricks,
+        "complete_image_failed": complete_failures,
+        "wrong_image": classification_counts.get("wrong_image", 0),
+        "timeout": timeouts,
+        "infrastructure_error": infrastructure_errors,
+        "control_succeeded": control_ok > 0,
+        "campaign_complete": bool(
+            total == planned
+            and partial_image_points > 0
+            and complete_points == 1
+            and control_ok == 1
+            and complete_failures == 0
+            and infrastructure_errors == 0
+            and timeouts == 0
+        ),
+        "issue_count": issue_count,
         "issue_rate": (
-            float(partial_booted + bricks) / float(total) if total else 0.0
+            float(issue_count) / float(total) if total else 0.0
         ),
         "classifications": classification_counts,
         "issues": issues,
@@ -603,6 +696,11 @@ def parse_partial_staging_config(
     header_size = int(raw.get("header_size", 32))
     trailer_size = int(raw.get("trailer_size", 0))
     truncation_points = str(raw.get("truncation_points", "heuristic"))
+    if truncation_points not in {"heuristic", "exhaustive", "explicit"}:
+        raise ValueError(
+            "partial_staging.truncation_points must be heuristic, exhaustive, "
+            "or explicit; got {!r}".format(truncation_points)
+        )
 
     explicit_offsets = None
     if truncation_points == "explicit":

@@ -31,6 +31,11 @@ from self_test import (
 
 
 class SelfTestProfileDiscoveryTests(unittest.TestCase):
+    def test_runtime_manifest_matches_discovered_profiles(self):
+        discovered = {path.name for path in discover_profiles(ROOT)}
+        _default_cost_s, profile_costs = load_runtime_manifest(ROOT)
+        self.assertEqual(set(profile_costs), discovered)
+
     def test_runtime_manifest_assigns_known_outlier_costs(self):
         default_cost_s, profile_costs = load_runtime_manifest(ROOT)
 
@@ -90,7 +95,6 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertNotIn("mcuboot_pr2214_offset_geom_fixed.yaml", discovered)
         self.assertNotIn("mcuboot_pr2206_scratch_geom_broken.yaml", discovered)
         self.assertNotIn("mcuboot_pr2206_scratch_geom_fixed.yaml", discovered)
-        self.assertNotIn("tfm_an521_verify_instruction_skip.yaml", discovered)
         self.assertNotIn("fault_no_crc.yaml", discovered)
         self.assertNotIn("fault_single_replica.yaml", discovered)
         self.assertNotIn("fault_wrong_slot_order.yaml", discovered)
@@ -317,6 +321,48 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
 
         self.assertTrue(passed)
         self.assertEqual(reason, "No issues found, as expected")
+
+    def test_check_verdict_rejects_infrastructure_exit_even_with_matching_report(self):
+        report = {
+            "verdict": "PASS",
+            "summary": {
+                "runtime_sweep": {
+                    "issue_points": 0,
+                    "bricks": 0,
+                    "brick_rate": 0.0,
+                    "control": {"effective_outcome": "success"},
+                }
+            },
+        }
+        for exit_code in (-9, 2, 3, 127):
+            with self.subTest(exit_code=exit_code):
+                passed, reason = check_verdict(
+                    profile_path=ROOT / "profiles" / "dummy.yaml",
+                    profile_raw={},
+                    report=report,
+                    exit_code=exit_code,
+                )
+                self.assertFalse(passed)
+                self.assertIn("infrastructure failure", reason.lower())
+
+    def test_check_verdict_still_allows_assertion_exit_for_expected_fixture(self):
+        passed, _reason = check_verdict(
+            profile_path=ROOT / "profiles" / "dummy.yaml",
+            profile_raw={},
+            report={
+                "verdict": "PASS",
+                "summary": {
+                    "runtime_sweep": {
+                        "issue_points": 0,
+                        "bricks": 0,
+                        "brick_rate": 0.0,
+                        "control": {"effective_outcome": "success"},
+                    }
+                },
+            },
+            exit_code=1,
+        )
+        self.assertTrue(passed)
 
 
 if __name__ == "__main__":

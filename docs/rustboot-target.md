@@ -1,4 +1,4 @@
-# rustBoot Target Design
+# rustBoot Adapter Reference
 
 ## Background
 
@@ -111,8 +111,9 @@ rustBoot targets nRF52840 via cargo:
 
 ```bash
 # Clone rustBoot
-git clone https://github.com/AmarTabakovic/rustBoot.git
+git clone https://github.com/nihalpasham/rustBoot.git
 cd rustBoot
+git checkout --detach d4394d383ba3758574159c6630e4c3261a6b47f1
 
 # Build bootloader for nRF52840
 cd boards/bootloaders/nrf52840
@@ -138,7 +139,7 @@ rustBoot on nRF52840 maps directly to tardigrade's existing infrastructure:
 - **Platform file**: Existing `cortex_m4_flash_fast.repl` or nRF52840 repl
 - **Flash size**: 1MB (0x00000000 - 0x000FFFFF)
 
-Partition mapping for the checked-in nRF52840 rustBoot build:
+Reference partition mapping used while developing the clean-room adapter:
 
 ```
 0x00000000 - 0x0002EFFF  Bootloader / immutable region
@@ -162,19 +163,16 @@ invariant_providers:
   - targets/rustboot/invariants.py
 ```
 
-Note: the current rustBoot probe defaults are pinned to this checked-in
-nRF52840 layout. The current fast nRF52 backend also infers write indices
-from NVMC mode transitions; rustBoot's nRF52840 HAL leaves NVMC in
-write-enable mode across flash writes, so the first working repo profile
-currently uses `interrupted_erase` coverage instead of write-indexed
-`power_loss` points. The checked-in ELF also does not export stable
-unmangled hash-bypass symbols, so the current profile runs without
-`sweep_hash_bypass_symbols`.
+The probe defaults use this reference layout. Override the monitor variables
+when a build uses different partition addresses or sizes. The fast nRF52
+backend infers write indices from NVMC mode transitions, while rustBoot's
+nRF52840 HAL may leave NVMC in write-enable mode across writes; an integration
+should validate trace coverage before relying on write-indexed fault points.
 
 ## References
 
-- rustBoot repository: https://github.com/AmarTabakovic/rustBoot
-- Issue #77 (interrupted swap): https://github.com/AmarTabakovic/rustBoot/issues/77
-- Issue #79 (corrupted boot): https://github.com/AmarTabakovic/rustBoot/issues/79
-- Issue #80 (damaged update): https://github.com/AmarTabakovic/rustBoot/issues/80
-- rustBoot design doc: https://github.com/AmarTabakovic/rustBoot/blob/main/docs/design.md
+- rustBoot repository: https://github.com/nihalpasham/rustBoot
+- Issue #77 (interrupted swap): https://github.com/nihalpasham/rustBoot/issues/77
+- Issue #79 (corrupted boot): https://github.com/nihalpasham/rustBoot/issues/79
+- Issue #80 (damaged update): https://github.com/nihalpasham/rustBoot/issues/80
+- rustBoot design doc: https://github.com/nihalpasham/rustBoot/blob/d4394d383ba3758574159c6630e4c3261a6b47f1/docs/design.md

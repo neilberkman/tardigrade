@@ -36,8 +36,9 @@ def validate_bootloader_vector_table(
     """Validate the ARM vector table at the start of a bootloader region.
 
     Checks:
-      1. Initial SP (first word) is in the SRAM range.
-      2. Reset vector (second word) points into the bootloader region.
+      1. Initial SP (first word) is in the inclusive SRAM range.
+      2. Reset vector (second word) has the Thumb bit set and its program
+         counter points into the bootloader region.
 
     Returns:
         (True, "ok") if valid, or (False, reason_string) if invalid.
@@ -47,13 +48,18 @@ def validate_bootloader_vector_table(
     sp = _struct.unpack_from("<I", memory_bytes, 0)[0]
     reset_vector = _struct.unpack_from("<I", memory_bytes, 4)[0]
     region_end = region_base + region_size
-    if not (sram_start <= sp < sram_end):
+    if not (sram_start <= sp <= sram_end):
         return False, "initial SP 0x{:08X} not in SRAM range 0x{:08X}-0x{:08X}".format(
             sp, sram_start, sram_end
         )
-    if not (region_base <= reset_vector < region_end):
+    reset_pc = reset_vector & ~1
+    if not (region_base <= reset_pc < region_end):
         return False, "reset vector 0x{:08X} not in bootloader region 0x{:08X}-0x{:08X}".format(
             reset_vector, region_base, region_end
+        )
+    if (reset_vector & 1) != 1:
+        return False, "reset vector 0x{:08X} does not set the Thumb bit".format(
+            reset_vector
         )
     return True, "ok"
 
@@ -571,7 +577,11 @@ def generate_multi_fault_sequences(
         raise ValueError("unknown multi-fault strategy {!r}, expected one of {}".format(strategy, sorted(known)))
 
     if strategy == "explicit":
-        return generate_explicit(explicit_sequences, max_faults_per_run)
+        return generate_explicit(
+            explicit_sequences,
+            max_faults_per_run,
+            max_sequences=max_pairs,
+        )
     elif strategy == "pairwise_interesting":
         plan = generate_pairwise_interesting(
             interesting_points, max_faults_per_run, max_pairs,
@@ -593,11 +603,19 @@ def generate_multi_fault_sequences(
 
 
 def generate_explicit(
-    sequences: Optional[List[List[int]]], max_faults_per_run: int
+    sequences: Optional[List[List[int]]],
+    max_faults_per_run: int,
+    max_sequences: Optional[int] = None,
 ) -> MultiFaultPlan:
     """Validate and return user-provided explicit sequences."""
     if not sequences:
         raise ValueError("explicit strategy requires non-empty sequences list")
+    if max_sequences is not None and len(sequences) > int(max_sequences):
+        raise ValueError(
+            "explicit strategy contains {} sequences, exceeding max_pairs={}".format(
+                len(sequences), max_sequences
+            )
+        )
     validated: List[AnnotatedSequence] = []
     for seq in sequences:
         if len(seq) < 2:
@@ -607,6 +625,12 @@ def generate_explicit(
         if len(seq) > max_faults_per_run:
             raise ValueError(
                 "sequence {} exceeds max_faults_per_run={}".format(seq, max_faults_per_run)
+            )
+        if any(int(point) < 0 for point in seq):
+            raise ValueError(
+                "multi-fault sequence contains a negative fault point: {}".format(
+                    seq
+                )
             )
         validated.append(AnnotatedSequence(
             fault_points=sorted(seq),

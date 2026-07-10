@@ -8,7 +8,7 @@ Trace replay and write-address heuristics make exhaustive fault sweeps (~15K poi
 
 ### NuttX nxboot -- original discovery
 
-Tardigrade's fault sweep against the upstream [NuttX nxboot bootloader](https://github.com/apache/nuttx-apps/tree/master/boot/nxboot) found a power-loss recovery vulnerability: 92 of 94 fault points resulted in the bootloader jumping to partially-written firmware. Three fixes submitted:
+Tardigrade's fault sweep against the upstream [NuttX nxboot bootloader](https://github.com/apache/nuttx-apps/tree/45d4c7098bb3a7a6d9b5642efc47df5998c048d5/boot/nxboot) found a power-loss recovery vulnerability: 92 of 94 fault points resulted in the bootloader jumping to partially-written firmware. Three fixes submitted:
 
 | Fix                                                                                         | PR                                                                       |
 | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
@@ -69,7 +69,7 @@ Diagnostic annotations include a barrier audit (detects missing flush barriers b
 
 ```yaml
 - id: tardigrade
-  uses: neilberkman/tardigrade@v1
+  uses: neilberkman/tardigrade@<reviewed-commit-sha>
   with:
     profile: profiles/mcuboot_swap_current.yaml
     quick: false
@@ -78,10 +78,27 @@ Diagnostic annotations include a barrier audit (detects missing flush barriers b
 
 Outputs: `verdict` (PASS/FAIL), `report-path`, `brick-rate`. Use `verdict` as the CI gate signal.
 
+Relative ELF, image, platform, setup, and hook paths are resolved from the
+caller's workspace. Set `asset-root` to a workspace subdirectory when those
+assets do not live at the repository root. A custom `renode-url` must be paired
+with its exact `renode-sha256`; downloads are rejected before extraction when
+the digest does not match. The default digest comes from Renode's public
+v1.16.1 release metadata. The Action also enables strict profile validation,
+so unknown keys and profiles without observable success criteria are rejected.
+The bundled runtime supports Linux x86-64 runners. It uses Renode's verified
+portable .NET archive and installs Python packages in a temporary virtual
+environment, leaving the caller's Python environment intact.
+
+Profiles are trusted executable input, not a sandbox. Platform definitions,
+setup scripts, boot hooks, and invariant providers can execute Renode commands
+or host Python. Run only profiles and referenced assets from reviewed,
+open-source revisions; do not accept them directly from an untrusted pull
+request or artifact.
+
 ```yaml
 - name: Upload tardigrade report
   if: always()
-  uses: actions/upload-artifact@v4
+  uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
   with:
     name: tardigrade-report
     path: ${{ steps.tardigrade.outputs.report-path }}
@@ -102,7 +119,7 @@ python3 scripts/audit_bootloader.py \
   --output results/report.json
 ```
 
-`--quick` runs a 3-point smoke test. Default is the heuristic sweep (~1K points, 2-4 min). Add `--workers N` for parallelism. Docker: `--renode-test docker://renode-patched:test`.
+`--quick` runs a 3-point smoke test. Default is the heuristic sweep (~1K points, 2-4 min). Add `--workers N` for parallelism. Build the public validation container with `docker build -f docker/oss-validation.Dockerfile -t tardigrade-oss-validation .`, then use `--renode-test docker://tardigrade-oss-validation`.
 
 ### Run modes
 
@@ -228,7 +245,10 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the complete 
 
 **NuttX nxboot** -- real upstream NuttX firmware built from source. Board configs are upstream ([apache/nuttx#18509](https://github.com/apache/nuttx/pull/18509)). Tardigrade found a power-loss recovery vulnerability (92/94 failure rate) that led to fixes in both the NuttX kernel ([#18552](https://github.com/apache/nuttx/pull/18552)) and nxboot itself ([nuttx-apps#3428](https://github.com/apache/nuttx-apps/pull/3428)). The target adapter (`targets/nuttx_nxboot/`) includes a build script, runtime profile generator, and state probe. See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
 
-**rustBoot** -- initial real upstream nRF52840 integration using checked-in public assets, a rustBoot-specific state probe/invariant package, and a first interrupted-erase campaign over the swap-scratch update path. Current limitation: the fast nRF52 backend does not yet recover write-index traces from rustBoot's NVMC usage, so the shipped profile is erase-fault focused and expected to find issues. See [`profiles/rustboot_nrf52840_update.yaml`](profiles/rustboot_nrf52840_update.yaml), [`targets/rustboot/`](targets/rustboot/), and [`docs/rustboot-target.md`](docs/rustboot-target.md).
+**rustBoot** -- a clean-room state probe and invariant package for the public
+MIT-licensed rustBoot partition/trailer protocol. No rustBoot prebuilt firmware
+is distributed. See [`targets/rustboot/`](targets/rustboot/) and
+[`docs/rustboot-target.md`](docs/rustboot-target.md) for the adapter reference.
 
 ### Reference examples
 
@@ -240,7 +260,6 @@ The `examples/` directory contains standalone bootloader firmware for engine val
 | `vulnerable_ota`         | Copy-in-place OTA with frequent boot-visible failures              |
 | `nxboot_style`           | Modeled nxboot family for adapter/probe/invariant development      |
 | `esp_idf_ota`            | Clean-room model of ESP-IDF OTA slot-selection behavior            |
-| `riotboot_standalone`    | Standalone RIOTboot-style slot-selection model                     |
 | `bootloader_self_update` | Bootloader-region integrity and self-update fault modeling         |
 | `nvs_config_migration`   | Config/NVS-region corruption and migration validation              |
 
@@ -299,7 +318,7 @@ tardigrade/
 │   ├── mcuboot/                      # MCUboot probe, invariants, state fuzzer
 │   ├── nuttx_nxboot/                 # Real NuttX build + runtime profile gen
 │   └── nxboot/                       # Shared nxboot-style probe + invariants
-├── profiles/                         # YAML audit profiles (~140 profiles)
+├── profiles/                         # YAML audit profiles (~180 profiles)
 ├── scenarios/                        # Multi-step scenario definitions
 ├── examples/                         # Built-in reference bootloader firmware
 ├── harnesses/                        # Fuzzer harness templates
@@ -338,4 +357,5 @@ Tardigrades survive vacuum, radiation, and temperature extremes. The name maps t
 
 ## License
 
-Apache 2.0. See `LICENSE`.
+Apache 2.0. See [`LICENSE`](LICENSE). Required bundled notices and license
+texts are indexed by [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

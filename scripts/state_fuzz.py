@@ -339,6 +339,8 @@ def summarize_state_campaign(
     boot_outcomes: Dict[str, int] = {}
     issue_reasons_total: Dict[str, int] = {}
     findings = 0
+    infrastructure_errors = 0
+    timeouts = 0
     effective_tuples: set = set()
 
     for entry in results:
@@ -348,6 +350,10 @@ def summarize_state_campaign(
             issue_reasons_total[str(reason)] = issue_reasons_total.get(str(reason), 0) + int(count)
         if entry.get("finding"):
             findings += 1
+        if entry.get("infrastructure_error") or outcome == "infra_error":
+            infrastructure_errors += 1
+        if entry.get("timeout") or outcome == "timeout":
+            timeouts += 1
         effective_tuples.add(
             (
                 str(entry.get("effective_outcome") or entry.get("boot_outcome") or "unknown"),
@@ -380,6 +386,8 @@ def summarize_state_campaign(
         "iterations_requested": int(iterations),
         "iterations_completed": len(results),
         "findings": findings,
+        "infrastructure_errors": infrastructure_errors,
+        "timeouts": timeouts,
         "expected_control_outcome": expected_outcome,
         "boot_outcomes": boot_outcomes,
         "issue_reasons": issue_reasons_total,
@@ -405,7 +413,13 @@ def extract_state_fuzz_result(
             if reason not in {"boot_outcome", "pc_expectation", "vtor_expectation"}
         ]
     issue_reasons = {reason: 1 for reason in issue_reason_list}
-    finding = bool(issue_reason_list)
+    raw_outcome = str(result.get("boot_outcome", "unknown")).strip().lower()
+    infrastructure_error = bool(
+        result.get("infrastructure_error") or raw_outcome == "infra_error"
+    )
+    timeout = bool(result.get("timeout") or raw_outcome == "timeout")
+    unreliable = infrastructure_error or timeout or raw_outcome == "unknown"
+    finding = bool(issue_reason_list) and not unreliable
     return {
         "scenario_index": int(scenario["index"]),
         "mode": scenario["mode"],
@@ -413,11 +427,14 @@ def extract_state_fuzz_result(
         "blob_sha256": scenario["blob_sha256"],
         "field_values": dict(scenario["field_values"]),
         "scenario_matches_model": scenario_matches_model,
-        "boot_outcome": str(result.get("boot_outcome", "unknown")),
+        "boot_outcome": raw_outcome,
         "boot_slot": result.get("boot_slot"),
         "effective_outcome": effective_outcome,
         "effective_slot": effective_slot,
         "issue_count": len(issue_reason_list),
         "issue_reasons": issue_reasons,
         "finding": finding,
+        "infrastructure_error": infrastructure_error,
+        "timeout": timeout,
+        "error_kind": result.get("error_kind"),
     }
