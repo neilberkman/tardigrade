@@ -1,5 +1,6 @@
 *** Keywords ***
 Create Generic Controller Machine
+    Execute Command    include "${CURDIR}/../peripherals/ITardigradeFaultInjectable.cs"
     Execute Command    include "${CURDIR}/../peripherals/NVMemoryController.cs"
     Execute Command    include "${CURDIR}/../peripherals/GenericNvmController.cs"
     Execute Command    mach create

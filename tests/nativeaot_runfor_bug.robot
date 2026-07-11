@@ -26,6 +26,7 @@ RunFor Completes With Dynamically Compiled Peripheral On Fetch Path
     ...    compiled C# peripheral (loaded via include). Works with built-in
     ...    MappedMemory and on Mono/.NET Renode. Deadlocks on native-AOT.
     [Timeout]    30s
+    Execute Command    include "${ROOT}/peripherals/ITardigradeFaultInjectable.cs"
     Execute Command    include "${ROOT}/peripherals/NVMemoryController.cs"
     Execute Command    include "${ROOT}/peripherals/GenericNvmController.cs"
     Execute Command    mach create

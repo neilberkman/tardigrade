@@ -43,9 +43,9 @@ pre_boot_state:
 success_criteria:
   # After rollback, VTOR should point to slot 0 (exec)
   vtor_in_slot: exec
-  # Firmware writes slot_id=0 to marker
+  # Firmware writes slot 0's distinct nonzero sentinel to the marker.
   marker_address: 0x000FC000
-  marker_value: 0x00000000
+  marker_value: 0x45535030
 
 invariant_providers:
   - targets/esp_idf/invariants.py

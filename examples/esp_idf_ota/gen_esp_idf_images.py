@@ -46,6 +46,13 @@ OTA_STATES = {
 # Marker address (test harness reads this)
 MARKER_ADDR = 0x000FC000
 
+# Runtime boot sentinels.  These render as "ESP0" and "ESP1" in hexadecimal
+# and stay nonzero so an unwritten/zero-initialized marker cannot identify a
+# booted slot.
+SLOT0_MARKER = 0x45535030
+SLOT1_MARKER = 0x45535031
+SLOT_MARKERS = (SLOT0_MARKER, SLOT1_MARKER)
+
 
 def crc32_table():
     """Build CRC-32 table with polynomial 0xEDB88320."""
@@ -128,9 +135,10 @@ def movt(rd, imm16):
 def make_slot_firmware(slot_base, slot_id):
     """Build minimal Cortex-M4 firmware for a slot.
 
-    On boot: sets VTOR, writes slot_id marker to MARKER_ADDR, loops.
+    On boot: writes the slot's nonzero sentinel to MARKER_ADDR, then loops.
     """
     code_offset = 0x40
+    marker = SLOT_MARKERS[slot_id]
 
     code = b""
     # Preserve bootloader-selected VTOR; only write marker for observability.
@@ -138,8 +146,8 @@ def make_slot_firmware(slot_base, slot_id):
     # than image self-relocation.
     code += movw(0, MARKER_ADDR & 0xFFFF)
     code += movt(0, (MARKER_ADDR >> 16) & 0xFFFF)
-    code += movw(1, slot_id & 0xFFFF)
-    code += movt(1, 0)
+    code += movw(1, marker & 0xFFFF)
+    code += movt(1, (marker >> 16) & 0xFFFF)
     code += struct.pack("<H", 0x6001)  # STR R1, [R0]
 
     # WFI loop
@@ -190,7 +198,8 @@ def main():
 
     if args.mode == "slot":
         base = SLOT0_BASE if args.index == 0 else SLOT1_BASE
-        # slot_id: 0 for slot 0 (current), 1 for slot 1 (update)
+        # slot_id still selects the deterministic payload seed independently
+        # of the runtime boot sentinel.
         fw = make_slot_firmware(base, args.index)
         with open(args.output, "wb") as f:
             f.write(fw)

@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 
 namespace Antmicro.Renode.Peripherals.Memory
 {
@@ -18,7 +19,12 @@ namespace Antmicro.Renode.Peripherals.Memory
     //   poll Status register for SuccessStatusValue
     //
     // The controller delegates storage semantics and write-fault behavior to NVMemory.
-    public class GenericNvmController : BasicDoubleWordPeripheral, IKnownSize
+    //
+    // ITardigradeFaultInjectable is implemented so the audit engine can bind to
+    // this controller as a fault backend without a mid-campaign missing-member
+    // abort.  Declaring the interface also makes any missing member a load-time
+    // C# compile error instead of a runtime AttributeError deep in a sweep.
+    public class GenericNvmController : BasicDoubleWordPeripheral, IKnownSize, ITardigradeFaultInjectable
     {
         public GenericNvmController(IMachine machine) : base(machine)
         {
@@ -211,6 +217,163 @@ namespace Antmicro.Renode.Peripherals.Memory
         public uint LastCommandAddress
         {
             get { return addressRegisterValue; }
+        }
+
+        // --- ITardigradeFaultInjectable ---------------------------------------
+        //
+        // All persistent-fault state lives in the backing NVMemory, so members
+        // that model it forward to Nvm (null-guarded, because the .repl sets the
+        // Nvm property after construction).  This controller has no page-erase
+        // cycle and no shadow/diff engine, so those members are inert stubs.
+        // A null Nvm returns benign defaults rather than throwing, matching the
+        // controller's existing "illegal operation" tolerance.
+
+        public IMemory Flash
+        {
+            get { return Nvm; }
+        }
+
+        public long FlashBaseAddress
+        {
+            get { return NvmBaseAddress; }
+            set { NvmBaseAddress = value; }
+        }
+
+        public long FlashSize
+        {
+            get { return Nvm != null ? Nvm.Size : 0L; }
+            set { }
+        }
+
+        public int PageSize { get; set; }
+
+        public byte EraseFill
+        {
+            get { return Nvm != null ? Nvm.EraseFill : (byte)0xFF; }
+            set { if(Nvm != null) { Nvm.EraseFill = value; } }
+        }
+
+        public ulong TotalWordWrites
+        {
+            get { return Nvm != null ? Nvm.TotalWordWrites : 0UL; }
+            set { if(Nvm != null) { Nvm.TotalWordWrites = value; } }
+        }
+
+        public ulong FaultAtWordWrite
+        {
+            get { return Nvm != null ? Nvm.FaultAtWordWrite : ulong.MaxValue; }
+            set { if(Nvm != null) { Nvm.FaultAtWordWrite = value; } }
+        }
+
+        public bool FaultFired
+        {
+            get { return Nvm != null && Nvm.FaultEverFired; }
+            set { if(Nvm != null) { Nvm.FaultEverFired = value; } }
+        }
+
+        // NVMemory commits exactly one word per program, so its write count is
+        // per-write accurate (no diff-window approximation).
+        public bool PerWriteAccurate
+        {
+            get { return true; }
+        }
+
+        // Page-erase faults are not modelled by this controller.
+        public ulong TotalPageErases { get; set; }
+        public ulong FaultAtPageErase { get; set; } = ulong.MaxValue;
+        public bool EraseFaultFired { get; set; }
+
+        public bool AnyFaultFired
+        {
+            get { return Nvm != null && Nvm.FaultEverFired; }
+        }
+
+        public bool FaultRequiresImmediateStop
+        {
+            get { return Nvm != null && Nvm.FaultEverFired; }
+        }
+
+        public bool DriverErrorFired
+        {
+            get { return Nvm != null && Nvm.DriverErrorFired; }
+            set { if(Nvm != null) { Nvm.DriverErrorFired = value; } }
+        }
+
+        public uint LastFaultAddress { get; set; }
+        public byte[] FaultFlashSnapshot { get; set; }
+
+        public int WriteFaultMode
+        {
+            get { return Nvm != null ? Nvm.WriteFaultMode : 0; }
+            set { if(Nvm != null) { Nvm.WriteFaultMode = value; } }
+        }
+
+        public int EraseFaultMode { get; set; }
+
+        public uint CorruptionSeed
+        {
+            get { return Nvm != null ? Nvm.CorruptionSeed : 0U; }
+            set { if(Nvm != null) { Nvm.CorruptionSeed = value; } }
+        }
+
+        // No shadow/diff engine: these are inert.
+        public int DiffLookahead { get; set; }
+        public bool SkipShadowScan { get; set; }
+        public bool PassthroughMode { get; set; }
+        public void InvalidateShadow() { }
+
+        // No execution-trace ring buffer on this controller.
+        public bool WriteTraceEnabled { get; set; }
+        public int WriteTraceCount { get { return 0; } }
+        public string WriteTraceToString() { return string.Empty; }
+        public void WriteTraceClear() { }
+        public bool EraseTraceEnabled { get; set; }
+        public int EraseTraceCount { get { return 0; } }
+        public string EraseTraceToString() { return string.Empty; }
+        public void EraseTraceClear() { }
+
+        // Read-fault injection is modelled by NVMemory (CPU reads flow through
+        // the peripheral), so forward directly.
+        public bool ReadFaultEnabled
+        {
+            get { return Nvm != null && Nvm.ReadFaultEnabled; }
+            set { if(Nvm != null) { Nvm.ReadFaultEnabled = value; } }
+        }
+
+        public long ReadFaultAddress
+        {
+            get { return Nvm != null ? Nvm.ReadFaultAddress : -1L; }
+            set { if(Nvm != null) { Nvm.ReadFaultAddress = value; } }
+        }
+
+        public uint ReadFaultSeed
+        {
+            get { return Nvm != null ? Nvm.ReadFaultSeed : 0U; }
+            set { if(Nvm != null) { Nvm.ReadFaultSeed = value; } }
+        }
+
+        public int ReadFaultBitFlips
+        {
+            get { return Nvm != null ? Nvm.ReadFaultBitFlips : 1; }
+            set { if(Nvm != null) { Nvm.ReadFaultBitFlips = value; } }
+        }
+
+        public bool ReadFaultFired
+        {
+            get { return Nvm != null && Nvm.ReadFaultFired; }
+            set { if(Nvm != null) { Nvm.ReadFaultFired = value; } }
+        }
+
+        public ulong ReadFaultSkipCount
+        {
+            get { return Nvm != null ? Nvm.ReadFaultSkipCount : 0UL; }
+            set { if(Nvm != null) { Nvm.ReadFaultSkipCount = value; } }
+        }
+
+        public ulong ReadFaultTotalReads
+        {
+            get { return Nvm != null ? Nvm.ReadFaultTotalReads : 0UL; }
+            set { if(Nvm != null) { Nvm.ReadFaultTotalReads = value; } }
         }
 
         private void ExecuteIfWriteCommand()

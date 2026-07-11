@@ -35,7 +35,7 @@ pre_boot_state:
 success_criteria:
   vtor_in_slot: exec
   marker_address: 0x000FC000
-  marker_value: 0x00000000
+  marker_value: 0x45535030
   otadata_expect:
     otadata_available: true
     otadata_active_entry: entry1

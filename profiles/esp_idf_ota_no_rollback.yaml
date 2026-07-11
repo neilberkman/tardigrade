@@ -44,7 +44,7 @@ success_criteria:
   # Boots slot 1 (highest ota_seq)
   vtor_in_slot: staging
   marker_address: 0x000FC000
-  marker_value: 0x00000001
+  marker_value: 0x45535031
 
 fault_sweep:
   mode: runtime

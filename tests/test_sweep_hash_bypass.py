@@ -95,7 +95,10 @@ class SweepHashBypassRuntimeScopeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
             with mock.patch("sweep._run_batches_chunked", return_value=[]) as mock_batch:
-                with mock.patch("sweep.run_single_point", return_value={}) as mock_single:
+                with mock.patch(
+                    "sweep.run_single_point",
+                    return_value={"boot_outcome": "success", "boot_slot": "exec"},
+                ) as mock_single:
                     run_runtime_sweep(
                         repo_root=work_dir,
                         renode_test="renode-test",
@@ -151,7 +154,10 @@ class SweepHashBypassRuntimeScopeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
             with mock.patch("sweep._run_batches_chunked", return_value=[]) as mock_batch:
-                with mock.patch("sweep.run_single_point", return_value={}) as mock_single:
+                with mock.patch(
+                    "sweep.run_single_point",
+                    return_value={"boot_outcome": "success", "boot_slot": "exec"},
+                ) as mock_single:
                     run_runtime_sweep(
                         repo_root=work_dir,
                         renode_test="renode-test",

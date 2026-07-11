@@ -8,7 +8,6 @@ Not intended as a user-facing CLI -- use audit_bootloader.py for direct profile 
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import datetime as dt
 import json
 import os
@@ -18,12 +17,37 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from fault_classification import _effective_boot_result
+from layout_validation import LayoutValidationError, validate_load_plan
 
 
 PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+LAYOUT_ROBOT_VARIABLES = {
+    "BOOTLOADER_ENTRY",
+    "BOOT_MARKER_ADDR",
+    "BOOT_MARKER_OTHER_VALUE",
+    "BOOT_MARKER_VALUE",
+    "BOOT_OBSERVATION_TIMEOUT_S",
+    "BOOT_POLL_INTERVAL_S",
+    "BOOT_WALL_TIMEOUT_S",
+    "EXPECTED_CONTROL_SLOT",
+    "META_BASE",
+    "META_BASE_0",
+    "META_BASE_1",
+    "META_SIZE",
+    "NVM_BASE",
+    "NVM_SIZE",
+    "OTA_HEADER_SIZE",
+    "PRE_BOOT_WRITES",
+    "RUN_DURATION",
+    "SLOT_A_BASE",
+    "SLOT_B_BASE",
+    "SLOT_SIZE",
+    "WRITE_GRANULARITY",
+}
 
 
 def validate_profile_name(value: Any) -> str:
@@ -273,71 +297,461 @@ def ensure_source_worktree(
         raise
 
 
-def run_single_fault_point(
-    repo_root: Path, renode_test: str, robot_suite: str,
-    fault_at: int, robot_vars: List[str], work_dir: Path,
-    total_writes: int, is_control: bool,
+class BatchProtocolError(RuntimeError):
+    """The one-process campaign did not return a complete, ordered result."""
+
+
+def _parse_int(value: Any, label: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError("{} must be an integer".format(label))
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value), 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("{} must be an integer, got {!r}".format(label, value)) from exc
+
+
+def _robot_var_map(robot_vars: List[str]) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for entry in robot_vars:
+        key, separator, value = str(entry).partition(":")
+        key = key.strip().upper()
+        if not separator or not key:
+            raise ValueError("invalid Robot variable {!r}".format(entry))
+        if key in result:
+            raise ValueError("duplicate Robot variable '{}'".format(key))
+        result[key] = value
+    return result
+
+
+def _layout_contract(
+    rendered: Dict[str, Any],
+    robot_vars: List[str],
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Validate the manifest layout and derive every address Robot receives."""
+    layout = rendered.get("layout")
+    if not isinstance(layout, dict) or layout.get("version") != 1:
+        raise ValueError("profile requires a version 1 layout mapping")
+
+    robot_map = _robot_var_map(robot_vars)
+    duplicates = sorted(LAYOUT_ROBOT_VARIABLES.intersection(robot_map))
+    if duplicates:
+        raise ValueError(
+            "layout-owned Robot variables must not be repeated in robot_vars: {}".format(
+                ", ".join(duplicates)
+            )
+        )
+
+    nvm = layout.get("nvm")
+    bootloader = layout.get("bootloader")
+    slots = layout.get("slots")
+    if not isinstance(nvm, dict) or not isinstance(bootloader, dict):
+        raise ValueError("layout.nvm and layout.bootloader must be mappings")
+    if not isinstance(slots, dict) or set(slots) != {"A", "B"}:
+        raise ValueError("layout.slots must define exactly A and B")
+
+    nvm_base = _parse_int(nvm.get("base"), "layout.nvm.base")
+    nvm_size = _parse_int(nvm.get("size"), "layout.nvm.size")
+    bootloader_base = _parse_int(
+        bootloader.get("base"), "layout.bootloader.base"
+    )
+    write_granularity = _parse_int(
+        layout.get("write_granularity"), "layout.write_granularity"
+    )
+    header_size = _parse_int(
+        layout.get("ota_header_size", 0), "layout.ota_header_size"
+    )
+
+    normalized_slots: Dict[str, Dict[str, int]] = {}
+    for slot_name in ("A", "B"):
+        definition = slots[slot_name]
+        if not isinstance(definition, dict):
+            raise ValueError("layout.slots.{} must be a mapping".format(slot_name))
+        normalized_slots[slot_name] = {
+            "base": _parse_int(
+                definition.get("base"), "layout.slots.{}.base".format(slot_name)
+            ),
+            "size": _parse_int(
+                definition.get("size"), "layout.slots.{}.size".format(slot_name)
+            ),
+        }
+    if normalized_slots["A"]["size"] != normalized_slots["B"]["size"]:
+        raise ValueError("generic A/B runner requires equal slot sizes")
+
+    raw_metadata = layout.get("metadata", [])
+    if not isinstance(raw_metadata, list) or len(raw_metadata) > 2:
+        raise ValueError("layout.metadata must be a list with at most two regions")
+    metadata: List[Dict[str, Any]] = []
+    for index, definition in enumerate(raw_metadata):
+        if not isinstance(definition, dict):
+            raise ValueError("layout.metadata[{}] must be a mapping".format(index))
+        metadata.append({
+            "name": str(definition.get("name", "replica_{}".format(index))),
+            "base": _parse_int(
+                definition.get("base"), "layout.metadata[{}].base".format(index)
+            ),
+            "size": _parse_int(
+                definition.get("size"), "layout.metadata[{}].size".format(index)
+            ),
+        })
+    if len(metadata) == 2 and metadata[0]["size"] != metadata[1]["size"]:
+        raise ValueError("generic A/B runner requires equal metadata replica sizes")
+
+    control = layout.get("control")
+    if not isinstance(control, dict):
+        raise ValueError("layout.control must be a mapping")
+    expected_slot = str(control.get("expected_slot", "")).upper()
+    if expected_slot not in {"A", "B"}:
+        raise ValueError("layout.control.expected_slot must be A or B")
+    marker = control.get("marker")
+    if not isinstance(marker, dict):
+        raise ValueError("layout.control.marker must be a mapping")
+    marker_slot = str(marker.get("address_slot", "")).upper()
+    if marker_slot not in normalized_slots:
+        raise ValueError("layout.control.marker.address_slot must be A or B")
+    marker_offset = _parse_int(
+        marker.get("offset"), "layout.control.marker.offset"
+    )
+    marker_value = _parse_int(
+        marker.get("value"), "layout.control.marker.value"
+    ) & 0xFFFFFFFF
+    marker_other = _parse_int(
+        marker.get("other_value"), "layout.control.marker.other_value"
+    ) & 0xFFFFFFFF
+    if marker_value in {0, 0xFFFFFFFF} or marker_other in {0, 0xFFFFFFFF}:
+        raise ValueError("slot marker sentinels must be nonzero and non-erased")
+    if marker_value == marker_other:
+        raise ValueError("slot marker sentinels must be distinct")
+    marker_slot_def = normalized_slots[marker_slot]
+    if marker_offset < 0 or marker_offset + 4 > marker_slot_def["size"]:
+        raise ValueError("layout.control.marker.offset lies outside its slot")
+    marker_address = marker_slot_def["base"] + marker_offset
+
+    expected_image_slot = str(marker.get("expected_image_slot", "")).upper()
+    alternate_image_slot = str(marker.get("alternate_image_slot", "")).upper()
+    if expected_image_slot not in {"A", "B"} or alternate_image_slot not in {"A", "B"}:
+        raise ValueError(
+            "layout control marker must name expected_image_slot and alternate_image_slot"
+        )
+    if expected_image_slot == alternate_image_slot:
+        raise ValueError("control marker image slots must be distinct")
+
+    observation = layout.get("observation")
+    if not isinstance(observation, dict):
+        raise ValueError("layout.observation must be a mapping")
+    timeout_s = float(observation.get("emulated_timeout_s", 20.0))
+    poll_s = float(observation.get("poll_interval_s", 0.02))
+    wall_s = float(observation.get("wall_timeout_s", 180.0))
+    if timeout_s <= 0 or poll_s <= 0 or wall_s <= 0:
+        raise ValueError("layout observation budgets must be positive")
+
+    raw_pre_boot_writes = layout.get("pre_boot_writes", [])
+    if not isinstance(raw_pre_boot_writes, list):
+        raise ValueError("layout.pre_boot_writes must be a list")
+    pre_boot_writes: List[Dict[str, int]] = []
+    nvm_end = nvm_base + nvm_size
+    for index, definition in enumerate(raw_pre_boot_writes):
+        if not isinstance(definition, dict):
+            raise ValueError(
+                "layout.pre_boot_writes[{}] must be a mapping".format(index)
+            )
+        address = _parse_int(
+            definition.get("address"),
+            "layout.pre_boot_writes[{}].address".format(index),
+        )
+        value = _parse_int(
+            definition.get("value"),
+            "layout.pre_boot_writes[{}].value".format(index),
+        ) & 0xFFFFFFFF
+        if address % 4 or not (nvm_base <= address <= nvm_end - 4):
+            raise ValueError(
+                "layout.pre_boot_writes[{}] is unaligned or outside NVM".format(index)
+            )
+        pre_boot_writes.append({"address": address, "value": value})
+
+    metadata_size = metadata[0]["size"] if metadata else 0
+    metadata_base_0 = metadata[0]["base"] if metadata else 0
+    metadata_base_1 = metadata[1]["base"] if len(metadata) == 2 else metadata_base_0
+
+    contract = {
+        "version": 1,
+        "nvm": {"base": nvm_base, "size": nvm_size},
+        "bootloader": {"base": bootloader_base},
+        "slots": normalized_slots,
+        "metadata": metadata,
+        "pre_boot_writes": pre_boot_writes,
+        "write_granularity": write_granularity,
+        "ota_header_size": header_size,
+        "control": {
+            "expected_slot": expected_slot,
+            "marker": {
+                "address": marker_address,
+                "offset": marker_offset,
+                "value": marker_value,
+                "other_value": marker_other,
+                "expected_image_slot": expected_image_slot,
+                "alternate_image_slot": alternate_image_slot,
+            },
+        },
+        "observation": {
+            "emulated_timeout_s": timeout_s,
+            "poll_interval_s": poll_s,
+            "wall_timeout_s": wall_s,
+        },
+    }
+
+    derived = [
+        "NVM_BASE:0x{:08X}".format(nvm_base),
+        "NVM_SIZE:0x{:X}".format(nvm_size),
+        "BOOTLOADER_ENTRY:0x{:08X}".format(bootloader_base),
+        "WRITE_GRANULARITY:{}".format(write_granularity),
+        "SLOT_A_BASE:0x{:08X}".format(normalized_slots["A"]["base"]),
+        "SLOT_B_BASE:0x{:08X}".format(normalized_slots["B"]["base"]),
+        "SLOT_SIZE:0x{:X}".format(normalized_slots["A"]["size"]),
+        "META_BASE:0x{:08X}".format(metadata_base_0),
+        "META_BASE_0:0x{:08X}".format(metadata_base_0),
+        "META_BASE_1:0x{:08X}".format(metadata_base_1),
+        "META_SIZE:0x{:X}".format(metadata_size),
+        "OTA_HEADER_SIZE:0x{:X}".format(header_size),
+        "EXPECTED_CONTROL_SLOT:{}".format(expected_slot),
+        "BOOT_MARKER_ADDR:0x{:08X}".format(marker_address),
+        "BOOT_MARKER_VALUE:0x{:08X}".format(marker_value),
+        "BOOT_MARKER_OTHER_VALUE:0x{:08X}".format(marker_other),
+        "BOOT_OBSERVATION_TIMEOUT_S:{}".format(timeout_s),
+        "BOOT_POLL_INTERVAL_S:{}".format(poll_s),
+        "BOOT_WALL_TIMEOUT_S:{}".format(wall_s),
+    ]
+    if pre_boot_writes:
+        derived.append(
+            "PRE_BOOT_WRITES:{}".format(
+                ",".join(
+                    "0x{:08X}=0x{:08X}".format(item["address"], item["value"])
+                    for item in pre_boot_writes
+                )
+            )
+        )
+    return contract, derived
+
+
+def _resolve_robot_path(repo_root: Path, value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else repo_root / path
+
+
+def validate_rendered_load_plan(
+    repo_root: Path,
+    rendered: Dict[str, Any],
+    robot_vars: List[str],
+    contract: Dict[str, Any],
 ) -> Dict[str, Any]:
-    label = "control" if is_control else "f{}".format(fault_at)
-    point_dir = work_dir / label
-    point_dir.mkdir(parents=True, exist_ok=True)
-    result_file = point_dir / "result.json"
+    """Fail before Renode if any real write can damage the bootloader."""
+    robot_map = _robot_var_map(robot_vars)
+    bootloader_value = robot_map.get("BOOTLOADER_ELF")
+    if not bootloader_value:
+        raise LayoutValidationError("BOOTLOADER_ELF is required")
+    bootloader_elf = _resolve_robot_path(repo_root, bootloader_value)
+
+    loads: List[Dict[str, Any]] = []
+    image_paths: Dict[str, Path] = {}
+    for slot_name, top_level_key in (
+        ("A", "slot_a_image_file"),
+        ("B", "slot_b_image_file"),
+    ):
+        raw_path = rendered.get(top_level_key)
+        if not raw_path:
+            raise LayoutValidationError("{} is required".format(top_level_key))
+        path = _resolve_robot_path(repo_root, str(raw_path))
+        image_paths[slot_name] = path
+        loads.append({
+            "name": "slot {} image".format(slot_name),
+            "path": str(path),
+            "address": contract["slots"][slot_name]["base"],
+            "slot": slot_name,
+        })
+
+    plan = {
+        "version": 1,
+        "nvm": dict(contract["nvm"]),
+        "bootloader": {"elf": str(bootloader_elf)},
+        "slots": {
+            "A": dict(contract["slots"]["A"], write_full=True),
+            "B": dict(contract["slots"]["B"], write_full=True),
+        },
+        "metadata": list(contract["metadata"]),
+        "loads": loads,
+    }
+    normalized = validate_load_plan(plan)
+
+    for index, write in enumerate(contract.get("pre_boot_writes", [])):
+        start = write["address"]
+        end = start + 4
+        for boot_interval in normalized["bootloader"]:
+            if start < boot_interval["end"] and boot_interval["start"] < end:
+                raise LayoutValidationError(
+                    "pre-boot write {} [0x{:x}, 0x{:x}) overlaps {} [0x{:x}, 0x{:x})".format(
+                        index,
+                        start,
+                        end,
+                        boot_interval["name"],
+                        boot_interval["start"],
+                        boot_interval["end"],
+                    )
+                )
+
+    marker = contract["control"]["marker"]
+    marker_offset = marker["offset"]
+    for slot_name, expected in (
+        (marker["expected_image_slot"], marker["value"]),
+        (marker["alternate_image_slot"], marker["other_value"]),
+    ):
+        image = image_paths[slot_name]
+        data = image.read_bytes()
+        if marker_offset + 4 > len(data):
+            raise LayoutValidationError(
+                "marker offset 0x{:X} lies outside {}".format(marker_offset, image)
+            )
+        actual = int.from_bytes(data[marker_offset:marker_offset + 4], "little")
+        if actual != expected:
+            raise LayoutValidationError(
+                "{} marker at offset 0x{:X} is 0x{:08X}, expected 0x{:08X}".format(
+                    image, marker_offset, actual, expected
+                )
+            )
+
+    return normalized
+
+
+def _validate_batch_payload(
+    payload: Any,
+    fault_points: List[int],
+) -> Dict[str, Any]:
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise BatchProtocolError("batch result must be a version 1 object")
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        raise BatchProtocolError("batch result must contain the clean control")
+    control = results[0]
+    if not isinstance(control, dict):
+        raise BatchProtocolError("clean control result must be an object")
+    if (
+        control.get("fault_at") != -1
+        or control.get("is_control") is not True
+        or control.get("fault_injected") is not False
+    ):
+        raise BatchProtocolError("first result is not a clean, unfaulted control")
+
+    control_passed = payload.get("control_passed") is True
+    if not control_passed:
+        if payload.get("aborted") is not True or len(results) != 1:
+            raise BatchProtocolError(
+                "failed control must abort before every fault point"
+            )
+        return payload
+
+    if payload.get("aborted"):
+        raise BatchProtocolError(
+            "campaign aborted after a passing control: {}".format(
+                payload.get("abort_reason") or "unknown reason"
+            )
+        )
+    expected = [-1] + list(fault_points)
+    observed = [result.get("fault_at") for result in results if isinstance(result, dict)]
+    if len(results) != len(expected) or observed != expected:
+        raise BatchProtocolError(
+            "batch result order/cardinality mismatch: expected {}, observed {}".format(
+                expected, observed
+            )
+        )
+    for index, result in enumerate(results[1:], start=1):
+        if not isinstance(result, dict) or result.get("is_control") is not False:
+            raise BatchProtocolError("fault result {} is malformed".format(index))
+    return payload
+
+
+def run_fault_batch(
+    repo_root: Path,
+    renode_test: str,
+    robot_suite: str,
+    fault_points: List[int],
+    robot_vars: List[str],
+    work_dir: Path,
+    total_writes: int,
+    wall_timeout_s: float,
+) -> Dict[str, Any]:
+    """Run control plus all fault points in one Renode process."""
+    batch_dir = work_dir / "batch"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    result_file = batch_dir / "result.json"
+    try:
+        result_file.unlink()
+    except FileNotFoundError:
+        pass
     bundle_dir = work_dir / ".dotnet_bundle"
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
+    ordered_points = [-1] + list(fault_points)
     cmd = [
         renode_test,
         "--renode-config", str(work_dir / "renode.config"),
         str(repo_root / robot_suite),
-        "--results-dir", str(point_dir / "robot"),
-        "--variable", "FAULT_AT:{}".format(fault_at),
+        "--results-dir", str(batch_dir / "robot"),
+        "--variable", "FAULT_AT:-1",
+        "--variable", "FAULT_POINTS_CSV:{}".format(
+            ",".join(str(point) for point in ordered_points)
+        ),
         "--variable", "TOTAL_WRITES:{}".format(total_writes),
         "--variable", "RESULT_FILE:{}".format(result_file),
     ]
-    for rv in robot_vars:
-        cmd.extend(["--variable", rv])
+    for robot_var in robot_vars:
+        cmd.extend(["--variable", robot_var])
 
     env = os.environ.copy()
     env.setdefault("DOTNET_BUNDLE_EXTRACT_BASE_DIR", str(bundle_dir))
-
+    process_timeout = max(120.0, 120.0 + len(ordered_points) * wall_timeout_s)
     try:
         proc = subprocess.run(
-            cmd, cwd=str(repo_root), capture_output=True, text=True,
-            check=False, env=env, timeout=120,
+            cmd,
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            timeout=process_timeout,
         )
-    except subprocess.TimeoutExpired:
-        return {"fault_at": fault_at, "is_control": is_control,
-                "boot_outcome": "infra_error", "error": "timeout"}
+    except subprocess.TimeoutExpired as exc:
+        raise BatchProtocolError(
+            "Renode campaign exceeded {:.1f}s process budget".format(process_timeout)
+        ) from exc
 
-    if proc.returncode != 0 or not result_file.exists():
-        return {"fault_at": fault_at, "is_control": is_control,
-                "boot_outcome": "infra_error",
-                "error": "rc={} stderr={}".format(proc.returncode, (proc.stderr or "")[-500:])}
-
-    data = json.loads(result_file.read_text(encoding="utf-8"))
-    fault_injected = data.get("fault_injected")
-    if type(fault_injected) is not bool:
-        nvm_state = data.get("nvm_state")
-        if isinstance(nvm_state, dict):
-            fault_injected = nvm_state.get("faulted")
-    return {
-        "fault_at": fault_at,
-        "is_control": is_control,
-        "fault_injected": fault_injected,
-        "boot_outcome": data.get("boot_outcome", "unknown"),
-        "boot_slot": data.get("boot_slot"),
-        "initial_boot_outcome": data.get("initial_boot_outcome"),
-        "initial_boot_slot": data.get("initial_boot_slot"),
-        "final_boot_outcome": data.get("final_boot_outcome"),
-        "final_boot_slot": data.get("final_boot_slot"),
-        "multi_boot_analysis": data.get("multi_boot_analysis"),
-    }
+    if not result_file.exists():
+        raise BatchProtocolError(
+            "Renode campaign produced no result (rc={}): {}".format(
+                proc.returncode, (proc.stderr or "")[-1000:]
+            )
+        )
+    try:
+        payload = json.loads(result_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BatchProtocolError("Renode campaign result is invalid JSON") from exc
+    payload = _validate_batch_payload(payload, fault_points)
+    if proc.returncode != 0:
+        raise BatchProtocolError(
+            "Renode campaign failed after writing a result (rc={}): {}".format(
+                proc.returncode, (proc.stderr or "")[-1000:]
+            )
+        )
+    return payload
 
 
 def run_profile(
     repo_root: Path, renode_test: str, profile: Dict[str, Any],
     variables: Dict[str, str], workers: int, skip_setup: bool,
 ) -> Dict[str, Any]:
+    if workers != 1:
+        raise ValueError(
+            "--workers must be 1: each profile now runs as one isolated Renode batch"
+        )
     name = validate_profile_name(profile["name"])
     variables = dict(variables)
     source_checkout = render(profile.get("source_checkout"), variables)
@@ -352,11 +766,13 @@ def run_profile(
     if total_writes <= 0:
         raise ValueError("total_writes must be positive")
 
-    for key in ("slot_a_image_file", "slot_b_image_file", "ota_header_size",
+    for key in ("slot_a_image_file", "slot_b_image_file",
                 "evaluation_mode", "boot_mode"):
         val = rendered.get(key)
         if val is not None:
             robot_vars.append("{}:{}".format(key.upper(), val))
+    contract, derived_layout_vars = _layout_contract(rendered, robot_vars)
+    robot_vars.extend(derived_layout_vars)
 
     source_worktree_ready = False
     if not skip_setup:
@@ -377,6 +793,11 @@ def run_profile(
     elif source_checkout and source_worktree is not None:
         ensure_source_worktree(repo_root, name, source_checkout, source_worktree)
 
+    # Resolve and inspect the real built artifacts immediately before Renode
+    # loads them.  The guard uses PT_LOAD memory extents rather than the ELF
+    # file's size and rejects any slot/metadata write that can touch one.
+    validate_rendered_load_plan(repo_root, rendered, robot_vars, contract)
+
     # Build fault point list from profile range/step.
     fault_range = str(rendered.get("fault_range", "0:{}".format(total_writes - 1)))
     fault_step = int(rendered.get("fault_step", 4000))
@@ -395,42 +816,34 @@ def run_profile(
     if end not in fault_points:
         fault_points.append(end)
 
-    control_fault_at = max(999999, total_writes) + 1
-    all_tasks = [(fp, False) for fp in fault_points] + [(control_fault_at, True)]
-
     temp_ctx = tempfile.TemporaryDirectory(prefix="oss_val_{}_".format(name))
     work_dir = Path(temp_ctx.name)
+    print(
+        "  one-process batch: control + {} fault point(s)".format(len(fault_points)),
+        file=sys.stderr,
+    )
+    campaign_error: str | None = None
+    payload: Dict[str, Any] = {}
+    try:
+        payload = run_fault_batch(
+            repo_root=repo_root,
+            renode_test=renode_test,
+            robot_suite=robot_suite,
+            fault_points=fault_points,
+            robot_vars=robot_vars,
+            work_dir=work_dir,
+            total_writes=total_writes,
+            wall_timeout_s=contract["observation"]["wall_timeout_s"],
+        )
+    except BatchProtocolError as exc:
+        campaign_error = str(exc)
+    finally:
+        temp_ctx.cleanup()
 
-    def execute(task):
-        fp, is_ctrl = task
-        return run_single_fault_point(
-            repo_root, renode_test, robot_suite, fp,
-            robot_vars, work_dir, total_writes, is_ctrl)
-
-    results: List[Dict[str, Any]] = []
-    total = len(all_tasks)
-
-    if workers <= 1:
-        for i, task in enumerate(all_tasks):
-            print("\r  [{}/{}] {} fault_at={}".format(i + 1, total, name, task[0]),
-                  end="", flush=True, file=sys.stderr)
-            results.append(execute(task))
-        print("", file=sys.stderr)
-    else:
-        completed = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            fmap = {pool.submit(execute, t): t for t in all_tasks}
-            for future in concurrent.futures.as_completed(fmap):
-                completed += 1
-                print("\r  [{}/{}] {} fault_at={}".format(completed, total, name, fmap[future][0]),
-                      end="", flush=True, file=sys.stderr)
-                results.append(future.result())
-        print("", file=sys.stderr)
-
-    temp_ctx.cleanup()
+    results = list(payload.get("results") or [])
 
     # Evaluate against expectations.
-    expect = profile.get("expect") or {}
+    expect = rendered.get("expect") or {}
     control = [r for r in results if r.get("is_control")]
     faulted = [r for r in results if not r.get("is_control")]
     bricks = sum(1 for r in faulted if is_brick(r))
@@ -460,10 +873,31 @@ def run_profile(
             )
         )
     ]
-    errors = len(incomplete_results)
+    errors = len(incomplete_results) + (1 if campaign_error else 0)
     brick_rate = (float(bricks) / len(faulted)) if faulted else 0.0
     issue_rate = (float(issues) / len(faulted)) if faulted else 0.0
     failures: List[str] = []
+
+    if campaign_error:
+        failures.append("campaign infrastructure failure: {}".format(campaign_error))
+
+    if payload.get("aborted"):
+        failures.append(
+            "campaign aborted before fault dispatch: {}".format(
+                payload.get("abort_reason") or "clean control failed"
+            )
+        )
+
+    if len(control) != 1:
+        failures.append("exactly one clean control is required")
+    elif (
+        payload.get("control_passed") is not True
+        or control[0].get("control_passed") is not True
+        or _effective_outcome_str(control[0]) != "success"
+    ):
+        failures.append(
+            "control failed: {}".format(_format_outcome_span(control[0]))
+        )
 
     if incomplete_results:
         failures.append(
@@ -485,13 +919,6 @@ def run_profile(
     issues_min = expect.get("issues_min")
     if issues_min is not None and issues < int(issues_min):
         failures.append("issues={} below min {}".format(issues, issues_min))
-
-    if expect.get("require_control_success"):
-        bad = [r for r in control if _effective_outcome_str(r) != "success"]
-        if bad:
-            failures.append("control failed: {}".format(_format_outcome_span(bad[0])))
-        if not control:
-            failures.append("no control run")
 
     return {
         "profile": name, "passed": len(failures) == 0,

@@ -38,7 +38,7 @@ success_criteria:
   # aborting entry 0.
   vtor_in_slot: exec
   marker_address: 0x000FC000
-  marker_value: 0x00000000
+  marker_value: 0x45535030
 fault_sweep:
   mode: runtime
   evaluation_mode: execute

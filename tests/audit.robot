@@ -98,6 +98,7 @@ Run Audit Point
     Run Keyword If    '${HASH_BYPASS_SYMBOLS}' != '${EMPTY}'    Execute Command    $hash_bypass_symbols="${HASH_BYPASS_SYMBOLS}"
 
     # Load platform + firmware.
+    Execute Command    include "${ROOT}/peripherals/ITardigradeFaultInjectable.cs"
     Execute Command    include "${ROOT}/peripherals/NVMemoryController.cs"
     Execute Command    include "${ROOT}/peripherals/GenericNvmController.cs"
     Execute Command    include "${ROOT}/peripherals/TraceReplayEngine.cs"

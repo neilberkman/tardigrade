@@ -4934,10 +4934,6 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
         pc_ok = (s_lo <= (pc_value & ~1) < s_hi)
         if sticky_pc_slot == success_pc_slot and not no_boot_phase_without_vtor:
             pc_ok = True
-        # If VTOR was captured but PC is now 0 (e.g. crash/reset),
-        # treat the VTOR jump as proof of execution attempt.
-        if sticky_vtor['captured'] and pc_value == 0:
-            pc_ok = True
 
     marker_ok = True
     hash_result = None

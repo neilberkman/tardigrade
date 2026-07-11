@@ -114,9 +114,9 @@ ${TEST_TIMEOUT}                2 minutes
 *** Keywords ***
 Load Runtime Scenario
     [Documentation]    Profile-driven runtime scenario: load peripheral, platform, ELF, and seed images.
+    Execute Command    include "${ROOT}/peripherals/ITardigradeFaultInjectable.cs"
     Execute Command    include "${ROOT}/peripherals/NVMemoryController.cs"
     Execute Command    include "${ROOT}/peripherals/GenericNvmController.cs"
-    Execute Command    include "${ROOT}/peripherals/ITardigradeFaultInjectable.cs"
     Execute Command    include "${ROOT}/peripherals/FaultTracker.cs"
     Execute Command    include "${ROOT}/peripherals/NRF52NVMC.cs"
     Execute Command    include "${ROOT}/peripherals/NRF52UARTE.cs"

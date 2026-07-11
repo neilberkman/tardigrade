@@ -137,6 +137,93 @@ def build_control_robot_vars(
     )
 
 
+def _validate_runtime_control_result(
+    profile: ProfileConfig,
+    result: Dict[str, Any],
+) -> None:
+    """Fail closed when the clean control does not meet its profile contract."""
+    expect = getattr(profile, "expect", None)
+    expected_outcome = str(
+        getattr(expect, "control_outcome", "success") or "success"
+    ).strip().lower()
+    observed_outcome, observed_slot = _effective_boot_result(result)
+    observed_outcome = str(observed_outcome or "unknown").strip().lower()
+    observed_slot_name = str(observed_slot or "").strip().lower()
+
+    if observed_outcome != expected_outcome:
+        raise RuntimeError(
+            "Clean control failed: expected outcome {!r}, observed {!r}. "
+            "Fault dispatch was aborted.".format(
+                expected_outcome,
+                observed_outcome,
+            )
+        )
+
+    # Slot and marker checks describe successful application handoff.  They do
+    # not apply to profiles whose clean control intentionally expects no boot
+    # or another non-success outcome.
+    if expected_outcome != "success":
+        return
+
+    criteria = getattr(profile, "success_criteria", None)
+    if criteria is None:
+        return
+
+    for criterion_name in ("pc_in_slot", "vtor_in_slot"):
+        expected_slot = str(
+            getattr(criteria, criterion_name, "") or ""
+        ).strip().lower()
+        if (
+            expected_slot
+            and expected_slot != "any"
+            and observed_slot_name != expected_slot
+        ):
+            raise RuntimeError(
+                "Clean control failed: success_criteria.{} requires slot {!r}, "
+                "observed {!r}. Fault dispatch was aborted.".format(
+                    criterion_name,
+                    expected_slot,
+                    observed_slot_name or None,
+                )
+            )
+
+    marker_address = getattr(criteria, "marker_address", None)
+    if marker_address in (None, 0):
+        return
+
+    marker_value = getattr(criteria, "marker_value", None)
+    try:
+        expected_marker = int(str(marker_value), 0)
+    except (TypeError, ValueError):
+        expected_marker = 0
+    if expected_marker == 0:
+        raise RuntimeError(
+            "Clean control failed: a configured success marker must use a "
+            "non-zero sentinel. Fault dispatch was aborted."
+        )
+
+    signals = result.get("signals")
+    if not isinstance(signals, dict) or signals.get("marker_ok") is not True:
+        raise RuntimeError(
+            "Clean control failed: configured success marker was not confirmed. "
+            "Fault dispatch was aborted."
+        )
+
+    marker_actual_raw = signals.get("marker_actual")
+    try:
+        marker_actual = int(str(marker_actual_raw), 0)
+    except (TypeError, ValueError):
+        marker_actual = None
+    if marker_actual != expected_marker:
+        raise RuntimeError(
+            "Clean control failed: expected marker {}, observed {}. "
+            "Fault dispatch was aborted.".format(
+                _fmt_u32(expected_marker),
+                marker_actual_raw,
+            )
+        )
+
+
 def _fmt_u32(value: int) -> str:
     return "0x{0:08X}".format(int(value) & 0xFFFFFFFF)
 
@@ -1086,9 +1173,10 @@ def run_runtime_sweep(
 ) -> List[Dict[str, Any]]:
     """Run the full runtime fault sweep.
 
-    Uses batch mode (single Renode session) for all fault points, then
-    runs the control point separately.  When num_workers > 1, fault
-    points are split across parallel Renode instances.
+    Runs and validates the clean control first, then uses batch mode for all
+    fault points.  The returned control remains last for report compatibility.
+    When num_workers > 1, fault points are split across parallel Renode
+    instances.
 
     If trace_file is provided, uses trace-replay mode: reconstructs
     flash state from the calibration trace instead of re-emulating
@@ -1106,6 +1194,26 @@ def run_runtime_sweep(
         profile,
         no_hash_bypass=no_hash_bypass,
     )
+
+    control_result: Optional[Dict[str, Any]] = None
+    if include_control:
+        max_fp = max(fault_points) if fault_points else 999999
+        control_at = max(999999, max_fp) + 1
+        control_result = run_single_point(
+            repo_root=repo_root,
+            renode_test=renode_test,
+            robot_suite=robot_suite,
+            profile=profile,
+            fault_at=control_at,
+            robot_vars=control_robot_vars,
+            work_dir=work_dir,
+            renode_remote_server_dir=renode_remote_server_dir,
+            is_control=True,
+            keep_run_artifacts=keep_run_artifacts,
+        )
+        control_result["is_control"] = True
+        _validate_runtime_control_result(profile, control_result)
+
     hybrid_eval_results: List[Dict[str, Any]] = []
     hybrid_selection = None
     if allow_state_evaluator:
@@ -1231,24 +1339,8 @@ def run_runtime_sweep(
         data["is_control"] = False
         results.append(data)
 
-    # Control point runs separately (fault_at far beyond max writes).
-    if include_control:
-        max_fp = max(fault_points) if fault_points else 999999
-        control_at = max(999999, max_fp) + 1
-        data = run_single_point(
-            repo_root=repo_root,
-            renode_test=renode_test,
-            robot_suite=robot_suite,
-            profile=profile,
-            fault_at=control_at,
-            robot_vars=control_robot_vars,
-            work_dir=work_dir,
-            renode_remote_server_dir=renode_remote_server_dir,
-            is_control=True,
-            keep_run_artifacts=keep_run_artifacts,
-        )
-        data["is_control"] = True
-        results.append(data)
+    if control_result is not None:
+        results.append(control_result)
 
     if fault_types_list is not None:
         original_order = {

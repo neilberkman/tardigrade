@@ -10,6 +10,40 @@
       "fault_range": "0:1887",
       "fault_step": 400,
       "total_writes": 1888,
+      "layout": {
+        "version": 1,
+        "nvm": {"base": "0x00000000", "size": "0x00100000"},
+        "bootloader": {"base": "0x00000000"},
+        "write_granularity": 256,
+        "ota_header_size": 512,
+        "slots": {
+          "A": {"base": "0x0000C000", "size": "0x00076000"},
+          "B": {"base": "0x00082000", "size": "0x00076000"}
+        },
+        "metadata": [],
+        "pre_boot_writes": [
+          {"address": "0x000F7FF0", "value": "0xF395C277"},
+          {"address": "0x000F7FF4", "value": "0x7FEFD260"},
+          {"address": "0x000F7FF8", "value": "0x0F505235"},
+          {"address": "0x000F7FFC", "value": "0x8079B62C"}
+        ],
+        "control": {
+          "expected_slot": "A",
+          "marker": {
+            "address_slot": "A",
+            "offset": "0x14",
+            "value": "0x00010001",
+            "other_value": "0x00000001",
+            "expected_image_slot": "B",
+            "alternate_image_slot": "A"
+          }
+        },
+        "observation": {
+          "emulated_timeout_s": 30.0,
+          "poll_interval_s": 0.02,
+          "wall_timeout_s": 180.0
+        }
+      },
       "expect": {
         "bricks_max": 0,
         "issues_max": 0,
@@ -17,7 +51,6 @@
       },
       "slot_a_image_file": "{repo_root}/results/oss_validation/assets/zephyr_slot0_padded.bin",
       "slot_b_image_file": "{repo_root}/results/oss_validation/assets/zephyr_slot1_padded.bin",
-      "ota_header_size": 512,
       "source_checkout": {
         "repo": "third_party/zephyr_ws/bootloader/mcuboot",
         "ref": "664093d07023bb3051f00f3ad5585b3220ad2354",
@@ -31,17 +64,7 @@
       "robot_vars": [
         "PLATFORM_REPL:{repo_root}/platforms/nrf52840_nvmc_psel.repl",
         "BOOTLOADER_ELF:{repo_root}/results/oss_validation/assets/oss_mcuboot_{variant_name}.elf",
-        "BOOT_META_BIN:{repo_root}/results/oss_validation/assets/zephyr_slot0_padded.bin",
-        "FAULT_POINT_SCRIPT:scripts/run_bootloader_ab_fault_point.resc",
-        "WRITE_GRANULARITY:256",
-        "SLOT_A_BASE:0x0000C000",
-        "SLOT_B_BASE:0x00082000",
-        "SLOT_SIZE:0x76000",
-        "META_BASE_0:0x000F8000",
-        "META_BASE_1:0x000F8100",
-        "META_SIZE:0",
-        "BOOTLOADER_ENTRY:0x00000000",
-        "RUN_DURATION:0.5"
+        "FAULT_POINT_SCRIPT:scripts/run_bootloader_ab_fault_point.resc"
       ]
     },
     {
@@ -51,6 +74,66 @@
       "robot_suite": "tests/generic_fault_point.robot",
       "evaluation_mode": "execute",
       "boot_mode": "copy",
+      "layout": {
+        "version": 1,
+        "nvm": {"base": "0x10000000", "size": "0x00080000"},
+        "bootloader": {"base": "0x10000000"},
+        "write_granularity": 4,
+        "ota_header_size": 0,
+        "slots": {
+          "A": {"base": "0x10002000", "size": "0x00037000"},
+          "B": {"base": "0x10039000", "size": "0x00037000"}
+        },
+        "metadata": [
+          {"name": "pending flag", "base": "0x10070000", "size": 4}
+        ],
+        "control": {
+          "expected_slot": "A",
+          "marker": {
+            "address_slot": "A",
+            "offset": "0x44",
+            "value": "0x534C4F42",
+            "other_value": "0x534C4F41",
+            "expected_image_slot": "B",
+            "alternate_image_slot": "A"
+          }
+        },
+        "observation": {
+          "emulated_timeout_s": 10.0,
+          "poll_interval_s": 0.02,
+          "wall_timeout_s": 120.0
+        }
+      },
+      "layout": {
+        "version": 1,
+        "nvm": {"base": "0x10000000", "size": "0x00080000"},
+        "bootloader": {"base": "0x10000000"},
+        "write_granularity": 4,
+        "ota_header_size": 512,
+        "slots": {
+          "A": {"base": "0x10002000", "size": "0x00023000"},
+          "B": {"base": "0x10025000", "size": "0x00023000"}
+        },
+        "metadata": [
+          {"name": "confirmation", "base": "0x1006B000", "size": 4}
+        ],
+        "control": {
+          "expected_slot": "A",
+          "marker": {
+            "address_slot": "A",
+            "offset": "0x1C",
+            "value": "0x00000002",
+            "other_value": "0x00000001",
+            "expected_image_slot": "B",
+            "alternate_image_slot": "A"
+          }
+        },
+        "observation": {
+          "emulated_timeout_s": 20.0,
+          "poll_interval_s": 0.02,
+          "wall_timeout_s": 180.0
+        }
+      },
       "expect": {
         "bricks_max": 0,
         "issues_max": 0,
@@ -58,23 +141,13 @@
       },
       "slot_a_image_file": "{repo_root}/examples/nxboot_style/nxboot_primary.bin",
       "slot_b_image_file": "{repo_root}/examples/nxboot_style/nxboot_update.bin",
-      "ota_header_size": 512,
       "setup_commands": [
         "make -C \"{repo_root}/examples/nxboot_style\"",
         "python3 \"{repo_root}/examples/nxboot_style/gen_nxboot_images.py\" --output-dir \"{repo_root}/examples/nxboot_style\""
       ],
       "robot_vars": [
         "BOOTLOADER_ELF:{repo_root}/examples/nxboot_style/bootloader_nxboot_none.elf",
-        "FAULT_POINT_SCRIPT:scripts/run_bootloader_ab_fault_point.resc",
-        "WRITE_GRANULARITY:4",
-        "SLOT_A_BASE:0x10002000",
-        "SLOT_B_BASE:0x10025000",
-        "SLOT_SIZE:0x23000",
-        "META_BASE_0:0x1006B000",
-        "META_BASE_1:0x1006B000",
-        "META_SIZE:0",
-        "BOOTLOADER_ENTRY:0x10000000",
-        "RUN_DURATION:0.5"
+        "FAULT_POINT_SCRIPT:scripts/run_bootloader_ab_fault_point.resc"
       ]
     },
     {
@@ -84,29 +157,49 @@
       "robot_suite": "tests/generic_fault_point.robot",
       "evaluation_mode": "execute",
       "boot_mode": "copy",
+      "layout": {
+        "version": 1,
+        "nvm": {"base": "0x10000000", "size": "0x00080000"},
+        "bootloader": {"base": "0x10000000"},
+        "write_granularity": 4,
+        "ota_header_size": 512,
+        "slots": {
+          "A": {"base": "0x10002000", "size": "0x00023000"},
+          "B": {"base": "0x10025000", "size": "0x00023000"}
+        },
+        "metadata": [
+          {"name": "confirmation", "base": "0x1006B000", "size": 4}
+        ],
+        "control": {
+          "expected_slot": "A",
+          "marker": {
+            "address_slot": "A",
+            "offset": "0x1C",
+            "value": "0x00000002",
+            "other_value": "0x00000001",
+            "expected_image_slot": "B",
+            "alternate_image_slot": "A"
+          }
+        },
+        "observation": {
+          "emulated_timeout_s": 20.0,
+          "poll_interval_s": 0.02,
+          "wall_timeout_s": 180.0
+        }
+      },
       "expect": {
         "bricks_min": 1,
         "require_control_success": true
       },
       "slot_a_image_file": "{repo_root}/examples/nxboot_style/nxboot_primary.bin",
       "slot_b_image_file": "{repo_root}/examples/nxboot_style/nxboot_update.bin",
-      "ota_header_size": 512,
       "setup_commands": [
         "make -C \"{repo_root}/examples/nxboot_style\"",
         "python3 \"{repo_root}/examples/nxboot_style/gen_nxboot_images.py\" --output-dir \"{repo_root}/examples/nxboot_style\""
       ],
       "robot_vars": [
         "BOOTLOADER_ELF:{repo_root}/examples/nxboot_style/bootloader_nxboot_no_recovery.elf",
-        "FAULT_POINT_SCRIPT:scripts/run_bootloader_ab_fault_point.resc",
-        "WRITE_GRANULARITY:4",
-        "SLOT_A_BASE:0x10002000",
-        "SLOT_B_BASE:0x10025000",
-        "SLOT_SIZE:0x23000",
-        "META_BASE_0:0x1006B000",
-        "META_BASE_1:0x1006B000",
-        "META_SIZE:0",
-        "BOOTLOADER_ENTRY:0x10000000",
-        "RUN_DURATION:0.5"
+        "FAULT_POINT_SCRIPT:scripts/run_bootloader_ab_fault_point.resc"
       ]
     },
     {
@@ -116,23 +209,51 @@
       "robot_suite": "tests/generic_fault_point.robot",
       "evaluation_mode": "execute",
       "boot_mode": "copy",
+      "layout": {
+        "version": 1,
+        "nvm": {"base": "0x10000000", "size": "0x00080000"},
+        "bootloader": {"base": "0x10000000"},
+        "write_granularity": 4,
+        "ota_header_size": 0,
+        "slots": {
+          "A": {"base": "0x10002000", "size": "0x00037000"},
+          "B": {"base": "0x10039000", "size": "0x00037000"}
+        },
+        "metadata": [
+          {"name": "pending flag", "base": "0x10070000", "size": 4}
+        ],
+        "control": {
+          "expected_slot": "A",
+          "marker": {
+            "address_slot": "A",
+            "offset": "0x44",
+            "value": "0x534C4F42",
+            "other_value": "0x534C4F41",
+            "expected_image_slot": "B",
+            "alternate_image_slot": "A"
+          }
+        },
+        "observation": {
+          "emulated_timeout_s": 10.0,
+          "poll_interval_s": 0.02,
+          "wall_timeout_s": 120.0
+        }
+      },
       "expect": {
         "bricks_min": 1,
         "require_control_success": true
       },
-      "setup_commands": ["make -C \"{repo_root}/examples/naive_copy\""],
+      "slot_a_image_file": "{repo_root}/examples/naive_copy/test_firmware_a.bin",
+      "slot_b_image_file": "{repo_root}/examples/naive_copy/test_firmware_b.bin",
+      "setup_commands": [
+        "make -C \"{repo_root}/examples/naive_copy\"",
+        "python3 \"{repo_root}/examples/naive_copy/gen_test_images.py\" --output-dir \"{repo_root}/examples/naive_copy\""
+      ],
       "robot_vars": [
         "BOOTLOADER_ELF:{repo_root}/examples/naive_copy/bootloader_bare_copy.elf",
+        "BOOT_META_BIN:{repo_root}/examples/naive_copy/pending_flag.bin",
         "FAULT_POINT_SCRIPT:scripts/run_bootloader_ab_fault_point.resc",
-        "WRITE_GRANULARITY:4",
-        "SLOT_A_BASE:0x10002000",
-        "SLOT_B_BASE:0x10039000",
-        "SLOT_SIZE:0x37000",
-        "META_BASE_0:0x10070000",
-        "META_BASE_1:0x10070000",
-        "META_SIZE:0",
-        "BOOTLOADER_ENTRY:0x10000000",
-        "RUN_DURATION:0.5"
+        "INCLUDE_METADATA_FAULTS:false"
       ]
     }
   ]

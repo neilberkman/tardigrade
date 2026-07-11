@@ -17,11 +17,16 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from run_oss_validation import (  # noqa: E402
+    BatchProtocolError,
+    _layout_contract,
+    _validate_batch_payload,
     ensure_source_worktree,
+    run_fault_batch,
     run_profile,
-    run_single_fault_point,
+    render,
     source_worktree_path,
     validate_profile_name,
+    validate_rendered_load_plan,
 )
 
 
@@ -199,54 +204,44 @@ class TestManagedWorktreeRemoval(unittest.TestCase):
 
 
 class TestCampaignCompleteness(unittest.TestCase):
-    def test_runner_preserves_nested_fault_fired_telemetry(self):
-        def fake_subprocess(cmd, **kwargs):
-            del kwargs
-            result_var = next(
-                cmd[index + 1]
-                for index, value in enumerate(cmd)
-                if value == "--variable" and cmd[index + 1].startswith("RESULT_FILE:")
-            )
-            result_path = Path(result_var.split(":", 1)[1])
-            result_path.write_text(
-                json.dumps(
-                    {
-                        "boot_outcome": "success",
-                        "nvm_state": {"faulted": True},
-                    }
-                ),
-                encoding="utf-8",
-            )
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-
-        with tempfile.TemporaryDirectory() as td, mock.patch(
-            "run_oss_validation.subprocess.run",
-            side_effect=fake_subprocess,
-        ):
-            result = run_single_fault_point(
-                Path(td),
-                "renode-test",
-                "tests/generic_fault_point.robot",
-                0,
-                [],
-                Path(td) / "work",
-                1,
-                False,
-            )
-
-        self.assertIs(result["fault_injected"], True)
-
-    def test_fault_range_cannot_include_nonexistent_terminal_write(self):
-        profile = {
-            "name": "public_guard",
-            "fault_range": "0:2",
-            "total_writes": 2,
+    @staticmethod
+    def passing_control():
+        return {
+            "fault_at": -1,
+            "is_control": True,
+            "fault_injected": False,
+            "boot_outcome": "success",
+            "boot_slot": "A",
+            "control_passed": True,
         }
-        with tempfile.TemporaryDirectory() as td, self.assertRaisesRegex(
-            ValueError,
-            "inclusive subset of 0:1",
+
+    @classmethod
+    def payload(cls, fault_results):
+        return {
+            "schema_version": 1,
+            "aborted": False,
+            "abort_reason": None,
+            "control_passed": True,
+            "results": [cls.passing_control()] + list(fault_results),
+        }
+
+    @staticmethod
+    def contract():
+        return {
+            "observation": {"wall_timeout_s": 1.0},
+        }
+
+    def run_profile_with_payload(self, profile, payload):
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "run_oss_validation._layout_contract",
+            return_value=(self.contract(), []),
+        ), mock.patch(
+            "run_oss_validation.validate_rendered_load_plan",
+        ), mock.patch(
+            "run_oss_validation.run_fault_batch",
+            return_value=payload,
         ):
-            run_profile(
+            return run_profile(
                 Path(td),
                 "renode-test",
                 profile,
@@ -255,18 +250,128 @@ class TestCampaignCompleteness(unittest.TestCase):
                 skip_setup=True,
             )
 
-    def test_nonfiring_fault_cannot_satisfy_clean_expectations(self):
-        def fake_run(*args, **kwargs):
-            del kwargs
-            fault_at = args[3]
-            is_control = args[7]
-            return {
-                "fault_at": fault_at,
-                "is_control": is_control,
-                "fault_injected": False,
+    def test_batch_runner_uses_one_process_and_preserves_telemetry(self):
+        payload = self.payload([
+            {
+                "fault_at": 0,
+                "is_control": False,
+                "fault_injected": True,
                 "boot_outcome": "success",
+                "nvm_state": {"faulted": True},
             }
+        ])
+        calls = []
 
+        def fake_subprocess(cmd, **kwargs):
+            del kwargs
+            calls.append(cmd)
+            result_var = next(
+                cmd[index + 1]
+                for index, value in enumerate(cmd)
+                if value == "--variable" and cmd[index + 1].startswith("RESULT_FILE:")
+            )
+            result_path = Path(result_var.split(":", 1)[1])
+            result_path.write_text(json.dumps(payload), encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "run_oss_validation.subprocess.run",
+            side_effect=fake_subprocess,
+        ):
+            result = run_fault_batch(
+                Path(td),
+                "renode-test",
+                "tests/generic_fault_point.robot",
+                [0],
+                [],
+                Path(td) / "work",
+                1,
+                1.0,
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("FAULT_POINTS_CSV:-1,0", calls[0])
+        self.assertIs(result["results"][1]["nvm_state"]["faulted"], True)
+
+    def test_batch_protocol_rejects_short_or_reordered_results(self):
+        short = self.payload([])
+        with self.assertRaisesRegex(BatchProtocolError, "order/cardinality"):
+            _validate_batch_payload(short, [0])
+
+        reordered = self.payload([
+            {
+                "fault_at": 1,
+                "is_control": False,
+                "fault_injected": True,
+                "boot_outcome": "success",
+            },
+            {
+                "fault_at": 0,
+                "is_control": False,
+                "fault_injected": True,
+                "boot_outcome": "success",
+            },
+        ])
+        with self.assertRaisesRegex(BatchProtocolError, "order/cardinality"):
+            _validate_batch_payload(reordered, [0, 1])
+
+    def test_failed_control_must_abort_without_fault_results(self):
+        payload = {
+            "schema_version": 1,
+            "aborted": True,
+            "abort_reason": "control failed",
+            "control_passed": False,
+            "results": [dict(self.passing_control(), control_passed=False)],
+        }
+        payload["results"][0]["boot_outcome"] = "wrong_pc"
+        validated = _validate_batch_payload(payload, [0, 1])
+        self.assertTrue(validated["aborted"])
+
+        invalid = dict(payload)
+        invalid["results"] = payload["results"] + [{
+            "fault_at": 0,
+            "is_control": False,
+            "fault_injected": True,
+            "boot_outcome": "no_boot",
+        }]
+        with self.assertRaisesRegex(BatchProtocolError, "abort before every fault"):
+            _validate_batch_payload(invalid, [0, 1])
+
+    def test_failed_control_fails_profile_before_fault_results_exist(self):
+        payload = {
+            "schema_version": 1,
+            "aborted": True,
+            "abort_reason": "wrong marker",
+            "control_passed": False,
+            "results": [dict(self.passing_control(), control_passed=False)],
+        }
+        payload["results"][0]["boot_outcome"] = "wrong_image"
+        profile = {
+            "name": "public_guard",
+            "fault_range": "0:0",
+            "fault_step": 1,
+            "total_writes": 1,
+        }
+        result = self.run_profile_with_payload(profile, payload)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["faulted_runs"], 0)
+        self.assertIn("aborted before fault dispatch", " ".join(result["failures"]))
+
+    def test_fault_range_cannot_include_nonexistent_terminal_write(self):
+        profile = {
+            "name": "public_guard",
+            "fault_range": "0:2",
+            "total_writes": 2,
+        }
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "run_oss_validation._layout_contract",
+            return_value=(self.contract(), []),
+        ), mock.patch(
+            "run_oss_validation.validate_rendered_load_plan",
+        ), self.assertRaisesRegex(ValueError, "inclusive subset of 0:1"):
+            run_profile(Path(td), "renode-test", profile, {}, 1, True)
+
+    def test_nonfiring_fault_cannot_satisfy_clean_expectations(self):
         profile = {
             "name": "public_guard",
             "fault_range": "0:0",
@@ -277,63 +382,18 @@ class TestCampaignCompleteness(unittest.TestCase):
                 "require_control_success": True,
             },
         }
-        with tempfile.TemporaryDirectory() as td, mock.patch(
-            "run_oss_validation.run_single_fault_point",
-            side_effect=fake_run,
-        ):
-            result = run_profile(
-                Path(td),
-                "renode-test",
-                profile,
-                {},
-                workers=1,
-                skip_setup=True,
-            )
+        payload = self.payload([{
+            "fault_at": 0,
+            "is_control": False,
+            "fault_injected": False,
+            "boot_outcome": "success",
+        }])
+        result = self.run_profile_with_payload(profile, payload)
 
         self.assertFalse(result["passed"])
         self.assertIn("incomplete", " ".join(result["failures"]))
 
     def test_infrastructure_result_cannot_satisfy_adverse_minimum(self):
-        def fake_run(
-            repo_root,
-            renode_test,
-            robot_suite,
-            fault_at,
-            robot_vars,
-            work_dir,
-            total_writes,
-            is_control,
-        ):
-            del (
-                repo_root,
-                renode_test,
-                robot_suite,
-                robot_vars,
-                work_dir,
-                total_writes,
-            )
-            if is_control:
-                return {
-                    "fault_at": fault_at,
-                    "is_control": True,
-                    "fault_injected": False,
-                    "boot_outcome": "success",
-                }
-            if fault_at == 0:
-                return {
-                    "fault_at": fault_at,
-                    "is_control": False,
-                    "fault_injected": True,
-                    "boot_outcome": "no_boot",
-                }
-            return {
-                "fault_at": fault_at,
-                "is_control": False,
-                "fault_injected": False,
-                "boot_outcome": "infra_error",
-                "error": "runner unavailable",
-            }
-
         profile = {
             "name": "public_guard",
             "fault_range": "0:1",
@@ -344,22 +404,72 @@ class TestCampaignCompleteness(unittest.TestCase):
                 "require_control_success": True,
             },
         }
-        with tempfile.TemporaryDirectory() as td, mock.patch(
-            "run_oss_validation.run_single_fault_point",
-            side_effect=fake_run,
-        ):
-            result = run_profile(
-                Path(td),
-                "renode-test",
-                profile,
-                {},
-                workers=1,
-                skip_setup=True,
-            )
+        payload = self.payload([
+            {
+                "fault_at": 0,
+                "is_control": False,
+                "fault_injected": True,
+                "boot_outcome": "no_boot",
+            },
+            {
+                "fault_at": 1,
+                "is_control": False,
+                "fault_injected": False,
+                "boot_outcome": "infra_error",
+                "error": "runner unavailable",
+            },
+        ])
+        result = self.run_profile_with_payload(profile, payload)
 
         self.assertFalse(result["passed"])
         self.assertEqual(result["infra_errors"], 1)
         self.assertIn("incomplete or infrastructure", " ".join(result["failures"]))
+
+    def test_point_workers_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "workers must be 1"):
+            run_profile(Path("."), "renode-test", {"name": "public_guard"}, {}, 2, True)
+
+
+class TestDeclarativeCampaignLayouts(unittest.TestCase):
+    def test_public_profiles_have_one_valid_artifact_backed_layout(self):
+        manifest = json.loads(
+            (ROOT / "docs" / "oss_validation_profiles.json").read_text(encoding="utf-8")
+        )
+        for raw_profile in manifest["profiles"]:
+            variables = {
+                "repo_root": str(ROOT),
+                "variant_name": raw_profile["name"],
+            }
+            profile = render(raw_profile, variables)
+            robot_vars = [str(value) for value in profile.get("robot_vars", [])]
+            for key in (
+                "slot_a_image_file",
+                "slot_b_image_file",
+                "evaluation_mode",
+                "boot_mode",
+            ):
+                value = profile.get(key)
+                if value is not None:
+                    robot_vars.append("{}:{}".format(key.upper(), value))
+            with self.subTest(profile=raw_profile["name"]):
+                contract, derived = _layout_contract(profile, robot_vars)
+                normalized = validate_rendered_load_plan(
+                    ROOT,
+                    profile,
+                    robot_vars + derived,
+                    contract,
+                )
+                self.assertEqual(contract["version"], 1)
+                self.assertTrue(normalized["bootloader"])
+
+    def test_layout_owned_robot_literal_is_rejected(self):
+        profile = {
+            "layout": {
+                "version": 1,
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "must not be repeated"):
+            _layout_contract(profile, ["SLOT_A_BASE:0x1000"])
 
 
 if __name__ == "__main__":

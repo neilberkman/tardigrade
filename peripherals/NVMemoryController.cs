@@ -9,6 +9,7 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 
 namespace Antmicro.Renode.Peripherals.Memory
 {
@@ -753,7 +754,12 @@ namespace Antmicro.Renode.Peripherals.Memory
 namespace Antmicro.Renode.Peripherals
 {
     // Control/register block companion for NVMemory.
-    public class NVMemoryController : BasicDoubleWordPeripheral, IKnownSize
+    //
+    // ITardigradeFaultInjectable is implemented so the audit engine can bind to
+    // this controller as a fault backend without a mid-campaign missing-member
+    // abort; declaring the interface turns any missing member into a load-time
+    // C# compile error instead of a runtime failure deep in a sweep.
+    public class NVMemoryController : BasicDoubleWordPeripheral, IKnownSize, ITardigradeFaultInjectable
     {
         public NVMemoryController(Machine machine) : base(machine)
         {
@@ -892,6 +898,155 @@ namespace Antmicro.Renode.Peripherals
         public long NvmBaseAddress { get; set; } = 0x10000000;
 
         public long NvReadOffset { get; set; } = 0x80000;
+
+        // --- ITardigradeFaultInjectable ---------------------------------------
+        //
+        // Persistent-fault state lives in the backing NVMemory, so members that
+        // model it forward to Nvm (null-guarded, because the .repl sets Nvm after
+        // construction).  Page-erase counters, shadow/diff, and execution trace
+        // are not modelled by this control block, so those members are inert
+        // stubs.  A null Nvm returns benign defaults instead of throwing.
+
+        public IMemory Flash
+        {
+            get { return Nvm; }
+        }
+
+        public long FlashBaseAddress
+        {
+            get { return NvmBaseAddress; }
+            set { NvmBaseAddress = value; }
+        }
+
+        public long FlashSize
+        {
+            get { return Nvm != null ? Nvm.Size : 0L; }
+            set { }
+        }
+
+        public int PageSize { get; set; }
+
+        public byte EraseFill
+        {
+            get { return Nvm != null ? Nvm.EraseFill : (byte)0xFF; }
+            set { if(Nvm != null) { Nvm.EraseFill = value; } }
+        }
+
+        public ulong TotalWordWrites
+        {
+            get { return Nvm != null ? Nvm.TotalWordWrites : 0UL; }
+            set { if(Nvm != null) { Nvm.TotalWordWrites = value; } }
+        }
+
+        public ulong FaultAtWordWrite
+        {
+            get { return Nvm != null ? Nvm.FaultAtWordWrite : ulong.MaxValue; }
+            set { if(Nvm != null) { Nvm.FaultAtWordWrite = value; } }
+        }
+
+        public bool FaultFired
+        {
+            get { return Nvm != null && Nvm.FaultEverFired; }
+            set { if(Nvm != null) { Nvm.FaultEverFired = value; } }
+        }
+
+        public bool PerWriteAccurate
+        {
+            get { return true; }
+        }
+
+        public ulong TotalPageErases { get; set; }
+        public ulong FaultAtPageErase { get; set; } = ulong.MaxValue;
+        public bool EraseFaultFired { get; set; }
+
+        public bool AnyFaultFired
+        {
+            get { return Nvm != null && Nvm.FaultEverFired; }
+        }
+
+        public bool FaultRequiresImmediateStop
+        {
+            get { return Nvm != null && Nvm.FaultEverFired; }
+        }
+
+        public bool DriverErrorFired
+        {
+            get { return Nvm != null && Nvm.DriverErrorFired; }
+            set { if(Nvm != null) { Nvm.DriverErrorFired = value; } }
+        }
+
+        public uint LastFaultAddress { get; set; }
+        public byte[] FaultFlashSnapshot { get; set; }
+
+        public int WriteFaultMode
+        {
+            get { return Nvm != null ? Nvm.WriteFaultMode : 0; }
+            set { if(Nvm != null) { Nvm.WriteFaultMode = value; } }
+        }
+
+        public int EraseFaultMode { get; set; }
+
+        public uint CorruptionSeed
+        {
+            get { return Nvm != null ? Nvm.CorruptionSeed : 0U; }
+            set { if(Nvm != null) { Nvm.CorruptionSeed = value; } }
+        }
+
+        public int DiffLookahead { get; set; }
+        public bool SkipShadowScan { get; set; }
+        public bool PassthroughMode { get; set; }
+        public void InvalidateShadow() { }
+
+        public bool WriteTraceEnabled { get; set; }
+        public int WriteTraceCount { get { return 0; } }
+        public string WriteTraceToString() { return string.Empty; }
+        public void WriteTraceClear() { }
+        public bool EraseTraceEnabled { get; set; }
+        public int EraseTraceCount { get { return 0; } }
+        public string EraseTraceToString() { return string.Empty; }
+        public void EraseTraceClear() { }
+
+        public bool ReadFaultEnabled
+        {
+            get { return Nvm != null && Nvm.ReadFaultEnabled; }
+            set { if(Nvm != null) { Nvm.ReadFaultEnabled = value; } }
+        }
+
+        public long ReadFaultAddress
+        {
+            get { return Nvm != null ? Nvm.ReadFaultAddress : -1L; }
+            set { if(Nvm != null) { Nvm.ReadFaultAddress = value; } }
+        }
+
+        public uint ReadFaultSeed
+        {
+            get { return Nvm != null ? Nvm.ReadFaultSeed : 0U; }
+            set { if(Nvm != null) { Nvm.ReadFaultSeed = value; } }
+        }
+
+        public int ReadFaultBitFlips
+        {
+            get { return Nvm != null ? Nvm.ReadFaultBitFlips : 1; }
+            set { if(Nvm != null) { Nvm.ReadFaultBitFlips = value; } }
+        }
+
+        public bool ReadFaultFired
+        {
+            get { return Nvm != null && Nvm.ReadFaultFired; }
+            set { if(Nvm != null) { Nvm.ReadFaultFired = value; } }
+        }
+
+        public ulong ReadFaultSkipCount
+        {
+            get { return Nvm != null ? Nvm.ReadFaultSkipCount : 0UL; }
+            set { if(Nvm != null) { Nvm.ReadFaultSkipCount = value; } }
+        }
+
+        public ulong ReadFaultTotalReads
+        {
+            get { return Nvm != null ? Nvm.ReadFaultTotalReads : 0UL; }
+            set { if(Nvm != null) { Nvm.ReadFaultTotalReads = value; } }
+        }
 
         private void DefineRegisters()
         {

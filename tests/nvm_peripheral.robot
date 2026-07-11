@@ -3,16 +3,19 @@ Library    String
 
 *** Keywords ***
 Create NVM Machine
+    Execute Command    include "${CURDIR}/../peripherals/ITardigradeFaultInjectable.cs"
     Execute Command    include "${CURDIR}/../peripherals/NVMemoryController.cs"
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${CURDIR}/../platforms/cortex_m0_nvm.repl
 
 Create Flash Machine
+    Execute Command    include "${CURDIR}/../peripherals/ITardigradeFaultInjectable.cs"
     Execute Command    include "${CURDIR}/../peripherals/NVMemoryController.cs"
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${CURDIR}/../platforms/cortex_m0_nvm_flash.repl
 
 Create OTP Machine
+    Execute Command    include "${CURDIR}/../peripherals/ITardigradeFaultInjectable.cs"
     Execute Command    include "${CURDIR}/../peripherals/NVMemoryController.cs"
     Execute Command    include "${CURDIR}/../peripherals/OTPMemory.cs"
     Execute Command    mach create

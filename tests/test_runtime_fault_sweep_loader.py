@@ -377,6 +377,11 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertIn("'pc_sticky_ignored_no_boot_phase': no_boot_phase_without_vtor", text)
         self.assertIn("if not execution_observed:", text)
 
+    def test_vtor_capture_does_not_override_a_zero_final_pc(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("if sticky_vtor['captured'] and pc_value == 0:", text)
+        self.assertNotIn("treat the VTOR jump as proof of execution attempt", text)
+
     def test_slow_backend_flash_reads_use_bulk_nvm_reads(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("def read_flash_bytes(start_addr, size):", text)

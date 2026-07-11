@@ -1,3 +1,4 @@
+include @../peripherals/ITardigradeFaultInjectable.cs
 include @../peripherals/NVMemoryController.cs
 include @../peripherals/GenericNvmController.cs
 
