@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import tempfile
 import textwrap
 import unittest
@@ -33,6 +34,10 @@ from trigger_discovery import (  # noqa: E402
     _clone_for_strategy,
     _detect_mcuboot_swap_algorithm,
     _read_elf_symbol_names,
+    _calibration_boot_evidence_is_success,
+    _image_digest_for_evidence,
+    _trace_less_content_evidence,
+    _validate_trace_artifacts,
     discover_update_trigger,
     should_auto_discover_trigger,
     validate_compiled_flash_map,
@@ -60,6 +65,295 @@ def _write_erase_trace(path: Path, rows: list[dict[str, int]]) -> None:
 
 
 class TriggerDiscoveryTests(unittest.TestCase):
+    @staticmethod
+    def _evidence_data(**signals):
+        return {
+            "total_writes": 1,
+            "total_erases": 0,
+            "calibration_stop_reason": "vtor_captured",
+            "calibration_boot_outcome": "success",
+            "boot_slot": "exec",
+            "signals": {
+                "expectations_met": True,
+                "vtor_final": "0x0000C000",
+                "vtor_aligned": True,
+                "pc": "0x0000C100",
+                **signals,
+            },
+        }
+
+    @staticmethod
+    def _content_profile(tempdir: Path, *, marker_value=0x12345678,
+                          baseline_word=0, target_word=None, image_hash=False):
+        target_word = marker_value if target_word is None else target_word
+        exec_image = tempdir / "exec.bin"
+        staging_image = tempdir / "staging.bin"
+        exec_data = bytearray(b"baseline image".ljust(0x40, b"\x00"))
+        staging_data = bytearray(b"target image".ljust(0x40, b"\x00"))
+        exec_data[0x14:0x18] = int(baseline_word).to_bytes(4, "little")
+        staging_data[0x14:0x18] = int(target_word).to_bytes(4, "little")
+        exec_image.write_bytes(exec_data)
+        staging_image.write_bytes(staging_data)
+        return SimpleNamespace(
+            success_criteria=SimpleNamespace(
+                vtor_in_slot="exec",
+                marker_address=0xC014,
+                marker_value=marker_value,
+                image_hash=image_hash,
+                image_hash_slot="exec" if image_hash else None,
+                expected_image="staging",
+            ),
+            memory=SimpleNamespace(
+                slots={
+                    "exec": SimpleNamespace(base=0xC000, size=0x2000),
+                    "staging": SimpleNamespace(base=0xE000, size=0x2000),
+                }
+            ),
+            images={"exec": str(exec_image), "staging": str(staging_image)},
+            flash_backend="faultFlash",
+        )
+
+    def test_trace_less_exact_marker_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td))
+            evidence = _trace_less_content_evidence(
+                profile,
+                self._evidence_data(marker_ok=True, marker_actual="0x12345678"),
+                ROOT,
+            )
+        self.assertEqual(evidence["kind"], "exact_marker")
+
+    def test_trace_less_marker_requires_nonzero_exact_configured_value(self) -> None:
+        for signals in (
+            {"marker_ok": False, "marker_actual": "0x12345678"},
+            {"marker_ok": True},
+            {"marker_ok": True, "marker_actual": "0x00000000"},
+            {"marker_ok": True, "marker_actual": "0x87654321"},
+        ):
+            with self.subTest(signals=signals), tempfile.TemporaryDirectory() as td:
+                profile = self._content_profile(Path(td))
+                self.assertIsNone(
+                    _trace_less_content_evidence(profile, self._evidence_data(**signals), ROOT)
+                )
+
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td), marker_value=0)
+            self.assertIsNone(
+                _trace_less_content_evidence(
+                    profile,
+                    self._evidence_data(marker_ok=True, marker_actual="0x00000000"),
+                    ROOT,
+                )
+            )
+
+    def test_trace_less_marker_rejects_baseline_already_containing_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td), baseline_word=0x12345678)
+            data = self._evidence_data(marker_ok=True, marker_actual="0x12345678")
+            self.assertIsNone(_trace_less_content_evidence(profile, data, ROOT))
+
+    def test_trace_less_marker_rejects_target_without_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td), target_word=0x87654321)
+            data = self._evidence_data(marker_ok=True, marker_actual="0x12345678")
+            self.assertIsNone(_trace_less_content_evidence(profile, data, ROOT))
+
+    def test_trace_less_marker_rejects_address_outside_exec_slot_or_short_images(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td))
+            data = self._evidence_data(marker_ok=True, marker_actual="0x12345678")
+            profile.success_criteria.marker_address = 0x1000
+            self.assertIsNone(_trace_less_content_evidence(profile, data, ROOT))
+
+            profile = self._content_profile(Path(td))
+            Path(profile.images["staging"]).write_bytes(b"short")
+            self.assertIsNone(_trace_less_content_evidence(profile, data, ROOT))
+
+    def test_trace_less_exact_expected_hash_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td), image_hash=True)
+            profile.success_criteria.marker_address = None
+            profile.success_criteria.marker_value = None
+            expected = _image_digest_for_evidence(profile, ROOT, "staging")
+            data = self._evidence_data()
+            data["calibration_exec_hash"] = expected
+            self.assertEqual(_trace_less_content_evidence(profile, data, ROOT)["kind"], "exact_expected_image_hash")
+
+    def test_trace_less_hash_rejects_wrong_or_unknown_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td), image_hash=True)
+            profile.success_criteria.marker_address = None
+            profile.success_criteria.marker_value = None
+            expected = _image_digest_for_evidence(profile, ROOT, "staging")
+            for observed in ("0" * 64, "unknown", "expected_image", None):
+                with self.subTest(observed=observed):
+                    data = self._evidence_data()
+                    data["calibration_exec_hash"] = observed
+                    self.assertIsNone(
+                        _trace_less_content_evidence(profile, data, ROOT)
+                    )
+
+    def test_trace_less_hash_rejects_identical_exec_and_target_images(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td), image_hash=True)
+            profile.success_criteria.marker_address = None
+            profile.success_criteria.marker_value = None
+            exec_path = Path(profile.images["exec"])
+            staging_path = Path(profile.images["staging"])
+            staging_path.write_bytes(exec_path.read_bytes())
+            target_hash = _image_digest_for_evidence(profile, ROOT, "staging")
+            data = self._evidence_data()
+            data["calibration_exec_hash"] = target_hash
+            self.assertIsNone(_trace_less_content_evidence(profile, data, ROOT))
+
+    def test_trace_less_hash_rejects_conflicting_runtime_hash_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td), image_hash=True)
+            profile.success_criteria.marker_address = None
+            profile.success_criteria.marker_value = None
+            target_hash = _image_digest_for_evidence(profile, ROOT, "staging")
+            data = self._evidence_data()
+            data["calibration_exec_hash"] = target_hash
+            data["signals"]["image_hash_actual"] = "0" * 64
+            self.assertIsNone(_trace_less_content_evidence(profile, data, ROOT))
+
+    def test_trace_less_without_content_evidence_fails_closed(self) -> None:
+        profile = SimpleNamespace(
+            success_criteria=SimpleNamespace(
+                marker_address=None,
+                marker_value=None,
+                image_hash=False,
+                expected_image=None,
+            ),
+            images={},
+        )
+        self.assertIsNone(
+            _trace_less_content_evidence(profile, self._evidence_data(), ROOT)
+        )
+
+    def test_trace_less_requires_explicit_expected_boot_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td))
+            valid = self._evidence_data(marker_ok=True, marker_actual="0x12345678")
+            for mutation in (
+                {"signals": {}},
+                {"calibration_boot_outcome": "wrong_image"},
+                {"boot_slot": "staging"},
+            ):
+                with self.subTest(mutation=mutation):
+                    candidate = dict(valid)
+                    candidate.update(mutation)
+                    self.assertIsNone(_trace_less_content_evidence(profile, candidate, ROOT))
+
+    def test_trace_less_rejects_conflicting_boot_outcomes(self) -> None:
+        data = self._evidence_data()
+        data["final_boot_outcome"] = "wrong_image"
+        self.assertFalse(_calibration_boot_evidence_is_success(data))
+        self.assertIsNone(
+            _trace_less_content_evidence(
+                SimpleNamespace(),
+                data,
+                ROOT,
+            )
+        )
+
+    def test_trace_less_rejects_sticky_success_when_final_vtor_is_outside_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td))
+            data = self._evidence_data(marker_ok=True, marker_actual="0x12345678")
+            data["signals"]["vtor_final"] = "0x00010000"
+            self.assertIsNone(_trace_less_content_evidence(profile, data, ROOT))
+
+    def test_trace_less_rejects_misaligned_final_vtor_even_if_sticky_was_aligned(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td))
+            data = self._evidence_data(marker_ok=True, marker_actual="0x12345678")
+            data["signals"]["vtor_final"] = "0x0000C001"
+            data["signals"]["vtor_aligned"] = True
+            self.assertIsNone(_trace_less_content_evidence(profile, data, ROOT))
+
+    def test_trace_less_rejects_missing_or_malformed_final_vtor(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td))
+            for value in (None, "not-an-address"):
+                with self.subTest(value=value):
+                    data = self._evidence_data(marker_ok=True, marker_actual="0x12345678")
+                    if value is None:
+                        del data["signals"]["vtor_final"]
+                    else:
+                        data["signals"]["vtor_final"] = value
+                    self.assertIsNone(_trace_less_content_evidence(profile, data, ROOT))
+
+    def test_trace_less_rejects_missing_or_malformed_final_pc(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td))
+            for value in (None, "not-an-address"):
+                with self.subTest(value=value):
+                    data = self._evidence_data(marker_ok=True, marker_actual="0x12345678")
+                    if value is None:
+                        del data["signals"]["pc"]
+                    else:
+                        data["signals"]["pc"] = value
+                    self.assertIsNone(_trace_less_content_evidence(profile, data, ROOT))
+
+    def test_trace_less_rejects_final_pc_outside_target_slot_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td))
+            data = self._evidence_data(marker_ok=True, marker_actual="0x12345678")
+            data["signals"]["pc"] = "0x00000000"
+            self.assertIsNone(_trace_less_content_evidence(profile, data, ROOT))
+
+    def test_trace_less_rejects_non_integer_or_negative_counters(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td))
+            for field_name, value in (
+                ("total_writes", True),
+                ("total_writes", 1.5),
+                ("total_writes", "1"),
+                ("total_writes", -1),
+                ("total_erases", False),
+                ("total_erases", 2.5),
+                ("total_erases", "2"),
+                ("total_erases", -1),
+            ):
+                with self.subTest(field_name=field_name, value=value):
+                    data = self._evidence_data(marker_ok=True, marker_actual="0x12345678")
+                    data[field_name] = value
+                    self.assertIsNone(_trace_less_content_evidence(profile, data, ROOT))
+
+    def test_malformed_trace_path_is_rejected(self) -> None:
+        self.assertIn(
+            "must be a string path",
+            _validate_trace_artifacts({"trace_file": {"path": "bad"}}),
+        )
+
+    def test_malformed_trace_content_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            trace = Path(td) / "trace.csv"
+            trace.write_text("not,a,valid,trace\n", encoding="utf-8")
+            error = _validate_trace_artifacts({"trace_file": str(trace)})
+        self.assertIn("missing required columns", error)
+
+    def test_trace_less_combined_marker_and_hash_requires_both(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = self._content_profile(Path(td), image_hash=True)
+            expected = _image_digest_for_evidence(profile, ROOT, "staging")
+            marker = {"marker_ok": True, "marker_actual": "0x12345678"}
+            data = self._evidence_data(**marker)
+            data["calibration_exec_hash"] = expected
+            self.assertEqual(
+                _trace_less_content_evidence(profile, data, ROOT)["kind"],
+                "exact_marker_and_expected_image_hash",
+            )
+            # The runtime's hash-only evaluation does not produce marker
+            # evidence, so the combined criterion remains fail-closed.
+            marker.pop("marker_ok")
+            data = self._evidence_data(**marker)
+            data["calibration_exec_hash"] = expected
+            self.assertIsNone(
+                _trace_less_content_evidence(profile, data, ROOT)
+            )
+
     def test_detect_mcuboot_swap_algorithm_from_elf_symbols(self) -> None:
         profile = SimpleNamespace(
             name="mcuboot_auto",
@@ -454,6 +748,153 @@ class TriggerDiscoveryTests(unittest.TestCase):
         self.assertEqual(result.selected_strategy, "offset_image_swap_metadata_align8")
         self.assertEqual(result.attempts[0].name, "offset_image_swap_metadata_align8")
         self.assertEqual(result.attempts[0].coverage["status"], "slot_activity")
+
+    def test_discovery_selects_exact_target_boot_without_a_trace(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
+        if not (ASSETS / "zephyr_slot0_padded.bin").exists():
+            self.skipTest("required discovery asset missing")
+        profile = load_profile(ROOT / "profiles" / "mcuboot_offset_upgrade.yaml")
+        profile.update_trigger = None
+        profile.auto_update_trigger = True
+        profile.pre_boot_state = []
+
+        def fake_run_single_point(*, profile, **kwargs):
+            self.assertFalse(
+                any(
+                    value.startswith("CALIBRATION_TRACE_PHASE1:")
+                    for value in kwargs["robot_vars"]
+                )
+            )
+            return {
+                "total_writes": 17,
+                "total_erases": 2,
+                "trace_file": None,
+                "erase_trace_file": None,
+                "trace_file_bin": None,
+                "erase_trace_file_bin": None,
+                "calibration_stop_reason": "vtor_captured",
+                "calibration_boot_outcome": "success",
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "signals": {
+                    "expectations_met": True,
+                    "vtor_final": "0x0000C000",
+                    "vtor_aligned": True,
+                    "pc": "0x0000C100",
+                    "marker_ok": True,
+                    "marker_actual": "0x{:08X}".format(
+                        int(profile.success_criteria.marker_value)
+                    ),
+                },
+                "calibration_elapsed_s": 1.0,
+                "calibration_emulated_s": 1.0,
+                "calibration_pc": "0x0000C100",
+                "setup_writes": 0,
+                "total_i2c_transactions": 0,
+                "total_otp_blows": 0,
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            with mock.patch(
+                "trigger_discovery.run_single_point",
+                side_effect=fake_run_single_point,
+            ):
+                result = discover_update_trigger(
+                    profile,
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    work_dir=tempdir,
+                    renode_remote_server_dir="",
+                    keep_run_artifacts=False,
+                    robot_vars_factory=lambda candidate: candidate.robot_vars(ROOT),
+                )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(result.selected_strategy, "offset_image_swap_metadata_align8")
+        self.assertIsNotNone(result.selected_calibration)
+        self.assertIsNone(result.selected_calibration.trace_file)
+        self.assertEqual(
+            result.attempts[0].coverage["status"],
+            "verified_target_boot",
+        )
+        self.assertEqual(
+            result.attempts[0].coverage["trace_less_evidence"]["kind"],
+            "exact_marker",
+        )
+
+    def test_discovery_reports_malformed_calibration_without_aborting(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
+        if not (ASSETS / "zephyr_slot0_padded.bin").exists():
+            self.skipTest("required discovery asset missing")
+
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            malformed_trace = tempdir / "malformed.csv"
+            malformed_trace.write_text("not,a,valid,trace\n", encoding="utf-8")
+            cases = (
+                {"total_writes": True},
+                {"setup_writes": "0"},
+                {"trace_file": {"path": "not-a-string"}},
+                {"trace_file": str(malformed_trace)},
+            )
+            for mutation in cases:
+                with self.subTest(mutation=mutation):
+                    profile = load_profile(
+                        ROOT / "profiles" / "mcuboot_offset_upgrade.yaml"
+                    )
+                    profile.update_trigger = None
+                    profile.auto_update_trigger = True
+                    profile.pre_boot_state = []
+
+                    def fake_run_single_point(**_kwargs):
+                        data = self._evidence_data(
+                            marker_ok=True,
+                            marker_actual="0x{:08X}".format(
+                                int(profile.success_criteria.marker_value)
+                            ),
+                        )
+                        data.update(
+                            {
+                                "trace_file": None,
+                                "erase_trace_file": None,
+                                "trace_file_bin": None,
+                                "erase_trace_file_bin": None,
+                                "setup_writes": 0,
+                                "total_i2c_transactions": 0,
+                                "total_otp_blows": 0,
+                            }
+                        )
+                        data.update(mutation)
+                        return data
+
+                    with mock.patch(
+                        "trigger_discovery.run_single_point",
+                        side_effect=fake_run_single_point,
+                    ):
+                        result = discover_update_trigger(
+                            profile,
+                            repo_root=ROOT,
+                            renode_test="renode-test",
+                            robot_suite="tests/ota_fault_point.robot",
+                            work_dir=tempdir,
+                            renode_remote_server_dir="",
+                            keep_run_artifacts=False,
+                            robot_vars_factory=lambda candidate: candidate.robot_vars(ROOT),
+                        )
+
+                    self.assertFalse(result.succeeded)
+                    self.assertGreater(len(result.attempts), 0)
+                    self.assertTrue(all(attempt.error for attempt in result.attempts))
+                    self.assertTrue(
+                        all(
+                            attempt.coverage.get("status") == "unavailable"
+                            for attempt in result.attempts
+                        )
+                    )
 
     def test_discovery_selects_named_metadata_activity(self) -> None:
         if not HAVE_PYYAML:

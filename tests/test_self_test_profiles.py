@@ -68,6 +68,33 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
             max(round_robin_costs) - min(round_robin_costs),
         )
 
+    def test_weighted_ci_shards_leave_headroom_for_timeout(self):
+        profiles = discover_profiles(ROOT)
+        default_cost_s, profile_costs = load_runtime_manifest(ROOT)
+        weighted = partition_profiles_by_estimated_cost(
+            profiles,
+            5,
+            profile_costs,
+            default_cost_s,
+        )
+
+        # CI allows 45 minutes per shard; keep at least five minutes for
+        # setup, teardown, and runtime variance beyond profile estimates.
+        ci_timeout_s = 45 * 60
+        required_headroom_s = 5 * 60
+        self.assertLessEqual(
+            max(shard_costs_s(weighted, profile_costs, default_cost_s)),
+            ci_timeout_s - required_headroom_s,
+        )
+
+    def test_runtime_manifest_keeps_measured_otp_harness_cost(self):
+        _default_cost_s, profile_costs = load_runtime_manifest(ROOT)
+        self.assertGreaterEqual(
+            profile_costs["firmware_otp_blow_nop_harness.yaml"],
+            1700,
+            "the long-running OTP harness must not fall back to a generic estimate",
+        )
+
     def test_benchmark_and_execute_only_profiles_are_skipped(self):
         repo_root = ROOT
         discovered = {p.name for p in discover_profiles(repo_root)}

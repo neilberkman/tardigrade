@@ -19,7 +19,7 @@
     "fault_single_replica_selftest.yaml": 21,
     "fault_staging_overlap_selftest.yaml": 20,
     "fault_wrong_slot_order_selftest.yaml": 21,
-    "firmware_otp_blow_nop_harness.yaml": 60,
+    "firmware_otp_blow_nop_harness.yaml": 1800,
     "mcuboot_head_move_nrf52_revert_extended_selftest.yaml": 221,
     "mcuboot_head_move_nrf52_revert_phase2fault_selftest.yaml": 88,
     "mcuboot_head_move_nrf52_revert_rc_injection_selftest.yaml": 126,

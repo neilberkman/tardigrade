@@ -9892,6 +9892,21 @@ if calibration_mode:
         total_erases = get_total_erases() - base_erases
         cpu_ref.IsHalted = True
 
+        # Calibration stops with the CPU halted.  Capture the resulting boot
+        # evidence from that state without advancing emulation.  Trigger
+        # discovery uses this only as a trace-less fallback; keeping the
+        # observation here means marker/hash criteria remain authoritative
+        # even when phase 1 reaches VTOR before trace capture begins.
+        calibration_vtor = as_int(bus.ReadDoubleWord(0xE000ED08))
+        calibration_pc = as_int(cpu_ref.GetRegisterUnsafe(15))
+        calibration_boot_outcome, calibration_boot_slot, calibration_signals = (
+            evaluate_boot_outcome(
+                calibration_vtor,
+                calibration_pc,
+                fault_injected=False,
+            )
+        )
+
         # Export write trace if available.
         trace_file = None
         trace_file_bin = None
@@ -9978,6 +9993,9 @@ if calibration_mode:
             'calibration_emulated_s': float(cal_status.get('emulated_s', 0)),
             'calibration_elapsed_s': float(cal_status.get('elapsed_s', 0)),
             'calibration_pc': cal_status.get('pc', '0x00000000'),
+            'boot_outcome': calibration_boot_outcome,
+            'boot_slot': calibration_boot_slot,
+            'signals': calibration_signals,
             'calibration_lr': fmt_u32(calibration_lr),
             'calibration_sp': fmt_u32(calibration_sp),
             'calibration_backend_kind': backend['kind'],
@@ -10097,8 +10115,7 @@ if calibration_mode:
             result['calibration_exec_hash'] = cal_exec_hash
             log('calibration: exec slot hash = {}'.format(cal_exec_hash[:16]))
     result = annotate_boot_span_result(result)
-    if success_image_hash:
-        result['calibration_boot_outcome'] = result.get('final_boot_outcome') or result.get('boot_outcome')
+    result['calibration_boot_outcome'] = result.get('final_boot_outcome') or result.get('boot_outcome')
     with open(result_file, 'w') as f:
         f.write(_json_dump_text(result))
     log('calibration done: total_writes={}'.format(result.get('total_writes', '?')))

@@ -50,6 +50,57 @@ class DiscoveryFeaturesTest(unittest.TestCase):
         path.write_text(textwrap.dedent(body), encoding="utf-8")
         return path
 
+    def test_final_calibration_report_exposes_target_boot_without_claiming_trace(self) -> None:
+        discovery = SimpleNamespace(
+            attempts=[
+                SimpleNamespace(
+                    selected=True,
+                    coverage={
+                        "status": "verified_target_boot",
+                        "reason": "halted-state target matched",
+                        "trace_less_evidence": {
+                            "kind": "exact_marker",
+                            "boot_outcome": "success",
+                            "boot_slot": "exec",
+                            "vtor_final": "0x0000C000",
+                            "pc_final": "0x0000C100",
+                            "outcomes": {
+                                "calibration_boot_outcome": "success",
+                                "boot_outcome": "success",
+                            },
+                            "writes": 17,
+                            "erases": 2,
+                            "target_image": "staging",
+                            "marker": {
+                                "address": "0x0000C014",
+                                "expected": "0x00010001",
+                                "observed": "0x00010001",
+                                "baseline": "0x00010000",
+                                "target": "0x00010001",
+                            },
+                            "hash": None,
+                        },
+                        "trace_status": "unavailable",
+                        "trace_reason": "no bounded NVM trace was captured",
+                    },
+                )
+            ]
+        )
+
+        evidence = audit_bootloader._selected_trigger_target_boot_evidence(discovery)
+
+        self.assertEqual(evidence["status"], "verified_target_boot")
+        self.assertEqual(evidence["trace_status"], "unavailable")
+        self.assertEqual(
+            evidence["trace_reason"], "no bounded NVM trace was captured"
+        )
+        proof = evidence["trace_less_evidence"]
+        self.assertEqual(proof["kind"], "exact_marker")
+        self.assertEqual(proof["boot_slot"], "exec")
+        self.assertEqual(proof["vtor_final"], "0x0000C000")
+        self.assertEqual(proof["marker"]["observed"], "0x00010001")
+        self.assertNotEqual(proof["marker"]["baseline"], proof["marker"]["target"])
+
     def test_run_renode_subprocess_kills_process_group_on_timeout(self) -> None:
         proc = mock.Mock()
         proc.pid = 4242

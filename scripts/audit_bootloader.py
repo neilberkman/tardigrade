@@ -631,6 +631,33 @@ def _write_trigger_discovery_failure(
     )
 
 
+def _selected_trigger_target_boot_evidence(
+    discovery: Optional[TriggerDiscoveryResult],
+) -> Optional[Dict[str, Any]]:
+    """Return selected trace-less target-boot evidence for the final report.
+
+    Trigger discovery may select a calibration that proves the configured
+    target boot from halted-state content/signals without a bounded NVM trace.
+    Keep that evidence distinct from the report's trace coverage field: a
+    target-boot proof does not imply that write/erase addresses were traced.
+    """
+    if discovery is None:
+        return None
+    for attempt in getattr(discovery, "attempts", []) or []:
+        if not getattr(attempt, "selected", False):
+            continue
+        coverage = getattr(attempt, "coverage", None)
+        if not isinstance(coverage, dict):
+            return None
+        if coverage.get("status") != "verified_target_boot":
+            return None
+        # Preserve the discovery record verbatim, including the original
+        # trace status/reason, while publishing it under an explicitly
+        # separate calibration-report field.
+        return dict(coverage)
+    return None
+
+
 def _write_geometry_preflight_failure(
     *,
     args: argparse.Namespace,
@@ -2496,6 +2523,13 @@ def _main_single() -> int:
             "elapsed_s": cal.elapsed_s if cal is not None else None,
             "pc": cal.pc if cal is not None else None,
         }
+        selected_target_boot_evidence = _selected_trigger_target_boot_evidence(discovery)
+        if selected_target_boot_evidence is not None:
+            # This is intentionally separate from ``coverage`` above.  The
+            # latter reports observed write/erase trace coverage; this field
+            # reports the independent halted-state target-boot proof used by
+            # trace-less trigger discovery.
+            payload["calibration"]["target_boot_evidence"] = selected_target_boot_evidence
         if control_only_calibration_fallback:
             payload["calibration"]["fallback_reason"] = control_only_calibration_fallback
         if clean_trace_meta is not None:
