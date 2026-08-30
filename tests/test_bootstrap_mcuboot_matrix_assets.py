@@ -56,6 +56,20 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    def test_zephyr_init_resolves_ref_after_clone_and_verifies_checkout(self) -> None:
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('ZEPHYR_INIT_REF="v3.7.0"', text)
+        self.assertIn('ZEPHYR_INIT_REF="${ZEPHYR_REF}"', text)
+        self.assertIn('--mr "${ZEPHYR_INIT_REF}"', text)
+        self.assertIn("checkout_zephyr_ref \"${ZEPHYR_WS}/zephyr\" \"${ZEPHYR_REF}\"", text)
+        self.assertIn('git -C "${repo}" fetch --quiet origin -- "${ref}"', text)
+        self.assertIn("'+refs/heads/*:refs/remotes/origin/*'", text)
+        self.assertIn("Direct Zephyr SHA fetch failed", text)
+        self.assertIn('git -C "${repo}" checkout --detach --quiet FETCH_HEAD', text)
+        self.assertIn('git -C "${repo}" cat-file -e "${ref}^{commit}"', text)
+        self.assertIn('[[ "${resolved,,}" != "${ref,,}" ]]', text)
+        self.assertIn('verify_zephyr_checkout "${ZEPHYR_WS}/zephyr"', text)
+
     def test_script_builds_seccounter_assets(self) -> None:
         text = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("oss_mcuboot_head_move_nrf52_seccounter.elf", text)

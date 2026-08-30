@@ -8,6 +8,14 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Public Zephyr v3.7.0 commit. Keep this immutable for reproducible assets.
 ZEPHYR_REF="${ZEPHYR_REF:-36940db938a8f4a1e919496793ed439850a221c2}"
+# west passes --mr to git clone --branch, so use the advertised release tag
+# when resolving the immutable default commit. Non-SHA overrides can be used
+# directly as the manifest ref (for example, a branch or another tag).
+if [[ "${ZEPHYR_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    ZEPHYR_INIT_REF="v3.7.0"
+else
+    ZEPHYR_INIT_REF="${ZEPHYR_REF}"
+fi
 ZEPHYR_WS="${REPO_ROOT}/third_party/zephyr_ws"
 ZEPHYR_VENV="${REPO_ROOT}/third_party/zephyr-venv"
 MCUBOOT_DIR="${ZEPHYR_WS}/bootloader/mcuboot"
@@ -41,6 +49,71 @@ printf -v PR2206_GEOM_TRAILER_RESERVE '0x%x' \
 msg() { echo ">> $*" >&2; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 require_file() { [[ -e "$1" ]] || die "missing required path: $1"; }
+
+zephyr_ref_is_commit() {
+    [[ "$1" =~ ^[0-9a-fA-F]{40}$ ]]
+}
+
+fetch_zephyr_ref() {
+    local repo="$1"
+    local ref="$2"
+
+    if git -C "${repo}" fetch --quiet origin -- "${ref}"; then
+        return
+    fi
+    if ! zephyr_ref_is_commit "${ref}"; then
+        return 1
+    fi
+
+    # Some Git hosts reject wants addressed only by an object ID. Fetch all
+    # branch refs as a fallback; this makes a full-SHA ZEPHYR_REF override
+    # work when the commit is reachable from a non-default branch.
+    msg "Direct Zephyr SHA fetch failed; fetching remote branch refs"
+    git -C "${repo}" fetch --quiet origin \
+        '+refs/heads/*:refs/remotes/origin/*'
+}
+
+checkout_zephyr_ref() {
+    local repo="$1"
+    local ref="$2"
+    local resolved
+
+    require_file "${repo}"
+
+    # west init uses the manifest repository's ref as a git clone --branch
+    # argument.  A commit ID is not an advertised branch, so initialize from
+    # the v3.7.0 release tag and resolve the requested ref in the
+    # already-cloned repository.
+    # Keep the full commit check below so the default pin remains immutable.
+    if zephyr_ref_is_commit "${ref}"; then
+        if ! git -C "${repo}" cat-file -e "${ref}^{commit}" >/dev/null 2>&1; then
+            fetch_zephyr_ref "${repo}" "${ref}"
+        fi
+        git -C "${repo}" checkout --detach --quiet "${ref}"
+    else
+        # FETCH_HEAD avoids accidentally using a stale local branch when an
+        # operator supplies a branch or tag through ZEPHYR_REF.
+        fetch_zephyr_ref "${repo}" "${ref}"
+        git -C "${repo}" checkout --detach --quiet FETCH_HEAD
+    fi
+
+    resolved="$(git -C "${repo}" rev-parse --verify HEAD^{commit})"
+    if zephyr_ref_is_commit "${ref}" && [[ "${resolved,,}" != "${ref,,}" ]]; then
+        die "Zephyr checkout ${resolved} does not match pinned commit ${ref}"
+    fi
+    RESOLVED_ZEPHYR_COMMIT="${resolved}"
+    msg "Using Zephyr commit ${resolved} (ref ${ref})"
+}
+
+verify_zephyr_checkout() {
+    local repo="$1"
+    local actual
+
+    actual="$(git -C "${repo}" rev-parse --verify HEAD^{commit})"
+    if [[ "${actual}" != "${RESOLVED_ZEPHYR_COMMIT}" ]]; then
+        die "Zephyr checkout changed from ${RESOLVED_ZEPHYR_COMMIT} to ${actual}"
+    fi
+}
 
 restore_mcuboot_module_yml() {
     if git -C "${MCUBOOT_DIR}" diff --quiet -- "zephyr/module.yml" >/dev/null 2>&1; then
@@ -903,13 +976,14 @@ fi
 
 # --- 2. Initialize Zephyr workspace ---
 if [[ ! -d "${ZEPHYR_WS}/.west" ]]; then
-    msg "Initializing Zephyr workspace (${ZEPHYR_REF})"
+    msg "Initializing Zephyr workspace (manifest ref ${ZEPHYR_INIT_REF}; Zephyr ref ${ZEPHYR_REF})"
     "${WEST}" init \
         -m https://github.com/zephyrproject-rtos/zephyr \
-        --mr "${ZEPHYR_REF}" "${ZEPHYR_WS}"
+        --mr "${ZEPHYR_INIT_REF}" "${ZEPHYR_WS}"
 else
     msg "Zephyr workspace already initialized"
 fi
+checkout_zephyr_ref "${ZEPHYR_WS}/zephyr" "${ZEPHYR_REF}"
 
 # --- 3. Fetch only the Zephyr/MCUboot projects needed for the differential corpus ---
 if [[ -d "${MCUBOOT_DIR}/.git" ]]; then
@@ -918,6 +992,7 @@ fi
 msg "Running targeted west update (zephyr + mcuboot + nrf/stm32 deps)"
 ( cd "${ZEPHYR_WS}" && \
   "${WEST}" update --narrow -o=--depth=1 zephyr mcuboot hal_nordic hal_stm32 cmsis )
+verify_zephyr_checkout "${ZEPHYR_WS}/zephyr"
 
 # --- 4. Add upstream MCUboot remote for commit checkouts ---
 if [[ ! -d "${MCUBOOT_DIR}" ]]; then

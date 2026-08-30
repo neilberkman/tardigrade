@@ -2,8 +2,8 @@ schema_version: 1
 name: mcuboot_pr2100_broken_discovery
 description: >
   MCUboot swap-using-move BEFORE PR #2100 fix (commit 2ac79767).
-  Discovery mode: uses image hash validation and update_trigger instead
-  of hand-computed pre_boot_state and marker_address.
+  Discovery mode: uses update_trigger instead of hand-computed
+  pre_boot_state.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -32,14 +32,14 @@ update_trigger:
   slot: exec
   copy_done: 1
 
-# Image hash mode: after recovery, hash exec slot and compare against
-# both known images. No need to know MCUboot header offsets.
-# expected_image: which image should end up in exec after successful revert.
-# For revert, MCUboot swaps staging (old image) back into exec.
+# After a successful revert, exec must contain the original slot0 image.
+# Check its MCUboot image-version field rather than hashing the full slot:
+# the observed post-revert slot is not byte-identical to the raw staging
+# fixture, so full-slot equality is not a stable differential oracle.
 success_criteria:
   vtor_in_slot: exec
-  image_hash: true
-  expected_image: staging
+  marker_address: 0x0000C014
+  marker_value: 0x00000001
 
 fault_sweep:
   mode: runtime

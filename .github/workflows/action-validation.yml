@@ -80,7 +80,7 @@ jobs:
       matrix:
         include:
           # PR #2100: revert magic bug (swap-move).
-          # Vulnerability at fault points 2-4 out of ~15K.
+          # Revert failure at fault points 3-5 out of ~15K.
           # Target first 10 points instead of full sweep.
           - name: pr2100
             broken: profiles/mcuboot_pr2100_broken_discovery.yaml
@@ -112,7 +112,7 @@ jobs:
       - name: Install Python dependencies
         run: python3 -m pip install --user -r requirements.txt
 
-      - name: "Broken ELF: must detect bricks"
+      - name: "Broken ELF: must detect revert failure"
         run: |
           python3 scripts/audit_bootloader.py \
             --profile "${{ matrix.broken }}" \
@@ -124,10 +124,21 @@ jobs:
           r = json.load(open('${RUNNER_TEMP}/${{ matrix.name }}_broken.json'))
           sweep = r.get('summary', {}).get('runtime_sweep', {})
           issues = int(sweep.get('issue_points', 0) or 0)
-          bricks = int(sweep.get('bricks', 0) or 0)
-          print('Broken ELF: {} issue points, {} bricks'.format(issues, bricks))
-          if bricks <= 0:
-              print('FAIL: tool did not detect the known brick regression')
+          wrong_image = int((sweep.get('failure_classes') or {}).get('wrong_image', 0) or 0)
+          complete = bool(sweep.get('campaign_complete', False))
+          infrastructure_errors = int(sweep.get('infrastructure_error_points', 0) or 0)
+          wrong_points = {
+              int(result.get('fault_at'))
+              for result in r.get('runtime_sweep_results', [])
+              if result.get('fault_injected') is True
+              and result.get('boot_outcome') == 'wrong_image'
+          }
+          expected_points = {3, 4, 5}
+          print('Broken ELF: {} issue points, {} wrong-image outcomes at {}'.format(
+              issues, wrong_image, sorted(wrong_points)))
+          if (not complete or infrastructure_errors != 0 or issues <= 0
+                  or wrong_image <= 0 or not expected_points.issubset(wrong_points)):
+              print('FAIL: tool did not reproduce the known revert failure cleanly')
               sys.exit(1)
           "
 

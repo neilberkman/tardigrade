@@ -245,6 +245,27 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
                 self.assertIn("power_loss", fault_types)
                 self.assertIn("swap_progress", fault_types)
 
+    def test_pr2100_discovery_profiles_use_stable_revert_marker(self):
+        for name in (
+            "mcuboot_pr2100_broken_discovery.yaml",
+            "mcuboot_pr2100_fixed_discovery.yaml",
+        ):
+            with self.subTest(profile=name):
+                raw = yaml.safe_load(
+                    (ROOT / "profiles" / name).read_text(encoding="utf-8")
+                )
+                self.assertNotIn("pre_boot_state", raw)
+                self.assertEqual(
+                    raw.get("update_trigger", {}).get("type"),
+                    "mcuboot_trailer_magic",
+                )
+                success = raw.get("success_criteria", {})
+                self.assertEqual(success.get("vtor_in_slot"), "exec")
+                self.assertEqual(success.get("marker_address"), 0x0000C014)
+                self.assertEqual(success.get("marker_value"), 0x00000001)
+                self.assertNotIn("image_hash", success)
+                self.assertNotIn("expected_image", success)
+
     def test_run_audit_forwards_extra_args(self):
         repo_root = ROOT
         profile_path = ROOT / "profiles" / "fault_no_crc.yaml"

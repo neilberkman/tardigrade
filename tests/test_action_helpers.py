@@ -393,6 +393,18 @@ class TestActionSourceBoundaries(unittest.TestCase):
         self.assertIn("consumer-assets/caller-only.elf", source)
         self.assertIn("test ! -e tardigrade-action/consumer-assets/caller-only.elf", source)
 
+    def test_pr2100_workflow_requires_completed_wrong_image_reproduction(self):
+        source = (
+            ROOT / ".github" / "workflows" / "action-validation.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("issues <= 0", source)
+        self.assertIn("wrong_image <= 0", source)
+        self.assertIn("not complete", source)
+        self.assertIn("infrastructure_errors != 0", source)
+        self.assertIn("expected_points = {3, 4, 5}", source)
+        self.assertIn("expected_points.issubset(wrong_points)", source)
+        self.assertNotIn("bricks <= 0", source)
+
     def test_pinned_renode_workflows_verify_the_archive(self):
         workflows = ROOT / ".github" / "workflows"
         for path in workflows.glob("*.yml"):
