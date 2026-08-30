@@ -123,6 +123,19 @@ def test_exact_adjacency_is_allowed(tmp_path):
     assert normalized["loads"][0]["start"] == 0x2000
 
 
+def test_normalizes_foreign_filesystem_size_integer(tmp_path, monkeypatch):
+    class ForeignInteger:
+        def __str__(self):
+            return "128"
+
+    plan = _plan(tmp_path, boot_start=0x1F00, boot_size=0x100)
+    monkeypatch.setattr(os.path, "getsize", lambda _path: ForeignInteger())
+
+    normalized = validate_load_plan(plan)
+
+    assert normalized["loads"][0]["end"] - normalized["loads"][0]["start"] == 128
+
+
 def test_rejects_binary_spill_from_declared_slot(tmp_path):
     plan = _plan(tmp_path)
     plan["loads"][0]["address"] = 0x2FC0

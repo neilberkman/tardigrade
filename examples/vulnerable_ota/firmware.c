@@ -73,7 +73,7 @@ static void init_runtime(void)
     }
 }
 
-__attribute__((section(".ramfunc")))
+__attribute__((noinline, section(".ramfunc")))
 static void copy_staging_to_active(void)
 {
     volatile uint64_t* dst = (volatile uint64_t*)ACTIVE_BASE;

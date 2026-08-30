@@ -438,10 +438,10 @@ class InstructionSkipSymbolResolutionTest(unittest.TestCase):
                 profile = load_profile(profile_path)
         self.assertEqual(
             profile.fault_sweep.instruction_skip_config.target_addresses,
-            [(0x10000044, 0x100000F8)],
+            [(0x10000044, 0x100000C8)],
         )
         self.assertIn("Resolved 'Reset' -> Reset_Handler", stderr.getvalue())
-        self.assertIn("89 fault points", stderr.getvalue())
+        self.assertIn("65 fault points", stderr.getvalue())
 
     def test_symbol_target_resolves_multiple_matches(self) -> None:
         cfg = _parse_instruction_skip_config(
@@ -450,7 +450,7 @@ class InstructionSkipSymbolResolutionTest(unittest.TestCase):
         )
         self.assertEqual(
             cfg.target_addresses,
-            [(0x10000040, 0x10000042), (0x10000044, 0x100000F8)],
+            [(0x10000040, 0x10000042), (0x10000044, 0x100000C8)],
         )
 
     def test_symbol_target_no_match_lists_available_symbols(self) -> None:
@@ -496,7 +496,7 @@ class InstructionSkipSymbolResolutionTest(unittest.TestCase):
         )
         self.assertEqual(
             cfg.target_addresses,
-            [(0x10000040, 0x10000042), (0x10000044, 0x100000F8)],
+            [(0x10000040, 0x10000042), (0x10000044, 0x100000C8)],
         )
 
     def test_glob_prefix_star_matches(self) -> None:
@@ -507,7 +507,7 @@ class InstructionSkipSymbolResolutionTest(unittest.TestCase):
         )
         self.assertEqual(
             cfg.target_addresses,
-            [(0x10000044, 0x100000F8)],
+            [(0x10000044, 0x100000C8)],
         )
 
     def test_glob_question_mark_matches(self) -> None:
@@ -518,7 +518,7 @@ class InstructionSkipSymbolResolutionTest(unittest.TestCase):
         )
         self.assertEqual(
             cfg.target_addresses,
-            [(0x10000044, 0x100000F8)],
+            [(0x10000044, 0x100000C8)],
         )
 
     def test_glob_no_match_raises(self) -> None:
@@ -538,7 +538,7 @@ class InstructionSkipSymbolResolutionTest(unittest.TestCase):
         )
         self.assertEqual(
             cfg.target_addresses,
-            [(0x10000044, 0x100000F8)],
+            [(0x10000044, 0x100000C8)],
         )
 
 

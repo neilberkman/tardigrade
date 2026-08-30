@@ -368,8 +368,22 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertEqual(broken["expect"]["control_outcome"], "no_boot")
         self.assertTrue(broken["expect"]["allow_control_only_issues"])
         self.assertEqual(fixed["expect"]["control_outcome"], "success")
-        self.assertEqual(broken["success_criteria"], {"vtor_in_slot": "exec"})
-        self.assertEqual(fixed["success_criteria"], {"vtor_in_slot": "exec"})
+        self.assertEqual(
+            broken["success_criteria"],
+            {
+                "vtor_in_slot": "exec",
+                "marker_address": 0x0800C014,
+                "marker_value": 0x00000102,
+            },
+        )
+        self.assertEqual(
+            fixed["success_criteria"],
+            {
+                "vtor_in_slot": "exec",
+                "marker_address": 0x0800C014,
+                "marker_value": 0x00000102,
+            },
+        )
 
     def test_pr2206_geom_profiles_use_geom_scratch_elfs(self) -> None:
         broken = yaml.safe_load(

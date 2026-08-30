@@ -1255,6 +1255,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                         "brick_rate": 0.0,
                         "issue_points": 1,
                         "issue_reasons": {"semantic_assertion": 1},
+                        "control": {"effective_outcome": "success"},
                     }
                 }
             },
@@ -1279,6 +1280,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                         "brick_rate": 0.0,
                         "issue_points": 2,
                         "issue_reasons": {"semantic_assertion": 2},
+                        "control": {"effective_outcome": "success"},
                     }
                 }
             },

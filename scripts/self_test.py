@@ -313,6 +313,18 @@ def check_verdict(
         allow_control_only_issues
         and control_outcome == expected_control_outcome
     )
+
+    # A fault finding cannot compensate for a missing or bad clean baseline.
+    # Require the reported control to match before evaluating issue counters;
+    # otherwise unrelated fault points can hide an invalid campaign baseline.
+    if not control:
+        return False, "Clean control result is missing"
+    if control_outcome != expected_control_outcome:
+        return False, "Control outcome '{}' != expected '{}'".format(
+            control_outcome or "missing",
+            expected_control_outcome,
+        )
+
     ignored_issue_points = 0
     if ignored_issue_fault_types and fault_type_issue_points:
         ignored_issue_points = sum(

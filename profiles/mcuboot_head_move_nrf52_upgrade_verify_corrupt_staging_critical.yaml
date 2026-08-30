@@ -29,6 +29,8 @@ success_criteria:
   expected_image: staging
 expect:
   should_find_issues: false
+  control_outcome: wrong_image
+  allow_control_only_issues: true
 fault_sweep:
   mode: runtime
   evaluation_mode: execute

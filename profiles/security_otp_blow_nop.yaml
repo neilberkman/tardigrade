@@ -1,11 +1,9 @@
 schema_version: 1
 name: security_otp_blow_nop
 description: >-
-  Test bootloader behavior when an OTP fuse blow physically fails to
-  take effect.  The programming instruction executes but the fuse
-  state does not change.  Catches firmware that retries fuse blows
-  in an unbounded loop without checking for forward progress, which
-  leads to a permanent device brick.
+  Legacy configuration example for the otp_blow_nop fault model against the
+  generic OTA memory layout.  This fixture does not issue OTP writes; use
+  firmware_otp_blow_nop_harness for an executable end-to-end campaign.
 
 platform: platforms/cortex_m0_otp.repl
 flash_backend: nvm_ctrl
@@ -44,3 +42,6 @@ fault_sweep:
 
 expect:
   should_find_issues: false
+
+# Executable CI coverage lives in firmware_otp_blow_nop_harness.
+skip_self_test: true

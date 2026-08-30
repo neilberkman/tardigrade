@@ -35,6 +35,11 @@ pre_boot_state:
 
 success_criteria:
   vtor_in_slot: exec
+  # A successful handoff must be the staged v2.1.0 image, not the old v1
+  # image already present in exec.  The offset payload's header is at the
+  # executable slot base and carries version 0x00000102 at +0x14.
+  marker_address: 0x0800C014
+  marker_value: 0x00000102
 
 fault_sweep:
   mode: runtime

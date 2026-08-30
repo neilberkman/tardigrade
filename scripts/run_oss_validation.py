@@ -669,6 +669,13 @@ def _validate_batch_payload(
     return payload
 
 
+def _batch_process_output_tail(proc: subprocess.CompletedProcess, limit: int = 2000) -> str:
+    """Return bounded stdout/stderr tails for a failed Renode batch."""
+    stdout = (proc.stdout or "")[-limit:]
+    stderr = (proc.stderr or "")[-limit:]
+    return "\nstdout tail:\n{}\nstderr tail:\n{}".format(stdout, stderr)
+
+
 def run_fault_batch(
     repo_root: Path,
     renode_test: str,
@@ -726,8 +733,8 @@ def run_fault_batch(
 
     if not result_file.exists():
         raise BatchProtocolError(
-            "Renode campaign produced no result (rc={}): {}".format(
-                proc.returncode, (proc.stderr or "")[-1000:]
+            "Renode campaign produced no result (rc={}){}".format(
+                proc.returncode, _batch_process_output_tail(proc)
             )
         )
     try:

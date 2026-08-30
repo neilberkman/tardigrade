@@ -275,7 +275,7 @@ flowchart TD
     U["Classify outcome + failure class"] --> V["Aggregate into results JSON"]
 ```
 
-1. **Trigger discovery** -- if the profile does not already seed a `pre_boot_state`, tardigrade can try a short trigger cascade (`no_trigger`, trailer magic, trailer metadata, offset placement) until calibration reaches real slot data movement. MCUboot profiles also get a compiled flash-map preflight so bad slot geometry fails fast instead of looking "clean."
+1. **Trigger discovery** -- if the profile does not already seed a `pre_boot_state`, tardigrade can try a short trigger cascade (`no_trigger`, trailer magic, trailer metadata, offset placement) until calibration reaches real slot data movement. MCUboot profiles also get a compiled flash-map preflight: mismatches between the ELF's slot layout and the declared slots fail fast instead of looking "clean." Nonuniform or partially covered erase-sector geometry remains an advisory diagnostic for intentional geometry-specific profiles.
 2. **Calibration** -- run the firmware once, count total NVM writes, and record write/erase traces.
 3. **Cutpoint selection** -- choose candidate fault points from the clean trace. This includes raw write indices, erase indices, semantic `swap_progress` boundaries, and security-state erase/restoration boundaries.
 4. **Heuristic pruning** -- classify write-indexed points by address into tiers, often reducing routine campaign size.

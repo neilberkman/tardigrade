@@ -101,7 +101,7 @@ class TestHeuristicConfigPartialParse:
             bootloader_elf=str(elf),
         )
         assert hc is not None
-        assert hc.critical_regions == [(0x10000044, 0x100000F8)]
+        assert hc.critical_regions == [(0x10000044, 0x100000C8)]
 
 
 class TestHeuristicConfigAbsent:

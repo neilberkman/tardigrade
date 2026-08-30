@@ -293,6 +293,31 @@ class TestCampaignCompleteness(unittest.TestCase):
         self.assertIn("FAULT_POINTS_CSV:-1,0", calls[0])
         self.assertIs(result["results"][1]["nvm_state"]["faulted"], True)
 
+    def test_batch_runner_no_result_error_includes_both_output_tails(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "run_oss_validation.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                ["renode-test"],
+                17,
+                stdout="stdout diagnostic\n",
+                stderr="stderr diagnostic\n",
+            ),
+        ), self.assertRaises(BatchProtocolError) as raised:
+            run_fault_batch(
+                Path(td),
+                "renode-test",
+                "tests/generic_fault_point.robot",
+                [0],
+                [],
+                Path(td) / "work",
+                1,
+                1.0,
+            )
+
+        message = str(raised.exception)
+        self.assertIn("stdout tail:\nstdout diagnostic", message)
+        self.assertIn("stderr tail:\nstderr diagnostic", message)
+
     def test_batch_protocol_rejects_short_or_reordered_results(self):
         short = self.payload([])
         with self.assertRaisesRegex(BatchProtocolError, "order/cardinality"):

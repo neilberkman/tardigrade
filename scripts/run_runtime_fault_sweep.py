@@ -6090,9 +6090,24 @@ def run_state_fault(fault_at):
                 boot_slot = slot_name
                 break
 
+    marker_actual = None
+    marker_ok = None
+    marker_is_slot_content = any(
+        slot_lo <= success_marker_addr < slot_hi
+        for slot_lo, slot_hi in slot_ranges.values()
+    )
+    if (
+            copy_completed
+            and success_marker_addr != 0
+            and not marker_is_slot_content):
+        # State mode does not execute the updater.  Model an external
+        # completion marker only after the simulated copy finishes; markers
+        # inside an image slot remain content oracles and are never forged.
+        bus.WriteDoubleWord(success_marker_addr, success_marker_value)
     if success_marker_addr != 0 and boot_outcome == 'success':
-        actual_marker = as_int(bus.ReadDoubleWord(success_marker_addr))
-        if actual_marker != success_marker_value:
+        marker_actual = as_int(bus.ReadDoubleWord(success_marker_addr))
+        marker_ok = (marker_actual == success_marker_value)
+        if not marker_ok:
             boot_outcome = 'hard_fault'
             boot_slot = None
     signals = {
@@ -6102,6 +6117,10 @@ def run_state_fault(fault_at):
         'vector_base': fmt_u32(vector_base),
         'copy_completed': copy_completed,
     }
+    if marker_actual is not None:
+        signals['marker_actual'] = fmt_u32(marker_actual)
+        signals['marker_ok'] = bool(marker_ok)
+        signals['marker_is_slot_content'] = bool(marker_is_slot_content)
     structured_observations = evaluate_structured_success_checks()
     if structured_observations.get('requested'):
         signals['success_checks'] = structured_observations

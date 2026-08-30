@@ -400,10 +400,19 @@ def validate_load_plan(plan):
         if not isinstance(path, string_types) or not path:
             raise LayoutValidationError("load %s.path must be non-empty" % load_name)
         try:
-            size = os.path.getsize(path)
+            raw_size = os.path.getsize(path)
         except (IOError, OSError) as exc:
             raise LayoutValidationError(
                 "cannot inspect load %s path %r: %s" % (load_name, path, exc)
+            )
+        # Renode's embedded IronPython can return a CLR integral value here.
+        # Normalize it inside this module before the strict region validator;
+        # values supplied by a load plan remain subject to exact type checks.
+        try:
+            size = int(str(raw_size), 10)
+        except (TypeError, ValueError, OverflowError):
+            raise LayoutValidationError(
+                "load %s path %r returned a non-integer size" % (load_name, path)
             )
         load_region = _region(
             "load %s" % load_name,

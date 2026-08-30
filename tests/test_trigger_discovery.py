@@ -282,6 +282,21 @@ class TriggerDiscoveryTests(unittest.TestCase):
         self.assertEqual(check["status"], "mismatch")
         self.assertTrue(any("staging" in item for item in check["mismatches"]))
 
+    def test_validate_compiled_flash_map_keeps_sector_advisory_separate(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
+        profile = load_profile(ROOT / "profiles/mcuboot_pr2214_offset_fixed.yaml")
+        check = validate_compiled_flash_map(profile, ROOT)
+        if check["status"] == "unavailable":
+            self.skipTest(check["reason"])
+        self.assertEqual(check["status"], "match")
+        self.assertEqual(
+            [slot["status"] for slot in check["checked_slots"]],
+            ["match", "match"],
+        )
+        self.assertEqual(check["sector_geometry"]["status"], "mismatch")
+        self.assertIn("sector geometry advisory", check["reason"])
+
     def test_discovery_uses_compiled_flash_map_when_profile_geometry_mismatches(self) -> None:
         if not HAVE_PYYAML:
             self.skipTest("PyYAML not installed")

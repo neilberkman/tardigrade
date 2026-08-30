@@ -77,7 +77,6 @@
     "nxboot_style_partial_staging.yaml": 144,
     "nxboot_style_writeback.yaml": 21,
     "security_otp_rollback_counter.yaml": 43,
-    "security_otp_blow_nop.yaml": 60,
     "security_otp_security_fuses.yaml": 45,
     "security_rollback_no_protection.yaml": 44,
     "security_rollback_with_protection.yaml": 42

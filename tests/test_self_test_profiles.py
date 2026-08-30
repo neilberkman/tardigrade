@@ -101,6 +101,7 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertNotIn("fault_no_fallback.yaml", discovered)
         self.assertNotIn("fault_no_meta_replication.yaml", discovered)
         self.assertNotIn("fault_no_vector_check.yaml", discovered)
+        self.assertNotIn("security_otp_blow_nop.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_stm32f4_fast_upgrade.yaml", discovered)
         self.assertNotIn("mcuboot_head_offset_stm32f4_fast_upgrade.yaml", discovered)
         self.assertNotIn("mcuboot_head_scratch_stm32f4_fast_upgrade.yaml", discovered)
@@ -384,6 +385,54 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
             exit_code=1,
         )
         self.assertTrue(passed)
+
+    def test_check_verdict_rejects_faults_when_control_outcome_mismatches(self):
+        passed, reason = check_verdict(
+            profile_path=ROOT / "profiles" / "dummy.yaml",
+            profile_raw={"expect": {"should_find_issues": True}},
+            report={
+                "summary": {
+                    "runtime_sweep": {
+                        "issue_points": 3,
+                        "bricks": 3,
+                        "control": {"effective_outcome": "wrong_image"},
+                    }
+                }
+            },
+            exit_code=0,
+        )
+        self.assertFalse(passed)
+        self.assertEqual(reason, "Control outcome 'wrong_image' != expected 'success'")
+
+    def test_check_verdict_rejects_faults_when_control_is_missing(self):
+        passed, reason = check_verdict(
+            profile_path=ROOT / "profiles" / "dummy.yaml",
+            profile_raw={"expect": {"should_find_issues": True}},
+            report={
+                "summary": {
+                    "runtime_sweep": {
+                        "issue_points": 3,
+                        "bricks": 3,
+                    }
+                }
+            },
+            exit_code=0,
+        )
+        self.assertFalse(passed)
+        self.assertEqual(reason, "Clean control result is missing")
+
+    def test_corrupted_staging_skip_profiles_expect_clean_rejection(self):
+        for name in (
+            "mcuboot_head_move_nrf52_upgrade_verify_corrupt_staging_candidates.yaml",
+            "mcuboot_head_move_nrf52_upgrade_verify_corrupt_staging_critical.yaml",
+            "mcuboot_head_move_nrf52_upgrade_verify_corrupt_staging_full.yaml",
+        ):
+            with self.subTest(profile=name):
+                raw = yaml.safe_load(
+                    (ROOT / "profiles" / name).read_text(encoding="utf-8")
+                )
+                self.assertEqual(raw["expect"]["control_outcome"], "wrong_image")
+                self.assertTrue(raw["expect"]["allow_control_only_issues"])
 
 
 if __name__ == "__main__":

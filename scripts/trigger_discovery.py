@@ -519,23 +519,33 @@ def validate_compiled_flash_map(
 
     sector_geometry = validate_swap_sector_geometry(profile)
 
-    if mismatches or sector_geometry.get("status") == "mismatch":
-        combined_mismatches = list(mismatches)
-        if sector_geometry.get("status") == "mismatch":
-            combined_mismatches.append(str(sector_geometry.get("reason")))
+    # The compiled area table is the authoritative flash-map contract.  A
+    # nonuniform or partially covered sector layout is useful diagnostic
+    # information, but it is not a compiled-map mismatch: profiles may
+    # intentionally describe such layouts for geometry-specific regressions.
+    # Keep the advisory nested under ``sector_geometry`` while failing closed
+    # only when the ELF's area offsets/sizes differ from the profile.
+    if mismatches:
         return {
             "status": "mismatch",
-            "reason": "compiled flash map or erase-sector layout does not match declared slot layout",
+            "reason": "compiled flash map does not match declared slot layout",
             "bootloader_elf": resolved_elf,
             "flash_base": "0x{:08X}".format(flash_base),
             "checked_slots": checked_slots,
             "compiled_entries": entries,
-            "mismatches": combined_mismatches,
+            "mismatches": list(mismatches),
             "sector_geometry": sector_geometry,
         }
+    geometry_note = ""
+    if sector_geometry.get("status") == "mismatch":
+        geometry_note = "; sector geometry advisory: {}".format(
+            sector_geometry.get("reason") or "nonuniform or partial sector layout"
+        )
     return {
         "status": "match",
-        "reason": "compiled flash map matches declared slot layout",
+        "reason": "compiled flash map matches declared slot layout{}".format(
+            geometry_note
+        ),
         "bootloader_elf": resolved_elf,
         "flash_base": "0x{:08X}".format(flash_base),
         "checked_slots": checked_slots,
