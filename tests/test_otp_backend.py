@@ -59,6 +59,19 @@ class OTPFaultTypeRegistrationTest(unittest.TestCase):
         self.assertEqual(OTP_FAULT_TYPE_CODES["otp_read_disturb"], 2)
         self.assertEqual(OTP_FAULT_TYPE_CODES["otp_overblow"], 3)
 
+    def test_runtime_restores_otp_between_fault_points(self) -> None:
+        runtime_source = (SCRIPTS / "run_runtime_fault_sweep.py").read_text(
+            encoding="utf-8"
+        )
+        peripheral_source = (ROOT / "peripherals" / "OTPMemory.cs").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("restore_initial_otp_cache()", runtime_source)
+        self.assertIn("cache_initial_otp()", runtime_source)
+        self.assertIn("public byte[] TestSnapshot()", peripheral_source)
+        self.assertIn("public void TestRestore(byte[] snapshot)", peripheral_source)
+
 
 class OTPFaultTypeLabelTest(unittest.TestCase):
     """Verify round-trip from wire code to human label."""

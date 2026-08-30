@@ -1,0 +1,52 @@
+# Vendor-neutral authorization-review fixture.
+# It uses the same synthetic declaration as the vulnerable fixture.
+schema_version: 1
+name: authorization_review_fixed
+description: Synthetic reviewed token is the token covered by authorization.
+platform: platforms/cortex_m0_nvm.repl
+flash_backend: nvm_ctrl
+bootloader:
+  elf: examples/vulnerable_ota/firmware.elf
+  entry: 0x10000000
+memory:
+  sram: {start: 0x20000000, end: 0x20020000}
+  write_granularity: 8
+  slots:
+    exec: {base: 0x10000000, size: 0x38000}
+    staging: {base: 0x10038000, size: 0x38000}
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+success_criteria:
+  vtor_in_slot: exec
+  image_hash: true
+  expected_image: staging
+fault_sweep:
+  mode: runtime
+  max_writes: 1
+  max_writes_cap: 1
+  run_duration: "0.01"
+expect:
+  should_find_issues: false
+skip_self_test: true
+
+authorization_review:
+  scalars:
+    request_token:
+      path: synthetic_request.token
+      type: bytes
+      max_bytes: 32
+      review: required
+      authorization: required
+  digests:
+    auth:
+      algorithm: sha256
+      covers: [request_token]
+  events:
+    parse: {kind: parse, produces: [request_token]}
+    review: {kind: user_review, reviews: [request_token]}
+    digest: {kind: digest, digest: auth}
+    signature: {kind: signature, digest: auth}
+    authorize: {kind: authorization, requires: [request_token]}
+  sequences:
+    - name: normal
+      events: [parse, review, digest, signature, authorize]

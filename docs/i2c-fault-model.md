@@ -96,8 +96,8 @@ Each I2C fault type has a two-character wire code for batch dispatch:
 | `i2c_nack`          | `in`      |
 | `i2c_timeout`       | `it`      |
 | `i2c_bit_flip`      | `ib`      |
-| `i2c_truncated`     | `ir`      |
-| `i2c_wrong_address` | `ia`      |
+| `i2c_truncated`     | `ic`      |
+| `i2c_wrong_address` | `iw`      |
 
 ## Platform Setup Example
 

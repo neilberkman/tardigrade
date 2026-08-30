@@ -28,6 +28,26 @@ def _fmt_u32(value: int) -> str:
     return "0x{0:08X}".format(int(value) & 0xFFFFFFFF)
 
 
+def _trace_absolute_address(
+    flash_offset: int,
+    flash_base: int,
+    trace_address_map: Optional[List[Dict[str, int]]] = None,
+) -> int:
+    """Map a backend trace offset to a CPU-visible address.
+
+    Most backends expose offsets relative to their declared flash base.  An
+    aliased backend may expose one shared backing offset for multiple CPU
+    ranges; an explicit map (offset range plus ``address_addend``) lets the
+    profile select the canonical alias for classification without changing
+    the trace file format.
+    """
+    offset = int(flash_offset)
+    for mapping in trace_address_map or []:
+        if int(mapping["offset_start"]) <= offset < int(mapping["offset_end"]):
+            return int(mapping["address_addend"]) + offset
+    return int(flash_base) + offset
+
+
 def _classify_slot_region(
     address: int,
     slots: Dict[str, Any],
@@ -144,6 +164,7 @@ def summarize_calibration_coverage(
     slots: Dict[str, Any],
     page_size: int = 4096,
     metadata_regions: Optional[List[MetadataFaultRegion]] = None,
+    trace_address_map: Optional[List[Dict[str, int]]] = None,
 ) -> Dict[str, Any]:
     """Summarize whether calibration exercised slot data movement."""
     has_write_trace = bool(trace_file and os.path.exists(trace_file))
@@ -174,7 +195,9 @@ def summarize_calibration_coverage(
     named_region_ops: Dict[str, int] = {}
 
     for entry in write_entries:
-        address = int(flash_base) + int(entry["flash_offset"])
+        address = _trace_absolute_address(
+            entry["flash_offset"], flash_base, trace_address_map
+        )
         region = _classify_slot_region(address, slots, page_size)
         if region.endswith("_data"):
             counts["slot_data_writes"] += 1
@@ -191,7 +214,9 @@ def summarize_calibration_coverage(
             counts["outside_slot_writes"] += 1
 
     for entry in erase_entries:
-        address = int(flash_base) + int(entry["flash_offset"])
+        address = _trace_absolute_address(
+            entry["flash_offset"], flash_base, trace_address_map
+        )
         region = _classify_slot_region(address, slots, page_size)
         if region.endswith("_data"):
             counts["slot_data_erases"] += 1
@@ -260,6 +285,7 @@ def build_clean_operation_trace(
     write_entries: List[Dict[str, int]],
     erase_entries: List[Dict[str, Any]],
     flash_base: int,
+    trace_address_map: Optional[List[Dict[str, int]]] = None,
 ) -> List[Dict[str, Any]]:
     """Interleave clean-run write+erase operations into a single timeline."""
     ops: List[Dict[str, Any]] = []
@@ -276,7 +302,9 @@ def build_clean_operation_trace(
                 "kind": "write",
                 "write_index": idx,
                 "flash_offset": off,
-                "address": _fmt_u32(flash_base + off),
+                "address": _fmt_u32(
+                    _trace_absolute_address(off, flash_base, trace_address_map)
+                ),
                 "value": _fmt_u32(val),
             }
         )
@@ -302,7 +330,9 @@ def build_clean_operation_trace(
                 "writes_at_this_point": writes_at_raw,
                 "writes_at_known": writes_at_known,
                 "flash_offset": off,
-                "address": _fmt_u32(flash_base + off),
+                "address": _fmt_u32(
+                    _trace_absolute_address(off, flash_base, trace_address_map)
+                ),
             }
         )
     ops.sort(key=lambda o: o["_sort_key"])
@@ -393,6 +423,7 @@ def annotate_clean_trace(
     trace_file: Optional[str],
     erase_trace_file: Optional[str],
     flash_base: int,
+    trace_address_map: Optional[List[Dict[str, int]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Load clean traces, annotate sweep results with fault windows, return metadata.
 
@@ -409,6 +440,7 @@ def annotate_clean_trace(
         write_entries=clean_write_trace,
         erase_entries=clean_erase_trace,
         flash_base=flash_base,
+        trace_address_map=trace_address_map,
     )
     erase_missing_writes_at = sum(
         1 for e in clean_erase_trace if e.get("writes_at_this_point") is None

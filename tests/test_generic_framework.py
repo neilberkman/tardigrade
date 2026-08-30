@@ -289,6 +289,82 @@ class GenericFrameworkTest(unittest.TestCase):
             annotate_result_checks(results, profile)
             self.assertEqual(results[0].get("invariant_violations", []), [])
 
+    def test_invariant_semantic_stage_selects_fault_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            provider = tempdir / "provider.py"
+            provider.write_text(
+                textwrap.dedent(
+                    """
+                    from invariants import InvariantViolation
+
+                    def check_stage(result, result_signals=None, **_):
+                        if (result.nvm_state or {}).get("stage") != "fault":
+                            raise InvariantViolation(
+                                invariant_name="wrong_stage",
+                                description="invariant did not receive fault state",
+                                result=result,
+                            )
+                        if (result_signals or {}).get("semantic_state", {}).get("stage") != "fault":
+                            raise InvariantViolation(
+                                invariant_name="wrong_signal_stage",
+                                description="signals did not receive fault state",
+                                result=result,
+                            )
+
+                    INVARIANTS = {"check_stage": check_stage}
+                    """
+                ),
+                encoding="utf-8",
+            )
+            profile_path = self._write_profile(
+                tempdir,
+                f"""
+                schema_version: 1
+                name: staged_profile
+                description: generic
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: {{ start: 0x20000000, end: 0x20020000 }}
+                  slots:
+                    exec: {{ base: 0x10000000, size: 0x1000 }}
+                    staging: {{ base: 0x10001000, size: 0x1000 }}
+                invariant_providers:
+                  - {provider.as_posix()}
+                invariants:
+                  - check_stage
+                invariant_config:
+                  semantic_state_stage: fault_snapshot
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            results = [{
+                "fault_at": 1,
+                "fault_injected": True,
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "semantic_state": {"stage": "recovery"},
+                "fault_semantic_state": {"stage": "fault"},
+                "signals": {"semantic_state": {"stage": "recovery"}},
+                "is_control": False,
+            }]
+            annotate_result_checks(results, profile)
+            self.assertEqual(results[0].get("invariant_violations", []), [])
+
+            missing = dict(results[0])
+            missing.pop("fault_semantic_state", None)
+            missing.pop("semantic_observation_failures", None)
+            annotate_result_checks([missing], profile)
+            self.assertEqual(
+                missing["semantic_observation_failures"][0]["path"],
+                "fault_semantic_state",
+            )
+
     def test_invariant_provider_sees_elapsed_virtual_time(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)

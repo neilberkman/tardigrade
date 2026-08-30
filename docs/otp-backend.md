@@ -48,7 +48,7 @@ Set `BlowFaultMode` to select the fault model when `FaultAtBlow` triggers:
 | `TotalBlows`         | ulong  | Total blow operations performed                |
 | `FaultAtBlow`        | ulong  | Inject fault at Nth blow (MaxValue = disabled) |
 | `BlowFaultFired`     | bool   | Sticky: set when fault fires, survives blows   |
-| `BlowFaultMode`      | int    | Fault mode (0-3, see table above)              |
+| `BlowFaultMode`      | int    | Fault mode (0-4, see table above)              |
 | `FaultSeed`          | uint   | PRNG seed for deterministic fault patterns     |
 | `BlownBitCount`      | int    | Count of 1-bits in the entire OTP region       |
 | `RemainingLife`      | long   | Total bits minus blown bits                    |

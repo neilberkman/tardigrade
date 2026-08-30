@@ -139,7 +139,7 @@ rustBoot on nRF52840 maps directly to tardigrade's existing infrastructure:
 - **Platform file**: Existing `cortex_m4_flash_fast.repl` or nRF52840 repl
 - **Flash size**: 1MB (0x00000000 - 0x000FFFFF)
 
-Reference partition mapping used while developing the clean-room adapter:
+Reference partition mapping used while developing the independent adapter:
 
 ```
 0x00000000 - 0x0002EFFF  Bootloader / immutable region

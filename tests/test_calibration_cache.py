@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import hashlib
+import struct
 import sys
 import tempfile
 import unittest
@@ -238,7 +241,7 @@ class TestSaveLoadCalibration(unittest.TestCase):
         import shutil
         shutil.rmtree(self.td)
 
-    def _make_cal(self, total_writes=100, trace_data=None):
+    def _make_cal(self, total_writes=100, trace_data=None, trace_bin_data=None):
         trace_file = None
         trace_file_bin = None
         if trace_data is not None:
@@ -247,7 +250,7 @@ class TestSaveLoadCalibration(unittest.TestCase):
                 f.write(trace_data)
             trace_file_bin = os.path.join(self.td, "trace.bin")
             with open(trace_file_bin, "wb") as f:
-                f.write(trace_data[::-1])
+                f.write(trace_bin_data if trace_bin_data is not None else b"")
         return CalibrationResult(
             total_writes=total_writes,
             total_erases=5,
@@ -255,7 +258,7 @@ class TestSaveLoadCalibration(unittest.TestCase):
             erase_trace_file=None,
             trace_file_bin=trace_file_bin,
             erase_trace_file_bin=None,
-            calibration_exec_hash="abc123",
+            calibration_exec_hash="ab" * 32,
             stop_reason="done",
             emulated_s=1.5,
             elapsed_s=55.0,
@@ -272,11 +275,13 @@ class TestSaveLoadCalibration(unittest.TestCase):
         save_calibration(self.cache_path, cal, cache_key)
         self.assertTrue(os.path.exists(self.cache_path))
 
-        loaded = load_calibration(self.cache_path, cache_key, self.work_dir)
+        loaded = load_calibration(
+            self.cache_path, cache_key, self.work_dir, allow_unsigned=True
+        )
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.total_writes, 42)
         self.assertEqual(loaded.total_erases, 5)
-        self.assertEqual(loaded.calibration_exec_hash, "abc123")
+        self.assertEqual(loaded.calibration_exec_hash, "ab" * 32)
         self.assertEqual(loaded.stop_reason, "done")
         self.assertEqual(loaded.setup_writes, 10)
         self.assertEqual(loaded.total_i2c_transactions, 2)
@@ -286,7 +291,9 @@ class TestSaveLoadCalibration(unittest.TestCase):
         cal = self._make_cal()
         save_calibration(self.cache_path, cal, "key_a")
 
-        loaded = load_calibration(self.cache_path, "key_b", self.work_dir)
+        loaded = load_calibration(
+            self.cache_path, "key_b", self.work_dir, allow_unsigned=True
+        )
         self.assertIsNone(loaded)
 
     def test_cache_miss_no_file(self):
@@ -294,12 +301,31 @@ class TestSaveLoadCalibration(unittest.TestCase):
         self.assertIsNone(loaded)
 
     def test_trace_files_round_trip(self):
-        trace_data = b"1,0x1000,0xDEADBEEF\n2,0x1004,0xCAFEBABE\n"
-        cal = self._make_cal(trace_data=trace_data)
+        trace_data = (
+            b"write_index,flash_offset,value\n"
+            b"1,0x1000,0xDEADBEEF\n"
+            b"2,0x1004,0xCAFEBABE\n"
+        )
+        trace_bin_data = struct.pack(
+            "<IIIIII",
+            1,
+            0x1000,
+            0xDEADBEEF,
+            2,
+            0x1004,
+            0xCAFEBABE,
+        )
+        cal = self._make_cal(
+            total_writes=2,
+            trace_data=trace_data,
+            trace_bin_data=trace_bin_data,
+        )
         cache_key = "trace_key"
 
         save_calibration(self.cache_path, cal, cache_key)
-        loaded = load_calibration(self.cache_path, cache_key, self.work_dir)
+        loaded = load_calibration(
+            self.cache_path, cache_key, self.work_dir, allow_unsigned=True
+        )
 
         self.assertIsNotNone(loaded)
         self.assertIsNotNone(loaded.trace_file)
@@ -310,14 +336,48 @@ class TestSaveLoadCalibration(unittest.TestCase):
         self.assertIsNotNone(loaded.trace_file_bin)
         self.assertTrue(os.path.exists(loaded.trace_file_bin))
         with open(loaded.trace_file_bin, "rb") as f:
-            self.assertEqual(f.read(), trace_data[::-1])
+            self.assertEqual(f.read(), trace_bin_data)
+
+    def test_write_trace_may_be_a_subset_of_total_write_counter(self):
+        trace_data = (
+            b"write_index,flash_offset,value\n"
+            b"1,0x1000,0xDEADBEEF\n"
+            b"2,0x1004,0xCAFEBABE\n"
+        )
+        trace_bin_data = struct.pack(
+            "<IIIIII",
+            1,
+            0x1000,
+            0xDEADBEEF,
+            2,
+            0x1004,
+            0xCAFEBABE,
+        )
+        cal = self._make_cal(
+            total_writes=3,
+            trace_data=trace_data,
+            trace_bin_data=trace_bin_data,
+        )
+
+        save_calibration(self.cache_path, cal, "subset_key")
+        loaded = load_calibration(
+            self.cache_path,
+            "subset_key",
+            self.work_dir,
+            allow_unsigned=True,
+        )
+
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.total_writes, 3)
 
     def test_no_trace_files_round_trip(self):
         cal = self._make_cal(trace_data=None)
         cache_key = "no_trace_key"
 
         save_calibration(self.cache_path, cal, cache_key)
-        loaded = load_calibration(self.cache_path, cache_key, self.work_dir)
+        loaded = load_calibration(
+            self.cache_path, cache_key, self.work_dir, allow_unsigned=True
+        )
 
         self.assertIsNotNone(loaded)
         self.assertIsNone(loaded.trace_file)
@@ -331,8 +391,90 @@ class TestSaveLoadCalibration(unittest.TestCase):
             payload = json.load(f)
 
         self.assertEqual(payload["cache_key"], "k")
-        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["version"], 2)
         self.assertEqual(payload["total_writes"], 100)
+
+    def test_rejects_tampered_counter_and_trace(self):
+        trace_data = (
+            b"write_index,flash_offset,value\n"
+            b"1,4096,3735928559\n"
+        )
+        trace_bin_data = struct.pack("<III", 1, 4096, 3735928559)
+        cal = self._make_cal(
+            total_writes=1,
+            trace_data=trace_data,
+            trace_bin_data=trace_bin_data,
+        )
+        save_calibration(self.cache_path, cal, "key")
+        payload = json.loads(Path(self.cache_path).read_text(encoding="utf-8"))
+
+        payload["total_writes"] = -1
+        Path(self.cache_path).write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "total_writes"):
+            load_calibration(
+                self.cache_path, "key", self.work_dir, allow_unsigned=True
+            )
+
+        payload["total_writes"] = 0
+        Path(self.cache_path).write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "inconsistent with total_writes"):
+            load_calibration(
+                self.cache_path, "key", self.work_dir, allow_unsigned=True
+            )
+
+        save_calibration(self.cache_path, cal, "key")
+        payload = json.loads(Path(self.cache_path).read_text(encoding="utf-8"))
+        payload["trace_file_bin_b64"] = payload["trace_file_bin_b64"][:-1] + "A"
+        Path(self.cache_path).write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "trace_file_bin_b64"):
+            load_calibration(
+                self.cache_path, "key", self.work_dir, allow_unsigned=True
+            )
+
+        save_calibration(self.cache_path, cal, "key")
+        payload = json.loads(Path(self.cache_path).read_text(encoding="utf-8"))
+        changed_binary = struct.pack("<III", 1, 8192, 3735928559)
+        payload["trace_file_bin_b64"] = base64.b64encode(changed_binary).decode("ascii")
+        payload["trace_file_bin_sha256"] = hashlib.sha256(changed_binary).hexdigest()
+        Path(self.cache_path).write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "binary records do not match CSV"):
+            load_calibration(
+                self.cache_path, "key", self.work_dir, allow_unsigned=True
+            )
+
+    def test_optional_cache_digest_pins_provenance(self):
+        cal = self._make_cal()
+        save_calibration(self.cache_path, cal, "key")
+        digest = hashlib.sha256(Path(self.cache_path).read_bytes()).hexdigest()
+        self.assertIsNotNone(load_calibration(
+            self.cache_path,
+            "key",
+            self.work_dir,
+            expected_sha256=digest,
+        ))
+        with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+            load_calibration(
+                self.cache_path,
+                "key",
+                self.work_dir,
+                expected_sha256="0" * 64,
+            )
+
+    def test_rejects_legacy_cache_version(self):
+        cal = self._make_cal()
+        save_calibration(self.cache_path, cal, "key")
+        payload = json.loads(Path(self.cache_path).read_text(encoding="utf-8"))
+        payload["version"] = 1
+        Path(self.cache_path).write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "unsupported calibration cache version"):
+            load_calibration(
+                self.cache_path, "key", self.work_dir, allow_unsigned=True
+            )
+
+    def test_rejects_unsigned_existing_cache_by_default(self):
+        save_calibration(self.cache_path, self._make_cal(), "key")
+        with self.assertRaisesRegex(ValueError, "refusing unsigned"):
+            load_calibration(self.cache_path, "key", self.work_dir)
 
     def test_save_creates_parent_dirs(self):
         nested_path = os.path.join(self.td, "a", "b", "c", "cache.json")

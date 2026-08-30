@@ -47,3 +47,6 @@ results/oss_validation/worktrees/
 third_party/
 .worktrees/
 .claude/
+
+# Local investigation scratch and retained research evidence
+/tmp/

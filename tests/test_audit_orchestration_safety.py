@@ -88,6 +88,46 @@ def test_multi_component_all_failed_is_not_ignored() -> None:
     assert _multi_component_verdict(result, _profile()).startswith("FAIL")
 
 
+def test_multi_component_verdict_uses_exact_union_count() -> None:
+    result = {
+        "per_component": {
+            "app": _component_data(issue_points=1),
+            "radio": _component_data(),
+        },
+        "combined_summary": {
+            "security_issue_points": 1,
+            "control_security_issue_points": 0,
+            "split_brain": 1,
+            "all_failed": 0,
+            "degraded": 0,
+            "state_relation_violations": 1,
+        },
+    }
+    assert _multi_component_verdict(result, _profile()) == (
+        "FAIL -- found 1 component issues"
+    )
+
+
+def test_multi_component_verdict_keeps_control_relation_finding() -> None:
+    result = {
+        "per_component": {
+            "app": _component_data(),
+            "radio": _component_data(),
+        },
+        "combined_summary": {
+            "security_issue_points": 0,
+            "control_security_issue_points": 1,
+        },
+        "control_invariant_violations": [
+            {"name": "state_relations"},
+            {"name": "state_relations"},
+        ],
+    }
+    assert _multi_component_verdict(result, _profile()) == (
+        "FAIL -- component control state relation checks failed"
+    )
+
+
 def test_multi_component_timeout_is_inconclusive() -> None:
     result = {
         "per_component": {

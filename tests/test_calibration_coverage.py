@@ -17,7 +17,10 @@ if str(SCRIPTS) not in sys.path:
 
 from audit_report import compute_verdict  # noqa: E402
 from self_test import check_verdict  # noqa: E402
-from trace_utils import summarize_calibration_coverage  # noqa: E402
+from trace_utils import (  # noqa: E402
+    build_clean_operation_trace,
+    summarize_calibration_coverage,
+)
 from fault_inject import MetadataFaultRegion  # noqa: E402
 
 
@@ -114,6 +117,52 @@ def test_summarize_calibration_coverage_detects_named_metadata_activity() -> Non
     assert coverage["metadata_region_writes"] == 1
     assert coverage["outside_slot_writes"] == 0
     assert coverage["metadata_region_breakdown"] == {"otadata0": 1}
+
+
+def test_aliased_trace_offsets_are_classified_by_canonical_address() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        trace_file = Path(td) / "trace.csv"
+        _write_trace(
+            trace_file,
+            [
+                "1,1048552,4294967041",
+                "2,1572840,4294967041",
+            ],
+        )
+        slots = {
+            "secure": _slot(0x10080000, 0x80000),
+            "nonsecure": _slot(0x00100000, 0x80000),
+        }
+        coverage = summarize_calibration_coverage(
+            trace_file=str(trace_file),
+            erase_trace_file=None,
+            flash_base=0x10080000,
+            slots=slots,
+            page_size=0x100,
+            trace_address_map=[
+                {"offset_start": 0x80000, "offset_end": 0x100000, "address_addend": 0x10000000},
+                {"offset_start": 0x100000, "offset_end": 0x180000, "address_addend": 0},
+            ],
+        )
+    assert coverage["status"] == "metadata_only"
+    assert coverage["slot_trailer_writes"] == 2
+    assert coverage["outside_slot_writes"] == 0
+
+
+def test_aliased_trace_operation_addresses_use_canonical_aliases() -> None:
+    ops = build_clean_operation_trace(
+        [
+            {"write_index": 1, "flash_offset": 0x0FFFE8, "value": 1},
+            {"write_index": 2, "flash_offset": 0x17FFE8, "value": 1},
+        ],
+        [],
+        0x10080000,
+        trace_address_map=[
+            {"offset_start": 0x80000, "offset_end": 0x100000, "address_addend": 0x10000000},
+            {"offset_start": 0x100000, "offset_end": 0x180000, "address_addend": 0},
+        ],
+    )
+    assert [item["address"] for item in ops] == ["0x100FFFE8", "0x0017FFE8"]
 
 
 def test_compute_verdict_fails_clean_profile_when_calibration_only_touches_metadata() -> None:

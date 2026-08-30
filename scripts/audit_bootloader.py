@@ -75,7 +75,9 @@ from renode_runner import (
 from calibration_cache import compute_cache_key, load_calibration, save_calibration
 from fault_plan import CalibrationInputs, FaultPlan, build_fault_plan
 from fault_types import EXECUTE_ONLY_FAULT_TYPES, TRACE_REPLAY_FAULT_TYPES
+from security_state_layout import analyze_persistent_state_layout
 from finding_validator import validate_runtime_findings
+from authorization_review_analyzer import analyze_authorization_review, load_trace
 from sweep import (
     MultiFaultPhaseResult,
     evaluate_config_checks,
@@ -86,6 +88,12 @@ from sweep import (
     validate_runtime_fault_mode_compat,
 )
 from profile_loader import HeuristicConfig, PreBootWrite, ProfileConfig, load_profile, load_profile_raw
+from terminal_error_escape import (
+    discover_terminal_error_paths,
+    evaluate_terminal_error_differential,
+)
+from boundary_campaigns import aggregate_boundary_results, boundary_campaign_dict
+from report_security_status import attach_security_aggregate
 from verdicts import is_pass_verdict
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -159,6 +167,7 @@ def _can_skip_auto_calibration(profile: ProfileConfig, eval_mode: str) -> bool:
     calibration_dependent_faults = {
         "power_loss",
         "swap_progress",
+        "security_state_erase",
         "bit_corruption",
         "interrupted_erase",
         "multi_sector_atomicity",
@@ -284,15 +293,36 @@ def _multi_component_verdict(
                 "{} expected {} but observed {}".format(name, expected, actual or "missing")
             )
 
-    adverse_combined = sum(
-        int(combined.get(key, 0) or 0)
-        for key in ("split_brain", "all_failed", "degraded")
+    canonical_issue_points = combined.get("security_issue_points")
+    if canonical_issue_points is None:
+        # Legacy reports did not preserve point-level union accounting.  Keep
+        # the security gate fail-closed without double-counting overlapping
+        # component, combined-outcome, and relation observations.
+        adverse_combined = sum(
+            int(combined.get(key, 0) or 0)
+            for key in ("split_brain", "all_failed", "degraded")
+        )
+        relation_findings = int(
+            combined.get("state_relation_violations", 0) or 0
+        )
+        canonical_issue_points = max(
+            issue_points, adverse_combined, relation_findings
+        )
+    else:
+        canonical_issue_points = int(canonical_issue_points or 0)
+    control_security_issue_points = int(
+        combined.get("control_security_issue_points", 0) or 0
     )
-    found_issues = issue_points + adverse_combined > 0
+    if result.get("control_invariant_violations") and not control_security_issue_points:
+        # Backward-compatible fallback for an older in-memory producer.
+        control_security_issue_points = 1
+    found_issues = canonical_issue_points > 0
     if control_failures:
         return "FAIL -- component control checks failed: {}".format(
             "; ".join(control_failures)
         )
+    if control_security_issue_points:
+        return "FAIL -- component control state relation checks failed"
     if total_planned <= 0:
         return "INCONCLUSIVE -- multi-component campaign planned no fault points"
     if unreliable_points:
@@ -303,7 +333,7 @@ def _multi_component_verdict(
         return "FAIL -- expected to find multi-component issues but found none"
     if not profile.expect.should_find_issues and found_issues:
         return "FAIL -- found {} component issues".format(
-            issue_points + adverse_combined
+            canonical_issue_points
         )
     return "PASS"
 
@@ -584,6 +614,7 @@ def _write_trigger_discovery_failure(
         },
         "git": git_metadata(repo_root),
     }
+    attach_security_aggregate(payload)
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -626,6 +657,7 @@ def _write_geometry_preflight_failure(
         },
         "git": git_metadata(repo_root),
     }
+    attach_security_aggregate(payload)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -760,6 +792,12 @@ def parse_args() -> argparse.Namespace:
         help="Reject unknown profile fields and missing observable success criteria.",
     )
     parser.add_argument(
+        "--authorization-review-trace", "--trace",
+        dest="authorization_review_traces", action="append", default=[],
+        metavar="PATH",
+        help="Authorization-review trace JSON (repeatable; requires authorization_review).",
+    )
+    parser.add_argument(
         "--reuse-calibration",
         default="",
         metavar="PATH",
@@ -768,6 +806,23 @@ def parse_args() -> argparse.Namespace:
             "the cache key matches, calibration is loaded from it instead of "
             "running Renode. After a fresh calibration the result is saved "
             "to this path for future reuse."
+        ),
+    )
+    parser.add_argument(
+        "--reuse-calibration-sha256",
+        default="",
+        metavar="SHA256",
+        help=(
+            "Require --reuse-calibration to match this exact SHA-256 before "
+            "loading it. Use this when the cache crosses a trust boundary."
+        ),
+    )
+    parser.add_argument(
+        "--trust-unsigned-calibration-cache",
+        action="store_true",
+        help=(
+            "Load an existing cache without a trusted digest. Only use for a "
+            "local cache that untrusted writers cannot modify."
         ),
     )
     parser.add_argument(
@@ -786,6 +841,17 @@ def parse_args() -> argparse.Namespace:
         parser.error("--fault-start must be non-negative")
     if args.fault_end is not None and args.fault_end < 0:
         parser.error("--fault-end must be non-negative")
+    if args.reuse_calibration_sha256:
+        digest = args.reuse_calibration_sha256.strip().lower()
+        if not args.reuse_calibration:
+            parser.error("--reuse-calibration-sha256 requires --reuse-calibration")
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            parser.error("--reuse-calibration-sha256 must be 64 hexadecimal characters")
+        args.reuse_calibration_sha256 = digest
+    if args.trust_unsigned_calibration_cache and not args.reuse_calibration:
+        parser.error(
+            "--trust-unsigned-calibration-cache requires --reuse-calibration"
+        )
     return args
 
 
@@ -903,6 +969,9 @@ def _compute_calibration_cache_key(
         runtime_config={
             "robot_suite": robot_suite,
             "fault_sweep": profile.fault_sweep,
+            # Keep the activation boundary explicit in the cache material even
+            # when callers omit the generated Robot variable list.
+            "tracking_start_address": profile.fault_sweep.tracking_start_address,
             "memory": profile.memory,
             "success_criteria": profile.success_criteria,
             "success_criteria_overrides": profile.success_criteria_overrides,
@@ -920,7 +989,25 @@ def _compute_calibration_cache_key(
             "otp_peripheral": profile.otp_peripheral,
             "boot_register_pre_writes": profile.boot_register_pre_writes,
             "residual_image": profile.residual_image,
+            "terminal_error_paths": [
+                item.to_dict() for item in getattr(profile, "terminal_error_paths", [])
+            ],
             "nvs_region": profile.nvs_region,
+            "boundary_campaign": (
+                {
+                    "name": profile.boundary_campaign.name,
+                    "parameter": profile.boundary_campaign.parameter,
+                    "setup_environment": profile.boundary_campaign.setup_environment,
+                    "value": profile.boundary_value,
+                    "previous_value": profile.boundary_previous_value,
+                }
+                if getattr(profile, "boundary_campaign", None) is not None
+                else None
+            ),
+            "boundary_campaigns": [
+                boundary_campaign_dict(item)
+                for item in getattr(profile, "boundary_campaigns", [])
+            ],
             "effective_calibration_robot_vars": _cache_robot_var_material(
                 robot_vars or []
             ),
@@ -1076,7 +1163,10 @@ def _common_robot_vars(
     stall_timeout: float,
     extra_robot_vars: List[str],
 ) -> List[str]:
-    robot_vars = profile.robot_vars(repo_root) + list(extra_robot_vars)
+    # Overlay child-run variables by key so a follow-up's N-1 transport value
+    # replaces the resolved candidate default rather than relying on Robot's
+    # duplicate-variable precedence.
+    robot_vars = merge_robot_vars(profile.robot_vars(repo_root), list(extra_robot_vars))
     robot_vars.append("EVALUATION_MODE:{}".format(evaluation_mode))
     robot_vars.append("PROGRESS_STALL_TIMEOUT_S:{:.6f}".format(stall_timeout))
     robot_vars.append(
@@ -1329,6 +1419,14 @@ def _main_single() -> int:
             profile = profile.resolve_initial_state(matches[0])
         if args.strict_profile:
             _validate_profile_asset_containment(profile, repo_root)
+        authorization_review_analysis = None
+        if getattr(profile, "authorization_review", None) is not None:
+            authorization_traces = [load_trace(path) for path in args.authorization_review_traces]
+            authorization_review_analysis = analyze_authorization_review(
+                profile.authorization_review, authorization_traces
+            )
+        elif args.authorization_review_traces:
+            raise RuntimeError("authorization-review traces were provided but profile has no authorization_review block")
         robot_suite = args.robot_suite
 
         if profile.success_criteria.image_hash:
@@ -1367,6 +1465,19 @@ def _main_single() -> int:
             stall_timeout=stall_timeout,
             extra_robot_vars=extra_robot_vars,
         )
+        # Follow-up children intentionally reuse the candidate initial-state
+        # profile while overriding only the fixed transport value.  Echo the
+        # effective value in the report, rather than the profile's original N,
+        # so the host can prove that the child actually ran N-1.
+        boundary_report_value = getattr(profile, "boundary_value", None)
+        for robot_var in robot_vars:
+            key, separator, raw_value = str(robot_var).partition(":")
+            if key == "BOUNDARY_VALUE" and separator:
+                try:
+                    boundary_report_value = int(raw_value, 10)
+                except (TypeError, ValueError):
+                    boundary_report_value = None
+                break
 
         # Write success_criteria_overrides to a temp file so the .resc can
         # read it directly, bypassing Robot→Renode variable escaping issues.
@@ -1447,6 +1558,11 @@ def _main_single() -> int:
             # results, and combined outcomes.
             combined_summary = mc_result["combined_summary"]
             mc_verdict = _multi_component_verdict(mc_result, profile)
+            if authorization_review_analysis is not None:
+                if authorization_review_analysis["verdict"] == "FAIL":
+                    mc_verdict = "FAIL -- authorization review analysis found a mismatch"
+                elif authorization_review_analysis["verdict"] != "PASS":
+                    mc_verdict = "INCONCLUSIVE -- authorization review evidence incomplete"
 
             payload: Dict[str, Any] = {
                 "engine": "renode-test",
@@ -1463,6 +1579,14 @@ def _main_single() -> int:
                     },
                 },
                 "combined_results": mc_result["combined_results"],
+                "control_combined_result": mc_result.get(
+                    "control_combined_result"
+                ),
+                "control_state": mc_result.get("control_state"),
+                "control_invariant_violations": mc_result.get(
+                    "control_invariant_violations", []
+                ),
+                "authorization_review_analysis": authorization_review_analysis,
                 "expect": {
                     "should_find_issues": profile.expect.should_find_issues,
                 },
@@ -1475,6 +1599,7 @@ def _main_single() -> int:
                 "git": git_metadata(repo_root),
             }
 
+            attach_security_aggregate(payload)
             out_path = Path(args.output)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(
@@ -1591,6 +1716,7 @@ def _main_single() -> int:
             or "multi_sector_atomicity" in fault_types
         )
         include_erase_trace = include_erases or "swap_progress" in fault_types
+        include_erase_trace = include_erase_trace or "security_state_erase" in fault_types
 
         # Pass fault_types to calibration so erase trace is captured.
         if include_erase_trace:
@@ -1674,7 +1800,13 @@ def _main_single() -> int:
                         robot_vars=_without_hash_bypass(robot_vars),
                         renode_remote_server_dir=args.renode_remote_server_dir,
                     )
-                    cal = load_calibration(_cal_cache_path, _cal_cache_key, work_dir)
+                    cal = load_calibration(
+                        _cal_cache_path,
+                        _cal_cache_key,
+                        work_dir,
+                        expected_sha256=args.reuse_calibration_sha256 or None,
+                        allow_unsigned=args.trust_unsigned_calibration_cache,
+                    )
                     if cal is not None:
                         print(
                             "Loaded calibration from cache: {}".format(_cal_cache_path),
@@ -1780,7 +1912,13 @@ def _main_single() -> int:
                         robot_vars=_without_hash_bypass(robot_vars),
                         renode_remote_server_dir=args.renode_remote_server_dir,
                     )
-                    cal = load_calibration(_cal_cache_path, _cal_cache_key, work_dir)
+                    cal = load_calibration(
+                        _cal_cache_path,
+                        _cal_cache_key,
+                        work_dir,
+                        expected_sha256=args.reuse_calibration_sha256 or None,
+                        allow_unsigned=args.trust_unsigned_calibration_cache,
+                    )
                     if cal is not None:
                         print(
                             "Loaded calibration from cache: {}".format(_cal_cache_path),
@@ -1911,6 +2049,7 @@ def _main_single() -> int:
         fault_types_list = plan.fault_types_list
         heuristic_summary = plan.heuristic_summary
         swap_progress_summary = getattr(plan, "swap_progress_summary", None)
+        security_state_erase_summary = getattr(plan, "security_state_erase_summary", None)
         clustered_bit_count = plan.clustered_bit_count
         multi_fault_plan: Optional[MultiFaultPlan] = None
 
@@ -1959,11 +2098,78 @@ def _main_single() -> int:
             file=sys.stderr,
         )
 
+        # Binary-driven terminal-error escape campaign.  Its control and
+        # instruction-skip runs intentionally use the same profile inputs,
+        # while the skip points come only from the emitted ELF callsites.
+        terminal_error_results = None
+        terminal_error_summary = None
+        if getattr(profile, "terminal_error_paths", None):
+            terminal_discovery = discover_terminal_error_paths(
+                profile.resolve_path(repo_root, profile.bootloader_elf),
+                profile.terminal_error_paths,
+            )
+            terminal_points = [item.callsite_address for item in terminal_discovery.candidates]
+            terminal_types = ["i:0x{:X}".format(item) for item in terminal_points]
+            if terminal_points and not terminal_discovery.infrastructure_errors:
+                terminal_robot_vars = [
+                    item for item in robot_vars
+                    if not item.startswith((
+                        "EVALUATION_MODE:",
+                        "INSTRUCTION_SKIP_COUNT:",
+                    ))
+                ]
+                terminal_robot_vars.append("EVALUATION_MODE:execute")
+                # Terminal candidates are single-instruction experiments even
+                # when the parent profile requests a wider ordinary skip.
+                terminal_robot_vars.append("INSTRUCTION_SKIP_COUNT:1")
+                terminal_error_results = run_runtime_sweep(
+                    repo_root=repo_root,
+                    renode_test=renode_test,
+                    robot_suite=robot_suite,
+                    profile=profile,
+                    fault_points=terminal_points,
+                    robot_vars=terminal_robot_vars,
+                    work_dir=work_dir / "terminal_error_escape",
+                    renode_remote_server_dir=args.renode_remote_server_dir,
+                    include_control=True,
+                    num_workers=args.workers,
+                    evaluation_mode="execute",
+                    max_batch_points=args.max_batch_points,
+                    trace_file=None,
+                    erase_trace_file=None,
+                    trace_file_bin=None,
+                    erase_trace_file_bin=None,
+                    fault_types_list=terminal_types,
+                    keep_run_artifacts=args.keep_run_artifacts,
+                    no_hash_bypass=True,
+                    allow_state_evaluator=False,
+                    profile_initial_state_name=args.initial_state or None,
+                )
+                terminal_control = next(
+                    (item for item in terminal_error_results if item.get("is_control")),
+                    {},
+                )
+                terminal_faults = [
+                    item for item in terminal_error_results if not item.get("is_control")
+                ]
+                terminal_error_summary = evaluate_terminal_error_differential(
+                    terminal_discovery, terminal_control, terminal_faults
+                )
+            else:
+                terminal_error_summary = {
+                    "candidates": len(terminal_discovery.candidates),
+                    "unresolved_candidates": terminal_discovery.unresolved_candidates,
+                    "infrastructure_errors": terminal_discovery.infrastructure_errors,
+                    "results": [],
+                    "findings": [],
+                }
+
         flash_base = 0
         if profile.memory.slots:
             flash_base = min(slot.base for slot in profile.memory.slots.values())
         clean_trace_meta = annotate_clean_trace(
             sweep_results, trace_file, erase_trace_file, flash_base,
+            trace_address_map=getattr(profile.memory, "trace_address_map", None),
         )
         calibration_coverage = summarize_calibration_coverage(
             trace_file=trace_file,
@@ -1972,6 +2178,7 @@ def _main_single() -> int:
             slots=profile.memory.slots,
             page_size=getattr(profile.memory, "page_size", 4096),
             metadata_regions=getattr(profile, "metadata_fault_regions", None),
+            trace_address_map=getattr(profile.memory, "trace_address_map", None),
         )
         if clean_trace_meta is not None:
             clean_trace_meta["coverage"] = calibration_coverage
@@ -2160,6 +2367,16 @@ def _main_single() -> int:
             fuzz_crash_summary=fuzz_crash_summary,
             geometry_preflight=geometry_preflight,
         )
+        if terminal_error_summary is not None:
+            if terminal_error_summary.get("infrastructure_errors") or terminal_error_summary.get("unresolved_candidates"):
+                verdict = "INCONCLUSIVE -- terminal-error campaign infrastructure failure"
+            elif terminal_error_summary.get("findings"):
+                verdict = "FAIL -- terminal-error path escaped"
+        if authorization_review_analysis is not None:
+            if authorization_review_analysis["verdict"] == "FAIL":
+                verdict = "FAIL -- authorization review analysis found a mismatch"
+            elif authorization_review_analysis["verdict"] != "PASS":
+                verdict = "INCONCLUSIVE -- authorization review evidence incomplete"
 
         # -------------------------------------------------------------------
         # Build output
@@ -2174,6 +2391,7 @@ def _main_single() -> int:
             "profile": profile.name,
             "profile_path": str(profile.profile_path) if profile.profile_path else None,
             "schema_version": profile.schema_version,
+            "rc_injection_config": profile.fault_sweep.rc_injection_config.to_dict(),
             "calibrated_writes": max_writes,
             "calibrated_erases": total_erases,
             "setup_writes": setup_writes,
@@ -2193,11 +2411,31 @@ def _main_single() -> int:
             "expect": {
                 "should_find_issues": profile.expect.should_find_issues,
             },
+            "boundary_campaign": (
+                {
+                    "name": profile.boundary_campaign.name,
+                    "parameter": profile.boundary_campaign.parameter,
+                    "setup_environment": profile.boundary_campaign.setup_environment,
+                    "resolved_value": boundary_report_value,
+                    "previous_value": profile.boundary_previous_value,
+                    "follow_up": (
+                        {
+                            "parameter_value": profile.boundary_campaign.follow_up.parameter_value,
+                            "expect": profile.boundary_campaign.follow_up.expect,
+                        }
+                        if profile.boundary_campaign.follow_up is not None
+                        else None
+                    ),
+                }
+                if getattr(profile, "boundary_campaign", None) is not None
+                else None
+            ),
             "security_policy": {
                 "anti_rollback": profile.security_policy.anti_rollback,
                 "minimum_version": profile.security_policy.minimum_version,
                 "toctou_protection": profile.security_policy.toctou_protection,
             },
+            "authorization_review_analysis": authorization_review_analysis,
             "runtime_sweep_results": sweep_results,
             "execution": {
                 "run_utc": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
@@ -2222,6 +2460,12 @@ def _main_single() -> int:
             payload["summary"]["geometry_preflight"] = geometry_preflight
         if swap_progress_summary is not None:
             payload["summary"]["swap_progress_inference"] = swap_progress_summary
+        if profile.persistent_state_layout is not None:
+            payload["summary"]["persistent_state_layout"] = analyze_persistent_state_layout(
+                profile.persistent_state_layout
+            )
+        if security_state_erase_summary is not None:
+            payload["summary"]["security_state_erase"] = security_state_erase_summary
         payload["contracts"] = {
             "state_probe": (
                 {
@@ -2262,6 +2506,24 @@ def _main_single() -> int:
                 "selected_strategy": discovery.selected_strategy,
                 "flash_map_check": discovery.flash_map_check,
             }
+        if getattr(profile, "terminal_error_paths", None):
+            terminal_discovery = discover_terminal_error_paths(
+                profile.resolve_path(repo_root, profile.bootloader_elf),
+                profile.terminal_error_paths,
+            )
+            payload["terminal_error_paths"] = {
+                "declarations": [item.to_dict() for item in profile.terminal_error_paths],
+                "discovery": terminal_discovery.to_dict(),
+            }
+            payload["summary"]["terminal_error_paths"] = {
+                "candidates": len(terminal_discovery.candidates),
+                "unresolved_candidates": len(terminal_discovery.unresolved_candidates),
+                "infrastructure_errors": len(terminal_discovery.infrastructure_errors),
+            }
+            if terminal_error_results is not None:
+                payload["terminal_error_results"] = terminal_error_results
+            if terminal_error_summary is not None:
+                payload["summary"]["terminal_error_campaign"] = terminal_error_summary
 
         if state_fuzz_results is not None:
             payload["state_fuzz_results"] = state_fuzz_results
@@ -2283,6 +2545,7 @@ def _main_single() -> int:
         if fuzz_crash_summary is not None:
             payload["summary"]["fuzz_crash"] = fuzz_crash_summary
 
+        attach_security_aggregate(payload)
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -2352,6 +2615,7 @@ def _main_single() -> int:
 def _initial_state_child_command(
     state_name: str,
     output_path: Path,
+    extra_robot_vars: Optional[List[str]] = None,
 ) -> List[str]:
     """Rebuild the current CLI for one resolved initial-state child run."""
     filtered: List[str] = []
@@ -2368,11 +2632,124 @@ def _initial_state_child_command(
         filtered.append(token)
         index += 1
     filtered.extend(["--output", str(output_path), "--initial-state", state_name])
+    for robot_var in extra_robot_vars or []:
+        filtered.extend(["--robot-var", robot_var])
     if "--no-assert-verdict" not in filtered:
         filtered.append("--no-assert-verdict")
     if "--no-assert-control-boots" not in filtered:
         filtered.append("--no-assert-control-boots")
     return [sys.executable, str(Path(__file__).resolve())] + filtered
+
+
+def _boundary_result_control(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the single clean control observation from a child report."""
+    results = payload.get("runtime_sweep_results")
+    if not isinstance(results, list):
+        return None
+    controls = [item for item in results if isinstance(item, dict) and item.get("is_control")]
+    return controls[0] if len(controls) == 1 else None
+
+
+def _boundary_state_value(result: Dict[str, Any], parameter: str) -> Any:
+    """Resolve a declared parameter from semantic post-state telemetry."""
+    state = result.get("semantic_state")
+    if not isinstance(state, dict):
+        return None
+    current: Any = state
+    for token in str(parameter).split("."):
+        if not isinstance(current, dict) or token not in current:
+            current = None
+            break
+        current = current[token]
+    return current
+
+
+def _boundary_acceptance_status(result: Dict[str, Any]) -> Optional[str]:
+    """Read the setup/update action's explicit acceptance contract."""
+    raw = result.get("boundary_acceptance_status")
+    if raw is None and isinstance(result.get("signals"), dict):
+        raw = result["signals"].get("boundary_acceptance_status")
+    return raw if isinstance(raw, str) and raw in {"accepted", "rejected"} else None
+
+
+def _boundary_observation(
+    payload: Dict[str, Any],
+    campaign: Any,
+    value: int,
+    *,
+    phase: str = "candidate",
+    candidate_value: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Build a strict boundary observation from a child control report."""
+    # The runner transports the expected value into the child, and the child
+    # must echo the resolved value in its signed/report payload.  Otherwise a
+    # stale or mis-overridden follow-up could be reported as N-1 merely because
+    # the parent intended to pass N-1 on the command line.
+    metadata = payload.get("boundary_campaign") if isinstance(payload, dict) else None
+    metadata_value = metadata.get("resolved_value") if isinstance(metadata, dict) else None
+    metadata_value_ok = (
+        isinstance(metadata, dict)
+        and metadata.get("name") == campaign.name
+        and isinstance(metadata_value, int)
+        and not isinstance(metadata_value, bool)
+        and metadata_value == value
+    )
+    if not metadata_value_ok:
+        if phase == "follow_up":
+            return {
+                "resolved_value": value if candidate_value is None else candidate_value,
+                "follow_up_value": value,
+                "follow_up_status": "infrastructure/setup failure",
+                "infrastructure_failure": True,
+            }
+        return {
+            "resolved_value": value,
+            "candidate_status": "infrastructure/setup failure",
+            "infrastructure_failure": True,
+        }
+    control = _boundary_result_control(payload)
+    if control is None:
+        return {
+            "resolved_value": value,
+            "infrastructure_failure": True,
+            "candidate_status": "infrastructure/setup failure",
+        }
+    outcome = str(control.get("final_boot_outcome", control.get("boot_outcome", ""))).strip().lower()
+    status = _boundary_acceptance_status(control)
+    state_value = _boundary_state_value(control, campaign.parameter)
+    control_signals = control.get("signals") if isinstance(control.get("signals"), dict) else {}
+    if phase == "follow_up":
+        row = {
+            "resolved_value": value if candidate_value is None else candidate_value,
+            "follow_up_value": value,
+            "follow_up_status": status or "infrastructure/setup failure",
+            "infrastructure_failure": status is None or outcome in {
+                "", "unknown", "infra_error", "timeout", "error",
+                "infrastructure/setup failure", "infrastructure_failure", "setup_failure",
+            },
+        }
+        if control_signals.get("boundary_snapshot_restore") is not None:
+            row["boundary_snapshot_restore"] = control_signals["boundary_snapshot_restore"]
+        return row
+    row: Dict[str, Any] = {
+        "resolved_value": value,
+        "candidate_status": status or "infrastructure/setup failure",
+    }
+    if status is None or outcome in {
+        "", "unknown", "infra_error", "timeout", "error",
+        "infrastructure/setup failure", "infrastructure_failure", "setup_failure",
+    }:
+        row["infrastructure_failure"] = True
+    # A rejected candidate is a valid outcome before persistence, so it does
+    # not need semantic post-state telemetry.  Accepted candidates do: absent
+    # state would make the persistence claim unverifiable.
+    if state_value is not None:
+        row["persisted_value"] = state_value
+    elif status == "accepted":
+        row["infrastructure_failure"] = True
+    if control_signals.get("boundary_snapshot_capture") is not None:
+        row["boundary_snapshot_capture"] = control_signals["boundary_snapshot_capture"]
+    return row
 
 
 def _is_pass_verdict(value: Any) -> bool:
@@ -2391,7 +2768,16 @@ def _run_initial_state_matrix(
         temp_root = Path(td)
         for index, state in enumerate(profile.initial_states):
             child_output = temp_root / "state_{:04d}.json".format(index)
-            command = _initial_state_child_command(state.name, child_output)
+            campaign = getattr(state, "boundary_campaign", None)
+            candidate_vars: List[str] = []
+            candidate_state_file = temp_root / "state_{:04d}_durable.bin".format(index)
+            if campaign is not None and campaign.follow_up is not None:
+                candidate_vars.append(
+                    "BOUNDARY_DURABLE_STATE_FILE:{}".format(candidate_state_file)
+                )
+            command = _initial_state_child_command(
+                state.name, child_output, candidate_vars
+            )
             proc = subprocess.run(
                 command,
                 cwd=str(repo_root),
@@ -2412,6 +2798,64 @@ def _run_initial_state_matrix(
                     parse_error = str(exc)
             else:
                 parse_error = "child report was not created"
+
+            # Boundary campaigns are intentionally runner-owned two-phase
+            # relations.  The first child performs the ordinary update
+            # sequence for N; its semantic post-state is handed to the
+            # follow-up setup script, which performs the existing update
+            # sequence for N-1.  No update execution logic is duplicated here.
+            if campaign is not None:
+                boundary_observation = _boundary_observation(
+                    child_payload, campaign, int(state.boundary_value or 0)
+                )
+                if proc.returncode != 0:
+                    boundary_observation["infrastructure_failure"] = True
+                if campaign.follow_up is not None:
+                    if candidate_state_file.is_file():
+                        state_file = candidate_state_file
+                        previous = state.boundary_previous_value
+                        if previous is not None:
+                            follow_output = temp_root / "state_{:04d}_followup.json".format(index)
+                            follow_vars = [
+                                "BOUNDARY_VALUE:{}".format(int(previous)),
+                                "BOUNDARY_PHASE:follow_up",
+                                "BOUNDARY_DURABLE_STATE_FILE:{}".format(state_file),
+                            ]
+                            follow_command = _initial_state_child_command(
+                                state.name, follow_output, follow_vars
+                            )
+                            follow_proc = subprocess.run(
+                                follow_command,
+                                cwd=str(repo_root),
+                                capture_output=True,
+                                text=True,
+                                check=False,
+                            )
+                            follow_payload: Dict[str, Any] = {}
+                            if follow_output.exists():
+                                try:
+                                    loaded_follow = json.loads(
+                                        follow_output.read_text(encoding="utf-8")
+                                    )
+                                    if isinstance(loaded_follow, dict):
+                                        follow_payload = loaded_follow
+                                except (OSError, ValueError):
+                                    pass
+                            follow_observation = _boundary_observation(
+                                follow_payload,
+                                campaign,
+                                int(previous),
+                                phase="follow_up",
+                                candidate_value=int(state.boundary_value or 0),
+                            )
+                            boundary_observation.update(follow_observation)
+                            if follow_proc.returncode != 0:
+                                boundary_observation["infrastructure_failure"] = True
+                        else:
+                            boundary_observation["infrastructure_failure"] = True
+                    else:
+                        boundary_observation["infrastructure_failure"] = True
+                child_payload["boundary_observation"] = boundary_observation
             entry: Dict[str, Any] = {
                 "state": state.name,
                 "description": state.description,
@@ -2419,7 +2863,22 @@ def _run_initial_state_matrix(
                 "verdict": child_payload.get("verdict"),
                 "summary": child_payload.get("summary", {}),
                 "profile": child_payload.get("profile"),
+                "_child_payload": child_payload,
             }
+            # Preserve canonical multi-component point evidence in the
+            # wrapper; the validator cannot verify a child's aggregate after
+            # the private payload is discarded below without these fields.
+            if isinstance(child_payload.get("summary"), dict) and isinstance(
+                child_payload.get("summary", {}).get("combined"), dict
+            ) and "security_issue_points" in child_payload["summary"]["combined"]:
+                for evidence_key in (
+                    "combined_results",
+                    "control_combined_result",
+                    "control_state",
+                    "control_invariant_violations",
+                ):
+                    if evidence_key in child_payload:
+                        entry[evidence_key] = child_payload[evidence_key]
             if parse_error:
                 entry["error"] = parse_error
             if proc.returncode != 0:
@@ -2455,6 +2914,35 @@ def _run_initial_state_matrix(
     else:
         verdict = "PASS"
 
+    boundary_reports: List[Dict[str, Any]] = []
+    boundary_by_campaign: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in entries:
+        child = entry.get("_child_payload")
+        boundary = child.get("boundary_campaign") if isinstance(child, dict) else None
+        if not isinstance(boundary, dict) or not boundary.get("name"):
+            continue
+        observation = child.get("boundary_observation", {}) if isinstance(child, dict) else {}
+        row = {
+            "resolved_value": boundary.get("resolved_value"),
+            **(observation if isinstance(observation, dict) else {}),
+        }
+        boundary_by_campaign.setdefault(str(boundary["name"]), []).append(row)
+    for campaign in getattr(profile, "boundary_campaigns", []):
+        report = aggregate_boundary_results(campaign, boundary_by_campaign.get(campaign.name, []))
+        boundary_reports.append(report)
+        if report.get("verdict") == "FAIL":
+            verdict = "FAIL -- boundary campaign '{}' failed".format(campaign.name)
+        elif report.get("verdict") == "INCONCLUSIVE" and verdict == "PASS":
+            verdict = "INCONCLUSIVE -- boundary campaign '{}' lacked reliable observations".format(campaign.name)
+    boundary_infra = any(
+        report.get("verdict") == "INCONCLUSIVE" for report in boundary_reports
+    )
+    boundary_failed = any(
+        report.get("verdict") == "FAIL" for report in boundary_reports
+    )
+    for entry in entries:
+        entry.pop("_child_payload", None)
+
     payload: Dict[str, Any] = {
         "engine": "renode-test",
         "profile": profile.name,
@@ -2462,6 +2950,11 @@ def _run_initial_state_matrix(
         "schema_version": profile.schema_version,
         "initial_states": True,
         "verdict": verdict,
+        "expect": {
+            "should_find_issues": bool(
+                getattr(getattr(profile, "expect", None), "should_find_issues", False)
+            ),
+        },
         "summary": {
             "initial_states": {
                 "requested": len(profile.initial_states),
@@ -2474,6 +2967,7 @@ def _run_initial_state_matrix(
             }
         },
         "initial_state_results": entries,
+        "boundary_campaign_results": boundary_reports,
         "execution": {
             "run_utc": dt.datetime.now(dt.timezone.utc)
             .replace(microsecond=0)
@@ -2482,6 +2976,7 @@ def _run_initial_state_matrix(
         },
         "git": git_metadata(repo_root),
     }
+    attach_security_aggregate(payload)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -2496,9 +2991,14 @@ def _run_initial_state_matrix(
             sort_keys=True,
         )
     )
-    if missing_or_infra:
+    if missing_or_infra or boundary_infra:
         return EXIT_INFRA_FAILURE
-    if nonpassing and not args.no_assert_verdict:
+    # --no-assert-verdict suppresses assertion failures, including boundary
+    # FAIL verdicts. Infrastructure remains a hard exit because it means the
+    # campaign did not produce trustworthy observations.
+    if (boundary_failed and not args.no_assert_verdict) or (
+        nonpassing and not args.no_assert_verdict
+    ):
         return EXIT_ASSERTION_FAILURE
     return 0
 

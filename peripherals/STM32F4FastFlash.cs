@@ -360,9 +360,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         var snap = new byte[flashLen];
                         Array.Copy(preFaultSnapshot, snap, flashLen);
 
-                        ApplyWriteFaultAtOffset(snap, preFaultSnapshot, current, changedOffset, flashLen);
-
-                        FaultFlashSnapshot = snap;
+                        if(WriteFaultMode == 0)
+                        {
+                            FaultFlashSnapshot = snap;
+                        }
+                        else
+                        {
+                            // Non-power faults continue on the same boot.  Persist
+                            // the corrupted result into mapped flash now so the CPU
+                            // observes it even if it reaches a boot marker before
+                            // the sweep runner regains control.
+                            var faultedCurrent = new byte[flashLen];
+                            Array.Copy(current, faultedCurrent, flashLen);
+                            ApplyWriteFaultAtOffset(faultedCurrent, preFaultSnapshot, current, changedOffset, flashLen);
+                            Flash.WriteBytes(0, faultedCurrent, 0, flashLen);
+                            FaultFlashSnapshot = faultedCurrent;
+                        }
                     }
                 }
                 else

@@ -706,6 +706,15 @@ def test_compound_fault_runtime_telemetry_contract() -> None:
     assert "_tb_state['armed']" not in runtime_source
 
 
+def test_state_mode_clean_control_preserves_control_identity() -> None:
+    runtime_source = (SCRIPTS / "run_runtime_fault_sweep.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "requested_fault_type = 'control' if int(fault_at) < 0 else 'w'" in runtime_source
+    assert "'fault_type': requested_fault_type" in runtime_source
+
+
 def test_single_point_cannot_reuse_stale_result_file() -> None:
     profile = SimpleNamespace(name="stale", fault_sweep=None)
     with tempfile.TemporaryDirectory() as td:

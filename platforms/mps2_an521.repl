@@ -1,7 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Tardigrade contributors
 // MPS2+ AN521 - SSE-200 Subsystem (Cortex-M33 with TrustZone)
 // For TF-M BL2 (MCUboot) secure boot fault injection
 //
-// Memory map (secure aliases at 0x10000000):
+// Memory map: AN521 exposes the same SSRAM1 through secure 0x10000000 and
+// non-secure 0x00000000 aliases.  TF-M's AN521 flash driver selects the NS
+// alias for NS/secondary partitions even while called from secure code.
 //   0x10000000: Code SSRAM1 (4MB) — BL2 + firmware images
 //   0x38000000: Data SSRAM2+3 (4MB) — SRAM
 //   Peripherals: 0x50000000 (secure) / 0x40000000 (non-secure)
@@ -12,16 +16,46 @@ cpu: CPU.CortexM @ sysbus
     enableTrustZone: true
     numberOfSAURegions: 8
 
-nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+// Cortex-M33 secure and non-secure System Control Space aliases.  The
+// non-secure window must carry the NonSecure bus region so Renode keeps the
+// VTOR_NS/MSP_NS state separate from the secure SCS registers.
+nvic: IRQControllers.NVIC @ {
+    sysbus new Bus.BusPointRegistration { address: 0xE000E000; cpu: cpu };
+    sysbus new Bus.BusMultiRegistration { address: 0xE002E000; size: 0x1000; region: "NonSecure"; cpu: cpu }
+}
     priorityMask: 0xF0
     -> cpu@0
 
-// Code SSRAM1 — secure alias (BL2 loads here at 0x10000000)
-ssram1: Memory.MappedMemory @ sysbus 0x10000000
+// Code SSRAM1 — secure alias remains a direct, executable MappedMemory.
+// The non-secure primary code window is also direct MappedMemory so the
+// Cortex-M execution-region check recognizes NS Reset_Handler as executable.
+// Its offset maps to the same primary-image bytes in ssram1.
+ssram1: Memory.MappedMemory @ {
+        sysbus new Bus.BusRangeRegistration {
+            address: 0x10000000;
+            size: 0x0FF000;
+            offset: 0x000000
+        };
+        sysbus new Bus.BusRangeRegistration {
+            address: 0x10100000;
+            size: 0x300000;
+            offset: 0x100000
+        };
+        sysbus new Bus.BusRangeRegistration {
+            address: 0x00100000;
+            size: 0x7F000;
+            offset: 0x100000
+        }
+    }
     size: 0x400000
 
-// Data SSRAM2+3 — secure alias
-ssram2: Memory.MappedMemory @ sysbus 0x38000000
+// Data SSRAM2+3 — secure and non-secure aliases.  MappedMemory is IMapped,
+// so the non-secure alias must use a plain registration; BusMultiRegistration
+// is rejected by current Renode for this peripheral type.
+ssram2: Memory.MappedMemory @ {
+        sysbus 0x38000000;
+        sysbus 0x28000000
+    }
     size: 0x400000
 
 // UART0 — CMSDK APB UART (secure + non-secure aliases)
@@ -32,14 +66,88 @@ uart0: UART.CMSDK_APB_UART @ {
     TxInterrupt -> nvic@33
     RxInterrupt -> nvic@32
 
-// Tardigrade flash backend — wraps ssram1 for write tracking.
-// AN521 has no real flash controller; this satisfies the profile requirement.
-faultFlash: Miscellaneous.NRF52NVMC @ sysbus 0x5030F000
-    Flash: ssram1
-    FlashBaseAddress: 0x10000000
+// SSE-200 Secure Privilege Control. Offset 0x14 is NSCCFG, which TF-M
+// updates while configuring the non-secure callable code region.
+spctrl: Memory.MappedMemory @ {
+        sysbus 0x50080000;
+        sysbus 0x40080000
+    }
+    size: 0x1000
+
+// CMSDK S32K timer/watchdog register windows. The APB watchdogs have separate
+// secure and non-secure instances at 0x50081000 and 0x40081000; the S32K
+// watchdog remains a distinct slow-clock instance at 0x5002E000.
+s32kTimer: Memory.MappedMemory @ {
+        sysbus 0x5002F000;
+        sysbus 0x4002F000
+    }
+    size: 0x1000
+s32kWatchdog: Memory.MappedMemory @ {
+        sysbus 0x5002E000;
+        sysbus 0x4002E000
+    }
+    size: 0x1000
+watchdogNs: Tardigrade.CMSDKAPBWatchdog @ sysbus 0x40081000
+    ClockFrequency: 25000000
+    -> nvic@1
+watchdogSecure: Tardigrade.CMSDKAPBWatchdog @ sysbus 0x50081000
+    ClockFrequency: 25000000
+
+// SIE-200 MPCs. The AN521 register geometry is BLK_CFG=8 and BLK_MAX=511;
+// the stub exposes the indexed LUT and register-driver compatibility only.
+mpc_code_sram1: Tardigrade.Sse200MpcStub @ sysbus 0x58007000
+mpc_code_sram2: Tardigrade.Sse200MpcStub @ sysbus 0x58008000
+mpc_code_sram3: Tardigrade.Sse200MpcStub @ sysbus 0x58009000
+
+// SSE-200 system information/control windows. SYSCTRL offset 0x08 is the
+// secure-debug clear register and offset 0x104 is reset-mask state; both are
+// ordinary retained control registers during BL2 startup.
+sysinfo: Memory.MappedMemory @ {
+        sysbus 0x50020000;
+        sysbus 0x40020000
+    }
+    size: 0x1000
+sysctrl: Memory.MappedMemory @ sysbus 0x50021000
+    size: 0x1000
+
+// Tardigrade flash backend — intercept the secure primary trailer, the
+// non-secure boot alias, and the trailer/secondary ranges while leaving
+// executable primary code direct. Ranges are non-overlapping:
+// [0x100FF000, 0x10100000), [0, 0x100000), and [0x17F000, 0x400000).
+faultFlash: Miscellaneous.An521NvmInterceptor @ {
+        sysbus new Bus.BusRangeRegistration {
+            address: 0x100FF000;
+            size: 0x001000;
+            offset: 0x0FF000
+        };
+        sysbus new Bus.BusRangeRegistration {
+            address: 0x00000000;
+            size: 0x100000;
+            offset: 0x000000
+        };
+        sysbus new Bus.BusRangeRegistration {
+            address: 0x0017F000;
+            size: 0x281000;
+            offset: 0x17F000
+        };
+        // Official AN521 code aliases. Route both through the interceptor so
+        // writes via either code alias remain observable and faultable.
+        sysbus new Bus.BusRangeRegistration {
+            address: 0x00400000;
+            size: 0x400000;
+            offset: 0x000000
+        };
+        sysbus new Bus.BusRangeRegistration {
+            address: 0x10400000;
+            size: 0x400000;
+            offset: 0x000000
+        }
+    }
+    BackingMemory: ssram1
+    FlashBaseAddress: 0x00000000
     FlashSize: 0x400000
     EraseFill: 0xFF
-    PageSize: 4096
+    PageSize: 0x20000
 
 sysbus:
     init:
@@ -47,12 +155,24 @@ sysbus:
         Tag <0x50000000 0x1000> "TIMER0"
         Tag <0x50001000 0x1000> "TIMER1"
         Tag <0x50002000 0x1000> "DTIMER0"
-        Tag <0x50081000 0x1000> "S32K_WATCHDOG"
+        Tag <0x5002E000 0x1000> "S32K_WATCHDOG"
+        Tag <0x4002E000 0x1000> "S32K_WATCHDOG_NS"
+        Tag <0x40081000 0x1000> "CMSDK_WATCHDOG_NS"
+        Tag <0x50081000 0x1000> "CMSDK_WATCHDOG_S"
+        Tag <0x5002F000 0x1000> "S32K_TIMER"
+        Tag <0x4002F000 0x1000> "S32K_TIMER_NS"
+        Tag <0x50080000 0x1000> "SPCTRL"
+        Tag <0x40080000 0x1000> "NSPCTRL"
+        Tag <0x50020000 0x1000> "SYSINFO"
+        Tag <0x40020000 0x1000> "SYSINFO_NS"
+        Tag <0x50021000 0x1000> "SYSCTRL"
         Tag <0x50302000 0x1000> "FPGAIO"
         Tag <0x50008000 0x1000> "MPC_SSRAM1"
         Tag <0x50009000 0x1000> "MPC_SSRAM2"
         Tag <0x5000A000 0x1000> "MPC_SSRAM3"
-        Tag <0x50080000 0x1000> "S32K_TIMER"
+        Tag <0x58007000 0x1000> "MPC_CODE_SRAM1"
+        Tag <0x58008000 0x1000> "MPC_CODE_SRAM2"
+        Tag <0x58009000 0x1000> "MPC_CODE_SRAM3"
         Tag <0x50100000 0x1000> "GPIO0"
         Tag <0x50101000 0x1000> "GPIO1"
         Tag <0x50102000 0x1000> "GPIO2"

@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Tardigrade contributors
+#
+# Template only. Substitute every ${...} value, then rename to .yaml before
+# passing it to audit_bootloader.py. No compiled TF-M or GCC-linked artifact
+# is part of this repository.
+schema_version: 1
+name: tf_m_bl2_an521_native
+description: >
+  Native AN521 TF-M multi-image runner profile. This is an interface template
+  for a locally built BL2 and signed S/NS images.
+
+platform: platforms/mps2_an521.repl
+flash_backend: faultFlash
+bootloader:
+  elf: ${TFM_BL2_ELF}
+  entry: ${TFM_BL2_ENTRY}
+memory:
+  sram: { start: 0x38000000, end: 0x38040000 }
+  write_granularity: 4
+  # An521NvmInterceptor traces shared backing offsets. Map each range to its
+  # canonical CPU-visible alias for coverage and fault-window classification.
+  trace_address_map:
+    - { offset_start: 0x00080000, offset_end: 0x00100000, address_addend: 0x10000000 }
+    - { offset_start: 0x00100000, offset_end: 0x00180000, address_addend: 0x00000000 }
+    - { offset_start: 0x00180000, offset_end: 0x00200000, address_addend: 0x10000000 }
+    - { offset_start: 0x00200000, offset_end: 0x00280000, address_addend: 0x00000000 }
+  slots:
+    exec: { base: ${TFM_SECURE_PRIMARY_BASE}, size: ${TFM_SLOT_SIZE} }
+    staging: { base: ${TFM_SECURE_SECONDARY_BASE}, size: ${TFM_SLOT_SIZE} }
+    tertiary: { base: ${TFM_NS_PRIMARY_BASE}, size: ${TFM_SLOT_SIZE} }
+    recovery: { base: ${TFM_NS_SECONDARY_BASE}, size: ${TFM_SLOT_SIZE} }
+images:
+  exec: ${TFM_SECURE_PRIMARY_IMAGE}
+  staging: ${TFM_SECURE_SECONDARY_IMAGE}
+  tertiary: ${TFM_NS_PRIMARY_IMAGE}
+  recovery: ${TFM_NS_SECONDARY_IMAGE}
+success_criteria:
+  # Renode exposes the post-handoff PC reliably; VTOR_NS reads as zero on
+  # this platform even though execution has entered the tertiary image.
+  pc_in_slot: tertiary
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  run_duration: "${TFM_RUN_DURATION_S}"
+  vtor_settle_iters: ${TFM_VTOR_SETTLE_ITERS}
+  tracking_start_address: ${TFM_TRACKING_START_ADDRESS}
+  max_writes: auto
+  max_writes_cap: ${TFM_MAX_WRITES_CAP}
+  boot_cycles: 1
+state_probe:
+  script: targets/tf_m_bl2/probe.py
+  format: python
+  contract_version: 1
+invariants:
+  - tfm_multi_image_consistency
+  - tfm_multi_image_acceptance_consistency
+  - tfm_no_partial_magic
+  - tfm_secure_slot_not_empty
+invariant_providers:
+  - targets/tf_m_bl2/invariants.py
+invariant_config:
+  tfm_joint_acceptance: true
+  # S/NS images may differ in minor, revision, and build metadata, but the
+  # declared major-version contract must match. Set mode to equal for builds
+  # whose integration contract requires identical complete versions.
+  tfm_joint_version_policy: compatible
+  # Evaluate the acceptance invariant at the injected power-loss boundary;
+  # subsequent recovery is allowed to change persistent state again.
+  semantic_state_stage: fault_snapshot
+expect:
+  # The reusable template makes no claim about a particular build. Change this
+  # only after establishing and documenting the expected baseline locally.
+  should_find_issues: false

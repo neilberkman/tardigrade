@@ -213,6 +213,8 @@ def categorize_failure(
         payload["severity_rationale"] = result.get("severity_rationale")
     signals = result.get("signals") or {}
     if isinstance(signals, dict):
+        if signals.get("function_return_probes") is not None:
+            payload["function_return_probes"] = signals.get("function_return_probes")
         if signals.get("verification_probe_classification") is not None:
             payload["verification_probe_classification"] = signals.get(
                 "verification_probe_classification"
@@ -270,6 +272,27 @@ def summarize_runtime_sweep(
     """Compute summary statistics from runtime sweep results."""
     non_control = [r for r in results if not r.get("is_control", False)]
     control = [r for r in results if r.get("is_control", False)]
+    rc_telemetry = [
+        r.get("rc_injection") for r in results
+        if str(r.get("fault_type", "") or "").split(":", 1)[0] == "x"
+        and isinstance(r.get("rc_injection"), dict)
+    ]
+    rc_cfg = getattr(getattr(profile, "fault_sweep", None), "rc_injection_config", None)
+    if rc_cfg is not None and bool(getattr(rc_cfg, "require_applied", True)):
+        # Validate the runtime contract at the reporting boundary too.  This
+        # protects callers that construct result dictionaries without using
+        # the Renode epilogue and keeps a missing return hook fail-closed.
+        for result in non_control:
+            fault_type = str(result.get("fault_type", "") or "").split(":", 1)[0]
+            telemetry = result.get("rc_injection")
+            if (
+                fault_type == "x"
+                and result.get("fault_injected") is True
+                and (not isinstance(telemetry, dict) or not telemetry.get("applied"))
+            ):
+                result["infrastructure_error"] = True
+                result["error_kind"] = "rc_injection_not_applied"
+                result["boot_outcome"] = "infra_error"
     returned_fault_points = len(non_control)
     if expected_fault_points is None:
         planned_fault_points = returned_fault_points
@@ -357,6 +380,17 @@ def summarize_runtime_sweep(
         and id(r) not in infrastructure_error_ids
     ]
 
+    terminal_escape_results = [
+        r for r in non_control
+        if isinstance(r.get("signals"), dict)
+        and r["signals"].get("terminal_error_escaped")
+    ]
+    terminal_unresolved_results = [
+        r for r in non_control
+        if isinstance(r.get("signals"), dict)
+        and r["signals"].get("terminal_error_unresolved_candidates")
+    ]
+
     total = len(injected)
     # Treat the profile's control outcome as the expected successful outcome.
     expected_outcome = "success"
@@ -388,6 +422,13 @@ def summarize_runtime_sweep(
     )
     invariant_issue_points = sum(1 for r in injected if r.get("invariant_violations"))
     metadata_delta_issue_points = sum(1 for r in injected if r.get("metadata_delta_violations"))
+    success_effect_issue_points = sum(
+        1 for r in injected
+        if any(
+            isinstance(v, dict) and v.get("name") == "success_implies_effect"
+            for v in (r.get("invariant_violations") or [])
+        )
+    )
     bus_fault_points = sum(
         1 for r in injected
         if _effective_boot_result(r)[0] == "bus_fault"
@@ -473,6 +514,7 @@ def summarize_runtime_sweep(
     validation_stages: Dict[str, int] = {}
     glitch_realism_counts: Dict[str, int] = {}
     verification_probe_class_counts: Dict[str, int] = {}
+    success_effect_points: List[Any] = []
     verification_bypass_points: List[Any] = []
     full_bypass_points: List[Any] = []
     defense_in_depth_held = 0
@@ -495,6 +537,11 @@ def summarize_runtime_sweep(
             elif iskip["severity"] == "dos_recovery":
                 dos_recovery_points += 1
         signals = r.get("signals") or {}
+        if any(
+            isinstance(v, dict) and v.get("name") == "success_implies_effect"
+            for v in (r.get("invariant_violations") or [])
+        ):
+            success_effect_points.append(r.get("fault_at"))
         if isinstance(signals, dict):
             probe_class = str(signals.get("verification_probe_classification") or "").strip()
             if probe_class:
@@ -583,6 +630,7 @@ def summarize_runtime_sweep(
         "semantic_observation_points": semantic_observation_points,
         "invariant_issue_points": invariant_issue_points,
         "metadata_delta_issue_points": metadata_delta_issue_points,
+        "success_implies_effect_issue_points": success_effect_issue_points,
         "bus_fault_points": bus_fault_points,
         "timeout_points": timeout_points,
         "infrastructure_error_points": len(infrastructure_errors),
@@ -613,6 +661,8 @@ def summarize_runtime_sweep(
         "fault_type_bricks": fault_type_brick_counts,
         "instruction_skip_points": instruction_skip_points,
         "security_bypass_points": security_bypass_points,
+        "terminal_error_escape_points": len(terminal_escape_results),
+        "terminal_error_unresolved_points": len(terminal_unresolved_results),
         "dos_crash_points": dos_crash_points,
         "dos_recovery_points": dos_recovery_points,
         "campaign_integrity": {
@@ -642,6 +692,16 @@ def summarize_runtime_sweep(
             "complete": campaign_complete,
         },
     }
+    if rc_telemetry:
+        first_rc = rc_telemetry[0]
+        summary["rc_injection"] = {
+            "configured_symbols": list(first_rc.get("configured_symbols") or []),
+            "resolved_symbols": first_rc.get("resolved_symbols") or {},
+            "return_value": int(first_rc.get("return_value", 0)) & 0xFFFFFFFF,
+            "return_register": int(first_rc.get("return_register", 0)),
+            "entered_calls": sum(int(item.get("entered_calls", 0) or 0) for item in rc_telemetry),
+            "applied_points": sum(1 for item in rc_telemetry if item.get("applied")),
+        }
     if skip_reason_counts:
         summary["skip_reasons"] = skip_reason_counts
     if phase2_skip_reason_counts:
@@ -666,6 +726,8 @@ def summarize_runtime_sweep(
         summary["verification_bypass_points"] = verification_bypass_points
         summary["defense_in_depth_held"] = defense_in_depth_held
         summary["full_bypass_points"] = full_bypass_points
+    if success_effect_points:
+        summary["success_implies_effect_points"] = success_effect_points
     if calibration_coverage is not None:
         summary["calibration_coverage"] = calibration_coverage
     did_layers = build_defense_in_depth_layers(injected)

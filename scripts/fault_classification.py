@@ -350,6 +350,9 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
         reasons.append("invariant")
     if result.get("metadata_delta_violations"):
         reasons.append("metadata_delta")
+    signals = result.get("signals") or {}
+    if isinstance(signals, dict) and signals.get("terminal_error_escaped"):
+        reasons.append("terminal_error_path_escape")
     # Confirm-cycle specific finding categories.
     confirm_meta = result.get("confirm_cycle")
     if isinstance(confirm_meta, dict):

@@ -360,11 +360,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                         }
                                     }
 
-                                    // Handle faulted word according to the selected
-                                    // write fault mode.
-                                    ApplyWriteFaultAtOffset(snap, wenSnapshot, current, off, len);
-
-                                    FaultFlashSnapshot = snap;
+                                    // Power-loss mode resumes from the partial
+                                    // pre-WEN snapshot above.  Other write faults
+                                    // continue executing, so their corruption must
+                                    // be applied to the live mapped flash rather than
+                                    // existing only in the diagnostic snapshot.
+                                    if(WriteFaultMode == 0)
+                                    {
+                                        FaultFlashSnapshot = snap;
+                                    }
+                                    else
+                                    {
+                                        var faultedCurrent = new byte[len];
+                                        Array.Copy(current, faultedCurrent, len);
+                                        ApplyWriteFaultAtOffset(faultedCurrent, wenSnapshot, current, off, len);
+                                        Flash.WriteBytes(0, faultedCurrent, 0, len);
+                                        FaultFlashSnapshot = faultedCurrent;
+                                    }
                                     break; // Stop counting further words.
                                 }
                             }

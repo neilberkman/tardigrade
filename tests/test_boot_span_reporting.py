@@ -54,7 +54,8 @@ class HtmlBootSpanRenderingTests(unittest.TestCase):
                 }
             ]
         )
-        self.assertIn("#059669", html_doc)
+        self.assertIn("#37f6a0", html_doc)
+        self.assertIn("cell-safe", html_doc)
         self.assertIn("initial=wrong_image final=success", html_doc)
 
     def test_audit_card_shows_control_initial_and_final_outcomes(self) -> None:
@@ -79,10 +80,24 @@ class HtmlBootSpanRenderingTests(unittest.TestCase):
                 "runtime_sweep_results": [],
             },
         )
-        self.assertIn("control initial", card)
-        self.assertIn("control final", card)
+        self.assertIn("control span", card)
+        self.assertIn("wrong_image <em>→</em> success", card)
         self.assertEqual(summary["control_initial_outcome"], "wrong_image")
         self.assertEqual(summary["control_final_outcome"], "success")
+
+    def test_audit_card_uses_fixed_status_class_for_report_verdict(self) -> None:
+        card, _ = render_audit_card(
+            Path("/tmp/report.json"),
+            {
+                "profile": "demo",
+                "verdict": "FAIL -- injected value' onclick='bad",
+                "summary": {"runtime_sweep": {}},
+                "runtime_sweep_results": [],
+            },
+        )
+        self.assertIn("audit-card status-fail", card)
+        self.assertNotIn("onclick='bad", card)
+        self.assertIn("onclick=&#x27;bad", card)
 
 
 class ResilientRollbackTests(unittest.TestCase):

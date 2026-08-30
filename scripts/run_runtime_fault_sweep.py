@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import base64
+import hashlib
 import json
 import os
 import struct
@@ -21,6 +22,12 @@ from read_fault_translation import (
     pick_target_address_in_regions,
     translate_bus_address_to_backend_offset,
 )
+from boundary_snapshot import (
+    digest_components as _boundary_digest_components,
+    read_snapshot as _read_boundary_snapshot_artifact,
+    write_snapshot as _write_boundary_snapshot_artifact,
+)
+from boundary_reserved import BOUNDARY_RESERVED_VARIABLES
 
 
 def _try_disable_backend_fast_path(periph):
@@ -411,8 +418,104 @@ def resolve_backend():
 
 backend = resolve_backend()
 
+tracking_start_address_config = get_optional_int_var('tracking_start_address', 0)
+if tracking_start_address_config < 0 or tracking_start_address_config > 0xFFFFFFFF:
+    raise Exception(
+        'tracking_start_address must be a 32-bit non-negative address, got {}'.format(
+            tracking_start_address_config
+        )
+    )
+
+def _apply_tracking_start_address(data, backend_name, address):
+    """Set the precise write-tracking boundary on capable backends."""
+    if not hasattr(data, 'TrackingStartAddress'):
+        if address:
+            raise Exception(
+                'tracking_start_address=0x{:08X} requires backend {} to expose '
+                'TrackingStartAddress'.format(address, backend_name)
+            )
+        return
+    data.TrackingStartAddress = address
+
+def _configure_tracking_start_address():
+    """Apply the optional precise tracking boundary to the active backend."""
+    _apply_tracking_start_address(
+        backend['data'], backend['backend_sysbus_name'], tracking_start_address_config
+    )
+    log('tracking_gate: requested=0x{:08X} actual=0x{:08X} started={} start_hook={} memory_hook={}'.format(
+        tracking_start_address_config,
+        int(getattr(backend['data'], 'TrackingStartAddress', 0)),
+        getattr(backend['data'], 'TrackingStarted', 'unknown'),
+        getattr(backend['data'], 'StartHookInstalled', 'unknown'),
+        getattr(backend['data'], 'MemoryAccessHookInstalled', 'unknown'),
+    ))
+
+# Some Renode CPU models accept ICPUWithHooks registrations but do not invoke
+# the C# CpuAddressHook on instruction fetch.  Keep a RESC/Python hook as the
+# authoritative activation boundary for profiles that request one.  The hook
+# only exists before the boundary; activation hands ownership to the
+# interceptor's memory hook and resets its counters exactly once.
+_python_tracking_gate = {
+    'address': 0,
+    'cpu': None,
+    'installed': False,
+    'started': False,
+}
+
+def _python_tracking_gate_hook(cpu, addr):
+    current = int(addr) & ~1
+    if not _python_tracking_gate['installed'] or current != _python_tracking_gate['address']:
+        return
+    data = backend['data']
+    # Setting zero removes the inert C# start hook and enables memory access
+    # accounting.  Preserve any fault point already armed by the caller.
+    if hasattr(data, 'TrackingStartAddress'):
+        data.TrackingStartAddress = 0
+    data.TotalWordWrites = 0
+    if hasattr(data, 'WriteTraceClear'):
+        data.WriteTraceClear()
+    if hasattr(data, 'InvalidateShadow'):
+        data.InvalidateShadow()
+    _python_tracking_gate['started'] = True
+    _python_tracking_gate['installed'] = False
+    try:
+        cpu.RemoveHook(_python_tracking_gate['address'], _python_tracking_gate_hook)
+    except Exception:
+        # A one-shot hook can be removed by the CPU after dispatch.  Do not
+        # turn successful activation into a run failure if removal is already
+        # complete on a particular Renode build.
+        pass
+    log('tracking_gate: python activation at 0x{:08X}'.format(current))
+
+def _configure_python_tracking_gate(force=False):
+    address = tracking_start_address_config & 0xFFFFFFFF
+    gate = _python_tracking_gate
+    if (not force and gate['installed'] and gate['address'] == address and
+            gate['cpu'] is monitor.Machine['sysbus.cpu']):
+        return
+    if gate['installed'] and gate['cpu'] is not None:
+        try:
+            gate['cpu'].RemoveHook(gate['address'], _python_tracking_gate_hook)
+        except Exception:
+            pass
+    gate['address'] = address
+    gate['cpu'] = None
+    gate['installed'] = False
+    gate['started'] = address == 0
+    if address == 0:
+        return
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.AddHook(address, _python_tracking_gate_hook)
+    gate['cpu'] = cpu_ref
+    gate['installed'] = True
+    log('tracking_gate: python hook installed at 0x{:08X}'.format(address))
+
+_configure_tracking_start_address()
+_configure_python_tracking_gate()
+
 _cached_erase_page = None
 _cached_initial_flash = None
+_cached_initial_otp = None
 _cached_phase1_snapshot_path = None
 _cached_recovery_snapshot_path = None
 _machine_selector = '0'
@@ -441,6 +544,9 @@ def refresh_runtime_handles():
 def _machine_reset():
     monitor.Parse('machine Reset')
     refresh_runtime_handles()
+    _configure_tracking_start_address()
+    _configure_python_tracking_gate(force=True)
+    reset_sticky_handoff_state()
 
 # Read monitor variables.
 result_file = str(monitor.GetVariable('result_file'))
@@ -523,6 +629,12 @@ except Exception:
     boot_cycles = 1
 if boot_cycles < 1:
     boot_cycles = 1
+try:
+    vtor_settle_iters_config = max(
+        0, int(str(monitor.GetVariable('vtor_settle_iters')).strip(), 0)
+    )
+except Exception:
+    vtor_settle_iters_config = 0
 
 # Confirm-cycle configuration.
 _confirm_cycle_enabled = get_optional_var('confirm_cycle_enabled', 'false').lower() in ('1', 'true', 'yes')
@@ -859,6 +971,7 @@ else:
 _FAULT_CODE_TO_NAME = {
     'w': 'power_loss',
     'w:sp': 'swap_progress',
+    'w:ss': 'security_state_erase',
     'e': 'interrupted_erase',
     'a': 'multi_sector_atomicity',
     'b': 'bit_corruption',
@@ -907,6 +1020,8 @@ def get_effective_criteria(fault_type_code):
         return global_criteria
     # Resolve code to name.
     fault_name = _FAULT_CODE_TO_NAME.get(str(fault_type_code), str(fault_type_code))
+    if str(fault_type_code).startswith('w:ss:'):
+        fault_name = 'security_state_erase'
     overrides = _success_criteria_overrides.get(fault_name)
     if not overrides:
         return global_criteria
@@ -961,6 +1076,61 @@ if update_sequence_enabled:
 
 # Setup script.
 setup_script = str(monitor.GetVariable('setup_script')).strip()
+boundary_setup_env = get_optional_var('boundary_setup_env', '')
+boundary_value_raw = get_optional_var('boundary_value', '')
+boundary_durable_state_file = get_optional_var('boundary_durable_state_file', '')
+boundary_phase = get_optional_var('boundary_phase', '')
+boundary_acceptance = get_optional_var('boundary_acceptance', '')
+_boundary_snapshot_restore_evidence = None
+_boundary_snapshot_capture_evidence = None
+_boundary_snapshot_loaded = False
+if boundary_setup_env:
+    import re as _boundary_re
+    if _boundary_re.fullmatch(r'[A-Z][A-Z0-9_]*', boundary_setup_env) is None:
+        raise RuntimeError('boundary_setup_env is not a valid environment variable name')
+    # Keep this check in the Renode-side trust boundary as well as in the
+    # profile parser: command-line Robot variables can otherwise override a
+    # validated profile after it has been loaded.
+    if boundary_setup_env in BOUNDARY_RESERVED_VARIABLES:
+        raise RuntimeError('boundary_setup_env conflicts with a reserved harness variable')
+    try:
+        if _boundary_re.fullmatch(r'(?:0|[1-9][0-9]*)', str(boundary_value_raw)) is None:
+            raise ValueError('non-canonical')
+        boundary_value = int(boundary_value_raw, 10)
+    except Exception:
+        raise RuntimeError('boundary_value must be a canonical decimal integer')
+else:
+    if boundary_value_raw or boundary_durable_state_file or boundary_phase:
+        raise RuntimeError('boundary transport requires boundary_setup_env')
+    boundary_value = None
+if boundary_phase.strip().lower() == 'follow_up' and not boundary_durable_state_file:
+    raise RuntimeError('boundary follow-up requires boundary_durable_state_file')
+
+def apply_boundary_setup_environment(value=None):
+    """Expose the declared campaign value to the setup script safely."""
+    if not boundary_setup_env:
+        return
+    selected = boundary_value if value is None else int(value)
+    monitor.Parse('${}={}'.format(boundary_setup_env, selected))
+
+def get_boundary_acceptance_status():
+    """Read the setup script's explicit update acceptance contract."""
+    raw = str(monitor.GetVariable('boundary_acceptance'))
+    if raw not in ('accepted', 'rejected'):
+        return None
+    return raw
+
+
+def add_boundary_contract_signals(signals):
+    """Attach explicit acceptance and snapshot evidence to a control result."""
+    if not isinstance(signals, dict) or not boundary_setup_env:
+        return
+    signals['boundary_acceptance_status'] = get_boundary_acceptance_status()
+    if _boundary_snapshot_capture_evidence is not None:
+        signals['boundary_snapshot_capture'] = dict(_boundary_snapshot_capture_evidence)
+    if _boundary_snapshot_restore_evidence is not None:
+        signals['boundary_snapshot_restore'] = dict(_boundary_snapshot_restore_evidence)
+
 state_probe = str(monitor.GetVariable('state_probe')).strip()
 
 # Fault type support: 'write', 'erase', or 'both'.
@@ -1208,6 +1378,16 @@ sticky_pc = {'value': 0, 'slot': None, 'captured': False}
 console_fatal_patterns = (
     'Cannot upgrade:',
 )
+
+
+def reset_sticky_handoff_state():
+    """Discard handoff observations invalidated by a machine reset."""
+    sticky_vtor['value'] = 0
+    sticky_vtor['slot'] = None
+    sticky_vtor['captured'] = False
+    sticky_pc['value'] = 0
+    sticky_pc['slot'] = None
+    sticky_pc['captured'] = False
 
 
 def _get_console_peripherals():
@@ -1485,10 +1665,24 @@ if _hash_bypass_active:
 
 # ---------------------------------------------------------------------------
 # RC injection: force flash_area_write()-style wrappers to return -EIO after
-# a targeted write fault without halting the CPU. This is MCUboot-specific.
+# a targeted write fault without halting the CPU. The target function is
+# selected by profile-configured ELF symbols.
 # ---------------------------------------------------------------------------
 _rc_injection_symbols_raw = get_optional_var('rc_injection_symbols', 'flash_area_write')
 _rc_injection_symbols = [sym.strip() for sym in _rc_injection_symbols_raw.split(',') if sym.strip()]
+_rc_injection_return_value_raw = get_optional_var('rc_injection_return_value', '4294967291')
+try:
+    _rc_injection_return_value = int(_rc_injection_return_value_raw, 0) & 0xFFFFFFFF
+except Exception:
+    raise RuntimeError('rc_injection: return_value must be a 32-bit integer')
+_rc_injection_return_register_raw = get_optional_var('rc_injection_return_register', '0')
+try:
+    _rc_injection_return_register = int(_rc_injection_return_register_raw, 0)
+except Exception:
+    raise RuntimeError('rc_injection: return_register must be an integer')
+if _rc_injection_return_register < 0 or _rc_injection_return_register > 15:
+    raise RuntimeError('rc_injection: return_register must be in range 0..15')
+_rc_injection_require_applied = get_optional_var('rc_injection_require_applied', 'true').lower() == 'true'
 _rc_injection_state = {
     'checked': False,
     'supported': False,
@@ -1496,12 +1690,15 @@ _rc_injection_state = {
     'enabled': False,
     'entry_symbol_by_addr': {},
     'installed_return_hooks': set(),
-    'active_symbol': None,
-    'active_return_addr': None,
+    'active_frames': [],
+    'entered_calls': 0,
     'injected': False,
     'injected_symbol': None,
     'injected_return_addr': None,
-    'return_value': 0xFFFFFFFB,
+    'return_value': _rc_injection_return_value,
+    'return_register': _rc_injection_return_register,
+    'require_applied': _rc_injection_require_applied,
+    'resolved_symbols': {},
 }
 
 # Pre-resolve rc_injection symbols at load time (like hash_bypass).
@@ -1510,35 +1707,56 @@ _rc_injection_state = {
 _rc_injection_pre_resolved = {}
 for _rci_sym in _rc_injection_symbols:
     for _rci_addr in _resolve_elf_symbol_addresses(_rci_sym):
-        _rc_injection_pre_resolved[_rci_sym] = _rci_addr
+        _rc_injection_pre_resolved.setdefault(_rci_sym, []).append(_rci_addr)
         log('rc_injection: pre-resolved {}=0x{:08X}'.format(_rci_sym, _rci_addr & 0xFFFFFFFF))
 
 def _rc_injection_return_hook(cpu, addr):
     current_addr = int(addr) & ~1
     if not _rc_injection_state.get('enabled'):
         return
-    if _rc_injection_state.get('active_return_addr') != current_addr:
+    active_frames = _rc_injection_state.get('active_frames') or []
+    matched_index = None
+    matched_frame = None
+    for idx in range(len(active_frames) - 1, -1, -1):
+        frame = active_frames[idx]
+        if frame.get('return_addr') == current_addr:
+            matched_index = idx
+            matched_frame = frame
+            break
+    if matched_frame is None:
         return
     if not _rc_injection_state.get('injected') and was_fault_injected():
-        cpu.SetRegister(0, RegisterValue.Create(_rc_injection_state['return_value'], 32))
+        cpu.SetRegister(
+            int(_rc_injection_state.get('return_register', 0)),
+            RegisterValue.Create(_rc_injection_state['return_value'], 32),
+        )
         _rc_injection_state['injected'] = True
-        _rc_injection_state['injected_symbol'] = _rc_injection_state.get('active_symbol')
+        _rc_injection_state['injected_symbol'] = matched_frame.get('symbol')
         _rc_injection_state['injected_return_addr'] = current_addr
-        log('rc_injection: forced r0=0x{:08X} at return 0x{:08X} for {}'.format(
+        log('rc_injection: forced r{}=0x{:08X} at return 0x{:08X} for {}'.format(
+            int(_rc_injection_state.get('return_register', 0)),
             _rc_injection_state['return_value'] & 0xFFFFFFFF,
             current_addr & 0xFFFFFFFF,
-            _rc_injection_state.get('active_symbol') or '<unknown>',
+            matched_frame.get('symbol') or '<unknown>',
         ))
-    _rc_injection_state['active_symbol'] = None
-    _rc_injection_state['active_return_addr'] = None
+    try:
+        del active_frames[matched_index]
+    except Exception:
+        pass
 
 def _rc_injection_entry_hook(cpu, addr):
     if not _rc_injection_state.get('enabled'):
         return
     current_addr = int(addr) & ~1
     return_addr = int(cpu.GetRegister(14).RawValue) & ~1
-    _rc_injection_state['active_symbol'] = _rc_injection_state['entry_symbol_by_addr'].get(current_addr)
-    _rc_injection_state['active_return_addr'] = return_addr if return_addr > 0 else None
+    symbol = _rc_injection_state['entry_symbol_by_addr'].get(current_addr)
+    _rc_injection_state['entered_calls'] = int(_rc_injection_state.get('entered_calls', 0)) + 1
+    if return_addr <= 0:
+        return
+    _rc_injection_state.setdefault('active_frames', []).append({
+        'symbol': symbol,
+        'return_addr': return_addr,
+    })
     if return_addr > 0 and return_addr not in _rc_injection_state['installed_return_hooks']:
         cpu.AddHook(return_addr, _rc_injection_return_hook)
         _rc_injection_state['installed_return_hooks'].add(return_addr)
@@ -1558,19 +1776,23 @@ def ensure_rc_injection_preflight():
         }
     cpu_ref = monitor.Machine['sysbus.cpu']
     resolved = 0
-    # Use pre-resolved addresses, falling back to runtime resolution.
-    sym_addrs = []
-    if _rc_injection_pre_resolved:
-        for sym_name, addr in _rc_injection_pre_resolved.items():
-            sym_addrs.append((sym_name, addr))
-    else:
-        for sym_name in _rc_injection_symbols:
-            for addr in _resolve_elf_symbol_addresses(sym_name):
-                sym_addrs.append((sym_name, addr))
+    sym_addrs, unresolved_symbols = _collect_rc_injection_symbol_addresses(
+        _rc_injection_symbols,
+        _rc_injection_pre_resolved,
+        _resolve_elf_symbol_addresses,
+    )
+    if unresolved_symbols:
+        _rc_injection_state['reason'] = 'symbol_not_found:' + ','.join(unresolved_symbols)
+        return {
+            'supported': False,
+            'reason': _rc_injection_state['reason'],
+        }
     for sym_name, addr in sym_addrs:
         if addr in _rc_injection_state['entry_symbol_by_addr']:
+            _rc_injection_state['resolved_symbols'].setdefault(sym_name, []).append(addr)
             continue
         _rc_injection_state['entry_symbol_by_addr'][addr] = sym_name
+        _rc_injection_state['resolved_symbols'].setdefault(sym_name, []).append(addr)
         cpu_ref.AddHook(addr, _rc_injection_entry_hook)
         resolved += 1
         log('rc_injection: {}=0x{:08X}'.format(sym_name, addr & 0xFFFFFFFF))
@@ -1587,13 +1809,72 @@ def ensure_rc_injection_preflight():
         'reason': '',
     }
 
+def _collect_rc_injection_symbol_addresses(symbols, pre_resolved, resolver):
+    """Resolve every requested symbol without silently dropping misses."""
+    addresses = []
+    unresolved = []
+    for sym_name in symbols:
+        found = pre_resolved.get(sym_name)
+        if found is None:
+            found = resolver(sym_name)
+        if not found:
+            unresolved.append(sym_name)
+            continue
+        for addr in found:
+            addresses.append((sym_name, addr))
+    return addresses, unresolved
+
 def reset_rc_injection_state(enabled=False):
     _rc_injection_state['enabled'] = bool(enabled)
-    _rc_injection_state['active_symbol'] = None
-    _rc_injection_state['active_return_addr'] = None
+    _rc_injection_state['active_frames'] = []
+    _rc_injection_state['entered_calls'] = 0
     _rc_injection_state['injected'] = False
     _rc_injection_state['injected_symbol'] = None
     _rc_injection_state['injected_return_addr'] = None
+
+def rc_injection_telemetry():
+    """Return the stable, JSON-native RC injection telemetry contract."""
+    resolved = {}
+    for symbol in _rc_injection_symbols:
+        resolved[symbol] = [int(addr) for addr in (_rc_injection_state.get('resolved_symbols', {}).get(symbol) or [])]
+    return {
+        'configured_symbols': list(_rc_injection_symbols),
+        'resolved_symbols': resolved,
+        'return_value': int(_rc_injection_state.get('return_value', 0)) & 0xFFFFFFFF,
+        'return_register': int(_rc_injection_state.get('return_register', 0)),
+        'entered_calls': int(_rc_injection_state.get('entered_calls', 0)),
+        'applied': bool(_rc_injection_state.get('injected')),
+        'applied_symbol': _rc_injection_state.get('injected_symbol'),
+        'applied_return_address': (
+            int(_rc_injection_state.get('injected_return_addr'))
+            if _rc_injection_state.get('injected_return_addr') is not None else None
+        ),
+    }
+
+def _apply_rc_injection_result_contract(result, signals, fault_type, fault_injected):
+    """Attach telemetry and enforce require_applied on one execute result."""
+    if _base_fault_type_code(fault_type) != 'x':
+        return result
+    telemetry = rc_injection_telemetry()
+    result['rc_injection'] = telemetry
+    signals['rc_injection'] = dict(telemetry)
+    signals['rc_injection_model'] = 'software_return_code'
+    signals['rc_injection_value'] = fmt_u32(telemetry['return_value'])
+    signals['rc_injection_applied'] = telemetry['applied']
+    if telemetry['applied_symbol']:
+        signals['rc_injection_symbol'] = telemetry['applied_symbol']
+    if telemetry['applied_return_address'] is not None:
+        signals['rc_injection_return_addr'] = fmt_u32(telemetry['applied_return_address'])
+    if fault_injected and _rc_injection_state.get('require_applied') and not telemetry['applied']:
+        result['infrastructure_error'] = True
+        result['error_kind'] = 'rc_injection_not_applied'
+        result['error'] = (
+            'rc_injection requested a write fault but no configured return '
+            'frame applied the configured return value'
+        )
+        result['boot_outcome'] = 'infra_error'
+        result['fault_class'] = 'infrastructure_error'
+    return result
 
 # ---------------------------------------------------------------------------
 # Verification probes: capture return values from verification-layer helpers
@@ -1601,7 +1882,9 @@ def reset_rc_injection_state(enabled=False):
 # from "later layer caught it" deterministically.
 # ---------------------------------------------------------------------------
 _verification_probes_raw = get_optional_var('verification_probes', '')
+_function_return_probes_raw = get_optional_var('function_return_probes', '')
 _verification_probe_order = []
+_function_return_probe_order = []
 _verification_probe_state = {
     'entry_templates': {},
     'entry_hook_addrs': set(),
@@ -1624,6 +1907,21 @@ def _make_verification_probe_capture(cfg):
         'return_value': None,
         'return_values': [],
         'bypassed': False,
+    }
+
+def _make_function_return_probe_capture(cfg):
+    return {
+        'label': cfg.get('label'),
+        'symbol': cfg.get('symbol'),
+        'return_register': cfg.get('return_register'),
+        'capture': cfg.get('capture', 'last'),
+        'reached': False,
+        'call_count': 0,
+        'raw_values': [],
+        'return_values': [],
+        'entry_addresses': [],
+        'return_addresses': [],
+        'calls': [],
     }
 
 def _load_verification_probe_configs(raw_text):
@@ -1660,6 +1958,44 @@ def _load_verification_probe_configs(raw_text):
         })
     return cfgs
 
+def _load_function_return_probe_configs(raw_text):
+    if not raw_text:
+        return []
+    try:
+        decoded = base64.b64decode(raw_text).decode('utf-8')
+        payload = json.loads(decoded)
+    except Exception as e:
+        raise RuntimeError('function_return_probes: failed to decode payload: {}'.format(e))
+    if not isinstance(payload, list):
+        raise RuntimeError('function_return_probes: expected list payload')
+    cfgs = []
+    seen_labels = set()
+    for i, entry in enumerate(payload):
+        if not isinstance(entry, dict):
+            raise RuntimeError('function_return_probes[{}]: expected mapping'.format(i))
+        label = str(entry.get('label') or entry.get('symbol') or '').strip()
+        symbol = str(entry.get('symbol') or '').strip()
+        reg_name = str(entry.get('return_register') or 'r0').strip().lower()
+        reg_index = int(entry.get('return_register_index', 0))
+        capture = str(entry.get('capture') or 'last').strip().lower()
+        if not label or not symbol:
+            raise RuntimeError('function_return_probes[{}]: label/symbol must be non-empty'.format(i))
+        if label in seen_labels:
+            raise RuntimeError('function_return_probes[{}]: duplicate label {}'.format(i, label))
+        if capture not in ('first', 'last', 'all'):
+            raise RuntimeError('function_return_probes[{}]: capture must be first, last, or all'.format(i))
+        if reg_index < 0 or reg_index > 15:
+            raise RuntimeError('function_return_probes[{}]: return register must be in range 0..15'.format(i))
+        seen_labels.add(label)
+        cfgs.append({
+            'label': label,
+            'symbol': symbol,
+            'return_register': reg_name,
+            'return_register_index': reg_index,
+            'capture': capture,
+        })
+    return cfgs
+
 def _verification_probe_return_hook(cpu, addr):
     current_addr = int(addr) & ~1
     active_frames = _verification_probe_state.get('active_frames') or []
@@ -1673,10 +2009,12 @@ def _verification_probe_return_hook(cpu, addr):
             break
     if matched_frame is None:
         return
+    register_error = None
     try:
         raw_value = int(cpu.GetRegister(int(matched_frame['return_register_index'])).RawValue) & 0xFFFFFFFF
-    except Exception:
-        raw_value = 0
+    except Exception as exc:
+        register_error = str(exc) or 'register read failed'
+        raw_value = None
     label = matched_frame.get('label')
     capture = _verification_probe_state['captures'].get(label)
     if capture is None:
@@ -1684,7 +2022,52 @@ def _verification_probe_return_hook(cpu, addr):
         _verification_probe_state['captures'][label] = capture
     capture['reached'] = True
     capture['call_count'] = int(capture.get('call_count') or 0) + 1
-    formatted_value = _verification_fmt_u32(raw_value)
+    formatted_value = _verification_fmt_u32(raw_value) if raw_value is not None else None
+    if matched_frame.get('probe_kind') == 'function_return':
+        call_index = int(capture.get('call_count') or 0) - 1
+        call = {
+            'raw_value': raw_value,
+            'return_value': formatted_value,
+            'entry_address': _verification_fmt_u32(matched_frame.get('entry_addr', 0)),
+            'return_address': _verification_fmt_u32(current_addr),
+            'call_index': call_index,
+        }
+        if register_error:
+            call['register_read_error'] = register_error
+        all_calls = capture.get('calls') or []
+        mode = capture.get('capture', 'last')
+        if mode == 'all':
+            all_calls.append(call)
+        elif mode == 'first':
+            if not all_calls:
+                all_calls.append(call)
+        else:
+            if all_calls:
+                all_calls[0] = call
+            else:
+                all_calls.append(call)
+        selected = all_calls
+        capture['calls'] = all_calls
+        capture['entry_addresses'] = [item['entry_address'] for item in selected]
+        capture['return_addresses'] = [item['return_address'] for item in selected]
+        capture['raw_values'] = [
+            int(item['raw_value']) & 0xFFFFFFFF
+            for item in selected if item.get('raw_value') is not None
+        ]
+        capture['return_values'] = [item['return_value'] for item in selected]
+        log('function_return_probe: {} rv={} entry={} return={}'.format(
+            label, formatted_value, call['entry_address'], call['return_address']))
+        try:
+            del active_frames[matched_index]
+        except Exception:
+            pass
+        if any(
+            frame.get('return_addr') == current_addr
+            and frame.get('entry_addr') == matched_frame.get('entry_addr')
+            for frame in active_frames
+        ):
+            _verification_probe_return_hook(cpu, addr)
+        return
     is_success = raw_value == (int(matched_frame.get('success_value', 0)) & 0xFFFFFFFF)
     if capture.get('first_return_value') is None:
         capture['first_return_value'] = formatted_value
@@ -1696,7 +2079,7 @@ def _verification_probe_return_hook(cpu, addr):
     log(
         'verification_probe_return: {} rv={} bypass={}'.format(
             label,
-            _verification_fmt_u32(raw_value),
+            _verification_fmt_u32(raw_value) if raw_value is not None else 'read_error',
             bool(capture.get('bypassed')),
         )
     )
@@ -1704,6 +2087,12 @@ def _verification_probe_return_hook(cpu, addr):
         del active_frames[matched_index]
     except Exception:
         pass
+    if any(
+        frame.get('return_addr') == current_addr
+        and frame.get('entry_addr') == matched_frame.get('entry_addr')
+        for frame in active_frames
+    ):
+        _verification_probe_return_hook(cpu, addr)
 
 def _verification_probe_entry_hook(cpu, addr):
     current_addr = int(addr) & ~1
@@ -1724,15 +2113,21 @@ def _verification_probe_entry_hook(cpu, addr):
             'return_register_index': int(template.get('return_register_index', 0)),
             'success_value': int(template.get('success_value', 0)) & 0xFFFFFFFF,
             'return_addr': return_addr,
+            'entry_addr': current_addr,
+            'probe_kind': template.get('probe_kind', 'verification'),
         }
         _verification_probe_state['active_frames'].append(frame)
 
-def reset_verification_probes():
+def reset_verification_probes(selected_terminal_callsite=None):
     _verification_probe_state['active_frames'] = []
     captures = {}
     for cfg in _load_verification_probe_configs(_verification_probes_raw):
         captures[cfg['label']] = _make_verification_probe_capture(cfg)
+    for cfg in _load_function_return_probe_configs(_function_return_probes_raw):
+        captures[cfg['label']] = _make_function_return_probe_capture(cfg)
     _verification_probe_state['captures'] = captures
+    if '_terminal_error_state' in globals():
+        reset_terminal_error_paths(selected_callsite=selected_terminal_callsite)
 
 def capture_verification_probe_summary():
     if not _verification_probe_order:
@@ -1799,22 +2194,248 @@ def capture_verification_probe_summary():
         'full_bypass': full_bypass,
     }
 
-def merge_verification_probe_signals(signals):
-    summary = capture_verification_probe_summary()
+def capture_function_return_probe_summary():
+    if not _function_return_probe_order:
+        return None
+    probes = {}
+    for label in _function_return_probe_order:
+        capture = _verification_probe_state['captures'].get(label)
+        if capture is None:
+            continue
+        probes[label] = {
+            'label': capture.get('label'),
+            'symbol': capture.get('symbol'),
+            'return_register': capture.get('return_register'),
+            'capture': capture.get('capture', 'last'),
+            'reached': bool(capture.get('reached')),
+            'call_count': int(capture.get('call_count') or 0),
+            'raw_values': [int(v) & 0xFFFFFFFF for v in (capture.get('raw_values') or [])],
+            'return_values': list(capture.get('return_values') or []),
+            'entry_addresses': list(capture.get('entry_addresses') or []),
+            'return_addresses': list(capture.get('return_addresses') or []),
+            'entry_addresses_raw': [int(item.get('entry_address'), 0) for item in (capture.get('calls') or [])],
+            'return_addresses_raw': [int(item.get('return_address'), 0) for item in (capture.get('calls') or [])],
+            'calls': list(capture.get('calls') or []),
+        }
+    return probes or None
+
+def merge_verification_probe_signals(signals, include_verification=True):
+    summary = capture_verification_probe_summary() if include_verification else None
+    if summary:
+        signals['verification_probes'] = summary.get('probes')
+        signals['verification_probe_classification'] = summary.get('classification')
+        signals['verification_defense_in_depth'] = summary.get('defense_in_depth')
+        signals['verification_bypass_labels'] = summary.get('bypassed_labels')
+        signals['verification_bypass_detected'] = bool(summary.get('layer1_breached'))
+        signals['verification_full_bypass'] = bool(summary.get('full_bypass'))
+    function_summary = capture_function_return_probe_summary()
+    if function_summary:
+        signals['function_return_probes'] = function_summary
+    if '_terminal_error_state' in globals():
+        merge_terminal_error_signals(signals)
+
+# ---------------------------------------------------------------------------
+# Terminal-error escape telemetry.  Callsite addresses are resolved from the
+# exact ELF by the host profile loader and passed as JSON.  The runtime only
+# observes emitted instructions and sink entries; it never credits a source
+# annotation or a skipped source-level return path.
+# ---------------------------------------------------------------------------
+_terminal_error_paths_raw = get_optional_var('terminal_error_paths_b64', '')
+_terminal_error_snapshot_hash = get_optional_var('terminal_error_snapshot_hash', '')
+_terminal_error_artifact_hash = get_optional_var('terminal_error_artifact_hash', '')
+_terminal_error_state = {
+    'paths': [],
+    'by_callsite': {},
+    'by_sink': {},
+    'captures': {},
+    'selected_callsite': None,
+    'patch_applied': False,
+    'observation_started_at': 0.0,
+    'hook_addrs': set(),
+}
+
+def _load_terminal_error_paths(raw_text):
+    if not raw_text:
+        return []
+    try:
+        decoded_bytes = base64.b64decode(raw_text)
+        if not _terminal_error_artifact_hash or hashlib.sha256(decoded_bytes).hexdigest() != str(_terminal_error_artifact_hash).strip().lower():
+            raise RuntimeError('terminal_error_paths: artifact hash mismatch')
+        decoded = decoded_bytes.decode('utf-8')
+        payload = json.loads(decoded)
+    except Exception as exc:
+        raise RuntimeError('terminal_error_paths: failed to decode payload: {}'.format(exc))
+    if not isinstance(payload, list):
+        raise RuntimeError('terminal_error_paths: expected list payload')
+    return payload
+
+def _terminal_hash_valid(value):
+    text = str(value or '').strip().lower()
+    return len(text) == 64 and all(ch in '0123456789abcdef' for ch in text)
+
+def _terminal_marker_matches(marker):
+    if not isinstance(marker, dict):
+        return False, None
+    try:
+        actual = as_int(bus.ReadDoubleWord(int(marker.get('address', 0))))
+        expected = int(marker.get('expected_value', 0)) & 0xFFFFFFFF
+        mask = int(marker.get('mask', 0xFFFFFFFF)) & 0xFFFFFFFF
+        op = str(marker.get('op', 'eq')).lower()
+        lhs = actual & mask
+        rhs = expected & mask
+        if op == 'eq': ok = lhs == rhs
+        elif op == 'ne': ok = lhs != rhs
+        elif op == 'ge': ok = lhs >= rhs
+        elif op == 'le': ok = lhs <= rhs
+        else: ok = actual != 0
+        return bool(ok), fmt_u32(actual)
+    except Exception:
+        return False, None
+
+def _terminal_error_hook(cpu, addr):
+    current = int(addr) & ~1
+    callsite = _terminal_error_state.get('by_callsite', {}).get(current)
+    if callsite is not None:
+        capture = _terminal_error_state['captures'].get(callsite['campaign'])
+        if capture is not None:
+            elapsed = _time.time() - _terminal_error_state.get('observation_started_at', 0.0)
+            capture['observation_elapsed_s'] = max(0.0, elapsed)
+            window = capture.get('observation_window')
+            if window is not None and elapsed > float(window):
+                capture['observation_window_expired'] = True
+                return
+            capture['callsite_reached'] = True
+            capture['callsite_count'] = int(capture.get('callsite_count', 0)) + 1
+            marker = callsite.get('required_failure_marker')
+            if marker is not None:
+                marker_ok, marker_actual = _terminal_marker_matches(marker)
+                capture['failure_marker_observed'] = marker_actual
+                if marker_ok:
+                    capture['failure_marker_before_callsite'] = True
+            capture['last_callsite'] = '0x{:08X}'.format(current)
+            capture['selected_artifact_hash'] = callsite.get('artifact_hash') or _terminal_error_artifact_hash
+        return
+    campaigns = _terminal_error_state.get('by_sink', {}).get(current, [])
+    for campaign in campaigns:
+        capture = _terminal_error_state['captures'].get(campaign)
+        if capture is not None:
+            elapsed = _time.time() - _terminal_error_state.get('observation_started_at', 0.0)
+            capture['observation_elapsed_s'] = max(0.0, elapsed)
+            window = capture.get('observation_window')
+            if window is not None and elapsed > float(window):
+                capture['observation_window_expired'] = True
+                continue
+            capture['forbidden_sink_reached'] = True
+            if capture.get('first_forbidden_sink') is None:
+                capture['first_forbidden_sink'] = '0x{:08X}'.format(current)
+
+def reset_terminal_error_paths(selected_callsite=None):
+    _terminal_error_state['selected_callsite'] = None if selected_callsite is None else (int(selected_callsite) & ~1)
+    _terminal_error_state['patch_applied'] = False
+    _terminal_error_state['observation_started_at'] = _time.time()
+    captures = {}
+    for entry in _terminal_error_state.get('paths', []):
+        cfg = entry.get('config') if isinstance(entry, dict) else {}
+        name = str(cfg.get('name') or '').strip()
+        if name:
+            captures[name] = {
+                'name': name,
+                'expected_control': cfg.get('expected_control', 'terminal'),
+                'callsite_reached': False,
+                'callsite_count': 0,
+                'failure_marker_before_callsite': False,
+                'failure_marker_observed': None,
+                'failure_marker_configured': bool(cfg.get('required_failure_marker')),
+                'observation_window': cfg.get('observation_window'),
+                'observation_window_expired': False,
+                'observation_elapsed_s': 0.0,
+                'forbidden_sink_reached': False,
+                'first_forbidden_sink': None,
+                'selected_artifact_hash': _terminal_error_artifact_hash,
+                'snapshot_identity_hash': _terminal_error_snapshot_hash,
+                'unresolved_candidates': list(entry.get('unresolved_candidates') or []),
+                'infrastructure_errors': list(entry.get('infrastructure_errors') or []),
+            }
+    _terminal_error_state['captures'] = captures
+
+def mark_terminal_error_patch_applied(skip_addr):
+    """Record successful application of the selected instruction patch."""
+    _terminal_error_state['selected_callsite'] = int(skip_addr) & ~1
+    _terminal_error_state['patch_applied'] = True
+
+def capture_terminal_error_summary():
+    if not _terminal_error_state.get('paths'):
+        return None
+    result = {}
+    selected = _terminal_error_state.get('selected_callsite')
+    for name, capture in _terminal_error_state.get('captures', {}).items():
+        item = dict(capture)
+        item['selected_callsite'] = ('0x{:08X}'.format(selected) if selected is not None else None)
+        item['fault_applied'] = bool(selected is not None and _terminal_error_state.get('patch_applied'))
+        item['escaped'] = bool(item.get('fault_applied') and item.get('forbidden_sink_reached'))
+        item['control_terminal'] = bool(
+            item.get('callsite_reached')
+            and not item.get('forbidden_sink_reached')
+            and (
+                item.get('failure_marker_before_callsite')
+                or not item.get('failure_marker_configured')
+            )
+        )
+        result[name] = item
+    return result
+
+def merge_terminal_error_signals(signals):
+    summary = capture_terminal_error_summary()
     if not summary:
         return
-    signals['verification_probes'] = summary.get('probes')
-    signals['verification_probe_classification'] = summary.get('classification')
-    signals['verification_defense_in_depth'] = summary.get('defense_in_depth')
-    signals['verification_bypass_labels'] = summary.get('bypassed_labels')
-    signals['verification_bypass_detected'] = bool(summary.get('layer1_breached'))
-    signals['verification_full_bypass'] = bool(summary.get('full_bypass'))
+    signals['terminal_error_paths'] = summary
+    signals['terminal_error_snapshot_hash'] = _terminal_error_snapshot_hash or None
+    signals['terminal_error_artifact_hash'] = _terminal_error_artifact_hash or None
+    escaped = [name for name, item in summary.items() if item.get('escaped')]
+    if escaped:
+        signals['terminal_error_escaped'] = escaped
+        signals['finding'] = 'TERMINAL_ERROR_PATH_ESCAPED'
+    if any(item.get('infrastructure_errors') for item in summary.values()):
+        signals['terminal_error_infrastructure_error'] = True
+    if any(item.get('unresolved_candidates') for item in summary.values()):
+        signals['terminal_error_unresolved_candidates'] = True
+
+_terminal_error_state['paths'] = _load_terminal_error_paths(_terminal_error_paths_raw)
+if _terminal_error_state['paths'] and not _terminal_hash_valid(_terminal_error_snapshot_hash):
+    raise RuntimeError('terminal_error_paths: snapshot identity hash is missing or invalid')
+for _terminal_entry in _terminal_error_state['paths']:
+    _terminal_cfg = _terminal_entry.get('config') if isinstance(_terminal_entry, dict) else {}
+    _terminal_name = str(_terminal_cfg.get('name') or '').strip()
+    for _terminal_candidate in (_terminal_entry.get('candidates') or []):
+        try:
+            _terminal_addr = int(str(_terminal_candidate.get('callsite_address')), 0) & ~1
+        except Exception:
+            continue
+        _terminal_candidate = dict(_terminal_candidate)
+        _terminal_candidate['campaign'] = _terminal_name
+        _terminal_candidate['required_failure_marker'] = _terminal_cfg.get('required_failure_marker')
+        _terminal_error_state['by_callsite'][_terminal_addr] = _terminal_candidate
+    for _terminal_sink in (_terminal_entry.get('forbidden_sink_addresses') or []):
+        try:
+            _terminal_addr = int(str(_terminal_sink), 0) & ~1
+            _terminal_error_state['by_sink'].setdefault(_terminal_addr, []).append(_terminal_name)
+        except Exception:
+            pass
+if _terminal_error_state['paths']:
+    _terminal_cpu = monitor.Machine['sysbus.cpu']
+    for _terminal_addr in list(_terminal_error_state['by_callsite']) + list(_terminal_error_state['by_sink']):
+        if _terminal_addr not in _terminal_error_state['hook_addrs']:
+            _terminal_cpu.AddHook(_terminal_addr, _terminal_error_hook)
+            _terminal_error_state['hook_addrs'].add(_terminal_addr)
+    reset_terminal_error_paths()
 
 _verification_probe_cfgs = _load_verification_probe_configs(_verification_probes_raw)
-if _verification_probe_cfgs:
+_function_return_probe_cfgs = _load_function_return_probe_configs(_function_return_probes_raw)
+if _verification_probe_cfgs or _function_return_probe_cfgs:
     _verification_probe_order = [cfg['label'] for cfg in _verification_probe_cfgs]
+    _function_return_probe_order = [cfg['label'] for cfg in _function_return_probe_cfgs]
     cpu_ref = monitor.Machine['sysbus.cpu']
-    for cfg in _verification_probe_cfgs:
+    for cfg in _verification_probe_cfgs + _function_return_probe_cfgs:
         resolved_addrs = _resolve_elf_symbol_addresses(cfg['symbol'])
         if not resolved_addrs:
             raise RuntimeError(
@@ -1822,17 +2443,23 @@ if _verification_probe_cfgs:
             )
         for resolved_addr in resolved_addrs:
             templates = _verification_probe_state['entry_templates'].setdefault(resolved_addr, [])
-            templates.append(cfg)
+            template = dict(cfg)
+            if cfg in _function_return_probe_cfgs:
+                template['probe_kind'] = 'function_return'
+            templates.append(template)
             if resolved_addr not in _verification_probe_state['entry_hook_addrs']:
                 cpu_ref.AddHook(resolved_addr, _verification_probe_entry_hook)
                 _verification_probe_state['entry_hook_addrs'].add(resolved_addr)
             log(
-                'verification_probe: {} {}=0x{:08X} {} success={}'.format(
+                '{}: {} {}=0x{:08X} {}{}'.format(
+                    'function_return_probe' if cfg in _function_return_probe_cfgs else 'verification_probe',
                     cfg['label'],
                     cfg['symbol'],
                     resolved_addr & 0xFFFFFFFF,
                     cfg['return_register'],
-                    _verification_fmt_u32(cfg['success_value']),
+                    (' success=' + _verification_fmt_u32(cfg['success_value']))
+                    if 'success_value' in cfg else
+                    (' capture=' + str(cfg.get('capture', 'last'))),
                 )
             )
     reset_verification_probes()
@@ -2417,14 +3044,33 @@ def load_state_probe():
     return _state_probe_collect
 
 
+def _runtime_slot_geometry():
+    """Return slot geometry cached before machine Reset clears monitor vars."""
+    geometry = {
+        'exec': {'base': int(slot_exec_base), 'size': int(slot_exec_size)},
+        'staging': {'base': int(slot_staging_base), 'size': int(slot_staging_size)},
+    }
+    if slot_tertiary_base is not None and slot_tertiary_size is not None:
+        geometry['tertiary'] = {
+            'base': int(slot_tertiary_base), 'size': int(slot_tertiary_size),
+        }
+    if slot_recovery_base is not None and slot_recovery_size is not None:
+        geometry['recovery'] = {
+            'base': int(slot_recovery_base), 'size': int(slot_recovery_size),
+        }
+    return geometry
+
+
 def collect_semantic_state(context):
     collect_fn = load_state_probe()
     if collect_fn is None:
         return None
+    probe_context = dict(context) if isinstance(context, dict) else {}
+    probe_context.setdefault('slot_geometry', _runtime_slot_geometry())
     try:
-        state = collect_fn(bus=bus, monitor=monitor, context=context)
+        state = collect_fn(bus=bus, monitor=monitor, context=probe_context)
     except TypeError:
-        state = collect_fn(bus, monitor, context)
+        state = collect_fn(bus, monitor, probe_context)
     if state is None:
         return None
     if not isinstance(state, dict):
@@ -2681,6 +3327,8 @@ def _copy_on_boot_vtor_settle_iters():
     writes are still in flight.
     """
     try:
+        if vtor_settle_iters_config:
+            return vtor_settle_iters_config
         is_exec_handoff = success_vtor_slot == 'exec'
         expects_staging_image = bool(expected_exec_sha256) and bool(image_staging_sha256) and (
             expected_exec_sha256 == image_staging_sha256
@@ -2699,6 +3347,103 @@ def _snapshot_current_flash():
     if b['kind'] == 'fast':
         return b['data'].Flash.ReadBytes(0, int(b['data'].FlashSize))
     return None
+
+
+def _boundary_snapshot_components():
+    """Capture every supported persistent array needed by a follow-up."""
+    flash = _snapshot_current_flash()
+    if flash is None:
+        raise RuntimeError(
+            'boundary follow-up requires a snapshot-capable fast, MRAM, or OTP backend'
+        )
+    components = {'flash': to_py_bytes(flash)}
+    otp = backend.get('otp')
+    if otp is not None:
+        try:
+            components['otp'] = to_py_bytes(otp.TestSnapshot())
+        except Exception as exc:
+            raise RuntimeError(
+                'boundary follow-up cannot snapshot OTP peripheral: {}'.format(exc)
+            )
+    return components
+
+
+def _boundary_snapshot_identity():
+    """Identify every persistent peripheral participating in the artifact."""
+    return '{}|{}|otp={}'.format(
+        backend.get('backend_sysbus_name', ''),
+        backend.get('kind', ''),
+        backend.get('otp_sysbus_name', '') or '',
+    )
+
+
+def _write_boundary_snapshot(path):
+    """Write an authenticated, length-checked persistent-memory artifact."""
+    global _boundary_snapshot_capture_evidence
+    if not path:
+        raise RuntimeError('boundary candidate snapshot path is missing')
+    components = _boundary_snapshot_components()
+    identity = _boundary_snapshot_identity()
+    try:
+        header = _write_boundary_snapshot_artifact(
+            path, components,
+            identity,
+        )
+    except Exception as exc:
+        raise RuntimeError('boundary candidate snapshot failed: {}'.format(exc))
+    _boundary_snapshot_capture_evidence = {
+        'path': path,
+        'backend_identity': identity,
+        'sha256': _boundary_digest_components(components),
+        'components': header['components'],
+    }
+    return components
+
+
+def _read_boundary_snapshot(path):
+    """Read and verify a candidate artifact before mutating the machine."""
+    if not path or not os.path.isfile(path):
+        raise RuntimeError('boundary durable snapshot is missing')
+    expected = _boundary_snapshot_components()
+    try:
+        components, header = _read_boundary_snapshot_artifact(
+            path,
+            _boundary_snapshot_identity(),
+            {name: len(data) for name, data in expected.items()},
+        )
+    except Exception as exc:
+        raise RuntimeError('boundary durable snapshot validation failed: {}'.format(exc))
+    return components, header
+
+
+def restore_boundary_persistent_snapshot(path):
+    """Restore a verified candidate state before follow-up setup executes."""
+    global _boundary_snapshot_restore_evidence, _boundary_snapshot_loaded
+    if _boundary_snapshot_loaded:
+        return
+    components, header = _read_boundary_snapshot(path)
+    if backend['kind'] == 'mram':
+        backend['data'].WriteBytes(0, components['flash'], 0, len(components['flash']))
+    elif backend['kind'] == 'fast':
+        backend['data'].Flash.WriteBytes(0, components['flash'])
+    elif backend['kind'] == 'otp':
+        backend['data'].TestRestore(components['flash'])
+    else:
+        raise RuntimeError('boundary follow-up backend cannot restore persistent state')
+    otp = backend.get('otp')
+    if otp is not None:
+        otp.TestRestore(components['otp'])
+    observed = _boundary_snapshot_components()
+    for name in components:
+        if observed[name] != components[name]:
+            raise RuntimeError('boundary durable snapshot restore verification failed for {}'.format(name))
+    _boundary_snapshot_restore_evidence = {
+        'path': path,
+        'backend_identity': header['identity'],
+        'sha256': _boundary_digest_components(components),
+        'components': header['components'],
+    }
+    _boundary_snapshot_loaded = True
 
 
 def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=None, wall_timeout=10):
@@ -3974,6 +4719,13 @@ def prime_bootloader_entry():
 def apply_pre_boot_state():
     global _pre_boot_state_debug
     _pre_boot_state_debug = []
+    if boundary_phase.strip().lower() == 'follow_up' and pre_boot_bin:
+        raise RuntimeError(
+            'boundary follow-up cannot apply baseline pre_boot_state after candidate restore'
+        )
+    apply_boundary_setup_environment()
+    if boundary_phase.strip().lower() == 'follow_up':
+        restore_boundary_persistent_snapshot(boundary_durable_state_file)
     if setup_script:
         monitor.Parse('include @' + setup_script)
     if pre_boot_bin:
@@ -4139,6 +4891,7 @@ def restore_hw_init():
 
 def reset_nvmc_for_sweep():
     # Reset NVM counters and prepare for fault-injected run.
+    _configure_tracking_start_address()
     b = backend
     if b['kind'] == 'mram':
         b['data'].TotalWordWrites = 0
@@ -4182,6 +4935,7 @@ def reset_nvmc_for_sweep():
 
 def reset_nvmc_for_recovery():
     # Reset NVM for recovery boot: no write counting needed, fast mode.
+    _configure_tracking_start_address()
     b = backend
     if b['kind'] == 'mram':
         b['data'].TotalWordWrites = 0
@@ -4251,6 +5005,21 @@ def restore_initial_flash_cache():
     return False
 
 
+def cache_initial_otp():
+    """Capture the declared OTP peripheral after profile setup."""
+    global _cached_initial_otp
+    otp_dev = backend.get('otp')
+    if otp_dev is not None:
+        _cached_initial_otp = otp_dev.TestSnapshot()
+
+
+def restore_initial_otp_cache():
+    """Isolate fault points by restoring the profile's clean OTP baseline."""
+    otp_dev = backend.get('otp')
+    if otp_dev is not None and _cached_initial_otp is not None:
+        otp_dev.TestRestore(_cached_initial_otp)
+
+
 def prepare_clean_phase1_state():
     _machine_reset()
     monitor.Parse('machine Pause')
@@ -4258,6 +5027,7 @@ def prepare_clean_phase1_state():
     needs_pre_boot = restore_initial_flash_cache()
     if needs_pre_boot:
         apply_pre_boot_state()
+    restore_initial_otp_cache()
     if _hash_bypass_active:
         apply_hash_bypass()
     # Some platforms do not reload SP/PC from the bootloader vector table
@@ -4520,6 +5290,13 @@ def _prepare_update_phase_start_state(phase, phase_index):
 
 def _apply_update_phase_pre_boot(phase):
     phase_setup_script = str(phase.get('setup_script', '') or '').strip()
+    if boundary_phase.strip().lower() == 'follow_up' and phase.get('pre_boot_state'):
+        raise RuntimeError(
+            'boundary follow-up cannot apply update-phase baseline pre_boot_state'
+        )
+    apply_boundary_setup_environment()
+    if boundary_phase.strip().lower() == 'follow_up':
+        restore_boundary_persistent_snapshot(boundary_durable_state_file)
     if phase_setup_script:
         monitor.Parse('include @' + phase_setup_script)
     _apply_pre_boot_entries(phase.get('pre_boot_state', []))
@@ -5333,8 +6110,12 @@ def run_state_fault(fault_at):
         signals['bootloader_integrity_ok'] = structured_observations.get(
             'bootloader_integrity_ok'
         )
-        if not structured_observations.get('all_ok'):
-            boot_outcome = 'wrong_image'
+    if not structured_observations.get('all_ok'):
+        boot_outcome = 'wrong_image'
+    if (boundary_setup_env and boundary_durable_state_file and not calibration_mode
+            and boundary_phase.strip().lower() != 'follow_up'):
+        _write_boundary_snapshot(boundary_durable_state_file)
+    add_boundary_contract_signals(signals)
     semantic_state = collect_semantic_state({
         'cycle': 0,
         'boot_outcome': boot_outcome,
@@ -5343,13 +6124,18 @@ def run_state_fault(fault_at):
         'fault_injected': bool(fault_injected),
         'stage': 'state_mode',
     })
-    eff_criteria = get_effective_criteria('w')
+    # A negative point is the clean control dispatched by run_single_point().
+    # Keep its request identity distinct from an ordinary write-fault run so
+    # the host-side fail-closed validator can prove that no faulted result was
+    # accidentally substituted for the baseline.
+    requested_fault_type = 'control' if int(fault_at) < 0 else 'w'
+    eff_criteria = get_effective_criteria(requested_fault_type)
     fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
 
     result = {
         'fault_at': fault_at,
         'fault_requested': fault_at,
-        'fault_type': 'w',
+        'fault_type': requested_fault_type,
         'fault_injected': fault_injected,
         'fault_address': fmt_u32(fault_address),
         'boot_outcome': boot_outcome,
@@ -5358,6 +6144,8 @@ def run_state_fault(fault_at):
         'actual_writes': actual_writes,
         'signals': signals,
     }
+    if isinstance(signals.get('function_return_probes'), dict):
+        result['function_return_probes'] = signals['function_return_probes']
     if eff_criteria is not None:
         result['effective_success_criteria'] = eff_criteria
     if semantic_state is not None:
@@ -6260,6 +7048,11 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
     if skip_count is None:
         skip_count = _instruction_skip_count
     skip_addr = int(skip_addr)
+    # Every fault point starts with fresh verification, function-return, and
+    # terminal-error observations.  Keep only the immutable probe
+    # configuration and identify the terminal callsite selected for this
+    # point.
+    reset_verification_probes(selected_terminal_callsite=skip_addr)
     eff_criteria = get_effective_criteria('i')
     fp_t0 = _time.time()
     log('fp=0x{:X} type=i skip_count={} phase1_setup'.format(skip_addr, skip_count))
@@ -6295,6 +7088,8 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
                 'original_halfwords': ['0x{:04X}'.format(h) for h in original_halfwords],
             },
         }
+    if '_terminal_error_state' in globals():
+        mark_terminal_error_patch_applied(skip_addr)
     log('fp=0x{:X} type=i model={} patched {} halfword(s) across {} instruction(s) at 0x{:08X}'.format(
         skip_addr,
         patch_meta.get('model'),
@@ -6409,7 +7204,7 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
     signals['instruction_patch_supported'] = True
     signals['original_halfwords'] = ['0x{:04X}'.format(h) for h in original_halfwords]
     signals['patched_halfwords'] = ['0x{:04X}'.format(h) for h in patched_halfwords]
-    merge_verification_probe_signals(signals)
+    merge_verification_probe_signals(signals, include_verification=False)
     if phase1_status is not None:
         merge_stop_status_signals(signals, 'phase1', phase1_status)
 
@@ -6725,6 +7520,7 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
                         p2_status=None, followup_label='followup',
                         saved_flash=None, fault_snapshot_bytes=None,
                         extra_fields=None, metadata_delta_pre_snapshot=None,
+                        fault_semantic_state=None,
                         persist_snapshot=False, cycle_wall_timeout=10,
                         skip_followup_if_failed=False):
     # Shared epilogue for all fault runners.
@@ -6738,6 +7534,14 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
     fault_class = classify_fault_result(
         boot_outcome, boot_slot, signals, effective_criteria=eff_criteria
     )
+    # Shared entry/return probe telemetry is collected for every execute-mode
+    # result, including control runs and non-instruction faults.
+    merge_verification_probe_signals(signals)
+    if signals.get('terminal_error_escaped'):
+        fault_class = 'terminal_error_path_escape'
+    if signals.get('terminal_error_infrastructure_error') or signals.get('terminal_error_unresolved_candidates'):
+        fault_class = 'infrastructure_error'
+        boot_outcome = 'infra_error'
     # Metadata delta: capture post-recovery-boot snapshot BEFORE followup
     # boot cycles so the delta measures "pre-fault -> first recovery boot",
     # not "pre-fault -> after N followup boots".  Followup boots may
@@ -6815,6 +7619,11 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         'actual_writes': actual_writes,
         'signals': signals,
     }
+    if isinstance(signals.get('function_return_probes'), dict):
+        result['function_return_probes'] = signals['function_return_probes']
+    # Shared execute epilogue: every result carries the configured/applied RC
+    # injection contract and enforces require_applied fail-closed.
+    _apply_rc_injection_result_contract(result, signals, fault_type, fault_injected)
     if persist_snapshot and fault_snapshot_bytes is not None:
         _snapshot_path = persist_fault_snapshot(fault_at, fault_type, fault_snapshot_bytes)
         if _snapshot_path:
@@ -6871,6 +7680,14 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         result['effective_success_criteria'] = eff_criteria
     if semantic_state is not None:
         result['semantic_state'] = semantic_state
+        # Preserve the state observed at the recovery boundary separately
+        # from the final post-recovery state.  Recovery firmware may repair
+        # the fault (or, as with an acceptance API, repeat the operation),
+        # so the final state is not a substitute for the fault snapshot.
+        if fault_semantic_state is not None:
+            result['recovery_semantic_state'] = semantic_state
+    if fault_semantic_state is not None:
+        result['fault_semantic_state'] = fault_semantic_state
     if boot_cycle_records is not None:
         result['boot_cycles'] = boot_cycle_records
         result['multi_boot_analysis'] = multi_boot_analysis
@@ -7102,6 +7919,7 @@ def run_execute_fault(fault_at, fault_type='w'):
     # Compute effective criteria for this fault type.
     # Control runs (fault_at < 0) always use global criteria.
     eff_criteria = get_effective_criteria(fault_type) if int(fault_at) >= 0 else None
+    reset_verification_probes()
 
     cpu_ref = monitor.Machine['sysbus.cpu']
     if int(fault_at) < 0:
@@ -7161,6 +7979,11 @@ def run_execute_fault(fault_at, fault_type='w'):
             merge_stop_status_signals(signals, 'phase1', phase1_status)
             signals['zero_point_execute_control'] = zero_point_execute_control
 
+        if (boundary_setup_env and boundary_durable_state_file and not calibration_mode
+                and boundary_phase.strip().lower() != 'follow_up'):
+            _write_boundary_snapshot(boundary_durable_state_file)
+        add_boundary_contract_signals(signals)
+
         control_snapshot_bytes = None
         control_stop_reason = phase1_status.get('reason') if phase1_status is not None else ''
         if boot_outcome == 'no_boot' or str(control_stop_reason).startswith('no_boot'):
@@ -7186,6 +8009,7 @@ def run_execute_fault(fault_at, fault_type='w'):
     phase1_status = None
     phase2_status = None
     fault_snapshot_bytes = None
+    fault_semantic_state = None
     saved_flash = None
     md_pre_snapshot = None
     fault_base = _base_fault_type_code(fault_type)
@@ -7376,6 +8200,16 @@ def run_execute_fault(fault_at, fault_type='w'):
 
             phase2_t0 = _time.time()
             restore_flash_and_boot(saved_flash)
+            # Probe only after the exact persisted snapshot has been
+            # installed. This matters for writeback durability, where the
+            # snapshot may have had volatile writes stripped above.
+            fault_semantic_state = collect_semantic_state({
+                'cycle': 0,
+                'boot_outcome': 'power_loss_boundary',
+                'boot_slot': None,
+                'fault_injected': bool(fault_injected),
+                'stage': 'fault_snapshot',
+            })
             if _hash_bypass_active:
                 apply_hash_bypass()
             reset_nvmc_for_recovery()
@@ -7510,14 +8344,6 @@ def run_execute_fault(fault_at, fault_type='w'):
     if fault_injected and fault_type == 'g':
         signals['driver_error_flag_set'] = driver_error_flag_set()
         signals['driver_error_model'] = 'peripheral_status_flag'
-    if fault_type == 'x':
-        signals['rc_injection_model'] = 'software_return_code'
-        signals['rc_injection_value'] = fmt_u32(_rc_injection_state['return_value'])
-        signals['rc_injection_applied'] = bool(_rc_injection_state.get('injected'))
-        if _rc_injection_state.get('injected_symbol'):
-            signals['rc_injection_symbol'] = _rc_injection_state.get('injected_symbol')
-        if _rc_injection_state.get('injected_return_addr') is not None:
-            signals['rc_injection_return_addr'] = fmt_u32(_rc_injection_state.get('injected_return_addr'))
     if phase2_status is not None:
         merge_stop_status_signals(signals, 'phase2', phase2_status)
 
@@ -7540,6 +8366,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         fault_snapshot_bytes=fault_snapshot_bytes,
         extra_fields=extras,
         metadata_delta_pre_snapshot=md_pre_snapshot,
+        fault_semantic_state=fault_semantic_state,
     )
 
     # Release large .NET byte[] to prevent memory exhaustion in batch mode.
@@ -8937,6 +9764,7 @@ if not update_sequence_enabled:
 # Cache initial flash state for fast restore during sweep.
 if not update_sequence_enabled:
     cache_initial_flash()
+    cache_initial_otp()
 
 # ---------------------------------------------------------------------------
 # Calibration mode
@@ -9134,6 +9962,13 @@ if calibration_mode:
             'calibration_lr': fmt_u32(calibration_lr),
             'calibration_sp': fmt_u32(calibration_sp),
             'calibration_backend_kind': backend['kind'],
+            'tracking_gate': {
+                'requested': fmt_u32(tracking_start_address_config),
+                'actual': fmt_u32(getattr(backend['data'], 'TrackingStartAddress', 0)),
+                'started': bool(getattr(backend['data'], 'TrackingStarted', False)),
+                'start_hook_installed': bool(getattr(backend['data'], 'StartHookInstalled', False)),
+                'memory_hook_installed': bool(getattr(backend['data'], 'MemoryAccessHookInstalled', False)),
+            },
             'hash_bypass_active': bool(_hash_bypass_active),
             'hash_bypass_symbols_raw': _hash_bypass_symbols_raw,
             'hash_bypass_symbols_resolved': list(dict.fromkeys(sym for _addr, sym in _hash_bypass_patches)),

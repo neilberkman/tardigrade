@@ -20,6 +20,10 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from verdicts import is_pass_verdict
+from report_security_status import (
+    build_security_aggregate,
+    validate_security_aggregate,
+)
 
 
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -241,22 +245,75 @@ def _github_output_line(stream: TextIO, name: str, value: Any) -> None:
     stream.write("{}={}\n".format(name, text))
 
 
-def publish_report(report_path: Path, output_path: Path, audit_exit: int) -> bool:
-    """Publish sanitized Action outputs and return whether the audit passed."""
+def publish_report(
+    report_path: Path,
+    output_path: Path,
+    audit_exit: int,
+    *,
+    regression_mode: bool = False,
+) -> bool:
+    """Publish sanitized Action outputs and return whether its gate passed.
+
+    The CLI verdict checks a profile assertion, so a vulnerable regression
+    profile can legitimately report PASS.  The Action defaults to a security
+    gate and permits that result only when regression mode is explicit.
+    """
     payload = json.loads(report_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("report must contain a JSON object")
     verdict_value = payload.get("verdict")
     if not isinstance(verdict_value, str) or not verdict_value.strip():
         raise ValueError("report verdict must be a non-empty string")
     report_passed = is_pass_verdict(verdict_value)
-    passed = report_passed and audit_exit == 0
-    runtime = payload.get("summary", {}).get("runtime_sweep", {})
-    brick_rate = runtime.get("brick_rate", 0)
-    if not isinstance(brick_rate, (int, float)) or isinstance(brick_rate, bool):
-        raise ValueError("report brick_rate must be numeric")
+    assertion_passed = report_passed and audit_exit == 0
+
+    expect = payload.get("expect")
+    if not isinstance(expect, dict) or not isinstance(
+        expect.get("should_find_issues"), bool
+    ):
+        raise ValueError("report expect.should_find_issues must be boolean")
+    computed_aggregate = build_security_aggregate(payload)
+    emitted_aggregate = payload.get("security_aggregate")
+    if emitted_aggregate is not None:
+        emitted_aggregate = validate_security_aggregate(emitted_aggregate)
+        if emitted_aggregate != computed_aggregate:
+            raise ValueError("report security_aggregate does not match report evidence")
+        aggregate = emitted_aggregate
+    else:
+        # Compatibility for reports produced before the normalized aggregate
+        # was added.  All new audit reports emit and verify it.
+        aggregate = computed_aggregate
+
+    security_status = aggregate["status"]
+    issue_points = aggregate["issue_points"]
+    security_bypass_points = aggregate["security_bypass_points"]
+    brick_rate = aggregate["brick_rate"]
+    security_clean = security_status == "CLEAN"
+    security_reliable = not aggregate["inconclusive_reasons"]
+    passed = assertion_passed and (
+        security_clean
+        or (
+            regression_mode
+            and security_status == "FINDINGS"
+            and security_reliable
+        )
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("a", encoding="utf-8") as stream:
         _github_output_line(stream, "verdict", "PASS" if passed else "FAIL")
+        _github_output_line(
+            stream,
+            "assertion_status",
+            "PASS" if assertion_passed else "FAIL",
+        )
+        _github_output_line(stream, "security_status", security_status)
+        _github_output_line(stream, "issue_points", issue_points)
+        _github_output_line(
+            stream,
+            "security_bypass_points",
+            security_bypass_points,
+        )
         _github_output_line(stream, "brick_rate", brick_rate)
         _github_output_line(stream, "report_path", report_path)
     return passed
@@ -306,6 +363,7 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("--report", required=True)
     report.add_argument("--github-output", required=True)
     report.add_argument("--audit-exit", required=True, type=int)
+    report.add_argument("--regression-mode", action="store_true")
     return parser
 
 
@@ -341,6 +399,7 @@ def main() -> int:
                 Path(args.report),
                 Path(args.github_output),
                 args.audit_exit,
+                regression_mode=args.regression_mode,
             )
             return 0 if passed else 1
     except (OSError, ValueError, json.JSONDecodeError) as exc:

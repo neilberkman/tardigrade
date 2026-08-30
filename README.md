@@ -1,14 +1,20 @@
 # tardigrade
 
-High-speed fault-injection testing for embedded OTA bootloaders. Tardigrade systematically injects NVM faults along the firmware update path under [Renode](https://renode.io/) emulation, then checks whether the device recovers -- going beyond boot/no-boot to catch state-correctness bugs that corrupt the update state machine without necessarily bricking the device.
+Fault-injection and security-invariant testing for embedded update systems. Tardigrade drives storage, CPU, bus, and OTP faults through firmware update paths under [Renode](https://renode.io/) emulation, then checks recovery and security postconditions -- going beyond boot/no-boot to catch state-correctness bugs that do not necessarily brick the device.
 
-Trace replay and write-address heuristics make exhaustive fault sweeps (~15K points) feasible in minutes, not hours -- fast enough for CI gating. An optional CBMC bridge connects formal verification to empirical testing by converting counterexamples into replay profiles.
+Trace replay avoids repeated prefix emulation, while address-aware heuristics
+can substantially reduce routine power-loss campaign size. Actual savings and
+runtime are target-dependent. Declarative analyzers cover update-artifact
+authentication, reviewed-versus-signed authorization, persistent security
+state, and optimized-build assertion loss. An optional CBMC bridge connects
+formal verification to empirical testing by converting counterexamples into
+replay profiles.
 
 ## Findings
 
 ### NuttX nxboot -- original discovery
 
-Tardigrade's fault sweep against the upstream [NuttX nxboot bootloader](https://github.com/apache/nuttx-apps/tree/45d4c7098bb3a7a6d9b5642efc47df5998c048d5/boot/nxboot) found a power-loss recovery vulnerability: 92 of 94 fault points resulted in the bootloader jumping to partially-written firmware. Three fixes submitted:
+A historical Tardigrade campaign against the upstream [NuttX nxboot bootloader](https://github.com/apache/nuttx-apps/tree/45d4c7098bb3a7a6d9b5642efc47df5998c048d5/boot/nxboot) found a power-loss recovery vulnerability: 92 of 94 tested fault points resulted in the bootloader jumping to partially-written firmware. Three fixes were submitted:
 
 | Fix                                                                                         | PR                                                                       |
 | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
@@ -22,14 +28,13 @@ The FTL `O_DIRECT` bug affects all NuttX applications that write to MTD partitio
 
 These are retroactive tests against known MCUboot bugs, not discoveries. The point is showing that tardigrade's generic sweep catches real bug classes without target-specific tuning:
 
-| PR                                                      | Bug                                                                 | Broken               | Fixed    |
-| ------------------------------------------------------- | ------------------------------------------------------------------- | -------------------- | -------- |
+| PR                                                      | Bug                                                                 | Historical broken run | Fixed control |
+| ------------------------------------------------------- | ------------------------------------------------------------------- | --------------------- | ------------- |
 | [#2100](https://github.com/mcu-tools/mcuboot/pull/2100) | Revert magic left in bad state (swap-move)                          | 3 bricks (9.7%)      | 0 bricks |
 | [#2109](https://github.com/mcu-tools/mcuboot/pull/2109) | Header reload from wrong slot after interrupted swap (swap-scratch) | 19 bricks (33.3%)    | 0 bricks |
 | [#2199](https://github.com/mcu-tools/mcuboot/pull/2199) | Stuck revert: primary trailer never cleared (swap-move)             | 1 wrong_image (100%) | 0 issues |
 
 Additional differential profiles for PRs [#2205](https://github.com/mcu-tools/mcuboot/pull/2205), [#2206](https://github.com/mcu-tools/mcuboot/pull/2206), and [#2214](https://github.com/mcu-tools/mcuboot/pull/2214).
-
 
 ## Integrations
 
@@ -41,21 +46,95 @@ Additional differential profiles for PRs [#2205](https://github.com/mcu-tools/mc
 
 [`scripts/cbmc_to_profile.py`](scripts/cbmc_to_profile.py) converts CBMC counterexamples into tardigrade replay profiles. CBMC proves a fault sequence _could_ cause corruption at the source level; tardigrade runs the compiled firmware under that sequence to confirm whether it manifests in practice. The bridge maps source-level state violations to NVM write indices using the counterexample's variable traces and the calibration write log.
 
-## How it works
+### Declarative update-protocol analysis
+
+[`scripts/update_protocol_analyzer.py`](scripts/update_protocol_analyzer.py) enumerates the paths through a declared update protocol, including optional event groups, and checks that every commit follows required policy gates, metadata bindings, and authenticated-content coverage. The model is vendor-neutral and evidence-limited: a clean result says the declaration is internally safe, not that the declaration matches a particular implementation.
+
+```bash
+python3 scripts/update_protocol_analyzer.py \
+  --profile profiles/update_protocol_artifact_binding_fixed.yaml \
+  --json
+```
+
+## Core campaign capabilities
 
 ### Trace replay engine
 
-Naive fault injection re-emulates the entire firmware prefix for each fault point -- O(N^2) total emulation for N fault points. Tardigrade records a write trace during calibration, then replays it from the trace file (~20ms) instead of re-emulating Phase 1. This is what makes 15,000-point exhaustive sweeps feasible in minutes instead of hours.
+Naive fault injection re-emulates the entire firmware prefix for each fault
+point, producing O(N^2) total emulation for N points. For supported power-loss
+campaigns, Tardigrade records a write trace during calibration and replays the
+prefix instead of re-emulating Phase 1. The target and host determine the
+resulting runtime savings.
 
 ### Write-address heuristic
 
-Not all NVM writes are equally interesting. The heuristic classifier (`scripts/write_trace_heuristic.py`) analyzes write addresses and groups them into tiers: trailer metadata (exhaustive coverage), slot boundaries (dense sampling), and bulk data copies (sparse sampling). Result: ~10x reduction in sweep points while preserving coverage of the writes most likely to cause state-machine corruption. This makes fault injection practical for CI pipelines.
+Not all NVM writes are equally interesting. The heuristic classifier
+(`scripts/write_trace_heuristic.py`) analyzes write addresses and groups them
+into tiers: trailer metadata (exhaustive coverage), slot boundaries (dense
+sampling), and bulk data copies (sparse sampling). This concentrates routine
+campaigns on writes more likely to expose state-machine corruption; the actual
+reduction is target-dependent.
 
 ### Semantic assertions beyond boot/no-boot
 
 A device that boots to the wrong slot, confirms a corrupt image, or gets stuck in a revert loop is not "working." Tardigrade's state probes, semantic assertions, and composable invariant providers catch state-correctness bugs that pass a naive boot check. PR #2199 (stuck revert) is an example: the device boots, but it boots the wrong image permanently. Tardigrade catches it.
 
 Instruction-skip sweeps can also attach verification bypass probes that record per-function return values instead of relying only on the final boot outcome. This lets tardigrade separate noisy CPU crashes from defense-in-depth catches and true full verification bypasses, which cuts down the false positives that otherwise show up in glitch-style campaigns.
+
+Execute-mode `rc_injection` rejects a selected write and forces a configured
+return value when a named wrapper returns. General `function_return_probes`
+capture first, last, or all calls; the `success_implies_effect` invariant then
+checks that a successful API return produced its declared persistent effect.
+Other built-ins enforce atomic state groups, monotonic fields, and
+cross-component state relations.
+
+### Reviewed-versus-signed authorization
+
+The vendor-neutral `authorization_review` analyzer compares observed parsed,
+reviewed, digested, signed, and authorized value identities. It fails closed
+when required trace evidence is missing or incomplete; it consumes supplied
+JSON traces and does not automatically extract vendor traces from firmware.
+
+The vulnerable and fixed fixtures are [`profiles/authorization_review_vulnerable.yaml`](profiles/authorization_review_vulnerable.yaml) with [`examples/authorization_review/vulnerable_trace.json`](examples/authorization_review/vulnerable_trace.json), and [`profiles/authorization_review_fixed.yaml`](profiles/authorization_review_fixed.yaml) with [`examples/authorization_review/fixed_trace.json`](examples/authorization_review/fixed_trace.json).
+
+```bash
+python3 scripts/authorization_review_analyzer.py \
+  --profile profiles/authorization_review_fixed.yaml \
+  --trace examples/authorization_review/fixed_trace.json \
+  --json
+```
+
+The fixed fixture reports `PASS`; substitute the vulnerable profile and trace
+to see the reviewed-versus-signed mismatch finding.
+
+To create a starting point for collecting runtime evidence for every expanded
+sequence path, emit incomplete trace templates:
+
+```bash
+python3 scripts/authorization_review_analyzer.py \
+  --profile profiles/my_profile.yaml \
+  --emit-trace-template-dir traces/authorization
+```
+
+Template files contain the exact model digest and sequence name, ordered event
+occurrences, and empty evidence placeholders. The command only writes files
+and warns that they are incomplete observations; it does not run analysis or
+produce a verdict. Existing output files are never overwritten.
+
+### Security-state and emitted-code campaigns
+
+`persistent_state_layout` maps monotonic-security, authorization, secret,
+recovery, and mutable fields to physical erase units. The offline analyzer flags risky
+co-location, while the `security_state_erase` selector creates power-loss
+cutpoints around erase and restoration boundaries. `boundary_campaigns`
+expands logical counters around zero, storage capacity, and integer limits,
+with optional lower-value follow-ups that verify rejection and persistence.
+
+For CPU-fault campaigns, `terminal_error_paths` derives direct calls and tail
+branches to fatal handlers from the emitted ELF. A finding requires a terminal
+control run, an applied instruction skip against the same artifact and restored
+state, and observation of a declared forbidden sink. Missing or ambiguous
+evidence is inconclusive rather than clean.
 
 ### Write-back durability model
 
@@ -76,7 +155,17 @@ Diagnostic annotations include a barrier audit (detects missing flush barriers b
     workers: 2
 ```
 
-Outputs: `verdict` (PASS/FAIL), `report-path`, `brick-rate`. Use `verdict` as the CI gate signal.
+Outputs include `verdict` (PASS/FAIL), `security-status` (CLEAN/FINDINGS/
+INCONCLUSIVE), `assertion-status`, `issue-points`, `security-bypass-points`,
+`report-path`, and `brick-rate`. By default, `verdict` is a fail-safe security
+gate: it is PASS only when the profile expects no issues, no issues were found,
+the evidence is complete, and the CLI assertion passed.
+
+Known-vulnerable profiles used as regression tests must opt in explicitly with
+`regression-mode: true`. In that mode, `verdict` is PASS only when the
+regression assertion passes, `security-status` is `FINDINGS`, and the evidence
+has no inconclusive reasons. Do not use regression mode as a release security
+gate.
 
 Relative ELF, image, platform, setup, and hook paths are resolved from the
 caller's workspace. Set `asset-root` to a workspace subdirectory when those
@@ -110,7 +199,8 @@ See [`action.yml`](action.yml) for all inputs and outputs.
 
 For a step-by-step walkthrough, see the [Getting Started guide](docs/getting-started.md).
 
-Prerequisites: `python3`, `python3 -m pip install -r requirements.txt`, and either `renode-test` on PATH or Docker.
+Prerequisites: Python 3.10+, `python3 -m pip install -r requirements.txt`, and
+either `renode-test` on PATH or Docker.
 
 ```bash
 python3 scripts/audit_bootloader.py \
@@ -119,15 +209,22 @@ python3 scripts/audit_bootloader.py \
   --output results/report.json
 ```
 
-`--quick` runs a 3-point smoke test. Default is the heuristic sweep (~1K points, 2-4 min). Add `--workers N` for parallelism. Build the public validation container with `docker build -f docker/oss-validation.Dockerfile -t tardigrade-oss-validation .`, then use `--renode-test docker://tardigrade-oss-validation`.
+By default, `--quick` selects the first, middle, and last point independently
+for each enabled fault family or selector, so mixed campaigns can run more than
+three points. With `quick_use_heuristic: true`, write-indexed faults use the
+heuristic-selected set and the ordinary three-point reductions are not applied
+to other enabled families. Add `--workers N` for parallelism. Build the public
+validation container with
+`docker build -f docker/oss-validation.Dockerfile -t tardigrade-oss-validation .`,
+then use `--renode-test docker://tardigrade-oss-validation`.
 
 ### Run modes
 
-| Mode       | Flag              | Points | Time    | Use case               |
-| ---------- | ----------------- | ------ | ------- | ---------------------- |
-| Quick      | `--quick`         | 3      | seconds | smoke only             |
-| Heuristic  | _(default)_       | ~1K    | 2-4 min | normal CI / canary     |
-| Exhaustive | `--fault-start 0` | ~15K   | 15 min  | deep manual validation |
+| Mode       | Selection                                       | Typical points      | Use case               |
+| ---------- | ----------------------------------------------- | ------------------- | ---------------------- |
+| Quick      | CLI `--quick`                                   | Up to 3 per enabled family by default | smoke only |
+| Heuristic  | profile `fault_sweep.sweep_strategy: heuristic`  | target-specific     | normal CI / canary     |
+| Exhaustive | profile `fault_sweep.sweep_strategy: exhaustive` | every planned point | deep manual validation |
 
 ## How it works
 
@@ -144,12 +241,12 @@ flowchart TD
     D --> E
 
     subgraph pf["Per fault point"]
-        E["Phase 1: replay trace<br/>to selected cutpoint (~20ms)"] --> F{"Fault type"}
+        E["Phase 1: replay trace or run CPU<br/>to selected cutpoint"] --> F{"Fault type"}
         F -->|power_loss| G["Truncate write N<br/>(partial word)"]
         F -->|swap_progress| G2["Cut power at swap iteration N<br/>(sector-boundary transition)"]
         F -->|bit_corruption| H["Flip random bits<br/>(NOR physics model)"]
         F -->|interrupted_erase| I["Partial page erase"]
-        F -->|"20 others<br/>(I2C, OTP, NVM,<br/>instruction_skip, ...)"| J["Backend-specific<br/>fault injection"]
+        F -->|"24 others<br/>(I2C, OTP, NVM,<br/>instruction_skip, ...)"| J["Backend-specific<br/>fault injection"]
 
         G --> K["Faulted NVM state"]
         G2 --> K
@@ -180,31 +277,31 @@ flowchart TD
 
 1. **Trigger discovery** -- if the profile does not already seed a `pre_boot_state`, tardigrade can try a short trigger cascade (`no_trigger`, trailer magic, trailer metadata, offset placement) until calibration reaches real slot data movement. MCUboot profiles also get a compiled flash-map preflight so bad slot geometry fails fast instead of looking "clean."
 2. **Calibration** -- run the firmware once, count total NVM writes, and record write/erase traces.
-3. **Cutpoint selection** -- choose candidate fault points from the clean trace. Today this includes raw write indices, erase indices, and semantic `swap_progress` boundaries.
-4. **Heuristic pruning** -- classify write-indexed points by address into tiers, reducing routine sweeps ~10x.
-5. **Phase 1** -- replay the clean trace up to the selected cutpoint and inject the fault (trace replay eliminates O(N^2) prefix re-emulation).
+3. **Cutpoint selection** -- choose candidate fault points from the clean trace. This includes raw write indices, erase indices, semantic `swap_progress` boundaries, and security-state erase/restoration boundaries.
+4. **Heuristic pruning** -- classify write-indexed points by address into tiers, often reducing routine campaign size.
+5. **Phase 1** -- replay the clean trace where supported, or execute the CPU to the selected cutpoint, then inject the fault. Trace replay eliminates O(N^2) prefix re-emulation for eligible power-loss points.
 6. **Phase 2** -- `execute` mode resets the CPU and performs a full recovery boot from faulted NVM; `state` mode infers the outcome from NVM contents alone.
 7. **Follow-up cycles / hooks** -- optional repeated boots and between-cycle hook actions model confirm-or-rollback flows and staged recovery.
 8. **Classification** -- boot outcomes (`success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`) and failure classes (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`). A `timeout` means the bootloader was still actively working when the wall-clock budget expired -- this is not counted as a failure.
 
 ### Fault types
 
-27 fault types across 8 backend categories:
+28 implemented fault types and semantic selectors across 8 backend categories:
 
-| Category        | Fault types                                                                                                                                                           | Backend              |
-| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| NVM write/erase | `power_loss`, `swap_progress`, `bit_corruption`, `interrupted_erase`, `silent_write_failure`, `write_disturb`, `write_rejection`, `multi_sector_atomicity`, `wear_leveling_corruption` | All                  |
-| NVM read/time   | `read_bit_flip`, `reset_at_time`, `timed_bit_corruption`                                                                                                              | NVMemory, MRAM / All |
-| NVM controller  | `command_drop`                                                                                                                                                        | GenericNvmController |
-| NVM region      | `bootloader_region_write`, `nvs_corruption`                                                                                                                           | All                  |
-| CPU glitch      | `instruction_skip`                                                                                                                                                    | All                  |
-| Driver error    | `driver_error` (peripheral sets error status register), `rc_injection` (forces flash write return code to -EIO at software level)                                     | All                  |
-| I2C bus         | `i2c_nack`, `i2c_timeout`, `i2c_bit_flip`, `i2c_truncated`, `i2c_wrong_address`                                                                                       | I2CFaultProxy        |
-| OTP fuse        | `otp_partial_program`, `otp_stuck_bit`, `otp_read_disturb`, `otp_overblow`, `otp_blow_nop`                                                                            | OTPMemory            |
+| Category        | Fault types                                                                                                                                                                                    | Backend requirement                         |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
+| NVM write/erase | `power_loss`, `swap_progress`, `security_state_erase`, `bit_corruption`, `interrupted_erase`, `silent_write_failure`, `write_disturb`, `write_rejection`, `multi_sector_atomicity`, `wear_leveling_corruption` | Flash/MRAM capability-dependent             |
+| NVM read/time   | `read_bit_flip`, `reset_at_time`, `timed_bit_corruption`                                                                                                                                       | NVMemory/MRAM for read faults; reset is all |
+| NVM controller  | `command_drop`                                                                                                                                                                                 | GenericNvmController                        |
+| NVM region      | `nvs_corruption`                                                                                                                                                                               | Declared NVS region                         |
+| CPU glitch      | `instruction_skip`                                                                                                                                                                             | Arm execute mode                            |
+| Driver error    | `driver_error`, `rc_injection`                                                                                                                                                                 | Instrumented driver / Arm execute mode      |
+| I2C bus         | `i2c_nack`, `i2c_timeout`, `i2c_bit_flip`, `i2c_truncated`, `i2c_wrong_address`                                                                                                                | I2CFaultProxy                               |
+| OTP fuse        | `otp_partial_program`, `otp_stuck_bit`, `otp_read_disturb`, `otp_overblow`, `otp_blow_nop`                                                                                                     | OTPMemory                                   |
 
-Faults can be injected at different lifecycle stages: during the initial update write path, during pre-boot metadata/setup writes (`metadata_fault`), during between-boot confirm/accept hooks (`hook_fault`), during the recovery write path itself (`phase2_fault`), or as compound sequences (`multi_fault`). The optional `durability_model: writeback` composes with any fault type to simulate write-buffering storage stacks.
+Faults can be injected at different lifecycle stages: during the initial update write path, during pre-boot metadata/setup writes (`metadata_fault`), during between-boot confirm/accept hooks (`hook_fault`), during the recovery write path itself (`phase2_fault`), or as compound sequences (`multi_fault`). The optional `durability_model: writeback` composes with fault campaigns to simulate write-buffering storage stacks.
 
-`swap_progress` is the first semantic cutpoint selector beyond raw write indices. It uses calibration erase data to find real sector-boundary transitions in slot traffic, then reuses the normal power-cut replay path at those boundaries. On platforms where an erase trace is unavailable, tardigrade falls back to uniform `memory.page_size` buckets, which is usable on uniform flash and only approximate on non-uniform layouts.
+`swap_progress` uses calibration erase data to find real sector-boundary transitions in slot traffic, then reuses the normal power-cut replay path at those boundaries. On platforms where an erase trace is unavailable, tardigrade falls back to uniform `memory.page_size` buckets, which is usable on uniform flash and only approximate on non-uniform layouts. `security_state_erase` is also a semantic power-loss selector; it targets erase and restoration boundaries for declared persistent security fields.
 
 Clean verdicts are coverage-gated. If calibration shows trailer-only activity, flash traffic outside the declared slots, or no NVM activity at all, tardigrade reports that as a failed/inconclusive setup instead of a clean `PASS`.
 
@@ -222,16 +319,16 @@ In `execute` mode, Phase 2 performs a full CPU recovery boot from faulted NVM:
 
 ### Performance
 
-- **Trace replay** -- recorded trace replay (~20ms) replaces full Phase 1 re-emulation
+- **Trace replay** -- recorded prefixes replace repeated Phase 1 emulation where supported
 - **Cached flash restore** -- single `WriteBytes` per fault point instead of per-page erase+load
 - **Hash bypass** -- patches out crypto validation on faulted sweep runs via `sweep_hash_bypass_symbols`
 - **Parallel workers** -- `--workers N` distributes fault points across N Renode instances
-- **Heuristic pruning** -- ~15K to ~1K points for routine CI
+- **Heuristic pruning** -- address-aware tiers reduce routine point sets by a target-dependent amount
 - **Interleaved distribution** -- round-robin assignment balances load across workers
 
 ## Profile-driven architecture
 
-Sweeps are purely declarative YAML -- describe the memory layout, slots, images, and success criteria. Advanced semantic checking (state probes, custom invariants, boot register capture, write-order constraints) requires small Python hooks. A `security_policy` block models anti-rollback floors, minimum version enforcement, and TOCTOU protection for adversarial fault scenarios.
+Sweeps are profile-driven YAML -- describe the memory layout, slots, images, and success criteria. Advanced semantic checking (state probes, custom invariants, boot register capture, write-order constraints) requires small Python hooks. A `security_policy` block models anti-rollback floors, minimum version enforcement, and TOCTOU protection for adversarial fault scenarios. Optional `update_protocol`, `authorization_review`, `persistent_state_layout`, and `boundary_campaigns` blocks add declarative security-path analysis and campaign expansion.
 
 For upgrade-style profiles, the preferred starting point is minimal: ELF, slot layout, images, and success criteria. If you omit `pre_boot_state` and either omit `update_trigger` or set `update_trigger: auto`, tardigrade will try to discover the update trigger automatically before the real sweep.
 
@@ -245,27 +342,55 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the complete 
 
 **NuttX nxboot** -- real upstream NuttX firmware built from source. Board configs are upstream ([apache/nuttx#18509](https://github.com/apache/nuttx/pull/18509)). Tardigrade found a power-loss recovery vulnerability (92/94 failure rate) that led to fixes in both the NuttX kernel ([#18552](https://github.com/apache/nuttx/pull/18552)) and nxboot itself ([nuttx-apps#3428](https://github.com/apache/nuttx-apps/pull/3428)). The target adapter (`targets/nuttx_nxboot/`) includes a build script, runtime profile generator, and state probe. See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
 
-**rustBoot** -- a clean-room state probe and invariant package for the public
+**rustBoot** -- an independent state probe and invariant package for the public
 MIT-licensed rustBoot partition/trailer protocol. No rustBoot prebuilt firmware
 is distributed. See [`targets/rustboot/`](targets/rustboot/) and
 [`docs/rustboot-target.md`](docs/rustboot-target.md) for the adapter reference.
 
+**Trusted Firmware-M BL2** -- a four-slot probe, multi-image acceptance
+invariants, persisted-snapshot evaluator, and path-neutral native-run template
+for locally built dual-image TF-M BL2 on MPS2 AN521. No TF-M firmware binary is
+distributed. The AN521 platform currently provides update-state observation,
+fault instrumentation, and register-driver compatibility; it does not validate
+live SAU/MPC memory isolation. See [`targets/tf_m_bl2/`](targets/tf_m_bl2/).
+
 ### Reference examples
 
-The `examples/` directory contains standalone bootloader firmware for engine validation and self-testing:
+The `examples/` directory contains standalone firmware plus declarative models
+and trace fixtures for engine validation and self-testing:
 
 | Example                  | Purpose                                                            |
 | ------------------------ | ------------------------------------------------------------------ |
+| `authorization_review`   | Reviewed-versus-signed declarative model and trace fixtures         |
 | `naive_copy`             | Worst-case baseline; proves the engine catches obvious brick paths |
 | `vulnerable_ota`         | Copy-in-place OTA with frequent boot-visible failures              |
 | `nxboot_style`           | Modeled nxboot family for adapter/probe/invariant development      |
-| `esp_idf_ota`            | Clean-room model of ESP-IDF OTA slot-selection behavior            |
+| `esp_idf_ota`            | Standalone model of ESP-IDF OTA slot-selection behavior            |
 | `bootloader_self_update` | Bootloader-region integrity and self-update fault modeling         |
 | `nvs_config_migration`   | Config/NVS-region corruption and migration validation              |
+| `firmware_otp_harness`   | OTP programming and fuse-fault validation                          |
+| `cbmc_bridge`            | Formal-counterexample and crash-input conversion fixtures          |
+| `fuzzer_harness`         | End-to-end parser fuzzing and regression-profile example           |
 
 ## Report structure
 
-Top-level verdict is `PASS` or `FAIL` -- use this as the CI gate signal. `bricks` counts unrecoverable failures (device didn't boot). `issue_points` includes broader mismatches (wrong slot, semantic assertions, invariant violations). `timeout_points` counts fault points where the bootloader was still actively working when the wall-clock budget expired -- these are not failures (increase `run_duration` to resolve). Boot outcomes: `success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`. A clean `PASS` also requires calibration coverage: if the bootloader never moves slot data during calibration, tardigrade fails the run instead of claiming the bootloader is clean.
+The CLI report's top-level `verdict` is an expectation assertion and begins
+with `PASS`, `FAIL`, or `INCONCLUSIVE`. A `PASS` can mean that a deliberately
+vulnerable regression profile produced the expected findings. The separate
+`security_aggregate.status` is `CLEAN`, `FINDINGS`, or `INCONCLUSIVE` across
+runtime, multi-component, boundary, terminal-error, and authorization
+evidence. The GitHub Action combines both values into its binary `verdict`
+output and requires `CLEAN` unless `regression-mode` is explicitly enabled.
+
+For runtime sweeps, `bricks` counts unrecoverable failures, `issue_points`
+includes broader mismatches (wrong slot, semantic assertions, and invariant
+violations), and `timeout_points` counts points where the bootloader was still
+working when the wall-clock budget expired. Timeouts are not failures; increase
+`run_duration` to resolve them. Common boot outcomes are `success`,
+`wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, and `timeout`. Clean runtime
+evidence also requires calibration coverage: if the bootloader never moves
+slot data during calibration, tardigrade reports an incomplete setup rather
+than claiming the bootloader is clean.
 
 See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the full report JSON structure and how to interpret results.
 
@@ -276,16 +401,20 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the full repo
 - **Fuzzer bridge** ([`scripts/fuzz_crash_to_profile.py`](scripts/fuzz_crash_to_profile.py)) -- converts libFuzzer/AFL/honggfuzz crash inputs into regression profiles; supports batch mode, staging-image injection, and auto-detection of fuzzer types. Workflow helpers live in [`scripts/fuzz_corpus.py`](scripts/fuzz_corpus.py), with an end-to-end template in [`examples/fuzzer_harness/`](examples/fuzzer_harness/). Legacy converter: `scripts/fuzz_to_profile.py`.
 - **Geometry matrix** ([`scripts/geometry_matrix.py`](scripts/geometry_matrix.py)) -- parametric slot-layout permutations to catch geometry-dependent bugs.
 - **State fuzzer** -- structured metadata-state fuzzing via the `state_fuzzer` profile block, plus the MCUboot-specific scenario generator in [`targets/mcuboot/state_fuzzer.py`](targets/mcuboot/state_fuzzer.py).
+- **Update-protocol analyzer** ([`scripts/update_protocol_analyzer.py`](scripts/update_protocol_analyzer.py)) -- checks declarative commit paths for required security gates, metadata bindings, and authenticated content.
+- **Authorization-review analyzer** ([`scripts/authorization_review_analyzer.py`](scripts/authorization_review_analyzer.py)) -- compares observed parsed, reviewed, digested, signed, and authorized values using complete trace evidence.
+- **Production-assert analyzer** ([`scripts/production_assert_analyzer.py`](scripts/production_assert_analyzer.py)) -- identifies Python assertions that disappear under optimization and need reachability and impact review; candidates are not confirmed vulnerabilities.
+- **Persistent-state layout analyzer** ([`scripts/security_state_layout.py`](scripts/security_state_layout.py)) -- maps declared fields to erase units and identifies security state co-located with mutable or recovery data.
 - **HTML report** ([`scripts/render_results_html.py`](scripts/render_results_html.py)) -- renders JSON reports as HTML.
 
 ## CI workflows
 
 | Workflow                              | Trigger                  | What it does                          |
 | ------------------------------------- | ------------------------ | ------------------------------------- |
-| `ci.yml`                              | push, PR                 | Robot suites + sharded self-test      |
+| `ci.yml`                              | push, PR                 | License gate, Robot/pytest, self-test |
 | `profile-sweep.yml`                   | workflow_dispatch        | On-demand single-profile sweep        |
 | `action-validation.yml`               | push, PR                 | Validates the reusable GitHub Action  |
-| `oss-validation.yml`                  | push to `main`, schedule | OSS validation guards                 |
+| `oss-validation.yml`                  | path-filtered push to `main`, schedule, dispatch | OSS validation guards |
 | `mcuboot-head-exploratory.yml`        | workflow_dispatch        | MCUboot exploratory scenario          |
 | `nuttx-nxboot-real-exploratory.yml`   | workflow_dispatch        | Real NuttX nxboot exploratory sweep   |
 | `nuttx-nxboot-revert-canary.yml`      | schedule, dispatch       | NuttX revert property canary          |
@@ -301,7 +430,7 @@ tardigrade/
 │   ├── audit_bootloader.py           # Primary CLI entry point
 │   ├── run_scenario.py               # Multi-step scenario runner
 │   ├── profile_loader.py             # YAML profile parser + validation
-│   ├── invariants.py                 # 14 built-in postcondition invariants
+│   ├── invariants.py                 # 18 named postcondition invariants
 │   ├── self_test.py                  # Self-test across known defect corpus
 │   ├── run_runtime_fault_sweep.resc  # Renode fault sweep engine
 │   ├── write_trace_heuristic.py      # Write-trace classification
@@ -310,17 +439,27 @@ tardigrade/
 │   ├── partial_staging.py            # Partial staging-image simulation
 │   ├── render_results_html.py        # HTML report renderer
 │   ├── geometry_matrix.py            # Parametric slot-layout generator
+│   ├── boundary_campaigns.py         # Security-counter boundary expansion
+│   ├── security_state_layout.py      # Persistent erase-domain analysis
+│   ├── terminal_error_escape.py      # Emitted-ELF terminal-path analysis
+│   ├── update_protocol_analyzer.py   # Update gate/content-binding analysis
+│   ├── authorization_review_analyzer.py # Reviewed-versus-signed analysis
+│   ├── production_assert_analyzer.py # Optimized-build assertion review
 │   ├── cbmc_to_profile.py            # CBMC counterexample converter
 │   ├── fuzz_crash_to_profile.py      # Fuzzer crash-to-profile converter
 │   ├── fuzz_to_profile.py            # Legacy fuzzer bridge
-│   └── run_oss_validation.py         # OSS validation runner
+│   ├── run_oss_validation.py         # OSS validation runner
+│   └── license_certify.py            # Strict source-release license gate
 ├── targets/
+│   ├── esp_idf/                      # ESP-IDF model probe + invariants
 │   ├── mcuboot/                      # MCUboot probe, invariants, state fuzzer
 │   ├── nuttx_nxboot/                 # Real NuttX build + runtime profile gen
-│   └── nxboot/                       # Shared nxboot-style probe + invariants
+│   ├── nxboot/                       # Shared nxboot-style probe + invariants
+│   ├── rustboot/                     # rustBoot probe + invariants
+│   └── tf_m_bl2/                     # TF-M multi-image probe + evaluator
 ├── profiles/                         # YAML audit profiles (~180 profiles)
 ├── scenarios/                        # Multi-step scenario definitions
-├── examples/                         # Built-in reference bootloader firmware
+├── examples/                         # Reference firmware, models, and trace fixtures
 ├── harnesses/                        # Fuzzer harness templates
 ├── peripherals/                      # Renode C# peripherals with fault hooks
 │   ├── NRF52NVMC.cs                  #   NVMC flash with write/erase faults
@@ -330,6 +469,9 @@ tardigrade/
 │   ├── OTPMemory.cs                  #   OTP fuse-blow fault model
 │   ├── STM32F4FlashController.cs     #   STM32F4 flash controller
 │   ├── STM32H7FlashController.cs     #   STM32H7 flash controller
+│   ├── An521NvmInterceptor.cs        #   AN521 RAM-backed NVM interception
+│   ├── CMSDKAPBWatchdog.cs           #   CMSDK watchdog model
+│   ├── Sse200MpcStub.cs              #   SSE-200 MPC register model
 │   ├── TraceReplayEngine.cs          #   Trace replay for fast Phase 1
 │   └── FaultTracker.cs               #   Shared fault-tracking + writeback overlay
 ├── platforms/                        # Renode platform definitions (.repl)
@@ -338,18 +480,21 @@ tardigrade/
 ├── results/oss_validation/assets/    # Pre-built MCUboot ELFs + slot images
 └── docs/
     ├── writing-profiles.md           # Profile-writing guide + result interpretation
+    ├── license-certification.md      # Strict source-package license boundary
+    ├── rustboot-target.md            # rustBoot adapter reference
     ├── i2c-fault-model.md            # I2C fault injection model
     └── otp-backend.md                # OTP fuse-blow backend
 ```
 
 ## Limitations
 
-- Fault model operates at write-operation granularity, not analog brownout simulation.
-- Cortex-M targets only; non-Cortex architectures are not first-class.
-- Some fault types are backend-specific: `read_bit_flip` requires a backend that intercepts CPU reads (NVMemory or MRAMMemory -- fast-path backends like NVMC/STM32 expose flash via MappedMemory that the CPU reads directly); `command_drop` requires GenericNvmController; I2C faults require the I2CFaultProxy peripheral; OTP faults require the OTPMemory peripheral. The profile loader warns at load time for incompatible combinations.
+- Storage power-loss faults operate at write/erase-operation granularity, not analog brownout simulation.
+- The primary fault-sweep path is first-class for Cortex-M; auxiliary Cortex-A boot helpers are not integrated fault-sweep targets.
+- Some fault types are backend-specific: `read_bit_flip` requires a backend that intercepts CPU reads (NVMemory or MRAMMemory -- fast-path backends like NVMC/STM32 expose flash via MappedMemory that the CPU reads directly); `command_drop` requires GenericNvmController; I2C faults require the I2CFaultProxy peripheral; OTP faults require the OTPMemory peripheral. The loader emits heuristic warnings for several obvious backend mismatches; runtime evidence remains coverage-gated.
 - Multi-fault sweeps currently execute all stages as power-loss faults regardless of the original fault type.
-- Semantic bugs that don't change boot outcome require explicit target instrumentation.
-- Exhaustive sweeps take ~15 min on a 2-core CI runner; heuristic mode is 2-4 min.
+- Runtime semantic bugs that do not change boot outcome require explicit target instrumentation or trace evidence.
+- Campaign time varies substantially with target, fault types, recovery cycles, and worker count; the bundled power-loss profiles are reference points, not a general runtime guarantee.
+- Declarative and static analyzers are evidence-limited and do not prove that a supplied model matches deployed firmware.
 
 ## Why "tardigrade"
 
@@ -359,3 +504,18 @@ Tardigrades survive vacuum, radiation, and temperature extremes. The name maps t
 
 Apache 2.0. See [`LICENSE`](LICENSE). Required bundled notices and license
 texts are indexed by [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+The checked-in certification manifest defines a narrower
+`tardigrade-core-source` release boundary, enforces exact file digests and
+tracked-path classification, then checks the package's reviewer-supplied
+license declaration against a strict no-copyleft policy:
+
+```bash
+python3 scripts/license_certify.py license-certification-manifest.json --strict
+```
+
+That result applies only to the declared source package. It does not certify
+the full checkout, retained firmware fixtures, generated binaries, external
+toolchains, emulators, or dependencies. See
+[`docs/license-certification.md`](docs/license-certification.md) for the exact
+boundary and refresh procedure.

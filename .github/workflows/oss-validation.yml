@@ -12,10 +12,13 @@ on:
       - action.yml
       - docker/oss-validation.Dockerfile
       - docs/oss_validation_profiles.json
+      - examples/**
+      - peripherals/**
       - platforms/**
       - profiles/**
       - 'requirements*.txt'
       - scripts/**
+      - targets/**
       - tests/**
   schedule:
     - cron: '0 9 * * *'
@@ -55,10 +58,13 @@ jobs:
               action.yml \
               docker/oss-validation.Dockerfile \
               docs/oss_validation_profiles.json \
+              examples \
+              peripherals \
               platforms \
               profiles \
               'requirements*.txt' \
               scripts \
+              targets \
               tests \
             | sed '/^$/d' \
             | sort -u

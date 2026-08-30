@@ -1,0 +1,79 @@
+base_profile: naive_bare_copy.yaml
+name: update_protocol_artifact_binding_fixed
+description: >-
+  Fixed synthetic model: commit always follows a deployment-policy check of the
+  class in the signed control record, and an optional unsigned routing hint is
+  bound to that record whenever the hint is present.
+skip_self_test: true
+
+update_protocol:
+  content:
+    control_record: { semantic: signed_control_record }
+    resource_bundle: { semantic: resource_bundle }
+  destinations:
+    quarantine: { role: staging }
+    active_store: { role: executable, require_modeled_content: true }
+  content_bindings:
+    resource_digest:
+      authenticated_parent: control_record
+      child: resource_bundle
+      method: digest
+
+  metadata:
+    requested_class:
+      source: unsigned_routing_hint
+      semantic: deployment_class
+      authenticated: false
+      available_after: receive_routing_hint
+    signed_class:
+      source: signed_control_record
+      semantic: deployment_class
+      authenticated: true
+      available_after: authenticate_control_record
+
+  events:
+    receive_routing_hint: { kind: message }
+    check_requested_class:
+      kind: security_gate
+      policy: deployment_authorization
+      metadata: requested_class
+    authenticate_control_record:
+      kind: authentication
+      covers: [control_record]
+    verify_resource_digest:
+      kind: content_binding
+      content_binding: resource_digest
+    bind_routing_hint_to_record:
+      kind: binding
+      binding: requested_class_matches_signed_record
+    check_signed_class:
+      kind: security_gate
+      policy: deployment_authorization
+      metadata: signed_class
+    write_resource_bundle:
+      kind: write
+      content: resource_bundle
+      destination: active_store
+    commit_resource_bundle:
+      kind: commit
+      destinations: [active_store]
+
+  bindings:
+    requested_class_matches_signed_record:
+      fields: [requested_class, signed_class]
+      before: commit_resource_bundle
+      required: true
+
+  required_policies: [deployment_authorization]
+
+  sequences:
+    - name: synthetic_deployer
+      events:
+        - { event: receive_routing_hint, optional_group: routing_hint }
+        - { event: check_requested_class, optional_group: routing_hint }
+        - authenticate_control_record
+        - verify_resource_digest
+        - { event: bind_routing_hint_to_record, optional_group: routing_hint }
+        - write_resource_bundle
+        - check_signed_class
+        - commit_resource_bundle

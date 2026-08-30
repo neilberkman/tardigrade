@@ -48,7 +48,22 @@ Run it:
 python3 scripts/audit_bootloader.py --profile my_profile.yaml --quick
 ```
 
-`--quick` runs 3 fault points as a smoke test. If it passes, drop `--quick` for the full heuristic sweep.
+By default, `--quick` selects up to three representative points independently
+for each enabled fault family or selector, so mixed campaigns can run more
+than three points. If it passes, drop `--quick` for the full configured sweep.
+
+### Precise write-trace activation
+
+Backends that expose `TrackingStartAddress` can defer CPU write tracing until a
+known instruction address, avoiding instrumentation of boot-time swap traffic.
+Set `fault_sweep.tracking_start_address` to a 32-bit instruction address; the
+default `0` preserves tracing from reset. If a nonzero address is configured
+for a backend without this capability, the runtime fails clearly.
+
+```yaml
+fault_sweep:
+  tracking_start_address: 0x08001000
+```
 
 ## Profile inheritance
 
@@ -418,7 +433,8 @@ fault_sweep:
   fault_types: [power_loss, bit_corruption, interrupted_erase]
 ```
 
-Default is `[power_loss]`. Available types (27 total):
+Default is `[power_loss]`. Available types include the semantic
+`security_state_erase` selector in addition to the injectable mechanisms:
 
 | Fault type                 | What it does                                   | Backend requirement  |
 | -------------------------- | ---------------------------------------------- | -------------------- |
@@ -427,18 +443,19 @@ Default is `[power_loss]`. Available types (27 total):
 | `bit_corruption`           | NOR-physics bit flips (1-to-0)                 | All                  |
 | `interrupted_erase`        | Partial page erase                             | NVMC, NVMemory       |
 | `command_drop`             | Silently dropped NVM controller command        | GenericNvmController |
+| `security_state_erase`     | Power-loss cuts around security/shared erase units | Calibration trace or declared geometry |
 | `silent_write_failure`     | Write accepted but data not stored             | All                  |
-| `driver_error`             | Write rejected and error status raised         | All                  |
-| `rc_injection`             | Write rejected and return code forced non-zero | MCUboot execute      |
+| `driver_error`             | Write rejected and error status raised         | Instrumented driver/backend |
+| `rc_injection`             | Write rejected and return code forced non-zero | Arm execute          |
 | `write_disturb`            | Adjacent cell corruption                       | All                  |
 | `write_rejection`          | Write dropped with no driver-visible error     | All                  |
-| `multi_sector_atomicity`   | Cross-page partial erase                       | All                  |
+| `multi_sector_atomicity`   | Cross-page partial erase                       | Erase-capable flash  |
 | `wear_leveling_corruption` | Wear-leveling metadata corruption              | All                  |
 | `reset_at_time`            | CPU reset at a time offset                     | All                  |
 | `read_bit_flip`            | Transient read corruption                      | NVMemory, MRAM       |
 | `timed_bit_corruption`     | TOCTOU: bit flip armed at specific code point  | NVMemory, MRAM       |
-| `instruction_skip`         | Voltage-glitch instruction skip (NOP)          | All                  |
-| `nvs_corruption`           | NVS/config region corruption                   | All                  |
+| `instruction_skip`         | Voltage-glitch instruction skip (NOP)          | Arm execute mode     |
+| `nvs_corruption`           | NVS/config region corruption                   | Declared `nvs_region` |
 | `i2c_nack`                 | I2C NACK on secure element transaction         | I2CFaultProxy        |
 | `i2c_timeout`              | I2C bus timeout                                | I2CFaultProxy        |
 | `i2c_bit_flip`             | I2C data bit flip in transit                   | I2CFaultProxy        |
@@ -453,6 +470,38 @@ Default is `[power_loss]`. Available types (27 total):
 ### Swap progress (semantic cutpoints)
 
 `swap_progress` is the first semantic fault selector beyond raw write indices. Instead of "cut power at write N", it means "let the bootloader make real swap progress, interrupt it at the next slot-sector boundary, then reboot and observe resume behavior."
+
+### Security-state erase domains
+
+Persistent records can be logically separate while sharing one physical flash
+erase unit. Declare that coupling when it matters:
+
+```yaml
+persistent_state_layout:
+  erase_regions:
+    - {start: 0x08010000, end: 0x08020000, erase_size: 0x2000}
+  fields:
+    - {name: policy_epoch, base: 0x08012000, size: 8, role: security_monotonic}
+    - {name: display_preference, base: 0x08012020, size: 4, role: mutable}
+
+fault_sweep:
+  fault_types: [security_state_erase]
+```
+
+The offline profile report maps every field to its physical half-open erase
+unit and emits `SECURITY_STATE_SHARED_ERASE_UNIT` when a security field shares
+one with a mutable or recovery field. This is a candidate risk, not proof of a
+security failure. The semantic selector prefers calibration erase boundaries;
+when no erase events are available it maps the write trace using the declared
+geometry. It cuts power at the erase boundary, the first write afterward, and
+the final restoration write for each security field. A trace/geometry mismatch
+is an infrastructure error and is never silently resolved.
+
+To print this report without running Renode, use:
+
+```bash
+python3 scripts/security_state_layout.py profiles/my_profile.yaml
+```
 
 ```yaml
 fault_sweep:
@@ -480,9 +529,54 @@ For instruction\_skip testing, the tool automatically suppresses sysbus warnings
 
 `driver_error` is a non-halting write fault. The target write does not land, but the peripheral raises a software-visible error flag/register. On nRF52 NVMC paths this currently behaves like `write_rejection` from the driver's point of view because the Zephyr NVMC driver only polls READY and does not inspect the injected error flag. The distinction is still useful in sweep results because it separates "data dropped silently" from "peripheral reported an error that software ignored."
 
-`rc_injection` is a non-halting MCUboot-specific execute fault. It reuses the write-rejection data path so the target write does not land, then forces the active `flash_area_write()` call to return `-EIO` (`r0 = 0xFFFFFFFB`) when control returns to MCUboot. This directly tests the assert-only error-handling claim even on platforms where the flash driver would otherwise return success.
+`rc_injection` is a non-halting execute fault. It reuses the write-rejection data path so the target write does not land, then forces a configured wrapper's return register when control returns to that wrapper. The target function is selected by ELF symbol, so the same profile mechanism can exercise storage, security-state, or bootloader wrappers:
 
-This requires an `instruction_skip_config` block inside `fault_sweep`:
+```yaml
+fault_sweep:
+  fault_types: [rc_injection]
+  rc_injection_config:
+    symbols: [storage_write]
+    return_value: -5          # signed or unsigned 32-bit integer
+    return_register: 0        # Arm r0 by default
+    require_applied: true     # missing entry/return hook is infrastructure failure
+```
+
+The defaults preserve existing profiles: `symbols: [flash_area_write]`, `return_value: -5`, `return_register: 0`, and `require_applied: true`. `symbols` must be non-empty and contain unique ELF names. Nested calls are tracked independently, and the result contains configured symbols, resolved addresses, entered-call count, and the symbol/address where the return value was applied. An explicit symbol that cannot be resolved fails closed; it is never replaced with the default symbol.
+
+### Terminal-error escape campaigns
+
+Use `terminal_error_paths` to derive instruction-skip points from the emitted
+bootloader ELF. Direct `BL` calls and direct tail branches to a declared fatal
+handler are recorded with their bytes and disassembly. The runtime control must
+reach the callsite and remain terminal; the paired skip run observes the same
+restored inputs and reports `TERMINAL_ERROR_PATH_ESCAPED` only after the skip
+was applied and a forbidden sink was reached.
+
+```yaml
+terminal_error_paths:
+  - name: rejected_request_must_remain_terminal
+    handler_symbols: [reject_request]
+    containing_symbols: [process_candidate]
+    forbidden_sink_symbols: [commit_state]
+    expected_control: terminal
+    required_failure_marker:
+      address: 0x20001000
+      expected_value: 0x45525221
+      mask: 0xffffffff
+      op: eq
+```
+
+`required_failure_marker` uses the existing `success_criteria.memory_checks`
+operators (`eq`, `ne`, `ge`, `le`, and `nonzero`). An indirect call that cannot
+be resolved, an ambiguous symbol range, or a missing symbol is retained as an
+unresolved or infrastructure result; it is never treated as passing.
+
+Terminal-error campaigns derive and run their own execute-mode instruction-skip
+points and do not require `fault_types: [instruction_skip]` or an
+`instruction_skip_config`. They always skip exactly one emitted instruction.
+
+Configure a separate ordinary instruction-skip campaign inside `fault_sweep`
+when broader CPU-fault coverage is also desired:
 
 ```yaml
 fault_sweep:
@@ -579,6 +673,45 @@ This lets tardigrade distinguish:
 - first layer held
 - first layer breached but later layer caught it
 - full end-to-end bypass
+
+#### Function-return effect contracts
+
+Use `function_return_probes` to capture a function's return value in every
+execute-mode campaign, including control runs and non-instruction faults. The
+same entry/return hook and telemetry path is used as `verification_probes`.
+`capture` may be `first`, `last`, or `all`; `all` retains every raw 32-bit
+return value and requires an explicit contract call selector.
+
+```yaml
+fault_sweep:
+  evaluation_mode: execute
+  function_return_probes:
+    - label: persist_generation
+      symbol: commit_generation
+      return_register: 0
+      capture: last
+
+invariants: [success_implies_effect]
+invariant_config:
+  success_implies_effect:
+    - name: generation_is_persisted
+      probe: persist_generation
+      success_values: [0]
+      call: last
+      evaluate_control: true
+      require:
+        all:
+          - {source: post, path: state.commit_generation, op: ge, value: 6}
+          - {source: post, path: state.commit_generation, op: gt_pre}
+```
+
+The condition operators are `eq`, `ne`, `lt`, `le`, `gt`, `ge`, their
+`*_pre` comparison forms, `changed`, and `unchanged`. Conditions read the
+semantic pre-state and post-state dictionaries; `any` requires one child and
+`all` requires every child. A successful configured return with a missing
+effect is reported as `SUCCESS_WITHOUT_REQUIRED_EFFECT`. Missing telemetry,
+state, paths, or selected calls fail closed as evaluation errors. A non-success
+return does not violate the contract.
 
 ### Sweep strategy
 
@@ -750,7 +883,7 @@ A point fails if any assertion doesn't match, even if the device booted.
 
 ### Built-in invariants
 
-Tardigrade ships 14 postcondition invariants. Enable them by name:
+Tardigrade ships 18 named postcondition invariants. Enable them by name:
 
 ```yaml
 invariants:
@@ -768,9 +901,103 @@ invariants:
   - boot_target_matches_metadata # boot slot matches metadata active slot
   - last_known_good_preserved # at least one slot has a valid image
   - no_oob_writes # no writes outside allowed regions
+  - atomic_state_groups # jointly committed persistent state is all-before or all-after
+  - monotonic_state_fields # configured numeric persistent state does not regress
+  - state_relations # cross-component compatibility rules
+  - success_implies_effect # successful API return has its durable effect
 ```
 
-Use `invariants: [strict]` to enable all of them.
+Use `invariants: [strict]` to enable the 17 generally applicable invariants.
+`success_implies_effect` is excluded from that preset because it needs an
+explicit function-return probe and effect contract; name and configure it
+directly when applicable.
+
+For a transition that commits several durable objects, declare each member's
+stable value before and after the transition:
+
+```yaml
+invariants:
+  - atomic_state_groups
+invariant_config:
+  atomic_state_groups:
+    - name: joint_component_commit
+      members:
+        - path: components.controller.commit_state
+          before: unset
+          after: set
+        - path: components.worker.commit_state
+          before: unset
+          after: set
+```
+
+At the observation boundary after fault handling or recovery, all members may
+remain at their `before` values or all may reach their `after` values. Any
+mixture is reported as an interrupted durable commit. The contract is explicit
+so independently updatable components are not treated as an atomic group
+accidentally.
+
+For numeric policy state such as a policy epoch or credential epoch, require
+the value to remain nondecreasing across a fault/recovery boundary. Configure
+one or more nested state paths:
+
+```yaml
+invariants:
+  - monotonic_state_fields
+invariant_config:
+  monotonic_state_fields:
+    direction: nondecreasing
+    paths:
+      - policy.policy_epoch
+      - policy.credential_epoch
+```
+
+The paths are read from both the control run's `pre_state` and the fault
+result's `nvm_state`. A decrease is reported with the path and before/after
+values. Missing paths, non-numeric values, and malformed configuration fail
+closed as invariant evaluation errors. Control runs are skipped.
+
+For compatibility requirements spanning multiple state fields or components,
+use `state_relations`. Operands either point to a path in the control (`pre`)
+or observed (`post`) state, or contain a literal `value`:
+
+```yaml
+invariants: [state_relations]
+invariant_config:
+  state_relations:
+    - name: controller_and_worker_generation_match
+      compare:
+        left: {source: post, path: components.controller.generation}
+        op: eq
+        right: {source: post, path: components.worker.generation}
+
+    - name: approved_component_pairs
+      when:
+        left: {source: post, path: update.activated}
+        op: eq
+        right: {value: true}
+      allowed_tuples:
+        fields:
+          - {source: post, path: components.controller.generation}
+          - {source: post, path: components.worker.generation}
+        values:
+          - [1, 4]
+          - [2, 5]
+```
+
+Supported operators are `eq`, `ne`, `lt`, `le`, `gt`, and `ge`. Ordering uses
+the same strict numeric conversion as `monotonic_state_fields`; equality keeps
+string and boolean types distinct. `allowed_tuples` needs at least two fields,
+one tuple, and no duplicate tuples. Every operand must contain exactly one of
+`path` or `value`; paths require `source: pre` or `source: post`, while literal
+values must not include a source. Missing paths and incompatible observed types
+are evaluation errors. Relations run for clean controls and faulted results;
+`when` skips a relation when its condition is false.
+
+In a `multi_component` report, each combined result includes every component's
+observed semantic state and the aggregate relation finding includes component
+identifiers, resolved values, the expected rule, and the control/faulted run
+phase. A compatibility violation is emitted as the security finding
+`STATE_RELATION_VIOLATION`, even when all components boot successfully.
 
 ### Custom invariant providers
 
@@ -1051,6 +1278,195 @@ security_policy:
   toctou_protection: true
 ```
 
+### Update-protocol content and metadata evidence
+
+Runtime fault injection cannot by itself prove that every message path applies
+policy to authenticated metadata or that committed bytes are covered by the
+accepted authentication result. The optional `update_protocol` block models
+that control flow for a bounded static check. This fully synthetic example uses
+an optional routing hint, a signed control record, and a generic resource
+bundle:
+
+```yaml
+update_protocol:
+  content:
+    control_record: { semantic: signed_control_record }
+    resource_bundle: { semantic: resource_bundle }
+  destinations:
+    quarantine: { role: staging }
+    active_store: { role: executable, require_modeled_content: true }
+  content_bindings:
+    resource_digest:
+      authenticated_parent: control_record
+      child: resource_bundle
+      method: digest
+  metadata:
+    requested_class:
+      source: unsigned_routing_hint
+      semantic: deployment_class
+      authenticated: false
+      available_after: receive_routing_hint
+    signed_class:
+      source: signed_control_record
+      semantic: deployment_class
+      authenticated: true
+      available_after: authenticate_control_record
+  events:
+    receive_routing_hint: { kind: message }
+    check_requested_class:
+      { kind: security_gate, policy: deployment_authorization, metadata: requested_class }
+    authenticate_control_record:
+      kind: authentication
+      covers: [control_record]
+    verify_resource_digest:
+      kind: content_binding
+      content_binding: resource_digest
+    write_resource_bundle:
+      kind: write
+      content: resource_bundle
+      destination: active_store
+    bind_requested_class:
+      { kind: binding, binding: requested_class_matches_signed_record }
+    check_signed_class:
+      { kind: security_gate, policy: deployment_authorization, metadata: signed_class }
+    commit_resource_bundle:
+      kind: commit
+      destinations: [active_store]
+  bindings:
+    requested_class_matches_signed_record:
+      fields: [requested_class, signed_class]
+      before: commit_resource_bundle
+      required: true
+  required_policies: [deployment_authorization]
+  sequences:
+    - name: synthetic_deployer
+      events:
+        - { event: receive_routing_hint, optional_group: routing_hint }
+        - { event: check_requested_class, optional_group: routing_hint }
+        - authenticate_control_record
+        - verify_resource_digest
+        - { event: bind_requested_class, optional_group: routing_hint }
+        - write_resource_bundle
+        - check_signed_class
+        - commit_resource_bundle
+```
+
+Run the analysis without starting Renode:
+
+```bash
+python3 scripts/update_protocol_analyzer.py --profile profiles/my_profile.yaml
+```
+
+The analyzer expands explicit sequences plus `optional` events and atomic
+`optional_group` entries (up to 256 variants). For every path to a `commit`
+event, it checks required policy gates, gate metadata availability, and
+expected bindings. Policy names that every commit path must satisfy are listed
+in `update_protocol.required_policies`. For compatibility,
+`security_policy.anti_rollback: true` also makes the `anti_rollback` gate
+mandatory.
+
+A required binding applies when all of its metadata fields are available on a
+path. Its `binding` event must occur after those availability events and before
+the named commit. This lets an optional routing hint be absent safely, while
+requiring it to agree with the signed control record whenever it is present.
+
+Authentication events cover only the content listed in `covers`; authenticating
+a control record does not automatically cover a separate resource bundle. A
+`content_binding` event propagates coverage from an already covered parent
+through a declared digest (or equivalent) relation. Writes to a committed
+destination must therefore be covered before the commit. A destination with
+`require_modeled_content: true` also requires at least one modeled write.
+Staging destinations do not require coverage until content is modeled as a
+write into a committed destination. If the model declares any non-staging
+destination, every commit path must name its destinations explicitly; an
+omitted destination list is a configuration failure because the analyzer cannot
+assess what content is committed. Legacy metadata-only protocols without
+content/destination declarations retain their existing behavior.
+
+Every write to a non-staging destination must have a later commit that
+explicitly names that destination. A path ending after such a write, or writing
+again after its last governing commit, reports
+`WRITE_WITHOUT_GOVERNING_COMMIT`. Staging-only preparation paths remain
+allowed.
+
+For block verification, declare a byte `size` and use half-open ranges such as
+`{content: resource_bundle, offset: 0, size: 4096}` in `covers` or `content`.
+Overlapping ranges are normalized, and the union must cover every range written
+to the committed destination. The analyzer reports
+`UNAUTHENTICATED_COMMITTED_CONTENT`,
+`CONTENT_AUTHENTICATED_AFTER_COMMIT`, and
+`COMMIT_DESTINATION_WITH_UNKNOWN_CONTENT` with the affected sequence, content,
+destination, write, commit, and authentication events.
+
+See `profiles/update_protocol_artifact_binding_vulnerable.yaml` and
+`profiles/update_protocol_artifact_binding_fixed.yaml` for vendor-neutral
+regression models. These encode declared behavior; inspect source or traces to
+build an accurate model before treating a clean result as evidence.
+
+### Reviewed versus signed authorization content
+
+Transaction-style authorization flows use the separate
+`authorization_review` block. It is intentionally independent of
+`update_protocol`: it declares bounded scalar and collection values, review
+coverage, and accepted signature/digest coverage. Use `authorization: required`
+(or omit the key); boolean authorization values are rejected. Collection item
+members declare their own review policy. v1 requires `review: required` for
+every authorization-required field and item member. Trusted exemptions are
+not available until an enforceable, code-side semantic verifier exists:
+`trusted_bindings`, `trusted_binding`, `required_or_trusted`, `hidden`, and
+`trusted_validation` declarations are rejected. The declaration digest
+excludes trace paths and evidence.
+Version 1 supports flat scalar fields and bounded flat collections; structured
+scalar layouts are rejected until recursive member evidence is available.
+Partial review captures must include exact `reviewed_indices`; parse and signed
+captures remain complete.
+Declarations alone are inconclusive. Run the dedicated analyzer with one
+trace per expanded sequence variant:
+
+```bash
+python3 scripts/authorization_review_analyzer.py \
+  --profile profiles/my_profile.yaml \
+  --trace traces/authorization.normal.json \
+  --json
+```
+
+Traces must carry the canonical model digest, exact expanded sequence name,
+ordered event occurrences, complete type-tagged value evidence, and complete
+collection indices. Signed values omitted from required review emit
+`SIGNED_FIELD_NOT_REVIEWED`; missing signed coverage, malformed evidence, or
+missing traces are never a pass. Audit runs accept repeatable
+`--authorization-review-trace` (or
+`--trace`) arguments and include this analysis in the JSON and HTML reports.
+
+For a new integration, generate one incomplete observation template per
+expanded sequence path:
+
+```bash
+python3 scripts/authorization_review_analyzer.py \
+  --profile profiles/my_profile.yaml \
+  --emit-trace-template-dir traces/authorization
+```
+
+The generated JSON keeps the exact model digest, expanded sequence name, event
+order, and repeat occurrences while leaving all evidence empty and all
+completion/acceptance flags false. The command prints a warning that the files
+are incomplete observations, does not analyze them, and never overwrites an
+existing output file. Fill the templates with observed evidence before passing
+them through `--trace`; unfilled templates produce an `INCONCLUSIVE` result.
+Pass one `--trace` argument for each expanded-variant file:
+
+```bash
+python3 scripts/authorization_review_analyzer.py \
+  --profile profiles/my_profile.yaml \
+  --trace traces/authorization/0000-normal-without-0-1.json \
+  --trace traces/authorization/0001-normal.json \
+  --json
+```
+
+`--trace` accepts one path per occurrence; a single `--trace` followed by a
+shell glob is not accepted as multiple trace values. Expand the glob yourself
+and repeat the option for every path.
+
 ## State fuzzer
 
 The `state_fuzzer` block generates random and boundary-value metadata states to stress-test bootloader invariants. Instead of replaying a single known-good metadata configuration, it synthesizes many plausible and deliberately invalid metadata blobs, writes them as `pre_boot_state`, and runs the sweep for each -- catching bootloaders that crash or misbehave on unexpected metadata combinations.
@@ -1095,11 +1511,13 @@ The fuzzer generates a mix of fully valid states, single-field boundary violatio
 
 ### Verdicts
 
-The top-level verdict is `PASS` or `FAIL`. This is what CI gates on.
+The top-level verdict begins with `PASS`, `FAIL`, or `INCONCLUSIVE`. CI must
+treat only `PASS` as passing.
 
 - **PASS + `should_find_issues: false`**: No bricks, no wrong-image, no invariant violations. The bootloader survived all faults.
 - **PASS + `should_find_issues: true`**: Issues were found (expected for known-vulnerable code).
 - **FAIL**: Unexpected result — either issues found when none expected, or no issues found when expected.
+- **INCONCLUSIVE**: Required coverage, runtime, trace, or infrastructure evidence was unavailable or incomplete.
 
 For write/erase-style campaigns, a clean `PASS` also requires calibration coverage. If calibration never shows slot data movement, tardigrade treats the run as a failed setup rather than evidence that the bootloader is clean.
 
@@ -1114,6 +1532,7 @@ Each fault point produces one of:
 | `no_boot`     | Device did not reach any valid vector table             |
 | `wrong_pc`    | PC ended up outside all known slots                     |
 | `hard_fault`  | CFSR indicated a HardFault                              |
+| `timeout`     | Bootloader was still working at the wall-clock limit; evidence is incomplete |
 
 ### Failure classes
 
@@ -1129,7 +1548,7 @@ Outcomes are grouped into classes:
 ### Report JSON structure
 
 ```
-summary.runtime_sweep.total_points      -- how many fault points tested
+summary.runtime_sweep.total_fault_points -- how many fault points tested
 summary.runtime_sweep.bricks            -- unrecoverable failures
 summary.runtime_sweep.issue_points      -- any non-success result
 summary.runtime_sweep.brick_rate        -- bricks / total
@@ -1323,7 +1742,9 @@ steps:
 ```
 
 ```bash
-python3 scripts/run_scenario.py --scenario scenarios/mcuboot_upgrade_then_revert.yaml
+python3 scripts/run_scenario.py \
+  --scenario scenarios/mcuboot_upgrade_then_revert.yaml \
+  --output /tmp/mcuboot_scenario.json
 ```
 
 ## Geometry matrix
@@ -1374,7 +1795,7 @@ Profiles with `skip_self_test: true` are skipped (typically narrow-window or CI-
 
 ### Calibration caching
 
-Calibration (running the firmware once to count NVM writes and build a trace) can be cached across runs. Pass `--reuse-calibration` with a path to a JSON cache file:
+Calibration (running the firmware once to count NVM writes and build a trace) can be cached across runs. To create a cache, pass `--reuse-calibration` with a path that does not yet exist:
 
 ```bash
 python3 scripts/audit_bootloader.py \
@@ -1382,11 +1803,47 @@ python3 scripts/audit_bootloader.py \
     --reuse-calibration /tmp/cal_cache.json
 ```
 
-The cache key is derived from the ELF hash, image hashes, fault types, flash backend, and write granularity. If the file exists and the key matches, calibration is loaded from cache (skipping the Renode calibration run entirely). After a fresh calibration, the result is saved to the file for future reuse. This is useful in CI pipelines where the same ELF is swept with different profiles or parameters.
+The cache key is derived from the ELF hash, image hashes, fault types, flash
+backend, and write granularity. Cache files also have a strict versioned schema,
+bounded counters, per-artifact digests, and agreement checks between CSV and
+binary traces. Invalid and legacy caches are rejected. If no cache exists, a
+fresh calibration is saved to the requested path.
+
+A calibration cache can determine which fault points run, so an existing cache
+is trusted input. Loading one requires either a SHA-256 obtained through a
+trusted channel:
+
+```bash
+python3 scripts/audit_bootloader.py \
+    --profile profiles/mcuboot_head_upgrade.yaml \
+    --reuse-calibration /tmp/cal_cache.json \
+    --reuse-calibration-sha256 "$CACHE_SHA256"
+```
+
+Here `CACHE_SHA256` is the digest recorded when the trusted producer published
+the cache, not a digest read from the same untrusted artifact source.
+
+or an explicit opt-in for a private local cache:
+
+```bash
+python3 scripts/audit_bootloader.py \
+    --profile profiles/mcuboot_head_upgrade.yaml \
+    --reuse-calibration /tmp/cal_cache.json \
+    --trust-unsigned-calibration-cache
+```
+
+Do not use the unsigned option for shared CI caches, pull-request artifacts, or
+paths writable by another user or job. A digest fetched alongside an untrusted
+cache is not a trust anchor; pin it in reviewed configuration or carry it over
+a separately authenticated channel.
 
 ### Quick mode with heuristic points
 
-By default, `--quick` picks 3 representative fault points (first, middle, last). Set `quick_use_heuristic: true` in `fault_sweep` to use heuristic-selected points instead, which gives better coverage of trailer and boundary regions:
+By default, `--quick` selects the first, middle, and last point independently
+for each enabled fault family or selector, so mixed campaigns can run more than
+three points. Set `quick_use_heuristic: true` in `fault_sweep` to use the
+heuristic-selected set for write-indexed faults; the ordinary three-point
+reductions are then not applied to other enabled families either:
 
 ```yaml
 fault_sweep:
@@ -1394,7 +1851,11 @@ fault_sweep:
   max_heuristic_points: 64
 ```
 
-`max_heuristic_points` caps the total heuristic output (default 2000 for full sweeps). When combined with `quick_use_heuristic: true`, this controls how many points `--quick` mode runs -- typically set to 64 for a fast but meaningful smoke test. Set to `null` to disable the cap entirely.
+`max_heuristic_points` caps the write-indexed heuristic output (default 2000
+for full sweeps). With `quick_use_heuristic: true`, it controls that portion of
+the quick campaign; other enabled families retain their planned sets. A profile
+can set a smaller value such as 64 for a bounded write-fault sample. Set it to
+`null` to disable the cap entirely.
 
 ### Heuristic sharding
 
@@ -1413,7 +1874,7 @@ Each shard gets a disjoint subset of heuristic fault points.
 
 Before submitting a profile:
 
-1. Does `--quick` pass? (smoke test: 3 fault points)
+1. Does `--quick` pass? (small per-family smoke campaign by default)
 2. Does the control run (fault_at=0) boot successfully?
 3. Is `flash_backend` set to the correct sysbus peripheral name?
 4. Are slot addresses and sizes correct for your linker script?
@@ -1425,7 +1886,10 @@ Before submitting a profile:
 
 ESP-IDF uses a dual-sector otadata partition to track which OTA app slot to boot. Each sector contains a 32-byte `esp_ota_select_entry_t` with a sequence number, OTA state, and CRC-32. The bootloader selects the entry with the highest valid `ota_seq` and maps it to a slot index via `(ota_seq - 1) % num_slots`.
 
-Tardigrade ships a clean-room model of this algorithm (`examples/esp_idf_ota/esp_idf_ota.c`) that compiles to a Cortex-M4 ELF running on the `cortex_m4_flash_fast.repl` platform. This is not ESP-IDF code -- it is a standalone reimplementation of the same algorithm for fault-injection testing.
+Tardigrade ships a standalone model of this algorithm
+(`examples/esp_idf_ota/esp_idf_ota.c`) that compiles to a Cortex-M4 ELF running
+on the `cortex_m4_flash_fast.repl` platform. It contains no ESP-IDF code and
+implements only the behavior needed for fault-injection testing.
 
 ### otadata layout
 
@@ -1476,6 +1940,42 @@ invariants:
 ```
 
 The probe reads both otadata sectors, validates CRC-32, determines the active entry, and exposes `replica0_valid`/`replica1_valid` for the built-in `metadata_single_fault_consistency` invariant.
+
+### Security counter boundary campaigns
+
+Use `boundary_campaigns` for logical counter values that are not faults. The
+loader derives the physical capacity, resolves named values deterministically,
+and materializes ordinary initial-state runs named `<campaign>__<decimal>`.
+
+```yaml
+boundary_campaigns:
+  - name: synthetic_epoch_capacity
+    parameter: candidate_epoch
+    type: unsigned_integer
+    width_bits: 32
+    capacity: {storage_bytes: 64, element_bytes: 4}
+    values: [zero, one, capacity_minus_one, capacity, capacity_plus_one, type_max]
+    setup_environment: CANDIDATE_EPOCH
+    follow_up: {parameter_value: previous, expect: rejected}
+```
+
+Capacity may be `{elements: N}`, a fixed-entry array using
+`storage_bytes`/`element_bytes`, or bit-packed state using
+`storage_bytes`/`bits_per_increment`. Division must be exact. Values are
+deduplicated in declaration order; each setup script receives only the
+declared environment variable and its canonical decimal value. With a
+follow-up relation, candidate `N` is followed by `N - 1`; zero is rejected as
+invalid for such a relation. The setup/update hook must also set the fixed
+Renode variable `$boundary_acceptance` to exactly `accepted` or `rejected`;
+boot success alone is not evidence that an update was accepted. Candidate
+follow-ups use an authenticated persistent-memory snapshot (flash plus any
+declared OTP array), verified for backend identity, length, and digest before
+the follow-up setup runs. Unsupported backends fail closed. Reports group
+results by campaign and value and distinguish rejection, correct persistence,
+smaller persisted state, lower follow-up acceptance, and setup/infrastructure
+failure.
+The audit CLI's `--no-assert-verdict` suppresses assertion exits for a boundary
+`FAIL`, but never suppresses an `INCONCLUSIVE` infrastructure exit.
 
 ### Upgrade vs rollback scenarios
 

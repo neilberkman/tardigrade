@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 The format follows [common-changelog](https://common-changelog.org/).
 
+## [Unreleased]
+
+### Added
+
+- Configurable function-return fault injection and per-call return probes.
+- Success-implies-effect, atomic-state, monotonic-state, and cross-component
+  security invariants.
+- Update artifact authentication/metadata coverage and reviewed-versus-signed
+  authorization analyzers.
+- Security-counter boundary campaigns, persistent erase-domain analysis,
+  production-assert checks, and emitted-binary terminal-error escape analysis.
+- Native TF-M BL2/AN521 target support and supporting Renode peripherals.
+- Fail-closed source-release license certification with exact file digests and
+  tracked-file completeness enforcement in CI.
+
+### Changed
+
+- GitHub Action results now separate assertion status from security status and
+  require an explicit regression mode for known-vulnerable profiles.
+- Runtime reports include richer fault classification, probe evidence, and
+  security-state diagnostics.
+
+### Fixed
+
+- Flash/OTP persistence and reset handling across multi-boot fault campaigns.
+- Calibration caching and coverage validation for expanded fault plans.
+- Probe state isolation between instruction-skip points and normalized,
+  fail-closed GitHub Action result accounting.
+- Update-protocol commit-path coverage and wildcard terminal-sink propagation.
+
 ## [0.5.0] - 2026-07-10
 
 ### Changed

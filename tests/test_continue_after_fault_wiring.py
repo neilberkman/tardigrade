@@ -106,6 +106,52 @@ class TestPeripheralImmediateStopContract(unittest.TestCase):
                 source = (ROOT / relpath).read_text(encoding="utf-8")
                 self.assertIn(expected, source)
 
+    def test_robot_loader_includes_all_fast_backends(self) -> None:
+        source = (ROOT / "tests" / "ota_fault_point.robot").read_text(
+            encoding="utf-8"
+        )
+        for filename in (
+            "NRF52NVMC.cs",
+            "STM32F4FastFlash.cs",
+            "STM32H7FastFlash.cs",
+        ):
+            with self.subTest(filename=filename):
+                self.assertIn(
+                    'include "${{ROOT}}/peripherals/{}"'.format(filename),
+                    source,
+                )
+
+    def test_fast_backends_persist_non_power_faults_to_live_flash(self) -> None:
+        expected_writes = {
+            "peripherals/NRF52NVMC.cs": (
+                "ApplyWriteFaultAtOffset(faultedCurrent, wenSnapshot, current, off, len);",
+                "Flash.WriteBytes(0, faultedCurrent, 0, len);",
+            ),
+            "peripherals/STM32F4FastFlash.cs": (
+                "ApplyWriteFaultAtOffset(faultedCurrent, preFaultSnapshot, current, changedOffset, flashLen);",
+                "Flash.WriteBytes(0, faultedCurrent, 0, flashLen);",
+            ),
+            "peripherals/STM32H7FastFlash.cs": (
+                "ApplyWriteFaultAtOffset(faultedCurrent, preFaultSnapshot, current, changedOffset, flashLen);",
+                "flash.WriteBytes(0, faultedCurrent, 0, flashLen);",
+            ),
+        }
+        for relpath, snippets in expected_writes.items():
+            with self.subTest(relpath=relpath):
+                source = (ROOT / relpath).read_text(encoding="utf-8")
+                self.assertIn("if(WriteFaultMode == 0)", source)
+                for snippet in snippets:
+                    self.assertIn(snippet, source)
+
+    def test_h7_dual_bank_view_supports_context_aware_reads(self) -> None:
+        source = (ROOT / "peripherals" / "STM32H7FastFlash.cs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "public byte[] ReadBytes(long offset, int count, IPeripheral context)",
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,11 @@ ${IMAGE_RECOVERY_LOAD_ADDR}    ${SLOT_RECOVERY_BASE}
 ${PRE_BOOT_STATE_BIN}          ${EMPTY}
 ${UPDATE_SEQUENCE_FILE}        ${EMPTY}
 ${SETUP_SCRIPT}                ${EMPTY}
+${BOUNDARY_SETUP_ENV}         ${EMPTY}
+${BOUNDARY_VALUE}             ${EMPTY}
+${BOUNDARY_DURABLE_STATE_FILE}    ${EMPTY}
+${BOUNDARY_PHASE}             ${EMPTY}
+${BOUNDARY_ACCEPTANCE}        ${EMPTY}
 ${SUCCESS_VTOR_SLOT}           exec
 ${SUCCESS_VECTOR_OFFSET}       0
 ${SUCCESS_PC_SLOT}             ${EMPTY}
@@ -53,6 +58,8 @@ ${ERASE_TRACE_FILE_BIN}        ${EMPTY}
 ${FAULT_TYPES}                 write
 ${FAULT_TYPE_CSV}              ${EMPTY}
 ${BOOT_CYCLES}                 1
+${VTOR_SETTLE_ITERS}           0
+${TRACKING_START_ADDRESS}      0
 ${CALIBRATION_TIME_SLICE}      ${EMPTY}
 ${PHASE1_TIME_SLICE}           ${EMPTY}
 ${PHASE2_TIME_SLICE}           ${EMPTY}
@@ -80,6 +87,7 @@ ${RESUME_TRACE_MAX_OPS}        1024
 ${RESUME_TRACE_TIME_SLICE}     0.02
 ${RESUME_TRACE_WALL_TIMEOUT_S}    30
 ${EXTRA_PERIPHERALS}           ${EMPTY}
+${WATCHDOG_FREQUENCY}          ${EMPTY}
 ${FLASH_BACKEND}               ${EMPTY}
 ${NVM_CONTROLLER}              ${EMPTY}
 ${BOOT_REGISTER_PRE_WRITES}    ${EMPTY}
@@ -101,6 +109,13 @@ ${I2C_FAULT_PERIPHERAL}        ${EMPTY}
 ${INSTRUCTION_SKIP_REGIONS}    ${EMPTY}
 ${INSTRUCTION_SKIP_COUNT}      1
 ${VERIFICATION_PROBES}         ${EMPTY}
+${TERMINAL_ERROR_PATHS_B64}    ${EMPTY}
+${TERMINAL_ERROR_SNAPSHOT_HASH}    ${EMPTY}
+${TERMINAL_ERROR_ARTIFACT_HASH}    ${EMPTY}
+${RC_INJECTION_SYMBOLS}        flash_area_write
+${RC_INJECTION_RETURN_VALUE}   4294967291
+${RC_INJECTION_RETURN_REGISTER}    0
+${RC_INJECTION_REQUIRE_APPLIED}    true
 ${READ_FAULT_REGIONS}          ${EMPTY}
 ${READ_FAULT_BIT_FLIPS}        0
 ${READ_FAULT_PROBABILITY}      1.0
@@ -118,15 +133,19 @@ Load Runtime Scenario
     Execute Command    include "${ROOT}/peripherals/NVMemoryController.cs"
     Execute Command    include "${ROOT}/peripherals/GenericNvmController.cs"
     Execute Command    include "${ROOT}/peripherals/FaultTracker.cs"
+    Execute Command    include "${ROOT}/peripherals/An521NvmInterceptor.cs"
     Execute Command    include "${ROOT}/peripherals/NRF52NVMC.cs"
     Execute Command    include "${ROOT}/peripherals/NRF52UARTE.cs"
     Execute Command    include "${ROOT}/peripherals/SimpleCacheController.cs"
     Execute Command    include "${ROOT}/peripherals/TraceReplayEngine.cs"
+    Execute Command    include "${ROOT}/peripherals/Sse200MpcStub.cs"
+    Execute Command    include "${ROOT}/peripherals/CMSDKAPBWatchdog.cs"
     Execute Command    include "${ROOT}/peripherals/STM32F4FlashController.cs"
     Execute Command    include "${ROOT}/peripherals/STM32F4FlashInterceptor.cs"
     Execute Command    include "${ROOT}/peripherals/STM32F4FastFlash.cs"
     Execute Command    include "${ROOT}/peripherals/STM32F4RCCStub.cs"
     Execute Command    include "${ROOT}/peripherals/STM32H7FlashController.cs"
+    Execute Command    include "${ROOT}/peripherals/STM32H7FastFlash.cs"
     Execute Command    include "${ROOT}/peripherals/STM32H7RCCStub.cs"
     Execute Command    include "${ROOT}/peripherals/STM32H7PWRStub.cs"
     Execute Command    include "${ROOT}/peripherals/STM32DummyUSART.cs"
@@ -135,6 +154,7 @@ Load Runtime Scenario
     Run Keyword If    '${EXTRA_PERIPHERALS}' != ''    Load Extra Peripherals
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${PLATFORM_REPL}
+    Run Keyword If    '${WATCHDOG_FREQUENCY}' != ''    Execute Command    watchdogNs ClockFrequency ${WATCHDOG_FREQUENCY}
     ${load_cmds}=    Set Variable    bus=monitor.Machine.SystemBus; bus.LoadELF(r'${BOOTLOADER_ELF}')
     Run Keyword If    '${IMAGE_EXEC}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_EXEC}', ${IMAGE_EXEC_LOAD_ADDR})"
     Run Keyword If    '${IMAGE_STAGING}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_STAGING}', ${IMAGE_STAGING_LOAD_ADDR})"
@@ -177,6 +197,11 @@ Run Runtime Fault Point
     Execute Command    $pre_boot_state_bin="${PRE_BOOT_STATE_BIN}"
     Run Keyword If    '${UPDATE_SEQUENCE_FILE}' != ''    Execute Command    $update_sequence_file="${UPDATE_SEQUENCE_FILE}"
     Execute Command    $setup_script="${SETUP_SCRIPT}"
+    Execute Command    $boundary_setup_env="${BOUNDARY_SETUP_ENV}"
+    Execute Command    $boundary_value="${BOUNDARY_VALUE}"
+    Execute Command    $boundary_durable_state_file="${BOUNDARY_DURABLE_STATE_FILE}"
+    Execute Command    $boundary_phase="${BOUNDARY_PHASE}"
+    Execute Command    $boundary_acceptance="${BOUNDARY_ACCEPTANCE}"
     Execute Command    $flash_backend="${FLASH_BACKEND}"
     Run Keyword If    '${NVM_CONTROLLER}' != ''    Execute Command    $nvm_controller="${NVM_CONTROLLER}"
     Execute Command    $enable_machine_snapshots="${ENABLE_MACHINE_SNAPSHOTS}"
@@ -201,6 +226,8 @@ Run Runtime Fault Point
     Execute Command    $fault_types="${FAULT_TYPES}"
     Execute Command    $fault_type_csv="${FAULT_TYPE_CSV}"
     Execute Command    $boot_cycles="${BOOT_CYCLES}"
+    Execute Command    $vtor_settle_iters="${VTOR_SETTLE_ITERS}"
+    Execute Command    $tracking_start_address="${TRACKING_START_ADDRESS}"
     Run Keyword If    '${CALIBRATION_TIME_SLICE}' != ''    Execute Command    $calibration_time_slice="${CALIBRATION_TIME_SLICE}"
     Run Keyword If    '${PHASE1_TIME_SLICE}' != ''    Execute Command    $phase1_time_slice="${PHASE1_TIME_SLICE}"
     Run Keyword If    '${PHASE2_TIME_SLICE}' != ''    Execute Command    $phase2_time_slice="${PHASE2_TIME_SLICE}"
@@ -243,6 +270,13 @@ Run Runtime Fault Point
     Run Keyword If    '${INSTRUCTION_SKIP_REGIONS}' != ''    Execute Command    $instruction_skip_regions="${INSTRUCTION_SKIP_REGIONS}"
     Run Keyword If    '${INSTRUCTION_SKIP_COUNT}' != '1'    Execute Command    $instruction_skip_count="${INSTRUCTION_SKIP_COUNT}"
     Run Keyword If    '${VERIFICATION_PROBES}' != ''    Execute Command    $verification_probes="${VERIFICATION_PROBES}"
+    Run Keyword If    '${TERMINAL_ERROR_PATHS_B64}' != ''    Execute Command    $terminal_error_paths_b64="${TERMINAL_ERROR_PATHS_B64}"
+    Run Keyword If    '${TERMINAL_ERROR_SNAPSHOT_HASH}' != ''    Execute Command    $terminal_error_snapshot_hash="${TERMINAL_ERROR_SNAPSHOT_HASH}"
+    Run Keyword If    '${TERMINAL_ERROR_ARTIFACT_HASH}' != ''    Execute Command    $terminal_error_artifact_hash="${TERMINAL_ERROR_ARTIFACT_HASH}"
+    Execute Command    $rc_injection_symbols="${RC_INJECTION_SYMBOLS}"
+    Execute Command    $rc_injection_return_value="${RC_INJECTION_RETURN_VALUE}"
+    Execute Command    $rc_injection_return_register="${RC_INJECTION_RETURN_REGISTER}"
+    Execute Command    $rc_injection_require_applied="${RC_INJECTION_REQUIRE_APPLIED}"
     Run Keyword If    '${READ_FAULT_REGIONS}' != ''    Execute Command    $read_fault_regions="${READ_FAULT_REGIONS}"
     Run Keyword If    '${READ_FAULT_BIT_FLIPS}' != '0'    Execute Command    $read_fault_bit_flips="${READ_FAULT_BIT_FLIPS}"
     Run Keyword If    '${READ_FAULT_PROBABILITY}' != '1.0'    Execute Command    $read_fault_probability="${READ_FAULT_PROBABILITY}"

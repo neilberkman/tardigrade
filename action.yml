@@ -1,15 +1,18 @@
 name: Tardigrade OTA Resilience Audit
 description: >
   Run fault-injection testing against an embedded bootloader.
-  Provide a profile YAML and bootloader ELF; Tardigrade installs Renode,
-  injects faults at every NVM write point, and returns a verdict.
+  Provide a profile YAML and referenced assets; Tardigrade installs Renode,
+  runs the selected campaign or analyzer, and returns assertion and security status.
 
 inputs:
   profile:
     description: Path to profile YAML (relative to caller's workspace)
     required: true
   quick:
-    description: Smoke test only (first/middle/last fault points)
+    description: >-
+      Smoke test; by default selects first/middle/last per enabled fault family.
+      Profiles with quick_use_heuristic use their configured heuristic set and
+      do not apply ordinary three-point reductions to other enabled families.
     required: false
     default: "true"
   renode-url:
@@ -29,11 +32,27 @@ inputs:
     description: Number of parallel Renode workers for sweep
     required: false
     default: "2"
+  regression-mode:
+    description: Allow expected-finding profiles to pass their regression assertion
+    required: false
+    default: "false"
 
 outputs:
   verdict:
-    description: PASS or FAIL
+    description: PASS only when the default security gate, or explicit regression gate, passes
     value: ${{ steps.run.outputs.verdict }}
+  assertion-status:
+    description: PASS when observed results match the profile expect block
+    value: ${{ steps.run.outputs.assertion_status }}
+  security-status:
+    description: CLEAN, FINDINGS, or INCONCLUSIVE independent of regression expectations
+    value: ${{ steps.run.outputs.security_status }}
+  issue-points:
+    description: Total issue points across enabled fault campaigns
+    value: ${{ steps.run.outputs.issue_points }}
+  security-bypass-points:
+    description: Instruction-skip points classified as security bypasses
+    value: ${{ steps.run.outputs.security_bypass_points }}
   brick-rate:
     description: Fraction of fault points that bricked the device
     value: ${{ steps.run.outputs.brick_rate }}
@@ -92,6 +111,7 @@ runs:
         ASSET_ROOT_INPUT: ${{ inputs.asset-root }}
         QUICK_INPUT: ${{ inputs.quick }}
         WORKERS_INPUT: ${{ inputs.workers }}
+        REGRESSION_MODE_INPUT: ${{ inputs.regression-mode }}
         TARDIGRADE_RENODE_DIR: ${{ steps.runtime.outputs.renode_dir }}
         TARDIGRADE_VENV_PYTHON: ${{ steps.runtime.outputs.venv_python }}
       run: |
@@ -109,6 +129,8 @@ runs:
           --name quick --value "${QUICK_INPUT}")"
         WORKERS="$("${TARDIGRADE_VENV_PYTHON}" "${helper}" normalize-positive-int \
           --name workers --value "${WORKERS_INPUT}" --maximum 64)"
+        REGRESSION_MODE="$("${TARDIGRADE_VENV_PYTHON}" "${helper}" normalize-bool \
+          --name regression-mode --value "${REGRESSION_MODE_INPUT}")"
         PROFILE="$("${TARDIGRADE_VENV_PYTHON}" "${helper}" resolve \
           --workspace "${GITHUB_WORKSPACE}" \
           --path "${PROFILE_INPUT}" \
@@ -143,16 +165,25 @@ runs:
 
         if [ ! -f "${REPORT}" ]; then
           echo "verdict=FAIL" >> "${GITHUB_OUTPUT}"
+          echo "assertion_status=FAIL" >> "${GITHUB_OUTPUT}"
+          echo "security_status=INCONCLUSIVE" >> "${GITHUB_OUTPUT}"
+          echo "issue_points=0" >> "${GITHUB_OUTPUT}"
+          echo "security_bypass_points=0" >> "${GITHUB_OUTPUT}"
           echo "brick_rate=-1" >> "${GITHUB_OUTPUT}"
           echo "report_path=" >> "${GITHUB_OUTPUT}"
           echo "::error::Audit produced no report (exit ${audit_exit})"
           exit 1
         fi
 
-        if ! "${TARDIGRADE_VENV_PYTHON}" "${helper}" publish-report \
-          --report "${REPORT}" \
-          --github-output "${GITHUB_OUTPUT}" \
-          --audit-exit "${audit_exit}"; then
-          echo "::error::Tardigrade audit failed or returned a non-PASS verdict"
+        publish_args=(
+          --report "${REPORT}"
+          --github-output "${GITHUB_OUTPUT}"
+          --audit-exit "${audit_exit}"
+        )
+        if [ "${REGRESSION_MODE}" = "true" ]; then
+          publish_args+=(--regression-mode)
+        fi
+        if ! "${TARDIGRADE_VENV_PYTHON}" "${helper}" publish-report "${publish_args[@]}"; then
+          echo "::error::Tardigrade audit failed its assertion or security gate"
           exit 1
         fi

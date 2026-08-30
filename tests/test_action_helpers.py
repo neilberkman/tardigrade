@@ -222,7 +222,11 @@ class TestReportPublishing(unittest.TestCase):
                     outputs = root / "outputs-{}".format(index)
                     report.write_text(json.dumps({
                         "verdict": verdict,
-                        "summary": {"runtime_sweep": {"brick_rate": 0.0}},
+                        "expect": {"should_find_issues": False},
+                        "summary": {"runtime_sweep": {
+                            "brick_rate": 0.0,
+                            "issue_points": 0,
+                        }},
                     }), encoding="utf-8")
                     self.assertFalse(publish_report(report, outputs, audit_exit=0))
                     self.assertIn("verdict=FAIL\n", outputs.read_text(encoding="utf-8"))
@@ -233,7 +237,11 @@ class TestReportPublishing(unittest.TestCase):
                     outputs = root / "outputs-{}".format(index)
                     report.write_text(json.dumps({
                         "verdict": verdict,
-                        "summary": {"runtime_sweep": {"brick_rate": 0.0}},
+                        "expect": {"should_find_issues": False},
+                        "summary": {"runtime_sweep": {
+                            "brick_rate": 0.0,
+                            "issue_points": 0,
+                        }},
                     }), encoding="utf-8")
                     with self.assertRaisesRegex(ValueError, "non-empty string"):
                         publish_report(report, outputs, audit_exit=0)
@@ -243,7 +251,11 @@ class TestReportPublishing(unittest.TestCase):
             outputs = root / "pass-outputs"
             report.write_text(json.dumps({
                 "verdict": "  PASS with complete coverage  ",
-                "summary": {"runtime_sweep": {"brick_rate": 0.0}},
+                "expect": {"should_find_issues": False},
+                "summary": {"runtime_sweep": {
+                    "brick_rate": 0.0,
+                    "issue_points": 0,
+                }},
             }), encoding="utf-8")
             self.assertTrue(publish_report(report, outputs, audit_exit=0))
             self.assertIn("verdict=PASS\n", outputs.read_text(encoding="utf-8"))
@@ -254,12 +266,96 @@ class TestReportPublishing(unittest.TestCase):
             outputs = Path(td) / "outputs"
             report.write_text(json.dumps({
                 "verdict": "PASS",
-                "summary": {"runtime_sweep": {"brick_rate": 0.0}},
+                "expect": {"should_find_issues": False},
+                "summary": {"runtime_sweep": {
+                    "brick_rate": 0.0,
+                    "issue_points": 0,
+                }},
             }), encoding="utf-8")
             self.assertFalse(publish_report(report, outputs, audit_exit=2))
             written = outputs.read_text(encoding="utf-8")
             self.assertIn("verdict=FAIL\n", written)
             self.assertIn("brick_rate=0.0\n", written)
+
+    def test_expected_findings_fail_safe_unless_regression_mode_is_explicit(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = Path(td) / "report.json"
+            report.write_text(json.dumps({
+                "verdict": "PASS",
+                "expect": {"should_find_issues": True},
+                "summary": {"runtime_sweep": {
+                    "brick_rate": 0.25,
+                    "issue_points": 3,
+                    "security_bypass_points": 1,
+                }},
+            }), encoding="utf-8")
+
+            safe_outputs = Path(td) / "safe-outputs"
+            self.assertFalse(publish_report(report, safe_outputs, audit_exit=0))
+            written = safe_outputs.read_text(encoding="utf-8")
+            self.assertIn("verdict=FAIL\n", written)
+            self.assertIn("assertion_status=PASS\n", written)
+            self.assertIn("security_status=FINDINGS\n", written)
+            self.assertIn("issue_points=3\n", written)
+            self.assertIn("security_bypass_points=1\n", written)
+
+            regression_outputs = Path(td) / "regression-outputs"
+            self.assertTrue(publish_report(
+                report,
+                regression_outputs,
+                audit_exit=0,
+                regression_mode=True,
+            ))
+            self.assertIn(
+                "verdict=PASS\n",
+                regression_outputs.read_text(encoding="utf-8"),
+            )
+
+    def test_missing_security_expectation_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = Path(td) / "report.json"
+            outputs = Path(td) / "outputs"
+            report.write_text(json.dumps({
+                "verdict": "PASS",
+                "summary": {"runtime_sweep": {"brick_rate": 0.0}},
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "should_find_issues"):
+                publish_report(report, outputs, audit_exit=0)
+            self.assertFalse(outputs.exists())
+
+    def test_unused_bricks_fallback_is_not_evaluated(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = Path(td) / "report.json"
+            outputs = Path(td) / "outputs"
+            report.write_text(json.dumps({
+                "verdict": "PASS",
+                "expect": {"should_find_issues": False},
+                "summary": {"runtime_sweep": {
+                    "brick_rate": 0.0,
+                    "issue_points": 0,
+                    "bricks": -1,
+                }},
+            }), encoding="utf-8")
+
+            self.assertTrue(publish_report(report, outputs, audit_exit=0))
+            self.assertIn("issue_points=0\n", outputs.read_text(encoding="utf-8"))
+
+    def test_malformed_bricks_is_rejected_when_used_as_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = Path(td) / "report.json"
+            outputs = Path(td) / "outputs"
+            report.write_text(json.dumps({
+                "verdict": "PASS",
+                "expect": {"should_find_issues": False},
+                "summary": {"runtime_sweep": {
+                    "brick_rate": 0.0,
+                    "bricks": -1,
+                }},
+            }), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "bricks"):
+                publish_report(report, outputs, audit_exit=0)
+            self.assertFalse(outputs.exists())
 
 
 class TestActionSourceBoundaries(unittest.TestCase):

@@ -8,10 +8,10 @@
 // set NVMC CONFIG=WEN before each flash word write and CONFIG=REN after.
 // NRF52NVMC counts these transitions as TotalWordWrites.
 //
-// Trade-off: no per-byte write tracking in flash, no partial-write fault
-// injection. Fault injection works by counting NVMC CONFIG transitions and
-// signaling via FaultFired. The test harness checks FaultFired to determine
-// if the target write was reached.
+// Trade-off: no per-byte write interception in flash. Fault injection counts
+// NVMC CONFIG transitions, snapshots each WEN window when necessary, and
+// applies non-power corruption directly to the mapped flash before execution
+// continues.
 
 cpu: CPU.CortexM @ sysbus
     cpuType: "cortex-m4"

@@ -163,12 +163,27 @@ def _evaluate_state_probe_contract(
     result: Dict[str, Any],
     profile: ProfileConfig,
 ) -> List[Dict[str, Any]]:
+    failures: List[Dict[str, Any]] = []
+    if (
+        (getattr(profile, "invariant_config", {}) or {}).get("semantic_state_stage")
+        == "fault_snapshot"
+        and result.get("fault_injected")
+        and not isinstance(result.get("fault_semantic_state"), dict)
+    ):
+        failures.append(
+            {
+                "scope": "contract",
+                "contract": "invariant_config.semantic_state_stage",
+                "path": "fault_semantic_state",
+                "expected": "present",
+                "actual": "<missing>",
+            }
+        )
     if getattr(profile, "state_probe", None) is None:
-        return []
+        return failures
     required_paths = list(getattr(profile.state_probe, "required_paths", []) or [])
     if not required_paths:
-        return []
-    failures: List[Dict[str, Any]] = []
+        return failures
     for path in required_paths:
         actual = _lookup_result_path(result, path)
         if actual is _MISSING:
@@ -204,6 +219,10 @@ def _derive_runtime_pre_state(
         return explicit
     if not isinstance(control_result, dict):
         return None
+    if not result.get("is_control"):
+        control_semantic = _result_state_payload(control_result)
+        if isinstance(control_semantic, dict):
+            return control_semantic
     expected_outcome = getattr(profile.expect, "control_outcome", "success") or "success"
     eff_outcome, eff_slot = _effective_boot_result(control_result)
     if eff_outcome != expected_outcome:
@@ -339,11 +358,26 @@ def _evaluate_invariants(
             fault_sequence = decode_multi_fault_sequence(fault_type)
         except (ValueError, TypeError):
             fault_sequence = None
+    invariant_config = getattr(profile, "invariant_config", {}) or {}
+    semantic_stage = invariant_config.get("semantic_state_stage", "final")
+    invariant_state = _result_state_payload(result)
+    result_signals = result.get("signals") if isinstance(result.get("signals"), dict) else {}
+    invariant_signals = dict(result_signals)
+    if isinstance(invariant_state, dict):
+        invariant_signals.setdefault("semantic_state", invariant_state)
+    if semantic_stage == "fault_snapshot":
+        staged = result.get("fault_semantic_state")
+        if isinstance(staged, dict):
+            invariant_state = staged
+            # Generic invariants that consume result_signals rather than
+            # FaultResult.nvm_state see the same selected stage.
+            invariant_signals["semantic_state"] = staged
+
     fault_result = FaultResult(
         fault_at=int(result.get("fault_at", 0)),
         boot_outcome=str(result.get("boot_outcome", "unknown")),
         boot_slot=result.get("boot_slot"),
-        nvm_state=_result_state_payload(result),
+        nvm_state=invariant_state,
         raw_log="",
         is_control=bool(result.get("is_control", False)),
         elapsed_virtual_time_s=elapsed_virtual_time_s,
@@ -352,7 +386,6 @@ def _evaluate_invariants(
     boot_register_values = getattr(
         profile.success_criteria, "boot_register_values", None
     ) or None
-    result_signals = result.get("signals") if isinstance(result.get("signals"), dict) else {}
     violations = run_invariants(
         fault_result,
         invariant_fns,
@@ -361,9 +394,10 @@ def _evaluate_invariants(
         partition_ranges=_profile_partition_ranges(profile),
         multi_boot_analysis=result.get("multi_boot_analysis"),
         boot_cycles=result.get("boot_cycles"),
-        invariant_config=getattr(profile, "invariant_config", {}) or {},
+        invariant_config=invariant_config,
         boot_register_values=boot_register_values,
-        result_signals=result_signals,
+        result_signals=invariant_signals,
+        result_dict=result,
     )
     violation_dicts = []
     for v in violations:
@@ -372,6 +406,10 @@ def _evaluate_invariants(
             "description": v.description,
             "details": v.details,
         }
+        if isinstance(v.details, dict) and v.details.get("finding_code"):
+            vd["finding"] = v.details.get("finding_code")
+        if semantic_stage == "fault_snapshot" and isinstance(result.get("fault_semantic_state"), dict):
+            vd["semantic_state_stage"] = "fault_snapshot"
         if fault_sequence is not None:
             vd["fault_sequence"] = fault_sequence
         violation_dicts.append(vd)

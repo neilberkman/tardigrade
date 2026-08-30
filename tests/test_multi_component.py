@@ -32,7 +32,12 @@ from profile_loader import (
     ProfileError,
     load_profile,
 )
-from sweep import _bounded_component_write_count, _run_batch_worker
+from sweep import (
+    _bounded_component_write_count,
+    _multi_component_issue_annotation,
+    _multi_component_security_counts,
+    _run_batch_worker,
+)
 
 
 class TestClassifyMultiComponentOutcome(unittest.TestCase):
@@ -111,6 +116,131 @@ class TestMultiComponentFaultResult(unittest.TestCase):
         self.assertEqual(r.fault_at, 42)
         self.assertEqual(r.combined_outcome, "split_brain")
         self.assertFalse(r.is_control)
+
+
+class TestMultiComponentSecurityAccounting(unittest.TestCase):
+    def test_overlapping_sources_count_one_fault_point(self) -> None:
+        annotation = _multi_component_issue_annotation(
+            {
+                "fault_injected": True,
+                "boot_outcome": "no_boot",
+                "semantic_assertion_failures": [{"name": "version"}],
+            },
+            expected_outcome="success",
+            combined_outcome="split_brain",
+            relation_violations=[{"name": "state_relations"}],
+            require_fault=True,
+        )
+        self.assertTrue(annotation["component_issue"])
+        self.assertTrue(annotation["security_issue"])
+        self.assertEqual(
+            annotation["issue_sources"],
+            ["component", "combined_outcome", "state_relation"],
+        )
+        counts = _multi_component_security_counts(
+            [annotation],
+            {"reliable": True, "security_issue": False},
+        )
+        self.assertEqual(counts["security_issue_points"], 1)
+
+    def test_semantic_only_component_finding_is_preserved(self) -> None:
+        annotation = _multi_component_issue_annotation(
+            {
+                "fault_injected": True,
+                "boot_outcome": "success",
+                "semantic_assertion_failures": [{"name": "version"}],
+            },
+            expected_outcome="success",
+            combined_outcome="success",
+            relation_violations=[],
+            require_fault=True,
+        )
+        self.assertTrue(annotation["security_issue"])
+        self.assertEqual(annotation["issue_sources"], ["component"])
+
+    def test_infrastructure_result_is_not_a_security_issue(self) -> None:
+        annotation = _multi_component_issue_annotation(
+            {
+                "fault_injected": True,
+                "boot_outcome": "infra_error",
+                "infrastructure_error": True,
+            },
+            expected_outcome="success",
+            combined_outcome="degraded",
+            relation_violations=[],
+            require_fault=True,
+        )
+        self.assertFalse(annotation["reliable"])
+        self.assertFalse(annotation["security_issue"])
+        counts = _multi_component_security_counts(
+            [annotation],
+            {"reliable": True, "security_issue": False},
+        )
+        self.assertEqual(counts["security_issue_points"], 0)
+        self.assertEqual(counts["unreliable_fault_points"], 1)
+
+    def test_bad_supporting_control_cannot_create_combined_finding(self) -> None:
+        annotation = _multi_component_issue_annotation(
+            {
+                "fault_injected": True,
+                "boot_outcome": "success",
+            },
+            expected_outcome="success",
+            combined_outcome="split_brain",
+            relation_violations=[{"name": "state_relations"}],
+            require_fault=True,
+            supporting_controls_reliable=False,
+        )
+        self.assertTrue(annotation["component_reliable"])
+        self.assertFalse(annotation["reliable"])
+        self.assertFalse(annotation["component_issue"])
+        self.assertFalse(annotation["security_issue"])
+        self.assertEqual(annotation["issue_sources"], [])
+
+    def test_local_finding_survives_bad_supporting_control(self) -> None:
+        annotation = _multi_component_issue_annotation(
+            {
+                "fault_injected": True,
+                "boot_outcome": "success",
+                "semantic_assertion_failures": [{"name": "version"}],
+            },
+            expected_outcome="success",
+            combined_outcome="split_brain",
+            relation_violations=[{"name": "state_relations"}],
+            require_fault=True,
+            supporting_controls_reliable=False,
+        )
+        self.assertTrue(annotation["component_reliable"])
+        self.assertFalse(annotation["reliable"])
+        self.assertTrue(annotation["component_issue"])
+        self.assertTrue(annotation["security_issue"])
+        self.assertEqual(annotation["issue_sources"], ["component"])
+        counts = _multi_component_security_counts(
+            [annotation],
+            {"reliable": True, "security_issue": False},
+        )
+        self.assertEqual(counts["component_reliable_fault_points"], 1)
+        self.assertEqual(counts["reliable_fault_points"], 0)
+        self.assertEqual(counts["security_issue_points"], 1)
+
+    def test_control_findings_have_a_separate_binary_count(self) -> None:
+        control = _multi_component_issue_annotation(
+            {
+                "fault_injected": False,
+                "boot_outcome": "success",
+                "semantic_assertion_failures": [
+                    {"name": "one"},
+                    {"name": "two"},
+                ],
+            },
+            expected_outcome="success",
+            combined_outcome="success",
+            relation_violations=[{"name": "state_relations"}],
+            require_fault=False,
+        )
+        counts = _multi_component_security_counts([], control)
+        self.assertEqual(counts["security_issue_points"], 0)
+        self.assertEqual(counts["control_security_issue_points"], 1)
 
 
 class TestComponentConfigParsing(unittest.TestCase):
@@ -276,6 +406,10 @@ class TestComponentConfigParsing(unittest.TestCase):
         profile.invariant_config = {"allowed": ["exec"]}
         profile.nvm_controller = "nvmController"
         profile.otp_peripheral = "otp"
+        persistent_layout = object()
+        terminal_declarations = [object()]
+        profile.persistent_state_layout = persistent_layout
+        profile.terminal_error_paths = terminal_declarations
         profile.multi_component.components[0].pre_boot_state = [
             PreBootWrite(address=0x20000004, u32=0xDEAD)
         ]
@@ -287,6 +421,8 @@ class TestComponentConfigParsing(unittest.TestCase):
         )
 
         resolved_parent = profile.resolve_initial_state(state)
+        self.assertIs(resolved_parent.persistent_state_layout, persistent_layout)
+        self.assertIs(resolved_parent.terminal_error_paths, terminal_declarations)
         component_profiles = resolved_parent.component_profiles()
         self.assertEqual(len(component_profiles), 2)
         for component in component_profiles:
@@ -304,6 +440,8 @@ class TestComponentConfigParsing(unittest.TestCase):
                 self.assertEqual(component.invariant_config, profile.invariant_config)
                 self.assertEqual(component.nvm_controller, "nvmController")
                 self.assertEqual(component.otp_peripheral, "otp")
+                self.assertIs(component.persistent_state_layout, persistent_layout)
+                self.assertIs(component.terminal_error_paths, terminal_declarations)
 
     def test_component_auto_write_count_uses_profile_cap(self) -> None:
         profile = load_profile(

@@ -172,6 +172,33 @@ def _verification_probe_summary(result: Dict[str, Any]) -> Optional[Dict[str, An
     }
 
 
+def _success_effect_summary(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the structured success-implies-effect evidence, when present."""
+    violations = result.get("invariant_violations") or []
+    for violation in violations:
+        if isinstance(violation, dict) and violation.get("name") == "success_implies_effect":
+            details = dict(violation.get("details") or {})
+            details.setdefault("fault_at", result.get("fault_at"))
+            details.setdefault("fault_point", result.get("fault_address"))
+            return details
+    return None
+
+
+def _state_relation_summary(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the first declarative state-relation finding, when present."""
+    violations = result.get("invariant_violations") or []
+    for violation in violations:
+        if not isinstance(violation, dict):
+            continue
+        if violation.get("name") != "state_relations":
+            continue
+        details = dict(violation.get("details") or {})
+        details.setdefault("fault_at", result.get("fault_at"))
+        details.setdefault("fault_point", result.get("fault_address"))
+        return details
+    return None
+
+
 def _make_single_point_runner(
     *,
     repo_root: Path,
@@ -688,6 +715,42 @@ def validate_runtime_findings(
                 _apply_validation(result, validation)
                 continue
         if not (result_is_brick(result) or result_has_issues(result, expected_outcome)):
+            continue
+
+        effect_evidence = _success_effect_summary(result)
+        if effect_evidence is not None:
+            validation = _build_validation(
+                stage="validated",
+                disposition="confirmed",
+                fault_type=result.get("fault_type"),
+                expected_outcome=expected_outcome,
+                security_property="auth_integrity",
+                counterfactuals={
+                    "success_implies_effect": effect_evidence,
+                    "multi_boot_replay": _steady_state_status(result),
+                },
+                reasons=["success_without_required_effect"],
+                skeptical_summary="Validated: the configured API returned success but its required durable effect was absent.",
+            )
+            _apply_validation(result, validation)
+            continue
+
+        relation_evidence = _state_relation_summary(result)
+        if relation_evidence is not None:
+            validation = _build_validation(
+                stage="validated",
+                disposition="confirmed",
+                fault_type=result.get("fault_type"),
+                expected_outcome=expected_outcome,
+                security_property="auth_integrity",
+                counterfactuals={
+                    "state_relation": relation_evidence,
+                    "multi_boot_replay": _steady_state_status(result),
+                },
+                reasons=["state_relation_violation"],
+                skeptical_summary="Validated: the boot completed, but the observed component state violated the configured compatibility relation.",
+            )
+            _apply_validation(result, validation)
             continue
 
         if base_code == "i":

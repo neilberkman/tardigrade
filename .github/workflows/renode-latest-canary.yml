@@ -66,8 +66,70 @@ jobs:
         run: python3 -m pip install -r requirements.txt
 
       - name: Native-AOT RunFor regression test (expected FAIL)
-        continue-on-error: true
-        run: renode-test tests/nativeaot_runfor_bug.robot
+        run: |
+          set -euo pipefail
+          report_dir="${RUNNER_TEMP}/nativeaot_runfor_report"
+          rm -rf "${report_dir}"
+          mkdir -p "${report_dir}"
+          set +e
+          renode-test \
+            --outputdir "${report_dir}" \
+            --save-logs always \
+            --keep-renode-output \
+            tests/nativeaot_runfor_bug.robot \
+            >"${report_dir}/console.log" 2>&1
+          renode_status=$?
+          set -e
+          report="${report_dir}/output.xml"
+          if [ ! -s "${report}" ]; then
+            echo "::error::Native-AOT regression produced no trustworthy Robot report"
+            tail -200 "${report_dir}/console.log" || true
+            exit 1
+          fi
+          python3 - "${report}" "${renode_status}" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          report_path, raw_status = sys.argv[1:]
+          process_status = int(raw_status)
+          try:
+              root = ET.parse(report_path).getroot()
+          except (OSError, ET.ParseError) as exc:
+              raise SystemExit("Native-AOT Robot report is unreadable: {}".format(exc))
+
+          tests = {
+              test.get("name"): test
+              for test in root.findall(".//test")
+              if test.get("name")
+          }
+          control_name = "RunFor Completes With Built-In MappedMemory"
+          regression_name = "RunFor Completes With Dynamically Compiled Peripheral On Fetch Path"
+          missing = [name for name in (control_name, regression_name) if name not in tests]
+          if missing:
+              raise SystemExit(
+                  "Native-AOT Robot report is missing expected test(s): {}".format(
+                      ", ".join(missing)
+                  )
+              )
+
+          def status(test):
+              node = test.find("status")
+              return node.get("status") if node is not None else None
+
+          control_status = status(tests[control_name])
+          regression_status = status(tests[regression_name])
+          print(
+              "Native-AOT expected failure: process_status={}, control={}, regression={}".format(
+                  process_status, control_status, regression_status
+              )
+          )
+          if process_status == 0:
+              raise SystemExit("Native-AOT regression unexpectedly succeeded")
+          if control_status != "PASS" or regression_status != "FAIL":
+              raise SystemExit(
+                  "Native-AOT report did not show the expected control PASS / regression FAIL"
+              )
+          PY
 
       - name: Run latest-Renode canary suites
         timeout-minutes: 35

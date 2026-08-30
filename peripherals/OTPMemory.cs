@@ -411,6 +411,35 @@ namespace Antmicro.Renode.Peripherals.Memory
             FaultSnapshot = null;
         }
 
+        /// <summary>
+        /// Capture the full OTP array for deterministic test isolation.
+        /// This is test infrastructure, not a hardware operation.
+        /// </summary>
+        public byte[] TestSnapshot()
+        {
+            var snapshot = new byte[size];
+            Array.Copy(storage, snapshot, (int)size);
+            return snapshot;
+        }
+
+        /// <summary>
+        /// Restore a previously captured test snapshot and reset transient
+        /// fault bookkeeping. Real OTP remains one-way; only the emulator's
+        /// between-run baseline uses this method.
+        /// </summary>
+        public void TestRestore(byte[] snapshot)
+        {
+            if(snapshot == null || snapshot.LongLength != size)
+            {
+                throw new ArgumentException("OTP test snapshot size mismatch");
+            }
+            Array.Copy(snapshot, storage, (int)size);
+            TotalBlows = 0;
+            BlowFaultFired = false;
+            LastFaultAddress = 0;
+            FaultSnapshot = null;
+        }
+
         // --- Core blow logic ---
 
         private void BlowBits(long offset, byte[] data)

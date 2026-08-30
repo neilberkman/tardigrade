@@ -1,0 +1,20 @@
+{
+  "schema_version": 2,
+  "name": "tardigrade-strict-no-copyleft",
+  "build_only_copyleft": "fail",
+  "licenses": {
+    "Apache-2.0": {"decision": "allow", "class": "permissive"},
+    "BSD-2-Clause": {"decision": "allow", "class": "permissive"},
+    "BSD-3-Clause": {"decision": "allow", "class": "permissive"},
+    "ISC": {"decision": "allow", "class": "permissive"},
+    "MIT": {"decision": "allow", "class": "permissive"},
+    "MPL-2.0": {"decision": "prohibit", "class": "copyleft"},
+    "LGPL-3.0-only": {"decision": "prohibit", "class": "copyleft"},
+    "GPL-3.0-only": {"decision": "prohibit", "class": "copyleft"},
+    "GPL-3.0-only WITH GCC-exception-3.1": {
+      "decision": "prohibit",
+      "class": "copyleft-with-exception"
+    },
+    "PSF-2.0": {"decision": "allow", "class": "permissive"}
+  }
+}

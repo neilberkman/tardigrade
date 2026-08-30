@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import fnmatch
+import hashlib
 import json
 import re
 import struct
@@ -40,6 +41,40 @@ from fault_types import (
 )
 from thumb_instructions import enumerate_instruction_skip_addresses, make_elf_halfword_reader
 from boot_outcomes import DEVICE_BOOT_OUTCOMES
+from update_protocol_analyzer import (
+    UpdateProtocolError,
+    UpdateProtocolModel,
+    analyze_update_protocol,
+    parse_update_protocol,
+)
+from authorization_review_analyzer import (
+    AuthorizationReviewError,
+    AuthorizationReviewModel,
+    analyze_authorization_review,
+    parse_authorization_review,
+)
+from security_state_layout import (
+    analyze_persistent_state_layout,
+    PersistentStateLayout,
+    SecurityStateLayoutError,
+    parse_persistent_state_layout,
+)
+from terminal_error_escape import (
+    TerminalErrorPathConfig,
+    build_terminal_runtime_payload,
+    discover_terminal_error_paths,
+    parse_terminal_error_paths,
+    terminal_snapshot_identity,
+)
+from boundary_campaigns import (
+    BoundaryCampaign,
+    BoundaryCampaignError,
+    boundary_campaign_dict,
+    parse_boundary_campaign,
+    resolve_boundary_capacity,
+    resolve_boundary_values,
+    resolve_followup_value,
+)
 
 try:
     import yaml
@@ -212,6 +247,7 @@ class MemoryConfig:
         "page_size",
         "slots",
         "bootloader_region",
+        "trace_address_map",
     )
 
     def __init__(
@@ -222,6 +258,7 @@ class MemoryConfig:
         slots: Dict[str, SlotConfig],
         page_size: int = 4096,
         bootloader_region: Optional[BootloaderRegionConfig] = None,
+        trace_address_map: Optional[List[Dict[str, int]]] = None,
     ) -> None:
         self.sram_start = sram_start
         self.sram_end = sram_end
@@ -229,6 +266,10 @@ class MemoryConfig:
         self.page_size = page_size
         self.slots = slots
         self.bootloader_region = bootloader_region
+        # Optional mapping from backend trace offsets to CPU-visible absolute
+        # addresses.  This is needed for aliased memories while preserving
+        # the historical zero-based trace format.
+        self.trace_address_map = trace_address_map or []
 
 
 class ResidualImageConfig:
@@ -668,6 +709,52 @@ class VerificationProbeConfig:
         }
 
 
+class FunctionReturnProbeConfig:
+    """Capture return values from a function on every execute-mode run.
+
+    This deliberately shares the runtime entry/return hook used by
+    ``verification_probes``.  Verification probes remain instruction-skip
+    telemetry; these probes are general return telemetry and are independent
+    of the selected fault type.
+    """
+
+    __slots__ = (
+        "symbol", "return_register", "return_register_index", "label", "capture"
+    )
+
+    def __init__(
+        self,
+        *,
+        symbol: str,
+        return_register: str = "r0",
+        return_register_index: int = 0,
+        label: Optional[str] = None,
+        capture: str = "last",
+    ) -> None:
+        self.symbol = str(symbol).strip()
+        if not self.symbol:
+            raise ProfileError("fault_sweep.function_return_probes.symbol: expected non-empty string")
+        self.return_register = str(return_register).strip().lower()
+        self.return_register_index = int(return_register_index)
+        self.label = str(label or self.symbol).strip()
+        if not self.label:
+            raise ProfileError("fault_sweep.function_return_probes.label: expected non-empty string")
+        self.capture = str(capture or "last").strip().lower()
+        if self.capture not in {"first", "last", "all"}:
+            raise ProfileError(
+                "fault_sweep.function_return_probes.capture: expected 'first', 'last', or 'all'"
+            )
+
+    def to_runtime_dict(self) -> Dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "return_register": self.return_register,
+            "return_register_index": self.return_register_index,
+            "label": self.label,
+            "capture": self.capture,
+        }
+
+
 class MetadataFaultConfig:
     """Configuration for faulting host-side metadata/setup writes before boot."""
 
@@ -843,6 +930,8 @@ class ComponentConfig:
             metadata_fault_regions=parent.metadata_fault_regions,
             nvs_region=parent.nvs_region,
             security_policy=parent.security_policy,
+            update_protocol=parent.update_protocol,
+            authorization_review=getattr(parent, "authorization_review", None),
             bootloader_region=component_bootloader_region,
             success_criteria_overrides=parent.success_criteria_overrides,
             boot_register_pre_writes=parent.boot_register_pre_writes,
@@ -851,6 +940,12 @@ class ComponentConfig:
             fuzz_corpus=parent.fuzz_corpus,
             residual_image=parent.residual_image,
             firmware_elf=parent.firmware_elf,
+            persistent_state_layout=getattr(parent, "persistent_state_layout", None),
+            terminal_error_paths=getattr(parent, "terminal_error_paths", []),
+            boundary_campaigns=getattr(parent, "boundary_campaigns", []),
+            boundary_campaign=getattr(parent, "boundary_campaign", None),
+            boundary_value=getattr(parent, "boundary_value", None),
+            boundary_previous_value=getattr(parent, "boundary_previous_value", None),
         )
         resolved.auto_update_trigger = bool(
             getattr(parent, "auto_update_trigger", False)
@@ -1119,6 +1214,85 @@ class WritebackConfig:
         self.erase_flushes_domain = bool(erase_flushes_domain)
 
 
+class RcInjectionConfig:
+    """Configuration for non-halting return-code injection faults.
+
+    Values are kept in the representation used by the target CPU: the return
+    value is always an unsigned 32-bit word, while ``return_register`` is the
+    Arm register number to overwrite on return.
+    """
+
+    __slots__ = ("symbols", "return_value", "return_register", "require_applied")
+
+    def __init__(
+        self,
+        symbols: Optional[List[str]] = None,
+        return_value: int = -5,
+        return_register: int = 0,
+        require_applied: bool = True,
+    ) -> None:
+        raw_symbols = symbols if symbols is not None else ["flash_area_write"]
+        if not isinstance(raw_symbols, list):
+            raise ProfileError(
+                "fault_sweep.rc_injection_config.symbols: expected non-empty list"
+            )
+        if any(not isinstance(symbol, str) for symbol in raw_symbols):
+            raise ProfileError(
+                "fault_sweep.rc_injection_config.symbols: expected ELF symbol names"
+            )
+        values = [symbol.strip() for symbol in raw_symbols]
+        if not values or any(not symbol for symbol in values):
+            raise ProfileError(
+                "fault_sweep.rc_injection_config.symbols: expected a non-empty list"
+            )
+        if len(values) != len(set(values)):
+            raise ProfileError(
+                "fault_sweep.rc_injection_config.symbols: symbols must be unique"
+            )
+        self.symbols = values
+
+        if type(return_value) is bool or not isinstance(return_value, int):
+            raise ProfileError(
+                "fault_sweep.rc_injection_config.return_value: expected a 32-bit integer"
+            )
+        if return_value < -0x80000000 or return_value > 0xFFFFFFFF:
+            raise ProfileError(
+                "fault_sweep.rc_injection_config.return_value: expected -2147483648..4294967295"
+            )
+        self.return_value = int(return_value) & 0xFFFFFFFF
+
+        if type(return_register) is bool or not isinstance(return_register, int):
+            raise ProfileError(
+                "fault_sweep.rc_injection_config.return_register: expected integer 0..15"
+            )
+        if return_register < 0 or return_register > 15:
+            raise ProfileError(
+                "fault_sweep.rc_injection_config.return_register: expected integer 0..15"
+            )
+        self.return_register = int(return_register)
+        if type(require_applied) is not bool:
+            raise ProfileError(
+                "fault_sweep.rc_injection_config.require_applied: expected boolean"
+            )
+        self.require_applied = require_applied
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "symbols": list(self.symbols),
+            "return_value": self.return_value,
+            "return_register": self.return_register,
+            "require_applied": self.require_applied,
+        }
+
+    def to_runtime_dict(self) -> Dict[str, Any]:
+        """Alias used by profile-to-runtime serializers."""
+        return self.to_dict()
+
+
+# Descriptive alias for callers that prefer the long configuration name.
+ReturnCodeInjectionConfig = RcInjectionConfig
+
+
 class FaultSweepConfig:
     __slots__ = (
         "mode",
@@ -1137,6 +1311,8 @@ class FaultSweepConfig:
         "progress_stall_timeout_s",
         "boot_cycles",
         "boot_cycle_hook",
+        "vtor_settle_iters",
+        "tracking_start_address",
         "expected_rollback_at_cycle",
         "phase2_fault",
         "hook_fault",
@@ -1146,6 +1322,7 @@ class FaultSweepConfig:
         "instruction_skip_config",
         "timed_bit_corruption_config",
         "verification_probes",
+        "function_return_probes",
         "metadata_fault",
         "metadata_delta",
         "partial_staging",
@@ -1160,6 +1337,7 @@ class FaultSweepConfig:
         "i2c_fault_config",
         "durability_model",
         "writeback",
+        "rc_injection_config",
     )
 
     def __init__(
@@ -1180,6 +1358,8 @@ class FaultSweepConfig:
         progress_stall_timeout_s: Optional[float] = None,
         boot_cycles: int = 1,
         boot_cycle_hook: Optional[str] = None,
+        vtor_settle_iters: int = 0,
+        tracking_start_address: int = 0,
         expected_rollback_at_cycle: Optional[int] = None,
         phase2_fault: Optional["Phase2FaultConfig"] = None,
         hook_fault: Optional["HookFaultConfig"] = None,
@@ -1189,6 +1369,7 @@ class FaultSweepConfig:
         instruction_skip_config: Optional["InstructionSkipConfig"] = None,
         timed_bit_corruption_config: Optional["TimedBitCorruptionConfig"] = None,
         verification_probes: Optional[List["VerificationProbeConfig"]] = None,
+        function_return_probes: Optional[List["FunctionReturnProbeConfig"]] = None,
         metadata_fault: Optional["MetadataFaultConfig"] = None,
         metadata_delta: Optional["MetadataDeltaConfig"] = None,
         partial_staging: Optional[Any] = None,
@@ -1203,6 +1384,7 @@ class FaultSweepConfig:
         i2c_fault_config: Optional["I2CFaultConfig"] = None,
         durability_model: str = "direct",
         writeback: Optional["WritebackConfig"] = None,
+        rc_injection_config: Optional["RcInjectionConfig"] = None,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -1253,6 +1435,12 @@ class FaultSweepConfig:
                 )
             )
         self.run_duration = run_duration
+        self.vtor_settle_iters = max(0, int(vtor_settle_iters))
+        self.tracking_start_address = int(tracking_start_address)
+        if self.tracking_start_address < 0 or self.tracking_start_address > 0xFFFFFFFF:
+            raise ProfileError(
+                "fault_sweep.tracking_start_address must be a 32-bit address"
+            )
         self.calibration_time_slice = (
             str(calibration_time_slice).strip()
             if calibration_time_slice
@@ -1290,6 +1478,7 @@ class FaultSweepConfig:
         self.instruction_skip_config = instruction_skip_config
         self.timed_bit_corruption_config = timed_bit_corruption_config
         self.verification_probes = verification_probes or []
+        self.function_return_probes = function_return_probes or []
         self.metadata_fault = metadata_fault or MetadataFaultConfig()
         self.metadata_delta = metadata_delta or MetadataDeltaConfig()
         self.partial_staging = partial_staging
@@ -1321,6 +1510,7 @@ class FaultSweepConfig:
         self.i2c_fault_config = i2c_fault_config
         self.durability_model = durability_model
         self.writeback = writeback
+        self.rc_injection_config = rc_injection_config or RcInjectionConfig()
 
 
 class StateFuzzerConfig:
@@ -1497,19 +1687,26 @@ class UpdatePhase:
 class InitialStateConfig:
     """A named initial-state seed for sweep matrix expansion."""
     __slots__ = ("name", "description", "pre_boot_state", "setup_script",
-                 "update_trigger", "expect_overrides")
+                 "update_trigger", "expect_overrides", "boundary_campaign",
+                 "boundary_value", "boundary_previous_value")
 
     def __init__(self, name: str, description: str = "",
                  pre_boot_state: Optional[List[PreBootWrite]] = None,
                  setup_script: Optional[str] = None,
                  update_trigger: Optional[UpdateTrigger] = None,
-                 expect_overrides: Optional[Dict[str, Any]] = None) -> None:
+                 expect_overrides: Optional[Dict[str, Any]] = None,
+                 boundary_campaign: Optional[BoundaryCampaign] = None,
+                 boundary_value: Optional[int] = None,
+                 boundary_previous_value: Optional[int] = None) -> None:
         self.name = name
         self.description = description
         self.pre_boot_state = pre_boot_state
         self.setup_script = setup_script
         self.update_trigger = update_trigger
         self.expect_overrides = expect_overrides or {}
+        self.boundary_campaign = boundary_campaign
+        self.boundary_value = boundary_value
+        self.boundary_previous_value = boundary_previous_value
 
 
 class BootRegisterPreWrite:
@@ -1616,6 +1813,8 @@ class ProfileConfig:
         multi_component: Optional["MultiComponentConfig"] = None,
         nvs_region: Optional[NvsRegionConfig] = None,
         security_policy: Optional["SecurityPolicyConfig"] = None,
+        update_protocol: Optional[UpdateProtocolModel] = None,
+        authorization_review: Optional[AuthorizationReviewModel] = None,
         bootloader_region: Optional[BootloaderRegionConfig] = None,
         success_criteria_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         boot_register_pre_writes: Optional[List[BootRegisterPreWrite]] = None,
@@ -1626,6 +1825,12 @@ class ProfileConfig:
         residual_image: Optional["ResidualImageConfig"] = None,
 
         firmware_elf: Optional[str] = None,
+        persistent_state_layout: Optional[PersistentStateLayout] = None,
+        terminal_error_paths: Optional[List[TerminalErrorPathConfig]] = None,
+        boundary_campaigns: Optional[List[BoundaryCampaign]] = None,
+        boundary_campaign: Optional[BoundaryCampaign] = None,
+        boundary_value: Optional[int] = None,
+        boundary_previous_value: Optional[int] = None,
 
     ) -> None:
         self.schema_version = schema_version
@@ -1659,6 +1864,8 @@ class ProfileConfig:
         self.nvm_controller = nvm_controller
         self.otp_peripheral = otp_peripheral
         self.security_policy = security_policy or SecurityPolicyConfig()
+        self.update_protocol = update_protocol
+        self.authorization_review = authorization_review
         self.initial_states: List[InitialStateConfig] = initial_states or []
         self.metadata_fault_regions: List[MetadataFaultRegion] = metadata_fault_regions or []
         self.multi_component: Optional[MultiComponentConfig] = multi_component
@@ -1698,6 +1905,12 @@ class ProfileConfig:
         self.residual_image: Optional[ResidualImageConfig] = residual_image
 
         self.firmware_elf: Optional[str] = firmware_elf
+        self.persistent_state_layout: Optional[PersistentStateLayout] = persistent_state_layout
+        self.terminal_error_paths: List[TerminalErrorPathConfig] = terminal_error_paths or []
+        self.boundary_campaigns: List[BoundaryCampaign] = boundary_campaigns or []
+        self.boundary_campaign = boundary_campaign
+        self.boundary_value = boundary_value
+        self.boundary_previous_value = boundary_previous_value
 
 
     @property
@@ -1776,6 +1989,8 @@ class ProfileConfig:
             multi_component=self.multi_component,
             nvs_region=self.nvs_region,
             security_policy=self.security_policy,
+            update_protocol=self.update_protocol,
+            authorization_review=self.authorization_review,
             bootloader_region=self.bootloader_region,
             success_criteria_overrides=self.success_criteria_overrides,
             boot_register_pre_writes=self.boot_register_pre_writes,
@@ -1786,6 +2001,17 @@ class ProfileConfig:
             residual_image=self.residual_image,
 
             firmware_elf=self.firmware_elf,
+            persistent_state_layout=self.persistent_state_layout,
+            terminal_error_paths=self.terminal_error_paths,
+            boundary_campaigns=self.boundary_campaigns,
+            boundary_campaign=state.boundary_campaign or getattr(self, "boundary_campaign", None),
+            boundary_value=(state.boundary_value if state.boundary_value is not None
+                            else getattr(self, "boundary_value", None)),
+            boundary_previous_value=(
+                state.boundary_previous_value
+                if state.boundary_previous_value is not None
+                else getattr(self, "boundary_previous_value", None)
+            ),
 
         )
         if state.update_trigger is not None and state.pre_boot_state is None:
@@ -2098,6 +2324,8 @@ class ProfileConfig:
             "MAX_STEP_LIMIT:{}".format(fs.max_step_limit),
             "MAX_WRITES_CAP:{}".format(fs.max_writes_cap),
             "BOOT_CYCLES:{}".format(fs.boot_cycles),
+            "VTOR_SETTLE_ITERS:{}".format(fs.vtor_settle_iters),
+            "TRACKING_START_ADDRESS:0x{:08X}".format(fs.tracking_start_address),
             "RUNTIME_MODE:true",
         ]
         if fs.calibration_time_slice:
@@ -2251,6 +2479,23 @@ class ProfileConfig:
             vars_list.append(
                 "SETUP_SCRIPT:{}".format(self.resolve_path(repo_root, self.setup_script))
             )
+        # Boundary campaigns use fixed harness variables for transport.  The
+        # runner materializes the validated declared name inside Renode just
+        # before including the setup script; exposing an arbitrary Robot
+        # variable here could collide with FAULT_AT/RESULT_FILE/etc.
+        boundary = getattr(self, "boundary_campaign", None)
+        boundary_value = getattr(self, "boundary_value", None)
+        if boundary is not None and boundary_value is not None:
+            vars_list.append(
+                "BOUNDARY_SETUP_ENV:{}".format(boundary.setup_environment)
+            )
+            vars_list.append("BOUNDARY_VALUE:{}".format(int(boundary_value)))
+        boundary_state_file = getattr(self, "boundary_durable_state_file", None)
+        if boundary_state_file:
+            vars_list.append("BOUNDARY_DURABLE_STATE_FILE:{}".format(boundary_state_file))
+        boundary_phase = getattr(self, "boundary_phase", None)
+        if boundary_phase:
+            vars_list.append("BOUNDARY_PHASE:{}".format(boundary_phase))
         if self.state_probe is not None:
             vars_list.append(
                 "STATE_PROBE:{}".format(
@@ -2332,6 +2577,18 @@ class ProfileConfig:
             )
             vars_list.append("READ_FAULT_SEED:{}".format(rfc.seed))
 
+        # Return-code injection configuration.  These scalar variables are
+        # consumed by the Renode runtime and preserve arbitrary ELF symbols.
+        rci = fs.rc_injection_config
+        vars_list.append("RC_INJECTION_SYMBOLS:{}".format(",".join(rci.symbols)))
+        vars_list.append("RC_INJECTION_RETURN_VALUE:{}".format(rci.return_value))
+        vars_list.append("RC_INJECTION_RETURN_REGISTER:{}".format(rci.return_register))
+        vars_list.append(
+            "RC_INJECTION_REQUIRE_APPLIED:{}".format(
+                "true" if rci.require_applied else "false"
+            )
+        )
+
         # Instruction skip config: emit target address ranges and skip count.
         if "instruction_skip" in fs.fault_types and fs.instruction_skip_config is not None:
             isc = fs.instruction_skip_config
@@ -2354,6 +2611,50 @@ class ProfileConfig:
                 ).encode("utf-8")
             ).decode("ascii")
             vars_list.append("VERIFICATION_PROBES:{}".format(encoded))
+        if fs.function_return_probes:
+            encoded = base64.b64encode(
+                json.dumps(
+                    [probe.to_runtime_dict() for probe in fs.function_return_probes],
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).decode("ascii")
+            vars_list.append("FUNCTION_RETURN_PROBES:{}".format(encoded))
+
+        # Terminal-error campaigns receive the declarative contract.  The
+        # campaign runner may replace this with the emitted-ELF-resolved
+        # payload; retaining the declaration here also makes ordinary runtime
+        # results self-describing.
+        if self.terminal_error_paths:
+            terminal_elf = self.resolve_path(repo_root, self.bootloader_elf)
+            terminal_discovery = discover_terminal_error_paths(
+                terminal_elf, self.terminal_error_paths
+            )
+            terminal_payload = json.dumps(
+                build_terminal_runtime_payload(
+                    terminal_discovery, self.terminal_error_paths
+                ),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            encoded = base64.b64encode(terminal_payload).decode("ascii")
+            vars_list.append("TERMINAL_ERROR_PATHS_B64:{}".format(encoded))
+            vars_list.append(
+                "TERMINAL_ERROR_ARTIFACT_HASH:{}".format(
+                    hashlib.sha256(terminal_payload).hexdigest()
+                )
+            )
+            vars_list.append(
+                "TERMINAL_ERROR_SNAPSHOT_HASH:{}".format(
+                    terminal_snapshot_identity(
+                        terminal_elf,
+                        {
+                            name: self.resolve_path(repo_root, image)
+                            for name, image in self.images.items()
+                        },
+                        self.pre_boot_state,
+                    )
+                )
+            )
 
         # I2C fault config: emit when any i2c_* fault type is active.
         i2c_types_active = [ft for ft in fs.fault_types if ft.startswith("i2c_")]
@@ -2517,6 +2818,16 @@ class ProfileConfig:
             )
 
         return vars_list
+
+    def boundary_followup_robot_vars(self) -> List[str]:
+        """Return fixed transport variables for the previous phase."""
+        campaign = getattr(self, "boundary_campaign", None)
+        previous = getattr(self, "boundary_previous_value", None)
+        candidate = getattr(self, "boundary_value", None)
+        if campaign is None or candidate is None or previous is None or campaign.follow_up is None:
+            return []
+        resolve_followup_value(int(candidate))
+        return ["BOUNDARY_VALUE:{}".format(int(previous)), "BOUNDARY_PHASE:follow_up"]
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
@@ -2650,6 +2961,55 @@ def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
         raise ProfileError("memory.page_size must be > 0")
     slots = _parse_slots(_require(raw, "slots", "memory"))
     bootloader_region = _parse_bootloader_region(raw.get("bootloader_region"))
+    trace_address_map = []
+    raw_trace_map = raw.get("trace_address_map", [])
+    if not isinstance(raw_trace_map, list):
+        raise ProfileError("memory.trace_address_map: expected list")
+    for index, entry in enumerate(raw_trace_map):
+        if not isinstance(entry, dict):
+            raise ProfileError(
+                "memory.trace_address_map[{}]: expected mapping".format(index)
+            )
+        for key in ("offset_start", "offset_end", "address_addend"):
+            if key not in entry:
+                raise ProfileError(
+                    "memory.trace_address_map[{}]: missing {}".format(index, key)
+                )
+        offset_start = _parse_int(
+            entry["offset_start"],
+            "memory.trace_address_map[{}].offset_start".format(index),
+        )
+        offset_end = _parse_int(
+            entry["offset_end"],
+            "memory.trace_address_map[{}].offset_end".format(index),
+        )
+        address_addend = _parse_int(
+            entry["address_addend"],
+            "memory.trace_address_map[{}].address_addend".format(index),
+        )
+        if (
+            offset_start < 0
+            or offset_end <= offset_start
+            or offset_end > 0x100000000
+            or address_addend < 0
+            or address_addend + offset_end > 0x100000000
+        ):
+            raise ProfileError(
+                "memory.trace_address_map[{}]: invalid range or 32-bit address bound".format(index)
+            )
+        trace_address_map.append({
+            "offset_start": offset_start,
+            "offset_end": offset_end,
+            "address_addend": address_addend,
+        })
+    for index, current in enumerate(trace_address_map):
+        for prior in trace_address_map[:index]:
+            if max(current["offset_start"], prior["offset_start"]) < min(
+                current["offset_end"], prior["offset_end"]
+            ):
+                raise ProfileError(
+                    "memory.trace_address_map: overlapping offset ranges"
+                )
     return MemoryConfig(
         sram_start=sram_start,
         sram_end=sram_end,
@@ -2657,6 +3017,7 @@ def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
         page_size=page_size,
         slots=slots,
         bootloader_region=bootloader_region,
+        trace_address_map=trace_address_map,
     )
 
 
@@ -2695,6 +3056,14 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         ),
         memory_checks=_parse_memory_checks(raw.get("memory_checks")),
     )
+
+
+def _parse_terminal_error_paths(raw: Optional[Any]) -> List[TerminalErrorPathConfig]:
+    """Parse binary-driven terminal-error escape declarations."""
+    try:
+        return parse_terminal_error_paths(raw)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ProfileError(str(exc)) from exc
 
 
 def _parse_memory_checks(raw: Optional[list]) -> List[MemoryCheck]:
@@ -3145,6 +3514,11 @@ def _parse_fault_sweep(
         progress_stall_timeout_s=stall_timeout,
         boot_cycles=boot_cycles,
         boot_cycle_hook=boot_cycle_hook,
+        vtor_settle_iters=int(raw.get("vtor_settle_iters", 0)),
+        tracking_start_address=_parse_int(
+            raw.get("tracking_start_address", 0),
+            "fault_sweep.tracking_start_address",
+        ),
         expected_rollback_at_cycle=expected_rollback_at_cycle,
         phase2_fault=_parse_phase2_fault(raw.get("phase2_fault")),
         hook_fault=hook_fault,
@@ -3160,6 +3534,9 @@ def _parse_fault_sweep(
             raw.get("timed_bit_corruption_config"),
         ),
         verification_probes=_parse_verification_probe_config(raw),
+        function_return_probes=_parse_function_return_probes(
+            raw.get("function_return_probes")
+        ),
         metadata_fault=_parse_metadata_fault(raw.get("metadata_fault")),
         metadata_delta=_parse_metadata_delta(raw.get("metadata_delta")),
         partial_staging=partial_staging,
@@ -3187,6 +3564,9 @@ def _parse_fault_sweep(
         i2c_fault_config=_parse_i2c_fault_config(raw.get("i2c_fault_config")),
         durability_model=durability_model,
         writeback=writeback,
+        rc_injection_config=_parse_rc_injection_config(
+            raw.get("rc_injection_config")
+        ),
     )
 
 
@@ -3845,6 +4225,8 @@ def _parse_instruction_skip_config(
 
 
 def _parse_probe_register(raw: Any, ctx: str) -> Tuple[str, int]:
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        raw = "r{}".format(raw)
     text = str(raw or "r0").strip().lower()
     if not text:
         raise ProfileError("{}.return_register: expected non-empty register name".format(ctx))
@@ -3952,6 +4334,38 @@ def _parse_verification_probe_config(raw: Dict[str, Any]) -> List[VerificationPr
     if has_old:
         return _parse_verification_bypass_probe(raw.get("verification_bypass_probe"))
     return []
+
+
+def _parse_function_return_probes(raw: Optional[Any]) -> List[FunctionReturnProbeConfig]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("fault_sweep.function_return_probes: expected list")
+    probes: List[FunctionReturnProbeConfig] = []
+    seen_labels = set()
+    for i, entry in enumerate(raw):
+        ctx = "fault_sweep.function_return_probes[{}]".format(i)
+        if not isinstance(entry, dict):
+            raise ProfileError("{}: expected mapping".format(ctx))
+        symbol = str(_require(entry, "symbol", ctx)).strip()
+        reg_name, reg_index = _parse_probe_register(
+            entry.get("return_register", "r0"), ctx
+        )
+        label = str(entry.get("label", symbol)).strip()
+        if label in seen_labels:
+            raise ProfileError("{}.label: duplicate function return probe label {!r}".format(ctx, label))
+        seen_labels.add(label)
+        capture = str(entry.get("capture", "last") or "last").strip().lower()
+        probes.append(
+            FunctionReturnProbeConfig(
+                symbol=symbol,
+                return_register=reg_name,
+                return_register_index=reg_index,
+                label=label,
+                capture=capture,
+            )
+        )
+    return probes
 
 
 def _parse_i2c_fault_config(raw):
@@ -4816,6 +5230,58 @@ def _normalize_fault_types(raw: Any, field_name: str) -> List[str]:
     return normalized
 
 
+def _parse_rc_injection_config(raw: Optional[Any]) -> RcInjectionConfig:
+    """Parse the target-configurable return-code injection block."""
+    if raw is None:
+        return RcInjectionConfig()
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep.rc_injection_config: expected mapping")
+    unknown = sorted(set(raw) - {"symbols", "return_value", "return_register", "require_applied"})
+    if unknown:
+        raise ProfileError(
+            "fault_sweep.rc_injection_config: unknown field(s): {}".format(
+                ", ".join(str(key) for key in unknown)
+            )
+        )
+    symbols = raw.get("symbols", ["flash_area_write"])
+    if not isinstance(symbols, list):
+        raise ProfileError(
+            "fault_sweep.rc_injection_config.symbols: expected non-empty list"
+        )
+    parsed_symbols = []
+    for index, symbol in enumerate(symbols):
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ProfileError(
+                "fault_sweep.rc_injection_config.symbols[{}]: expected non-empty string".format(index)
+            )
+        parsed_symbols.append(symbol.strip())
+    value = raw.get("return_value", -5)
+    if isinstance(value, str):
+        try:
+            value = int(value, 0)
+        except ValueError as exc:
+            raise ProfileError(
+                "fault_sweep.rc_injection_config.return_value: expected 32-bit integer"
+            ) from exc
+    register = raw.get("return_register", 0)
+    if isinstance(register, str):
+        try:
+            register = int(register, 0)
+        except ValueError as exc:
+            raise ProfileError(
+                "fault_sweep.rc_injection_config.return_register: expected integer 0..15"
+            ) from exc
+    return RcInjectionConfig(
+        symbols=parsed_symbols,
+        return_value=value,
+        return_register=register,
+        require_applied=_parse_bool(
+            raw.get("require_applied", True),
+            "fault_sweep.rc_injection_config.require_applied",
+        ),
+    )
+
+
 def _parse_update_sequence(
     raw: Optional[Any],
     *,
@@ -5071,6 +5537,55 @@ def _parse_initial_states(raw: Optional[List[Any]]) -> List[InitialStateConfig]:
     return states
 
 
+def _parse_boundary_campaigns(raw: Optional[List[Any]]) -> List[BoundaryCampaign]:
+    """Parse top-level deterministic counter boundary campaigns."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("boundary_campaigns: expected list of campaign definitions")
+    campaigns: List[BoundaryCampaign] = []
+    names: set[str] = set()
+    for index, entry in enumerate(raw):
+        try:
+            campaign = parse_boundary_campaign(entry, index)
+        except BoundaryCampaignError as exc:
+            raise ProfileError(str(exc)) from exc
+        if campaign.name in names:
+            raise ProfileError("boundary_campaigns: duplicate name '{}'".format(campaign.name))
+        names.add(campaign.name)
+        campaigns.append(campaign)
+    return campaigns
+
+
+def _boundary_initial_states(
+    campaigns: List[BoundaryCampaign],
+    existing: List[InitialStateConfig],
+) -> List[InitialStateConfig]:
+    """Materialize campaigns as ordinary named initial-state runs."""
+    names = {state.name for state in existing}
+    generated: List[InitialStateConfig] = []
+    for campaign in campaigns:
+        for value in resolve_boundary_values(campaign):
+            name = "{}__{}".format(campaign.name, value)
+            if name in names:
+                raise ProfileError(
+                    "boundary campaign run name '{}' conflicts with an initial state".format(name)
+                )
+            names.add(name)
+            generated.append(
+                InitialStateConfig(
+                    name=name,
+                    description="{}={} (logical capacity {})".format(
+                        campaign.parameter, value, campaign.logical_capacity
+                    ),
+                    boundary_campaign=campaign,
+                    boundary_value=value,
+                    boundary_previous_value=(value - 1 if value > 0 else None),
+                )
+            )
+    return generated
+
+
 def _parse_component(
     raw: Dict[str, Any],
     idx: int,
@@ -5212,7 +5727,298 @@ def _parse_invariant_config(raw: Optional[Any]) -> Dict[str, Any]:
         return {}
     if not isinstance(raw, dict):
         raise ProfileError("invariant_config: expected mapping")
-    return dict(raw)
+    parsed = dict(raw)
+    stage = parsed.get("semantic_state_stage")
+    if stage is not None and stage not in ("final", "fault_snapshot"):
+        raise ProfileError(
+            "invariant_config.semantic_state_stage: expected 'final' or "
+            "'fault_snapshot'"
+        )
+    contracts = parsed.get("success_implies_effect")
+    if contracts is not None:
+        _validate_success_implies_effect_config(contracts)
+        names = set()
+        for index, contract in enumerate(contracts):
+            if isinstance(contract, dict):
+                name = str(contract.get("name") or "").strip()
+                if name in names:
+                    raise ProfileError(
+                        "invariant_config.success_implies_effect[{}].name: duplicate contract name {!r}".format(
+                            index, name
+                        )
+                    )
+                names.add(name)
+    if "state_relations" in parsed:
+        _validate_state_relations_config(parsed["state_relations"])
+    return parsed
+
+
+_SUCCESS_EFFECT_OPS = {
+    "eq", "ne", "lt", "le", "gt", "ge", "gt_pre", "ge_pre",
+    "lt_pre", "le_pre", "changed", "unchanged",
+}
+
+_STATE_RELATION_OPS = {"eq", "ne", "lt", "le", "gt", "ge"}
+
+
+def _relation_value_type(value: Any) -> str:
+    """Return the strict YAML value category used by tuple validation."""
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (int, float)):
+        return "number"
+    if value is None:
+        return "null"
+    return type(value).__name__
+
+
+def _validate_state_relation_operand(raw: Any, context: str) -> None:
+    if not isinstance(raw, dict):
+        raise ProfileError("{}: expected operand mapping".format(context))
+    has_path = "path" in raw
+    has_value = "value" in raw
+    if has_path == has_value:
+        raise ProfileError(
+            "{}: operand must contain exactly one of path or value".format(context)
+        )
+    if has_path:
+        unknown = sorted(set(raw) - {"source", "path"})
+        if unknown:
+            raise ProfileError(
+                "{}: path operand has unknown field(s): {}".format(
+                    context, ", ".join(map(str, unknown))
+                )
+            )
+        if raw.get("source") not in {"pre", "post"}:
+            raise ProfileError("{}.source: expected pre or post".format(context))
+        if not isinstance(raw.get("path"), str) or not raw.get("path", "").strip():
+            raise ProfileError("{}.path: expected non-empty string".format(context))
+    else:
+        unknown = sorted(set(raw) - {"value"})
+        if unknown:
+            raise ProfileError(
+                "{}: literal operand has unknown field(s): {}".format(
+                    context, ", ".join(map(str, unknown))
+                )
+            )
+
+
+def _validate_state_relation_comparison(raw: Any, context: str) -> None:
+    if not isinstance(raw, dict) or set(raw) != {"left", "op", "right"}:
+        raise ProfileError("{}: expected exactly left, op, and right".format(context))
+    _validate_state_relation_operand(raw["left"], context + ".left")
+    _validate_state_relation_operand(raw["right"], context + ".right")
+    op = str(raw.get("op") or "").strip().lower()
+    if op not in _STATE_RELATION_OPS:
+        raise ProfileError("{}.op: unsupported operator {!r}".format(context, op))
+
+
+def _validate_state_relations_config(raw: Any) -> None:
+    if not isinstance(raw, list) or not raw:
+        raise ProfileError("invariant_config.state_relations: expected non-empty list")
+    names = set()
+    for index, relation in enumerate(raw):
+        context = "invariant_config.state_relations[{}]".format(index)
+        if not isinstance(relation, dict):
+            raise ProfileError("{}: expected mapping".format(context))
+        unknown = sorted(set(relation) - {"name", "compare", "allowed_tuples", "when"})
+        if unknown:
+            raise ProfileError(
+                "{}: unknown field(s): {}".format(context, ", ".join(map(str, unknown)))
+            )
+        name = str(relation.get("name") or "").strip()
+        if not name:
+            raise ProfileError("{}.name: expected non-empty string".format(context))
+        if name in names:
+            raise ProfileError("{}.name: duplicate relation name {!r}".format(context, name))
+        names.add(name)
+        has_compare = "compare" in relation
+        has_tuples = "allowed_tuples" in relation
+        if has_compare == has_tuples:
+            raise ProfileError(
+                "{}: expected exactly one of compare or allowed_tuples".format(context)
+            )
+        if "when" in relation:
+            _validate_state_relation_comparison(relation["when"], context + ".when")
+        if has_compare:
+            _validate_state_relation_comparison(relation["compare"], context + ".compare")
+            continue
+
+        tuples = relation["allowed_tuples"]
+        if not isinstance(tuples, dict) or set(tuples) != {"fields", "values"}:
+            raise ProfileError(
+                "{}.allowed_tuples: expected exactly fields and values".format(context)
+            )
+        fields = tuples["fields"]
+        values = tuples["values"]
+        if not isinstance(fields, list) or len(fields) < 2:
+            raise ProfileError(
+                "{}.allowed_tuples.fields: expected at least two fields".format(context)
+            )
+        if not isinstance(values, list) or not values:
+            raise ProfileError(
+                "{}.allowed_tuples.values: expected at least one tuple".format(context)
+            )
+        for field_index, field in enumerate(fields):
+            _validate_state_relation_operand(
+                field, "{}.allowed_tuples.fields[{}]".format(context, field_index)
+            )
+        expected_types: Optional[List[str]] = None
+        seen_tuples = set()
+        for tuple_index, item in enumerate(values):
+            tuple_context = "{}.allowed_tuples.values[{}]".format(context, tuple_index)
+            if not isinstance(item, (list, tuple)) or len(item) != len(fields):
+                raise ProfileError(
+                    "{}: expected tuple with {} values".format(tuple_context, len(fields))
+                )
+            item_types = [_relation_value_type(value) for value in item]
+            if expected_types is None:
+                expected_types = item_types
+            elif item_types != expected_types:
+                raise ProfileError(
+                    "{}: value types must match other allowed tuples".format(tuple_context)
+                )
+            # Include type tags so Python's bool/int equivalence cannot hide a duplicate.
+            duplicate_key = tuple((item_types[i], item[i]) for i in range(len(item)))
+            try:
+                duplicate = duplicate_key in seen_tuples
+                seen_tuples.add(duplicate_key)
+            except TypeError as exc:
+                raise ProfileError("{}: values must be scalar".format(tuple_context)) from exc
+            if duplicate:
+                raise ProfileError("{}: duplicate allowed tuple".format(tuple_context))
+
+
+def _validate_success_implies_effect_config(raw: Any) -> None:
+    if not isinstance(raw, list):
+        raise ProfileError("invariant_config.success_implies_effect: expected list")
+    for index, contract in enumerate(raw):
+        ctx = "invariant_config.success_implies_effect[{}]".format(index)
+        if not isinstance(contract, dict):
+            raise ProfileError("{}: expected mapping".format(ctx))
+        allowed = {"name", "probe", "success_values", "call", "evaluate_control", "require"}
+        unknown = sorted(set(contract) - allowed)
+        if unknown:
+            raise ProfileError("{}: unknown field(s): {}".format(ctx, ", ".join(map(str, unknown))))
+        for key in ("name", "probe"):
+            if not str(contract.get(key) or "").strip():
+                raise ProfileError("{}.{}: expected non-empty string".format(ctx, key))
+        values = contract.get("success_values")
+        if not isinstance(values, list) or not values:
+            raise ProfileError("{}.success_values: expected non-empty list".format(ctx))
+        for value_index, value in enumerate(values):
+            if isinstance(value, bool):
+                raise ProfileError("{}.success_values[{}]: expected integer, got boolean".format(ctx, value_index))
+            try:
+                _parse_int(value, "{}.success_values[{}]".format(ctx, value_index))
+            except (TypeError, ValueError, ProfileError) as exc:
+                raise ProfileError(str(exc)) from exc
+        if "evaluate_control" in contract and type(contract["evaluate_control"]) is not bool:
+            raise ProfileError("{}.evaluate_control: expected boolean".format(ctx))
+        if "call" in contract:
+            call = contract["call"]
+            if isinstance(call, bool):
+                raise ProfileError("{}.call: expected first, last, or non-negative integer".format(ctx))
+            if isinstance(call, str) and call.strip().lower() in {"first", "last"}:
+                pass
+            else:
+                try:
+                    parsed_call = int(call, 0) if isinstance(call, str) else int(call)
+                except (TypeError, ValueError) as exc:
+                    raise ProfileError("{}.call: expected first, last, or non-negative integer".format(ctx)) from exc
+                if parsed_call < 0:
+                    raise ProfileError("{}.call: expected non-negative integer".format(ctx))
+        require = contract.get("require")
+        if not isinstance(require, dict) or set(require) not in ({"all"}, {"any"}):
+            raise ProfileError("{}.require: expected exactly one of all or any".format(ctx))
+        conditions = next(iter(require.values()))
+        if not isinstance(conditions, list) or not conditions:
+            raise ProfileError("{}.require: condition group must be a non-empty list".format(ctx))
+        for condition_index, condition in enumerate(conditions):
+            cctx = "{}.require[{}]".format(ctx, condition_index)
+            if not isinstance(condition, dict):
+                raise ProfileError("{}: expected condition mapping".format(cctx))
+            unknown_condition = sorted(set(condition) - {"source", "path", "op", "value"})
+            if unknown_condition:
+                raise ProfileError("{}: unknown field(s): {}".format(cctx, ", ".join(map(str, unknown_condition))))
+            if condition.get("source") not in {"pre", "post"}:
+                raise ProfileError("{}.source: expected pre or post".format(cctx))
+            if not str(condition.get("path") or "").strip():
+                raise ProfileError("{}.path: expected non-empty string".format(cctx))
+            op = str(condition.get("op") or "").strip().lower()
+            if op not in _SUCCESS_EFFECT_OPS:
+                raise ProfileError("{}.op: unsupported operator {!r}".format(cctx, op))
+            if op not in {"changed", "unchanged", "gt_pre", "ge_pre", "lt_pre", "le_pre"} and "value" not in condition:
+                raise ProfileError("{}.value: required for {}".format(cctx, op))
+            if "value" in condition and op not in {"changed", "unchanged"}:
+                try:
+                    _parse_int(condition["value"], "{}.value".format(cctx))
+                except (TypeError, ValueError, ProfileError) as exc:
+                    raise ProfileError(str(exc)) from exc
+
+
+def _validate_success_effect_runtime_compatibility(
+    fault_sweep: FaultSweepConfig,
+    invariants: List[str],
+    effect_contracts: List[Any],
+) -> None:
+    """Reject effect telemetry configurations that cannot run in execute mode."""
+    features = []
+    if fault_sweep.function_return_probes:
+        features.append("function_return_probes")
+    if "success_implies_effect" in invariants or effect_contracts:
+        features.append("success_implies_effect")
+    if not features:
+        return
+    feature_text = " and ".join(features)
+    if str(fault_sweep.mode).strip().lower() != "runtime":
+        raise ProfileError(
+            "{} requires fault_sweep.mode 'runtime'".format(feature_text)
+        )
+    if str(fault_sweep.evaluation_mode).strip().lower() != "execute":
+        raise ProfileError(
+            "{} requires fault_sweep.evaluation_mode 'execute'".format(feature_text)
+        )
+
+
+def _validate_success_effect_selectors(
+    effect_contracts: List[Any],
+    probe_captures: Dict[str, str],
+) -> None:
+    """Validate contract call selectors against their probe capture policy."""
+    for index, contract in enumerate(effect_contracts):
+        if not isinstance(contract, dict):
+            continue
+        probe_name = str(contract.get("probe") or "").strip()
+        capture = probe_captures.get(probe_name)
+        if capture is None:
+            continue  # The undefined-probe error is reported by the caller.
+        call = contract.get("call")
+        ctx = "invariant_config.success_implies_effect[{}]".format(index)
+        if capture == "all":
+            if call is None:
+                raise ProfileError(
+                    "{}.call is required when probe capture is 'all'".format(ctx)
+                )
+            continue
+        if call is None:
+            continue
+        if isinstance(call, str) and call.strip().lower() in {"first", "last"}:
+            selector = call.strip().lower()
+        else:
+            selector = int(call, 0) if isinstance(call, str) else int(call)
+        if capture == "first" and selector not in {"first", 0}:
+            raise ProfileError(
+                "{}.call={!r} is incompatible with probe capture='first'; "
+                "use omitted, 'first', or 0".format(ctx, call)
+            )
+        if capture == "last" and selector != "last":
+            raise ProfileError(
+                "{}.call={!r} is incompatible with probe capture='last'; "
+                "use omitted or 'last'".format(ctx, call)
+            )
 
 
 def _parse_metadata_fault_regions(raw, slots=None):
@@ -5315,12 +6121,16 @@ _STRICT_TOP_LEVEL_KEYS = frozenset(
         "flash_backend", "nvm_controller", "otp_peripheral", "extra_peripherals",
         "state_probe", "success_criteria", "success_criteria_overrides",
         "fault_sweep", "update_sequence", "state_fuzzer", "security_policy",
+        "update_protocol", "authorization_review",
         "firmware_elf", "fuzz_corpus", "expect", "semantic_assertions",
         "invariants", "invariant_providers", "invariant_config", "initial_states",
         "metadata_fault_regions", "multi_component", "nvs_region",
         "bootloader_region", "boot_register_pre_writes", "boot_registers",
         "write_order_constraints", "residual_image", "scenario",
         "skip_self_test", "strict_validation",
+        "persistent_state_layout",
+        "terminal_error_paths",
+        "boundary_campaigns",
     }
 )
 
@@ -5341,14 +6151,17 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
         "phase1_time_slice", "phase2_time_slice", "fault_types",
         "evaluation_mode", "sweep_strategy", "sweep_hash_bypass_symbols",
         "progress_stall_timeout_s", "boot_cycles", "boot_cycle_hook",
+        "vtor_settle_iters",
+        "tracking_start_address",
         "expected_rollback_at_cycle", "phase2_fault", "hook_fault",
         "confirm_cycle", "multi_fault", "read_fault_config",
         "instruction_skip_config", "timed_bit_corruption_config",
-        "verification_probes", "verification_bypass_probe", "metadata_fault",
+        "verification_probes", "function_return_probes", "verification_bypass_probe", "metadata_fault",
         "metadata_delta", "partial_staging", "nvs_corruption",
         "fault_distribution", "heuristic", "max_heuristic_points",
         "quick_use_heuristic", "reset_mode", "i2c_fault_config",
         "durability_model", "writeback",
+        "rc_injection_config",
     }
 )
 
@@ -5399,7 +6212,10 @@ def _validate_strict_memory(raw: Any, context: str) -> None:
     _reject_unknown_keys(
         raw,
         frozenset(
-            {"sram", "write_granularity", "page_size", "slots", "bootloader_region"}
+            {
+                "sram", "write_granularity", "page_size", "slots",
+                "bootloader_region", "trace_address_map",
+            }
         ),
         context,
     )
@@ -5422,6 +6238,15 @@ def _validate_strict_memory(raw: Any, context: str) -> None:
             raw.get("bootloader_region"),
             frozenset({"base", "size"}),
             "{}.bootloader_region".format(context),
+        )
+    trace_address_map = raw.get("trace_address_map", [])
+    if not isinstance(trace_address_map, list):
+        raise ProfileError("{}.trace_address_map: expected list".format(context))
+    for index, entry in enumerate(trace_address_map):
+        _reject_unknown_keys(
+            entry,
+            frozenset({"offset_start", "offset_end", "address_addend"}),
+            "{}.trace_address_map[{}]".format(context, index),
         )
 
 
@@ -5481,6 +6306,24 @@ def _validate_strict_success_criteria(
                 )
 
 
+def _validate_strict_terminal_error_paths(raw: Any, context: str) -> None:
+    if raw is None:
+        return
+    if not isinstance(raw, list):
+        raise ProfileError("{}: expected list".format(context))
+    allowed = frozenset({
+        "name", "handler_symbols", "containing_symbols", "forbidden_sink_symbols",
+        "expected_control", "required_failure_marker", "observation_window",
+    })
+    marker_allowed = frozenset({"address", "expected_value", "mask", "op"})
+    for index, entry in enumerate(raw):
+        item_context = "{}[{}]".format(context, index)
+        _reject_unknown_keys(entry, allowed, item_context)
+        marker = entry.get("required_failure_marker")
+        if marker is not None:
+            _reject_unknown_keys(marker, marker_allowed, item_context + ".required_failure_marker")
+
+
 def _validate_strict_relative_path(value: Any, context: str) -> None:
     text = str(value or "").strip()
     normalized = text.replace("\\", "/")
@@ -5533,6 +6376,9 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
 
     criteria = data.get("success_criteria")
     _validate_strict_success_criteria(criteria, "success_criteria")
+    _validate_strict_terminal_error_paths(
+        data.get("terminal_error_paths"), "terminal_error_paths"
+    )
 
     if "fault_sweep" in data:
         _reject_unknown_keys(
@@ -5588,6 +6434,9 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
             "writeback": {
                 "buffer_capacity", "domains", "barriers", "erase_flushes_domain",
             },
+            "rc_injection_config": {
+                "symbols", "return_value", "return_register", "require_applied",
+            },
         }
         for field_name, allowed in nested_fault_schemas.items():
             nested = fault_sweep.get(field_name)
@@ -5607,6 +6456,16 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
                 probe,
                 frozenset({"symbol", "return_register", "success_value", "label"}),
                 "fault_sweep.verification_probes[{}]".format(index),
+            )
+
+        function_probes = fault_sweep.get("function_return_probes") or []
+        if not isinstance(function_probes, list):
+            raise ProfileError("fault_sweep.function_return_probes: expected list")
+        for index, probe in enumerate(function_probes):
+            _reject_unknown_keys(
+                probe,
+                frozenset({"symbol", "return_register", "label", "capture"}),
+                "fault_sweep.function_return_probes[{}]".format(index),
             )
 
         bypass_probe = fault_sweep.get("verification_bypass_probe")
@@ -5823,6 +6682,11 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
             _validate_strict_relative_path(data.get(field_name), field_name)
     _validate_strict_path_list(data.get("extra_peripherals"), "extra_peripherals")
     _validate_strict_path_list(data.get("invariant_providers"), "invariant_providers")
+    if "invariant_config" in data and isinstance(data.get("invariant_config"), dict):
+        if "success_implies_effect" in data["invariant_config"]:
+            _validate_success_implies_effect_config(
+                data["invariant_config"].get("success_implies_effect")
+            )
 
     state_probe = data.get("state_probe")
     if isinstance(state_probe, dict) and state_probe.get("script"):
@@ -5924,6 +6788,27 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
                     phase.get(field_name),
                     "{}.{}".format(context, field_name),
                 )
+
+    boundary_campaigns = data.get("boundary_campaigns") or []
+    if not isinstance(boundary_campaigns, list):
+        raise ProfileError("boundary_campaigns: expected list")
+    for index, campaign in enumerate(boundary_campaigns):
+        context = "boundary_campaigns[{}]".format(index)
+        _reject_unknown_keys(
+            campaign,
+            frozenset({
+                "name", "parameter", "type", "width_bits", "capacity",
+                "values", "setup_environment", "follow_up",
+            }),
+            context,
+        )
+        follow_up = campaign.get("follow_up")
+        if follow_up is not None:
+            _reject_unknown_keys(
+                follow_up,
+                frozenset({"parameter_value", "expect"}),
+                context + ".follow_up",
+            )
 
     multi_component = data.get("multi_component") or {}
     if not isinstance(multi_component, dict):
@@ -6092,6 +6977,13 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
     )
 
     memory = _parse_memory(_require(data, "memory"))
+    try:
+        persistent_state_layout = parse_persistent_state_layout(
+            data.get("persistent_state_layout")
+        )
+    except SecurityStateLayoutError as exc:
+        raise ProfileError(str(exc)) from exc
+    terminal_error_paths = _parse_terminal_error_paths(data.get("terminal_error_paths"))
     images = {}
     raw_images = data.get("images", {})
     if isinstance(raw_images, dict):
@@ -6148,6 +7040,14 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         )
     state_fuzzer = _parse_state_fuzzer(data.get("state_fuzzer"))
     security_policy = _parse_security_policy(data.get("security_policy"))
+    try:
+        update_protocol = parse_update_protocol(data.get("update_protocol"))
+    except UpdateProtocolError as exc:
+        raise ProfileError(str(exc)) from exc
+    try:
+        authorization_review = parse_authorization_review(data.get("authorization_review"))
+    except AuthorizationReviewError as exc:
+        raise ProfileError(str(exc)) from exc
 
     firmware_elf_raw = data.get("firmware_elf")
     firmware_elf: Optional[str] = str(firmware_elf_raw).strip() if firmware_elf_raw is not None else None
@@ -6159,7 +7059,73 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
     invariants = _parse_invariants(data.get("invariants"))
     invariant_providers = _parse_invariant_providers(data.get("invariant_providers"))
     invariant_config = _parse_invariant_config(data.get("invariant_config"))
+    effect_contracts = invariant_config.get("success_implies_effect") or []
+    probe_captures = {
+        probe.label: probe.capture for probe in fault_sweep.function_return_probes
+    }
+    verification_labels = {probe.label for probe in fault_sweep.verification_probes}
+    function_labels = set(probe_captures)
+    collisions = sorted(verification_labels & function_labels)
+    if collisions:
+        raise ProfileError(
+            "fault_sweep: verification_probes and function_return_probes label collision(s): {}".format(
+                ", ".join(collisions)
+            )
+        )
+    if "success_implies_effect" in invariants and not effect_contracts:
+        raise ProfileError(
+            "invariants includes success_implies_effect but invariant_config.success_implies_effect is missing"
+        )
+    state_relations = invariant_config.get("state_relations")
+    if "state_relations" in invariants and not state_relations:
+        raise ProfileError(
+            "invariants includes state_relations but invariant_config.state_relations is missing"
+        )
+    _validate_success_effect_runtime_compatibility(
+        fault_sweep, invariants, effect_contracts
+    )
+    contract_names = set()
+    for index, contract in enumerate(effect_contracts):
+        if isinstance(contract, dict):
+            contract_name = str(contract.get("name") or "").strip()
+            if contract_name in contract_names:
+                raise ProfileError(
+                    "invariant_config.success_implies_effect[{}].name: duplicate contract name {!r}".format(
+                        index, contract_name
+                    )
+                )
+            contract_names.add(contract_name)
+            probe_name = str(contract.get("probe") or "").strip()
+            if probe_name not in function_labels:
+                raise ProfileError(
+                    "invariant_config.success_implies_effect[{}].probe references undefined function_return_probe {!r}".format(
+                        index, probe_name
+                    )
+                )
+        if (
+            isinstance(contract, dict)
+            and contract.get("call") is None
+            and probe_captures.get(str(contract.get("probe") or "").strip()) == "all"
+        ):
+            raise ProfileError(
+                "invariant_config.success_implies_effect[{}].call is required "
+                "when probe capture is 'all'".format(index)
+            )
+    _validate_success_effect_selectors(effect_contracts, probe_captures)
     initial_states = _parse_initial_states(data.get("initial_states"))
+    boundary_campaigns = _parse_boundary_campaigns(data.get("boundary_campaigns"))
+    if any(campaign.follow_up is not None for campaign in boundary_campaigns):
+        if not update_sequence:
+            raise ProfileError(
+                "boundary campaign follow_up requires a real update_sequence"
+            )
+        if str(fault_sweep.evaluation_mode or "").strip().lower() != "execute":
+            raise ProfileError(
+                "boundary campaign follow_up requires fault_sweep.evaluation_mode: execute"
+            )
+    initial_states = initial_states + _boundary_initial_states(
+        boundary_campaigns, initial_states
+    )
     metadata_fault_regions = _parse_metadata_fault_regions(
         data.get("metadata_fault_regions"), slots=memory.slots
     )
@@ -6167,6 +7133,10 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         data.get("multi_component"),
         profile_path=path,
     )
+    if boundary_campaigns and multi_component is not None:
+        raise ProfileError(
+            "boundary_campaigns cannot be combined with multi_component profiles"
+        )
     nvs_region = _parse_nvs_region(data.get("nvs_region"))
     bootloader_region = _parse_bootloader_region(data.get("bootloader_region"))
     boot_register_pre_writes = _parse_boot_register_pre_writes_list(
@@ -6243,6 +7213,8 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         multi_component=multi_component,
         nvs_region=nvs_region,
         security_policy=security_policy,
+        update_protocol=update_protocol,
+        authorization_review=authorization_review,
         bootloader_region=bootloader_region,
         success_criteria_overrides=success_criteria_overrides,
         boot_register_pre_writes=boot_register_pre_writes,
@@ -6253,6 +7225,9 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         residual_image=residual_image,
 
         firmware_elf=firmware_elf,
+        persistent_state_layout=persistent_state_layout,
+        terminal_error_paths=terminal_error_paths,
+        boundary_campaigns=boundary_campaigns,
 
     )
     profile.auto_update_trigger = auto_update_trigger
@@ -6307,6 +7282,19 @@ def expand_initial_states(profile: ProfileConfig) -> List[ProfileConfig]:
     return [profile.resolve_initial_state(s) for s in profile.initial_states]
 
 
+def expand_boundary_campaigns(profile: ProfileConfig) -> List[ProfileConfig]:
+    """Return one ordinary resolved profile per boundary value.
+
+    This helper is useful to scenario runners that want campaign children
+    without also selecting manually enumerated initial states.
+    """
+    states = [
+        state for state in profile.initial_states
+        if getattr(state, "boundary_campaign", None) is not None
+    ]
+    return [profile.resolve_initial_state(state) for state in states]
+
+
 def load_profile_raw(path: str | Path) -> Dict[str, Any]:
     """Load a profile as raw dict (for self_test.py to read expect section).
 
@@ -6345,6 +7333,12 @@ def main() -> int:
         },
         "images": profile.images,
         "fault_sweep_mode": profile.fault_sweep.mode,
+        "fault_types": profile.fault_sweep.fault_types,
+        "rc_injection_config": profile.fault_sweep.rc_injection_config.to_dict(),
+        "function_return_probes": [
+            probe.to_runtime_dict()
+            for probe in profile.fault_sweep.function_return_probes
+        ],
         "max_writes": profile.fault_sweep.max_writes,
         "boot_cycles": profile.fault_sweep.boot_cycles,
         "calibration_time_slice": profile.fault_sweep.calibration_time_slice,
@@ -6406,6 +7400,8 @@ def main() -> int:
         "pre_boot_state_count": len(profile.pre_boot_state),
         "initial_states": [{"name": s.name, "description": s.description}
                            for s in profile.initial_states],
+        "boundary_campaigns": [boundary_campaign_dict(campaign)
+                               for campaign in profile.boundary_campaigns],
         "multi_fault": {
             "enabled": profile.fault_sweep.multi_fault.enabled,
             "strategy": profile.fault_sweep.multi_fault.strategy,
@@ -6449,6 +7445,21 @@ def main() -> int:
             "minimum_version": profile.security_policy.minimum_version,
             "toctou_protection": profile.security_policy.toctou_protection,
         },
+        "persistent_state_layout": (
+            analyze_persistent_state_layout(profile.persistent_state_layout)
+            if profile.persistent_state_layout is not None
+            else None
+        ),
+        "update_protocol_analysis": (
+            analyze_update_protocol(profile.update_protocol, profile.security_policy)
+            if profile.update_protocol is not None
+            else None
+        ),
+        "authorization_review_analysis": (
+            analyze_authorization_review(profile.authorization_review)
+            if getattr(profile, "authorization_review", None) is not None
+            else None
+        ),
         "residual_image": (
             {
                 "slot": profile.residual_image.slot,

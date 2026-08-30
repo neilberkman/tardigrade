@@ -19,7 +19,13 @@ import time as _time_mod
 
 from audit_report import summarize_runtime_sweep
 from fault_plan import CalibrationInputs, build_fault_plan
-from fault_classification import _effective_boot_result, _interesting_multi_fault_points
+from fault_classification import (
+    _effective_boot_result,
+    _interesting_multi_fault_points,
+    finding_validation_disposition,
+    finding_validation_stage,
+    result_issue_reasons,
+)
 from fault_inject import (
     AnnotatedSequence,
     MultiFaultPlan,
@@ -29,6 +35,7 @@ from fault_inject import (
     generate_multi_fault_sequences,
     multi_fault_plan_summary,
 )
+from invariants import check_state_relations, default_invariants, run_invariants
 from fault_types import EXECUTE_ONLY_FAULT_TYPES, TRACE_REPLAY_WIRE_CODES
 from partial_staging import (
     PartialStagingConfig,
@@ -1462,6 +1469,226 @@ def _bounded_component_write_count(
     return min(int(write_count), int(profile.fault_sweep.max_writes_cap))
 
 
+def _component_state_payload(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Extract the final semantic state that a component reported."""
+    cycles = result.get("boot_cycles")
+    if isinstance(cycles, list) and cycles:
+        last = cycles[-1]
+        if isinstance(last, dict) and isinstance(last.get("semantic_state"), dict):
+            return last["semantic_state"]
+    for key in ("semantic_state", "nvm_state"):
+        value = result.get(key)
+        if isinstance(value, dict):
+            return value
+    signals = result.get("signals")
+    if isinstance(signals, dict) and isinstance(signals.get("semantic_state"), dict):
+        return signals["semantic_state"]
+    return None
+
+
+def _component_relation_record(
+    result: Dict[str, Any], *, expected_outcome: Optional[str] = None
+) -> Dict[str, Any]:
+    """Retain state evidence alongside the boot outcome in combined reports."""
+    record = {
+        "boot_outcome": result.get("boot_outcome"),
+        "boot_slot": result.get("boot_slot"),
+    }
+    if expected_outcome is not None:
+        record["expected_outcome"] = str(expected_outcome)
+    state = _component_state_payload(result)
+    if state is not None:
+        record["semantic_state"] = state
+    if isinstance(result.get("pre_state"), dict):
+        record["pre_state"] = result["pre_state"]
+    if isinstance(result.get("nvm_state"), dict):
+        record["nvm_state"] = result["nvm_state"]
+    return record
+
+
+def _non_reportable_multi_component_result(result: Dict[str, Any]) -> bool:
+    """Return true for outcomes deliberately excluded from security findings."""
+    fault_class = str(result.get("fault_class") or "").strip().lower()
+    if fault_class in {"bus_fault", "dos_only", "safe_dos", "harness", "harness_artifact"}:
+        return True
+    if finding_validation_stage(result) in {"candidate", "dismissed"}:
+        return True
+    if finding_validation_disposition(result) in {
+        "harness_artifact", "dos_only", "self_healed", "defense_in_depth",
+        "no_verification_bypass", "low_confidence", "model_specific_candidate",
+        "needs_mechanism_confirmation",
+    }:
+        return True
+    return False
+
+
+def _multi_component_issue_annotation(
+    result: Dict[str, Any],
+    *,
+    expected_outcome: str,
+    combined_outcome: str,
+    combined_expected_outcome: str = "success",
+    relation_violations: List[Dict[str, Any]],
+    require_fault: bool,
+    component_control_reliable: bool = True,
+    supporting_controls_reliable: bool = True,
+) -> Dict[str, Any]:
+    """Return trustworthy, point-level issue accounting for one observation."""
+    effective_outcome, _ = _effective_boot_result(result)
+    effective = str(effective_outcome or "unknown").strip().lower()
+    fault_flag = result.get("fault_injected")
+    fault_state_valid = (
+        fault_flag is True if require_fault else fault_flag is False
+    )
+    component_reliable = bool(
+        fault_state_valid
+        and component_control_reliable
+        and not result.get("infrastructure_error")
+        and not result.get("timeout")
+        and effective not in {"infra_error", "timeout", "skipped", "unknown"}
+    )
+    non_reportable = _non_reportable_multi_component_result(result)
+    relation_findings = [
+        item
+        for item in relation_violations
+        if isinstance(item, dict) and item.get("name") == "state_relations"
+    ]
+    relation_errors = [item for item in relation_violations if item not in relation_findings]
+    combined_reliable = bool(
+        component_reliable
+        and supporting_controls_reliable
+        and not relation_errors
+        and not non_reportable
+    )
+    component_reasons = result_issue_reasons(result, expected_outcome)
+    sources: List[str] = []
+    if component_reliable and component_reasons and not non_reportable:
+        sources.append("component")
+    if combined_reliable and combined_outcome != combined_expected_outcome:
+        sources.append("combined_outcome")
+    if combined_reliable and relation_findings:
+        sources.append("state_relation")
+    return {
+        "fault_injected": fault_flag,
+        "component_reliable": component_reliable,
+        "reliable": combined_reliable,
+        "component_issue": bool(component_reasons),
+        "component_issue_reasons": component_reasons,
+        "security_issue": bool(sources),
+        "issue_sources": sources,
+        "fault_class": result.get("fault_class"),
+        "non_reportable": non_reportable,
+    }
+
+
+def _multi_component_security_counts(
+    combined_results: List[Dict[str, Any]],
+    control_record: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Count the exact union of trustworthy fault and control observations."""
+    reliable_fault_points = sum(
+        1 for result in combined_results if result.get("reliable") is True
+    )
+    component_reliable_fault_points = sum(
+        1
+        for result in combined_results
+        if result.get("component_reliable") is True
+    )
+    return {
+        "component_reliable_fault_points": component_reliable_fault_points,
+        "reliable_fault_points": reliable_fault_points,
+        "unreliable_fault_points": len(combined_results) - reliable_fault_points,
+        "control_reliable": control_record.get("reliable") is True,
+        "security_issue_points": sum(
+            1
+            for result in combined_results
+            if result.get("security_issue") is True
+        ),
+        "control_security_issue_points": int(
+            control_record.get("security_issue") is True
+        ),
+    }
+
+
+def _expected_combined_outcome(
+    component_profiles: Dict[str, ProfileConfig],
+) -> str:
+    """Compute the combined baseline from each component's expected outcome."""
+    return classify_multi_component_outcome(
+        {
+            name: {"boot_outcome": component.expect.control_outcome}
+            for name, component in component_profiles.items()
+        }
+    )
+
+
+def _evaluate_component_state_relations(
+    combined: Dict[str, Any],
+    profile: ProfileConfig,
+) -> List[Dict[str, Any]]:
+    """Evaluate parent-level relations over an atomic component snapshot."""
+    configured_invariants = set(profile.invariants or [])
+    if "state_relations" not in configured_invariants and "strict" not in configured_invariants:
+        return []
+    per_component = combined.get("per_component") or {}
+    post_components: Dict[str, Any] = {}
+    pre_components: Dict[str, Any] = {}
+    for name, item in per_component.items():
+        if not isinstance(item, dict):
+            continue
+        state = item.get("semantic_state")
+        if isinstance(state, dict):
+            post_components[name] = state
+        pre = item.get("pre_state")
+        if not isinstance(pre, dict):
+            # A clean control's semantic state is the pre-update baseline for
+            # the faulted component when no explicit pre-state was emitted.
+            pre = state
+        if isinstance(pre, dict):
+            pre_components[name] = pre
+    from fault_inject import FaultResult
+
+    aggregate = FaultResult(
+        fault_at=int(combined.get("fault_at", 0) or 0),
+        boot_outcome=str(combined.get("combined_outcome", "unknown")),
+        boot_slot=None,
+        nvm_state={"components": post_components},
+        raw_log="",
+        is_control=bool(combined.get("is_control", False)),
+    )
+    try:
+        violations = run_invariants(
+            aggregate,
+            [check_state_relations],
+            pre_state={"components": pre_components},
+            invariant_config=getattr(profile, "invariant_config", {}) or {},
+        )
+    except (TypeError, ValueError, KeyError) as exc:
+        return [{
+            "name": "state_relations_error",
+            "description": "State relation evaluation failed: {}".format(exc),
+            "infrastructure_error": True,
+        }]
+    return [
+        {
+            "name": (
+                "state_relations_error"
+                if violation.invariant_name == "invariant_evaluation_error"
+                and (violation.details or {}).get("check") == "check_state_relations"
+                else violation.invariant_name
+            ),
+            "description": violation.description,
+            "details": violation.details,
+            "finding": (violation.details or {}).get("finding_code"),
+            "infrastructure_error": bool(
+                violation.invariant_name == "invariant_evaluation_error"
+                and (violation.details or {}).get("check") == "check_state_relations"
+            ),
+        }
+        for violation in violations
+    ]
+
+
 def run_multi_component_sweep(
     repo_root: Path,
     renode_test: str,
@@ -1662,7 +1889,31 @@ def run_multi_component_sweep(
             profile_component_name=comp_name,
         )
 
-        annotate_result_checks(comp_results, comp_profile, repo_root=repo_root)
+        # Parent-level state relations consume an aggregate ``components``
+        # snapshot.  Keep them out of component-local checks; they are
+        # evaluated after controls and faulted component states are joined.
+        original_invariants = comp_profile.invariants
+        relation_enabled = (
+            "state_relations" in original_invariants
+            or "strict" in original_invariants
+        )
+        component_invariants: List[str] = []
+        for invariant in original_invariants:
+            if invariant == "state_relations":
+                continue
+            if invariant == "strict" and relation_enabled:
+                component_invariants.extend(
+                    fn.__name__.replace("check_", "", 1)
+                    for fn in default_invariants("strict")
+                    if fn is not check_state_relations
+                )
+            else:
+                component_invariants.append(invariant)
+        comp_profile.invariants = component_invariants
+        try:
+            annotate_result_checks(comp_results, comp_profile, repo_root=repo_root)
+        finally:
+            comp_profile.invariants = original_invariants
 
         # Store per-component summary.
         comp_summary = summarize_runtime_sweep(
@@ -1684,6 +1935,11 @@ def run_multi_component_sweep(
     # Combine each faulted component with independently observed clean
     # controls from every other component.  This remains a cross-run model,
     # but no outcome is fabricated from profile expectations.
+    component_profiles_by_name = {
+        config.name: component_profile
+        for config, component_profile in zip(mc.components, component_profiles)
+    }
+    expected_combined_outcome = _expected_combined_outcome(component_profiles_by_name)
     observed_controls: Dict[str, Dict[str, Any]] = {}
     for comp_name, data in per_component_data.items():
         controls = [r for r in data["results"] if r.get("is_control")]
@@ -1694,16 +1950,93 @@ def run_multi_component_sweep(
                 )
             )
         outcome, slot = _effective_boot_result(controls[0])
+        control_annotation = _multi_component_issue_annotation(
+            controls[0],
+            expected_outcome=component_profiles_by_name[comp_name].expect.control_outcome,
+            combined_outcome="success",
+            # Control findings are accounted for per component; do not turn
+            # the parent classifier into a second control finding.
+            combined_expected_outcome="success",
+            relation_violations=[],
+            require_fault=False,
+        )
         observed_controls[comp_name] = {
+            **_component_relation_record(
+                controls[0],
+                expected_outcome=component_profiles_by_name[comp_name].expect.control_outcome,
+            ),
+            **control_annotation,
             "boot_outcome": outcome,
             "boot_slot": slot,
             "faulted": False,
             "observed_control": True,
         }
 
+    control_relation_record = {
+        "combined_outcome": classify_multi_component_outcome(
+            {
+                name: {"boot_outcome": control.get("boot_outcome")}
+                for name, control in observed_controls.items()
+            }
+        ),
+        "per_component": observed_controls,
+        "is_control": True,
+        "expected_outcomes": {
+            name: component_profiles_by_name[name].expect.control_outcome
+            for name in observed_controls
+        },
+        "expected_combined_outcome": expected_combined_outcome,
+    }
+    control_relation_violations = _evaluate_component_state_relations(
+        control_relation_record, profile
+    )
+    control_components_reliable = bool(
+        observed_controls
+        and all(item.get("reliable") is True for item in observed_controls.values())
+    )
+    control_component_issue = any(
+        item.get("component_reliable") is True
+        and item.get("component_issue") is True
+        for item in observed_controls.values()
+    )
+    control_relation_findings = [
+        item
+        for item in control_relation_violations
+        if isinstance(item, dict) and item.get("name") == "state_relations"
+    ]
+    control_relation_errors = [
+        item
+        for item in control_relation_violations
+        if item not in control_relation_findings
+    ]
+    control_reliable = bool(
+        control_components_reliable and not control_relation_errors
+    )
+    control_issue_sources = (
+        (["component"] if control_component_issue else [])
+        + (
+            ["state_relation"]
+            if control_reliable and control_relation_findings
+            else []
+        )
+    )
+    control_relation_record.update({
+        "fault_injected": False,
+        "component_reliable": control_components_reliable,
+        "reliable": control_reliable,
+        "component_issue": control_component_issue,
+        "security_issue": bool(control_issue_sources),
+        "issue_sources": control_issue_sources,
+    })
+    supporting_controls_reliable = bool(
+        control_reliable
+        and not control_component_issue
+        and not control_relation_findings
+    )
+
     for comp_name, data in per_component_data.items():
         for result in data["results"]:
-            if result.get("is_control") or not result.get("fault_injected", False):
+            if result.get("is_control") or result.get("fault_injected") is not True:
                 continue
             faulted_outcome, faulted_slot = _effective_boot_result(result)
             per_comp_outcomes = {
@@ -1711,14 +2044,17 @@ def run_multi_component_sweep(
                 for name, control in observed_controls.items()
             }
             per_comp_outcomes[comp_name] = {
+                **_component_relation_record(
+                    result,
+                    expected_outcome=component_profiles_by_name[comp_name].expect.control_outcome,
+                ),
                 "boot_outcome": faulted_outcome,
                 "boot_slot": faulted_slot,
                 "fault_at": result.get("fault_at"),
                 "faulted": True,
                 "observed_control": False,
             }
-            combined_results.append(
-                {
+            combined_record = {
                     "faulted_component": comp_name,
                     "fault_at": result.get("fault_at"),
                     "fault_type": result.get("fault_type"),
@@ -1727,8 +2063,34 @@ def run_multi_component_sweep(
                     ),
                     "per_component": per_comp_outcomes,
                     "is_control": False,
+                    "expected_outcomes": {
+                        name: component_profiles_by_name[name].expect.control_outcome
+                        for name in per_comp_outcomes
+                    },
+                    "expected_combined_outcome": expected_combined_outcome,
                 }
+            relation_violations = _evaluate_component_state_relations(
+                combined_record, profile
             )
+            if relation_violations:
+                combined_record["invariant_violations"] = relation_violations
+            combined_record.update(
+                _multi_component_issue_annotation(
+                    result,
+                    expected_outcome=(
+                        component_profiles_by_name[comp_name].expect.control_outcome
+                    ),
+                    combined_outcome=combined_record["combined_outcome"],
+                    relation_violations=relation_violations,
+                    require_fault=True,
+                    component_control_reliable=bool(
+                        observed_controls[comp_name].get("reliable") is True
+                        and observed_controls[comp_name].get("component_issue") is False
+                    ),
+                    supporting_controls_reliable=supporting_controls_reliable,
+                )
+            )
+            combined_results.append(combined_record)
 
     # Compute multi-component combined summary.
     total_combined = len(combined_results)
@@ -1744,13 +2106,29 @@ def run_multi_component_sweep(
     degraded_count = sum(
         1 for r in combined_results if r.get("combined_outcome") == "degraded"
     )
+    state_relation_violation_count = sum(
+        1
+        for item in combined_results
+        if any(
+            isinstance(violation, dict)
+            and violation.get("name") == "state_relations"
+            for violation in (item.get("invariant_violations") or [])
+        )
+    )
+    state_relation_control_violation_count = len(control_relation_findings)
+    security_counts = _multi_component_security_counts(
+        combined_results, control_relation_record
+    )
 
     combined_summary = {
         "total_fault_points": total_combined,
+        **security_counts,
         "split_brain": split_brain_count,
         "all_failed": all_failed_count,
         "success": success_count,
         "degraded": degraded_count,
+        "state_relation_violations": state_relation_violation_count,
+        "state_relation_control_violations": state_relation_control_violation_count,
         "split_brain_rate": (
             float(split_brain_count) / float(total_combined)
         ) if total_combined > 0 else 0.0,
@@ -1770,6 +2148,9 @@ def run_multi_component_sweep(
         "components": [c.name for c in mc.components],
         "per_component": per_component_data,
         "combined_results": combined_results,
+        "control_combined_result": control_relation_record,
+        "control_state": observed_controls,
+        "control_invariant_violations": control_relation_violations,
         "combined_summary": combined_summary,
     }
 

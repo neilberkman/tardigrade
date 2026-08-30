@@ -16,6 +16,7 @@ from fault_types import FAULT_TYPE_NAME_TO_CODE
 from profile_loader import MAX_PROFILE_FAULT_POINTS, ProfileConfig, ProfileError
 from renode_runner import quick_subset
 from trace_utils import load_clean_erase_trace, load_clean_write_trace
+from security_state_layout import select_security_state_erase_cutpoints
 from thumb_instructions import (
     build_instruction_skip_patch_plan,
     enumerate_instruction_skip_addresses,
@@ -64,6 +65,7 @@ class FaultPlan:
     fault_types_list: Optional[List[str]]
     heuristic_summary: Optional[Dict[str, Any]]
     swap_progress_summary: Optional[Dict[str, Any]] = None
+    security_state_erase_summary: Optional[Dict[str, Any]] = None
     clustered_bit_count: int = 0
 
 
@@ -565,6 +567,7 @@ def build_fault_plan(
     fault_types = list(getattr(profile.fault_sweep, "fault_types", []) or [])
     include_power_loss = "power_loss" in fault_types or not fault_types
     include_swap_progress = "swap_progress" in fault_types
+    include_security_state_erase = "security_state_erase" in fault_types
     include_erases = (
         "interrupted_erase" in fault_types or "multi_sector_atomicity" in fault_types
     )
@@ -725,6 +728,7 @@ def build_fault_plan(
         or include_read_bit_flip
         or include_command_drop
         or include_swap_progress
+        or include_security_state_erase
         or include_instruction_skip
         or include_i2c_faults
         or include_otp_faults
@@ -738,12 +742,48 @@ def build_fault_plan(
     )
     clustered_bit_count = 0
     swap_progress_summary: Optional[Dict[str, Any]] = None
+    security_state_erase_summary: Optional[Dict[str, Any]] = None
     if has_mixed_types:
         write_fps: List[Tuple[int, str]] = []
         if include_power_loss:
             write_fps = [(fp, 'w') for fp in fault_points] if max_writes > 0 else []
         combined = _BoundedFaultPointList(write_fps)
         swap_progress_count = 0
+
+        # Security-state erase-domain selector.  It emits ordinary power-loss
+        # points and only annotates their wire label with the semantic phase;
+        # the runtime therefore uses the existing reboot path.
+        if include_security_state_erase:
+            security_write_entries = load_clean_write_trace(trace_file)
+            security_erase_entries = load_clean_erase_trace(erase_trace_file)
+            try:
+                security_cutpoints, security_state_erase_summary = (
+                    select_security_state_erase_cutpoints(
+                        getattr(profile, "persistent_state_layout", None),
+                        security_write_entries,
+                        security_erase_entries,
+                        flash_base=(
+                            min(int(slot.base) for slot in profile.memory.slots.values())
+                            if profile.memory.slots else 0
+                        ),
+                        max_writes=max_writes,
+                        trace_address_map=getattr(
+                            profile.memory, "trace_address_map", None
+                        ),
+                    )
+                )
+            except ValueError as exc:
+                raise ProfileError(
+                    "security_state_erase campaign preflight failed: {}".format(exc)
+                ) from exc
+            for cutpoint in security_cutpoints:
+                combined.append((cutpoint["fault_at"], cutpoint["wire_type"]))
+            if not security_cutpoints:
+                print(
+                    "Skipping security_state_erase: no shared security erase units found.",
+                    file=sys.stderr,
+                )
+
         if include_swap_progress:
             swap_entries = load_clean_write_trace(trace_file)
             erase_entries = load_clean_erase_trace(erase_trace_file)
@@ -1309,6 +1349,12 @@ def build_fault_plan(
             parts.append("{} command-drop".format(command_drop_count))
         if swap_progress_count:
             parts.append("{} swap-progress".format(swap_progress_count))
+        if security_state_erase_summary:
+            parts.append(
+                "{} security-state erase cutpoints".format(
+                    len(security_state_erase_summary.get("cutpoints", []))
+                )
+            )
         if i2c_fault_count:
             parts.append("{} i2c-fault".format(i2c_fault_count))
         if otp_fault_count:
@@ -1353,5 +1399,6 @@ def build_fault_plan(
         fault_types_list=fault_types_list,
         heuristic_summary=heuristic_summary,
         swap_progress_summary=swap_progress_summary,
+        security_state_erase_summary=security_state_erase_summary,
         clustered_bit_count=clustered_bit_count,
     )

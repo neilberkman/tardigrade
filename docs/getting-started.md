@@ -18,7 +18,7 @@ cd tardigrade
 pip install -r requirements.txt
 ```
 
-The dependencies are minimal: `pyyaml` and `pyelftools`.
+The dependencies are minimal: `pyyaml`, `pyelftools`, and `capstone`.
 
 If you downloaded Renode as a portable release, note the path to `renode-test` inside the extracted directory. You will pass it via `--renode-test`.
 
@@ -50,7 +50,8 @@ Because `naive_bare_copy` has `expect.should_find_issues: true`, tardigrade expe
 
 ### Full sweep
 
-Drop `--quick` to run the default heuristic sweep (~1K fault points, typically 2-4 minutes):
+Drop `--quick` to run the default heuristic sweep. Point count and runtime
+depend on the trace, enabled fault families, target, and worker count:
 
 ```bash
 python3 scripts/audit_bootloader.py \
@@ -76,11 +77,18 @@ The `summary.runtime_sweep` section has the key fields:
 | `issue_points`       | Any non-success result (bricks + wrong image) |
 | `brick_rate`         | Bricks / total points                         |
 
-The top-level `verdict` is `PASS` or `FAIL`. Use this as your CI gate signal.
+The CLI's top-level `verdict` begins with `PASS`, `FAIL`, or `INCONCLUSIVE`.
+CI must treat only `PASS` as passing. The verdict evaluates the profile's
+declared expectation:
 
 - **PASS + `should_find_issues: false`**: The bootloader survived all faults. No bricks, no wrong-image boots, no invariant violations.
 - **PASS + `should_find_issues: true`**: Issues were found, as expected for known-vulnerable code.
 - **FAIL**: Unexpected result -- either issues found when none expected, or no issues found when they were expected.
+- **INCONCLUSIVE**: Required coverage, runtime, trace, or infrastructure evidence was unavailable or incomplete.
+
+The GitHub Action adds a fail-safe security gate around this assertion. Its
+default `verdict` passes only clean profiles; see the Action quick start in the
+README for its separate `security-status` and regression mode.
 
 ### Per-fault-point detail
 
@@ -93,7 +101,9 @@ The `runtime_sweep_results` array contains one entry per fault point with:
 For a visual report, render the JSON as HTML:
 
 ```bash
-python3 scripts/render_results_html.py /tmp/my_first_sweep.json /tmp/report.html
+python3 scripts/render_results_html.py \
+  --input /tmp/my_first_sweep.json \
+  --output /tmp/report.html
 ```
 
 ## Testing your own bootloader

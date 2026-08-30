@@ -51,6 +51,7 @@ EXECUTE_ONLY_FAULT_TYPES = {
 TRACE_REPLAY_FAULT_TYPES = {
     "power_loss",
     "swap_progress",
+    "security_state_erase",
 }
 
 # Canonical mapping from human-readable fault type names to single-char
@@ -59,6 +60,9 @@ TRACE_REPLAY_FAULT_TYPES = {
 FAULT_TYPE_NAME_TO_CODE = {
     "power_loss": "w",
     "swap_progress": "w:sp",
+    # Semantic selector; it is dispatched as ordinary power loss (wire base
+    # code ``w``) with planner metadata in the suffix.
+    "security_state_erase": "w:ss",
     "bit_corruption": "b",
     "silent_write_failure": "s",
     "driver_error": "g",
@@ -196,6 +200,8 @@ def _fault_type_label(code: Any) -> str:
         return "bit_corruption_clustered"
     if code == "w:sp":
         return "swap_progress"
+    if code.startswith("w:ss:") or code == "w:ss":
+        return "security_state_erase"
     if code.startswith("m:"):
         return "metadata_{}".format(_fault_type_label(code.split(":", 1)[1]))
     if code.startswith("h:"):

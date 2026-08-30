@@ -1,0 +1,43 @@
+{
+  "SPDX-License-Identifier": "Apache-2.0",
+  "name": "tf_m_bl2_an521_snapshot",
+  "description": "AN521 MCUBOOT_IMAGE_NUMBER=2 scratch-strategy snapshot geometry",
+  "address_base": "0x0",
+  "trailer_align": 8,
+  "expected_primary_magic": ["good", "good"],
+  "slots": {
+    "secure_exec": {"base": "0x80000", "size": "0x80000"},
+    "ns_exec": {"base": "0x100000", "size": "0x80000"},
+    "secure_staging": {"base": "0x180000", "size": "0x80000"},
+    "ns_staging": {"base": "0x200000", "size": "0x80000"}
+  },
+  "invariant_providers": ["targets/tf_m_bl2/invariants.py"],
+  "invariants": [
+    "atomic_state_groups",
+    "tfm_multi_image_consistency",
+    "tfm_multi_image_acceptance_consistency",
+    "tfm_no_partial_magic",
+    "tfm_secure_slot_not_empty"
+  ],
+  "invariant_config": {
+    "tfm_joint_acceptance": true,
+    "tfm_joint_version_policy": "compatible",
+    "atomic_state_groups": [
+      {
+        "name": "tfm_primary_image_acceptance",
+        "members": [
+          {
+            "path": "slots.secure_exec.image_ok.state",
+            "before": "unset",
+            "after": "set"
+          },
+          {
+            "path": "slots.ns_exec.image_ok.state",
+            "before": "unset",
+            "after": "set"
+          }
+        ]
+      }
+    ]
+  }
+}
