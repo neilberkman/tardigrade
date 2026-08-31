@@ -4,8 +4,8 @@
 //
 // Registered at 0x40023C00 (STM32F4 FLASH register base), size 0x20.
 // Counts program operations on PG 1->0 transitions (per-operation accurate).
-// No shadow scanning — each PG deactivation reports one aligned merged dword;
-// the driver's underlying byte width is not retained in the legacy trace.
+// No shadow scanning — when a snapshot is available, each PG deactivation
+// reports one aligned merged dword with an explicit four-byte event width.
 //
 // When WriteTraceEnabled or fault snapshot is needed, captures flash
 // on PG 0->1 and diffs on PG 1->0 to find the changed address.
@@ -56,10 +56,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool DriverErrorFired { get => tracker.DriverErrorFired; set => tracker.DriverErrorFired = value; }
 
         public bool PerWriteAccurate => true;
-        // The STM32F4 driver programs bytes (FLASH_PSIZE_BYTE), while this
-        // fast tracker reports an aligned merged dword.  Legacy trace rows
-        // therefore do not carry a safe operation width.
-        public bool WriteTraceWidthExplicit => false;
+        // Diff-based tracing reconstructs the aligned dword affected by the
+        // programming operation and records it as an explicit four-byte event.
+        public bool WriteTraceWidthExplicit => true;
 
         // Stored but always effectively true — no shadow scanning.
         public bool SkipShadowScan { get; set; } = true;
@@ -372,7 +371,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     uint wordValue = FaultTracker.ReadU32(current, changedOffset);
 
-                    if(tracker.RecordWriteAndCheckFault(changedOffset, wordValue))
+                    if(tracker.RecordWriteAndCheckFault(changedOffset, wordValue, 4))
                     {
                         FaultFired = true;
                         LastFaultAddress = (uint)(FlashBaseAddress + changedOffset);

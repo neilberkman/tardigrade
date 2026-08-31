@@ -116,7 +116,15 @@ def test_write_trace_parser_accepts_colon_comma_and_width_records():
     assert parse_write_trace_record('1:16:287454020') == (1, 16, 287454020)
     assert parse_write_trace_record('1,16,287454020') == (1, 16, 287454020)
     assert parse_write_trace_record('1,16,287454020,2') == (1, 16, 287454020, 2)
+    assert parse_write_trace_record('1:16:287454020:4') == (1, 16, 287454020, 4)
     assert parse_write_trace_record('1:16') == (1, 16, 0)
+
+
+def test_write_trace_parser_rejects_extra_fields():
+    with pytest.raises(AmbiguousWriteEvent, match="more than four fields"):
+        parse_write_trace_record('1:16:287454020:4:unexpected')
+    with pytest.raises(AmbiguousWriteEvent, match="more than four fields"):
+        normalise_write_event((1, 16, 287454020, 4, 99))
 
 
 def test_erase_trace_validation_rejects_negative_and_out_of_bounds_records():
@@ -124,6 +132,8 @@ def test_erase_trace_validation_rejects_negative_and_out_of_bounds_records():
         validate_erase_trace_data([(-1, 0, 4)], flash_size=16, page_size=4)
     with pytest.raises(ValueError):
         validate_erase_trace_data([(14, 0, 4)], flash_size=16, page_size=4)
+    with pytest.raises(ValueError, match="more than four fields"):
+        validate_erase_trace_data([(0, 0, 4, 1, 99)], flash_size=16, page_size=4)
 
 
 def test_erase_trace_validation_can_reject_non_monotonic_native_records():
@@ -162,3 +172,49 @@ def test_unknown_or_malformed_writeback_fault_types_fail_closed():
 def test_writeback_erase_and_atomicity_faults_are_explicitly_unsupported():
     for fault_type in ("e", "a", "interrupted_erase", "multi_sector_atomicity"):
         assert is_unsupported_writeback_fault_type(fault_type)
+
+
+@pytest.mark.parametrize(
+    "trace",
+    [
+        [(-1, 0, 1, 4)],
+        [(1, -1, 1, 4)],
+        [(2, 0, 1, 4), (2, 4, 2, 4)],
+        [(2, 0, 1, 4), (1, 4, 2, 4)],
+    ],
+)
+def test_write_trace_validation_rejects_negative_duplicate_and_out_of_order(trace):
+    with pytest.raises((ValueError, AmbiguousWriteEvent)):
+        validate_write_trace_width(trace, flash_size=16)
+
+
+def test_write_trace_validation_rejects_width_span_beyond_each_image():
+    with pytest.raises(ValueError, match="baseline"):
+        validate_write_trace_width(
+            [(1, 3, 0x12345678, 4)], flash_size=16, baseline_size=6
+        )
+    with pytest.raises(ValueError, match="snapshot"):
+        validate_write_trace_width(
+            [(1, 3, 0x12345678, 4)], flash_size=16, snapshot_size=6
+        )
+
+
+def test_reconstruction_rejects_bad_trace_before_replay_mutation():
+    with pytest.raises(ValueError, match="baseline"):
+        reconstruct_committed_snapshot(
+            bytes([0xFF] * 8), [(1, 7, 0x1234, 2)], [], 1,
+            0x08000000, 4, 1,
+        )
+
+
+def test_reconstruction_rejects_out_of_order_erases_before_replay():
+    with pytest.raises(ValueError, match="not monotonic"):
+        reconstruct_committed_snapshot(
+            bytes([0xFF] * 16),
+            [(1, 0, 0x12345678, 4)],
+            [(0, 2, 4), (4, 1, 4)],
+            1,
+            0x08000000,
+            4,
+            1,
+        )

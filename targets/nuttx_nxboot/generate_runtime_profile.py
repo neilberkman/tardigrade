@@ -15,6 +15,12 @@ BOOTLOADER_ENTRY = 0x08000000
 SRAM_START = 0x20000000
 SRAM_END = 0x240A0000
 WRITE_GRANULARITY = 8
+# STM32H743/H753 platform files map two 1 MiB flash banks at these bases;
+# STM32H7FlashController models each bank as 128 KiB erase sectors.
+FLASH_BANK1_BASE = 0x08000000
+FLASH_BANK2_BASE = 0x08100000
+FLASH_BANK_SIZE = 0x100000
+ERASE_SECTOR_SIZE = 0x20000
 CAMPAIGNS = {
     "baseline": {
         "image_suffix": "",
@@ -39,6 +45,18 @@ CAMPAIGNS = {
             "metadata and erase interruption campaign covering critical "
             "slot-metadata transitions and partially completed erase recovery"
         ),
+    },
+    "sector_boundary_writeback": {
+        "image_suffix": "-sector-boundary",
+        "default_fault_types": "power_loss",
+        "default_boot_cycles": 3,
+        "description": (
+            "three-boot writeback campaign using the sector-boundary update "
+            "image and STM32H7 sector geometry"
+        ),
+        "durability_model": "writeback",
+        "writeback_buffer_capacity": "auto",
+        "writeback_erase_flushes_domain": False,
     },
 }
 
@@ -89,6 +107,18 @@ def render_runtime_profile(
         if boot_cycles is None
         else int(boot_cycles)
     )
+    durability_model = campaign_config.get("durability_model")
+    writeback_block = ""
+    if durability_model == "writeback":
+        writeback_block = (
+            "\n  durability_model: writeback"
+            "\n  writeback:"
+            "\n    buffer_capacity: {}"
+            "\n    erase_flushes_domain: {}".format(
+                campaign_config.get("writeback_buffer_capacity", "auto"),
+                str(campaign_config.get("writeback_erase_flushes_domain", False)).lower(),
+            )
+        )
 
     return """schema_version: 1
 name: {name}
@@ -101,6 +131,10 @@ bootloader:
 memory:
   sram: {{ start: 0x{sram_start:08X}, end: 0x{sram_end:08X} }}
   write_granularity: {write_granularity}
+  page_size: 0x{erase_sector_size:X}
+  erase_regions:
+    - {{ base: 0x{flash_bank1_base:08X}, size: 0x{flash_bank_size:X}, sector_size: 0x{erase_sector_size:X} }}
+    - {{ base: 0x{flash_bank2_base:08X}, size: 0x{flash_bank_size:X}, sector_size: 0x{erase_sector_size:X} }}
   slots:
     exec: {{ base: 0x{slot_exec_base:08X}, size: 0x{slot_size:05X} }}
     staging: {{ base: 0x{slot_staging_base:08X}, size: 0x{slot_size:05X} }}
@@ -121,6 +155,7 @@ fault_sweep:
   run_duration: "{run_duration}"
   calibration_time_slice: "{calibration_time_slice}"
   boot_cycles: {boot_cycles}{rollback_line}{fault_types_line}{instruction_skip_block}
+{writeback_block}
 state_probe:
   script: targets/nuttx_nxboot/probe.py
 semantic_assertions:
@@ -164,6 +199,7 @@ expect:
             "\n    skip_count: 1"
             if "instruction_skip" in selected_fault_types else ""
         ),
+        writeback_block=writeback_block,
         name=name,
         loader_elf=loader_elf,
         primary_img=primary_img,
@@ -172,6 +208,10 @@ expect:
         sram_start=SRAM_START,
         sram_end=SRAM_END,
         write_granularity=WRITE_GRANULARITY,
+        flash_bank1_base=FLASH_BANK1_BASE,
+        flash_bank2_base=FLASH_BANK2_BASE,
+        flash_bank_size=FLASH_BANK_SIZE,
+        erase_sector_size=ERASE_SECTOR_SIZE,
         slot_exec_base=SLOT_EXEC_BASE,
         slot_staging_base=SLOT_STAGING_BASE,
         slot_tertiary_base=SLOT_TERTIARY_BASE,

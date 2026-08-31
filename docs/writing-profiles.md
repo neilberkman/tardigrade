@@ -824,13 +824,17 @@ Writeback campaigns require a bounded, trace-capable backend so the runner can
 reconstruct the committed image. The `nvm_ctrl`/`NVMemoryController` path does
 not expose that operation trace and is refused before fault dispatch; such
 profiles are configuration fixtures, not executable self-tests. Legacy
-three-column traces are accepted only from backends that explicitly declare
-four-byte events. Width-bearing CSV traces support 1-, 2-, 4-, and 8-byte
-events; the fixed-width native binary replay path rejects any trace containing
-another width and falls back to the width-aware Python replay. Of the bundled
-backends, CFI flash currently advertises an unambiguous legacy four-byte trace;
-other bundled flash backends fail closed until their exporter can identify the
-program width for every event. External width-bearing traces remain supported.
+three-column traces are accepted only from backends that separately declare a
+fixed archived-trace width. Width-bearing CSV traces support 1-, 2-, 4-, and
+8-byte events; the fixed-width native binary replay path rejects any trace
+containing another width and valid such traces use the width-aware Python
+replay. Malformed or provenance-invalid traces are rejected during preflight,
+not passed to a fallback. The bundled CFI, nRF52, STM32F4, STM32H7, and AN521
+trace exporters now identify a write width for every new program event. External
+width-bearing traces remain supported. Writeback replay also refuses any
+backend that explicitly declares `PerWriteAccurate=false`: address-difference
+traces cannot establish the ordered operations needed to reconstruct durable
+state.
 
 Diagnostics include a barrier audit (detects missing flush barriers between update phases), per-fault dirty-domain state, and a `commit_ratio` metric.
 

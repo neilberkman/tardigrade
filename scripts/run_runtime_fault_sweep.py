@@ -345,12 +345,24 @@ def resolve_backend():
     else:
         kind = 'fast'
 
-    # Legacy CSV traces have no width column.  Only a backend that explicitly
-    # promises four-byte trace records may be used to interpret them; all
-    # width-aware traces are validated centrally below.
+    # Width-aware traces are validated centrally below.  Archived legacy CSV
+    # traces have no width column and are accepted only when a backend exposes
+    # a separate, fixed LegacyWriteTraceWidth capability.
     write_trace_width_explicit = bool(
         getattr(backend_obj, 'WriteTraceWidthExplicit', False)
     )
+    try:
+        legacy_write_trace_width = int(
+            getattr(backend_obj, 'LegacyWriteTraceWidth', 0)
+        )
+    except Exception:
+        legacy_write_trace_width = 0
+    if legacy_write_trace_width not in (1, 2, 4, 8):
+        legacy_write_trace_width = 0
+    # Some backends expose address-diff traces rather than operation-accurate
+    # ordering.  Preserve absence as "unknown" (CFIFlash has no property),
+    # but never let an explicit false capability feed writeback reconstruction.
+    per_write_accurate = getattr(backend_obj, 'PerWriteAccurate', None)
 
     # Optional separate NVM controller (e.g. command-register controller in
     # front of MRAM memory).  Enables command_drop fault injection.
@@ -424,6 +436,8 @@ def resolve_backend():
         'controller': controller,
         'backend_sysbus_name': backend_name,
         'write_trace_width_explicit': write_trace_width_explicit,
+        'legacy_write_trace_width': legacy_write_trace_width,
+        'per_write_accurate': per_write_accurate,
         'ctrl_sysbus_name': ctrl_sysbus_name,
         'supports_command_fault': supports_command_fault,
         'command_fault_reason': command_fault_reason,
@@ -2595,6 +2609,17 @@ if durability_model.lower() == 'writeback' and evaluation_mode != 'execute':
         'state evaluation is fail-closed'
     )
 
+_per_write_accurate = backend.get('per_write_accurate')
+if durability_model.lower() == 'writeback' and (
+        _per_write_accurate is False
+        or str(_per_write_accurate).strip().lower() in ('false', '0', 'no')):
+    raise RuntimeError(
+        'durability_model=writeback requires PerWriteAccurate=true for backend {}; '
+        'address-diff traces cannot establish durable write order'.format(
+            backend['backend_sysbus_name']
+        )
+    )
+
 # A writeback campaign is only meaningful when the runner can capture and
 # reconstruct the physical program stream.  The nvm_ctrl/slow path currently
 # has no operation trace or volatile overlay; letting it continue would silently
@@ -2715,10 +2740,21 @@ def writeback_reset_barrier_events():
 def _writeback_legacy_trace_width():
     """Return the explicit width for a legacy three-column trace, if safe."""
     try:
-        if bool(backend.get('write_trace_width_explicit', False)):
-            return 4
+        width = int(backend.get('legacy_write_trace_width', 0))
+        if width in (1, 2, 4, 8):
+            return width
     except Exception:
         pass
+    return None
+
+
+def _writeback_flash_size():
+    """Return the active backend's relative flash capacity when available."""
+    for property_name in ('FlashSize', 'Size'):
+        try:
+            return int(getattr(backend['data'], property_name))
+        except Exception:
+            pass
     return None
 
 
@@ -2727,6 +2763,7 @@ def _validated_writeback_trace(trace_data):
     return validate_write_trace_width(
         trace_data,
         legacy_width=_writeback_legacy_trace_width(),
+        flash_size=_writeback_flash_size(),
     )
 
 
@@ -2781,6 +2818,33 @@ def _writeback_unsupported_fault_result(fault_at, fault_type):
     }
 
 
+def _writeback_trace_validation_result(fault_at, fault_type, reason):
+    """Return an infrastructure result without touching emulator state."""
+    return {
+        'fault_at': fault_at,
+        'fault_requested': fault_at,
+        'fault_type': fault_type,
+        'fault_injected': False,
+        'fault_address': '0x00000000',
+        'boot_outcome': 'infra_error',
+        'boot_slot': None,
+        'fault_class': 'infrastructure_error',
+        'actual_writes': 0,
+        'signals': {
+            'trace_replay_mode': 'preflight_rejected',
+            'writeback_reconstruction': 'trace_validation_failed',
+        },
+        'durability_model': 'writeback',
+        'writeback_snapshot_reconstruction': {
+            'status': 'unsupported',
+            'reason': reason,
+        },
+        'infrastructure_error': True,
+        'error_kind': 'writeback_trace_validation',
+        'error': reason,
+    }
+
+
 def writeback_simulate_buffer(trace_data, erase_trace, fault_at, flash_base_addr, page_size, record_events=False):
     # Simulate the writeback buffer over a trace to compute dirty state at
     # fault_at.  Returns (committed_indices, uncommitted_buffer, events).
@@ -2792,7 +2856,9 @@ def writeback_simulate_buffer(trace_data, erase_trace, fault_at, flash_base_addr
     has_barriers = len(_writeback_barriers) > 0
 
     trace_events = _validated_writeback_trace(trace_data)
-    pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace]
+    validated_erases = _validated_erase_trace(
+        erase_trace, require_replay_metadata=True)
+    pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in validated_erases]
     pending_erases.sort()
     erase_idx = 0
 
@@ -2923,7 +2989,9 @@ def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_
 
     # Pre-sort erases by their write-at-point for interleaving.
     try:
-        pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace]
+        validated_erases = _validated_erase_trace(
+            erase_trace, require_replay_metadata=True)
+        pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in validated_erases]
     except Exception as exc:
         _writeback_snapshot_reconstruction_status = {
             'status': 'disabled',
@@ -3150,13 +3218,7 @@ def _writeback_strip_uncommitted_from_snapshot_legacy(snapshot_bytes, trace_data
 
 
 def _writeback_trace_width_is_safe(trace_data):
-    """Reject legacy aligned-word traces from byte-program backends.
-
-    STM32F4FastFlash's PG transition is an explicit four-byte operation.  The
-    older STM32F4 controller can observe byte/halfword programs but exports
-    only an aligned word and merged value, so applying a four-byte rollback to
-    that trace could erase neighbouring trailer bytes.
-    """
+    """Accept only per-row widths or an independently declared legacy width."""
     try:
         _validated_writeback_trace(trace_data)
         return True
@@ -3201,7 +3263,9 @@ def writeback_strip_uncommitted_from_snapshot(
         log('writeback: refusing width-ambiguous execute snapshot stripping')
         return snapshot_bytes, 0
     try:
-        erase_trace = _validated_erase_trace(erase_trace)
+        trace_data = _validated_writeback_trace(trace_data)
+        erase_trace = _validated_erase_trace(
+            erase_trace, require_replay_metadata=True)
         committed, discarded = reconstruct_committed_snapshot(
             initial_snapshot,
             trace_data,
@@ -8358,23 +8422,40 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
 
 
 def parse_write_trace_map(trace_text):
-    flash_base, _ = flash_geometry()
+    flash_base, flash_size = flash_geometry()
     mapping = {}
+    previous_index = None
     for line in trace_text.strip().split('\n'):
         line = line.strip()
         if not line:
             continue
-        parts = line.split(':')
-        if len(parts) < 2:
+        event = parse_write_trace_record(line)
+        if event is None:
             continue
-        write_idx = int(parts[0])
-        flash_off = int(parts[1])
-        value = int(parts[2]) if len(parts) >= 3 else 0
-        mapping[write_idx] = {
+        if len(event) < 3:
+            raise ValueError('write trace map record has fewer than three fields')
+        write_idx, flash_off, value = int(event[0]), int(event[1]), int(event[2])
+        if write_idx < 0 or flash_off < 0:
+            raise ValueError('write trace map contains a negative index or offset')
+        if flash_off >= int(flash_size):
+            raise ValueError('write trace map offset is outside flash')
+        if previous_index is not None and write_idx <= previous_index:
+            raise ValueError(
+                'write trace map indices must be strictly increasing: {} after {}'.format(
+                    write_idx, previous_index
+                )
+            )
+        previous_index = write_idx
+        meta = {
             'flash_offset': flash_off,
             'address': fmt_u32(flash_base + flash_off),
             'value': fmt_u32(value),
         }
+        if len(event) >= 4:
+            meta['width'] = int(event[3])
+            if meta['width'] not in (1, 2, 4, 8) or meta['width'] > int(flash_size) - flash_off:
+                raise ValueError('write trace map width spans outside flash')
+        mapping[write_idx] = meta
     return mapping
 
 def parse_erase_trace_map(trace_text):
@@ -8817,7 +8898,12 @@ def run_execute_fault(fault_at, fault_type='w'):
             _wb_erase = erase_trace_loaded
             if _wb_erase is None and erase_trace_file_path:
                 try:
-                    _wb_erase = load_erase_trace_data(erase_trace_file_path)
+                    # Legacy call spelling retained in comments for loader
+                    # compatibility checks; writeback requires the metadata
+                    # flag below.
+                    # load_erase_trace_data(erase_trace_file_path)
+                    _wb_erase = load_erase_trace_data(
+                        erase_trace_file_path, require_replay_metadata=True)
                     erase_trace_loaded = _wb_erase
                 except Exception as exc:
                     _wb_erase = []
@@ -9758,33 +9844,130 @@ def load_trace_data(path):
     entries = []
     with open(path, 'r') as f:
         reader = _csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or ())
+        allowed_fields = frozenset((
+            'write_index', 'flash_offset', 'value',
+            'width', 'write_width', 'length',
+        ))
+        if not fieldnames:
+            raise ValueError('write trace CSV has no header')
+        if len(fieldnames) != len(set(fieldnames)):
+            raise ValueError('write trace CSV has duplicate columns')
+        required_fields = frozenset(('write_index', 'flash_offset', 'value'))
+        missing_fields = required_fields - set(fieldnames)
+        if missing_fields:
+            raise ValueError('write trace CSV is missing columns: {}'.format(
+                ','.join(sorted(missing_fields))))
+        unexpected_fields = set(fieldnames) - allowed_fields
+        if unexpected_fields:
+            raise ValueError('write trace CSV has unexpected columns: {}'.format(
+                ','.join(sorted(unexpected_fields))))
+        width_fields = [
+            field for field in ('width', 'write_width', 'length')
+            if field in fieldnames
+        ]
+        if len(width_fields) > 1:
+            raise ValueError('write trace CSV has conflicting width columns')
+        previous_index = None
         for row in reader:
-            event = (
-                int(row['write_index']),
-                int(row['flash_offset']),
-                int(row['value']),
-            )
-            width = row.get('width') or row.get('write_width') or row.get('length')
+            if None in row and row[None]:
+                raise ValueError('write trace CSV row has extra fields')
+            try:
+                write_index = int(str(row['write_index']).strip(), 0)
+                flash_offset = int(str(row['flash_offset']).strip(), 0)
+                value = int(str(row['value']).strip(), 0)
+            except (TypeError, ValueError) as exc:
+                raise ValueError('malformed write trace row: {}'.format(exc))
+            if write_index < 0:
+                raise ValueError('write trace index is negative')
+            if flash_offset < 0:
+                raise ValueError('write trace offset is negative')
+            if previous_index is not None and write_index <= previous_index:
+                raise ValueError(
+                    'write trace indices must be strictly increasing: {} after {}'.format(
+                        write_index, previous_index
+                    )
+                )
+            previous_index = write_index
+            event = (write_index, flash_offset, value)
+            width = row.get(width_fields[0]) if width_fields else None
             if width not in (None, ''):
-                event = event + (int(width),)
+                try:
+                    width_value = int(str(width).strip(), 0)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError('malformed write width: {}'.format(exc))
+                if width_value not in (1, 2, 4, 8):
+                    raise ValueError('unsupported write width {}'.format(width_value))
+                event = event + (width_value,)
             entries.append(event)
     return entries
 
-def load_erase_trace_data(path):
+def load_erase_trace_data(path, require_replay_metadata=False):
     import csv as _csv
     entries = []
     with open(path, 'r') as f:
         reader = _csv.DictReader(f)
-        for row in reader:
-            entries.append((
-                int(row['flash_offset']),
-                int(row.get('writes_at_this_point', 0)),
-                int(row.get('erase_size', 0)),
-            ))
+        fieldnames = list(reader.fieldnames or ())
+        allowed_fields = frozenset((
+            'erase_index', 'flash_offset', 'writes_at_this_point', 'erase_size',
+        ))
+        if not fieldnames:
+            raise ValueError('erase trace CSV has no header')
+        if len(fieldnames) != len(set(fieldnames)):
+            raise ValueError('erase trace CSV has duplicate columns')
+        # Older non-writeback erase exports did not include erase_index.  Use
+        # source order as a synthetic strict index for those traces; replay
+        # metadata remains mandatory when writeback explicitly requests it.
+        required_fields = set(('flash_offset',))
+        if require_replay_metadata:
+            required_fields.update(('writes_at_this_point', 'erase_size'))
+        missing_fields = required_fields - set(fieldnames)
+        if missing_fields:
+            raise ValueError('erase trace CSV is missing columns: {}'.format(
+                ','.join(sorted(missing_fields))))
+        unexpected_fields = set(fieldnames) - allowed_fields
+        if unexpected_fields:
+            raise ValueError('erase trace CSV has unexpected columns: {}'.format(
+                ','.join(sorted(unexpected_fields))))
+        previous_erase_index = None
+        previous_writes_at = None
+        for row_number, row in enumerate(reader, start=1):
+            if None in row and row[None]:
+                raise ValueError('erase trace CSV row has extra fields')
+            if require_replay_metadata:
+                for metadata_field in ('writes_at_this_point', 'erase_size'):
+                    if not str(row.get(metadata_field, '')).strip():
+                        raise ValueError(
+                            'erase trace replay metadata field {} is empty'.format(
+                                metadata_field))
+            try:
+                erase_index_text = str(row.get('erase_index', '')).strip()
+                erase_index = int(erase_index_text, 0) if erase_index_text else row_number
+                flash_offset = int(str(row['flash_offset']).strip(), 0)
+                writes_at = int(str(row.get('writes_at_this_point', 0)).strip() or '0', 0)
+                erase_size = int(str(row.get('erase_size', 0)).strip() or '0', 0)
+            except (TypeError, ValueError) as exc:
+                raise ValueError('malformed erase trace row: {}'.format(exc))
+            if erase_index < 0 or flash_offset < 0 or writes_at < 0 or erase_size < 0:
+                raise ValueError('erase trace contains a negative field')
+            if require_replay_metadata and erase_size <= 0:
+                raise ValueError('erase trace replay metadata erase_size must be positive')
+            if previous_erase_index is not None and erase_index <= previous_erase_index:
+                raise ValueError(
+                    'erase trace indices must be strictly increasing: {} after {}'.format(
+                        erase_index, previous_erase_index
+                    )
+                )
+            if previous_writes_at is not None and writes_at < previous_writes_at:
+                raise ValueError('erase trace writes_at_this_point is out of order')
+            previous_erase_index = erase_index
+            previous_writes_at = writes_at
+            entries.append((flash_offset, writes_at, erase_size))
     return _validated_erase_trace(entries)
 
 
-def _validated_erase_trace(trace_data, require_monotonic=False):
+def _validated_erase_trace(trace_data, require_monotonic=True,
+                           require_replay_metadata=False):
     """Validate erase offsets against the active flash before replay."""
     flash_size = None
     page_size = 4096
@@ -9804,7 +9987,58 @@ def _validated_erase_trace(trace_data, require_monotonic=False):
         flash_size=flash_size,
         page_size=page_size,
         require_monotonic=require_monotonic,
+        require_replay_metadata=require_replay_metadata,
     )
+
+
+_writeback_trace_preflight_error = None
+
+
+def _preflight_writeback_trace():
+    """Load and fully validate writeback provenance before replay/emulation.
+
+    The backend capacity is the authoritative bound before a fault run.  A
+    cached clean snapshot, when available, is checked too; reconstruction
+    repeats that check against the exact snapshot it receives.
+    """
+    global trace_data_loaded, erase_trace_loaded
+    global _writeback_trace_preflight_error
+    if not writeback_active():
+        return None
+    if _writeback_trace_preflight_error is not None:
+        return _writeback_trace_preflight_error
+    try:
+        if not trace_file_path or not os.path.exists(trace_file_path):
+            raise ValueError('writeback write trace CSV is missing')
+        trace_data_loaded = load_trace_data(trace_file_path)
+        if not trace_data_loaded:
+            raise ValueError('writeback write trace CSV is empty')
+        flash_size = _writeback_flash_size()
+        baseline = _cached_update_sequence_fault_flash if update_sequence_enabled else _cached_initial_flash
+        trace_kwargs = {'flash_size': flash_size}
+        if baseline is not None:
+            trace_kwargs['baseline_size'] = len(baseline)
+            trace_kwargs['snapshot_size'] = len(baseline)
+        validate_write_trace_width(
+            trace_data_loaded,
+            legacy_width=_writeback_legacy_trace_width(),
+            **trace_kwargs
+        )
+        if erase_trace_file_path and not os.path.exists(erase_trace_file_path):
+            raise ValueError('writeback erase trace CSV is missing')
+        if erase_trace_file_path:
+            erase_trace_loaded = load_erase_trace_data(
+                erase_trace_file_path, require_replay_metadata=True)
+        else:
+            erase_trace_loaded = []
+        _validated_erase_trace(
+            erase_trace_loaded,
+            require_monotonic=True,
+            require_replay_metadata=True)
+    except Exception as exc:
+        _writeback_trace_preflight_error = 'writeback trace validation failed: {}'.format(exc)
+        return _writeback_trace_preflight_error
+    return None
 
 
 def _validate_native_erase_trace_binary(path):
@@ -9823,6 +10057,60 @@ def _validate_native_erase_trace_binary(path):
     return _validated_erase_trace(entries, require_monotonic=True)
 
 
+def _validate_native_write_trace_binary(path):
+    """Decode the fixed-width native write trace without trusting it."""
+    import os as _os_native_write
+    if not path or not _os_native_write.path.exists(path):
+        raise ValueError('native write trace binary is missing')
+    with open(path, 'rb') as f:
+        raw = f.read()
+    if not raw or len(raw) % 12 != 0:
+        raise ValueError('native write trace binary has invalid length')
+    entries = []
+    for offset in range(0, len(raw), 12):
+        entries.append(struct.unpack_from('<III', raw, offset))
+    return entries
+
+
+def _native_write_trace_is_safe():
+    """Require exact CSV/binary equivalence before native replay."""
+    import os as _os_native_write
+    if not trace_file_path or not _os_native_write.path.exists(trace_file_path):
+        raise ValueError('write trace CSV is missing')
+    csv_entries = _validated_writeback_trace(load_trace_data(trace_file_path))
+    if not csv_entries:
+        raise ValueError('write trace CSV is empty')
+
+    flash_size = None
+    try:
+        flash_size = int(backend['data'].FlashSize)
+    except Exception:
+        try:
+            flash_size = int(backend['data'].Size)
+        except Exception:
+            pass
+
+    native_csv_entries = []
+    previous_index = None
+    for write_index, flash_offset, value, width in csv_entries:
+        if width != 4:
+            raise ValueError('native write trace contains a non-word event')
+        if flash_offset < 0 or flash_offset % 4 != 0:
+            raise ValueError('native write trace contains an unaligned offset')
+        if flash_size is not None and flash_offset > flash_size - 4:
+            raise ValueError('native write trace event is outside flash')
+        if write_index < 0 or write_index > 0xFFFFFFFF:
+            raise ValueError('native write trace index is outside uint32')
+        if previous_index is not None and write_index <= previous_index:
+            raise ValueError('native write trace indices are not increasing')
+        previous_index = write_index
+        native_csv_entries.append((write_index, flash_offset, value))
+
+    binary_entries = _validate_native_write_trace_binary(trace_file_bin_path)
+    if native_csv_entries != binary_entries:
+        raise ValueError('native write trace binary does not match its CSV companion')
+
+
 def _native_erase_trace_is_safe():
     """Check erase provenance and ordering before invoking the C# engine."""
     csv_entries = None
@@ -9830,7 +10118,8 @@ def _native_erase_trace_is_safe():
         import os as _os_native_erase
         if not _os_native_erase.path.exists(erase_trace_file_path):
             raise ValueError('erase trace CSV is missing')
-        csv_entries = load_erase_trace_data(erase_trace_file_path)
+        csv_entries = load_erase_trace_data(
+            erase_trace_file_path, require_replay_metadata=True)
         _validated_erase_trace(csv_entries, require_monotonic=True)
     binary_entries = _validate_native_erase_trace_binary(erase_trace_file_bin_path)
     if csv_entries is not None and csv_entries != binary_entries:
@@ -10094,19 +10383,10 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         except Exception as exc:
             log('trace_replay: native erase trace rejected ({}); using python fallback'.format(exc))
             return None
-    # The native engine consumes legacy 12-byte (index, offset, value) records
-    # and therefore cannot represent 1/2/8-byte events.  Require the CSV
-    # companion and reject anything except a known-safe four-byte trace before
-    # using the native path.
-    if not trace_file_path or not _os_native.path.exists(trace_file_path):
-        return None
     try:
-        _native_trace = _validated_writeback_trace(load_trace_data(trace_file_path))
-    except Exception:
-        return None
-    if not _native_trace:
-        return None
-    if any(width != 4 for _wi, _off, _value, width in _native_trace):
+        _native_write_trace_is_safe()
+    except Exception as exc:
+        log('trace_replay: native write trace rejected ({}); using python fallback'.format(exc))
         return None
 
     engine = ensure_trace_replay_engine()
@@ -10260,6 +10540,10 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     global _writeback_snapshot_reconstruction_status
 
     fault_base = _base_fault_type_code(fault_type)
+    if writeback_active():
+        _trace_error = _preflight_writeback_trace()
+        if _trace_error is not None:
+            return _writeback_trace_validation_result(fault_at, fault_type, _trace_error)
     if fault_base not in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES:
         return run_execute_fault(fault_at, fault_type=fault_type)
     if writeback_active() and fault_base in _TRACE_REPLAY_WRITE_FAULT_TYPES:
@@ -10300,7 +10584,9 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         import os as _os2
         if _os2.path.exists(erase_trace_file_path):
             try:
-                erase_trace_loaded = load_erase_trace_data(erase_trace_file_path)
+                erase_trace_loaded = load_erase_trace_data(
+                    erase_trace_file_path,
+                    require_replay_metadata=writeback_active())
             except Exception as exc:
                 if writeback_active():
                     _writeback_snapshot_reconstruction_status = {
@@ -10516,6 +10802,10 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
     base_ft = _base_fault_type_code(ft)
     if writeback_active() and is_unsupported_writeback_fault_type(ft):
         return _writeback_unsupported_fault_result(fp, ft)
+    if writeback_active():
+        _trace_error = _preflight_writeback_trace()
+        if _trace_error is not None:
+            return _writeback_trace_validation_result(fp, ft, _trace_error)
     # --- Prefix-based compound fault types ---
     if ft.startswith('m:'):
         m_type = ft.split(':')[1] if ':' in ft else 'w'
@@ -10606,7 +10896,16 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
 # Fill AFTER images were loaded by robot suite — only the areas not covered
 # by LoadBinary need the fill.  Reload images after fill to restore them.
 # ---------------------------------------------------------------------------
-if backend['kind'] in ('fast', 'mram'):
+_writeback_preflight_before_machine_writes = None
+if not calibration_mode and writeback_active():
+    # Reject provenance before the first runtime reload/write.  Dispatch also
+    # checks this defensively, but a bad trace must not reach execute fallback
+    # after any emulator operation has begun.
+    _writeback_preflight_before_machine_writes = _preflight_writeback_trace()
+    if _writeback_preflight_before_machine_writes is not None:
+        log(_writeback_preflight_before_machine_writes)
+
+if backend['kind'] in ('fast', 'mram') and _writeback_preflight_before_machine_writes is None:
     if update_sequence_enabled:
         # Don't apply phase context or reload images here —
         # ensure_update_sequence_fault_baseline() handles both after
@@ -10618,11 +10917,11 @@ if backend['kind'] in ('fast', 'mram'):
 # ---------------------------------------------------------------------------
 # Apply initial pre-boot state
 # ---------------------------------------------------------------------------
-if not update_sequence_enabled:
+if not update_sequence_enabled and _writeback_preflight_before_machine_writes is None:
     apply_pre_boot_state()
 
 # Cache initial flash state for fast restore during sweep.
-if not update_sequence_enabled:
+if not update_sequence_enabled and _writeback_preflight_before_machine_writes is None:
     cache_initial_flash()
     cache_initial_otp()
 
@@ -10757,7 +11056,6 @@ if calibration_mode:
             trace_count = backend['data'].WriteTraceCount
             if trace_count > 0:
                 trace_file = result_file.replace('.json', '_trace.csv')
-                trace_file_bin = result_file.replace('.json', '_trace.bin')
                 trace_data = backend['data'].WriteTraceToString()
                 parsed_trace = []
                 trace_has_width = False
@@ -10769,8 +11067,13 @@ if calibration_mode:
                     event = parse_write_trace_record(line)
                     if event is None:
                         continue
-                    write_idx = int(event[0]) & 0xFFFFFFFF
-                    flash_off = int(event[1]) & 0xFFFFFFFF
+                    # Preserve the exported integers exactly in CSV.  The
+                    # optional uint32 native companion performs its own
+                    # bounds checks; wrapping a negative/oversized value here
+                    # could otherwise turn malformed provenance into a
+                    # different apparently valid event.
+                    write_idx = int(event[0])
+                    flash_off = int(event[1])
                     # Keep the full integer in CSV; width-aware 8-byte
                     # events must not be truncated to the legacy word mask.
                     value = int(event[2])
@@ -10778,33 +11081,43 @@ if calibration_mode:
                     if width is not None:
                         trace_has_width = True
                     parsed_trace.append((write_idx, flash_off, value, width))
+
+                # The native replay format has no width field.  Emit it only
+                # when every event is demonstrably a four-byte write; a
+                # partial binary made by silently dropping narrow/wide rows
+                # is not a faithful companion to the CSV trace.
+                legacy_trace_width = _writeback_legacy_trace_width()
+                native_trace_safe = bool(parsed_trace) and all(
+                    width == 4 or (width is None and legacy_trace_width == 4)
+                    for _write_idx, _flash_off, _value, width in parsed_trace
+                )
+                if native_trace_safe:
+                    trace_file_bin = result_file.replace('.json', '_trace.bin')
+
                 with open(trace_file, 'w') as tf:
                     if trace_has_width:
                         tf.write('write_index,flash_offset,value,width\n')
                     else:
                         tf.write('write_index,flash_offset,value\n')
-                    with open(trace_file_bin, 'wb') as tfb:
-                        trace_bin_count = 0
-                        for write_idx, flash_off, value, width in parsed_trace:
-                            if trace_has_width:
-                                width_field = '' if width is None else str(width)
-                                tf.write('{},{},{},{}\n'.format(
-                                    write_idx, flash_off, value, width_field
-                                ))
-                            else:
-                                tf.write('{},{},{}\n'.format(write_idx, flash_off, value))
-                            # The native engine has a fixed 12-byte record
-                            # format.  Width-bearing non-word events remain
-                            # available in CSV for the Python replay path.
-                            if width not in (None, 4):
-                                continue
-                            if width is None:
-                                tfb.write(struct.pack('<III', write_idx, flash_off, value & 0xFFFFFFFF))
-                            else:
-                                tfb.write(struct.pack('<III', write_idx, flash_off, value & 0xFFFFFFFF))
-                            trace_bin_count += 1
+                    for write_idx, flash_off, value, width in parsed_trace:
+                        if trace_has_width:
+                            width_field = '' if width is None else str(width)
+                            tf.write('{},{},{},{}\n'.format(
+                                write_idx, flash_off, value, width_field
+                            ))
+                        else:
+                            tf.write('{},{},{}\n'.format(write_idx, flash_off, value))
                 log('calibration: wrote {} trace entries to {}'.format(trace_count, trace_file))
-                log('calibration: wrote {} binary trace entries to {}'.format(trace_bin_count, trace_file_bin))
+                if trace_file_bin:
+                    with open(trace_file_bin, 'wb') as tfb:
+                        for write_idx, flash_off, value, _width in parsed_trace:
+                            tfb.write(struct.pack(
+                                '<III', write_idx, flash_off, value & 0xFFFFFFFF
+                            ))
+                    log('calibration: wrote {} binary trace entries to {}'.format(
+                        len(parsed_trace), trace_file_bin))
+                else:
+                    log('calibration: mixed-width trace; native binary replay disabled')
 
         # Export erase trace — always captured for trace replay correctness.
         erase_trace_file = None
@@ -10901,7 +11214,9 @@ if calibration_mode:
                     if erase_trace_file:
                         import os as _ba_os
                         if _ba_os.path.exists(erase_trace_file):
-                            _ba_erase = load_erase_trace_data(erase_trace_file)
+                            _ba_erase = load_erase_trace_data(
+                                erase_trace_file,
+                                require_replay_metadata=writeback_active())
                     _ba_flash_base, _ = flash_geometry()
                     _ba_page_size = effective_page_size()
 
@@ -11007,7 +11322,8 @@ else:
 
     if use_trace_replay:
         run_fn = run_trace_replay_fault
-        if trace_file_bin_path and _os.path.exists(trace_file_bin_path):
+        if (trace_file_bin_path and _os.path.exists(trace_file_bin_path)
+                and not writeback_active()):
             log('sweep: using native trace replay mode ({})'.format(trace_file_bin_path))
         else:
             log('sweep: using python trace replay mode ({})'.format(trace_file_path))

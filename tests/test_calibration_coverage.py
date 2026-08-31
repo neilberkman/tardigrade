@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
@@ -18,7 +20,10 @@ if str(SCRIPTS) not in sys.path:
 from audit_report import compute_verdict  # noqa: E402
 from self_test import check_verdict  # noqa: E402
 from trace_utils import (  # noqa: E402
+    annotate_clean_trace,
     build_clean_operation_trace,
+    load_clean_erase_trace,
+    load_clean_write_trace,
     summarize_calibration_coverage,
 )
 from fault_inject import MetadataFaultRegion  # noqa: E402
@@ -163,6 +168,86 @@ def test_aliased_trace_operation_addresses_use_canonical_aliases() -> None:
         ],
     )
     assert [item["address"] for item in ops] == ["0x100FFFE8", "0x0017FFE8"]
+
+
+def test_width_aware_clean_trace_is_preserved_in_operation_metadata(tmp_path: Path) -> None:
+    trace_file = tmp_path / "widths.csv"
+    trace_file.write_text(
+        "write_index,flash_offset,value,width\n1,0,4660,2\n2,4,1,4\n",
+        encoding="utf-8",
+    )
+    entries = load_clean_write_trace(str(trace_file))
+    assert entries[0]["width"] == 2
+    ops = build_clean_operation_trace(entries, [], 0x08000000)
+    assert ops[0]["width"] == 2
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        "-1,0,1\n",
+        "1,-1,1\n",
+        "2,0,1\n2,4,2\n",
+        "2,0,1\n1,4,2\n",
+    ],
+)
+def test_clean_write_trace_fails_closed_on_bad_provenance(tmp_path: Path, rows: str) -> None:
+    trace_file = tmp_path / "bad.csv"
+    trace_file.write_text("write_index,flash_offset,value\n" + rows, encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_clean_write_trace(str(trace_file))
+
+
+def test_clean_trace_bounds_and_negative_erase_offsets_fail_closed(tmp_path: Path) -> None:
+    write_trace = tmp_path / "write.csv"
+    write_trace.write_text(
+        "write_index,flash_offset,value\n1,16,1\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="outside flash"):
+        load_clean_write_trace(str(write_trace), flash_size=16)
+
+    erase_trace = tmp_path / "erase.csv"
+    erase_trace.write_text(
+        "erase_index,flash_offset,writes_at_this_point,erase_size\n"
+        "1,-1,0,4\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="offset is negative"):
+        load_clean_erase_trace(str(erase_trace), flash_size=16, page_size=4)
+
+
+def test_clean_erase_trace_rejects_nonblank_malformed_size_but_keeps_legacy_blank(
+    tmp_path: Path,
+) -> None:
+    malformed = tmp_path / "malformed-erase.csv"
+    malformed.write_text(
+        "erase_index,flash_offset,writes_at_this_point,erase_size\n"
+        "1,0,0,nope\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="size is malformed"):
+        load_clean_erase_trace(str(malformed), flash_size=16, page_size=4)
+
+    legacy = tmp_path / "legacy-erase.csv"
+    legacy.write_text(
+        "flash_offset,writes_at_this_point\n0,0\n",
+        encoding="utf-8",
+    )
+    entries = load_clean_erase_trace(str(legacy), flash_size=16, page_size=4)
+    assert entries[0]["erase_index"] == 1
+    assert entries[0]["erase_size"] == 0
+
+
+def test_clean_trace_annotation_reports_to_stderr_without_runtime_error(
+    tmp_path: Path,
+) -> None:
+    trace_file = tmp_path / "writes.csv"
+    trace_file.write_text(
+        "write_index,flash_offset,value\n1,0,1\n", encoding="utf-8"
+    )
+    metadata = annotate_clean_trace([], str(trace_file), None, 0x08000000)
+    assert metadata is not None
+    assert metadata["writes"] == 1
 
 
 def test_compute_verdict_fails_clean_profile_when_calibration_only_touches_metadata() -> None:

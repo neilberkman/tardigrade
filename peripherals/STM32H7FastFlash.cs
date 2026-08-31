@@ -9,7 +9,7 @@
 // Use STM32H7FlashController for hardware-faithful fault indexing.
 //
 // When WriteTraceEnabled or fault snapshot is needed, captures flash
-// on PG 0->1 and diffs on PG 1->0 to find the changed address.
+// on PG 0->1 and diffs on PG 1->0 to find every changed aligned word.
 // Otherwise just increments the counter.
 //
 // STM32H743 uniform sector geometry:
@@ -104,10 +104,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int WriteTraceCount => tracker.WriteTraceCount;
         public string WriteTraceToString() => tracker.WriteTraceToString();
         public void WriteTraceClear() => tracker.WriteTraceClear();
-        // The fast tracker diffs aligned dwords, while H7 programming may
-        // update a narrower chunk within the programming buffer.  Legacy
-        // rows therefore do not carry a safe operation width.
-        public bool WriteTraceWidthExplicit => false;
+        // The fast tracker diffs aligned dwords, so every trace row is an
+        // explicit aligned uint write.
+        public bool WriteTraceWidthExplicit => true;
 
         // --- Erase trace ---
 
@@ -352,8 +351,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
+            // A PG transaction can contain several words, so the next fault
+            // may be any one of them. Keep a pre-state snapshot while the
+            // armed write point is still ahead, not only when it appears to
+            // be the very next word.
             bool needSnapshot = WriteTraceEnabled
-                || TotalWordWrites + 1 == FaultAtWordWrite;
+                || (FaultAtWordWrite != ulong.MaxValue
+                    && TotalWordWrites < FaultAtWordWrite);
 
             if(needSnapshot)
             {
@@ -377,60 +381,61 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 int flashLen = checked((int)FlashSize);
                 byte[] current = flash.ReadBytes(0, flashLen);
-                int changedOffset = -1;
+                var faultOffset = -1;
+                ulong faultWriteIndex = 0;
 
+                // A single H7 PG transaction may commit several aligned words.
+                // Walk the complete diff in address order: every changed word is
+                // a separate replay event, while untouched words must not enter
+                // the trace or write counter.
                 for(int off = 0; off <= flashLen - 4; off += 4)
                 {
-                    if(current[off]     != preFaultSnapshot[off]
-                    || current[off + 1] != preFaultSnapshot[off + 1]
-                    || current[off + 2] != preFaultSnapshot[off + 2]
-                    || current[off + 3] != preFaultSnapshot[off + 3])
+                    if(current[off]     == preFaultSnapshot[off]
+                    && current[off + 1] == preFaultSnapshot[off + 1]
+                    && current[off + 2] == preFaultSnapshot[off + 2]
+                    && current[off + 3] == preFaultSnapshot[off + 3])
                     {
-                        changedOffset = off;
-                        break;
+                        continue;
+                    }
+
+                    uint wordValue = FaultTracker.ReadU32(current, off);
+                    if(tracker.RecordWriteAndCheckFault(off, wordValue, 4)
+                        && faultOffset < 0)
+                    {
+                        faultOffset = off;
+                        // The rest of this PG transaction is still diffed for
+                        // trace completeness, so preserve the triggering
+                        // event's index before TotalWordWrites advances.
+                        faultWriteIndex = tracker.TotalWordWrites;
                     }
                 }
 
-                if(changedOffset >= 0)
+                if(faultOffset >= 0)
                 {
-                    uint wordValue = FaultTracker.ReadU32(current, changedOffset);
+                    FaultFired = true;
+                    LastFaultAddress = (uint)(FlashBaseAddress + faultOffset);
 
-                    if(tracker.RecordWriteAndCheckFault(changedOffset, wordValue))
+                    var snap = new byte[flashLen];
+                    Array.Copy(preFaultSnapshot, snap, flashLen);
+
+                    if(WriteFaultMode == 0)
                     {
-                        FaultFired = true;
-                        LastFaultAddress = (uint)(FlashBaseAddress + changedOffset);
-
-                        var snap = new byte[flashLen];
-                        Array.Copy(preFaultSnapshot, snap, flashLen);
-
-                        if(WriteFaultMode == 0)
-                        {
-                            FaultFlashSnapshot = snap;
-                        }
-                        else
-                        {
-                            // Non-power faults continue on the same boot.  Persist
-                            // the corrupted result into mapped flash now so the CPU
-                            // observes it even if it reaches a boot marker before
-                            // the sweep runner regains control.
-                            var faultedCurrent = new byte[flashLen];
-                            Array.Copy(current, faultedCurrent, flashLen);
-                            ApplyWriteFaultAtOffset(faultedCurrent, preFaultSnapshot, current, changedOffset, flashLen);
-                            flash.WriteBytes(0, faultedCurrent, 0, flashLen);
-                            FaultFlashSnapshot = faultedCurrent;
-                        }
+                        FaultFlashSnapshot = snap;
+                    }
+                    else
+                    {
+                        // Non-power faults continue on the same boot.  Persist
+                        // the corrupted result into mapped flash now so the CPU
+                        // observes it even if it reaches a boot marker before
+                        // the sweep runner regains control.
+                        var faultedCurrent = new byte[flashLen];
+                        Array.Copy(current, faultedCurrent, flashLen);
+                        ApplyWriteFaultAtOffset(faultedCurrent, preFaultSnapshot, current,
+                            faultOffset, flashLen, faultWriteIndex);
+                        flash.WriteBytes(0, faultedCurrent, 0, flashLen);
+                        FaultFlashSnapshot = faultedCurrent;
                     }
                 }
-                else
-                {
-                    if(tracker.IncrementWriteCount())
-                    {
-                        FaultFired = true;
-                        LastFaultAddress = 0;
-                        FaultFlashSnapshot = flash.ReadBytes(0, flashLen);
-                    }
-                }
-
                 preFaultSnapshot = null;
             }
             else
@@ -455,7 +460,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return oldWord & ~actuallyFlipped;
         }
 
-        private void ApplyWriteFaultAtOffset(byte[] snap, byte[] pre, byte[] post, int off, int len)
+        private uint BuildFaultSeedForWrite(int offset, ulong writeIndex)
+        {
+            var seed = CorruptionSeed != 0 ? CorruptionSeed : (uint)writeIndex;
+            seed ^= (uint)offset;
+            seed ^= (uint)(TotalPageErases * 2654435761UL);
+            return seed;
+        }
+
+        private void ApplyWriteFaultAtOffset(byte[] snap, byte[] pre, byte[] post,
+                                             int off, int len, ulong writeIndex)
         {
             if(off > len - 4)
             {
@@ -469,7 +483,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 case 1: // Bit corruption: keep only some intended 1->0 transitions.
                 {
-                    uint seed = tracker.BuildFaultSeed(off);
+                    uint seed = BuildFaultSeedForWrite(off, writeIndex);
                     uint keepMask = FaultTracker.NextLcg(ref seed);
                     uint corrupted = KeepOneToZeroTransitions(oldWord, newWord, keepMask);
                     FaultTracker.WriteU32(snap, off, corrupted);
@@ -477,7 +491,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 case 2: // Silent write failure.
                 {
-                    uint silentValue = ((TotalWordWrites & 1UL) == 0UL) ? 0xFFFFFFFFU : 0x00000000U;
+                    uint silentValue = ((writeIndex & 1UL) == 0UL) ? 0xFFFFFFFFU : 0x00000000U;
                     FaultTracker.WriteU32(snap, off, silentValue);
                     break;
                 }
@@ -495,7 +509,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 case 4: // Write-disturb: target commits, neighbors corrupted.
                 {
                     FaultTracker.WriteU32(snap, off, newWord);
-                    uint seed = tracker.BuildFaultSeed(off);
+                    uint seed = BuildFaultSeedForWrite(off, writeIndex);
                     foreach(int nOff in new[] { off - 4, off + 4 })
                     {
                         if(nOff < 0 || nOff > len - 4)
@@ -516,7 +530,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     int pageStart = (off / pageSize) * pageSize;
                     int wordsPerPage = Math.Max(1, pageSize / 4);
                     int errorCount = 2 + (int)Math.Min(10UL, TotalPageErases / 8UL);
-                    uint seed = tracker.BuildFaultSeed(off);
+                    uint seed = BuildFaultSeedForWrite(off, writeIndex);
                     for(int i = 0; i < errorCount; i++)
                     {
                         int idx = (int)(FaultTracker.NextLcg(ref seed) % (uint)wordsPerPage);

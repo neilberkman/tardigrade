@@ -40,14 +40,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // --- Write counting ---
 
         // Full write record: increment counter, add trace entry if enabled,
-        // check fault arm.  Returns true if TotalWordWrites == FaultAtWordWrite.
-        // Caller is responsible for ALL fault application.
-        public bool RecordWriteAndCheckFault(int alignedOffset, uint wordValue)
+        // check fault arm.  The trace records the byte offset and the value
+        // written by this event in little-endian integer form, together with
+        // the event width.  Caller is responsible for ALL fault application.
+        // Returns true if TotalWordWrites == FaultAtWordWrite.
+        public bool RecordWriteAndCheckFault(int byteOffset, ulong eventValue, int width)
         {
+            if(width != 1 && width != 2 && width != 4 && width != 8)
+            {
+                throw new ArgumentOutOfRangeException(nameof(width),
+                    "Write trace width must be 1, 2, 4, or 8 bytes");
+            }
             TotalWordWrites++;
             if(WriteTraceEnabled)
             {
-                writeTrace.Add(Tuple.Create(TotalWordWrites, alignedOffset, wordValue));
+                writeTrace.Add(Tuple.Create(TotalWordWrites, byteOffset, eventValue, width));
             }
             return TotalWordWrites == FaultAtWordWrite;
         }
@@ -81,7 +88,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public string WriteTraceToString()
         {
-            var sb = new StringBuilder(writeTrace.Count * 24);
+            var sb = new StringBuilder(writeTrace.Count * 32);
             foreach(var entry in writeTrace)
             {
                 sb.Append(entry.Item1);
@@ -89,6 +96,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 sb.Append(entry.Item2);
                 sb.Append(':');
                 sb.Append(entry.Item3);
+                sb.Append(':');
+                sb.Append(entry.Item4);
                 sb.Append('\n');
             }
             return sb.ToString();
@@ -205,7 +214,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         // --- Private trace storage ---
-        private readonly List<Tuple<ulong, int, uint>> writeTrace = new List<Tuple<ulong, int, uint>>();
+        private readonly List<Tuple<ulong, int, ulong, int>> writeTrace = new List<Tuple<ulong, int, ulong, int>>();
         private readonly List<Tuple<ulong, long, ulong, int>> eraseTrace = new List<Tuple<ulong, long, ulong, int>>();
     }
 

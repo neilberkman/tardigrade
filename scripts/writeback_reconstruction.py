@@ -76,6 +76,10 @@ def parse_write_trace_record(line):
         raise AmbiguousWriteEvent(
             "write trace record has fewer than two fields: {!r}".format(text)
         )
+    if len(parts) > 4:
+        raise AmbiguousWriteEvent(
+            "write trace record has more than four fields: {!r}".format(text)
+        )
     values = [_parse_trace_int(parts[index]) for index in range(min(3, len(parts)))]
     if len(values) == 2:
         # Preserve the old two-column exporter convention, which represented
@@ -95,14 +99,26 @@ def normalise_write_event(event):
     """
     if len(event) < 3:
         raise AmbiguousWriteEvent("write event has fewer than three fields")
+    if len(event) > 4:
+        raise AmbiguousWriteEvent("write event has more than four fields")
+    try:
+        write_index = int(event[0])
+        flash_offset = int(event[1])
+    except (TypeError, ValueError, IndexError):
+        raise AmbiguousWriteEvent("write event index/offset is not an integer")
+    if write_index < 0:
+        raise AmbiguousWriteEvent("write event index is negative")
+    if flash_offset < 0:
+        raise AmbiguousWriteEvent("write event offset is negative")
     width = 4 if len(event) < 4 else int(event[3])
     if width not in SUPPORTED_WRITE_WIDTHS:
         raise AmbiguousWriteEvent("unsupported or ambiguous write width {!r}".format(width))
     value_mask = (1 << (8 * width)) - 1
-    return int(event[0]), int(event[1]), int(event[2]) & value_mask, width
+    return write_index, flash_offset, int(event[2]) & value_mask, width
 
 
-def validate_write_trace_width(trace_data, legacy_width=None):
+def validate_write_trace_width(trace_data, legacy_width=None, flash_size=None,
+                               baseline_size=None, snapshot_size=None):
     """Normalize a trace only when every event width is unambiguous.
 
     Three-column traces predate width-aware traces.  They may be accepted only
@@ -112,17 +128,50 @@ def validate_write_trace_width(trace_data, legacy_width=None):
     if legacy_width is not None and int(legacy_width) not in SUPPORTED_WRITE_WIDTHS:
         raise AmbiguousWriteEvent("unsupported legacy write width {!r}".format(legacy_width))
     normalized = []
+    previous_index = None
+    capacities = []
+    for name, value in (
+        ("flash", flash_size),
+        ("baseline", baseline_size),
+        ("snapshot", snapshot_size),
+    ):
+        if value is None:
+            continue
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("{} size is not an integer".format(name))
+        if value < 0:
+            raise ValueError("{} size is negative".format(name))
+        capacities.append((name, value))
     for event in trace_data or ():
         if len(event) < 4:
             if legacy_width is None:
                 raise AmbiguousWriteEvent("legacy write event has no declared width")
             event = tuple(event[:3]) + (int(legacy_width),)
-        normalized.append(normalise_write_event(event))
+        normalized_event = normalise_write_event(event)
+        write_index, flash_offset, _value, width = normalized_event
+        if previous_index is not None and write_index <= previous_index:
+            raise ValueError(
+                "write trace indices must be strictly increasing: {} after {}".format(
+                    write_index, previous_index
+                )
+            )
+        previous_index = write_index
+        for name, capacity in capacities:
+            if flash_offset > capacity or width > capacity - flash_offset:
+                raise ValueError(
+                    "write event span [{}, {}) is outside {} size {}".format(
+                        flash_offset, flash_offset + width, name, capacity
+                    )
+                )
+        normalized.append(normalized_event)
     return normalized
 
 
 def validate_erase_trace_data(trace_data, flash_size=None, page_size=4096,
-                              require_monotonic=False):
+                              require_monotonic=False,
+                              require_replay_metadata=False):
     """Validate and normalize erase records before replay.
 
     ``erase_size == 0`` retains the legacy meaning of the backend page size.
@@ -137,14 +186,21 @@ def validate_erase_trace_data(trace_data, flash_size=None, page_size=4096,
         raise ValueError("erase trace flash size is negative")
     normalized = []
     previous_writes_at = None
+    previous_erase_index = None
     for entry in trace_data or ():
         if len(entry) < 3:
             raise ValueError("erase trace record has fewer than three fields")
+        if len(entry) > 4:
+            raise ValueError("erase trace record has more than four fields")
         offset = int(entry[0])
         writes_at = int(entry[1])
         erase_size = int(entry[2])
         if offset < 0 or writes_at < 0 or erase_size < 0:
             raise ValueError("erase trace contains a negative field")
+        if require_replay_metadata and erase_size <= 0:
+            raise ValueError(
+                "erase trace replay metadata requires a positive erase_size"
+            )
         effective_size = erase_size if erase_size > 0 else page_size
         if capacity is not None and (
             offset > capacity or effective_size > capacity - offset
@@ -160,7 +216,22 @@ def validate_erase_trace_data(trace_data, flash_size=None, page_size=4096,
                 "erase trace writes_at_this_point is not monotonic: {} after {}".format(
                     writes_at, previous_writes_at
                 )
-            )
+                )
+        # Erase tuples historically omit erase_index.  If a caller supplies a
+        # fourth field, treat it as the source index and enforce the same
+        # strict ordering as writes; equal writes_at values remain valid for
+        # multiple erases emitted at one operation boundary.
+        if len(entry) >= 4:
+            erase_index = int(entry[3])
+            if erase_index < 0:
+                raise ValueError("erase trace index is negative")
+            if previous_erase_index is not None and erase_index <= previous_erase_index:
+                raise ValueError(
+                    "erase trace indices must be strictly increasing: {} after {}".format(
+                        erase_index, previous_erase_index
+                    )
+                )
+            previous_erase_index = erase_index
         previous_writes_at = writes_at
         normalized.append((offset, writes_at, erase_size))
     return normalized
@@ -195,17 +266,33 @@ def reconstruct_committed_snapshot(
     in the pre-write state of later events.  Pending events are discarded at
     the fault boundary.  The return value is ``(image, discarded_count)``.
     """
+    if int(fault_at) < 0:
+        raise ValueError("fault boundary is negative")
+    # Validate the complete provenance before making even the first mutation
+    # of the replay image.  In particular, do not let _apply_write discover a
+    # width/span problem only after earlier writes or erases were applied.
+    trace_data = list(trace_data or ())
+    normalized_trace = validate_write_trace_width(
+        trace_data,
+        legacy_width=None,
+        baseline_size=len(initial_snapshot),
+        snapshot_size=len(initial_snapshot),
+    )
+    normalized_erases = validate_erase_trace_data(
+        list(erase_trace or ()),
+        flash_size=len(initial_snapshot),
+        page_size=page_size,
+        require_monotonic=True,
+    )
     image = bytearray(initial_snapshot)
     capacity = max(0, int(capacity))
     page_size = max(1, int(page_size))
     barrier_addresses = {int(value) for value in barriers}
     pending_erases = []
-    for entry in erase_trace or ():
-        if len(entry) < 2:
-            continue
+    for entry in normalized_erases:
         offset = int(entry[0])
         writes_at = int(entry[1])
-        size = int(entry[2]) if len(entry) >= 3 and int(entry[2]) > 0 else page_size
+        size = int(entry[2]) if int(entry[2]) > 0 else page_size
         pending_erases.append((writes_at, offset, size))
     pending_erases.sort()
 
@@ -245,8 +332,7 @@ def reconstruct_committed_snapshot(
             apply_erase(offset, size)
             erase_index[0] += 1
 
-    for raw_event in trace_data:
-        write_index, offset, value, width = normalise_write_event(raw_event)
+    for write_index, offset, value, width in normalized_trace:
         if write_index > int(fault_at):
             break
         process_erases_before(write_index)

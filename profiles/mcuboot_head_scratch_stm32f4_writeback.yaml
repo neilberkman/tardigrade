@@ -1,0 +1,17 @@
+base_profile: mcuboot_head_scratch_stm32f4_upgrade.yaml
+
+schema_version: 1
+name: mcuboot_head_scratch_stm32f4_writeback
+description: >
+  MCUboot current-HEAD scratch upgrade on nucleo_f429zi with a writeback
+  durability model. Inherits the established scratch geometry and artifacts;
+  only power-loss cutpoints are selected.
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  durability_model: writeback
+  writeback:
+    buffer_capacity: auto
+    erase_flushes_domain: false
+skip_self_test: true

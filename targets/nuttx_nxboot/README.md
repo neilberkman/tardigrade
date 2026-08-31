@@ -50,6 +50,22 @@ python3 targets/nuttx_nxboot/generate_runtime_profile.py \
   --campaign metadata_erase_resume
 ```
 
-Both second-wave profiles require the real build artifacts and reject images
+`sector_boundary_writeback` uses the existing sector-boundary image artifacts,
+the same three-boot sequence, and only `power_loss` faults under the writeback
+durability model. The model uses its automatic buffer capacity and does not
+invent barrier addresses or erase flushes:
+
+```sh
+python3 targets/nuttx_nxboot/generate_runtime_profile.py \
+  --build-dir "$RUNNER_TEMP/nuttx-build" \
+  --output-profile "$RUNNER_TEMP/nuttx-sector-boundary-writeback.yaml" \
+  --campaign sector_boundary_writeback
+```
+
+Generated profiles declare the platform's two 1 MiB STM32H7 flash banks and
+their verified 128 KiB erase sectors. No extra postmortem partition is added;
+the platform does not establish a distinct metadata or scratch partition.
+
+All named campaigns require the real build artifacts and reject images
 larger than the declared slot. A clean control boot is still required before
 the fault sweep; a failing control is a setup/build result, not a finding.

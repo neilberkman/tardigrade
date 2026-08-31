@@ -132,7 +132,7 @@ class TestPeripheralImmediateStopContract(unittest.TestCase):
                 "Flash.WriteBytes(0, faultedCurrent, 0, flashLen);",
             ),
             "peripherals/STM32H7FastFlash.cs": (
-                "ApplyWriteFaultAtOffset(faultedCurrent, preFaultSnapshot, current, changedOffset, flashLen);",
+                "ApplyWriteFaultAtOffset(faultedCurrent, preFaultSnapshot, current,\n                            faultOffset, flashLen, faultWriteIndex);",
                 "flash.WriteBytes(0, faultedCurrent, 0, flashLen);",
             ),
         }
@@ -151,6 +151,17 @@ class TestPeripheralImmediateStopContract(unittest.TestCase):
             "public byte[] ReadBytes(long offset, int count, IPeripheral context)",
             source,
         )
+
+    def test_h7_fast_fault_uses_triggering_word_index_after_full_diff(self) -> None:
+        source = (ROOT / "peripherals" / "STM32H7FastFlash.cs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("ulong faultWriteIndex = 0;", source)
+        self.assertIn("faultWriteIndex = tracker.TotalWordWrites;", source)
+        self.assertIn("ApplyWriteFaultAtOffset(faultedCurrent, preFaultSnapshot, current,", source)
+        self.assertIn("faultOffset, flashLen, faultWriteIndex);", source)
+        self.assertIn("BuildFaultSeedForWrite(off, writeIndex)", source)
+        self.assertIn("((writeIndex & 1UL) == 0UL)", source)
 
 
 if __name__ == "__main__":

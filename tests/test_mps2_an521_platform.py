@@ -238,6 +238,22 @@ class Mps2An521PlatformTest(unittest.TestCase):
         self.assertIn("offset > BackingMemory.Size - width", self.nvm)
         self.assertIn("offset > BackingMemory.Size - count", self.nvm)
 
+    def test_nvm_trace_rows_carry_replayable_widths(self):
+        self.assertIn("public bool WriteTraceWidthExplicit => true;", self.nvm)
+        self.assertIn(
+            "tracker.RecordWriteAndCheckFault(\n                traceOffset, traceValue, traceWidth)",
+            self.nvm,
+        )
+        self.assertIn("traceValue = (ulong)result;", self.nvm)
+        self.assertIn("traceValue = (ulong)newWord;", self.nvm)
+        self.assertIn("traceWidth = 4;", self.nvm)
+
+    def test_nrf_wen_trace_rows_are_explicit_aligned_words(self):
+        nrf = (ROOT / "peripherals/NRF52NVMC.cs").read_text(encoding="utf-8")
+        self.assertIn("public bool WriteTraceWidthExplicit => true;", nrf)
+        self.assertIn("tracker.RecordWriteAndCheckFault(off, val32, 4)", nrf)
+        self.assertIn("&& (WriteTraceEnabled", nrf)
+
 
 if __name__ == "__main__":
     unittest.main()

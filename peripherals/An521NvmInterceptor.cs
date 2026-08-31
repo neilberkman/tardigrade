@@ -109,7 +109,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
         public int WriteTraceCount => tracker.WriteTraceCount;
-        public bool WriteTraceWidthExplicit => false;
+        public bool WriteTraceWidthExplicit => true;
 
         // Optional run-time gate used by long boot traces.  Zero preserves
         // the historical behavior and starts tracking from reset.
@@ -263,11 +263,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
 
             EnsureShadow();
-            var faultArmed = tracker.RecordWriteAndCheckFault((int)aligned, result);
+            // Fault application operates on the containing aligned word.
+            // Record the same canonical post-state dword so trace replay has
+            // exactly the granularity used by the fault model, including for
+            // narrow byte and halfword accesses.
+            var traceOffset = (int)aligned;
+            var traceValue = (ulong)result;
+            var traceWidth = 4;
+            var faultArmed = tracker.RecordWriteAndCheckFault(
+                traceOffset, traceValue, traceWidth);
             if(faultArmed)
             {
                 FaultFired = true;
-                LastFaultAddress = (uint)(FlashBaseAddress + offset);
+                LastFaultAddress = (uint)(FlashBaseAddress + aligned);
                 FaultFlashSnapshot = (byte[])flashShadow.Clone();
 
                 var faultWord = FaultWord(ReadShadowWord(aligned), result, aligned);
@@ -341,10 +349,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var oldWord = ReadShadowWord(aligned);
                 var newWord = OverlayWriteChunk(oldWord, value, cursor, inWord, bytes);
 
-                if(tracker.RecordWriteAndCheckFault((int)aligned, newWord))
+                // Fault application operates on the containing aligned word.
+                // Record the same canonical post-state dword for every chunk;
+                // this preserves untouched bytes and makes replay exact.
+                var traceOffset = (int)aligned;
+                var traceValue = (ulong)newWord;
+                var traceWidth = 4;
+
+                if(tracker.RecordWriteAndCheckFault(traceOffset, traceValue, traceWidth))
                 {
                     FaultFired = true;
-                    LastFaultAddress = (uint)(FlashBaseAddress + offset + cursor);
+                    LastFaultAddress = (uint)(FlashBaseAddress + aligned);
                     FaultFlashSnapshot = (byte[])flashShadow.Clone();
                     var faultWord = FaultWord(oldWord, newWord, aligned);
                     // The MappedMemory fast path has already committed the

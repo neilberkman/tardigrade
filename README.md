@@ -4,11 +4,16 @@ Fault-injection and security-invariant testing for embedded update systems. Tard
 
 Trace replay avoids repeated prefix emulation, while address-aware heuristics
 can substantially reduce routine power-loss campaign size. Actual savings and
-runtime are target-dependent. Declarative analyzers cover update-artifact
-authentication, reviewed-versus-signed authorization, persistent security
-state, and optimized-build assertion loss. An optional CBMC bridge connects
-formal verification to empirical testing by converting counterexamples into
-replay profiles.
+runtime are target-dependent. Width-aware, operation-accurate backends can emit
+write traces with the access width, allowing byte-exact writeback reconstruction
+and replay; legacy traces require an explicitly declared fixed width. A backend
+that explicitly declares `PerWriteAccurate=false` is refused for writeback
+replay. Declarative analyzers cover update-artifact authentication,
+authenticated-content equivalence,
+reviewed-versus-signed authorization, persistent security state, and
+optimized-build assertion loss. An optional CBMC bridge connects formal
+verification to empirical testing by converting counterexamples into replay
+profiles.
 
 ## Findings
 
@@ -56,6 +61,19 @@ python3 scripts/update_protocol_analyzer.py \
   --json
 ```
 
+### Authenticated-content equivalence
+
+[`scripts/authenticated_equivalence.py`](scripts/authenticated_equivalence.py)
+runs a grammar-aware, black-box campaign against a supplied parser or harness.
+It mutates only records after both the declared authentication boundary and
+the signature record, then fails closed on malformed evidence or
+authenticated-identity drift. Findings are semantic divergences in the
+supplied harness; the campaign does not claim to discover cryptographic
+weaknesses. See
+[`docs/authenticated-equivalence.md`](docs/authenticated-equivalence.md) and
+the synthetic fixtures in
+[`examples/authenticated_equivalence/`](examples/authenticated_equivalence/).
+
 ## Core campaign capabilities
 
 ### Trace replay engine
@@ -65,6 +83,11 @@ point, producing O(N^2) total emulation for N points. For supported power-loss
 campaigns, Tardigrade records a write trace during calibration and replays the
 prefix instead of re-emulating Phase 1. The target and host determine the
 resulting runtime savings.
+
+Width-bearing rows record `write_index`, `flash_offset`, `value`, and `width`
+(`1`, `2`, `4`, or `8` bytes). This preserves the access granularity needed for
+byte-exact writeback reconstruction; traces without a width are accepted only
+when the backend separately declares their fixed archived width.
 
 ### Write-address heuristic
 
@@ -138,9 +161,23 @@ evidence is inconclusive rather than clean.
 
 ### Write-back durability model
 
-Real storage stacks often buffer writes in RAM before committing to flash. A bootloader that assumes write-through durability can have latent bugs invisible to direct fault injection. The optional `durability_model: writeback` mode reconstructs the persisted Phase 2 snapshot from a bounded operation trace: writes remain pending until a configured barrier or capacity eviction commits them, and a power cut discards the rest. Phase 1 still observes the live write-through view, so the model evaluates recovery durability without claiming to reproduce same-boot stale reads. Ambiguous or unavailable trace evidence fails closed.
+Real storage stacks often buffer writes in RAM before committing to flash. A bootloader that assumes write-through durability can have latent bugs invisible to direct fault injection. The optional `durability_model: writeback` mode reconstructs the persisted Phase 2 snapshot from a bounded operation trace: writes remain pending until a configured barrier or capacity eviction commits them, and a power cut discards the rest. Phase 1 still observes the live write-through view, so the model evaluates recovery durability without claiming to reproduce same-boot stale reads. Ambiguous or unavailable trace evidence fails closed. Replay refuses a backend that explicitly declares `PerWriteAccurate=false`, because address-difference traces cannot establish operation ordering for durability reconstruction.
 
 Diagnostic annotations include a barrier audit (detects missing flush barriers between update phases), per-fault dirty-domain state, and a `commit_ratio` metric that quantifies how much of the write stream is uncommitted at each fault point.
+
+The current-head MCUboot STM32F4 scratch entry point is
+[`profiles/mcuboot_head_scratch_stm32f4_writeback.yaml`](profiles/mcuboot_head_scratch_stm32f4_writeback.yaml).
+Run it with the normal audit CLI after the current-head assets are available:
+
+```bash
+python3 scripts/audit_bootloader.py \
+  --profile profiles/mcuboot_head_scratch_stm32f4_writeback.yaml \
+  --renode-test /path/to/renode-test
+```
+
+For real NuttX nxboot artifacts, the runtime profile generator exposes the
+`sector_boundary_writeback` campaign; see the command in
+[`targets/nuttx_nxboot/README.md`](targets/nuttx_nxboot/README.md).
 
 ## Quick start
 
@@ -360,9 +397,14 @@ export GNUARMEMB_TOOLCHAIN_PATH=/path/to/arm-gnu-toolchain
 The build script writes the generated ELFs and signed slot images under
 `results/oss_validation/assets/`. The normal and fast STM32F4 profiles share
 the current-head bootloader and mirrored slot images; the fast profile changes
-the Renode backend for execute-mode performance.
+the Renode backend for execute-mode performance. The dedicated
+[`mcuboot_head_scratch_stm32f4_writeback.yaml`](profiles/mcuboot_head_scratch_stm32f4_writeback.yaml)
+profile applies the writeback durability model to this current-head geometry.
 
 **NuttX nxboot** -- real upstream NuttX firmware built from source. Board configs are upstream ([apache/nuttx#18509](https://github.com/apache/nuttx/pull/18509)). Tardigrade found a power-loss recovery vulnerability (92/94 failure rate) that led to fixes in both the NuttX kernel ([#18552](https://github.com/apache/nuttx/pull/18552)) and nxboot itself ([nuttx-apps#3428](https://github.com/apache/nuttx-apps/pull/3428)). The target adapter (`targets/nuttx_nxboot/`) includes a build script, runtime profile generator, and state probe. See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
+The generator's `--campaign sector_boundary_writeback` preset emits a
+three-boot, power-loss profile using the sector-boundary image and writeback
+durability settings; it is a campaign entry point, not a new upstream finding.
 
 **rustBoot** -- an independent state probe and invariant package for the public
 MIT-licensed rustBoot partition/trailer protocol. No rustBoot prebuilt firmware
@@ -384,6 +426,7 @@ and trace fixtures for engine validation and self-testing:
 | Example                  | Purpose                                                            |
 | ------------------------ | ------------------------------------------------------------------ |
 | `authorization_review`   | Reviewed-versus-signed declarative model and trace fixtures         |
+| `authenticated_equivalence` | Grammar-aware authenticated-content equivalence fixtures         |
 | `naive_copy`             | Worst-case baseline; proves the engine catches obvious brick paths |
 | `vulnerable_ota`         | Copy-in-place OTA with frequent boot-visible failures              |
 | `nxboot_style`           | Modeled nxboot family for adapter/probe/invariant development      |
@@ -424,7 +467,9 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the full repo
 - **Geometry matrix** ([`scripts/geometry_matrix.py`](scripts/geometry_matrix.py)) -- parametric slot-layout permutations to catch geometry-dependent bugs.
 - **State fuzzer** -- structured metadata-state fuzzing via the `state_fuzzer` profile block, plus the MCUboot-specific scenario generator in [`targets/mcuboot/state_fuzzer.py`](targets/mcuboot/state_fuzzer.py).
 - **Update-protocol analyzer** ([`scripts/update_protocol_analyzer.py`](scripts/update_protocol_analyzer.py)) -- checks declarative commit paths for required security gates, metadata bindings, and authenticated content.
+- **Authenticated-equivalence campaign** ([`scripts/authenticated_equivalence.py`](scripts/authenticated_equivalence.py)) -- mutates records after both the declared authentication boundary and signature record, then checks supplied harness outcomes while preserving the authenticated identity. See [`docs/authenticated-equivalence.md`](docs/authenticated-equivalence.md).
 - **Authorization-review analyzer** ([`scripts/authorization_review_analyzer.py`](scripts/authorization_review_analyzer.py)) -- compares observed parsed, reviewed, digested, signed, and authorized values using complete trace evidence.
+- **NuttX runtime profile generator** ([`targets/nuttx_nxboot/generate_runtime_profile.py`](targets/nuttx_nxboot/generate_runtime_profile.py)) -- emits `baseline`, `sector_boundary_resume`, `metadata_erase_resume`, and `sector_boundary_writeback` profiles from built nxboot artifacts.
 - **Production-assert analyzer** ([`scripts/production_assert_analyzer.py`](scripts/production_assert_analyzer.py)) -- identifies Python assertions that disappear under optimization and need reachability and impact review; candidates are not confirmed vulnerabilities.
 - **Persistent-state layout analyzer** ([`scripts/security_state_layout.py`](scripts/security_state_layout.py)) -- maps declared fields to erase units and identifies security state co-located with mutable or recovery data.
 - **HTML report** ([`scripts/render_results_html.py`](scripts/render_results_html.py)) -- renders JSON reports as HTML.
@@ -457,6 +502,7 @@ tardigrade/
 │   ├── run_runtime_fault_sweep.resc  # Renode fault sweep engine
 │   ├── write_trace_heuristic.py      # Write-trace classification
 │   ├── writeback_reconstruction.py   # Durable snapshot reconstruction
+│   ├── authenticated_equivalence.py  # Authenticated-content equivalence campaign
 │   ├── boot_cycle_analysis.py        # Multi-boot convergence analysis
 │   ├── fault_inject.py               # Fault injection helpers
 │   ├── partial_staging.py            # Partial staging-image simulation
@@ -503,6 +549,7 @@ tardigrade/
 ├── results/oss_validation/assets/    # Pre-built MCUboot ELFs + slot images
 └── docs/
     ├── writing-profiles.md           # Profile-writing guide + result interpretation
+    ├── authenticated-equivalence.md  # Authenticated-content campaign guide
     ├── license-certification.md      # Strict source-package license boundary
     ├── rustboot-target.md            # rustBoot adapter reference
     ├── i2c-fault-model.md            # I2C fault injection model

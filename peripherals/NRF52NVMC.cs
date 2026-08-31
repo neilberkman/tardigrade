@@ -104,9 +104,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int WriteTraceCount => tracker.WriteTraceCount;
         public string WriteTraceToString() => tracker.WriteTraceToString();
         public void WriteTraceClear() => tracker.WriteTraceClear();
-        // WEN diffing records aligned four-byte words even when the driver
-        // changed only part of one, so legacy rows have ambiguous width.
-        public bool WriteTraceWidthExplicit => false;
+        // WEN diffing reconstructs aligned four-byte word writes, so every
+        // trace row has an explicit, replay-safe width.
+        public bool WriteTraceWidthExplicit => true;
 
         // Missing interface members (NRF52 uses WEN->REN window counting).
         public bool PerWriteAccurate => false;
@@ -296,7 +296,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     // DiffLookahead == int.MaxValue forces always-diff mode
                     // (used during calibration to get accurate word counts).
                     bool needDiff = !AnyFaultFired
-                        && (DiffLookahead == int.MaxValue
+                        && (WriteTraceEnabled
+                            || DiffLookahead == int.MaxValue
                             || (FaultAtWordWrite != ulong.MaxValue
                                 && TotalWordWrites + (ulong)DiffLookahead >= FaultAtWordWrite));
 
@@ -339,7 +340,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                     | (current[off + 2] << 16)
                                     | (current[off + 3] << 24));
 
-                                if(tracker.RecordWriteAndCheckFault(off, val32))
+                                if(tracker.RecordWriteAndCheckFault(off, val32, 4))
                                 {
                                     FaultFired = true;
                                     LastFaultAddress = (uint)(FlashBaseAddress + off);

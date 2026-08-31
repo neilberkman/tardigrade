@@ -13,11 +13,17 @@ The format follows [common-changelog](https://common-changelog.org/).
   security invariants.
 - Update artifact authentication/metadata coverage and reviewed-versus-signed
   authorization analyzers.
+- Grammar-aware authenticated-equivalence campaigns for supplied parser or
+  harness evidence, with authenticated-identity checks and fail-closed
+  semantic findings.
 - Security-counter boundary campaigns, persistent erase-domain analysis,
   production-assert checks, and emitted-binary terminal-error escape analysis.
 - Native TF-M BL2/AN521 target support and supporting Renode peripherals.
-- Width-aware, fail-closed writeback snapshot reconstruction for traced
+- Explicit access-width write traces from the bundled flash backends and
+  width-aware, fail-closed writeback snapshot reconstruction for traced
   storage operations.
+- Current-head MCUboot STM32F4 scratch and NuttX nxboot
+  `sector_boundary_writeback` campaign presets.
 - Bounded no-boot postmortem evidence for image slots, non-uniform erase
   geometry, and auxiliary flash partitions.
 - Reproducible second-wave NuttX nxboot build and runtime-profile presets.
@@ -30,6 +36,11 @@ The format follows [common-changelog](https://common-changelog.org/).
   require an explicit regression mode for known-vulnerable profiles.
 - Runtime reports include richer fault classification, probe evidence, and
   security-state diagnostics.
+- Calibration exports preserve write widths. Writeback preflight rejects
+  malformed or invalid traces; valid traces whose widths are unsupported by the
+  fixed-width native replay use the width-aware path.
+- Writeback replay refuses backends that explicitly declare non-operation-accurate
+  write traces instead of reconstructing durability from address differences.
 - MCUboot HEAD swap-scratch validation uses mirrored STM32F429 bank geometry
   and dedicated signed slot images.
 - Recovery-boot wall-clock budgets are profile-configurable and remain

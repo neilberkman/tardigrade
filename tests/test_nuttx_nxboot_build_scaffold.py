@@ -152,6 +152,14 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             self.assertEqual(profile.fault_sweep.expected_rollback_at_cycle, 1)
             self.assertEqual(profile.fault_sweep.run_duration, "8.0")
             self.assertEqual(profile.fault_sweep.calibration_time_slice, "0.1")
+            self.assertEqual(profile.memory.page_size, 0x20000)
+            self.assertEqual(
+                [(region.base, region.size, region.sector_size) for region in profile.memory.erase_regions],
+                [
+                    (0x08000000, 0x100000, 0x20000),
+                    (0x08100000, 0x100000, 0x20000),
+                ],
+            )
             self.assertEqual(
                 profile.semantic_assertions["control"]["semantic_state.roles.next_boot"],
                 "none",
@@ -293,6 +301,36 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             )
             self.assertEqual(profile.fault_sweep.boot_cycles, 3)
             self.assertIn("nxboot_confirmed_has_recovery", profile.invariants)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_render_sector_boundary_writeback_campaign(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_writeback_campaign_"))
+        try:
+            build_dir = temp_dir / "build"
+            images_dir = build_dir / "images"
+            images_dir.mkdir(parents=True)
+            (build_dir / "nxboot-loader.elf").write_bytes(b"ELF")
+            (images_dir / "nxboot-primary-v1-h400-sector-boundary.img").write_bytes(b"P")
+            (images_dir / "nxboot-update-v2-h400-sector-boundary.img").write_bytes(b"U")
+
+            profile_path = temp_dir / "profile.yaml"
+            profile_path.write_text(
+                render_runtime_profile(
+                    build_dir,
+                    campaign="sector_boundary_writeback",
+                    name="nuttx_nxboot_sector_boundary_writeback",
+                )
+            )
+            profile = load_profile(profile_path)
+            self.assertEqual(profile.fault_sweep.fault_types, ["power_loss"])
+            self.assertEqual(profile.fault_sweep.boot_cycles, 3)
+            self.assertEqual(profile.fault_sweep.durability_model, "writeback")
+            self.assertEqual(profile.fault_sweep.writeback.buffer_capacity, "auto")
+            self.assertFalse(profile.fault_sweep.writeback.erase_flushes_domain)
+            self.assertEqual(profile.fault_sweep.writeback.barriers, [])
+            self.assertNotIn("barriers:", profile_path.read_text())
+            self.assertIn("sector-boundary", profile.images["staging"])
         finally:
             shutil.rmtree(temp_dir)
 

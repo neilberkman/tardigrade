@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import ast
 import struct
+import tempfile
 from types import SimpleNamespace
 
 
@@ -573,7 +574,18 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("write_trace_width_explicit", text)
         self.assertIn("reason': 'width_ambiguous_trace'", text)
-        self.assertIn("trace_file_path or not _os_native.path.exists(trace_file_path)", text)
+        self.assertIn("_native_write_trace_is_safe()", text)
+
+    def test_writeback_rejects_explicitly_inaccurate_write_order_backend(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("PerWriteAccurate", text)
+        self.assertIn("address-diff traces cannot establish durable write order", text)
+
+    def test_writeback_trace_preflight_runs_before_machine_reload(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("_preflight_writeback_trace()", text)
+        self.assertIn("_writeback_trace_validation_result", text)
+        self.assertIn("error_kind': 'writeback_trace_validation'", text)
 
     def test_writeback_execute_loads_both_traces_and_fails_closed(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
@@ -590,30 +602,170 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
 
     def test_calibration_export_preserves_width_column_and_legacy_records(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
+        helper_text = (ROOT / "scripts" / "writeback_reconstruction.py").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("parse_write_trace_record(line)", text)
-        self.assertIn("if len(parts) >= 4:", text)
+        self.assertIn("if len(parts) >= 4 and parts[3] != '':", helper_text)
         self.assertIn("tf.write('write_index,flash_offset,value,width\\n')", text)
         self.assertIn("width_field = '' if width is None else str(width)", text)
-        self.assertIn("if width not in (None, 4):", text)
+        self.assertIn("native_trace_safe = bool(parsed_trace) and all(", text)
+        self.assertIn("calibration: mixed-width trace; native binary replay disabled", text)
+        self.assertIn("write_idx = int(event[0])", text)
+        self.assertIn("flash_off = int(event[1])", text)
+        self.assertNotIn("int(event[0]) & 0xFFFFFFFF", text)
+        self.assertNotIn("int(event[1]) & 0xFFFFFFFF", text)
+
+    def test_native_replay_validates_write_provenance_alignment_and_order(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("_native_write_trace_is_safe()", text)
+        self.assertIn("native write trace binary does not match its CSV companion", text)
+        self.assertIn("flash_offset % 4 != 0", text)
+        self.assertIn("write_index <= previous_index", text)
+
+    def test_write_trace_csv_rejects_ambiguous_or_malformed_headers(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "load_trace_data"
+        )
+        namespace = {}
+        exec(
+            compile(ast.Module(body=[function], type_ignores=[]), str(PY_PATH), "exec"),
+            namespace,
+        )
+        load_trace_data = namespace["load_trace_data"]
+
+        rejected = (
+            "write_index,flash_offset,value,width,write_width\n1,0,1,4,2\n",
+            "write_index,flash_offset,value,width,width\n1,0,1,4,4\n",
+            "write_index,flash_offset,width\n1,0,4\n",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.csv"
+            for contents in rejected:
+                with self.subTest(header=contents.splitlines()[0]):
+                    path.write_text(contents, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_trace_data(path)
+
+            path.write_text(
+                "write_index,flash_offset,value,write_width\n1,2,4660,2\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(load_trace_data(path), [(1, 2, 4660, 2)])
 
     def test_native_replay_validates_erase_provenance_and_falls_back(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("_native_erase_trace_is_safe()", text)
         self.assertIn("not _os_native.path.exists(erase_trace_file_bin_path)", text)
         self.assertIn("require_monotonic=True", text)
+        self.assertIn("require_replay_metadata=True", text)
+
+    def test_erase_trace_csv_rejects_malformed_headers(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "load_erase_trace_data"
+        )
+        namespace = {"_validated_erase_trace": lambda entries: entries}
+        exec(
+            compile(ast.Module(body=[function], type_ignores=[]), str(PY_PATH), "exec"),
+            namespace,
+        )
+        load_erase_trace_data = namespace["load_erase_trace_data"]
+
+        rejected = (
+            "",
+            "erase_index,flash_offset,flash_offset\n1,0,0\n",
+            "erase_index,flash_offset,extra\n1,0,x\n",
+            "erase_index,flash_offset\n1,0\n",
+            "erase_index,flash_offset,writes_at_this_point,erase_size\n1,0,,4096\n",
+            "erase_index,flash_offset,writes_at_this_point,erase_size\n1,0,2,0\n",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "erase.csv"
+            for contents in rejected:
+                with self.subTest(header=contents.splitlines()[0] if contents else "empty"):
+                    path.write_text(contents, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_erase_trace_data(path, require_replay_metadata=True)
+
+            path.write_text(
+                "erase_index,flash_offset,writes_at_this_point,erase_size\n"
+                "1,0,2,4096\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                load_erase_trace_data(path, require_replay_metadata=True),
+                [(0, 2, 4096)],
+            )
+
+    def test_non_writeback_erase_loader_preserves_legacy_missing_index(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "load_erase_trace_data"
+        )
+        namespace = {"_validated_erase_trace": lambda entries: entries}
+        exec(
+            compile(ast.Module(body=[function], type_ignores=[]), str(PY_PATH), "exec"),
+            namespace,
+        )
+        load_erase_trace_data = namespace["load_erase_trace_data"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-erase.csv"
+            path.write_text(
+                "flash_offset,writes_at_this_point,erase_size\n0,0,0\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(load_erase_trace_data(path), [(0, 0, 0)])
+            with self.assertRaises(ValueError):
+                load_erase_trace_data(path, require_replay_metadata=True)
+
+            path.write_text(
+                "flash_offset,writes_at_this_point,erase_size\n0,0,4096\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                load_erase_trace_data(path, require_replay_metadata=True),
+                [(0, 0, 4096)],
+            )
+
+    def test_write_trace_map_rejects_exact_flash_end_offset(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "parse_write_trace_map"
+        )
+        namespace = {
+            "flash_geometry": lambda: (0x08000000, 16),
+            "parse_write_trace_record": lambda line: tuple(
+                int(part) for part in line.split(":")
+            ),
+            "fmt_u32": lambda value: "0x{:08X}".format(value),
+        }
+        exec(
+            compile(ast.Module(body=[function], type_ignores=[]), str(PY_PATH), "exec"),
+            namespace,
+        )
+        with self.assertRaises(ValueError):
+            namespace["parse_write_trace_map"]("1:16:1")
 
     def test_python_replay_rejects_out_of_bounds_erase_events(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("trace erase event is outside the replay image", text)
         self.assertIn("_validated_erase_trace(entries)", text)
 
-    def test_only_trackers_with_true_operation_width_are_legacy_safe(self) -> None:
+    def test_trace_capable_backends_emit_explicit_widths(self) -> None:
         expected = {
-            "STM32F4FastFlash.cs": False,
-            "STM32F4FlashController.cs": False,
-            "STM32H7FastFlash.cs": False,
-            "STM32H7FlashController.cs": False,
-            "NRF52NVMC.cs": False,
+            "STM32F4FastFlash.cs": True,
+            "STM32F4FlashController.cs": True,
+            "STM32H7FastFlash.cs": True,
+            "STM32H7FlashController.cs": True,
+            "NRF52NVMC.cs": True,
+            "An521NvmInterceptor.cs": True,
             "CFIFlash.cs": True,
         }
         for name, value in expected.items():
@@ -623,6 +775,19 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
                 text,
                 name,
             )
+
+    def test_legacy_trace_width_is_a_separate_capability(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("getattr(backend_obj, 'LegacyWriteTraceWidth', 0)", text)
+        self.assertIn("backend.get('legacy_write_trace_width', 0)", text)
+        cfi = (ROOT / "peripherals" / "CFIFlash.cs").read_text(encoding="utf-8")
+        self.assertIn("public int LegacyWriteTraceWidth => 4;", cfi)
+        self.assertIn('string.Format("{0},{1},{2},4"', cfi)
+
+    def test_writeback_capacity_supports_flashsize_and_size_backends(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("for property_name in ('FlashSize', 'Size'):", text)
+        self.assertIn("getattr(backend['data'], property_name)", text)
 
     def test_no_boot_zero_write_counter_increments_once_per_loop(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")

@@ -6,6 +6,43 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class Stm32f4PlatformTests(unittest.TestCase):
+    def test_f4_write_traces_are_width_bearing(self) -> None:
+        tracker = (ROOT / "peripherals" / "FaultTracker.cs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "RecordWriteAndCheckFault(int byteOffset, ulong eventValue, int width)",
+            tracker,
+        )
+        self.assertIn(
+            "List<Tuple<ulong, int, ulong, int>> writeTrace",
+            tracker,
+        )
+        self.assertIn("width != 1 && width != 2 && width != 4 && width != 8", tracker)
+        self.assertIn("sb.Append(entry.Item4);", tracker)
+
+        controller = (ROOT / "peripherals" / "STM32F4FlashController.cs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("public bool WriteTraceWidthExplicit => true;", controller)
+        self.assertIn(
+            "tracker.RecordWriteAndCheckFault(checked((int)offset), value, width)",
+            controller,
+        )
+        self.assertIn(
+            "tracker.RecordWriteAndCheckFault(aligned, wordValue, 4)",
+            controller,
+        )
+
+        fast = (ROOT / "peripherals" / "STM32F4FastFlash.cs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("public bool WriteTraceWidthExplicit => true;", fast)
+        self.assertIn(
+            "tracker.RecordWriteAndCheckFault(changedOffset, wordValue, 4)",
+            fast,
+        )
+
     def test_stm32f4_platforms_expose_2mb_flash(self) -> None:
         for relpath in ("platforms/stm32f4.repl", "platforms/stm32f4_fast.repl"):
             with self.subTest(platform=relpath):

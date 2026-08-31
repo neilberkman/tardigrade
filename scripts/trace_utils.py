@@ -66,37 +66,98 @@ def _classify_slot_region(
     return "outside"
 
 
-def load_clean_write_trace(trace_file: Optional[str]) -> List[Dict[str, int]]:
-    """Load calibration write trace CSV."""
+def load_clean_write_trace(
+    trace_file: Optional[str], flash_size: Optional[int] = None
+) -> List[Dict[str, int]]:
+    """Load and validate calibration write trace CSV.
+
+    Trace provenance is security-sensitive: malformed rows are an error, not
+    rows to skip.  Indices must be non-negative, unique, and strictly
+    increasing in source order.  Width is retained when an exporter supplied
+    one; legacy three-column rows intentionally have no ``width`` key.
+    """
     if not trace_file or not os.path.exists(trace_file):
         return []
     entries: List[Dict[str, int]] = []
-    skip_count = 0
     with open(trace_file, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        fields = [str(name).strip() for name in (reader.fieldnames or ()) if name]
+        if not fields:
+            raise ValueError("write trace CSV has no header")
+        if len(fields) != len(set(fields)):
+            raise ValueError("write trace CSV has duplicate columns")
+        required = {"write_index", "flash_offset", "value"}
+        missing = required - set(fields)
+        if missing:
+            raise ValueError(
+                "write trace CSV is missing columns: {}".format(",".join(sorted(missing)))
+            )
+        width_fields = [
+            name for name in ("width", "write_width", "length") if name in fields
+        ]
+        if len(width_fields) > 1:
+            raise ValueError("write trace CSV has conflicting width columns")
+        capacity = None if flash_size is None else int(flash_size)
+        if capacity is not None and capacity < 0:
+            raise ValueError("write trace flash size is negative")
+        previous_index: Optional[int] = None
         for row in reader:
+            if None in row and row[None]:
+                raise ValueError("write trace CSV row has extra fields")
             try:
-                entries.append(
-                    {
-                        "write_index": int(row.get("write_index", "0")),
-                        "flash_offset": int(row.get("flash_offset", "0")),
-                        "value": int(row.get("value", "0") or "0"),
-                    }
+                write_index = int(str(row.get("write_index", "")).strip(), 0)
+                flash_offset = int(str(row.get("flash_offset", "")).strip(), 0)
+                value = int(str(row.get("value", "")).strip() or "0", 0)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("malformed write trace row: {}".format(exc))
+            if write_index < 0:
+                raise ValueError("write trace index is negative")
+            if flash_offset < 0:
+                raise ValueError("write trace offset is negative")
+            if capacity is not None and flash_offset >= capacity:
+                raise ValueError(
+                    "write trace offset {} is outside flash size {}".format(
+                        flash_offset, capacity
+                    )
                 )
-            except Exception:
-                skip_count += 1
-                continue
-    if skip_count:
-        print(
-            "WARNING: skipped {} malformed rows in write trace".format(skip_count),
-            file=sys.stderr,
-            flush=True,
-        )
-    entries.sort(key=lambda e: e["write_index"])
+            if previous_index is not None and write_index <= previous_index:
+                raise ValueError(
+                    "write trace indices must be strictly increasing: {} after {}".format(
+                        write_index, previous_index
+                    )
+                )
+            previous_index = write_index
+            entry = {
+                "write_index": write_index,
+                "flash_offset": flash_offset,
+                "value": value,
+            }
+            if width_fields:
+                raw_width = row.get(width_fields[0], "")
+                if str(raw_width).strip():
+                    try:
+                        width = int(str(raw_width).strip(), 0)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("malformed write width: {}".format(exc))
+                    if width not in (1, 2, 4, 8):
+                        raise ValueError("unsupported write width {}".format(width))
+                    if capacity is not None and (
+                        flash_offset > capacity or width > capacity - flash_offset
+                    ):
+                        raise ValueError(
+                            "write trace span [{}, {}) is outside flash size {}".format(
+                                flash_offset, flash_offset + width, capacity
+                            )
+                        )
+                    entry["width"] = width
+            entries.append(entry)
     return entries
 
 
-def load_clean_erase_trace(erase_trace_file: Optional[str]) -> List[Dict[str, Any]]:
+def load_clean_erase_trace(
+    erase_trace_file: Optional[str], flash_size: Optional[int] = None,
+    page_size: int = 4096,
+) -> List[Dict[str, Any]]:
     """Load calibration erase trace CSV (if available).
 
     The preferred column is `writes_at_this_point`. Some traces may omit it;
@@ -108,6 +169,8 @@ def load_clean_erase_trace(erase_trace_file: Optional[str]) -> List[Dict[str, An
     entries: List[Dict[str, Any]] = []
     with open(erase_trace_file, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError("erase trace CSV has no header")
         if reader.fieldnames:
             fieldnames = {name.strip().lower() for name in reader.fieldnames if name}
         else:
@@ -122,7 +185,17 @@ def load_clean_erase_trace(erase_trace_file: Optional[str]) -> List[Dict[str, An
             if candidate in fieldnames:
                 writes_at_key = candidate
                 break
+        capacity = None if flash_size is None else int(flash_size)
+        page_size = int(page_size)
+        if page_size <= 0:
+            page_size = 4096
+        if capacity is not None and capacity < 0:
+            raise ValueError("erase trace flash size is negative")
+        previous_erase_index: Optional[int] = None
+        previous_writes_at: Optional[int] = None
         for idx, row in enumerate(reader, start=1):
+            if None in row and row[None]:
+                raise ValueError("erase trace CSV row has extra fields")
             try:
                 erase_index_raw = row.get("erase_index", str(idx))
                 erase_index = int(str(erase_index_raw).strip() or str(idx), 0)
@@ -130,19 +203,58 @@ def load_clean_erase_trace(erase_trace_file: Optional[str]) -> List[Dict[str, An
                 if flash_offset_raw is None:
                     flash_offset_raw = row.get("offset", "0")
                 flash_offset = int(str(flash_offset_raw).strip() or "0", 0)
-            except Exception:
-                continue
+            except Exception as exc:
+                raise ValueError("malformed erase trace row: {}".format(exc))
+            if flash_offset < 0:
+                raise ValueError("erase trace offset is negative")
             writes_at: Optional[int] = None
             if writes_at_key is not None:
                 writes_at = _parse_optional_int(row.get(writes_at_key, ""))
-            if writes_at is not None and writes_at < 0:
-                writes_at = None
+                if writes_at is None:
+                    raise ValueError("erase trace writes_at_this_point is malformed")
+                if writes_at < 0:
+                    raise ValueError("erase trace writes_at_this_point is negative")
+                if previous_writes_at is not None and writes_at < previous_writes_at:
+                    raise ValueError("erase trace writes_at_this_point is out of order")
+                previous_writes_at = writes_at
+            if erase_index < 0:
+                raise ValueError("erase trace index is negative")
+            if previous_erase_index is not None and erase_index <= previous_erase_index:
+                raise ValueError(
+                    "erase trace indices must be strictly increasing: {} after {}".format(
+                        erase_index, previous_erase_index
+                    )
+                )
+            previous_erase_index = erase_index
+            # Missing/blank erase_size is the legacy page-size sentinel.  A
+            # nonblank value that cannot be parsed is malformed provenance,
+            # not another spelling of that sentinel.
+            erase_size_raw = row.get("erase_size", "")
+            erase_size_text = str(erase_size_raw).strip()
+            erase_size = (
+                0 if not erase_size_text
+                else _parse_optional_int(erase_size_text)
+            )
+            if erase_size is None:
+                raise ValueError("erase trace size is malformed")
+            if erase_size < 0:
+                raise ValueError("erase trace size is negative")
+            effective_size = erase_size if erase_size > 0 else page_size
+            if capacity is not None and (
+                flash_offset > capacity
+                or effective_size > capacity - flash_offset
+            ):
+                raise ValueError(
+                    "erase trace region [{}, {}) is outside flash size {}".format(
+                        flash_offset, flash_offset + effective_size, capacity
+                    )
+                )
             entries.append(
                 {
                     "erase_index": erase_index,
                     "flash_offset": flash_offset,
                     "writes_at_this_point": writes_at,
-                    "erase_size": _parse_optional_int(row.get("erase_size", "")) or 0,
+                    "erase_size": erase_size,
                     "source_order": idx,
                 }
             )
@@ -296,8 +408,7 @@ def build_clean_operation_trace(
             max_write_index = idx
         off = int(w["flash_offset"])
         val = int(w["value"])
-        ops.append(
-            {
+        op = {
                 "_sort_key": (idx, 1, 0),
                 "kind": "write",
                 "write_index": idx,
@@ -307,7 +418,9 @@ def build_clean_operation_trace(
                 ),
                 "value": _fmt_u32(val),
             }
-        )
+        if "width" in w and w.get("width") is not None:
+            op["width"] = int(w["width"])
+        ops.append(op)
     for e in erase_entries:
         erase_idx = int(e["erase_index"])
         writes_at_raw = e.get("writes_at_this_point")
@@ -354,6 +467,8 @@ def _compact_operation(op: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
     if op.get("kind") == "write":
         base["write_index"] = int(op.get("write_index", 0))
         base["value"] = op.get("value")
+        if op.get("width") is not None:
+            base["width"] = int(op.get("width"))
     elif op.get("kind") == "erase":
         base["erase_index"] = int(op.get("erase_index", 0))
         writes_at = op.get("writes_at_this_point")

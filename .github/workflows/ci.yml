@@ -65,6 +65,7 @@ jobs:
             tests/nvm_peripheral.robot
             tests/generic_nvm_controller.robot
             tests/cmsdk_apb_watchdog.robot
+            tests/write_trace_widths.robot
           artifacts-path: results/ci_artifacts
 
       - name: Upload Renode artifacts

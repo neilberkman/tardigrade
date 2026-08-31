@@ -76,9 +76,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int DiffLookahead { get; set; } = 32;
 
         public bool PerWriteAccurate => true;
-        // Direct byte/halfword interception is represented as an aligned
-        // merged value in the legacy trace, so its event width is ambiguous.
-        public bool WriteTraceWidthExplicit => false;
+        // Every traced path supplies its operation width explicitly: direct
+        // interception records the requested byte/halfword/word, while the
+        // shadow-diff path records an aligned reconstructed word.
+        public bool WriteTraceWidthExplicit => true;
 
         public bool SkipShadowScan { get; set; }
 
@@ -162,28 +163,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return true;
             }
 
-            // Word-align for trace and fault tracking.
-            int aligned = (int)(offset & ~3L);
-
-            // Compute the full word value for trace recording.
-            var pre = Flash.ReadBytes(aligned, 4);
-            uint wordValue = FaultTracker.ReadU32(pre, 0);
-            if(width == 4)
-            {
-                wordValue = value;
-            }
-            else if(width == 2)
-            {
-                int shift = (int)((offset & 2) * 8);
-                wordValue = (wordValue & ~(0xFFFFU << shift)) | ((value & 0xFFFF) << shift);
-            }
-            else
-            {
-                int shift = (int)((offset & 3) * 8);
-                wordValue = (wordValue & ~(0xFFU << shift)) | ((value & 0xFF) << shift);
-            }
-
-            if(tracker.RecordWriteAndCheckFault(aligned, wordValue))
+            // Preserve the actual operation in the trace.  In particular, a
+            // byte/halfword write is not promoted to a merged aligned word:
+            // callers need the byte offset, raw little-endian value, and
+            // width to replay the same mutation.
+            if(tracker.RecordWriteAndCheckFault(checked((int)offset), value, width))
             {
                 FaultFired = true;
                 LastFaultAddress = (uint)(FlashBaseAddress + offset);
@@ -588,7 +572,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // Update shadow to reflect the write.
             flashShadow[changedOffset] = newValue;
 
-            if(tracker.RecordWriteAndCheckFault(aligned, wordValue))
+            if(tracker.RecordWriteAndCheckFault(aligned, wordValue, 4))
             {
                 FaultFired = true;
                 LastFaultAddress = (uint)(FlashBaseAddress + changedOffset);

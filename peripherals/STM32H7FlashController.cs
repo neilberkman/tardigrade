@@ -145,10 +145,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public void WriteTraceClear() => tracker.WriteTraceClear();
 
-        // The controller records an aligned merged dword for each changed
-        // chunk, but the actual access may be byte/halfword/dword width.
-        // Legacy rows therefore do not carry a safe operation width.
-        public bool WriteTraceWidthExplicit => false;
+        // Every trace row carries the canonical aligned post-state dword used
+        // by the word-granular fault model, including narrow accesses.
+        public bool WriteTraceWidthExplicit => true;
 
         public bool EraseTraceEnabled { get => tracker.EraseTraceEnabled; set => tracker.EraseTraceEnabled = value; }
 
@@ -372,7 +371,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var oldWord = ReadWordFromShadow(alignedOffset);
                 var newWord = OverlayWriteChunk(oldWord, value, cursor, inWordOffset, bytesInWord);
 
-                if(tracker.RecordWriteAndCheckFault((int)alignedOffset, newWord))
+                // Fault application and LastFaultAddress operate on the
+                // containing aligned word.  Record that same canonical
+                // post-state dword so trace replay has exactly the granularity
+                // used by the fault model, including for narrow accesses.
+                var traceOffset = (int)alignedOffset;
+                var traceValue = newWord;
+                var traceWidth = 4;
+
+                if(tracker.RecordWriteAndCheckFault(traceOffset, traceValue, traceWidth))
                 {
                     FaultFired = true;
                     LastFaultAddress = (uint)(FlashBaseAddress + alignedOffset);
