@@ -171,6 +171,7 @@ invariants:
   - nxboot_confirmed_has_recovery
   - nxboot_duplicate_update_consumed
   - nxboot_unconfirmed_internal_requires_revert
+  - nxboot_unconfirmed_internal_requires_recovery
   - successful_rollback
 expect:
   should_find_issues: false

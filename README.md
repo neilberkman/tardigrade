@@ -65,8 +65,10 @@ python3 scripts/update_protocol_analyzer.py \
 
 [`scripts/authenticated_equivalence.py`](scripts/authenticated_equivalence.py)
 runs a grammar-aware, black-box campaign against a supplied parser or harness.
-It mutates only records after both the declared authentication boundary and
-the signature record, then fails closed on malformed evidence or
+It supports legacy duplicate/reorder mutations and declarative coupled
+post-authentication copy/patch/replace cases, mutates only records after both
+the declared authentication boundary and signature record, and compares
+canonical semantic outcomes while failing closed on malformed evidence or
 authenticated-identity drift. Findings are semantic divergences in the
 supplied harness; the campaign does not claim to discover cryptographic
 weaknesses. See
@@ -484,7 +486,7 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the full repo
 - **Geometry matrix** ([`scripts/geometry_matrix.py`](scripts/geometry_matrix.py)) -- parametric slot-layout permutations to catch geometry-dependent bugs.
 - **State fuzzer** -- structured metadata-state fuzzing via the `state_fuzzer` profile block, plus the MCUboot-specific scenario generator in [`targets/mcuboot/state_fuzzer.py`](targets/mcuboot/state_fuzzer.py).
 - **Update-protocol analyzer** ([`scripts/update_protocol_analyzer.py`](scripts/update_protocol_analyzer.py)) -- checks declarative commit paths for required security gates, metadata bindings, and authenticated content.
-- **Authenticated-equivalence campaign** ([`scripts/authenticated_equivalence.py`](scripts/authenticated_equivalence.py)) -- mutates records after both the declared authentication boundary and signature record, then checks supplied harness outcomes while preserving the authenticated identity. See [`docs/authenticated-equivalence.md`](docs/authenticated-equivalence.md).
+- **Authenticated-equivalence campaign** ([`scripts/authenticated_equivalence.py`](scripts/authenticated_equivalence.py)) -- supports legacy duplicate/reorder and declarative coupled post-authentication copy/patch/replace mutations, then compares canonical semantic outcomes while preserving the authenticated identity. See [`docs/authenticated-equivalence.md`](docs/authenticated-equivalence.md).
 - **Pre-authentication bounds oracle** ([`scripts/preauth_bounds_oracle.py`](scripts/preauth_bounds_oracle.py)) -- mutates synthetic nested-header length fields and detects extent escapes before signature/key consumption. See [`docs/preauth-bounds-oracle.md`](docs/preauth-bounds-oracle.md) and [`examples/preauth_bounds_oracle/`](examples/preauth_bounds_oracle/).
 - **Authorization-review analyzer** ([`scripts/authorization_review_analyzer.py`](scripts/authorization_review_analyzer.py)) -- compares observed parsed, reviewed, digested, signed, and authorized values using complete trace evidence.
 - **NuttX runtime profile generator** ([`targets/nuttx_nxboot/generate_runtime_profile.py`](targets/nuttx_nxboot/generate_runtime_profile.py)) -- emits `baseline`, `sector_boundary_resume`, `metadata_erase_resume`, and `sector_boundary_writeback` profiles from built nxboot artifacts.

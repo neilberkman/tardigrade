@@ -1,5 +1,5 @@
 schema_version: 2
-name: synthetic_authenticated_equivalence
+name: synthetic_paired_authenticated_equivalence
 input_hex: a00441555448a104010203041003617070200444415441110102
 grammar:
   kind: tlv
@@ -13,11 +13,20 @@ authentication:
   signature_type: 161
   include_boundary: true
 mutations:
-  duplicate_types: [32]
-  reorder_types: [16, 32]
-  max_mutants: 8
+  max_mutants: 1
+  cases:
+    - id: paired-copy-and-patch
+      operations:
+        - operation: duplicate
+          source: {type: 32, occurrence: 1}
+          patches:
+            - {offset: 0, bytes_hex: "58"}
+        - operation: patch
+          target: {type: 17, occurrence: 1}
+          patches:
+            - {offset: 0, bytes_hex: "03"}
 harness:
-  command: [python3, parser.py, --input, "{input}", --mode, "{mode}"]
+  command: [python3, parser.py, --input, "{input}", --mode, vulnerable]
   timeout_seconds: 5
 mode: vulnerable
 outcomes:

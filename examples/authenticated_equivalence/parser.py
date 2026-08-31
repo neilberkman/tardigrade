@@ -73,6 +73,13 @@ def main() -> int:
         "size": len(payload),
         "installed_payload_digest": hashlib.sha256(payload).hexdigest(),
         "rollback_outcome": "none" if accepted else "rejected",
+        # Model persistent security state observed after the parser's decision.
+        # The vulnerable implementation exposes duplicate records to the state
+        # transition; the fixed implementation rejects them before installation.
+        "security_state": {
+            "accepted": accepted,
+            "payload_record_count": len(payload_values),
+        },
         "authenticated_bytes_b64": base64.b64encode(authenticated).decode("ascii"),
         "authenticated_digest": hashlib.sha256(authenticated).hexdigest(),
         "signature_bytes_b64": base64.b64encode(signature_values[0]).decode("ascii"),

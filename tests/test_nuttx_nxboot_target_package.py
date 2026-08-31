@@ -21,6 +21,7 @@ from targets.nxboot.invariants import (  # noqa: E402
     check_nxboot_duplicate_update_consumed,
     check_nxboot_roles_distinct,
     check_nxboot_unconfirmed_internal_requires_revert,
+    check_nxboot_unconfirmed_internal_requires_recovery,
 )
 from targets.nuttx_nxboot.probe import (  # noqa: E402
     NXBOOT_HEADER_MAGIC_INT,
@@ -536,6 +537,49 @@ class NuttxNxbootTargetPackageTest(unittest.TestCase):
         )
         with self.assertRaises(InvariantViolation):
             check_nxboot_duplicate_update_consumed(result)
+
+    def test_invariant_rejects_unconfirmed_internal_without_recovery(self) -> None:
+        result = SimpleNamespace(
+            nvm_state={
+                "slots": {"primary": {"bootable": True, "magic_kind": "internal"}},
+                "roles": {
+                    "primary_valid": True,
+                    "primary_confirmed": False,
+                    "recovery_valid": False,
+                    "next_boot": "none",
+                },
+            }
+        )
+        with self.assertRaises(InvariantViolation):
+            check_nxboot_unconfirmed_internal_requires_recovery(result)
+
+    def test_invariant_allows_crc_valid_but_nonbootable_internal_primary(self) -> None:
+        result = SimpleNamespace(
+            nvm_state={
+                "slots": {"primary": {"bootable": False, "magic_kind": "internal", "crc_valid": True}},
+                "roles": {
+                    "primary_valid": True,
+                    "primary_confirmed": False,
+                    "recovery_valid": False,
+                    "next_boot": "none",
+                },
+            }
+        )
+        check_nxboot_unconfirmed_internal_requires_recovery(result)
+
+    def test_invariant_allows_scheduled_update_without_recovery(self) -> None:
+        result = SimpleNamespace(
+            nvm_state={
+                "slots": {"primary": {"bootable": True, "magic_kind": "internal", "crc_valid": True}},
+                "roles": {
+                    "primary_valid": True,
+                    "primary_confirmed": False,
+                    "recovery_valid": False,
+                    "next_boot": "update",
+                },
+            }
+        )
+        check_nxboot_unconfirmed_internal_requires_recovery(result)
 
     def test_invariant_rejects_collapsed_roles(self) -> None:
         result = SimpleNamespace(

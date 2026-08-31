@@ -116,9 +116,46 @@ def check_nxboot_unconfirmed_internal_requires_revert(result, **_):
     )
 
 
+def check_nxboot_unconfirmed_internal_requires_recovery(result, **_):
+    """Reject a bootable unconfirmed internal image with no valid recovery.
+
+    nxboot's state machine only schedules a revert when ``recovery_valid`` is
+    true. If an interrupted recovery write leaves primary valid but
+    unconfirmed and recovery invalid, returning ``next_boot: none`` silently
+    accepts an image that cannot be rolled back after an application failure.
+    """
+    root = _semantic_root(result)
+    roles = _roles(root)
+    primary = _slot(root, "primary")
+    if primary.get("magic_kind") != "internal":
+        return
+    if roles.get("primary_confirmed") or not primary.get("bootable"):
+        return
+    if roles.get("next_boot") != "none":
+        return
+    if roles.get("recovery_valid"):
+        return
+    raise InvariantViolation(
+        invariant_name="nxboot_unconfirmed_internal_requires_recovery",
+        description=(
+            "Valid internal unconfirmed primary image has no valid recovery image."
+        ),
+        result=result,
+        details={
+            "primary_magic_kind": primary.get("magic_kind"),
+            "primary_bootable": primary.get("bootable"),
+            "primary_valid": roles.get("primary_valid"),
+            "primary_confirmed": roles.get("primary_confirmed"),
+            "recovery_valid": roles.get("recovery_valid"),
+            "next_boot": roles.get("next_boot"),
+        },
+    )
+
+
 INVARIANTS = {
     "nxboot_roles_distinct": check_nxboot_roles_distinct,
     "nxboot_confirmed_has_recovery": check_nxboot_confirmed_has_recovery,
     "nxboot_duplicate_update_consumed": check_nxboot_duplicate_update_consumed,
     "nxboot_unconfirmed_internal_requires_revert": check_nxboot_unconfirmed_internal_requires_revert,
+    "nxboot_unconfirmed_internal_requires_recovery": check_nxboot_unconfirmed_internal_requires_recovery,
 }

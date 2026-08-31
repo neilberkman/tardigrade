@@ -19,6 +19,7 @@ from targets.nxboot.invariants import (  # noqa: E402
     check_nxboot_confirmed_has_recovery,
     check_nxboot_duplicate_update_consumed,
     check_nxboot_unconfirmed_internal_requires_revert,
+    check_nxboot_unconfirmed_internal_requires_recovery,
 )
 from targets.nxboot.probe import _crc32, collect_state  # noqa: E402
 
@@ -92,7 +93,7 @@ class NxbootTargetPackageTest(unittest.TestCase):
     def test_invariant_rejects_confirmed_internal_without_recovery(self) -> None:
         result = SimpleNamespace(
             nvm_state={
-                "slots": {"primary": {"magic_kind": "internal"}},
+                "slots": {"primary": {"bootable": True, "magic_kind": "internal"}},
                 "roles": {
                     "primary_confirmed": True,
                     "recovery_valid": False,
@@ -122,6 +123,20 @@ class NxbootTargetPackageTest(unittest.TestCase):
         with self.assertRaises(InvariantViolation):
             check_nxboot_duplicate_update_consumed(result)
 
+    def test_invariant_allows_crc_valid_but_nonbootable_internal_primary(self) -> None:
+        result = SimpleNamespace(
+            nvm_state={
+                "slots": {"primary": {"bootable": False, "magic_kind": "internal", "crc_valid": True}},
+                "roles": {
+                    "primary_valid": True,
+                    "primary_confirmed": False,
+                    "recovery_valid": False,
+                    "next_boot": "none",
+                },
+            }
+        )
+        check_nxboot_unconfirmed_internal_requires_recovery(result)
+
     def test_invariant_requires_revert_for_unconfirmed_internal_primary(self) -> None:
         result = SimpleNamespace(
             nvm_state={
@@ -137,6 +152,91 @@ class NxbootTargetPackageTest(unittest.TestCase):
         )
         with self.assertRaises(InvariantViolation):
             check_nxboot_unconfirmed_internal_requires_revert(result)
+
+    def test_invariant_rejects_unconfirmed_internal_without_recovery(self) -> None:
+        result = SimpleNamespace(
+            nvm_state={
+                "slots": {"primary": {"bootable": True, "magic_kind": "internal"}},
+                "roles": {
+                    "primary_valid": True,
+                    "primary_confirmed": False,
+                    "recovery_valid": False,
+                    "next_boot": "none",
+                },
+            }
+        )
+        with self.assertRaises(InvariantViolation):
+            check_nxboot_unconfirmed_internal_requires_recovery(result)
+
+    def test_invariant_allows_external_unconfirmed_without_recovery(self) -> None:
+        result = SimpleNamespace(
+            nvm_state={
+                "slots": {"primary": {"bootable": True, "magic_kind": "external"}},
+                "roles": {
+                    "primary_valid": True,
+                    "primary_confirmed": False,
+                    "recovery_valid": False,
+                    "next_boot": "none",
+                },
+            }
+        )
+        check_nxboot_unconfirmed_internal_requires_recovery(result)
+
+    def test_invariant_allows_invalid_internal_primary(self) -> None:
+        result = SimpleNamespace(
+            nvm_state={
+                "slots": {"primary": {"bootable": False, "magic_kind": "internal"}},
+                "roles": {
+                    "primary_valid": False,
+                    "primary_confirmed": False,
+                    "recovery_valid": False,
+                    "next_boot": "none",
+                },
+            }
+        )
+        check_nxboot_unconfirmed_internal_requires_recovery(result)
+
+    def test_invariant_allows_confirmed_internal_primary(self) -> None:
+        result = SimpleNamespace(
+            nvm_state={
+                "slots": {"primary": {"bootable": True, "magic_kind": "internal"}},
+                "roles": {
+                    "primary_valid": True,
+                    "primary_confirmed": True,
+                    "recovery_valid": False,
+                    "next_boot": "none",
+                },
+            }
+        )
+        check_nxboot_unconfirmed_internal_requires_recovery(result)
+
+    def test_invariant_allows_valid_internal_unconfirmed_with_recovery(self) -> None:
+        result = SimpleNamespace(
+            nvm_state={
+                "slots": {"primary": {"bootable": True, "magic_kind": "internal"}},
+                "roles": {
+                    "primary_valid": True,
+                    "primary_confirmed": False,
+                    "recovery_valid": True,
+                    "next_boot": "none",
+                },
+            }
+        )
+        check_nxboot_unconfirmed_internal_requires_recovery(result)
+
+    def test_invariant_allows_scheduled_update_without_recovery(self) -> None:
+        result = SimpleNamespace(
+            nvm_state={
+                "slots": {"primary": {"bootable": True, "magic_kind": "internal"}},
+                "roles": {
+                    "primary_valid": True,
+                    "primary_confirmed": False,
+                    "recovery_valid": False,
+                    "next_boot": "update",
+                },
+            }
+        )
+        check_nxboot_unconfirmed_internal_requires_recovery(result)
 
 
 if __name__ == "__main__":
