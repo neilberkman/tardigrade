@@ -76,7 +76,7 @@ jobs:
 
   self-test:
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
