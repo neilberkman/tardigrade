@@ -69,8 +69,10 @@ jobs:
         run: |
           set -euo pipefail
           report_dir="${RUNNER_TEMP}/nativeaot_runfor_report"
+          artifact_dir="results/renode_latest_canary/nativeaot"
           rm -rf "${report_dir}"
           mkdir -p "${report_dir}"
+          mkdir -p "${artifact_dir}"
           set +e
           renode-test \
             -r "${report_dir}" \
@@ -80,8 +82,15 @@ jobs:
             >"${report_dir}/console.log" 2>&1
           renode_status=$?
           set -e
-          report="${report_dir}/output.xml"
-          if [ ! -s "${report}" ]; then
+          cp -R "${report_dir}/." "${artifact_dir}/"
+          report=""
+          for candidate in "${report_dir}/robot_output.xml" "${report_dir}/output.xml"; do
+            if [ -s "${candidate}" ]; then
+              report="${candidate}"
+              break
+            fi
+          done
+          if [ -z "${report}" ]; then
             echo "::error::Native-AOT regression produced no trustworthy Robot report"
             tail -200 "${report_dir}/console.log" || true
             exit 1

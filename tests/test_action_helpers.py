@@ -410,6 +410,10 @@ class TestActionSourceBoundaries(unittest.TestCase):
             ROOT / ".github" / "workflows" / "renode-latest-canary.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("renode-test \\\n            -r \"${report_dir}\"", source)
+        self.assertIn('"${report_dir}/robot_output.xml"', source)
+        self.assertIn('"${report_dir}/output.xml"', source)
+        self.assertIn('artifact_dir="results/renode_latest_canary/nativeaot"', source)
+        self.assertIn('cp -R "${report_dir}/." "${artifact_dir}/"', source)
         self.assertNotIn("--outputdir", source)
 
     def test_pinned_renode_workflows_verify_the_archive(self):
