@@ -17,6 +17,7 @@ from fault_classification import (
     annotate_instruction_skip_severity,
     classify_instruction_skip_severity,
     instruction_skip_severity_model,
+    result_has_initial_timeout,
     result_has_issues,
     result_is_brick,
 )
@@ -73,6 +74,23 @@ def _security_property(result: Dict[str, Any], expected_outcome: str) -> str:
 
 
 def _steady_state_status(result: Dict[str, Any]) -> str:
+    # A failed first boot intentionally skips follow-up cycles.  Do not infer
+    # persistence merely because the report copies the initial outcome into
+    # ``final_boot_outcome``; there was no second observation.
+    cycle_results = result.get("boot_cycles")
+    signals = result.get("signals")
+    cycles_run = signals.get("multiboot_cycles_run") if isinstance(signals, dict) else None
+    if isinstance(cycle_results, list):
+        # The cycle records are the authoritative observation count.  A
+        # copied/stale counter must not make one initial boot look persistent.
+        if len(cycle_results) <= 1:
+            return "single_boot_only"
+    elif cycles_run is not None:
+        try:
+            if int(cycles_run) <= 0:
+                return "single_boot_only"
+        except (TypeError, ValueError):
+            pass
     mba = result.get("multi_boot_analysis")
     if isinstance(mba, dict):
         status = str(mba.get("status") or "").strip()
@@ -692,6 +710,12 @@ def validate_runtime_findings(
         if result.get("is_control", False):
             continue
         if not result.get("fault_injected", False):
+            continue
+        # A wall-clock timeout is an incomplete observation, not a terminal
+        # security outcome.  Leave an initial timeout unvalidated; a concrete
+        # initial failure followed by a later timeout remains eligible for
+        # validation, with its multi-boot status still marked incomplete.
+        if result_has_initial_timeout(result):
             continue
         base_code = _base_fault_type_code(result.get("fault_type"))
         if base_code == "i":

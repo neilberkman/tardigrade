@@ -15,6 +15,32 @@ BOOTLOADER_ENTRY = 0x08000000
 SRAM_START = 0x20000000
 SRAM_END = 0x240A0000
 WRITE_GRANULARITY = 8
+CAMPAIGNS = {
+    "baseline": {
+        "image_suffix": "",
+        "default_fault_types": "",
+        "default_boot_cycles": 2,
+        "description": "ordinary update and recovery control",
+    },
+    "sector_boundary_resume": {
+        "image_suffix": "-sector-boundary",
+        "default_fault_types": "swap_progress",
+        "default_boot_cycles": 3,
+        "description": (
+            "resume campaign with the update image padded to the next "
+            "STM32H7 erase-sector boundary and a three-boot recovery sequence"
+        ),
+    },
+    "metadata_erase_resume": {
+        "image_suffix": "",
+        "default_fault_types": "swap_progress,interrupted_erase",
+        "default_boot_cycles": 3,
+        "description": (
+            "metadata and erase interruption campaign covering critical "
+            "slot-metadata transitions and partially completed erase recovery"
+        ),
+    },
+}
 
 
 def render_runtime_profile(
@@ -22,24 +48,51 @@ def render_runtime_profile(
     *,
     header_size: int = 0x400,
     fault_max_writes: str = "auto",
-    boot_cycles: int = 1,
+    boot_cycles: int | None = None,
     run_duration: str = "8.0",
     calibration_time_slice: str = "0.1",
     name: str = "nuttx_nxboot_real_update",
     fault_types: str = "",
+    campaign: str = "baseline",
 ) -> str:
+    try:
+        campaign_config = CAMPAIGNS[campaign]
+    except KeyError as exc:
+        raise ValueError(
+            "unsupported NuttX nxboot campaign: {} (choose {})".format(
+                campaign, ", ".join(sorted(CAMPAIGNS))
+            )
+        ) from exc
     build_dir = build_dir.resolve()
     loader_elf = build_dir / "nxboot-loader.elf"
-    primary_img = build_dir / "images" / "nxboot-primary-v1-h400.img"
-    update_img = build_dir / "images" / "nxboot-update-v2-h400.img"
+    image_suffix = campaign_config["image_suffix"]
+    primary_img = build_dir / "images" / (
+        "nxboot-primary-v1-h400{}.img".format(image_suffix)
+    )
+    update_img = build_dir / "images" / (
+        "nxboot-update-v2-h400{}.img".format(image_suffix)
+    )
 
     for required in (loader_elf, primary_img, update_img):
         if not required.exists():
             raise FileNotFoundError(required)
+        if required != loader_elf and required.stat().st_size > SLOT_SIZE:
+            raise ValueError(
+                "{} is larger than the declared nxboot slot (0x{:X} bytes)".format(
+                    required, SLOT_SIZE
+                )
+            )
+
+    selected_fault_types = fault_types or campaign_config["default_fault_types"]
+    selected_boot_cycles = (
+        int(campaign_config["default_boot_cycles"])
+        if boot_cycles is None
+        else int(boot_cycles)
+    )
 
     return """schema_version: 1
 name: {name}
-description: Real NuttX nxboot STM32H7 update profile generated from public build outputs
+description: Real NuttX nxboot STM32H7 {campaign_description}
 platform: platforms/nucleo_h753zi_tardigrade.repl
 flash_backend: faultFlash
 bootloader:
@@ -89,11 +142,17 @@ expect:
 """.format(
         rollback_line=(
             "\n  expected_rollback_at_cycle: 1"
-            if int(boot_cycles) > 1 else ""
+            if int(selected_boot_cycles) > 1 else ""
         ),
         fault_types_line=(
-            "\n  fault_types: [{}]".format(fault_types)
-            if fault_types else ""
+            "\n  fault_types: [{}]".format(
+                ", ".join(
+                    item.strip()
+                    for item in selected_fault_types.split(",")
+                    if item.strip()
+                )
+            )
+            if selected_fault_types else ""
         ),
         instruction_skip_block=(
             "\n  instruction_skip_config:"
@@ -103,7 +162,7 @@ expect:
             "\n      - { symbol: perform_update }"
             "\n      - { symbol: get_update_type }"
             "\n    skip_count: 1"
-            if "instruction_skip" in fault_types else ""
+            if "instruction_skip" in selected_fault_types else ""
         ),
         name=name,
         loader_elf=loader_elf,
@@ -119,7 +178,8 @@ expect:
         slot_size=SLOT_SIZE,
         header_size=int(header_size),
         fault_max_writes=fault_max_writes,
-        boot_cycles=max(1, int(boot_cycles)),
+        boot_cycles=max(1, int(selected_boot_cycles)),
+        campaign_description=campaign_config["description"],
         run_duration=str(run_duration),
         calibration_time_slice=str(calibration_time_slice),
     )
@@ -131,10 +191,21 @@ def main() -> int:
     parser.add_argument("--output-profile", type=Path, required=True)
     parser.add_argument("--header-size", type=lambda x: int(x, 0), default=0x400)
     parser.add_argument("--fault-max-writes", default="auto")
-    parser.add_argument("--boot-cycles", type=int, default=2)
+    parser.add_argument(
+        "--boot-cycles",
+        type=int,
+        default=None,
+        help="clean boots to execute (defaults to the selected campaign preset)",
+    )
     parser.add_argument("--run-duration", default="8.0")
     parser.add_argument("--calibration-time-slice", default="0.1")
     parser.add_argument("--name", default="nuttx_nxboot_real_update")
+    parser.add_argument(
+        "--campaign",
+        choices=tuple(sorted(CAMPAIGNS)),
+        default="baseline",
+        help="named second-wave campaign preset (default: baseline)",
+    )
     parser.add_argument(
         "--fault-types",
         default="",
@@ -151,6 +222,7 @@ def main() -> int:
         calibration_time_slice=args.calibration_time_slice,
         name=args.name,
         fault_types=args.fault_types,
+        campaign=args.campaign,
     )
     args.output_profile.parent.mkdir(parents=True, exist_ok=True)
     args.output_profile.write_text(rendered)

@@ -28,6 +28,17 @@ from boundary_snapshot import (
     write_snapshot as _write_boundary_snapshot_artifact,
 )
 from boundary_reserved import BOUNDARY_RESERVED_VARIABLES
+from boot_outcomes import boot_outcome_after_stop, count_followup_boot_cycles
+from writeback_reconstruction import (
+    AmbiguousWriteEvent,
+    normalise_write_event,
+    parse_write_trace_record,
+    reconstruct_committed_snapshot,
+    validate_erase_trace_data,
+    validate_write_trace_width,
+    is_known_writeback_fault_type,
+    is_unsupported_writeback_fault_type,
+)
 
 
 def _try_disable_backend_fast_path(periph):
@@ -334,6 +345,13 @@ def resolve_backend():
     else:
         kind = 'fast'
 
+    # Legacy CSV traces have no width column.  Only a backend that explicitly
+    # promises four-byte trace records may be used to interpret them; all
+    # width-aware traces are validated centrally below.
+    write_trace_width_explicit = bool(
+        getattr(backend_obj, 'WriteTraceWidthExplicit', False)
+    )
+
     # Optional separate NVM controller (e.g. command-register controller in
     # front of MRAM memory).  Enables command_drop fault injection.
     controller = None
@@ -405,6 +423,7 @@ def resolve_backend():
         'data': backend_obj,
         'controller': controller,
         'backend_sysbus_name': backend_name,
+        'write_trace_width_explicit': write_trace_width_explicit,
         'ctrl_sysbus_name': ctrl_sysbus_name,
         'supports_command_fault': supports_command_fault,
         'command_fault_reason': command_fault_reason,
@@ -589,6 +608,12 @@ if sweep_diff_lookahead < 1:
 if sweep_diff_lookahead > 2147483647:
     sweep_diff_lookahead = 2147483647
 postmortem_dump_no_boot = str(monitor.GetVariable('postmortem_dump_no_boot')).strip().lower() in ('1', 'true', 'yes')
+# Postmortem evidence is intentionally bounded independently of erase-sector
+# size.  A large physical sector must not turn into a large JSON/base64 dump.
+POSTMORTEM_MAX_REGION_BYTES = 16384
+POSTMORTEM_MAX_RAW_BYTES = 4096
+POSTMORTEM_PARTITION_CHUNK_BYTES = 65536
+POSTMORTEM_PARTITION_TAIL_BYTES = 512
 postmortem_dump_header_bytes_raw = str(monitor.GetVariable('postmortem_dump_header_bytes')).strip()
 try:
     postmortem_dump_header_bytes = int(postmortem_dump_header_bytes_raw, 0)
@@ -596,6 +621,34 @@ except Exception:
     postmortem_dump_header_bytes = 4096
 if postmortem_dump_header_bytes < 32:
     postmortem_dump_header_bytes = 32
+postmortem_dump_header_bytes = min(postmortem_dump_header_bytes, POSTMORTEM_MAX_REGION_BYTES)
+postmortem_dump_trailer_bytes = get_optional_int_var(
+    'postmortem_dump_trailer_bytes', 4096
+)
+if postmortem_dump_trailer_bytes < 32:
+    postmortem_dump_trailer_bytes = 32
+postmortem_dump_trailer_bytes = min(
+    postmortem_dump_trailer_bytes, POSTMORTEM_MAX_REGION_BYTES
+)
+postmortem_layout = {'contract_version': 1, 'erase_regions': [], 'partitions': []}
+postmortem_layout_source = 'fallback_page_size'
+postmortem_layout_raw = get_optional_var('postmortem_layout_b64', '')
+if postmortem_layout_raw:
+    try:
+        _decoded_layout = json.loads(
+            base64.b64decode(postmortem_layout_raw).decode('utf-8')
+        )
+        if (
+            isinstance(_decoded_layout, dict)
+            and int(_decoded_layout.get('contract_version', 0)) == 1
+        ):
+            postmortem_layout = _decoded_layout
+            if _decoded_layout.get('erase_regions'):
+                postmortem_layout_source = 'profile_declared'
+        else:
+            log('WARNING: ignoring unsupported postmortem layout contract')
+    except Exception as _layout_exc:
+        log('WARNING: ignoring invalid postmortem layout: {}'.format(_layout_exc))
 resume_trace_no_boot = str(monitor.GetVariable('resume_trace_no_boot')).strip().lower() in ('1', 'true', 'yes')
 resume_trace_max_ops_raw = str(monitor.GetVariable('resume_trace_max_ops')).strip()
 try:
@@ -611,6 +664,13 @@ zero_point_execute_control = get_optional_var(
 ).strip().lower() in ('1', 'true', 'yes')
 phase1_time_slice = get_optional_var('phase1_time_slice', '0.02')
 phase2_time_slice = get_optional_var('phase2_time_slice', '0.05')
+phase2_wall_timeout_raw = get_optional_var('phase2_wall_timeout_s', '30')
+try:
+    phase2_wall_timeout_s = float(phase2_wall_timeout_raw)
+except Exception:
+    phase2_wall_timeout_s = 30.0
+if not (phase2_wall_timeout_s > 0):
+    phase2_wall_timeout_s = 30.0
 resume_trace_wall_timeout_raw = str(monitor.GetVariable('resume_trace_wall_timeout_s')).strip()
 try:
     resume_trace_wall_timeout_s = float(resume_trace_wall_timeout_raw)
@@ -2526,6 +2586,26 @@ writeback_buffer_capacity = str(monitor.GetVariable('writeback_buffer_capacity')
 writeback_barriers = str(monitor.GetVariable('writeback_barriers')).strip()
 writeback_erase_flushes = str(monitor.GetVariable('writeback_erase_flushes')).strip().lower() in ('1', 'true', 'yes')
 
+# Writeback reconstruction is an execute-mode model.  State evaluation cannot
+# produce a committed physical snapshot, so reject it before overlay setup or
+# fault dispatch rather than silently evaluating direct persistent state.
+if durability_model.lower() == 'writeback' and evaluation_mode != 'execute':
+    raise RuntimeError(
+        'durability_model=writeback requires evaluation_mode=execute; '
+        'state evaluation is fail-closed'
+    )
+
+# A writeback campaign is only meaningful when the runner can capture and
+# reconstruct the physical program stream.  The nvm_ctrl/slow path currently
+# has no operation trace or volatile overlay; letting it continue would silently
+# evaluate direct persistent state as if it were writeback state.
+if durability_model == 'writeback' and backend['kind'] == 'slow':
+    raise RuntimeError(
+        'durability_model=writeback is unsupported for backend {}: '
+        'nvm_ctrl has no bounded width-aware trace/overlay path; campaign '
+        'refused before fault dispatch'.format(backend['backend_sysbus_name'])
+    )
+
 # ---------------------------------------------------------------------------
 # Writeback durability layer
 #
@@ -2552,6 +2632,8 @@ writeback_erase_flushes = str(monitor.GetVariable('writeback_erase_flushes')).st
 writeback_domains = {}
 _writeback_barriers = set()
 _writeback_barrier_events = []  # list of dicts recording barrier flush events
+_writeback_snapshot_reconstruction_status = None
+_WRITEBACK_RECONSTRUCTION_OK = frozenset(('reconstructed', 'trace_replay'))
 
 if durability_model == 'writeback':
     # Inline erase size calc (effective_page_size not yet defined at this point).
@@ -2630,26 +2712,96 @@ def writeback_reset_barrier_events():
     _writeback_barrier_events[:] = []
 
 
+def _writeback_legacy_trace_width():
+    """Return the explicit width for a legacy three-column trace, if safe."""
+    try:
+        if bool(backend.get('write_trace_width_explicit', False)):
+            return 4
+    except Exception:
+        pass
+    return None
+
+
+def _validated_writeback_trace(trace_data):
+    """Normalize writeback events while enforcing legacy-width capability."""
+    return validate_write_trace_width(
+        trace_data,
+        legacy_width=_writeback_legacy_trace_width(),
+    )
+
+
+def _writeback_unsupported_fault_result(fault_at, fault_type):
+    """Return an explicit infrastructure result for unsupported writeback paths."""
+    fault_code = str(fault_type or '').strip().lower().split(':', 1)[0]
+    if not is_known_writeback_fault_type(fault_type):
+        reason = (
+            'durability_model=writeback received unknown or malformed fault '
+            'path {!r}; refusing to default it to power loss'.format(
+                str(fault_type)
+            )
+        )
+        reconstruction_signal = 'unknown_fault_path'
+    elif fault_code in ('e', 'a', 'interrupted_erase', 'multi_sector_atomicity'):
+        reason = (
+            'durability_model=writeback does not support erase/atomicity fault '
+            'path {!r}; the captured partial/neighbor-corruption snapshot cannot '
+            'be reconstructed from the clean baseline'.format(str(fault_type))
+        )
+        reconstruction_signal = 'unsupported_erase_atomicity_path'
+    else:
+        reason = (
+            'durability_model=writeback does not support lifecycle/compound fault '
+            'path {!r}; no committed-snapshot reconstruction is available'.format(
+                str(fault_type)
+            )
+        )
+        reconstruction_signal = 'unsupported_lifecycle_path'
+    return {
+        'fault_at': fault_at,
+        'fault_requested': fault_at,
+        'fault_type': fault_type,
+        'fault_injected': False,
+        'fault_address': '0x00000000',
+        'boot_outcome': 'infra_error',
+        'boot_slot': None,
+        'fault_class': 'infrastructure_error',
+        'actual_writes': 0,
+        'signals': {
+            'trace_replay_mode': 'unsupported',
+            'writeback_reconstruction': reconstruction_signal,
+        },
+        'durability_model': 'writeback',
+        'writeback_snapshot_reconstruction': {
+            'status': 'unsupported',
+            'reason': reason,
+        },
+        'infrastructure_error': True,
+        'error_kind': 'writeback_unsupported_fault',
+        'error': reason,
+    }
+
+
 def writeback_simulate_buffer(trace_data, erase_trace, fault_at, flash_base_addr, page_size, record_events=False):
     # Simulate the writeback buffer over a trace to compute dirty state at
     # fault_at.  Returns (committed_indices, uncommitted_buffer, events).
     #
     # committed_indices: set of write_index values that were flushed.
-    # uncommitted_buffer: list of (write_index, flash_offset, value) still dirty.
+    # uncommitted_buffer: list of (write_index, flash_offset, value, width).
     # events: list of barrier event dicts (only populated when record_events=True).
     cap = writeback_capacity()
     has_barriers = len(_writeback_barriers) > 0
 
+    trace_events = _validated_writeback_trace(trace_data)
     pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace]
     pending_erases.sort()
     erase_idx = 0
 
-    buffer = []  # (write_index, flash_offset, value)
+    buffer = []  # (write_index, flash_offset, value, width)
     committed = set()
     events = []
 
     def _flush(trigger, wi, addr):
-        for bi, boff, bval in buffer:
+        for bi, boff, bval, _bwidth in buffer:
             committed.add(bi)
         if record_events and buffer:
             events.append({
@@ -2661,7 +2813,7 @@ def writeback_simulate_buffer(trace_data, erase_trace, fault_at, flash_base_addr
             })
         buffer[:] = []
 
-    for write_idx, flash_off, value in trace_data:
+    for write_idx, flash_off, value, width in trace_events:
         if write_idx > fault_at:
             break
 
@@ -2672,19 +2824,19 @@ def writeback_simulate_buffer(trace_data, erase_trace, fault_at, flash_base_addr
                 _flush('erase_flush', e_wap, flash_base_addr + e_off)
             else:
                 buffer[:] = [
-                    (bi, boff, bval) for bi, boff, bval in buffer
-                    if not (e_off <= boff < e_off + e_sz)
+                    (bi, boff, bval, bwidth) for bi, boff, bval, bwidth in buffer
+                    if not (boff < e_off + e_sz and e_off < boff + bwidth)
                 ]
             erase_idx += 1
 
         if write_idx <= fault_at:
-            buffer.append((write_idx, flash_off, value))
+            buffer.append((write_idx, flash_off, value, width))
             bus_addr = flash_off + flash_base_addr
             if has_barriers and bus_addr in _writeback_barriers:
                 _flush('address', write_idx, bus_addr)
             else:
                 while len(buffer) > cap:
-                    bi, boff, bval = buffer.pop(0)
+                    bi, boff, bval, _bwidth = buffer.pop(0)
                     committed.add(bi)
                     if record_events:
                         events.append({
@@ -2694,6 +2846,21 @@ def writeback_simulate_buffer(trace_data, erase_trace, fault_at, flash_base_addr
                             'address': flash_base_addr + boff,
                             'flushed_count': 1,
                         })
+
+    # An erase is recorded with the write count immediately before it starts.
+    # Drain erases at the fault boundary even when no later write exists.
+    while erase_idx < len(pending_erases):
+        e_wap, e_off, e_sz = pending_erases[erase_idx]
+        if e_wap > fault_at:
+            break
+        if writeback_erase_flushes:
+            _flush('erase_flush', e_wap, flash_base_addr + e_off)
+        else:
+            buffer[:] = [
+                (bi, boff, bval, bwidth) for bi, boff, bval, bwidth in buffer
+                if not (boff < e_off + e_sz and e_off < boff + bwidth)
+            ]
+        erase_idx += 1
 
     return committed, list(buffer), events
 
@@ -2707,7 +2874,7 @@ def writeback_dirty_state_at(trace_data, erase_trace, fault_at, flash_base_addr,
         trace_data, erase_trace, fault_at, flash_base_addr, page_size,
     )
     per_domain = {}
-    for wi, foff, val in uncommitted:
+    for wi, foff, val, _width in uncommitted:
         bus_addr = foff + flash_base_addr
         dname = writeback_domain_for_address(bus_addr) or 'unknown'
         if dname not in per_domain:
@@ -2732,36 +2899,58 @@ def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_
     #
     # Barrier semantics: when a write targets a barrier address, the entire
     # buffer (including that write) is flushed to flash immediately.
+    global _writeback_snapshot_reconstruction_status
+    if not trace_data:
+        _writeback_snapshot_reconstruction_status = {
+            'status': 'disabled', 'reason': 'empty_write_trace'
+        }
+        return 0, False, 0, 0
+    _writeback_snapshot_reconstruction_status = {
+        'status': 'trace_replay', 'reason': 'committed_events_replayed_directly'
+    }
     import System
 
+    try:
+        trace_events = _validated_writeback_trace(trace_data)
+    except Exception as exc:
+        _writeback_snapshot_reconstruction_status = {
+            'status': 'disabled',
+            'reason': 'malformed_write_trace:{}'.format(exc),
+        }
+        return 0, False, 0, 0
     cap = writeback_capacity()
     has_barriers = len(_writeback_barriers) > 0
 
     # Pre-sort erases by their write-at-point for interleaving.
-    pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace]
+    try:
+        pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace]
+    except Exception as exc:
+        _writeback_snapshot_reconstruction_status = {
+            'status': 'disabled',
+            'reason': 'malformed_erase_trace:{}'.format(exc),
+        }
+        return 0, False, 0, 0
     pending_erases.sort()
     erase_idx = [0]  # mutable container to allow mutation from helper scope
 
-    # Buffer: list of (write_index, flash_offset, value) for uncommitted writes.
+    # Buffer: list of (write_index, flash_offset, value, width) for uncommitted writes.
     buffer = []
     writes_applied = [0]  # mutable container for same reason
     fault_injected = False
     fault_address = 0
 
-    def _wb_write_word(flash_off, value):
-        # Write a single 4-byte word to flash.
-        b = System.Array.CreateInstance(System.Byte, 4)
-        b[0] = value & 0xFF
-        b[1] = (value >> 8) & 0xFF
-        b[2] = (value >> 16) & 0xFF
-        b[3] = (value >> 24) & 0xFF
+    def _wb_write_event(flash_off, value, width):
+        # Replay one program event to flash.
+        b = System.Array.CreateInstance(System.Byte, width)
+        for byte_index in range(width):
+            b[byte_index] = (value >> (8 * byte_index)) & 0xFF
         flash_ref.WriteBytes(flash_off, b)
 
     def _wb_flush_buffer(trigger='address', write_index=0, bus_addr=0):
         # Flush all buffered writes to physical flash.
         cnt = len(buffer)
-        for _bi, _boff, _bval in buffer:
-            _wb_write_word(_boff, _bval)
+        for _bi, _boff, _bval, _bwidth in buffer:
+            _wb_write_event(_boff, _bval, _bwidth)
             writes_applied[0] += 1
         buffer[:] = []
         if cnt > 0:
@@ -2775,15 +2964,15 @@ def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_
         else:
             # Clear buffered writes that fall in the erased range.
             buffer[:] = [
-                (bi, boff, bval) for bi, boff, bval in buffer
-                if not (e_off <= boff < e_off + e_sz)
+                (bi, boff, bval, bwidth) for bi, boff, bval, bwidth in buffer
+                if not (boff < e_off + e_sz and e_off < boff + bwidth)
             ]
         erase_buf = System.Array.CreateInstance(System.Byte, e_sz)
         for bi in range(e_sz):
             erase_buf[bi] = 0xFF
         flash_ref.WriteBytes(int(e_off), erase_buf)
 
-    for write_idx, flash_off, value in trace_data:
+    for write_idx, flash_off, value, width in trace_events:
         if write_idx > fault_at + 1:
             break
 
@@ -2795,7 +2984,7 @@ def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_
 
         if write_idx <= fault_at:
             # Add to buffer.
-            buffer.append((write_idx, flash_off, value))
+            buffer.append((write_idx, flash_off, value, width))
 
             # Check barrier: if the bus address hits a barrier, flush everything.
             bus_addr = flash_off + flash_base_addr
@@ -2805,8 +2994,8 @@ def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_
             else:
                 # Evict oldest if buffer exceeds capacity.
                 while len(buffer) > cap:
-                    _bi, _boff, _bval = buffer.pop(0)
-                    _wb_write_word(_boff, _bval)
+                    _bi, _boff, _bval, _bwidth = buffer.pop(0)
+                    _wb_write_event(_boff, _bval, _bwidth)
                     writes_applied[0] += 1
                     writeback_record_barrier_event(
                         _bi, 'capacity', 1, flash_base_addr + _boff)
@@ -2829,7 +3018,7 @@ def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_
     return writes_applied[0], fault_injected, fault_address, discarded
 
 
-def writeback_strip_uncommitted_from_snapshot(snapshot_bytes, trace_data, erase_trace, fault_at, flash_base_addr, page_size):
+def _writeback_strip_uncommitted_from_snapshot_legacy(snapshot_bytes, trace_data, erase_trace, fault_at, flash_base_addr, page_size):
     # Execute-mode variant: given a full flash snapshot (with ALL writes
     # applied), revert the uncommitted writes to produce the committed-only
     # state.
@@ -2960,6 +3149,83 @@ def writeback_strip_uncommitted_from_snapshot(snapshot_bytes, trace_data, erase_
     return bytes(committed), len(buffer)
 
 
+def _writeback_trace_width_is_safe(trace_data):
+    """Reject legacy aligned-word traces from byte-program backends.
+
+    STM32F4FastFlash's PG transition is an explicit four-byte operation.  The
+    older STM32F4 controller can observe byte/halfword programs but exports
+    only an aligned word and merged value, so applying a four-byte rollback to
+    that trace could erase neighbouring trailer bytes.
+    """
+    try:
+        _validated_writeback_trace(trace_data)
+        return True
+    except Exception:
+        return False
+
+
+def writeback_strip_uncommitted_from_snapshot(
+    snapshot_bytes,
+    trace_data,
+    erase_trace,
+    fault_at,
+    flash_base_addr,
+    page_size,
+    initial_snapshot=None,
+):
+    """Return the committed image at a power-loss boundary.
+
+    The old implementation guessed a pre-write value from write history and
+    therefore ignored a sector erase between the previous and pending write.
+    Reconstructing from the clean baseline keeps erases and byte/halfword
+    events in chronological order.  Legacy traces are accepted only for a
+    backend known to emit four-byte events.
+    """
+    global _writeback_snapshot_reconstruction_status
+    if not trace_data:
+        _writeback_snapshot_reconstruction_status = {
+            'status': 'disabled', 'reason': 'missing_trace_data'
+        }
+        log('writeback: no trace data for execute-mode snapshot stripping')
+        return snapshot_bytes, 0
+    if initial_snapshot is None:
+        _writeback_snapshot_reconstruction_status = {
+            'status': 'disabled', 'reason': 'missing_clean_baseline'
+        }
+        log('writeback: no clean baseline; refusing execute snapshot stripping')
+        return snapshot_bytes, 0
+    if not _writeback_trace_width_is_safe(trace_data):
+        _writeback_snapshot_reconstruction_status = {
+            'status': 'disabled', 'reason': 'width_ambiguous_trace'
+        }
+        log('writeback: refusing width-ambiguous execute snapshot stripping')
+        return snapshot_bytes, 0
+    try:
+        erase_trace = _validated_erase_trace(erase_trace)
+        committed, discarded = reconstruct_committed_snapshot(
+            initial_snapshot,
+            trace_data,
+            erase_trace,
+            fault_at,
+            flash_base_addr,
+            page_size,
+            writeback_capacity(),
+            barriers=_writeback_barriers,
+            erase_fill=(0x00 if backend['kind'] == 'mram' else 0xFF),
+            erase_flushes_domain=writeback_erase_flushes,
+        )
+    except Exception as exc:
+        _writeback_snapshot_reconstruction_status = {
+            'status': 'disabled', 'reason': 'reconstruction_error:{}'.format(exc)
+        }
+        log('writeback: refusing execute snapshot reconstruction: {}'.format(exc))
+        return snapshot_bytes, 0
+    _writeback_snapshot_reconstruction_status = {
+        'status': 'reconstructed', 'discarded_events': int(discarded)
+    }
+    return committed, discarded
+
+
 # Total words in the copy (for state mode).
 total_copy_writes = slot_exec_size // write_granularity
 
@@ -3017,10 +3283,17 @@ def normalize_signal_token(value):
 def to_py_bytes(raw):
     if raw is None:
         return None
-    try:
-        return bytes(raw)
-    except Exception:
-        return bytes([int(x) & 0xFF for x in raw])
+    result = bytearray()
+    for value in raw:
+        try:
+            # Python 2/IronPython byte strings and character-yielding CLR
+            # wrappers iterate as one-character strings rather than ints.
+            value = ord(value)
+        except TypeError:
+            # Python 3 bytes/bytearray and CLR System.Byte values are numeric.
+            value = int(value)
+        result.append(value & 0xFF)
+    return result
 
 
 _state_probe_collect = None
@@ -3102,6 +3375,12 @@ def build_cycle_record(cycle_index, boot_outcome, boot_slot, signals, stop_statu
     if semantic_state is not None:
         record['semantic_state'] = semantic_state
     return record
+
+
+def set_multiboot_cycles_run(signals, cycle_records):
+    """Record follow-up boot attempts (cycle zero is the initial boot)."""
+    if isinstance(signals, dict) and isinstance(cycle_records, list):
+        signals['multiboot_cycles_run'] = count_followup_boot_cycles(cycle_records)
 
 
 def merge_stop_status_signals(signals, prefix, status):
@@ -3446,7 +3725,9 @@ def restore_boundary_persistent_snapshot(path):
     _boundary_snapshot_loaded = True
 
 
-def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=None, wall_timeout=10):
+def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=None, wall_timeout=None):
+    if wall_timeout is None:
+        wall_timeout = phase2_wall_timeout_s
     cpu_ref = monitor.Machine['sysbus.cpu']
     reset_nvmc_for_recovery()
     arm_vtor_watchpoint()
@@ -3468,6 +3749,7 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
         fault_injected=fault_injected,
         enforce_content_criteria=False,
         effective_criteria=effective_criteria,
+        p2_status=status,
     )
     signals['followup_cycle'] = int(cycle_index)
     signals['phase_followup_stop_reason'] = status.get('reason')
@@ -3482,7 +3764,9 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
     )
 
 
-def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injected, label, effective_criteria=None, cycle_wall_timeout=10):
+def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injected, label, effective_criteria=None, cycle_wall_timeout=None):
+    if cycle_wall_timeout is None:
+        cycle_wall_timeout = phase2_wall_timeout_s
     b = backend
     if b['kind'] == 'slow':
         return cycle_records, {
@@ -3515,7 +3799,7 @@ def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injec
 
 def run_followup_boot_cycles(initial_boot_outcome, initial_boot_slot, initial_signals,
                              initial_status=None, fault_injected=False, label='followup',
-                             effective_criteria=None, cycle_wall_timeout=10,
+                             effective_criteria=None, cycle_wall_timeout=None,
                              skip_if_initial_failed=False):
     cycle_records = [
         build_cycle_record(
@@ -3583,6 +3867,7 @@ def run_hook_fault(hook_fault_at, hook_fault_type='w'):
             'skip_reason': reason,
         }
         if cycle_records is not None:
+            set_multiboot_cycles_run(result['signals'], cycle_records)
             result['boot_cycles'] = cycle_records
             result['multi_boot_analysis'] = analyze_boot_cycles(cycle_records)
         return result
@@ -3616,7 +3901,7 @@ def run_hook_fault(hook_fault_at, hook_fault_type='w'):
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     boot_outcome0, boot_slot0, signals0 = evaluate_boot_outcome(
-        vtor_value, pc_value, fault_injected=False
+        vtor_value, pc_value, fault_injected=False, p2_status=phase1_status
     )
     signals0['phase1_ms'] = phase1_ms
     signals0['phase2_ms'] = 0
@@ -3683,6 +3968,7 @@ def run_hook_fault(hook_fault_at, hook_fault_type='w'):
     cycle1_signals['phase2_ms'] = int(phase2_ms)
     cycle1_signals['hook_ms'] = int(hook_ms)
     cycle1_signals['followup_ms'] = int(followup_ms)
+    set_multiboot_cycles_run(cycle1_signals, cycle_records)
 
     result = {
         'fault_at': hook_fault_at,
@@ -3864,6 +4150,7 @@ def run_confirm_cycle_fault(cc_fault_at, cc_fault_type='w'):
             'skip_reason': reason,
         }
         if cycle_records is not None:
+            set_multiboot_cycles_run(result['signals'], cycle_records)
             result['boot_cycles'] = cycle_records
             result['multi_boot_analysis'] = analyze_boot_cycles(cycle_records)
         return result
@@ -3903,7 +4190,7 @@ def run_confirm_cycle_fault(cc_fault_at, cc_fault_type='w'):
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     boot_outcome0, boot_slot0, signals0 = evaluate_boot_outcome(
-        vtor_value, pc_value, fault_injected=False
+        vtor_value, pc_value, fault_injected=False, p2_status=phase1_status
     )
     signals0['phase1_ms'] = phase1_ms
     signals0['confirm_ms'] = 0
@@ -4011,6 +4298,7 @@ def run_confirm_cycle_fault(cc_fault_at, cc_fault_type='w'):
     cycle1_signals['phase2_ms'] = int(phase3_ms)
     cycle1_signals['confirm_ms'] = int(confirm_ms)
     cycle1_signals['followup_ms'] = int(followup_ms)
+    set_multiboot_cycles_run(cycle1_signals, cycle_records)
 
     result = {
         'fault_at': cc_fault_at,
@@ -4052,6 +4340,48 @@ def effective_page_size():
         except Exception:
             pass
     return 4096
+
+
+def known_erase_regions():
+    """Return geometry for backends whose sector map is part of the model.
+
+    STM32F4's PageSize is the largest sector, not a uniform erase size.  The
+    model has a fixed F429 map, so expose that known fact to evidence without
+    changing a profile's declared slot geometry.
+    """
+    try:
+        type_name = str(backend['data'].GetType().FullName)
+    except Exception:
+        type_name = str(type(backend.get('data')))
+    if 'STM32F4FastFlash' not in type_name and 'STM32F4FlashController' not in type_name:
+        return []
+    try:
+        base = int(backend['data'].FlashBaseAddress)
+        flash_size = int(backend['data'].FlashSize)
+    except Exception:
+        return []
+    bank = [0x4000, 0x4000, 0x4000, 0x4000, 0x10000] + [0x20000] * 7
+    sizes = bank + bank
+    regions = []
+    offset = 0
+    for sector_size in sizes:
+        if offset >= flash_size:
+            break
+        size = min(sector_size, flash_size - offset)
+        regions.append({
+            'base': base + offset,
+            'size': size,
+            'sector_size': size,
+        })
+        offset += size
+    return regions
+
+
+if not postmortem_layout.get('erase_regions'):
+    _known_layout = known_erase_regions()
+    if _known_layout:
+        postmortem_layout['erase_regions'] = _known_layout
+        postmortem_layout_source = 'modeled_backend'
 
 def flash_geometry():
     slot_bases = [int(slot_exec_base), int(slot_staging_base)]
@@ -4130,39 +4460,149 @@ def read_flash_bytes(start_addr, size):
     try:
         return to_py_bytes(b['data'].Nvm.ReadBytes(rel, max_len, None))
     except Exception:
-        return bytes([as_int(bus.ReadByte(start_addr + i)) & 0xFF for i in range(max_len)])
+        result = bytearray()
+        for i in range(max_len):
+            result.append(as_int(bus.ReadByte(start_addr + i)) & 0xFF)
+        return result
 
-def region_dump(region_bytes, region_addr):
+def region_dump(region_bytes, region_addr, raw_limit=POSTMORTEM_MAX_RAW_BYTES):
     import base64
     import hashlib
-    non_ff = []
+    region_bytes = to_py_bytes(region_bytes)
+    raw_limit = max(0, min(int(raw_limit), POSTMORTEM_MAX_RAW_BYTES))
+    non_ff_count = 0
+    non_ff_preview = []
     for i, b in enumerate(region_bytes):
         if b != 0xFF:
-            non_ff.append({
-                'offset': i,
-                'address': fmt_u32(region_addr + i),
-                'value': fmt_u8(b),
-            })
-    non_ff_preview = non_ff[:512]
+            non_ff_count += 1
+            if len(non_ff_preview) < 512:
+                non_ff_preview.append({
+                    'offset': i,
+                    'address': fmt_u32(region_addr + i),
+                    'value': fmt_u8(b),
+                })
+    raw_bytes = bytes(region_bytes[:raw_limit])
     return {
         'address': fmt_u32(region_addr),
         'size': len(region_bytes),
-        'all_ff': len(non_ff) == 0,
-        'non_ff_count': len(non_ff),
+        'all_ff': non_ff_count == 0,
+        'non_ff_count': non_ff_count,
         'non_ff_preview': non_ff_preview,
-        'non_ff_preview_truncated': len(non_ff) > len(non_ff_preview),
+        'non_ff_preview_truncated': non_ff_count > len(non_ff_preview),
         'sha256': hashlib.sha256(region_bytes).hexdigest(),
-        'raw_base64': base64.b64encode(region_bytes).decode('ascii'),
+        'raw_base64': base64.b64encode(raw_bytes).decode('ascii'),
+        'raw_base64_bytes': len(raw_bytes),
+        'raw_base64_truncated': len(raw_bytes) < len(region_bytes),
     }
 
-def evaluate_slot_header(slot_base, slot_size, header_bytes):
-    if len(header_bytes) < 8:
+
+def streamed_region_dump(region_addr, region_size, snapshot_bytes=None,
+                         raw_limit=POSTMORTEM_MAX_RAW_BYTES,
+                         chunk_size=POSTMORTEM_PARTITION_CHUNK_BYTES,
+                         tail_limit=POSTMORTEM_PARTITION_TAIL_BYTES):
+    """Collect bounded evidence while hashing a partition incrementally.
+
+    Generic postmortem partitions may be much larger than the small header
+    and trailer windows.  Read them in bounded chunks and retain only a
+    preview, raw prefix, and raw suffix; the complete-region digest is emitted
+    only when the requested range was fully readable.
+    """
+    import base64
+    import hashlib
+
+    requested_size = max(0, int(region_size))
+    raw_limit = max(0, min(int(raw_limit), POSTMORTEM_MAX_RAW_BYTES))
+    chunk_size = max(1, min(int(chunk_size), POSTMORTEM_PARTITION_CHUNK_BYTES))
+    tail_limit = max(0, min(int(tail_limit), POSTMORTEM_MAX_RAW_BYTES))
+    digest = hashlib.sha256()
+    raw_bytes = bytearray()
+    tail_bytes = bytearray()
+    non_ff_count = 0
+    non_ff_preview = []
+    total_read = 0
+
+    while total_read < requested_size:
+        want = min(chunk_size, requested_size - total_read)
+        chunk = read_flash_span(
+            int(region_addr) + total_read,
+            want,
+            snapshot_bytes=snapshot_bytes,
+        )
+        if not chunk:
+            break
+        if len(chunk) > want:
+            chunk = chunk[:want]
+        # Normalize CLR signed bytes and IronPython character iteration before
+        # every consumer sees the chunk.  In particular, -1 and '\xff' must
+        # both count as erased 0xFF rather than non-erased values.
+        chunk = to_py_bytes(chunk)
+        digest.update(chunk)
+        if len(raw_bytes) < raw_limit:
+            raw_bytes.extend(chunk[:raw_limit - len(raw_bytes)])
+        if tail_limit > 0:
+            tail_bytes.extend(chunk)
+            if len(tail_bytes) > tail_limit:
+                del tail_bytes[:len(tail_bytes) - tail_limit]
+        for index, value in enumerate(chunk):
+            if value != 0xFF:
+                non_ff_count += 1
+                if len(non_ff_preview) < 512:
+                    absolute_offset = total_read + index
+                    non_ff_preview.append({
+                        'offset': absolute_offset,
+                        'address': fmt_u32(int(region_addr) + absolute_offset),
+                        'value': fmt_u8(value),
+                    })
+        total_read += len(chunk)
+        if len(chunk) < want:
+            break
+
+    complete = total_read == requested_size
+    tail_offset = max(0, total_read - len(tail_bytes))
+    tail_hex = ''.join('{:02x}'.format(int(value) & 0xFF) for value in tail_bytes)
+    tail_base64 = base64.b64encode(bytes(tail_bytes)).decode('ascii')
+    return {
+        'address': fmt_u32(region_addr),
+        'size': total_read,
+        'requested_size': requested_size,
+        'read_complete': complete,
+        'all_ff': non_ff_count == 0,
+        'non_ff_count': non_ff_count,
+        'non_ff_preview': non_ff_preview,
+        'non_ff_preview_truncated': non_ff_count > len(non_ff_preview),
+        'sha256': digest.hexdigest() if complete else None,
+        'raw_base64': base64.b64encode(bytes(raw_bytes)).decode('ascii'),
+        'raw_base64_bytes': len(raw_bytes),
+        'raw_base64_truncated': len(raw_bytes) < total_read,
+        'tail_hex': tail_hex,
+        'tail_base64': tail_base64,
+        'tail_base64_bytes': len(tail_bytes),
+        'tail_base64_truncated': len(tail_bytes) < total_read,
+        'tail_offset': tail_offset,
+        'tail_address': fmt_u32(int(region_addr) + tail_offset),
+        'tail_size': len(tail_bytes),
+        'tail_source': 'streamed_read_suffix',
+        'tail_provenance': {
+            'source': 'streamed_read_suffix',
+            'offset': tail_offset,
+            'address': fmt_u32(int(region_addr) + tail_offset),
+            'size': len(tail_bytes),
+            'limit': tail_limit,
+            'complete': bool(complete),
+        },
+    }
+
+def evaluate_slot_header(slot_base, slot_size, vector_bytes, vector_table_offset=0):
+    """Validate a vector table while keeping image-header evidence separate."""
+    vector_table_offset = max(0, int(vector_table_offset))
+    if len(vector_bytes) < 8:
         return {
             'valid': False,
-            'reason': 'header_too_small',
+            'reason': 'vector_table_too_small',
+            'vector_table_offset': vector_table_offset,
         }
-    sp = struct.unpack_from('<I', header_bytes, 0)[0]
-    reset_vector = struct.unpack_from('<I', header_bytes, 4)[0]
+    sp = struct.unpack_from('<I', vector_bytes, 0)[0]
+    reset_vector = struct.unpack_from('<I', vector_bytes, 4)[0]
     reset_pc = reset_vector & ~1
     valid = (
         sram_start <= sp <= sram_end
@@ -4171,23 +4611,97 @@ def evaluate_slot_header(slot_base, slot_size, header_bytes):
     )
     return {
         'valid': bool(valid),
+        'vector_table_offset': vector_table_offset,
+        'vector_table_address': fmt_u32(slot_base + vector_table_offset),
         'sp': fmt_u32(sp),
         'reset_vector': fmt_u32(reset_vector),
         'reset_pc': fmt_u32(reset_pc),
     }
 
-def summarize_slot_sectors(slot_bytes, sector_size):
+def _normalise_erase_regions(erase_regions):
+    """Return validated ``(base, end, sector_size)`` geometry entries."""
+    result = []
+    for entry in erase_regions or []:
+        try:
+            base = int(entry.get('base'))
+            size = int(entry.get('size'))
+            sector_size = int(entry.get('sector_size', entry.get('erase_size')))
+        except Exception:
+            continue
+        if base < 0 or size <= 0 or sector_size <= 0:
+            continue
+        result.append((base, base + size, sector_size))
+    result.sort(key=lambda item: item[0])
+    return result
+
+
+def summarize_slot_sectors(
+    slot_bytes, sector_size, slot_base=0, erase_regions=None,
+    geometry_provenance=None,
+):
+    """Summarize actual erase sectors, with explicit fallback metadata."""
     sector_size = max(1, int(sector_size))
     sectors = []
     erased = []
     non_erased = []
-    count = (len(slot_bytes) + sector_size - 1) // sector_size
-    for idx in range(count):
-        off = idx * sector_size
-        chunk = slot_bytes[off:off + sector_size]
+    geometry = _normalise_erase_regions(erase_regions)
+    geometry_source = str(geometry_provenance or 'profile_declared')
+    intervals = []
+    for region_base, region_end, region_sector_size in geometry:
+        cursor = region_base
+        while cursor < region_end:
+            end = min(region_end, cursor + region_sector_size)
+            intervals.append((cursor, end, region_sector_size, geometry_source))
+            cursor = end
+    slot_end = int(slot_base) + len(slot_bytes)
+    selected = [item for item in intervals if item[1] > slot_base and item[0] < slot_end]
+    if not selected:
+        geometry_source = 'fallback_page_size'
+    approximate = not bool(selected)
+    if selected:
+        # A profile can describe only part of a memory map.  Keep the gap
+        # visible with page-sized fallback sectors rather than claiming full
+        # coverage from an incomplete declaration.
+        cursor = int(slot_base)
+        expanded = []
+        for start, end, actual_size, source in selected:
+            start = max(start, int(slot_base))
+            end = min(end, slot_end)
+            if start > cursor:
+                gap = cursor
+                while gap < start:
+                    gap_end = min(start, gap + sector_size)
+                    expanded.append((gap, gap_end, sector_size, 'fallback_gap'))
+                    gap = gap_end
+                approximate = True
+            expanded.append((start, end, actual_size, source))
+            cursor = max(cursor, end)
+        if cursor < slot_end:
+            gap = cursor
+            while gap < slot_end:
+                gap_end = min(slot_end, gap + sector_size)
+                expanded.append((gap, gap_end, sector_size, 'fallback_gap'))
+                gap = gap_end
+                approximate = True
+        selected = expanded
+    else:
+        selected = [
+            (int(slot_base) + idx * sector_size,
+             min(slot_end, int(slot_base) + (idx + 1) * sector_size),
+             sector_size, 'fallback_page_size')
+            for idx in range((len(slot_bytes) + sector_size - 1) // sector_size)
+        ]
+    for idx, (start, end, declared_size, source) in enumerate(selected):
+        off = max(0, start - int(slot_base))
+        chunk = slot_bytes[off:max(off, end - int(slot_base))]
         is_erased = all(b == 0xFF for b in chunk)
         sectors.append({
             'index': idx,
+            'address': fmt_u32(start),
+            'offset': off,
+            'size': max(0, end - start),
+            'declared_sector_size': declared_size,
+            'geometry_source': source,
             'all_ff': bool(is_erased),
         })
         if is_erased:
@@ -4195,8 +4709,14 @@ def summarize_slot_sectors(slot_bytes, sector_size):
         else:
             non_erased.append(idx)
     return {
-        'count': count,
+        'count': len(sectors),
         'sector_size': sector_size,
+        'geometry_source': geometry_source,
+        'geometry_approximate': bool(approximate),
+        'geometry_regions': [
+            {'base': base, 'size': end - base, 'sector_size': region_size}
+            for base, end, region_size in geometry
+        ],
         'erased_indices': erased,
         'non_erased_indices': non_erased,
         'map': sectors,
@@ -4240,16 +4760,25 @@ def build_slot_partition_dump(slot_name, slot_base, slot_size, snapshot_bytes=No
     slot_data = read_flash_span(slot_base, slot_size, snapshot_bytes=snapshot_bytes)
     page_size = effective_page_size()
     header_len = min(max(32, postmortem_dump_header_bytes), slot_size)
-    trailer_len = min(page_size, slot_size)
+    trailer_len = min(postmortem_dump_trailer_bytes, slot_size)
     header = slot_data[:header_len]
     trailer = slot_data[max(0, slot_size - trailer_len):slot_size]
+    vector_offset = min(max(0, int(success_vector_offset)), max(0, slot_size))
+    vector = slot_data[vector_offset:vector_offset + 8]
     return {
         'name': slot_name,
         'base': fmt_u32(slot_base),
         'size': slot_size,
-        'sector_summary': summarize_slot_sectors(slot_data, page_size),
+        'sector_summary': summarize_slot_sectors(
+            slot_data, page_size, slot_base=slot_base,
+            erase_regions=postmortem_layout.get('erase_regions', []),
+            geometry_provenance=postmortem_layout_source,
+        ),
         'header': region_dump(header, slot_base),
-        'header_eval': evaluate_slot_header(slot_base, slot_size, header),
+        'vector_table': region_dump(vector, slot_base + vector_offset),
+        'header_eval': evaluate_slot_header(
+            slot_base, slot_size, vector, vector_table_offset=vector_offset
+        ),
         'trailer': region_dump(trailer, slot_base + slot_size - trailer_len),
         'trailer_flags': decode_trailer_flags(slot_base, slot_size, trailer),
     }
@@ -4263,11 +4792,46 @@ def build_postmortem_partition_dump(snapshot_bytes=None, source='live_flash'):
             slot_end - slot_base,
             snapshot_bytes=snapshot_bytes,
         )
+    partition_dump = {}
+    for partition in postmortem_layout.get('partitions', []):
+        try:
+            name = str(partition.get('name', '')).strip()
+            base = int(partition.get('base'))
+            size = int(partition.get('size'))
+        except Exception:
+            continue
+        if not name or base < 0 or size <= 0:
+            continue
+        partition_dump[name] = {
+            'name': name,
+            'base': fmt_u32(base),
+            'size': size,
+            'evidence': streamed_region_dump(
+                base,
+                size,
+                snapshot_bytes=snapshot_bytes,
+            ),
+        }
+    erase_regions = _normalise_erase_regions(postmortem_layout.get('erase_regions', []))
     return {
         'source': source,
         'header_region_bytes': postmortem_dump_header_bytes,
+        'trailer_region_bytes': postmortem_dump_trailer_bytes,
+        'partition_tail_bytes': POSTMORTEM_PARTITION_TAIL_BYTES,
         'sector_size': effective_page_size(),
+        'sector_geometry': {
+            'source': (
+                postmortem_layout_source if erase_regions
+                else 'fallback_page_size'
+            ),
+            'approximate': not bool(erase_regions),
+            'regions': [
+                {'base': base, 'size': end - base, 'sector_size': sector_size}
+                for base, end, sector_size in erase_regions
+            ],
+        },
         'slots': slots_dump,
+        'partitions': partition_dump,
     }
 
 def parse_otadata_expect(raw):
@@ -4914,7 +5478,7 @@ def reset_nvmc_for_sweep():
         b['data'].FaultFlashSnapshot = None
         # Shadow scanning: enable for NRF52-style controllers (WEN batches
         # multiple writes, needs diff to count them).  Skip for STM32F4-style
-        # controllers where each PG deactivation = exactly 1 word write —
+        # controllers where each PG deactivation = exactly 1 program event —
         # shadow scanning adds 1MB ReadBytes per write with no accuracy benefit.
         if getattr(b['data'], 'PerWriteAccurate', False):
             b['data'].SkipShadowScan = True
@@ -5334,6 +5898,7 @@ def _run_clean_update_phase(phase, phase_index):
         vtor_value,
         pc_value,
         fault_injected=False,
+        p2_status=status,
     )
     cycle_records, multi_boot_analysis, _followup_ms = run_followup_boot_cycles(
         boot_outcome,
@@ -5673,10 +6238,8 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     vtor_aligned = (actual_vtor % 128 == 0)
 
     p2_reason = ''
-    p2_writes = 0
     if p2_status is not None:
         p2_reason = str(p2_status.get('reason', ''))
-        p2_writes = int(p2_status.get('writes', 0))
     no_boot_phase_without_vtor = (
         p2_reason.startswith('no_boot') and not bool(sticky_vtor['captured'])
     )
@@ -5857,22 +6420,13 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     expectations_met = vtor_ok and vtor_aligned and pc_ok and criteria_ok
     signals['expectations_met'] = expectations_met
 
-    # Distinguish wall_timeout with active bootloader (still retrying,
-    # just slow) from wall_timeout with stuck execution (real failure).
-    # A timeout where the bootloader was still making NVM progress is
-    # not a boot failure — it's an insufficient wall-clock budget.
-    is_wall_timeout = p2_reason.startswith('wall_timeout')
-
     # Keep execution failures separate from expectation mismatches:
     # a boot into a real slot with the "wrong" image/slot is not "no_boot".
     if not execution_observed:
-        if is_wall_timeout and p2_writes > 0:
-            # Bootloader was actively writing to flash when we killed it.
-            # This is a timeout, not a brick — the bootloader may have
-            # recovered given more time.
-            boot_outcome = 'timeout'
-        else:
-            boot_outcome = 'no_boot'
+        # A wall timeout is an incomplete observation even when no writes were
+        # seen.  Only deliberate no_boot terminal reasons (for example
+        # no_boot_stall) are evidence of a no-boot outcome.
+        boot_outcome = boot_outcome_after_stop('no_boot', p2_reason)
     elif not vtor_aligned:
         boot_outcome = 'misaligned_vtor'
     elif not pc_ok:
@@ -6722,7 +7276,7 @@ def run_read_bit_flip_fault(fault_at):
         label='fp{}_f_p2'.format(fault_at),
         expect_writes=False,
         zero_writes_is_brick=False,
-        wall_timeout=30,
+        wall_timeout=phase2_wall_timeout_s,
         time_slice=phase2_time_slice,
     )
     disarm_vtor_watchpoint()
@@ -6907,7 +7461,7 @@ def run_timed_bit_corruption_fault(fault_at, trigger_addr, corrupt_addr, bit_fli
         label='fp{}_tb'.format(fault_at),
         expect_writes=False,
         zero_writes_is_brick=False,
-        wall_timeout=30,
+        wall_timeout=phase2_wall_timeout_s,
         time_slice=phase2_time_slice,
     )
     disarm_vtor_watchpoint()
@@ -7161,7 +7715,8 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
-        vtor_value, pc_value, fault_injected=True, effective_criteria=eff_criteria
+        vtor_value, pc_value, fault_injected=True, effective_criteria=eff_criteria,
+        p2_status=phase1_status,
     )
 
     # Bus fault detection for instruction-skip: distinguish safe
@@ -7291,7 +7846,7 @@ def run_timed_reset_fault(fault_at):
         label='fp{}_t_p2'.format(fault_at),
         expect_writes=False,
         zero_writes_is_brick=False,
-        wall_timeout=30,
+        wall_timeout=phase2_wall_timeout_s,
         time_slice=phase2_time_slice,
     )
     disarm_vtor_watchpoint()
@@ -7443,7 +7998,7 @@ def run_nvs_corruption_fault(variant_idx):
         label='nvs_{}'.format(variant_idx),
         expect_writes=False,
         zero_writes_is_brick=False,
-        wall_timeout=30,
+        wall_timeout=phase2_wall_timeout_s,
         time_slice=phase2_time_slice,
     )
     disarm_vtor_watchpoint()
@@ -7490,7 +8045,7 @@ def run_metadata_fault(fault_at, fault_type='w'):
     reset_nvmc_for_sweep()
     disarm_fault()
     arm_vtor_watchpoint()
-    p2_status = run_until_done(cpu_ref, label='fp{}_m{}_boot'.format(fault_at, m_type), expect_writes=False, zero_writes_is_brick=False, wall_timeout=30, time_slice=phase2_time_slice)
+    p2_status = run_until_done(cpu_ref, label='fp{}_m{}_boot'.format(fault_at, m_type), expect_writes=False, zero_writes_is_brick=False, wall_timeout=phase2_wall_timeout_s, time_slice=phase2_time_slice)
     disarm_vtor_watchpoint()
     phase1_ms = int((_time.time() - fp_t0) * 1000)
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
@@ -7540,7 +8095,7 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
                         saved_flash=None, fault_snapshot_bytes=None,
                         extra_fields=None, metadata_delta_pre_snapshot=None,
                         fault_semantic_state=None,
-                        persist_snapshot=False, cycle_wall_timeout=10,
+                        persist_snapshot=False, cycle_wall_timeout=None,
                         skip_followup_if_failed=False):
     # Shared epilogue for all fault runners.
     #
@@ -7550,6 +8105,7 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
     #
     # Callers must have already called evaluate_boot_outcome() and populated
     # signals with timing/phase data BEFORE calling this.
+    global _writeback_snapshot_reconstruction_status
     fault_class = classify_fault_result(
         boot_outcome, boot_slot, signals, effective_criteria=eff_criteria
     )
@@ -7587,6 +8143,7 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         skip_if_initial_failed=skip_followup_if_failed,
     )
     signals['followup_ms'] = int(followup_ms)
+    set_multiboot_cycles_run(signals, boot_cycle_records)
 
     semantic_state = collect_semantic_state({
         'cycle': 0,
@@ -7657,42 +8214,106 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         if _wb_diag_trace is None and trace_file_path:
             try:
                 _wb_diag_trace = load_trace_data(trace_file_path)
-            except Exception:
+            except Exception as exc:
                 _wb_diag_trace = None
+                if _writeback_snapshot_reconstruction_status is None:
+                    _writeback_snapshot_reconstruction_status = {
+                        'status': 'disabled',
+                        'reason': 'malformed_write_trace:{}'.format(exc),
+                    }
         _wb_diag_erase = erase_trace_loaded if erase_trace_loaded is not None else []
-        if _wb_diag_trace:
-            _wb_flash_base, _ = flash_geometry()
-            _wb_ps = effective_page_size()
-            _wb_dirty = writeback_dirty_state_at(
-                _wb_diag_trace, _wb_diag_erase, fault_at,
-                _wb_flash_base, _wb_ps,
-            )
-            _wb_total_issued = fault_at + 1 if fault_injected else actual_writes
-            _wb_cap = writeback_capacity()
-            _wb_total_pending = sum(d['pending'] for d in _wb_dirty.values())
-            _wb_total_committed = max(0, _wb_total_issued - _wb_total_pending)
-            _wb_commit_ratio = (
-                round(float(_wb_total_committed) / _wb_total_issued, 4)
-                if _wb_total_issued > 0 else 1.0
-            )
-            result['writeback_diagnostics'] = {
-                'dirty_domains_at_fault': _wb_dirty,
-                'writeback_stats': {
-                    'writes_issued': _wb_total_issued,
-                    'writes_committed': _wb_total_committed,
-                    'write_differential': _wb_total_pending,
-                    'commit_ratio': _wb_commit_ratio,
-                },
+        if _wb_diag_trace is None and _writeback_snapshot_reconstruction_status is None:
+            _writeback_snapshot_reconstruction_status = {
+                'status': 'disabled', 'reason': 'missing_trace_data'
             }
-            # Tag fault_class when boot failed and overlay had pending data.
-            if (
-                fault_class in ('unrecoverable', 'wrong_image', 'silent_corruption')
-                and _wb_total_pending > 0
-                and fault_injected
-            ):
-                result['writeback_diagnostics']['writeback_buffer_loss'] = True
-                if fault_class == 'unrecoverable':
-                    result['fault_class'] = 'writeback_buffer_loss'
+        elif not _wb_diag_trace and _writeback_snapshot_reconstruction_status is None:
+            _writeback_snapshot_reconstruction_status = {
+                'status': 'disabled', 'reason': 'empty_write_trace'
+            }
+        elif not _writeback_trace_width_is_safe(_wb_diag_trace):
+            _writeback_snapshot_reconstruction_status = {
+                'status': 'disabled', 'reason': 'width_ambiguous_trace'
+            }
+            _wb_diag_trace = None
+        if _wb_diag_trace:
+            try:
+                _wb_flash_base, _ = flash_geometry()
+                _wb_ps = effective_page_size()
+                _wb_dirty = writeback_dirty_state_at(
+                    _wb_diag_trace, _wb_diag_erase, fault_at,
+                    _wb_flash_base, _wb_ps,
+                )
+                _wb_total_issued = fault_at + 1 if fault_injected else actual_writes
+                _wb_cap = writeback_capacity()
+                _wb_total_pending = sum(d['pending'] for d in _wb_dirty.values())
+                _wb_total_committed = max(0, _wb_total_issued - _wb_total_pending)
+                _wb_commit_ratio = (
+                    round(float(_wb_total_committed) / _wb_total_issued, 4)
+                    if _wb_total_issued > 0 else 1.0
+                )
+                result['writeback_diagnostics'] = {
+                    'dirty_domains_at_fault': _wb_dirty,
+                    'writeback_stats': {
+                        'writes_issued': _wb_total_issued,
+                        'writes_committed': _wb_total_committed,
+                        'write_differential': _wb_total_pending,
+                        'commit_ratio': _wb_commit_ratio,
+                    },
+                }
+                # Tag fault_class when boot failed and overlay had pending data.
+                if (
+                    fault_class in ('unrecoverable', 'wrong_image', 'silent_corruption')
+                    and _wb_total_pending > 0
+                    and fault_injected
+                ):
+                    result['writeback_diagnostics']['writeback_buffer_loss'] = True
+                    if fault_class == 'unrecoverable':
+                        result['fault_class'] = 'writeback_buffer_loss'
+            except Exception as exc:
+                _writeback_snapshot_reconstruction_status = {
+                    'status': 'disabled',
+                    'reason': 'malformed_writeback_trace:{}'.format(exc),
+                }
+        if _writeback_snapshot_reconstruction_status is not None:
+            result['writeback_snapshot_reconstruction'] = dict(
+                _writeback_snapshot_reconstruction_status
+            )
+        elif backend['kind'] == 'slow':
+            result['writeback_snapshot_reconstruction'] = {
+                'status': 'not_applied',
+                'reason': 'slow_backend_retains_faulted_nvm_without_snapshot_overlay',
+            }
+        else:
+            result['writeback_snapshot_reconstruction'] = {
+                'status': 'disabled',
+                'reason': 'missing_reconstruction_status',
+            }
+        # A reconstruction artifact is required only when this result really
+        # represents a power-loss fault whose persisted image was mutated.
+        # Controls, non-power write faults, and points beyond the observed
+        # operation stream must remain valid observations even though they do
+        # not have an execute-mode snapshot to reconstruct.
+        _reconstruction_required = bool(fault_injected) and (
+            _base_fault_type_code(fault_type) in ('w', 'e', 'a')
+        )
+        reconstruction = result.get('writeback_snapshot_reconstruction')
+        if not _reconstruction_required:
+            result['writeback_snapshot_reconstruction'] = {
+                'status': 'not_required',
+                'reason': 'no_persisted_power_loss_snapshot_for_result',
+            }
+        elif (
+            isinstance(reconstruction, dict)
+            and reconstruction.get('status') not in _WRITEBACK_RECONSTRUCTION_OK
+        ):
+            reason = str(reconstruction.get('reason') or 'unknown reconstruction failure')
+            result['infrastructure_error'] = True
+            result['error_kind'] = 'writeback_reconstruction'
+            result['error'] = (
+                'writeback durability observation incomplete: {}'.format(reason)
+            )
+            result['boot_outcome'] = 'infra_error'
+            result['fault_class'] = 'infrastructure_error'
     elif durability_model != 'direct':
         result['durability_model'] = durability_model
     if eff_criteria is not None:
@@ -7835,7 +8456,7 @@ def run_resume_trace_from_snapshot(snapshot_flash, fault_at, fault_type):
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     boot_outcome, boot_slot, _signals = evaluate_boot_outcome(
-        vtor_value, pc_value, fault_injected=True
+        vtor_value, pc_value, fault_injected=True, p2_status=status
     )
 
     return {
@@ -7858,6 +8479,11 @@ def run_resume_trace_from_snapshot(snapshot_flash, fault_at, fault_type):
     }
 
 def run_execute_fault(fault_at, fault_type='w'):
+    global _writeback_snapshot_reconstruction_status
+    global trace_data_loaded, erase_trace_loaded
+    _writeback_snapshot_reconstruction_status = None
+    if writeback_active() and is_unsupported_writeback_fault_type(fault_type):
+        return _writeback_unsupported_fault_result(fault_at, fault_type)
     # Execute mode: full CPU boot with fault injection.
     #
     # fault_type:
@@ -8170,16 +8796,53 @@ def run_execute_fault(fault_at, fault_type='w'):
         # are in a volatile buffer and lost on power failure.  We revert
         # them using the calibration trace data.
         if writeback_active() and fault_snapshot_bytes is not None and is_power_loss_fault:
+            _wb_artifacts_valid = True
             _wb_trace = trace_data_loaded
             if _wb_trace is None and trace_file_path:
-                _wb_trace = load_trace_data(trace_file_path)
-            _wb_erase = erase_trace_loaded if erase_trace_loaded is not None else []
-            if _wb_trace:
+                try:
+                    _wb_trace = load_trace_data(trace_file_path)
+                    trace_data_loaded = _wb_trace
+                except Exception as exc:
+                    _wb_trace = None
+                    _wb_artifacts_valid = False
+                    _writeback_snapshot_reconstruction_status = {
+                        'status': 'disabled',
+                        'reason': 'malformed_write_trace:{}'.format(exc),
+                    }
+            if _wb_trace is not None and not _wb_trace:
+                _wb_artifacts_valid = False
+                _writeback_snapshot_reconstruction_status = {
+                    'status': 'disabled', 'reason': 'empty_write_trace'
+                }
+            _wb_erase = erase_trace_loaded
+            if _wb_erase is None and erase_trace_file_path:
+                try:
+                    _wb_erase = load_erase_trace_data(erase_trace_file_path)
+                    erase_trace_loaded = _wb_erase
+                except Exception as exc:
+                    _wb_erase = []
+                    _wb_artifacts_valid = False
+                    _writeback_snapshot_reconstruction_status = {
+                        'status': 'disabled',
+                        'reason': 'malformed_erase_trace:{}'.format(exc),
+                    }
+            if _wb_erase is None:
+                _wb_erase = []
+            if _wb_trace and _wb_artifacts_valid:
                 _wb_flash_base, _ = flash_geometry()
                 _wb_page_size = effective_page_size()
+                _wb_initial_snapshot = (
+                    _cached_update_sequence_fault_flash
+                    if update_sequence_enabled
+                    else _cached_initial_flash
+                )
+                if _wb_initial_snapshot is not None:
+                    _wb_initial_snapshot = to_py_bytes(_wb_initial_snapshot)
+                _wb_discarded = 0
                 fault_snapshot_bytes, _wb_discarded = writeback_strip_uncommitted_from_snapshot(
                     fault_snapshot_bytes, _wb_trace, _wb_erase, fault_at,
                     _wb_flash_base, _wb_page_size,
+                    initial_snapshot=_wb_initial_snapshot,
                 )
                 # Convert Python bytes back to .NET byte[] for restore_flash_and_boot.
                 import System as _WbSys
@@ -8189,7 +8852,11 @@ def run_execute_fault(fault_at, fault_type='w'):
                 log('fp={} writeback: stripped {} uncommitted writes from snapshot'.format(
                     fault_at, _wb_discarded))
             else:
-                log('fp={} writeback: WARNING no trace data, using full snapshot (direct-mode fallback)'.format(fault_at))
+                if _writeback_snapshot_reconstruction_status is None:
+                    _writeback_snapshot_reconstruction_status = {
+                        'status': 'disabled', 'reason': 'missing_trace_data'
+                    }
+                log('fp={} writeback: WARNING no trace data; reconstruction refused and result will be incomplete'.format(fault_at))
 
         if phase1_stopped_on_fault and is_power_loss_fault:
             # Power-loss class: simulate a cold reset and recovery boot.
@@ -8240,7 +8907,7 @@ def run_execute_fault(fault_at, fault_type='w'):
                 label='fp{}_p2'.format(fault_at),
                 expect_writes=False,
                 zero_writes_is_brick=False,
-                wall_timeout=30,
+                wall_timeout=phase2_wall_timeout_s,
                 stop_on_fault=False,
                 time_slice=phase2_time_slice,
             )
@@ -8267,7 +8934,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             phase2_status = run_until_done(
                 cpu_ref,
                 label='fp{}_p1c'.format(fault_at),
-                wall_timeout=30,
+                wall_timeout=phase2_wall_timeout_s,
                 stop_on_fault=False,
                 time_slice=phase2_time_slice,
             )
@@ -8297,7 +8964,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             label='fp{}_p2'.format(fault_at),
             expect_writes=False,
             zero_writes_is_brick=False,
-            wall_timeout=30,
+            wall_timeout=phase2_wall_timeout_s,
             stop_on_fault=False,
             time_slice=phase2_time_slice,
         )
@@ -8312,7 +8979,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         phase2_status = run_until_done(
             cpu_ref,
             label='fp{}_p1c'.format(fault_at),
-            wall_timeout=30,
+            wall_timeout=phase2_wall_timeout_s,
             stop_on_fault=False,
             time_slice=phase2_time_slice,
         )
@@ -8328,7 +8995,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         phase2_status = run_until_done(
             cpu_ref,
             label='fp{}_i2c_cont'.format(fault_at),
-            wall_timeout=30,
+            wall_timeout=phase2_wall_timeout_s,
             stop_on_fault=False,
             time_slice=phase2_time_slice,
         )
@@ -8349,7 +9016,8 @@ def run_execute_fault(fault_at, fault_type='w'):
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
-        vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria
+        vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria,
+        p2_status=phase2_status,
     )
     signals['phase1_ms'] = phase1_ms
     signals['phase2_ms'] = phase2_ms
@@ -8471,7 +9139,7 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
     arm_erase_fault(erase_fault_at + 1)  # 0-indexed → 1-indexed
 
     log('cascade w={} e={} phase2_step'.format(write_fault_at, erase_fault_at))
-    run_until_done(
+    p2_status = run_until_done(
         cpu_ref,
         label='cascade_w{}_e{}_p2'.format(write_fault_at, erase_fault_at),
         time_slice=phase2_time_slice,
@@ -8484,6 +9152,7 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
     log('cascade w={} e={} phase2_done erase_injected={} erases={} writes={}'.format(
         write_fault_at, erase_fault_at, p2_injected, p2_erases, p2_writes))
 
+    p3_status = None
     if not p2_injected:
         # Erase fault didn't fire during recovery (fewer erases than expected).
         # Read final state from Phase 2 directly.
@@ -8499,12 +9168,12 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
 
         log('cascade w={} e={} phase3_step'.format(write_fault_at, erase_fault_at))
         arm_vtor_watchpoint()
-        run_until_done(
+        p3_status = run_until_done(
             cpu_ref,
             label='cascade_w{}_e{}_p3'.format(write_fault_at, erase_fault_at),
             expect_writes=False,
             zero_writes_is_brick=False,
-            wall_timeout=30,
+            wall_timeout=phase2_wall_timeout_s,
             time_slice=phase2_time_slice,
         )
         disarm_vtor_watchpoint()
@@ -8514,8 +9183,13 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     eff_criteria = get_effective_criteria('w')
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
-        vtor_value, pc_value, fault_injected=(p1_injected and p2_injected), effective_criteria=eff_criteria
+        vtor_value, pc_value, fault_injected=(p1_injected and p2_injected), effective_criteria=eff_criteria,
+        p2_status=p3_status if p2_injected else p2_status,
     )
+    if p2_status is not None:
+        merge_stop_status_signals(signals, 'phase2', p2_status)
+    if p3_status is not None:
+        merge_stop_status_signals(signals, 'phase3', p3_status)
     fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
 
     # Release large .NET byte[] to prevent memory exhaustion in batch mode.
@@ -8771,7 +9445,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
             label='p2fault_p3_{}_{}'.format(p1_fault_at, p2_fault_at),
             expect_writes=False,
             zero_writes_is_brick=False,
-            wall_timeout=30,
+            wall_timeout=phase2_wall_timeout_s,
             stop_on_fault=False,
             time_slice=phase2_time_slice,
         )
@@ -8787,7 +9461,11 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
-        vtor_value, pc_value, fault_injected=(p1_injected and p2_injected), effective_criteria=eff_criteria
+        vtor_value,
+        pc_value,
+        fault_injected=(p1_injected and p2_injected),
+        effective_criteria=eff_criteria,
+        p2_status=p3_status if p2_injected else p2_status,
     )
     signals['phase1_ms'] = phase1_ms
     signals['phase2_ms'] = phase2_ms
@@ -8798,7 +9476,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     if p2_status is not None:
         merge_stop_status_signals(signals, 'phase2', p2_status)
     if p3_status is not None:
-        signals['phase3_stop_reason'] = p3_status.get('reason')
+        merge_stop_status_signals(signals, 'phase3', p3_status)
 
     semantic_state = collect_semantic_state({
         'cycle': 0,
@@ -8974,7 +9652,7 @@ def run_multi_fault_sequence(fault_sequence):
         label='mf_final_{}'.format(seq[0]),
         expect_writes=False,
         zero_writes_is_brick=False,
-        wall_timeout=30,
+        wall_timeout=phase2_wall_timeout_s,
         stop_on_fault=False,
         time_slice=phase2_time_slice,
     )
@@ -8985,7 +9663,8 @@ def run_multi_fault_sequence(fault_sequence):
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
     eff_criteria = get_effective_criteria('w')
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
-        vtor_value, pc_value, fault_injected=True, effective_criteria=eff_criteria
+        vtor_value, pc_value, fault_injected=True, effective_criteria=eff_criteria,
+        p2_status=final_status,
     )
     signals['multi_fault_count'] = len(seq)
     signals['multi_fault_recovery_ms'] = recovery_ms
@@ -9080,11 +9759,15 @@ def load_trace_data(path):
     with open(path, 'r') as f:
         reader = _csv.DictReader(f)
         for row in reader:
-            entries.append((
+            event = (
                 int(row['write_index']),
                 int(row['flash_offset']),
                 int(row['value']),
-            ))
+            )
+            width = row.get('width') or row.get('write_width') or row.get('length')
+            if width not in (None, ''):
+                event = event + (int(width),)
+            entries.append(event)
     return entries
 
 def load_erase_trace_data(path):
@@ -9098,7 +9781,60 @@ def load_erase_trace_data(path):
                 int(row.get('writes_at_this_point', 0)),
                 int(row.get('erase_size', 0)),
             ))
-    return entries
+    return _validated_erase_trace(entries)
+
+
+def _validated_erase_trace(trace_data, require_monotonic=False):
+    """Validate erase offsets against the active flash before replay."""
+    flash_size = None
+    page_size = 4096
+    try:
+        flash_size = int(backend['data'].FlashSize)
+    except Exception:
+        try:
+            flash_size = int(backend['data'].Size)
+        except Exception:
+            pass
+    try:
+        page_size = int(backend['data'].PageSize)
+    except Exception:
+        pass
+    return validate_erase_trace_data(
+        trace_data,
+        flash_size=flash_size,
+        page_size=page_size,
+        require_monotonic=require_monotonic,
+    )
+
+
+def _validate_native_erase_trace_binary(path):
+    """Validate native erase records when no CSV companion is available."""
+    import os as _os_native_erase
+    if not path or not _os_native_erase.path.exists(path):
+        raise ValueError('native erase trace binary is missing')
+    with open(path, 'rb') as f:
+        raw = f.read()
+    if len(raw) % 12 != 0:
+        raise ValueError('native erase trace binary has invalid length')
+    entries = []
+    for offset in range(0, len(raw), 12):
+        writes_at, flash_off, erase_size = struct.unpack_from('<III', raw, offset)
+        entries.append((flash_off, writes_at, erase_size))
+    return _validated_erase_trace(entries, require_monotonic=True)
+
+
+def _native_erase_trace_is_safe():
+    """Check erase provenance and ordering before invoking the C# engine."""
+    csv_entries = None
+    if erase_trace_file_path:
+        import os as _os_native_erase
+        if not _os_native_erase.path.exists(erase_trace_file_path):
+            raise ValueError('erase trace CSV is missing')
+        csv_entries = load_erase_trace_data(erase_trace_file_path)
+        _validated_erase_trace(csv_entries, require_monotonic=True)
+    binary_entries = _validate_native_erase_trace_binary(erase_trace_file_bin_path)
+    if csv_entries is not None and csv_entries != binary_entries:
+        raise ValueError('native erase trace binary does not match its CSV companion')
 
 
 def decode_multi_fault_sequence_local(encoded):
@@ -9133,18 +9869,47 @@ def _trace_replay_write_u32(image, offset, value):
     struct.pack_into('<I', image, int(offset), int(value) & 0xFFFFFFFF)
 
 
+def _trace_replay_read_value(image, offset, width):
+    """Read a little-endian trace value without assuming a word-width event."""
+    offset = int(offset)
+    width = int(width)
+    if width not in (1, 2, 4, 8) or offset < 0 or offset + width > len(image):
+        raise ValueError("trace write event is outside the replay image")
+    value = 0
+    for byte_index in range(width):
+        value |= (int(image[offset + byte_index]) & 0xFF) << (8 * byte_index)
+    return value
+
+
+def _trace_replay_write_value(image, offset, value, width):
+    """Write a little-endian trace value at its recorded access width."""
+    offset = int(offset)
+    width = int(width)
+    if width not in (1, 2, 4, 8) or offset < 0 or offset + width > len(image):
+        raise ValueError("trace write event is outside the replay image")
+    for byte_index in range(width):
+        image[offset + byte_index] = (int(value) >> (8 * byte_index)) & 0xFF
+
+
 def _trace_replay_erase_region(image, offset, size, erase_fill):
     size = max(0, int(size))
     if size == 0:
         return
     start = int(offset)
-    image[start:start + size] = bytes([int(erase_fill) & 0xFF]) * size
+    if start < 0 or start > len(image) or size > len(image) - start:
+        raise ValueError('trace erase event is outside the replay image')
+    fill = int(erase_fill) & 0xFF
+    # Keep this compatible with Renode's IronPython 2 runtime, where
+    # list-to-bytes construction is not a one-byte sequence.
+    for index in range(start, start + size):
+        image[index] = fill
 
 
-def _trace_replay_keep_one_to_zero_transitions(old_word, new_word, keep_mask):
+def _trace_replay_keep_one_to_zero_transitions(old_word, new_word, keep_mask,
+                                               value_mask=0xFFFFFFFF):
     bits_to_flip = old_word & ~new_word
-    actually_flipped = bits_to_flip & keep_mask
-    return old_word & ~actually_flipped
+    actually_flipped = bits_to_flip & keep_mask & value_mask
+    return old_word & ~actually_flipped & value_mask
 
 
 def _trace_replay_next_lcg(seed):
@@ -9161,61 +9926,66 @@ def _trace_replay_build_seed(offset, write_index, total_page_erases, corruption_
 
 
 def _trace_replay_apply_write_fault(image, flash_off, value, fault_type, write_index,
-                                    total_page_erases, page_size, corruption_seed=0):
+                                    total_page_erases, page_size, corruption_seed=0,
+                                    width=4):
     flash_off = int(flash_off)
-    page_size = max(4, int(page_size))
-    old_word = _trace_replay_read_u32(image, flash_off)
-    new_word = int(value) & 0xFFFFFFFF
+    width = int(width)
+    page_size = max(width, int(page_size))
+    old_word = _trace_replay_read_value(image, flash_off, width)
+    value_mask = (1 << (8 * width)) - 1
+    new_word = int(value) & value_mask
 
     if fault_type == 'b':
         seed = _trace_replay_build_seed(flash_off, write_index, total_page_erases, corruption_seed)
         keep_mask = _trace_replay_next_lcg(seed)
-        corrupted = _trace_replay_keep_one_to_zero_transitions(old_word, new_word, keep_mask)
-        _trace_replay_write_u32(image, flash_off, corrupted)
+        corrupted = _trace_replay_keep_one_to_zero_transitions(
+            old_word, new_word, keep_mask, value_mask=value_mask
+        )
+        _trace_replay_write_value(image, flash_off, corrupted, width)
         return corrupted
 
     if fault_type == 's':
-        silent_value = 0xFFFFFFFF if (int(write_index) & 1) == 0 else 0x00000000
-        _trace_replay_write_u32(image, flash_off, silent_value)
+        silent_value = value_mask if (int(write_index) & 1) == 0 else 0x00000000
+        _trace_replay_write_value(image, flash_off, silent_value, width)
         return silent_value
 
     if fault_type == 'r':
-        _trace_replay_write_u32(image, flash_off, old_word)
+        _trace_replay_write_value(image, flash_off, old_word, width)
         return old_word
 
     if fault_type == 'd':
-        _trace_replay_write_u32(image, flash_off, new_word)
+        _trace_replay_write_value(image, flash_off, new_word, width)
         seed = _trace_replay_build_seed(flash_off, write_index, total_page_erases, corruption_seed)
-        for neighbor_off in (flash_off - 4, flash_off + 4):
-            if neighbor_off < 0 or neighbor_off > len(image) - 4:
+        disturb_mask = sum(0x11 << (8 * index) for index in range(width))
+        for neighbor_off in (flash_off - width, flash_off + width):
+            if neighbor_off < 0 or neighbor_off > len(image) - width:
                 continue
-            neighbor_word = _trace_replay_read_u32(image, neighbor_off)
+            neighbor_word = _trace_replay_read_value(image, neighbor_off, width)
             seed = _trace_replay_next_lcg(seed)
-            disturb_mask = seed & 0x11111111
-            disturbed = neighbor_word & (~disturb_mask & 0xFFFFFFFF)
-            _trace_replay_write_u32(image, neighbor_off, disturbed)
+            disturbed = neighbor_word & (~(seed & disturb_mask) & value_mask)
+            _trace_replay_write_value(image, neighbor_off, disturbed, width)
         return new_word
 
     if fault_type == 'l':
-        _trace_replay_write_u32(image, flash_off, new_word)
+        _trace_replay_write_value(image, flash_off, new_word, width)
         page_start = (flash_off // page_size) * page_size
-        words_per_page = max(1, page_size // 4)
+        words_per_page = max(1, page_size // width)
         error_count = 2 + min(10, int(total_page_erases) // 8)
         seed = _trace_replay_build_seed(flash_off, write_index, total_page_erases, corruption_seed)
         for _ in range(error_count):
             seed = _trace_replay_next_lcg(seed)
             idx = seed % words_per_page
-            target_off = page_start + idx * 4
-            if target_off < 0 or target_off > len(image) - 4:
+            target_off = page_start + idx * width
+            if target_off < 0 or target_off > len(image) - width:
                 continue
-            word = _trace_replay_read_u32(image, target_off)
+            word = _trace_replay_read_value(image, target_off, width)
             seed = _trace_replay_next_lcg(seed)
-            mask = seed & 0x01010101
+            mask = seed & sum(0x01 << (8 * index) for index in range(width))
             if mask == 0:
                 seed = _trace_replay_next_lcg(seed)
-                mask = 1 << (seed % 32)
-            aged = word & (~mask & 0xFFFFFFFF)
-            _trace_replay_write_u32(image, target_off, aged)
+                mask = 1 << (seed % (8 * width))
+            aged = word & (~mask & value_mask)
+            _trace_replay_write_value(image, target_off, aged, width)
         return new_word
 
     raise RuntimeError('trace replay write fault type {} unsupported'.format(fault_type))
@@ -9240,7 +10010,20 @@ def _build_trace_replay_write_fault_snapshot(fault_at, fault_type, flash_base_ad
     except Exception:
         corruption_seed = 0
 
-    for write_idx, flash_off, value in trace_data_loaded:
+    # Keep this function usable by the small AST-based replay regression,
+    # which deliberately compiles only the replay helpers.  The full runner
+    # always supplies the centralized validator; the fallback still preserves
+    # width-bearing events for that isolated test harness.
+    if '_validated_writeback_trace' in globals():
+        trace_events = _validated_writeback_trace(trace_data_loaded)
+    elif 'validate_write_trace_width' in globals():
+        trace_events = validate_write_trace_width(trace_data_loaded)
+    else:
+        trace_events = []
+        for raw_event in trace_data_loaded:
+            write_idx, flash_off, value, width = normalise_write_event(raw_event)
+            trace_events.append((write_idx, flash_off, value, width))
+    for write_idx, flash_off, value, width in trace_events:
         while erase_idx < len(pending_erases) and pending_erases[erase_idx][0] < write_idx:
             _e_wap, e_off, e_sz = pending_erases[erase_idx]
             _trace_replay_erase_region(flash_bytes, e_off, e_sz, erase_fill)
@@ -9248,7 +10031,7 @@ def _build_trace_replay_write_fault_snapshot(fault_at, fault_type, flash_base_ad
             total_page_erases += 1
 
         if write_idx < target_write_index:
-            _trace_replay_write_u32(flash_bytes, flash_off, value)
+            _trace_replay_write_value(flash_bytes, flash_off, value, width)
             writes_applied += 1
             continue
 
@@ -9264,15 +10047,18 @@ def _build_trace_replay_write_fault_snapshot(fault_at, fault_type, flash_base_ad
                 total_page_erases,
                 page_size,
                 corruption_seed=corruption_seed,
+                width=width,
             )
             writes_applied += 1
             continue
 
-        _trace_replay_write_u32(flash_bytes, flash_off, value)
+        _trace_replay_write_value(flash_bytes, flash_off, value, width)
         writes_applied += 1
 
     while erase_idx < len(pending_erases):
         _e_wap, e_off, e_sz = pending_erases[erase_idx]
+        if _e_wap > int(fault_at):
+            break
         _trace_replay_erase_region(flash_bytes, e_off, e_sz, erase_fill)
         erase_idx += 1
 
@@ -9295,9 +10081,32 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         return None
     if not _os_native.path.exists(trace_file_bin_path):
         return None
-    # Preserve correctness for legacy calibrations: if erase CSV exists
-    # but erase BIN is missing, fall back to Python interleaving logic.
-    if erase_trace_file_path and not erase_trace_file_bin_path:
+    # Preserve correctness for legacy calibrations: if an erase CSV is
+    # declared, its binary companion must exist and both representations must
+    # be valid/chronological before the native engine is allowed to run.
+    if erase_trace_file_path and (
+            not erase_trace_file_bin_path or
+            not _os_native.path.exists(erase_trace_file_bin_path)):
+        return None
+    if erase_trace_file_bin_path:
+        try:
+            _native_erase_trace_is_safe()
+        except Exception as exc:
+            log('trace_replay: native erase trace rejected ({}); using python fallback'.format(exc))
+            return None
+    # The native engine consumes legacy 12-byte (index, offset, value) records
+    # and therefore cannot represent 1/2/8-byte events.  Require the CSV
+    # companion and reject anything except a known-safe four-byte trace before
+    # using the native path.
+    if not trace_file_path or not _os_native.path.exists(trace_file_path):
+        return None
+    try:
+        _native_trace = _validated_writeback_trace(load_trace_data(trace_file_path))
+    except Exception:
+        return None
+    if not _native_trace:
+        return None
+    if any(width != 4 for _wi, _off, _value, width in _native_trace):
         return None
 
     engine = ensure_trace_replay_engine()
@@ -9390,7 +10199,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         label='fp{}_native_replay_p2'.format(fault_at),
         expect_writes=False,
         zero_writes_is_brick=False,
-        wall_timeout=30,
+        wall_timeout=phase2_wall_timeout_s,
         time_slice=phase2_time_slice,
     )
     emulation_ms = int((_time.time() - t_emu) * 1000)
@@ -9448,6 +10257,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
 
 def run_trace_replay_fault(fault_at, fault_type='w'):
     global trace_data_loaded, erase_trace_loaded
+    global _writeback_snapshot_reconstruction_status
 
     fault_base = _base_fault_type_code(fault_type)
     if fault_base not in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES:
@@ -9461,13 +10271,43 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         return native_result
 
     if trace_data_loaded is None:
-        trace_data_loaded = load_trace_data(trace_file_path)
+        try:
+            trace_data_loaded = load_trace_data(trace_file_path)
+        except Exception as exc:
+            if writeback_active():
+                _writeback_snapshot_reconstruction_status = {
+                    'status': 'disabled',
+                    'reason': 'malformed_write_trace:{}'.format(exc),
+                }
+            return run_execute_fault(fault_at, fault_type=fault_type)
         log('trace_replay: loaded {} write entries from {}'.format(
             len(trace_data_loaded), trace_file_path))
+    if not trace_data_loaded:
+        if writeback_active():
+            _writeback_snapshot_reconstruction_status = {
+                'status': 'disabled', 'reason': 'empty_write_trace'
+            }
+        return run_execute_fault(fault_at, fault_type=fault_type)
+    try:
+        _validated_writeback_trace(trace_data_loaded)
+    except Exception:
+        if writeback_active():
+            _writeback_snapshot_reconstruction_status = {
+                'status': 'disabled', 'reason': 'width_ambiguous_trace'
+            }
+        return run_execute_fault(fault_at, fault_type=fault_type)
     if erase_trace_loaded is None and erase_trace_file_path:
         import os as _os2
         if _os2.path.exists(erase_trace_file_path):
-            erase_trace_loaded = load_erase_trace_data(erase_trace_file_path)
+            try:
+                erase_trace_loaded = load_erase_trace_data(erase_trace_file_path)
+            except Exception as exc:
+                if writeback_active():
+                    _writeback_snapshot_reconstruction_status = {
+                        'status': 'disabled',
+                        'reason': 'malformed_erase_trace:{}'.format(exc),
+                    }
+                return run_execute_fault(fault_at, fault_type=fault_type)
             log('trace_replay: loaded {} erase entries from {}'.format(
                 len(erase_trace_loaded), erase_trace_file_path))
         else:
@@ -9535,7 +10375,8 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         fault_injected = False
         fault_address = 0
 
-        for write_idx, flash_off, value in trace_data_loaded:
+        trace_events = _validated_writeback_trace(trace_data_loaded)
+        for write_idx, flash_off, value, width in trace_events:
             if write_idx > fault_at + 1:
                 break
 
@@ -9548,11 +10389,9 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
                 erase_idx += 1
 
             if write_idx <= fault_at:
-                b = System.Array.CreateInstance(System.Byte, 4)
-                b[0] = value & 0xFF
-                b[1] = (value >> 8) & 0xFF
-                b[2] = (value >> 16) & 0xFF
-                b[3] = (value >> 24) & 0xFF
+                b = System.Array.CreateInstance(System.Byte, width)
+                for byte_index in range(width):
+                    b[byte_index] = (value >> (8 * byte_index)) & 0xFF
                 flash_ref.WriteBytes(flash_off, b)
                 writes_applied += 1
             elif write_idx == fault_at + 1:
@@ -9595,7 +10434,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         label='fp{}_replay_p2'.format(fault_at),
         expect_writes=False,
         zero_writes_is_brick=False,
-        wall_timeout=30,
+        wall_timeout=phase2_wall_timeout_s,
         time_slice=phase2_time_slice,
     )
     emulation_ms = int((_time.time() - t_emu) * 1000)
@@ -9675,6 +10514,8 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
     # Returns the result dict from the runner.
     parts = None  # IronPython requires pre-declaration for locals used in multiple if-branches
     base_ft = _base_fault_type_code(ft)
+    if writeback_active() and is_unsupported_writeback_fault_type(ft):
+        return _writeback_unsupported_fault_result(fp, ft)
     # --- Prefix-based compound fault types ---
     if ft.startswith('m:'):
         m_type = ft.split(':')[1] if ':' in ft else 'w'
@@ -9812,7 +10653,7 @@ if calibration_mode:
             apply_pre_boot_state()
             if _hash_bypass_active:
                 apply_hash_bypass()
-        # Force word-level diff for calibration so the count matches sweep.
+        # Force per-program diff for calibration so the count matches sweep.
         # NOTE: Write/erase trace is NOT enabled in phase 1 (coarse detection).
         # It's enabled in phase 2 only if trace replay is needed. The write
         # count from get_total_writes() uses the peripheral counter, not trace.
@@ -9904,6 +10745,7 @@ if calibration_mode:
                 calibration_vtor,
                 calibration_pc,
                 fault_injected=False,
+                p2_status=cal_status,
             )
         )
 
@@ -9917,25 +10759,50 @@ if calibration_mode:
                 trace_file = result_file.replace('.json', '_trace.csv')
                 trace_file_bin = result_file.replace('.json', '_trace.bin')
                 trace_data = backend['data'].WriteTraceToString()
+                parsed_trace = []
+                trace_has_width = False
+                for line in trace_data.strip().split('\n'):
+                    if not line.strip():
+                        continue
+                    # FaultTracker emits colon records; CFIFlash emits
+                    # comma records.  Normalize both before writing CSV.
+                    event = parse_write_trace_record(line)
+                    if event is None:
+                        continue
+                    write_idx = int(event[0]) & 0xFFFFFFFF
+                    flash_off = int(event[1]) & 0xFFFFFFFF
+                    # Keep the full integer in CSV; width-aware 8-byte
+                    # events must not be truncated to the legacy word mask.
+                    value = int(event[2])
+                    width = int(event[3]) if len(event) >= 4 else None
+                    if width is not None:
+                        trace_has_width = True
+                    parsed_trace.append((write_idx, flash_off, value, width))
                 with open(trace_file, 'w') as tf:
-                    tf.write('write_index,flash_offset,value\n')
+                    if trace_has_width:
+                        tf.write('write_index,flash_offset,value,width\n')
+                    else:
+                        tf.write('write_index,flash_offset,value\n')
                     with open(trace_file_bin, 'wb') as tfb:
                         trace_bin_count = 0
-                        for line in trace_data.strip().split('\n'):
-                            parts = line.split(':')
-                            if len(parts) == 3:
-                                write_idx = int(parts[0]) & 0xFFFFFFFF
-                                flash_off = int(parts[1]) & 0xFFFFFFFF
-                                value = int(parts[2]) & 0xFFFFFFFF
+                        for write_idx, flash_off, value, width in parsed_trace:
+                            if trace_has_width:
+                                width_field = '' if width is None else str(width)
+                                tf.write('{},{},{},{}\n'.format(
+                                    write_idx, flash_off, value, width_field
+                                ))
+                            else:
                                 tf.write('{},{},{}\n'.format(write_idx, flash_off, value))
-                                tfb.write(struct.pack('<III', write_idx, flash_off, value))
-                                trace_bin_count += 1
-                            elif len(parts) == 2:
-                                write_idx = int(parts[0]) & 0xFFFFFFFF
-                                flash_off = int(parts[1]) & 0xFFFFFFFF
-                                tf.write('{},{},0\n'.format(write_idx, flash_off))
-                                tfb.write(struct.pack('<III', write_idx, flash_off, 0))
-                                trace_bin_count += 1
+                            # The native engine has a fixed 12-byte record
+                            # format.  Width-bearing non-word events remain
+                            # available in CSV for the Python replay path.
+                            if width not in (None, 4):
+                                continue
+                            if width is None:
+                                tfb.write(struct.pack('<III', write_idx, flash_off, value & 0xFFFFFFFF))
+                            else:
+                                tfb.write(struct.pack('<III', write_idx, flash_off, value & 0xFFFFFFFF))
+                            trace_bin_count += 1
                 log('calibration: wrote {} trace entries to {}'.format(trace_count, trace_file))
                 log('calibration: wrote {} binary trace entries to {}'.format(trace_bin_count, trace_file_bin))
 
@@ -10049,7 +10916,7 @@ if calibration_mode:
                     _ba_cur_domain = None
                     _ba_phase_start = 0
                     _ba_phase_writes = 0
-                    for _ba_wi, _ba_foff, _ba_val in _ba_trace:
+                    for _ba_wi, _ba_foff, _ba_val, _ba_width in _validated_writeback_trace(_ba_trace):
                         _ba_addr = _ba_foff + _ba_flash_base
                         _ba_dom = writeback_domain_for_address(_ba_addr)
                         if _ba_dom is not None and _ba_dom != _ba_cur_domain:

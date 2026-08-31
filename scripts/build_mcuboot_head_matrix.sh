@@ -7,6 +7,12 @@
 #   4. head_scratch_stm32f4 - swap-scratch, nucleo_f429zi, non-uniform sectors
 #   5. head_move_small      - swap-move, nrf52840dk, 128KB slots
 #   6. head_scratch_small   - swap-scratch, nrf52840dk, 128KB+4KB scratch
+#   7. head_offset_nrf52    - offset metadata, nrf52840dk
+#   8. head_offset_stm32f4 - offset metadata, nucleo_f429zi
+#   9. head_offset_small    - offset metadata, nrf52840dk, 128KB slots
+#
+# Auxiliary PR-2206 geometry images are generated between configurations 4
+# and 5; they do not add a separate MCUboot build configuration.
 #
 # Each config gets two DIFFERENT-SIZED test images to expose geometry bugs.
 set -euo pipefail
@@ -287,7 +293,9 @@ cat > "${OVERLAY_DIR}/stm32f4_move.dts" <<'DTS'
 };
 DTS
 
-# STM32F4 (nucleo_f429zi) swap-scratch overlay
+# STM32F4 (nucleo_f429zi) swap-scratch overlay.
+# The two slots mirror the 16K/16K/64K/128K sector sequence across the
+# STM32F429's two flash banks; scratch and storage each start on a sector.
 cat > "${OVERLAY_DIR}/stm32f4_scratch.dts" <<'DTS'
 &flash0 {
     /delete-node/ partitions;
@@ -299,23 +307,23 @@ cat > "${OVERLAY_DIR}/stm32f4_scratch.dts" <<'DTS'
 
         boot_partition: partition@0 {
             label = "mcuboot";
-            reg = <0x0 0x20000>;
+            reg = <0x0 0x08000>;
         };
-        slot0_partition: partition@20000 {
+        slot0_partition: partition@8000 {
             label = "image-0";
-            reg = <0x20000 0x58000>;
+            reg = <0x08000 0x38000>;
         };
-        slot1_partition: partition@78000 {
+        slot1_partition: partition@108000 {
             label = "image-1";
-            reg = <0x78000 0x58000>;
+            reg = <0x108000 0x38000>;
         };
-        scratch_partition: partition@d0000 {
+        scratch_partition: partition@40000 {
             label = "image-scratch";
-            reg = <0xd0000 0x10000>;
+            reg = <0x40000 0x20000>;
         };
-        storage_partition: partition@e0000 {
+        storage_partition: partition@60000 {
             label = "storage";
-            reg = <0xe0000 0x20000>;
+            reg = <0x60000 0xA0000>;
         };
     };
 };
@@ -579,13 +587,14 @@ sign_image "move_stm32f4" "0x60000" "1.0.0+0" "zephyr_head_move_stm32f4_slot0.bi
 sign_image "move_stm32f4" "0x60000" "1.1.0+0" "zephyr_head_move_stm32f4_slot1.bin" "36864"
 
 # --- 4. head_scratch_stm32f4: swap-scratch, nucleo_f429zi ---
-# Slots: 0x58000 (352KB) each, scratch: 0x10000 (64KB)
+# Slots: 0x38000 (224KB) each, mirrored across banks; scratch: 0x20000
+# (128KB). Every partition boundary is an STM32F429 erase-sector boundary.
 build_mcuboot "scratch_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_scratch.dts" \
     -DCONFIG_BOOT_SWAP_USING_SCRATCH=y
 
 build_test_app "scratch_stm32f4" "nucleo_f429zi" "${OVERLAY_DIR}/stm32f4_scratch.dts"
-sign_image "scratch_stm32f4" "0x58000" "1.0.0+0" "zephyr_head_scratch_stm32f4_slot0.bin"
-sign_image "scratch_stm32f4" "0x58000" "1.1.0+0" "zephyr_head_scratch_stm32f4_slot1.bin" "36864"
+sign_image "scratch_stm32f4" "0x38000" "1.0.0+0" "zephyr_head_scratch_stm32f4_mirrored_slot0.bin"
+sign_image "scratch_stm32f4" "0x38000" "1.1.0+0" "zephyr_head_scratch_stm32f4_mirrored_slot1.bin" "36864"
 
 # --- 4b. head_scratch_stm32f4_pr2206: swap-scratch, PR2206 trigger geometry ---
 # Mirror the 0x18000 low-bank sector pattern into bank 2 so scratch swap can

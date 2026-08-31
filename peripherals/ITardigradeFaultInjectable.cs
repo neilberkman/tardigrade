@@ -38,6 +38,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         void InvalidateShadow();
 
         bool WriteTraceEnabled { get; set; }
+        // True when legacy three-column trace records have a known operation
+        // width. False requires width-aware records for reconstruction.
+        bool WriteTraceWidthExplicit { get; }
         int WriteTraceCount { get; }
         string WriteTraceToString();
         void WriteTraceClear();

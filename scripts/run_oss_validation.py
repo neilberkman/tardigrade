@@ -19,7 +19,10 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from fault_classification import _effective_boot_result
+from fault_classification import (
+    _effective_boot_result,
+    writeback_reconstruction_is_valid,
+)
 from layout_validation import LayoutValidationError, validate_load_plan
 
 
@@ -877,6 +880,11 @@ def run_profile(
             or (
                 r.get("is_control")
                 and r.get("fault_injected") is not False
+            )
+            or (
+                not r.get("is_control")
+                and str(r.get("durability_model", "")).strip().lower() == "writeback"
+                and not writeback_reconstruction_is_valid(r)
             )
         )
     ]

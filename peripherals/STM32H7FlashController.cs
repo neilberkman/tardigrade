@@ -145,6 +145,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public void WriteTraceClear() => tracker.WriteTraceClear();
 
+        // The controller records an aligned merged dword for each changed
+        // chunk, but the actual access may be byte/halfword/dword width.
+        // Legacy rows therefore do not carry a safe operation width.
+        public bool WriteTraceWidthExplicit => false;
+
         public bool EraseTraceEnabled { get => tracker.EraseTraceEnabled; set => tracker.EraseTraceEnabled = value; }
 
         public int EraseTraceCount => tracker.EraseTraceCount;

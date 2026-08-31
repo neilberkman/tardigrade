@@ -324,6 +324,7 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         // No execution-trace ring buffer on this controller.
         public bool WriteTraceEnabled { get; set; }
+        public bool WriteTraceWidthExplicit => false;
         public int WriteTraceCount { get { return 0; } }
         public string WriteTraceToString() { return string.Empty; }
         public void WriteTraceClear() { }

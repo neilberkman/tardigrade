@@ -21,10 +21,12 @@ from fault_classification import (
     finding_validation_disposition,
     instruction_skip_severity_model,
     is_resilient_rollback,
+    result_has_initial_timeout,
     result_has_issues,
     result_is_brick,
     result_is_timeout,
     result_issue_reasons,
+    writeback_reconstruction_is_valid,
 )
 from fault_inject import (
     BootloaderRegionConfig,
@@ -89,9 +91,19 @@ def compute_region_breakdown(
         if region is None:
             continue
         if region not in breakdown:
-            breakdown[region] = {"total": 0, "bricks": 0, "issues": 0, "recoveries": 0}
+            breakdown[region] = {
+                "total": 0,
+                "bricks": 0,
+                "issues": 0,
+                "recoveries": 0,
+                "timeouts": 0,
+            }
         bucket = breakdown[region]
         bucket["total"] += 1
+        if result_is_timeout(r):
+            bucket["timeouts"] += 1
+        if result_has_initial_timeout(r):
+            continue
         if result_is_brick(r):
             bucket["bricks"] += 1
         if result_has_issues(r, expected_outcome):
@@ -311,11 +323,28 @@ def summarize_runtime_sweep(
     malformed_fault_injection_results = [
         r for r in non_control if type(r.get("fault_injected")) is not bool
     ]
+    # Writeback power-loss results are valid only when the volatile overlay
+    # was reconstructed, except for the runner's explicit no-snapshot cases
+    # (controls, non-power faults, and points beyond the observed trace).
+    # A disabled/not-applied reconstruction must never be counted as
+    # direct-state security evidence.
+    for result in non_control:
+        if str(result.get("durability_model", "")).strip().lower() != "writeback":
+            continue
+        reconstruction = result.get("writeback_snapshot_reconstruction")
+        if writeback_reconstruction_is_valid(result):
+            continue
+        reason = (
+            str(reconstruction.get("reason") or "unknown reconstruction failure")
+            if isinstance(reconstruction, dict)
+            else "missing_reconstruction_status"
+        )
+        result["infrastructure_error"] = True
+        result["error_kind"] = "writeback_reconstruction"
+        result["error"] = "writeback durability observation incomplete: {}".format(reason)
+        result["boot_outcome"] = "infra_error"
     injected = [r for r in non_control if r.get("fault_injected") is True]
-    timeout_results = [
-        r for r in non_control
-        if bool(r.get("timeout")) or _effective_boot_result(r)[0] == "timeout"
-    ]
+    timeout_results = [r for r in non_control if result_is_timeout(r)]
     infrastructure_errors = [
         r for r in non_control
         if bool(r.get("infrastructure_error"))
@@ -324,10 +353,7 @@ def summarize_runtime_sweep(
     skipped_results = [
         r for r in non_control if _effective_boot_result(r)[0] == "skipped"
     ]
-    control_timeouts = [
-        r for r in control
-        if bool(r.get("timeout")) or _effective_boot_result(r)[0] == "timeout"
-    ]
+    control_timeouts = [r for r in control if result_is_timeout(r)]
     control_infrastructure_errors = [
         r for r in control
         if bool(r.get("infrastructure_error"))
@@ -409,28 +435,31 @@ def summarize_runtime_sweep(
             expected_outcome=expected_outcome,
             default_model=instruction_skip_model,
         )
-    boot_failures = [r for r in injected if result_is_brick(r)]
-    failures = [r for r in injected if result_has_issues(r, expected_outcome)]
+    # A later follow-up timeout does not erase a concrete initial result; only
+    # an initial timeout is excluded from security issue/failure points.
+    reportable_injected = [r for r in injected if not result_has_initial_timeout(r)]
+    boot_failures = [r for r in reportable_injected if result_is_brick(r)]
+    failures = [r for r in reportable_injected if result_has_issues(r, expected_outcome)]
     recoveries = sum(
         1 for r in injected
         if not result_has_issues(r, expected_outcome) and not result_is_timeout(r)
     )
-    resilient_rollbacks = sum(1 for r in injected if is_resilient_rollback(r))
-    semantic_issue_points = sum(1 for r in injected if r.get("semantic_assertion_failures"))
+    resilient_rollbacks = sum(1 for r in reportable_injected if is_resilient_rollback(r))
+    semantic_issue_points = sum(1 for r in reportable_injected if r.get("semantic_assertion_failures"))
     semantic_observation_points = sum(
-        1 for r in injected if r.get("semantic_observation_failures")
+        1 for r in reportable_injected if r.get("semantic_observation_failures")
     )
-    invariant_issue_points = sum(1 for r in injected if r.get("invariant_violations"))
-    metadata_delta_issue_points = sum(1 for r in injected if r.get("metadata_delta_violations"))
+    invariant_issue_points = sum(1 for r in reportable_injected if r.get("invariant_violations"))
+    metadata_delta_issue_points = sum(1 for r in reportable_injected if r.get("metadata_delta_violations"))
     success_effect_issue_points = sum(
-        1 for r in injected
+        1 for r in reportable_injected
         if any(
             isinstance(v, dict) and v.get("name") == "success_implies_effect"
             for v in (r.get("invariant_violations") or [])
         )
     )
     bus_fault_points = sum(
-        1 for r in injected
+        1 for r in reportable_injected
         if _effective_boot_result(r)[0] == "bus_fault"
     )
     timeout_points = len(timeout_results)
@@ -528,6 +557,8 @@ def summarize_runtime_sweep(
             instruction_skip_points += 1
         ft_name = _fault_type_label(r.get("fault_type"))
         fault_type_counts[ft_name] = fault_type_counts.get(ft_name, 0) + 1
+        if result_has_initial_timeout(r):
+            continue
         iskip = classify_instruction_skip_severity(r, expected_outcome=expected_outcome)
         if iskip is not None:
             if iskip["severity"] == "security_bypass":
@@ -730,7 +761,10 @@ def summarize_runtime_sweep(
         summary["success_implies_effect_points"] = success_effect_points
     if calibration_coverage is not None:
         summary["calibration_coverage"] = calibration_coverage
-    did_layers = build_defense_in_depth_layers(injected)
+    # Initial wall-clock timeouts are incomplete observations, not security
+    # evidence.  Keep them out of the aggregate probe/layer counts just as
+    # they are excluded from issue, brick, and validation aggregates above.
+    did_layers = build_defense_in_depth_layers(reportable_injected)
     if did_layers is not None:
         summary["defense_in_depth_layers"] = did_layers
 

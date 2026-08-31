@@ -258,8 +258,8 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
             "mcuboot_head_offset_stm32f4_upgrade.yaml": (0x08020014, 0x00000101),
             "mcuboot_head_move_stm32f4_fast_upgrade.yaml": (0x08020014, 0x00000101),
             "mcuboot_head_offset_stm32f4_fast_upgrade.yaml": (0x08020014, 0x00000101),
-            "mcuboot_head_scratch_stm32f4_upgrade.yaml": (0x08020014, 0x00000101),
-            "mcuboot_head_scratch_stm32f4_fast_upgrade.yaml": (0x08020014, 0x00000101),
+            "mcuboot_head_scratch_stm32f4_upgrade.yaml": (0x08008014, 0x00000101),
+            "mcuboot_head_scratch_stm32f4_fast_upgrade.yaml": (0x08008014, 0x00000101),
         }
         for name, (marker_address, marker_value) in expected.items():
             with self.subTest(profile=name):

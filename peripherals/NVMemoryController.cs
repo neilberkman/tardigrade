@@ -998,6 +998,7 @@ namespace Antmicro.Renode.Peripherals
         public void InvalidateShadow() { }
 
         public bool WriteTraceEnabled { get; set; }
+        public bool WriteTraceWidthExplicit => false;
         public int WriteTraceCount { get { return 0; } }
         public string WriteTraceToString() { return string.Empty; }
         public void WriteTraceClear() { }

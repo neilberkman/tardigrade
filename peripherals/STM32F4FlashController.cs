@@ -1,7 +1,7 @@
 // Copyright (c) 2026
 // SPDX-License-Identifier: Apache-2.0
 //
-// STM32F4 RCC + FLASH peripheral with word-level write tracking and fault
+// STM32F4 RCC + FLASH peripheral with program-operation tracking and fault
 // injection.  API-compatible with NRF52NVMC so the generic sweep script
 // (run_runtime_fault_sweep.resc) can use it via `sysbus.faultFlash`.
 //
@@ -76,6 +76,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int DiffLookahead { get; set; } = 32;
 
         public bool PerWriteAccurate => true;
+        // Direct byte/halfword interception is represented as an aligned
+        // merged value in the legacy trace, so its event width is ambiguous.
+        public bool WriteTraceWidthExplicit => false;
 
         public bool SkipShadowScan { get; set; }
 
@@ -270,7 +273,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const uint PG_BIT    = 1U << 0;
         private const uint SER_BIT   = 1U << 1;
         private const uint SNB_SHIFT = 3;
-        private const uint SNB_MASK  = 0xFU << 3;
+        // STM32F42x/43x use five SNB bits.  Bank-2 sectors 12-23 are
+        // encoded as 16-27 in FLASH_CR (the logical sector plus four).
+        private const uint SNB_MASK  = 0x1FU << 3;
         private const uint STRT_BIT  = 1U << 16;
         private const uint LOCK_BIT  = 1U << 31;
         private const uint PROGRAM_ERROR_BIT = 1U << 7;
@@ -507,10 +512,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // Detect SER + STRT for erase.
             if((newCr & SER_BIT) != 0 && (newCr & STRT_BIT) != 0)
             {
-                int sectorNum = (int)((newCr & SNB_MASK) >> (int)SNB_SHIFT);
+                int sectorNum = DecodeSectorNumber(newCr);
                 HandleErase(sectorNum);
                 crValue &= ~STRT_BIT;
             }
+        }
+
+        private static int DecodeSectorNumber(uint cr)
+        {
+            int encodedSector = (int)((cr & SNB_MASK) >> (int)SNB_SHIFT);
+            if(encodedSector >= 0 && encodedSector <= 11)
+            {
+                return encodedSector;
+            }
+            if(encodedSector >= 16 && encodedSector <= 27)
+            {
+                return encodedSector - 4;
+            }
+            return -1;
         }
 
         // ---------------------------------------------------------------
@@ -532,7 +551,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
 
             // Fast path: just count PG transitions without scanning flash.
-            // Each PG deactivation = exactly 1 word write on STM32F4.
+            // Each PG deactivation is one program operation on STM32F4.
             if(SkipShadowScan)
             {
                 if(tracker.IncrementWriteCount())

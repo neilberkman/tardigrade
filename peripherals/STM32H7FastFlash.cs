@@ -104,6 +104,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int WriteTraceCount => tracker.WriteTraceCount;
         public string WriteTraceToString() => tracker.WriteTraceToString();
         public void WriteTraceClear() => tracker.WriteTraceClear();
+        // The fast tracker diffs aligned dwords, while H7 programming may
+        // update a narrower chunk within the programming buffer.  Legacy
+        // rows therefore do not carry a safe operation width.
+        public bool WriteTraceWidthExplicit => false;
 
         // --- Erase trace ---
 

@@ -2,8 +2,8 @@ schema_version: 1
 name: mcuboot_head_scratch_stm32f4_fast_upgrade
 description: >
   Zero-day hunt: MCUboot HEAD swap-scratch upgrade on nucleo_f429zi.
-  Non-uniform sectors, 352KB slots, 64KB scratch. Combines scratch
-  algorithm with non-uniform geometry for maximum bug surface.
+  Mirrored-bank non-uniform sectors, 224KB slots, 128KB scratch. Combines
+  scratch algorithm with sector-aligned geometry for maximum bug surface.
 
 platform: platforms/stm32f4_fast.repl
 flash_backend: faultFlash
@@ -13,16 +13,25 @@ bootloader:
 memory:
   sram: { start: 0x20000000, end: 0x20040000 }
   write_granularity: 4
+  erase_regions:
+    - { base: 0x08000000, size: 0x10000, sector_size: 0x4000 }
+    - { base: 0x08010000, size: 0x10000, sector_size: 0x10000 }
+    - { base: 0x08020000, size: 0xE0000, sector_size: 0x20000 }
+    - { base: 0x08100000, size: 0x10000, sector_size: 0x4000 }
+    - { base: 0x08110000, size: 0x10000, sector_size: 0x10000 }
+    - { base: 0x08120000, size: 0xE0000, sector_size: 0x20000 }
+  postmortem_partitions:
+    - { name: scratch, base: 0x08040000, size: 0x20000 }
   slots:
-    exec: { base: 0x08020000, size: 0x58000 }
-    staging: { base: 0x08078000, size: 0x58000 }
+    exec: { base: 0x08008000, size: 0x38000 }
+    staging: { base: 0x08108000, size: 0x38000 }
 images:
-  exec: results/oss_validation/assets/zephyr_head_scratch_stm32f4_slot0.bin
-  staging: results/oss_validation/assets/zephyr_head_scratch_stm32f4_slot1.bin
+  exec: results/oss_validation/assets/zephyr_head_scratch_stm32f4_mirrored_slot0.bin
+  staging: results/oss_validation/assets/zephyr_head_scratch_stm32f4_mirrored_slot1.bin
 update_trigger: auto
 success_criteria:
   vtor_in_slot: exec
-  marker_address: 0x08020014
+  marker_address: 0x08008014
   marker_value: 0x00000101
 fault_sweep:
   mode: runtime

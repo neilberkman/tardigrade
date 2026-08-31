@@ -104,6 +104,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int WriteTraceCount => tracker.WriteTraceCount;
         public string WriteTraceToString() => tracker.WriteTraceToString();
         public void WriteTraceClear() => tracker.WriteTraceClear();
+        // WEN diffing records aligned four-byte words even when the driver
+        // changed only part of one, so legacy rows have ambiguous width.
+        public bool WriteTraceWidthExplicit => false;
 
         // Missing interface members (NRF52 uses WEN->REN window counting).
         public bool PerWriteAccurate => false;

@@ -63,6 +63,7 @@ ${TRACKING_START_ADDRESS}      0
 ${CALIBRATION_TIME_SLICE}      ${EMPTY}
 ${PHASE1_TIME_SLICE}           ${EMPTY}
 ${PHASE2_TIME_SLICE}           ${EMPTY}
+${PHASE2_WALL_TIMEOUT_S}       30
 ${ZERO_POINT_EXECUTE_CONTROL}  false
 ${BOOT_CYCLE_HOOK}            ${EMPTY}
 ${EXPECTED_ROLLBACK_AT_CYCLE}    ${EMPTY}
@@ -82,6 +83,8 @@ ${PROGRESS_STALL_TIMEOUT_S}    5
 ${EXPECT_CONTROL_OUTCOME}      ${EMPTY}
 ${POSTMORTEM_DUMP_NO_BOOT}     true
 ${POSTMORTEM_DUMP_HEADER_BYTES}    4096
+${POSTMORTEM_DUMP_TRAILER_BYTES}    4096
+${POSTMORTEM_LAYOUT_B64}       ${EMPTY}
 ${RESUME_TRACE_NO_BOOT}        true
 ${RESUME_TRACE_MAX_OPS}        1024
 ${RESUME_TRACE_TIME_SLICE}     0.02
@@ -231,6 +234,7 @@ Run Runtime Fault Point
     Run Keyword If    '${CALIBRATION_TIME_SLICE}' != ''    Execute Command    $calibration_time_slice="${CALIBRATION_TIME_SLICE}"
     Run Keyword If    '${PHASE1_TIME_SLICE}' != ''    Execute Command    $phase1_time_slice="${PHASE1_TIME_SLICE}"
     Run Keyword If    '${PHASE2_TIME_SLICE}' != ''    Execute Command    $phase2_time_slice="${PHASE2_TIME_SLICE}"
+    Execute Command    $phase2_wall_timeout_s="${PHASE2_WALL_TIMEOUT_S}"
     Execute Command    $zero_point_execute_control="${ZERO_POINT_EXECUTE_CONTROL}"
     Run Keyword If    '${BOOT_CYCLE_HOOK}' != ''    Execute Command    $boot_cycle_hook="${BOOT_CYCLE_HOOK}"
     Run Keyword If    '${EXPECTED_ROLLBACK_AT_CYCLE}' != ''    Execute Command    $expected_rollback_at_cycle=${EXPECTED_ROLLBACK_AT_CYCLE}
@@ -250,6 +254,8 @@ Run Runtime Fault Point
     Execute Command    $expect_control_outcome="${EXPECT_CONTROL_OUTCOME}"
     Execute Command    $postmortem_dump_no_boot="${POSTMORTEM_DUMP_NO_BOOT}"
     Execute Command    $postmortem_dump_header_bytes="${POSTMORTEM_DUMP_HEADER_BYTES}"
+    Execute Command    $postmortem_dump_trailer_bytes="${POSTMORTEM_DUMP_TRAILER_BYTES}"
+    Execute Command    $postmortem_layout_b64="${POSTMORTEM_LAYOUT_B64}"
     Execute Command    $resume_trace_no_boot="${RESUME_TRACE_NO_BOOT}"
     Execute Command    $resume_trace_max_ops="${RESUME_TRACE_MAX_OPS}"
     Execute Command    $resume_trace_time_slice="${RESUME_TRACE_TIME_SLICE}"

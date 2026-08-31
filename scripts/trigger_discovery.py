@@ -28,13 +28,6 @@ from renode_runner import (
 from profile_loader import ELFFile, ProfileConfig, UpdateTrigger
 
 
-MCUBOOT_FLASH_AREA_IDS = {
-    "bootloader": 0,
-    "exec": 1,
-    "staging": 2,
-    "scratch": 3,
-}
-
 STM32F4_ERASE_GEOMETRY = [
     (0x00000, 0x04000),
     (0x04000, 0x04000),
@@ -332,6 +325,79 @@ def _resolve_mcuboot_flash_map(elf_path: str) -> Tuple[Optional[List[Dict[str, i
     return _parse_flash_map_entries(raw)
 
 
+def _compiled_flash_map_candidates(
+    entries: List[Dict[str, int]],
+    *,
+    profile_off: int,
+    profile_size: int,
+    exclude_indices: Optional[Set[int]] = None,
+) -> List[Dict[str, int]]:
+    """Return compiled areas that can represent one declared slot.
+
+    Zephyr assigns flash-map area IDs from the complete partition table.  The
+    IDs therefore are not stable slot identities: a scratch or storage area
+    may be inserted between the two image slots.  Offset and size are the
+    contract shared by the profile and the compiled map.
+    """
+    excluded = exclude_indices or set()
+    return [
+        entry
+        for entry in entries
+        if int(entry.get("index", -1)) not in excluded
+        and int(entry.get("off", -1)) == profile_off
+        and int(entry.get("size", -1)) == profile_size
+    ]
+
+
+def _resolve_compiled_flash_slots(
+    entries: List[Dict[str, int]],
+    slots: Dict[str, Any],
+    flash_base: int,
+) -> Tuple[Dict[str, Dict[str, int]], Dict[str, str]]:
+    """Resolve declared slots to unique compiled areas without using area IDs.
+
+    Exact offset/size matches are required.  A size-only match is unsafe:
+    scratch and storage commonly have the same size as an image slot, so a
+    stale profile must fail closed rather than silently selecting another
+    partition.
+    """
+    resolved: Dict[str, Dict[str, int]] = {}
+    errors: Dict[str, str] = {}
+    used_indices: Set[int] = set()
+    pending: List[Tuple[str, int, int]] = []
+
+    for slot_name, slot in slots.items():
+        profile_off = int(slot.base) - flash_base
+        profile_size = int(slot.size)
+        candidates = _compiled_flash_map_candidates(
+            entries,
+            profile_off=profile_off,
+            profile_size=profile_size,
+            exclude_indices=used_indices,
+        )
+        if len(candidates) == 1:
+            compiled = candidates[0]
+            resolved[slot_name] = compiled
+            used_indices.add(int(compiled["index"]))
+        elif len(candidates) > 1:
+            errors[slot_name] = (
+                "ambiguous compiled flash map: {} entries match off=0x{:X} size=0x{:X}".format(
+                    len(candidates), profile_off, profile_size
+                )
+            )
+        else:
+            pending.append((slot_name, profile_off, profile_size))
+
+    for slot_name, profile_off, profile_size in pending:
+        errors[slot_name] = (
+            "no compiled flash-map entry matches off=0x{:X} size=0x{:X}; "
+            "size-only resolution is disabled".format(
+                profile_off, profile_size
+            )
+        )
+    return resolved, errors
+
+
 def _read_elf_symbol_names(elf_path: str) -> Tuple[Optional[Set[str]], Optional[str]]:
     path = Path(elf_path)
     if ELFFile is not None:
@@ -477,46 +543,46 @@ def validate_compiled_flash_map(
         }
 
     flash_base = _flash_base(profile)
-    by_id = {entry["area_id"]: entry for entry in entries}
     checked_slots: List[Dict[str, Any]] = []
     mismatches: List[str] = []
-    for slot_name, area_id in (("exec", 1), ("staging", 2)):
-        slot = profile.memory.slots.get(slot_name)
-        if slot is None:
-            continue
-        compiled = by_id.get(area_id)
+    declared_slots = {
+        slot_name: profile.memory.slots[slot_name]
+        for slot_name in ("exec", "staging")
+        if slot_name in profile.memory.slots
+    }
+    resolved_slots, resolution_errors = _resolve_compiled_flash_slots(
+        entries,
+        declared_slots,
+        flash_base,
+    )
+    for slot_name, slot in declared_slots.items():
         profile_off = int(slot.base) - flash_base
         slot_summary: Dict[str, Any] = {
             "slot": slot_name,
-            "area_id": area_id,
             "profile_base": "0x{:08X}".format(int(slot.base)),
             "profile_size": "0x{:X}".format(int(slot.size)),
             "profile_off": "0x{:X}".format(profile_off),
         }
-        if compiled is None:
-            slot_summary["status"] = "missing"
-            mismatches.append("{} missing from compiled flash map".format(slot_name))
+        if slot_name in resolution_errors:
+            error = resolution_errors[slot_name]
+            slot_summary["status"] = "ambiguous" if error.startswith("ambiguous") else "missing"
+            slot_summary["resolution_error"] = error
+            mismatches.append("{}: {}".format(slot_name, error))
             checked_slots.append(slot_summary)
             continue
+        compiled = resolved_slots[slot_name]
         slot_summary.update(
             {
+                # Keep ``area_id`` as a compatibility alias for serialized
+                # reports; unlike the old checker, it records the actual
+                # compiled ID rather than assuming an ID for the slot role.
+                "area_id": compiled["area_id"],
+                "compiled_area_id": compiled["area_id"],
                 "compiled_off": "0x{:X}".format(compiled["off"]),
                 "compiled_size": "0x{:X}".format(compiled["size"]),
             }
         )
-        if compiled["off"] != profile_off or compiled["size"] != int(slot.size):
-            slot_summary["status"] = "mismatch"
-            mismatches.append(
-                "{} profile={} size={} compiled_off={} compiled_size={}".format(
-                    slot_name,
-                    slot_summary["profile_off"],
-                    slot_summary["profile_size"],
-                    slot_summary["compiled_off"],
-                    slot_summary["compiled_size"],
-                )
-            )
-        else:
-            slot_summary["status"] = "match"
+        slot_summary["status"] = "match"
         checked_slots.append(slot_summary)
 
     sector_geometry = validate_swap_sector_geometry(profile)
@@ -573,19 +639,28 @@ def _clone_with_compiled_flash_map(
     except Exception:
         return None, None, "compiled flash-map base is invalid"
 
-    by_id = {
-        int(entry["area_id"]): entry
-        for entry in compiled_entries
-        if isinstance(entry, dict) and "area_id" in entry
-    }
     candidate = copy.deepcopy(profile)
     changed_slots: List[Dict[str, str]] = []
 
-    for slot_name, area_id in (("exec", 1), ("staging", 2), ("scratch", 3)):
-        slot = candidate.memory.slots.get(slot_name)
-        compiled = by_id.get(area_id)
-        if slot is None or compiled is None:
-            continue
+    declared_slots = {
+        slot_name: candidate.memory.slots[slot_name]
+        for slot_name in ("exec", "staging")
+        if slot_name in candidate.memory.slots
+    }
+    resolved_slots, resolution_errors = _resolve_compiled_flash_slots(
+        compiled_entries,
+        declared_slots,
+        flash_base,
+    )
+    if resolution_errors:
+        details = "; ".join(
+            "{}: {}".format(slot_name, error)
+            for slot_name, error in sorted(resolution_errors.items())
+        )
+        return None, None, "cannot resolve declared slots in compiled flash map: " + details
+
+    for slot_name, slot in declared_slots.items():
+        compiled = resolved_slots[slot_name]
         old_base = int(slot.base)
         old_size = int(slot.size)
         new_base = flash_base + int(compiled["off"])
@@ -1037,6 +1112,16 @@ def _validate_trace_artifacts(data: Dict[str, Any]) -> Optional[str]:
                 return "{} does not identify a regular file: {}".format(field_name, path)
         except (OSError, TypeError, ValueError) as exc:
             return "{} path could not be checked: {}".format(field_name, exc)
+
+    for binary_field, csv_field in (
+        ("trace_file_bin", "trace_file"),
+        ("erase_trace_file_bin", "erase_trace_file"),
+    ):
+        if data.get(binary_field) and not data.get(csv_field):
+            return (
+                "{} requires its CSV companion {} for coverage classification"
+                .format(binary_field, csv_field)
+            )
 
     csv_specs = (
         ("trace_file", ("write_index", "flash_offset", "value")),

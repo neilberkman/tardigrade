@@ -109,6 +109,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
         public int WriteTraceCount => tracker.WriteTraceCount;
+        public bool WriteTraceWidthExplicit => false;
 
         // Optional run-time gate used by long boot traces.  Zero preserves
         // the historical behavior and starts tracking from reset.

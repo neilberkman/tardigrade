@@ -138,7 +138,7 @@ evidence is inconclusive rather than clean.
 
 ### Write-back durability model
 
-Real storage stacks often buffer writes in RAM before committing to flash. A bootloader that assumes write-through durability can have latent bugs invisible to direct fault injection. The optional `durability_model: writeback` mode adds a volatile overlay between the bootloader's writes and physical flash -- writes accumulate in the overlay, explicit barriers commit them, and power-loss discards uncommitted data. This exposes missing flush barriers without requiring the firmware to be built with a specific storage configuration.
+Real storage stacks often buffer writes in RAM before committing to flash. A bootloader that assumes write-through durability can have latent bugs invisible to direct fault injection. The optional `durability_model: writeback` mode reconstructs the persisted Phase 2 snapshot from a bounded operation trace: writes remain pending until a configured barrier or capacity eviction commits them, and a power cut discards the rest. Phase 1 still observes the live write-through view, so the model evaluates recovery durability without claiming to reproduce same-boot stale reads. Ambiguous or unavailable trace evidence fails closed.
 
 Diagnostic annotations include a barrier audit (detects missing flush barriers between update phases), per-fault dirty-domain state, and a `commit_ratio` metric that quantifies how much of the write stream is uncommitted at each fault point.
 
@@ -299,7 +299,7 @@ flowchart TD
 | I2C bus         | `i2c_nack`, `i2c_timeout`, `i2c_bit_flip`, `i2c_truncated`, `i2c_wrong_address`                                                                                                                | I2CFaultProxy                               |
 | OTP fuse        | `otp_partial_program`, `otp_stuck_bit`, `otp_read_disturb`, `otp_overblow`, `otp_blow_nop`                                                                                                     | OTPMemory                                   |
 
-Faults can be injected at different lifecycle stages: during the initial update write path, during pre-boot metadata/setup writes (`metadata_fault`), during between-boot confirm/accept hooks (`hook_fault`), during the recovery write path itself (`phase2_fault`), or as compound sequences (`multi_fault`). The optional `durability_model: writeback` composes with fault campaigns to simulate write-buffering storage stacks.
+Faults can be injected at different lifecycle stages: during the initial update write path, during pre-boot metadata/setup writes (`metadata_fault`), during between-boot confirm/accept hooks (`hook_fault`), during the recovery write path itself (`phase2_fault`), or as compound sequences (`multi_fault`). The optional `durability_model: writeback` currently supports ordinary trace-reconstructable write paths. Lifecycle/compound and erase-atomicity combinations are rejected as incomplete until their persisted-state provenance can be reconstructed safely.
 
 `swap_progress` uses calibration erase data to find real sector-boundary transitions in slot traffic, then reuses the normal power-cut replay path at those boundaries. On platforms where an erase trace is unavailable, tardigrade falls back to uniform `memory.page_size` buckets, which is usable on uniform flash and only approximate on non-uniform layouts. `security_state_erase` is also a semantic power-loss selector; it targets erase and restoration boundaries for declared persistent security fields.
 
@@ -339,6 +339,28 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the complete 
 ### Real upstream integrations
 
 **MCUboot** -- narrow canary profiles against MCUboot HEAD, retroactive differential profiles for 6 known bugs (broken/fixed pairs for PRs #2100, #2109, #2199, #2205, #2206, #2214), geometry-variant profiles, and multi-step exploratory scenarios with semantic probes and invariant checking. Platforms include nRF52840 (NVMC) and STM32F4. The MCUboot differentials cover three distinct fault-resilience bug classes (revert-magic corruption, header-reload-after-resume, stuck-revert-trailer) -- each was also checked against the other swap algorithms to test for cross-algorithm variants. See `profiles/mcuboot_*.yaml` and [`targets/mcuboot/`](targets/mcuboot/).
+
+The current-head STM32F4 swap-scratch profiles use dedicated mirrored-bank
+assets. Their 2 MiB STM32F429 layout places 224 KiB slots at `0x08008000` and
+`0x08108000`, with a 128 KiB scratch sector at flash offset `0x40000`; the
+slots each span the final two of a bank's four 16 KiB sectors, its 64 KiB
+sector, and one 128 KiB sector. These assets are separate from the historical
+PR2205 images, which intentionally retain their older asymmetric layout.
+
+To rebuild the MCUboot matrix assets, make an Arm GNU toolchain available,
+bootstrap the pinned Zephyr and MCUboot workspace, and then run the matrix
+builder:
+
+```bash
+export GNUARMEMB_TOOLCHAIN_PATH=/path/to/arm-gnu-toolchain
+./scripts/bootstrap_mcuboot_matrix_assets.sh
+./scripts/build_mcuboot_head_matrix.sh
+```
+
+The build script writes the generated ELFs and signed slot images under
+`results/oss_validation/assets/`. The normal and fast STM32F4 profiles share
+the current-head bootloader and mirrored slot images; the fast profile changes
+the Renode backend for execute-mode performance.
 
 **NuttX nxboot** -- real upstream NuttX firmware built from source. Board configs are upstream ([apache/nuttx#18509](https://github.com/apache/nuttx/pull/18509)). Tardigrade found a power-loss recovery vulnerability (92/94 failure rate) that led to fixes in both the NuttX kernel ([#18552](https://github.com/apache/nuttx/pull/18552)) and nxboot itself ([nuttx-apps#3428](https://github.com/apache/nuttx-apps/pull/3428)). The target adapter (`targets/nuttx_nxboot/`) includes a build script, runtime profile generator, and state probe. See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
 
@@ -434,6 +456,7 @@ tardigrade/
 │   ├── self_test.py                  # Self-test across known defect corpus
 │   ├── run_runtime_fault_sweep.resc  # Renode fault sweep engine
 │   ├── write_trace_heuristic.py      # Write-trace classification
+│   ├── writeback_reconstruction.py   # Durable snapshot reconstruction
 │   ├── boot_cycle_analysis.py        # Multi-boot convergence analysis
 │   ├── fault_inject.py               # Fault injection helpers
 │   ├── partial_staging.py            # Partial staging-image simulation

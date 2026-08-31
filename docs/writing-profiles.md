@@ -126,6 +126,31 @@ memory:
 
 `page_size` is the effective erase unit used by state evaluation and as a fallback geometry hint for semantic cutpoints like `swap_progress`. On uniform flash, this is usually the real sector size. On non-uniform flash, calibration erase traces are preferred because they provide the actual per-sector map; `page_size` is only a fallback.
 
+### Postmortem flash evidence
+
+For no-boot diagnostics, declare non-uniform erase geometry and optional
+non-image regions under `memory`. Each `erase_regions` entry describes a
+contiguous range divided into sectors of `sector_size`; each
+`postmortem_partitions` entry is a named region such as scratch or metadata:
+
+```yaml
+memory:
+  erase_regions:
+    - { base: 0x08000000, size: 0x4000, sector_size: 0x4000 }
+    - { base: 0x08004000, size: 0x10000, sector_size: 0x10000 }
+  postmortem_partitions:
+    - { name: scratch, base: 0x08014000, size: 0x4000 }
+```
+
+Postmortem capture keeps the image header separate from vector-table
+validation. `success_criteria.vector_table_offset` selects where the stack
+pointer and reset vector are read, while the raw header remains available as
+evidence. Trailer and raw partition evidence is bounded independently of
+erase-sector size; larger regions retain their size, non-erased preview, and
+SHA-256 without expanding the report. If geometry is not declared and the
+active modeled backend has no known map, the report labels its uniform
+`page_size` sector map as an approximation.
+
 ### How to find your slot addresses
 
 From your linker script or partition table. For MCUboot, the DTS overlay defines `boot_partition`, `slot0_partition`, and `slot1_partition`. For custom bootloaders, grep your linker script for `ORIGIN` and `LENGTH` of each firmware region.
@@ -156,7 +181,7 @@ images:
   staging: path/to/app_36kb.bin # larger image in staging
 ```
 
-No special profile flag is needed -- the size difference comes from the image files themselves. The build script `scripts/build_mcuboot_head_matrix.sh` produces size-asymmetric pairs by truncating the slot1 payload to a specific size (e.g., 36KB vs the full ~19KB app), ensuring every MCUboot HEAD matrix config exercises geometry-dependent code paths.
+No special profile flag is needed -- the size difference comes from the image files themselves. The build script `scripts/build_mcuboot_head_matrix.sh` produces size-asymmetric pairs by padding or truncating the slot1 payload to a requested size (for example, 36 KiB versus the unmodified app payload), ensuring every MCUboot HEAD matrix config exercises geometry-dependent code paths.
 
 If your bootloader validates image hashes (MCUboot does), the hash in the image header must match the actual payload. You cannot simply pad an arbitrary binary -- the image must be properly signed/hashed at the new size.
 
@@ -762,10 +787,11 @@ fault_sweep:
 ```yaml
 fault_sweep:
   phase2_time_slice: "0.05" # emulation slice for recovery boot (default: calibration_time_slice)
-  progress_stall_timeout_s: 10.0 # wall-clock timeout for zero-progress stall detection
+  phase2_wall_timeout_s: 30.0 # wall-clock budget per regular recovery boot (default: 30)
+  progress_stall_timeout_s: 10.0 # emulated-time threshold for zero-progress stall detection
 ```
 
-`phase2_time_slice` controls the emulation time per slice during Phase 2 recovery boot. Defaults to the calibration slice. Larger values mean fewer IPC round-trips but coarser progress detection. `progress_stall_timeout_s` is the wall-clock timeout for detecting a stalled bootloader (zero NVM writes across consecutive slices). When a stall is detected with the PC inside a slot, the outcome is `no_boot` (bricked); with active writes, it's `timeout` (needs more time).
+`phase2_time_slice` controls the emulation time per slice during Phase 2 recovery boot. Defaults to the calibration slice. Larger values mean fewer IPC round-trips but coarser progress detection. `phase2_wall_timeout_s` bounds the wall-clock time for each regular execute/replay recovery boot and defaults to 30 seconds. The outer Renode/Robot timeout remains the hard cap for the run. Specialized Phase 2 fault-injection paths may use their own larger budget. `progress_stall_timeout_s` is the amount of emulated time with no change in the tracked progress signals before the boot is considered stalled. A terminal `no_boot_stall(...)` or `no_progress_stall(...)` observation is treated as `no_boot` when no valid execution is observed. The separate wall-clock guard produces a `timeout` outcome, which marks the observation incomplete rather than treating it as evidence of a brick.
 
 ### Write-back durability model
 
@@ -781,7 +807,7 @@ fault_sweep:
       - address: "0x10002000"
 ```
 
-**`durability_model`**: `"direct"` (default) or `"writeback"`. Direct mode writes go straight to flash. Writeback mode interposes a volatile buffer — writes accumulate and are discarded on power loss unless explicitly flushed by a barrier.
+**`durability_model`**: `"direct"` (default) or `"writeback"`. Direct mode writes go straight to flash. Writeback mode interposes a volatile buffer — writes accumulate and are discarded on power loss unless committed by a configured barrier, capacity eviction, or enabled erase-domain flush.
 
 **`buffer_capacity`**: Number of write operations the buffer holds before evicting the oldest. `"auto"` (default) sets it to one erase sector worth of writes (`erase_size / write_granularity`). Set an explicit integer for a known buffer depth.
 
@@ -789,7 +815,22 @@ fault_sweep:
 
 **`erase_flushes_domain`**: When `true`, erase operations flush the write buffer for the affected domain. Set `true` for storage stacks where erases are synchronous barriers.
 
-The writeback model only affects the faulted flash state used for Phase 2 recovery boot. Phase 1 execution sees all writes (optimistic) — this is conservative: if the bootloader survives writeback mode, it would also survive on real hardware where reads might return stale data.
+`writeback.domains` is reserved for a future per-region buffer model and must
+remain `auto`; custom domain lists are rejected during profile validation.
+
+The writeback model only changes the persisted flash snapshot used for Phase 2 recovery. Phase 1 executes against the live, write-through view of the bootloader's writes; this is an optimistic observation and does not model same-boot reads seeing stale data. A Phase 1 success therefore cannot by itself establish hardware-equivalent durability; the reconstructed committed snapshot is the security-relevant Phase 2 check.
+
+Writeback campaigns require a bounded, trace-capable backend so the runner can
+reconstruct the committed image. The `nvm_ctrl`/`NVMemoryController` path does
+not expose that operation trace and is refused before fault dispatch; such
+profiles are configuration fixtures, not executable self-tests. Legacy
+three-column traces are accepted only from backends that explicitly declare
+four-byte events. Width-bearing CSV traces support 1-, 2-, 4-, and 8-byte
+events; the fixed-width native binary replay path rejects any trace containing
+another width and falls back to the width-aware Python replay. Of the bundled
+backends, CFI flash currently advertises an unambiguous legacy four-byte trace;
+other bundled flash backends fail closed until their exporter can identify the
+program width for every event. External width-bearing traces remain supported.
 
 Diagnostics include a barrier audit (detects missing flush barriers between update phases), per-fault dirty-domain state, and a `commit_ratio` metric.
 

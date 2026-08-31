@@ -111,6 +111,73 @@ class BootCycleAnalysisTests(unittest.TestCase):
         self.assertEqual(analysis["status"], "initial_no_boot_recovered")
         self.assertFalse(analysis["initial_execution_observed"])
 
+    def test_initial_wall_timeout_is_inconclusive(self) -> None:
+        analysis = analyze_boot_cycles(
+            [
+                {
+                    "cycle": 0,
+                    "boot_slot": None,
+                    "boot_outcome": "timeout",
+                    "stop_reason": "wall_timeout(30s)",
+                    "signals": {"execution_observed": False},
+                },
+                {
+                    "cycle": 1,
+                    "boot_slot": "exec",
+                    "boot_outcome": "success",
+                },
+            ],
+            requested_cycles=2,
+        )
+        self.assertEqual(analysis["status"], "timeout")
+        self.assertEqual(analysis["timeout_cycles"], [0])
+        self.assertNotIn("converged_at_cycle", analysis)
+
+    def test_followup_wall_timeout_does_not_erase_initial_no_boot_stall(self) -> None:
+        analysis = analyze_boot_cycles(
+            [
+                {
+                    "cycle": 0,
+                    "boot_slot": None,
+                    "boot_outcome": "no_boot",
+                    "stop_reason": "no_boot_stall(20.00s_emulated)",
+                    "signals": {"execution_observed": False},
+                },
+                {
+                    "cycle": 1,
+                    "boot_slot": None,
+                    "boot_outcome": "timeout",
+                    "stop_reason": "wall_timeout(10s)",
+                },
+            ],
+            requested_cycles=2,
+        )
+        self.assertEqual(analysis["initial_outcome"], "no_boot")
+        self.assertEqual(analysis["final_outcome"], "timeout")
+        self.assertEqual(analysis["status"], "timeout")
+        self.assertNotIn("converged_at_cycle", analysis)
+
+    def test_no_boot_stall_remains_a_concrete_terminal_observation(self) -> None:
+        analysis = analyze_boot_cycles(
+            [
+                {
+                    "cycle": 0,
+                    "boot_slot": None,
+                    "boot_outcome": "no_boot",
+                    "stop_reason": "no_boot_stall(20.00s_emulated)",
+                    "signals": {"execution_observed": False},
+                },
+                {
+                    "cycle": 1,
+                    "boot_slot": None,
+                    "boot_outcome": "no_boot",
+                    "stop_reason": "no_boot_stall(20.00s_emulated)",
+                },
+            ],
+            requested_cycles=2,
+        )
+        self.assertEqual(analysis["status"], "converged")
+
 
 if __name__ == "__main__":
     unittest.main()

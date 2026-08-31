@@ -30,6 +30,11 @@ from targets.tf_m_bl2.probe import (  # noqa: E402
 )
 from profile_loader import (  # noqa: E402
     ProfileError,
+    ProfileConfig,
+    SuccessCriteria,
+    FaultSweepConfig,
+    StateFuzzerConfig,
+    ExpectConfig,
     _parse_fault_sweep,
     _parse_invariant_config,
     _parse_memory,
@@ -396,6 +401,51 @@ class TfmBl2ProbeSlotCompatibilityTest(unittest.TestCase):
                     "offset_end": 0x100000000,
                     "address_addend": 1,
                 }],
+            })
+
+    def test_postmortem_geometry_and_partitions_parse_and_emit(self):
+        parsed = _parse_memory({
+            "sram": {"start": 0x20000000, "end": 0x20010000},
+            "slots": {"exec": {"base": 0x08010000, "size": 0x10000}},
+            "erase_regions": [
+                {"base": 0x08000000, "size": 0x4000, "sector_size": 0x4000},
+                {"base": 0x08004000, "size": 0x10000, "sector_size": 0x10000},
+            ],
+            "postmortem_partitions": [
+                {"name": "scratch", "base": 0x08014000, "size": 0x4000}
+            ],
+        })
+        self.assertEqual(parsed.erase_regions[1].sector_size, 0x10000)
+        self.assertEqual(parsed.postmortem_partitions[0].name, "scratch")
+        profile = ProfileConfig(
+            schema_version=1, name="postmortem", description="",
+            platform="platforms/cortex_m0_nvm.repl",
+            bootloader_elf="test.elf", bootloader_entry=0,
+            memory=parsed, images={}, pre_boot_state=[], setup_script=None,
+            extra_peripherals=None, success_criteria=SuccessCriteria(),
+            fault_sweep=FaultSweepConfig(), state_fuzzer=StateFuzzerConfig(),
+            expect=ExpectConfig(),
+        )
+        vars_list = profile.robot_vars(ROOT)
+        layout = next(v for v in vars_list if v.startswith("POSTMORTEM_LAYOUT_B64:"))
+        self.assertTrue(layout.split(":", 1)[1])
+
+    def test_postmortem_regions_require_valid_geometry_and_names(self):
+        base = {
+            "sram": {"start": 0x20000000, "end": 0x20010000},
+            "slots": {"exec": {"base": 0x08000000, "size": 0x10000}},
+        }
+        with self.assertRaises(ProfileError):
+            _parse_memory({**base, "erase_regions": [{"base": 0, "size": 4}]})
+        with self.assertRaises(ProfileError):
+            _parse_memory({**base, "postmortem_partitions": [{"base": 0, "size": 4}]})
+        with self.assertRaises(ProfileError):
+            _parse_memory({
+                **base,
+                "postmortem_partitions": [
+                    {"name": "scratch", "base": 0, "size": 4},
+                    {"name": "scratch", "base": 8, "size": 4},
+                ],
             })
 
     def test_runtime_tracking_gate_fails_closed_on_unsupported_backend(self):

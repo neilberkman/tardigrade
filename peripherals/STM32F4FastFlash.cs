@@ -3,8 +3,9 @@
 // Minimal STM32F4 FLASH-only peripheral for fast emulation.
 //
 // Registered at 0x40023C00 (STM32F4 FLASH register base), size 0x20.
-// Counts writes on PG 1->0 transitions (per-word accurate).
-// No shadow scanning — each PG deactivation = exactly 1 word write.
+// Counts program operations on PG 1->0 transitions (per-operation accurate).
+// No shadow scanning — each PG deactivation reports one aligned merged dword;
+// the driver's underlying byte width is not retained in the legacy trace.
 //
 // When WriteTraceEnabled or fault snapshot is needed, captures flash
 // on PG 0->1 and diffs on PG 1->0 to find the changed address.
@@ -55,6 +56,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool DriverErrorFired { get => tracker.DriverErrorFired; set => tracker.DriverErrorFired = value; }
 
         public bool PerWriteAccurate => true;
+        // The STM32F4 driver programs bytes (FLASH_PSIZE_BYTE), while this
+        // fast tracker reports an aligned merged dword.  Legacy trace rows
+        // therefore do not carry a safe operation width.
+        public bool WriteTraceWidthExplicit => false;
 
         // Stored but always effectively true — no shadow scanning.
         public bool SkipShadowScan { get; set; } = true;
@@ -122,7 +127,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const uint PG_BIT    = 1U << 0;
         private const uint SER_BIT   = 1U << 1;
         private const uint SNB_SHIFT = 3;
-        private const uint SNB_MASK  = 0xFU << 3;
+        // STM32F42x/43x use five SNB bits.  Bank-2 sectors 12-23 are
+        // encoded as 16-27 in FLASH_CR (the logical sector plus four).
+        private const uint SNB_MASK  = 0x1FU << 3;
         private const uint STRT_BIT  = 1U << 16;
         private const uint LOCK_BIT  = 1U << 31;
 
@@ -287,10 +294,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // SER + STRT: sector erase.
             if((newCr & SER_BIT) != 0 && (newCr & STRT_BIT) != 0)
             {
-                int sectorNum = (int)((newCr & SNB_MASK) >> (int)SNB_SHIFT);
+                int sectorNum = DecodeSectorNumber(newCr);
                 HandleErase(sectorNum);
                 crValue &= ~STRT_BIT;
             }
+        }
+
+        private static int DecodeSectorNumber(uint cr)
+        {
+            int encodedSector = (int)((cr & SNB_MASK) >> (int)SNB_SHIFT);
+            if(encodedSector >= 0 && encodedSector <= 11)
+            {
+                return encodedSector;
+            }
+            if(encodedSector >= 16 && encodedSector <= 27)
+            {
+                return encodedSector - 4;
+            }
+            return -1;
         }
 
         // ---------------------------------------------------------------

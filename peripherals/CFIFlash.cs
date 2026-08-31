@@ -72,6 +72,10 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             writeTrace.Clear();
         }
 
+        // WordProgram is the only traced programming operation, so legacy
+        // three-column traces have an unambiguous four-byte width.
+        public bool WriteTraceWidthExplicit => true;
+
         public void EraseTraceClear()
         {
             eraseTrace.Clear();

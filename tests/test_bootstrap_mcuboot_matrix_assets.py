@@ -217,6 +217,96 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
             text,
         )
 
+    def test_head_matrix_stm32f4_scratch_layout_is_mirrored_and_sector_aligned(self) -> None:
+        text = HEAD_MATRIX_SCRIPT.read_text(encoding="utf-8")
+        expected_dts = (
+            'reg = <0x0 0x08000>;',
+            'slot0_partition: partition@8000',
+            'reg = <0x08000 0x38000>;',
+            'slot1_partition: partition@108000',
+            'reg = <0x108000 0x38000>;',
+            'scratch_partition: partition@40000',
+            'reg = <0x40000 0x20000>;',
+            'storage_partition: partition@60000',
+            'reg = <0x60000 0xA0000>;',
+        )
+        for snippet in expected_dts:
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, text)
+        self.assertIn(
+            'sign_image "scratch_stm32f4" "0x38000" "1.0.0+0" "zephyr_head_scratch_stm32f4_mirrored_slot0.bin"',
+            text,
+        )
+        self.assertIn(
+            'sign_image "scratch_stm32f4" "0x38000" "1.1.0+0" "zephyr_head_scratch_stm32f4_mirrored_slot1.bin" "36864"',
+            text,
+        )
+        self.assertNotIn('reg = <0x20000 0x58000>;', text)
+        self.assertNotIn('reg = <0x78000 0x58000>;', text)
+
+        for name in (
+            "mcuboot_head_scratch_stm32f4_upgrade.yaml",
+            "mcuboot_head_scratch_stm32f4_fast_upgrade.yaml",
+        ):
+            with self.subTest(profile=name):
+                profile = yaml.safe_load((ROOT / "profiles" / name).read_text(encoding="utf-8"))
+                self.assertEqual(
+                    profile["memory"]["slots"],
+                    {
+                        "exec": {"base": 0x08008000, "size": 0x38000},
+                        "staging": {"base": 0x08108000, "size": 0x38000},
+                    },
+                )
+                self.assertEqual(
+                    profile["memory"]["erase_regions"],
+                    [
+                        {"base": 0x08000000, "size": 0x10000, "sector_size": 0x4000},
+                        {"base": 0x08010000, "size": 0x10000, "sector_size": 0x10000},
+                        {"base": 0x08020000, "size": 0xE0000, "sector_size": 0x20000},
+                        {"base": 0x08100000, "size": 0x10000, "sector_size": 0x4000},
+                        {"base": 0x08110000, "size": 0x10000, "sector_size": 0x10000},
+                        {"base": 0x08120000, "size": 0xE0000, "sector_size": 0x20000},
+                    ],
+                )
+                self.assertEqual(
+                    profile["memory"]["postmortem_partitions"],
+                    [{"name": "scratch", "base": 0x08040000, "size": 0x20000}],
+                )
+                self.assertIn("Mirrored-bank non-uniform sectors", profile["description"])
+                self.assertEqual(profile["success_criteria"]["marker_address"], 0x08008014)
+                self.assertTrue(
+                    profile["images"]["exec"].endswith(
+                        "zephyr_head_scratch_stm32f4_mirrored_slot0.bin"
+                    )
+                )
+                self.assertTrue(
+                    profile["images"]["staging"].endswith(
+                        "zephyr_head_scratch_stm32f4_mirrored_slot1.bin"
+                    )
+                )
+
+        historical = yaml.safe_load(
+            (ROOT / "profiles" / "mcuboot_pr2205_scratch_broken.yaml").read_text(encoding="utf-8")
+        )
+        current = yaml.safe_load(
+            (ROOT / "profiles" / "mcuboot_head_scratch_stm32f4_upgrade.yaml").read_text(encoding="utf-8")
+        )
+        self.assertNotEqual(current["images"], historical["images"])
+        self.assertNotEqual(
+            current["memory"]["slots"]["exec"]["base"],
+            historical["memory"]["slots"]["exec"]["base"],
+        )
+        self.assertTrue(
+            historical["images"]["exec"].endswith(
+                "zephyr_head_scratch_stm32f4_slot0.bin"
+            )
+        )
+        self.assertTrue(
+            historical["images"]["staging"].endswith(
+                "zephyr_head_scratch_stm32f4_slot1.bin"
+            )
+        )
+
     def test_upgrade_differential_profiles_hash_exec_slot(self) -> None:
         for relpath in PR_DIFFERENTIAL_PROFILES:
             with self.subTest(profile=relpath):

@@ -9,6 +9,8 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Dict, List, Optional, Tuple
 
+from fault_types import FAULT_TYPE_NAME_TO_CODE
+
 
 # Multi-boot statuses that represent a successful final state.
 _MULTI_BOOT_SUCCESS_STATUSES = frozenset({"converged", "rollback_converged"})
@@ -33,6 +35,40 @@ _INSTRUCTION_SKIP_SECURITY_OUTCOMES = frozenset(
 )
 _KNOWN_GOOD_IMAGE_HASH_MATCHES = frozenset(
     {"exec_image", "staging_image", "expected_image"}
+)
+
+_WRITEBACK_RECONSTRUCTION_OK = frozenset({"reconstructed", "trace_replay"})
+_WRITEBACK_POWER_FAULT_CODES = frozenset(
+    {
+        "w",
+        "e",
+        "a",
+        "power_loss",
+        "interrupted_erase",
+        "multi_sector_atomicity",
+    }
+)
+_WRITEBACK_NON_POWER_FAULT_CODES = frozenset(
+    set(FAULT_TYPE_NAME_TO_CODE)
+    | set(FAULT_TYPE_NAME_TO_CODE.values())
+) - _WRITEBACK_POWER_FAULT_CODES
+_WRITEBACK_BEYOND_TRACE_REASONS = frozenset(
+    {
+        "no_write_at_index",
+        "no_erase_at_index",
+    }
+)
+_WRITEBACK_UNSUPPORTED_LIFECYCLE_PREFIXES = frozenset(
+    {"m", "h", "cc", "p2", "mf", "c"}
+)
+_WRITEBACK_UNSUPPORTED_ERASE_FAULT_CODES = frozenset(
+    {"e", "a", "interrupted_erase", "multi_sector_atomicity"}
+)
+_WRITEBACK_KNOWN_FAULT_CODES = frozenset(
+    set(FAULT_TYPE_NAME_TO_CODE)
+    | set(FAULT_TYPE_NAME_TO_CODE.values())
+    | set(_WRITEBACK_UNSUPPORTED_LIFECYCLE_PREFIXES)
+    | {"cascade"}
 )
 
 
@@ -84,6 +120,86 @@ def _base_fault_type_code(result: Dict[str, Any]) -> str:
     if not raw:
         return ""
     return raw.split(":", 1)[0]
+
+
+def _writeback_fault_type_code(result: Dict[str, Any]) -> str:
+    """Return a safe writeback classification code for a result.
+
+    Lifecycle and compound encodings do not carry a reconstructed persisted
+    snapshot in the current runner.  Keep their prefix as the classification
+    code; nested codes must not make an unsupported path look like a valid
+    non-power result.  Ordinary prefixed wire codes (for example ``nv:0`` and
+    ``i:...``) retain their recognized base code.
+    """
+    raw = str(result.get("fault_type") or "").strip().lower()
+    base = raw.split(":", 1)[0] if raw else ""
+    if base in _WRITEBACK_UNSUPPORTED_LIFECYCLE_PREFIXES:
+        return base
+    return base
+
+
+def writeback_reconstruction_is_valid(result: Dict[str, Any]) -> bool:
+    """Return whether a writeback result has a legitimate reconstruction state.
+
+    A reconstructed committed snapshot is required for an injected power-loss
+    fault.  Controls and known non-power fault types do not mutate persisted
+    state through that path.  A power-loss point that was not injected is
+    valid only when the runner can establish that the requested point was
+    beyond the observed trace.
+    """
+
+    if str(result.get("durability_model", "")).strip().lower() != "writeback":
+        return True
+    reconstruction = result.get("writeback_snapshot_reconstruction")
+    if not isinstance(reconstruction, dict):
+        return False
+    # Erase and multi-sector atomicity faults mutate a captured snapshot in
+    # ways that cannot be reconstructed from the clean baseline: interrupted
+    # erases are partial and atomicity faults may corrupt a neighbouring
+    # sector.  Treat even a mistakenly marked ``reconstructed`` result as
+    # infrastructure-incomplete until a provenance-preserving model exists.
+    raw_fault_type = str(result.get("fault_type") or "").strip().lower()
+    base_fault_type = raw_fault_type.split(":", 1)[0] if raw_fault_type else ""
+    if (
+        base_fault_type in _WRITEBACK_UNSUPPORTED_LIFECYCLE_PREFIXES
+        or base_fault_type in _WRITEBACK_UNSUPPORTED_ERASE_FAULT_CODES
+    ):
+        return False
+    # Control observations intentionally have no injectable fault encoding.
+    if result.get("is_control") is True:
+        return True
+    # A producer cannot make an unknown fault family valid by labeling its
+    # snapshot reconstructed.  Classification must recognize the encoding
+    # before accepting any reconstruction status.
+    if (
+        raw_fault_type not in _WRITEBACK_KNOWN_FAULT_CODES
+        and base_fault_type not in _WRITEBACK_KNOWN_FAULT_CODES
+    ):
+        return False
+    status = str(reconstruction.get("status") or "").strip().lower()
+    if status in _WRITEBACK_RECONSTRUCTION_OK:
+        return True
+    if status != "not_required":
+        return False
+    fault_type = _writeback_fault_type_code(result)
+    if fault_type in _WRITEBACK_NON_POWER_FAULT_CODES:
+        return True
+    if fault_type not in _WRITEBACK_POWER_FAULT_CODES:
+        return False
+    if result.get("fault_injected") is not False:
+        return False
+
+    reason = str(result.get("skip_reason") or "").strip().lower()
+    if reason in _WRITEBACK_BEYOND_TRACE_REASONS or (
+        reason.startswith("stage") and reason.endswith("_fault_index_beyond_writes")
+    ):
+        return True
+    try:
+        requested = int(result.get("fault_requested", result.get("fault_at")))
+        actual = int(result.get("actual_writes"))
+    except (TypeError, ValueError):
+        return False
+    return requested >= 0 and actual >= 0 and requested >= actual
 
 
 def instruction_skip_severity_model(result: Dict[str, Any], default: str = "security") -> str:
@@ -206,11 +322,16 @@ def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     raw_slot = result.get("initial_boot_slot") or result.get("boot_slot")
     if result.get("timeout", False):
         return ("timeout", raw_slot)
+    mba = result.get("multi_boot_analysis")
+    if isinstance(mba, dict) and mba.get("status") == "timeout":
+        # Keep a concrete initial result authoritative; the follow-up timeout
+        # makes the campaign incomplete, but must not turn an initial
+        # no_boot-stall observation into a synthetic convergence.
+        return (raw_outcome, raw_slot)
     final_outcome = result.get("final_boot_outcome")
     final_slot = result.get("final_boot_slot")
     if final_outcome is not None:
         return (final_outcome, final_slot)
-    mba = result.get("multi_boot_analysis")
     if not isinstance(mba, dict):
         return (raw_outcome, raw_slot)
     status = mba.get("status")
@@ -289,6 +410,11 @@ def is_resilient_rollback(result: Dict[str, Any]) -> bool:
 def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[str]:
     reasons: List[str] = []
     if result_is_invalidated_finding(result):
+        return reasons
+    # A wall-clock timeout has no terminal boot evidence.  Keep it visible as
+    # an operational timeout, but never reinterpret the copied raw no_boot
+    # fields as a security failure.
+    if result_has_initial_timeout(result):
         return reasons
     iskip = classify_instruction_skip_severity(result, expected_outcome=expected_outcome)
     model = instruction_skip_severity_model(result)
@@ -379,13 +505,85 @@ def result_has_issues(result: Dict[str, Any], expected_outcome: str) -> bool:
 
 
 def result_is_timeout(result: Dict[str, Any]) -> bool:
+    if result_has_initial_timeout(result):
+        return True
+    cycles = result.get("boot_cycles")
+    if isinstance(cycles, list) and cycles:
+        if any(
+            str(cycle.get("stop_reason") or "").startswith("wall_timeout")
+            or cycle.get("boot_outcome") == "timeout"
+            for cycle in cycles if isinstance(cycle, dict)
+        ):
+            return True
+        # A recorded cycle-0 terminal result outranks copied aggregate/raw
+        # timeout fields, including a stale multi_boot_analysis status.
+        return False
+    mba = result.get("multi_boot_analysis")
+    if isinstance(mba, dict) and mba.get("status") == "timeout":
+        return True
+    if result.get("timeout", False):
+        # Some older result producers set a broad timeout flag for the
+        # operation even after collecting a concrete terminal boot outcome.
+        # Keep that evidence authoritative; only promote the flag when the
+        # boot outcome is absent or itself inconclusive.
+        raw_boot_outcome = str(
+            result.get("initial_boot_outcome") or result.get("boot_outcome") or ""
+        ).strip().lower()
+        if raw_boot_outcome and raw_boot_outcome not in {"unknown", "no_boot", "timeout"}:
+            return False
+        return True
     eff_outcome, _ = _effective_boot_result(result)
     outcome = str(eff_outcome or "unknown").strip().lower()
     return outcome == "timeout"
 
 
+def result_has_initial_timeout(result: Dict[str, Any]) -> bool:
+    """Return whether the initial boot observation timed out.
+
+    A later timed-out follow-up is distinct from an initial wall-clock
+    timeout: the former may preserve a concrete initial failure, while the
+    latter has no terminal boot evidence and must not be validated.
+    """
+    cycles = result.get("boot_cycles")
+    if isinstance(cycles, list) and cycles:
+        first = cycles[0]
+        if isinstance(first, dict):
+            if str(first.get("boot_outcome") or "").strip().lower() == "timeout":
+                return True
+            if str(first.get("stop_reason") or "").startswith("wall_timeout"):
+                return True
+        return False
+
+    initial_outcome = result.get("initial_boot_outcome")
+    if str(initial_outcome or "").strip().lower() == "timeout":
+        return True
+
+    if result.get("timeout", False):
+        # A concrete terminal outcome wins over the broad legacy flag.  A
+        # raw no_boot remains inconclusive and is still operationally timed
+        # out unless cycle-0 evidence below establishes a real stall.
+        raw_boot_outcome = str(
+            result.get("initial_boot_outcome") or result.get("boot_outcome") or ""
+        ).strip().lower()
+        if raw_boot_outcome and raw_boot_outcome not in {"unknown", "no_boot", "timeout"}:
+            return False
+        return True
+
+    if str(result.get("boot_outcome") or "").strip().lower() == "timeout":
+        return True
+    signals = result.get("signals")
+    if isinstance(signals, dict):
+        for key in ("phase1_stop_reason", "phase2_stop_reason"):
+            reason = str(signals.get(key) or "")
+            if reason.startswith("wall_timeout"):
+                return True
+    return False
+
+
 def result_is_brick(result: Dict[str, Any]) -> bool:
     if result_is_invalidated_finding(result):
+        return False
+    if result_has_initial_timeout(result):
         return False
     iskip = classify_instruction_skip_severity(result)
     if iskip is not None and iskip["severity"] in {"dos_crash", "dos_recovery"}:

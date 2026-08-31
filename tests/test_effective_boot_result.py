@@ -20,6 +20,7 @@ from fault_classification import (
     classify_failure_class,
     result_has_issues,
     result_is_brick,
+    result_is_timeout,
     result_issue_reasons,
 )
 from audit_report import summarize_runtime_sweep
@@ -224,6 +225,38 @@ class IssueDetectionIntegrationTests(unittest.TestCase):
     def test_no_boot_without_multi_boot_is_brick(self):
         result = {"boot_outcome": "no_boot", "boot_slot": None}
         self.assertTrue(result_is_brick(result))
+
+    def test_followup_timeout_preserves_initial_no_boot_without_convergence(self):
+        result = {
+            "boot_outcome": "no_boot",
+            "boot_slot": None,
+            "initial_boot_outcome": "no_boot",
+            "initial_boot_slot": None,
+            "final_boot_outcome": "timeout",
+            "final_boot_slot": None,
+            "boot_cycles": [
+                {
+                    "cycle": 0,
+                    "boot_outcome": "no_boot",
+                    "stop_reason": "no_boot_stall(20s_emulated)",
+                },
+                {
+                    "cycle": 1,
+                    "boot_outcome": "timeout",
+                    "stop_reason": "wall_timeout(10s)",
+                },
+            ],
+            "multi_boot_analysis": {
+                "status": "timeout",
+                "initial_outcome": "no_boot",
+                "final_outcome": "timeout",
+            },
+        }
+        outcome, slot = _effective_boot_result(result)
+        self.assertEqual(outcome, "no_boot")
+        self.assertIsNone(slot)
+        self.assertTrue(result_is_brick(result))
+        self.assertTrue(result_is_timeout(result))
 
     def test_classify_rollback_converged_is_recoverable(self):
         self.assertEqual(

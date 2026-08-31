@@ -17,7 +17,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from profile_loader import WritebackConfig, load_profile
+from profile_loader import ProfileError, WritebackConfig, load_profile
 
 
 class WritebackProfileParsingTest(unittest.TestCase):
@@ -58,6 +58,7 @@ class WritebackProfileParsingTest(unittest.TestCase):
                 td,
                 textwrap.dedent("""\
                     fault_sweep:
+                      evaluation_mode: execute
                       durability_model: writeback
                 """),
             )
@@ -70,13 +71,27 @@ class WritebackProfileParsingTest(unittest.TestCase):
             self.assertEqual(wb.barriers, [])
             self.assertFalse(wb.erase_flushes_domain)
 
-    def test_writeback_config_explicit(self):
-        """Explicit buffer_capacity, barriers, and erase_flushes_domain are parsed."""
+    def test_writeback_requires_execute_evaluation(self):
         with tempfile.TemporaryDirectory() as td:
             path = self._write_profile(
                 td,
                 textwrap.dedent("""\
                     fault_sweep:
+                      evaluation_mode: state
+                      durability_model: writeback
+                """),
+            )
+            with self.assertRaisesRegex(ProfileError, "writeback.*evaluation_mode.*execute"):
+                load_profile(path)
+
+    def test_writeback_config_rejects_custom_domains(self):
+        """Custom domains are rejected until per-region buffering is implemented."""
+        with tempfile.TemporaryDirectory() as td:
+            path = self._write_profile(
+                td,
+                textwrap.dedent("""\
+                    fault_sweep:
+                      evaluation_mode: execute
                       durability_model: writeback
                       writeback:
                         buffer_capacity: 4
@@ -86,12 +101,28 @@ class WritebackProfileParsingTest(unittest.TestCase):
                         erase_flushes_domain: true
                 """),
             )
+            with self.assertRaisesRegex(ProfileError, "custom domains are not supported"):
+                load_profile(path)
+
+    def test_writeback_config_explicit_options(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._write_profile(
+                td,
+                textwrap.dedent("""\
+                    fault_sweep:
+                      evaluation_mode: execute
+                      durability_model: writeback
+                      writeback:
+                        buffer_capacity: 4
+                        barriers:
+                          - {type: erase, address: 0x10038000}
+                        erase_flushes_domain: true
+                """),
+            )
             profile = load_profile(path)
-            self.assertEqual(profile.fault_sweep.durability_model, "writeback")
             wb = profile.fault_sweep.writeback
-            self.assertIsNotNone(wb)
             self.assertEqual(wb.buffer_capacity, 4)
-            self.assertEqual(wb.domains, ["slot_data", "slot_trailer"])
+            self.assertEqual(wb.domains, "auto")
             self.assertEqual(len(wb.barriers), 1)
             self.assertEqual(wb.barriers[0]["type"], "erase")
             self.assertEqual(wb.barriers[0]["address"], 0x10038000)

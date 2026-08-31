@@ -19,6 +19,7 @@ if str(SCRIPTS) not in sys.path:
 
 
 from audit_report import compute_verdict, summarize_runtime_sweep  # noqa: E402
+from fault_classification import writeback_reconstruction_is_valid  # noqa: E402
 from renode_runner import (  # noqa: E402
     RenodeProtocolError,
     _run_batch_with_fallback,
@@ -69,6 +70,172 @@ def test_arbitrary_runner_failure_cannot_satisfy_expected_findings() -> None:
     assert "infrastructure error" in verdict
 
 
+def test_writeback_reconstruction_refusal_is_incomplete() -> None:
+    results = [
+        _control(),
+        {
+            "is_control": False,
+            "fault_at": 3,
+            "fault_requested": 3,
+            "fault_injected": True,
+            "boot_outcome": "success",
+            "durability_model": "writeback",
+            "writeback_snapshot_reconstruction": {
+                "status": "disabled",
+                "reason": "missing_trace_data",
+            },
+        },
+    ]
+    summary = summarize_runtime_sweep(results, expected_fault_points=1)
+    assert summary["infrastructure_error_points"] == 1
+    assert summary["incomplete_fault_points"] == 1
+    assert summary["campaign_complete"] is False
+    assert compute_verdict(summary, _expect()).startswith("FAIL")
+
+
+def test_writeback_missing_reconstruction_status_is_incomplete() -> None:
+    results = [_control(), {
+        "is_control": False,
+        "fault_at": 3,
+        "fault_requested": 3,
+        "fault_injected": True,
+        "boot_outcome": "success",
+        "durability_model": "writeback",
+    }]
+    summary = summarize_runtime_sweep(results, expected_fault_points=1)
+    assert summary["infrastructure_error_points"] == 1
+    assert summary["campaign_complete"] is False
+
+
+def test_writeback_not_required_is_limited_to_runner_legitimate_contexts() -> None:
+    reconstruction = {
+        "status": "not_required",
+        "reason": "no_persisted_power_loss_snapshot_for_result",
+    }
+    assert writeback_reconstruction_is_valid({
+        "is_control": True,
+        "durability_model": "writeback",
+        "writeback_snapshot_reconstruction": reconstruction,
+    })
+    assert writeback_reconstruction_is_valid({
+        "is_control": False,
+        "fault_type": "b",
+        "fault_injected": True,
+        "durability_model": "writeback",
+        "writeback_snapshot_reconstruction": reconstruction,
+    })
+    assert writeback_reconstruction_is_valid({
+        "is_control": False,
+        "fault_type": "w",
+        "fault_requested": 10,
+        "fault_at": 10,
+        "actual_writes": 10,
+        "fault_injected": False,
+        "durability_model": "writeback",
+        "writeback_snapshot_reconstruction": reconstruction,
+    })
+
+    # An injected power-loss point must never be made valid by an optimistic
+    # not_required marker, and missing reconstruction must fail closed too.
+    assert not writeback_reconstruction_is_valid({
+        "is_control": False,
+        "fault_type": "w",
+        "fault_injected": True,
+        "durability_model": "writeback",
+        "writeback_snapshot_reconstruction": reconstruction,
+    })
+    assert not writeback_reconstruction_is_valid({
+        "is_control": False,
+        "fault_type": "w",
+        "fault_requested": 10,
+        "fault_at": 10,
+        "actual_writes": 10,
+        "fault_injected": False,
+        "durability_model": "writeback",
+    })
+    assert not writeback_reconstruction_is_valid({
+        "is_control": False,
+        "fault_type": "unrecognized_fault",
+        "fault_injected": True,
+        "durability_model": "writeback",
+        "writeback_snapshot_reconstruction": reconstruction,
+    })
+    for status in ("reconstructed", "trace_replay"):
+        assert not writeback_reconstruction_is_valid({
+            "is_control": False,
+            "fault_type": "unknown_family:1",
+            "fault_injected": True,
+            "durability_model": "writeback",
+            "writeback_snapshot_reconstruction": {"status": status},
+        })
+
+
+def test_writeback_not_required_non_power_fault_remains_complete() -> None:
+    results = [_control(), {
+        "is_control": False,
+        "fault_at": 3,
+        "fault_requested": 3,
+        "fault_type": "b",
+        "fault_injected": True,
+        "boot_outcome": "success",
+        "durability_model": "writeback",
+        "writeback_snapshot_reconstruction": {
+            "status": "not_required",
+            "reason": "no_persisted_power_loss_snapshot_for_result",
+        },
+    }]
+    summary = summarize_runtime_sweep(results, expected_fault_points=1)
+    assert summary["infrastructure_error_points"] == 0
+    assert summary["incomplete_fault_points"] == 0
+    assert summary["campaign_complete"] is True
+
+
+def test_writeback_prefixed_fault_codes_remain_fail_closed() -> None:
+    reconstruction = {
+        "status": "not_required",
+        "reason": "no_persisted_power_loss_snapshot_for_result",
+    }
+    for fault_type in (
+        "m:w",
+        "m:b",
+        "h:3:w",
+        "h:3:b",
+        "cc:2:w",
+        "p2:4:5:w:e",
+        "p2:4:5:b:b",
+        "mf:1:2",
+        "c:4:7",
+    ):
+        assert not writeback_reconstruction_is_valid({
+            "is_control": False,
+            "fault_type": fault_type,
+            "fault_injected": True,
+            "durability_model": "writeback",
+            "writeback_snapshot_reconstruction": reconstruction,
+        })
+    assert writeback_reconstruction_is_valid({
+        "is_control": False,
+        "fault_type": "nv:0",
+        "fault_injected": True,
+        "durability_model": "writeback",
+        "writeback_snapshot_reconstruction": reconstruction,
+    })
+
+
+def test_writeback_erase_faults_cannot_be_reported_as_reconstructed() -> None:
+    for fault_type in ("e", "a", "interrupted_erase", "multi_sector_atomicity"):
+        assert not writeback_reconstruction_is_valid({
+            "is_control": False,
+            "fault_type": fault_type,
+            "fault_injected": True,
+            "durability_model": "writeback",
+            "writeback_snapshot_reconstruction": {
+                "status": "reconstructed",
+                "reason": "incorrectly supplied by an unsafe caller",
+            },
+        })
+
+
 def test_verified_timeout_is_incomplete_not_a_recovery() -> None:
     results = [
         _control(),
@@ -89,6 +256,52 @@ def test_verified_timeout_is_incomplete_not_a_recovery() -> None:
     verdict = compute_verdict(summary, _expect())
     assert verdict.startswith("FAIL")
     assert "timed out" in verdict
+
+
+def test_zero_write_phase_timeout_is_not_a_no_boot_finding() -> None:
+    results = [
+        _control(),
+        {
+            "is_control": False,
+            "fault_at": 9,
+            "fault_requested": 9,
+            "fault_injected": True,
+            "boot_outcome": "timeout",
+            "boot_slot": None,
+            "error_kind": "wall_timeout",
+        },
+    ]
+    summary = summarize_runtime_sweep(results, expected_fault_points=1)
+    assert summary["timeout_points"] == 1
+    assert summary["bricks"] == 0
+    assert summary["campaign_complete"] is False
+    assert compute_verdict(summary, _expect()).startswith("FAIL")
+
+
+def test_followup_timeout_keeps_initial_stall_but_campaign_incomplete() -> None:
+    results = [
+        _control(),
+        {
+            "is_control": False,
+            "fault_at": 9,
+            "fault_requested": 9,
+            "fault_injected": True,
+            "boot_outcome": "no_boot",
+            "boot_slot": None,
+            "initial_boot_outcome": "no_boot",
+            "final_boot_outcome": "timeout",
+            "signals": {"multiboot_cycles_run": 1},
+            "boot_cycles": [
+                {"cycle": 0, "boot_outcome": "no_boot", "stop_reason": "no_boot_stall(20s_emulated)"},
+                {"cycle": 1, "boot_outcome": "timeout", "stop_reason": "wall_timeout(10s)"},
+            ],
+            "multi_boot_analysis": {"status": "timeout", "final_outcome": "timeout"},
+        },
+    ]
+    summary = summarize_runtime_sweep(results, expected_fault_points=1)
+    assert summary["timeout_points"] == 1
+    assert summary["incomplete_fault_points"] == 1
+    assert summary["campaign_complete"] is False
 
 
 @pytest.mark.parametrize(

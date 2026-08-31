@@ -7,15 +7,28 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from audit_report import summarize_runtime_sweep
-from fault_classification import classify_failure_class, result_has_issues, result_is_brick
-from finding_validator import _apply_validation, _validate_instruction_skip, _validate_write_fault
+from audit_report import compute_region_breakdown, summarize_runtime_sweep
+from fault_classification import (
+    classify_failure_class,
+    result_has_initial_timeout,
+    result_has_issues,
+    result_is_brick,
+    result_is_timeout,
+)
+from finding_validator import (
+    _apply_validation,
+    _steady_state_status,
+    _validate_instruction_skip,
+    _validate_write_fault,
+    validate_runtime_findings,
+)
 
 
 def _profile_stub():
@@ -184,6 +197,102 @@ class WriteFaultValidationTests(unittest.TestCase):
 
 
 class ValidationClassificationTests(unittest.TestCase):
+    def test_initial_wall_timeout_is_detected_even_when_raw_outcome_is_no_boot(self) -> None:
+        result = {
+            "boot_outcome": "no_boot",
+            "signals": {"phase2_stop_reason": "wall_timeout(30s)"},
+        }
+        self.assertTrue(result_has_initial_timeout(result))
+        self.assertTrue(result_is_timeout(result))
+
+    def test_concrete_initial_stall_is_not_reclassified_by_followup_timeout(self) -> None:
+        result = {
+            "initial_boot_outcome": "no_boot",
+            "boot_cycles": [
+                {"cycle": 0, "boot_outcome": "no_boot", "stop_reason": "no_boot_stall(20s)"},
+                {"cycle": 1, "boot_outcome": "timeout", "stop_reason": "wall_timeout(10s)"},
+            ],
+        }
+        self.assertFalse(result_has_initial_timeout(result))
+        self.assertTrue(result_is_timeout(result))
+
+    def test_concrete_terminal_outcome_overrides_legacy_timeout_flag(self) -> None:
+        result = {
+            "boot_outcome": "success",
+            "boot_slot": "staging",
+            "timeout": True,
+        }
+        self.assertFalse(result_has_initial_timeout(result))
+        self.assertFalse(result_is_timeout(result))
+
+    def test_cycle_zero_terminal_outcome_overrides_copied_initial_timeout(self) -> None:
+        result = {
+            "initial_boot_outcome": "timeout",
+            "boot_outcome": "success",
+            "boot_cycles": [
+                {"cycle": 0, "boot_outcome": "success", "stop_reason": "vtor_captured"},
+            ],
+        }
+        self.assertFalse(result_has_initial_timeout(result))
+        self.assertFalse(result_is_timeout(result))
+
+    def test_validator_leaves_initial_timeout_unvalidated(self) -> None:
+        result = {
+            "fault_injected": True,
+            "fault_type": "w",
+            "boot_outcome": "no_boot",
+            "signals": {"phase2_stop_reason": "wall_timeout(30s)"},
+        }
+        profile = SimpleNamespace(
+            expect=SimpleNamespace(control_outcome="success"),
+            fault_sweep=None,
+        )
+        with mock.patch("finding_validator.build_fault_robot_vars", return_value=[]), \
+             mock.patch("finding_validator._make_single_point_runner"):
+            validate_runtime_findings(
+                results=[result],
+                profile=profile,
+                repo_root=ROOT,
+                renode_test="renode-test",
+                robot_suite="suite.robot",
+                robot_vars=[],
+                work_dir=ROOT,
+                renode_remote_server_dir="/tmp",
+            )
+        self.assertNotIn("finding_validation", result)
+
+    def test_no_followup_boot_is_not_reported_as_persistent(self) -> None:
+        result = {
+            "boot_outcome": "no_boot",
+            "initial_boot_outcome": "no_boot",
+            "final_boot_outcome": "no_boot",
+            "signals": {"multiboot_cycles_run": 0},
+        }
+        self.assertEqual(_steady_state_status(result), "single_boot_only")
+
+    def test_followup_boot_preserves_persistent_status(self) -> None:
+        result = {
+            "boot_outcome": "no_boot",
+            "initial_boot_outcome": "no_boot",
+            "final_boot_outcome": "no_boot",
+            "signals": {"multiboot_cycles_run": 1},
+            "boot_cycles": [
+                {"cycle": 0, "boot_outcome": "no_boot"},
+                {"cycle": 1, "boot_outcome": "no_boot"},
+            ],
+        }
+        self.assertEqual(_steady_state_status(result), "persistent_after_followup")
+
+    def test_stale_followup_counter_cannot_claim_persistence(self) -> None:
+        result = {
+            "boot_outcome": "no_boot",
+            "initial_boot_outcome": "no_boot",
+            "final_boot_outcome": "no_boot",
+            "signals": {"multiboot_cycles_run": 1},
+            "boot_cycles": [{"cycle": 0, "boot_outcome": "no_boot"}],
+        }
+        self.assertEqual(_steady_state_status(result), "single_boot_only")
+
     def test_candidate_and_dismissed_findings_are_not_reportable(self) -> None:
         candidate = {
             "boot_outcome": "wrong_image",
@@ -231,6 +340,74 @@ class ValidationClassificationTests(unittest.TestCase):
 
 
 class ValidationReportingTests(unittest.TestCase):
+    def test_initial_timeout_is_operationally_visible_not_a_security_issue(self) -> None:
+        profile = _profile_stub()
+        timeout = {
+            "is_control": False,
+            "fault_injected": True,
+            "fault_at": 1,
+            "fault_type": "w",
+            "boot_outcome": "no_boot",
+            "initial_boot_outcome": "no_boot",
+            "final_boot_outcome": "no_boot",
+            "signals": {
+                "phase2_stop_reason": "wall_timeout(30s)",
+            },
+            "semantic_assertion_failures": ["unproven"],
+            "invariant_violations": [{"name": "unproven"}],
+        }
+        summary = summarize_runtime_sweep([timeout], profile=profile)
+        self.assertEqual(summary["timeout_points"], 1)
+        self.assertEqual(summary["incomplete_fault_points"], 1)
+        self.assertEqual(summary["issue_points"], 0)
+        self.assertEqual(summary["bricks"], 0)
+        self.assertFalse(result_has_issues(timeout, "success"))
+        self.assertFalse(result_is_brick(timeout))
+        self.assertEqual(summary["semantic_issue_points"], 0)
+        self.assertEqual(summary["invariant_issue_points"], 0)
+        self.assertEqual(summary["fault_type_issue_points"], {})
+        self.assertFalse(summary["campaign_complete"])
+
+        # Even contradictory copied terminal fields cannot turn an initial
+        # wall timeout into a resilient rollback security aggregate.
+        timeout["initial_boot_outcome"] = "success"
+        timeout["final_boot_outcome"] = "wrong_image"
+        timeout["boot_slot"] = "staging"
+        timeout["final_boot_slot"] = "staging"
+        summary = summarize_runtime_sweep([timeout], profile=profile)
+        self.assertEqual(summary["resilient_rollbacks"], 0)
+
+    def test_followup_timeout_keeps_initial_failure_point(self) -> None:
+        profile = _profile_stub()
+        mixed = {
+            "is_control": False,
+            "fault_injected": True,
+            "fault_at": 1,
+            "fault_type": "w",
+            "boot_outcome": "no_boot",
+            "initial_boot_outcome": "no_boot",
+            "boot_cycles": [
+                {"cycle": 0, "boot_outcome": "no_boot", "stop_reason": "no_boot_stall(20s)"},
+                {"cycle": 1, "boot_outcome": "timeout", "stop_reason": "wall_timeout(10s)"},
+            ],
+            "multi_boot_analysis": {
+                "status": "timeout",
+                "initial_outcome": "no_boot",
+                "final_outcome": "timeout",
+            },
+        }
+        summary = summarize_runtime_sweep([mixed], profile=profile)
+        self.assertEqual(summary["timeout_points"], 1)
+        self.assertEqual(summary["issue_points"], 1)
+        self.assertEqual(summary["bricks"], 1)
+        self.assertFalse(summary["campaign_complete"])
+        mixed["fault_region"] = "data"
+        region = compute_region_breakdown([mixed], "success")["data"]
+        self.assertEqual(region["timeouts"], 1)
+        self.assertEqual(region["issues"], 1)
+        self.assertEqual(region["bricks"], 1)
+        self.assertEqual(region["recoveries"], 0)
+
     def test_summary_includes_validation_stages_and_evidence(self) -> None:
         profile = _profile_stub()
         validated = {

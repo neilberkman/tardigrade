@@ -16,6 +16,11 @@ The format follows [common-changelog](https://common-changelog.org/).
 - Security-counter boundary campaigns, persistent erase-domain analysis,
   production-assert checks, and emitted-binary terminal-error escape analysis.
 - Native TF-M BL2/AN521 target support and supporting Renode peripherals.
+- Width-aware, fail-closed writeback snapshot reconstruction for traced
+  storage operations.
+- Bounded no-boot postmortem evidence for image slots, non-uniform erase
+  geometry, and auxiliary flash partitions.
+- Reproducible second-wave NuttX nxboot build and runtime-profile presets.
 - Fail-closed source-release license certification with exact file digests and
   tracked-file completeness enforcement in CI.
 
@@ -25,6 +30,10 @@ The format follows [common-changelog](https://common-changelog.org/).
   require an explicit regression mode for known-vulnerable profiles.
 - Runtime reports include richer fault classification, probe evidence, and
   security-state diagnostics.
+- MCUboot HEAD swap-scratch validation uses mirrored STM32F429 bank geometry
+  and dedicated signed slot images.
+- Recovery-boot wall-clock budgets are profile-configurable and remain
+  distinct from emulated-time stall detection.
 
 ### Fixed
 
@@ -33,6 +42,10 @@ The format follows [common-changelog](https://common-changelog.org/).
 - Probe state isolation between instruction-skip points and normalized,
   fail-closed GitHub Action result accounting.
 - Update-protocol commit-path coverage and wildcard terminal-sink propagation.
+- Trace-less trigger discovery now requires exact configured target evidence,
+  and incomplete recovery observations remain timeouts instead of bricks.
+- Removed three trace-less NVMemory writeback profiles that could not produce
+  executable durability evidence under the fail-closed runtime contract.
 
 ## [0.5.0] - 2026-07-10
 

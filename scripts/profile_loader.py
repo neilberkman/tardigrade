@@ -22,6 +22,7 @@ import base64
 import fnmatch
 import hashlib
 import json
+import math
 import re
 import struct
 import sys
@@ -239,6 +240,29 @@ class SlotConfig:
         self.size = size
 
 
+class MemoryRegionConfig:
+    """A declared flash region and its erase-sector granularity.
+
+    ``sector_size`` is optional for postmortem-only regions, but is required
+    for erase geometry entries.  Keeping this small mapping generic avoids
+    coupling evidence collection to a particular bootloader.
+    """
+
+    __slots__ = ("name", "base", "size", "sector_size")
+
+    def __init__(
+        self,
+        base: int,
+        size: int,
+        sector_size: Optional[int] = None,
+        name: Optional[str] = None,
+    ) -> None:
+        self.name = str(name) if name is not None else None
+        self.base = int(base)
+        self.size = int(size)
+        self.sector_size = int(sector_size) if sector_size is not None else None
+
+
 class MemoryConfig:
     __slots__ = (
         "sram_start",
@@ -248,6 +272,8 @@ class MemoryConfig:
         "slots",
         "bootloader_region",
         "trace_address_map",
+        "erase_regions",
+        "postmortem_partitions",
     )
 
     def __init__(
@@ -259,6 +285,8 @@ class MemoryConfig:
         page_size: int = 4096,
         bootloader_region: Optional[BootloaderRegionConfig] = None,
         trace_address_map: Optional[List[Dict[str, int]]] = None,
+        erase_regions: Optional[List[MemoryRegionConfig]] = None,
+        postmortem_partitions: Optional[List[MemoryRegionConfig]] = None,
     ) -> None:
         self.sram_start = sram_start
         self.sram_end = sram_end
@@ -270,6 +298,8 @@ class MemoryConfig:
         # addresses.  This is needed for aliased memories while preserving
         # the historical zero-based trace format.
         self.trace_address_map = trace_address_map or []
+        self.erase_regions = erase_regions or []
+        self.postmortem_partitions = postmortem_partitions or []
 
 
 class ResidualImageConfig:
@@ -1304,6 +1334,7 @@ class FaultSweepConfig:
         "calibration_time_slice",
         "phase1_time_slice",
         "phase2_time_slice",
+        "phase2_wall_timeout_s",
         "fault_types",
         "evaluation_mode",
         "sweep_strategy",
@@ -1385,6 +1416,7 @@ class FaultSweepConfig:
         durability_model: str = "direct",
         writeback: Optional["WritebackConfig"] = None,
         rc_injection_config: Optional["RcInjectionConfig"] = None,
+        phase2_wall_timeout_s: Optional[float] = 30.0,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -1452,6 +1484,19 @@ class FaultSweepConfig:
         self.phase2_time_slice = (
             str(phase2_time_slice).strip() if phase2_time_slice else None
         )
+        if phase2_wall_timeout_s is None:
+            phase2_wall_timeout_s = 30.0
+        try:
+            phase2_wall_timeout_s = float(phase2_wall_timeout_s)
+        except (TypeError, ValueError) as exc:
+            raise ProfileError(
+                "fault_sweep.phase2_wall_timeout_s: expected positive number"
+            ) from exc
+        if not math.isfinite(phase2_wall_timeout_s) or phase2_wall_timeout_s <= 0:
+            raise ProfileError(
+                "fault_sweep.phase2_wall_timeout_s: expected positive number"
+            )
+        self.phase2_wall_timeout_s = phase2_wall_timeout_s
         self.fault_types = fault_types or ["power_loss"]
         self.evaluation_mode = evaluation_mode
         self.sweep_strategy = sweep_strategy
@@ -2336,6 +2381,9 @@ class ProfileConfig:
             vars_list.append("PHASE1_TIME_SLICE:{}".format(fs.phase1_time_slice))
         if fs.phase2_time_slice:
             vars_list.append("PHASE2_TIME_SLICE:{}".format(fs.phase2_time_slice))
+        vars_list.append(
+            "PHASE2_WALL_TIMEOUT_S:{}".format(fs.phase2_wall_timeout_s)
+        )
         if fs.boot_cycle_hook:
             vars_list.append(
                 "BOOT_CYCLE_HOOK:{}".format(
@@ -2448,6 +2496,34 @@ class ProfileConfig:
         vars_list.append(
             "SUCCESS_OTADATA_EXPECT_SCOPE:{}".format(sc.otadata_expect_scope or "always")
         )
+
+        # Postmortem evidence layout.  Base64-encoded JSON keeps nested
+        # geometry and optional non-image partitions safe across Robot and
+        # Renode command parsing.  Empty layouts are omitted for compatibility.
+        if mem.erase_regions or mem.postmortem_partitions:
+            layout = {
+                "contract_version": 1,
+                "erase_regions": [
+                    {
+                        "base": region.base,
+                        "size": region.size,
+                        "sector_size": region.sector_size,
+                    }
+                    for region in mem.erase_regions
+                ],
+                "partitions": [
+                    {
+                        "name": region.name,
+                        "base": region.base,
+                        "size": region.size,
+                    }
+                    for region in mem.postmortem_partitions
+                ],
+            }
+            encoded_layout = base64.b64encode(
+                json.dumps(layout, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).decode("ascii")
+            vars_list.append("POSTMORTEM_LAYOUT_B64:{}".format(encoded_layout))
 
         # Image hash mode: pre-compute SHA-256 of each image binary.
         # Hash only the data portion (slot_size - page_size), excluding the
@@ -2844,6 +2920,19 @@ def _parse_int(value: Any, field_name: str) -> int:
     raise ProfileError("{}: expected integer, got {!r}".format(field_name, value))
 
 
+def _parse_positive_float(value: Any, field_name: str) -> float:
+    """Parse a finite, strictly positive floating-point value."""
+    if isinstance(value, bool):
+        raise ProfileError("{}: expected positive number, got {!r}".format(field_name, value))
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise ProfileError("{}: expected positive number, got {!r}".format(field_name, value))
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ProfileError("{}: expected positive number, got {!r}".format(field_name, value))
+    return parsed
+
+
 def _parse_bool(value: Any, field_name: str) -> bool:
     """Parse a YAML boolean without accepting truthy strings or integers."""
     if type(value) is not bool:
@@ -2951,6 +3040,51 @@ def _parse_bootloader_region(raw: Optional[Dict[str, Any]]) -> Optional[Bootload
     return BootloaderRegionConfig(base=base, size=size)
 
 
+def _parse_memory_regions(
+    raw: Optional[Any], field: str, require_sector_size: bool = False
+) -> List[MemoryRegionConfig]:
+    """Parse generic flash-geometry or postmortem partition declarations."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("{}: expected list".format(field))
+    regions: List[MemoryRegionConfig] = []
+    names = set()
+    for index, entry in enumerate(raw):
+        path = "{}[{}]".format(field, index)
+        if not isinstance(entry, dict):
+            raise ProfileError("{}: expected mapping".format(path))
+        base = _parse_int(_require(entry, "base", path), "{}.base".format(path))
+        size = _parse_int(_require(entry, "size", path), "{}.size".format(path))
+        if base < 0 or size <= 0 or base + size > 0x100000000:
+            raise ProfileError("{}: invalid 32-bit range".format(path))
+        sector_raw = entry.get("sector_size", entry.get("erase_size"))
+        sector_size = None
+        if sector_raw is not None:
+            sector_size = _parse_int(sector_raw, "{}.sector_size".format(path))
+            if sector_size <= 0 or sector_size > size:
+                raise ProfileError("{}.sector_size must be in 1..size".format(path))
+        if require_sector_size and sector_size is None:
+            raise ProfileError("{}: missing sector_size".format(path))
+        name = entry.get("name")
+        if name is not None:
+            name = str(name).strip()
+            if not name or name in names:
+                raise ProfileError("{}: name must be non-empty and unique".format(path))
+            names.add(name)
+        regions.append(
+            MemoryRegionConfig(
+                base=base, size=size, sector_size=sector_size, name=name
+            )
+        )
+    regions.sort(key=lambda region: (region.base, region.size))
+    for index, current in enumerate(regions):
+        prior = regions[index - 1] if index else None
+        if prior is not None and current.base < prior.base + prior.size:
+            raise ProfileError("{}: overlapping ranges".format(field))
+    return regions
+
+
 def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
     sram = _require(raw, "sram", "memory")
     sram_start = _parse_int(_require(sram, "start", "memory.sram"), "memory.sram.start")
@@ -2961,6 +3095,17 @@ def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
         raise ProfileError("memory.page_size must be > 0")
     slots = _parse_slots(_require(raw, "slots", "memory"))
     bootloader_region = _parse_bootloader_region(raw.get("bootloader_region"))
+    erase_regions = _parse_memory_regions(
+        raw.get("erase_regions"), "memory.erase_regions", require_sector_size=True
+    )
+    postmortem_partitions = _parse_memory_regions(
+        raw.get("postmortem_partitions"), "memory.postmortem_partitions"
+    )
+    for index, partition in enumerate(postmortem_partitions):
+        if not partition.name:
+            raise ProfileError(
+                "memory.postmortem_partitions[{}]: missing name".format(index)
+            )
     trace_address_map = []
     raw_trace_map = raw.get("trace_address_map", [])
     if not isinstance(raw_trace_map, list):
@@ -3018,6 +3163,8 @@ def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
         slots=slots,
         bootloader_region=bootloader_region,
         trace_address_map=trace_address_map,
+        erase_regions=erase_regions,
+        postmortem_partitions=postmortem_partitions,
     )
 
 
@@ -3479,13 +3626,27 @@ def _parse_fault_sweep(
             "fault_sweep.durability_model: expected 'direct' or 'writeback', "
             "got '{}'".format(durability_model)
         )
+    if (
+        durability_model == "writeback"
+        and str(eval_mode or "").strip().lower() != "execute"
+    ):
+        raise ProfileError(
+            "fault_sweep.durability_model=writeback requires "
+            "fault_sweep.evaluation_mode 'execute'"
+        )
     writeback = None
     if durability_model == "writeback":
         wb_raw = raw.get("writeback") or {}
         barriers = wb_raw.get("barriers", [])
+        domains = wb_raw.get("domains", "auto")
+        if domains not in ("auto", None):
+            raise ProfileError(
+                "fault_sweep.writeback.domains: custom domains are not supported; "
+                "use 'auto'"
+            )
         writeback = WritebackConfig(
             buffer_capacity=wb_raw.get("buffer_capacity", "auto"),
-            domains=wb_raw.get("domains", "auto"),
+            domains="auto",
             barriers=barriers,
             erase_flushes_domain=_parse_bool(
                 wb_raw.get("erase_flushes_domain", False),
@@ -3507,6 +3668,14 @@ def _parse_fault_sweep(
         calibration_time_slice=raw.get("calibration_time_slice"),
         phase1_time_slice=raw.get("phase1_time_slice"),
         phase2_time_slice=raw.get("phase2_time_slice"),
+        phase2_wall_timeout_s=(
+            30.0
+            if raw.get("phase2_wall_timeout_s") is None
+            else _parse_positive_float(
+                raw.get("phase2_wall_timeout_s"),
+                "fault_sweep.phase2_wall_timeout_s",
+            )
+        ),
         fault_types=fault_types,
         evaluation_mode=eval_mode,
         sweep_strategy=str(raw.get("sweep_strategy", "heuristic")),
@@ -6148,7 +6317,8 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
     {
         "mode", "max_writes", "max_otp_blows", "max_writes_cap",
         "max_step_limit", "run_duration", "calibration_time_slice",
-        "phase1_time_slice", "phase2_time_slice", "fault_types",
+        "phase1_time_slice", "phase2_time_slice", "phase2_wall_timeout_s",
+        "fault_types",
         "evaluation_mode", "sweep_strategy", "sweep_hash_bypass_symbols",
         "progress_stall_timeout_s", "boot_cycles", "boot_cycle_hook",
         "vtor_settle_iters",
@@ -6214,7 +6384,8 @@ def _validate_strict_memory(raw: Any, context: str) -> None:
         frozenset(
             {
                 "sram", "write_granularity", "page_size", "slots",
-                "bootloader_region", "trace_address_map",
+                "bootloader_region", "trace_address_map", "erase_regions",
+                "postmortem_partitions",
             }
         ),
         context,
@@ -6233,6 +6404,18 @@ def _validate_strict_memory(raw: Any, context: str) -> None:
             frozenset({"base", "size"}),
             "{}.slots.{}".format(context, slot_name),
         )
+    for field_name in ("erase_regions", "postmortem_partitions"):
+        regions = raw.get(field_name)
+        if regions is None:
+            continue
+        if not isinstance(regions, list):
+            raise ProfileError("{}.{}: expected list".format(context, field_name))
+        for index, region in enumerate(regions):
+            _reject_unknown_keys(
+                region,
+                frozenset({"base", "size", "sector_size", "erase_size", "name"}),
+                "{}.{}[{}]".format(context, field_name, index),
+            )
     if "bootloader_region" in raw:
         _reject_unknown_keys(
             raw.get("bootloader_region"),
@@ -7344,6 +7527,7 @@ def main() -> int:
         "calibration_time_slice": profile.fault_sweep.calibration_time_slice,
         "phase1_time_slice": profile.fault_sweep.phase1_time_slice,
         "phase2_time_slice": profile.fault_sweep.phase2_time_slice,
+        "phase2_wall_timeout_s": profile.fault_sweep.phase2_wall_timeout_s,
         "boot_cycle_hook": profile.fault_sweep.boot_cycle_hook,
         "expected_rollback_at_cycle": profile.fault_sweep.expected_rollback_at_cycle,
         "phase2_fault_enabled": profile.fault_sweep.phase2_fault.enabled,

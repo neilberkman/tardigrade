@@ -46,6 +46,17 @@ def analyze_boot_cycles(
         if target_slot is not None:
             analysis["rollback_target_slot"] = target_slot
 
+    timeout_cycles = [
+        int(record.get("cycle", index))
+        for index, record in enumerate(cycle_records)
+        if str(record.get("stop_reason") or "").startswith("wall_timeout")
+        or record.get("boot_outcome") == "timeout"
+    ]
+    if timeout_cycles:
+        analysis["timeout_cycles"] = timeout_cycles
+        analysis["status"] = "timeout"
+        return analysis
+
     if len(cycle_records) == 1:
         analysis["status"] = "single_boot"
         return analysis

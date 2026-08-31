@@ -40,7 +40,7 @@ from renode_runner import (  # noqa: E402
 from result_checks import annotate_result_checks  # noqa: E402
 from audit_report import summarize_runtime_sweep  # noqa: E402
 from audit_bootloader import _trace_replay_eligible_fault_types  # noqa: E402
-from profile_loader import load_profile  # noqa: E402
+from profile_loader import ProfileError, load_profile  # noqa: E402
 from self_test import check_verdict  # noqa: E402
 
 
@@ -450,6 +450,95 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertIn("EXPECTED_ROLLBACK_AT_CYCLE:2", robot_vars)
             self.assertIn("STATE_PROBE:{}".format(probe), robot_vars)
             self.assertIn("SUCCESS_VECTOR_OFFSET:0x00000200", robot_vars)
+
+    def test_phase2_wall_timeout_defaults_and_serializes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            common = """
+                schema_version: 1
+                name: phase2_timeout_profile
+                description: phase2 timeout
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  phase2_wall_timeout_s: {timeout}
+                expect:
+                  should_find_issues: false
+                """
+            profile = load_profile(
+                self._write_profile(
+                    tempdir, common.replace("{timeout}", "47.5")
+                )
+            )
+            self.assertEqual(profile.fault_sweep.phase2_wall_timeout_s, 47.5)
+            self.assertIn("PHASE2_WALL_TIMEOUT_S:47.5", profile.robot_vars(ROOT))
+
+            default_profile = load_profile(
+                self._write_profile(
+                    tempdir,
+                    common.replace("{timeout}", "30.0").replace(
+                        "phase2_wall_timeout_s: 30.0", ""
+                    ),
+                )
+            )
+            self.assertEqual(default_profile.fault_sweep.phase2_wall_timeout_s, 30.0)
+
+    def test_phase2_wall_timeout_rejects_non_positive_values(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            body = """
+                schema_version: 1
+                name: invalid_phase2_timeout
+                description: phase2 timeout
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  phase2_wall_timeout_s: 0
+                expect:
+                  should_find_issues: false
+                """
+            with self.assertRaisesRegex(ProfileError, "phase2_wall_timeout_s"):
+                load_profile(self._write_profile(tempdir, body))
+
+    def test_regular_phase2_runtime_calls_use_configured_wall_timeout(self) -> None:
+        runtime = (ROOT / "scripts" / "run_runtime_fault_sweep.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "phase2_wall_timeout_raw = get_optional_var('phase2_wall_timeout_s', '30')",
+            runtime,
+        )
+        self.assertNotIn("wall_timeout=30", runtime)
+        self.assertIn("wall_timeout=60", runtime)
+        robot = (ROOT / "tests" / "ota_fault_point.robot").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("${PHASE2_WALL_TIMEOUT_S}", robot)
+        self.assertIn("$phase2_wall_timeout_s=", robot)
 
     def test_semantic_assertions_and_invariants_annotate_results(self) -> None:
         with tempfile.TemporaryDirectory() as td:

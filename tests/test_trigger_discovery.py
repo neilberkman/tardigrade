@@ -31,9 +31,11 @@ from profile_loader import load_profile  # noqa: E402
 from trigger_discovery import (  # noqa: E402
     TriggerStrategy,
     _build_mcuboot_strategies,
+    _clone_with_compiled_flash_map,
     _clone_for_strategy,
     _detect_mcuboot_swap_algorithm,
     _read_elf_symbol_names,
+    _resolve_compiled_flash_slots,
     _calibration_boot_evidence_is_success,
     _image_digest_for_evidence,
     _trace_less_content_evidence,
@@ -334,6 +336,13 @@ class TriggerDiscoveryTests(unittest.TestCase):
             error = _validate_trace_artifacts({"trace_file": str(trace)})
         self.assertIn("missing required columns", error)
 
+    def test_binary_trace_requires_csv_companion_for_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            binary = Path(td) / "trace.bin"
+            binary.write_bytes(b"\x00" * 12)
+            error = _validate_trace_artifacts({"trace_file_bin": str(binary)})
+        self.assertIn("requires its CSV companion trace_file", error)
+
     def test_trace_less_combined_marker_and_hash_requires_both(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             profile = self._content_profile(Path(td), image_hash=True)
@@ -565,6 +574,99 @@ class TriggerDiscoveryTests(unittest.TestCase):
         self.assertEqual(check["status"], "match")
         self.assertEqual(len(check["checked_slots"]), 2)
 
+    def test_validate_compiled_flash_map_resolves_noncontiguous_slot_ids(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
+        profile = load_profile(ROOT / "profiles" / "mcuboot_head_scratch_stm32f4_upgrade.yaml")
+        entries = [
+            {"index": 0, "area_id": 0, "off": 0x00000, "size": 0x08000, "device_ptr": 0},
+            {"index": 1, "area_id": 1, "off": 0x08000, "size": 0x38000, "device_ptr": 0},
+            {"index": 2, "area_id": 2, "off": 0x40000, "size": 0x20000, "device_ptr": 0},
+            {"index": 3, "area_id": 3, "off": 0x60000, "size": 0xA0000, "device_ptr": 0},
+            {"index": 4, "area_id": 4, "off": 0x108000, "size": 0x38000, "device_ptr": 0},
+        ]
+        with mock.patch("trigger_discovery._resolve_mcuboot_flash_map", return_value=(entries, None)):
+            check = validate_compiled_flash_map(profile, ROOT)
+        self.assertEqual(check["status"], "match")
+        self.assertEqual(
+            [slot["compiled_area_id"] for slot in check["checked_slots"]],
+            [1, 4],
+        )
+        self.assertEqual(
+            [slot["area_id"] for slot in check["checked_slots"]],
+            [1, 4],
+        )
+
+    def test_validate_compiled_flash_map_rejects_ambiguous_geometry_match(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
+        profile = load_profile(ROOT / "profiles" / "mcuboot_head_scratch_stm32f4_upgrade.yaml")
+        entries = [
+            {"index": 1, "area_id": 1, "off": 0x08000, "size": 0x38000, "device_ptr": 0},
+            {"index": 4, "area_id": 4, "off": 0x108000, "size": 0x38000, "device_ptr": 0},
+            {"index": 5, "area_id": 5, "off": 0x108000, "size": 0x38000, "device_ptr": 0},
+        ]
+        with mock.patch("trigger_discovery._resolve_mcuboot_flash_map", return_value=(entries, None)):
+            check = validate_compiled_flash_map(profile, ROOT)
+        self.assertEqual(check["status"], "mismatch")
+        staging = next(slot for slot in check["checked_slots"] if slot["slot"] == "staging")
+        self.assertEqual(staging["status"], "ambiguous")
+        self.assertIn("ambiguous", staging["resolution_error"])
+
+    def test_compiled_flash_map_resolution_fails_closed_on_stale_geometry(self) -> None:
+        slots = {
+            "exec": SimpleNamespace(base=0x08008000, size=0x38000),
+            "staging": SimpleNamespace(base=0x0810A000, size=0x38000),
+        }
+        entries = [
+            {"index": 1, "area_id": 1, "off": 0x08000, "size": 0x38000, "device_ptr": 0},
+            {"index": 4, "area_id": 4, "off": 0x108000, "size": 0x38000, "device_ptr": 0},
+        ]
+        resolved, errors = _resolve_compiled_flash_slots(entries, slots, 0x08000000)
+        self.assertEqual(set(resolved), {"exec"})
+        self.assertIn("staging", errors)
+        self.assertIn("no compiled flash-map entry matches", errors["staging"])
+
+        entries.append(
+            {"index": 5, "area_id": 5, "off": 0x150000, "size": 0x38000, "device_ptr": 0}
+        )
+        _resolved, errors = _resolve_compiled_flash_slots(entries, slots, 0x08000000)
+        self.assertIn("staging", errors)
+        self.assertIn("size-only resolution is disabled", errors["staging"])
+
+    def test_compiled_flash_map_override_rejects_stale_geometry(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
+        profile = load_profile(ROOT / "profiles" / "mcuboot_head_scratch_stm32f4_upgrade.yaml")
+        profile.memory.slots["staging"].base += 0x2000
+        flash_map = {
+            "compiled_entries": [
+                {"index": 1, "area_id": 1, "off": 0x08000, "size": 0x38000, "device_ptr": 0},
+                {"index": 4, "area_id": 4, "off": 0x108000, "size": 0x38000, "device_ptr": 0},
+            ],
+            "flash_base": "0x08000000",
+        }
+        cloned, override, error = _clone_with_compiled_flash_map(profile, flash_map)
+        self.assertIsNone(cloned)
+        self.assertIsNone(override)
+        self.assertIn("size-only resolution is disabled", error)
+
+    def test_compiled_flash_map_does_not_select_same_sized_scratch(self) -> None:
+        slots = {
+            "exec": SimpleNamespace(base=0x08008000, size=0x38000),
+            "staging": SimpleNamespace(base=0x0810A000, size=0x38000),
+        }
+        entries = [
+            {"index": 1, "area_id": 1, "off": 0x08000, "size": 0x38000, "device_ptr": 0},
+            # A scratch/storage region with the same size must not be used as
+            # a replacement for a stale staging offset.
+            {"index": 2, "area_id": 2, "off": 0x40000, "size": 0x38000, "device_ptr": 0},
+        ]
+        resolved, errors = _resolve_compiled_flash_slots(entries, slots, 0x08000000)
+        self.assertEqual(set(resolved), {"exec"})
+        self.assertIn("staging", errors)
+        self.assertIn("size-only resolution is disabled", errors["staging"])
+
     def test_validate_compiled_flash_map_detects_mismatch(self) -> None:
         if not HAVE_PYYAML:
             self.skipTest("PyYAML not installed")
@@ -601,60 +703,24 @@ class TriggerDiscoveryTests(unittest.TestCase):
         profile.update_trigger = None
         profile.auto_update_trigger = True
         profile.pre_boot_state = []
-        original_staging_base = int(profile.memory.slots["staging"].base)
         profile.memory.slots["staging"].base += 0x2000
 
         with tempfile.TemporaryDirectory() as td:
-            tempdir = Path(td)
-            slot_trace = tempdir / "slot.csv"
-            _write_trace(
-                slot_trace,
-                [
-                    {
-                        "write_index": 0,
-                        "flash_offset": (original_staging_base - int(profile.bootloader_entry)) + 4,
-                        "value": 0x12345678,
-                    }
-                ],
+            result = discover_update_trigger(
+                profile,
+                repo_root=ROOT,
+                renode_test="renode-test",
+                robot_suite="tests/audit.robot",
+                work_dir=Path(td),
+                renode_remote_server_dir="",
+                keep_run_artifacts=False,
+                robot_vars_factory=lambda _candidate: [],
             )
 
-            def fake_run_single_point(*, profile, **_kwargs):
-                self.assertEqual(
-                    int(profile.memory.slots["staging"].base),
-                    original_staging_base,
-                )
-                return {
-                    "total_writes": 1,
-                    "total_erases": 0,
-                    "trace_file": str(slot_trace),
-                    "erase_trace_file": None,
-                    "trace_file_bin": None,
-                    "erase_trace_file_bin": None,
-                    "calibration_stop_reason": "vtor_captured",
-                }
-
-            with mock.patch(
-                "trigger_discovery.run_single_point",
-                side_effect=fake_run_single_point,
-            ):
-                result = discover_update_trigger(
-                    profile,
-                    repo_root=ROOT,
-                    renode_test="renode-test",
-                    robot_suite="tests/audit.robot",
-                    work_dir=tempdir,
-                    renode_remote_server_dir="",
-                    keep_run_artifacts=False,
-                    robot_vars_factory=lambda _candidate: [],
-                )
-
-        self.assertTrue(result.succeeded)
+        self.assertFalse(result.succeeded)
         self.assertIsNotNone(result.geometry_override)
-        self.assertEqual(result.geometry_override["status"], "applied")
-        self.assertEqual(
-            int(result.selected_profile.memory.slots["staging"].base),
-            original_staging_base,
-        )
+        self.assertEqual(result.geometry_override["status"], "failed")
+        self.assertIn("size-only resolution is disabled", result.geometry_override["reason"])
 
     def test_offset_strategy_uses_real_next_erase_boundary(self) -> None:
         if not HAVE_PYYAML:

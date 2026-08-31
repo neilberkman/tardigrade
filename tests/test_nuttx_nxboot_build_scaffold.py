@@ -17,6 +17,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from examples.nxboot_style.gen_nxboot_images import wrap_nxboot_image  # noqa: E402
 from targets.nuttx_nxboot.build_public_target import (  # noqa: E402
+    NXBOOT_SECTOR_SIZE,
     build_env,
     ensure_host_tools,
     normalize_generated_config,
@@ -47,6 +48,42 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             for path in written:
                 self.assertTrue(path.exists())
                 self.assertGreater(path.stat().st_size, 0x400)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_package_images_sector_boundary_layout_only_pads_update(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_sector_pkg_"))
+        try:
+            app_bin = temp_dir / "app.bin"
+            app_bin.write_bytes(b"\xAA" * 128)
+            out = temp_dir / "out"
+            written = package_images(
+                app_bin, out, 0x400, 0x42, image_layout="sector_boundary"
+            )
+            self.assertEqual([path.name for path in written], [
+                "nxboot-primary-v1-h400-sector-boundary.img",
+                "nxboot-update-v2-h400-sector-boundary.img",
+            ])
+            primary, update = written
+            self.assertNotEqual(primary.stat().st_size, update.stat().st_size)
+            self.assertEqual(update.stat().st_size % NXBOOT_SECTOR_SIZE, 0)
+            self.assertEqual(primary.read_bytes()[0x400:], b"\xAA" * 128)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_package_images_rejects_sector_layout_larger_than_slot(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_oversize_pkg_"))
+        try:
+            app_bin = temp_dir / "app.bin"
+            app_bin.write_bytes(b"\xAA" * (0x80000 - 0x400))
+            with self.assertRaisesRegex(ValueError, "exceed the nxboot slot"):
+                package_images(
+                    app_bin,
+                    temp_dir / "out",
+                    0x400,
+                    0x42,
+                    image_layout="sector_boundary",
+                )
         finally:
             shutil.rmtree(temp_dir)
 
@@ -131,6 +168,131 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             self.assertIn("EXPECTED_ROLLBACK_AT_CYCLE:1", robot_vars)
             self.assertIn("CALIBRATION_TIME_SLICE:0.1", robot_vars)
             self.assertIn("successful_rollback", profile.invariants)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_render_baseline_uses_campaign_default_boot_cycles(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_baseline_default_"))
+        try:
+            build_dir = temp_dir / "build"
+            images_dir = build_dir / "images"
+            images_dir.mkdir(parents=True)
+            (build_dir / "nxboot-loader.elf").write_bytes(b"ELF")
+            (images_dir / "nxboot-primary-v1-h400.img").write_bytes(b"P")
+            (images_dir / "nxboot-update-v2-h400.img").write_bytes(b"U")
+
+            profile_path = temp_dir / "profile.yaml"
+            profile_path.write_text(render_runtime_profile(build_dir))
+            profile = load_profile(profile_path)
+
+            self.assertEqual(profile.fault_sweep.boot_cycles, 2)
+            self.assertEqual(profile.fault_sweep.expected_rollback_at_cycle, 1)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_render_sector_boundary_resume_campaign_requires_distinct_images(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_campaign_"))
+        try:
+            build_dir = temp_dir / "build"
+            images_dir = build_dir / "images"
+            images_dir.mkdir(parents=True)
+            (build_dir / "nxboot-loader.elf").write_bytes(b"ELF")
+            (images_dir / "nxboot-primary-v1-h400-sector-boundary.img").write_bytes(b"P")
+            (images_dir / "nxboot-update-v2-h400-sector-boundary.img").write_bytes(b"U")
+
+            profile_path = temp_dir / "profile.yaml"
+            profile_path.write_text(
+                render_runtime_profile(
+                    build_dir,
+                    campaign="sector_boundary_resume",
+                    name="nuttx_nxboot_sector_boundary_resume",
+                )
+            )
+            profile = load_profile(profile_path)
+            self.assertEqual(profile.fault_sweep.fault_types, ["swap_progress"])
+            self.assertEqual(profile.fault_sweep.boot_cycles, 3)
+            self.assertTrue(profile.fault_sweep.expected_rollback_at_cycle == 1)
+            self.assertIn("sector-boundary", profile.images["staging"])
+            self.assertIn("successful_rollback", profile.invariants)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_render_profile_rejects_oversized_image(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_oversize_profile_"))
+        try:
+            build_dir = temp_dir / "build"
+            images_dir = build_dir / "images"
+            images_dir.mkdir(parents=True)
+            (build_dir / "nxboot-loader.elf").write_bytes(b"ELF")
+            (images_dir / "nxboot-primary-v1-h400.img").write_bytes(b"P")
+            (images_dir / "nxboot-update-v2-h400.img").write_bytes(
+                b"U" * (0x80000 + 1)
+            )
+            with self.assertRaisesRegex(
+                ValueError, "larger than the declared nxboot slot"
+            ):
+                render_runtime_profile(build_dir)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_render_profile_rejects_unsupported_campaign(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_bad_campaign_"))
+        try:
+            with self.assertRaisesRegex(
+                ValueError, "unsupported NuttX nxboot campaign"
+            ):
+                render_runtime_profile(temp_dir / "build", campaign="not-a-campaign")
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_named_campaign_respects_explicit_single_boot(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_single_boot_"))
+        try:
+            build_dir = temp_dir / "build"
+            images_dir = build_dir / "images"
+            images_dir.mkdir(parents=True)
+            (build_dir / "nxboot-loader.elf").write_bytes(b"ELF")
+            (images_dir / "nxboot-primary-v1-h400-sector-boundary.img").write_bytes(b"P")
+            (images_dir / "nxboot-update-v2-h400-sector-boundary.img").write_bytes(b"U")
+            profile_path = temp_dir / "profile.yaml"
+            profile_path.write_text(
+                render_runtime_profile(
+                    build_dir,
+                    campaign="sector_boundary_resume",
+                    boot_cycles=1,
+                )
+            )
+            profile = load_profile(profile_path)
+            self.assertEqual(profile.fault_sweep.boot_cycles, 1)
+            self.assertIsNone(profile.fault_sweep.expected_rollback_at_cycle)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_render_metadata_erase_resume_campaign_has_distinct_faults(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_metadata_campaign_"))
+        try:
+            build_dir = temp_dir / "build"
+            images_dir = build_dir / "images"
+            images_dir.mkdir(parents=True)
+            (build_dir / "nxboot-loader.elf").write_bytes(b"ELF")
+            (images_dir / "nxboot-primary-v1-h400.img").write_bytes(b"P")
+            (images_dir / "nxboot-update-v2-h400.img").write_bytes(b"U")
+
+            profile_path = temp_dir / "profile.yaml"
+            profile_path.write_text(
+                render_runtime_profile(
+                    build_dir,
+                    campaign="metadata_erase_resume",
+                    name="nuttx_nxboot_metadata_erase_resume",
+                )
+            )
+            profile = load_profile(profile_path)
+            self.assertEqual(
+                profile.fault_sweep.fault_types,
+                ["swap_progress", "interrupted_erase"],
+            )
+            self.assertEqual(profile.fault_sweep.boot_cycles, 3)
+            self.assertIn("nxboot_confirmed_has_recovery", profile.invariants)
         finally:
             shutil.rmtree(temp_dir)
 

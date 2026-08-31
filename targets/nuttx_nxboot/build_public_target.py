@@ -20,6 +20,10 @@ sys.path.insert(0, str(ROOT))
 from examples.nxboot_style.gen_nxboot_images import wrap_nxboot_image
 
 
+NXBOOT_SECTOR_SIZE = 0x20000
+NXBOOT_SLOT_SIZE = 0x80000
+
+
 def _ensure_config_value(text: str, key: str, value: str) -> tuple[str, bool]:
     line = f'{key}="{value}"'
     changed = False
@@ -64,16 +68,47 @@ def verify_nxboot_support(nuttx_root: Path) -> None:
         )
 
 
-def package_images(app_bin: Path, output_dir: Path, header_size: int, platform_id: int) -> list[Path]:
+def _next_sector_image_payload(payload: bytes, header_size: int) -> bytes:
+    """Pad a real app payload to the next STM32H7 erase-sector boundary."""
+    total = int(header_size) + len(payload)
+    target = ((total // NXBOOT_SECTOR_SIZE) + 1) * NXBOOT_SECTOR_SIZE
+    if target > NXBOOT_SLOT_SIZE:
+        raise ValueError(
+            "sector-boundary image would exceed the nxboot slot: "
+            "0x{:X} > 0x{:X}".format(target, NXBOOT_SLOT_SIZE)
+        )
+    return payload + (b"\xFF" * (target - total))
+
+
+def package_images(
+    app_bin: Path,
+    output_dir: Path,
+    header_size: int,
+    platform_id: int,
+    image_layout: str = "baseline",
+) -> list[Path]:
+    if image_layout not in {"baseline", "sector_boundary"}:
+        raise ValueError("unsupported nxboot image layout: {}".format(image_layout))
     payload = app_bin.read_bytes()
     output_dir.mkdir(parents=True, exist_ok=True)
-    primary = output_dir / "nxboot-primary-v1-h400.img"
-    update = output_dir / "nxboot-update-v2-h400.img"
+    suffix = "" if image_layout == "baseline" else "-sector-boundary"
+    primary = output_dir / "nxboot-primary-v1-h400{}.img".format(suffix)
+    update = output_dir / "nxboot-update-v2-h400{}.img".format(suffix)
+    update_payload = (
+        payload
+        if image_layout == "baseline"
+        else _next_sector_image_payload(payload, header_size)
+    )
     primary.write_bytes(
         wrap_nxboot_image(payload, (1, 0, 0), header_size=header_size, platform_id=platform_id)
     )
     update.write_bytes(
-        wrap_nxboot_image(payload, (2, 0, 0), header_size=header_size, platform_id=platform_id)
+        wrap_nxboot_image(
+            update_payload,
+            (2, 0, 0),
+            header_size=header_size,
+            platform_id=platform_id,
+        )
     )
     return [primary, update]
 
@@ -128,6 +163,15 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--header-size", type=lambda x: int(x, 0), default=0x400)
     parser.add_argument("--platform-id", type=lambda x: int(x, 0), default=0x0)
+    parser.add_argument(
+        "--image-layout",
+        choices=("baseline", "sector_boundary"),
+        default="baseline",
+        help=(
+            "Package the ordinary pair or a real-app pair whose update image "
+            "ends at the next STM32H7 erase-sector boundary."
+        ),
+    )
     parser.add_argument("--jobs", type=int, default=8)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--package-only", type=Path, default=None, metavar="APP_BIN")
@@ -140,7 +184,13 @@ def main() -> int:
     verify_nxboot_support(args.nuttx_root)
 
     if args.package_only is not None:
-        for path in package_images(args.package_only, args.output_dir, args.header_size, args.platform_id):
+        for path in package_images(
+            args.package_only,
+            args.output_dir,
+            args.header_size,
+            args.platform_id,
+            args.image_layout,
+        ):
             print(f"wrote {path}")
         return 0
 
@@ -163,7 +213,13 @@ def main() -> int:
     app_bin = args.output_dir / "nxboot-app.bin"
     shutil.copyfile(args.nuttx_root / "nuttx", app_elf)
     shutil.copyfile(args.nuttx_root / "nuttx.bin", app_bin)
-    for path in package_images(app_bin, args.output_dir / "images", args.header_size, args.platform_id):
+    for path in package_images(
+        app_bin,
+        args.output_dir / "images",
+        args.header_size,
+        args.platform_id,
+        args.image_layout,
+    ):
         print(f"wrote {path}")
     return 0
 

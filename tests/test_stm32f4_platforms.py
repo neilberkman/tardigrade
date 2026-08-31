@@ -41,3 +41,16 @@ class Stm32f4PlatformTests(unittest.TestCase):
                 self.assertIn("(0x110000L, 0x10000)", text)
                 self.assertIn("(0x120000L, 0x20000)", text)
                 self.assertIn("(0x1E0000L, 0x20000)", text)
+
+    def test_stm32f429_peripherals_decode_bank_two_sector_encoding(self) -> None:
+        for relpath in (
+            "peripherals/STM32F4FlashController.cs",
+            "peripherals/STM32F4FastFlash.cs",
+        ):
+            with self.subTest(source=relpath):
+                text = (ROOT / relpath).read_text(encoding="utf-8")
+                self.assertIn("SNB_MASK  = 0x1FU << 3", text)
+                self.assertIn("int sectorNum = DecodeSectorNumber(newCr);", text)
+                self.assertIn("encodedSector >= 16 && encodedSector <= 27", text)
+                self.assertIn("return encodedSector - 4;", text)
+                self.assertIn("return -1;", text)

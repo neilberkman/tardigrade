@@ -6,15 +6,77 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 import re
+import ast
+import struct
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
 RESC_PATH = ROOT / "scripts" / "run_runtime_fault_sweep.resc"
 PY_PATH = ROOT / "scripts" / "run_runtime_fault_sweep.py"
 ROBOT_PATH = ROOT / "tests" / "ota_fault_point.robot"
+IRONPYTHON_HELPERS = (
+    ROOT / "scripts" / "boot_outcomes.py",
+    ROOT / "scripts" / "writeback_reconstruction.py",
+)
 
 
 class RuntimeFaultSweepLoaderTests(unittest.TestCase):
+    def test_runtime_helper_modules_avoid_unsupported_future_annotations(self) -> None:
+        for path in IRONPYTHON_HELPERS:
+            with self.subTest(path=path.name):
+                text = path.read_text(encoding="utf-8")
+                self.assertNotIn("from __future__ import annotations", text)
+
+    def test_writeback_lifecycle_dispatch_is_fail_closed(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("is_unsupported_writeback_fault_type(ft)", text)
+        self.assertIn("_writeback_unsupported_fault_result(fp, ft)", text)
+        self.assertIn(
+            "if writeback_active() and is_unsupported_writeback_fault_type(fault_type):",
+            text,
+        )
+        self.assertIn(
+            "_writeback_unsupported_fault_result(fault_at, fault_type)", text
+        )
+        self.assertIn("'error_kind': 'writeback_unsupported_fault'", text)
+        self.assertIn("unsupported_erase_atomicity_path", text)
+        self.assertIn("captured partial/neighbor-corruption snapshot", text)
+        self.assertIn('"c:"', (ROOT / "scripts" / "writeback_reconstruction.py").read_text(encoding="utf-8"))
+        self.assertIn("not is_known_writeback_fault_type(fault_type)", text)
+        self.assertIn("unknown or malformed fault", text)
+
+    def test_writeback_requires_execute_mode_before_overlay_setup(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "if durability_model.lower() == 'writeback' and evaluation_mode != 'execute':",
+            text,
+        )
+        self.assertIn("state evaluation is fail-closed", text)
+
+    def test_followup_cycles_default_to_configured_phase2_timeout(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=None, wall_timeout=None):",
+            text,
+        )
+        self.assertIn("wall_timeout = phase2_wall_timeout_s", text)
+        self.assertIn("cycle_wall_timeout=3", text)
+
+    def test_renode_imported_python_has_embedded_runtime_safe_syntax(self) -> None:
+        # Renode embeds IronPython 2.7.  Parse every imported helper and the
+        # runner, then reject syntax/library idioms that fail there or produce
+        # the wrong byte semantics under its Python 2 ``bytes`` implementation.
+        for path in (PY_PATH,) + IRONPYTHON_HELPERS:
+            with self.subTest(path=path.name):
+                text = path.read_text(encoding="utf-8")
+                tree = ast.parse(text, filename=str(path))
+                self.assertFalse(
+                    any(isinstance(node, ast.Nonlocal) for node in ast.walk(tree)),
+                    "Python 3-only closure rebinding in {}".format(path.name),
+                )
+                self.assertNotIn("bytes([", text)
+
     def test_resc_uses_explicit_file_scoped_exec(self) -> None:
         text = RESC_PATH.read_text(encoding="utf-8")
         self.assertNotIn("exec(open(_sweep_py).read())", text)
@@ -51,6 +113,22 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertIn("signals[prefix + '_console_fatal_pattern'] = status.get('console_fatal_pattern')", text)
         self.assertIn("merge_stop_status_signals(signals, 'phase1', phase1_status)", text)
         self.assertIn("merge_stop_status_signals(signals, 'phase2', p2_status)", text)
+
+    def test_phase2_wall_timeout_is_not_classified_as_no_boot(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("from boot_outcomes import boot_outcome_after_stop", text)
+        self.assertIn("boot_outcome = boot_outcome_after_stop('no_boot', p2_reason)", text)
+
+    def test_followup_observations_pass_stop_status_to_outcome_evaluator(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("p2_status=status,", text)
+        self.assertIn("p2_status=phase2_status,", text)
+        self.assertIn("p2_status=final_status,", text)
+
+    def test_multiboot_telemetry_uses_recorded_followups(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("def set_multiboot_cycles_run(signals, cycle_records):", text)
+        self.assertIn("signals['multiboot_cycles_run'] = count_followup_boot_cycles(cycle_records)", text)
 
     def test_runtime_runner_uses_verified_inline_binary_loads(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
@@ -407,6 +485,148 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertNotIn("write_storm(", text)
         self.assertNotIn("step_slowdown(", text)
         self.assertIn("if elapsed > wall_timeout:", text)
+
+    def test_postmortem_evidence_separates_header_vector_and_trailer_limits(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("POSTMORTEM_MAX_RAW_BYTES = 4096", text)
+        self.assertIn("postmortem_dump_trailer_bytes", text)
+        self.assertIn("vector_table_offset=vector_offset", text)
+        self.assertIn("'vector_table': region_dump(vector", text)
+        self.assertIn("'raw_base64_truncated': len(raw_bytes) < len(region_bytes)", text)
+        self.assertIn("tail_limit=POSTMORTEM_PARTITION_TAIL_BYTES", text)
+        self.assertIn("'tail_provenance':", text)
+        self.assertIn("'partition_tail_bytes': POSTMORTEM_PARTITION_TAIL_BYTES", text)
+        self.assertEqual(text.count("'trailer': region_dump(trailer, slot_base + slot_size - trailer_len)"), 1)
+
+    def test_postmortem_evidence_has_declared_geometry_and_generic_partitions(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("def _normalise_erase_regions(erase_regions):", text)
+        self.assertIn("'geometry_source': source", text)
+        self.assertIn("'geometry_approximate': bool(approximate)", text)
+        self.assertIn("postmortem_layout.get('partitions', [])", text)
+        self.assertIn("'partitions': partition_dump", text)
+        self.assertIn("def known_erase_regions():", text)
+        self.assertIn("postmortem_layout_source = 'profile_declared'", text)
+        self.assertIn("postmortem_layout_source = 'modeled_backend'", text)
+        self.assertIn("postmortem_layout_source if erase_regions", text)
+
+    def test_trace_replay_normalizes_width_bearing_events(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("for raw_event in trace_data_loaded:", text)
+        self.assertIn(
+            "write_idx, flash_off, value, width = normalise_write_event(raw_event)",
+            text,
+        )
+        self.assertIn("width=width,", text)
+
+    def test_trace_replay_python_fallback_applies_two_byte_event(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        wanted = {
+            "_trace_replay_read_value",
+            "_trace_replay_write_value",
+            "_trace_replay_keep_one_to_zero_transitions",
+            "_trace_replay_next_lcg",
+            "_trace_replay_build_seed",
+            "_trace_replay_apply_write_fault",
+            "_build_trace_replay_write_fault_snapshot",
+        }
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in wanted
+        ]
+
+        class FakeFlash:
+            def ReadBytes(self, _offset, _size):
+                return b"\xFF" * 8
+
+        def normalise(event):
+            return int(event[0]), int(event[1]), int(event[2]), int(event[3])
+
+        namespace = {
+            "struct": struct,
+            "bytearray": bytearray,
+            "backend": {"data": SimpleNamespace(Flash=FakeFlash())},
+            "trace_data_loaded": [(0, 0, 0x1234, 2), (1, 2, 0xABCD, 2)],
+            "erase_trace_loaded": [],
+            "to_py_bytes": bytes,
+            "to_clr_bytes": bytes,
+            "normalise_write_event": normalise,
+        }
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(PY_PATH), "exec"), namespace)
+        snapshot, injected, address, writes, _word = namespace[
+            "_build_trace_replay_write_fault_snapshot"
+        ](0, "s", 0x08000000, 8, 4, 0xFF)
+        self.assertTrue(injected)
+        self.assertEqual(address, 0x08000002)
+        self.assertEqual(writes, 2)
+        self.assertEqual(bytes(snapshot), b"\x34\x12\x00\x00\xFF\xFF\xFF\xFF")
+
+    def test_committed_writeback_profiles_do_not_use_trace_less_nvm_ctrl(self) -> None:
+        offenders = []
+        for path in sorted((ROOT / "profiles").glob("*.yaml")):
+            text = path.read_text(encoding="utf-8")
+            if "durability_model: writeback" in text and "flash_backend: nvm_ctrl" in text:
+                offenders.append(path.name)
+        self.assertEqual(offenders, [])
+
+    def test_writeback_replay_rejects_legacy_width_without_backend_capability(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("write_trace_width_explicit", text)
+        self.assertIn("reason': 'width_ambiguous_trace'", text)
+        self.assertIn("trace_file_path or not _os_native.path.exists(trace_file_path)", text)
+
+    def test_writeback_execute_loads_both_traces_and_fails_closed(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("load_erase_trace_data(erase_trace_file_path)", text)
+        self.assertIn("reason': 'malformed_write_trace:", text)
+        self.assertIn("reason': 'malformed_erase_trace:", text)
+        self.assertIn("reason': 'empty_write_trace'", text)
+
+    def test_writeback_reconstruction_is_required_only_for_injected_power_loss(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("bool(fault_injected) and (", text)
+        self.assertIn("_base_fault_type_code(fault_type) in ('w', 'e', 'a')", text)
+        self.assertIn("'status': 'not_required'", text)
+
+    def test_calibration_export_preserves_width_column_and_legacy_records(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("parse_write_trace_record(line)", text)
+        self.assertIn("if len(parts) >= 4:", text)
+        self.assertIn("tf.write('write_index,flash_offset,value,width\\n')", text)
+        self.assertIn("width_field = '' if width is None else str(width)", text)
+        self.assertIn("if width not in (None, 4):", text)
+
+    def test_native_replay_validates_erase_provenance_and_falls_back(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("_native_erase_trace_is_safe()", text)
+        self.assertIn("not _os_native.path.exists(erase_trace_file_bin_path)", text)
+        self.assertIn("require_monotonic=True", text)
+
+    def test_python_replay_rejects_out_of_bounds_erase_events(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("trace erase event is outside the replay image", text)
+        self.assertIn("_validated_erase_trace(entries)", text)
+
+    def test_only_trackers_with_true_operation_width_are_legacy_safe(self) -> None:
+        expected = {
+            "STM32F4FastFlash.cs": False,
+            "STM32F4FlashController.cs": False,
+            "STM32H7FastFlash.cs": False,
+            "STM32H7FlashController.cs": False,
+            "NRF52NVMC.cs": False,
+            "CFIFlash.cs": True,
+        }
+        for name, value in expected.items():
+            text = (ROOT / "peripherals" / name).read_text(encoding="utf-8")
+            self.assertIn(
+                "WriteTraceWidthExplicit => {};".format(str(value).lower()),
+                text,
+                name,
+            )
+
+    def test_no_boot_zero_write_counter_increments_once_per_loop(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertEqual(text.count("no_boot_zero_write_count += 1"), 1)
 
 
 if __name__ == "__main__":
