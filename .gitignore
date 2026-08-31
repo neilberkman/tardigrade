@@ -6,6 +6,7 @@ __pycache__/
 *.elf
 *.o
 *.bin
+*.dSYM/
 
 # Keep prebuilt examples for out-of-the-box runnable OSS usage.
 !examples/vulnerable_ota/*.elf

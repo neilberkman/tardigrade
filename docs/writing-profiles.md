@@ -934,7 +934,7 @@ A point fails if any assertion doesn't match, even if the device booted.
 
 ### Built-in invariants
 
-Tardigrade ships 18 named postcondition invariants. Enable them by name:
+Tardigrade ships 19 named postcondition invariants. Enable them by name:
 
 ```yaml
 invariants:
@@ -956,12 +956,13 @@ invariants:
   - monotonic_state_fields # configured numeric persistent state does not regress
   - state_relations # cross-component compatibility rules
   - success_implies_effect # successful API return has its durable effect
+  - persistent_state_fail_closed # failed state reads cannot write or accept
 ```
 
-Use `invariants: [strict]` to enable the 17 generally applicable invariants.
-`success_implies_effect` is excluded from that preset because it needs an
-explicit function-return probe and effect contract; name and configure it
-directly when applicable.
+Use `invariants: [strict]` to enable all built-in invariants. Contracts that
+need specialized telemetry, such as `success_implies_effect` and
+`persistent_state_fail_closed`, remain inactive unless their corresponding
+configuration block is present; configure them directly when applicable.
 
 For a transition that commits several durable objects, declare each member's
 stable value before and after the transition:
@@ -1049,6 +1050,35 @@ observed semantic state and the aggregate relation finding includes component
 identifiers, resolved values, the expected rule, and the control/faulted run
 phase. A compatibility violation is emitted as the security finding
 `STATE_RELATION_VIOLATION`, even when all components boot successfully.
+
+#### Failed persistent-state reads must fail closed
+
+For a security-sensitive persistent-state operation, have `state_probe`
+return target-neutral telemetry under `persistent_state_operations` and
+enable the generic invariant with an empty configuration block:
+
+```yaml
+invariants:
+  - persistent_state_fail_closed
+invariant_config:
+  persistent_state_fail_closed: {}
+```
+
+Each operation record must include `operation` (a non-empty identifier),
+`read_ok` (boolean), `write_count` (non-negative integer), and `outcome`. The
+outcome must be one of `aborted`, `error`, `failed`, `none`, `rejected`,
+`accepted`, `booted`, `committed`, or `success`. After `read_ok: false`, the
+operation must have `write_count: 0` and a non-accepted outcome. Any write,
+accepted/committed/booted/success operation outcome, or successful global boot
+is reported as
+`PERSISTENT_STATE_FAIL_CLOSED`. Missing or malformed telemetry is an
+evaluation error, so infrastructure gaps cannot be promoted into a finding.
+The probe must derive these fields from target instrumentation or observed
+runtime evidence; merely restating expected behavior does not qualify a
+campaign.
+
+The minimal synthetic vulnerable/fixed records are in
+[`examples/persistent_state_fail_closed/`](../examples/persistent_state_fail_closed/).
 
 ### Custom invariant providers
 

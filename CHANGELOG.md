@@ -29,6 +29,10 @@ The format follows [common-changelog](https://common-changelog.org/).
 - Reproducible second-wave NuttX nxboot build and runtime-profile presets.
 - Fail-closed source-release license certification with exact file digests and
   tracked-file completeness enforcement in CI.
+- Freshness-aware authenticated-metadata campaigns and valid/invalid parser
+  harness preflight qualification.
+- A generic persistent-state invariant that rejects writes or successful boot
+  outcomes after a configured security-state read fails.
 
 ### Changed
 

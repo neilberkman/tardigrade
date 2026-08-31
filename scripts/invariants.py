@@ -24,7 +24,7 @@ import math
 import numbers
 from pathlib import Path
 import sys
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from fault_inject import FaultResult
 
@@ -283,6 +283,148 @@ def check_success_implies_effect(
                 result,
                 details=details,
             )
+
+
+_PERSISTENT_STATE_SAFE_OUTCOMES = frozenset(
+    {"aborted", "error", "failed", "none", "rejected"}
+)
+_PERSISTENT_STATE_ACCEPTED_OUTCOMES = frozenset(
+    {"accepted", "booted", "committed", "success"}
+)
+
+
+def check_persistent_state_fail_closed(
+    result: FaultResult,
+    invariant_config: Optional[Dict[str, Any]] = None,
+    result_signals: Optional[Dict[str, Any]] = None,
+    **_: Any,
+) -> None:
+    """Require failed persistent-state reads to stop the same operation.
+
+    This opt-in invariant consumes target-neutral operation telemetry from
+    ``signals.persistent_state_operations``.  Each entry must contain:
+
+    ``operation``
+        Non-empty operation identifier (for example, ``security_metadata``).
+    ``read_ok``
+        Boolean indicating whether the operation's state read succeeded.
+    ``write_count``
+        Number of persistent writes performed by that operation.
+    ``outcome``
+        One of ``aborted``, ``error``, ``failed``, ``none``, ``rejected``,
+        ``accepted``, ``booted``, ``committed``, or ``success``.
+
+    When ``read_ok`` is false, the operation must have no writes and must not
+    report an accepted/committed/booted outcome.  Missing or malformed
+    telemetry raises ``ValueError``; :func:`run_invariants` records that as an
+    evaluation error, so incomplete infrastructure evidence cannot become a
+    finding.
+
+    The invariant is enabled by listing ``persistent_state_fail_closed`` in
+    ``invariants`` and providing the corresponding (currently empty)
+    ``invariant_config`` mapping.  Keeping the contract opt-in avoids
+    requiring telemetry from profiles that do not observe persistent-state
+    operations.
+    """
+    if invariant_config is not None and not isinstance(invariant_config, Mapping):
+        raise ValueError("invariant_config must be a mapping")
+    config_map = invariant_config or {}
+    if "persistent_state_fail_closed" not in config_map:
+        return
+    config = config_map["persistent_state_fail_closed"]
+    if not isinstance(config, Mapping):
+        raise ValueError("persistent_state_fail_closed must be a mapping")
+
+    if result_signals is not None and not isinstance(result_signals, Mapping):
+        raise ValueError("result_signals must be a mapping")
+    signals = result_signals or {}
+    operations = signals.get("persistent_state_operations")
+    if operations is None:
+        semantic_state = signals.get("semantic_state")
+        if isinstance(semantic_state, dict):
+            operations = semantic_state.get("persistent_state_operations")
+    if not isinstance(operations, list) or not operations:
+        raise ValueError(
+            "persistent_state_fail_closed requires a non-empty "
+            "persistent_state_operations list"
+        )
+
+    violations: List[Dict[str, Any]] = []
+    allowed_outcomes = (
+        _PERSISTENT_STATE_SAFE_OUTCOMES | _PERSISTENT_STATE_ACCEPTED_OUTCOMES
+    )
+    required = {"operation", "read_ok", "write_count", "outcome"}
+    for index, operation in enumerate(operations):
+        label = "persistent_state_operations[{}]".format(index)
+        if not isinstance(operation, dict):
+            raise ValueError("{} must be a mapping".format(label))
+        missing = sorted(required - set(operation))
+        if missing:
+            raise ValueError(
+                "{} is missing required field(s): {}".format(
+                    label, ", ".join(missing)
+                )
+            )
+        name = operation.get("operation")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("{}.operation must be a non-empty string".format(label))
+        name = name.strip()
+        read_ok = operation.get("read_ok")
+        if type(read_ok) is not bool:
+            raise ValueError("{}.read_ok must be boolean".format(label))
+        write_count = operation.get("write_count")
+        if isinstance(write_count, bool) or not isinstance(write_count, int):
+            raise ValueError("{}.write_count must be a non-negative integer".format(label))
+        if write_count < 0:
+            raise ValueError("{}.write_count must be a non-negative integer".format(label))
+        outcome = operation.get("outcome")
+        if not isinstance(outcome, str) or not outcome.strip():
+            raise ValueError("{}.outcome must be a non-empty string".format(label))
+        outcome = outcome.strip().lower()
+        if outcome not in allowed_outcomes:
+            raise ValueError(
+                "{}.outcome {!r} is not a recognized persistent-state outcome".format(
+                    label, operation.get("outcome")
+                )
+            )
+
+        if read_ok:
+            continue
+        if (write_count or outcome in _PERSISTENT_STATE_ACCEPTED_OUTCOMES
+                or result.boot_outcome == "success"):
+            violations.append(
+                {
+                    "operation": name,
+                    "read_ok": read_ok,
+                    "write_count": write_count,
+                    "outcome": outcome,
+                    "index": index,
+                }
+            )
+
+    if violations:
+        raise InvariantViolation(
+            invariant_name="persistent_state_fail_closed",
+            description=(
+                "A persistent-state operation continued after a failed read: "
+                "{}.".format(
+                    ", ".join(
+                        "{} (writes={}, outcome={}, boot={})".format(
+                            item["operation"], item["write_count"],
+                            item["outcome"], result.boot_outcome,
+                        )
+                        for item in violations
+                    )
+                )
+            ),
+            result=result,
+            details={
+                "finding_code": "PERSISTENT_STATE_FAIL_CLOSED",
+                "violations": violations,
+                "fault_at": result.fault_at,
+                "boot_outcome": result.boot_outcome,
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1779,6 +1921,7 @@ _ALL_INVARIANTS: List[InvariantFn] = [
     check_atomic_state_groups,
     check_monotonic_state_fields,
     check_state_relations,
+    check_persistent_state_fail_closed,
 ]
 
 _INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
@@ -1800,6 +1943,7 @@ _INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
     "monotonic_state_fields": check_monotonic_state_fields,
     "state_relations": check_state_relations,
     "success_implies_effect": check_success_implies_effect,
+    "persistent_state_fail_closed": check_persistent_state_fail_closed,
 }
 _PROVIDER_CACHE: Dict[str, Dict[str, InvariantFn]] = {}
 

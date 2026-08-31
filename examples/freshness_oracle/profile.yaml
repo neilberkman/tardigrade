@@ -1,0 +1,33 @@
+schema_version: 1
+name: synthetic_metadata_freshness
+initial_state:
+  now: 10
+  installed:
+    version: 3
+    target: stable
+    payload_digest: 9067a4303ee542c96bd4a7c73e81f1a43fbbebcb9a103d739d1be6603cdc6557
+  metadata:
+    authenticated_digest: 3f9ecef369e582930d1d5622a188d99705d33e6bc178231313d1378651338d1c
+    version: 3
+    target: stable
+    payload_digest: 9067a4303ee542c96bd4a7c73e81f1a43fbbebcb9a103d739d1be6603cdc6557
+    expires_at: 20
+scenarios:
+  - id: baseline
+    events: []
+  - id: expired_refresh_failure
+    events:
+      - advance_time: 20
+      - refresh_failure: true
+  - id: installed_channel_advances
+    events:
+      - update_installed:
+          version: 4
+          target: stable
+          payload_digest: e76414d6fa6f04437c4afbd157cd2950588dcba44813eae12c6e04f70efb4401
+      - advance_time: 20
+      - refresh_failure: true
+harness:
+  command: [python3, harness.py, "{scenario}"]
+  timeout_seconds: 5
+mode: synthetic

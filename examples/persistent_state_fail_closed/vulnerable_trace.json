@@ -1,0 +1,14 @@
+{
+  "boot_outcome": "success",
+  "mode": "vulnerable",
+  "semantic_state": {
+    "persistent_state_operations": [
+      {
+        "operation": "security_metadata",
+        "read_ok": false,
+        "write_count": 1,
+        "outcome": "committed"
+      }
+    ]
+  }
+}

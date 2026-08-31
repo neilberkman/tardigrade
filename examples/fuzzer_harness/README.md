@@ -10,6 +10,31 @@ Workflow:
 3. Convert the crashes into tardigrade profiles.
 4. Audit the generated profiles under emulation.
 
+Before fuzzing, qualify the parser contract with a known-valid seed and a
+known-invalid control. The example builds the same C source twice: once as a
+libFuzzer target and once as a small command-line adapter that emits the JSON
+preflight result:
+
+```bash
+make -C examples/fuzzer_harness preflight_adapter.bin
+python3 scripts/fuzzer_harness.py \
+  --config examples/fuzzer_harness/preflight.yaml --json
+```
+
+The command resolves its working directory and seed paths relative to the
+configuration file, so it is runnable from any current directory. Building
+the libFuzzer target with plain `make` additionally requires a compiler that
+ships the libFuzzer runtime.
+
+The command must emit the declared outcome field as JSON. A setup error,
+intentional abort, non-zero exit, timeout, malformed output, or mismatch in
+either control is reported as `INFRASTRUCTURE_FAILURE`; it cannot be promoted
+to a product finding. Keep the valid and invalid controls representative of
+the parser contract, and rerun qualification after changing the harness. The
+preflight stages both inputs under opaque temporary paths and exposes no case
+label to the command, so the adapter must distinguish their contents. Review
+the adapter to ensure it calls the same parser entry point as the fuzzer.
+
 Example commands:
 
 ```bash

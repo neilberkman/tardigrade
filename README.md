@@ -87,6 +87,16 @@ the input. See [`docs/preauth-bounds-oracle.md`](docs/preauth-bounds-oracle.md)
 and the original minimal vulnerable/fixed fixtures in
 [`examples/preauth_bounds_oracle/`](examples/preauth_bounds_oracle/).
 
+### Freshness-aware metadata state
+
+[`scripts/freshness_oracle.py`](scripts/freshness_oracle.py) models synthetic
+update protocols in which installed image state and authenticated metadata can
+advance through separate channels. It exercises time advancement, refresh
+failure, and expiry-aware acceptance/commit/rollback decisions. It also flags
+accepted selections that regress an independently advanced installed channel,
+even while the metadata remains within its wall-clock validity period. See
+[`examples/freshness_oracle/`](examples/freshness_oracle/).
+
 ## Core campaign capabilities
 
 ### Trace replay engine
@@ -122,7 +132,10 @@ return value when a named wrapper returns. General `function_return_probes`
 capture first, last, or all calls; the `success_implies_effect` invariant then
 checks that a successful API return produced its declared persistent effect.
 Other built-ins enforce atomic state groups, monotonic fields, and
-cross-component state relations.
+cross-component state relations. The `persistent_state_fail_closed` invariant
+checks that a failed persistent-state read cannot be followed by a write or an
+accepted, committed, or booted outcome; incomplete telemetry is an evaluation
+error rather than a finding.
 
 ### Reviewed-versus-signed authorization
 
@@ -445,6 +458,7 @@ and trace fixtures for engine validation and self-testing:
 | ------------------------ | ------------------------------------------------------------------ |
 | `authorization_review`   | Reviewed-versus-signed declarative model and trace fixtures         |
 | `authenticated_equivalence` | Grammar-aware authenticated-content equivalence fixtures         |
+| `freshness_oracle`       | Authenticated-metadata expiry and split-channel regression fixtures |
 | `preauth_bounds_oracle` | Synthetic nested-header pre-authentication bounds fixtures        |
 | `naive_copy`             | Worst-case baseline; proves the engine catches obvious brick paths |
 | `vulnerable_ota`         | Copy-in-place OTA with frequent boot-visible failures              |
@@ -455,6 +469,7 @@ and trace fixtures for engine validation and self-testing:
 | `firmware_otp_harness`   | OTP programming and fuse-fault validation                          |
 | `cbmc_bridge`            | Formal-counterexample and crash-input conversion fixtures          |
 | `fuzzer_harness`         | End-to-end parser fuzzing and regression-profile example           |
+| `persistent_state_fail_closed` | Failed persistent-state read/write outcome fixtures          |
 
 ## Report structure
 
@@ -483,6 +498,7 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the full repo
 - **Scenarios** ([`scripts/run_scenario.py`](scripts/run_scenario.py)) -- multi-step discovery runs with profile overrides per step. See [`scenarios/`](scenarios/).
 - **CBMC bridge** ([`scripts/cbmc_to_profile.py`](scripts/cbmc_to_profile.py)) -- converts CBMC counterexamples into tardigrade replay profiles, bridging formal verification and empirical fault injection.
 - **Fuzzer bridge** ([`scripts/fuzz_crash_to_profile.py`](scripts/fuzz_crash_to_profile.py)) -- converts libFuzzer/AFL/honggfuzz crash inputs into regression profiles; supports batch mode, staging-image injection, and auto-detection of fuzzer types. Workflow helpers live in [`scripts/fuzz_corpus.py`](scripts/fuzz_corpus.py), with an end-to-end template in [`examples/fuzzer_harness/`](examples/fuzzer_harness/). Legacy converter: `scripts/fuzz_to_profile.py`.
+- **Fuzzer harness preflight** ([`scripts/fuzzer_harness.py`](scripts/fuzzer_harness.py)) -- validates a known-valid seed and known-invalid control before a parser campaign. Setup errors, aborts, timeouts, malformed evidence, and mismatched controls are infrastructure failures, never findings.
 - **Geometry matrix** ([`scripts/geometry_matrix.py`](scripts/geometry_matrix.py)) -- parametric slot-layout permutations to catch geometry-dependent bugs.
 - **State fuzzer** -- structured metadata-state fuzzing via the `state_fuzzer` profile block, plus the MCUboot-specific scenario generator in [`targets/mcuboot/state_fuzzer.py`](targets/mcuboot/state_fuzzer.py).
 - **Update-protocol analyzer** ([`scripts/update_protocol_analyzer.py`](scripts/update_protocol_analyzer.py)) -- checks declarative commit paths for required security gates, metadata bindings, and authenticated content.
@@ -517,7 +533,7 @@ tardigrade/
 │   ├── audit_bootloader.py           # Primary CLI entry point
 │   ├── run_scenario.py               # Multi-step scenario runner
 │   ├── profile_loader.py             # YAML profile parser + validation
-│   ├── invariants.py                 # 18 named postcondition invariants
+│   ├── invariants.py                 # 19 named postcondition invariants
 │   ├── self_test.py                  # Self-test across known defect corpus
 │   ├── run_runtime_fault_sweep.resc  # Renode fault sweep engine
 │   ├── write_trace_heuristic.py      # Write-trace classification

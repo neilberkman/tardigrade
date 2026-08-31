@@ -1,0 +1,10 @@
+command: [./preflight_adapter.bin, "{input}"]
+cwd: .
+valid_seed: corpus/valid.seed
+invalid_seed: corpus/invalid.seed
+valid:
+  outcome: true
+invalid:
+  outcome: false
+timeout_seconds: 10
+outcome_field: accepted

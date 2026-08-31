@@ -5919,7 +5919,23 @@ def _parse_invariant_config(raw: Optional[Any]) -> Dict[str, Any]:
                 names.add(name)
     if "state_relations" in parsed:
         _validate_state_relations_config(parsed["state_relations"])
+    if "persistent_state_fail_closed" in parsed:
+        _validate_persistent_state_fail_closed_config(
+            parsed["persistent_state_fail_closed"]
+        )
     return parsed
+
+
+def _validate_persistent_state_fail_closed_config(raw: Any) -> None:
+    """Validate the opt-in generic persistent-state fail-closed contract."""
+    if not isinstance(raw, dict):
+        raise ProfileError(
+            "invariant_config.persistent_state_fail_closed: expected mapping"
+        )
+    if raw:
+        raise ProfileError(
+            "invariant_config.persistent_state_fail_closed: mapping must be empty"
+        )
 
 
 _SUCCESS_EFFECT_OPS = {
@@ -7263,6 +7279,14 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
     if "state_relations" in invariants and not state_relations:
         raise ProfileError(
             "invariants includes state_relations but invariant_config.state_relations is missing"
+        )
+    if (
+        "persistent_state_fail_closed" in invariants
+        and "persistent_state_fail_closed" not in invariant_config
+    ):
+        raise ProfileError(
+            "invariants includes persistent_state_fail_closed but "
+            "invariant_config.persistent_state_fail_closed is missing"
         )
     _validate_success_effect_runtime_compatibility(
         fault_sweep, invariants, effect_contracts

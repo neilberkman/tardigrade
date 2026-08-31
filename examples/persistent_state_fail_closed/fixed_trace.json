@@ -1,0 +1,14 @@
+{
+  "boot_outcome": "no_boot",
+  "mode": "fixed",
+  "semantic_state": {
+    "persistent_state_operations": [
+      {
+        "operation": "security_metadata",
+        "read_ok": false,
+        "write_count": 0,
+        "outcome": "aborted"
+      }
+    ]
+  }
+}
