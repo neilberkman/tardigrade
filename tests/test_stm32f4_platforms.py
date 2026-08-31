@@ -33,6 +33,16 @@ class Stm32f4PlatformTests(unittest.TestCase):
             "tracker.RecordWriteAndCheckFault(aligned, wordValue, 4)",
             controller,
         )
+        self.assertIn(
+            "if(WriteTraceEnabled && flashShadow == null",
+            controller,
+        )
+        self.assertIn(
+            "if(SkipShadowScan && !WriteTraceEnabled)",
+            controller,
+        )
+        self.assertIn("for(int i = 0; i < 4; i++)", controller)
+        self.assertIn("flashShadow[aligned + i] = wordBytes[i];", controller)
 
         fast = (ROOT / "peripherals" / "STM32F4FastFlash.cs").read_text(
             encoding="utf-8"

@@ -57,6 +57,8 @@ The format follows [common-changelog](https://common-changelog.org/).
   and incomplete recovery observations remain timeouts instead of bricks.
 - Removed three trace-less NVMemory writeback profiles that could not produce
   executable durability evidence under the fail-closed runtime contract.
+- Clean writeback controls now execute normally, and STM32F4 fine calibration
+  exports complete address-bearing write traces.
 
 ## [0.5.0] - 2026-07-10
 

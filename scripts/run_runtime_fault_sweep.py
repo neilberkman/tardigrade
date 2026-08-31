@@ -8563,7 +8563,8 @@ def run_execute_fault(fault_at, fault_type='w'):
     global _writeback_snapshot_reconstruction_status
     global trace_data_loaded, erase_trace_loaded
     _writeback_snapshot_reconstruction_status = None
-    if writeback_active() and is_unsupported_writeback_fault_type(fault_type):
+    if writeback_active() and _writeback_fault_path_is_unsupported(
+            fault_at, fault_type):
         return _writeback_unsupported_fault_result(fault_at, fault_type)
     # Execute mode: full CPU boot with fault injection.
     #
@@ -10041,6 +10042,24 @@ def _preflight_writeback_trace():
     return None
 
 
+def _is_clean_control_fault_point(fault_at):
+    """Return whether a point denotes the unfaulted control execution."""
+    return int(fault_at) < 0
+
+
+def _writeback_preflight_needed(fault_points):
+    """Return whether any requested point can inject a fault."""
+    return any(not _is_clean_control_fault_point(fp) for fp in fault_points)
+
+
+def _writeback_fault_path_is_unsupported(fault_at, fault_type):
+    """Apply writeback fault-path validation only to injected points."""
+    return (
+        not _is_clean_control_fault_point(fault_at)
+        and is_unsupported_writeback_fault_type(fault_type)
+    )
+
+
 def _validate_native_erase_trace_binary(path):
     """Validate native erase records when no CSV companion is available."""
     import os as _os_native_erase
@@ -10799,6 +10818,11 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
     #
     # Returns the result dict from the runner.
     parts = None  # IronPython requires pre-declaration for locals used in multiple if-branches
+    # A clean control has no fault provenance to replay.  Route it straight
+    # through normal execute mode and never let writeback validation turn it
+    # into a synthetic write-fault result.
+    if _is_clean_control_fault_point(fp):
+        return run_execute_fault(fp, fault_type='control')
     base_ft = _base_fault_type_code(ft)
     if writeback_active() and is_unsupported_writeback_fault_type(ft):
         return _writeback_unsupported_fault_result(fp, ft)
@@ -10897,7 +10921,8 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
 # by LoadBinary need the fill.  Reload images after fill to restore them.
 # ---------------------------------------------------------------------------
 _writeback_preflight_before_machine_writes = None
-if not calibration_mode and writeback_active():
+if (not calibration_mode and writeback_active()
+        and _writeback_preflight_needed(fault_points)):
     # Reject provenance before the first runtime reload/write.  Dispatch also
     # checks this defensively, but a bad trace must not reach execute fallback
     # after any emulator operation has begun.
@@ -10928,6 +10953,45 @@ if not update_sequence_enabled and _writeback_preflight_before_machine_writes is
 # ---------------------------------------------------------------------------
 # Calibration mode
 # ---------------------------------------------------------------------------
+_CALIBRATION_TRACE_COMPLETION_REASONS = frozenset((
+    'vtor_captured',
+    'pc_captured',
+))
+
+
+def _calibration_phase2_trace_allowed(
+        phase1_reason, trace_capable, writeback_replay_required=False):
+    """Allow fine tracing after completion, with writeback-specific capture."""
+    reason = str(phase1_reason or '')
+    if not trace_capable:
+        return False
+    if reason == 'vtor_captured':
+        # Direct-durability campaigns historically stop at the coarse VTOR
+        # observation.  Writeback replay needs a fine trace of that successful
+        # boot, so enable this reason only for that mode.
+        return bool(writeback_replay_required)
+    return reason in _CALIBRATION_TRACE_COMPLETION_REASONS
+
+
+def _enable_fine_trace(data):
+    """Enable address-bearing traces without changing count-only fast runs."""
+    # Per-write-accurate PG controllers normally skip their expensive shadow
+    # scan.  Fine calibration needs the post-write diff to recover the actual
+    # address/value/width, so temporarily enable that scan.  Direct memory
+    # interceptors expose the same knobs but do not depend on this scan; their
+    # InvalidateShadow implementation is harmless, and their direct hook
+    # remains the authoritative recorder.
+    if getattr(data, 'PerWriteAccurate', False):
+        if hasattr(data, 'SkipShadowScan'):
+            data.SkipShadowScan = False
+        if hasattr(data, 'InvalidateShadow'):
+            data.InvalidateShadow()
+    data.WriteTraceClear()
+    data.WriteTraceEnabled = True
+    data.EraseTraceClear()
+    data.EraseTraceEnabled = True
+
+
 if calibration_mode:
     if evaluation_mode == 'state':
         result = {
@@ -10996,7 +11060,8 @@ if calibration_mode:
         # Only skip phase 2 for backends that don't support write trace (mram).
         trace_capable = backend['kind'] == 'fast'
 
-        if phase1_reason in ('vtor', 'vtor_settled', 'pc_captured') and trace_capable:
+        if _calibration_phase2_trace_allowed(
+                phase1_reason, trace_capable, writeback_active()):
             # Phase 2: Reset and re-run with fine slices, bounded by phase 1 time.
             fine_margin_s = max(1.0, phase1_emulated_s * 0.2)
             fine_budget_s = phase1_emulated_s + fine_margin_s
@@ -11011,10 +11076,7 @@ if calibration_mode:
                 apply_hash_bypass()
             reset_nvmc_for_sweep()
             if backend['kind'] == 'fast':
-                backend['data'].WriteTraceClear()
-                backend['data'].WriteTraceEnabled = True
-                backend['data'].EraseTraceClear()
-                backend['data'].EraseTraceEnabled = True
+                _enable_fine_trace(backend['data'])
             base_writes = get_total_writes()
             base_erases = get_total_erases()
             cal_status = run_until_done(cpu_ref, label='calibration_p2',

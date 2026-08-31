@@ -477,6 +477,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 hadDirectWrite = false;
 
+                // Trace mode needs a pre-write shadow so the first PG
+                // transition can be located.  Without this, the lazy shadow
+                // initialization in HandlePgDeactivation observes the
+                // already-modified flash and loses the first trace event.
+                if(WriteTraceEnabled && flashShadow == null
+                   && Flash != null && FlashSize > 0)
+                {
+                    flashShadow = Flash.ReadBytes(0, checked((int)FlashSize));
+                }
+
                 // In SkipShadowScan mode, capture flash state before the
                 // faulted write so we can diff to find the changed byte.
                 if(SkipShadowScan && !AnyFaultFired
@@ -536,7 +546,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             // Fast path: just count PG transitions without scanning flash.
             // Each PG deactivation is one program operation on STM32F4.
-            if(SkipShadowScan)
+            if(SkipShadowScan && !WriteTraceEnabled)
             {
                 if(tracker.IncrementWriteCount())
                 {
@@ -569,8 +579,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var wordBytes = Flash.ReadBytes(aligned, 4);
             uint wordValue = FaultTracker.ReadU32(wordBytes, 0);
 
-            // Update shadow to reflect the write.
-            flashShadow[changedOffset] = newValue;
+            // STM32F4 PG operations are one aligned 32-bit program word.
+            // Keep the complete word synchronized so a later PG transition
+            // does not rediscover bytes from this event as changed.
+            for(int i = 0; i < 4; i++)
+            {
+                flashShadow[aligned + i] = wordBytes[i];
+            }
 
             if(tracker.RecordWriteAndCheckFault(aligned, wordValue, 4))
             {

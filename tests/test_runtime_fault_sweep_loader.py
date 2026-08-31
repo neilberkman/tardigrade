@@ -33,10 +33,7 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("is_unsupported_writeback_fault_type(ft)", text)
         self.assertIn("_writeback_unsupported_fault_result(fp, ft)", text)
-        self.assertIn(
-            "if writeback_active() and is_unsupported_writeback_fault_type(fault_type):",
-            text,
-        )
+        self.assertIn("_writeback_fault_path_is_unsupported(", text)
         self.assertIn(
             "_writeback_unsupported_fault_result(fault_at, fault_type)", text
         )
@@ -586,6 +583,87 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertIn("_preflight_writeback_trace()", text)
         self.assertIn("_writeback_trace_validation_result", text)
         self.assertIn("error_kind': 'writeback_trace_validation'", text)
+
+    def test_writeback_control_dispatch_runs_without_replay_provenance(self) -> None:
+        """A clean control must reach execute mode even when writeback is on."""
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        wanted = {
+            "_is_clean_control_fault_point",
+            "_writeback_preflight_needed",
+            "_writeback_fault_path_is_unsupported",
+            "_dispatch_fault_point",
+        }
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in wanted
+        ]
+        self.assertEqual({node.name for node in functions}, wanted)
+
+        preflight_calls = []
+        unsupported_calls = []
+
+        def should_not_preflight():
+            preflight_calls.append(True)
+            raise AssertionError("clean control requested writeback replay")
+
+        def clean_execute(fault_at, fault_type="w"):
+            return {
+                "fault_at": fault_at,
+                "fault_type": fault_type,
+                "fault_injected": False,
+            }
+
+        def unsupported_result(fault_at, fault_type):
+            unsupported_calls.append((fault_at, fault_type))
+            return {
+                "fault_at": fault_at,
+                "fault_type": fault_type,
+                "fault_class": "infrastructure_error",
+            }
+
+        namespace = {
+            "run_execute_fault": clean_execute,
+            "writeback_active": lambda: True,
+            "is_unsupported_writeback_fault_type": lambda _fault_type: True,
+            "_writeback_unsupported_fault_result": unsupported_result,
+            "_preflight_writeback_trace": should_not_preflight,
+            "_base_fault_type_code": lambda fault_type: fault_type,
+            "run_trace_replay_fault": object(),
+            "run_state_fault": object(),
+        }
+        exec(
+            compile(
+                ast.Module(body=functions, type_ignores=[]),
+                str(PY_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+
+        self.assertFalse(namespace["_writeback_preflight_needed"]([-1]))
+        self.assertTrue(namespace["_writeback_preflight_needed"]([-1, 0]))
+        self.assertFalse(
+            namespace["_writeback_fault_path_is_unsupported"](-1, "control")
+        )
+        self.assertTrue(
+            namespace["_writeback_fault_path_is_unsupported"](0, "control")
+        )
+
+        result = namespace["_dispatch_fault_point"](
+            -1, "w", namespace["run_trace_replay_fault"]
+        )
+
+        self.assertEqual(result["fault_at"], -1)
+        self.assertEqual(result["fault_type"], "control")
+        self.assertFalse(result["fault_injected"])
+        self.assertEqual(preflight_calls, [])
+
+        rejected = namespace["_dispatch_fault_point"](
+            0, "control", namespace["run_trace_replay_fault"]
+        )
+        self.assertEqual(rejected["fault_class"], "infrastructure_error")
+        self.assertEqual(unsupported_calls, [(0, "control")])
 
     def test_writeback_execute_loads_both_traces_and_fails_closed(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")

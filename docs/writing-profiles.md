@@ -820,6 +820,12 @@ remain `auto`; custom domain lists are rejected during profile validation.
 
 The writeback model only changes the persisted flash snapshot used for Phase 2 recovery. Phase 1 executes against the live, write-through view of the bootloader's writes; this is an optimistic observation and does not model same-boot reads seeing stale data. A Phase 1 success therefore cannot by itself establish hardware-equivalent durability; the reconstructed committed snapshot is the security-relevant Phase 2 check.
 
+Writeback preflight and replay apply to injected fault points. The clean control
+executes normally and does not require replay provenance. During fine
+calibration, capable backends may temporarily enable address and shadow
+tracking so the complete write trace can be exported; ordinary fast, count-only
+runs retain their optimized path.
+
 Writeback campaigns require a bounded, trace-capable backend so the runner can
 reconstruct the committed image. The `nvm_ctrl`/`NVMemoryController` path does
 not expose that operation trace and is refused before fault dispatch; such

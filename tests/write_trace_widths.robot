@@ -11,6 +11,15 @@ Create STM32F4 Fast Machine
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${root}/platforms/stm32f4_fast.repl
 
+Create STM32F4 Controller Machine
+    ${root}=    Set Variable    ${CURDIR}/..
+    Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${root}/peripherals/FaultTracker.cs"
+    Execute Command    include "${root}/peripherals/STM32F4FlashController.cs"
+    Execute Command    include "${root}/peripherals/STM32DummyUSART.cs"
+    Execute Command    mach create
+    Execute Command    machine LoadPlatformDescription @${root}/platforms/stm32f4.repl
+
 Create STM32H7 Fast Machine
     ${root}=    Set Variable    ${CURDIR}/..
     Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
@@ -44,6 +53,25 @@ Create AN521 Machine
     Execute Command    machine LoadPlatformDescription @${root}/platforms/mps2_an521.repl
 
 *** Test Cases ***
+STM32F4 Controller Trace Captures First And Second PG Writes
+    Create STM32F4 Controller Machine
+    # Force the normal count-only setting to prove trace mode overrides it.
+    Execute Command    faultFlash SkipShadowScan true
+    Execute Command    faultFlash WriteTraceEnabled true
+    Execute Command    sysbus WriteDoubleWord 0x40023C04 0x45670123
+    Execute Command    sysbus WriteDoubleWord 0x40023C04 0xCDEF89AB
+    Execute Command    sysbus WriteDoubleWord 0x40023C10 1
+    Execute Command    sysbus WriteDoubleWord 0x08000000 0x44332211
+    Execute Command    sysbus WriteDoubleWord 0x40023C10 0
+    Execute Command    sysbus WriteDoubleWord 0x40023C10 1
+    Execute Command    sysbus WriteDoubleWord 0x08000004 0x88776655
+    Execute Command    sysbus WriteDoubleWord 0x40023C10 0
+    ${count}=    Execute Command    faultFlash WriteTraceCount
+    Should Be Equal As Integers    ${count}    2
+    ${trace}=    Execute Command    faultFlash WriteTraceToString
+    Should Contain    ${trace}    1:0:1144201745:4
+    Should Contain    ${trace}    2:4:2289526357:4
+
 STM32F4 Fast Trace Carries Reconstructed Word Width
     Create STM32F4 Fast Machine
     Execute Command    faultFlash WriteTraceEnabled true
