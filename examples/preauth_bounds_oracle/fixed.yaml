@@ -1,0 +1,22 @@
+schema_version: 1
+name: synthetic_preauth_nested_bounds
+input_hex: 200018005348523108000400415554484b4559303132333435363738394142434445464748494a4b4c4d4e4f505152
+layout:
+  byteorder: little
+  component_offset: 0
+  component_length: 40
+  authentication_offset: 8
+  authentication_length: 16
+  authentication_header_size: 4
+  fields:
+    total_length: {offset: 0, width: 2}
+    used_length: {offset: 2, width: 2}
+    signature_length: {offset: 8, width: 2}
+    key_length: {offset: 10, width: 2}
+mutations:
+  max_mutants: 16
+  include_safe_edges: true
+harness:
+  command: [python3, parser.py, --input, "{input}", --mode, "{mode}"]
+  timeout_seconds: 5
+mode: fixed
