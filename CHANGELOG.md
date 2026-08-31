@@ -66,6 +66,8 @@ The format follows [common-changelog](https://common-changelog.org/).
   through real execute-mode recovery.
 - Calibration caches accept the explicit-width write traces emitted by current
   backends while retaining legacy three-column trace compatibility.
+- Automatic batching treats writeback recovery replay as expensive work,
+  isolating fault points and assigning conservative Robot timeout budgets.
 - The experimental MCUboot state evaluator is now disabled for CLI audits
   unless `--allow-mcuboot-state-evaluator` is explicitly supplied; hybrid
   routing accepts only the exact ordinary power-loss wire type `w`, preserves

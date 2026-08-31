@@ -466,6 +466,9 @@ def _is_trace_replay_execute_batch(
     trace_file_bin: Optional[str],
     fault_types_list: Optional[List[str]],
 ) -> bool:
+    # Writeback power-loss points use Python trace reconstruction followed by
+    # recovery/follow-up boots.  They remain trace-replay batches, but their
+    # expensive runtime is handled explicitly by the planner below.
     if not (trace_file or trace_file_bin):
         return False
     if not fault_types_list:
@@ -506,9 +509,19 @@ def _auto_execute_batch_points(
             for ft in fault_types_list
         )
     )
+    writeback_durability = str(
+        getattr(getattr(profile, "fault_sweep", None), "durability_model", "direct")
+    ).strip().lower() == "writeback"
     update_sequence_overhead_s = (
         12.0 if getattr(profile, "has_update_sequence", False) else 0.0
     )
+
+    if eval_mode == "execute" and writeback_durability:
+        _progress(
+            "Writeback recovery replay: forcing 1 pt/batch until measured timing "
+            "can be used safely ({} points).".format(len(fault_points))
+        )
+        return 1
 
     if eval_mode == "execute" and _is_trace_replay_execute_batch(
         trace_file=trace_file,

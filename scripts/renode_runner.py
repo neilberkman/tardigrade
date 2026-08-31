@@ -300,11 +300,24 @@ def _estimate_batch_runtime_seconds(
     fault_types_list: Optional[List[str]],
     trace_replay: bool,
 ) -> float:
+    writeback_durability = str(
+        getattr(getattr(profile, "fault_sweep", None), "durability_model", "direct")
+    ).strip().lower() == "writeback"
     update_sequence_overhead_s = (
         12.0 if getattr(profile, "has_update_sequence", False) else 0.0
     )
     if trace_replay:
         platform = str(getattr(profile, "platform", "") or "").lower()
+        if writeback_durability:
+            # Writeback power_loss is reconstructed in Python, then the
+            # machine is rebooted for recovery and may run follow-up boots.
+            # It is therefore much slower than ordinary trace replay.  Keep
+            # the estimate conservative until per-profile timing calibration
+            # is available; run_runtime_sweep also forces one point/batch.
+            writeback_point_cost_s = 120.0
+            return update_sequence_overhead_s + (
+                len(fault_points) * writeback_point_cost_s
+            )
         trace_replay_point_cost_s = 1.25 if "stm32f4" in platform else 0.9
         return update_sequence_overhead_s + (len(fault_points) * trace_replay_point_cost_s)
 
