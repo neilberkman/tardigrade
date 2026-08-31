@@ -108,6 +108,7 @@ class NxbootTargetPackageTest(unittest.TestCase):
         result = SimpleNamespace(
             nvm_state={
                 "slots": {
+                    "primary": {"bootable": True},
                     "secondary": {"magic_kind": "external", "crc_valid": True},
                 },
                 "roles": {
@@ -122,6 +123,25 @@ class NxbootTargetPackageTest(unittest.TestCase):
         )
         with self.assertRaises(InvariantViolation):
             check_nxboot_duplicate_update_consumed(result)
+
+    def test_invariant_allows_crc_valid_but_nonbootable_duplicate_primary(self) -> None:
+        result = SimpleNamespace(
+            nvm_state={
+                "slots": {
+                    "primary": {"bootable": False},
+                    "secondary": {"magic_kind": "external", "crc_valid": True},
+                },
+                "roles": {
+                    "primary_valid": True,
+                    "update_slot": "secondary",
+                    "next_boot": "update",
+                },
+                "flags": {
+                    "same_primary_update_crc": True,
+                },
+            }
+        )
+        check_nxboot_duplicate_update_consumed(result)
 
     def test_invariant_allows_crc_valid_but_nonbootable_internal_primary(self) -> None:
         result = SimpleNamespace(

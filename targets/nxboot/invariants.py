@@ -69,9 +69,10 @@ def check_nxboot_duplicate_update_consumed(result, **_):
     root = _semantic_root(result)
     roles = _roles(root)
     flags = _flags(root)
+    primary = _slot(root, "primary")
     update = _slot(root, roles.get("update_slot", ""))
     if not (
-        roles.get("primary_valid")
+        primary.get("bootable")
         and flags.get("same_primary_update_crc")
         and update.get("magic_kind") == "external"
         and update.get("crc_valid")
@@ -88,6 +89,7 @@ def check_nxboot_duplicate_update_consumed(result, **_):
         details={
             "next_boot": roles.get("next_boot"),
             "update_slot": roles.get("update_slot"),
+            "primary_bootable": primary.get("bootable"),
         },
     )
 
