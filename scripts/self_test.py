@@ -24,6 +24,8 @@ import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
 
 from profile_loader import load_profile_raw
+from fault_types import _fault_type_label
+from verdicts import expectation_requires_findings, is_exploratory_expectation
 
 DEFAULT_SELF_TEST_RUNTIME_MANIFEST = "scripts/self_test_runtime_manifest.json"
 DEFAULT_SELF_TEST_PROFILE_COST_S = 60.0
@@ -32,6 +34,27 @@ DEFAULT_SELF_TEST_PROFILE_COST_S = 60.0
 # budget, while keeping the original attempt fail-closed for every other error.
 SELF_TEST_CONTROL_TIMEOUT_RETRIES = 1
 SELF_TEST_CONTROL_TIMEOUT_RETRY_MINUTES = 5
+
+_TRACE_COVERAGE_FAULT_TYPES = frozenset(
+    {
+        "interrupted_erase",
+        "multi_sector_atomicity",
+        "power_loss",
+        "security_state_erase",
+        "swap_progress",
+    }
+)
+
+
+def _normalized_fault_types(profile_raw: Dict[str, Any]) -> set[str]:
+    raw_fault_types = (profile_raw.get("fault_sweep") or {}).get("fault_types", [])
+    if not isinstance(raw_fault_types, list):
+        return set()
+    return {
+        _fault_type_label(value).strip().lower()
+        for value in raw_fault_types
+        if isinstance(value, str) and value.strip()
+    }
 
 
 def _normalize_expect_fault_type(name: str) -> str:
@@ -42,6 +65,120 @@ def _normalize_expect_fault_type(name: str) -> str:
         "power_loss": "power_loss",
     }
     return aliases.get(value, value)
+
+
+def _report_integrity_failure_reason(report: Dict[str, Any]) -> Optional[str]:
+    """Return a fail-closed reason when an audit report is not complete.
+
+    ``check_verdict`` must not treat matching counters in a partial report as
+    a valid self-test result.  Current audit reports expose this through the
+    runtime campaign-integrity block and the security aggregate; the explicit
+    checks for the top-level verdict and ``campaign_complete`` also protect
+    imported/older report variants that lack one of those blocks.
+    """
+    verdict = str(report.get("verdict") or "").strip()
+    verdict_lower = verdict.lower()
+    if verdict_lower.startswith("inconclusive") or any(
+        marker in verdict_lower
+        for marker in (
+            "campaign incomplete",
+            "infrastructure failure",
+            "infrastructure error",
+        )
+    ):
+        return "Audit report is incomplete or infrastructure-invalid: {}".format(
+            verdict or "missing verdict"
+        )
+
+    aggregate = report.get("security_aggregate")
+    if isinstance(aggregate, dict):
+        status = str(aggregate.get("status") or "").strip().upper()
+        if status == "INCONCLUSIVE":
+            reasons = aggregate.get("inconclusive_reasons")
+            detail = ""
+            if isinstance(reasons, list):
+                detail = "; ".join(str(reason).strip() for reason in reasons if str(reason).strip())
+            suffix = ": {}".format(detail) if detail else ""
+            return "Audit report security aggregate is inconclusive{}".format(
+                suffix
+            )
+
+    summary = report.get("summary")
+    if not isinstance(summary, dict):
+        return None
+
+    runtime_sweeps = []
+    runtime = summary.get("runtime_sweep")
+    if isinstance(runtime, dict):
+        runtime_sweeps.append(("runtime sweep", runtime))
+    multi_fault = summary.get("multi_fault_runtime_sweep")
+    if isinstance(multi_fault, dict):
+        runtime_sweeps.append(("multi-fault sweep", multi_fault))
+
+    integrity_count_fields = (
+        "incomplete",
+        "missing_results",
+        "extra_results",
+        "protocol_errors",
+        "runner_errors",
+        "malformed_results",
+        "malformed_controls",
+        "infrastructure_errors",
+        "control_infrastructure_errors",
+        "timeouts",
+        "control_timeouts",
+        "skipped_results",
+        "control_skipped",
+        "not_injected",
+        "faulted_controls",
+    )
+    runtime_failure_counter_fields = (
+        "infrastructure_error_points",
+        "timeout_points",
+        "missing_result_points",
+        "extra_result_points",
+        "protocol_error_points",
+        "runner_error_points",
+        "malformed_result_points",
+        "malformed_control_points",
+        "control_infrastructure_error_points",
+        "control_timeout_points",
+        "control_skipped_points",
+        "faulted_control_points",
+        "skipped_fault_points",
+        "incomplete_fault_points",
+        "terminal_error_unresolved_points",
+    )
+    for label, sweep in runtime_sweeps:
+        if sweep.get("campaign_complete") is False:
+            return "{} campaign is incomplete".format(label.capitalize())
+        for field in runtime_failure_counter_fields:
+            count = sweep.get(field, 0)
+            if (
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or count < 0
+            ):
+                return "{} has invalid {}".format(label.capitalize(), field)
+            if count > 0:
+                return "{} reports {}".format(label.capitalize(), field)
+        integrity = sweep.get("campaign_integrity")
+        if not isinstance(integrity, dict):
+            continue
+        if integrity.get("complete") is False:
+            return "{} campaign integrity is incomplete".format(label.capitalize())
+        for field in integrity_count_fields:
+            count = integrity.get(field, 0)
+            if (
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or count < 0
+            ):
+                return "{} campaign integrity has invalid {}".format(label.capitalize(), field)
+            if count > 0:
+                return "{} campaign integrity reports {}".format(label.capitalize(), field)
+
+    return None
 
 
 def load_runtime_manifest(
@@ -200,7 +337,7 @@ def build_detailed_result(
     """
     report = report or {}
     sweep = report.get("summary", {}).get("runtime_sweep", {})
-    return {
+    result = {
         "profile": profile,
         "passed": passed,
         "reason": reason,
@@ -210,6 +347,11 @@ def build_detailed_result(
         "bricks": sweep.get("bricks"),
         "brick_rate": sweep.get("brick_rate"),
     }
+    # Self-test summaries wrap audit reports. Preserve explicit target source
+    # provenance when present, without deriving it from the profile path.
+    if report.get("target_source") is not None:
+        result["target_source"] = report["target_source"]
+    return result
 
 
 def run_audit(
@@ -314,8 +456,11 @@ def check_verdict(
             exit_code
         )
 
+    integrity_reason = _report_integrity_failure_reason(report)
+    if integrity_reason:
+        return False, integrity_reason
+
     expect = profile_raw.get("expect", {})
-    should_find_issues = expect.get("should_find_issues", False)
     brick_rate_min = float(expect.get("brick_rate_min", 0.0))
     allow_semantic_only_issues = bool(expect.get("allow_semantic_only_issues", False))
     allow_control_only_issues = bool(expect.get("allow_control_only_issues", False))
@@ -355,11 +500,19 @@ def check_verdict(
         coverage = {}
     coverage_status = str(coverage.get("status", "") or "")
     coverage_reason = str(coverage.get("reason", "") or "")
+    configured_fault_types = _normalized_fault_types(profile_raw)
+    fault_sweep_declared = isinstance(profile_raw.get("fault_sweep"), dict)
+    calibration_required = bool(
+        configured_fault_types & _TRACE_COVERAGE_FAULT_TYPES
+    ) or (not fault_sweep_declared and bool(coverage))
     coverage_blocks_clean = coverage_status in {
+        "unavailable",
         "metadata_only",
         "outside_slots_only",
         "no_nvm_activity",
-    }
+    } and calibration_required
+    swap_progress_required = "swap_progress" in configured_fault_types
+    swap_progress = summary.get("swap_progress_inference")
     control_only_issue = (
         allow_control_only_issues
         and control_outcome == expected_control_outcome
@@ -375,6 +528,15 @@ def check_verdict(
             control_outcome or "missing",
             expected_control_outcome,
         )
+    if calibration_required and not coverage:
+        return False, "Calibration coverage is missing"
+    if swap_progress_required and (
+        not isinstance(swap_progress, dict)
+        or swap_progress.get("status") != "inferred"
+    ):
+        return False, "Swap-progress coverage is unavailable"
+    if coverage_blocks_clean:
+        return False, coverage_reason or "Calibration did not exercise slot data movement"
 
     ignored_issue_points = 0
     if ignored_issue_fault_types and fault_type_issue_points:
@@ -385,14 +547,12 @@ def check_verdict(
         )
     effective_issue_points = max(0, issue_points - ignored_issue_points)
 
-    if should_find_issues:
+    if expectation_requires_findings(expect):
         if issue_points == 0:
             if control_only_issue:
                 return True, "Control exhibits expected {}, as intended".format(
                     control_outcome
                 )
-            if coverage_blocks_clean:
-                return False, coverage_reason or "Calibration did not exercise slot data movement"
             return False, "Expected issues but found none"
         if brick_rate_min > 0 and brick_rate < brick_rate_min:
             return False, "Brick rate {:.1%} below minimum {:.1%}".format(
@@ -414,12 +574,14 @@ def check_verdict(
         return True, "Found {} semantic/invariant issue points, as expected".format(
             issue_points
         )
-    else:
-        if coverage_blocks_clean:
-            return False, coverage_reason or "Calibration did not exercise slot data movement"
+    elif not is_exploratory_expectation(expect):
         if effective_issue_points > 0:
             return False, "Expected no issues but found {} point(s)".format(effective_issue_points)
         return True, "No issues found, as expected"
+    else:
+        return True, "Exploratory campaign completed ({} issue point(s))".format(
+            effective_issue_points
+        )
 
 
 def main() -> int:

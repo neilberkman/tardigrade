@@ -20,6 +20,9 @@ if str(SCRIPTS) not in sys.path:
 
 from audit_report import compute_verdict, summarize_runtime_sweep  # noqa: E402
 from fault_classification import writeback_reconstruction_is_valid  # noqa: E402
+from profile_loader import ExpectConfig, _parse_expect_values  # noqa: E402
+from self_test import check_verdict  # noqa: E402
+from verdicts import expectation_mode  # noqa: E402
 from renode_runner import (  # noqa: E402
     RenodeProtocolError,
     _run_batch_with_fallback,
@@ -29,8 +32,14 @@ from renode_runner import (  # noqa: E402
 )
 
 
-def _expect(*, should_find_issues: bool = False, allow_control_only: bool = False):
+def _expect(
+    *,
+    should_find_issues: bool = False,
+    allow_control_only: bool = False,
+    mode: str = "regression",
+):
     return SimpleNamespace(
+        mode=mode,
         should_find_issues=should_find_issues,
         control_outcome="success",
         allow_control_only_issues=allow_control_only,
@@ -544,6 +553,135 @@ def test_unexpected_empty_campaign_fails() -> None:
     assert compute_verdict(summary, _expect()) == (
         "FAIL \u2014 campaign executed no fault points"
     )
+
+
+def test_exploratory_hunt_allows_zero_findings_after_complete_campaign() -> None:
+    summary = summarize_runtime_sweep(
+        [_control(), {
+            "is_control": False,
+            "fault_at": 1,
+            "fault_requested": 1,
+            "fault_injected": True,
+            "boot_outcome": "success",
+            "boot_slot": "exec",
+        }],
+        expected_fault_points=1,
+    )
+
+    assert summary["campaign_complete"] is True
+    assert compute_verdict(
+        summary, _expect(should_find_issues=True, mode="hunt")
+    ).startswith("PASS")
+
+
+def test_regression_mode_still_requires_expected_findings() -> None:
+    summary = summarize_runtime_sweep(
+        [_control(), {
+            "is_control": False,
+            "fault_at": 1,
+            "fault_requested": 1,
+            "fault_injected": True,
+            "boot_outcome": "success",
+            "boot_slot": "exec",
+        }],
+        expected_fault_points=1,
+    )
+
+    assert compute_verdict(
+        summary, _expect(should_find_issues=True, mode="regression")
+    ) == "FAIL \u2014 expected to find issues but found none"
+
+
+def test_hunt_alias_is_canonicalized_and_is_outcome_neutral() -> None:
+    assert ExpectConfig(mode="hunt").mode == "exploratory"
+    assert expectation_mode({"mode": "hunt"}) == "exploratory"
+    assert _parse_expect_values(
+        {"mode": "hunt"}, context="expect", partial=False
+    )["mode"] == "exploratory"
+    summary = summarize_runtime_sweep(
+        [_control(), {
+            "is_control": False,
+            "fault_at": 1,
+            "fault_requested": 1,
+            "fault_injected": True,
+            "boot_outcome": "wrong_image",
+            "boot_slot": "staging",
+        }],
+        expected_fault_points=1,
+    )
+
+    assert compute_verdict(summary, _expect(mode="hunt")).startswith("PASS")
+
+
+def test_hunt_mode_does_not_accept_incomplete_or_infrastructure_failed_campaign() -> None:
+    summary = summarize_runtime_sweep(
+        [_control(), {
+            "is_control": False,
+            "fault_at": 1,
+            "fault_requested": 1,
+            "fault_injected": False,
+            "boot_outcome": "infra_error",
+            "infrastructure_error": True,
+            "error_kind": "runner_error",
+        }],
+        expected_fault_points=1,
+    )
+
+    verdict = compute_verdict(summary, _expect(should_find_issues=True, mode="hunt"))
+    assert verdict.startswith("FAIL")
+    assert "infrastructure error" in verdict
+
+
+def test_self_test_hunt_requires_configured_calibration_coverage() -> None:
+    report = {
+        "summary": {
+            "runtime_sweep": {
+                "issue_points": 0,
+                "bricks": 0,
+                "brick_rate": 0.0,
+                "control": {"effective_outcome": "success"},
+                "calibration_coverage": {"status": "unavailable"},
+            }
+        },
+        "verdict": "PASS",
+    }
+    passed, reason = check_verdict(
+        Path("profile.yaml"),
+        {
+            "fault_sweep": {"fault_types": ["power_loss"]},
+            "expect": {"should_find_issues": True, "mode": "hunt"},
+        },
+        report,
+        0,
+    )
+    assert passed is False
+    assert "Calibration" in reason
+
+
+def test_self_test_hunt_requires_configured_swap_progress_coverage() -> None:
+    report = {
+        "summary": {
+            "runtime_sweep": {
+                "issue_points": 0,
+                "bricks": 0,
+                "brick_rate": 0.0,
+                "control": {"effective_outcome": "success"},
+                "calibration_coverage": {"status": "slot_activity"},
+            }
+        },
+        "verdict": "PASS",
+    }
+    passed, reason = check_verdict(
+        Path("profile.yaml"),
+        {
+            "fault_sweep": {"fault_types": ["swap_progress"]},
+            "expect": {"should_find_issues": False, "mode": "exploratory"},
+        },
+        report,
+        0,
+    )
+    assert passed is False
+    assert "Swap-progress" in reason
 
 
 def test_fault_campaign_without_clean_control_fails() -> None:

@@ -103,6 +103,35 @@ def _report_has_explicit_verdict(report: Optional[Dict[str, Any]]) -> bool:
     )
 
 
+def _consistent_target_source(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return a shared child target source for the scenario wrapper.
+
+    Each audit child remains authoritative.  The wrapper advertises one
+    top-level value only when every audit/replay child declares provenance
+    and those declarations agree, avoiding a misleading value for scenarios
+    that intentionally compare different target revisions or have incomplete
+    provenance. Assertion steps do not produce child audit reports and are
+    therefore excluded.
+    """
+    sources: List[Dict[str, Any]] = []
+    for step in (results.get("steps") or {}).values():
+        if not isinstance(step, dict):
+            continue
+        kind = str(step.get("kind", "audit")).strip().lower()
+        if kind not in {"audit", "replay"}:
+            continue
+        report = step.get("report")
+        if not isinstance(report, dict):
+            return None
+        source = report.get("target_source")
+        if not isinstance(source, dict) or not source:
+            return None
+        sources.append(source)
+    if not sources or any(source != sources[0] for source in sources[1:]):
+        return None
+    return dict(sources[0])
+
+
 def _scenario_asserts_step_verdict(
     steps: Sequence[Dict[str, Any]],
     audit_step_id: str,
@@ -581,6 +610,10 @@ def main() -> int:
             if failures:
                 results["status"] = "FAIL"
             results["steps"][step_id] = step_result
+
+    target_source = _consistent_target_source(results)
+    if target_source is not None:
+        results["target_source"] = target_source
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

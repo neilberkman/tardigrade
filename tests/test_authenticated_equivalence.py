@@ -43,8 +43,8 @@ def test_vulnerable_and_fixed_harnesses_use_semantic_outcomes() -> None:
         "mutant": 8,
     }
     assert vulnerable["findings"][0]["differing_outcomes"]["security_state"] == {
-        "base": {"accepted": True, "payload_record_count": 1},
-        "mutant": {"accepted": True, "payload_record_count": 2},
+        "base": {"installed_payload_record_count": 1},
+        "mutant": {"installed_payload_record_count": 2},
     }
 
     fixed = run_campaign(_config("fixed"))
@@ -162,7 +162,7 @@ def test_committed_false_to_true_escalation_is_reported(monkeypatch: pytest.Monk
         "size": 4,
         "installed_payload_digest": "c97c29c7a71b392b437ee03fd17f09bb10b75e879466fc0eb757b2c4a78ac938",
         "rollback_outcome": "none",
-        "security_state": {"accepted": True, "payload_record_count": 1},
+        "security_state": {"installed_payload_record_count": 1},
         "input_sha256": "",
     }
     mutant = dict(expected)
@@ -231,6 +231,96 @@ def test_security_state_only_divergence_is_reported(monkeypatch: pytest.MonkeyPa
     report = run_campaign(config)
     assert report["status"] == "FINDINGS"
     assert list(report["findings"][0]["differing_outcomes"]) == ["security_state"]
+
+
+def test_rejected_mutant_state_divergence_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _config()
+    base = {
+        "authenticated_bytes_b64": "oARBVVRI",
+        "authenticated_digest": "f16719742870ca30e8b935bd6d323003b3d5c3c0245fb54286122e5727652a9c",
+        "signature_bytes_b64": "AQIDBA==",
+        "accepted": True,
+        "committed": True,
+        "version": 2,
+        "target": "app",
+        "size": 4,
+        "installed_payload_digest": "c97c29c7a71b392b437ee03fd17f09bb10b75e879466fc0eb757b2c4a78ac938",
+        "rollback_outcome": "none",
+        "security_state": {"installed_version": 2, "commit_marker": "stable"},
+        "security_state_before": {"installed_version": 2, "commit_marker": "stable"},
+        "security_state_after": {"installed_version": 2, "commit_marker": "stable"},
+    }
+    mutant = {
+        **base,
+        "accepted": False,
+        "committed": False,
+        # These values are intentionally inapplicable on an ordinary reject.
+        "version": None,
+        "target": None,
+        "size": -1,
+        "installed_payload_digest": "not-applicable",
+        "rollback_outcome": "rejected",
+        # The persistent state changed despite the rejection.
+        "security_state": {"installed_version": 3, "commit_marker": "stable"},
+        "security_state_before": {"installed_version": 2, "commit_marker": "stable"},
+        "security_state_after": {"installed_version": 3, "commit_marker": "stable"},
+    }
+
+    def fake_harness(_config: dict, path: Path, mutation_id: str, _index: int) -> dict:
+        result = base if mutation_id == "base" else mutant
+        return {**result, "input_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+    monkeypatch.setattr(ae, "_run_harness", fake_harness)
+    report = run_campaign(config)
+    assert report["status"] == "FINDINGS"
+    assert report["findings"][0]["differing_outcomes"]["security_state_transition"] == {
+        "before": {"installed_version": 2, "commit_marker": "stable"},
+        "after": {"installed_version": 3, "commit_marker": "stable"},
+    }
+
+
+def test_rejected_mutant_absolute_state_difference_is_not_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected input may simply leave the shared pre-update state old."""
+    config = _config()
+    base = {
+        "authenticated_bytes_b64": "oARBVVRI",
+        "authenticated_digest": "f16719742870ca30e8b935bd6d323003b3d5c3c0245fb54286122e5727652a9c",
+        "signature_bytes_b64": "AQIDBA==",
+        "accepted": True,
+        "committed": True,
+        "version": 2,
+        "target": "app",
+        "size": 4,
+        "installed_payload_digest": "c97c29c7a71b392b437ee03fd17f09bb10b75e879466fc0eb757b2c4a78ac938",
+        "rollback_outcome": "none",
+        "security_state": {"installed_version": 2},
+        "security_state_before": {"installed_version": 1},
+        "security_state_after": {"installed_version": 2},
+    }
+    mutant = {
+        **base,
+        "accepted": False,
+        "committed": False,
+        "version": None,
+        "target": None,
+        "size": -1,
+        "installed_payload_digest": "not-applicable",
+        "rollback_outcome": "rejected",
+        "security_state": {"installed_version": 1},
+        "security_state_before": {"installed_version": 1},
+        "security_state_after": {"installed_version": 1},
+    }
+
+    def fake_harness(_config: dict, path: Path, mutation_id: str, _index: int) -> dict:
+        result = base if mutation_id == "base" else mutant
+        return {**result, "input_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+    monkeypatch.setattr(ae, "_run_harness", fake_harness)
+    report = run_campaign(config)
+    assert report["status"] == "PASS"
+    assert report["findings"] == []
 
 
 @pytest.mark.parametrize(
@@ -431,7 +521,7 @@ def test_committed_true_to_false_escalation_is_reported(monkeypatch: pytest.Monk
         "size": 4,
         "installed_payload_digest": "c97c29c7a71b392b437ee03fd17f09bb10b75e879466fc0eb757b2c4a78ac938",
         "rollback_outcome": "none",
-        "security_state": {"accepted": True, "payload_record_count": 1},
+        "security_state": {"installed_payload_record_count": 1},
     }
     mutant = dict(base)
     mutant["committed"] = False

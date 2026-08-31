@@ -30,6 +30,19 @@ Harness values are validated as well: `security_state` must be a JSON object,
 non-negative integer `size`, and a committed result must report a lowercase
 SHA-256 `installed_payload_digest`. Rejected mutants may use null or otherwise
 inapplicable install fields because they are not treated as accepted installs.
+For rejected-mutant side-effect detection, a harness may additionally provide
+`security_state_before` and `security_state_after` JSON objects. Both must be
+present for every run, the `before` object must match the base run, and `after`
+must equal the required `security_state` field. A rejected mutant is reported
+only when this explicit transition changes state. This avoids treating the
+accepted base's new absolute state versus a rejected mutant's unchanged old
+state as a finding. Existing v2 harnesses without transition evidence remain
+valid, but cannot establish rejected side effects. The ordinary rejection value
+of `rollback_outcome` is not compared on rejection because it commonly changes
+from the baseline's successful outcome to a rejection label; any persistent
+rollback effect belongs in the explicit state transition or `security_state`.
+Accepted mutants compare every canonical semantic outcome, including the
+rollback result.
 
 The campaign independently checks `input_sha256` against the supplied bytes,
 and checks the authenticated identity against the parsed records. The harness
@@ -77,10 +90,11 @@ out-of-bounds cases fail closed.
 The campaign fails closed for malformed input/configuration, missing canonical
 semantic outcome fields in v2, empty mutations, timeouts, non-zero harness exits,
 malformed output, missing fields, or any
-authenticated-identity drift. A safe parser rejection is never a finding. A
+authenticated-identity drift. A safe parser rejection is not a finding. A
 finding is semantic only: it records a divergent declared outcome such as
 acceptance, commit, version, target, size, installed payload digest, or rollback
-result or persistent security state. Parser crashes are not findings.
+result for an accepted mutant, or an explicit persistent security-state
+transition for a rejected mutant. Parser crashes are not findings.
 
 The synthetic vulnerable/fixed harness is in
 [`examples/authenticated_equivalence/`](../examples/authenticated_equivalence/):

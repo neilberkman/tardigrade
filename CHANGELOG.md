@@ -33,6 +33,11 @@ The format follows [common-changelog](https://common-changelog.org/).
   harness preflight qualification.
 - A generic persistent-state invariant that rejects writes or successful boot
   outcomes after a configured security-state read fails.
+- Explicit `target_source` provenance is preserved across audit, scenario,
+  self-test, merged, and OSS-validation reports; `expect.mode` supports
+  explicit exploratory and hunt campaigns.
+- Authenticated-equivalence campaigns can use explicit before/after evidence
+  to detect persistent security-state changes caused by rejected mutants.
 
 ### Changed
 
@@ -49,6 +54,10 @@ The format follows [common-changelog](https://common-changelog.org/).
   and dedicated signed slot images.
 - Recovery-boot wall-clock budgets are profile-configurable and remain
   distinct from emulated-time stall detection.
+- Optional selector coverage no longer makes unrelated campaigns incomplete;
+  explicitly configured selectors remain fail-closed.
+- Renode-test receives the configured Robot timeout so healthy long-running
+  controls are not terminated by its shorter default suite timeout.
 
 ### Fixed
 
@@ -76,6 +85,10 @@ The format follows [common-changelog](https://common-changelog.org/).
   unless `--allow-mcuboot-state-evaluator` is explicitly supplied; hybrid
   routing accepts only the exact ordinary power-loss wire type `w`, preserves
   per-point fault types, and remains conservative for overlapping trailers.
+- Self-test expectation checks reject incomplete or infrastructure-invalid
+  campaign reports before evaluating expected findings.
+- OSS validation initializes and verifies a clean managed source worktree
+  before attributing a built target to its exact revision.
 
 ## [0.5.0] - 2026-07-10
 

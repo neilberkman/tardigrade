@@ -62,11 +62,14 @@ def merge_runtime_sweep_payloads(
 
     first = payloads[0]
     first_profile_path = first.get("profile_path")
+    first_target_source = first.get("target_source")
     for payload in payloads[1:]:
         if payload.get("profile") != first.get("profile"):
             raise ValueError("cannot merge reports from different profiles")
         if payload.get("profile_path") != first_profile_path:
             raise ValueError("cannot merge reports with different profile paths")
+        if payload.get("target_source") != first_target_source:
+            raise ValueError("cannot merge reports with different target sources")
 
     profile = _load_profile_if_present(first_profile_path)
     merged_results: List[Dict[str, Any]] = []
@@ -126,6 +129,8 @@ def merge_runtime_sweep_payloads(
         },
         "git": first.get("git"),
     }
+    if first_target_source is not None:
+        merged_payload["target_source"] = first_target_source
     for key in ("contracts", "calibration", "clean_trace"):
         if key in first:
             merged_payload[key] = first.get(key)

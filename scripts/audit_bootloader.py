@@ -91,14 +91,26 @@ from sweep import (
     run_runtime_sweep,
     validate_runtime_fault_mode_compat,
 )
-from profile_loader import HeuristicConfig, PreBootWrite, ProfileConfig, load_profile, load_profile_raw
+from profile_loader import (
+    HeuristicConfig,
+    PreBootWrite,
+    ProfileConfig,
+    TargetSourceConfig,
+    load_profile,
+    load_profile_raw,
+)
 from terminal_error_escape import (
     discover_terminal_error_paths,
     evaluate_terminal_error_differential,
 )
 from boundary_campaigns import aggregate_boundary_results, boundary_campaign_dict
 from report_security_status import attach_security_aggregate
-from verdicts import is_pass_verdict
+from verdicts import (
+    EXPECTATION_MODES,
+    expectation_requires_findings,
+    is_exploratory_expectation,
+    is_pass_verdict,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RENODE_TEST = os.environ.get("RENODE_TEST", "renode-test")
@@ -333,9 +345,13 @@ def _multi_component_verdict(
         return "INCONCLUSIVE -- {} component fault results were incomplete".format(
             unreliable_points
         )
-    if profile.expect.should_find_issues and not found_issues:
+    if expectation_requires_findings(profile.expect) and not found_issues:
         return "FAIL -- expected to find multi-component issues but found none"
-    if not profile.expect.should_find_issues and found_issues:
+    if (
+        not is_exploratory_expectation(profile.expect)
+        and not profile.expect.should_find_issues
+        and found_issues
+    ):
         return "FAIL -- found {} component issues".format(
             canonical_issue_points
         )
@@ -421,7 +437,10 @@ def _aggregate_auxiliary_verdict(
         auxiliary_findings += reported_security_findings
 
     if auxiliary_findings:
-        if not profile.expect.should_find_issues:
+        if (
+            not is_exploratory_expectation(profile.expect)
+            and not profile.expect.should_find_issues
+        ):
             return "FAIL -- auxiliary campaigns found {} issues".format(
                 auxiliary_findings
             )
@@ -573,6 +592,40 @@ def _profile_requests_zero_fault_points(max_writes: object) -> bool:
         return False
 
 
+def _report_provenance(profile: ProfileConfig, repo_root: Path) -> Dict[str, Any]:
+    """Return report provenance, including only explicitly declared target data.
+
+    ``git_metadata`` identifies the audit tool checkout.  Target source
+    provenance is separate because the target artifact may have been built in
+    another checkout (or before a containerized run); never derive it from a
+    runtime path.
+    """
+    result: Dict[str, Any] = {"git": git_metadata(repo_root)}
+    profile_fields = getattr(profile, "__dict__", None)
+    target_source = getattr(profile, "target_source", None)
+    # Bare mocks synthesize every missing attribute. Treat one of those as
+    # absent, while rejecting an explicitly assigned malformed value on a
+    # real profile object instead of silently dropping provenance.
+    if target_source is None or (
+        isinstance(profile_fields, dict) and "target_source" not in profile_fields
+    ):
+        return result
+    if isinstance(target_source, TargetSourceConfig):
+        result["target_source"] = target_source.to_dict()
+        return result
+    if isinstance(target_source, dict):
+        if not target_source or set(target_source) - {"name", "repository", "revision"}:
+            raise TypeError("profile.target_source must be a valid target-source mapping")
+        if not isinstance(target_source.get("revision"), str) or not target_source["revision"].strip():
+            raise TypeError("profile.target_source.revision must be a non-empty string")
+        for field_name in ("name", "repository"):
+            if field_name in target_source and not isinstance(target_source[field_name], str):
+                raise TypeError("profile.target_source.{} must be a string".format(field_name))
+        result["target_source"] = dict(target_source)
+        return result
+    raise TypeError("profile.target_source must be TargetSourceConfig or mapping")
+
+
 def _write_trigger_discovery_failure(
     *,
     args: argparse.Namespace,
@@ -598,6 +651,7 @@ def _write_trigger_discovery_failure(
         },
         "expect": {
             "should_find_issues": profile.expect.should_find_issues,
+            "mode": profile.expect.mode,
         },
         "calibration": {
             "performed": False,
@@ -616,7 +670,7 @@ def _write_trigger_discovery_failure(
             "artifacts_dir": report_artifacts_dir,
             "workers": args.workers,
         },
-        "git": git_metadata(repo_root),
+        **_report_provenance(profile, repo_root),
     }
     attach_security_aggregate(payload)
     out_path = Path(args.output)
@@ -679,14 +733,17 @@ def _write_geometry_preflight_failure(
         "schema_version": profile.schema_version,
         "verdict": verdict,
         "summary": {"geometry_preflight": geometry},
-        "expect": {"should_find_issues": profile.expect.should_find_issues},
+        "expect": {
+            "should_find_issues": profile.expect.should_find_issues,
+            "mode": profile.expect.mode,
+        },
         "execution": {
             "run_utc": dt.datetime.now(dt.timezone.utc)
             .replace(microsecond=0)
             .isoformat()
             .replace("+00:00", "Z"),
         },
-        "git": git_metadata(repo_root),
+        **_report_provenance(profile, repo_root),
     }
     attach_security_aggregate(payload)
     output = Path(args.output)
@@ -1408,10 +1465,19 @@ def run_fuzz_crash_campaign(
                 audit_payload = {}
             child_verdict = str(audit_payload.get("verdict", ""))
             child_passed = is_pass_verdict(child_verdict)
+            child_expect = audit_payload.get("expect", {})
+            child_security_status = (
+                audit_payload.get("security_aggregate", {}).get("status")
+                if isinstance(audit_payload.get("security_aggregate"), dict)
+                else None
+            )
             security_finding = bool(
                 proc.returncode == 0
-                and audit_payload.get("expect", {}).get("should_find_issues")
                 and child_passed
+                and (
+                    child_security_status == "FINDINGS"
+                    or expectation_requires_findings(child_expect)
+                )
             )
             result_entry: Dict[str, Any] = {
                 "crash_file": generated["crash_file"],
@@ -1631,6 +1697,7 @@ def _main_single() -> int:
                 "authorization_review_analysis": authorization_review_analysis,
                 "expect": {
                     "should_find_issues": profile.expect.should_find_issues,
+                    "mode": profile.expect.mode,
                 },
                 "execution": {
                     "run_utc": dt.datetime.now(dt.timezone.utc).replace(
@@ -1638,7 +1705,7 @@ def _main_single() -> int:
                     ).isoformat().replace("+00:00", "Z"),
                     "workers": args.workers,
                 },
-                "git": git_metadata(repo_root),
+                **_report_provenance(profile, repo_root),
             }
 
             attach_security_aggregate(payload)
@@ -2447,6 +2514,7 @@ def _main_single() -> int:
             },
             "expect": {
                 "should_find_issues": profile.expect.should_find_issues,
+                "mode": profile.expect.mode,
             },
             "boundary_campaign": (
                 {
@@ -2480,7 +2548,7 @@ def _main_single() -> int:
                 "artifacts_dir": report_artifacts_dir,
                 "workers": args.workers,
             },
-            "git": git_metadata(repo_root),
+            **_report_provenance(profile, repo_root),
         }
         dist = profile.fault_sweep.fault_distribution
         if dist is not None and dist.mode != "uniform":
@@ -2987,6 +3055,11 @@ def _run_initial_state_matrix(
     for entry in entries:
         entry.pop("_child_payload", None)
 
+    expect_mode = getattr(getattr(profile, "expect", None), "mode", "regression")
+    if not isinstance(expect_mode, str) or expect_mode.strip().lower() not in EXPECTATION_MODES:
+        expect_mode = "regression"
+    if expect_mode.strip().lower() == "hunt":
+        expect_mode = "exploratory"
     payload: Dict[str, Any] = {
         "engine": "renode-test",
         "profile": profile.name,
@@ -2998,6 +3071,7 @@ def _run_initial_state_matrix(
             "should_find_issues": bool(
                 getattr(getattr(profile, "expect", None), "should_find_issues", False)
             ),
+            "mode": expect_mode,
         },
         "summary": {
             "initial_states": {
@@ -3018,7 +3092,7 @@ def _run_initial_state_matrix(
             .isoformat()
             .replace("+00:00", "Z"),
         },
-        "git": git_metadata(repo_root),
+        **_report_provenance(profile, repo_root),
     }
     attach_security_aggregate(payload)
     output = Path(args.output)

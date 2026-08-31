@@ -558,6 +558,9 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
             exit_code=1,
             report={
                 "verdict": "FAIL — found 1042 issue points",
+                "target_source": {
+                    "revision": "4f8c0d3e2a1b9876543210fedcba0123456789ab",
+                },
                 "summary": {"runtime_sweep": {"bricks": 1042, "brick_rate": 0.97}},
             },
         )
@@ -566,6 +569,10 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["audit_verdict"], "FAIL — found 1042 issue points")
         self.assertEqual(result["bricks"], 1042)
         self.assertEqual(result["brick_rate"], 0.97)
+        self.assertEqual(
+            result["target_source"]["revision"],
+            "4f8c0d3e2a1b9876543210fedcba0123456789ab",
+        )
 
     def test_check_verdict_defaults_missing_expect_to_no_issues(self):
         passed, reason = check_verdict(
@@ -610,6 +617,131 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
                 )
                 self.assertFalse(passed)
                 self.assertIn("infrastructure failure", reason.lower())
+
+    def test_check_verdict_rejects_incomplete_campaign_before_expectation(self):
+        report = {
+            "verdict": "PASS",
+            "summary": {
+                "runtime_sweep": {
+                    "issue_points": 0,
+                    "bricks": 0,
+                    "brick_rate": 0.0,
+                    "control": {"effective_outcome": "success"},
+                    "campaign_integrity": {
+                        "complete": False,
+                        "requested": 3,
+                        "returned": 2,
+                        "incomplete": 1,
+                    },
+                }
+            },
+        }
+        for profile_raw in (
+            {},
+            {"expect": {"mode": "exploratory"}},
+            {"expect": {"mode": "hunt"}},
+        ):
+            with self.subTest(profile_raw=profile_raw):
+                passed, reason = check_verdict(
+                    profile_path=ROOT / "profiles" / "dummy.yaml",
+                    profile_raw=profile_raw,
+                    report=report,
+                    exit_code=1,
+                )
+                self.assertFalse(passed)
+                self.assertIn("campaign integrity is incomplete", reason.lower())
+
+    def test_check_verdict_rejects_infrastructure_invalid_campaign_report(self):
+        report = {
+            "verdict": "PASS",
+            "summary": {
+                "runtime_sweep": {
+                    "issue_points": 3,
+                    "bricks": 3,
+                    "brick_rate": 1.0,
+                    "control": {"effective_outcome": "success"},
+                    "campaign_integrity": {
+                        "complete": True,
+                        "requested": 3,
+                        "returned": 3,
+                        "infrastructure_errors": 1,
+                    },
+                }
+            },
+        }
+        passed, reason = check_verdict(
+            profile_path=ROOT / "profiles" / "dummy.yaml",
+            profile_raw={"expect": {"mode": "exploratory"}},
+            report=report,
+            exit_code=0,
+        )
+        self.assertFalse(passed)
+        self.assertIn("infrastructure_errors", reason)
+
+    def test_check_verdict_rejects_legacy_runtime_failure_counters_without_integrity(self):
+        for field in (
+            "infrastructure_error_points",
+            "timeout_points",
+            "missing_result_points",
+            "extra_result_points",
+            "malformed_result_points",
+            "control_timeout_points",
+            "skipped_fault_points",
+            "incomplete_fault_points",
+        ):
+            with self.subTest(field=field):
+                passed, reason = check_verdict(
+                    profile_path=ROOT / "profiles" / "dummy.yaml",
+                    profile_raw={"expect": {"mode": "exploratory"}},
+                    report={
+                        "verdict": "PASS",
+                        "summary": {
+                            "runtime_sweep": {
+                                "issue_points": 0,
+                                "bricks": 0,
+                                "brick_rate": 0.0,
+                                "control": {"effective_outcome": "success"},
+                                field: 1,
+                            }
+                        },
+                    },
+                    exit_code=0,
+                )
+                self.assertFalse(passed)
+                self.assertIn(field, reason)
+
+    def test_check_verdict_rejects_malformed_runtime_failure_counters(self):
+        for value in (-1, True, "0"):
+            with self.subTest(value=value):
+                passed, reason = check_verdict(
+                    profile_path=ROOT / "profiles" / "dummy.yaml",
+                    profile_raw={"expect": {"mode": "exploratory"}},
+                    report={
+                        "verdict": "PASS",
+                        "summary": {
+                            "runtime_sweep": {
+                                "issue_points": 0,
+                                "bricks": 0,
+                                "brick_rate": 0.0,
+                                "control": {"effective_outcome": "success"},
+                                "timeout_points": value,
+                            }
+                        },
+                    },
+                    exit_code=0,
+                )
+                self.assertFalse(passed)
+                self.assertIn("invalid timeout_points", reason)
+
+    def test_check_verdict_rejects_inconclusive_top_level_verdict(self):
+        passed, reason = check_verdict(
+            profile_path=ROOT / "profiles" / "dummy.yaml",
+            profile_raw={"expect": {"mode": "exploratory"}},
+            report={"verdict": "INCONCLUSIVE -- campaign result coverage is incomplete"},
+            exit_code=1,
+        )
+        self.assertFalse(passed)
+        self.assertIn("incomplete or infrastructure-invalid", reason)
 
     def test_check_verdict_still_allows_assertion_exit_for_expected_fixture(self):
         passed, _reason = check_verdict(

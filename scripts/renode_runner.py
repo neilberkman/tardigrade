@@ -796,6 +796,11 @@ def run_single_point(
     cmd = [
         renode_test,
         "--renode-config", str(renode_config),
+        # TEST_TIMEOUT is the Robot test-level budget.  Renode-test also has
+        # its own outer suite timeout (120s by default); without forwarding
+        # the same budget here, long but healthy controls are terminated by
+        # Renode before the Robot timeout or self-test retry can apply.
+        "--test-timeout", "{}s".format(int(single_point_timeout_m * 60)),
         robot_suite,
         "--results-dir", str(rf_results),
         "--variable", "FAULT_AT:{}".format(point_fault_at),
@@ -1112,6 +1117,16 @@ def run_batch(
         trace_replay=trace_replay_batch,
     )
     robot_test_timeout_s = max(120, 120 + estimated_s)
+    # A batch containing a small number of points can otherwise receive a
+    # shorter Robot/renode-test budget than the same profile's healthy single
+    # point.  Keep the outer suite timeout at least as long as the profile's
+    # configured execute budget (the same floor used by run_single_point()).
+    profile_timeout_m = profile_robot_timeout_minutes(profile)
+    if profile_timeout_m is not None:
+        robot_test_timeout_s = max(
+            robot_test_timeout_s,
+            float(profile_timeout_m) * 60.0,
+        )
     if getattr(profile, "has_update_sequence", False):
         # Multi-phase clean baselines add significant fixed overhead before the
         # fault points run. Keep a higher floor so healthy batches do not trip
@@ -1137,6 +1152,11 @@ def run_batch(
     cmd = [
         renode_test,
         "--renode-config", str(renode_config),
+        # Keep Renode's process-level timeout at least as large as the
+        # per-suite Robot timeout computed above.  Otherwise a batch can be
+        # reported as an infrastructure failure at Renode's 120s default
+        # even though its bounded campaign budget is larger.
+        "--test-timeout", "{}s".format(int(robot_test_timeout_m * 60)),
         robot_suite,
         "--results-dir", str(rf_results),
         "--variable", "FAULT_POINTS_CSV:{}".format(csv),
@@ -1180,6 +1200,12 @@ def run_batch(
             )
             if getattr(profile, "has_update_sequence", False):
                 timeout_s = min(7200.0, max(timeout_s, 600.0))
+        if profile_timeout_m is not None:
+            # Keep the subprocess guard at least as long as the profile
+            # budget represented by --test-timeout.  Without this floor, the
+            # default 300-second point budget becomes a 450-second process
+            # guard while a 10-minute healthy profile run is still active.
+            timeout_s = max(timeout_s, float(profile_timeout_m) * 60.0)
     else:
         timeout_s = None
     process_timeout_s = _renode_process_timeout(timeout_s)

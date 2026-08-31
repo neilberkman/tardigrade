@@ -24,6 +24,7 @@ from run_oss_validation import (  # noqa: E402
     run_fault_batch,
     run_profile,
     render,
+    resolve_source_worktree_commit,
     source_worktree_path,
     validate_profile_name,
     validate_rendered_load_plan,
@@ -191,6 +192,18 @@ class TestManagedWorktreeRemoval(unittest.TestCase):
             "",
         )
         self.assertTrue(first_git_file)
+
+    def test_source_worktree_revision_requires_clean_contents(self):
+        ensure_source_worktree(
+            self.root,
+            "public_guard",
+            self.checkout,
+            self.target,
+        )
+        (self.target / "README").write_text("changed after checkout\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(RuntimeError, "not clean"):
+            resolve_source_worktree_commit(self.target)
 
     def test_source_repository_must_be_contained(self):
         outside = Path(self.temp.name).parent
@@ -453,6 +466,161 @@ class TestCampaignCompleteness(unittest.TestCase):
     def test_point_workers_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "workers must be 1"):
             run_profile(Path("."), "renode-test", {"name": "public_guard"}, {}, 2, True)
+
+    def test_profile_report_preserves_explicit_source_checkout_revision(self):
+        profile = {
+            "name": "public_guard",
+            "fault_range": "0:0",
+            "fault_step": 1,
+            "total_writes": 1,
+            "source_checkout": {
+                "repo": "source",
+                "ref": "HEAD",
+            },
+            "setup_commands": ["build {source_worktree}"],
+        }
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "run_oss_validation._layout_contract",
+            return_value=(self.contract(), []),
+        ), mock.patch(
+            "run_oss_validation.validate_rendered_load_plan",
+        ), mock.patch(
+            "run_oss_validation.ensure_source_worktree",
+        ), mock.patch(
+            "run_oss_validation.resolve_source_worktree_commit",
+            return_value="4f8c0d3e2a1b9876543210fedcba0123456789ab",
+        ), mock.patch(
+            "run_oss_validation.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ), mock.patch(
+            "run_oss_validation.run_fault_batch",
+            return_value=self.payload([
+                {
+                    "fault_at": 0,
+                    "is_control": False,
+                    "fault_injected": True,
+                    "boot_outcome": "success",
+                }
+            ]),
+        ):
+            result = run_profile(Path(td), "renode-test", profile, {}, 1, False)
+
+        self.assertEqual(
+            result["target_source"],
+            {
+                "repository": "source",
+                "revision": "4f8c0d3e2a1b9876543210fedcba0123456789ab",
+            },
+        )
+
+    def test_source_checkout_setup_must_reference_managed_worktree(self):
+        profile = {
+            "name": "public_guard",
+            "fault_range": "0:0",
+            "fault_step": 1,
+            "total_writes": 1,
+            "source_checkout": {"repo": "source", "ref": "HEAD"},
+            "setup_commands": ["build source/bootloader"],
+        }
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "run_oss_validation._layout_contract",
+            return_value=(self.contract(), []),
+        ), mock.patch(
+            "run_oss_validation.ensure_source_worktree",
+        ), mock.patch(
+            "run_oss_validation.resolve_source_worktree_commit",
+            return_value="4f8c0d3e2a1b9876543210fedcba0123456789ab",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "must reference the managed source worktree"):
+                run_profile(Path(td), "renode-test", profile, {}, 1, False)
+
+    def test_source_worktree_is_initialized_before_setup_command(self):
+        profile = {
+            "name": "public_guard",
+            "fault_range": "0:0",
+            "fault_step": 1,
+            "total_writes": 1,
+            "source_checkout": {"repo": "source", "ref": "HEAD"},
+            "setup_commands": ["build {source_worktree}"],
+        }
+        events = []
+
+        def record_setup(cmd, **kwargs):
+            del kwargs
+            events.append("setup")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "run_oss_validation._layout_contract",
+            return_value=(self.contract(), []),
+        ), mock.patch(
+            "run_oss_validation.validate_rendered_load_plan",
+        ), mock.patch(
+            "run_oss_validation.ensure_source_worktree",
+            side_effect=lambda *args, **kwargs: events.append("ensure"),
+        ), mock.patch(
+            "run_oss_validation.resolve_source_worktree_commit",
+            return_value="4f8c0d3e2a1b9876543210fedcba0123456789ab",
+        ), mock.patch(
+            "run_oss_validation.subprocess.run",
+            side_effect=record_setup,
+        ), mock.patch(
+            "run_oss_validation.run_fault_batch",
+            return_value=self.payload([
+                {
+                    "fault_at": 0,
+                    "is_control": False,
+                    "fault_injected": True,
+                    "boot_outcome": "success",
+                }
+            ]),
+        ):
+            run_profile(Path(td), "renode-test", profile, {}, 1, False)
+
+        self.assertEqual(events[:2], ["ensure", "setup"])
+
+    def test_source_checkout_skip_setup_cannot_claim_provenance(self):
+        profile = {
+            "name": "public_guard",
+            "fault_range": "0:0",
+            "fault_step": 1,
+            "total_writes": 1,
+            "source_checkout": {"repo": "source", "ref": "HEAD"},
+        }
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "run_oss_validation._layout_contract",
+            return_value=(self.contract(), []),
+        ), mock.patch(
+            "run_oss_validation.ensure_source_worktree",
+        ), mock.patch(
+            "run_oss_validation.resolve_source_worktree_commit",
+            return_value="4f8c0d3e2a1b9876543210fedcba0123456789ab",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "setup is skipped"):
+                run_profile(Path(td), "renode-test", profile, {}, 1, True)
+
+    def test_profile_report_fails_closed_when_source_commit_cannot_be_resolved(self):
+        profile = {
+            "name": "public_guard",
+            "fault_range": "0:0",
+            "fault_step": 1,
+            "total_writes": 1,
+            "source_checkout": {"repo": "source", "ref": "HEAD"},
+            "setup_commands": ["build {source_worktree}"],
+        }
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "run_oss_validation._layout_contract",
+            return_value=(self.contract(), []),
+        ), mock.patch(
+            "run_oss_validation.validate_rendered_load_plan",
+        ), mock.patch(
+            "run_oss_validation.ensure_source_worktree",
+        ), mock.patch(
+            "run_oss_validation.resolve_source_worktree_commit",
+            side_effect=RuntimeError("could not resolve a complete commit"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "could not resolve"):
+                run_profile(Path(td), "renode-test", profile, {}, 1, False)
 
 
 class TestDeclarativeCampaignLayouts(unittest.TestCase):

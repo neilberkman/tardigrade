@@ -192,6 +192,66 @@ def git_ref_exists(repo: Path, ref: str) -> bool:
     return proc.returncode == 0
 
 
+def resolve_source_worktree_commit(source_worktree: Path) -> str:
+    """Resolve a clean source worktree to its complete Git object ID.
+
+    A commit ID alone is not sufficient provenance when setup/build commands
+    may have changed tracked, untracked, ignored, or submodule content in the
+    worktree.  Reject those cases instead of attributing an artifact to the
+    clean commit that happened to be checked out initially.
+    """
+    status = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source_worktree),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if status.returncode != 0:
+        raise RuntimeError(
+            "could not inspect source worktree cleanliness: {}".format(
+                source_worktree
+            )
+        )
+    if status.stdout.strip():
+        raise RuntimeError(
+            "source worktree is not clean; refusing to claim exact commit provenance: {}".format(
+                source_worktree
+            )
+        )
+
+    proc = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source_worktree),
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    commit = proc.stdout.strip().lower()
+    if proc.returncode != 0 or not re.fullmatch(
+        r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit
+    ):
+        raise RuntimeError(
+            "could not resolve a complete commit for source worktree {}".format(
+                source_worktree
+            )
+        )
+    return commit
+
+
 def ensure_source_worktree(
     repo_root: Path,
     profile_name: str,
@@ -785,23 +845,51 @@ def run_profile(
     robot_vars.extend(derived_layout_vars)
 
     source_worktree_ready = False
+    source_commit = None
+    if source_checkout and source_worktree is not None:
+        # Materialize the declared source before any setup/build command can
+        # inspect or compile from a different checkout.
+        ensure_source_worktree(repo_root, name, source_checkout, source_worktree)
+        source_worktree_ready = True
+        source_commit = resolve_source_worktree_commit(source_worktree)
+
     if not skip_setup:
-        for raw_cmd in (rendered.get("setup_commands") or []):
-            cmd = str(render(raw_cmd, variables))
-            if (
-                source_checkout
-                and source_worktree is not None
-                and not source_worktree_ready
-                and str(source_worktree) in cmd
-            ):
-                ensure_source_worktree(repo_root, name, source_checkout, source_worktree)
-                source_worktree_ready = True
+        setup_commands = [
+            str(render(raw_cmd, variables))
+            for raw_cmd in (rendered.get("setup_commands") or [])
+        ]
+        if source_checkout and source_worktree is not None:
+            if not setup_commands:
+                raise RuntimeError(
+                    "source_checkout requires setup_commands that build from the managed source worktree"
+                )
+            if not any(str(source_worktree) in cmd for cmd in setup_commands):
+                raise RuntimeError(
+                    "source_checkout setup_commands must reference the managed source worktree {}".format(
+                        source_worktree
+                    )
+                )
+        for cmd in setup_commands:
             print("  setup>> {}".format(cmd), file=sys.stderr)
             proc = subprocess.run(["/bin/bash", "-lc", cmd], cwd=str(repo_root), check=False)
             if proc.returncode != 0:
                 raise RuntimeError("setup failed (rc={}): {}".format(proc.returncode, cmd))
-    elif source_checkout and source_worktree is not None:
-        ensure_source_worktree(repo_root, name, source_checkout, source_worktree)
+    elif source_checkout:
+        raise RuntimeError(
+            "cannot claim source provenance when setup is skipped for a source_checkout profile"
+        )
+
+    if source_checkout and source_worktree is not None:
+        if not source_worktree_ready:
+            raise RuntimeError("managed source worktree was not initialized")
+        final_source_commit = resolve_source_worktree_commit(source_worktree)
+        if source_commit != final_source_commit:
+            raise RuntimeError(
+                "managed source worktree revision changed during setup: {} -> {}".format(
+                    source_commit, final_source_commit
+                )
+            )
+        source_commit = final_source_commit
 
     # Resolve and inspect the real built artifacts immediately before Renode
     # loads them.  The guard uses PT_LOAD memory extents rather than the ELF
@@ -935,13 +1023,22 @@ def run_profile(
     if issues_min is not None and issues < int(issues_min):
         failures.append("issues={} below min {}".format(issues, issues_min))
 
-    return {
+    result = {
         "profile": name, "passed": len(failures) == 0,
         "faulted_runs": len(faulted), "bricks": bricks,
         "brick_rate": round(brick_rate, 4), "issues": issues,
         "issue_rate": round(issue_rate, 4), "infra_errors": errors,
         "failures": failures, "results": results,
     }
+    # ``source_checkout`` is the manifest's explicit target-source
+    # declaration. Report the complete commit resolved from its managed
+    # worktree; do not infer provenance from an artifact path.
+    if source_checkout:
+        result["target_source"] = {
+            "repository": str(source_checkout["repo"]),
+            "revision": source_commit,
+        }
+    return result
 
 
 def main() -> int:

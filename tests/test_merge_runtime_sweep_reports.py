@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from merge_runtime_sweep_reports import merge_runtime_sweep_payloads
@@ -85,3 +87,29 @@ def test_merge_runtime_sweep_payloads_dedupes_duplicate_fault_rows() -> None:
     assert merged["fault_points_tested"] == 1
     non_control = [r for r in merged["runtime_sweep_results"] if not r.get("is_control")]
     assert non_control == [row]
+
+
+def test_merge_runtime_sweep_payloads_preserves_explicit_target_source() -> None:
+    payload_a = _base_payload()
+    payload_b = _base_payload()
+    target_source = {
+        "name": "example-target",
+        "repository": "https://example.invalid/target",
+        "revision": "4f8c0d3e2a1b9876543210fedcba0123456789ab",
+    }
+    payload_a["target_source"] = target_source
+    payload_b["target_source"] = dict(target_source)
+
+    merged = merge_runtime_sweep_payloads([payload_a, payload_b])
+
+    assert merged["target_source"] == target_source
+
+
+def test_merge_runtime_sweep_payloads_rejects_mismatched_target_sources() -> None:
+    payload_a = _base_payload()
+    payload_b = _base_payload()
+    payload_a["target_source"] = {"revision": "source-a"}
+    payload_b["target_source"] = {"revision": "source-b"}
+
+    with pytest.raises(ValueError, match="different target sources"):
+        merge_runtime_sweep_payloads([payload_a, payload_b])

@@ -6,6 +6,29 @@ This guide walks through creating a tardigrade profile for your bootloader, from
 
 Every profile is a YAML file with `schema_version: 1`. The simplest useful profile needs five things: a platform, a bootloader ELF, memory layout, at least one slot image, and success criteria.
 
+## Target source provenance
+
+When the target artifact was built from a separate source checkout, declare
+its source revision explicitly. This metadata is copied into the report
+as `target_source`, including containerized Renode runs. Tardigrade records
+only what the profile declares; it never guesses a target revision from an ELF
+filename, runtime path, or the audit-tool checkout.
+
+```yaml
+target_source:
+  name: example-bootloader
+  repository: https://example.invalid/example/bootloader
+  revision: 4f8c0d3e2a1b9876543210fedcba0123456789ab
+```
+
+`revision` is a bounded, whitespace-free source identifier supplied by the
+profile. For exact Git provenance, use the complete 40-character (SHA-1) or
+64-character (SHA-256) object ID. The mapping also accepts `commit` as a
+Git-specific spelling for a complete hexadecimal object ID; it is normalized
+to `revision` in the report. `revision` and `commit` cannot both be supplied.
+`name` and `repository` are optional descriptive fields and are retained after
+trimming and basic validation.
+
 ```yaml
 schema_version: 1
 name: my_bootloader_upgrade
@@ -1125,10 +1148,11 @@ The `expect` block tells the self-test harness whether this profile _should_ fin
 ```yaml
 expect:
   should_find_issues: false # resilient bootloader: expect no bricks
+  mode: regression # strict expectation; use exploratory for a hunt
   control_outcome: success # unfaulted run should boot successfully
 ```
 
-For known-vulnerable code (differential testing), set `should_find_issues: true`. The self-test fails if the sweep doesn't find issues.
+For known-vulnerable code (differential testing), set `should_find_issues: true`. The self-test fails if the sweep doesn't find issues. Set `mode: exploratory` (or its `hunt` alias) for an explicit exploratory campaign where a complete zero-finding sweep is successful; findings remain useful evidence. Reports serialize both spellings as `exploratory`. The default `regression` mode preserves the strict requirement for profiles that genuinely require findings.
 
 ### Control-only issues
 
@@ -1597,8 +1621,16 @@ treat only `PASS` as passing.
 
 - **PASS + `should_find_issues: false`**: No bricks, no wrong-image, no invariant violations. The bootloader survived all faults.
 - **PASS + `should_find_issues: true`**: Issues were found (expected for known-vulnerable code).
+- **PASS + `mode: exploratory`**: The campaign completed; zero findings are allowed because this is a hunt rather than a finding-required regression.
 - **FAIL**: Unexpected result — either issues found when none expected, or no issues found when expected.
 - **INCONCLUSIVE**: Required coverage, runtime, trace, or infrastructure evidence was unavailable or incomplete.
+
+An unavailable calibration trace or `swap_progress` inference is reported as a
+coverage diagnostic. It makes `security_aggregate.status` `INCONCLUSIVE` only
+when the profile actually enables the corresponding trace-dependent selector;
+optional coverage that was not configured does not turn an otherwise complete
+security result inconclusive. Missing coverage for an enabled selector, and
+all runtime or infrastructure failures, remain fail-closed.
 
 For write/erase-style campaigns, a clean `PASS` also requires calibration coverage. If calibration never shows slot data movement, tardigrade treats the run as a failed setup rather than evidence that the bootloader is clean.
 

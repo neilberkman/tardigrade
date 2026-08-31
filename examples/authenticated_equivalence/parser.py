@@ -74,11 +74,20 @@ def main() -> int:
         "installed_payload_digest": hashlib.sha256(payload).hexdigest(),
         "rollback_outcome": "none" if accepted else "rejected",
         # Model persistent security state observed after the parser's decision.
-        # The vulnerable implementation exposes duplicate records to the state
-        # transition; the fixed implementation rejects them before installation.
+        # A safe rejection leaves the installed state unchanged; the
+        # vulnerable implementation exposes duplicate records to the state
+        # transition before accepting them.
         "security_state": {
-            "accepted": accepted,
-            "payload_record_count": len(payload_values),
+            "installed_payload_record_count": len(payload_values),
+        },
+        # The explicit transition lets the campaign distinguish a rejected
+        # input that leaves the pre-existing install untouched from one that
+        # mutates persistent state before rejecting.
+        "security_state_before": {
+            "installed_payload_record_count": 1,
+        },
+        "security_state_after": {
+            "installed_payload_record_count": len(payload_values),
         },
         "authenticated_bytes_b64": base64.b64encode(authenticated).decode("ascii"),
         "authenticated_digest": hashlib.sha256(authenticated).hexdigest(),

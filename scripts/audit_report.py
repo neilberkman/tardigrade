@@ -46,6 +46,7 @@ from read_fault_translation import (
     cpu_path_capability_warning,
     read_fault_warning,
 )
+from verdicts import expectation_requires_findings, is_exploratory_expectation
 
 
 def _fault_type_base_code(fault_type: Any) -> str:
@@ -761,6 +762,14 @@ def summarize_runtime_sweep(
         summary["success_implies_effect_points"] = success_effect_points
     if calibration_coverage is not None:
         summary["calibration_coverage"] = calibration_coverage
+    if profile is not None and getattr(profile, "fault_sweep", None) is not None:
+        # Keep the enabled selectors beside coverage diagnostics so report
+        # consumers can tell an unavailable optional trace from a missing
+        # result for a selector the profile actually requested.
+        summary["configured_fault_types"] = [
+            _fault_type_label(value)
+            for value in (getattr(profile.fault_sweep, "fault_types", None) or [])
+        ]
     # Initial wall-clock timeouts are incomplete observations, not security
     # evidence.  Keep them out of the aggregate probe/layer counts just as
     # they are excluded from issue, brick, and validation aggregates above.
@@ -1212,9 +1221,13 @@ def compute_verdict(
         and not intentional_control_only_campaign
     ):
         verdict = "FAIL \u2014 {}".format(coverage_gate_reason)
-    elif profile_expect.should_find_issues and not found_issues:
+    elif expectation_requires_findings(profile_expect) and not found_issues:
         verdict = "FAIL \u2014 expected to find issues but found none"
-    elif not profile_expect.should_find_issues and found_issues:
+    elif (
+        not is_exploratory_expectation(profile_expect)
+        and not profile_expect.should_find_issues
+        and found_issues
+    ):
         total_issues = sweep_summary.get("issue_points", 0)
         if multi_fault_summary:
             total_issues += int(

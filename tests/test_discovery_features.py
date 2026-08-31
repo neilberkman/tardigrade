@@ -1706,6 +1706,8 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             def fake_run(cmd, *, cwd, env, timeout_s):
                 observed_timeouts.append(timeout_s)
                 self.assertIn("TEST_TIMEOUT:45 minutes", cmd)
+                self.assertIn("--test-timeout", cmd)
+                self.assertIn("2700s", cmd)
                 result_token = next(
                     cmd[i + 1]
                     for i, token in enumerate(cmd[:-1])
@@ -1809,6 +1811,8 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             def fake_run(cmd, *, cwd, env, timeout_s):
                 observed_timeouts.append(timeout_s)
                 self.assertIn("TEST_TIMEOUT:10 minutes", cmd)
+                self.assertIn("--test-timeout", cmd)
+                self.assertIn("600s", cmd)
                 result_token = next(
                     cmd[i + 1]
                     for i, token in enumerate(cmd[:-1])
@@ -2446,6 +2450,76 @@ class DiscoveryFeaturesTest(unittest.TestCase):
 
             self.assertEqual(results, [])
 
+    def test_run_batch_uses_profile_run_duration_as_robot_timeout_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = tempdir / "profile.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    """
+                    schema_version: 1
+                    name: long_run_duration_batch_profile
+                    description: timeout
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    bootloader:
+                      elf: examples/vulnerable_ota/firmware.elf
+                      entry: 0x10000000
+                    memory:
+                      sram: { start: 0x20000000, end: 0x20020000 }
+                      write_granularity: 4
+                      slots:
+                        exec: { base: 0x10000000, size: 0x1000 }
+                        staging: { base: 0x10001000, size: 0x1000 }
+                    images:
+                      staging: examples/vulnerable_ota/firmware.bin
+                    success_criteria:
+                      vtor_in_slot: exec
+                    fault_sweep:
+                      run_duration: "20.0"
+                    expect:
+                      should_find_issues: false
+                    """
+                ),
+                encoding="utf-8",
+            )
+            profile = load_profile(profile_path)
+            observed_timeouts = []
+
+            def fake_run(cmd, *, cwd, env, timeout_s):
+                # A 20-second execute budget maps to the same 10-minute floor
+                # used by run_single_point(), even for a one-point batch.
+                observed_timeouts.append(timeout_s)
+                self.assertIn("TEST_TIMEOUT:10 minutes", cmd)
+                timeout_index = cmd.index("--test-timeout")
+                self.assertEqual(cmd[timeout_index + 1], "600s")
+                rf_results = Path(cmd[cmd.index("--results-dir") + 1])
+                rf_results.mkdir(parents=True, exist_ok=True)
+                result_var = next(
+                    entry for entry in cmd
+                    if isinstance(entry, str) and entry.startswith("RESULT_FILE:")
+                )
+                result_file = Path(result_var.split("RESULT_FILE:", 1)[1])
+                result_file.write_text("[]", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch("renode_runner.run_renode_subprocess", side_effect=fake_run):
+                results = run_batch(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    fault_points=[1],
+                    robot_vars=[],
+                    work_dir=tempdir / "work",
+                    renode_remote_server_dir="",
+                    keep_run_artifacts=False,
+                )
+
+            self.assertEqual(results, [])
+            # The default 300-second point budget must not produce a 450-second
+            # process guard that kills the healthy 10-minute profile run.
+            self.assertEqual(observed_timeouts, [900.0])
+
     def test_run_batch_uses_trace_replay_timeout_model(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
@@ -2640,7 +2714,9 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                     )
 
             self.assertEqual(results, [])
-            self.assertEqual(observed_timeouts, [60.0])
+            # The profile's default execute budget still supplies the healthy
+            # single-point floor, so the process guard is 1.5x two minutes.
+            self.assertEqual(observed_timeouts, [180.0])
 
     def test_run_batch_single_point_robot_timeout_matches_process_guard(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -46,6 +46,8 @@ IDENTITY_FIELDS = (
     "signature_bytes_b64",
 )
 INPUT_DIGEST_FIELD = "input_sha256"
+STATE_BEFORE_FIELD = "security_state_before"
+STATE_AFTER_FIELD = "security_state_after"
 EVIDENCE_FIELDS = IDENTITY_FIELDS + (INPUT_DIGEST_FIELD,)
 REQUIRED_OUTCOME_FIELDS = ("accepted", "committed")
 # These fields are the security outcomes this campaign is intended to compare
@@ -877,6 +879,46 @@ def _validate_digest(value: Any, context: str) -> str:
     return value
 
 
+def _validate_state_transition(
+    output: Mapping[str, Any],
+    *,
+    expected_after: Mapping[str, Any],
+    context: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Validate optional before/after evidence for persistent security state.
+
+    Legacy harnesses only report the post-decision ``security_state``. They
+    remain valid, but cannot establish whether a rejected input changed state
+    because each invocation may start from the same pre-update state.
+    """
+
+    present = [field in output for field in (STATE_BEFORE_FIELD, STATE_AFTER_FIELD)]
+    if not any(present):
+        return None
+    if not all(present):
+        raise CampaignError(
+            "{} must include both {} and {}".format(
+                context, STATE_BEFORE_FIELD, STATE_AFTER_FIELD
+            )
+        )
+    before = output[STATE_BEFORE_FIELD]
+    after = output[STATE_AFTER_FIELD]
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise CampaignError(
+            "{} and {} must be JSON objects".format(
+                context + "." + STATE_BEFORE_FIELD,
+                context + "." + STATE_AFTER_FIELD,
+            )
+        )
+    if after != expected_after:
+        raise CampaignError(
+            "{} does not match security_state".format(
+                context + "." + STATE_AFTER_FIELD
+            )
+        )
+    return dict(before), dict(after)
+
+
 def _run_harness(config: Mapping[str, Any], input_path: Path, mutation_id: str, mutation_index: int) -> dict[str, Any]:
     command = _render_command(
         config["harness"]["command"],
@@ -1025,6 +1067,13 @@ def run_campaign(config: Mapping[str, Any]) -> dict[str, Any]:
             expected_input=data,
             context="base harness output",
         )
+        base_state_transition = None
+        if normalized["schema_version"] >= SCHEMA_VERSION:
+            base_state_transition = _validate_state_transition(
+                base_output,
+                expected_after=base_outcome["security_state"],
+                context="base harness output",
+            )
         if not base_outcome["accepted"]:
             raise CampaignError("canonical base harness outcome is not accepted")
         report["base"] = {"outcome": base_outcome}
@@ -1049,16 +1098,51 @@ def run_campaign(config: Mapping[str, Any]) -> dict[str, Any]:
                 expected_input=mutant_data,
                 context="{} harness output".format(mutation.mutation_id),
             )
+            state_transition = None
+            if normalized["schema_version"] >= SCHEMA_VERSION:
+                state_transition = _validate_state_transition(
+                    output,
+                    expected_after=outcome["security_state"],
+                    context="{} harness output".format(mutation.mutation_id),
+                )
+            if (base_state_transition is None) != (state_transition is None):
+                raise CampaignError(
+                    "base and mutant harness outputs must consistently include "
+                    "security-state transition evidence"
+                )
+            if (
+                base_state_transition is not None
+                and state_transition is not None
+                and state_transition[0] != base_state_transition[0]
+            ):
+                raise CampaignError(
+                    "{} security_state_before differs from the base state".format(
+                        mutation.mutation_id
+                    )
+                )
             # A parser that safely rejects a mutant is not an equivalence
-            # finding.  For accepted mutants, accepted/committed are control
-            # gates; compare protected fields and any commit-state divergence.
+            # finding by itself.  Rejection does not make an absolute
+            # post-decision state comparable: each harness invocation may
+            # begin from the same old installed state while the accepted base
+            # advances it.  Explicit before/after evidence is required to
+            # report a rejected side effect.  The ordinary rejection values
+            # for version/target/size/payload and rollback outcome remain
+            # intentionally excluded because they are inapplicable on reject.
             differing = {
                 field: {"base": base_outcome[field], "mutant": outcome[field]}
                 for field in normalized["outcomes"]
-                if field not in ("accepted", "committed")
-                and outcome["accepted"]
+                if field not in ("accepted", "committed") and outcome["accepted"]
                 and outcome[field] != base_outcome[field]
             }
+            if (
+                not outcome["accepted"]
+                and state_transition is not None
+                and state_transition[0] != state_transition[1]
+            ):
+                differing["security_state_transition"] = {
+                    "before": state_transition[0],
+                    "after": state_transition[1],
+                }
             if (
                 outcome["accepted"]
                 and outcome["committed"] != base_outcome["committed"]

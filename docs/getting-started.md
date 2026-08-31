@@ -83,6 +83,7 @@ declared expectation:
 
 - **PASS + `should_find_issues: false`**: The bootloader survived all faults. No bricks, no wrong-image boots, no invariant violations.
 - **PASS + `should_find_issues: true`**: Issues were found, as expected for known-vulnerable code.
+- **PASS + `expect.mode: exploratory`**: The complete hunt passed even with zero findings; use the default `regression` mode when findings are required.
 - **FAIL**: Unexpected result -- either issues found when none expected, or no issues found when they were expected.
 - **INCONCLUSIVE**: Required coverage, runtime, trace, or infrastructure evidence was unavailable or incomplete.
 

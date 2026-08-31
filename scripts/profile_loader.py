@@ -42,6 +42,7 @@ from fault_types import (
 )
 from thumb_instructions import enumerate_instruction_skip_addresses, make_elf_halfword_reader
 from boot_outcomes import DEVICE_BOOT_OUTCOMES
+from verdicts import EXPECTATION_MODES, expectation_mode
 from update_protocol_analyzer import (
     UpdateProtocolError,
     UpdateProtocolModel,
@@ -976,6 +977,7 @@ class ComponentConfig:
             boundary_campaign=getattr(parent, "boundary_campaign", None),
             boundary_value=getattr(parent, "boundary_value", None),
             boundary_previous_value=getattr(parent, "boundary_previous_value", None),
+            target_source=getattr(parent, "target_source", None),
         )
         resolved.auto_update_trigger = bool(
             getattr(parent, "auto_update_trigger", False)
@@ -1616,8 +1618,41 @@ class StateProbeConfig:
         self.required_paths = required_paths or []
 
 
+class TargetSourceConfig:
+    """Explicit provenance for the source used to build the target artifact.
+
+    This is deliberately supplied by the profile.  In particular, the loader
+    must not try to infer a target revision from an ELF path or from the
+    repository containing the audit tool: containerized runs commonly have no
+    target source checkout available.
+    """
+
+    __slots__ = ("name", "repository", "revision")
+
+    def __init__(
+        self,
+        revision: str,
+        *,
+        name: Optional[str] = None,
+        repository: Optional[str] = None,
+    ) -> None:
+        self.name = name
+        self.repository = repository
+        self.revision = revision
+
+    def to_dict(self) -> Dict[str, str]:
+        """Return deterministic, JSON-ready provenance fields."""
+        result: Dict[str, str] = {"revision": self.revision}
+        if self.name is not None:
+            result["name"] = self.name
+        if self.repository is not None:
+            result["repository"] = self.repository
+        return result
+
+
 class ExpectConfig:
     __slots__ = (
+        "mode",
         "should_find_issues",
         "control_outcome",
         "allow_semantic_only_issues",
@@ -1634,7 +1669,15 @@ class ExpectConfig:
         allow_control_only_issues: bool = False,
         required_issue_reasons: Optional[List[str]] = None,
         ignored_issue_fault_types: Optional[List[str]] = None,
+        mode: str = "regression",
     ) -> None:
+        if not isinstance(mode, str) or mode.strip().lower() not in EXPECTATION_MODES:
+            raise ProfileError(
+                "expect.mode: expected 'regression', 'exploratory', or 'hunt', got {!r}".format(
+                    mode
+                )
+            )
+        self.mode = expectation_mode({"mode": mode})
         for field_name, value in (
             ("should_find_issues", should_find_issues),
             ("allow_semantic_only_issues", allow_semantic_only_issues),
@@ -1876,6 +1919,7 @@ class ProfileConfig:
         boundary_campaign: Optional[BoundaryCampaign] = None,
         boundary_value: Optional[int] = None,
         boundary_previous_value: Optional[int] = None,
+        target_source: Optional[TargetSourceConfig] = None,
 
     ) -> None:
         self.schema_version = schema_version
@@ -1956,6 +2000,7 @@ class ProfileConfig:
         self.boundary_campaign = boundary_campaign
         self.boundary_value = boundary_value
         self.boundary_previous_value = boundary_previous_value
+        self.target_source: Optional[TargetSourceConfig] = target_source
 
 
     @property
@@ -2003,6 +2048,7 @@ class ProfileConfig:
         if state.expect_overrides:
             eo = state.expect_overrides
             new_expect = ExpectConfig(
+                mode=eo.get("mode", self.expect.mode),
                 should_find_issues=eo.get("should_find_issues", self.expect.should_find_issues),
                 control_outcome=eo.get("control_outcome", self.expect.control_outcome),
                 allow_semantic_only_issues=eo.get("allow_semantic_only_issues", self.expect.allow_semantic_only_issues),
@@ -2057,6 +2103,7 @@ class ProfileConfig:
                 if state.boundary_previous_value is not None
                 else getattr(self, "boundary_previous_value", None)
             ),
+            target_source=getattr(self, "target_source", None),
 
         )
         if state.update_trigger is not None and state.pre_boot_state is None:
@@ -5240,6 +5287,81 @@ def _parse_state_probe(raw: Optional[Any]) -> Optional[StateProbeConfig]:
     )
 
 
+_TARGET_SOURCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:/@-]{0,255}$")
+_TARGET_SOURCE_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
+
+
+def _parse_target_source(raw: Optional[Any]) -> Optional[TargetSourceConfig]:
+    """Parse explicit target-source provenance without inspecting runtime paths.
+
+    ``revision`` is an opaque, bounded source identifier so this remains
+    target-neutral (for example, a non-Git source can use its own immutable
+    revision).  The ``commit`` spelling is accepted as a stricter Git
+    convenience and requires a complete SHA-1 or SHA-256 object ID.  The two
+    spellings cannot be supplied together and reports always use ``revision``.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        revision = raw.strip()
+        name = repository = None
+    elif isinstance(raw, dict):
+        unknown = sorted(set(raw) - {"name", "repository", "revision", "commit"})
+        if unknown:
+            raise ProfileError(
+                "target_source: unknown field(s): {}".format(
+                    ", ".join(str(key) for key in unknown)
+                )
+            )
+        if "revision" in raw and "commit" in raw:
+            raise ProfileError(
+                "target_source: specify only one of 'revision' or 'commit'"
+            )
+        revision_key = "commit" if "commit" in raw else "revision"
+        if revision_key not in raw:
+            raise ProfileError(
+                "target_source: required field 'revision' (or 'commit') is missing"
+            )
+        revision = raw.get(revision_key)
+        if not isinstance(revision, str):
+            raise ProfileError(
+                "target_source.{}: expected non-empty string".format(revision_key)
+            )
+        revision = revision.strip()
+        name = raw.get("name")
+        repository = raw.get("repository")
+        for field_name, value in (("name", name), ("repository", repository)):
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                raise ProfileError(
+                    "target_source.{}: expected non-empty string".format(field_name)
+                )
+            value = value.strip()
+            if len(value) > 256 or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+                raise ProfileError(
+                    "target_source.{}: contains unsupported characters or is too long".format(
+                        field_name
+                    )
+                )
+            if field_name == "name":
+                name = value
+            else:
+                repository = value
+    else:
+        raise ProfileError("target_source: expected string or mapping")
+
+    if not revision or len(revision) > 256 or not _TARGET_SOURCE_ID_RE.fullmatch(revision):
+        raise ProfileError(
+            "target_source.revision: expected a non-empty bounded source identifier"
+        )
+    if isinstance(raw, dict) and "commit" in raw and not _TARGET_SOURCE_COMMIT_RE.fullmatch(revision):
+        raise ProfileError(
+            "target_source.commit: expected a complete 40- or 64-character hexadecimal commit"
+        )
+    return TargetSourceConfig(revision, name=name, repository=repository)
+
+
 _EXPECT_BOOLEAN_FIELDS = frozenset(
     {
         "should_find_issues",
@@ -5247,11 +5369,15 @@ _EXPECT_BOOLEAN_FIELDS = frozenset(
         "allow_control_only_issues",
     }
 )
+_EXPECT_STRING_FIELDS = frozenset({"mode"})
 _EXPECT_LIST_FIELDS = frozenset(
     {"required_issue_reasons", "ignored_issue_fault_types"}
 )
 _EXPECT_KEYS = frozenset(
-    set(_EXPECT_BOOLEAN_FIELDS) | set(_EXPECT_LIST_FIELDS) | {"control_outcome"}
+    set(_EXPECT_BOOLEAN_FIELDS)
+    | set(_EXPECT_LIST_FIELDS)
+    | set(_EXPECT_STRING_FIELDS)
+    | {"control_outcome"}
 )
 
 
@@ -5272,6 +5398,17 @@ def _parse_expect_values(
         raise ProfileError("{}: expected mapping".format(context))
 
     parsed: Dict[str, Any] = {}
+    if "mode" in raw:
+        mode = raw["mode"]
+        if not isinstance(mode, str) or mode.strip().lower() not in EXPECTATION_MODES:
+            raise ProfileError(
+                "{}.mode: expected 'regression', 'exploratory', or 'hunt', got {!r}".format(
+                    context, mode
+                )
+            )
+        parsed["mode"] = expectation_mode({"mode": mode})
+    elif not partial:
+        parsed["mode"] = "regression"
     for field_name in sorted(_EXPECT_BOOLEAN_FIELDS):
         if field_name not in raw:
             if not partial:
@@ -6316,6 +6453,7 @@ _STRICT_TOP_LEVEL_KEYS = frozenset(
         "persistent_state_layout",
         "terminal_error_paths",
         "boundary_campaigns",
+        "target_source",
     }
 )
 
@@ -6578,6 +6716,13 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
     _validate_strict_terminal_error_paths(
         data.get("terminal_error_paths"), "terminal_error_paths"
     )
+    target_source = data.get("target_source")
+    if isinstance(target_source, dict):
+        _reject_unknown_keys(
+            target_source,
+            frozenset({"name", "repository", "revision", "commit"}),
+            "target_source",
+        )
 
     if "fault_sweep" in data:
         _reject_unknown_keys(
@@ -7183,6 +7328,7 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
     except SecurityStateLayoutError as exc:
         raise ProfileError(str(exc)) from exc
     terminal_error_paths = _parse_terminal_error_paths(data.get("terminal_error_paths"))
+    target_source = _parse_target_source(data.get("target_source"))
     images = {}
     raw_images = data.get("images", {})
     if isinstance(raw_images, dict):
@@ -7435,6 +7581,7 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         persistent_state_layout=persistent_state_layout,
         terminal_error_paths=terminal_error_paths,
         boundary_campaigns=boundary_campaigns,
+        target_source=target_source,
 
     )
     profile.auto_update_trigger = auto_update_trigger
@@ -7571,6 +7718,7 @@ def main() -> int:
         "state_fuzzer_iterations": profile.state_fuzzer.iterations,
         "state_fuzzer_metadata_model": profile.state_fuzzer.metadata_model,
         "expect_should_find_issues": profile.expect.should_find_issues,
+        "expect_mode": profile.expect.mode,
         "expect_control_outcome": profile.expect.control_outcome,
         "expect_allow_semantic_only_issues": profile.expect.allow_semantic_only_issues,
         "expect_allow_control_only_issues": profile.expect.allow_control_only_issues,

@@ -11,7 +11,13 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Set, Tuple
 
-from verdicts import is_pass_verdict
+from verdicts import (
+    EXPECTATION_MODES,
+    expectation_mode,
+    expectation_requires_findings,
+    is_pass_verdict,
+)
+from fault_types import _fault_type_label
 
 
 SECURITY_AGGREGATE_VERSION = 1
@@ -254,6 +260,72 @@ def _collect_runtime(
     return fault_issues, control_issues
 
 
+_TRACE_COVERAGE_FAULT_TYPES = frozenset(
+    {
+        "interrupted_erase",
+        "multi_sector_atomicity",
+        "power_loss",
+        "security_state_erase",
+        "swap_progress",
+    }
+)
+
+
+def _configured_fault_types(summary: Mapping[str, Any]) -> Optional[Set[str]]:
+    """Read explicit selector metadata when the producer emitted it."""
+    runtime = summary.get("runtime_sweep")
+    if not isinstance(runtime, dict):
+        return None
+    raw = runtime.get("configured_fault_types")
+    if raw is None:
+        raw = runtime.get("fault_types")
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError("summary.runtime_sweep configured fault types must be a list")
+    normalized: Set[str] = set()
+    for value in raw:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                "summary.runtime_sweep configured fault types must contain non-empty strings"
+            )
+        text = value.strip().lower()
+        label = _fault_type_label(text).strip().lower()
+        normalized.add(label or text.split(":", 1)[0])
+    return normalized
+
+
+def _coverage_check_required(
+    summary: Mapping[str, Any], check: str
+) -> bool:
+    """Tell optional coverage apart from a required-but-missing check.
+
+    Current producers emit selector metadata.  For older complete runtime
+    summaries, absence of that metadata means optional coverage; an orphan
+    coverage section without a runtime campaign remains inconclusive.
+    """
+    configured = _configured_fault_types(summary)
+    if configured is not None:
+        if check == "calibration":
+            return bool(configured & _TRACE_COVERAGE_FAULT_TYPES)
+        return check in configured
+    # A legacy report did not carry selector metadata.  Preserve its
+    # fail-closed meaning when it explicitly emitted one of these summaries;
+    # only a current report with explicit metadata can prove that coverage is
+    # optional.
+    if check == "swap_progress" and "swap_progress_inference" in summary:
+        return True
+    if check == "security_state_erase" and "security_state_erase" in summary:
+        return True
+    if (
+        check == "calibration"
+        and isinstance(summary.get("runtime_sweep"), dict)
+        and "calibration_coverage" in summary["runtime_sweep"]
+    ):
+        return True
+    return not isinstance(summary.get("runtime_sweep"), dict)
+
+
 def _collect_summary(
     state: MutableMapping[str, Any], summary_value: Any, *, prefix: str = "summary"
 ) -> None:
@@ -266,6 +338,30 @@ def _collect_summary(
 
     if "runtime_sweep" in summary:
         _collect_runtime(state, summary["runtime_sweep"], "{}.runtime_sweep".format(prefix))
+        runtime = _mapping(summary["runtime_sweep"], "{}.runtime_sweep".format(prefix))
+        configured = _configured_fault_types(summary)
+        coverage = runtime.get("calibration_coverage")
+        if (
+            configured is not None
+            and configured & _TRACE_COVERAGE_FAULT_TYPES
+            and coverage is None
+        ):
+            _record_inconclusive(
+                state,
+                "{}.runtime_sweep calibration coverage is missing".format(prefix),
+            )
+        if isinstance(coverage, dict) and coverage.get("status") in {
+            "unavailable",
+            "metadata_only",
+            "outside_slots_only",
+            "no_nvm_activity",
+        } and _coverage_check_required(summary, "calibration"):
+            _record_inconclusive(
+                state,
+                "{}.runtime_sweep calibration coverage is {}".format(
+                    prefix, coverage.get("status") or "unavailable"
+                ),
+            )
     if "multi_fault_runtime_sweep" in summary:
         _collect_runtime(
             state,
@@ -587,10 +683,17 @@ def _collect_summary(
     swap = summary.get("swap_progress_inference")
     if swap is not None:
         swap = _mapping(swap, "{}.swap_progress_inference".format(prefix))
-        if swap.get("status") != "inferred":
+        if (
+            swap.get("status") != "inferred"
+            and _coverage_check_required(summary, "swap_progress")
+        ):
             _record_inconclusive(
                 state, "{}.swap_progress_inference status is {}".format(prefix, swap.get("status") or "missing")
             )
+    elif "swap_progress" in (_configured_fault_types(summary) or set()):
+        _record_inconclusive(
+            state, "{}.swap_progress_inference status is missing".format(prefix)
+        )
 
     security_erase = summary.get("security_state_erase")
     if security_erase is not None:
@@ -598,11 +701,18 @@ def _collect_summary(
             security_erase, "{}.security_state_erase".format(prefix)
         )
         status = security_erase.get("status")
-        if status not in {"clean", "selected"}:
+        if (
+            status not in {"clean", "selected"}
+            and _coverage_check_required(summary, "security_state_erase")
+        ):
             _record_inconclusive(
                 state, "{}.security_state_erase status is {}".format(prefix, status or "missing")
             )
-        if status == "selected" and not security_erase.get("cutpoints"):
+        if (
+            status == "selected"
+            and not security_erase.get("cutpoints")
+            and _coverage_check_required(summary, "security_state_erase")
+        ):
             _record_inconclusive(
                 state, "{}.security_state_erase selected no cutpoints".format(prefix)
             )
@@ -1008,6 +1118,14 @@ def build_security_aggregate(report_value: Any) -> Dict[str, Any]:
     should_find = expect.get("should_find_issues")
     if not isinstance(should_find, bool):
         raise ValueError("report expect.should_find_issues must be boolean")
+    expectation = dict(expect)
+    if "mode" in expectation:
+        mode = expectation["mode"]
+        if not isinstance(mode, str) or mode.strip().lower() not in EXPECTATION_MODES:
+            raise ValueError("report expect.mode is invalid")
+        expectation["mode"] = expectation_mode(expectation)
+    else:
+        expectation["mode"] = "regression"
 
     state: Dict[str, Any] = {
         "issue_points": 0,
@@ -1191,7 +1309,7 @@ def build_security_aggregate(report_value: Any) -> Dict[str, Any]:
         _record_inconclusive(
             state, "report failed without normalized finding evidence"
         )
-    if should_find and state["issue_points"] == 0:
+    if expectation_requires_findings(expectation) and state["issue_points"] == 0:
         _record_inconclusive(
             state, "profile expected findings but the report accounted for none"
         )

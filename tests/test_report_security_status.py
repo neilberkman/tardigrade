@@ -24,10 +24,10 @@ from sweep import (  # noqa: E402
 )
 
 
-def _report(summary, *, verdict="PASS", should_find=False, **extra):
+def _report(summary, *, verdict="PASS", should_find=False, mode="regression", **extra):
     return {
         "verdict": verdict,
-        "expect": {"should_find_issues": should_find},
+        "expect": {"should_find_issues": should_find, "mode": mode},
         "summary": summary,
         **extra,
     }
@@ -999,6 +999,157 @@ def test_expected_findings_without_evidence_are_inconclusive():
             {"runtime_sweep": {"issue_points": 0, "brick_rate": 0.0}},
             should_find=True,
         )
+    )
+    assert aggregate["status"] == "INCONCLUSIVE"
+
+
+def test_exploratory_hunt_zero_findings_is_clean():
+    aggregate = build_security_aggregate(
+        _report(
+            {
+                "runtime_sweep": {
+                    "issue_points": 0,
+                    "brick_rate": 0.0,
+                    "campaign_complete": True,
+                }
+            },
+            should_find=True,
+            mode="hunt",
+        )
+    )
+    assert aggregate["status"] == "CLEAN"
+
+
+def test_exploratory_hunt_does_not_hide_incomplete_campaign():
+    aggregate = build_security_aggregate(
+        _report(
+            {
+                "runtime_sweep": {
+                    "issue_points": 0,
+                    "brick_rate": 0.0,
+                    "campaign_complete": False,
+                    "infrastructure_error_points": 1,
+                }
+            },
+            should_find=True,
+            mode="exploratory",
+        )
+    )
+    assert aggregate["status"] == "INCONCLUSIVE"
+
+
+def test_optional_unavailable_swap_progress_does_not_poison_complete_result():
+    aggregate = build_security_aggregate(
+        _report({
+            "runtime_sweep": {
+                "issue_points": 0,
+                "brick_rate": 0.0,
+                "campaign_complete": True,
+                "configured_fault_types": ["read_bit_flip"],
+                "calibration_coverage": {"status": "unavailable"},
+            },
+            "swap_progress_inference": {"status": "unavailable"},
+        })
+    )
+    assert aggregate["status"] == "CLEAN"
+
+
+def test_unavailable_configured_swap_progress_remains_inconclusive():
+    aggregate = build_security_aggregate(
+        _report({
+            "runtime_sweep": {
+                "issue_points": 0,
+                "brick_rate": 0.0,
+                "campaign_complete": True,
+                "configured_fault_types": ["swap_progress"],
+            },
+            "swap_progress_inference": {"status": "unavailable"},
+        })
+    )
+    assert aggregate["status"] == "INCONCLUSIVE"
+
+
+def test_wire_selector_alias_is_treated_as_configured_swap_progress():
+    aggregate = build_security_aggregate(
+        _report({
+            "runtime_sweep": {
+                "issue_points": 0,
+                "brick_rate": 0.0,
+                "campaign_complete": True,
+                "configured_fault_types": ["w:sp"],
+            },
+            "swap_progress_inference": {"status": "unavailable"},
+        })
+    )
+    assert aggregate["status"] == "INCONCLUSIVE"
+
+
+def test_legacy_swap_progress_summary_remains_fail_closed_without_selector_metadata():
+    aggregate = build_security_aggregate(
+        _report({
+            "runtime_sweep": {
+                "issue_points": 0,
+                "brick_rate": 0.0,
+                "campaign_complete": True,
+            },
+            "swap_progress_inference": {"status": "unavailable"},
+        })
+    )
+    assert aggregate["status"] == "INCONCLUSIVE"
+
+
+def test_legacy_calibration_coverage_remains_fail_closed_without_selector_metadata():
+    aggregate = build_security_aggregate(
+        _report({
+            "runtime_sweep": {
+                "issue_points": 0,
+                "brick_rate": 0.0,
+                "campaign_complete": True,
+                "calibration_coverage": {"status": "unavailable"},
+            },
+        })
+    )
+    assert aggregate["status"] == "INCONCLUSIVE"
+
+
+@pytest.mark.parametrize("configured", [[None], [""], [1]])
+def test_malformed_configured_fault_types_are_rejected(configured):
+    with pytest.raises(ValueError, match="configured fault types"):
+        build_security_aggregate(_report({
+            "runtime_sweep": {
+                "issue_points": 0,
+                "brick_rate": 0.0,
+                "campaign_complete": True,
+                "configured_fault_types": configured,
+            },
+        }))
+
+
+def test_missing_configured_calibration_coverage_remains_inconclusive():
+    aggregate = build_security_aggregate(
+        _report({
+            "runtime_sweep": {
+                "issue_points": 0,
+                "brick_rate": 0.0,
+                "campaign_complete": True,
+                "configured_fault_types": ["power_loss"],
+            },
+        })
+    )
+    assert aggregate["status"] == "INCONCLUSIVE"
+
+
+def test_unavailable_configured_calibration_coverage_remains_inconclusive():
+    aggregate = build_security_aggregate(
+        _report({
+            "runtime_sweep": {
+                "issue_points": 0,
+                "brick_rate": 0.0,
+                "campaign_complete": True,
+                "configured_fault_types": ["power_loss"],
+                "calibration_coverage": {"status": "unavailable"},
+            },
+        })
     )
     assert aggregate["status"] == "INCONCLUSIVE"
 
