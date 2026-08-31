@@ -27,6 +27,11 @@ from profile_loader import load_profile_raw
 
 DEFAULT_SELF_TEST_RUNTIME_MANIFEST = "scripts/self_test_runtime_manifest.json"
 DEFAULT_SELF_TEST_PROFILE_COST_S = 60.0
+# A clean control that reaches Robot's short default timeout can be a transient
+# Renode startup/host-load failure. Give one retry a bounded, larger Robot
+# budget, while keeping the original attempt fail-closed for every other error.
+SELF_TEST_CONTROL_TIMEOUT_RETRIES = 1
+SELF_TEST_CONTROL_TIMEOUT_RETRY_MINUTES = 5
 
 
 def _normalize_expect_fault_type(name: str) -> str:
@@ -214,8 +219,8 @@ def run_audit(
     quick: bool,
     renode_test: str,
     extra_args: List[str],
-) -> Tuple[int, Dict[str, Any]]:
-    """Run audit_bootloader.py for a single profile and return (exit_code, report)."""
+) -> Tuple[int, Dict[str, Any], str]:
+    """Run audit_bootloader.py and return (exit_code, report, stderr)."""
     cmd = [
         sys.executable,
         str(repo_root / "scripts" / "audit_bootloader.py"),
@@ -228,19 +233,65 @@ def run_audit(
         cmd.extend(["--renode-test", renode_test])
     cmd.extend(extra_args)
 
-    proc = subprocess.run(
-        cmd, cwd=str(repo_root),
-        capture_output=True, text=True, check=False,
-    )
+    for attempt in range(SELF_TEST_CONTROL_TIMEOUT_RETRIES + 1):
+        env = None
+        if attempt:
+            # Preserve a caller's larger budget, but never let the retry fall
+            # back to the two-minute suite default that triggered it.
+            env = os.environ.copy()
+            raw_existing = str(
+                env.get("OTA_RENODE_ROBOT_TIMEOUT_MINUTES", "") or ""
+            ).strip()
+            try:
+                existing_minutes = float(raw_existing) if raw_existing else 0.0
+            except ValueError:
+                existing_minutes = 0.0
+            env["OTA_RENODE_ROBOT_TIMEOUT_MINUTES"] = str(
+                max(existing_minutes, float(SELF_TEST_CONTROL_TIMEOUT_RETRY_MINUTES))
+            )
 
-    report: Dict[str, Any] = {}
-    if output_path.exists():
-        try:
-            report = json.loads(output_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            pass
+        proc = subprocess.run(
+            cmd, cwd=str(repo_root),
+            capture_output=True, text=True, check=False,
+            **({"env": env} if env is not None else {}),
+        )
 
-    return proc.returncode, report, proc.stderr
+        report: Dict[str, Any] = {}
+        if output_path.exists():
+            try:
+                report = json.loads(output_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                pass
+
+        # Only retry a missing-report infrastructure timeout from the clean
+        # control. A report, a target assertion failure, or a fault-point
+        # timeout is authoritative and must not be hidden by a rerun.
+        stderr = proc.stderr or ""
+        stderr_lower = stderr.lower()
+        control_timeout = (
+            proc.returncode >= 2
+            and not report
+            and "infrastructure failure" in stderr_lower
+            and "timeout" in stderr_lower
+            and ("clean control" in stderr_lower or "for control" in stderr_lower)
+        )
+        if attempt < SELF_TEST_CONTROL_TIMEOUT_RETRIES and control_timeout:
+            try:
+                output_path.unlink()
+            except FileNotFoundError:
+                pass
+            print(
+                "  infrastructure clean-control timeout; retrying once with "
+                "a {} minute Robot budget".format(
+                    SELF_TEST_CONTROL_TIMEOUT_RETRY_MINUTES
+                ),
+                file=sys.stderr,
+            )
+            continue
+
+        return proc.returncode, report, stderr
+
+    raise AssertionError("unreachable self-test audit retry loop")
 
 
 def check_verdict(

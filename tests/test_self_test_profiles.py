@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -313,6 +314,222 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         cmd = mock_run.call_args.kwargs["args"] if "args" in mock_run.call_args.kwargs else mock_run.call_args.args[0]
         self.assertIn("--workers", cmd)
         self.assertIn("8", cmd)
+
+    def test_run_audit_retries_missing_report_for_clean_control_timeout(self):
+        profile_path = ROOT / "profiles" / "fault_no_crc.yaml"
+        with tempfile.TemporaryDirectory() as td:
+            output_path = Path(td) / "audit.json"
+            calls = []
+
+            def fake_run(*args, **kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    return mock.Mock(
+                        returncode=2,
+                        stderr=(
+                            "INFRASTRUCTURE FAILURE: renode-test failed for "
+                            "control fault_at=1000000\n"
+                            "Test timeout 2 minutes exceeded"
+                        ),
+                    )
+                output_path.write_text('{"verdict":"PASS"}', encoding="utf-8")
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch("self_test.subprocess.run", side_effect=fake_run):
+                exit_code, report, stderr = run_audit(
+                    repo_root=ROOT,
+                    profile_path=profile_path,
+                    output_path=output_path,
+                    quick=False,
+                    renode_test="renode-test",
+                    extra_args=[],
+                )
+
+        self.assertEqual((exit_code, report, stderr), (0, {"verdict": "PASS"}, ""))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls[1]["env"]["OTA_RENODE_ROBOT_TIMEOUT_MINUTES"],
+            "5.0",
+        )
+
+    def test_run_audit_timeout_retry_preserves_larger_robot_budget(self):
+        profile_path = ROOT / "profiles" / "fault_no_crc.yaml"
+        with tempfile.TemporaryDirectory() as td:
+            output_path = Path(td) / "audit.json"
+            calls = []
+
+            def fake_run(*args, **kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    return mock.Mock(
+                        returncode=2,
+                        stderr=(
+                            "INFRASTRUCTURE FAILURE: renode-test failed for "
+                            "control fault_at=1000000\n"
+                            "Test timeout 2 minutes exceeded"
+                        ),
+                    )
+                output_path.write_text('{"verdict":"PASS"}', encoding="utf-8")
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch.dict(
+                "os.environ",
+                {"OTA_RENODE_ROBOT_TIMEOUT_MINUTES": "10"},
+                clear=False,
+            ):
+                with mock.patch("self_test.subprocess.run", side_effect=fake_run):
+                    exit_code, report, stderr = run_audit(
+                        repo_root=ROOT,
+                        profile_path=profile_path,
+                        output_path=output_path,
+                        quick=False,
+                        renode_test="renode-test",
+                        extra_args=[],
+                    )
+
+        self.assertEqual((exit_code, report, stderr), (0, {"verdict": "PASS"}, ""))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls[1]["env"]["OTA_RENODE_ROBOT_TIMEOUT_MINUTES"],
+            "10.0",
+        )
+
+    def test_run_audit_does_not_retry_non_timeout_control_failure(self):
+        profile_path = ROOT / "profiles" / "fault_no_crc.yaml"
+        with tempfile.TemporaryDirectory() as td:
+            output_path = Path(td) / "audit.json"
+            with mock.patch(
+                "self_test.subprocess.run",
+                return_value=mock.Mock(
+                    returncode=2,
+                    stderr=(
+                        "INFRASTRUCTURE FAILURE: Clean control failed: "
+                        "expected outcome 'success', observed 'wrong_image'"
+                    ),
+                ),
+            ) as mock_run:
+                exit_code, report, _stderr = run_audit(
+                    repo_root=ROOT,
+                    profile_path=profile_path,
+                    output_path=output_path,
+                    quick=False,
+                    renode_test="renode-test",
+                    extra_args=[],
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(report, {})
+        self.assertEqual(mock_run.call_count, 1)
+
+    def test_run_audit_does_not_retry_fault_point_timeout(self):
+        profile_path = ROOT / "profiles" / "fault_no_crc.yaml"
+        with tempfile.TemporaryDirectory() as td:
+            output_path = Path(td) / "audit.json"
+            with mock.patch(
+                "self_test.subprocess.run",
+                return_value=mock.Mock(
+                    returncode=2,
+                    stderr=(
+                        "INFRASTRUCTURE FAILURE: RenodeTimeoutError: "
+                        "renode-test timed out for fault_17 fault_at=17"
+                    ),
+                ),
+            ) as mock_run:
+                exit_code, report, _stderr = run_audit(
+                    repo_root=ROOT,
+                    profile_path=profile_path,
+                    output_path=output_path,
+                    quick=False,
+                    renode_test="renode-test",
+                    extra_args=[],
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(report, {})
+        self.assertEqual(mock_run.call_count, 1)
+
+    def test_run_audit_does_not_retry_exit_one_timeout(self):
+        profile_path = ROOT / "profiles" / "fault_no_crc.yaml"
+        with tempfile.TemporaryDirectory() as td:
+            output_path = Path(td) / "audit.json"
+            with mock.patch(
+                "self_test.subprocess.run",
+                return_value=mock.Mock(
+                    returncode=1,
+                    stderr=(
+                        "INFRASTRUCTURE FAILURE: renode-test failed for "
+                        "control fault_at=1000000\n"
+                        "Test timeout 2 minutes exceeded"
+                    ),
+                ),
+            ) as mock_run:
+                exit_code, report, _stderr = run_audit(
+                    repo_root=ROOT,
+                    profile_path=profile_path,
+                    output_path=output_path,
+                    quick=False,
+                    renode_test="renode-test",
+                    extra_args=[],
+                )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(report, {})
+        self.assertEqual(mock_run.call_count, 1)
+
+    def test_run_audit_does_not_retry_when_timeout_report_exists(self):
+        profile_path = ROOT / "profiles" / "fault_no_crc.yaml"
+        with tempfile.TemporaryDirectory() as td:
+            output_path = Path(td) / "audit.json"
+            output_path.write_text('{"verdict":"INCONCLUSIVE"}', encoding="utf-8")
+            with mock.patch(
+                "self_test.subprocess.run",
+                return_value=mock.Mock(
+                    returncode=2,
+                    stderr=(
+                        "INFRASTRUCTURE FAILURE: Clean control timed out "
+                        "after 120s"
+                    ),
+                ),
+            ) as mock_run:
+                exit_code, report, _stderr = run_audit(
+                    repo_root=ROOT,
+                    profile_path=profile_path,
+                    output_path=output_path,
+                    quick=False,
+                    renode_test="renode-test",
+                    extra_args=[],
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(report, {"verdict": "INCONCLUSIVE"})
+        self.assertEqual(mock_run.call_count, 1)
+
+    def test_run_audit_timeout_retry_is_bounded(self):
+        profile_path = ROOT / "profiles" / "fault_no_crc.yaml"
+        with tempfile.TemporaryDirectory() as td:
+            output_path = Path(td) / "audit.json"
+            with mock.patch(
+                "self_test.subprocess.run",
+                return_value=mock.Mock(
+                    returncode=2,
+                    stderr=(
+                        "INFRASTRUCTURE FAILURE: RenodeTimeoutError: "
+                        "renode-test timed out for control fault_at=-1"
+                    ),
+                ),
+            ) as mock_run:
+                exit_code, report, _stderr = run_audit(
+                    repo_root=ROOT,
+                    profile_path=profile_path,
+                    output_path=output_path,
+                    quick=False,
+                    renode_test="renode-test",
+                    extra_args=[],
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(report, {})
+        self.assertEqual(mock_run.call_count, 2)
 
     def test_write_summary_records_partial_progress(self):
         output_path = ROOT / "tmp_self_test_summary.json"
