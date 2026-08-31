@@ -405,6 +405,13 @@ class TestActionSourceBoundaries(unittest.TestCase):
         self.assertIn("expected_points.issubset(wrong_points)", source)
         self.assertNotIn("bricks <= 0", source)
 
+    def test_latest_renode_canary_uses_cross_version_results_option(self):
+        source = (
+            ROOT / ".github" / "workflows" / "renode-latest-canary.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("renode-test \\\n            -r \"${report_dir}\"", source)
+        self.assertNotIn("--outputdir", source)
+
     def test_pinned_renode_workflows_verify_the_archive(self):
         workflows = ROOT / ".github" / "workflows"
         for path in workflows.glob("*.yml"):

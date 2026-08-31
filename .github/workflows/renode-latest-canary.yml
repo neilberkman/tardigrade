@@ -73,7 +73,7 @@ jobs:
           mkdir -p "${report_dir}"
           set +e
           renode-test \
-            --outputdir "${report_dir}" \
+            -r "${report_dir}" \
             --save-logs always \
             --keep-renode-output \
             tests/nativeaot_runfor_bug.robot \
