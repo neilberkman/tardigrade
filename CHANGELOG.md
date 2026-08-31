@@ -57,8 +57,19 @@ The format follows [common-changelog](https://common-changelog.org/).
   and incomplete recovery observations remain timeouts instead of bricks.
 - Removed three trace-less NVMemory writeback profiles that could not produce
   executable durability evidence under the fail-closed runtime contract.
-- Clean writeback controls now execute normally, and STM32F4 fine calibration
-  exports complete address-bearing write traces.
+- Clean writeback controls now execute normally without rerouting non-writeback
+  state controls, and STM32F4 fine calibration exports complete address-bearing
+  write traces.
+- MCUboot hybrid evaluation now uses the backing-flash trace base, derives
+  vectors from MCUboot image headers, validates secondary-slot images at their
+  eventual execution address, and sends scratch or other out-of-slot writes
+  through real execute-mode recovery.
+- Calibration caches accept the explicit-width write traces emitted by current
+  backends while retaining legacy three-column trace compatibility.
+- The experimental MCUboot state evaluator is now disabled for CLI audits
+  unless `--allow-mcuboot-state-evaluator` is explicitly supplied; hybrid
+  routing accepts only the exact ordinary power-loss wire type `w`, preserves
+  per-point fault types, and remains conservative for overlapping trailers.
 
 ## [0.5.0] - 2026-07-10
 

@@ -15,7 +15,11 @@ from fault_inject import apply_clustered_distribution
 from fault_types import FAULT_TYPE_NAME_TO_CODE
 from profile_loader import MAX_PROFILE_FAULT_POINTS, ProfileConfig, ProfileError
 from renode_runner import quick_subset
-from trace_utils import load_clean_erase_trace, load_clean_write_trace
+from trace_utils import (
+    flash_base_for_profile,
+    load_clean_erase_trace,
+    load_clean_write_trace,
+)
 from security_state_layout import select_security_state_erase_cutpoints
 from thumb_instructions import (
     build_instruction_skip_patch_plan,
@@ -89,7 +93,7 @@ def _build_swap_progress_erase_map(
     erase_map: List[Tuple[int, int]] = []
     seen: set[Tuple[int, int]] = set()
     page_size = max(1, int(getattr(profile.memory, "page_size", 4096) or 4096))
-    flash_base = min(int(slot.base) for slot in profile.memory.slots.values())
+    flash_base = flash_base_for_profile(profile)
 
     for entry in erase_entries:
         start = int(entry.get("flash_offset", 0))
@@ -619,7 +623,7 @@ def build_fault_plan(
         slot_ranges_for_heuristic: Dict[str, Tuple[int, int]] = {}
         for sname, sinfo in profile.memory.slots.items():
             slot_ranges_for_heuristic[sname] = (sinfo.base, sinfo.base + sinfo.size)
-        flash_base = min(s.base for s in profile.memory.slots.values())
+        flash_base = flash_base_for_profile(profile)
 
         bl_region_for_heuristic = None
         if profile.bootloader_region is not None:
@@ -762,10 +766,7 @@ def build_fault_plan(
                         getattr(profile, "persistent_state_layout", None),
                         security_write_entries,
                         security_erase_entries,
-                        flash_base=(
-                            min(int(slot.base) for slot in profile.memory.slots.values())
-                            if profile.memory.slots else 0
-                        ),
+                        flash_base=flash_base_for_profile(profile),
                         max_writes=max_writes,
                         trace_address_map=getattr(
                             profile.memory, "trace_address_map", None
@@ -788,7 +789,7 @@ def build_fault_plan(
             swap_entries = load_clean_write_trace(trace_file)
             erase_entries = load_clean_erase_trace(erase_trace_file)
             if swap_entries:
-                flash_base = min(int(slot.base) for slot in profile.memory.slots.values())
+                flash_base = flash_base_for_profile(profile)
                 slot_ranges = sorted(
                     (
                         int(slot.base) - flash_base,
@@ -822,7 +823,7 @@ def build_fault_plan(
                 )
                 swap_progress_count = len(swap_fps)
             elif erase_entries:
-                flash_base = min(int(slot.base) for slot in profile.memory.slots.values())
+                flash_base = flash_base_for_profile(profile)
                 slot_ranges = sorted(
                     (
                         int(slot.base) - flash_base,

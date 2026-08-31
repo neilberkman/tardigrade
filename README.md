@@ -255,6 +255,11 @@ validation container with
 `docker build -f docker/oss-validation.Dockerfile -t tardigrade-oss-validation .`,
 then use `--renode-test docker://tardigrade-oss-validation`.
 
+The experimental MCUboot bulk-write state evaluator is disabled for CLI
+audits by default because it predicts recovery from reconstructed flash state.
+Use `--allow-mcuboot-state-evaluator` only for explicitly reviewed campaigns;
+direct Python API callers may still opt in with `allow_state_evaluator=True`.
+
 ### Run modes
 
 | Mode       | Selection                                       | Typical points      | Use case               |

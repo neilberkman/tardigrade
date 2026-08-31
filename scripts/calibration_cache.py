@@ -162,7 +162,27 @@ def _parse_trace_csv(
             values = tuple(int(value.strip(), 0) for value in row)
         except ValueError as exc:
             raise ValueError("{} row {} is not numeric".format(name, line_number)) from exc
-        if any(value < 0 or value > 0xFFFFFFFF for value in values):
+        # Trace indices, offsets, and erase metadata are uint32. Write values
+        # may be wider when the CSV exporter records a write width explicitly.
+        if any(value < 0 or value > 0xFFFFFFFF for value in values[:1]):
+            raise ValueError("{} row {} exceeds uint32 range".format(name, line_number))
+        if len(values) > 1 and not (0 <= values[1] <= 0xFFFFFFFF):
+            raise ValueError("{} row {} exceeds uint32 range".format(name, line_number))
+        if header == ["write_index", "flash_offset", "value", "width"]:
+            width = values[3]
+            if width not in (1, 2, 4, 8):
+                raise ValueError(
+                    "{} row {} has unsupported write width {}".format(
+                        name, line_number, width
+                    )
+                )
+            if values[2] < 0 or values[2] > (1 << (width * 8)) - 1:
+                raise ValueError(
+                    "{} row {} value exceeds width {}".format(
+                        name, line_number, width
+                    )
+                )
+        elif any(value < 0 or value > 0xFFFFFFFF for value in values[2:]):
             raise ValueError("{} row {} exceeds uint32 range".format(name, line_number))
         if values[0] <= previous_index:
             raise ValueError("{} indices must be positive and increasing".format(name))
@@ -178,23 +198,46 @@ def _validate_trace_pair(
     erase: bool,
 ) -> int:
     name = "erase trace" if erase else "write trace"
-    if (csv_data is None) != (bin_data is None):
-        raise ValueError("{} CSV and binary artifacts must be present together".format(name))
-    if csv_data is None or bin_data is None:
+    # CSV is the canonical trace representation and may be present without a
+    # binary companion (for example after a backend emits width-bearing CSV
+    # only). A binary artifact without its CSV cannot be validated safely.
+    if csv_data is None and bin_data is not None:
+        raise ValueError("{} binary artifact requires a CSV artifact".format(name))
+    if csv_data is None:
         return 0
-    header = (
-        ["erase_index", "flash_offset", "writes_at_this_point", "erase_size"]
-        if erase
-        else ["write_index", "flash_offset", "value"]
-    )
+    if erase:
+        header = [
+            "erase_index",
+            "flash_offset",
+            "writes_at_this_point",
+            "erase_size",
+        ]
+    else:
+        try:
+            decoded = csv.reader(io.StringIO(csv_data.decode("utf-8"), newline=""))
+            actual_header = next(decoded)
+        except (UnicodeDecodeError, StopIteration) as exc:
+            raise ValueError("write trace has an invalid header") from exc
+        legacy_header = ["write_index", "flash_offset", "value"]
+        width_header = legacy_header + ["width"]
+        if actual_header not in (legacy_header, width_header):
+            raise ValueError("write trace has an unexpected header")
+        header = actual_header
     rows = _parse_trace_csv(csv_data, name=name, header=header)
+    if bin_data is None:
+        return len(rows)
+    if not erase and header == ["write_index", "flash_offset", "value", "width"]:
+        if any(row[3] != 4 for row in rows):
+            raise ValueError(
+                "write trace binary companion requires every width to be 4"
+            )
     if len(bin_data) != len(rows) * 12:
         raise ValueError("{} binary record count does not match CSV".format(name))
     binary_rows = list(struct.iter_unpack("<III", bin_data))
     expected_rows = (
         [(row[2], row[1], row[3]) for row in rows]
         if erase
-        else rows
+        else [(row[0], row[1], row[2]) for row in rows]
     )
     if binary_rows != expected_rows:
         raise ValueError("{} binary records do not match CSV".format(name))

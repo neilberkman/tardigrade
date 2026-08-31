@@ -87,6 +87,7 @@ class RuntimeControlGateTests(unittest.TestCase):
                         work_dir=work_dir,
                         renode_remote_server_dir="",
                         include_control=True,
+                        allow_state_evaluator=True,
                     )
                 except Exception:
                     self.assertFalse(select_mock.called)

@@ -1890,6 +1890,11 @@ a separately authenticated channel.
 
 ### Quick mode with heuristic points
 
+The experimental MCUboot state evaluator is disabled by default for CLI runs.
+Pass `--allow-mcuboot-state-evaluator` only after reviewing the profile and
+campaign assumptions. It is intended for explicitly reviewed bulk-write
+campaigns; direct API callers can opt in with `allow_state_evaluator=True`.
+
 By default, `--quick` selects the first, middle, and last point independently
 for each enabled fault family or selector, so mixed campaigns can run more than
 three points. Set `quick_use_heuristic: true` in `fault_sweep` to use the

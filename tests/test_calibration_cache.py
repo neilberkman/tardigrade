@@ -338,6 +338,117 @@ class TestSaveLoadCalibration(unittest.TestCase):
         with open(loaded.trace_file_bin, "rb") as f:
             self.assertEqual(f.read(), trace_bin_data)
 
+    def test_width_bearing_trace_files_round_trip(self):
+        trace_data = (
+            b"write_index,flash_offset,value,width\n"
+            b"1,0x1000,0xBEEF,4\n"
+            b"2,0x1004,0xCAFEBABE,4\n"
+        )
+        trace_bin_data = struct.pack(
+            "<IIIIII",
+            1,
+            0x1000,
+            0xBEEF,
+            2,
+            0x1004,
+            0xCAFEBABE,
+        )
+        cal = self._make_cal(
+            total_writes=2,
+            trace_data=trace_data,
+            trace_bin_data=trace_bin_data,
+        )
+
+        save_calibration(self.cache_path, cal, "width_trace_key")
+        loaded = load_calibration(
+            self.cache_path,
+            "width_trace_key",
+            self.work_dir,
+            allow_unsigned=True,
+        )
+
+        self.assertIsNotNone(loaded)
+        with open(loaded.trace_file, "rb") as stream:
+            self.assertEqual(stream.read(), trace_data)
+
+    def test_width_bearing_binary_rejects_non_four_byte_width(self):
+        trace_data = (
+            b"write_index,flash_offset,value,width\n"
+            b"1,0x1000,0xBEEF,4\n"
+            b"2,0x1004,0xCAFE,2\n"
+        )
+        trace_bin_data = struct.pack(
+            "<IIIIII", 1, 0x1000, 0xBEEF, 2, 0x1004, 0xCAFE
+        )
+        cal = self._make_cal(
+            total_writes=1,
+            trace_data=trace_data,
+            trace_bin_data=trace_bin_data,
+        )
+        with self.assertRaisesRegex(ValueError, "binary companion"):
+            save_calibration(self.cache_path, cal, "width_binary_reject_key")
+
+    def test_width_bearing_csv_only_trace_round_trip(self):
+        trace_data = (
+            b"write_index,flash_offset,value,width\n"
+            b"1,0x1000,0xBEEF,2\n"
+            b"2,0x1004,0xCAFEBABE,4\n"
+        )
+        trace_file = os.path.join(self.td, "width-only.csv")
+        with open(trace_file, "wb") as stream:
+            stream.write(trace_data)
+        cal = CalibrationResult(
+            total_writes=2,
+            total_erases=0,
+            trace_file=trace_file,
+            erase_trace_file=None,
+            trace_file_bin=None,
+            erase_trace_file_bin=None,
+        )
+
+        save_calibration(self.cache_path, cal, "width_csv_only_key")
+        loaded = load_calibration(
+            self.cache_path,
+            "width_csv_only_key",
+            self.work_dir,
+            allow_unsigned=True,
+        )
+
+        self.assertIsNotNone(loaded)
+        self.assertIsNotNone(loaded.trace_file)
+        self.assertIsNone(loaded.trace_file_bin)
+        with open(loaded.trace_file, "rb") as stream:
+            self.assertEqual(stream.read(), trace_data)
+
+    def test_eight_byte_csv_only_value_round_trip(self):
+        trace_data = (
+            b"write_index,flash_offset,value,width\n"
+            b"1,0x1000,0x1000000000000001,8\n"
+        )
+        trace_file = os.path.join(self.td, "width-eight-only.csv")
+        with open(trace_file, "wb") as stream:
+            stream.write(trace_data)
+        cal = CalibrationResult(
+            total_writes=1,
+            total_erases=0,
+            trace_file=trace_file,
+            erase_trace_file=None,
+            trace_file_bin=None,
+            erase_trace_file_bin=None,
+        )
+
+        save_calibration(self.cache_path, cal, "width_eight_csv_only_key")
+        loaded = load_calibration(
+            self.cache_path,
+            "width_eight_csv_only_key",
+            self.work_dir,
+            allow_unsigned=True,
+        )
+
+        self.assertIsNotNone(loaded)
+        with open(loaded.trace_file, "rb") as stream:
+            self.assertEqual(stream.read(), trace_data)
+
     def test_write_trace_may_be_a_subset_of_total_write_counter(self):
         trace_data = (
             b"write_index,flash_offset,value\n"

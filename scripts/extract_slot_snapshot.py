@@ -9,13 +9,12 @@ from pathlib import Path
 from typing import Iterable, Tuple
 
 from profile_loader import ProfileConfig, load_profile
+from trace_utils import flash_base_for_profile as _trace_flash_base_for_profile
 
 
 def flash_base_for_profile(profile: ProfileConfig) -> int:
-    slot_bases = [int(slot.base) for slot in profile.memory.slots.values()]
-    if slot_bases:
-        return min([int(profile.bootloader_entry)] + slot_bases)
-    return int(profile.bootloader_entry)
+    """Compatibility wrapper for callers that imported this helper here."""
+    return _trace_flash_base_for_profile(profile)
 
 
 def extract_slot_bytes(

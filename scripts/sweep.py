@@ -56,7 +56,11 @@ from renode_runner import (
     run_single_point,
 )
 from result_checks import annotate_result_checks
-from trace_utils import load_clean_erase_trace, load_clean_write_trace
+from trace_utils import (
+    flash_base_for_profile,
+    load_clean_erase_trace,
+    load_clean_write_trace,
+)
 
 
 def _cleanup_generated_robot_vars(robot_vars: List[str]) -> None:
@@ -262,8 +266,20 @@ def _build_mcuboot_state_slot_config(
     repo_root: Path,
 ) -> Dict[str, Any]:
     slots = profile.memory.slots
-    flash_base = min(int(slot.base) for slot in slots.values())
-    flash_end = max(int(slot.base) + int(slot.size) for slot in slots.values())
+    flash_base = flash_base_for_profile(profile)
+    flash_ends = [
+        int(slot.base) + int(slot.size)
+        for slot in slots.values()
+    ]
+    flash_ends.extend(
+        int(region.base) + int(region.size)
+        for region in getattr(profile.memory, "erase_regions", ()) or ()
+    )
+    flash_ends.extend(
+        int(region.base) + int(region.size)
+        for region in getattr(profile.memory, "postmortem_partitions", ()) or ()
+    )
+    flash_end = max(flash_ends)
     if profile.pre_boot_state:
         flash_base = min(
             flash_base,
@@ -598,6 +614,11 @@ def _select_mcuboot_state_evaluator_points(
         return None
     if not _looks_like_mcuboot_profile(profile):
         return None
+    # Shared/aliased backing stores need inverse address translation before a
+    # byte-level state reconstruction can be sound.  Keep those points on the
+    # real execute path until the evaluator supports that mapping explicitly.
+    if getattr(profile.memory, "trace_address_map", None):
+        return None
     if not trace_file or not os.path.exists(trace_file):
         return None
     if getattr(profile, "has_update_sequence", False):
@@ -618,18 +639,20 @@ def _select_mcuboot_state_evaluator_points(
         )
 
     evaluate_points: List[int] = []
+    evaluate_types: List[str] = []
     execute_points: List[int] = []
     execute_types: List[str] = []
 
     for idx, fault_at in enumerate(fault_points):
         fault_type = fault_types_list[idx] if fault_types_list and idx < len(fault_types_list) else "w"
-        base_fault_type = str(fault_type or "w").split(":", 1)[0]
+        original_fault_type = str(fault_type or "w")
         fault_address = target_addr_by_fault_at.get(int(fault_at))
-        if base_fault_type == "w" and fault_address is not None and not evaluator.should_use_execute_mode(
+        if original_fault_type == "w" and fault_address is not None and not evaluator.should_use_execute_mode(
             fault_address,
             slot_config,
         ):
             evaluate_points.append(int(fault_at))
+            evaluate_types.append(original_fault_type)
             continue
         execute_points.append(int(fault_at))
         execute_types.append(str(fault_type))
@@ -641,6 +664,7 @@ def _select_mcuboot_state_evaluator_points(
         "module": evaluator,
         "slot_config": slot_config,
         "evaluate_points": evaluate_points,
+        "evaluate_types": evaluate_types,
         "execute_points": execute_points,
         "execute_types": execute_types,
         "write_entries": write_entries,
@@ -666,6 +690,11 @@ def _run_mcuboot_state_evaluator_points(
     )
     evaluator = selection["module"]
     results: List[Dict[str, Any]] = []
+    evaluate_types = selection.get("evaluate_types", [])
+    type_by_fault_at = {
+        int(point): str(fault_type)
+        for point, fault_type in zip(selection["evaluate_points"], evaluate_types)
+    }
     for fault_at in sorted(selection["evaluate_points"]):
         committed_writes = cursor.advance_to_fault_point(fault_at)
         prediction = evaluator.predict_boot_outcome(cursor.flash, selection["slot_config"])
@@ -674,7 +703,7 @@ def _run_mcuboot_state_evaluator_points(
         result: Dict[str, Any] = {
             "fault_at": int(fault_at),
             "fault_requested": int(fault_at),
-            "fault_type": "w",
+            "fault_type": type_by_fault_at.get(int(fault_at), "w"),
             "fault_injected": True,
             "fault_address": _fmt_u32(cursor.target_fault_address(fault_at) or 0),
             "boot_outcome": prediction.get("boot_outcome", "unknown"),
@@ -1174,7 +1203,7 @@ def run_runtime_sweep(
     fault_types_list: Optional[List[str]] = None,
     keep_run_artifacts: bool = False,
     no_hash_bypass: bool = False,
-    allow_state_evaluator: bool = True,
+    allow_state_evaluator: bool = False,
     profile_component_name: Optional[str] = None,
     profile_initial_state_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
@@ -1190,6 +1219,8 @@ def run_runtime_sweep(
     Phase 1.  This eliminates the O(N^2) prefix cost.
 
     fault_types_list: parallel list of per-point fault type codes.
+    allow_state_evaluator: explicit opt-in to the experimental MCUboot
+    reconstructed-state evaluator; disabled by default.
     """
     control_robot_vars = build_control_robot_vars(
         robot_vars,
@@ -1716,6 +1747,7 @@ def run_multi_component_sweep(
     no_hash_bypass: bool = False,
     keep_run_artifacts: bool = False,
     no_control: bool = False,
+    allow_state_evaluator: bool = False,
 ) -> Dict[str, Any]:
     """Orchestrate fault injection across multiple components.
 
@@ -1893,7 +1925,7 @@ def run_multi_component_sweep(
             fault_types_list=fault_types_list,
             keep_run_artifacts=keep_run_artifacts,
             no_hash_bypass=no_hash_bypass,
-            allow_state_evaluator=not quick,
+            allow_state_evaluator=allow_state_evaluator,
             profile_component_name=comp_name,
         )
 

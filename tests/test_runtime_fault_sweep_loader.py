@@ -614,6 +614,13 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
                 "fault_injected": False,
             }
 
+        def clean_state(fault_at):
+            return {
+                "fault_at": fault_at,
+                "fault_type": "state-control",
+                "fault_injected": False,
+            }
+
         def unsupported_result(fault_at, fault_type):
             unsupported_calls.append((fault_at, fault_type))
             return {
@@ -622,15 +629,17 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
                 "fault_class": "infrastructure_error",
             }
 
+        writeback_enabled = [True]
         namespace = {
             "run_execute_fault": clean_execute,
-            "writeback_active": lambda: True,
+            "writeback_active": lambda: writeback_enabled[0],
             "is_unsupported_writeback_fault_type": lambda _fault_type: True,
             "_writeback_unsupported_fault_result": unsupported_result,
             "_preflight_writeback_trace": should_not_preflight,
             "_base_fault_type_code": lambda fault_type: fault_type,
+            "_EXECUTE_ONLY_FAULT_TYPES": frozenset(),
             "run_trace_replay_fault": object(),
-            "run_state_fault": object(),
+            "run_state_fault": clean_state,
         }
         exec(
             compile(
@@ -658,6 +667,13 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertEqual(result["fault_type"], "control")
         self.assertFalse(result["fault_injected"])
         self.assertEqual(preflight_calls, [])
+
+        writeback_enabled[0] = False
+        state_result = namespace["_dispatch_fault_point"](
+            -1, "w", namespace["run_state_fault"]
+        )
+        self.assertEqual(state_result["fault_type"], "state-control")
+        writeback_enabled[0] = True
 
         rejected = namespace["_dispatch_fault_point"](
             0, "control", namespace["run_trace_replay_fault"]

@@ -41,7 +41,11 @@ from partial_staging import (
     parse_partial_staging_config,
     summarize_partial_staging,
 )
-from trace_utils import annotate_clean_trace, summarize_calibration_coverage
+from trace_utils import (
+    annotate_clean_trace,
+    flash_base_for_profile,
+    summarize_calibration_coverage,
+)
 from trigger_discovery import (
     TriggerDiscoveryResult,
     discover_update_trigger,
@@ -777,6 +781,14 @@ def parse_args() -> argparse.Namespace:
         help="Disable trace replay optimization; force full CPU execution for every fault point.",
     )
     parser.add_argument(
+        "--allow-mcuboot-state-evaluator",
+        action="store_true",
+        help=(
+            "Opt into the experimental MCUboot bulk-write state evaluator. "
+            "Disabled by default; use real CPU execution unless explicitly enabled."
+        ),
+    )
+    parser.add_argument(
         "--no-hash-bypass", action="store_true",
         help="Disable sweep-only hash validation bypass; run full crypto in emulation (slower but hyper-realistic).",
     )
@@ -1334,6 +1346,8 @@ def _build_fuzz_audit_command(
         cmd.append("--keep-run-artifacts")
     if args.no_trace_replay:
         cmd.append("--no-trace-replay")
+    if args.allow_mcuboot_state_evaluator:
+        cmd.append("--allow-mcuboot-state-evaluator")
     if args.no_hash_bypass:
         cmd.append("--no-hash-bypass")
     if args.renode_remote_server_dir:
@@ -1579,6 +1593,7 @@ def _main_single() -> int:
                 no_hash_bypass=args.no_hash_bypass,
                 keep_run_artifacts=args.keep_run_artifacts,
                 no_control=args.no_control,
+                allow_state_evaluator=args.allow_mcuboot_state_evaluator,
             )
 
             # Determine a verdict from all per-component controls, fault
@@ -2106,13 +2121,10 @@ def _main_single() -> int:
             fault_types_list=fault_types_list,
             keep_run_artifacts=args.keep_run_artifacts,
             no_hash_bypass=effective_no_hash_bypass,
-            # Allow the state evaluator in --quick runs only when the
-            # fault planner actually selected the heuristic path.  The
-            # profile opt-in (``quick_use_heuristic``) is necessary but
-            # not sufficient; ``build_fault_plan`` has several other
-            # preconditions (trace available, no explicit bounds, step 1,
-            # non-exhaustive strategy) that must also hold.
-            allow_state_evaluator=(not args.quick) or bool(heuristic_summary),
+            # The MCUboot state evaluator is experimental and requires an
+            # explicit CLI opt-in. Direct API callers retain their existing
+            # ``allow_state_evaluator`` default for focused tools/tests.
+            allow_state_evaluator=bool(args.allow_mcuboot_state_evaluator),
             profile_initial_state_name=args.initial_state or None,
         )
 
@@ -2191,9 +2203,7 @@ def _main_single() -> int:
                     "findings": [],
                 }
 
-        flash_base = 0
-        if profile.memory.slots:
-            flash_base = min(slot.base for slot in profile.memory.slots.values())
+        flash_base = flash_base_for_profile(profile)
         clean_trace_meta = annotate_clean_trace(
             sweep_results, trace_file, erase_trace_file, flash_base,
             trace_address_map=getattr(profile.memory, "trace_address_map", None),

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from trace_utils import summarize_calibration_coverage
+from trace_utils import flash_base_for_profile, summarize_calibration_coverage
 from renode_runner import (
     CalibrationResult,
     calibration_completed,
@@ -154,10 +154,7 @@ def should_auto_discover_trigger(profile: ProfileConfig, eval_mode: str) -> bool
 
 
 def _flash_base(profile: ProfileConfig) -> int:
-    slot_bases = [int(slot.base) for slot in profile.memory.slots.values()]
-    if slot_bases:
-        return min([int(profile.bootloader_entry)] + slot_bases)
-    return int(profile.bootloader_entry)
+    return flash_base_for_profile(profile)
 
 
 def _detect_bootloader_family(profile: ProfileConfig) -> str:

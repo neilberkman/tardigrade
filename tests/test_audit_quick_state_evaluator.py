@@ -22,6 +22,27 @@ from renode_runner import CalibrationResult  # noqa: E402
 
 
 class AuditQuickStateEvaluatorTests(unittest.TestCase):
+    def test_state_evaluator_is_cli_opt_in(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["audit_bootloader.py", "--profile", "profile.yaml", "--output", "out.json"],
+        ):
+            self.assertFalse(audit_bootloader.parse_args().allow_mcuboot_state_evaluator)
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "audit_bootloader.py",
+                "--profile",
+                "profile.yaml",
+                "--output",
+                "out.json",
+                "--allow-mcuboot-state-evaluator",
+            ],
+        ):
+            self.assertTrue(audit_bootloader.parse_args().allow_mcuboot_state_evaluator)
+
     def _write_profile(self, tempdir: Path, extra_fault_sweep: str = "") -> Path:
         profile_path = tempdir / "profile.yaml"
         profile_path.write_text(
@@ -112,6 +133,7 @@ class AuditQuickStateEvaluatorTests(unittest.TestCase):
                 "--output",
                 str(output_path),
                 "--quick",
+                "--allow-mcuboot-state-evaluator",
             ]
 
             with mock.patch.object(sys, "argv", argv):

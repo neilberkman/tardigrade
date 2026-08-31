@@ -21,6 +21,7 @@ MCUBOOT_GOOD_MAGIC = struct.pack(
     0x0F505235,
     0x8079B62C,
 )
+MCUBOOT_IMAGE_MAGIC = 0x96F3B83D
 
 
 def _fmt_u32(value: int) -> str:
@@ -37,6 +38,19 @@ def _read_u32_le(blob: bytes, offset: int) -> int:
     if offset < 0 or offset + 4 > len(blob):
         return 0xFFFFFFFF
     return struct.unpack_from("<I", blob, offset)[0]
+
+
+def _vector_table_offset(slot_bytes: bytes, configured_offset: int) -> int:
+    """Resolve an explicit vector offset or an MCUboot image header size."""
+    configured = max(0, int(configured_offset))
+    if configured:
+        return configured
+    if len(slot_bytes) < 12 or _read_u32_le(slot_bytes, 0) != MCUBOOT_IMAGE_MAGIC:
+        return 0
+    header_size = int(struct.unpack_from("<H", slot_bytes, 8)[0])
+    if header_size < 32 or header_size % 4 != 0 or header_size + 8 > len(slot_bytes):
+        return 0
+    return header_size
 
 
 def _flag_state(raw: int) -> str:
@@ -91,6 +105,7 @@ def _slot_state(
     flash_base: int,
     slot_name: str,
     slot_info: Mapping[str, int],
+    execution_base: int,
     sram_start: int,
     sram_end: int,
     vector_table_offset: int,
@@ -102,13 +117,14 @@ def _slot_state(
     trailer_magic_off = size - 16
     image_ok_off = trailer_magic_off - int(trailer_align)
     copy_done_off = trailer_magic_off - (2 * int(trailer_align))
+    resolved_vector_offset = _vector_table_offset(slot_bytes, vector_table_offset)
     vector = _vector_snapshot(
         slot_bytes,
-        slot_base=base,
+        slot_base=int(execution_base),
         slot_size=size,
         sram_start=sram_start,
         sram_end=sram_end,
-        vector_table_offset=vector_table_offset,
+        vector_table_offset=resolved_vector_offset,
     )
     return {
         "name": slot_name,
@@ -116,6 +132,7 @@ def _slot_state(
         "size": size,
         "bytes": slot_bytes,
         "vector": vector,
+        "vector_table_offset": resolved_vector_offset,
         "magic_state": _magic_state(slot_bytes[trailer_magic_off:trailer_magic_off + 16]),
         "image_ok": _flag_state(_read_u32_le(slot_bytes, image_ok_off)),
         "copy_done": _flag_state(_read_u32_le(slot_bytes, copy_done_off)),
@@ -130,14 +147,22 @@ def should_use_execute_mode(
     if fault_address is None:
         return True
     trailer_window = int(slot_config.get("trailer_window", 4096))
+    matched_slot = False
     for slot_info in slot_config.get("slots", {}).values():
         base = int(slot_info["base"])
         size = int(slot_info["size"])
+        if not (base <= int(fault_address) < base + size):
+            continue
+        matched_slot = True
         trailer_start = base + max(0, size - trailer_window)
         trailer_end = base + size
         if trailer_start <= int(fault_address) < trailer_end:
             return True
-    return False
+    if matched_slot:
+        return False
+    # Scratch, bootloader, and other non-slot writes can influence recovery
+    # but are not represented by this two-slot evaluator.
+    return True
 
 
 def _predict_final_source(exec_slot: Mapping[str, Any], staging_slot: Mapping[str, Any]) -> str:
@@ -182,6 +207,7 @@ def predict_boot_outcome(
         flash_base=flash_base,
         slot_name="exec",
         slot_info=slots["exec"],
+        execution_base=int(slots["exec"]["base"]),
         sram_start=int(slot_config["sram_start"]),
         sram_end=int(slot_config["sram_end"]),
         vector_table_offset=vector_table_offset,
@@ -192,6 +218,7 @@ def predict_boot_outcome(
         flash_base=flash_base,
         slot_name="staging",
         slot_info=slots["staging"],
+        execution_base=int(slots["exec"]["base"]),
         sram_start=int(slot_config["sram_start"]),
         sram_end=int(slot_config["sram_end"]),
         vector_table_offset=vector_table_offset,
@@ -201,7 +228,7 @@ def predict_boot_outcome(
     final_source = _predict_final_source(exec_slot, staging_slot)
     final_slot = exec_slot if final_source == "exec" else staging_slot
     final_vector = final_slot["vector"]
-    actual_vtor = int(slots["exec"]["base"]) if final_vector["valid"] else 0
+    actual_vtor = int(final_vector["vector_base"]) if final_vector["valid"] else 0
     boot_slot = "exec" if final_vector["valid"] else None
     vtor_ok = boot_slot == "exec"
     vtor_aligned = actual_vtor == 0 or (actual_vtor % 128 == 0)
@@ -266,6 +293,8 @@ def predict_boot_outcome(
         "state_evaluator_exec_copy_done": exec_slot["copy_done"],
         "state_evaluator_exec_image_ok": exec_slot["image_ok"],
         "state_evaluator_staging_magic_state": staging_slot["magic_state"],
+        "state_evaluator_exec_vector_offset": exec_slot["vector_table_offset"],
+        "state_evaluator_staging_vector_offset": staging_slot["vector_table_offset"],
         "trace_replay_mode": "state_evaluator",
     }
     if hash_result is not None:
@@ -279,4 +308,3 @@ def predict_boot_outcome(
         "boot_slot": boot_slot,
         "signals": signals,
     }
-

@@ -10818,10 +10818,11 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
     #
     # Returns the result dict from the runner.
     parts = None  # IronPython requires pre-declaration for locals used in multiple if-branches
-    # A clean control has no fault provenance to replay.  Route it straight
-    # through normal execute mode and never let writeback validation turn it
-    # into a synthetic write-fault result.
-    if _is_clean_control_fault_point(fp):
+    # A writeback control has no fault provenance to replay.  Route it through
+    # normal execute mode and never let writeback validation turn it into a
+    # synthetic write-fault result.  Non-writeback controls must retain their
+    # selected evaluator (including state-mode self-tests).
+    if writeback_active() and _is_clean_control_fault_point(fp):
         return run_execute_fault(fp, fault_type='control')
     base_ft = _base_fault_type_code(ft)
     if writeback_active() and is_unsupported_writeback_fault_type(ft):

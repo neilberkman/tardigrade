@@ -14,6 +14,35 @@ from typing import Any, Dict, List, Optional, Tuple
 from fault_inject import MetadataFaultRegion
 
 
+def flash_base_for_profile(profile: Any) -> int:
+    """Return the address corresponding to backend trace offset zero.
+
+    Runtime flash traces are relative to the backing peripheral, not to the
+    first application slot.  The bootloader entry is the canonical backing
+    base for ordinary profiles.  Profiles with an explicit address map trace
+    shared backing offsets directly, so their unmapped fallback base is zero.
+    """
+    memory = profile.memory
+    if getattr(memory, "trace_address_map", None):
+        return 0
+
+    candidates = [int(profile.bootloader_entry)]
+    candidates.extend(int(slot.base) for slot in memory.slots.values())
+
+    bootloader_region = getattr(profile, "bootloader_region", None)
+    if bootloader_region is not None:
+        candidates.append(int(bootloader_region.base))
+    candidates.extend(
+        int(region.base)
+        for region in getattr(memory, "erase_regions", ()) or ()
+    )
+    candidates.extend(
+        int(region.base)
+        for region in getattr(memory, "postmortem_partitions", ()) or ()
+    )
+    return min(candidates)
+
+
 def _parse_optional_int(value: Any) -> Optional[int]:
     text = str(value).strip()
     if not text:

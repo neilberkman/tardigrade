@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import sys
 import tempfile
 import textwrap
@@ -40,6 +41,22 @@ def _make_slot_image(slot_base: int, slot_size: int, marker_value: int, fill: in
     return bytes(image)
 
 
+def _make_headered_slot_image(
+    execution_base: int,
+    slot_size: int,
+    marker_value: int,
+    fill: int,
+) -> bytes:
+    data_size = slot_size - 4096
+    image = bytearray([fill & 0xFF] * data_size)
+    image[0:4] = (0x96F3B83D).to_bytes(4, "little")
+    image[8:10] = (0x200).to_bytes(2, "little")
+    image[0x14:0x18] = int(marker_value).to_bytes(4, "little")
+    image[0x200:0x204] = (0x20008000).to_bytes(4, "little")
+    image[0x204:0x208] = (execution_base + 0x301).to_bytes(4, "little")
+    return bytes(image)
+
+
 class MCUbootStateEvaluatorModuleTest(unittest.TestCase):
     def test_bulk_point_predicts_successful_resume_into_staging_image(self) -> None:
         module = _load_state_evaluator()
@@ -50,7 +67,7 @@ class MCUbootStateEvaluatorModuleTest(unittest.TestCase):
         flash_size = (staging_base + slot_size) - flash_base
         flash = bytearray([0xFF] * flash_size)
         exec_image = _make_slot_image(exec_base, slot_size, 0x11111111, 0x11)
-        staging_image = _make_slot_image(staging_base, slot_size, 0x22222222, 0x22)
+        staging_image = _make_slot_image(exec_base, slot_size, 0x22222222, 0x22)
         flash[0:len(exec_image)] = exec_image
         stage_off = staging_base - flash_base
         flash[stage_off:stage_off + len(staging_image)] = staging_image
@@ -90,8 +107,69 @@ class MCUbootStateEvaluatorModuleTest(unittest.TestCase):
         self.assertEqual(result["signals"]["marker_actual"], "0x22222222")
         self.assertEqual(result["signals"]["trace_replay_mode"], "state_evaluator")
 
+    def test_header_size_and_exec_link_address_are_used_for_staging_image(self) -> None:
+        module = _load_state_evaluator()
+        flash_base = 0x08000000
+        exec_base = 0x08008000
+        staging_base = 0x08108000
+        slot_size = 0x4000
+        flash = bytearray([0xFF] * ((staging_base + slot_size) - flash_base))
+        exec_image = _make_headered_slot_image(exec_base, slot_size, 0x00000100, 0x11)
+        staging_image = _make_headered_slot_image(exec_base, slot_size, 0x00000101, 0x22)
+        exec_off = exec_base - flash_base
+        staging_off = staging_base - flash_base
+        flash[exec_off:exec_off + len(exec_image)] = exec_image
+        flash[staging_off:staging_off + len(staging_image)] = staging_image
+        magic_base = staging_off + slot_size - 16
+        flash[magic_base:magic_base + 16] = module.MCUBOOT_GOOD_MAGIC
+
+        slot_config = {
+            "flash_base": flash_base,
+            "slots": {
+                "exec": {"base": exec_base, "size": slot_size},
+                "staging": {"base": staging_base, "size": slot_size},
+            },
+            "sram_start": 0x20000000,
+            "sram_end": 0x20040000,
+            "vector_table_offset": 0,
+            "trailer_align": 8,
+            "trailer_window": 4096,
+            "page_size": 4096,
+            "pad_byte": 0xFF,
+            "marker_address": exec_base + 0x14,
+            "marker_value": 0x00000101,
+            "image_hash": False,
+            "image_hash_slot": "",
+        }
+
+        result = module.predict_boot_outcome(bytes(flash), slot_config)
+        self.assertEqual(result["boot_outcome"], "success")
+        self.assertEqual(result["signals"]["vtor"], "0x08008200")
+        self.assertEqual(result["signals"]["pc"], "0x08008300")
+        self.assertEqual(result["signals"]["state_evaluator_staging_vector_offset"], 0x200)
+        self.assertTrue(module.should_use_execute_mode(0x0805FFD8, slot_config))
+
+    def test_overlapping_slot_matches_check_every_trailer(self) -> None:
+        module = _load_state_evaluator()
+        slot_config = {
+            "trailer_window": 0x100,
+            "slots": {
+                # The second interval overlaps the first and contains the
+                # address in its trailer window.
+                "first": {"base": 0x1000, "size": 0x1000},
+                "second": {"base": 0x1800, "size": 0x1000},
+            },
+        }
+        self.assertTrue(module.should_use_execute_mode(0x1FF0, slot_config))
+        self.assertFalse(module.should_use_execute_mode(0x1100, slot_config))
 
 class MCUbootStateEvaluatorSweepRoutingTest(unittest.TestCase):
+    def test_runtime_sweep_requires_explicit_state_evaluator_opt_in(self) -> None:
+        parameter = inspect.signature(run_runtime_sweep).parameters[
+            "allow_state_evaluator"
+        ]
+        self.assertIs(parameter.default, False)
+
     def test_run_runtime_sweep_splits_bulk_points_to_state_evaluator(self) -> None:
         exec_base = 0x08020000
         staging_base = 0x08022000
@@ -102,15 +180,19 @@ class MCUbootStateEvaluatorSweepRoutingTest(unittest.TestCase):
             exec_image = tempdir / "exec.bin"
             staging_image = tempdir / "staging.bin"
             exec_image.write_bytes(_make_slot_image(exec_base, slot_size, 0x11111111, 0x11))
-            staging_image.write_bytes(_make_slot_image(staging_base, slot_size, 0x22222222, 0x22))
+            staging_image.write_bytes(_make_slot_image(exec_base, slot_size, 0x22222222, 0x22))
             trace_file = tempdir / "trace.csv"
             trace_file.write_text(
                 "write_index,flash_offset,value\n"
-                "{},256,305419896\n"
-                "{},{},2271560481\n".format(
+                "{},{},305419896\n"
+                "{},{},2271560481\n"
+                "{},{},305419896\n".format(
                     1,
+                    (exec_base - 0x08000000) + 256,
                     2,
-                    (staging_base - exec_base) + slot_size - 4,
+                    (staging_base - 0x08000000) + slot_size - 4,
+                    3,
+                    (exec_base - 0x08000000) + 512,
                 ),
                 encoding="utf-8",
             )
@@ -150,7 +232,7 @@ class MCUbootStateEvaluatorSweepRoutingTest(unittest.TestCase):
                     fault_sweep:
                       mode: runtime
                       evaluation_mode: execute
-                      max_writes: 2
+                      max_writes: 3
                       fault_types: [power_loss]
                     """
                 ).strip()
@@ -164,7 +246,7 @@ class MCUbootStateEvaluatorSweepRoutingTest(unittest.TestCase):
                 return_value=[
                     {
                         "fault_at": 1,
-                        "fault_type": "w",
+                        "fault_type": "w:sp",
                         "fault_injected": True,
                         "boot_outcome": "success",
                         "boot_slot": "exec",
@@ -177,20 +259,23 @@ class MCUbootStateEvaluatorSweepRoutingTest(unittest.TestCase):
                     renode_test="renode-test",
                     robot_suite="tests/ota_fault_point.robot",
                     profile=profile,
-                    fault_points=[0, 1],
+                    fault_points=[0, 1, 2],
                     robot_vars=[],
                     work_dir=tempdir / "work",
                     renode_remote_server_dir="",
                     include_control=False,
                     evaluation_mode="execute",
                     trace_file=str(trace_file),
-                    fault_types_list=["w", "w"],
+                    fault_types_list=["w", "w:sp", "w:sp"],
+                    allow_state_evaluator=True,
                 )
 
         mock_batch.assert_called_once()
-        self.assertEqual(mock_batch.call_args.kwargs["fault_points"], [1])
+        self.assertEqual(mock_batch.call_args.kwargs["fault_points"], [1, 2])
+        self.assertEqual(mock_batch.call_args.kwargs["fault_types_list"], ["w:sp", "w:sp"])
         state_eval_result = next(r for r in results if r.get("fault_at") == 0)
         self.assertEqual(state_eval_result["boot_outcome"], "success")
+        self.assertEqual(state_eval_result["fault_address"], "0x08020100")
         self.assertEqual(
             state_eval_result["signals"]["trace_replay_mode"],
             "state_evaluator",

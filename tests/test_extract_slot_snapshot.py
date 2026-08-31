@@ -23,6 +23,7 @@ from extract_slot_snapshot import (  # noqa: E402
     parse_span,
     span_to_pre_boot_state,
 )
+from profile_loader import load_profile  # noqa: E402
 
 
 class ExtractSlotSnapshotTest(unittest.TestCase):
@@ -44,6 +45,11 @@ class ExtractSlotSnapshotTest(unittest.TestCase):
         snapshot = bytes([0xAA]) * 0x1000 + bytes([0x11]) * 0x1000 + bytes([0xBB]) * 0x1000 + bytes([0x22]) * 0x1000
         self.assertEqual(extract_slot_bytes(profile, snapshot, "exec"), bytes([0x11]) * 0x1000)
         self.assertEqual(extract_slot_bytes(profile, snapshot, "staging"), bytes([0x22]) * 0x1000)
+
+    def test_stm32_trace_base_is_bootloader_base_not_first_slot(self) -> None:
+        profile = load_profile(ROOT / "profiles/mcuboot_head_scratch_stm32f4_upgrade.yaml")
+        self.assertEqual(profile.memory.slots["exec"].base, 0x08008000)
+        self.assertEqual(flash_base_for_profile(profile), 0x08000000)
 
     def test_extract_slots_writes_selected_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
