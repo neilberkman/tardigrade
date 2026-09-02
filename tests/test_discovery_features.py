@@ -1706,8 +1706,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             def fake_run(cmd, *, cwd, env, timeout_s):
                 observed_timeouts.append(timeout_s)
                 self.assertIn("TEST_TIMEOUT:45 minutes", cmd)
-                self.assertIn("--test-timeout", cmd)
-                self.assertIn("2700s", cmd)
+                self.assertNotIn("--test-timeout", cmd)
                 result_token = next(
                     cmd[i + 1]
                     for i, token in enumerate(cmd[:-1])
@@ -1811,8 +1810,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             def fake_run(cmd, *, cwd, env, timeout_s):
                 observed_timeouts.append(timeout_s)
                 self.assertIn("TEST_TIMEOUT:10 minutes", cmd)
-                self.assertIn("--test-timeout", cmd)
-                self.assertIn("600s", cmd)
+                self.assertNotIn("--test-timeout", cmd)
                 result_token = next(
                     cmd[i + 1]
                     for i, token in enumerate(cmd[:-1])
@@ -2490,8 +2488,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 # used by run_single_point(), even for a one-point batch.
                 observed_timeouts.append(timeout_s)
                 self.assertIn("TEST_TIMEOUT:10 minutes", cmd)
-                timeout_index = cmd.index("--test-timeout")
-                self.assertEqual(cmd[timeout_index + 1], "600s")
+                self.assertNotIn("--test-timeout", cmd)
                 rf_results = Path(cmd[cmd.index("--results-dir") + 1])
                 rf_results.mkdir(parents=True, exist_ok=True)
                 result_var = next(
