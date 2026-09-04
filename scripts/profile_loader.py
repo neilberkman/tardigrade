@@ -482,7 +482,7 @@ class Phase2FaultConfig:
         max_points: int = 0,
     ) -> None:
         self.enabled = enabled
-        self.fault_types = fault_types or ["power_loss"]
+        self.fault_types = ["power_loss"] if fault_types is None else list(fault_types)
         self.max_points = max(0, int(max_points))
         if self.max_points > MAX_PROFILE_FAULT_POINTS:
             raise ProfileError(
@@ -504,7 +504,7 @@ class HookFaultConfig:
         max_points: int = 0,
     ) -> None:
         self.enabled = enabled
-        self.fault_types = fault_types or ["power_loss"]
+        self.fault_types = ["power_loss"] if fault_types is None else list(fault_types)
         self.max_points = max(0, int(max_points))
         if self.max_points > MAX_PROFILE_FAULT_POINTS:
             raise ProfileError(
@@ -545,7 +545,7 @@ class ConfirmCycleConfig:
         self.confirm_function = confirm_function
         self.post_confirm_assertions = post_confirm_assertions or []
         self.expected_ratchet_version = expected_ratchet_version
-        self.fault_types = fault_types or ["power_loss"]
+        self.fault_types = ["power_loss"] if fault_types is None else list(fault_types)
         self.max_points = max(0, int(max_points))
         if self.max_points > MAX_PROFILE_FAULT_POINTS:
             raise ProfileError(
@@ -797,7 +797,7 @@ class MetadataFaultConfig:
         fault_types: Optional[List[str]] = None,
     ) -> None:
         self.enabled = enabled
-        self.fault_types = fault_types or ["power_loss"]
+        self.fault_types = ["power_loss"] if fault_types is None else list(fault_types)
 
 
 class MetadataDeltaFieldConfig:
@@ -1499,7 +1499,7 @@ class FaultSweepConfig:
                 "fault_sweep.phase2_wall_timeout_s: expected positive number"
             )
         self.phase2_wall_timeout_s = phase2_wall_timeout_s
-        self.fault_types = fault_types or ["power_loss"]
+        self.fault_types = ["power_loss"] if fault_types is None else list(fault_types)
         self.evaluation_mode = evaluation_mode
         self.sweep_strategy = sweep_strategy
         self.sweep_hash_bypass_symbols = sweep_hash_bypass_symbols or []
@@ -1769,7 +1769,7 @@ class UpdatePhase:
             else max(1, int(expected_rollback_at_cycle))
         )
         self.fault_injection = bool(fault_injection)
-        self.fault_types = fault_types or ["power_loss"]
+        self.fault_types = ["power_loss"] if fault_types is None else list(fault_types)
 
 
 class InitialStateConfig:
@@ -3587,8 +3587,9 @@ def _parse_fault_sweep(
         if not partial_staging_enabled:
             partial_staging = None
     fault_types = _normalize_fault_types(
-        raw.get("fault_types", ["power_loss"]),
+        raw.get("fault_types"),
         "fault_sweep.fault_types",
+        allow_empty=True,
     )
     eval_mode = raw.get("evaluation_mode")
     if eval_mode is not None:
@@ -5498,11 +5499,16 @@ def _parse_update_trigger(raw: Optional[Any]) -> Optional[UpdateTrigger]:
     return trigger
 
 
-def _normalize_fault_types(raw: Any, field_name: str) -> List[str]:
+def _normalize_fault_types(
+    raw: Any,
+    field_name: str,
+    *,
+    allow_empty: bool = False,
+) -> List[str]:
     if raw is None:
         fault_types = ["power_loss"]
     elif isinstance(raw, list):
-        if not raw:
+        if not raw and not allow_empty:
             raise ProfileError("{}: expected non-empty list".format(field_name))
         fault_types = [str(ft) for ft in raw]
     else:

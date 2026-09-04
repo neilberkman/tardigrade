@@ -213,7 +213,7 @@ For real NuttX nxboot artifacts, the runtime profile generator exposes the
 - id: tardigrade
   uses: neilberkman/tardigrade@<reviewed-commit-sha>
   with:
-    profile: profiles/mcuboot_swap_current.yaml
+    profile: path/to/your/profile.yaml
     quick: false
     workers: 2
 ```

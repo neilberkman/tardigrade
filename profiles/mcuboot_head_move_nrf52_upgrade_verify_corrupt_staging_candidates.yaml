@@ -26,11 +26,10 @@ update_trigger:
 success_criteria:
   vtor_in_slot: exec
   image_hash: true
-  expected_image: staging
+  expected_image: exec
 expect:
   should_find_issues: false
-  control_outcome: wrong_image
-  allow_control_only_issues: true
+  control_outcome: success
 fault_sweep:
   mode: runtime
   evaluation_mode: execute

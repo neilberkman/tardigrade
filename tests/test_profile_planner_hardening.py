@@ -75,6 +75,29 @@ fault_sweep:
 """
             )
 
+    def test_explicit_empty_main_fault_types_disable_write_faults(self) -> None:
+        profile = self._load(
+            """
+fault_sweep:
+  mode: runtime
+  max_writes: 8
+  fault_types: []
+  boot_cycles: 3
+  boot_cycle_hook: examples/esp_idf_ota/hooks/confirm_pending_verify.py
+  hook_fault:
+    enabled: true
+    fault_types: [power_loss]
+    max_points: 2
+"""
+        )
+        self.assertEqual(profile.fault_sweep.fault_types, [])
+        plan = build_fault_plan(
+            profile,
+            CalibrationInputs(max_writes=8),
+            quick=False,
+        )
+        self.assertEqual(plan.fault_types_list, ["h:0:w", "h:1:w"])
+
     def test_profile_name_accepts_safe_identifier_punctuation(self) -> None:
         profile = self._load('name: "Release-1.2_alpha"')
         self.assertEqual(profile.name, "Release-1.2_alpha")

@@ -2153,6 +2153,7 @@ def _main_single() -> int:
             fault_step=args.fault_step,
             fault_start=fault_start,
             fault_end=fault_end,
+            repo_root=repo_root,
         )
         fault_points = plan.fault_points
         fault_types_list = plan.fault_types_list

@@ -50,6 +50,14 @@ class RuntimeFaultSweepCalibrationTests(unittest.TestCase):
                 self.assertFalse(allowed(reason, True, True))
         self.assertFalse(allowed("vtor_captured", False, True))
 
+    def test_semantic_trace_modes_request_phase2_after_vtor_capture(self) -> None:
+        """Erase and mixed selectors retain the trace their planner consumes."""
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "writeback_active() or fault_types_mode in ('erase', 'both')",
+            text,
+        )
+
     def test_fine_trace_enables_address_tracking_for_accurate_pg_backends(self) -> None:
         tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
         function = next(

@@ -1897,14 +1897,21 @@ Build the public, digest-pinned image from the repository root with
 
 ### Self-test
 
-`scripts/self_test.py` runs the full defect corpus — all profiles with `skip_self_test: false` — and verifies each one matches its `expect` block:
+`scripts/self_test.py` runs the default defect corpus and verifies each profile
+matches its `expect` block. When `scripts/self_test_runtime_manifest.json`
+contains `self_test_profiles`, that list is the default corpus. Otherwise the
+legacy fallback is every profile with `skip_self_test: false`:
 
 ```bash
 python3 scripts/self_test.py \
     --renode-test /path/to/renode-test
 ```
 
-Profiles with `skip_self_test: true` are skipped (typically narrow-window or CI-only profiles that need pre-built assets).
+Profiles with `skip_self_test: true` are skipped (typically narrow-window,
+campaign, or CI-only profiles that need pre-built assets or produce
+inconclusive coverage under quick self-test budgets). Runtime costs in the
+manifest may include historical or campaign profiles that are not in the
+default corpus.
 
 ### Calibration caching
 

@@ -1907,6 +1907,7 @@ def run_multi_component_sweep(
             fault_step=max(1, fault_step),
             fault_start=fault_start,
             fault_end=fault_end,
+            repo_root=repo_root,
         )
         fault_points = component_plan.fault_points
         fault_types_list = component_plan.fault_types_list

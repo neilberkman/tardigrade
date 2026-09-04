@@ -179,11 +179,11 @@ class HookFaultProfileLoadTest(unittest.TestCase):
         profile = load_profile(HOOK_FAULT_PROFILE)
         self.assertGreaterEqual(profile.fault_sweep.boot_cycles, 3)
 
-    def test_not_skipped_in_self_test(self):
-        """The hook_fault profile should be included in self-test runs."""
-        from profile_loader import load_profile_raw
-        raw = load_profile_raw(HOOK_FAULT_PROFILE)
-        self.assertFalse(raw.get("skip_self_test", False))
+    def test_hook_profile_is_campaign_only_by_default(self):
+        """The hook_fault profile loads but is not in the default self-test corpus."""
+        from self_test import discover_profiles
+        discovered = {p.name for p in discover_profiles(ROOT)}
+        self.assertNotIn(HOOK_FAULT_PROFILE.name, discovered)
 
 
 class HookFaultPlanGenerationTest(unittest.TestCase):

@@ -22,6 +22,7 @@ from self_test import (
     build_detailed_result,
     check_verdict,
     discover_profiles,
+    load_self_test_profile_names,
     load_runtime_manifest,
     partition_profiles_by_estimated_cost,
     partition_profiles_round_robin,
@@ -35,7 +36,10 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
     def test_runtime_manifest_matches_discovered_profiles(self):
         discovered = {path.name for path in discover_profiles(ROOT)}
         _default_cost_s, profile_costs = load_runtime_manifest(ROOT)
-        self.assertEqual(set(profile_costs), discovered)
+        allowlist = load_self_test_profile_names(ROOT)
+        self.assertIsNotNone(allowlist)
+        self.assertEqual(allowlist, discovered)
+        self.assertTrue(discovered.issubset(set(profile_costs)))
 
     def test_runtime_manifest_assigns_known_outlier_costs(self):
         default_cost_s, profile_costs = load_runtime_manifest(ROOT)
@@ -116,9 +120,9 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertNotIn("mcuboot_head_move_nrf52_seccounter_downgrade_rc_injection.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_nrf52_upgrade.yaml", discovered)
         self.assertNotIn("mcuboot_head_move_nrf52_upgrade_extended_selftest.yaml", discovered)
-        self.assertIn("mcuboot_head_move_nrf52_verify_instruction_skip.yaml", discovered)
-        self.assertIn("mcuboot_pr2199_move_broken.yaml", discovered)
-        self.assertIn("mcuboot_pr2199_move_fixed.yaml", discovered)
+        self.assertNotIn("mcuboot_head_move_nrf52_verify_instruction_skip.yaml", discovered)
+        self.assertNotIn("mcuboot_pr2199_move_broken.yaml", discovered)
+        self.assertNotIn("mcuboot_pr2199_move_fixed.yaml", discovered)
         self.assertNotIn("mcuboot_pr2214_offset_geom_broken.yaml", discovered)
         self.assertNotIn("mcuboot_pr2214_offset_geom_fixed.yaml", discovered)
         self.assertNotIn("mcuboot_pr2206_scratch_geom_broken.yaml", discovered)
@@ -135,7 +139,7 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertNotIn("mcuboot_head_scratch_stm32f4_fast_upgrade.yaml", discovered)
         self.assertIn("fault_copy_before_validate_selftest.yaml", discovered)
         self.assertIn("fault_staging_overlap_selftest.yaml", discovered)
-        self.assertIn("mcuboot_head_move_nrf52_revert_extended_selftest.yaml", discovered)
+        self.assertNotIn("mcuboot_head_move_nrf52_revert_extended_selftest.yaml", discovered)
         self.assertIn("mcuboot_head_move_nrf52_revert_rc_injection_selftest.yaml", discovered)
         self.assertIn("mcuboot_head_move_nrf52_revert_write_faults_selftest.yaml", discovered)
         self.assertIn("fault_no_crc_selftest.yaml", discovered)
@@ -797,9 +801,19 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertEqual(reason, "Clean control result is missing")
 
-    def test_corrupted_staging_skip_profiles_expect_clean_rejection(self):
+    def test_corrupted_staging_skip_profile_control_expectations(self):
+        candidate = yaml.safe_load(
+            (
+                ROOT
+                / "profiles"
+                / "mcuboot_head_move_nrf52_upgrade_verify_corrupt_staging_candidates.yaml"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(candidate["success_criteria"]["expected_image"], "exec")
+        self.assertEqual(candidate["expect"]["control_outcome"], "success")
+        self.assertNotIn("allow_control_only_issues", candidate["expect"])
+
         for name in (
-            "mcuboot_head_move_nrf52_upgrade_verify_corrupt_staging_candidates.yaml",
             "mcuboot_head_move_nrf52_upgrade_verify_corrupt_staging_critical.yaml",
             "mcuboot_head_move_nrf52_upgrade_verify_corrupt_staging_full.yaml",
         ):

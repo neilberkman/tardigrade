@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fault_inject import apply_clustered_distribution
@@ -532,6 +533,7 @@ def build_fault_plan(
     fault_step: int = 1,
     fault_start: Optional[int] = None,
     fault_end: Optional[int] = None,
+    repo_root: Optional[Path] = None,
 ) -> FaultPlan:
     """Build the full combinatorial fault plan from profile + calibration.
 
@@ -569,7 +571,7 @@ def build_fault_plan(
     erase_trace_file = calibration.erase_trace_file
 
     fault_types = list(getattr(profile.fault_sweep, "fault_types", []) or [])
-    include_power_loss = "power_loss" in fault_types or not fault_types
+    include_power_loss = "power_loss" in fault_types
     include_swap_progress = "swap_progress" in fault_types
     include_security_state_erase = "security_state_erase" in fault_types
     include_erases = (
@@ -1075,6 +1077,8 @@ def build_fault_plan(
                 literal_pools: set = set()
                 read_halfword = None
                 elf_path = profile.bootloader_elf
+                if elf_path and repo_root is not None:
+                    elf_path = profile.resolve_path(repo_root, elf_path)
                 if elf_path:
                     try:
                         read_halfword = make_elf_halfword_reader(elf_path)

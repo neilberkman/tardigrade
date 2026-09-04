@@ -617,6 +617,66 @@ class InstructionSkipPlannerRangeFilterTest(unittest.TestCase):
         self.assertEqual(plan.fault_points, [0x10000048, 0x1000004A])
         self.assertEqual(plan.fault_types_list, ["i:0x10000048", "i:0x1000004A"])
 
+    def test_relative_elf_resolves_against_repo_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            relative_elf = Path("consumer-assets") / "bootloader.elf"
+            expected_elf = repo_root / relative_elf
+            expected_elf.parent.mkdir()
+            expected_elf.touch()
+            profile_path = repo_root / "profile.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    schema_version: 1
+                    name: instruction_skip_relative_elf_profile
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    flash_backend: faultFlash
+                    bootloader:
+                      elf: {relative_elf}
+                      entry: 0x10000000
+                    memory:
+                      sram: {{ start: 0x20000000, end: 0x20020000 }}
+                      write_granularity: 4
+                      slots:
+                        primary: {{ base: 0x10000000, size: 0x1000 }}
+                        staging: {{ base: 0x10001000, size: 0x1000 }}
+                    fault_sweep:
+                      fault_types: [instruction_skip]
+                      evaluation_mode: execute
+                      instruction_skip_config:
+                        include_literal_pools: false
+                        target_addresses:
+                          - {{ start: 0x1000, end: 0x1004 }}
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            profile = load_profile(profile_path)
+
+            with (
+                mock.patch(
+                    "fault_plan.make_elf_halfword_reader",
+                    return_value=None,
+                ) as reader,
+                mock.patch(
+                    "thumb_classify.find_literal_pools",
+                    return_value=set(),
+                ) as literal_pools,
+            ):
+                build_fault_plan(
+                    profile,
+                    CalibrationInputs(max_writes=0),
+                    repo_root=repo_root,
+                )
+
+            reader.assert_called_once_with(str(expected_elf))
+            literal_pools.assert_called_once_with(
+                str(expected_elf),
+                [(0x1000, 0x1004)],
+            )
+
 
 class InstructionSkipQuickSamplingTest(unittest.TestCase):
     EXAMPLE_ELF = ROOT / "examples" / "vulnerable_ota" / "firmware.elf"

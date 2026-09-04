@@ -10961,16 +10961,17 @@ _CALIBRATION_TRACE_COMPLETION_REASONS = frozenset((
 
 
 def _calibration_phase2_trace_allowed(
-        phase1_reason, trace_capable, writeback_replay_required=False):
-    """Allow fine tracing after completion, with writeback-specific capture."""
+        phase1_reason, trace_capable, semantic_trace_required=False):
+    """Allow fine tracing when a campaign needs address-bearing evidence."""
     reason = str(phase1_reason or '')
     if not trace_capable:
         return False
     if reason == 'vtor_captured':
         # Direct-durability campaigns historically stop at the coarse VTOR
-        # observation.  Writeback replay needs a fine trace of that successful
-        # boot, so enable this reason only for that mode.
-        return bool(writeback_replay_required)
+        # observation.  Writeback replay and semantic write/erase selectors
+        # need a fine trace of that successful boot, so enable phase 2 when
+        # either kind of campaign explicitly requested trace capture.
+        return bool(semantic_trace_required)
     return reason in _CALIBRATION_TRACE_COMPLETION_REASONS
 
 
@@ -11061,8 +11062,11 @@ if calibration_mode:
         # Only skip phase 2 for backends that don't support write trace (mram).
         trace_capable = backend['kind'] == 'fast'
 
+        semantic_trace_required = (
+            writeback_active() or fault_types_mode in ('erase', 'both')
+        )
         if _calibration_phase2_trace_allowed(
-                phase1_reason, trace_capable, writeback_active()):
+                phase1_reason, trace_capable, semantic_trace_required):
             # Phase 2: Reset and re-run with fine slices, bounded by phase 1 time.
             fine_margin_s = max(1.0, phase1_emulated_s * 0.2)
             fine_budget_s = phase1_emulated_s + fine_margin_s

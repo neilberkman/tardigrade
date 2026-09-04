@@ -49,10 +49,10 @@ class WS3ProfileConfigTests(unittest.TestCase):
                 )
                 self.assertEqual(profile.fault_sweep.multi_fault.max_pairs, 100)
 
-    def test_selftest_profiles_are_discoverable(self) -> None:
+    def test_phase2_and_multifault_smokes_are_campaign_only(self) -> None:
         discovered = {path.name for path in discover_profiles(ROOT)}
-        self.assertIn(MOVE_P2_SELFTEST.name, discovered)
-        self.assertIn(MOVE_MF_SELFTEST.name, discovered)
+        self.assertNotIn(MOVE_P2_SELFTEST.name, discovered)
+        self.assertNotIn(MOVE_MF_SELFTEST.name, discovered)
         self.assertNotIn(MOVE_P2.name, discovered)
         self.assertNotIn(MOVE_MF.name, discovered)
         raw = load_profile_raw(MOVE_P2_SELFTEST)

@@ -214,6 +214,56 @@ def load_runtime_manifest(
     return default_cost_s, profile_costs
 
 
+def load_self_test_profile_names(
+    repo_root: Path,
+    manifest_path: Optional[str] = None,
+) -> Optional[set[str]]:
+    """Load the optional explicit self-test profile allowlist.
+
+    Older manifests did not contain this field; in that case discovery keeps
+    the legacy behavior of running every profile that is not marked
+    ``skip_self_test``.  When present, the allowlist is authoritative for the
+    default self-test corpus while per-profile runtime costs may remain a
+    historical superset.
+    """
+    path = Path(manifest_path or DEFAULT_SELF_TEST_RUNTIME_MANIFEST)
+    if not path.is_absolute():
+        path = (repo_root / path).resolve()
+    if not path.exists():
+        return None
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw_names = payload.get("self_test_profiles")
+    if raw_names is None:
+        return None
+    if not isinstance(raw_names, list):
+        raise ValueError("self-test runtime manifest self_test_profiles must be a list")
+
+    names: set[str] = set()
+    for idx, raw_name in enumerate(raw_names):
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValueError(
+                "self-test runtime manifest self_test_profiles[{}] must be a non-empty string".format(
+                    idx
+                )
+            )
+        name = raw_name.strip()
+        if "/" in name or "\\" in name or not name.endswith(".yaml"):
+            raise ValueError(
+                "self-test runtime manifest self_test_profiles[{}] must be a profile filename".format(
+                    idx
+                )
+            )
+        if name in names:
+            raise ValueError(
+                "self-test runtime manifest self_test_profiles contains duplicate {}".format(
+                    name
+                )
+            )
+        names.add(name)
+    return names
+
+
 def estimate_profile_cost(
     profile_path: Path,
     profile_costs: Dict[str, float],
@@ -288,18 +338,22 @@ def shard_costs_s(
 
 
 def discover_profiles(repo_root: Path) -> List[Path]:
-    """Find all testable .yaml profiles (excludes skip_self_test)."""
+    """Find default self-test profiles."""
     profiles_dir = repo_root / "profiles"
     if not profiles_dir.is_dir():
         return []
+    allowlist = load_self_test_profile_names(repo_root)
     profiles = []
     for p in sorted(profiles_dir.glob("*.yaml")):
         try:
             raw = load_profile_raw(p)
         except Exception:
-            profiles.append(p)  # let main loop handle load errors
+            if allowlist is None or p.name in allowlist:
+                profiles.append(p)  # let main loop handle load errors
             continue
         if not raw.get("skip_self_test", False):
+            if allowlist is not None and p.name not in allowlist:
+                continue
             profiles.append(p)
     return profiles
 
