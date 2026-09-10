@@ -774,6 +774,13 @@ return does not violate the contract.
 
 Default is `heuristic` — classifies writes by address and samples densely near trailer/metadata regions, sparsely over bulk data. Override with `sweep_strategy: exhaustive` for full coverage (slower).
 
+An explicitly configured heuristic strategy requires an address-bearing write
+trace. Trace-capable fast backends perform a fine calibration rerun when the
+coarse pass stops at VTOR, while direct NVMemory backends record their first
+pass. A controller-only `nvm_ctrl` backend cannot provide this trace; select
+its direct NVMemory peripheral when available, or use an exhaustive sweep
+bounded with `--fault-step`.
+
 ### Hash bypass
 
 If your bootloader validates image hashes (SHA-256, CRC), the Phase 2 recovery boot spends most of its time in crypto. Bypass it for speed:

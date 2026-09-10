@@ -60,6 +60,7 @@ ${FAULT_TYPE_CSV}              ${EMPTY}
 ${BOOT_CYCLES}                 1
 ${VTOR_SETTLE_ITERS}           0
 ${TRACKING_START_ADDRESS}      0
+${HEURISTIC_TRACE_REQUIRED}    false
 ${CALIBRATION_TIME_SLICE}      ${EMPTY}
 ${PHASE1_TIME_SLICE}           ${EMPTY}
 ${PHASE2_TIME_SLICE}           ${EMPTY}
@@ -189,6 +190,7 @@ Run Runtime Fault Point
     Execute Command    $bootloader_entry=${BOOTLOADER_ENTRY}
     Execute Command    $sram_start=${SRAM_START}
     Execute Command    $sram_end=${SRAM_END}
+    Execute Command    $heuristic_trace_required=${HEURISTIC_TRACE_REQUIRED}
     Execute Command    $slot_exec_base=${SLOT_EXEC_BASE}
     Execute Command    $slot_exec_size=${SLOT_EXEC_SIZE}
     Execute Command    $slot_staging_base=${SLOT_STAGING_BASE}

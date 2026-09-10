@@ -19,7 +19,9 @@ description: >
   to the bootloader's own code region.
 
 platform: platforms/cortex_m0_nvm.repl
-flash_backend: nvm_ctrl
+# Select the direct NVMemory peripheral so calibration can export the
+# address-bearing trace required by the explicit heuristic strategy.
+flash_backend: nvm
 
 bootloader:
   elf: path/to/bootloader.elf

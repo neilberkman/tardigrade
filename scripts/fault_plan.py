@@ -17,6 +17,7 @@ from fault_types import FAULT_TYPE_NAME_TO_CODE
 from profile_loader import MAX_PROFILE_FAULT_POINTS, ProfileConfig, ProfileError
 from renode_runner import quick_subset
 from trace_utils import (
+    _trace_absolute_address,
     flash_base_for_profile,
     load_clean_erase_trace,
     load_clean_write_trace,
@@ -653,26 +654,21 @@ def build_fault_plan(
         )
 
         trace = load_trace(trace_file)
+        flash_base = flash_base_for_profile(profile)
         trace_address_map = getattr(profile.memory, "trace_address_map", None) or []
         if trace_address_map:
-            mapped_trace = []
-            for write_index, flash_offset in trace:
-                mapped_offset = flash_offset
-                for mapping in trace_address_map:
-                    if (
-                        int(mapping["offset_start"])
-                        <= flash_offset
-                        < int(mapping["offset_end"])
-                    ):
-                        mapped_offset = int(mapping["address_addend"]) + flash_offset
-                        break
-                mapped_trace.append((write_index, mapped_offset))
-            trace = mapped_trace
+            trace = [
+                (
+                    write_index,
+                    _trace_absolute_address(
+                        flash_offset, flash_base, trace_address_map
+                    ),
+                )
+                for write_index, flash_offset in trace
+            ]
         slot_ranges_for_heuristic: Dict[str, Tuple[int, int]] = {}
         for sname, sinfo in profile.memory.slots.items():
             slot_ranges_for_heuristic[sname] = (sinfo.base, sinfo.base + sinfo.size)
-        flash_base = flash_base_for_profile(profile)
-
         bl_region_for_heuristic = None
         if profile.bootloader_region is not None:
             bl = profile.bootloader_region

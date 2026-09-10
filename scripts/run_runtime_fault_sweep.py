@@ -339,7 +339,14 @@ def resolve_backend():
     # Classify the backend path.
     if 'otp' in backend_name.lower():
         kind = 'otp'
-    elif 'mram' in backend_name.lower():
+    elif (
+        'mram' in backend_name.lower()
+        or (
+            hasattr(backend_obj, 'EnforceWordWriteSemantics')
+            and hasattr(backend_obj, 'WordSize')
+            and not hasattr(backend_obj, 'Flash')
+        )
+    ):
         kind = 'mram'
     elif 'nvm_ctrl' in backend_name.lower():
         kind = 'slow'
@@ -585,6 +592,9 @@ def _machine_reset():
 # Read monitor variables.
 result_file = str(monitor.GetVariable('result_file'))
 calibration_mode = str(monitor.GetVariable('calibration_mode')).lower() in ('1', 'true', 'yes')
+heuristic_trace_required = get_optional_var(
+    'heuristic_trace_required', 'false'
+).lower() in ('1', 'true', 'yes')
 evaluation_mode = str(monitor.GetVariable('evaluation_mode')).strip().lower()
 if evaluation_mode not in ('execute', 'state'):
     evaluation_mode = 'state'
@@ -10274,6 +10284,24 @@ def _trace_replay_erase_region(image, offset, size, erase_fill):
         image[index] = fill
 
 
+def _trace_replay_mram_torn_value(value, width, erase_fill):
+    """Return the word persisted by NVMemory power loss mid-program."""
+    width = int(width)
+    if width not in (1, 2, 4, 8):
+        raise ValueError('MRAM torn replay requires a supported write width')
+    half = width // 2
+    fill = int(erase_fill) & 0xFF
+    torn = 0
+    for byte_index in range(width):
+        byte_value = (
+            (int(value) >> (8 * byte_index)) & 0xFF
+            if byte_index < half
+            else fill
+        )
+        torn |= byte_value << (8 * byte_index)
+    return torn
+
+
 def _trace_replay_keep_one_to_zero_transitions(old_word, new_word, keep_mask,
                                                value_mask=0xFFFFFFFF):
     bits_to_flip = old_word & ~new_word
@@ -10708,6 +10736,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     flash_ref = backend['data'] if backend['kind'] == 'mram' else backend['data'].Flash
 
     fault_snapshot_word = None
+    mram_power_loss_torn = False
 
     if is_non_power_write_fault:
         faulted_flash, fault_injected, fault_address, writes_applied, fault_snapshot_word = \
@@ -10767,6 +10796,18 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
             elif write_idx == fault_at + 1:
                 fault_injected = True
                 fault_address = flash_off + flash_base_addr
+                if backend['kind'] == 'mram':
+                    torn_value = _trace_replay_mram_torn_value(
+                        value, width, erase_fill
+                    )
+                    b = System.Array.CreateInstance(System.Byte, width)
+                    for byte_index in range(width):
+                        b[byte_index] = (
+                            torn_value >> (8 * byte_index)
+                        ) & 0xFF
+                    _replay_storage_write_bytes(flash_off, b)
+                    writes_applied += 1
+                    mram_power_loss_torn = True
                 break
 
         while erase_idx < len(pending_erases) and pending_erases[erase_idx][0] <= fault_at:
@@ -10839,6 +10880,8 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     signals['p2_iters'] = p2_status.get('iters')
     signals['total_ms'] = total_ms
     signals['trace_replay_mode'] = 'python'
+    if mram_power_loss_torn:
+        signals['trace_replay_power_loss_semantics'] = 'mram_torn_word'
     signals['multiboot_cycles_run'] = _multiboot_cycles_run
     merge_stop_status_signals(signals, 'phase2', p2_status)
     if is_non_power_write_fault:
@@ -11131,13 +11174,19 @@ if calibration_mode:
         # known boot time. This gives write-level trace precision for trace
         # replay while keeping calibration fast. For targets where phase 1
         # already takes the full budget (slow swap), this is a no-op.
-        trace_capable = all(hasattr(backend['data'], member) for member in (
-            'WriteTraceClear', 'WriteTraceEnabled', 'WriteTraceCount',
-            'WriteTraceToString',
-        ))
+        trace_capable = (
+            backend['kind'] in ('fast', 'mram')
+            and bool(getattr(backend['data'], 'WriteTraceWidthExplicit', False))
+            and all(hasattr(backend['data'], member) for member in (
+                'WriteTraceClear', 'WriteTraceEnabled', 'WriteTraceCount',
+                'WriteTraceToString',
+            ))
+        )
 
         semantic_trace_required = (
-            writeback_active() or fault_types_mode in ('erase', 'both')
+            writeback_active()
+            or fault_types_mode in ('erase', 'both')
+            or (heuristic_trace_required and backend['kind'] == 'fast')
         )
         if _calibration_phase2_trace_allowed(
                 phase1_reason, trace_capable, semantic_trace_required):

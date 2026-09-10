@@ -2421,6 +2421,12 @@ class ProfileConfig:
             "BOOT_CYCLES:{}".format(fs.boot_cycles),
             "VTOR_SETTLE_ITERS:{}".format(fs.vtor_settle_iters),
             "TRACKING_START_ADDRESS:0x{:08X}".format(fs.tracking_start_address),
+            "HEURISTIC_TRACE_REQUIRED:{}".format(
+                str(
+                    fs.sweep_strategy == "heuristic"
+                    and fs.sweep_strategy_explicit
+                ).lower()
+            ),
             "RUNTIME_MODE:true",
         ]
         if fs.calibration_time_slice:

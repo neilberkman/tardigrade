@@ -54,7 +54,15 @@ class RuntimeFaultSweepCalibrationTests(unittest.TestCase):
         """Erase and mixed selectors retain the trace their planner consumes."""
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn(
-            "writeback_active() or fault_types_mode in ('erase', 'both')",
+            "or (heuristic_trace_required and backend['kind'] == 'fast')",
+            text,
+        )
+
+    def test_slow_controller_trace_stubs_are_not_trace_capable(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("backend['kind'] in ('fast', 'mram')", text)
+        self.assertIn(
+            "getattr(backend['data'], 'WriteTraceWidthExplicit', False)",
             text,
         )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
 
@@ -119,6 +120,42 @@ def test_direct_mram_fixture_is_small_and_trace_capable() -> None:
     assert "public bool WriteTraceWidthExplicit => true;" in peripheral
     assert "RecordWriteTrace(wordStart);" in peripheral
     assert "backend['kind'] in ('fast', 'mram')" in runtime
+
+
+def test_explicit_heuristic_is_sent_to_calibration_runtime() -> None:
+    profile = load_profile(FIXTURE / "profile.yaml")
+    robot_vars = profile.robot_vars(ROOT)
+
+    assert "HEURISTIC_TRACE_REQUIRED:true" in robot_vars
+
+
+def test_self_update_example_uses_trace_capable_direct_nvm() -> None:
+    profile = load_profile(ROOT / "examples" / "bootloader_self_update" / "profile.yaml")
+
+    assert profile.flash_backend == "nvm"
+    assert profile.fault_sweep.sweep_strategy == "heuristic"
+    assert profile.fault_sweep.sweep_strategy_explicit is True
+
+
+def test_mram_power_loss_replay_matches_half_word_programming() -> None:
+    runtime_path = ROOT / "scripts" / "run_runtime_fault_sweep.py"
+    tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_trace_replay_mram_torn_value"
+    )
+    namespace: dict = {}
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), str(runtime_path), "exec"),
+        namespace,
+    )
+
+    torn = namespace["_trace_replay_mram_torn_value"](
+        0x8877665544332211, 8, 0x00
+    )
+    assert torn == 0x0000000044332211
 
 
 def test_explicit_bounded_mode_caps_structural_overwrite_tier() -> None:
