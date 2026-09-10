@@ -17,6 +17,7 @@ from fault_types import FAULT_TYPE_NAME_TO_CODE
 from profile_loader import MAX_PROFILE_FAULT_POINTS, ProfileConfig, ProfileError
 from renode_runner import quick_subset
 from trace_utils import (
+    _trace_absolute_address,
     flash_base_for_profile,
     load_clean_erase_trace,
     load_clean_write_trace,
@@ -85,6 +86,7 @@ class CalibrationInputs:
     setup_writes: int = 0
     trace_file: Optional[str] = None
     erase_trace_file: Optional[str] = None
+    backend_name: Optional[str] = None
 
 
 def _build_swap_progress_erase_map(
@@ -604,14 +606,44 @@ def build_fault_plan(
     quick_use_heuristic = bool(
         getattr(profile.fault_sweep, "quick_use_heuristic", False)
     )
+    trace_available = bool(trace_file and os.path.exists(trace_file))
+    heuristic_requested = (
+        getattr(profile.fault_sweep, "sweep_strategy", "heuristic") == "heuristic"
+    )
+    heuristic_explicitly_requested = bool(
+        getattr(profile.fault_sweep, "sweep_strategy_explicit", False)
+    )
+    bounded_cli_selection = (
+        quick
+        or fault_start is not None
+        or fault_end is not None
+        or fault_step != 1
+    )
+    if (
+        heuristic_requested
+        and heuristic_explicitly_requested
+        and max_writes > 0
+        and not trace_available
+        and not bounded_cli_selection
+    ):
+        backend_name = (
+            calibration.backend_name
+            or getattr(profile, "flash_backend", None)
+            or "unknown"
+        )
+        raise ProfileError(
+            "heuristic sweep requested, but backend {!r} did not supply an "
+            "address-bearing calibration write trace; use --fault-step N for "
+            "a bounded exhaustive sweep".format(backend_name)
+        )
+
     use_heuristic = (
-        trace_file
-        and os.path.exists(trace_file)
+        trace_available
         and (not quick or quick_use_heuristic)
         and fault_start is None
         and fault_end is None
         and fault_step == 1
-        and getattr(profile.fault_sweep, "sweep_strategy", "heuristic") != "exhaustive"
+        and heuristic_requested
     )
 
     if use_heuristic:
@@ -622,11 +654,21 @@ def build_fault_plan(
         )
 
         trace = load_trace(trace_file)
+        flash_base = flash_base_for_profile(profile)
+        trace_address_map = getattr(profile.memory, "trace_address_map", None) or []
+        if trace_address_map:
+            trace = [
+                (
+                    write_index,
+                    _trace_absolute_address(
+                        flash_offset, flash_base, trace_address_map
+                    ),
+                )
+                for write_index, flash_offset in trace
+            ]
         slot_ranges_for_heuristic: Dict[str, Tuple[int, int]] = {}
         for sname, sinfo in profile.memory.slots.items():
             slot_ranges_for_heuristic[sname] = (sinfo.base, sinfo.base + sinfo.size)
-        flash_base = flash_base_for_profile(profile)
-
         bl_region_for_heuristic = None
         if profile.bootloader_region is not None:
             bl = profile.bootloader_region
@@ -638,6 +680,7 @@ def build_fault_plan(
             heuristic_kwargs["tier2_step"] = hc.tier2_step
             heuristic_kwargs["tier3_step"] = hc.tier3_step
             heuristic_kwargs["discontinuity_window"] = hc.discontinuity_window
+            heuristic_kwargs["preserve_critical_tiers"] = hc.preserve_critical_tiers
             if hc.critical_regions:
                 heuristic_kwargs["critical_regions"] = hc.critical_regions
             if hc.target_points is not None:

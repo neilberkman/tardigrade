@@ -1,0 +1,25 @@
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m0+"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+
+boot: Memory.MappedMemory @ sysbus 0x10000000
+    size: 0x1000
+
+boot_alias: Memory.MappedMemory @ sysbus 0x00000000
+    size: 0x1000
+
+mram: Memory.NVMemory @ sysbus 0x10100000
+    Size: 0x4000
+    WordSize: 8
+    EnforceWordWriteSemantics: true
+    WriteLatencyMicros: 0
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x2000
+
+nvm_ctrl: NVMemoryController @ sysbus 0x40001000
+    Nvm: mram
+    FullMode: true

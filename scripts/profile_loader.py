@@ -1340,6 +1340,7 @@ class FaultSweepConfig:
         "fault_types",
         "evaluation_mode",
         "sweep_strategy",
+        "sweep_strategy_explicit",
         "sweep_hash_bypass_symbols",
         "progress_stall_timeout_s",
         "boot_cycles",
@@ -1387,6 +1388,7 @@ class FaultSweepConfig:
         fault_types: Optional[List[str]] = None,
         evaluation_mode: Optional[str] = None,
         sweep_strategy: str = "heuristic",
+        sweep_strategy_explicit: bool = False,
         sweep_hash_bypass_symbols: Optional[List[str]] = None,
         progress_stall_timeout_s: Optional[float] = None,
         boot_cycles: int = 1,
@@ -1502,6 +1504,7 @@ class FaultSweepConfig:
         self.fault_types = ["power_loss"] if fault_types is None else list(fault_types)
         self.evaluation_mode = evaluation_mode
         self.sweep_strategy = sweep_strategy
+        self.sweep_strategy_explicit = bool(sweep_strategy_explicit)
         self.sweep_hash_bypass_symbols = sweep_hash_bypass_symbols or []
         self.progress_stall_timeout_s = progress_stall_timeout_s
         self.boot_cycles = max(1, int(boot_cycles))
@@ -2418,6 +2421,12 @@ class ProfileConfig:
             "BOOT_CYCLES:{}".format(fs.boot_cycles),
             "VTOR_SETTLE_ITERS:{}".format(fs.vtor_settle_iters),
             "TRACKING_START_ADDRESS:0x{:08X}".format(fs.tracking_start_address),
+            "HEURISTIC_TRACE_REQUIRED:{}".format(
+                str(
+                    fs.sweep_strategy == "heuristic"
+                    and fs.sweep_strategy_explicit
+                ).lower()
+            ),
             "RUNTIME_MODE:true",
         ]
         if fs.calibration_time_slice:
@@ -3727,6 +3736,7 @@ def _parse_fault_sweep(
         fault_types=fault_types,
         evaluation_mode=eval_mode,
         sweep_strategy=str(raw.get("sweep_strategy", "heuristic")),
+        sweep_strategy_explicit="sweep_strategy" in raw,
         sweep_hash_bypass_symbols=sweep_hash_bypass,
         progress_stall_timeout_s=stall_timeout,
         boot_cycles=boot_cycles,
@@ -6737,6 +6747,14 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
             "fault_sweep",
         )
         fault_sweep = data.get("fault_sweep")
+        if (
+            "max_heuristic_points" in fault_sweep
+            and str(fault_sweep.get("sweep_strategy", "heuristic")) != "heuristic"
+        ):
+            raise ProfileError(
+                "fault_sweep.max_heuristic_points is only valid when "
+                "fault_sweep.sweep_strategy is 'heuristic'"
+            )
         nested_fault_schemas = {
             "phase2_fault": {"enabled", "fault_types", "max_points"},
             "hook_fault": {"enabled", "fault_types", "max_points"},
