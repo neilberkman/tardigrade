@@ -5297,13 +5297,14 @@ def prime_bootloader_entry():
         # report command failures to the console without raising exceptions,
         # which makes a failed `cpu PC ...` prime look successful.
         try:
-            if initial_sp != 0:
-                cpu_ref.SP = RegisterValue.Create(initial_sp, 32)
-            if initial_pc != 0:
-                cpu_ref.PC = RegisterValue.Create(initial_pc, 32)
+            # Zero is evidence too: a power-loss fault can leave either
+            # vector word unprogrammed.  Always replace the shell snapshot's
+            # registers so clean-ELF values cannot survive the overlay.
+            cpu_ref.SP = RegisterValue.Create(initial_sp, 32)
+            cpu_ref.PC = RegisterValue.Create(initial_pc, 32)
 
-            sp_ok = (initial_sp == 0) or (as_int(cpu_ref.SP.RawValue) == initial_sp)
-            pc_ok = (initial_pc == 0) or ((as_int(cpu_ref.PC.RawValue) & ~1) == (initial_pc & ~1))
+            sp_ok = as_int(cpu_ref.SP.RawValue) == initial_sp
+            pc_ok = (as_int(cpu_ref.PC.RawValue) & ~1) == (initial_pc & ~1)
             if sp_ok and pc_ok:
                 prime_method = 'direct_registers'
         except Exception:
@@ -5313,13 +5314,11 @@ def prime_bootloader_entry():
             for cpu_name in ('cpu', 'sysbus.cpu'):
                 try:
                     monitor.Parse('{} VectorTableOffset 0x{:08X}'.format(cpu_name, int(bootloader_entry)))
-                    if initial_sp != 0:
-                        monitor.Parse('{} SP 0x{:08X}'.format(cpu_name, initial_sp))
-                    if initial_pc != 0:
-                        monitor.Parse('{} PC 0x{:08X}'.format(cpu_name, initial_pc))
+                    monitor.Parse('{} SP 0x{:08X}'.format(cpu_name, initial_sp))
+                    monitor.Parse('{} PC 0x{:08X}'.format(cpu_name, initial_pc))
 
-                    sp_ok = (initial_sp == 0) or (as_int(cpu_ref.SP.RawValue) == initial_sp)
-                    pc_ok = (initial_pc == 0) or ((as_int(cpu_ref.PC.RawValue) & ~1) == (initial_pc & ~1))
+                    sp_ok = as_int(cpu_ref.SP.RawValue) == initial_sp
+                    pc_ok = (as_int(cpu_ref.PC.RawValue) & ~1) == (initial_pc & ~1)
                     if sp_ok and pc_ok:
                         prime_method = 'monitor:{}'.format(cpu_name)
                         break
@@ -5694,7 +5693,6 @@ def prepare_recovery_shell_state():
     monitor.Parse('machine Pause')
     _bus_load_elf(bootloader_elf)
     restore_hw_init()
-    prime_bootloader_entry()
 
 def prepare_cold_reset():
     # Cold reset: save NVM, destroy and recreate machine, restore NVM.
@@ -5742,6 +5740,10 @@ def restore_flash_and_boot(saved_flash):
     else:
         flash_ref = b['data'].Flash
         flash_ref.WriteBytes(0, saved_flash)
+    # The shell was built from the clean ELF, but hardware reset state belongs
+    # to the restored persistent image.  Fetch both vector words only after
+    # installing that image, including zero/unprogrammed values.
+    prime_bootloader_entry()
     # Do NOT re-run setup_script here.  The faulted snapshot is the
     # ground-truth state for the recovery boot — re-running setup would
     # overwrite it with clean data and mask the fault.

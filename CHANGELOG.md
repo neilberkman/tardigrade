@@ -41,6 +41,9 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Changed
 
+- Recovery boots now derive the initial SP and PC from the restored faulted
+  vector table, exposing interrupted vector-table writes as boot failures
+  instead of retaining clean-ELF register values.
 - GitHub Action results now separate assertion status from security status and
   require an explicit regression mode for known-vulnerable profiles.
 - Runtime reports include richer fault classification, probe evidence, and

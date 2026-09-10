@@ -351,6 +351,14 @@ success_criteria:
   vector_table_offset: 0x400 # nxboot: 1KB image header
 ```
 
+The reset vector table is part of the fault surface. During an execute-mode
+recovery boot, tardigrade reads the initial SP and PC from the restored
+persistent image at `bootloader.entry`, just as the core does on reset. If
+that table lies in a region being programmed, an interrupted vector-table
+write can therefore produce a `no_boot` result. Keep the table outside the
+update region when the hardware layout permits it; otherwise include those
+writes in the campaign and expect vector-table bricks to be observable.
+
 ### Marker address
 
 For bootloaders that don't relocate VTOR, check a specific memory address after boot:
