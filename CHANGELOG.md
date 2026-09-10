@@ -71,6 +71,9 @@ The format follows [common-changelog](https://common-changelog.org/).
   heuristics force fine trace capture on fast backends, controller trace stubs
   are excluded, and direct-MRAM replay preserves the model's torn-word
   power-loss behavior.
+- Recovery boots now clear profile-declared volatile memory and report a
+  preexisting success marker as inconclusive instead of accepting stale SRAM
+  as recovery evidence.
 - Flash/OTP persistence and reset handling across multi-boot fault campaigns.
 - Calibration caching and coverage validation for expanded fault plans.
 - Probe state isolation between instruction-skip points and normalized,

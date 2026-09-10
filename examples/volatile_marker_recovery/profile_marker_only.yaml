@@ -1,0 +1,6 @@
+extends: profile.yaml
+name: volatile_marker_recovery_marker_only
+description: Synthetic stale-SRAM marker regression without stalled-PC evidence.
+fault_sweep:
+  progress_stall_timeout_s: 0
+  phase2_wall_timeout_s: 1

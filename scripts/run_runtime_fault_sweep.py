@@ -560,6 +560,7 @@ _cached_initial_otp = None
 _cached_phase1_snapshot_path = None
 _cached_recovery_snapshot_path = None
 _machine_selector = '0'
+_recovery_marker_precondition = None
 
 
 def refresh_runtime_handles():
@@ -588,6 +589,51 @@ def _machine_reset():
     _configure_tracking_start_address()
     _configure_python_tracking_gate(force=True)
     reset_sticky_handoff_state()
+
+
+def _clear_volatile_memory():
+    """Clear every profile-declared volatile range before a recovery boot."""
+    import System
+    chunk_limit = 65536
+    for region in volatile_regions:
+        cursor = int(region['base'])
+        remaining = int(region['size'])
+        while remaining > 0:
+            chunk_size = min(remaining, chunk_limit)
+            zeroes = System.Array.CreateInstance(System.Byte, chunk_size)
+            bus.WriteBytes(zeroes, cursor)
+            cursor += chunk_size
+            remaining -= chunk_size
+        log('recovery: cleared volatile region {} at {} ({} bytes)'.format(
+            region.get('name', 'unnamed'), fmt_u32(region['base']), region['size']))
+
+
+def _capture_recovery_marker_precondition():
+    global _recovery_marker_precondition
+    if success_marker_addr == 0:
+        return
+    try:
+        actual = as_int(bus.ReadDoubleWord(success_marker_addr))
+    except Exception as exc:
+        candidate = {
+            'checked': True,
+            'address': success_marker_addr,
+            'expected': success_marker_value,
+            'read_error': str(exc),
+            'matched': False,
+        }
+    else:
+        candidate = {
+            'checked': True,
+            'address': success_marker_addr,
+            'expected': success_marker_value,
+            'actual': actual,
+            'matched': actual == success_marker_value,
+        }
+    if _recovery_marker_precondition is None or candidate.get('matched'):
+        _recovery_marker_precondition = candidate
+    if candidate.get('matched'):
+        log('recovery: success marker already matched before volatile clear')
 
 # Read monitor variables.
 result_file = str(monitor.GetVariable('result_file'))
@@ -753,6 +799,35 @@ slot_recovery_base = get_optional_int_var('slot_recovery_base', None)
 slot_recovery_size = get_optional_int_var('slot_recovery_size', None)
 sram_start = int(str(monitor.GetVariable('sram_start')), 0)
 sram_end = int(str(monitor.GetVariable('sram_end')), 0)
+if sram_end <= sram_start:
+    raise RuntimeError('memory.sram end must be greater than start')
+volatile_regions = [{
+    'name': 'sram',
+    'base': sram_start,
+    'size': sram_end - sram_start,
+}]
+volatile_regions_b64 = get_optional_var('volatile_regions_b64', '')
+if volatile_regions_b64:
+    try:
+        decoded_volatile_regions = json.loads(
+            base64.b64decode(volatile_regions_b64).decode('utf-8')
+        )
+    except Exception as exc:
+        raise RuntimeError('invalid volatile region payload: {}'.format(exc))
+    if not isinstance(decoded_volatile_regions, list):
+        raise RuntimeError('volatile region payload must be a list')
+    for index, region in enumerate(decoded_volatile_regions):
+        if not isinstance(region, dict):
+            raise RuntimeError('volatile region {} must be a mapping'.format(index))
+        base = int(region.get('base', -1))
+        size = int(region.get('size', 0))
+        if base < 0 or size <= 0 or base + size > 0x100000000:
+            raise RuntimeError('volatile region {} has an invalid range'.format(index))
+        volatile_regions.append({
+            'name': str(region.get('name') or 'volatile_{}'.format(index)),
+            'base': base,
+            'size': size,
+        })
 bootloader_entry = int(str(monitor.GetVariable('bootloader_entry')), 0)
 bootloader_elf = str(monitor.GetVariable('bootloader_elf')).strip()
 platform_repl = get_optional_var('platform_repl', '').strip().lower()
@@ -5708,6 +5783,7 @@ def prepare_recovery_shell_state():
     else:
         _machine_reset()
     monitor.Parse('machine Pause')
+    _clear_volatile_memory()
     _bus_load_elf(bootloader_elf)
     restore_hw_init()
 
@@ -5740,6 +5816,7 @@ def restore_flash_and_boot(saved_flash):
     # the faulted flash snapshot.  This preserves semantics while avoiding
     # repeated full reset/ELF reload work on every point.
     global _cached_recovery_snapshot_path
+    _capture_recovery_marker_precondition()
     if not enable_machine_snapshots:
         prepare_recovery_shell_state()
     else:
@@ -8200,6 +8277,51 @@ def classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=N
     return 'unrecoverable'
 
 
+def _apply_recovery_marker_precondition(
+        signals, boot_outcome, fault_class, fault_injected):
+    evidence = _recovery_marker_precondition
+    if not fault_injected or not isinstance(evidence, dict) or not evidence.get('matched'):
+        return boot_outcome, fault_class, {}
+    signals['recovery_marker_preexisting'] = True
+    signals['recovery_marker_precondition'] = {
+        'address': fmt_u32(evidence['address']),
+        'expected': fmt_u32(evidence['expected']),
+        'actual': fmt_u32(evidence['actual']),
+        'matched': True,
+    }
+    signals['recovery_observation_inconclusive'] = (
+        'success marker already matched before recovery boot'
+    )
+    return 'infra_error', 'infrastructure_error', {
+        'infrastructure_error': True,
+        'error_kind': 'recovery_marker_preexisting',
+        'error': (
+            'recovery observation is inconclusive: success marker already '
+            'matched before volatile memory was cleared'
+        ),
+    }
+
+
+def _finalize_recovery_marker_precondition_result(result):
+    """Apply the marker precondition contract to every fault runner."""
+    if not isinstance(result, dict):
+        return result
+    signals = result.get('signals')
+    if not isinstance(signals, dict):
+        signals = {}
+        result['signals'] = signals
+    outcome, fault_class, fields = _apply_recovery_marker_precondition(
+        signals,
+        result.get('boot_outcome'),
+        result.get('fault_class'),
+        bool(result.get('fault_injected')),
+    )
+    result['boot_outcome'] = outcome
+    result['fault_class'] = fault_class
+    result.update(fields)
+    return result
+
+
 def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
                         actual_writes, signals, boot_outcome=None,
                         boot_slot=None, eff_criteria=None,
@@ -8229,6 +8351,11 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
     if signals.get('terminal_error_infrastructure_error') or signals.get('terminal_error_unresolved_candidates'):
         fault_class = 'infrastructure_error'
         boot_outcome = 'infra_error'
+    boot_outcome, fault_class, _marker_precondition_fields = (
+        _apply_recovery_marker_precondition(
+            signals, boot_outcome, fault_class, fault_injected
+        )
+    )
     # Metadata delta: capture post-recovery-boot snapshot BEFORE followup
     # boot cycles so the delta measures "pre-fault -> first recovery boot",
     # not "pre-fault -> after N followup boots".  Followup boots may
@@ -8307,6 +8434,7 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         'actual_writes': actual_writes,
         'signals': signals,
     }
+    result.update(_marker_precondition_fields)
     if isinstance(signals.get('function_return_probes'), dict):
         result['function_return_probes'] = signals['function_return_probes']
     # Shared execute epilogue: every result carries the configured/applied RC
@@ -9081,8 +9209,10 @@ def run_execute_fault(fault_at, fault_type='w'):
         # ELF and slot images (MappedMemory regions are cleared by reset,
         # but NVMemory preserves faulted metadata), then run Phase 2.
         phase2_t0 = _time.time()
+        _capture_recovery_marker_precondition()
         _machine_reset()
         monitor.Parse('machine Pause')
+        _clear_volatile_memory()
         _bus_load_elf(bootloader_elf)
         if image_exec_path:
             _bus_load_binary(image_exec_path, slot_load_addresses.get('exec', slot_exec_base))
@@ -10925,6 +11055,8 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
     # Dispatch a single fault point to the appropriate runner function.
     #
     # Returns the result dict from the runner.
+    global _recovery_marker_precondition
+    _recovery_marker_precondition = None
     parts = None  # IronPython requires pre-declaration for locals used in multiple if-branches
     # A writeback control has no fault provenance to replay.  Route it through
     # normal execute mode and never let writeback validation turn it into a
@@ -11533,7 +11665,11 @@ else:
         if ft == 'f':
             ensure_read_fault_preflight()
         result = annotate_boot_span_result(
-            annotate_update_sequence_result(_dispatch_fault_point(fp, ft, run_fn))
+            annotate_update_sequence_result(
+                _finalize_recovery_marker_precondition_result(
+                    _dispatch_fault_point(fp, ft, run_fn)
+                )
+            )
         )
         results.append(result)
 

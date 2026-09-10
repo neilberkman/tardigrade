@@ -65,6 +65,7 @@ ${CALIBRATION_TIME_SLICE}      ${EMPTY}
 ${PHASE1_TIME_SLICE}           ${EMPTY}
 ${PHASE2_TIME_SLICE}           ${EMPTY}
 ${PHASE2_WALL_TIMEOUT_S}       30
+${VOLATILE_REGIONS_B64}        ${EMPTY}
 ${ZERO_POINT_EXECUTE_CONTROL}  false
 ${BOOT_CYCLE_HOOK}            ${EMPTY}
 ${EXPECTED_ROLLBACK_AT_CYCLE}    ${EMPTY}
@@ -191,6 +192,7 @@ Run Runtime Fault Point
     Execute Command    $sram_start=${SRAM_START}
     Execute Command    $sram_end=${SRAM_END}
     Execute Command    $heuristic_trace_required=${HEURISTIC_TRACE_REQUIRED}
+    Execute Command    $volatile_regions_b64="${VOLATILE_REGIONS_B64}"
     Execute Command    $slot_exec_base=${SLOT_EXEC_BASE}
     Execute Command    $slot_exec_size=${SLOT_EXEC_SIZE}
     Execute Command    $slot_staging_base=${SLOT_STAGING_BASE}

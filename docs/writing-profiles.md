@@ -370,6 +370,23 @@ success_criteria:
   marker_value: 0x00000001
 ```
 
+Before every recovery boot, tardigrade fills `memory.sram` with zero so this
+criterion can pass only when the recovered firmware writes the marker. Declare
+additional volatile ranges when a platform has retained RAM outside that main
+interval:
+
+```yaml
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  volatile_regions:
+    - { name: retained_ram, base: 0x21000000, size: 0x1000 }
+```
+
+If the marker already equals its expected value at the recovery boundary, the
+point is reported as inconclusive with
+`error_kind: recovery_marker_preexisting`; a preexisting value is not accepted
+as recovery evidence.
+
 ### Memory checks
 
 Verify multiple memory locations after execution. Useful for firmware-level harnesses that report results through SRAM:
