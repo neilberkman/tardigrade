@@ -596,21 +596,48 @@ def _clear_volatile_memory():
     import System
     chunk_limit = 65536
     for region in volatile_regions:
-        cursor = int(region['base'])
-        remaining = int(region['size'])
+        region_base = int(region['base'])
+        region_size = int(region['size'])
+        probe_size = min(region_size, 4)
+        probe_addresses = [region_base]
+        final_probe = region_base + region_size - probe_size
+        if final_probe != region_base:
+            probe_addresses.append(final_probe)
+        for probe_index, probe_address in enumerate(probe_addresses):
+            probe = System.Array.CreateInstance(System.Byte, probe_size)
+            for byte_index in range(probe_size):
+                probe[byte_index] = (0xA5 ^ (probe_index * 0x3C) ^ byte_index) & 0xFF
+            bus.WriteBytes(probe, probe_address)
+            observed = to_py_bytes(bus.ReadBytes(probe_address, probe_size))
+            if observed != to_py_bytes(probe):
+                raise RuntimeError(
+                    'volatile region {} is not writable at {}'.format(
+                        region.get('name', 'unnamed'), fmt_u32(probe_address)
+                    )
+                )
+        cursor = region_base
+        remaining = region_size
         while remaining > 0:
             chunk_size = min(remaining, chunk_limit)
             zeroes = System.Array.CreateInstance(System.Byte, chunk_size)
             bus.WriteBytes(zeroes, cursor)
             cursor += chunk_size
             remaining -= chunk_size
+        for probe_address in probe_addresses:
+            observed = to_py_bytes(bus.ReadBytes(probe_address, probe_size))
+            if any(bytearray(observed)):
+                raise RuntimeError(
+                    'volatile region {} did not clear at {}'.format(
+                        region.get('name', 'unnamed'), fmt_u32(probe_address)
+                    )
+                )
         log('recovery: cleared volatile region {} at {} ({} bytes)'.format(
-            region.get('name', 'unnamed'), fmt_u32(region['base']), region['size']))
+            region.get('name', 'unnamed'), fmt_u32(region_base), region_size))
 
 
 def _capture_recovery_marker_precondition():
     global _recovery_marker_precondition
-    if success_marker_addr == 0:
+    if _recovery_marker_precondition is not None or success_marker_addr == 0:
         return
     marker_end = success_marker_addr + 4
     marker_is_volatile = any(
@@ -638,10 +665,33 @@ def _capture_recovery_marker_precondition():
             'actual': actual,
             'matched': actual == success_marker_value,
         }
-    if _recovery_marker_precondition is None or candidate.get('matched'):
-        _recovery_marker_precondition = candidate
-    if candidate.get('matched'):
+    candidate['matched_before_clear'] = candidate.pop('matched')
+    candidate['clear_checked'] = False
+    _recovery_marker_precondition = candidate
+    if candidate.get('matched_before_clear'):
         log('recovery: success marker already matched before volatile clear')
+
+
+def _verify_recovery_marker_cleared():
+    """Verify the first recovery boundary removed stale volatile evidence."""
+    evidence = _recovery_marker_precondition
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get('clear_checked')
+        or not evidence.get('matched_before_clear')
+    ):
+        return
+    evidence['clear_checked'] = True
+    try:
+        actual = as_int(bus.ReadDoubleWord(success_marker_addr))
+    except Exception as exc:
+        evidence['clear_read_error'] = str(exc)
+        evidence['matched_after_clear'] = False
+        return
+    evidence['actual_after_clear'] = actual
+    evidence['matched_after_clear'] = actual == success_marker_value
+    if evidence['matched_after_clear']:
+        log('recovery: success marker still matched after volatile clear')
 
 # Read monitor variables.
 result_file = str(monitor.GetVariable('result_file'))
@@ -5792,6 +5842,7 @@ def prepare_recovery_shell_state():
         _machine_reset()
     monitor.Parse('machine Pause')
     _clear_volatile_memory()
+    _verify_recovery_marker_cleared()
     _bus_load_elf(bootloader_elf)
     restore_hw_init()
 
@@ -5834,6 +5885,7 @@ def restore_flash_and_boot(saved_flash):
             save_machine_snapshot(_cached_recovery_snapshot_path)
         else:
             load_machine_snapshot(_cached_recovery_snapshot_path)
+            _verify_recovery_marker_cleared()
     b = backend
     if b['kind'] == 'mram':
         # MRAMMemory may or may not survive machine Reset depending on
@@ -8288,25 +8340,39 @@ def classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=N
 def _apply_recovery_marker_precondition(
         signals, boot_outcome, fault_class, fault_injected):
     evidence = _recovery_marker_precondition
-    if not fault_injected or not isinstance(evidence, dict) or not evidence.get('matched'):
+    if (
+        not fault_injected
+        or not isinstance(evidence, dict)
+        or not (
+            evidence.get('matched_after_clear')
+            or evidence.get('clear_read_error')
+        )
+    ):
         return boot_outcome, fault_class, {}
+    clear_read_error = evidence.get('clear_read_error')
     signals['recovery_marker_preexisting'] = True
     signals['recovery_marker_precondition'] = {
         'address': fmt_u32(evidence['address']),
         'expected': fmt_u32(evidence['expected']),
-        'actual': fmt_u32(evidence['actual']),
-        'matched': True,
+        'actual_before_clear': fmt_u32(evidence['actual']),
+        'matched_before_clear': True,
+        'matched_after_clear': bool(evidence.get('matched_after_clear')),
     }
-    signals['recovery_observation_inconclusive'] = (
-        'success marker already matched before recovery boot'
-    )
+    if clear_read_error:
+        signals['recovery_marker_precondition']['clear_read_error'] = clear_read_error
+        error_kind = 'recovery_marker_clear_unverified'
+        explanation = 'success marker could not be verified after volatile memory was cleared'
+    else:
+        signals['recovery_marker_precondition']['actual_after_clear'] = fmt_u32(
+            evidence['actual_after_clear']
+        )
+        error_kind = 'recovery_marker_preexisting'
+        explanation = 'success marker remained matched after volatile memory was cleared'
+    signals['recovery_observation_inconclusive'] = explanation
     return 'infra_error', 'infrastructure_error', {
         'infrastructure_error': True,
-        'error_kind': 'recovery_marker_preexisting',
-        'error': (
-            'recovery observation is inconclusive: success marker already '
-            'matched before volatile memory was cleared'
-        ),
+        'error_kind': error_kind,
+        'error': 'recovery observation is inconclusive: {}'.format(explanation),
     }
 
 
@@ -8359,11 +8425,6 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
     if signals.get('terminal_error_infrastructure_error') or signals.get('terminal_error_unresolved_candidates'):
         fault_class = 'infrastructure_error'
         boot_outcome = 'infra_error'
-    boot_outcome, fault_class, _marker_precondition_fields = (
-        _apply_recovery_marker_precondition(
-            signals, boot_outcome, fault_class, fault_injected
-        )
-    )
     # Metadata delta: capture post-recovery-boot snapshot BEFORE followup
     # boot cycles so the delta measures "pre-fault -> first recovery boot",
     # not "pre-fault -> after N followup boots".  Followup boots may
@@ -8442,7 +8503,6 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         'actual_writes': actual_writes,
         'signals': signals,
     }
-    result.update(_marker_precondition_fields)
     if isinstance(signals.get('function_return_probes'), dict):
         result['function_return_probes'] = signals['function_return_probes']
     # Shared execute epilogue: every result carries the configured/applied RC
@@ -9221,6 +9281,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         _machine_reset()
         monitor.Parse('machine Pause')
         _clear_volatile_memory()
+        _verify_recovery_marker_cleared()
         _bus_load_elf(bootloader_elf)
         if image_exec_path:
             _bus_load_binary(image_exec_path, slot_load_addresses.get('exec', slot_exec_base))

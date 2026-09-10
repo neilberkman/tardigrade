@@ -16,7 +16,7 @@ images:
   staging: examples/volatile_marker_recovery/firmware.bin
 flash_backend: faultFlash
 success_criteria:
-  marker_address: 0x20000020
+  marker_address: 0x20000100
   marker_value: 0x5A1ECA1B
 fault_sweep:
   mode: runtime

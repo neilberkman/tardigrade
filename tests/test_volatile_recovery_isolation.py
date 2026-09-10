@@ -35,6 +35,7 @@ def _load_runtime_functions(names: tuple[str, ...], namespace: dict) -> dict:
 
 def test_clear_volatile_memory_zeroes_every_declared_region(monkeypatch):
     writes: list[tuple[int, bytes]] = []
+    memory: dict[int, int] = {}
 
     class _Array:
         @staticmethod
@@ -43,12 +44,23 @@ def test_clear_volatile_memory_zeroes_every_declared_region(monkeypatch):
 
     fake_system = SimpleNamespace(Array=_Array, Byte=object())
     monkeypatch.setitem(sys.modules, "System", fake_system)
+
+    def write_bytes(data, address):
+        payload = bytes(data)
+        writes.append((address, payload))
+        memory.update({address + index: value for index, value in enumerate(payload)})
+
+    def read_bytes(address, size):
+        return bytes(memory.get(address + index, 0) for index in range(size))
+
     namespace = {
         "bus": SimpleNamespace(
-            WriteBytes=lambda data, address: writes.append((address, bytes(data)))
+            WriteBytes=write_bytes,
+            ReadBytes=read_bytes,
         ),
         "fmt_u32": lambda value: "0x{:08X}".format(value),
         "log": lambda message: None,
+        "to_py_bytes": bytes,
         "volatile_regions": [
             {"name": "sram", "base": 0x20000000, "size": 12},
             {"name": "retained", "base": 0x21000000, "size": 7},
@@ -58,7 +70,41 @@ def test_clear_volatile_memory_zeroes_every_declared_region(monkeypatch):
 
     functions["_clear_volatile_memory"]()
 
-    assert writes == [(0x20000000, bytes(12)), (0x21000000, bytes(7))]
+    assert memory[0x20000000] == 0
+    assert memory[0x2000000B] == 0
+    assert memory[0x21000000] == 0
+    assert memory[0x21000006] == 0
+    assert (0x20000000, bytes(12)) in writes
+    assert (0x21000000, bytes(7)) in writes
+
+
+def test_clear_volatile_memory_rejects_unmapped_region(monkeypatch):
+    class _Array:
+        @staticmethod
+        def CreateInstance(_byte_type, size):
+            return bytearray(size)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "System",
+        SimpleNamespace(Array=_Array, Byte=object()),
+    )
+    namespace = {
+        "bus": SimpleNamespace(
+            WriteBytes=lambda data, address: None,
+            ReadBytes=lambda address, size: bytes(size),
+        ),
+        "fmt_u32": lambda value: "0x{:08X}".format(value),
+        "log": lambda message: None,
+        "to_py_bytes": bytes,
+        "volatile_regions": [
+            {"name": "missing", "base": 0x22000000, "size": 0x100}
+        ],
+    }
+    functions = _load_runtime_functions(("_clear_volatile_memory",), namespace)
+
+    with pytest.raises(RuntimeError, match="not writable"):
+        functions["_clear_volatile_memory"]()
 
 
 @pytest.mark.parametrize(
@@ -68,8 +114,8 @@ def test_clear_volatile_memory_zeroes_every_declared_region(monkeypatch):
         {"marker_ok": True, "phase2_stop_reason": "no_boot_stall(0.10s_emulated)"},
     ],
 )
-def test_preexisting_marker_is_inconclusive_with_or_without_stall(signals):
-    marker_address = 0x20000020
+def test_marker_surviving_clear_is_inconclusive_with_or_without_stall(signals):
+    marker_address = 0x20000100
     marker_value = 0x5A1ECA1B
     namespace = {
         "_recovery_marker_precondition": None,
@@ -86,12 +132,14 @@ def test_preexisting_marker_is_inconclusive_with_or_without_stall(signals):
     functions = _load_runtime_functions(
         (
             "_capture_recovery_marker_precondition",
+            "_verify_recovery_marker_cleared",
             "_apply_recovery_marker_precondition",
         ),
         namespace,
     )
 
     functions["_capture_recovery_marker_precondition"]()
+    functions["_verify_recovery_marker_cleared"]()
     outcome, fault_class, fields = functions[
         "_apply_recovery_marker_precondition"
     ](signals, "success", "recoverable", True)
@@ -102,6 +150,111 @@ def test_preexisting_marker_is_inconclusive_with_or_without_stall(signals):
     assert fields["error_kind"] == "recovery_marker_preexisting"
     assert "inconclusive" in fields["error"]
     assert signals["recovery_marker_preexisting"] is True
+
+
+def test_successful_clear_removes_preexisting_marker_evidence():
+    marker_address = 0x20000100
+    marker_value = 0x5A1ECA1B
+    reads = iter((marker_value, 0))
+    namespace = {
+        "_recovery_marker_precondition": None,
+        "as_int": int,
+        "bus": SimpleNamespace(ReadDoubleWord=lambda address: next(reads)),
+        "fmt_u32": lambda value: "0x{:08X}".format(value),
+        "log": lambda message: None,
+        "success_marker_addr": marker_address,
+        "success_marker_value": marker_value,
+        "volatile_regions": [
+            {"name": "sram", "base": 0x20000000, "size": 0x1000}
+        ],
+    }
+    functions = _load_runtime_functions(
+        (
+            "_capture_recovery_marker_precondition",
+            "_verify_recovery_marker_cleared",
+            "_apply_recovery_marker_precondition",
+        ),
+        namespace,
+    )
+
+    functions["_capture_recovery_marker_precondition"]()
+    functions["_verify_recovery_marker_cleared"]()
+    outcome, fault_class, fields = functions[
+        "_apply_recovery_marker_precondition"
+    ]({}, "success", "recoverable", True)
+
+    assert (outcome, fault_class, fields) == ("success", "recoverable", {})
+
+
+def test_marker_clear_read_failure_is_inconclusive():
+    marker_address = 0x20000100
+    marker_value = 0x5A1ECA1B
+    reads = iter((marker_value,))
+
+    def read_marker(address):
+        try:
+            return next(reads)
+        except StopIteration:
+            raise RuntimeError("unmapped after clear")
+
+    namespace = {
+        "_recovery_marker_precondition": None,
+        "as_int": int,
+        "bus": SimpleNamespace(ReadDoubleWord=read_marker),
+        "fmt_u32": lambda value: "0x{:08X}".format(value),
+        "log": lambda message: None,
+        "success_marker_addr": marker_address,
+        "success_marker_value": marker_value,
+        "volatile_regions": [
+            {"name": "sram", "base": 0x20000000, "size": 0x1000}
+        ],
+    }
+    functions = _load_runtime_functions(
+        (
+            "_capture_recovery_marker_precondition",
+            "_verify_recovery_marker_cleared",
+            "_apply_recovery_marker_precondition",
+        ),
+        namespace,
+    )
+
+    functions["_capture_recovery_marker_precondition"]()
+    functions["_verify_recovery_marker_cleared"]()
+    outcome, fault_class, fields = functions[
+        "_apply_recovery_marker_precondition"
+    ]({}, "success", "recoverable", True)
+
+    assert outcome == "infra_error"
+    assert fault_class == "infrastructure_error"
+    assert fields["error_kind"] == "recovery_marker_clear_unverified"
+
+
+def test_followup_boot_cannot_replace_first_boundary_evidence():
+    marker_address = 0x20000100
+    marker_value = 0x5A1ECA1B
+    reads = iter((0, marker_value))
+    namespace = {
+        "_recovery_marker_precondition": None,
+        "as_int": int,
+        "bus": SimpleNamespace(ReadDoubleWord=lambda address: next(reads)),
+        "fmt_u32": lambda value: "0x{:08X}".format(value),
+        "log": lambda message: None,
+        "success_marker_addr": marker_address,
+        "success_marker_value": marker_value,
+        "volatile_regions": [
+            {"name": "sram", "base": 0x20000000, "size": 0x1000}
+        ],
+    }
+    functions = _load_runtime_functions(
+        ("_capture_recovery_marker_precondition",), namespace
+    )
+
+    functions["_capture_recovery_marker_precondition"]()
+    functions["_capture_recovery_marker_precondition"]()
+
+    evidence = namespace["_recovery_marker_precondition"]
+    assert evidence["actual"] == 0
+    assert evidence["matched_before_clear"] is False
 
 
 def test_persistent_marker_is_not_a_volatile_precondition():
@@ -168,5 +321,10 @@ def test_recovery_clear_wiring_and_fixture_contract():
         "NVMC_CONFIG = 0u"
     )
     assert "Brick_Handler();" in firmware
+    assert "MARKER_ADDRESS ((uintptr_t)0x20000100u)" in firmware
     assert (FIXTURE / "firmware.elf").stat().st_size < 64 * 1024
     assert (FIXTURE / "firmware.bin").stat().st_size < 1024
+
+    marker_only = load_profile(FIXTURE / "profile_marker_only.yaml", strict=True)
+    assert marker_only.fault_sweep.progress_stall_timeout_s == 0
+    assert marker_only.fault_sweep.phase2_wall_timeout_s == 1

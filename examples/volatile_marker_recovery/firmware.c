@@ -2,7 +2,7 @@
 
 #define VECTOR_BASE    ((uintptr_t)0x10000000u)
 #define NVMC_CONFIG    ((uintptr_t)0x4001E504u)
-#define MARKER_ADDRESS ((uintptr_t)0x20000020u)
+#define MARKER_ADDRESS ((uintptr_t)0x20000100u)
 #define MARKER_VALUE   0x5A1ECA1Bu
 #define VTOR_ADDRESS   ((uintptr_t)0xE000ED08u)
 

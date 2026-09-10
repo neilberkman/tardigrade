@@ -382,11 +382,13 @@ memory:
     - { name: retained_ram, base: 0x21000000, size: 0x1000 }
 ```
 
-If a marker inside one of these volatile ranges already equals its expected
-value at the recovery boundary, the point is reported as inconclusive with
-`error_kind: recovery_marker_preexisting`; a preexisting value is not accepted
-as recovery evidence. Markers outside the declared volatile ranges, such as
-flash metadata fields, are not subject to this precondition.
+At the first recovery boundary for each point, tardigrade verifies that clearing
+removed any preexisting matching value from a marker inside one of these
+volatile ranges. If the value still matches after the clear, the point is
+reported as inconclusive with `error_kind: recovery_marker_preexisting`.
+Markers outside the declared volatile ranges, such as flash metadata fields,
+are not subject to this precondition. Recovery also probes both ends of every
+declared range before clearing so an unmapped or non-writable range fails closed.
 
 ### Memory checks
 
