@@ -179,6 +179,7 @@ def classify_trace(
     shard_index: int = 0,
     random_tail_budget: int = 0,
     critical_regions: Optional[List[Tuple[int, int]]] = None,
+    preserve_critical_tiers: bool = True,
 ) -> Union[List[int], Dict[str, Any]]:
     """
     Classify trace entries into priority tiers and return a sorted list of
@@ -210,6 +211,9 @@ def classify_trace(
             from shard_index for reproducibility.
         critical_regions: Optional list of bus-address regions to promote to
             Tier 0 regardless of normal structural heuristics.
+        preserve_critical_tiers: Keep all Tier 0 and Tier 1 points even when
+            that exceeds target_points. Disable only for explicitly bounded
+            synthetic or exploratory campaigns.
 
     Returns:
         If return_details is False: sorted list of fault point indices.
@@ -237,6 +241,7 @@ def classify_trace(
                     "shard_index": shard_index,
                     "random_tail_budget": random_tail_budget,
                     "critical_regions": [],
+                    "preserve_critical_tiers": preserve_critical_tiers,
                 },
             }
         return []
@@ -419,7 +424,7 @@ def classify_trace(
 
     # Target points budget: trim low-risk tiers to fit.  Never trim
     # tier0 or tier1 — only tier3 then tier2 are expendable.
-    if target_points is not None and len(selected) > target_points:
+    if target_points is not None and len(selected) > target_points and preserve_critical_tiers:
         core = set(tier0 | tier1)
         if first_fp is not None:
             core.add(first_fp)
@@ -455,6 +460,38 @@ def classify_trace(
             selected = core | kept_lower
             tier3_selected = tier3_selected & selected
             tier2_selected = tier2_selected & selected
+    elif target_points is not None and len(selected) > target_points:
+        # Explicit bounded mode retains endpoint coverage, then spends the
+        # remaining budget in risk order. If a tier itself exceeds the
+        # budget, sample it evenly so large overwrite runs do not consume an
+        # unbounded campaign.
+        bounded: Set[int] = set()
+        if first_fp is not None and target_points > 0:
+            bounded.add(first_fp)
+        if last_fp is not None and target_points > 1:
+            bounded.add(last_fp)
+
+        for pool in (tier0, tier1, tier2_selected, tier3_selected):
+            remaining = target_points - len(bounded)
+            if remaining <= 0:
+                break
+            candidates = sorted(set(pool) - bounded)
+            if len(candidates) <= remaining:
+                bounded.update(candidates)
+                continue
+            if remaining == 1:
+                bounded.add(candidates[len(candidates) // 2])
+            else:
+                for index in range(remaining):
+                    position = int(round(
+                        float(index) * (len(candidates) - 1) / (remaining - 1)
+                    ))
+                    bounded.add(candidates[position])
+            break
+
+        selected = bounded
+        tier3_selected = tier3_selected & selected
+        tier2_selected = tier2_selected & selected
 
     result = sorted(selected)
 
@@ -477,6 +514,7 @@ def classify_trace(
                 "shard_index": shard_index,
                 "random_tail_budget": random_tail_budget,
                 "critical_regions": list(critical_regions or []),
+                "preserve_critical_tiers": preserve_critical_tiers,
             },
         }
 

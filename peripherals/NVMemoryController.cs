@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Text;
 using System.Threading;
 
 using Antmicro.Renode.Core;
@@ -178,6 +179,11 @@ namespace Antmicro.Renode.Peripherals.Memory
             return result;
         }
 
+        public byte[] ReadBytes(long offset, int count)
+        {
+            return ReadBytes(offset, count, null);
+        }
+
         public void WriteBytes(long offset, byte[] array, int startingIndex, int count, IPeripheral context)
         {
             if(array == null)
@@ -193,6 +199,11 @@ namespace Antmicro.Renode.Peripherals.Memory
             var data = new byte[count];
             Array.Copy(array, startingIndex, data, 0, count);
             WriteBytesInternal(offset, data);
+        }
+
+        public void WriteBytes(long offset, byte[] array, int startingIndex, int count)
+        {
+            WriteBytes(offset, array, startingIndex, count, null);
         }
 
         public void InjectFault(long address, long length, byte pattern = 0x00)
@@ -370,7 +381,7 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         public bool WriteInProgress { get; private set; }
 
-        public bool LastFaultInjected { get; private set; }
+        public bool LastFaultInjected { get; set; }
 
         // Sticky fault flag: set when any fault fires, cleared only by Reset()
         // or explicit assignment. Unlike LastFaultInjected (which is cleared at
@@ -385,6 +396,34 @@ namespace Antmicro.Renode.Peripherals.Memory
         public long LastWriteAddress { get; private set; }
 
         public List<long> WriteLog { get { return writeLog; } }
+
+        // Address-bearing, width-aware trace used by heuristic planning and
+        // replay when this memory is selected directly as the fault backend.
+        public bool WriteTraceEnabled { get; set; }
+        public bool WriteTraceWidthExplicit => true;
+        public int WriteTraceCount => writeTrace.Count;
+
+        public string WriteTraceToString()
+        {
+            var sb = new StringBuilder(writeTrace.Count * 40);
+            foreach(var entry in writeTrace)
+            {
+                sb.Append(entry.Item1);
+                sb.Append(':');
+                sb.Append(entry.Item2);
+                sb.Append(':');
+                sb.Append(entry.Item3);
+                sb.Append(':');
+                sb.Append(entry.Item4);
+                sb.Append('\n');
+            }
+            return sb.ToString();
+        }
+
+        public void WriteTraceClear()
+        {
+            writeTrace.Clear();
+        }
 
         // --- Read-fault injection ---
         //
@@ -567,10 +606,12 @@ namespace Antmicro.Renode.Peripherals.Memory
                         LastFaultPattern = (byte)(WriteFaultMode == 1 ? 0xCC : EraseFill);
                         TotalWordWrites++;
                         LastWriteAddress = wordStart;
+                        RecordWriteTrace(wordStart);
                         return;
                     }
 
                     TotalWordWrites++;
+                    RecordWriteTrace(wordStart);
                 }
 
                 return;
@@ -645,12 +686,14 @@ namespace Antmicro.Renode.Peripherals.Memory
                         LastFaultPattern = (byte)(WriteFaultMode == 1 ? 0xCC : EraseFill);
                         TotalWordWrites++;
                         writeLog.Add(wordStart);
+                        RecordWriteTrace(wordStart);
                         break;
                     }
 
                     ProgramWord(wordStart, mergedWord);
                     TotalWordWrites++;
                     writeLog.Add(wordStart);
+                    RecordWriteTrace(wordStart);
 
                     if(WriteLatencyMicros > 0)
                     {
@@ -669,6 +712,27 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             corruptionSeed = corruptionSeed * 1103515245u + 12345u;
             return corruptionSeed;
+        }
+
+        private void RecordWriteTrace(long wordStart)
+        {
+            if(!WriteTraceEnabled)
+            {
+                return;
+            }
+
+            var width = checked((int)WordSize);
+            if(width != 1 && width != 2 && width != 4 && width != 8)
+            {
+                throw new InvalidOperationException(
+                    "Write tracing requires a 1, 2, 4, or 8 byte WordSize");
+            }
+            ulong value = 0;
+            for(var i = 0; i < width; i++)
+            {
+                value |= (ulong)storage[wordStart + i] << (8 * i);
+            }
+            writeTrace.Add(Tuple.Create(TotalWordWrites, wordStart, value, width));
         }
 
         // Apply random bit flips to a word already in storage.
@@ -745,6 +809,8 @@ namespace Antmicro.Renode.Peripherals.Memory
         private byte[] storage;
         private uint corruptionSeed;
         private readonly List<long> writeLog = new List<long>();
+        private readonly List<Tuple<ulong, long, ulong, int>> writeTrace =
+            new List<Tuple<ulong, long, ulong, int>>();
 
         private const long DefaultSize = 0x80000;
         private const long DefaultWordSize = 8;

@@ -65,6 +65,9 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- Heuristic sweeps now fail before planning when their selected backend lacks
+  an address-bearing write trace, while direct word-write MRAM-style memory
+  supplies width-aware traces for tiered planning and replay.
 - Flash/OTP persistence and reset handling across multi-boot fault campaigns.
 - Calibration caching and coverage validation for expanded fault plans.
 - Probe state isolation between instruction-skip points and normalized,

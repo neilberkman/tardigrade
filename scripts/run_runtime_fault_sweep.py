@@ -3013,7 +3013,7 @@ def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_
         b = System.Array.CreateInstance(System.Byte, width)
         for byte_index in range(width):
             b[byte_index] = (value >> (8 * byte_index)) & 0xFF
-        flash_ref.WriteBytes(flash_off, b)
+        _replay_storage_write_bytes(flash_off, b)
 
     def _wb_flush_buffer(trigger='address', write_index=0, bus_addr=0):
         # Flush all buffered writes to physical flash.
@@ -3039,7 +3039,7 @@ def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_
         erase_buf = System.Array.CreateInstance(System.Byte, e_sz)
         for bi in range(e_sz):
             erase_buf[bi] = 0xFF
-        flash_ref.WriteBytes(int(e_off), erase_buf)
+        _replay_storage_write_bytes(int(e_off), erase_buf)
 
     for write_idx, flash_off, value, width in trace_events:
         if write_idx > fault_at + 1:
@@ -9858,6 +9858,29 @@ erase_trace_loaded = None
 trace_replay_engine = None
 trace_replay_engine_attempted = False
 
+
+def _replay_storage_geometry():
+    base, size = flash_geometry()
+    return (
+        int(base),
+        int(size),
+        int(effective_page_size()),
+        int(getattr(backend['data'], 'EraseFill', 0xFF)),
+    )
+
+
+def _replay_storage_read_bytes(offset, count):
+    if backend['kind'] == 'mram':
+        return backend['data'].ReadBytes(int(offset), int(count))
+    return backend['data'].Flash.ReadBytes(int(offset), int(count))
+
+
+def _replay_storage_write_bytes(offset, data):
+    if backend['kind'] == 'mram':
+        backend['data'].WriteBytes(int(offset), data, 0, len(data))
+        return
+    backend['data'].Flash.WriteBytes(int(offset), data)
+
 def ensure_trace_replay_engine():
     global trace_replay_engine, trace_replay_engine_attempted
     if trace_replay_engine is not None:
@@ -10339,8 +10362,12 @@ def _trace_replay_apply_write_fault(image, flash_off, value, fault_type, write_i
 
 def _build_trace_replay_write_fault_snapshot(fault_at, fault_type, flash_base_addr, flash_size,
                                              page_size, erase_fill):
-    flash_ref = backend['data'].Flash
-    flash_bytes = bytearray(to_py_bytes(flash_ref.ReadBytes(0, int(flash_size))))
+    if '_replay_storage_read_bytes' in globals():
+        initial_bytes = _replay_storage_read_bytes(0, int(flash_size))
+    else:
+        # Keep the replay helper independently testable by the AST harness.
+        initial_bytes = backend['data'].Flash.ReadBytes(0, int(flash_size))
+    flash_bytes = bytearray(to_py_bytes(initial_bytes))
     pending_erases = [(wap, foff, esz if esz > 0 else page_size) for foff, wap, esz in erase_trace_loaded]
     pending_erases.sort()
     erase_idx = 0
@@ -10412,6 +10439,9 @@ def _build_trace_replay_write_fault_snapshot(fault_at, fault_type, flash_base_ad
 
 def run_trace_replay_fault_native(fault_at, fault_type='w'):
     import os as _os_native
+
+    if backend['kind'] != 'fast':
+        return None
 
     fault_base = _base_fault_type_code(fault_type)
     if fault_base not in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES:
@@ -10674,11 +10704,8 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     md_pre_snapshot = capture_metadata_delta_snapshot()
 
     t_replay = _time.time()
-    flash_ref = backend['data'].Flash
-    flash_base_addr = int(backend['data'].FlashBaseAddress)
-    flash_size = int(backend['data'].FlashSize)
-    page_size = int(backend['data'].PageSize)
-    erase_fill = int(backend['data'].EraseFill)
+    flash_base_addr, flash_size, page_size, erase_fill = _replay_storage_geometry()
+    flash_ref = backend['data'] if backend['kind'] == 'mram' else backend['data'].Flash
 
     fault_snapshot_word = None
 
@@ -10705,7 +10732,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         if fault_at % 50 == 0:
             log('fp={} writeback_trace_replay: committed={} discarded={}'.format(
                 fault_at, writes_applied, _wb_discarded))
-        faulted_flash = flash_ref.ReadBytes(0, flash_size)
+        faulted_flash = _replay_storage_read_bytes(0, flash_size)
         fault_snapshot_bytes = to_py_bytes(faulted_flash)
     else:
         # Direct mode: all writes go to flash (original path).
@@ -10728,14 +10755,14 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
                 erase_buf = System.Array.CreateInstance(System.Byte, e_sz)
                 for bi in range(e_sz):
                     erase_buf[bi] = 0xFF
-                flash_ref.WriteBytes(int(e_off), erase_buf)
+                _replay_storage_write_bytes(int(e_off), erase_buf)
                 erase_idx += 1
 
             if write_idx <= fault_at:
                 b = System.Array.CreateInstance(System.Byte, width)
                 for byte_index in range(width):
                     b[byte_index] = (value >> (8 * byte_index)) & 0xFF
-                flash_ref.WriteBytes(flash_off, b)
+                _replay_storage_write_bytes(flash_off, b)
                 writes_applied += 1
             elif write_idx == fault_at + 1:
                 fault_injected = True
@@ -10747,10 +10774,10 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
             erase_buf = System.Array.CreateInstance(System.Byte, e_sz)
             for bi in range(e_sz):
                 erase_buf[bi] = 0xFF
-            flash_ref.WriteBytes(int(e_off), erase_buf)
+            _replay_storage_write_bytes(int(e_off), erase_buf)
             erase_idx += 1
         actual_writes = writes_applied
-        faulted_flash = flash_ref.ReadBytes(0, flash_size)
+        faulted_flash = _replay_storage_read_bytes(0, flash_size)
         fault_snapshot_bytes = to_py_bytes(faulted_flash)
 
     replay_ms = int((_time.time() - t_replay) * 1000)
@@ -11028,8 +11055,10 @@ def _enable_fine_trace(data):
             data.InvalidateShadow()
     data.WriteTraceClear()
     data.WriteTraceEnabled = True
-    data.EraseTraceClear()
-    data.EraseTraceEnabled = True
+    if hasattr(data, 'EraseTraceClear'):
+        data.EraseTraceClear()
+    if hasattr(data, 'EraseTraceEnabled'):
+        data.EraseTraceEnabled = True
 
 
 if calibration_mode:
@@ -11061,6 +11090,11 @@ if calibration_mode:
         # It's enabled in phase 2 only if trace replay is needed. The write
         # count from get_total_writes() uses the peripheral counter, not trace.
         reset_nvmc_for_sweep()
+        if backend['kind'] == 'mram' and hasattr(backend['data'], 'WriteTraceToString'):
+            # Direct memory interceptors can record the coarse calibration
+            # cheaply.  Keeping this active also covers successful boots that
+            # do not require the optional fine rerun.
+            _enable_fine_trace(backend['data'])
         log('calibration: starting step (fault_types={})'.format(fault_types_mode))
         base_writes = get_total_writes()
         base_erases = get_total_erases()
@@ -11097,8 +11131,10 @@ if calibration_mode:
         # known boot time. This gives write-level trace precision for trace
         # replay while keeping calibration fast. For targets where phase 1
         # already takes the full budget (slow swap), this is a no-op.
-        # Only skip phase 2 for backends that don't support write trace (mram).
-        trace_capable = backend['kind'] == 'fast'
+        trace_capable = all(hasattr(backend['data'], member) for member in (
+            'WriteTraceClear', 'WriteTraceEnabled', 'WriteTraceCount',
+            'WriteTraceToString',
+        ))
 
         semantic_trace_required = (
             writeback_active() or fault_types_mode in ('erase', 'both')
@@ -11118,7 +11154,7 @@ if calibration_mode:
             if _hash_bypass_active:
                 apply_hash_bypass()
             reset_nvmc_for_sweep()
-            if backend['kind'] == 'fast':
+            if trace_capable:
                 _enable_fine_trace(backend['data'])
             base_writes = get_total_writes()
             base_erases = get_total_erases()
@@ -11156,7 +11192,7 @@ if calibration_mode:
         # Export write trace if available.
         trace_file = None
         trace_file_bin = None
-        if backend['kind'] == 'fast' and backend['data'].WriteTraceEnabled:
+        if trace_capable and backend['data'].WriteTraceEnabled:
             backend['data'].WriteTraceEnabled = False
             trace_count = backend['data'].WriteTraceCount
             if trace_count > 0:
@@ -11420,7 +11456,7 @@ else:
         or (trace_file_path and _os.path.exists(trace_file_path))
     )
     use_trace_replay = (
-        backend['kind'] == 'fast'
+        backend['kind'] in ('fast', 'mram')
         and evaluation_mode == 'execute'
         and trace_source_exists
     )

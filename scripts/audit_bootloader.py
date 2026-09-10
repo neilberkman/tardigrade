@@ -2148,6 +2148,7 @@ def _main_single() -> int:
                 setup_writes=setup_writes,
                 trace_file=trace_file,
                 erase_trace_file=erase_trace_file,
+                backend_name=profile.flash_backend,
             ),
             quick=args.quick,
             fault_step=args.fault_step,
