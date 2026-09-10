@@ -46,7 +46,7 @@ class _RegisterValue:
         return _Register(value)
 
 
-def test_faulted_zero_vector_replaces_clean_shell_registers():
+def test_faulted_zero_vector_replaces_clean_shell_registers_and_halts():
     entry = 0x10000000
     cpu = _CPU()
     bus = SimpleNamespace(
@@ -68,6 +68,7 @@ def test_faulted_zero_vector_replaces_clean_shell_registers():
         "log": lambda message: None,
         "monitor": monitor,
         "RegisterValue": _RegisterValue,
+        "_recovery_zero_vector_guard": False,
     }
 
     prime = _load_runtime_function("prime_bootloader_entry", namespace)
@@ -75,7 +76,8 @@ def test_faulted_zero_vector_replaces_clean_shell_registers():
 
     assert cpu.SP.RawValue == 0
     assert cpu.PC.RawValue == 0
-    assert cpu.IsHalted is False
+    assert cpu.IsHalted is True
+    assert namespace["_recovery_zero_vector_guard"] is True
 
 
 def test_recovery_primes_only_after_faulted_flash_overlay():
@@ -90,6 +92,8 @@ def test_recovery_primes_only_after_faulted_flash_overlay():
     restore = functions["restore_flash_and_boot"]
     assert restore.rfind("prime_bootloader_entry()") > restore.find("WriteBytes")
     assert "prime_bootloader_entry()" not in functions["prepare_recovery_shell_state"]
+    assert "if _recovery_zero_vector_guard:" in functions["run_until_done"]
+    assert "'reason': 'no_boot_zero_vectors'" in functions["run_until_done"]
 
 
 def test_fixture_programs_reset_vector_as_its_only_tracked_write():

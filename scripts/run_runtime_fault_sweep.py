@@ -121,6 +121,7 @@ def _json_dump_text(value):
 
 bus = monitor.Machine.SystemBus
 _pre_boot_state_debug = []
+_recovery_zero_vector_guard = False
 
 
 def _snapshot_artifact_path(fault_at, fault_type):
@@ -5284,6 +5285,8 @@ _I2C_WIRE_CODE_TO_FAULT_TYPE = {
 }
 
 def prime_bootloader_entry():
+    global _recovery_zero_vector_guard
+    _recovery_zero_vector_guard = False
     # Some Cortex-M platforms do not reliably restore SP/PC from the loaded
     # bootloader image after machine Reset. Re-prime the core from the vector
     # table so execution starts from the bootloader entry on the next RunFor.
@@ -5324,8 +5327,12 @@ def prime_bootloader_entry():
                         break
                 except Exception:
                     continue
+        zero_vector_guard = initial_sp == 0 and initial_pc == 0
+        _recovery_zero_vector_guard = zero_vector_guard
+        if zero_vector_guard:
+            prime_method = 'halted_zero_vectors'
         try:
-            cpu_ref.IsHalted = False
+            cpu_ref.IsHalted = zero_vector_guard
         except Exception:
             pass
         try:
@@ -6812,6 +6819,35 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     #   6. (no_boot profiles) no writes + no VTOR for N slices/min emulated time
     #   7. (no_boot profiles) writes settled (>0 but unchanged) + no VTOR
     #   8. Iteration limit or wall-clock timeout exhausted
+    if _recovery_zero_vector_guard:
+        try:
+            cpu_ref.IsHalted = True
+        except Exception:
+            pass
+        writes_now = get_total_writes()
+        erases_now = get_total_erases()
+        pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
+        console_state = capture_console_state(include_recent=False)
+        log('run_done [{}]: reason=no_boot_zero_vectors iters=0 writes={} pc={} elapsed=0.0s'.format(
+            label, writes_now, fmt_u32(pc_now)))
+        return {
+            'iters': 0,
+            'reason': 'no_boot_zero_vectors',
+            'elapsed_s': 0.0,
+            'emulated_s': 0.0,
+            'writes': writes_now,
+            'erases': erases_now,
+            'pc': fmt_u32(pc_now),
+            'pc_samples': [],
+            'op_trace_events': 0,
+            'op_trace_truncated': False,
+            'console_attached_names': console_state.get('attached_names', []),
+            'console_attached_count': console_state.get('attached_count', 0),
+            'console_last_line': console_state.get('last_line'),
+            'console_last_lines': console_state.get('last_lines', []),
+            'console_recent_logs': console_state.get('recent_logs', []),
+            'console_fatal_pattern': None,
+        }
     if time_slice is None:
         time_slice = phase1_time_slice
     t0 = _time.time()
