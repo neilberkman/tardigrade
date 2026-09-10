@@ -382,10 +382,11 @@ memory:
     - { name: retained_ram, base: 0x21000000, size: 0x1000 }
 ```
 
-If the marker already equals its expected value at the recovery boundary, the
-point is reported as inconclusive with
+If a marker inside one of these volatile ranges already equals its expected
+value at the recovery boundary, the point is reported as inconclusive with
 `error_kind: recovery_marker_preexisting`; a preexisting value is not accepted
-as recovery evidence.
+as recovery evidence. Markers outside the declared volatile ranges, such as
+flash metadata fields, are not subject to this precondition.
 
 ### Memory checks
 

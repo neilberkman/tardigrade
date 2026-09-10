@@ -79,6 +79,9 @@ def test_preexisting_marker_is_inconclusive_with_or_without_stall(signals):
         "log": lambda message: None,
         "success_marker_addr": marker_address,
         "success_marker_value": marker_value,
+        "volatile_regions": [
+            {"name": "sram", "base": 0x20000000, "size": 0x1000}
+        ],
     }
     functions = _load_runtime_functions(
         (
@@ -99,6 +102,34 @@ def test_preexisting_marker_is_inconclusive_with_or_without_stall(signals):
     assert fields["error_kind"] == "recovery_marker_preexisting"
     assert "inconclusive" in fields["error"]
     assert signals["recovery_marker_preexisting"] is True
+
+
+def test_persistent_marker_is_not_a_volatile_precondition():
+    marker_address = 0x0000C014
+    marker_value = 0x00000001
+    namespace = {
+        "_recovery_marker_precondition": None,
+        "as_int": int,
+        "bus": SimpleNamespace(
+            ReadDoubleWord=lambda address: pytest.fail(
+                "persistent marker must not be read by volatile precondition"
+            )
+        ),
+        "fmt_u32": lambda value: "0x{:08X}".format(value),
+        "log": lambda message: None,
+        "success_marker_addr": marker_address,
+        "success_marker_value": marker_value,
+        "volatile_regions": [
+            {"name": "sram", "base": 0x20000000, "size": 0x1000}
+        ],
+    }
+    functions = _load_runtime_functions(
+        ("_capture_recovery_marker_precondition",), namespace
+    )
+
+    functions["_capture_recovery_marker_precondition"]()
+
+    assert namespace["_recovery_marker_precondition"] is None
 
 
 def test_profile_serializes_additional_volatile_regions(tmp_path):

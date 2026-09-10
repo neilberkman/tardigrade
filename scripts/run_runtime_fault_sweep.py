@@ -612,6 +612,14 @@ def _capture_recovery_marker_precondition():
     global _recovery_marker_precondition
     if success_marker_addr == 0:
         return
+    marker_end = success_marker_addr + 4
+    marker_is_volatile = any(
+        int(region['base']) <= success_marker_addr
+        and marker_end <= int(region['base']) + int(region['size'])
+        for region in volatile_regions
+    )
+    if not marker_is_volatile:
+        return
     try:
         actual = as_int(bus.ReadDoubleWord(success_marker_addr))
     except Exception as exc:
