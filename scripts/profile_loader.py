@@ -275,6 +275,7 @@ class MemoryConfig:
         "trace_address_map",
         "erase_regions",
         "postmortem_partitions",
+        "volatile_regions",
     )
 
     def __init__(
@@ -288,6 +289,7 @@ class MemoryConfig:
         trace_address_map: Optional[List[Dict[str, int]]] = None,
         erase_regions: Optional[List[MemoryRegionConfig]] = None,
         postmortem_partitions: Optional[List[MemoryRegionConfig]] = None,
+        volatile_regions: Optional[List[MemoryRegionConfig]] = None,
     ) -> None:
         self.sram_start = sram_start
         self.sram_end = sram_end
@@ -301,6 +303,7 @@ class MemoryConfig:
         self.trace_address_map = trace_address_map or []
         self.erase_regions = erase_regions or []
         self.postmortem_partitions = postmortem_partitions or []
+        self.volatile_regions = volatile_regions or []
 
 
 class ResidualImageConfig:
@@ -2429,6 +2432,21 @@ class ProfileConfig:
             ),
             "RUNTIME_MODE:true",
         ]
+        if mem.volatile_regions:
+            volatile_payload = [
+                {
+                    "name": region.name or "volatile_{}".format(index),
+                    "base": region.base,
+                    "size": region.size,
+                }
+                for index, region in enumerate(mem.volatile_regions)
+            ]
+            encoded_volatile = base64.b64encode(
+                json.dumps(
+                    volatile_payload, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).decode("ascii")
+            vars_list.append("VOLATILE_REGIONS_B64:{}".format(encoded_volatile))
         if fs.calibration_time_slice:
             vars_list.append(
                 "CALIBRATION_TIME_SLICE:{}".format(fs.calibration_time_slice)
@@ -3157,6 +3175,11 @@ def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
     postmortem_partitions = _parse_memory_regions(
         raw.get("postmortem_partitions"), "memory.postmortem_partitions"
     )
+    volatile_regions = _parse_memory_regions(
+        raw.get("volatile_regions"), "memory.volatile_regions"
+    )
+    if any(region.sector_size is not None for region in volatile_regions):
+        raise ProfileError("memory.volatile_regions does not accept sector_size")
     for index, partition in enumerate(postmortem_partitions):
         if not partition.name:
             raise ProfileError(
@@ -3221,6 +3244,7 @@ def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
         trace_address_map=trace_address_map,
         erase_regions=erase_regions,
         postmortem_partitions=postmortem_partitions,
+        volatile_regions=volatile_regions,
     )
 
 
@@ -6555,7 +6579,7 @@ def _validate_strict_memory(raw: Any, context: str) -> None:
             {
                 "sram", "write_granularity", "page_size", "slots",
                 "bootloader_region", "trace_address_map", "erase_regions",
-                "postmortem_partitions",
+                "postmortem_partitions", "volatile_regions",
             }
         ),
         context,
@@ -6574,16 +6598,19 @@ def _validate_strict_memory(raw: Any, context: str) -> None:
             frozenset({"base", "size"}),
             "{}.slots.{}".format(context, slot_name),
         )
-    for field_name in ("erase_regions", "postmortem_partitions"):
+    for field_name in ("erase_regions", "postmortem_partitions", "volatile_regions"):
         regions = raw.get(field_name)
         if regions is None:
             continue
         if not isinstance(regions, list):
             raise ProfileError("{}.{}: expected list".format(context, field_name))
         for index, region in enumerate(regions):
+            region_keys = {"base", "size", "name"}
+            if field_name != "volatile_regions":
+                region_keys.update({"sector_size", "erase_size"})
             _reject_unknown_keys(
                 region,
-                frozenset({"base", "size", "sector_size", "erase_size", "name"}),
+                frozenset(region_keys),
                 "{}.{}[{}]".format(context, field_name, index),
             )
     if "bootloader_region" in raw:
