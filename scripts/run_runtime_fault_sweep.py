@@ -121,6 +121,7 @@ def _json_dump_text(value):
 
 bus = monitor.Machine.SystemBus
 _pre_boot_state_debug = []
+_recovery_zero_vector_guard = False
 
 
 def _snapshot_artifact_path(fault_at, fault_type):
@@ -5284,6 +5285,8 @@ _I2C_WIRE_CODE_TO_FAULT_TYPE = {
 }
 
 def prime_bootloader_entry():
+    global _recovery_zero_vector_guard
+    _recovery_zero_vector_guard = False
     # Some Cortex-M platforms do not reliably restore SP/PC from the loaded
     # bootloader image after machine Reset. Re-prime the core from the vector
     # table so execution starts from the bootloader entry on the next RunFor.
@@ -5297,13 +5300,14 @@ def prime_bootloader_entry():
         # report command failures to the console without raising exceptions,
         # which makes a failed `cpu PC ...` prime look successful.
         try:
-            if initial_sp != 0:
-                cpu_ref.SP = RegisterValue.Create(initial_sp, 32)
-            if initial_pc != 0:
-                cpu_ref.PC = RegisterValue.Create(initial_pc, 32)
+            # Zero is evidence too: a power-loss fault can leave either
+            # vector word unprogrammed.  Always replace the shell snapshot's
+            # registers so clean-ELF values cannot survive the overlay.
+            cpu_ref.SP = RegisterValue.Create(initial_sp, 32)
+            cpu_ref.PC = RegisterValue.Create(initial_pc, 32)
 
-            sp_ok = (initial_sp == 0) or (as_int(cpu_ref.SP.RawValue) == initial_sp)
-            pc_ok = (initial_pc == 0) or ((as_int(cpu_ref.PC.RawValue) & ~1) == (initial_pc & ~1))
+            sp_ok = as_int(cpu_ref.SP.RawValue) == initial_sp
+            pc_ok = (as_int(cpu_ref.PC.RawValue) & ~1) == (initial_pc & ~1)
             if sp_ok and pc_ok:
                 prime_method = 'direct_registers'
         except Exception:
@@ -5313,20 +5317,22 @@ def prime_bootloader_entry():
             for cpu_name in ('cpu', 'sysbus.cpu'):
                 try:
                     monitor.Parse('{} VectorTableOffset 0x{:08X}'.format(cpu_name, int(bootloader_entry)))
-                    if initial_sp != 0:
-                        monitor.Parse('{} SP 0x{:08X}'.format(cpu_name, initial_sp))
-                    if initial_pc != 0:
-                        monitor.Parse('{} PC 0x{:08X}'.format(cpu_name, initial_pc))
+                    monitor.Parse('{} SP 0x{:08X}'.format(cpu_name, initial_sp))
+                    monitor.Parse('{} PC 0x{:08X}'.format(cpu_name, initial_pc))
 
-                    sp_ok = (initial_sp == 0) or (as_int(cpu_ref.SP.RawValue) == initial_sp)
-                    pc_ok = (initial_pc == 0) or ((as_int(cpu_ref.PC.RawValue) & ~1) == (initial_pc & ~1))
+                    sp_ok = as_int(cpu_ref.SP.RawValue) == initial_sp
+                    pc_ok = (as_int(cpu_ref.PC.RawValue) & ~1) == (initial_pc & ~1)
                     if sp_ok and pc_ok:
                         prime_method = 'monitor:{}'.format(cpu_name)
                         break
                 except Exception:
                     continue
+        zero_vector_guard = initial_sp == 0 and initial_pc == 0
+        _recovery_zero_vector_guard = zero_vector_guard
+        if zero_vector_guard:
+            prime_method = 'halted_zero_vectors'
         try:
-            cpu_ref.IsHalted = False
+            cpu_ref.IsHalted = zero_vector_guard
         except Exception:
             pass
         try:
@@ -5694,7 +5700,6 @@ def prepare_recovery_shell_state():
     monitor.Parse('machine Pause')
     _bus_load_elf(bootloader_elf)
     restore_hw_init()
-    prime_bootloader_entry()
 
 def prepare_cold_reset():
     # Cold reset: save NVM, destroy and recreate machine, restore NVM.
@@ -5742,6 +5747,10 @@ def restore_flash_and_boot(saved_flash):
     else:
         flash_ref = b['data'].Flash
         flash_ref.WriteBytes(0, saved_flash)
+    # The shell was built from the clean ELF, but hardware reset state belongs
+    # to the restored persistent image.  Fetch both vector words only after
+    # installing that image, including zero/unprogrammed values.
+    prime_bootloader_entry()
     # Do NOT re-run setup_script here.  The faulted snapshot is the
     # ground-truth state for the recovery boot — re-running setup would
     # overwrite it with clean data and mask the fault.
@@ -6810,6 +6819,35 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     #   6. (no_boot profiles) no writes + no VTOR for N slices/min emulated time
     #   7. (no_boot profiles) writes settled (>0 but unchanged) + no VTOR
     #   8. Iteration limit or wall-clock timeout exhausted
+    if _recovery_zero_vector_guard:
+        try:
+            cpu_ref.IsHalted = True
+        except Exception:
+            pass
+        writes_now = get_total_writes()
+        erases_now = get_total_erases()
+        pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
+        console_state = capture_console_state(include_recent=False)
+        log('run_done [{}]: reason=no_boot_zero_vectors iters=0 writes={} pc={} elapsed=0.0s'.format(
+            label, writes_now, fmt_u32(pc_now)))
+        return {
+            'iters': 0,
+            'reason': 'no_boot_zero_vectors',
+            'elapsed_s': 0.0,
+            'emulated_s': 0.0,
+            'writes': writes_now,
+            'erases': erases_now,
+            'pc': fmt_u32(pc_now),
+            'pc_samples': [],
+            'op_trace_events': 0,
+            'op_trace_truncated': False,
+            'console_attached_names': console_state.get('attached_names', []),
+            'console_attached_count': console_state.get('attached_count', 0),
+            'console_last_line': console_state.get('last_line'),
+            'console_last_lines': console_state.get('last_lines', []),
+            'console_recent_logs': console_state.get('recent_logs', []),
+            'console_fatal_pattern': None,
+        }
     if time_slice is None:
         time_slice = phase1_time_slice
     t0 = _time.time()

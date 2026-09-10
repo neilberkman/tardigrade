@@ -351,6 +351,15 @@ success_criteria:
   vector_table_offset: 0x400 # nxboot: 1KB image header
 ```
 
+The reset vector table is part of the fault surface when `bootloader.entry`
+lies inside the selected fast or direct-MRAM fault backend. On those paths,
+tardigrade reads the initial SP and PC after installing the restored persistent
+image, so an interrupted vector-table write can produce a `no_boot` result.
+This does not apply when the table is in separate boot ROM, and the slow
+`nvm_ctrl` recovery path does not currently provide this guarantee. Keep an
+updatable table outside the programmed region when the hardware layout permits
+it; otherwise include its writes in the campaign.
+
 ### Marker address
 
 For bootloaders that don't relocate VTOR, check a specific memory address after boot:

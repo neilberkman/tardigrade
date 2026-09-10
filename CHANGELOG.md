@@ -41,6 +41,10 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Changed
 
+- Fast and direct-MRAM recovery boots now derive the initial SP and PC from a
+  restored faulted vector table when it resides in the backend array, exposing
+  interrupted vector writes as boot failures instead of retaining clean-ELF
+  register values. An all-zero restored vector pair leaves the core halted.
 - GitHub Action results now separate assertion status from security status and
   require an explicit regression mode for known-vulnerable profiles.
 - Runtime reports include richer fault classification, probe evidence, and
