@@ -73,13 +73,18 @@ jobs:
           rm -rf "${report_dir}"
           mkdir -p "${report_dir}"
           mkdir -p "${artifact_dir}"
+          # Renode 1.17.0's portable renode-test appends its own -r $(pwd) after the caller's arguments,
+          # so the run starts in the report directory, where the report is then written on every release.
           set +e
-          renode-test \
-            -r "${report_dir}" \
-            --save-logs always \
-            --keep-renode-output \
-            tests/nativeaot_runfor_bug.robot \
-            >"${report_dir}/console.log" 2>&1
+          (
+            cd "${report_dir}" &&
+            renode-test \
+              -r "${report_dir}" \
+              --save-logs always \
+              --keep-renode-output \
+              "${GITHUB_WORKSPACE}/tests/nativeaot_runfor_bug.robot" \
+              >"${report_dir}/console.log" 2>&1
+          )
           renode_status=$?
           set -e
           cp -R "${report_dir}/." "${artifact_dir}/"
