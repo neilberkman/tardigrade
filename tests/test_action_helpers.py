@@ -409,7 +409,11 @@ class TestActionSourceBoundaries(unittest.TestCase):
         source = (
             ROOT / ".github" / "workflows" / "renode-latest-canary.yml"
         ).read_text(encoding="utf-8")
-        self.assertIn("renode-test \\\n            -r \"${report_dir}\"", source)
+        # Renode 1.17.0's portable renode-test appends its own -r $(pwd) after the caller's arguments, so the step
+        # runs from the report directory and names the suite by its absolute path.
+        self.assertIn('cd "${report_dir}" &&', source)
+        self.assertIn("renode-test \\\n              -r \"${report_dir}\"", source)
+        self.assertIn('"${GITHUB_WORKSPACE}/tests/nativeaot_runfor_bug.robot"', source)
         self.assertIn('"${report_dir}/robot_output.xml"', source)
         self.assertIn('"${report_dir}/output.xml"', source)
         self.assertIn('artifact_dir="results/renode_latest_canary/nativeaot"', source)
