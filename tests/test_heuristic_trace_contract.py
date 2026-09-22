@@ -129,6 +129,36 @@ def test_explicit_heuristic_is_sent_to_calibration_runtime() -> None:
     assert "HEURISTIC_TRACE_REQUIRED:true" in robot_vars
 
 
+def test_calibration_coverage_selectors_request_address_trace() -> None:
+    profile = load_profile(ROOT / "profiles" / "mcuboot_pr2100_fixed_discovery.yaml")
+    assert "CALIBRATION_TRACE_REQUIRED:true" in profile.robot_vars(ROOT)
+
+
+def test_unrelated_selector_keeps_address_trace_optional(tmp_path: Path) -> None:
+    profile_path = tmp_path / "profile.yaml"
+    profile_path.write_text(
+        """
+schema_version: 1
+name: unrelated_trace_contract
+platform: platform.repl
+bootloader: { elf: firmware.elf, entry: 0x10000000 }
+memory:
+  sram: { start: 0x20000000, end: 0x20001000 }
+  slots:
+    exec: { base: 0x10000000, size: 0x1000 }
+    staging: { base: 0x10001000, size: 0x1000 }
+images: { staging: firmware.bin }
+success_criteria: { vtor_in_slot: exec }
+fault_sweep:
+  fault_types: [bit_corruption]
+""",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(profile_path)
+    assert "CALIBRATION_TRACE_REQUIRED:false" in profile.robot_vars(tmp_path)
+
+
 def test_self_update_example_uses_trace_capable_direct_nvm() -> None:
     profile = load_profile(ROOT / "examples" / "bootloader_self_update" / "profile.yaml")
 

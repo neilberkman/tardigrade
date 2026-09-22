@@ -707,6 +707,9 @@ calibration_mode = str(monitor.GetVariable('calibration_mode')).lower() in ('1',
 heuristic_trace_required = get_optional_var(
     'heuristic_trace_required', 'false'
 ).lower() in ('1', 'true', 'yes')
+calibration_trace_required = get_optional_var(
+    'calibration_trace_required', 'false'
+).lower() in ('1', 'true', 'yes')
 evaluation_mode = str(monitor.GetVariable('evaluation_mode')).strip().lower()
 if evaluation_mode not in ('execute', 'state'):
     evaluation_mode = 'state'
@@ -12109,6 +12112,7 @@ if calibration_mode:
             writeback_active()
             or fault_types_mode in ('erase', 'both')
             or (heuristic_trace_required and backend['kind'] == 'fast')
+            or calibration_trace_required
         )
         if (not bounded_calibration) and _calibration_phase2_trace_allowed(
                 phase1_reason, trace_capable, semantic_trace_required):

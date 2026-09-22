@@ -937,8 +937,10 @@ The writeback model only changes the persisted flash snapshot used for Phase 2 r
 Writeback preflight and replay apply to injected fault points. The clean control
 executes normally and does not require replay provenance. During fine
 calibration, capable backends may temporarily enable address and shadow
-tracking so the complete write trace can be exported; ordinary fast, count-only
-runs retain their optimized path.
+tracking so the complete write trace can be exported. Profiles that enable a
+trace-dependent selector request that capture automatically; fast runs whose
+selectors do not require calibration coverage retain the optimized count-only
+path.
 
 Writeback campaigns require a bounded, trace-capable backend so the runner can
 reconstruct the committed image. The `nvm_ctrl`/`NVMemoryController` path does

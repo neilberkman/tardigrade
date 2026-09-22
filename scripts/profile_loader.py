@@ -39,6 +39,7 @@ from fault_types import (
     KNOWN_FAULT_TYPES,
     OTP_FAULT_TYPE_CODES,
     PHASE2_FAULT_TYPES,
+    TRACE_COVERAGE_FAULT_TYPES,
 )
 from thumb_instructions import enumerate_instruction_skip_addresses, make_elf_halfword_reader
 from boot_outcomes import DEVICE_BOOT_OUTCOMES
@@ -2479,6 +2480,11 @@ class ProfileConfig:
                 str(
                     fs.sweep_strategy == "heuristic"
                     and fs.sweep_strategy_explicit
+                ).lower()
+            ),
+            "CALIBRATION_TRACE_REQUIRED:{}".format(
+                str(
+                    bool(set(fs.fault_types) & TRACE_COVERAGE_FAULT_TYPES)
                 ).lower()
             ),
             "RUNTIME_MODE:true",

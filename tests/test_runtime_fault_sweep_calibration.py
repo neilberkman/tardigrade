@@ -57,6 +57,7 @@ class RuntimeFaultSweepCalibrationTests(unittest.TestCase):
             "or (heuristic_trace_required and backend['kind'] == 'fast')",
             text,
         )
+        self.assertIn("or calibration_trace_required", text)
 
     def test_slow_controller_trace_stubs_are_not_trace_capable(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
