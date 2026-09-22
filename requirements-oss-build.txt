@@ -1,6 +1,9 @@
-# Exact public, open-source build dependencies for the Zephyr 3.7 / MCUboot
-# validation asset pipeline. Transitive dependencies are listed explicitly.
+# Exact public, open-source build dependencies for the pinned and current
+# Zephyr / MCUboot validation asset pipelines. Transitive dependencies are
+# listed explicitly.
 anytree==2.13.0
+attrs==26.1.0
+boolean.py==5.0
 canopen==2.4.1
 cbor2==6.1.2
 certifi==2026.5.20
@@ -12,7 +15,13 @@ cryptography==48.0.1
 docopt==0.6.2
 idna==3.18
 intelhex==2.3.0
+Jinja2==3.1.6
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+license-expression==30.4.4
+MarkupSafe==3.0.3
 packaging==26.2
+patool==4.1.0
 progress==1.6.1
 psutil==7.2.2
 pycparser==3.0
@@ -22,10 +31,19 @@ pylink-square==1.7.0
 pyserial==3.5
 python-can==4.6.1
 python-dateutil==2.9.0.post0
+python-debian==1.1.1
+python-magic==0.4.27
 PyYAML==6.0.3
+referencing==0.37.0
 requests==2.34.2
+reuse==6.2.0
+rpds-py==2026.6.3
 ruamel.yaml==0.19.1
+semver==3.1.0
 six==1.17.0
+spdx-python-model==0.0.6
+tomlkit==0.14.0
+tqdm==4.70.1
 typing_extensions==4.15.0
 urllib3==2.7.0
 west==1.5.0

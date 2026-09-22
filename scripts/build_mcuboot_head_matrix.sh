@@ -95,6 +95,18 @@ require_file "${STRIP_BIN}"
 
 mkdir -p "${ASSETS_DIR}" "${BUILD_DIR}"
 
+ZEPHYR_VERSION_FILE="${ZEPHYR_WS}/zephyr/VERSION"
+require_file "${ZEPHYR_VERSION_FILE}"
+ZEPHYR_MAJOR="$(awk -F= '/^VERSION_MAJOR[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "${ZEPHYR_VERSION_FILE}")"
+if [[ ! "${ZEPHYR_MAJOR}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: unable to parse Zephyr major version from ${ZEPHYR_VERSION_FILE}" >&2
+    exit 1
+fi
+LEGACY_ZEPHYR_CMAKE=()
+if (( ZEPHYR_MAJOR < 4 )); then
+    LEGACY_ZEPHYR_CMAKE=(-DCONFIG_BOOTLOADER_SRAM_SIZE=64)
+fi
+
 # Resolve and check out the current public MCUboot head, then record the exact
 # commit for reproducibility. The original west-managed revision is restored
 # by the EXIT trap.
@@ -118,7 +130,7 @@ echo "${MCUBOOT_HEAD}" > "${ASSETS_DIR}/mcuboot_head_commit.txt"
 
 # Patch module.yml if it has 'package-managers' (unsupported by Zephyr < 4.0).
 MODULE_YML="${MCUBOOT_REPO}/zephyr/module.yml"
-if grep -q 'package-managers' "${MODULE_YML}" 2>/dev/null; then
+if (( ZEPHYR_MAJOR < 4 )) && grep -q 'package-managers' "${MODULE_YML}" 2>/dev/null; then
     msg "Stripping unsupported 'package-managers' from module.yml"
     sed -i.bak '/^package-managers:/,/^[^ ]/{ /^package-managers:/d; /^  /d; }' "${MODULE_YML}"
 fi
@@ -127,7 +139,8 @@ fi
 # which this repository pins for reproducible builds, predates that symbol and
 # therefore needs a local type declaration while configuring the dependency.
 MCUBOOT_KCONFIG="${MCUBOOT_REPO}/boot/zephyr/Kconfig"
-if grep -q '^config MBEDTLS_CONFIG_FILE$' "${MCUBOOT_KCONFIG}" && \
+if (( ZEPHYR_MAJOR < 4 )) && \
+   grep -q '^config MBEDTLS_CONFIG_FILE$' "${MCUBOOT_KCONFIG}" && \
    ! awk '
        /^config MBEDTLS_CONFIG_FILE$/ { in_symbol = 1; next }
        in_symbol && /^config / { exit }
@@ -446,13 +459,13 @@ build_mcuboot() {
           -DCONFIG_BOOT_SIGNATURE_TYPE_RSA=n \
           -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
           -DCONFIG_BOOT_MAX_IMG_SECTORS=1024 \
-          -DCONFIG_BOOTLOADER_SRAM_SIZE=64 \
           -DCONFIG_WARN_DEPRECATED=n \
           -DCONFIG_USE_SEGGER_RTT=n \
           -DCONFIG_MINIMAL_LIBC=y \
           -DCONFIG_PICOLIBC=n \
           -DCMAKE_GDB:FILEPATH="${TOOLCHAIN_PATH}/bin/arm-none-eabi-gdb" \
           "-DPython3_EXECUTABLE:FILEPATH=${IMGTOOL_PYTHON}" \
+          "${LEGACY_ZEPHYR_CMAKE[@]}" \
           "${extra_cmake[@]}"
     )
 

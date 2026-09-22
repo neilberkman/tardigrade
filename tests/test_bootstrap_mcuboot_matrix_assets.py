@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -175,7 +176,8 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertIn("\"${ASSETS_DIR}/zephyr_head_scratch_stm32f4_pr2206_slot1.bin\" \"36864\" \"32\"", text)
         self.assertIn('restore_mcuboot_module_yml', text)
         self.assertIn('patch_mcuboot_module_yml', text)
-        self.assertIn('update --narrow -o=--depth=1 zephyr mcuboot hal_nordic hal_stm32 cmsis', text)
+        self.assertIn("west_projects=(zephyr mcuboot hal_nordic hal_stm32 cmsis)", text)
+        self.assertIn('update --narrow -o=--depth=1 "${west_projects[@]}"', text)
         self.assertIn('fetch --quiet mcu-tools "+refs/pull/${pr}/head:refs/pull/${pr}"', text)
 
     def test_geometry_script_restores_header_gap_for_geom_payloads(self) -> None:
@@ -353,6 +355,30 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertIn("https://github.com/mcu-tools/mcuboot.git", bootstrap)
         self.assertIn('rev-parse FETCH_HEAD', head_matrix)
         self.assertIn('checkout --quiet --detach "${MCUBOOT_FETCHED_COMMIT}"', head_matrix)
+        self.assertIn("ZEPHYR_MAJOR", head_matrix)
+        self.assertIn("ZEPHYR_MAJOR < 4", head_matrix)
+
+    def test_bootstrap_supports_current_head_without_historical_builds(self) -> None:
+        bootstrap = (ROOT / "scripts" / "bootstrap_mcuboot_matrix_assets.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('BOOTSTRAP_SCOPE="${MCUBOOT_BOOTSTRAP_SCOPE:-full}"', bootstrap)
+        self.assertIn('if [[ "${BOOTSTRAP_SCOPE}" == "head" ]]', bootstrap)
+        self.assertIn('if [[ "${BOOTSTRAP_SCOPE}" == "full" ]]', bootstrap)
+        self.assertIn('"${ASSETS_DIR}/zephyr_head_commit.txt"', bootstrap)
+        self.assertIn("west_projects+=(cmsis_6)", bootstrap)
+
+    def test_bootstrap_rejects_unknown_scope_before_mutating_workspace(self) -> None:
+        proc = subprocess.run(
+            [str(SCRIPT)],
+            cwd=ROOT,
+            env={**os.environ, "MCUBOOT_BOOTSTRAP_SCOPE": "unknown"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("must be 'full' or 'head'", proc.stderr)
 
     def test_pr_differential_assets_are_tracked(self) -> None:
         tracked = subprocess.check_output(

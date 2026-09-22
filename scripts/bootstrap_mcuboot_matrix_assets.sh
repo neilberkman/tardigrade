@@ -5,14 +5,28 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+BOOTSTRAP_SCOPE="${MCUBOOT_BOOTSTRAP_SCOPE:-full}"
+case "${BOOTSTRAP_SCOPE}" in
+    full|head) ;;
+    *)
+        echo "ERROR: MCUBOOT_BOOTSTRAP_SCOPE must be 'full' or 'head'" >&2
+        exit 2
+        ;;
+esac
 
 # Public Zephyr v3.7.0 commit. Keep this immutable for reproducible assets.
 ZEPHYR_REF="${ZEPHYR_REF:-36940db938a8f4a1e919496793ed439850a221c2}"
 # west passes --mr to git clone --branch, so use the advertised release tag
-# when resolving the immutable default commit. Non-SHA overrides can be used
-# directly as the manifest ref (for example, a branch or another tag).
+# when resolving the immutable default commit. Head-only current-upstream
+# builds initialize from main so an immutable current Zephyr SHA does not need
+# to be discovered from the historical v3.7 branch first. Non-SHA overrides
+# can be used directly as the manifest ref (for example, a branch or tag).
 if [[ "${ZEPHYR_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
-    ZEPHYR_INIT_REF="v3.7.0"
+    if [[ "${BOOTSTRAP_SCOPE}" == "head" ]]; then
+        ZEPHYR_INIT_REF="main"
+    else
+        ZEPHYR_INIT_REF="v3.7.0"
+    fi
 else
     ZEPHYR_INIT_REF="${ZEPHYR_REF}"
 fi
@@ -989,10 +1003,17 @@ checkout_zephyr_ref "${ZEPHYR_WS}/zephyr" "${ZEPHYR_REF}"
 if [[ -d "${MCUBOOT_DIR}/.git" ]]; then
     restore_mcuboot_module_yml
 fi
-msg "Running targeted west update (zephyr + mcuboot + nrf/stm32 deps)"
+west_projects=(zephyr mcuboot hal_nordic hal_stm32 cmsis)
+if [[ "${BOOTSTRAP_SCOPE}" == "head" ]] && \
+   ( cd "${ZEPHYR_WS}" && "${WEST}" list cmsis_6 -f '{name}' >/dev/null 2>&1 ); then
+    west_projects+=(cmsis_6)
+fi
+msg "Running targeted west update (${west_projects[*]})"
 ( cd "${ZEPHYR_WS}" && \
-  "${WEST}" update --narrow -o=--depth=1 zephyr mcuboot hal_nordic hal_stm32 cmsis )
+  "${WEST}" update --narrow -o=--depth=1 "${west_projects[@]}" )
 verify_zephyr_checkout "${ZEPHYR_WS}/zephyr"
+mkdir -p "${ASSETS_DIR}"
+echo "${RESOLVED_ZEPHYR_COMMIT}" > "${ASSETS_DIR}/zephyr_head_commit.txt"
 
 # --- 4. Add upstream MCUboot remote for commit checkouts ---
 if [[ ! -d "${MCUBOOT_DIR}" ]]; then
@@ -1005,7 +1026,9 @@ if ! git -C "${MCUBOOT_DIR}" remote | grep -q '^upstream$'; then
         https://github.com/mcu-tools/mcuboot.git
 fi
 git -C "${MCUBOOT_DIR}" fetch --quiet upstream
-patch_mcuboot_module_yml
+if [[ "${BOOTSTRAP_SCOPE}" == "full" ]]; then
+    patch_mcuboot_module_yml
+fi
 
 # --- 5. Verify the pinned build environment ---
 "${ZEPHYR_VENV}/bin/pip" check
@@ -1018,8 +1041,11 @@ patch_mcuboot_module_yml
       "${WEST}" config build.generator "Unix Makefiles"
   fi )
 
-build_seccounter_assets
-
-build_pr_differential_assets
+if [[ "${BOOTSTRAP_SCOPE}" == "full" ]]; then
+    build_seccounter_assets
+    build_pr_differential_assets
+else
+    msg "Head-only bootstrap complete; historical asset builds skipped"
+fi
 
 msg "Bootstrap complete. Workspace: ${ZEPHYR_WS}"

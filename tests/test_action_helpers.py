@@ -497,6 +497,8 @@ class TestActionSourceBoundaries(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("normalize-git-ref", source)
         self.assertIn('MCUBOOT_REF="${ref}"', source)
+        self.assertIn('ZEPHYR_REF="${zephyr_ref}"', source)
+        self.assertIn("MCUBOOT_BOOTSTRAP_SCOPE=head", source)
         self.assertIn("build_mcuboot_head_matrix.sh", source)
         for profile in (
             "mcuboot_head_move_nrf52_revert_full_fault_coverage.yaml",
@@ -514,6 +516,7 @@ class TestActionSourceBoundaries(unittest.TestCase):
         self.assertIn("mcuboot-zero-day-${{ matrix.slug }}", source)
         self.assertIn('cron: "0 9 * * 1"', source)
         self.assertIn("inputs.mcuboot_ref || 'main'", source)
+        self.assertIn("inputs.zephyr_ref || 'main'", source)
 
     def test_dependency_files_use_exact_public_versions(self):
         requirement_files = (
