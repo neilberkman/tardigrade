@@ -77,8 +77,9 @@ than three points. If it passes, drop `--quick` for the full configured sweep.
 
 ### Precise write-trace activation
 
-Backends that expose `TrackingStartAddress` can defer CPU write tracing until a
-known instruction address, avoiding instrumentation of boot-time swap traffic.
+Backends that expose `TrackingStartAddress` can defer campaign tracking until a
+known instruction address, avoiding instrumentation of unrelated boot-time
+writes.
 Set `fault_sweep.tracking_start_address` to a 32-bit instruction address; the
 default `0` preserves tracing from reset. If a nonzero address is configured
 for a backend without this capability, the runtime fails clearly.
@@ -87,6 +88,13 @@ for a backend without this capability, the runtime fails clearly.
 fault_sweep:
   tracking_start_address: 0x08001000
 ```
+
+Before activation, reads and writes retain normal persistent-memory behavior,
+but write counts, traces, and armed write faults remain dormant. Reaching the
+boundary clears the property to zero atomically, and the next program is
+campaign write 1. A peripheral reset preserves storage and restores a
+configured nonzero boundary to its waiting state; profiles that omit the
+boundary retain the prior always-active behavior.
 
 ## Profile inheritance
 
@@ -420,6 +428,23 @@ success_criteria:
   expected_image: staging # after upgrade, exec should contain what was in staging
 ```
 
+If more than one declared image is a safe recovery result, use
+`allowed_images` instead of `expected_image`:
+
+```yaml
+success_criteria:
+  vtor_in_slot: exec
+  image_hash: true
+  allowed_images: [exec, staging]
+```
+
+The list must be nonempty, contain unique names from `images`, and cannot be
+combined with `expected_image`. The runtime accepts only an exact digest from
+the list and records the matched image name. A mixed or unknown image remains
+a failure. Trigger discovery also rejects an unchanged starting image when it
+is merely one member of the allowed set; discovery still has to demonstrate
+the configured update effect.
+
 ### Boot register values
 
 Capture and verify hardware register state at boot time. Useful for checking MPU configuration, peripheral lock bits, or clock settings:
@@ -481,6 +506,26 @@ fault_sweep:
 ```
 
 `max_writes: auto` runs the firmware once and counts NVM writes. Set a fixed number if you know it. `max_writes_cap` (default 100000) is a safety limit.
+
+To keep calibration bounded to the persistence operation of interest, add an
+address boundary, a success-observation boundary, or both:
+
+```yaml
+fault_sweep:
+  evaluation_mode: execute
+  max_writes: auto
+  calibration_stop:
+    address: 0x08002000
+    success_criteria: true
+```
+
+`address` stops when that halfword-aligned CPU address is reached.
+`success_criteria: true` stops when the configured success checks are first
+observed at the runtime polling boundary. The completed operation that caused
+the observation remains in the count and trace, and the calibration result
+records the stop reason, counts, final hash, and exact matched image. This is
+execute-mode only. Omitting `calibration_stop` preserves the existing terminal
+condition.
 
 OTP-only campaigns can declare an independent operation bound:
 
@@ -1110,6 +1155,32 @@ identifiers, resolved values, the expected rule, and the control/faulted run
 phase. A compatibility violation is emitted as the security finding
 `STATE_RELATION_VIOLATION`, even when all components boot successfully.
 
+#### Cross-transaction state isolation
+
+Use `transaction_state_isolation` with an `update_sequence` when a cancelled
+or cleaned transaction must not leave security metadata available to the next
+transaction. The runner retains the semantic state observed after each phase;
+the invariant requires the named paths to be cleared at every reset phase and
+rejects a later transaction that reuses the earlier value:
+
+```yaml
+invariants: [transaction_state_isolation]
+invariant_config:
+  transaction_state_isolation:
+    paths: [security.header, security.authorization]
+    reset_phases: [cancel]
+update_sequence:
+  - {name: transaction_a, fault_injection: false, ...}
+  - {name: cancel, fault_injection: false, ...}
+  - {name: transaction_b, fault_injection: true, ...}
+```
+
+The `cancel` phase can omit the fields (or report `null`, `false`, `0`, or an
+empty string) to represent cleared state. If transaction B omits a field or
+uses a new value, the check passes; reusing A's value emits
+`TRANSACTION_STATE_LEAK`. Missing phase state telemetry is an evaluation error,
+so an uninstrumented lifecycle cannot silently pass.
+
 #### Failed persistent-state reads must fail closed
 
 For a security-sensitive persistent-state operation, have `state_probe`
@@ -1680,8 +1751,24 @@ Each fault point produces one of:
 | `wrong_image` | Device booted but to the wrong slot or with wrong image |
 | `no_boot`     | Device did not reach any valid vector table             |
 | `wrong_pc`    | PC ended up outside all known slots                     |
-| `hard_fault`  | CFSR indicated a HardFault                              |
+| `hard_fault`  | Recovery fault evidence or an invalid reset vector was observed |
 | `timeout`     | Bootloader was still working at the wall-clock limit; evidence is incomplete |
+
+Execution failure has precedence over content identity. An observed recovery
+HardFault, active fault handler, invalid reset vector, or terminal liveness
+stall is reported as `hard_fault` or `no_boot`; an accompanying digest mismatch
+is retained in `signals.content_mismatch` and `signals.supporting_outcomes`
+instead of replacing the crash with `wrong_image`. A wall-clock timeout remains
+an incomplete observation rather than proof of a brick.
+
+For injected MRAM programs, the backend contract is fail-closed. The per-point
+record includes `mram_fault_evidence` with the selected and backend write
+indices, absolute address, offset, exact program width, intended/pre/post byte
+strings, and ordered width-aware program trace. `fault_snapshot` describes the
+immediate post-fault persistent-memory image with its SHA-256, closest declared
+image, differing-byte count, and compact differing ranges. The raw snapshot is
+stored in `fault_snapshot_file`. Missing or contradictory address/width data is
+an infrastructure error and cannot contribute valid campaign evidence.
 
 ### Failure classes
 
@@ -1708,6 +1795,9 @@ runtime_sweep_results[]                 -- per-point detail
   .boot_outcome                         -- success/wrong_image/no_boot/...
   .fault_class                          -- recoverable/wrong_image/unrecoverable
   .signals                              -- raw harness signals (VTOR, markers, etc.)
+  .mram_fault_evidence                  -- exact program bytes, address, width, trace
+  .fault_snapshot                       -- immediate digest, closest image, byte ranges
+  .fault_snapshot_file                  -- raw immediate persistent-memory snapshot
   .postmortem_partition_dump            -- (no_boot only) slot header/trailer data
   .resume_trace                         -- (no_boot only) PC samples from second boot
 ```

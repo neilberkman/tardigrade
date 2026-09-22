@@ -132,7 +132,9 @@ return value when a named wrapper returns. General `function_return_probes`
 capture first, last, or all calls; the `success_implies_effect` invariant then
 checks that a successful API return produced its declared persistent effect.
 Other built-ins enforce atomic state groups, monotonic fields, and
-cross-component state relations. The `persistent_state_fail_closed` invariant
+cross-component state relations. The `transaction_state_isolation` invariant
+retains semantic observations across update-sequence reset phases and detects
+security metadata reused by a later transaction. The `persistent_state_fail_closed` invariant
 checks that a failed persistent-state read cannot be followed by a write or an
 accepted, committed, or booted outcome; incomplete telemetry is an evaluation
 error rather than a finding.
@@ -350,7 +352,7 @@ flowchart TD
 5. **Phase 1** -- replay the clean trace where supported, or execute the CPU to the selected cutpoint, then inject the fault. Trace replay eliminates O(N^2) prefix re-emulation for eligible power-loss points.
 6. **Phase 2** -- `execute` mode resets the CPU and performs a full recovery boot from faulted NVM; `state` mode infers the outcome from NVM contents alone.
 7. **Follow-up cycles / hooks** -- optional repeated boots and between-cycle hook actions model confirm-or-rollback flows and staged recovery.
-8. **Classification** -- boot outcomes (`success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`) and failure classes (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`). A `timeout` means the bootloader was still actively working when the wall-clock budget expired -- this is not counted as a failure.
+8. **Classification** -- boot outcomes (`success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`) and failure classes (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`). Recovery faults and liveness stalls take precedence over a simultaneous image mismatch, which remains supporting evidence. MRAM program faults retain exact address/width/byte telemetry plus an immediate snapshot and compact image diff. A `timeout` means the bootloader was still actively working when the wall-clock budget expired -- this is not counted as a failure.
 
 ### Fault types
 
@@ -535,7 +537,7 @@ tardigrade/
 │   ├── audit_bootloader.py           # Primary CLI entry point
 │   ├── run_scenario.py               # Multi-step scenario runner
 │   ├── profile_loader.py             # YAML profile parser + validation
-│   ├── invariants.py                 # 19 named postcondition invariants
+│   ├── invariants.py                 # 20 named postcondition invariants
 │   ├── self_test.py                  # Self-test across known defect corpus
 │   ├── run_runtime_fault_sweep.resc  # Renode fault sweep engine
 │   ├── write_trace_heuristic.py      # Write-trace classification
