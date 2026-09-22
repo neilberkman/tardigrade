@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Dict, List, Optional, Tuple
 
+from boot_cycle_analysis import cycle_has_unresolved_timeout
 from fault_types import FAULT_TYPE_NAME_TO_CODE
 
 
@@ -510,8 +511,7 @@ def result_is_timeout(result: Dict[str, Any]) -> bool:
     cycles = result.get("boot_cycles")
     if isinstance(cycles, list) and cycles:
         if any(
-            str(cycle.get("stop_reason") or "").startswith("wall_timeout")
-            or cycle.get("boot_outcome") == "timeout"
+            cycle_has_unresolved_timeout(cycle)
             for cycle in cycles if isinstance(cycle, dict)
         ):
             return True
@@ -548,10 +548,7 @@ def result_has_initial_timeout(result: Dict[str, Any]) -> bool:
     if isinstance(cycles, list) and cycles:
         first = cycles[0]
         if isinstance(first, dict):
-            if str(first.get("boot_outcome") or "").strip().lower() == "timeout":
-                return True
-            if str(first.get("stop_reason") or "").startswith("wall_timeout"):
-                return True
+            return cycle_has_unresolved_timeout(first)
         return False
 
     initial_outcome = result.get("initial_boot_outcome")
@@ -575,7 +572,15 @@ def result_has_initial_timeout(result: Dict[str, Any]) -> bool:
     if isinstance(signals, dict):
         for key in ("phase1_stop_reason", "phase2_stop_reason"):
             reason = str(signals.get(key) or "")
-            if reason.startswith("wall_timeout"):
+            if cycle_has_unresolved_timeout(
+                {
+                    "boot_outcome": (
+                        result.get("boot_outcome")
+                        or result.get("initial_boot_outcome")
+                    ),
+                    "stop_reason": reason,
+                }
+            ):
                 return True
     return False
 

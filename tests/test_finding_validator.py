@@ -236,6 +236,32 @@ class ValidationClassificationTests(unittest.TestCase):
         self.assertFalse(result_has_initial_timeout(result))
         self.assertFalse(result_is_timeout(result))
 
+    def test_captured_usage_fault_outranks_cycle_wall_budget_reason(self) -> None:
+        result = {
+            "fault_type": "i:0x0800f354:nop",
+            "boot_outcome": "bus_fault",
+            "initial_boot_outcome": "bus_fault",
+            "final_boot_outcome": "bus_fault",
+            "boot_cycles": [
+                {
+                    "cycle": 0,
+                    "boot_outcome": "bus_fault",
+                    "stop_reason": "wall_timeout(9s)",
+                    "signals": {
+                        "bus_fault_detected": True,
+                        "cfsr": "0x00030000",
+                    },
+                }
+            ],
+            "signals": {
+                "bus_fault_detected": True,
+                "cfsr": "0x00030000",
+            },
+            "recovery_execution": {"hardfault_observed": True},
+        }
+        self.assertFalse(result_has_initial_timeout(result))
+        self.assertFalse(result_is_timeout(result))
+
     def test_validator_leaves_initial_timeout_unvalidated(self) -> None:
         result = {
             "fault_injected": True,

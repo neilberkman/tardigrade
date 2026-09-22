@@ -288,6 +288,58 @@ class SeveritySummaryTests(unittest.TestCase):
             "PASS — 0 security bypass points (1 DoS crash points, expected for glitch model)",
         )
 
+    def test_captured_usage_fault_is_complete_dos_advisory(self) -> None:
+        profile = _profile_stub("security")
+        results = [
+            {
+                "is_control": True,
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "fault_injected": False,
+            },
+            {
+                "is_control": False,
+                "fault_injected": True,
+                "fault_at": 1,
+                "fault_type": "i:0x0800f354:nop",
+                "fault_address": "0x0800f354",
+                "boot_outcome": "bus_fault",
+                "initial_boot_outcome": "bus_fault",
+                "final_boot_outcome": "bus_fault",
+                "boot_slot": None,
+                "boot_cycles": [
+                    {
+                        "cycle": 0,
+                        "boot_outcome": "bus_fault",
+                        "stop_reason": "wall_timeout(9s)",
+                        "signals": {
+                            "bus_fault_detected": True,
+                            "cfsr": "0x00030000",
+                        },
+                    }
+                ],
+                "signals": {
+                    "bus_fault_detected": True,
+                    "cfsr": "0x00030000",
+                },
+                "recovery_execution": {"hardfault_observed": True},
+            },
+        ]
+        summary = summarize_runtime_sweep(
+            results,
+            total_writes=1,
+            profile=profile,
+            expected_fault_points=1,
+        )
+        self.assertEqual(summary["timeout_points"], 0)
+        self.assertEqual(summary["dos_crash_points"], 1)
+        self.assertEqual(summary["issue_points"], 0)
+        self.assertTrue(summary["campaign_complete"])
+        self.assertEqual(
+            compute_verdict(summary, profile.expect),
+            "PASS — 0 security bypass points (1 DoS crash points, expected for glitch model)",
+        )
+
     def test_security_bypass_still_fails(self) -> None:
         profile = _profile_stub("security")
         results = [

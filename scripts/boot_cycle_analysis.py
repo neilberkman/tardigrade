@@ -9,6 +9,38 @@ syntax features here.
 """
 
 
+_CONCRETE_TERMINAL_BOOT_OUTCOMES = frozenset(
+    {
+        "success",
+        "wrong_image",
+        "hard_fault",
+        "bus_fault",
+        "wrong_pc",
+        "misaligned_vtor",
+        "config_crash",
+        "config_lost",
+        "rollback_accepted",
+        "toctou_corruption",
+    }
+)
+
+
+def cycle_has_unresolved_timeout(record):
+    """Return whether a cycle ended without a concrete terminal outcome.
+
+    A wall-clock budget can expire during the emulator call that also captures
+    a terminal CPU or boot result.  In that case the terminal observation is
+    authoritative and the wall-budget reason remains supporting telemetry.
+    """
+    outcome = str(record.get("boot_outcome") or "").strip().lower()
+    if outcome == "timeout":
+        return True
+    reason = str(record.get("stop_reason") or "")
+    if not reason.startswith("wall_timeout"):
+        return False
+    return outcome not in _CONCRETE_TERMINAL_BOOT_OUTCOMES
+
+
 def _pair_sequence(cycle_records):
     return [
         (record.get("boot_slot"), record.get("boot_outcome"))
@@ -49,8 +81,7 @@ def analyze_boot_cycles(
     timeout_cycles = [
         int(record.get("cycle", index))
         for index, record in enumerate(cycle_records)
-        if str(record.get("stop_reason") or "").startswith("wall_timeout")
-        or record.get("boot_outcome") == "timeout"
+        if cycle_has_unresolved_timeout(record)
     ]
     if timeout_cycles:
         analysis["timeout_cycles"] = timeout_cycles
