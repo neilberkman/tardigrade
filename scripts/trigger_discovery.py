@@ -1748,6 +1748,9 @@ def discover_update_trigger(
                 slots=candidate.memory.slots,
                 page_size=getattr(candidate.memory, "page_size", 4096),
                 metadata_regions=getattr(candidate, "metadata_fault_regions", None),
+                trace_address_map=getattr(
+                    candidate.memory, "trace_address_map", None
+                ),
                 program_trace_file=data.get("program_trace_file"),
             )
             if not isinstance(coverage, dict):

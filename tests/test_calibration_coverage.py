@@ -231,6 +231,82 @@ def test_exact_program_width_classifies_both_sides_of_region_boundary(
     assert coverage["cross_region_programs"] == 1
 
 
+def test_width_aware_write_classifies_every_touched_region(tmp_path: Path) -> None:
+    trace_file = tmp_path / "writes.csv"
+    trace_file.write_text(
+        "write_index,flash_offset,value,width\n"
+        "1,0xffc,0x1122334455667788,8\n",
+        encoding="utf-8",
+    )
+
+    coverage = summarize_calibration_coverage(
+        trace_file=str(trace_file),
+        erase_trace_file=None,
+        flash_base=0,
+        slots={"exec": _slot(0x1000)},
+        page_size=0x100,
+    )
+
+    assert coverage["status"] == "slot_activity"
+    assert coverage["slot_data_writes"] == 1
+    assert coverage["outside_slot_writes"] == 1
+    assert coverage["cross_region_writes"] == 1
+
+
+def test_erase_size_classifies_every_touched_region(tmp_path: Path) -> None:
+    erase_trace = tmp_path / "erases.csv"
+    erase_trace.write_text(
+        "erase_index,flash_offset,writes_at_this_point,erase_size\n"
+        "1,0,0,0x1100\n",
+        encoding="utf-8",
+    )
+
+    coverage = summarize_calibration_coverage(
+        trace_file=None,
+        erase_trace_file=str(erase_trace),
+        flash_base=0,
+        slots={"exec": _slot(0x1000)},
+        page_size=0x100,
+    )
+
+    assert coverage["status"] == "slot_activity"
+    assert coverage["slot_data_erases"] == 1
+    assert coverage["outside_slot_erases"] == 1
+    assert coverage["cross_region_erases"] == 1
+
+
+def test_width_aware_write_splits_at_trace_address_map_boundary(
+    tmp_path: Path,
+) -> None:
+    trace_file = tmp_path / "aliased-writes.csv"
+    trace_file.write_text(
+        "write_index,flash_offset,value,width\n"
+        "1,0xffc,0x1122334455667788,8\n",
+        encoding="utf-8",
+    )
+
+    coverage = summarize_calibration_coverage(
+        trace_file=str(trace_file),
+        erase_trace_file=None,
+        flash_base=0,
+        slots={"exec": _slot(0x3000)},
+        page_size=0x100,
+        trace_address_map=[
+            {"offset_start": 0, "offset_end": 0x1000, "address_addend": 0},
+            {
+                "offset_start": 0x1000,
+                "offset_end": 0x2000,
+                "address_addend": 0x2000,
+            },
+        ],
+    )
+
+    assert coverage["status"] == "slot_activity"
+    assert coverage["slot_data_writes"] == 1
+    assert coverage["outside_slot_writes"] == 1
+    assert coverage["cross_region_writes"] == 1
+
+
 @pytest.mark.parametrize(
     "rows",
     [

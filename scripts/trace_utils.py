@@ -386,11 +386,14 @@ def _classify_exact_program_regions(
     """Return every classified region touched by one exact program span."""
     start = int(address)
     end = start + int(width)
+    effective_page_size = int(page_size)
+    if effective_page_size <= 0:
+        effective_page_size = 4096
     boundaries = {start, end}
     for slot_info in slots.values():
         slot_start = int(slot_info.base)
         slot_end = slot_start + int(slot_info.size)
-        trailer_start = max(slot_start, slot_end - max(1, int(page_size)))
+        trailer_start = max(slot_start, slot_end - effective_page_size)
         for boundary in (slot_start, trailer_start, slot_end):
             if start < boundary < end:
                 boundaries.add(boundary)
@@ -405,7 +408,9 @@ def _classify_exact_program_regions(
     for segment_start, segment_end in zip(ordered, ordered[1:]):
         if segment_start >= segment_end:
             continue
-        slot_region = _classify_slot_region(segment_start, slots, page_size)
+        slot_region = _classify_slot_region(
+            segment_start, slots, effective_page_size
+        )
         if slot_region.endswith("_data"):
             categories.add("data")
             continue
@@ -425,6 +430,54 @@ def _classify_exact_program_regions(
             metadata_names.add(matched.name)
         else:
             categories.add("outside")
+    return categories, metadata_names
+
+
+def _classify_trace_span_regions(
+    flash_offset: int,
+    width: int,
+    flash_base: int,
+    slots: Dict[str, Any],
+    page_size: int,
+    metadata_regions: Optional[List[MetadataFaultRegion]],
+    trace_address_map: Optional[List[Dict[str, int]]],
+) -> Tuple[set[str], set[str]]:
+    """Classify every region touched by a relative trace operation span."""
+    start = int(flash_offset)
+    span_width = int(width)
+    if start < 0 or span_width <= 0:
+        raise ValueError(
+            "trace operation span must have a non-negative offset and positive width"
+        )
+    end = start + span_width
+    offset_boundaries = {start, end}
+    for mapping in trace_address_map or []:
+        for boundary in (
+            int(mapping["offset_start"]),
+            int(mapping["offset_end"]),
+        ):
+            if start < boundary < end:
+                offset_boundaries.add(boundary)
+
+    categories: set[str] = set()
+    metadata_names: set[str] = set()
+    ordered = sorted(offset_boundaries)
+    for segment_start, segment_end in zip(ordered, ordered[1:]):
+        if segment_start >= segment_end:
+            continue
+        segment_categories, segment_metadata = _classify_exact_program_regions(
+            _trace_absolute_address(
+                segment_start,
+                flash_base,
+                trace_address_map,
+            ),
+            segment_end - segment_start,
+            slots,
+            page_size,
+            metadata_regions,
+        )
+        categories.update(segment_categories)
+        metadata_names.update(segment_metadata)
     return categories, metadata_names
 
 
@@ -615,32 +668,40 @@ def summarize_calibration_coverage(
     }
     named_region_ops: Dict[str, int] = {}
     cross_region_programs = 0
+    cross_region_writes = 0
+    cross_region_erases = 0
+
+    def count_regions(
+        categories: set[str], metadata_names: set[str], operation: str
+    ) -> None:
+        suffix = "writes" if operation == "write" else "erases"
+        if "data" in categories:
+            counts["slot_data_{}".format(suffix)] += 1
+        if "trailer" in categories:
+            counts["slot_trailer_{}".format(suffix)] += 1
+        if "metadata" in categories:
+            counts["metadata_region_{}".format(suffix)] += 1
+            for name in metadata_names:
+                named_region_ops[name] = named_region_ops.get(name, 0) + 1
+        if "outside" in categories:
+            counts["outside_slot_{}".format(suffix)] += 1
 
     if has_write_trace:
         authoritative_write_entries: List[Dict[str, Any]] = write_entries
         write_trace_source = "legacy_write_trace"
         for entry in authoritative_write_entries:
-            address = _trace_absolute_address(
-                entry["flash_offset"], flash_base, trace_address_map
+            categories, metadata_names = _classify_trace_span_regions(
+                entry["flash_offset"],
+                entry.get("width", 1),
+                flash_base,
+                slots,
+                page_size,
+                metadata_regions,
+                trace_address_map,
             )
-            region = _classify_slot_region(address, slots, page_size)
-            if region.endswith("_data"):
-                counts["slot_data_writes"] += 1
-            elif region.endswith("_trailer"):
-                counts["slot_trailer_writes"] += 1
-            elif metadata_regions:
-                matched = next(
-                    (r for r in metadata_regions if r.contains(address)), None
-                )
-                if matched is not None:
-                    counts["metadata_region_writes"] += 1
-                    named_region_ops[matched.name] = (
-                        named_region_ops.get(matched.name, 0) + 1
-                    )
-                else:
-                    counts["outside_slot_writes"] += 1
-            else:
-                counts["outside_slot_writes"] += 1
+            if len(categories) > 1:
+                cross_region_writes += 1
+            count_regions(categories, metadata_names, "write")
     elif has_program_trace:
         authoritative_write_entries = program_entries
         write_trace_source = "exact_mram_program_trace"
@@ -654,38 +715,27 @@ def summarize_calibration_coverage(
             )
             if len(categories) > 1:
                 cross_region_programs += 1
-            if "data" in categories:
-                counts["slot_data_writes"] += 1
-            if "trailer" in categories:
-                counts["slot_trailer_writes"] += 1
-            if "metadata" in categories:
-                counts["metadata_region_writes"] += 1
-                for name in metadata_names:
-                    named_region_ops[name] = named_region_ops.get(name, 0) + 1
-            if "outside" in categories:
-                counts["outside_slot_writes"] += 1
+                cross_region_writes += 1
+            count_regions(categories, metadata_names, "write")
     else:
         authoritative_write_entries = []
         write_trace_source = "erase_trace_only"
 
     for entry in erase_entries:
-        address = _trace_absolute_address(
-            entry["flash_offset"], flash_base, trace_address_map
+        erase_size = int(entry.get("erase_size", 0))
+        effective_erase_size = erase_size if erase_size > 0 else max(1, int(page_size))
+        categories, metadata_names = _classify_trace_span_regions(
+            entry["flash_offset"],
+            effective_erase_size,
+            flash_base,
+            slots,
+            page_size,
+            metadata_regions,
+            trace_address_map,
         )
-        region = _classify_slot_region(address, slots, page_size)
-        if region.endswith("_data"):
-            counts["slot_data_erases"] += 1
-        elif region.endswith("_trailer"):
-            counts["slot_trailer_erases"] += 1
-        elif metadata_regions:
-            matched = next((r for r in metadata_regions if r.contains(address)), None)
-            if matched is not None:
-                counts["metadata_region_erases"] += 1
-                named_region_ops[matched.name] = named_region_ops.get(matched.name, 0) + 1
-            else:
-                counts["outside_slot_erases"] += 1
-        else:
-            counts["outside_slot_erases"] += 1
+        if len(categories) > 1:
+            cross_region_erases += 1
+        count_regions(categories, metadata_names, "erase")
 
     slot_data_ops = counts["slot_data_writes"] + counts["slot_data_erases"]
     trailer_ops = counts["slot_trailer_writes"] + counts["slot_trailer_erases"]
@@ -722,6 +772,8 @@ def summarize_calibration_coverage(
         "exact_programs": len(program_entries),
         "coexisting_write_traces": bool(has_write_trace and has_program_trace),
         "cross_region_programs": cross_region_programs,
+        "cross_region_writes": cross_region_writes,
+        "cross_region_erases": cross_region_erases,
         "slot_data_ops": slot_data_ops,
         "slot_trailer_ops": trailer_ops,
         "metadata_region_ops": metadata_region_ops,
