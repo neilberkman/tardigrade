@@ -500,8 +500,11 @@ class TestActionSourceBoundaries(unittest.TestCase):
         self.assertIn("build_mcuboot_head_matrix.sh", source)
         for profile in (
             "mcuboot_head_move_nrf52_revert_full_fault_coverage.yaml",
+            "mcuboot_head_move_nrf52_upgrade_extended.yaml",
             "mcuboot_head_offset_nrf52_revert_extended.yaml",
+            "mcuboot_head_offset_nrf52_upgrade_multifault.yaml",
             "mcuboot_head_scratch_nrf52_revert_extended.yaml",
+            "mcuboot_head_scratch_nrf52_upgrade_extended.yaml",
             "mcuboot_head_scratch_stm32f4_writeback.yaml",
         ):
             with self.subTest(profile=profile):
@@ -509,6 +512,8 @@ class TestActionSourceBoundaries(unittest.TestCase):
         self.assertIn("--quick", source)
         self.assertIn("--no-assert-verdict", source)
         self.assertIn("mcuboot-zero-day-${{ matrix.slug }}", source)
+        self.assertIn('cron: "0 9 * * 1"', source)
+        self.assertIn("inputs.mcuboot_ref || 'main'", source)
 
     def test_dependency_files_use_exact_public_versions(self):
         requirement_files = (

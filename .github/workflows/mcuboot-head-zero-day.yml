@@ -4,6 +4,8 @@ permissions:
   contents: read
 
 on:
+  schedule:
+    - cron: "0 9 * * 1"
   workflow_dispatch:
     inputs:
       mcuboot_ref:
@@ -20,7 +22,7 @@ on:
         default: 62629caa331ed4bd4eb7abe13ee2e4834fbcaa70de492db3965fafa4edc5694f
 
 concurrency:
-  group: mcuboot-head-zero-day-${{ github.event.inputs.mcuboot_ref }}
+  group: mcuboot-head-zero-day-${{ github.event.inputs.mcuboot_ref || 'main' }}
   cancel-in-progress: true
 
 jobs:
@@ -62,7 +64,7 @@ jobs:
 
       - name: Build current MCUboot matrix
         env:
-          MCUBOOT_REF_INPUT: ${{ inputs.mcuboot_ref }}
+          MCUBOOT_REF_INPUT: ${{ inputs.mcuboot_ref || 'main' }}
         run: |
           set -euxo pipefail
           ref="$(python3 scripts/action_helpers.py normalize-git-ref \
@@ -92,15 +94,21 @@ jobs:
         include:
           - profile: profiles/mcuboot_head_move_nrf52_revert_full_fault_coverage.yaml
             slug: move-nrf52-revert
+          - profile: profiles/mcuboot_head_move_nrf52_upgrade_extended.yaml
+            slug: move-nrf52-upgrade
           - profile: profiles/mcuboot_head_offset_nrf52_revert_extended.yaml
             slug: offset-nrf52-revert
+          - profile: profiles/mcuboot_head_offset_nrf52_upgrade_multifault.yaml
+            slug: offset-nrf52-upgrade
           - profile: profiles/mcuboot_head_scratch_nrf52_revert_extended.yaml
             slug: scratch-nrf52-revert
+          - profile: profiles/mcuboot_head_scratch_nrf52_upgrade_extended.yaml
+            slug: scratch-nrf52-upgrade
           - profile: profiles/mcuboot_head_scratch_stm32f4_writeback.yaml
             slug: scratch-stm32f4-writeback
     env:
-      RENODE_URL: ${{ inputs.renode_url }}
-      RENODE_SHA256: ${{ inputs.renode_sha256 }}
+      RENODE_URL: ${{ inputs.renode_url || 'https://github.com/renode/renode/releases/download/v1.16.1/renode-1.16.1.linux-dotnet.tar.gz' }}
+      RENODE_SHA256: ${{ inputs.renode_sha256 || '62629caa331ed4bd4eb7abe13ee2e4834fbcaa70de492db3965fafa4edc5694f' }}
       PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
