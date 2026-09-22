@@ -37,15 +37,10 @@ def cycle_has_unresolved_timeout(record):
     if outcome == "timeout":
         return True
     reason = str(record.get("stop_reason") or "").strip()
-    if reason != "budget" and not reason.startswith("wall_timeout"):
-        return False
-    signals = record.get("signals")
     if (
-        reason == "budget"
-        and outcome == "no_boot"
-        and isinstance(signals, dict)
-        and signals.get("execution_observed") is True
-        and signals.get("liveness_established") is False
+        reason != "budget"
+        and not reason.startswith("wall_timeout")
+        and not reason.startswith("instruction_limit")
     ):
         return False
     return outcome not in _CONCRETE_TERMINAL_BOOT_OUTCOMES

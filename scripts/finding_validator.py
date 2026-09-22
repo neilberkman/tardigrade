@@ -556,6 +556,8 @@ def _validate_write_fault(
     if not isinstance(signals, dict):
         signals = {}
     base_code = _base_fault_type_code(result.get("fault_type"))
+    if base_code == "x":
+        result["rc_injection_severity_model"] = rc_injection_severity_model
     glitch_models = {
         "nop": "not_applicable",
         "register_zero": "observed" if base_code == "x" else "not_applicable",
@@ -572,6 +574,11 @@ def _validate_write_fault(
     negative_evidence: List[str] = []
     self_healing = "not_applicable"
     inverse_validation = "not_applicable"
+    retain_availability_failure = bool(
+        base_code == "x"
+        and security_property == "availability"
+        and rc_injection_severity_model == "availability"
+    )
 
     if (
         signals.get("phase1_stop_reason") == "fault_fired"
@@ -632,26 +639,36 @@ def _validate_write_fault(
             negative_evidence.append(
                 "the faulted flash word was rewritten later in the same boot or follow-up boot sequence"
             )
-            return _build_validation(
-                stage="dismissed",
-                disposition="self_healed",
-                fault_type=result.get("fault_type"),
-                expected_outcome=expected_outcome,
-                security_property=security_property,
-                glitch_models=glitch_models,
-                defense_in_depth="not_applicable",
-                inverse_validation=inverse_validation,
-                self_healing=self_healing,
-                counterfactuals=counterfactuals,
-                negative_evidence=negative_evidence,
-                reasons=["faulted_word_rewritten_after_fault"],
-                skeptical_summary="Dismissed: the faulted word did not persist to steady state, so later write ordering self-healed the candidate anomaly.",
-            )
-        if changed_post_boot is False:
+            if not retain_availability_failure:
+                return _build_validation(
+                    stage="dismissed",
+                    disposition="self_healed",
+                    fault_type=result.get("fault_type"),
+                    expected_outcome=expected_outcome,
+                    security_property=security_property,
+                    glitch_models=glitch_models,
+                    defense_in_depth="not_applicable",
+                    inverse_validation=inverse_validation,
+                    self_healing=self_healing,
+                    counterfactuals=counterfactuals,
+                    negative_evidence=negative_evidence,
+                    reasons=["faulted_word_rewritten_after_fault"],
+                    skeptical_summary="Dismissed: the faulted word did not persist to steady state, so later write ordering self-healed the candidate anomaly.",
+                )
+        elif changed_post_boot is False:
             self_healing = "persisted"
         else:
             self_healing = "unknown"
 
+    reasons = []
+    skeptical_summary = "Validated: the adverse outcome persisted under the declared write fault model and was not automatically dismissed as a harness artifact or self-heal."
+    if retain_availability_failure:
+        reasons = ["rc_injection_availability_failure"]
+        skeptical_summary = (
+            "Validated under the availability model: the injected return "
+            "error caused an observed boot failure; a later storage rewrite "
+            "does not erase that availability failure."
+        )
     return _build_validation(
         stage="validated",
         disposition="confirmed",
@@ -664,8 +681,8 @@ def _validate_write_fault(
         self_healing=self_healing,
         counterfactuals=counterfactuals,
         negative_evidence=negative_evidence,
-        reasons=[],
-        skeptical_summary="Validated: the adverse outcome persisted under the declared write fault model and was not automatically dismissed as a harness artifact or self-heal.",
+        reasons=reasons,
+        skeptical_summary=skeptical_summary,
     )
 
 
@@ -747,13 +764,15 @@ def validate_runtime_findings(
             continue
         if not result.get("fault_injected", False):
             continue
+        base_code = _base_fault_type_code(result.get("fault_type"))
+        if base_code == "x":
+            result["rc_injection_severity_model"] = rc_injection_severity_model
         # A wall-clock timeout is an incomplete observation, not a terminal
         # security outcome.  Leave an initial timeout unvalidated; a concrete
         # initial failure followed by a later timeout remains eligible for
         # validation, with its multi-boot status still marked incomplete.
         if result_has_initial_timeout(result):
             continue
-        base_code = _base_fault_type_code(result.get("fault_type"))
         if base_code == "i":
             result["instruction_skip_severity_model"] = instruction_skip_model
             annotate_instruction_skip_severity(

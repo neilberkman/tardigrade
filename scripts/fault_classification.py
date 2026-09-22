@@ -123,6 +123,17 @@ def _base_fault_type_code(result: Dict[str, Any]) -> str:
     return raw.split(":", 1)[0]
 
 
+def rc_injection_availability_model(result: Dict[str, Any]) -> bool:
+    """Return whether an RC injection is being judged for availability."""
+    return bool(
+        _base_fault_type_code(result) == "x"
+        and str(result.get("rc_injection_severity_model") or "security")
+        .strip()
+        .lower()
+        == "availability"
+    )
+
+
 def _writeback_fault_type_code(result: Dict[str, Any]) -> str:
     """Return a safe writeback classification code for a result.
 
@@ -379,9 +390,17 @@ def finding_glitch_realism(result: Dict[str, Any]) -> Optional[str]:
 
 def result_is_invalidated_finding(result: Dict[str, Any]) -> bool:
     stage = finding_validation_stage(result)
+    disposition = finding_validation_disposition(result)
+    if (
+        disposition == "dos_only"
+        and rc_injection_availability_model(result)
+    ):
+        # Reports produced under the default security policy may carry a stale
+        # dismissed/dos_only validation.  An embedded availability policy is
+        # authoritative when reports are merged or re-summarized.
+        return False
     if stage in _NON_REPORTABLE_VALIDATION_STAGES:
         return True
-    disposition = finding_validation_disposition(result)
     return disposition in _NON_REPORTABLE_VALIDATION_DISPOSITIONS
 
 
@@ -430,7 +449,11 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
     # bus_fault is safe denial-of-service (HardFault on real silicon) — not
     # a security finding.  The bootloader crashed before reaching
     # validation/invariant code paths, so all issue signals are noise.
-    if eff_outcome == "bus_fault" and not unexpected_slot:
+    if (
+        eff_outcome == "bus_fault"
+        and not unexpected_slot
+        and not rc_injection_availability_model(result)
+    ):
         return reasons
     # timeout means the bootloader was still working when the wall-clock
     # budget expired.  This is not a failure — increase run_duration.
@@ -598,7 +621,20 @@ def result_is_brick(result: Dict[str, Any]) -> bool:
     outcome = str(eff_outcome or "unknown").strip().lower()
     # "timeout" is NOT a brick — the bootloader was still working when
     # the wall-clock budget expired. Increase run_duration to resolve.
-    return outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor", "config_crash"}
+    return bool(
+        outcome in {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor", "config_crash"}
+        or (outcome == "bus_fault" and rc_injection_availability_model(result))
+    )
+
+
+def result_is_recovery(result: Dict[str, Any], expected_outcome: str) -> bool:
+    """Return whether a completed fault point reached an acceptable boot state."""
+    if result_is_timeout(result) or result_has_issues(result, expected_outcome):
+        return False
+    outcome, _ = _effective_boot_result(result)
+    normalized = str(outcome or "unknown").strip().lower()
+    expected = str(expected_outcome or "success").strip().lower()
+    return normalized == expected or is_resilient_rollback(result)
 
 
 def classify_failure_class(result: Dict[str, Any]) -> str:
@@ -612,8 +648,9 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
       - rollback_accepted: device accepted a downgrade without rejection
       - toctou_corruption: corruption injected between validation and execution
     """
+    availability_rc = rc_injection_availability_model(result)
     raw = str(result.get("fault_class", "") or "").strip().lower()
-    if raw:
+    if raw and not (availability_rc and raw == "safe_dos"):
         return raw
 
     disposition = finding_validation_disposition(result)
@@ -628,7 +665,7 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
         return "defense_in_depth"
     if disposition == "no_verification_bypass":
         return "defense_in_depth"
-    if disposition == "dos_only":
+    if disposition == "dos_only" and not availability_rc:
         return "safe_dos"
     if disposition == "low_confidence":
         return "low_confidence"
@@ -676,7 +713,7 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
     if outcome == "success":
         return "recoverable"
     if outcome == "bus_fault":
-        return "safe_dos"
+        return "unrecoverable" if availability_rc else "safe_dos"
     if outcome == "wrong_image":
         if is_resilient_rollback(result):
             return "resilient_rollback"

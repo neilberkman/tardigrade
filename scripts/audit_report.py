@@ -24,6 +24,7 @@ from fault_classification import (
     result_has_initial_timeout,
     result_has_issues,
     result_is_brick,
+    result_is_recovery,
     result_is_timeout,
     result_issue_reasons,
     writeback_reconstruction_is_valid,
@@ -47,6 +48,50 @@ from read_fault_translation import (
     read_fault_warning,
 )
 from verdicts import expectation_requires_findings, is_exploratory_expectation
+
+
+def ownership_assessment(plan: Any) -> Tuple[bool, str]:
+    """Return whether whole-device ownership was assessed, including components."""
+    if not isinstance(plan, dict):
+        return False, "ownership plan is unavailable"
+    if plan.get("status") != "assessed":
+        return False, str(
+            plan.get("reason") or "ownership manifest completeness was not asserted"
+        )
+    components = plan.get("components")
+    if components is None:
+        return True, ""
+    if not isinstance(components, dict):
+        return False, "component ownership plans are malformed"
+    for name in sorted(components):
+        assessed, reason = ownership_assessment(components[name])
+        if not assessed:
+            return False, "component {}: {}".format(name, reason)
+    return True, ""
+
+
+def ownership_plan_for_report(plan: Any) -> Dict[str, Any]:
+    """Return a serializable ownership assessment for report-only callers."""
+    if isinstance(plan, dict):
+        return plan
+    return {
+        "version": 1,
+        "complete": False,
+        "status": "not_assessed",
+        "reason": "ownership plan is unavailable",
+        "bounds": [],
+        "geometry": [],
+        "regions": [],
+        "write_ranges": [],
+    }
+
+
+def qualify_ownership_verdict(verdict: str, plan: Any) -> str:
+    """Prevent a PASS label from implying unperformed whole-device analysis."""
+    assessed, _reason = ownership_assessment(plan)
+    if verdict.startswith("PASS") and not assessed:
+        return verdict + " — whole-device layout not assessed"
+    return verdict
 
 
 def _fault_type_base_code(fault_type: Any) -> str:
@@ -109,7 +154,7 @@ def compute_region_breakdown(
             bucket["bricks"] += 1
         if result_has_issues(r, expected_outcome):
             bucket["issues"] += 1
-        else:
+        elif result_is_recovery(r, expected_outcome):
             bucket["recoveries"] += 1
     return breakdown
 
@@ -309,6 +354,8 @@ def summarize_runtime_sweep(
     calibration_coverage: Optional[Dict[str, Any]] = None,
     expected_fault_points: Optional[int] = None,
     expected_control_points: int = 1,
+    expected_outcome_override: Optional[str] = None,
+    rc_injection_config_override: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Compute summary statistics from runtime sweep results."""
     non_control = [r for r in results if not r.get("is_control", False)]
@@ -319,7 +366,15 @@ def summarize_runtime_sweep(
         and isinstance(r.get("rc_injection"), dict)
     ]
     rc_cfg = getattr(getattr(profile, "fault_sweep", None), "rc_injection_config", None)
-    if rc_cfg is not None and bool(getattr(rc_cfg, "require_applied", True)):
+    if rc_injection_config_override is not None:
+        rc_require_applied = bool(
+            rc_injection_config_override.get("require_applied", True)
+        )
+    else:
+        rc_require_applied = bool(
+            getattr(rc_cfg, "require_applied", True)
+        ) if rc_cfg is not None else False
+    if rc_require_applied:
         # Validate the runtime contract at the reporting boundary too.  This
         # protects callers that construct result dictionaries without using
         # the Renode epilogue and keeps a missing return hook fail-closed.
@@ -448,17 +503,32 @@ def summarize_runtime_sweep(
 
     total = len(injected)
     # Treat the profile's control outcome as the expected successful outcome.
-    expected_outcome = "success"
-    if profile and getattr(profile, "expect", None):
+    expected_outcome = str(expected_outcome_override or "").strip()
+    if not expected_outcome:
+        expected_outcome = "success"
+    if expected_outcome_override is None and profile and getattr(profile, "expect", None):
         expected_outcome = (
             getattr(profile.expect, "control_outcome", "success") or "success"
         )
     instruction_skip_model = "security"
+    rc_injection_severity_model = None
+    if rc_injection_config_override is not None:
+        rc_injection_severity_model = str(
+            rc_injection_config_override.get("severity_model") or "security"
+        )
     if profile and getattr(profile, "fault_sweep", None):
         isc = getattr(profile.fault_sweep, "instruction_skip_config", None)
         if isc is not None:
             instruction_skip_model = getattr(isc, "severity_model", "security") or "security"
+        rci = getattr(profile.fault_sweep, "rc_injection_config", None)
+        if rci is not None and rc_injection_severity_model is None:
+            rc_injection_severity_model = getattr(rci, "severity_model", "security") or "security"
     for r in injected:
+        if _fault_type_base_code(r.get("fault_type")) == "x":
+            if rc_injection_severity_model is not None:
+                r["rc_injection_severity_model"] = rc_injection_severity_model
+            else:
+                r.setdefault("rc_injection_severity_model", "security")
         annotate_instruction_skip_severity(
             r,
             expected_outcome=expected_outcome,
@@ -471,7 +541,7 @@ def summarize_runtime_sweep(
     failures = [r for r in reportable_injected if result_has_issues(r, expected_outcome)]
     recoveries = sum(
         1 for r in injected
-        if not result_has_issues(r, expected_outcome) and not result_is_timeout(r)
+        if result_is_recovery(r, expected_outcome)
     )
     resilient_rollbacks = sum(1 for r in reportable_injected if is_resilient_rollback(r))
     semantic_issue_points = sum(1 for r in reportable_injected if r.get("semantic_assertion_failures"))

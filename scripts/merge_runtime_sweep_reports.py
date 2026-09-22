@@ -63,6 +63,8 @@ def merge_runtime_sweep_payloads(
     first = payloads[0]
     first_profile_path = first.get("profile_path")
     first_target_source = first.get("target_source")
+    first_rc_injection_config = first.get("rc_injection_config")
+    first_expect = first.get("expect")
     for payload in payloads[1:]:
         if payload.get("profile") != first.get("profile"):
             raise ValueError("cannot merge reports from different profiles")
@@ -70,6 +72,10 @@ def merge_runtime_sweep_payloads(
             raise ValueError("cannot merge reports with different profile paths")
         if payload.get("target_source") != first_target_source:
             raise ValueError("cannot merge reports with different target sources")
+        if payload.get("rc_injection_config") != first_rc_injection_config:
+            raise ValueError("cannot merge reports with different RC injection policies")
+        if payload.get("expect") != first_expect:
+            raise ValueError("cannot merge reports with different expectations")
 
     profile = _load_profile_if_present(first_profile_path)
     merged_results: List[Dict[str, Any]] = []
@@ -99,6 +105,16 @@ def merge_runtime_sweep_payloads(
         ordered_results,
         total_writes=calibrated_writes,
         profile=profile,
+        expected_outcome_override=(
+            first_expect.get("control_outcome")
+            if isinstance(first_expect, dict)
+            else None
+        ),
+        rc_injection_config_override=(
+            first_rc_injection_config
+            if isinstance(first_rc_injection_config, dict)
+            else None
+        ),
     )
 
     merged_payload: Dict[str, Any] = {
@@ -116,8 +132,9 @@ def merge_runtime_sweep_payloads(
         "multi_fault": first.get("multi_fault"),
         "verdict": first.get("verdict"),
         "summary": {"runtime_sweep": summary},
-        "expect": first.get("expect"),
+        "expect": first_expect,
         "security_policy": first.get("security_policy"),
+        "rc_injection_config": first_rc_injection_config,
         "runtime_sweep_results": ordered_results,
         "execution": {
             "run_utc": dt.datetime.now(dt.timezone.utc)

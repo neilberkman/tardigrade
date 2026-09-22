@@ -93,23 +93,23 @@ def _evaluate(*, fault_injected=False, status=None, vtor=0x1000, pc=0x1101):
     return result, state
 
 
-def test_clean_control_at_budget_with_passing_liveness_succeeds() -> None:
+def test_clean_control_at_budget_remains_incomplete() -> None:
     (outcome, slot, signals), _state = _evaluate()
 
-    assert outcome == "success"
+    assert outcome == "timeout"
     assert slot == "exec"
     assert signals["liveness_established"] is True
     assert signals["expectations_met"] is True
 
 
-def test_faulted_run_at_budget_with_passing_liveness_succeeds() -> None:
+def test_faulted_run_at_budget_with_passing_liveness_remains_incomplete() -> None:
     (outcome, _slot, signals), _state = _evaluate(fault_injected=True)
 
-    assert outcome == "success"
+    assert outcome == "timeout"
     assert signals["liveness_established"] is True
 
 
-def test_content_mismatch_at_budget_remains_content_failure() -> None:
+def test_content_mismatch_at_budget_is_supporting_incomplete_evidence() -> None:
     evaluate, state = _runtime_evaluator()
     state["image_hash"] = UNKNOWN_HASH
 
@@ -117,12 +117,13 @@ def test_content_mismatch_at_budget_remains_content_failure() -> None:
         0x1000, 0x1101, p2_status={"reason": "budget"}
     )
 
-    assert outcome == "wrong_image"
+    assert outcome == "timeout"
     assert signals["liveness_established"] is True
     assert signals["content_mismatch"] is True
+    assert signals["supporting_outcomes"] == ["wrong_image"]
 
 
-def test_budget_with_failed_configured_liveness_is_no_boot() -> None:
+def test_budget_with_failed_structured_check_is_incomplete_not_no_boot() -> None:
     evaluate, state = _runtime_evaluator()
     state["structured"] = {"requested": True, "all_ok": False}
 
@@ -130,8 +131,10 @@ def test_budget_with_failed_configured_liveness_is_no_boot() -> None:
         0x1000, 0x1101, p2_status={"reason": "budget"}
     )
 
-    assert outcome == "no_boot"
-    assert signals["liveness_established"] is False
+    assert outcome == "timeout"
+    assert signals["liveness_established"] is True
+    assert signals["content_mismatch"] is True
+    assert signals["supporting_outcomes"] == ["wrong_image"]
 
 
 def test_budget_without_observed_execution_is_timeout() -> None:
@@ -140,6 +143,24 @@ def test_budget_without_observed_execution_is_timeout() -> None:
     assert outcome == "timeout"
     assert slot is None
     assert signals["execution_observed"] is False
+
+
+def test_instruction_limit_is_timeout_even_with_observed_execution() -> None:
+    (outcome, slot, signals), _state = _evaluate(
+        status={"reason": "instruction_limit(500000)"}
+    )
+
+    assert outcome == "timeout"
+    assert slot == "exec"
+    assert signals["liveness_established"] is True
+
+
+def test_runtime_loop_enforces_the_configured_instruction_limit() -> None:
+    source = RUNTIME.read_text(encoding="utf-8")
+
+    assert "cpu_ref.ExecutedInstructions" in source
+    assert "instructions_executed >= max_step_limit" in source
+    assert "reason = 'instruction_limit({})'" in source
 
 
 def test_hardfault_and_invalid_vector_override_content_failure() -> None:

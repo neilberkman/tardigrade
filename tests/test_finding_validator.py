@@ -232,6 +232,48 @@ class WriteFaultValidationTests(unittest.TestCase):
         self.assertEqual(validation["stage"], "validated")
         self.assertEqual(validation["disposition"], "confirmed")
 
+    def test_rc_injection_availability_failure_survives_later_rewrite(self) -> None:
+        result = {
+            "fault_type": "x",
+            "boot_outcome": "no_boot",
+            "boot_slot": None,
+            "fault_injected": True,
+            "signals": {
+                "phase1_continued_after_fault": True,
+                "fault_word_changed_post_boot": True,
+            },
+        }
+
+        validation = _validate_write_fault(
+            result,
+            expected_outcome="success",
+            rc_injection_severity_model="availability",
+        )
+        self.assertEqual(validation["stage"], "validated")
+        self.assertEqual(validation["disposition"], "confirmed")
+        self.assertEqual(validation["self_healing"], "healed")
+        self.assertEqual(
+            validation["reasons"], ["rc_injection_availability_failure"]
+        )
+
+    def test_rc_injection_availability_model_retains_bus_fault(self) -> None:
+        result = {
+            "fault_type": "x",
+            "boot_outcome": "bus_fault",
+            "boot_slot": None,
+            "fault_injected": True,
+            "signals": {"phase1_continued_after_fault": True},
+        }
+
+        validation = _validate_write_fault(
+            result,
+            expected_outcome="success",
+            rc_injection_severity_model="availability",
+        )
+        self.assertEqual(validation["stage"], "validated")
+        self.assertEqual(validation["disposition"], "confirmed")
+        self.assertEqual(validation["security_property"], "availability")
+
 
 class ValidationClassificationTests(unittest.TestCase):
     def test_initial_wall_timeout_is_detected_even_when_raw_outcome_is_no_boot(self) -> None:
@@ -242,7 +284,57 @@ class ValidationClassificationTests(unittest.TestCase):
         self.assertTrue(result_has_initial_timeout(result))
         self.assertTrue(result_is_timeout(result))
 
-    def test_budget_with_observed_failed_liveness_is_terminal(self) -> None:
+    def test_initial_instruction_limit_is_incomplete(self) -> None:
+        result = {
+            "boot_outcome": "no_boot",
+            "signals": {"phase2_stop_reason": "instruction_limit(500000)"},
+        }
+        self.assertTrue(result_has_initial_timeout(result))
+        self.assertTrue(result_is_timeout(result))
+
+    def test_rc_availability_bus_fault_is_an_issue_and_brick(self) -> None:
+        result = {
+            "fault_type": "x",
+            "fault_injected": True,
+            "boot_outcome": "bus_fault",
+            "rc_injection_severity_model": "availability",
+        }
+
+        self.assertTrue(result_has_issues(result, "success"))
+        self.assertTrue(result_is_brick(result))
+        self.assertEqual(classify_failure_class(result), "unrecoverable")
+
+    def test_rc_availability_overrides_stale_safe_dos_class(self) -> None:
+        result = {
+            "fault_type": "x",
+            "fault_injected": True,
+            "boot_outcome": "bus_fault",
+            "fault_class": "safe_dos",
+            "rc_injection_severity_model": "availability",
+        }
+
+        self.assertEqual(classify_failure_class(result), "unrecoverable")
+
+    def test_dismissed_rc_dos_is_not_counted_as_recovery(self) -> None:
+        result = {
+            "is_control": False,
+            "fault_type": "x",
+            "fault_at": 1,
+            "fault_injected": True,
+            "boot_outcome": "no_boot",
+            "boot_slot": None,
+        }
+        _apply_validation(
+            result,
+            _validate_write_fault(result, expected_outcome="success"),
+        )
+
+        summary = summarize_runtime_sweep([result])
+        self.assertEqual(summary["recoveries"], 0)
+        self.assertEqual(summary["bricks"], 0)
+        self.assertEqual(summary["issue_points"], 0)
+
+    def test_budget_with_observed_execution_is_still_incomplete(self) -> None:
         result = {
             "boot_outcome": "no_boot",
             "signals": {
@@ -251,8 +343,8 @@ class ValidationClassificationTests(unittest.TestCase):
                 "liveness_established": False,
             },
         }
-        self.assertFalse(result_has_initial_timeout(result))
-        self.assertFalse(result_is_timeout(result))
+        self.assertTrue(result_has_initial_timeout(result))
+        self.assertTrue(result_is_timeout(result))
 
     def test_concrete_initial_stall_is_not_reclassified_by_followup_timeout(self) -> None:
         result = {

@@ -184,7 +184,7 @@ class BootCycleAnalysisTests(unittest.TestCase):
         self.assertEqual(analysis["status"], "single_boot")
         self.assertNotIn("timeout_cycles", analysis)
 
-    def test_observed_execution_with_failed_liveness_is_terminal(self) -> None:
+    def test_observed_execution_at_budget_is_still_incomplete(self) -> None:
         analysis = analyze_boot_cycles(
             [
                 {
@@ -200,8 +200,8 @@ class BootCycleAnalysisTests(unittest.TestCase):
             ],
             requested_cycles=1,
         )
-        self.assertEqual(analysis["status"], "single_boot")
-        self.assertNotIn("timeout_cycles", analysis)
+        self.assertEqual(analysis["status"], "timeout")
+        self.assertEqual(analysis["timeout_cycles"], [0])
 
     def test_followup_wall_timeout_does_not_erase_initial_no_boot_stall(self) -> None:
         analysis = analyze_boot_cycles(

@@ -293,11 +293,12 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
         self.assertTrue(data.invalidated)
 
     def test_success_stop_keeps_update_writes_and_excludes_post_reboot_writes(self) -> None:
-        state = {"writes": 0, "run_calls": 0}
+        state = {"writes": 0, "run_calls": 0, "instructions": 0}
 
         class Monitor:
             def Parse(self, _command):
                 state["run_calls"] += 1
+                state["instructions"] += 10
                 if state["run_calls"] == 1:
                     state["writes"] += 3  # final update operation included
                 else:
@@ -310,6 +311,10 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
 
         class Cpu:
             IsHalted = False
+
+            @property
+            def ExecutedInstructions(self):
+                return state["instructions"]
 
             @staticmethod
             def GetRegisterUnsafe(_index):
@@ -351,6 +356,7 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
                 "recent_logs": [],
             },
             "progress_stall_timeout_s": 0,
+            "max_step_limit": 1,
             "_recovery_zero_vector_guard": False,
             "expect_control_outcome": "success",
             "no_boot_zero_write_slices": 10,
@@ -362,7 +368,158 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(status["reason"], "calibration_stop_success_criteria")
         self.assertEqual(status["writes"], 3)
+        self.assertEqual(status["executed_instructions"], 10)
         self.assertEqual(state["run_calls"], 1)
+
+    def test_instruction_limit_stops_runtime_loop_across_counter_reset(self) -> None:
+        state = {"run_calls": 0, "instructions": 0}
+
+        class Monitor:
+            def Parse(self, _command):
+                state["run_calls"] += 1
+                if state["run_calls"] == 1:
+                    state["instructions"] = 300
+                else:
+                    state["instructions"] = 100
+
+        class Bus:
+            @staticmethod
+            def ReadDoubleWord(_address):
+                return 0
+
+        class Cpu:
+            IsHalted = False
+
+            @property
+            def ExecutedInstructions(self):
+                return state["instructions"]
+
+            @staticmethod
+            def GetRegisterUnsafe(_index):
+                return 0
+
+        namespace = {
+            "_time": SimpleNamespace(time=lambda: 0.0),
+            "phase1_time_slice": "0.02",
+            "success_pc_slot": None,
+            "slot_ranges": {},
+            "monitor": Monitor(),
+            "calibration_mode": False,
+            "_calibration_stop_state": {"address_hit": False},
+            "calibration_stop_address": 0,
+            "check_console_fatal": lambda: None,
+            "fault_requires_immediate_stop": lambda: False,
+            "was_otp_fault_injected": lambda: False,
+            "as_int": int,
+            "capture_sticky_pc": lambda _pc: None,
+            "bus": Bus(),
+            "sticky_vtor": {"captured": False, "value": 0, "slot": None},
+            "sticky_pc": {"captured": False, "value": 0, "slot": None},
+            "_calibration_success_stop_observation": lambda _cpu: None,
+            "get_total_writes": lambda: 0,
+            "get_total_erases": lambda: 0,
+            "fmt_u32": lambda value: "0x{:08X}".format(int(value)),
+            "log": lambda _message: None,
+            "capture_console_state": lambda include_recent=False: {
+                "attached_names": [],
+                "attached_count": 0,
+                "last_line": None,
+                "last_lines": [],
+                "recent_logs": [],
+            },
+            "progress_stall_timeout_s": 0,
+            "max_step_limit": 350,
+            "_recovery_zero_vector_guard": False,
+            "expect_control_outcome": "success",
+            "no_boot_zero_write_slices": 10,
+            "no_boot_min_emulated_s": 0.1,
+        }
+        exec(_runtime_function("run_until_done"), namespace)
+
+        status = namespace["run_until_done"](
+            Cpu(), time_slice="0.02", max_iters=5
+        )
+
+        self.assertEqual(status["reason"], "instruction_limit(400)")
+        self.assertEqual(status["iters"], 2)
+        self.assertEqual(status["executed_instructions"], 400)
+        self.assertEqual(status["instruction_limit"], 350)
+
+    def test_block_counter_survives_reset_to_same_public_count(self) -> None:
+        state = {"run_calls": 0, "instructions": 0, "block_hook": None}
+
+        class Monitor:
+            def Parse(self, _command):
+                state["run_calls"] += 1
+                state["instructions"] = 300
+                state["block_hook"](0x1000, 150)
+
+        class Bus:
+            @staticmethod
+            def ReadDoubleWord(_address):
+                return 0
+
+        class Cpu:
+            IsHalted = False
+
+            @property
+            def ExecutedInstructions(self):
+                return state["instructions"]
+
+            @staticmethod
+            def GetRegisterUnsafe(_index):
+                return 0
+
+            @staticmethod
+            def SetHookAtBlockEnd(callback):
+                state["block_hook"] = callback
+
+        namespace = {
+            "_time": SimpleNamespace(time=lambda: 0.0),
+            "phase1_time_slice": "0.02",
+            "success_pc_slot": None,
+            "slot_ranges": {},
+            "monitor": Monitor(),
+            "calibration_mode": False,
+            "_calibration_stop_state": {"address_hit": False},
+            "calibration_stop_address": 0,
+            "check_console_fatal": lambda: None,
+            "fault_requires_immediate_stop": lambda: False,
+            "was_otp_fault_injected": lambda: False,
+            "as_int": int,
+            "capture_sticky_pc": lambda _pc: None,
+            "bus": Bus(),
+            "sticky_vtor": {"captured": False, "value": 0, "slot": None},
+            "sticky_pc": {"captured": False, "value": 0, "slot": None},
+            "_calibration_success_stop_observation": lambda _cpu: None,
+            "get_total_writes": lambda: 0,
+            "get_total_erases": lambda: 0,
+            "fmt_u32": lambda value: "0x{:08X}".format(int(value)),
+            "log": lambda _message: None,
+            "capture_console_state": lambda include_recent=False: {
+                "attached_names": [],
+                "attached_count": 0,
+                "last_line": None,
+                "last_lines": [],
+                "recent_logs": [],
+            },
+            "progress_stall_timeout_s": 0,
+            "max_step_limit": 350,
+            "_recovery_zero_vector_guard": False,
+            "expect_control_outcome": "success",
+            "no_boot_zero_write_slices": 10,
+            "no_boot_min_emulated_s": 0.1,
+        }
+        exec(_runtime_function("run_until_done"), namespace)
+
+        status = namespace["run_until_done"](
+            Cpu(), time_slice="0.02", max_iters=5
+        )
+
+        self.assertEqual(status["reason"], "instruction_limit(450)")
+        self.assertEqual(status["iters"], 3)
+        self.assertEqual(status["executed_instructions"], 450)
+        self.assertIsNone(state["block_hook"])
 
 
 if __name__ == "__main__":

@@ -6998,13 +6998,9 @@ def recovery_failure_outcome(
         return 'bus_fault'
     if execution_evidence.get('reset_vector_valid') is False:
         return 'hard_fault'
-    if reason.startswith('wall_timeout'):
+    if reason.startswith('wall_timeout') or reason.startswith('instruction_limit'):
         return 'timeout'
-    if reason == 'budget' and (
-        not execution_observed or not liveness_established
-    ):
-        if execution_observed:
-            return 'no_boot'
+    if reason == 'budget':
         return 'timeout'
     if reason.startswith(('no_boot', 'no_progress', 'no_writes')):
         return 'no_boot'
@@ -7228,9 +7224,10 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
         and reset_vector_offset_ok
         and structured_checks_ok
     )
-    liveness_established = bool(
-        execution_observed and pc_ok and structured_checks_ok
-    )
+    # Liveness is execution progress, not content correctness. Structured
+    # success checks contribute to wrong_image/content evidence below, but a
+    # failed memory/configuration check does not prove execution stopped.
+    liveness_established = bool(execution_observed and pc_ok)
     expectations_met = vtor_ok and vtor_aligned and pc_ok and criteria_ok
     signals['liveness_established'] = liveness_established
     signals['expectations_met'] = expectations_met
@@ -7611,7 +7608,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     #   5. No forward progress for progress_stall_timeout_s
     #   6. (no_boot profiles) no writes + no VTOR for N slices/min emulated time
     #   7. (no_boot profiles) writes settled (>0 but unchanged) + no VTOR
-    #   8. Iteration limit or wall-clock timeout exhausted
+    #   8. Iteration, instruction, or wall-clock limit exhausted
     if _recovery_zero_vector_guard:
         try:
             cpu_ref.IsHalted = True
@@ -7664,12 +7661,39 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     trace_prev_writes = 0
     trace_prev_erases = 0
     pc_samples = []
+    instruction_previous = as_int(cpu_ref.ExecutedInstructions)
+    instructions_executed = 0
+    instruction_counter = {'count': 0}
+    instruction_counter_hooked = False
+
+    def count_executed_block(_pc, executed_instructions):
+        instruction_counter['count'] += as_int(executed_instructions)
+
+    try:
+        # TranslationCPU reports the exact instruction count for every
+        # completed block.  Unlike ExecutedInstructions, this accumulator is
+        # not reset when firmware resets the machine between polling slices.
+        cpu_ref.SetHookAtBlockEnd(count_executed_block)
+        instruction_counter_hooked = True
+    except Exception:
+        # Compatibility fallback for CPU models without block-end hooks.
+        instruction_counter_hooked = False
     pc_handoff_slot = success_pc_slot if success_pc_slot in slot_ranges else None
     if op_trace is not None and op_trace_limit <= 0:
         op_trace_limit = 1024
     for iters in range(max_iters):
         monitor.Parse('emulation RunFor "{}"'.format(time_slice))
         emulated_s += slice_s
+        instruction_now = as_int(cpu_ref.ExecutedInstructions)
+        if instruction_counter_hooked:
+            instructions_executed = instruction_counter['count']
+        elif instruction_now >= instruction_previous:
+            instructions_executed += instruction_now - instruction_previous
+        else:
+            # Some CPU models reset the public counter during a machine reset.
+            # Preserve the instructions observed before that reset.
+            instructions_executed += instruction_now
+        instruction_previous = instruction_now
         if calibration_mode and _calibration_stop_state.get('address_hit'):
             reason = 'calibration_stop_address(0x{:08X})'.format(
                 calibration_stop_address
@@ -7881,6 +7905,9 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         else:
             zero_writes_count = 0
         prev_writes = cur_writes
+        if instructions_executed >= max_step_limit:
+            reason = 'instruction_limit({})'.format(instructions_executed)
+            break
         # Wall-clock timeout.
         elapsed = now - t0
         if elapsed > wall_timeout:
@@ -7914,11 +7941,18 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         label, reason, iters + 1, writes_now,
         fmt_u32(pc_now), elapsed))
     console_state = capture_console_state(include_recent=bool(console_fatal))
+    if instruction_counter_hooked:
+        try:
+            cpu_ref.SetHookAtBlockEnd(None)
+        except Exception:
+            pass
     status = {
         'iters': iters + 1,
         'reason': reason,
         'elapsed_s': round(elapsed, 6),
         'emulated_s': round(emulated_s, 6),
+        'executed_instructions': instructions_executed,
+        'instruction_limit': max_step_limit,
         'writes': writes_now,
         'erases': erases_now,
         'pc': fmt_u32(pc_now),
