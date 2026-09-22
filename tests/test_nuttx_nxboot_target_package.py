@@ -182,8 +182,8 @@ class NuttxNxbootTargetPackageTest(unittest.TestCase):
                 "slot_staging_size": hex(slot_size),
                 "slot_tertiary_base": hex(tertiary_base),
                 "slot_tertiary_size": hex(slot_size),
-                "sram_start": hex(0x20000000),
-                "sram_end": hex(0x240A0000),
+                "sram_start": hex(0x24000000),
+                "sram_end": hex(0x24080000),
             }
         )
 

@@ -12,8 +12,19 @@ SLOT_STAGING_BASE = 0x080C0000
 SLOT_TERTIARY_BASE = 0x08140000
 SLOT_SIZE = 0x80000
 BOOTLOADER_ENTRY = 0x08000000
-SRAM_START = 0x20000000
-SRAM_END = 0x240A0000
+# NuttX places the loader stack in AXI SRAM.  Keep the primary SRAM interval
+# contiguous and exactly aligned with the Renode platform mapping; the STM32H7
+# RAM banks below are disjoint and are declared separately for cold-recovery
+# clearing rather than pretending the address holes are writable memory.
+SRAM_START = 0x24000000
+SRAM_END = 0x24080000
+VOLATILE_REGIONS = (
+    ("dtcm", 0x20000000, 0x20000),
+    ("sram1", 0x30000000, 0x20000),
+    ("sram2", 0x30020000, 0x20000),
+    ("sram3", 0x30040000, 0x8000),
+    ("sram4", 0x38000000, 0x10000),
+)
 WRITE_GRANULARITY = 8
 # STM32H743/H753 platform files map two 1 MiB flash banks at these bases;
 # STM32H7FlashController models each bank as 128 KiB erase sectors.
@@ -130,6 +141,8 @@ bootloader:
   entry: 0x{bootloader_entry:08X}
 memory:
   sram: {{ start: 0x{sram_start:08X}, end: 0x{sram_end:08X} }}
+  volatile_regions:
+{volatile_regions}
   write_granularity: {write_granularity}
   page_size: 0x{erase_sector_size:X}
   erase_regions:
@@ -208,6 +221,12 @@ expect:
         bootloader_entry=BOOTLOADER_ENTRY,
         sram_start=SRAM_START,
         sram_end=SRAM_END,
+        volatile_regions="\n".join(
+            "    - {{ name: {}, base: 0x{:08X}, size: 0x{:X} }}".format(
+                region_name, region_base, region_size
+            )
+            for region_name, region_base, region_size in VOLATILE_REGIONS
+        ),
         write_granularity=WRITE_GRANULARITY,
         flash_bank1_base=FLASH_BANK1_BASE,
         flash_bank2_base=FLASH_BANK2_BASE,

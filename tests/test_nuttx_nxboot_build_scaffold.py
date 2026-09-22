@@ -31,6 +31,26 @@ from profile_loader import load_profile  # noqa: E402
 
 
 class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
+    def test_generated_ram_regions_match_renode_platform(self) -> None:
+        platform = (ROOT / "platforms" / "stm32h743_tardigrade.repl").read_text(
+            encoding="utf-8"
+        )
+        expected_mappings = (
+            ("axiSram", 0x24000000, 0x80000),
+            ("dtcm", 0x20000000, 0x20000),
+            ("sram1", 0x30000000, 0x20000),
+            ("sram2", 0x30020000, 0x20000),
+            ("sram3", 0x30040000, 0x8000),
+            ("sram4", 0x38000000, 0x10000),
+        )
+        for name, base, size in expected_mappings:
+            with self.subTest(name=name):
+                declaration = (
+                    f"{name}: Memory.MappedMemory @ sysbus 0x{base:08X}\n"
+                    f"    size: 0x{size:X}"
+                )
+                self.assertIn(declaration, platform)
+
     def test_wrap_nxboot_image_preserves_payload(self) -> None:
         payload = bytes(range(64))
         image = wrap_nxboot_image(payload, (1, 2, 3), header_size=0x400, platform_id=0x42)
@@ -144,6 +164,21 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             self.assertEqual(profile.platform, "platforms/nucleo_h753zi_tardigrade.repl")
             self.assertEqual(profile.flash_backend, "faultFlash")
             self.assertEqual(profile.bootloader_entry, 0x08000000)
+            self.assertEqual(profile.memory.sram_start, 0x24000000)
+            self.assertEqual(profile.memory.sram_end, 0x24080000)
+            self.assertEqual(
+                [
+                    (region.name, region.base, region.size)
+                    for region in profile.memory.volatile_regions
+                ],
+                [
+                    ("dtcm", 0x20000000, 0x20000),
+                    ("sram1", 0x30000000, 0x20000),
+                    ("sram2", 0x30020000, 0x20000),
+                    ("sram3", 0x30040000, 0x8000),
+                    ("sram4", 0x38000000, 0x10000),
+                ],
+            )
             self.assertEqual(profile.success_criteria.vtor_in_slot, "exec")
             self.assertEqual(profile.success_criteria.vector_table_offset, 0x400)
             self.assertFalse(profile.success_criteria.image_hash)
