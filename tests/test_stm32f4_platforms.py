@@ -6,6 +6,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class Stm32f4PlatformTests(unittest.TestCase):
+    def test_stm32f4_clock_ready_bits_follow_enable_bits(self) -> None:
+        for relpath in (
+            "peripherals/STM32F4FlashController.cs",
+            "peripherals/STM32F4RCCStub.cs",
+        ):
+            with self.subTest(source=relpath):
+                text = (ROOT / relpath).read_text(encoding="utf-8")
+                self.assertIn("private const uint RCC_HSION", text)
+                self.assertIn("private const uint RCC_HSEON", text)
+                self.assertIn("private const uint RCC_PLLON", text)
+                self.assertIn("return RccCrWithReadyBits();", text)
+                self.assertIn("rccCr = value & ~RCC_CR_READY_BITS;", text)
+                self.assertIn("if((rccCr & RCC_PLLON) != 0)", text)
+
     def test_f4_write_traces_are_width_bearing(self) -> None:
         tracker = (ROOT / "peripherals" / "FaultTracker.cs").read_text(
             encoding="utf-8"

@@ -268,12 +268,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const uint KEY1 = 0x45670123U;
         private const uint KEY2 = 0xCDEF89ABU;
 
-        // RCC_CR: always-set ready bits (HSIRDY | HSERDY | PLLRDY).
+        // RCC_CR oscillator enable/ready pairs. Ready follows enable
+        // immediately, including clearing when firmware disables a source.
+        private const uint RCC_HSION   = 1U << 0;
         private const uint RCC_HSIRDY  = 1U << 1;
+        private const uint RCC_HSEON   = 1U << 16;
         private const uint RCC_HSERDY  = 1U << 17;
+        private const uint RCC_PLLON   = 1U << 24;
         private const uint RCC_PLLRDY  = 1U << 25;
         private const uint RCC_CR_READY_BITS = RCC_HSIRDY | RCC_HSERDY | RCC_PLLRDY;
-        private const uint RCC_CR_RESET = RCC_CR_READY_BITS;
+        private const uint RCC_CR_RESET = RCC_HSION;
 
         // RCC_BDCR (offset 0x70): LSEON bit 0 → LSERDY bit 1.
         // RCC_CSR  (offset 0x74): LSION bit 0 → LSIRDY bit 1.
@@ -331,7 +335,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             switch(offset)
             {
                 // --- RCC registers ---
-                case 0x000: return rccCr | RCC_CR_READY_BITS;
+                case 0x000: return RccCrWithReadyBits();
                 case 0x004: return rccPllCfgr;
                 case 0x008:
                     uint sw = rccCfgr & 0x3U;
@@ -375,7 +379,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 // --- RCC registers ---
                 case 0x000:
-                    rccCr = value;
+                    rccCr = value & ~RCC_CR_READY_BITS;
                     break;
                 case 0x004:
                     rccPllCfgr = value;
@@ -423,6 +427,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             preFaultSnapshot = null;
             Array.Clear(localityCache, 0, LocalityCacheSize);
             localityCacheIdx = 0;
+        }
+
+        private uint RccCrWithReadyBits()
+        {
+            uint value = rccCr & ~RCC_CR_READY_BITS;
+            if((rccCr & RCC_HSION) != 0)
+                value |= RCC_HSIRDY;
+            if((rccCr & RCC_HSEON) != 0)
+                value |= RCC_HSERDY;
+            if((rccCr & RCC_PLLON) != 0)
+                value |= RCC_PLLRDY;
+            return value;
         }
 
         // ---------------------------------------------------------------

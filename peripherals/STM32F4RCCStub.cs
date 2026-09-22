@@ -3,8 +3,8 @@
 // Minimal STM32F4 RCC (Reset and Clock Control) stub.
 //
 // Registered at 0x40023800, size 0x400 (up to the FLASH register boundary).
-// All clock ready bits are instantly set when the corresponding oscillator
-// is enabled: HSIRDY, HSERDY, PLLRDY, LSERDY, LSIRDY.
+// Clock ready bits follow the corresponding oscillator enable immediately,
+// including clearing when firmware disables a source.
 // SWS mirrors SW for instant clock switching.
 // Unhandled offsets use dictionary store/return.
 
@@ -19,9 +19,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     {
         public long Size => 0x400;
 
-        // RCC_CR ready bits: always set when corresponding enable is written.
+        // RCC_CR oscillator enable/ready pairs.
+        private const uint RCC_HSION   = 1U << 0;
         private const uint RCC_HSIRDY  = 1U << 1;
+        private const uint RCC_HSEON   = 1U << 16;
         private const uint RCC_HSERDY  = 1U << 17;
+        private const uint RCC_PLLON   = 1U << 24;
         private const uint RCC_PLLRDY  = 1U << 25;
         private const uint RCC_CR_READY_BITS = RCC_HSIRDY | RCC_HSERDY | RCC_PLLRDY;
 
@@ -32,7 +35,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const uint LSIRDY = 1U << 1;
 
         // Dedicated registers.
-        private uint rccCr = RCC_CR_READY_BITS;
+        private uint rccCr = RCC_HSION;
         private uint rccPllCfgr;
         private uint rccCfgr;
 
@@ -44,7 +47,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             switch(offset)
             {
                 case 0x00: // RCC_CR
-                    return rccCr | RCC_CR_READY_BITS;
+                    return RccCrWithReadyBits();
 
                 case 0x04: // RCC_PLLCFGR
                     return rccPllCfgr;
@@ -87,7 +90,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             switch(offset)
             {
                 case 0x00:
-                    rccCr = value;
+                    rccCr = value & ~RCC_CR_READY_BITS;
                     break;
                 case 0x04:
                     rccPllCfgr = value;
@@ -103,10 +106,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public void Reset()
         {
-            rccCr = RCC_CR_READY_BITS;
+            rccCr = RCC_HSION;
             rccPllCfgr = 0;
             rccCfgr = 0;
             genericStorage.Clear();
+        }
+
+        private uint RccCrWithReadyBits()
+        {
+            uint value = rccCr & ~RCC_CR_READY_BITS;
+            if((rccCr & RCC_HSION) != 0)
+                value |= RCC_HSIRDY;
+            if((rccCr & RCC_HSEON) != 0)
+                value |= RCC_HSERDY;
+            if((rccCr & RCC_PLLON) != 0)
+                value |= RCC_PLLRDY;
+            return value;
         }
     }
 }

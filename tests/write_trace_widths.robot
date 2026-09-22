@@ -53,6 +53,28 @@ Create AN521 Machine
     Execute Command    machine LoadPlatformDescription @${root}/platforms/mps2_an521.repl
 
 *** Test Cases ***
+STM32F4 Controller Clock Ready Bits Follow Enable Bits
+    Create STM32F4 Controller Machine
+    ${reset}=    Execute Command    sysbus ReadDoubleWord 0x40023800
+    Should Be Equal As Numbers    ${reset}    0x00000003
+    Execute Command    sysbus WriteDoubleWord 0x40023800 0x01010001
+    ${enabled}=    Execute Command    sysbus ReadDoubleWord 0x40023800
+    Should Be Equal As Numbers    ${enabled}    0x03030003
+    Execute Command    sysbus WriteDoubleWord 0x40023800 0x00010001
+    ${pll_disabled}=    Execute Command    sysbus ReadDoubleWord 0x40023800
+    Should Be Equal As Numbers    ${pll_disabled}    0x00030003
+
+STM32F4 Fast Clock Ready Bits Follow Enable Bits
+    Create STM32F4 Fast Machine
+    ${reset}=    Execute Command    sysbus ReadDoubleWord 0x40023800
+    Should Be Equal As Numbers    ${reset}    0x00000003
+    Execute Command    sysbus WriteDoubleWord 0x40023800 0x01010001
+    ${enabled}=    Execute Command    sysbus ReadDoubleWord 0x40023800
+    Should Be Equal As Numbers    ${enabled}    0x03030003
+    Execute Command    sysbus WriteDoubleWord 0x40023800 0x00010001
+    ${pll_disabled}=    Execute Command    sysbus ReadDoubleWord 0x40023800
+    Should Be Equal As Numbers    ${pll_disabled}    0x00030003
+
 STM32F4 Controller Trace Captures First And Second PG Writes
     Create STM32F4 Controller Machine
     # Force the normal count-only setting to prove trace mode overrides it.
