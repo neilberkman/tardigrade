@@ -406,10 +406,11 @@ class TfmBl2ProbeSlotCompatibilityTest(unittest.TestCase):
     def test_postmortem_geometry_and_partitions_parse_and_emit(self):
         parsed = _parse_memory({
             "sram": {"start": 0x20000000, "end": 0x20010000},
-            "slots": {"exec": {"base": 0x08010000, "size": 0x10000}},
+            "slots": {"exec": {"base": 0x08010000, "size": 0x4000}},
             "erase_regions": [
                 {"base": 0x08000000, "size": 0x4000, "sector_size": 0x4000},
                 {"base": 0x08004000, "size": 0x10000, "sector_size": 0x10000},
+                {"base": 0x08014000, "size": 0x4000, "sector_size": 0x4000},
             ],
             "postmortem_partitions": [
                 {"name": "scratch", "base": 0x08014000, "size": 0x4000}

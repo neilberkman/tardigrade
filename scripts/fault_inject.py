@@ -203,6 +203,7 @@ class MetadataFaultRegion:
     name: str
     start: int
     end: int
+    parent: Optional[str] = None
 
     def contains(self, address: int) -> bool:
         return self.start <= address < self.end

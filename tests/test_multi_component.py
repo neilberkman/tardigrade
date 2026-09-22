@@ -32,6 +32,7 @@ from profile_loader import (
     ProfileError,
     load_profile,
 )
+from security_state_layout import PersistentStateLayout
 from sweep import (
     _bounded_component_write_count,
     _multi_component_issue_annotation,
@@ -406,7 +407,7 @@ class TestComponentConfigParsing(unittest.TestCase):
         profile.invariant_config = {"allowed": ["exec"]}
         profile.nvm_controller = "nvmController"
         profile.otp_peripheral = "otp"
-        persistent_layout = object()
+        persistent_layout = PersistentStateLayout((), ())
         terminal_declarations = [object()]
         profile.persistent_state_layout = persistent_layout
         profile.terminal_error_paths = terminal_declarations

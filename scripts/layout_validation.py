@@ -320,6 +320,208 @@ def _validate_disjoint(regions):
             _reject_overlap(regions[left_index], regions[right_index])
 
 
+def _covered_by_bounds(region, bounds):
+    """Return whether sorted bounds cover every byte of *region*."""
+
+    cursor = region["start"]
+    for bound in bounds:
+        if bound["end"] <= cursor:
+            continue
+        if bound["start"] > cursor:
+            return False
+        cursor = max(cursor, bound["end"])
+        if cursor >= region["end"]:
+            return True
+    return False
+
+
+def _merge_intervals(regions):
+    merged = []
+    for region in sorted(regions, key=lambda item: (item["start"], item["end"])):
+        if not merged or region["start"] > merged[-1]["end"]:
+            merged.append({"start": region["start"], "end": region["end"]})
+        else:
+            merged[-1]["end"] = max(merged[-1]["end"], region["end"])
+    return merged
+
+
+def validate_ownership_plan(plan):
+    """Normalize and validate durable byte ownership for a profile.
+
+    Physical erase geometry is supplied as ``bounds`` but is not itself an
+    owner.  Declared owners may overlap only through an explicit parent chain;
+    peers remain disjoint.  The returned ``write_ranges`` are the exact union
+    consumed by the runtime ``no_oob_writes`` invariant.
+    """
+
+    if not isinstance(plan, dict):
+        raise LayoutValidationError("ownership plan must be a mapping")
+    if plan.get("version") != 1:
+        raise LayoutValidationError(
+            "unsupported ownership plan version %r (expected 1)"
+            % plan.get("version")
+        )
+    complete = plan.get("complete", False)
+    if not isinstance(complete, bool):
+        raise LayoutValidationError("ownership plan complete must be a boolean")
+
+    raw_bounds = plan.get("bounds", [])
+    if not isinstance(raw_bounds, list):
+        raise LayoutValidationError("ownership plan bounds must be a list")
+    bounds = []
+    for index, definition in enumerate(raw_bounds):
+        name = "ownership bound %d" % index
+        if isinstance(definition, dict) and definition.get("name"):
+            name = "ownership bound %s" % definition.get("name")
+        bounds.append(_region(name, definition))
+    bounds.sort(key=lambda item: (item["start"], item["end"]))
+    _validate_disjoint(bounds)
+    if complete and not bounds:
+        raise LayoutValidationError(
+            "complete ownership manifest requires memory.erase_regions bounds"
+        )
+
+    raw_geometry = plan.get("geometry", [])
+    if not isinstance(raw_geometry, list):
+        raise LayoutValidationError("ownership plan geometry must be a list")
+    geometry = []
+    for index, definition in enumerate(raw_geometry):
+        name = "ownership geometry %d" % index
+        if isinstance(definition, dict) and definition.get("name"):
+            name = "ownership geometry %s" % definition.get("name")
+        geometry.append(_region(name, definition))
+    geometry.sort(key=lambda item: (item["start"], item["end"]))
+    _validate_disjoint(geometry)
+    if bounds:
+        for region in geometry:
+            if not _covered_by_bounds(region, bounds):
+                raise LayoutValidationError(
+                    "%s is outside declared durable-memory bounds"
+                    % format_interval(region)
+                )
+
+    raw_regions = plan.get("regions", [])
+    if not isinstance(raw_regions, list):
+        raise LayoutValidationError("ownership plan regions must be a list")
+    regions = []
+    by_id = {}
+    for index, definition in enumerate(raw_regions):
+        if not isinstance(definition, dict):
+            raise LayoutValidationError(
+                "ownership plan regions[%d] must be a mapping" % index
+            )
+        owner_id = definition.get("id")
+        if not isinstance(owner_id, string_types) or not owner_id.strip():
+            raise LayoutValidationError(
+                "ownership plan regions[%d].id must be non-empty" % index
+            )
+        owner_id = owner_id.strip()
+        if owner_id in by_id:
+            raise LayoutValidationError("duplicate ownership id %r" % owner_id)
+        kind = definition.get("kind")
+        if not isinstance(kind, string_types) or not kind.strip():
+            raise LayoutValidationError(
+                "ownership plan region %s.kind must be non-empty" % owner_id
+            )
+        parent = definition.get("parent")
+        if parent is not None:
+            if not isinstance(parent, string_types) or not parent.strip():
+                raise LayoutValidationError(
+                    "ownership plan region %s.parent must be non-empty" % owner_id
+                )
+            parent = parent.strip()
+        interval = _region(
+            "owner %s" % owner_id,
+            definition,
+            base_key="base",
+            size_key="size",
+        )
+        interval.update({
+            "id": owner_id,
+            "kind": kind.strip(),
+            "parent": parent,
+        })
+        regions.append(interval)
+        by_id[owner_id] = interval
+
+    if complete and not regions:
+        raise LayoutValidationError(
+            "complete ownership manifest must declare at least one owner"
+        )
+
+    for region in regions:
+        parent_id = region.get("parent")
+        if parent_id is None:
+            continue
+        if parent_id not in by_id:
+            raise LayoutValidationError(
+                "owner %s names unknown parent %s" % (region["id"], parent_id)
+            )
+        if parent_id == region["id"]:
+            raise LayoutValidationError("owner %s cannot contain itself" % region["id"])
+        _require_inside(region, by_id[parent_id])
+
+    def ancestor(ancestor_id, child_id):
+        seen = set()
+        cursor = by_id[child_id].get("parent")
+        while cursor is not None:
+            if cursor in seen:
+                raise LayoutValidationError(
+                    "ownership parent cycle includes %s" % cursor
+                )
+            seen.add(cursor)
+            if cursor == ancestor_id:
+                return True
+            cursor = by_id[cursor].get("parent")
+        return False
+
+    # Traverse every chain once so a cycle is rejected even when no overlapping
+    # pair happens to query it.
+    for region in regions:
+        ancestor("__no_such_owner__", region["id"])
+
+    for left_index in range(len(regions)):
+        for right_index in range(left_index + 1, len(regions)):
+            left = regions[left_index]
+            right = regions[right_index]
+            if not _overlaps(left, right):
+                continue
+            if ancestor(left["id"], right["id"]) or ancestor(
+                right["id"], left["id"]
+            ):
+                continue
+            raise LayoutValidationError(
+                "%s overlaps peer %s without explicit containment"
+                % (format_interval(left), format_interval(right))
+            )
+
+    if bounds:
+        for region in regions:
+            if not _covered_by_bounds(region, bounds):
+                raise LayoutValidationError(
+                    "%s is outside declared durable-memory bounds"
+                    % format_interval(region)
+                )
+
+    normalized_regions = sorted(
+        regions, key=lambda item: (item["start"], item["end"], item["id"])
+    )
+    return {
+        "version": 1,
+        "complete": complete,
+        "status": "assessed" if complete else "not_assessed",
+        "reason": (
+            None
+            if complete
+            else "ownership manifest completeness was not asserted"
+        ),
+        "bounds": bounds,
+        "geometry": geometry,
+        "regions": normalized_regions,
+        "write_ranges": _merge_intervals(normalized_regions),
+    }
+
+
 def validate_load_plan(plan):
     """Validate and normalize a version 1 declarative load plan.
 

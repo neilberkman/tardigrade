@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from fault_classification import _effective_boot_result
+from audit_report import ownership_assessment
 
 
 FAULT_LABELS = {
@@ -23,6 +24,46 @@ FAULT_LABELS = {
     "e": "interrupted_erase",
     "a": "multi_sector_atomicity",
 }
+
+
+def render_ownership_layout_panel(payload: Dict[str, Any]) -> str:
+    """Render whole-device byte-ownership assessment state."""
+    plan = (payload.get("summary") or {}).get("ownership_layout")
+    if not isinstance(plan, dict):
+        return ""
+    assessed, reason = ownership_assessment(plan)
+    regions = plan.get("regions") or []
+    bounds = plan.get("bounds") or []
+    component_plans = plan.get("components") or {}
+    component_text = ""
+    if isinstance(component_plans, dict) and component_plans:
+        states = []
+        for name in sorted(component_plans):
+            component_ok, _component_reason = ownership_assessment(
+                component_plans[name]
+            )
+            states.append("{}={}".format(
+                name, "assessed" if component_ok else "not assessed"
+            ))
+        component_text = " &nbsp; <span>components</span> {}".format(
+            html.escape(", ".join(states))
+        )
+    status = "assessed" if assessed else "NOT ASSESSED"
+    detail = "complete manifest" if assessed else (reason or "completeness not asserted")
+    return (
+        "<div class='telemetry-heading'><span>durable-memory ownership</span>"
+        "<code>{}</code></div>"
+        "<p class='path'><span>status</span> {} &nbsp; "
+        "<span>owners</span> {} &nbsp; <span>bounds</span> {}{} &nbsp; "
+        "<span>detail</span> {}</p>"
+    ).format(
+        html.escape(status),
+        html.escape(status),
+        len(regions),
+        len(bounds),
+        component_text,
+        html.escape(str(detail)),
+    )
 
 
 def render_security_erase_panel(payload: Dict[str, Any]) -> str:
@@ -463,6 +504,7 @@ def render_audit_card(path: Path, payload: Dict[str, Any]) -> Tuple[str, Dict[st
         f"<span>{html.escape(verdict)}</span></div></header>"
         f"{metrics}"
         f"{rc_panel}"
+        f"{render_ownership_layout_panel(payload)}"
         f"{render_security_erase_panel(payload)}"
         f"{render_boundary_campaign_panel(payload)}"
         f"{render_authorization_review_panel(payload)}"

@@ -576,6 +576,7 @@ def check_no_oob_writes(
     result: FaultResult,
     write_log: Optional[List[int]] = None,
     partition_ranges: Optional[List[Tuple[int, int]]] = None,
+    write_width: int = 1,
     **_: Any,
 ) -> None:
     """Flag any NVM write outside the allowed partition ranges.
@@ -584,6 +585,7 @@ def check_no_oob_writes(
         write_log: List of write addresses observed during the run.
         partition_ranges: List of ``(start_inclusive, end_exclusive)`` tuples
             defining valid write regions.
+        write_width: Number of bytes owned by each recorded write address.
 
     Skipped when either argument is ``None``.
     """
@@ -592,10 +594,13 @@ def check_no_oob_writes(
 
     if not partition_ranges:
         return
+    if isinstance(write_width, bool) or not isinstance(write_width, int) or write_width <= 0:
+        raise ValueError("no_oob_writes write_width must be a positive integer")
 
     oob_addresses: List[int] = []
     for addr in write_log:
-        if not any(start <= addr < end for start, end in partition_ranges):
+        write_end = addr + write_width
+        if not any(start <= addr and write_end <= end for start, end in partition_ranges):
             oob_addresses.append(addr)
 
     if oob_addresses:
@@ -613,6 +618,7 @@ def check_no_oob_writes(
                     {"start": "0x{:08X}".format(s), "end": "0x{:08X}".format(e)}
                     for s, e in partition_ranges
                 ],
+                "write_width": write_width,
             },
         )
 

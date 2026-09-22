@@ -69,6 +69,7 @@ class PersistentField:
     base: int
     size: int
     role: str
+    parent: Optional[str] = None
 
     @property
     def end(self) -> int:
@@ -146,7 +147,13 @@ class PersistentStateLayout:
                 for r in self.erase_regions
             ],
             "fields": [
-                {"name": f.name, "base": f.base, "size": f.size, "role": f.role}
+                {
+                    "name": f.name,
+                    "base": f.base,
+                    "size": f.size,
+                    "role": f.role,
+                    "parent": f.parent,
+                }
                 for f in self.fields
             ],
         }
@@ -185,6 +192,11 @@ def parse_persistent_state_layout(raw: Optional[Dict[str, Any]]) -> Optional[Per
         context = "persistent_state_layout.erase_regions[{}]".format(index)
         if not isinstance(item, dict):
             raise SecurityStateLayoutError("{}: expected mapping".format(context))
+        unknown_keys = sorted(set(item) - {"start", "end", "erase_size"})
+        if unknown_keys:
+            raise SecurityStateLayoutError(
+                "{}: unknown key(s): {}".format(context, ", ".join(unknown_keys))
+            )
         for key in ("start", "end", "erase_size"):
             if key not in item:
                 raise SecurityStateLayoutError("{}.{}: missing required field".format(context, key))
@@ -214,6 +226,15 @@ def parse_persistent_state_layout(raw: Optional[Dict[str, Any]]) -> Optional[Per
         context = "persistent_state_layout.fields[{}]".format(index)
         if not isinstance(item, dict):
             raise SecurityStateLayoutError("{}: expected mapping".format(context))
+        unknown_keys = sorted(
+            set(item) - {"name", "base", "size", "role", "parent"}
+        )
+        if unknown_keys:
+            raise SecurityStateLayoutError(
+                "{}: unknown key(s): {}".format(
+                    context, ", ".join(unknown_keys)
+                )
+            )
         for key in ("name", "base", "size", "role"):
             if key not in item:
                 raise SecurityStateLayoutError("{}.{}: missing required field".format(context, key))
@@ -232,14 +253,71 @@ def parse_persistent_state_layout(raw: Optional[Dict[str, Any]]) -> Optional[Per
                     context, role, ", ".join(sorted(ALL_ROLES))
                 )
             )
-        field = PersistentField(name, base, size, role)
-        for prior in fields:
-            if _overlap(prior.base, prior.end, field.base, field.end):
+        parent = item.get("parent")
+        if parent is not None:
+            parent = str(parent).strip()
+            if not parent:
                 raise SecurityStateLayoutError(
-                    "field {!r} overlaps field {!r}".format(field.name, prior.name)
+                    "{}.parent must be a non-empty ownership id".format(context)
                 )
-        fields.append(field)
+        fields.append(PersistentField(name, base, size, role, parent))
         field_names.add(name)
+
+    fields_by_id = {
+        "persistent:{}".format(field.name): field for field in fields
+    }
+
+    def local_parent_id(field: PersistentField) -> Optional[str]:
+        parent_id = field.parent
+        if parent_id is not None and parent_id.startswith("persistent:"):
+            if parent_id not in fields_by_id:
+                raise SecurityStateLayoutError(
+                    "field {!r} names unknown parent {!r}".format(
+                        field.name, parent_id
+                    )
+                )
+            return parent_id
+        return None
+
+    def is_ancestor(ancestor_id: str, child: PersistentField) -> bool:
+        seen = set()
+        cursor = local_parent_id(child)
+        while cursor is not None:
+            if cursor in seen:
+                raise SecurityStateLayoutError(
+                    "persistent field parent cycle includes {!r}".format(cursor)
+                )
+            seen.add(cursor)
+            if cursor == ancestor_id:
+                return True
+            cursor = local_parent_id(fields_by_id[cursor])
+        return False
+
+    for field in fields:
+        parent_id = local_parent_id(field)
+        if parent_id is not None:
+            parent = fields_by_id[parent_id]
+            if not (parent.base <= field.base and field.end <= parent.end):
+                raise SecurityStateLayoutError(
+                    "field {!r} is outside parent {!r}".format(
+                        field.name, parent_id
+                    )
+                )
+        is_ancestor("__no_such_field__", field)
+
+    for left_index, left in enumerate(fields):
+        for right in fields[left_index + 1:]:
+            if not _overlap(left.base, left.end, right.base, right.end):
+                continue
+            left_id = "persistent:{}".format(left.name)
+            right_id = "persistent:{}".format(right.name)
+            if is_ancestor(left_id, right) or is_ancestor(right_id, left):
+                continue
+            raise SecurityStateLayoutError(
+                "field {!r} overlaps peer field {!r} without explicit containment".format(
+                    right.name, left.name
+                )
+            )
 
     layout = PersistentStateLayout(tuple(regions), tuple(fields))
     for field in layout.fields:
@@ -289,6 +367,7 @@ def analyze_persistent_state_layout(layout: Optional[PersistentStateLayout]) -> 
                 "end": field.end,
                 "size": field.size,
                 "role": field.role,
+                "parent": field.parent,
                 "units": [{"start": unit.start, "end": unit.end} for unit in field_units[field.name]],
             }
             for field in layout.fields

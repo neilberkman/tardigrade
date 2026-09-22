@@ -595,6 +595,63 @@ Default is `[power_loss]`. Available types include the semantic
 
 ### Security-state erase domains
 
+Before Renode starts, Tardigrade normalizes every declared durable byte owner
+into checked half-open intervals. This includes the bootloader, executable and
+staging slots, postmortem partitions, metadata, NVS/configuration storage, and
+named persistent fields. Adjacent owners are valid; overlapping peers are not.
+Containment must be explicit, while two disjoint fields may intentionally share
+one physical erase unit.
+
+Set `ownership_manifest_complete: true` only when the profile declares every
+durable allocation for the device. Complete manifests fail closed on missing
+durable-memory bounds, a missing bootloader region, overflow, out-of-bounds
+owners, unknown parents, or byte conflicts. Without the assertion, the same
+declared-region checks still run, but reports say `not_assessed` for whole-device
+layout safety instead of implying a clean result.
+
+Minimal vendor-neutral example:
+
+```yaml
+ownership_manifest_complete: true
+
+bootloader_region: {base: 0x08000000, size: 0x8000}
+
+memory:
+  erase_regions:
+    - {base: 0x08000000, size: 0x80000, sector_size: 0x1000}
+  slots:
+    exec: {base: 0x08008000, size: 0x20000}
+    staging: {base: 0x08028000, size: 0x20000}
+  postmortem_partitions:
+    - {name: scratch, base: 0x08048000, size: 0x8000}
+
+metadata_fault_regions:
+  # The relative form explicitly makes this a child of slot:staging.
+  - {name: trailer, slot: staging, offset: 0x1F000, size: 0x1000}
+
+nvs_region: {address: 0x08050000, size: 0x2000}
+
+persistent_state_layout:
+  erase_regions:
+    - {start: 0x08050000, end: 0x08052000, erase_size: 0x1000}
+  fields:
+    - {name: rollback, base: 0x08050000, size: 8,
+       role: security_monotonic, parent: nvs}
+    - {name: config, base: 0x08050100, size: 0x80,
+       role: mutable, parent: nvs}
+```
+
+Absolute metadata regions and persistent fields use canonical parent IDs when
+they are contained by another owner: `bootloader`, `slot:<name>`,
+`partition:<name>`, `metadata:<name>`, `nvs`, or `persistent:<name>`. Relative
+metadata declarations infer `slot:<name>` automatically. Physical erase-region
+declarations describe geometry and bounds, not byte ownership, so sharing an
+erase unit does not by itself create an ownership conflict.
+
+The normalized plan is emitted as `ownership_layout` in profile and campaign
+JSON. Its `write_ranges` are also the ranges consumed by `no_oob_writes`, so
+preflight and runtime checks use one source of truth.
+
 Persistent records can be logically separate while sharing one physical flash
 erase unit. Declare that coupling when it matters:
 
@@ -908,7 +965,7 @@ fault_sweep:
   progress_stall_timeout_s: 10.0 # emulated-time threshold for zero-progress stall detection
 ```
 
-`phase2_time_slice` controls the emulation time per slice during Phase 2 recovery boot. Defaults to the calibration slice. Larger values mean fewer IPC round-trips but coarser progress detection. `phase2_wall_timeout_s` bounds the wall-clock time for each regular execute/replay recovery boot and defaults to 30 seconds. The outer Renode/Robot timeout remains the hard cap for the run. Specialized Phase 2 fault-injection paths may use their own larger budget. `progress_stall_timeout_s` is the amount of emulated time with no change in the tracked progress signals before the boot is considered stalled. A terminal `no_boot_stall(...)` or `no_progress_stall(...)` observation is treated as `no_boot` when no valid execution is observed. Exhausting the configured emulation budget is not by itself a liveness failure: when execution was observed and configured liveness checks passed, classification continues through the remaining image and content criteria. The separate wall-clock guard produces a `timeout` outcome, which marks the observation incomplete rather than treating it as evidence of a brick.
+`phase2_time_slice` controls the emulation time per slice during Phase 2 recovery boot. Defaults to the calibration slice. Larger values mean fewer IPC round-trips but coarser progress detection. `phase2_wall_timeout_s` bounds the wall-clock time for each regular execute/replay recovery boot and defaults to 30 seconds. The outer Renode/Robot timeout remains the hard cap for the run. Specialized Phase 2 fault-injection paths may use their own larger budget. `progress_stall_timeout_s` is the amount of emulated time with no change in the tracked progress signals before the boot is considered stalled. A terminal `no_boot_stall(...)` or `no_progress_stall(...)` observation is treated as `no_boot` when no valid execution is observed. Exhausting the configured emulation, instruction, or wall-clock limit produces a `timeout` outcome and marks the observation incomplete. A captured PC or VTOR proves progress but does not, by itself, prove that the boot completed. Content mismatches observed at a limit remain supporting evidence and are not promoted to findings until a terminal boot result is captured.
 
 ### Write-back durability model
 
@@ -1070,7 +1127,7 @@ invariants:
   - boot_registers_match # captured registers match expected values
   - boot_target_matches_metadata # boot slot matches metadata active slot
   - last_known_good_preserved # at least one slot has a valid image
-  - no_oob_writes # no writes outside allowed regions
+  - no_oob_writes # no writes outside normalized durable ownership ranges
   - atomic_state_groups # jointly committed persistent state is all-before or all-after
   - monotonic_state_fields # configured numeric persistent state does not regress
   - state_relations # cross-component compatibility rules
@@ -1767,17 +1824,16 @@ Each fault point produces one of:
 | `no_boot`     | Device did not reach any valid vector table             |
 | `wrong_pc`    | PC ended up outside all known slots                     |
 | `hard_fault`  | Recovery fault evidence or an invalid reset vector was observed |
-| `timeout`     | Bootloader was still working at the wall-clock limit; evidence is incomplete |
+| `timeout`     | An emulation, instruction, or wall-clock limit expired; evidence is incomplete |
 
 Execution failure has precedence over content identity. An observed recovery
 HardFault, active fault handler, invalid reset vector, or terminal liveness
 stall is reported as `hard_fault` or `no_boot`; an accompanying digest mismatch
 is retained in `signals.content_mismatch` and `signals.supporting_outcomes`
-instead of replacing the crash with `wrong_image`. A wall-clock timeout remains
-an incomplete observation rather than proof of a brick. Likewise, configured
-emulation-budget exhaustion alone is not `no_boot` evidence. If valid execution
-and configured liveness were observed, the final outcome is determined by the
-remaining slot and content criteria.
+instead of replacing the crash with `wrong_image`. Exhausting an emulation,
+instruction, or wall-clock limit remains an incomplete observation even if
+image bytes differ. Captured execution is progress evidence, not terminal
+`no_boot` or successful-boot evidence.
 
 For injected MRAM programs, the backend contract is fail-closed. The per-point
 record includes `mram_fault_evidence` with the selected and backend write

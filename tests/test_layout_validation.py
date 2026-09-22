@@ -11,7 +11,106 @@ from layout_validation import (  # noqa: E402
     LayoutValidationError,
     parse_elf_load_intervals,
     validate_load_plan,
+    validate_ownership_plan,
 )
+
+
+def _ownership_plan(regions, *, complete=True, geometry=None, bounds=None):
+    return {
+        "version": 1,
+        "complete": complete,
+        "bounds": bounds or [{"base": 0x1000, "size": 0x4000}],
+        "geometry": geometry or [],
+        "regions": regions,
+    }
+
+
+def test_ownership_boundary_adjacency_is_valid():
+    plan = validate_ownership_plan(_ownership_plan([
+        {"id": "slot:a", "kind": "slot", "base": 0x1000, "size": 0x1000},
+        {"id": "slot:b", "kind": "slot", "base": 0x2000, "size": 0x1000},
+    ]))
+
+    assert plan["status"] == "assessed"
+    assert plan["write_ranges"] == [{"start": 0x1000, "end": 0x3000}]
+
+
+def test_ownership_one_byte_peer_overlap_is_rejected():
+    with pytest.raises(LayoutValidationError, match="overlaps peer"):
+        validate_ownership_plan(_ownership_plan([
+            {"id": "slot:a", "kind": "slot", "base": 0x1000, "size": 0x1001},
+            {"id": "slot:b", "kind": "slot", "base": 0x2000, "size": 0x1000},
+        ]))
+
+
+def test_ownership_address_overflow_is_rejected():
+    with pytest.raises(LayoutValidationError, match="64-bit address space"):
+        validate_ownership_plan(_ownership_plan([
+            {
+                "id": "slot:a",
+                "kind": "slot",
+                "base": (1 << 64) - 8,
+                "size": 16,
+            },
+        ]))
+
+
+def test_ownership_explicit_containment_is_valid():
+    plan = validate_ownership_plan(_ownership_plan([
+        {"id": "slot:a", "kind": "slot", "base": 0x1000, "size": 0x1000},
+        {
+            "id": "metadata:trailer",
+            "kind": "metadata",
+            "base": 0x1F00,
+            "size": 0x100,
+            "parent": "slot:a",
+        },
+    ]))
+
+    assert plan["write_ranges"] == [{"start": 0x1000, "end": 0x2000}]
+
+
+def test_ownership_distinguishes_erase_unit_sharing_from_byte_conflict():
+    plan = validate_ownership_plan(_ownership_plan(
+        [
+            {"id": "persistent:a", "kind": "persistent_field", "base": 0x1100, "size": 8},
+            {"id": "persistent:b", "kind": "persistent_field", "base": 0x1200, "size": 8},
+        ],
+        geometry=[{"base": 0x1000, "size": 0x1000}],
+    ))
+
+    assert plan["status"] == "assessed"
+    assert plan["geometry"] == [{"name": "ownership geometry 0", "start": 0x1000, "end": 0x2000}]
+
+
+def test_ownership_rejects_nvs_metadata_byte_conflict():
+    with pytest.raises(LayoutValidationError, match="overlaps peer"):
+        validate_ownership_plan(_ownership_plan([
+            {"id": "nvs", "kind": "nvs", "base": 0x2000, "size": 0x1000},
+            {"id": "metadata:state", "kind": "metadata", "base": 0x2F00, "size": 0x200},
+        ]))
+
+
+def test_incomplete_ownership_manifest_reports_not_assessed():
+    plan = validate_ownership_plan(_ownership_plan(
+        [{"id": "slot:a", "kind": "slot", "base": 0x1000, "size": 0x1000}],
+        complete=False,
+    ))
+
+    assert plan["status"] == "not_assessed"
+    assert "completeness was not asserted" in plan["reason"]
+
+
+def test_complete_ownership_manifest_without_bounds_fails_closed():
+    with pytest.raises(LayoutValidationError, match="requires memory.erase_regions"):
+        validate_ownership_plan({
+            "version": 1,
+            "complete": True,
+            "bounds": [],
+            "regions": [
+                {"id": "slot:a", "kind": "slot", "base": 0x1000, "size": 0x1000},
+            ],
+        })
 
 
 def _elf_bytes(segments, elf_class=1, byte_order="<"):

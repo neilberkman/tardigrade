@@ -120,6 +120,12 @@ def _lookup_result_path(result: Dict[str, Any], path: str) -> Any:
 
 
 def _profile_partition_ranges(profile: ProfileConfig) -> List[Tuple[int, int]]:
+    ownership_plan = getattr(profile, "ownership_plan", None)
+    if isinstance(ownership_plan, dict):
+        return [
+            (int(region["start"]), int(region["end"]))
+            for region in ownership_plan.get("write_ranges", [])
+        ]
     return [
         (slot.base, slot.base + slot.size)
         for slot in profile.memory.slots.values()
@@ -392,6 +398,7 @@ def _evaluate_invariants(
         pre_state=pre_state,
         write_log=result.get("write_log"),
         partition_ranges=_profile_partition_ranges(profile),
+        write_width=profile.memory.write_granularity,
         multi_boot_analysis=result.get("multi_boot_analysis"),
         boot_cycles=result.get("boot_cycles"),
         invariant_config=invariant_config,

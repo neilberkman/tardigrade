@@ -43,6 +43,7 @@ from fault_types import (
 )
 from thumb_instructions import enumerate_instruction_skip_addresses, make_elf_halfword_reader
 from boot_outcomes import DEVICE_BOOT_OUTCOMES
+from layout_validation import LayoutValidationError, validate_ownership_plan
 from verdicts import EXPECTATION_MODES, expectation_mode
 from update_protocol_analyzer import (
     UpdateProtocolError,
@@ -250,7 +251,7 @@ class MemoryRegionConfig:
     coupling evidence collection to a particular bootloader.
     """
 
-    __slots__ = ("name", "base", "size", "sector_size")
+    __slots__ = ("name", "base", "size", "sector_size", "parent")
 
     def __init__(
         self,
@@ -258,11 +259,13 @@ class MemoryRegionConfig:
         size: int,
         sector_size: Optional[int] = None,
         name: Optional[str] = None,
+        parent: Optional[str] = None,
     ) -> None:
         self.name = str(name) if name is not None else None
         self.base = int(base)
         self.size = int(size)
         self.sector_size = int(sector_size) if sector_size is not None else None
+        self.parent = str(parent) if parent is not None else None
 
 
 class MemoryConfig:
@@ -985,6 +988,7 @@ class ComponentConfig:
             boundary_value=getattr(parent, "boundary_value", None),
             boundary_previous_value=getattr(parent, "boundary_previous_value", None),
             target_source=getattr(parent, "target_source", None),
+            ownership_manifest_complete=parent.ownership_manifest_complete,
         )
         resolved.auto_update_trigger = bool(
             getattr(parent, "auto_update_trigger", False)
@@ -1014,17 +1018,19 @@ class MultiComponentConfig:
         self.fault_matrix = fault_matrix
 class NvsRegionConfig:
     """Configuration for an NVS (non-volatile storage) region on flash."""
-    __slots__ = ("address", "size", "snapshot")
+    __slots__ = ("address", "size", "snapshot", "parent")
 
     def __init__(
         self,
         address: int,
         size: int,
         snapshot: Optional[str] = None,
+        parent: Optional[str] = None,
     ) -> None:
         self.address = address
         self.size = size
         self.snapshot = snapshot
+        self.parent = parent
 
 
 class ConfigCheck:
@@ -1919,6 +1925,97 @@ def _align_down(value: int, align: int) -> int:
 VALID_SCENARIOS = {"runtime"}
 
 
+def _build_profile_ownership_plan(profile: "ProfileConfig") -> Dict[str, Any]:
+    """Build the single normalized durable-byte ownership plan for a profile."""
+
+    memory = profile.memory
+    bounds = [
+        {
+            "name": region.name or "erase_region_{}".format(index),
+            "base": region.base,
+            "size": region.size,
+        }
+        for index, region in enumerate(memory.erase_regions)
+    ]
+    geometry = []
+    persistent_layout = profile.persistent_state_layout
+    if persistent_layout is not None:
+        geometry = [
+            {
+                "name": "persistent_erase_region_{}".format(index),
+                "base": region.start,
+                "size": region.end - region.start,
+            }
+            for index, region in enumerate(persistent_layout.erase_regions)
+        ]
+
+    regions: List[Dict[str, Any]] = []
+    if profile.bootloader_region is not None:
+        regions.append({
+            "id": "bootloader",
+            "kind": "bootloader",
+            "base": profile.bootloader_region.base,
+            "size": profile.bootloader_region.size,
+        })
+    for name, slot in sorted(memory.slots.items()):
+        regions.append({
+            "id": "slot:{}".format(name),
+            "kind": "slot",
+            "base": slot.base,
+            "size": slot.size,
+        })
+    for region in memory.postmortem_partitions:
+        regions.append({
+            "id": "partition:{}".format(region.name),
+            "kind": "partition",
+            "base": region.base,
+            "size": region.size,
+            "parent": region.parent,
+        })
+    for region in profile.metadata_fault_regions:
+        regions.append({
+            "id": "metadata:{}".format(region.name),
+            "kind": "metadata",
+            "base": region.start,
+            "size": region.end - region.start,
+            "parent": region.parent,
+        })
+    if profile.nvs_region is not None:
+        regions.append({
+            "id": "nvs",
+            "kind": "nvs",
+            "base": profile.nvs_region.address,
+            "size": profile.nvs_region.size,
+            "parent": profile.nvs_region.parent,
+        })
+    if persistent_layout is not None:
+        for field in persistent_layout.fields:
+            regions.append({
+                "id": "persistent:{}".format(field.name),
+                "kind": "persistent_field",
+                "base": field.base,
+                "size": field.size,
+                "parent": field.parent,
+                "role": field.role,
+            })
+
+    complete = profile.ownership_manifest_complete
+    if complete and profile.bootloader_region is None:
+        raise ProfileError(
+            "ownership_manifest_complete requires bootloader_region"
+        )
+    try:
+        return validate_ownership_plan({
+            "version": 1,
+            "complete": complete,
+            "bounds": bounds,
+            "geometry": geometry,
+            "regions": regions,
+        })
+    except LayoutValidationError as exc:
+        raise ProfileError("memory ownership preflight: {}".format(exc)) from exc
+
+
 class ProfileConfig:
     """Fully-parsed bootloader profile."""
 
@@ -1975,6 +2072,7 @@ class ProfileConfig:
         boundary_value: Optional[int] = None,
         boundary_previous_value: Optional[int] = None,
         target_source: Optional[TargetSourceConfig] = None,
+        ownership_manifest_complete: bool = False,
 
     ) -> None:
         self.schema_version = schema_version
@@ -2056,6 +2154,13 @@ class ProfileConfig:
         self.boundary_value = boundary_value
         self.boundary_previous_value = boundary_previous_value
         self.target_source: Optional[TargetSourceConfig] = target_source
+        self.ownership_manifest_complete = ownership_manifest_complete
+        self.ownership_plan: Dict[str, Any] = _build_profile_ownership_plan(self)
+        if isinstance(self.multi_component, MultiComponentConfig):
+            self.ownership_plan["components"] = {
+                component.name: component.to_profile_config(self).ownership_plan
+                for component in self.multi_component.components
+            }
 
 
     @property
@@ -2159,6 +2264,7 @@ class ProfileConfig:
                 else getattr(self, "boundary_previous_value", None)
             ),
             target_source=getattr(self, "target_source", None),
+            ownership_manifest_complete=self.ownership_manifest_complete,
 
         )
         if state.update_trigger is not None and state.pre_boot_state is None:
@@ -2669,6 +2775,7 @@ class ProfileConfig:
                         "name": region.name,
                         "base": region.base,
                         "size": region.size,
+                        "parent": region.parent,
                     }
                     for region in mem.postmortem_partitions
                 ],
@@ -3252,9 +3359,24 @@ def _parse_memory_regions(
             if not name or name in names:
                 raise ProfileError("{}: name must be non-empty and unique".format(path))
             names.add(name)
+        parent = entry.get("parent")
+        if parent is not None:
+            if field != "memory.postmortem_partitions":
+                raise ProfileError(
+                    "{}.parent is only valid for postmortem partitions".format(path)
+                )
+            parent = str(parent).strip()
+            if not parent:
+                raise ProfileError(
+                    "{}.parent must be a non-empty ownership id".format(path)
+                )
         regions.append(
             MemoryRegionConfig(
-                base=base, size=size, sector_size=sector_size, name=name
+                base=base,
+                size=size,
+                sector_size=sector_size,
+                name=name,
+                parent=parent,
             )
         )
     regions.sort(key=lambda region: (region.base, region.size))
@@ -5126,7 +5248,17 @@ def _parse_nvs_region(raw: Optional[Dict[str, Any]]) -> Optional[NvsRegionConfig
     snapshot = raw.get("snapshot")
     if snapshot is not None:
         snapshot = str(snapshot)
-    return NvsRegionConfig(address=address, size=size, snapshot=snapshot)
+    parent = raw.get("parent")
+    if parent is not None:
+        parent = str(parent).strip()
+        if not parent:
+            raise ProfileError("nvs_region.parent: expected non-empty ownership id")
+    return NvsRegionConfig(
+        address=address,
+        size=size,
+        snapshot=snapshot,
+        parent=parent,
+    )
 
 
 def _parse_nvs_corruption(raw: Optional[Dict[str, Any]]) -> NvsCorruptionConfig:
@@ -6693,6 +6825,17 @@ def _parse_metadata_fault_regions(raw, slots=None):
                     "metadata_fault_regions[{}].slot: unknown slot '{}'".format(idx, slot_name)
                 )
             slot = slots[slot_name]
+            parent = "slot:{}".format(slot_name)
+            explicit_parent = entry.get("parent")
+            if (
+                explicit_parent is not None
+                and str(explicit_parent).strip() != parent
+            ):
+                raise ProfileError(
+                    "metadata_fault_regions[{}].parent must be {!r} for the relative slot form".format(
+                        idx, parent
+                    )
+                )
             offset = _parse_int(
                 _require(entry, "offset", "metadata_fault_regions[{}]".format(idx)),
                 "metadata_fault_regions[{}].offset".format(idx),
@@ -6719,6 +6862,15 @@ def _parse_metadata_fault_regions(raw, slots=None):
                     "metadata_fault_regions[{}]: relative form requires size or end_offset".format(idx)
                 )
         else:
+            parent = entry.get("parent")
+            if parent is not None:
+                parent = str(parent).strip()
+                if not parent:
+                    raise ProfileError(
+                        "metadata_fault_regions[{}].parent: expected non-empty ownership id".format(
+                            idx
+                        )
+                    )
             start = _parse_int(
                 _require(entry, "start", "metadata_fault_regions[{}]".format(idx)),
                 "metadata_fault_regions[{}].start".format(idx),
@@ -6733,7 +6885,9 @@ def _parse_metadata_fault_regions(raw, slots=None):
                     idx, end, start
                 )
             )
-        regions.append(MetadataFaultRegion(name=name, start=start, end=end))
+        regions.append(
+            MetadataFaultRegion(name=name, start=start, end=end, parent=parent)
+        )
     return regions
 
 
@@ -6756,6 +6910,7 @@ _STRICT_TOP_LEVEL_KEYS = frozenset(
         "write_order_constraints", "residual_image", "scenario",
         "skip_self_test", "strict_validation",
         "persistent_state_layout",
+        "ownership_manifest_complete",
         "terminal_error_paths",
         "boundary_campaigns",
         "target_source",
@@ -6874,6 +7029,8 @@ def _validate_strict_memory(raw: Any, context: str) -> None:
             region_keys = {"base", "size", "name"}
             if field_name != "volatile_regions":
                 region_keys.update({"sector_size", "erase_size"})
+            if field_name == "postmortem_partitions":
+                region_keys.add("parent")
             _reject_unknown_keys(
                 region,
                 frozenset(region_keys),
@@ -7226,15 +7383,16 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
                 )
 
     if "bootloader_region" in data:
-        _reject_unknown_keys(
-            data.get("bootloader_region"),
-            frozenset({"base", "size"}),
-            "bootloader_region",
-        )
+        if data.get("bootloader_region") is not None:
+            _reject_unknown_keys(
+                data.get("bootloader_region"),
+                frozenset({"base", "size"}),
+                "bootloader_region",
+            )
     if "nvs_region" in data:
         _reject_unknown_keys(
             data.get("nvs_region"),
-            frozenset({"address", "size", "snapshot"}),
+            frozenset({"address", "size", "snapshot", "parent"}),
             "nvs_region",
         )
 
@@ -7284,7 +7442,7 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
     for index, region in enumerate(metadata_regions):
         _reject_unknown_keys(
             region,
-            frozenset({"name", "start", "end", "slot", "offset", "size", "end_offset"}),
+            frozenset({"name", "start", "end", "slot", "offset", "size", "end_offset", "parent"}),
             "metadata_fault_regions[{}]".format(index),
         )
 
@@ -7639,6 +7797,52 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         _require(bootloader, "entry", "bootloader"), "bootloader.entry"
     )
 
+    ownership_manifest_complete = data.get("ownership_manifest_complete", False)
+    if not isinstance(ownership_manifest_complete, bool):
+        raise ProfileError("ownership_manifest_complete: expected boolean")
+    if ownership_manifest_complete:
+        # A completeness assertion is fail-closed for every declaration that
+        # contributes to byte ownership, even when general strict validation
+        # is not enabled for the rest of the profile.
+        _reject_unknown_keys(data, _STRICT_TOP_LEVEL_KEYS, "profile")
+        _validate_strict_memory(data.get("memory"), "memory")
+        if data.get("bootloader_region") is not None:
+            _reject_unknown_keys(
+                data.get("bootloader_region"),
+                frozenset({"base", "size"}),
+                "bootloader_region",
+            )
+        if data.get("nvs_region") is not None:
+            _reject_unknown_keys(
+                data.get("nvs_region"),
+                frozenset({"address", "size", "snapshot", "parent"}),
+                "nvs_region",
+            )
+        for index, region in enumerate(data.get("metadata_fault_regions") or []):
+            _reject_unknown_keys(
+                region,
+                frozenset({
+                    "name", "start", "end", "slot", "offset", "size",
+                    "end_offset", "parent",
+                }),
+                "metadata_fault_regions[{}]".format(index),
+            )
+        raw_multi_component = data.get("multi_component")
+        if raw_multi_component is not None:
+            if not isinstance(raw_multi_component, dict):
+                raise ProfileError("multi_component: expected mapping")
+            raw_components = raw_multi_component.get("components")
+            if not isinstance(raw_components, list):
+                raise ProfileError("multi_component.components: expected list")
+            for index, component in enumerate(raw_components):
+                if not isinstance(component, dict):
+                    raise ProfileError(
+                        "multi_component.components[{}]: expected mapping".format(index)
+                    )
+                _validate_strict_memory(
+                    component.get("memory"),
+                    "multi_component.components[{}].memory".format(index),
+                )
     memory = _parse_memory(_require(data, "memory"))
     try:
         persistent_state_layout = parse_persistent_state_layout(
@@ -7947,6 +8151,7 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         terminal_error_paths=terminal_error_paths,
         boundary_campaigns=boundary_campaigns,
         target_source=target_source,
+        ownership_manifest_complete=ownership_manifest_complete,
 
     )
     profile.auto_update_trigger = auto_update_trigger
@@ -8152,7 +8357,12 @@ def main() -> int:
             else None
         ),
         "metadata_fault_regions": [
-            {"name": r.name, "start": "0x{:X}".format(r.start), "end": "0x{:X}".format(r.end)}
+            {
+                "name": r.name,
+                "start": "0x{:X}".format(r.start),
+                "end": "0x{:X}".format(r.end),
+                "parent": r.parent,
+            }
             for r in profile.metadata_fault_regions
         ],
         "multi_component": (
@@ -8177,6 +8387,7 @@ def main() -> int:
             if profile.persistent_state_layout is not None
             else None
         ),
+        "ownership_layout": profile.ownership_plan,
         "update_protocol_analysis": (
             analyze_update_protocol(profile.update_protocol, profile.security_policy)
             if profile.update_protocol is not None

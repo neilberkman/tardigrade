@@ -180,6 +180,9 @@ co-location, while the `security_state_erase` selector creates power-loss
 cutpoints around erase and restoration boundaries. `boundary_campaigns`
 expands logical counters around zero, storage capacity, and integer limits,
 with optional lower-value follow-ups that verify rejection and persistence.
+Profiles also emit a normalized durable-memory ownership plan. Set
+`ownership_manifest_complete: true` to require fail-closed whole-device checks;
+otherwise reports explicitly mark whole-device layout safety as not assessed.
 
 For CPU-fault campaigns, `terminal_error_paths` derives direct calls and tail
 branches to fatal handlers from the emitted ELF. A finding requires a terminal
@@ -352,7 +355,7 @@ flowchart TD
 5. **Phase 1** -- replay the clean trace where supported, or execute the CPU to the selected cutpoint, then inject the fault. Trace replay eliminates O(N^2) prefix re-emulation for eligible power-loss points.
 6. **Phase 2** -- `execute` mode resets the CPU and performs a full recovery boot from faulted NVM; `state` mode infers the outcome from NVM contents alone.
 7. **Follow-up cycles / hooks** -- optional repeated boots and between-cycle hook actions model confirm-or-rollback flows and staged recovery.
-8. **Classification** -- boot outcomes (`success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`) and failure classes (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`). Recovery faults and liveness stalls take precedence over a simultaneous image mismatch, which remains supporting evidence. MRAM program faults retain exact address/width/byte telemetry plus an immediate snapshot and compact image diff. A `timeout` means the bootloader was still actively working when the wall-clock budget expired -- this is not counted as a failure.
+8. **Classification** -- boot outcomes (`success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`) and failure classes (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`). Recovery faults and liveness stalls take precedence over a simultaneous image mismatch, which remains supporting evidence. MRAM program faults retain exact address/width/byte telemetry plus an immediate snapshot and compact image diff. A `timeout` means an emulation, instruction, or wall-clock limit expired before a terminal result -- this is not counted as a failure.
 
 ### Fault types
 
@@ -487,9 +490,9 @@ output and requires `CLEAN` unless `regression-mode` is explicitly enabled.
 
 For runtime sweeps, `bricks` counts unrecoverable failures, `issue_points`
 includes broader mismatches (wrong slot, semantic assertions, and invariant
-violations), and `timeout_points` counts points where the bootloader was still
-working when the wall-clock budget expired. Timeouts are not failures; increase
-`run_duration` to resolve them. Common boot outcomes are `success`,
+violations), and `timeout_points` counts points where an emulation,
+instruction, or wall-clock limit expired without a terminal result. Timeouts
+are not failures; increase the relevant profile limit to resolve them. Common boot outcomes are `success`,
 `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, and `timeout`. Clean runtime
 evidence also requires calibration coverage: if the bootloader never moves
 slot data during calibration, tardigrade reports an incomplete setup rather

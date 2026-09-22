@@ -55,6 +55,8 @@ from trigger_discovery import (
 from audit_report import (
     compute_verdict,
     git_metadata,
+    ownership_plan_for_report,
+    qualify_ownership_verdict,
     report_skip_reasons,
     summarize_runtime_sweep,
 )
@@ -1671,6 +1673,10 @@ def _main_single() -> int:
                     mc_verdict = "FAIL -- authorization review analysis found a mismatch"
                 elif authorization_review_analysis["verdict"] != "PASS":
                     mc_verdict = "INCONCLUSIVE -- authorization review evidence incomplete"
+            ownership_plan = ownership_plan_for_report(
+                getattr(profile, "ownership_plan", None)
+            )
+            mc_verdict = qualify_ownership_verdict(mc_verdict, ownership_plan)
 
             payload: Dict[str, Any] = {
                 "engine": "renode-test",
@@ -1681,6 +1687,7 @@ def _main_single() -> int:
                 "verdict": mc_verdict,
                 "summary": {
                     "combined": combined_summary,
+                    "ownership_layout": ownership_plan,
                     "per_component": {
                         name: data["summary"]
                         for name, data in mc_result["per_component"].items()
@@ -2489,6 +2496,10 @@ def _main_single() -> int:
                 verdict = "FAIL -- authorization review analysis found a mismatch"
             elif authorization_review_analysis["verdict"] != "PASS":
                 verdict = "INCONCLUSIVE -- authorization review evidence incomplete"
+        ownership_plan = ownership_plan_for_report(
+            getattr(profile, "ownership_plan", None)
+        )
+        verdict = qualify_ownership_verdict(verdict, ownership_plan)
 
         # -------------------------------------------------------------------
         # Build output
@@ -2523,6 +2534,7 @@ def _main_single() -> int:
             "expect": {
                 "should_find_issues": profile.expect.should_find_issues,
                 "mode": profile.expect.mode,
+                "control_outcome": profile.expect.control_outcome,
             },
             "boundary_campaign": (
                 {
@@ -2571,6 +2583,7 @@ def _main_single() -> int:
             }
         if geometry_preflight is not None:
             payload["summary"]["geometry_preflight"] = geometry_preflight
+        payload["summary"]["ownership_layout"] = ownership_plan
         if swap_progress_summary is not None:
             payload["summary"]["swap_progress_inference"] = swap_progress_summary
         if profile.persistent_state_layout is not None:
@@ -3065,6 +3078,10 @@ def _run_initial_state_matrix(
     boundary_failed = any(
         report.get("verdict") == "FAIL" for report in boundary_reports
     )
+    ownership_plan = ownership_plan_for_report(
+        getattr(profile, "ownership_plan", None)
+    )
+    verdict = qualify_ownership_verdict(verdict, ownership_plan)
     for entry in entries:
         entry.pop("_child_payload", None)
 
@@ -3087,6 +3104,7 @@ def _run_initial_state_matrix(
             "mode": expect_mode,
         },
         "summary": {
+            "ownership_layout": ownership_plan,
             "initial_states": {
                 "requested": len(profile.initial_states),
                 "completed": len(entries) - len(missing_or_infra),

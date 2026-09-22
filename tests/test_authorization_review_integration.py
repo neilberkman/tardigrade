@@ -253,7 +253,7 @@ def test_audit_cli_rejects_trace_without_authorization_review(tmp_path, monkeypa
 @pytest.mark.parametrize(
     ("trace_kwargs", "expected_analysis", "expected_exit", "expected_verdict"),
     [
-        ({}, "PASS", 0, "PASS"),
+        ({}, "PASS", 0, "PASS — whole-device layout not assessed"),
         ({"review_digest": "f"}, "FAIL", 1, "FAIL -- authorization review analysis found a mismatch"),
         ({"include_signature": False}, "INCONCLUSIVE", 1, "INCONCLUSIVE -- authorization review evidence incomplete"),
     ],

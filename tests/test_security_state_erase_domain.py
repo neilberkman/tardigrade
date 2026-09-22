@@ -75,6 +75,32 @@ def test_conflicting_geometry_boundary_is_rejected():
         )
 
 
+def test_nested_persistent_fields_require_explicit_containment():
+    layout = _layout(
+        [{"start": 0x1000, "end": 0x2000, "erase_size": 0x1000}],
+        [
+            {"name": "record", "base": 0x1100, "size": 0x100, "role": "mutable"},
+            {
+                "name": "counter",
+                "base": 0x1120,
+                "size": 8,
+                "role": "security_monotonic",
+                "parent": "persistent:record",
+            },
+        ],
+    )
+    assert layout.fields[1].parent == "persistent:record"
+
+    with pytest.raises(SecurityStateLayoutError, match="explicit containment"):
+        _layout(
+            [{"start": 0x1000, "end": 0x2000, "erase_size": 0x1000}],
+            [
+                {"name": "record", "base": 0x1100, "size": 0x100, "role": "mutable"},
+                {"name": "counter", "base": 0x1120, "size": 8, "role": "security_monotonic"},
+            ],
+        )
+
+
 def test_erase_trace_precedes_geometry_and_emits_three_distinct_cuts():
     layout = _layout(
         [{"start": 0x1000, "end": 0x2000, "erase_size": 0x1000}],

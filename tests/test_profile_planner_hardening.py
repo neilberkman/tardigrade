@@ -259,13 +259,13 @@ fault_sweep:
     def test_top_level_bootloader_region_is_canonical(self) -> None:
         profile = self._load(
             """
-bootloader_region: { base: 0x10000000, size: 0x800 }
+bootloader_region: { base: 0x0FFF0000, size: 0x800 }
 """
         )
         self.assertIs(profile.bootloader_region, profile.memory.bootloader_region)
-        self.assertEqual(profile.bootloader_region.base, 0x10000000)
+        self.assertEqual(profile.bootloader_region.base, 0x0FFF0000)
         variables = profile.robot_vars(ROOT)
-        self.assertIn("BOOTLOADER_REGION_BASE:0x10000000", variables)
+        self.assertIn("BOOTLOADER_REGION_BASE:0x0FFF0000", variables)
         self.assertIn("BOOTLOADER_REGION_SIZE:0x00000800", variables)
 
     def test_memory_bootloader_region_remains_compatible(self) -> None:
@@ -274,7 +274,7 @@ bootloader_region: { base: 0x10000000, size: 0x800 }
 memory:
   sram: { start: 0x20000000, end: 0x20020000 }
   write_granularity: 4
-  bootloader_region: { base: 0x10000000, size: 0x800 }
+  bootloader_region: { base: 0x0FFF0000, size: 0x800 }
   slots:
     exec: { base: 0x10000000, size: 0x1000 }
     staging: { base: 0x10001000, size: 0x1000 }
@@ -286,7 +286,7 @@ memory:
         with self.assertRaisesRegex(ProfileError, "conflicts"):
             self._load(
                 """
-bootloader_region: { base: 0x10000000, size: 0x800 }
+bootloader_region: { base: 0x0FFF0000, size: 0x800 }
 memory:
   sram: { start: 0x20000000, end: 0x20020000 }
   write_granularity: 4
@@ -410,7 +410,7 @@ fault_sweep:
             """
 nvm_controller: nvmController
 otp_peripheral: otp
-bootloader_region: { base: 0x10000000, size: 0x800 }
+bootloader_region: { base: 0x0FFF0000, size: 0x800 }
 boot_register_pre_writes:
   - { address: 0x40000000, value: 1 }
 boot_registers:
@@ -611,7 +611,7 @@ fault_sweep:
     def test_structured_success_checks_are_encoded_for_runtime(self) -> None:
         profile = self._load(
             """
-bootloader_region: { base: 0x10000000, size: 0x800 }
+bootloader_region: { base: 0x0FFF0000, size: 0x800 }
 success_criteria:
   vtor_in_slot: exec
   bootloader_integrity: true

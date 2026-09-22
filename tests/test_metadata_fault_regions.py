@@ -279,9 +279,11 @@ class TestProfileLoadMetadataFaultRegions(unittest.TestCase):
                     - name: trailer
                       start: 0x3F000
                       end: 0x40000
+                      parent: slot:exec
                     - name: header
                       start: 0x0
                       end: 0x100
+                      parent: slot:exec
             """)
             profile = load_profile(path)
             self.assertEqual(len(profile.metadata_fault_regions), 2)
