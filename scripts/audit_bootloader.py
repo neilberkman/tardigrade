@@ -1807,6 +1807,7 @@ def _main_single() -> int:
             discovery.selected_calibration if discovery is not None else None
         )
         trace_file: Optional[str] = None
+        program_trace_file: Optional[str] = None
         erase_trace_file: Optional[str] = None
         trace_file_bin: Optional[str] = None
         erase_trace_file_bin: Optional[str] = None
@@ -1946,6 +1947,7 @@ def _main_single() -> int:
                         total_i2c_transactions = 0
                         total_otp_blows = 0
                         trace_file = None
+                        program_trace_file = None
                         erase_trace_file = None
                         trace_file_bin = None
                         erase_trace_file_bin = None
@@ -1966,6 +1968,7 @@ def _main_single() -> int:
                     max_writes = cal.total_writes
                     total_erases = cal.total_erases
                     trace_file = cal.trace_file
+                    program_trace_file = cal.program_trace_file
                     erase_trace_file = cal.erase_trace_file
                     trace_file_bin = cal.trace_file_bin
                     erase_trace_file_bin = cal.erase_trace_file_bin
@@ -2063,6 +2066,7 @@ def _main_single() -> int:
                         total_i2c_transactions = 0
                         total_otp_blows = 0
                         trace_file = None
+                        program_trace_file = None
                         erase_trace_file = None
                         trace_file_bin = None
                         erase_trace_file_bin = None
@@ -2082,6 +2086,7 @@ def _main_single() -> int:
                 if cal is not None:
                     total_erases = cal.total_erases
                     trace_file = cal.trace_file
+                    program_trace_file = cal.program_trace_file
                     erase_trace_file = cal.erase_trace_file
                     trace_file_bin = cal.trace_file_bin
                     erase_trace_file_bin = cal.erase_trace_file_bin
@@ -2285,6 +2290,7 @@ def _main_single() -> int:
             page_size=getattr(profile.memory, "page_size", 4096),
             metadata_regions=getattr(profile, "metadata_fault_regions", None),
             trace_address_map=getattr(profile.memory, "trace_address_map", None),
+            program_trace_file=program_trace_file,
         )
         if clean_trace_meta is not None:
             clean_trace_meta["coverage"] = calibration_coverage
@@ -2605,6 +2611,7 @@ def _main_single() -> int:
             "emulated_s": cal.emulated_s if cal is not None else None,
             "elapsed_s": cal.elapsed_s if cal is not None else None,
             "pc": cal.pc if cal is not None else None,
+            "program_trace_file": program_trace_file,
         }
         selected_target_boot_evidence = _selected_trigger_target_boot_evidence(discovery)
         if selected_target_boot_evidence is not None:

@@ -338,6 +338,43 @@ class TestSaveLoadCalibration(unittest.TestCase):
         with open(loaded.trace_file_bin, "rb") as f:
             self.assertEqual(f.read(), trace_bin_data)
 
+    def test_exact_program_trace_round_trip_and_digest_validation(self):
+        program_data = (
+            b"write_index,program_address,offset,width,intended_hex,"
+            b"pre_program_hex,post_program_hex,faulted\n"
+            b"1,0x10001000,4096,4,11223344,ffffffff,11223344,false\n"
+        )
+        program_trace = os.path.join(self.td, "program_trace.csv")
+        Path(program_trace).write_bytes(program_data)
+        cal = self._make_cal(total_writes=1)
+        cal.program_trace_file = program_trace
+
+        save_calibration(self.cache_path, cal, "program-trace-key")
+        loaded = load_calibration(
+            self.cache_path,
+            "program-trace-key",
+            self.work_dir,
+            allow_unsigned=True,
+        )
+
+        self.assertIsNotNone(loaded)
+        self.assertIsNotNone(loaded.program_trace_file)
+        self.assertEqual(Path(loaded.program_trace_file).read_bytes(), program_data)
+
+        payload = json.loads(Path(self.cache_path).read_text(encoding="utf-8"))
+        changed = program_data.replace(b"11223344", b"55667788", 1)
+        payload["program_trace_file_b64"] = base64.b64encode(changed).decode(
+            "ascii"
+        )
+        Path(self.cache_path).write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "digest mismatch"):
+            load_calibration(
+                self.cache_path,
+                "program-trace-key",
+                self.work_dir,
+                allow_unsigned=True,
+            )
+
     def test_width_bearing_trace_files_round_trip(self):
         trace_data = (
             b"write_index,flash_offset,value,width\n"
@@ -502,7 +539,7 @@ class TestSaveLoadCalibration(unittest.TestCase):
             payload = json.load(f)
 
         self.assertEqual(payload["cache_key"], "k")
-        self.assertEqual(payload["version"], 3)
+        self.assertEqual(payload["version"], 4)
         self.assertEqual(payload["total_writes"], 100)
 
     def test_rejects_tampered_counter_and_trace(self):

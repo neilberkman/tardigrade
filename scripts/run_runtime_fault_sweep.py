@@ -12251,30 +12251,30 @@ if calibration_mode:
                 )
             if program_trace:
                 calibration_last_program = dict(program_trace[-1])
-                program_trace_file = result_file.replace(
-                    '.json', '_program_trace.csv'
+            program_trace_file = result_file.replace(
+                '.json', '_program_trace.csv'
+            )
+            with open(program_trace_file, 'w') as program_file:
+                program_file.write(
+                    'write_index,program_address,offset,width,intended_hex,'
+                    'pre_program_hex,post_program_hex,faulted\n'
                 )
-                with open(program_trace_file, 'w') as program_file:
+                for event in program_trace:
                     program_file.write(
-                        'write_index,program_address,offset,width,intended_hex,'
-                        'pre_program_hex,post_program_hex,faulted\n'
-                    )
-                    for event in program_trace:
-                        program_file.write(
-                            '{},{},{},{},{},{},{},{}\n'.format(
-                                event['write_index'],
-                                event['program_address'],
-                                event['offset'],
-                                event['program_width'],
-                                event['intended_bytes'],
-                                event['pre_program_bytes'],
-                                event['post_program_bytes'],
-                                'true' if event['faulted'] else 'false',
-                            )
+                        '{},{},{},{},{},{},{},{}\n'.format(
+                            event['write_index'],
+                            event['program_address'],
+                            event['offset'],
+                            event['program_width'],
+                            event['intended_bytes'],
+                            event['pre_program_bytes'],
+                            event['post_program_bytes'],
+                            'true' if event['faulted'] else 'false',
                         )
-                log('calibration: wrote {} exact MRAM program entries to {}'.format(
-                    len(program_trace), program_trace_file
-                ))
+                    )
+            log('calibration: wrote {} exact MRAM program entries to {}'.format(
+                len(program_trace), program_trace_file
+            ))
 
         # Export erase trace — always captured for trace replay correctness.
         erase_trace_file = None

@@ -58,6 +58,7 @@ class AuditQuickStateEvaluatorTests(unittest.TestCase):
                 memory:
                   sram: { start: 0x20000000, end: 0x20020000 }
                   write_granularity: 4
+                  page_size: 0x100
                   slots:
                     exec: { base: 0x10000000, size: 0x1000 }
                     staging: { base: 0x10001000, size: 0x1000 }
@@ -87,19 +88,23 @@ class AuditQuickStateEvaluatorTests(unittest.TestCase):
             tempdir = Path(td)
             profile_path = self._write_profile(tempdir)
             output_path = tempdir / "audit.json"
-            trace_file = tempdir / "trace.csv"
-            trace_file.write_text(
-                "write_index,flash_offset,value\n1,0,0\n2,4,0\n",
+            program_trace_file = tempdir / "program_trace.csv"
+            program_trace_file.write_text(
+                "write_index,program_address,offset,width,intended_hex,"
+                "pre_program_hex,post_program_hex,faulted\n"
+                "1,0x10000000,0,4,11111111,ffffffff,11111111,false\n"
+                "2,0x10000004,4,4,22222222,ffffffff,22222222,false\n",
                 encoding="utf-8",
             )
 
             cal = CalibrationResult(
                 total_writes=2,
                 total_erases=0,
-                trace_file=str(trace_file),
+                trace_file=None,
                 erase_trace_file=None,
                 trace_file_bin=None,
                 erase_trace_file_bin=None,
+                program_trace_file=str(program_trace_file),
                 stop_reason="vtor_captured",
             )
 
@@ -194,6 +199,17 @@ class AuditQuickStateEvaluatorTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             payload = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertTrue(payload["quick"])
+            self.assertEqual(
+                payload["calibration"]["program_trace_file"],
+                str(program_trace_file),
+            )
+            self.assertEqual(
+                payload["calibration"]["coverage"]["status"], "slot_activity"
+            )
+            self.assertEqual(
+                payload["calibration"]["coverage"]["write_trace_source"],
+                "exact_mram_program_trace",
+            )
 
 
 if __name__ == "__main__":

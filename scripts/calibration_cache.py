@@ -24,9 +24,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from renode_runner import CalibrationResult
+from trace_utils import parse_exact_program_trace_csv
 
 
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 MAX_CACHE_BYTES = 256 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
 MAX_COUNTER = 100_000_000
@@ -52,6 +53,8 @@ CACHE_FIELDS = {
     "erase_trace_file_sha256",
     "trace_file_bin_b64",
     "trace_file_bin_sha256",
+    "program_trace_file_b64",
+    "program_trace_file_sha256",
     "erase_trace_file_bin_b64",
     "erase_trace_file_bin_sha256",
 }
@@ -305,15 +308,48 @@ def _validate_cache_payload(payload: Any) -> Dict[str, Any]:
     trace_csv = _decode_artifact(payload, "trace_file_b64")
     erase_csv = _decode_artifact(payload, "erase_trace_file_b64")
     trace_bin = _decode_artifact(payload, "trace_file_bin_b64")
+    program_csv = _decode_artifact(payload, "program_trace_file_b64")
     erase_bin = _decode_artifact(payload, "erase_trace_file_bin_b64")
     write_rows = _validate_trace_pair(trace_csv, trace_bin, erase=False)
     erase_rows = _validate_trace_pair(erase_csv, erase_bin, erase=True)
+    program_entries: List[Dict[str, Any]] = []
+    if program_csv is not None:
+        try:
+            program_text = program_csv.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("exact MRAM program trace must be UTF-8 CSV") from exc
+        program_entries = parse_exact_program_trace_csv(
+            program_text, source="cached exact MRAM program trace"
+        )
     # The trace records actual flash mutations, while TotalWordWrites also
     # includes counter-only write attempts (for example, programming an
     # already-erased word with 0xFFFFFFFF).  The trace is therefore a subset
     # of the counter, not an exact accounting of it.
     if write_rows > total_writes:
         raise ValueError("write trace record count is inconsistent with total_writes")
+    if len(program_entries) > total_writes:
+        raise ValueError(
+            "exact program trace record count is inconsistent with total_writes"
+        )
+    if trace_csv is not None and program_csv is not None:
+        decoded = csv.reader(io.StringIO(trace_csv.decode("utf-8"), newline=""))
+        write_header = next(decoded)
+        legacy_rows = _parse_trace_csv(
+            trace_csv, name="write trace", header=write_header
+        )
+        if len(legacy_rows) != len(program_entries):
+            raise ValueError(
+                "legacy write trace contradicts exact MRAM program trace count"
+            )
+        for legacy, exact in zip(legacy_rows, program_entries):
+            if legacy[0] != exact["write_index"] or legacy[1] != exact["offset"]:
+                raise ValueError(
+                    "legacy write trace contradicts exact MRAM program provenance"
+                )
+            if len(legacy) == 4 and legacy[3] != exact["program_width"]:
+                raise ValueError(
+                    "legacy write trace contradicts exact MRAM program width"
+                )
     if erase_rows and erase_rows != total_erases:
         raise ValueError("erase trace record count does not match total_erases")
     return payload
@@ -436,6 +472,9 @@ def save_calibration(
     trace_b64, trace_sha256 = _artifact_payload(cal.trace_file)
     erase_trace_b64, erase_trace_sha256 = _artifact_payload(cal.erase_trace_file)
     trace_bin_b64, trace_bin_sha256 = _artifact_payload(cal.trace_file_bin)
+    program_trace_b64, program_trace_sha256 = _artifact_payload(
+        cal.program_trace_file
+    )
     erase_trace_bin_b64, erase_trace_bin_sha256 = _artifact_payload(
         cal.erase_trace_file_bin
     )
@@ -460,6 +499,8 @@ def save_calibration(
         "erase_trace_file_sha256": erase_trace_sha256,
         "trace_file_bin_b64": trace_bin_b64,
         "trace_file_bin_sha256": trace_bin_sha256,
+        "program_trace_file_b64": program_trace_b64,
+        "program_trace_file_sha256": program_trace_sha256,
         "erase_trace_file_bin_b64": erase_trace_bin_b64,
         "erase_trace_file_bin_sha256": erase_trace_bin_sha256,
     }
@@ -544,6 +585,7 @@ def load_calibration(
     trace_csv = _decode_artifact(payload, "trace_file_b64")
     erase_csv = _decode_artifact(payload, "erase_trace_file_b64")
     trace_bin = _decode_artifact(payload, "trace_file_bin_b64")
+    program_csv = _decode_artifact(payload, "program_trace_file_b64")
     erase_bin = _decode_artifact(payload, "erase_trace_file_bin_b64")
 
     # Restore already-validated trace files into work_dir.
@@ -552,6 +594,9 @@ def load_calibration(
     trace_file = _restore_artifact(trace_csv, trace_dir / "write_trace.csv")
     erase_trace_file = _restore_artifact(erase_csv, trace_dir / "erase_trace.csv")
     trace_file_bin = _restore_artifact(trace_bin, trace_dir / "write_trace.bin")
+    program_trace_file = _restore_artifact(
+        program_csv, trace_dir / "program_trace.csv"
+    )
     erase_trace_file_bin = _restore_artifact(
         erase_bin,
         trace_dir / "erase_trace.bin",
@@ -564,6 +609,7 @@ def load_calibration(
         erase_trace_file=erase_trace_file,
         trace_file_bin=trace_file_bin,
         erase_trace_file_bin=erase_trace_file_bin,
+        program_trace_file=program_trace_file,
         calibration_exec_hash=payload.get("calibration_exec_hash"),
         calibration_matched_image=payload.get("calibration_matched_image"),
         calibration_boot_outcome=payload.get("calibration_boot_outcome"),

@@ -1014,6 +1014,7 @@ def _calibration_from_raw_data(profile: ProfileConfig, data: Dict[str, Any]) -> 
         erase_trace_file=data.get("erase_trace_file"),
         trace_file_bin=data.get("trace_file_bin"),
         erase_trace_file_bin=data.get("erase_trace_file_bin"),
+        program_trace_file=data.get("program_trace_file"),
         calibration_exec_hash=data.get("calibration_exec_hash"),
         calibration_matched_image=data.get("calibration_matched_image"),
         calibration_boot_outcome=data.get("calibration_boot_outcome"),
@@ -1099,6 +1100,7 @@ def _validate_trace_artifacts(data: Dict[str, Any]) -> Optional[str]:
     """Validate trace paths and CSV contents before coverage classification."""
     path_fields = (
         "trace_file",
+        "program_trace_file",
         "erase_trace_file",
         "trace_file_bin",
         "erase_trace_file_bin",
@@ -1127,6 +1129,15 @@ def _validate_trace_artifacts(data: Dict[str, Any]) -> Optional[str]:
 
     csv_specs = (
         ("trace_file", ("write_index", "flash_offset", "value")),
+        (
+            "program_trace_file",
+            (
+                "write_index",
+                "program_address",
+                "offset",
+                "width",
+            ),
+        ),
         ("erase_trace_file", ("erase_index", "flash_offset")),
     )
     for field_name, required_fields in csv_specs:
@@ -1737,6 +1748,7 @@ def discover_update_trigger(
                 slots=candidate.memory.slots,
                 page_size=getattr(candidate.memory, "page_size", 4096),
                 metadata_regions=getattr(candidate, "metadata_fault_regions", None),
+                program_trace_file=data.get("program_trace_file"),
             )
             if not isinstance(coverage, dict):
                 raise ValueError("coverage classifier returned a non-object result")
@@ -1781,6 +1793,7 @@ def discover_update_trigger(
             bool(data.get(name)) and os.path.exists(str(data.get(name)))
             for name in (
                 "trace_file",
+                "program_trace_file",
                 "erase_trace_file",
                 "trace_file_bin",
                 "erase_trace_file_bin",

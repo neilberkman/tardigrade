@@ -846,6 +846,16 @@ pass. A controller-only `nvm_ctrl` backend cannot provide this trace; select
 its direct NVMemory peripheral when available, or use an exhaustive sweep
 bounded with `--fault-step`.
 
+Calibration coverage can also consume the direct NVMemory backend's exact MRAM
+program trace. Each event carries an absolute address and program width, so a
+program crossing slot-data, trailer, declared-metadata, or outside-slot
+boundaries contributes to every region it touches. When a legacy write trace
+is present, it remains authoritative for coverage and the exact trace is
+validated against it; the two representations are never added together, and
+contradictory provenance fails closed. With no legacy write trace, the exact
+program trace is authoritative for coverage. Exact program events are not
+converted into replay input or heuristic fault points.
+
 ### Hash bypass
 
 If your bootloader validates image hashes (SHA-256, CRC), the Phase 2 recovery boot spends most of its time in crypto. Bypass it for speed:
@@ -1739,7 +1749,7 @@ optional coverage that was not configured does not turn an otherwise complete
 security result inconclusive. Missing coverage for an enabled selector, and
 all runtime or infrastructure failures, remain fail-closed.
 
-For write/erase-style campaigns, a clean `PASS` also requires calibration coverage. If calibration never shows slot data movement, tardigrade treats the run as a failed setup rather than evidence that the bootloader is clean.
+For write/erase-style campaigns, a clean `PASS` also requires calibration coverage. If calibration never shows slot data movement, tardigrade treats the run as a failed setup rather than evidence that the bootloader is clean. The report records the authoritative coverage representation in `calibration.coverage.write_trace_source`; exact-only MRAM calibration reports `exact_mram_program_trace` instead of declaring coverage unavailable.
 
 ### Boot outcomes
 
@@ -2055,8 +2065,9 @@ python3 scripts/audit_bootloader.py \
 The cache key is derived from the ELF hash, image hashes, fault types, flash
 backend, and write granularity. Cache files also have a strict versioned schema,
 bounded counters, per-artifact digests, and agreement checks between CSV and
-binary traces. Invalid and legacy caches are rejected. If no cache exists, a
-fresh calibration is saved to the requested path.
+binary traces. Exact MRAM program traces are cached with their own digest and
+strict event validation. Invalid and legacy caches are rejected. If no cache
+exists, a fresh calibration is saved to the requested path.
 
 A calibration cache can determine which fault points run, so an existing cache
 is trusted input. Loading one requires either a SHA-256 obtained through a

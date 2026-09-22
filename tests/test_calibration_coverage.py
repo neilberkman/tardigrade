@@ -28,6 +28,7 @@ from trace_utils import (  # noqa: E402
     summarize_calibration_coverage,
 )
 from fault_inject import MetadataFaultRegion  # noqa: E402
+import renode_runner  # noqa: E402
 
 
 def _slot(name_base: int, size: int = 0x1000) -> SimpleNamespace:
@@ -118,6 +119,39 @@ def test_exact_program_trace_provides_slot_coverage_without_legacy_trace(
     assert coverage["write_trace_source"] == "exact_mram_program_trace"
     assert coverage["writes"] == 1
     assert coverage["exact_programs"] == 1
+
+
+def test_run_calibration_preserves_exact_program_trace_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    program_trace = tmp_path / "programs.csv"
+    _program_trace(program_trace, [_program_row(1, 0x1000, 0, width=4)])
+    monkeypatch.setattr(
+        renode_runner,
+        "run_single_point",
+        lambda **_kwargs: {
+            "total_writes": 1,
+            "total_erases": 0,
+            "calibration_stop_reason": "vtor_captured",
+            "program_trace_file": str(program_trace),
+        },
+    )
+    profile = SimpleNamespace(
+        expect=SimpleNamespace(control_outcome="success"),
+        fault_sweep=SimpleNamespace(max_writes_cap=10),
+    )
+
+    calibration = renode_runner.run_calibration(
+        repo_root=ROOT,
+        renode_test="renode-test",
+        robot_suite="suite.robot",
+        profile=profile,
+        robot_vars=[],
+        work_dir=tmp_path,
+        renode_remote_server_dir="",
+    )
+
+    assert calibration.program_trace_file == str(program_trace)
 
 
 @pytest.mark.parametrize(
