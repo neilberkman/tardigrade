@@ -22,6 +22,7 @@ from self_test import check_verdict  # noqa: E402
 from trace_utils import (  # noqa: E402
     annotate_clean_trace,
     build_clean_operation_trace,
+    load_exact_program_trace,
     load_clean_erase_trace,
     load_clean_write_trace,
     summarize_calibration_coverage,
@@ -37,6 +38,30 @@ def _write_trace(path: Path, rows: list[str]) -> None:
     path.write_text(
         "write_index,flash_offset,value\n" + "\n".join(rows) + ("\n" if rows else ""),
         encoding="utf-8",
+    )
+
+
+def _program_trace(path: Path, rows: list[str]) -> None:
+    path.write_text(
+        "write_index,program_address,offset,width,intended_hex,"
+        "pre_program_hex,post_program_hex,faulted\n"
+        + "\n".join(rows)
+        + ("\n" if rows else ""),
+        encoding="utf-8",
+    )
+
+
+def _program_row(
+    index: int,
+    address: int,
+    offset: int,
+    width: int = 16,
+    byte: int = 0x11,
+) -> str:
+    data = "{:02x}".format(byte) * width
+    pre = "ff" * width
+    return "{},{:#x},{},{},{},{},{},false".format(
+        index, address, offset, width, data, pre, data
     )
 
 
@@ -72,6 +97,178 @@ def test_summarize_calibration_coverage_detects_slot_activity() -> None:
     assert coverage["status"] == "slot_activity"
     assert coverage["slot_data_writes"] == 1
     assert coverage["slot_trailer_writes"] == 0
+
+
+def test_exact_program_trace_provides_slot_coverage_without_legacy_trace(
+    tmp_path: Path,
+) -> None:
+    program_trace = tmp_path / "programs.csv"
+    _program_trace(program_trace, [_program_row(1, 0x1800, 0x800)])
+
+    coverage = summarize_calibration_coverage(
+        trace_file=None,
+        erase_trace_file=None,
+        flash_base=0x1000,
+        slots={"exec": _slot(0x1000)},
+        page_size=0x100,
+        program_trace_file=str(program_trace),
+    )
+
+    assert coverage["status"] == "slot_activity"
+    assert coverage["write_trace_source"] == "exact_mram_program_trace"
+    assert coverage["writes"] == 1
+    assert coverage["exact_programs"] == 1
+
+
+@pytest.mark.parametrize(
+    ("address", "offset", "expected_status", "expected_count"),
+    [
+        (0x1F10, 0xF10, "metadata_only", "slot_trailer_writes"),
+        (0x3000, 0x2000, "named_metadata_only", "metadata_region_writes"),
+        (0x4000, 0x3000, "outside_slots_only", "outside_slot_writes"),
+    ],
+)
+def test_exact_program_trace_classifies_non_data_regions(
+    tmp_path: Path,
+    address: int,
+    offset: int,
+    expected_status: str,
+    expected_count: str,
+) -> None:
+    program_trace = tmp_path / "programs.csv"
+    _program_trace(program_trace, [_program_row(1, address, offset)])
+
+    coverage = summarize_calibration_coverage(
+        trace_file=None,
+        erase_trace_file=None,
+        flash_base=0x1000,
+        slots={"exec": _slot(0x1000)},
+        page_size=0x100,
+        metadata_regions=[
+            MetadataFaultRegion(name="state", start=0x3000, end=0x3100)
+        ],
+        program_trace_file=str(program_trace),
+    )
+
+    assert coverage["status"] == expected_status
+    assert coverage[expected_count] == 1
+
+
+def test_empty_exact_program_trace_is_available_but_has_no_activity(
+    tmp_path: Path,
+) -> None:
+    program_trace = tmp_path / "programs.csv"
+    _program_trace(program_trace, [])
+
+    coverage = summarize_calibration_coverage(
+        trace_file=None,
+        erase_trace_file=None,
+        flash_base=0x1000,
+        slots={"exec": _slot(0x1000)},
+        page_size=0x100,
+        program_trace_file=str(program_trace),
+    )
+
+    assert coverage["status"] == "no_nvm_activity"
+    assert coverage["write_trace_source"] == "exact_mram_program_trace"
+    assert coverage["writes"] == 0
+
+
+def test_exact_program_width_classifies_both_sides_of_region_boundary(
+    tmp_path: Path,
+) -> None:
+    program_trace = tmp_path / "programs.csv"
+    _program_trace(
+        program_trace,
+        [_program_row(1, 0x1EF8, 0xEF8, width=16)],
+    )
+
+    coverage = summarize_calibration_coverage(
+        trace_file=None,
+        erase_trace_file=None,
+        flash_base=0x1000,
+        slots={"exec": _slot(0x1000)},
+        page_size=0x100,
+        program_trace_file=str(program_trace),
+    )
+
+    assert coverage["slot_data_writes"] == 1
+    assert coverage["slot_trailer_writes"] == 1
+    assert coverage["cross_region_programs"] == 1
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        ["1,0x1000,0,4,00,00000000,00000000,false"],
+        [
+            _program_row(1, 0x1000, 0, width=4),
+            _program_row(1, 0x1004, 4, width=4),
+        ],
+        [_program_row(1, 0xFFFFFFFF, 0xFFFFEFFF, width=2)],
+        [
+            _program_row(1, 0x1000, 0, width=4),
+            _program_row(2, 0x1008, 4, width=4),
+        ],
+    ],
+)
+def test_exact_program_trace_fails_closed_on_invalid_events(
+    tmp_path: Path, rows: list[str]
+) -> None:
+    program_trace = tmp_path / "bad-programs.csv"
+    _program_trace(program_trace, rows)
+
+    with pytest.raises(ValueError):
+        load_exact_program_trace(str(program_trace))
+
+
+def test_exact_program_trace_fails_closed_on_missing_file_and_columns(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="regular file"):
+        load_exact_program_trace(str(tmp_path / "missing.csv"))
+
+    missing_column = tmp_path / "missing-column.csv"
+    missing_column.write_text(
+        "write_index,program_address,offset\n1,0x1000,0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="header"):
+        load_exact_program_trace(str(missing_column))
+
+
+def test_coexisting_write_traces_use_legacy_once_and_require_agreement(
+    tmp_path: Path,
+) -> None:
+    write_trace = tmp_path / "writes.csv"
+    _write_trace(write_trace, ["1,256,286331153"])
+    program_trace = tmp_path / "programs.csv"
+    _program_trace(program_trace, [_program_row(1, 0x1100, 0x100, width=4)])
+
+    coverage = summarize_calibration_coverage(
+        trace_file=str(write_trace),
+        erase_trace_file=None,
+        flash_base=0x1000,
+        slots={"exec": _slot(0x1000)},
+        page_size=0x100,
+        program_trace_file=str(program_trace),
+    )
+
+    assert coverage["write_trace_source"] == "legacy_write_trace"
+    assert coverage["coexisting_write_traces"] is True
+    assert coverage["writes"] == 1
+    assert coverage["slot_data_writes"] == 1
+
+    _program_trace(program_trace, [_program_row(1, 0x1104, 0x104, width=4)])
+    with pytest.raises(ValueError, match="contradicts"):
+        summarize_calibration_coverage(
+            trace_file=str(write_trace),
+            erase_trace_file=None,
+            flash_base=0x1000,
+            slots={"exec": _slot(0x1000)},
+            page_size=0x100,
+            program_trace_file=str(program_trace),
+        )
 
 
 def test_summarize_calibration_coverage_detects_metadata_only() -> None:

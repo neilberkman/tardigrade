@@ -14,6 +14,19 @@ from typing import Any, Dict, List, Optional, Tuple
 from fault_inject import MetadataFaultRegion
 
 
+EXACT_PROGRAM_TRACE_FIELDS = (
+    "write_index",
+    "program_address",
+    "offset",
+    "width",
+    "intended_hex",
+    "pre_program_hex",
+    "post_program_hex",
+    "faulted",
+)
+MAX_EXACT_PROGRAM_WIDTH = 1 << 20
+
+
 def flash_base_for_profile(profile: Any) -> int:
     """Return the address corresponding to backend trace offset zero.
 
@@ -183,6 +196,226 @@ def load_clean_write_trace(
     return entries
 
 
+def parse_exact_program_trace_csv(
+    text: str,
+    source: str = "exact MRAM program trace",
+) -> List[Dict[str, Any]]:
+    """Parse and validate an exact, width-aware MRAM calibration trace."""
+    reader = csv.DictReader(text.splitlines(), strict=True)
+    fields = tuple(reader.fieldnames or ())
+    if fields != EXACT_PROGRAM_TRACE_FIELDS:
+        raise ValueError("{} has an unexpected header".format(source))
+
+    entries: List[Dict[str, Any]] = []
+    previous_index = 0
+    address_base: Optional[int] = None
+    for line_number, row in enumerate(reader, start=2):
+        if None in row and row[None]:
+            raise ValueError(
+                "{} row {} has extra fields".format(source, line_number)
+            )
+        if any(
+            row.get(field) is None or not str(row[field]).strip()
+            for field in EXACT_PROGRAM_TRACE_FIELDS
+        ):
+            raise ValueError(
+                "{} row {} has a missing field".format(source, line_number)
+            )
+        try:
+            write_index = int(str(row["write_index"]).strip(), 0)
+            program_address = int(str(row["program_address"]).strip(), 0)
+            offset = int(str(row["offset"]).strip(), 0)
+            width = int(str(row["width"]).strip(), 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "{} row {} has a malformed numeric field".format(
+                    source, line_number
+                )
+            ) from exc
+        if write_index <= previous_index:
+            raise ValueError(
+                "{} indices must be positive and strictly increasing".format(source)
+            )
+        if not 0 <= program_address <= 0xFFFFFFFF:
+            raise ValueError(
+                "{} row {} program address is outside uint32".format(
+                    source, line_number
+                )
+            )
+        if not 0 <= offset <= 0xFFFFFFFF:
+            raise ValueError(
+                "{} row {} offset is outside uint32".format(source, line_number)
+            )
+        if width <= 0 or width > MAX_EXACT_PROGRAM_WIDTH:
+            raise ValueError(
+                "{} row {} width is not positive and bounded".format(
+                    source, line_number
+                )
+            )
+        if program_address + width > 1 << 32 or offset + width > 1 << 32:
+            raise ValueError(
+                "{} row {} program span is outside uint32".format(
+                    source, line_number
+                )
+            )
+
+        current_base = program_address - offset
+        if current_base < 0:
+            raise ValueError(
+                "{} row {} address contradicts its offset".format(
+                    source, line_number
+                )
+            )
+        if address_base is None:
+            address_base = current_base
+        elif current_base != address_base:
+            raise ValueError(
+                "{} row {} has contradictory address provenance".format(
+                    source, line_number
+                )
+            )
+
+        exact_bytes: Dict[str, str] = {}
+        for field in ("intended_hex", "pre_program_hex", "post_program_hex"):
+            value = str(row[field]).strip()
+            if len(value) != width * 2 or any(
+                character not in "0123456789abcdefABCDEF" for character in value
+            ):
+                raise ValueError(
+                    "{} row {} {} does not match width {}".format(
+                        source, line_number, field, width
+                    )
+                )
+            exact_bytes[field] = value.lower()
+
+        faulted_text = str(row["faulted"]).strip().lower()
+        if faulted_text not in {"false", "true"}:
+            raise ValueError(
+                "{} row {} has an invalid fault marker".format(
+                    source, line_number
+                )
+            )
+        if faulted_text == "true":
+            raise ValueError(
+                "{} row {} contains a faulted calibration event".format(
+                    source, line_number
+                )
+            )
+
+        entries.append(
+            {
+                "write_index": write_index,
+                "program_address": program_address,
+                "offset": offset,
+                "program_width": width,
+                "intended_bytes": exact_bytes["intended_hex"],
+                "pre_program_bytes": exact_bytes["pre_program_hex"],
+                "post_program_bytes": exact_bytes["post_program_hex"],
+                "faulted": False,
+            }
+        )
+        previous_index = write_index
+    return entries
+
+
+def load_exact_program_trace(
+    program_trace_file: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Load an exact MRAM calibration trace, rejecting missing provenance."""
+    if not program_trace_file:
+        return []
+    if not os.path.isfile(program_trace_file):
+        raise ValueError(
+            "exact MRAM program trace does not identify a regular file: {}".format(
+                program_trace_file
+            )
+        )
+    try:
+        with open(program_trace_file, "r", encoding="utf-8", newline="") as stream:
+            return parse_exact_program_trace_csv(
+                stream.read(), source="exact MRAM program trace"
+            )
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise ValueError("exact MRAM program trace could not be read: {}".format(exc))
+
+
+def _validate_coexisting_write_traces(
+    write_entries: List[Dict[str, int]],
+    program_entries: List[Dict[str, Any]],
+) -> None:
+    """Require legacy and exact write representations to describe one stream."""
+    if len(write_entries) != len(program_entries):
+        raise ValueError(
+            "legacy write trace contradicts exact MRAM program trace count"
+        )
+    for legacy, exact in zip(write_entries, program_entries):
+        if (
+            int(legacy["write_index"]) != int(exact["write_index"])
+            or int(legacy["flash_offset"]) != int(exact["offset"])
+        ):
+            raise ValueError(
+                "legacy write trace contradicts exact MRAM program provenance"
+            )
+        if "width" in legacy and int(legacy["width"]) != int(
+            exact["program_width"]
+        ):
+            raise ValueError(
+                "legacy write trace contradicts exact MRAM program width"
+            )
+
+
+def _classify_exact_program_regions(
+    address: int,
+    width: int,
+    slots: Dict[str, Any],
+    page_size: int,
+    metadata_regions: Optional[List[MetadataFaultRegion]],
+) -> Tuple[set[str], set[str]]:
+    """Return every classified region touched by one exact program span."""
+    start = int(address)
+    end = start + int(width)
+    boundaries = {start, end}
+    for slot_info in slots.values():
+        slot_start = int(slot_info.base)
+        slot_end = slot_start + int(slot_info.size)
+        trailer_start = max(slot_start, slot_end - max(1, int(page_size)))
+        for boundary in (slot_start, trailer_start, slot_end):
+            if start < boundary < end:
+                boundaries.add(boundary)
+    for region in metadata_regions or []:
+        for boundary in (int(region.start), int(region.end)):
+            if start < boundary < end:
+                boundaries.add(boundary)
+
+    categories: set[str] = set()
+    metadata_names: set[str] = set()
+    ordered = sorted(boundaries)
+    for segment_start, segment_end in zip(ordered, ordered[1:]):
+        if segment_start >= segment_end:
+            continue
+        slot_region = _classify_slot_region(segment_start, slots, page_size)
+        if slot_region.endswith("_data"):
+            categories.add("data")
+            continue
+        if slot_region.endswith("_trailer"):
+            categories.add("trailer")
+            continue
+        matched = next(
+            (
+                region
+                for region in metadata_regions or []
+                if region.contains(segment_start)
+            ),
+            None,
+        )
+        if matched is not None:
+            categories.add("metadata")
+            metadata_names.add(matched.name)
+        else:
+            categories.add("outside")
+    return categories, metadata_names
+
+
 def load_clean_erase_trace(
     erase_trace_file: Optional[str], flash_size: Optional[int] = None,
     page_size: int = 4096,
@@ -306,14 +539,16 @@ def summarize_calibration_coverage(
     page_size: int = 4096,
     metadata_regions: Optional[List[MetadataFaultRegion]] = None,
     trace_address_map: Optional[List[Dict[str, int]]] = None,
+    program_trace_file: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Summarize whether calibration exercised slot data movement."""
     has_write_trace = bool(trace_file and os.path.exists(trace_file))
     has_erase_trace = bool(erase_trace_file and os.path.exists(erase_trace_file))
-    if not has_write_trace and not has_erase_trace:
+    has_program_trace = bool(program_trace_file)
+    if not has_write_trace and not has_erase_trace and not has_program_trace:
         return {
             "status": "unavailable",
-            "reason": "No calibration write or erase trace available.",
+            "reason": "No calibration write, exact program, or erase trace available.",
         }
     if not slots:
         return {
@@ -322,6 +557,11 @@ def summarize_calibration_coverage(
         }
 
     write_entries = load_clean_write_trace(trace_file) if has_write_trace else []
+    program_entries = (
+        load_exact_program_trace(program_trace_file) if has_program_trace else []
+    )
+    if has_write_trace and has_program_trace:
+        _validate_coexisting_write_traces(write_entries, program_entries)
     erase_entries = load_clean_erase_trace(erase_trace_file) if has_erase_trace else []
     counts = {
         "slot_data_writes": 0,
@@ -334,25 +574,59 @@ def summarize_calibration_coverage(
         "outside_slot_erases": 0,
     }
     named_region_ops: Dict[str, int] = {}
+    cross_region_programs = 0
 
-    for entry in write_entries:
-        address = _trace_absolute_address(
-            entry["flash_offset"], flash_base, trace_address_map
-        )
-        region = _classify_slot_region(address, slots, page_size)
-        if region.endswith("_data"):
-            counts["slot_data_writes"] += 1
-        elif region.endswith("_trailer"):
-            counts["slot_trailer_writes"] += 1
-        elif metadata_regions:
-            matched = next((r for r in metadata_regions if r.contains(address)), None)
-            if matched is not None:
-                counts["metadata_region_writes"] += 1
-                named_region_ops[matched.name] = named_region_ops.get(matched.name, 0) + 1
+    if has_write_trace:
+        authoritative_write_entries: List[Dict[str, Any]] = write_entries
+        write_trace_source = "legacy_write_trace"
+        for entry in authoritative_write_entries:
+            address = _trace_absolute_address(
+                entry["flash_offset"], flash_base, trace_address_map
+            )
+            region = _classify_slot_region(address, slots, page_size)
+            if region.endswith("_data"):
+                counts["slot_data_writes"] += 1
+            elif region.endswith("_trailer"):
+                counts["slot_trailer_writes"] += 1
+            elif metadata_regions:
+                matched = next(
+                    (r for r in metadata_regions if r.contains(address)), None
+                )
+                if matched is not None:
+                    counts["metadata_region_writes"] += 1
+                    named_region_ops[matched.name] = (
+                        named_region_ops.get(matched.name, 0) + 1
+                    )
+                else:
+                    counts["outside_slot_writes"] += 1
             else:
                 counts["outside_slot_writes"] += 1
-        else:
-            counts["outside_slot_writes"] += 1
+    elif has_program_trace:
+        authoritative_write_entries = program_entries
+        write_trace_source = "exact_mram_program_trace"
+        for entry in authoritative_write_entries:
+            categories, metadata_names = _classify_exact_program_regions(
+                entry["program_address"],
+                entry["program_width"],
+                slots,
+                page_size,
+                metadata_regions,
+            )
+            if len(categories) > 1:
+                cross_region_programs += 1
+            if "data" in categories:
+                counts["slot_data_writes"] += 1
+            if "trailer" in categories:
+                counts["slot_trailer_writes"] += 1
+            if "metadata" in categories:
+                counts["metadata_region_writes"] += 1
+                for name in metadata_names:
+                    named_region_ops[name] = named_region_ops.get(name, 0) + 1
+            if "outside" in categories:
+                counts["outside_slot_writes"] += 1
+    else:
+        authoritative_write_entries = []
+        write_trace_source = "erase_trace_only"
 
     for entry in erase_entries:
         address = _trace_absolute_address(
@@ -402,8 +676,12 @@ def summarize_calibration_coverage(
     return {
         "status": status,
         "reason": reason,
-        "writes": len(write_entries),
+        "writes": len(authoritative_write_entries),
         "erases": len(erase_entries),
+        "write_trace_source": write_trace_source,
+        "exact_programs": len(program_entries),
+        "coexisting_write_traces": bool(has_write_trace and has_program_trace),
+        "cross_region_programs": cross_region_programs,
         "slot_data_ops": slot_data_ops,
         "slot_trailer_ops": trailer_ops,
         "metadata_region_ops": metadata_region_ops,
