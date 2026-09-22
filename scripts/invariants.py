@@ -1900,6 +1900,182 @@ def check_state_relations(
 
 
 # ---------------------------------------------------------------------------
+# Cross-transaction state isolation
+# ---------------------------------------------------------------------------
+
+
+def _transaction_state_path(state: Any, path: str) -> Any:
+    """Resolve a state path while preserving a missing-value sentinel."""
+    current = state
+    for component in str(path).split("."):
+        if not component or not isinstance(current, dict) or component not in current:
+            return _MISSING
+        current = current[component]
+    return current
+
+
+def _transaction_state_empty(value: Any) -> bool:
+    """Return whether a reset boundary carries no transaction metadata."""
+    return value is _MISSING or value is None or value is False or value == "" or value == 0
+
+
+def check_transaction_state_isolation(
+    result: FaultResult,
+    invariant_config: Optional[Dict[str, Any]] = None,
+    result_dict: Optional[Dict[str, Any]] = None,
+    **_: Any,
+) -> None:
+    """Ensure a later transaction cannot reuse an earlier transaction's state.
+
+    ``update_sequence`` supplies phase records from clean setup/cancel phases
+    and the fault phase.  For every configured path and reset phase, the
+    preceding transaction's value must be cleared at the reset boundary.  The
+    first later transaction may omit the field or use a different value, but
+    it must not observe the exact value from the earlier transaction.
+
+    The check is opt-in because a target may intentionally retain unrelated
+    persistent state across transactions.  Missing state at a reset boundary
+    is the expected representation of cleared metadata; missing phase
+    telemetry for a configured campaign is an evaluation error.
+    """
+    if result.is_control:
+        return
+    config = (invariant_config or {}).get("transaction_state_isolation")
+    if config is None:
+        return
+    if not isinstance(config, dict):
+        raise ValueError("transaction_state_isolation must be a mapping")
+
+    raw_paths = config.get("paths", config.get("fields"))
+    if not isinstance(raw_paths, list) or not raw_paths:
+        raise ValueError("transaction_state_isolation.paths must be a non-empty list")
+    paths: List[str] = []
+    for index, raw_path in enumerate(raw_paths):
+        if isinstance(raw_path, dict):
+            if set(raw_path) != {"path"}:
+                raise ValueError(
+                    "transaction_state_isolation.paths[{}] must contain only path".format(index)
+                )
+            raw_path = raw_path.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise ValueError(
+                "transaction_state_isolation.paths[{}] must be a non-empty string".format(index)
+            )
+        paths.append(raw_path.strip())
+
+    raw_resets = config.get("reset_phases", config.get("clear_phases"))
+    if not isinstance(raw_resets, list) or not raw_resets:
+        raise ValueError(
+            "transaction_state_isolation.reset_phases must be a non-empty list"
+        )
+    reset_phases = []
+    for index, raw_phase in enumerate(raw_resets):
+        if not isinstance(raw_phase, str) or not raw_phase.strip():
+            raise ValueError(
+                "transaction_state_isolation.reset_phases[{}] must be a non-empty string".format(index)
+            )
+        reset_phases.append(raw_phase.strip())
+
+    sequence = result_dict.get("update_sequence") if isinstance(result_dict, dict) else None
+    records = sequence.get("phase_records") if isinstance(sequence, dict) else None
+    if not isinstance(records, list) or not records:
+        raise ValueError(
+            "transaction_state_isolation requires update_sequence phase_records telemetry"
+        )
+    normalized_records: List[Dict[str, Any]] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise ValueError(
+                "transaction_state_isolation phase_records[{}] must be a mapping".format(index)
+            )
+        name = str(record.get("phase_name", record.get("name", ""))).strip()
+        if not name:
+            raise ValueError(
+                "transaction_state_isolation phase_records[{}] has no phase name".format(index)
+            )
+        state = record.get("semantic_state")
+        if not isinstance(state, dict):
+            raise ValueError(
+                "transaction_state_isolation phase {!r} is missing semantic_state".format(name)
+            )
+        normalized_records.append({"name": name, "state": state})
+
+    violations: List[Dict[str, Any]] = []
+    observations: List[Dict[str, Any]] = []
+    for reset_name in reset_phases:
+        reset_indices = [
+            index for index, record in enumerate(normalized_records)
+            if record["name"] == reset_name
+        ]
+        if not reset_indices:
+            raise ValueError(
+                "transaction_state_isolation reset phase {!r} is absent".format(reset_name)
+            )
+        for reset_index in reset_indices:
+            before_index = reset_index - 1
+            while before_index >= 0 and normalized_records[before_index]["name"] in reset_phases:
+                before_index -= 1
+            after_index = reset_index + 1
+            while after_index < len(normalized_records) and normalized_records[after_index]["name"] in reset_phases:
+                after_index += 1
+            if before_index < 0 or after_index >= len(normalized_records):
+                raise ValueError(
+                    "transaction_state_isolation reset phase {!r} must be between transactions".format(
+                        reset_name
+                    )
+                )
+            before = normalized_records[before_index]
+            reset = normalized_records[reset_index]
+            after = normalized_records[after_index]
+            for path in paths:
+                before_value = _transaction_state_path(before["state"], path)
+                reset_value = _transaction_state_path(reset["state"], path)
+                after_value = _transaction_state_path(after["state"], path)
+                observation = {
+                    "path": path,
+                    "transaction_a": before["name"],
+                    "reset_phase": reset["name"],
+                    "transaction_b": after["name"],
+                    "transaction_a_value": None if before_value is _MISSING else before_value,
+                    "reset_value": None if reset_value is _MISSING else reset_value,
+                    "transaction_b_value": None if after_value is _MISSING else after_value,
+                    "reset_cleared": _transaction_state_empty(reset_value),
+                    "reused": (
+                        before_value is not _MISSING
+                        and after_value is not _MISSING
+                        and before_value == after_value
+                    ),
+                }
+                observations.append(observation)
+                if not _transaction_state_empty(reset_value) or observation["reused"]:
+                    violations.append(observation)
+
+    if violations:
+        raise InvariantViolation(
+            invariant_name="transaction_state_isolation",
+            description=(
+                "Transaction state crossed a reset boundary: {}.".format(
+                    "; ".join(
+                        "{} ({} -> {} -> {})".format(
+                            item["path"], item["transaction_a"], item["reset_phase"], item["transaction_b"]
+                        )
+                        for item in violations
+                    )
+                )
+            ),
+            result=result,
+            details={
+                "finding_code": "TRANSACTION_STATE_LEAK",
+                "violations": violations,
+                "observations": observations,
+                "reset_phases": reset_phases,
+                "paths": paths,
+                "fault_at": result.fault_at,
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -1921,6 +2097,7 @@ _ALL_INVARIANTS: List[InvariantFn] = [
     check_atomic_state_groups,
     check_monotonic_state_fields,
     check_state_relations,
+    check_transaction_state_isolation,
     check_persistent_state_fail_closed,
 ]
 
@@ -1942,6 +2119,7 @@ _INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
     "atomic_state_groups": check_atomic_state_groups,
     "monotonic_state_fields": check_monotonic_state_fields,
     "state_relations": check_state_relations,
+    "transaction_state_isolation": check_transaction_state_isolation,
     "success_implies_effect": check_success_implies_effect,
     "persistent_state_fail_closed": check_persistent_state_fail_closed,
 }
