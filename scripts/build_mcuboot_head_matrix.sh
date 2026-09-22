@@ -56,7 +56,9 @@ OVERLAY_DIR="$(mktemp -d /tmp/mcuboot_head_overlays.XXXXXX)"
 BUILD_TMP="$(mktemp -d /tmp/mcuboot_head_builds.XXXXXX)"
 WEST="${ZEPHYR_VENV}/bin/west"
 IMGTOOL_PYTHON="${ZEPHYR_VENV}/bin/python3"
-MCUBOOT_REMOTE="${MCUBOOT_REMOTE:-mcu-tools}"
+# bootstrap_mcuboot_matrix_assets.sh guarantees this public remote in a fresh
+# workspace.  Local developer workspaces may override it explicitly.
+MCUBOOT_REMOTE="${MCUBOOT_REMOTE:-upstream}"
 # Public revision used by the checked-in HEAD corpus. Override MCUBOOT_REF to
 # test another revision against the pinned Zephyr workspace.
 MCUBOOT_REF="${MCUBOOT_REF:-f84b9d3fd019fb1945e532924bee7a9c03c77373}"
@@ -106,7 +108,8 @@ if [[ "${MCUBOOT_FETCH_REF}" == "${MCUBOOT_REMOTE}/"* ]]; then
     MCUBOOT_FETCH_REF="${MCUBOOT_FETCH_REF#${MCUBOOT_REMOTE}/}"
 fi
 git -C "${MCUBOOT_REPO}" fetch --quiet "${MCUBOOT_REMOTE}" "${MCUBOOT_FETCH_REF}"
-git -C "${MCUBOOT_REPO}" checkout --quiet --detach "${MCUBOOT_REF}"
+MCUBOOT_FETCHED_COMMIT="$(git -C "${MCUBOOT_REPO}" rev-parse FETCH_HEAD)"
+git -C "${MCUBOOT_REPO}" checkout --quiet --detach "${MCUBOOT_FETCHED_COMMIT}"
 MCUBOOT_CHECKED_OUT=true
 
 MCUBOOT_HEAD="$(git -C "${MCUBOOT_REPO}" rev-parse HEAD)"

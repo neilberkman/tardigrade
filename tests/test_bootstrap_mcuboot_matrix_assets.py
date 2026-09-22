@@ -341,6 +341,19 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
                         image_path,
                     )
 
+    def test_head_matrix_uses_bootstrap_public_mcuboot_remote(self) -> None:
+        bootstrap = (ROOT / "scripts" / "bootstrap_mcuboot_matrix_assets.sh").read_text(
+            encoding="utf-8"
+        )
+        head_matrix = (ROOT / "scripts" / "build_mcuboot_head_matrix.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('MCUBOOT_REMOTE="${MCUBOOT_REMOTE:-upstream}"', head_matrix)
+        self.assertIn("remote add upstream", bootstrap)
+        self.assertIn("https://github.com/mcu-tools/mcuboot.git", bootstrap)
+        self.assertIn('rev-parse FETCH_HEAD', head_matrix)
+        self.assertIn('checkout --quiet --detach "${MCUBOOT_FETCHED_COMMIT}"', head_matrix)
+
     def test_pr_differential_assets_are_tracked(self) -> None:
         tracked = subprocess.check_output(
             ["git", "ls-files", "results/oss_validation/assets"],
