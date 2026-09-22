@@ -491,6 +491,25 @@ class TestActionSourceBoundaries(unittest.TestCase):
         self.assertIn('--campaign "${NXBOOT_CAMPAIGN}"', source)
         self.assertIn("--image-layout \"${image_layout}\"", source)
 
+    def test_mcuboot_zero_day_workflow_builds_current_public_ref(self):
+        source = (
+            ROOT / ".github" / "workflows" / "mcuboot-head-zero-day.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("normalize-git-ref", source)
+        self.assertIn('MCUBOOT_REF="${ref}"', source)
+        self.assertIn("build_mcuboot_head_matrix.sh", source)
+        for profile in (
+            "mcuboot_head_move_nrf52_revert_full_fault_coverage.yaml",
+            "mcuboot_head_offset_nrf52_revert_extended.yaml",
+            "mcuboot_head_scratch_nrf52_revert_extended.yaml",
+            "mcuboot_head_scratch_stm32f4_writeback.yaml",
+        ):
+            with self.subTest(profile=profile):
+                self.assertIn(profile, source)
+        self.assertIn("--quick", source)
+        self.assertIn("--no-assert-verdict", source)
+        self.assertIn("mcuboot-zero-day-${{ matrix.slug }}", source)
+
     def test_dependency_files_use_exact_public_versions(self):
         requirement_files = (
             "requirements.txt",
