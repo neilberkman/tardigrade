@@ -54,6 +54,19 @@ TRACE_REPLAY_FAULT_TYPES = {
     "security_state_erase",
 }
 
+# Selectors whose completeness depends on calibration write/erase provenance.
+# Keep this shared by report generation, aggregate accounting, and self-tests so
+# an unavailable trace cannot produce contradictory verdicts at those layers.
+TRACE_COVERAGE_FAULT_TYPES = frozenset(
+    {
+        "interrupted_erase",
+        "multi_sector_atomicity",
+        "power_loss",
+        "security_state_erase",
+        "swap_progress",
+    }
+)
+
 # Canonical mapping from human-readable fault type names to single-char
 # wire codes used in batch dispatch and result encoding.  Used by metadata
 # fault, hook fault, and phase2 fault point generation.

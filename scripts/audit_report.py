@@ -39,7 +39,7 @@ from bypass_probe import (
     build_defense_in_depth_layers,
     classify_probe_result,
 )
-from fault_types import _fault_type_label
+from fault_types import TRACE_COVERAGE_FAULT_TYPES, _fault_type_label
 from profile_loader import ProfileConfig
 from read_fault_translation import (
     ReadFaultStats,
@@ -1013,6 +1013,29 @@ def _coverage_gate_reason(sweep_summary: Dict[str, Any]) -> Optional[str]:
     if not isinstance(coverage, dict):
         return None
     status = str(coverage.get("status") or "").strip()
+    if status == "unavailable":
+        configured = sweep_summary.get("configured_fault_types")
+        # Current reports carry selector metadata.  Preserve the historical
+        # fail-closed behavior for imported reports that do not, while allowing
+        # explicitly unrelated selectors to treat calibration coverage as an
+        # optional diagnostic.
+        coverage_required = configured is None
+        if isinstance(configured, list):
+            coverage_required = bool(
+                {
+                    _fault_type_label(value).strip().lower()
+                    for value in configured
+                    if isinstance(value, str) and value.strip()
+                }
+                & TRACE_COVERAGE_FAULT_TYPES
+            )
+        elif configured is not None:
+            coverage_required = True
+        if coverage_required:
+            return str(coverage.get("reason") or "").strip() or (
+                "Calibration trace coverage is unavailable."
+            )
+        return None
     if status in {"metadata_only", "outside_slots_only", "no_nvm_activity"}:
         reason = str(coverage.get("reason") or "").strip()
         if reason:

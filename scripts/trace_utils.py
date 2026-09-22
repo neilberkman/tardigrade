@@ -118,8 +118,12 @@ def load_clean_write_trace(
     increasing in source order.  Width is retained when an exporter supplied
     one; legacy three-column rows intentionally have no ``width`` key.
     """
-    if not trace_file or not os.path.exists(trace_file):
+    if not trace_file:
         return []
+    if not os.path.isfile(trace_file):
+        raise ValueError(
+            "write trace path is not a regular file: {}".format(trace_file)
+        )
     entries: List[Dict[str, int]] = []
     with open(trace_file, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -133,6 +137,14 @@ def load_clean_write_trace(
         if missing:
             raise ValueError(
                 "write trace CSV is missing columns: {}".format(",".join(sorted(missing)))
+            )
+        allowed = required | {"width", "write_width", "length"}
+        unexpected = set(fields) - allowed
+        if unexpected:
+            raise ValueError(
+                "write trace CSV has unexpected columns: {}".format(
+                    ",".join(sorted(unexpected))
+                )
             )
         width_fields = [
             name for name in ("width", "write_width", "length") if name in fields
@@ -426,27 +438,55 @@ def load_clean_erase_trace(
     in that case entries are still loaded and kept in source order with
     `writes_at_this_point=None` so downstream interleaving can degrade safely.
     """
-    if not erase_trace_file or not os.path.exists(erase_trace_file):
+    if not erase_trace_file:
         return []
+    if not os.path.isfile(erase_trace_file):
+        raise ValueError(
+            "erase trace path is not a regular file: {}".format(erase_trace_file)
+        )
     entries: List[Dict[str, Any]] = []
     with open(erase_trace_file, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames:
             raise ValueError("erase trace CSV has no header")
-        if reader.fieldnames:
-            fieldnames = {name.strip().lower() for name in reader.fieldnames if name}
-        else:
-            fieldnames = set()
-        writes_at_key: Optional[str] = None
-        for candidate in (
+        fields = [str(name).strip() for name in reader.fieldnames if name]
+        if len(fields) != len(reader.fieldnames) or len(fields) != len(set(fields)):
+            raise ValueError("erase trace CSV has empty or duplicate columns")
+        allowed = {
+            "erase_index",
+            "flash_offset",
+            "offset",
             "writes_at_this_point",
             "writes_at",
             "write_index",
             "write_count_at_erase",
-        ):
-            if candidate in fieldnames:
-                writes_at_key = candidate
-                break
+            "erase_size",
+        }
+        unexpected = set(fields) - allowed
+        if unexpected:
+            raise ValueError(
+                "erase trace CSV has unexpected columns: {}".format(
+                    ",".join(sorted(unexpected))
+                )
+            )
+        offset_fields = [name for name in ("flash_offset", "offset") if name in fields]
+        if not offset_fields:
+            raise ValueError("erase trace CSV is missing flash_offset")
+        if len(offset_fields) > 1:
+            raise ValueError("erase trace CSV has conflicting offset columns")
+        writes_at_fields = [
+            candidate
+            for candidate in (
+                "writes_at_this_point",
+                "writes_at",
+                "write_index",
+                "write_count_at_erase",
+            )
+            if candidate in fields
+        ]
+        if len(writes_at_fields) > 1:
+            raise ValueError("erase trace CSV has conflicting write-count columns")
+        writes_at_key = writes_at_fields[0] if writes_at_fields else None
         capacity = None if flash_size is None else int(flash_size)
         page_size = int(page_size)
         if page_size <= 0:
@@ -461,10 +501,10 @@ def load_clean_erase_trace(
             try:
                 erase_index_raw = row.get("erase_index", str(idx))
                 erase_index = int(str(erase_index_raw).strip() or str(idx), 0)
-                flash_offset_raw = row.get("flash_offset")
-                if flash_offset_raw is None:
-                    flash_offset_raw = row.get("offset", "0")
-                flash_offset = int(str(flash_offset_raw).strip() or "0", 0)
+                flash_offset_raw = row.get(offset_fields[0])
+                if flash_offset_raw is None or not str(flash_offset_raw).strip():
+                    raise ValueError("erase trace offset is empty")
+                flash_offset = int(str(flash_offset_raw).strip(), 0)
             except Exception as exc:
                 raise ValueError("malformed erase trace row: {}".format(exc))
             if flash_offset < 0:
@@ -542,8 +582,8 @@ def summarize_calibration_coverage(
     program_trace_file: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Summarize whether calibration exercised slot data movement."""
-    has_write_trace = bool(trace_file and os.path.exists(trace_file))
-    has_erase_trace = bool(erase_trace_file and os.path.exists(erase_trace_file))
+    has_write_trace = bool(trace_file)
+    has_erase_trace = bool(erase_trace_file)
     has_program_trace = bool(program_trace_file)
     if not has_write_trace and not has_erase_trace and not has_program_trace:
         return {
@@ -849,12 +889,17 @@ def annotate_clean_trace(
 ) -> Optional[Dict[str, Any]]:
     """Load clean traces, annotate sweep results with fault windows, return metadata.
 
-    Returns None if *trace_file* is absent or does not exist on disk.
+    Returns None if *trace_file* is absent. A supplied path that is missing or
+    not a regular file is malformed provenance and raises ``ValueError``.
     As a side-effect, each entry in *sweep_results* is enriched with a
     ``fault_window`` key by :func:`annotate_fault_windows`.
     """
-    if not trace_file or not os.path.exists(trace_file):
+    if not trace_file:
         return None
+    if not os.path.isfile(trace_file):
+        raise ValueError(
+            "write trace path is not a regular file: {}".format(trace_file)
+        )
 
     clean_write_trace = load_clean_write_trace(trace_file)
     clean_erase_trace = load_clean_erase_trace(erase_trace_file)

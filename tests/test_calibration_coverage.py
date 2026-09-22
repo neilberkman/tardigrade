@@ -469,6 +469,57 @@ def test_clean_erase_trace_rejects_nonblank_malformed_size_but_keeps_legacy_blan
     assert entries[0]["erase_size"] == 0
 
 
+@pytest.mark.parametrize(
+    "header,row,error",
+    [
+        (
+            "erase_index,writes_at_this_point,erase_size",
+            "1,0,4096",
+            "missing flash_offset",
+        ),
+        (
+            "erase_index,flash_offset,offset,erase_size",
+            "1,0,0,4096",
+            "conflicting offset columns",
+        ),
+        (
+            "erase_index,flash_offset,erase_size,unknown",
+            "1,0,4096,1",
+            "unexpected columns",
+        ),
+    ],
+)
+def test_clean_erase_trace_rejects_ambiguous_or_incomplete_headers(
+    tmp_path: Path, header: str, row: str, error: str
+) -> None:
+    erase_trace = tmp_path / "bad-header.csv"
+    erase_trace.write_text("{}\n{}\n".format(header, row), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=error):
+        load_clean_erase_trace(str(erase_trace))
+
+
+def test_supplied_missing_clean_trace_paths_fail_closed(tmp_path: Path) -> None:
+    slots = {"exec": _slot(0x1000)}
+
+    with pytest.raises(ValueError, match="write trace path is not a regular file"):
+        summarize_calibration_coverage(
+            trace_file=str(tmp_path / "missing-write.csv"),
+            erase_trace_file=None,
+            flash_base=0,
+            slots=slots,
+        )
+    with pytest.raises(ValueError, match="erase trace path is not a regular file"):
+        summarize_calibration_coverage(
+            trace_file=None,
+            erase_trace_file=str(tmp_path / "missing-erase.csv"),
+            flash_base=0,
+            slots=slots,
+        )
+    with pytest.raises(ValueError, match="write trace path is not a regular file"):
+        annotate_clean_trace([], str(tmp_path / "missing-write.csv"), None, 0)
+
+
 def test_clean_trace_annotation_reports_to_stderr_without_runtime_error(
     tmp_path: Path,
 ) -> None:
@@ -513,6 +564,59 @@ def test_compute_verdict_allows_clean_profile_when_named_metadata_was_exercised(
         ),
     )
     assert verdict == "PASS"
+
+
+def test_compute_verdict_fails_closed_for_required_unavailable_calibration() -> None:
+    summary = _base_summary()
+    summary["configured_fault_types"] = ["power_loss"]
+    summary["calibration_coverage"] = {
+        "status": "unavailable",
+        "reason": "No calibration trace available.",
+    }
+    verdict = compute_verdict(
+        summary,
+        SimpleNamespace(
+            should_find_issues=False,
+            control_outcome="success",
+            allow_control_only_issues=False,
+        ),
+    )
+    assert verdict == "FAIL — No calibration trace available."
+
+
+def test_compute_verdict_keeps_unavailable_optional_calibration_diagnostic() -> None:
+    summary = _base_summary()
+    summary["configured_fault_types"] = ["read_bit_flip"]
+    summary["calibration_coverage"] = {
+        "status": "unavailable",
+        "reason": "No calibration trace available.",
+    }
+    verdict = compute_verdict(
+        summary,
+        SimpleNamespace(
+            should_find_issues=False,
+            control_outcome="success",
+            allow_control_only_issues=False,
+        ),
+    )
+    assert verdict == "PASS"
+
+
+def test_compute_verdict_fails_closed_for_legacy_unavailable_calibration() -> None:
+    summary = _base_summary()
+    summary["calibration_coverage"] = {
+        "status": "unavailable",
+        "reason": "No calibration trace available.",
+    }
+    verdict = compute_verdict(
+        summary,
+        SimpleNamespace(
+            should_find_issues=False,
+            control_outcome="success",
+            allow_control_only_issues=False,
+        ),
+    )
+    assert verdict == "FAIL — No calibration trace available."
 
 
 def test_compute_verdict_preserves_control_only_opt_in() -> None:

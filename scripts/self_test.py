@@ -24,7 +24,7 @@ import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
 
 from profile_loader import load_profile_raw
-from fault_types import _fault_type_label
+from fault_types import TRACE_COVERAGE_FAULT_TYPES, _fault_type_label
 from verdicts import expectation_requires_findings, is_exploratory_expectation
 
 DEFAULT_SELF_TEST_RUNTIME_MANIFEST = "scripts/self_test_runtime_manifest.json"
@@ -34,17 +34,6 @@ DEFAULT_SELF_TEST_PROFILE_COST_S = 60.0
 # budget, while keeping the original attempt fail-closed for every other error.
 SELF_TEST_CONTROL_TIMEOUT_RETRIES = 1
 SELF_TEST_CONTROL_TIMEOUT_RETRY_MINUTES = 5
-
-_TRACE_COVERAGE_FAULT_TYPES = frozenset(
-    {
-        "interrupted_erase",
-        "multi_sector_atomicity",
-        "power_loss",
-        "security_state_erase",
-        "swap_progress",
-    }
-)
-
 
 def _normalized_fault_types(profile_raw: Dict[str, Any]) -> set[str]:
     raw_fault_types = (profile_raw.get("fault_sweep") or {}).get("fault_types", [])
@@ -557,7 +546,7 @@ def check_verdict(
     configured_fault_types = _normalized_fault_types(profile_raw)
     fault_sweep_declared = isinstance(profile_raw.get("fault_sweep"), dict)
     calibration_required = bool(
-        configured_fault_types & _TRACE_COVERAGE_FAULT_TYPES
+        configured_fault_types & TRACE_COVERAGE_FAULT_TYPES
     ) or (not fault_sweep_declared and bool(coverage))
     coverage_blocks_clean = coverage_status in {
         "unavailable",

@@ -17,7 +17,7 @@ from verdicts import (
     expectation_requires_findings,
     is_pass_verdict,
 )
-from fault_types import _fault_type_label
+from fault_types import TRACE_COVERAGE_FAULT_TYPES, _fault_type_label
 
 
 SECURITY_AGGREGATE_VERSION = 1
@@ -260,17 +260,6 @@ def _collect_runtime(
     return fault_issues, control_issues
 
 
-_TRACE_COVERAGE_FAULT_TYPES = frozenset(
-    {
-        "interrupted_erase",
-        "multi_sector_atomicity",
-        "power_loss",
-        "security_state_erase",
-        "swap_progress",
-    }
-)
-
-
 def _configured_fault_types(summary: Mapping[str, Any]) -> Optional[Set[str]]:
     """Read explicit selector metadata when the producer emitted it."""
     runtime = summary.get("runtime_sweep")
@@ -307,7 +296,7 @@ def _coverage_check_required(
     configured = _configured_fault_types(summary)
     if configured is not None:
         if check == "calibration":
-            return bool(configured & _TRACE_COVERAGE_FAULT_TYPES)
+            return bool(configured & TRACE_COVERAGE_FAULT_TYPES)
         return check in configured
     # A legacy report did not carry selector metadata.  Preserve its
     # fail-closed meaning when it explicitly emitted one of these summaries;
@@ -343,7 +332,7 @@ def _collect_summary(
         coverage = runtime.get("calibration_coverage")
         if (
             configured is not None
-            and configured & _TRACE_COVERAGE_FAULT_TYPES
+            and configured & TRACE_COVERAGE_FAULT_TYPES
             and coverage is None
         ):
             _record_inconclusive(
