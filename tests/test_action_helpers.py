@@ -475,6 +475,22 @@ class TestActionSourceBoundaries(unittest.TestCase):
                 self.assertNotIn("pip install kconfiglib", source)
                 self.assertNotIn("git clone --depth 1 --branch", source)
 
+    def test_nuttx_exploratory_workflow_wires_all_real_campaigns(self):
+        source = (
+            ROOT / ".github" / "workflows" / "nuttx-nxboot-real-exploratory.yml"
+        ).read_text(encoding="utf-8")
+        for campaign in (
+            "baseline",
+            "sector_boundary_resume",
+            "metadata_erase_resume",
+            "sector_boundary_writeback",
+        ):
+            with self.subTest(campaign=campaign):
+                self.assertIn(f"          - {campaign}\n", source)
+        self.assertIn("github.event.inputs.campaign", source)
+        self.assertIn('--campaign "${NXBOOT_CAMPAIGN}"', source)
+        self.assertIn("--image-layout \"${image_layout}\"", source)
+
     def test_dependency_files_use_exact_public_versions(self):
         requirement_files = (
             "requirements.txt",

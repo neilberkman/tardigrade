@@ -18,6 +18,16 @@ on:
         description: Target fault points across the full write range (1-4096)
         required: true
         default: "16"
+      campaign:
+        description: Real nxboot campaign preset
+        type: choice
+        required: true
+        default: baseline
+        options:
+          - baseline
+          - sector_boundary_resume
+          - metadata_erase_resume
+          - sector_boundary_writeback
       renode_url:
         description: Renode archive URL
         required: true
@@ -28,7 +38,7 @@ on:
         default: 62629caa331ed4bd4eb7abe13ee2e4834fbcaa70de492db3965fafa4edc5694f
 
 concurrency:
-  group: nuttx-nxboot-real-exploratory-${{ github.event.inputs.nuttx_ref }}-${{ github.event.inputs.nuttx_apps_ref }}-${{ github.event.inputs.fault_budget }}-${{ github.event.inputs.renode_url }}
+  group: nuttx-nxboot-real-exploratory-${{ github.event.inputs.campaign }}-${{ github.event.inputs.nuttx_ref }}-${{ github.event.inputs.nuttx_apps_ref }}-${{ github.event.inputs.fault_budget }}-${{ github.event.inputs.renode_url }}
   cancel-in-progress: true
 
 jobs:
@@ -41,6 +51,7 @@ jobs:
       TOOLCHAIN_SHA256: 1252a8cafe9237de27a765376697230368eec21db44dc3f1edeb8d838dabd530
       RENODE_URL: ${{ inputs.renode_url }}
       RENODE_SHA256: ${{ inputs.renode_sha256 }}
+      NXBOOT_CAMPAIGN: ${{ inputs.campaign }}
       OTA_RENODE_POINT_TIMEOUT_S: "900"
       PYTHONUNBUFFERED: "1"
 
@@ -95,11 +106,24 @@ jobs:
       - name: Build real NuttX nxboot target
         run: |
           set -euo pipefail
+          case "${NXBOOT_CAMPAIGN}" in
+            sector_boundary_resume|sector_boundary_writeback)
+              image_layout=sector_boundary
+              ;;
+            baseline|metadata_erase_resume)
+              image_layout=baseline
+              ;;
+            *)
+              echo "unsupported campaign: ${NXBOOT_CAMPAIGN}" >&2
+              exit 2
+              ;;
+          esac
           build_log="${RUNNER_TEMP}/nuttx-build.log"
           if python3 targets/nuttx_nxboot/build_public_target.py \
             --nuttx-root "${RUNNER_TEMP}/nuttx" \
             --apps-root "${RUNNER_TEMP}/nuttx-apps" \
             --output-dir "${RUNNER_TEMP}/nuttx-build" \
+            --image-layout "${image_layout}" \
             --jobs 8 >"${build_log}" 2>&1; then
             echo "NuttX build completed. Showing final log tail:"
             tail -40 "${build_log}"
@@ -115,7 +139,7 @@ jobs:
             --build-dir "${RUNNER_TEMP}/nuttx-build" \
             --output-profile "${RUNNER_TEMP}/nuttx-runtime-profile.yaml" \
             --fault-max-writes auto \
-            --boot-cycles 2
+            --campaign "${NXBOOT_CAMPAIGN}"
 
       - name: Install Renode portable
         run: |
@@ -170,6 +194,7 @@ jobs:
           bricks = int(summary.get("bricks") or 0)
           cal = payload.get("calibration", {})
           print("Profile:", payload.get("profile"))
+          print("Campaign:", os.environ.get("NXBOOT_CAMPAIGN"))
           print("NuttX:", os.environ.get("NUTTX_SHA"), "apps:", os.environ.get("NUTTX_APPS_SHA"))
           print("Verdict:", payload.get("verdict"))
           print("Calibrated writes:", cal.get("writes"))
@@ -193,6 +218,7 @@ jobs:
               with open(summary_path, "a") as fh:
                   fh.write("## Real NuttX nxboot exploratory summary\n")
                   fh.write(f"- Profile: `{payload.get('profile')}`\n")
+                  fh.write(f"- Campaign: `{os.environ.get('NXBOOT_CAMPAIGN','?')}`\n")
                   fh.write(f"- NuttX: `{os.environ.get('NUTTX_SHA','?')}` apps: `{os.environ.get('NUTTX_APPS_SHA','?')}`\n")
                   fh.write(f"- Verdict: `{payload.get('verdict')}`\n")
                   fh.write(f"- Calibrated writes: `{cal.get('writes')}`\n")
