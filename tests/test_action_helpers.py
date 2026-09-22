@@ -28,6 +28,7 @@ from action_helpers import (  # noqa: E402
     parse_positive_int,
     parse_workers,
     publish_report,
+    require_conclusive_runtime_report,
     resolve_workspace_path,
     select_github_release_asset,
     validate_git_ref,
@@ -358,6 +359,81 @@ class TestReportPublishing(unittest.TestCase):
             self.assertFalse(outputs.exists())
 
 
+class TestConclusiveRuntimeGate(unittest.TestCase):
+    def _write_report(self, root: Path, **overrides) -> Path:
+        payload = {
+            "verdict": "PASS — whole-device layout not assessed",
+            "summary": {
+                "runtime_sweep": {
+                    "campaign_complete": True,
+                    "total_fault_points": 3,
+                    "campaign_integrity": {"complete": True},
+                }
+            },
+        }
+        payload.update(overrides)
+        path = root / "report.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_accepts_complete_clean_or_finding_runtime_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._write_report(root)
+            require_conclusive_runtime_report(report)
+            report = self._write_report(root, verdict="FAIL — found 2 issue points")
+            require_conclusive_runtime_report(report)
+
+    def test_rejects_inconclusive_or_missing_runtime_campaign(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cases = (
+                {
+                    "verdict": "INCONCLUSIVE -- could not trigger firmware update",
+                    "summary": {"trigger_discovery": {}},
+                },
+                {"verdict": "PASS", "summary": {}},
+                {
+                    "verdict": "PASS",
+                    "summary": {"runtime_sweep": {"campaign_complete": False}},
+                },
+            )
+            for index, payload in enumerate(cases):
+                with self.subTest(index=index):
+                    report = self._write_report(root, **payload)
+                    with self.assertRaises(ValueError):
+                        require_conclusive_runtime_report(report)
+
+    def test_rejects_zero_points_or_integrity_failures(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtimes = (
+                {
+                    "campaign_complete": True,
+                    "total_fault_points": 0,
+                    "campaign_integrity": {"complete": True},
+                },
+                {
+                    "campaign_complete": True,
+                    "total_fault_points": 1,
+                    "campaign_integrity": {"complete": False},
+                },
+                {
+                    "campaign_complete": True,
+                    "total_fault_points": 1,
+                    "campaign_integrity": {"complete": True, "timeouts": 1},
+                },
+            )
+            for index, runtime in enumerate(runtimes):
+                with self.subTest(index=index):
+                    report = self._write_report(
+                        root,
+                        summary={"runtime_sweep": runtime},
+                    )
+                    with self.assertRaises(ValueError):
+                        require_conclusive_runtime_report(report)
+
+
 class TestActionSourceBoundaries(unittest.TestCase):
     def test_caller_inputs_are_not_embedded_in_run_source(self):
         payload = yaml.safe_load((ROOT / "action.yml").read_text(encoding="utf-8"))
@@ -514,6 +590,7 @@ class TestActionSourceBoundaries(unittest.TestCase):
                 self.assertIn(profile, source)
         self.assertIn("--quick", source)
         self.assertIn("--no-assert-verdict", source)
+        self.assertIn("require-conclusive-runtime-report", source)
         self.assertIn("mcuboot-zero-day-${{ matrix.slug }}", source)
         self.assertIn('cron: "0 9 * * 1"', source)
         self.assertIn("inputs.mcuboot_ref || 'main'", source)

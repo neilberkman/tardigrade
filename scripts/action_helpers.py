@@ -29,6 +29,23 @@ from report_security_status import (
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 GITHUB_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 GIT_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
+RUNTIME_INTEGRITY_COUNT_FIELDS = (
+    "incomplete",
+    "missing_results",
+    "extra_results",
+    "protocol_errors",
+    "runner_errors",
+    "malformed_results",
+    "malformed_controls",
+    "infrastructure_errors",
+    "control_infrastructure_errors",
+    "timeouts",
+    "control_timeouts",
+    "skipped_results",
+    "control_skipped",
+    "not_injected",
+    "faulted_controls",
+)
 
 
 def validate_https_url(value: str) -> str:
@@ -319,6 +336,54 @@ def publish_report(
     return passed
 
 
+def require_conclusive_runtime_report(report_path: Path) -> None:
+    """Reject a runtime report that did not execute a complete campaign.
+
+    Exploratory workflows may intentionally accept either findings or a clean
+    result, but they must never turn missing trigger/coverage evidence into a
+    successful job.
+    """
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("report must contain a JSON object")
+    verdict = payload.get("verdict")
+    if not isinstance(verdict, str) or not verdict.strip():
+        raise ValueError("report verdict must be a non-empty string")
+    if verdict.strip().lower().startswith("inconclusive"):
+        raise ValueError("runtime report is inconclusive: {}".format(verdict.strip()))
+
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        raise ValueError("runtime report summary must be an object")
+    runtime = summary.get("runtime_sweep")
+    if not isinstance(runtime, dict):
+        raise ValueError("runtime report is missing summary.runtime_sweep")
+    if runtime.get("campaign_complete") is not True:
+        raise ValueError("runtime campaign_complete must be true")
+
+    total_points = runtime.get("total_fault_points")
+    if (
+        not isinstance(total_points, int)
+        or isinstance(total_points, bool)
+        or total_points < 1
+    ):
+        raise ValueError("runtime total_fault_points must be a positive integer")
+
+    integrity = runtime.get("campaign_integrity")
+    if not isinstance(integrity, dict) or integrity.get("complete") is not True:
+        raise ValueError("runtime campaign_integrity.complete must be true")
+    for field in RUNTIME_INTEGRITY_COUNT_FIELDS:
+        count = integrity.get(field, 0)
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError("runtime campaign_integrity.{} is invalid".format(field))
+        if count:
+            raise ValueError(
+                "runtime campaign_integrity.{} must be zero, got {}".format(
+                    field, count
+                )
+            )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -364,6 +429,9 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("--github-output", required=True)
     report.add_argument("--audit-exit", required=True, type=int)
     report.add_argument("--regression-mode", action="store_true")
+
+    conclusive = subparsers.add_parser("require-conclusive-runtime-report")
+    conclusive.add_argument("--report", required=True)
     return parser
 
 
@@ -402,6 +470,8 @@ def main() -> int:
                 regression_mode=args.regression_mode,
             )
             return 0 if passed else 1
+        elif args.command == "require-conclusive-runtime-report":
+            require_conclusive_runtime_report(Path(args.report))
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print("ERROR: {}".format(exc), file=os.sys.stderr)
         return 2

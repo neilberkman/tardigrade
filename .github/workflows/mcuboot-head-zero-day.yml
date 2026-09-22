@@ -165,6 +165,8 @@ jobs:
             --quick \
             --no-assert-verdict \
             --output "results/${slug}.json"
+          python3 scripts/action_helpers.py require-conclusive-runtime-report \
+            --report "results/${slug}.json"
 
       - name: Print summary
         if: always()
