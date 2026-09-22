@@ -335,6 +335,7 @@ def _evaluate_invariants(
     profile: ProfileConfig,
     pre_state: Optional[Dict[str, Any]] = None,
     repo_root: Optional[Path] = None,
+    write_spans: Optional[List[Tuple[int, int]]] = None,
 ) -> List[Dict[str, Any]]:
     if not profile.invariants:
         return []
@@ -397,6 +398,7 @@ def _evaluate_invariants(
         invariant_fns,
         pre_state=pre_state,
         write_log=result.get("write_log"),
+        write_spans=write_spans,
         partition_ranges=_profile_partition_ranges(profile),
         write_width=profile.memory.write_granularity,
         multi_boot_analysis=result.get("multi_boot_analysis"),
@@ -550,6 +552,7 @@ def annotate_result_checks(
     results: List[Dict[str, Any]],
     profile: ProfileConfig,
     repo_root: Optional[Path] = None,
+    write_spans: Optional[List[Tuple[int, int]]] = None,
 ) -> None:
     control_result: Optional[Dict[str, Any]] = None
     for candidate in results:
@@ -576,6 +579,7 @@ def annotate_result_checks(
             profile,
             pre_state=pre_state,
             repo_root=repo_root,
+            write_spans=write_spans,
         )
         if invariant_failures:
             result["invariant_violations"] = invariant_failures

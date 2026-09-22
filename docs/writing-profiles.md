@@ -624,12 +624,14 @@ memory:
     staging: {base: 0x08028000, size: 0x20000}
   postmortem_partitions:
     - {name: scratch, base: 0x08048000, size: 0x8000}
+    - {name: config_partition, base: 0x08050000, size: 0x2000}
 
 metadata_fault_regions:
   # The relative form explicitly makes this a child of slot:staging.
   - {name: trailer, slot: staging, offset: 0x1F000, size: 0x1000}
 
-nvs_region: {address: 0x08050000, size: 0x2000}
+nvs_region: {address: 0x08050000, size: 0x2000,
+             parent: partition:config_partition}
 
 persistent_state_layout:
   erase_regions:
@@ -647,6 +649,8 @@ they are contained by another owner: `bootloader`, `slot:<name>`,
 metadata declarations infer `slot:<name>` automatically. Physical erase-region
 declarations describe geometry and bounds, not byte ownership, so sharing an
 erase unit does not by itself create an ownership conflict.
+Postmortem partitions and `nvs_region` accept the same `parent` field; nested
+partitions use `parent: partition:<name>`.
 
 The normalized plan is emitted as `ownership_layout` in profile and campaign
 JSON. Its `write_ranges` are also the ranges consumed by `no_oob_writes`, so

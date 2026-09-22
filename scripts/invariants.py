@@ -575,6 +575,7 @@ def check_metadata_single_fault_consistency(result: FaultResult, **_: Any) -> No
 def check_no_oob_writes(
     result: FaultResult,
     write_log: Optional[List[int]] = None,
+    write_spans: Optional[List[Tuple[int, int]]] = None,
     partition_ranges: Optional[List[Tuple[int, int]]] = None,
     write_width: int = 1,
     **_: Any,
@@ -583,13 +584,17 @@ def check_no_oob_writes(
 
     Parameters:
         write_log: List of write addresses observed during the run.
+        write_spans: Optional list of observed ``(address, width)`` writes.
         partition_ranges: List of ``(start_inclusive, end_exclusive)`` tuples
             defining valid write regions.
         write_width: Number of bytes owned by each recorded write address.
 
-    Skipped when either argument is ``None``.
+    A configured check without write evidence fails closed as an invariant
+    evaluation error; absence is not evidence that all writes stayed in range.
     """
-    if write_log is None or partition_ranges is None:
+    if write_spans is None and write_log is None:
+        raise ValueError("no_oob_writes has no runtime write evidence")
+    if partition_ranges is None:
         return
 
     if not partition_ranges:
@@ -597,28 +602,63 @@ def check_no_oob_writes(
     if isinstance(write_width, bool) or not isinstance(write_width, int) or write_width <= 0:
         raise ValueError("no_oob_writes write_width must be a positive integer")
 
-    oob_addresses: List[int] = []
-    for addr in write_log:
-        write_end = addr + write_width
-        if not any(start <= addr and write_end <= end for start, end in partition_ranges):
-            oob_addresses.append(addr)
+    spans: List[Tuple[int, int]] = []
+    if write_spans is not None:
+        for index, span in enumerate(write_spans):
+            if not isinstance(span, (list, tuple)) or len(span) != 2:
+                raise ValueError(
+                    "no_oob_writes write_spans[{}] must be (address, width)".format(
+                        index
+                    )
+                )
+            addr, width = span
+            if (
+                isinstance(addr, bool)
+                or not isinstance(addr, int)
+                or addr < 0
+                or isinstance(width, bool)
+                or not isinstance(width, int)
+                or width <= 0
+            ):
+                raise ValueError(
+                    "no_oob_writes write_spans[{}] has an invalid address or width".format(
+                        index
+                    )
+                )
+            spans.append((addr, width))
+    else:
+        spans = [(addr, write_width) for addr in (write_log or [])]
 
-    if oob_addresses:
+    oob_spans: List[Tuple[int, int]] = []
+    for addr, width in spans:
+        write_end = addr + width
+        if not any(start <= addr and write_end <= end for start, end in partition_ranges):
+            oob_spans.append((addr, width))
+
+    if oob_spans:
         raise InvariantViolation(
             invariant_name="no_oob_writes",
             description=(
                 "{} write(s) landed outside allowed partition ranges. "
-                "First offender: 0x{:08X}.".format(len(oob_addresses), oob_addresses[0])
+                "First offender: [0x{:08X}, 0x{:08X}).".format(
+                    len(oob_spans),
+                    oob_spans[0][0],
+                    oob_spans[0][0] + oob_spans[0][1],
+                )
             ),
             result=result,
             details={
-                "oob_addresses": oob_addresses,
-                "oob_count": len(oob_addresses),
+                "oob_addresses": [address for address, _width in oob_spans],
+                "oob_spans": [
+                    {"start": address, "end": address + width, "width": width}
+                    for address, width in oob_spans
+                ],
+                "oob_count": len(oob_spans),
                 "partition_ranges": [
                     {"start": "0x{:08X}".format(s), "end": "0x{:08X}".format(e)}
                     for s, e in partition_ranges
                 ],
-                "write_width": write_width,
+                "write_width": write_width if write_spans is None else None,
             },
         )
 

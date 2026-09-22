@@ -3380,10 +3380,11 @@ def _parse_memory_regions(
             )
         )
     regions.sort(key=lambda region: (region.base, region.size))
-    for index, current in enumerate(regions):
-        prior = regions[index - 1] if index else None
-        if prior is not None and current.base < prior.base + prior.size:
-            raise ProfileError("{}: overlapping ranges".format(field))
+    if field != "memory.postmortem_partitions":
+        for index, current in enumerate(regions):
+            prior = regions[index - 1] if index else None
+            if prior is not None and current.base < prior.base + prior.size:
+                raise ProfileError("{}: overlapping ranges".format(field))
     return regions
 
 
@@ -7839,9 +7840,16 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
                     raise ProfileError(
                         "multi_component.components[{}]: expected mapping".format(index)
                     )
+                component_context = "multi_component.components[{}]".format(index)
+                _reject_unknown_keys(
+                    component, _STRICT_COMPONENT_KEYS, component_context
+                )
+                _validate_strict_bootloader(
+                    component.get("bootloader"), component_context + ".bootloader"
+                )
                 _validate_strict_memory(
                     component.get("memory"),
-                    "multi_component.components[{}].memory".format(index),
+                    component_context + ".memory",
                 )
     memory = _parse_memory(_require(data, "memory"))
     try:

@@ -208,6 +208,32 @@ def load_clean_write_trace(
     return entries
 
 
+def load_normalized_write_spans(
+    trace_file: Optional[str],
+    flash_base: int,
+    default_width: int,
+    trace_address_map: Optional[List[Dict[str, int]]] = None,
+) -> Optional[List[Tuple[int, int]]]:
+    """Load one calibration trace into absolute, width-aware write spans."""
+    if not trace_file:
+        return None
+    if (
+        isinstance(default_width, bool)
+        or not isinstance(default_width, int)
+        or default_width <= 0
+    ):
+        raise ValueError("default write width must be a positive integer")
+    return [
+        (
+            _trace_absolute_address(
+                entry["flash_offset"], flash_base, trace_address_map
+            ),
+            int(entry.get("width", default_width)),
+        )
+        for entry in load_clean_write_trace(trace_file)
+    ]
+
+
 def parse_exact_program_trace_csv(
     text: str,
     source: str = "exact MRAM program trace",

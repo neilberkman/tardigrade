@@ -62,6 +62,7 @@ from trace_utils import (
     flash_base_for_profile,
     load_clean_erase_trace,
     load_clean_write_trace,
+    load_normalized_write_spans,
 )
 
 
@@ -1971,7 +1972,17 @@ def run_multi_component_sweep(
                 component_invariants.append(invariant)
         comp_profile.invariants = component_invariants
         try:
-            annotate_result_checks(comp_results, comp_profile, repo_root=repo_root)
+            annotate_result_checks(
+                comp_results,
+                comp_profile,
+                repo_root=repo_root,
+                write_spans=load_normalized_write_spans(
+                    trace_file,
+                    flash_base_for_profile(comp_profile),
+                    comp_profile.memory.write_granularity,
+                    getattr(comp_profile.memory, "trace_address_map", None),
+                ),
+            )
         finally:
             comp_profile.invariants = original_invariants
 
@@ -2241,6 +2252,7 @@ def run_multi_fault_phase(
     explain_only: bool = False,
     keep_run_artifacts: bool = False,
     profile_initial_state_name: Optional[str] = None,
+    trace_file: Optional[str] = None,
 ) -> MultiFaultPhaseResult:
     """Plan and optionally execute multi-fault sequences.
 
@@ -2514,7 +2526,17 @@ def run_multi_fault_phase(
             if _rat:
                 mf_r["sequence_rationale"] = _rat
 
-    annotate_result_checks(out.results, profile, repo_root=repo_root)
+    annotate_result_checks(
+        out.results,
+        profile,
+        repo_root=repo_root,
+        write_spans=load_normalized_write_spans(
+            trace_file,
+            flash_base_for_profile(profile),
+            profile.memory.write_granularity,
+            getattr(profile.memory, "trace_address_map", None),
+        ),
+    )
     out.summary = summarize_runtime_sweep(
         out.results,
         total_writes=max_writes,

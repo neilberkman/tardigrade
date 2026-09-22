@@ -44,6 +44,7 @@ from partial_staging import (
 from trace_utils import (
     annotate_clean_trace,
     flash_base_for_profile,
+    load_normalized_write_spans,
     summarize_calibration_coverage,
 )
 from trigger_discovery import (
@@ -2285,6 +2286,12 @@ def _main_single() -> int:
                 }
 
         flash_base = flash_base_for_profile(profile)
+        runtime_write_spans = load_normalized_write_spans(
+            trace_file,
+            flash_base,
+            profile.memory.write_granularity,
+            getattr(profile.memory, "trace_address_map", None),
+        )
         clean_trace_meta = annotate_clean_trace(
             sweep_results, trace_file, erase_trace_file, flash_base,
             trace_address_map=getattr(profile.memory, "trace_address_map", None),
@@ -2302,7 +2309,12 @@ def _main_single() -> int:
         if clean_trace_meta is not None:
             clean_trace_meta["coverage"] = calibration_coverage
 
-        annotate_result_checks(sweep_results, profile, repo_root=repo_root)
+        annotate_result_checks(
+            sweep_results,
+            profile,
+            repo_root=repo_root,
+            write_spans=runtime_write_spans,
+        )
         validate_runtime_findings(
             results=sweep_results,
             profile=profile,
@@ -2346,6 +2358,7 @@ def _main_single() -> int:
             explain_only=args.explain_multi_fault_plan,
             keep_run_artifacts=args.keep_run_artifacts,
             profile_initial_state_name=args.initial_state or None,
+            trace_file=trace_file,
         )
         multi_fault_plan: Optional[MultiFaultPlan] = mf_phase.plan
         multi_fault_plan_data = mf_phase.plan_data
