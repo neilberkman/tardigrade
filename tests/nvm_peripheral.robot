@@ -37,6 +37,120 @@ NVM Persists Across Reset
     ${read_back}=      Execute Command    sysbus ReadDoubleWord 0x10000000
     Should Be Equal As Numbers    ${read_back}    0xAABBCCDD
 
+MRAM Tracking Boundary Defers Counting Tracing And Faults
+    Create NVM Machine
+    Execute Command    nvm TrackingStartAddress 0x10000100
+    Execute Command    nvm FaultAtWordWrite 1
+    Execute Command    nvm WriteTraceEnabled true
+    Execute Command    sysbus WriteDoubleWord 0x10000000 0xAABBCCDD
+    ${pre_value}=      Execute Command    sysbus ReadDoubleWord 0x10000000
+    ${pre_count}=      Execute Command    nvm TotalWordWrites
+    ${pre_trace}=      Execute Command    nvm WriteTraceCount
+    ${pre_fault}=      Read Normalized Bool    nvm FaultEverFired
+    ${waiting}=        Read Normalized Bool    nvm TrackingStarted
+    Should Be Equal As Numbers    ${pre_value}    0xAABBCCDD
+    Should Be Equal As Numbers    ${pre_count}    0
+    Should Be Equal As Numbers    ${pre_trace}    0
+    Should Be Equal As Strings    ${pre_fault}    false
+    Should Be Equal As Strings    ${waiting}    false
+    Execute Command    nvm TrackingStartAddress 0
+    Execute Command    sysbus WriteDoubleWord 0x10000008 0x55667788
+    ${active}=         Read Normalized Bool    nvm TrackingStarted
+    ${count}=          Execute Command    nvm TotalWordWrites
+    ${trace}=          Execute Command    nvm WriteTraceCount
+    ${fault}=          Read Normalized Bool    nvm FaultEverFired
+    Should Be Equal As Strings    ${active}    true
+    Should Be Equal As Numbers    ${count}    1
+    Should Be Equal As Numbers    ${trace}    1
+    Should Be Equal As Strings    ${fault}    true
+
+MRAM Sixteen Byte Power Cut Stops At Selected Program
+    Create NVM Machine
+    Execute Command    nvm WordSize 16
+    Execute Command    nvm ProgramAddressBase 0x10000000
+    Execute Command    nvm FaultAtWordWrite 2
+    Execute Command    python "from System import Array,Byte; n=monitor.Machine['sysbus.nvm']; d=Array[Byte](([0x11]*16)+([0x22]*16)+([0x33]*16)); n.WriteBytes(0,d,0,len(d))"
+    ${first}=          Execute Command    sysbus ReadQuadWord 0x10000000
+    ${fault_first}=    Execute Command    sysbus ReadQuadWord 0x10000010
+    ${fault_second}=   Execute Command    sysbus ReadQuadWord 0x10000018
+    ${later}=          Execute Command    sysbus ReadQuadWord 0x10000020
+    ${count}=          Execute Command    nvm TotalWordWrites
+    ${fault_index}=    Execute Command    nvm LastFaultWriteIndex
+    ${fault_address}=  Execute Command    nvm LastFaultProgramAddress
+    ${fault_offset}=   Execute Command    nvm LastFaultOffset
+    ${fault_width}=    Execute Command    nvm LastFaultProgramWidth
+    ${exact}=          Read Normalized Bool    nvm FaultEvidenceExact
+    ${program_trace}=  Execute Command    nvm ProgramTraceToString
+    Should Be Equal As Numbers    ${first}    0x1111111111111111
+    Should Be Equal As Numbers    ${fault_first}    0x2222222222222222
+    Should Be Equal As Numbers    ${fault_second}    0
+    Should Be Equal As Numbers    ${later}    0
+    Should Be Equal As Numbers    ${count}    2
+    Should Be Equal As Numbers    ${fault_index}    2
+    Should Be Equal As Numbers    ${fault_address}    0x10000010
+    Should Be Equal As Numbers    ${fault_offset}    16
+    Should Be Equal As Numbers    ${fault_width}    16
+    Should Be Equal As Strings    ${exact}    true
+    Should Contain    ${program_trace}    2:16:16:22222222222222222222222222222222:00000000000000000000000000000000:22222222222222220000000000000000:1
+
+MRAM First Program Retains Exact Immediate Evidence
+    Create NVM Machine
+    Execute Command    nvm WordSize 16
+    Execute Command    nvm ProgramAddressBase 0x10000000
+    Execute Command    nvm FaultAtWordWrite 1
+    Execute Command    python "from System import Array,Byte; n=monitor.Machine['sysbus.nvm']; d=Array[Byte]([0x5A]*32); n.WriteBytes(0,d,0,len(d))"
+    ${count}=          Execute Command    nvm TotalWordWrites
+    ${trace_count}=    Execute Command    nvm ProgramTraceCount
+    ${fault_index}=    Execute Command    nvm LastFaultWriteIndex
+    ${snapshot}=       Execute Command    nvm FaultMemorySnapshotSize
+    ${exact}=          Read Normalized Bool    nvm FaultEvidenceExact
+    Should Be Equal As Numbers    ${count}    1
+    Should Be Equal As Numbers    ${trace_count}    1
+    Should Be Equal As Numbers    ${fault_index}    1
+    Should Be Equal As Numbers    ${snapshot}    0x80000
+    Should Be Equal As Strings    ${exact}    true
+
+MRAM Final Torn Program Retains Erased Upper Bytes
+    Create NVM Machine
+    Execute Command    nvm WordSize 16
+    Execute Command    nvm EraseFill 0xFF
+    Execute Command    nvm ProgramAddressBase 0x10000000
+    Execute Command    nvm FaultAtWordWrite 3
+    Execute Command    python "from System import Array,Byte; n=monitor.Machine['sysbus.nvm']; d=Array[Byte](([0x11]*16)+([0x22]*16)+([0x33]*16)); n.WriteBytes(0,d,0,len(d))"
+    ${final_first}=    Execute Command    sysbus ReadQuadWord 0x10000020
+    ${final_second}=   Execute Command    sysbus ReadQuadWord 0x10000028
+    ${trace_count}=    Execute Command    nvm ProgramTraceCount
+    ${program_trace}=  Execute Command    nvm ProgramTraceToString
+    ${exact}=          Read Normalized Bool    nvm FaultEvidenceExact
+    Should Be Equal As Numbers    ${final_first}    0x3333333333333333
+    Should Be Equal As Numbers    ${final_second}    0xFFFFFFFFFFFFFFFF
+    Should Be Equal As Numbers    ${trace_count}    3
+    Should Be Equal As Strings    ${exact}    true
+    Should Contain    ${program_trace}    3:32:16:33333333333333333333333333333333:ffffffffffffffffffffffffffffffff:3333333333333333ffffffffffffffff:1
+
+MRAM Reset Preserves Storage And Restores Waiting Boundary
+    Create NVM Machine
+    Execute Command    nvm TrackingStartAddress 0x10000100
+    Execute Command    sysbus WriteDoubleWord 0x10000000 0xAABBCCDD
+    Execute Command    nvm TrackingStartAddress 0
+    Execute Command    sysbus WriteDoubleWord 0x10000008 0x11223344
+    Execute Command    nvm Reset
+    ${first}=          Execute Command    sysbus ReadDoubleWord 0x10000000
+    ${second}=         Execute Command    sysbus ReadDoubleWord 0x10000008
+    ${address}=        Execute Command    nvm TrackingStartAddress
+    ${started}=        Read Normalized Bool    nvm TrackingStarted
+    ${count}=          Execute Command    nvm TotalWordWrites
+    Should Be Equal As Numbers    ${first}    0xAABBCCDD
+    Should Be Equal As Numbers    ${second}    0x11223344
+    Should Be Equal As Numbers    ${address}    0x10000100
+    Should Be Equal As Strings    ${started}    false
+    Should Be Equal As Numbers    ${count}    0
+    Execute Command    sysbus WriteDoubleWord 0x10000010 0xCAFEBABE
+    ${third}=          Execute Command    sysbus ReadDoubleWord 0x10000010
+    ${still_zero}=     Execute Command    nvm TotalWordWrites
+    Should Be Equal As Numbers    ${third}    0xCAFEBABE
+    Should Be Equal As Numbers    ${still_zero}    0
+
 NVM Write Requires Erase First
     Create NVM Machine
     Execute Command    sysbus WriteQuadWord 0x10000000 0xFFEEDDCCBBAA9988

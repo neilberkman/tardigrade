@@ -43,6 +43,16 @@ namespace Antmicro.Renode.Peripherals.Memory
             LastFaultInjected = false;
             FaultEverFired = false;
             DriverErrorFired = false;
+            if(configuredTrackingStartAddress != 0)
+            {
+                trackingStartAddress = configuredTrackingStartAddress;
+                trackingStarted = false;
+                ResetCampaignObservability();
+            }
+            else
+            {
+                trackingStarted = true;
+            }
             // Read-fault state is intentionally NOT cleared on Reset: the
             // sweep engine re-arms between iterations, and clearing here
             // would hide the fact that a fault was scheduled but the boot
@@ -368,6 +378,213 @@ namespace Antmicro.Renode.Peripherals.Memory
         // Optional alias to expose NV_READ_OFFSET style mirrored view.
         public NVMemory AliasTarget { get; set; }
 
+        // Optional campaign boundary. The runtime installs the CPU hook and
+        // clears this property when execution reaches the requested address.
+        // Until then, storage behaves normally but campaign accounting and
+        // write-fault injection remain dormant.
+        public ulong TrackingStartAddress
+        {
+            get
+            {
+                return AliasTarget != null
+                    ? AliasTarget.TrackingStartAddress
+                    : trackingStartAddress;
+            }
+            set
+            {
+                if(AliasTarget != null)
+                {
+                    AliasTarget.TrackingStartAddress = value;
+                    return;
+                }
+                if(value != 0)
+                {
+                    configuredTrackingStartAddress = value;
+                    trackingStartAddress = value;
+                    trackingStarted = false;
+                    ResetCampaignObservability();
+                    return;
+                }
+
+                // Activation is one transition: discard any pre-campaign
+                // diagnostics, enable tracking, and leave the armed fault
+                // index untouched. The next program is therefore write 1.
+                if(!trackingStarted)
+                {
+                    ResetCampaignObservability();
+                }
+                trackingStartAddress = 0;
+                trackingStarted = true;
+            }
+        }
+
+        public bool TrackingStarted
+        {
+            get { return AliasTarget != null ? AliasTarget.TrackingStarted : trackingStarted; }
+        }
+
+        public bool WriteTraceEnabled
+        {
+            get { return AliasTarget != null ? AliasTarget.WriteTraceEnabled : writeTraceEnabled; }
+            set
+            {
+                if(AliasTarget != null) AliasTarget.WriteTraceEnabled = value;
+                else writeTraceEnabled = value;
+            }
+        }
+
+        public bool WriteTraceWidthExplicit => true;
+
+        public int WriteTraceCount
+        {
+            get { return AliasTarget != null ? AliasTarget.WriteTraceCount : writeTrace.Count; }
+        }
+
+        public string WriteTraceToString()
+        {
+            if(AliasTarget != null) return AliasTarget.WriteTraceToString();
+            var result = new StringBuilder(writeTrace.Count * 32);
+            foreach(var entry in writeTrace)
+            {
+                result.Append(entry.Index);
+                result.Append(':');
+                result.Append(entry.Offset);
+                result.Append(':');
+                result.Append(entry.Value);
+                result.Append(':');
+                result.Append(entry.Width);
+                result.Append('\n');
+            }
+            return result.ToString();
+        }
+
+        public void WriteTraceClear()
+        {
+            if(AliasTarget != null) AliasTarget.WriteTraceClear();
+            else writeTrace.Clear();
+        }
+
+        // Exact program evidence is separate from the legacy integer trace.
+        // The latter can encode at most eight data bytes, while MRAM program
+        // units are commonly 16 bytes and must not lose their upper half.
+        public ulong ProgramAddressBase
+        {
+            get { return AliasTarget != null ? AliasTarget.ProgramAddressBase : programAddressBase; }
+            set
+            {
+                if(AliasTarget != null) AliasTarget.ProgramAddressBase = value;
+                else programAddressBase = value;
+            }
+        }
+
+        public ulong LastFaultWriteIndex
+        {
+            get { return AliasTarget != null ? AliasTarget.LastFaultWriteIndex : lastFaultWriteIndex; }
+        }
+
+        public ulong LastFaultProgramAddress
+        {
+            get { return AliasTarget != null ? AliasTarget.LastFaultProgramAddress : lastFaultProgramAddress; }
+        }
+
+        public long LastFaultOffset
+        {
+            get { return AliasTarget != null ? AliasTarget.LastFaultOffset : lastFaultOffset; }
+        }
+
+        public int LastFaultProgramWidth
+        {
+            get { return AliasTarget != null ? AliasTarget.LastFaultProgramWidth : lastFaultProgramWidth; }
+        }
+
+        public byte[] LastFaultIntendedBytes
+        {
+            get { return AliasTarget != null ? AliasTarget.LastFaultIntendedBytes : CloneBytes(lastFaultIntendedBytes); }
+        }
+
+        public byte[] LastFaultPreProgramBytes
+        {
+            get { return AliasTarget != null ? AliasTarget.LastFaultPreProgramBytes : CloneBytes(lastFaultPreProgramBytes); }
+        }
+
+        public byte[] LastFaultPostFaultBytes
+        {
+            get { return AliasTarget != null ? AliasTarget.LastFaultPostFaultBytes : CloneBytes(lastFaultPostFaultBytes); }
+        }
+
+        public byte[] FaultMemorySnapshot
+        {
+            get { return AliasTarget != null ? AliasTarget.FaultMemorySnapshot : CloneBytes(faultMemorySnapshot); }
+        }
+
+        public int FaultMemorySnapshotSize
+        {
+            get
+            {
+                if(AliasTarget != null) return AliasTarget.FaultMemorySnapshotSize;
+                return faultMemorySnapshot != null ? faultMemorySnapshot.Length : 0;
+            }
+        }
+
+        public bool FaultEvidenceExact
+        {
+            get
+            {
+                if(AliasTarget != null) return AliasTarget.FaultEvidenceExact;
+                return lastFaultWriteIndex != 0
+                    && lastFaultOffset >= 0
+                    && lastFaultProgramWidth > 0
+                    && lastFaultIntendedBytes != null
+                    && lastFaultIntendedBytes.Length == lastFaultProgramWidth
+                    && lastFaultPreProgramBytes != null
+                    && lastFaultPreProgramBytes.Length == lastFaultProgramWidth
+                    && lastFaultPostFaultBytes != null
+                    && lastFaultPostFaultBytes.Length == lastFaultProgramWidth
+                    && faultMemorySnapshot != null
+                    && faultMemorySnapshot.Length == storage.Length;
+            }
+        }
+
+        public int ProgramTraceCount
+        {
+            get { return AliasTarget != null ? AliasTarget.ProgramTraceCount : programTrace.Count; }
+        }
+
+        public string ProgramTraceToString()
+        {
+            if(AliasTarget != null) return AliasTarget.ProgramTraceToString();
+            var result = new StringBuilder(programTrace.Count * 128);
+            foreach(var entry in programTrace)
+            {
+                result.Append(entry.Index);
+                result.Append(':');
+                result.Append(entry.Offset);
+                result.Append(':');
+                result.Append(entry.Width);
+                result.Append(':');
+                AppendHex(result, entry.Intended);
+                result.Append(':');
+                AppendHex(result, entry.PreProgram);
+                result.Append(':');
+                AppendHex(result, entry.PostProgram);
+                result.Append(':');
+                result.Append(entry.Faulted ? '1' : '0');
+                result.Append('\n');
+            }
+            return result.ToString();
+        }
+
+        public void ProgramTraceClear()
+        {
+            if(AliasTarget != null)
+            {
+                AliasTarget.ProgramTraceClear();
+                return;
+            }
+            programTrace.Clear();
+            ClearFaultEvidence();
+        }
+
         public ulong FaultAtWordWrite { get; set; } = ulong.MaxValue;
 
         // Fault mode: 0 = power_loss (partial write), 1 = bit_corruption (random bit flips),
@@ -396,34 +613,6 @@ namespace Antmicro.Renode.Peripherals.Memory
         public long LastWriteAddress { get; private set; }
 
         public List<long> WriteLog { get { return writeLog; } }
-
-        // Address-bearing, width-aware trace used by heuristic planning and
-        // replay when this memory is selected directly as the fault backend.
-        public bool WriteTraceEnabled { get; set; }
-        public bool WriteTraceWidthExplicit => true;
-        public int WriteTraceCount => writeTrace.Count;
-
-        public string WriteTraceToString()
-        {
-            var sb = new StringBuilder(writeTrace.Count * 40);
-            foreach(var entry in writeTrace)
-            {
-                sb.Append(entry.Item1);
-                sb.Append(':');
-                sb.Append(entry.Item2);
-                sb.Append(':');
-                sb.Append(entry.Item3);
-                sb.Append(':');
-                sb.Append(entry.Item4);
-                sb.Append('\n');
-            }
-            return sb.ToString();
-        }
-
-        public void WriteTraceClear()
-        {
-            writeTrace.Clear();
-        }
 
         // --- Read-fault injection ---
         //
@@ -550,6 +739,12 @@ namespace Antmicro.Renode.Peripherals.Memory
             }
             LastWriteAddress = offset;
 
+            if(!TrackingStarted)
+            {
+                ProgramWithoutCampaignTracking(offset, data);
+                return;
+            }
+
             if(!EnforceWordWriteSemantics)
             {
                 // Fast path: commit one word at a time.  A simulated power
@@ -560,17 +755,16 @@ namespace Antmicro.Renode.Peripherals.Memory
                 for(var wordStart = fastFirst; wordStart <= fastLast; wordStart += WordSize)
                 {
                     var previousWord = new byte[WordSize];
-                    if(WriteFaultMode == 6)
-                    {
-                        Array.Copy(storage, wordStart, previousWord, 0, WordSize);
-                    }
+                    Array.Copy(storage, wordStart, previousWord, 0, WordSize);
+                    var intendedWord = CloneBytes(previousWord);
 
                     var writeStart = Math.Max(offset, wordStart);
                     var writeEnd = Math.Min(offset + data.Length, wordStart + WordSize);
                     for(var address = writeStart; address < writeEnd; address++)
                     {
-                        storage[address] = data[(int)(address - offset)];
+                        intendedWord[address - wordStart] = data[(int)(address - offset)];
                     }
+                    ProgramWord(wordStart, intendedWord);
 
                     var currentWriteIndex = TotalWordWrites + 1;
                     if(currentWriteIndex == FaultAtWordWrite)
@@ -607,9 +801,22 @@ namespace Antmicro.Renode.Peripherals.Memory
                         TotalWordWrites++;
                         LastWriteAddress = wordStart;
                         RecordWriteTrace(wordStart);
+                        var postFaultWord = ReadStorageWord(wordStart);
+                        RecordProgramTrace(
+                            currentWriteIndex, wordStart, intendedWord,
+                            previousWord, postFaultWord, true
+                        );
+                        CaptureFaultEvidence(
+                            currentWriteIndex, wordStart, intendedWord,
+                            previousWord, postFaultWord
+                        );
                         return;
                     }
 
+                    RecordProgramTrace(
+                        currentWriteIndex, wordStart, intendedWord,
+                        previousWord, ReadStorageWord(wordStart), false
+                    );
                     TotalWordWrites++;
                     RecordWriteTrace(wordStart);
                 }
@@ -687,10 +894,23 @@ namespace Antmicro.Renode.Peripherals.Memory
                         TotalWordWrites++;
                         writeLog.Add(wordStart);
                         RecordWriteTrace(wordStart);
+                        var postFaultWord = ReadStorageWord(wordStart);
+                        RecordProgramTrace(
+                            currentWriteIndex, wordStart, mergedWord,
+                            previousWord, postFaultWord, true
+                        );
+                        CaptureFaultEvidence(
+                            currentWriteIndex, wordStart, mergedWord,
+                            previousWord, postFaultWord
+                        );
                         break;
                     }
 
                     ProgramWord(wordStart, mergedWord);
+                    RecordProgramTrace(
+                        currentWriteIndex, wordStart, mergedWord,
+                        previousWord, ReadStorageWord(wordStart), false
+                    );
                     TotalWordWrites++;
                     writeLog.Add(wordStart);
                     RecordWriteTrace(wordStart);
@@ -712,27 +932,6 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             corruptionSeed = corruptionSeed * 1103515245u + 12345u;
             return corruptionSeed;
-        }
-
-        private void RecordWriteTrace(long wordStart)
-        {
-            if(!WriteTraceEnabled)
-            {
-                return;
-            }
-
-            var width = checked((int)WordSize);
-            if(width != 1 && width != 2 && width != 4 && width != 8)
-            {
-                throw new InvalidOperationException(
-                    "Write tracing requires a 1, 2, 4, or 8 byte WordSize");
-            }
-            ulong value = 0;
-            for(var i = 0; i < width; i++)
-            {
-                value |= (ulong)storage[wordStart + i] << (8 * i);
-            }
-            writeTrace.Add(Tuple.Create(TotalWordWrites, wordStart, value, width));
         }
 
         // Apply random bit flips to a word already in storage.
@@ -768,6 +967,143 @@ namespace Antmicro.Renode.Peripherals.Memory
             {
                 storage[wordStart + i] = mergedWord[i];
             }
+        }
+
+        private void ProgramWithoutCampaignTracking(long offset, byte[] data)
+        {
+            LastFaultInjected = false;
+            if(!EnforceWordWriteSemantics)
+            {
+                Array.Copy(data, 0, storage, offset, data.Length);
+                return;
+            }
+
+            var firstWordStart = AlignDown(offset, WordSize);
+            var lastWordStart = AlignDown(offset + data.Length - 1, WordSize);
+            WriteInProgress = true;
+            try
+            {
+                for(var wordStart = firstWordStart; wordStart <= lastWordStart; wordStart += WordSize)
+                {
+                    var mergedWord = new byte[WordSize];
+                    Array.Copy(storage, wordStart, mergedWord, 0, WordSize);
+                    for(var i = 0; i < data.Length; i++)
+                    {
+                        var address = offset + i;
+                        if(address >= wordStart && address < wordStart + WordSize)
+                        {
+                            mergedWord[address - wordStart] = data[i];
+                        }
+                    }
+                    EraseWord(wordStart);
+                    ProgramWord(wordStart, mergedWord);
+                    if(WriteLatencyMicros > 0)
+                    {
+                        Thread.Sleep((int)Math.Max(1, WriteLatencyMicros / 1000));
+                    }
+                }
+            }
+            finally
+            {
+                WriteInProgress = false;
+            }
+        }
+
+        private void RecordWriteTrace(long wordStart)
+        {
+            if(!WriteTraceEnabled)
+            {
+                return;
+            }
+            var encodedWidth = (int)Math.Min(8L, WordSize);
+            ulong value = 0;
+            for(var i = 0; i < encodedWidth; i++)
+            {
+                value |= (ulong)storage[wordStart + i] << (8 * i);
+            }
+            // The legacy integer value carries at most eight bytes, but the
+            // explicit width remains authoritative. Full program bytes live
+            // in ProgramTraceToString and are never truncated there.
+            writeTrace.Add(new WriteTraceEntry(
+                TotalWordWrites, wordStart, value, checked((int)WordSize)
+            ));
+        }
+
+        private void RecordProgramTrace(ulong index, long offset, byte[] intended,
+                                        byte[] preProgram, byte[] postProgram, bool faulted)
+        {
+            programTrace.Add(new ProgramTraceEntry(
+                index, offset, (int)WordSize,
+                CloneBytes(intended), CloneBytes(preProgram), CloneBytes(postProgram),
+                faulted
+            ));
+        }
+
+        private void CaptureFaultEvidence(ulong index, long offset, byte[] intended,
+                                          byte[] preProgram, byte[] postFault)
+        {
+            lastFaultWriteIndex = index;
+            lastFaultOffset = offset;
+            lastFaultProgramAddress = programAddressBase + (ulong)offset;
+            lastFaultProgramWidth = (int)WordSize;
+            lastFaultIntendedBytes = CloneBytes(intended);
+            lastFaultPreProgramBytes = CloneBytes(preProgram);
+            lastFaultPostFaultBytes = CloneBytes(postFault);
+            faultMemorySnapshot = CloneBytes(storage);
+        }
+
+        private byte[] ReadStorageWord(long offset)
+        {
+            var result = new byte[WordSize];
+            Array.Copy(storage, offset, result, 0, WordSize);
+            return result;
+        }
+
+        private static byte[] CloneBytes(byte[] source)
+        {
+            if(source == null)
+            {
+                return null;
+            }
+            var result = new byte[source.Length];
+            Array.Copy(source, result, source.Length);
+            return result;
+        }
+
+        private static void AppendHex(StringBuilder builder, byte[] data)
+        {
+            if(data == null)
+            {
+                return;
+            }
+            foreach(var value in data)
+            {
+                builder.Append(value.ToString("x2"));
+            }
+        }
+
+        private void ClearFaultEvidence()
+        {
+            lastFaultWriteIndex = 0;
+            lastFaultProgramAddress = 0;
+            lastFaultOffset = -1;
+            lastFaultProgramWidth = 0;
+            lastFaultIntendedBytes = null;
+            lastFaultPreProgramBytes = null;
+            lastFaultPostFaultBytes = null;
+            faultMemorySnapshot = null;
+        }
+
+        private void ResetCampaignObservability()
+        {
+            TotalWordWrites = 0;
+            writeLog.Clear();
+            writeTrace.Clear();
+            programTrace.Clear();
+            ClearFaultEvidence();
+            LastFaultInjected = false;
+            FaultEverFired = false;
+            DriverErrorFired = false;
         }
 
         private long AlignDown(long value, long alignment)
@@ -809,8 +1145,61 @@ namespace Antmicro.Renode.Peripherals.Memory
         private byte[] storage;
         private uint corruptionSeed;
         private readonly List<long> writeLog = new List<long>();
-        private readonly List<Tuple<ulong, long, ulong, int>> writeTrace =
-            new List<Tuple<ulong, long, ulong, int>>();
+        private readonly List<WriteTraceEntry> writeTrace = new List<WriteTraceEntry>();
+        private readonly List<ProgramTraceEntry> programTrace = new List<ProgramTraceEntry>();
+        private bool writeTraceEnabled;
+        private ulong trackingStartAddress;
+        private ulong configuredTrackingStartAddress;
+        private bool trackingStarted = true;
+        private ulong programAddressBase;
+        private ulong lastFaultWriteIndex;
+        private ulong lastFaultProgramAddress;
+        private long lastFaultOffset = -1;
+        private int lastFaultProgramWidth;
+        private byte[] lastFaultIntendedBytes;
+        private byte[] lastFaultPreProgramBytes;
+        private byte[] lastFaultPostFaultBytes;
+        private byte[] faultMemorySnapshot;
+
+        private sealed class WriteTraceEntry
+        {
+            public WriteTraceEntry(ulong index, long offset, ulong value, int width)
+            {
+                Index = index;
+                Offset = offset;
+                Value = value;
+                Width = width;
+            }
+
+            public readonly ulong Index;
+            public readonly long Offset;
+            public readonly ulong Value;
+            public readonly int Width;
+        }
+
+        private sealed class ProgramTraceEntry
+        {
+            public ProgramTraceEntry(ulong index, long offset, int width,
+                                     byte[] intended, byte[] preProgram,
+                                     byte[] postProgram, bool faulted)
+            {
+                Index = index;
+                Offset = offset;
+                Width = width;
+                Intended = intended;
+                PreProgram = preProgram;
+                PostProgram = postProgram;
+                Faulted = faulted;
+            }
+
+            public readonly ulong Index;
+            public readonly long Offset;
+            public readonly int Width;
+            public readonly byte[] Intended;
+            public readonly byte[] PreProgram;
+            public readonly byte[] PostProgram;
+            public readonly bool Faulted;
+        }
 
         private const long DefaultSize = 0x80000;
         private const long DefaultWordSize = 8;
@@ -1010,6 +1399,37 @@ namespace Antmicro.Renode.Peripherals
             set { if(Nvm != null) { Nvm.FaultAtWordWrite = value; } }
         }
 
+        public ulong TrackingStartAddress
+        {
+            get { return Nvm != null ? Nvm.TrackingStartAddress : 0UL; }
+            set { if(Nvm != null) { Nvm.TrackingStartAddress = value; } }
+        }
+
+        public bool TrackingStarted
+        {
+            get { return Nvm == null || Nvm.TrackingStarted; }
+        }
+
+        public ulong ProgramAddressBase
+        {
+            get { return Nvm != null ? Nvm.ProgramAddressBase : 0UL; }
+            set { if(Nvm != null) { Nvm.ProgramAddressBase = value; } }
+        }
+
+        public ulong LastFaultWriteIndex => Nvm != null ? Nvm.LastFaultWriteIndex : 0UL;
+        public ulong LastFaultProgramAddress => Nvm != null ? Nvm.LastFaultProgramAddress : 0UL;
+        public long LastFaultOffset => Nvm != null ? Nvm.LastFaultOffset : -1L;
+        public int LastFaultProgramWidth => Nvm != null ? Nvm.LastFaultProgramWidth : 0;
+        public byte[] LastFaultIntendedBytes => Nvm != null ? Nvm.LastFaultIntendedBytes : null;
+        public byte[] LastFaultPreProgramBytes => Nvm != null ? Nvm.LastFaultPreProgramBytes : null;
+        public byte[] LastFaultPostFaultBytes => Nvm != null ? Nvm.LastFaultPostFaultBytes : null;
+        public byte[] FaultMemorySnapshot => Nvm != null ? Nvm.FaultMemorySnapshot : null;
+        public int FaultMemorySnapshotSize => Nvm != null ? Nvm.FaultMemorySnapshotSize : 0;
+        public bool FaultEvidenceExact => Nvm != null && Nvm.FaultEvidenceExact;
+        public int ProgramTraceCount => Nvm != null ? Nvm.ProgramTraceCount : 0;
+        public string ProgramTraceToString() { return Nvm != null ? Nvm.ProgramTraceToString() : string.Empty; }
+        public void ProgramTraceClear() { Nvm?.ProgramTraceClear(); }
+
         public bool FaultFired
         {
             get { return Nvm != null && Nvm.FaultEverFired; }
@@ -1063,11 +1483,15 @@ namespace Antmicro.Renode.Peripherals
         public bool PassthroughMode { get; set; }
         public void InvalidateShadow() { }
 
-        public bool WriteTraceEnabled { get; set; }
-        public bool WriteTraceWidthExplicit => false;
-        public int WriteTraceCount { get { return 0; } }
-        public string WriteTraceToString() { return string.Empty; }
-        public void WriteTraceClear() { }
+        public bool WriteTraceEnabled
+        {
+            get { return Nvm != null && Nvm.WriteTraceEnabled; }
+            set { if(Nvm != null) { Nvm.WriteTraceEnabled = value; } }
+        }
+        public bool WriteTraceWidthExplicit => Nvm != null && Nvm.WriteTraceWidthExplicit;
+        public int WriteTraceCount { get { return Nvm != null ? Nvm.WriteTraceCount : 0; } }
+        public string WriteTraceToString() { return Nvm != null ? Nvm.WriteTraceToString() : string.Empty; }
+        public void WriteTraceClear() { Nvm?.WriteTraceClear(); }
         public bool EraseTraceEnabled { get; set; }
         public int EraseTraceCount { get { return 0; } }
         public string EraseTraceToString() { return string.Empty; }

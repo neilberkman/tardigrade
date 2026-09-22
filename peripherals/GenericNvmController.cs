@@ -265,6 +265,37 @@ namespace Antmicro.Renode.Peripherals.Memory
             set { if(Nvm != null) { Nvm.FaultAtWordWrite = value; } }
         }
 
+        public ulong TrackingStartAddress
+        {
+            get { return Nvm != null ? Nvm.TrackingStartAddress : 0UL; }
+            set { if(Nvm != null) { Nvm.TrackingStartAddress = value; } }
+        }
+
+        public bool TrackingStarted
+        {
+            get { return Nvm == null || Nvm.TrackingStarted; }
+        }
+
+        public ulong ProgramAddressBase
+        {
+            get { return Nvm != null ? Nvm.ProgramAddressBase : 0UL; }
+            set { if(Nvm != null) { Nvm.ProgramAddressBase = value; } }
+        }
+
+        public ulong LastFaultWriteIndex => Nvm != null ? Nvm.LastFaultWriteIndex : 0UL;
+        public ulong LastFaultProgramAddress => Nvm != null ? Nvm.LastFaultProgramAddress : 0UL;
+        public long LastFaultOffset => Nvm != null ? Nvm.LastFaultOffset : -1L;
+        public int LastFaultProgramWidth => Nvm != null ? Nvm.LastFaultProgramWidth : 0;
+        public byte[] LastFaultIntendedBytes => Nvm != null ? Nvm.LastFaultIntendedBytes : null;
+        public byte[] LastFaultPreProgramBytes => Nvm != null ? Nvm.LastFaultPreProgramBytes : null;
+        public byte[] LastFaultPostFaultBytes => Nvm != null ? Nvm.LastFaultPostFaultBytes : null;
+        public byte[] FaultMemorySnapshot => Nvm != null ? Nvm.FaultMemorySnapshot : null;
+        public int FaultMemorySnapshotSize => Nvm != null ? Nvm.FaultMemorySnapshotSize : 0;
+        public bool FaultEvidenceExact => Nvm != null && Nvm.FaultEvidenceExact;
+        public int ProgramTraceCount => Nvm != null ? Nvm.ProgramTraceCount : 0;
+        public string ProgramTraceToString() { return Nvm != null ? Nvm.ProgramTraceToString() : string.Empty; }
+        public void ProgramTraceClear() { Nvm?.ProgramTraceClear(); }
+
         public bool FaultFired
         {
             get { return Nvm != null && Nvm.FaultEverFired; }
@@ -323,11 +354,15 @@ namespace Antmicro.Renode.Peripherals.Memory
         public void InvalidateShadow() { }
 
         // No execution-trace ring buffer on this controller.
-        public bool WriteTraceEnabled { get; set; }
-        public bool WriteTraceWidthExplicit => false;
-        public int WriteTraceCount { get { return 0; } }
-        public string WriteTraceToString() { return string.Empty; }
-        public void WriteTraceClear() { }
+        public bool WriteTraceEnabled
+        {
+            get { return Nvm != null && Nvm.WriteTraceEnabled; }
+            set { if(Nvm != null) { Nvm.WriteTraceEnabled = value; } }
+        }
+        public bool WriteTraceWidthExplicit => Nvm != null && Nvm.WriteTraceWidthExplicit;
+        public int WriteTraceCount { get { return Nvm != null ? Nvm.WriteTraceCount : 0; } }
+        public string WriteTraceToString() { return Nvm != null ? Nvm.WriteTraceToString() : string.Empty; }
+        public void WriteTraceClear() { Nvm?.WriteTraceClear(); }
         public bool EraseTraceEnabled { get; set; }
         public int EraseTraceCount { get { return 0; } }
         public string EraseTraceToString() { return string.Empty; }
