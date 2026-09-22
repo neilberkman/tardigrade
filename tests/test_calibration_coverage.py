@@ -134,6 +134,21 @@ def test_run_calibration_preserves_exact_program_trace_path(
             "total_erases": 0,
             "calibration_stop_reason": "vtor_captured",
             "program_trace_file": str(program_trace),
+            "barrier_audit": {
+                "total_phases": 1,
+                "phases": [
+                    {
+                        "domain": "exec",
+                        "start_write": 1,
+                        "end_write": 1,
+                        "write_count": 1,
+                        "barrier_at_end": True,
+                    }
+                ],
+                "total_barrier_events": 0,
+                "missing_barriers": 0,
+                "verdict": "ok",
+            },
         },
     )
     profile = SimpleNamespace(
@@ -152,6 +167,8 @@ def test_run_calibration_preserves_exact_program_trace_path(
     )
 
     assert calibration.program_trace_file == str(program_trace)
+    assert calibration.barrier_audit is not None
+    assert calibration.barrier_audit["verdict"] == "ok"
 
 
 @pytest.mark.parametrize(

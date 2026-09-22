@@ -956,7 +956,7 @@ backend that explicitly declares `PerWriteAccurate=false`: address-difference
 traces cannot establish the ordered operations needed to reconstruct durable
 state.
 
-Diagnostics include a barrier audit (detects missing flush barriers between update phases), per-fault dirty-domain state, and a `commit_ratio` metric.
+Diagnostics include a barrier audit (detects missing flush barriers between update phases), per-fault dirty-domain state, and a `commit_ratio` metric. The validated barrier diagnostic is preserved in calibration caches and emitted as `calibration.barrier_audit` in the final report.
 
 ### Read fault injection
 
@@ -2066,7 +2066,8 @@ The cache key is derived from the ELF hash, image hashes, fault types, flash
 backend, and write granularity. Cache files also have a strict versioned schema,
 bounded counters, per-artifact digests, and agreement checks between CSV and
 binary traces. Exact MRAM program traces are cached with their own digest and
-strict event validation. Invalid and legacy caches are rejected. If no cache
+strict event validation. Writeback barrier diagnostics are schema-validated and
+cached alongside those traces. Invalid and legacy caches are rejected. If no cache
 exists, a fresh calibration is saved to the requested path.
 
 A calibration cache can determine which fault points run, so an existing cache

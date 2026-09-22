@@ -2612,6 +2612,7 @@ def _main_single() -> int:
             "elapsed_s": cal.elapsed_s if cal is not None else None,
             "pc": cal.pc if cal is not None else None,
             "program_trace_file": program_trace_file,
+            "barrier_audit": cal.barrier_audit if cal is not None else None,
         }
         selected_target_boot_evidence = _selected_trigger_target_boot_evidence(discovery)
         if selected_target_boot_evidence is not None:

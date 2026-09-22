@@ -191,7 +191,7 @@ evidence is inconclusive rather than clean.
 
 Real storage stacks often buffer writes in RAM before committing to flash. A bootloader that assumes write-through durability can have latent bugs invisible to direct fault injection. The optional `durability_model: writeback` mode reconstructs the persisted Phase 2 snapshot from a bounded operation trace: writes remain pending until a configured barrier or capacity eviction commits them, and a power cut discards the rest. Phase 1 still observes the live write-through view, so the model evaluates recovery durability without claiming to reproduce same-boot stale reads. Ambiguous or unavailable trace evidence fails closed. Replay refuses a backend that explicitly declares `PerWriteAccurate=false`, because address-difference traces cannot establish operation ordering for durability reconstruction.
 
-Diagnostic annotations include a barrier audit (detects missing flush barriers between update phases), per-fault dirty-domain state, and a `commit_ratio` metric that quantifies how much of the write stream is uncommitted at each fault point.
+Diagnostic annotations include a barrier audit (detects missing flush barriers between update phases), per-fault dirty-domain state, and a `commit_ratio` metric that quantifies how much of the write stream is uncommitted at each fault point. The validated barrier diagnostic is preserved in calibration caches and reported as `calibration.barrier_audit`.
 
 The current-head MCUboot STM32F4 scratch entry point is
 [`profiles/mcuboot_head_scratch_stm32f4_writeback.yaml`](profiles/mcuboot_head_scratch_stm32f4_writeback.yaml).

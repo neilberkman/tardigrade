@@ -23,11 +23,11 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from renode_runner import CalibrationResult
+from renode_runner import CalibrationResult, validate_barrier_audit
 from trace_utils import parse_exact_program_trace_csv
 
 
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 MAX_CACHE_BYTES = 256 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
 MAX_COUNTER = 100_000_000
@@ -47,6 +47,7 @@ CACHE_FIELDS = {
     "setup_writes",
     "total_i2c_transactions",
     "total_otp_blows",
+    "barrier_audit",
     "trace_file_b64",
     "trace_file_sha256",
     "erase_trace_file_b64",
@@ -304,6 +305,7 @@ def _validate_cache_payload(payload: Any) -> Dict[str, Any]:
             or value < 0
         ):
             raise ValueError("{} must be a finite non-negative number or null".format(name))
+    validate_barrier_audit(payload["barrier_audit"])
 
     trace_csv = _decode_artifact(payload, "trace_file_b64")
     erase_csv = _decode_artifact(payload, "erase_trace_file_b64")
@@ -493,6 +495,7 @@ def save_calibration(
         "setup_writes": cal.setup_writes,
         "total_i2c_transactions": cal.total_i2c_transactions,
         "total_otp_blows": cal.total_otp_blows,
+        "barrier_audit": validate_barrier_audit(cal.barrier_audit),
         "trace_file_b64": trace_b64,
         "trace_file_sha256": trace_sha256,
         "erase_trace_file_b64": erase_trace_b64,
@@ -620,4 +623,5 @@ def load_calibration(
         setup_writes=payload.get("setup_writes", 0),
         total_i2c_transactions=payload.get("total_i2c_transactions", 0),
         total_otp_blows=payload.get("total_otp_blows", 0),
+        barrier_audit=validate_barrier_audit(payload.get("barrier_audit")),
     )

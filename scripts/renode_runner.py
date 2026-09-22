@@ -916,6 +916,102 @@ class CalibrationResult:
     setup_writes: int = 0
     total_i2c_transactions: int = 0
     total_otp_blows: int = 0
+    barrier_audit: Optional[Dict[str, Any]] = None
+
+
+def validate_barrier_audit(value: Any) -> Optional[Dict[str, Any]]:
+    """Validate and normalize one writeback calibration barrier diagnostic."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("barrier audit must be an object or null")
+    if set(value) == {"error"}:
+        error = value["error"]
+        if not isinstance(error, str) or not error.strip() or len(error) > 4096:
+            raise ValueError("barrier audit error must be a bounded non-empty string")
+        return {"error": error}
+
+    required = {
+        "total_phases",
+        "phases",
+        "total_barrier_events",
+        "missing_barriers",
+        "verdict",
+    }
+    if set(value) != required:
+        raise ValueError("barrier audit fields are invalid")
+
+    def count(container: Dict[str, Any], name: str) -> int:
+        result = container.get(name)
+        if (
+            not isinstance(result, int)
+            or isinstance(result, bool)
+            or result < 0
+            or result > 100_000_000
+        ):
+            raise ValueError(
+                "barrier audit {} must be a bounded non-negative integer".format(
+                    name
+                )
+            )
+        return result
+
+    phases_raw = value["phases"]
+    if not isinstance(phases_raw, list):
+        raise ValueError("barrier audit phases must be a list")
+    phases: List[Dict[str, Any]] = []
+    for index, phase_raw in enumerate(phases_raw):
+        if not isinstance(phase_raw, dict) or set(phase_raw) != {
+            "domain",
+            "start_write",
+            "end_write",
+            "write_count",
+            "barrier_at_end",
+        }:
+            raise ValueError("barrier audit phase {} fields are invalid".format(index))
+        domain = phase_raw["domain"]
+        if not isinstance(domain, str) or not domain or len(domain) > 256:
+            raise ValueError("barrier audit phase {} domain is invalid".format(index))
+        start_write = count(phase_raw, "start_write")
+        end_write = count(phase_raw, "end_write")
+        write_count = count(phase_raw, "write_count")
+        barrier_at_end = phase_raw["barrier_at_end"]
+        if end_write < start_write or write_count <= 0:
+            raise ValueError("barrier audit phase {} range is invalid".format(index))
+        if not isinstance(barrier_at_end, bool):
+            raise ValueError(
+                "barrier audit phase {} barrier_at_end must be boolean".format(
+                    index
+                )
+            )
+        phases.append(
+            {
+                "domain": domain,
+                "start_write": start_write,
+                "end_write": end_write,
+                "write_count": write_count,
+                "barrier_at_end": barrier_at_end,
+            }
+        )
+
+    total_phases = count(value, "total_phases")
+    total_barrier_events = count(value, "total_barrier_events")
+    missing_barriers = count(value, "missing_barriers")
+    if total_phases != len(phases):
+        raise ValueError("barrier audit total_phases does not match phases")
+    observed_missing = sum(1 for phase in phases if not phase["barrier_at_end"])
+    if missing_barriers != observed_missing:
+        raise ValueError("barrier audit missing_barriers does not match phases")
+    expected_verdict = "ok" if missing_barriers == 0 else "missing_barriers"
+    if value["verdict"] != expected_verdict:
+        raise ValueError("barrier audit verdict does not match phases")
+    return {
+        "total_phases": total_phases,
+        "phases": phases,
+        "total_barrier_events": total_barrier_events,
+        "missing_barriers": missing_barriers,
+        "verdict": expected_verdict,
+    }
 
 
 def calibration_completed(
@@ -1038,6 +1134,7 @@ def run_calibration(
         setup_writes=int(data.get("setup_writes", 0)),
         total_i2c_transactions=int(data.get("total_i2c_transactions", 0)),
         total_otp_blows=int(data.get("total_otp_blows", 0)),
+        barrier_audit=validate_barrier_audit(data.get("barrier_audit")),
     )
 
 

@@ -266,6 +266,28 @@ class TestSaveLoadCalibration(unittest.TestCase):
             setup_writes=10,
             total_i2c_transactions=2,
             total_otp_blows=0,
+            barrier_audit={
+                "total_phases": 2,
+                "phases": [
+                    {
+                        "domain": "staging",
+                        "start_write": 1,
+                        "end_write": 4,
+                        "write_count": 4,
+                        "barrier_at_end": False,
+                    },
+                    {
+                        "domain": "exec",
+                        "start_write": 5,
+                        "end_write": 8,
+                        "write_count": 4,
+                        "barrier_at_end": True,
+                    },
+                ],
+                "total_barrier_events": 1,
+                "missing_barriers": 1,
+                "verdict": "missing_barriers",
+            },
         )
 
     def test_save_and_load_match(self):
@@ -286,6 +308,7 @@ class TestSaveLoadCalibration(unittest.TestCase):
         self.assertEqual(loaded.setup_writes, 10)
         self.assertEqual(loaded.total_i2c_transactions, 2)
         self.assertEqual(loaded.total_otp_blows, 0)
+        self.assertEqual(loaded.barrier_audit, cal.barrier_audit)
 
     def test_cache_miss_wrong_key(self):
         cal = self._make_cal()
@@ -539,8 +562,21 @@ class TestSaveLoadCalibration(unittest.TestCase):
             payload = json.load(f)
 
         self.assertEqual(payload["cache_key"], "k")
-        self.assertEqual(payload["version"], 4)
+        self.assertEqual(payload["version"], 5)
         self.assertEqual(payload["total_writes"], 100)
+
+    def test_rejects_malformed_barrier_audit(self):
+        cal = self._make_cal()
+        cal.barrier_audit = {
+            "total_phases": 1,
+            "phases": [],
+            "total_barrier_events": 0,
+            "missing_barriers": 0,
+            "verdict": "ok",
+        }
+
+        with self.assertRaisesRegex(ValueError, "total_phases"):
+            save_calibration(self.cache_path, cal, "bad-barrier-audit")
 
     def test_rejects_tampered_counter_and_trace(self):
         trace_data = (

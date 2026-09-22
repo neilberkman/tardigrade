@@ -24,6 +24,7 @@ from renode_runner import (
     CalibrationResult,
     calibration_completed,
     run_single_point,
+    validate_barrier_audit,
 )
 from profile_loader import ELFFile, ProfileConfig, UpdateTrigger
 
@@ -1027,6 +1028,7 @@ def _calibration_from_raw_data(profile: ProfileConfig, data: Dict[str, Any]) -> 
             data, "total_i2c_transactions"
         ),
         total_otp_blows=_strict_nonnegative_counter(data, "total_otp_blows"),
+        barrier_audit=validate_barrier_audit(data.get("barrier_audit")),
     )
 
 

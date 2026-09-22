@@ -106,6 +106,21 @@ class AuditQuickStateEvaluatorTests(unittest.TestCase):
                 erase_trace_file_bin=None,
                 program_trace_file=str(program_trace_file),
                 stop_reason="vtor_captured",
+                barrier_audit={
+                    "total_phases": 1,
+                    "phases": [
+                        {
+                            "domain": "exec",
+                            "start_write": 1,
+                            "end_write": 2,
+                            "write_count": 2,
+                            "barrier_at_end": True,
+                        }
+                    ],
+                    "total_barrier_events": 1,
+                    "missing_barriers": 0,
+                    "verdict": "ok",
+                },
             )
 
             def fake_run_runtime_sweep(**kwargs):
@@ -209,6 +224,9 @@ class AuditQuickStateEvaluatorTests(unittest.TestCase):
             self.assertEqual(
                 payload["calibration"]["coverage"]["write_trace_source"],
                 "exact_mram_program_trace",
+            )
+            self.assertEqual(
+                payload["calibration"]["barrier_audit"]["verdict"], "ok"
             )
 
 
