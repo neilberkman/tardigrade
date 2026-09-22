@@ -376,6 +376,7 @@ class SuccessCriteria:
         "marker_value",
         "image_hash",
         "expected_image",
+        "allowed_images",
         "image_hash_slot",
         "otadata_expect",
         "otadata_expect_scope",
@@ -395,6 +396,7 @@ class SuccessCriteria:
         marker_value: Optional[int] = None,
         image_hash: bool = False,
         expected_image: Optional[str] = None,
+        allowed_images: Optional[List[str]] = None,
         image_hash_slot: Optional[str] = None,
         otadata_expect: Optional[Dict[str, List[str]]] = None,
         otadata_expect_scope: str = "always",
@@ -411,6 +413,7 @@ class SuccessCriteria:
         self.marker_value = marker_value
         self.image_hash = image_hash
         self.expected_image = expected_image
+        self.allowed_images = list(allowed_images or [])
         self.image_hash_slot = image_hash_slot
         self.otadata_expect = otadata_expect or {}
         self.otadata_expect_scope = otadata_expect_scope
@@ -1328,6 +1331,34 @@ class RcInjectionConfig:
 ReturnCodeInjectionConfig = RcInjectionConfig
 
 
+class CalibrationStopConfig:
+    """Optional operation boundary for execute-mode calibration."""
+
+    __slots__ = ("address", "success_criteria")
+
+    def __init__(
+        self,
+        address: Optional[int] = None,
+        success_criteria: bool = False,
+    ) -> None:
+        if address is not None:
+            address = int(address)
+            if address <= 0 or address > 0xFFFFFFFF:
+                raise ProfileError(
+                    "fault_sweep.calibration_stop.address must be a nonzero 32-bit address"
+                )
+            if address % 2:
+                raise ProfileError(
+                    "fault_sweep.calibration_stop.address must be halfword-aligned"
+                )
+        self.address = address
+        self.success_criteria = bool(success_criteria)
+
+    @property
+    def enabled(self) -> bool:
+        return self.address is not None or self.success_criteria
+
+
 class FaultSweepConfig:
     __slots__ = (
         "mode",
@@ -1350,6 +1381,7 @@ class FaultSweepConfig:
         "boot_cycle_hook",
         "vtor_settle_iters",
         "tracking_start_address",
+        "calibration_stop",
         "expected_rollback_at_cycle",
         "phase2_fault",
         "hook_fault",
@@ -1398,6 +1430,7 @@ class FaultSweepConfig:
         boot_cycle_hook: Optional[str] = None,
         vtor_settle_iters: int = 0,
         tracking_start_address: int = 0,
+        calibration_stop: Optional["CalibrationStopConfig"] = None,
         expected_rollback_at_cycle: Optional[int] = None,
         phase2_fault: Optional["Phase2FaultConfig"] = None,
         hook_fault: Optional["HookFaultConfig"] = None,
@@ -1480,6 +1513,7 @@ class FaultSweepConfig:
             raise ProfileError(
                 "fault_sweep.tracking_start_address must be a 32-bit address"
             )
+        self.calibration_stop = calibration_stop or CalibrationStopConfig()
         self.calibration_time_slice = (
             str(calibration_time_slice).strip()
             if calibration_time_slice
@@ -2176,7 +2210,6 @@ class ProfileConfig:
         if exec_slot is not None and exec_slot.size > page_size:
             data_size = exec_slot.size - page_size
         pad_byte = 0x00 if str(self.flash_backend or "").strip().lower() == "mram" else 0xFF
-
         digests: Dict[str, str] = {}
         for img_name, img_path in images.items():
             resolved = self.resolve_path(repo_root, img_path)
@@ -2201,6 +2234,22 @@ class ProfileConfig:
         expected_name = criteria.expected_image or "staging"
         if expected_name in digests:
             expected_exec_sha256 = digests[expected_name]
+        allowed_image_hashes = [
+            {"name": name, "sha256": digests[name]}
+            for name in criteria.allowed_images
+            if name in digests
+        ]
+        digest_names: Dict[str, List[str]] = {}
+        for entry in allowed_image_hashes:
+            digest_names.setdefault(entry["sha256"], []).append(entry["name"])
+        collisions = [names for names in digest_names.values() if len(names) > 1]
+        if collisions:
+            raise ProfileError(
+                "success_criteria.allowed_images contains indistinguishable image "
+                "content: {}".format(
+                    "; ".join(", ".join(names) for names in collisions)
+                )
+            )
 
         return {
             "vtor_in_slot": criteria.vtor_in_slot or "",
@@ -2210,6 +2259,8 @@ class ProfileConfig:
             "marker_value": criteria.marker_value,
             "image_hash": bool(criteria.image_hash),
             "expected_image": criteria.expected_image or "",
+            "allowed_images": list(criteria.allowed_images),
+            "allowed_image_hashes": allowed_image_hashes,
             "image_hash_slot": criteria.image_hash_slot or "",
             "image_exec_sha256": digests.get("exec", ""),
             "image_staging_sha256": digests.get("staging", ""),
@@ -2447,6 +2498,14 @@ class ProfileConfig:
                 ).encode("utf-8")
             ).decode("ascii")
             vars_list.append("VOLATILE_REGIONS_B64:{}".format(encoded_volatile))
+        if fs.calibration_stop.address is not None:
+            vars_list.append(
+                "CALIBRATION_STOP_ADDRESS:0x{:08X}".format(
+                    fs.calibration_stop.address
+                )
+            )
+        if fs.calibration_stop.success_criteria:
+            vars_list.append("CALIBRATION_STOP_ON_SUCCESS:true")
         if fs.calibration_time_slice:
             vars_list.append(
                 "CALIBRATION_TIME_SLICE:{}".format(fs.calibration_time_slice)
@@ -2611,10 +2670,37 @@ class ProfileConfig:
                 vars_list.append("IMAGE_{}_SHA256:{}".format(img_name.upper(), digest))
             # expected_image: which image should be in exec after a successful operation.
             expected = sc.expected_image or "staging"
+            vars_list.append("EXPECTED_IMAGE_NAME:{}".format(sc.expected_image or ""))
             if expected in image_digests:
                 vars_list.append("EXPECTED_EXEC_SHA256:{}".format(image_digests[expected]))
             else:
                 vars_list.append("EXPECTED_EXEC_SHA256:")
+            allowed_payload = [
+                {"name": name, "sha256": image_digests[name]}
+                for name in sc.allowed_images
+            ]
+            digest_names: Dict[str, List[str]] = {}
+            for entry in allowed_payload:
+                digest_names.setdefault(entry["sha256"], []).append(entry["name"])
+            collisions = [names for names in digest_names.values() if len(names) > 1]
+            if collisions:
+                raise ProfileError(
+                    "success_criteria.allowed_images contains indistinguishable image "
+                    "content: {}".format(
+                        "; ".join(", ".join(names) for names in collisions)
+                    )
+                )
+            if allowed_payload:
+                encoded_allowed = base64.b64encode(
+                    json.dumps(
+                        allowed_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).decode("ascii")
+                vars_list.append(
+                    "ALLOWED_IMAGE_HASHES_B64:{}".format(encoded_allowed)
+                )
 
         # Pre-boot state.
         pre_boot_bin = self.generate_pre_boot_bin()
@@ -3248,6 +3334,34 @@ def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
     )
 
 
+def _parse_allowed_images(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not raw:
+        raise ProfileError(
+            "success_criteria.allowed_images: expected a non-empty list of image names"
+        )
+    names: List[str] = []
+    seen = set()
+    for index, value in enumerate(raw):
+        if not isinstance(value, str) or not value.strip():
+            raise ProfileError(
+                "success_criteria.allowed_images[{}]: expected a non-empty string".format(
+                    index
+                )
+            )
+        name = value.strip()
+        if name in seen:
+            raise ProfileError(
+                "success_criteria.allowed_images[{}]: duplicate image name {!r}".format(
+                    index, name
+                )
+            )
+        seen.add(name)
+        names.append(name)
+    return names
+
+
 def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
     if raw is None:
         return SuccessCriteria()
@@ -3258,16 +3372,27 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         raise ProfileError(
             "success_criteria.otadata_expect_scope: expected 'always' or 'control'"
         )
+    image_hash = _parse_bool(
+        raw.get("image_hash", False), "success_criteria.image_hash"
+    )
+    allowed_images = _parse_allowed_images(raw.get("allowed_images"))
+    if allowed_images and raw.get("expected_image") is not None:
+        raise ProfileError(
+            "success_criteria: expected_image and allowed_images are alternatives; use only one"
+        )
+    if allowed_images and not image_hash:
+        raise ProfileError(
+            "success_criteria.allowed_images requires success_criteria.image_hash: true"
+        )
     return SuccessCriteria(
         vtor_in_slot=raw.get("vtor_in_slot"),
         vector_table_offset=_parse_int(raw.get("vector_table_offset", 0), "success_criteria.vector_table_offset"),
         pc_in_slot=raw.get("pc_in_slot"),
         marker_address=_parse_int(raw["marker_address"], "success_criteria.marker_address") if "marker_address" in raw else None,
         marker_value=_parse_int(raw["marker_value"], "success_criteria.marker_value") if "marker_value" in raw else None,
-        image_hash=_parse_bool(
-            raw.get("image_hash", False), "success_criteria.image_hash"
-        ),
+        image_hash=image_hash,
         expected_image=raw.get("expected_image"),
+        allowed_images=allowed_images,
         image_hash_slot=raw.get("image_hash_slot"),
         otadata_expect=_parse_otadata_expect(raw.get("otadata_expect")),
         otadata_expect_scope=otadata_expect_scope,
@@ -3283,6 +3408,25 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         ),
         memory_checks=_parse_memory_checks(raw.get("memory_checks")),
     )
+
+
+def _validate_success_image_names(
+    criteria: SuccessCriteria,
+    images: Dict[str, str],
+    context: str,
+) -> None:
+    names = list(criteria.allowed_images)
+    if criteria.expected_image:
+        names.append(str(criteria.expected_image))
+    for name in names:
+        if name not in images:
+            raise ProfileError(
+                "{}.{}={!r} is not present in the effective images mapping".format(
+                    context,
+                    "allowed_images" if criteria.allowed_images else "expected_image",
+                    name,
+                )
+            )
 
 
 def _parse_terminal_error_paths(raw: Optional[Any]) -> List[TerminalErrorPathConfig]:
@@ -3599,6 +3743,39 @@ def _warn_fault_backend_compat(
             )
 
 
+def _parse_calibration_stop(raw: Any) -> CalibrationStopConfig:
+    if raw is None:
+        return CalibrationStopConfig()
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep.calibration_stop: expected mapping")
+    unknown = sorted(set(raw) - {"address", "success_criteria"})
+    if unknown:
+        raise ProfileError(
+            "fault_sweep.calibration_stop: unknown field(s): {}".format(
+                ", ".join(map(str, unknown))
+            )
+        )
+    address = None
+    if "address" in raw:
+        address = _parse_int(
+            raw.get("address"),
+            "fault_sweep.calibration_stop.address",
+        )
+    success_criteria = _parse_bool(
+        raw.get("success_criteria", False),
+        "fault_sweep.calibration_stop.success_criteria",
+    )
+    config = CalibrationStopConfig(
+        address=address,
+        success_criteria=success_criteria,
+    )
+    if not config.enabled:
+        raise ProfileError(
+            "fault_sweep.calibration_stop must configure address and/or success_criteria: true"
+        )
+    return config
+
+
 def _parse_fault_sweep(
     raw: Optional[Dict[str, Any]],
     *,
@@ -3770,6 +3947,7 @@ def _parse_fault_sweep(
             raw.get("tracking_start_address", 0),
             "fault_sweep.tracking_start_address",
         ),
+        calibration_stop=_parse_calibration_stop(raw.get("calibration_stop")),
         expected_rollback_at_cycle=expected_rollback_at_cycle,
         phase2_fault=_parse_phase2_fault(raw.get("phase2_fault")),
         hook_fault=hook_fault,
@@ -5742,8 +5920,14 @@ def _parse_update_sequence(
                 "update_sequence[{}]: phase has no effective start images".format(idx)
             )
         phase.start_images = start_images
+        _validate_success_image_names(
+            phase.success_criteria,
+            start_images,
+            "update_sequence[{}].success_criteria".format(idx),
+        )
         current_images = dict(start_images)
         expected_name = phase.success_criteria.expected_image
+        allowed_names = phase.success_criteria.allowed_images
         is_last = idx == len(phases) - 1
         if expected_name:
             if expected_name not in start_images:
@@ -5752,6 +5936,12 @@ def _parse_update_sequence(
                     "is not present in the phase images".format(idx, expected_name)
                 )
             current_images["exec"] = start_images[expected_name]
+        elif allowed_names and not is_last and not phase.fault_injection:
+            raise ProfileError(
+                "update_sequence[{}] ('{}'): clean phases that precede another phase "
+                "must use scalar success_criteria.expected_image; allowed_images cannot "
+                "determine the next phase's exec image".format(idx, phase.name)
+            )
         elif not is_last and not phase.fault_injection:
             # Clean phases that feed into subsequent phases MUST declare
             # expected_image so the next phase knows which image ended up
@@ -5975,6 +6165,7 @@ def _parse_component(
             extra_peripherals = [str(extra_peripherals_raw)]
 
     success_criteria = _parse_success_criteria(raw.get("success_criteria"))
+    _validate_success_image_names(success_criteria, images, ctx + ".success_criteria")
     fault_sweep = (
         _parse_fault_sweep(
             raw.get("fault_sweep"),
@@ -6096,6 +6287,10 @@ def _parse_invariant_config(raw: Optional[Any]) -> Dict[str, Any]:
                 names.add(name)
     if "state_relations" in parsed:
         _validate_state_relations_config(parsed["state_relations"])
+    if "transaction_state_isolation" in parsed:
+        _validate_transaction_state_isolation_config(
+            parsed["transaction_state_isolation"]
+        )
     if "persistent_state_fail_closed" in parsed:
         _validate_persistent_state_fail_closed_config(
             parsed["persistent_state_fail_closed"]
@@ -6251,6 +6446,46 @@ def _validate_state_relations_config(raw: Any) -> None:
                 raise ProfileError("{}: values must be scalar".format(tuple_context)) from exc
             if duplicate:
                 raise ProfileError("{}: duplicate allowed tuple".format(tuple_context))
+
+
+def _validate_transaction_state_isolation_config(raw: Any) -> None:
+    """Validate the cross-transaction state isolation invariant contract."""
+    context = "invariant_config.transaction_state_isolation"
+    if not isinstance(raw, dict):
+        raise ProfileError("{}: expected mapping".format(context))
+    unknown = sorted(set(raw) - {"paths", "fields", "reset_phases", "clear_phases"})
+    if unknown:
+        raise ProfileError(
+            "{}: unknown field(s): {}".format(context, ", ".join(map(str, unknown)))
+        )
+    if "paths" in raw and "fields" in raw:
+        raise ProfileError("{}: use only one of paths or fields".format(context))
+    paths = raw.get("paths", raw.get("fields"))
+    if not isinstance(paths, list) or not paths:
+        raise ProfileError("{}.paths: expected a non-empty list".format(context))
+    for index, path in enumerate(paths):
+        if isinstance(path, dict):
+            if set(path) != {"path"}:
+                raise ProfileError(
+                    "{}.paths[{}]: mapping must contain only path".format(context, index)
+                )
+            path = path.get("path")
+        if not isinstance(path, str) or not path.strip():
+            raise ProfileError(
+                "{}.paths[{}]: expected a non-empty string".format(context, index)
+            )
+    if "reset_phases" in raw and "clear_phases" in raw:
+        raise ProfileError("{}: use only one of reset_phases or clear_phases".format(context))
+    reset_phases = raw.get("reset_phases", raw.get("clear_phases"))
+    if not isinstance(reset_phases, list) or not reset_phases:
+        raise ProfileError(
+            "{}.reset_phases: expected a non-empty list".format(context)
+        )
+    for index, phase in enumerate(reset_phases):
+        if not isinstance(phase, str) or not phase.strip():
+            raise ProfileError(
+                "{}.reset_phases[{}]: expected a non-empty string".format(context, index)
+            )
 
 
 def _validate_success_implies_effect_config(raw: Any) -> None:
@@ -6500,7 +6735,8 @@ _STRICT_TOP_LEVEL_KEYS = frozenset(
 _STRICT_SUCCESS_CRITERIA_KEYS = frozenset(
     {
         "vtor_in_slot", "vector_table_offset", "pc_in_slot", "marker_address",
-        "marker_value", "image_hash", "expected_image", "image_hash_slot",
+        "marker_value", "image_hash", "expected_image", "allowed_images",
+        "image_hash_slot",
         "otadata_expect", "otadata_expect_scope", "bootloader_integrity",
         "config_checks", "boot_register_values", "max_reset_vector_offset",
         "memory_checks",
@@ -6516,7 +6752,7 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
         "evaluation_mode", "sweep_strategy", "sweep_hash_bypass_symbols",
         "progress_stall_timeout_s", "boot_cycles", "boot_cycle_hook",
         "vtor_settle_iters",
-        "tracking_start_address",
+        "tracking_start_address", "calibration_stop",
         "expected_rollback_at_cycle", "phase2_fault", "hook_fault",
         "confirm_cycle", "multi_fault", "read_fault_config",
         "instruction_skip_config", "timed_bit_corruption_config",
@@ -6801,6 +7037,7 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
                 "severity_model",
             },
             "timed_bit_corruption_config": {"pairs"},
+            "calibration_stop": {"address", "success_criteria"},
             "verification_bypass_probe": {"enabled", "probe_functions"},
             "metadata_fault": {"enabled", "fault_types"},
             "metadata_delta": {"enabled", "fields"},
@@ -7415,6 +7652,15 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
     state_probe = _parse_state_probe(data.get("state_probe"))
 
     success_criteria = _parse_success_criteria(data.get("success_criteria"))
+    # Preserve scalar expected_image compatibility for update sequences that
+    # introduce the named image in a later phase. The new allowed_images list
+    # is unambiguous only when every member exists in the current declaration.
+    if success_criteria.allowed_images:
+        _validate_success_image_names(
+            success_criteria,
+            images,
+            "success_criteria",
+        )
     success_criteria_overrides = _parse_success_criteria_overrides(
         data.get("success_criteria_overrides")
     )
@@ -7423,12 +7669,43 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         bootloader_elf=bootloader_elf,
         profile_path=path,
     )
+    if (
+        fault_sweep.calibration_stop.enabled
+        and str(fault_sweep.evaluation_mode or "").strip().lower() == "state"
+    ):
+        raise ProfileError(
+            "fault_sweep.calibration_stop requires execute evaluation mode"
+        )
     update_sequence = _parse_update_sequence(
         data.get("update_sequence"),
         images=images,
         success_criteria=success_criteria,
         fault_sweep=fault_sweep,
     )
+    if fault_sweep.calibration_stop.success_criteria:
+        stop_criteria = (
+            update_sequence[-1].success_criteria
+            if update_sequence
+            else success_criteria
+        )
+        if not any(
+            (
+                stop_criteria.vtor_in_slot,
+                stop_criteria.pc_in_slot,
+                stop_criteria.marker_address is not None,
+                stop_criteria.image_hash,
+                stop_criteria.otadata_expect,
+                stop_criteria.bootloader_integrity,
+                stop_criteria.config_checks,
+                stop_criteria.boot_register_values,
+                stop_criteria.memory_checks,
+                stop_criteria.max_reset_vector_offset is not None,
+            )
+        ):
+            raise ProfileError(
+                "fault_sweep.calibration_stop.success_criteria requires an observable "
+                "success_criteria check"
+            )
     if update_sequence and setup_script:
         raise ProfileError(
             "setup_script is not supported with update_sequence — "
@@ -7476,6 +7753,12 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
     if "state_relations" in invariants and not state_relations:
         raise ProfileError(
             "invariants includes state_relations but invariant_config.state_relations is missing"
+        )
+    transaction_isolation = invariant_config.get("transaction_state_isolation")
+    if "transaction_state_isolation" in invariants and not transaction_isolation:
+        raise ProfileError(
+            "invariants includes transaction_state_isolation but "
+            "invariant_config.transaction_state_isolation is missing"
         )
     if (
         "persistent_state_fail_closed" in invariants
@@ -7776,7 +8059,13 @@ def main() -> int:
         "expect_required_issue_reasons": profile.expect.required_issue_reasons,
         "expect_ignored_issue_fault_types": profile.expect.ignored_issue_fault_types,
         "image_hash": profile.success_criteria.image_hash,
+        "expected_image": profile.success_criteria.expected_image,
+        "allowed_images": profile.success_criteria.allowed_images,
         "image_hash_slot": profile.success_criteria.image_hash_slot,
+        "calibration_stop": {
+            "address": profile.fault_sweep.calibration_stop.address,
+            "success_criteria": profile.fault_sweep.calibration_stop.success_criteria,
+        },
         "otadata_expect": profile.success_criteria.otadata_expect,
         "otadata_expect_scope": profile.success_criteria.otadata_expect_scope,
         "state_probe": (

@@ -838,7 +838,11 @@ def _prefers_triggered_upgrade(profile: ProfileConfig, repo_root: Path) -> bool:
     if criteria is None:
         return False
     expected_image = str(getattr(criteria, "expected_image", "") or "").strip().lower()
-    if expected_image == "staging":
+    allowed_images = {
+        str(name).strip().lower()
+        for name in (getattr(criteria, "allowed_images", []) or [])
+    }
+    if expected_image == "staging" or "staging" in allowed_images:
         return True
     marker_address = getattr(criteria, "marker_address", None)
     marker_value = getattr(criteria, "marker_value", None)
@@ -1011,6 +1015,7 @@ def _calibration_from_raw_data(profile: ProfileConfig, data: Dict[str, Any]) -> 
         trace_file_bin=data.get("trace_file_bin"),
         erase_trace_file_bin=data.get("erase_trace_file_bin"),
         calibration_exec_hash=data.get("calibration_exec_hash"),
+        calibration_matched_image=data.get("calibration_matched_image"),
         calibration_boot_outcome=data.get("calibration_boot_outcome"),
         stop_reason=data.get("calibration_stop_reason"),
         emulated_s=data.get("calibration_emulated_s"),
@@ -1383,10 +1388,15 @@ def _trace_less_content_evidence(
         and marker_actual == marker_value
     )
 
-    expected_name = str(getattr(criteria, "expected_image", None) or "staging").strip()
+    allowed_names = list(getattr(criteria, "allowed_images", []) or [])
+    candidate_names = allowed_names or [
+        str(getattr(criteria, "expected_image", None) or "staging").strip()
+    ]
     exec_hash = _image_digest_for_evidence(profile, repo_root, "exec")
-    target_hash = _image_digest_for_evidence(profile, repo_root, expected_name)
-    hashes_distinct = bool(exec_hash and target_hash and exec_hash != target_hash)
+    candidate_hashes = {
+        name: _image_digest_for_evidence(profile, repo_root, name)
+        for name in candidate_names
+    }
     observed_hashes = []
     for value in (
         data.get("calibration_exec_hash"),
@@ -1400,6 +1410,34 @@ def _trace_less_content_evidence(
             return None
         observed_hashes.append(normalized)
     observed_hash = observed_hashes[0] if observed_hashes else None
+    matching_names = [
+        name
+        for name, digest in candidate_hashes.items()
+        if digest is not None and observed_hash == digest
+    ]
+    runtime_names = [
+        str(value).strip()
+        for value in (
+            data.get("calibration_matched_image"),
+            signals.get("matched_image"),
+        )
+        if value is not None
+    ]
+    if runtime_names and (
+        len(set(runtime_names)) != 1
+        or not matching_names
+        or runtime_names[0] not in matching_names
+    ):
+        return None
+    if bool(getattr(criteria, "image_hash", False)) and len(matching_names) != 1:
+        return None
+    expected_name = (
+        matching_names[0]
+        if matching_names
+        else candidate_names[0]
+    )
+    target_hash = candidate_hashes.get(expected_name)
+    hashes_distinct = bool(exec_hash and target_hash and exec_hash != target_hash)
     hash_evidence = bool(
         hashes_distinct
         and observed_hash is not None
@@ -1461,7 +1499,11 @@ def _trace_less_content_evidence(
     elif marker_evidence:
         kind = "exact_marker"
     elif hash_configured and hash_evidence:
-        kind = "exact_expected_image_hash"
+        kind = (
+            "exact_allowed_image_hash"
+            if allowed_names
+            else "exact_expected_image_hash"
+        )
     else:
         return None
     return {

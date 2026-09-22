@@ -61,6 +61,8 @@ ${BOOT_CYCLES}                 1
 ${VTOR_SETTLE_ITERS}           0
 ${TRACKING_START_ADDRESS}      0
 ${HEURISTIC_TRACE_REQUIRED}    false
+${CALIBRATION_STOP_ADDRESS}    ${EMPTY}
+${CALIBRATION_STOP_ON_SUCCESS}    false
 ${CALIBRATION_TIME_SLICE}      ${EMPTY}
 ${PHASE1_TIME_SLICE}           ${EMPTY}
 ${PHASE2_TIME_SLICE}           ${EMPTY}
@@ -74,6 +76,8 @@ ${SUCCESS_IMAGE_HASH_SLOT}     ${EMPTY}
 ${IMAGE_EXEC_SHA256}           ${EMPTY}
 ${IMAGE_STAGING_SHA256}        ${EMPTY}
 ${EXPECTED_EXEC_SHA256}        ${EMPTY}
+${EXPECTED_IMAGE_NAME}         ${EMPTY}
+${ALLOWED_IMAGE_HASHES_B64}    ${EMPTY}
 ${SUCCESS_OTADATA_EXPECT}      ${EMPTY}
 ${SUCCESS_OTADATA_EXPECT_SCOPE}    always
 ${SUCCESS_CHECKS_B64}         ${EMPTY}
@@ -235,6 +239,8 @@ Run Runtime Fault Point
     Execute Command    $boot_cycles="${BOOT_CYCLES}"
     Execute Command    $vtor_settle_iters="${VTOR_SETTLE_ITERS}"
     Execute Command    $tracking_start_address="${TRACKING_START_ADDRESS}"
+    Execute Command    $calibration_stop_address="${CALIBRATION_STOP_ADDRESS}"
+    Execute Command    $calibration_stop_on_success="${CALIBRATION_STOP_ON_SUCCESS}"
     Run Keyword If    '${CALIBRATION_TIME_SLICE}' != ''    Execute Command    $calibration_time_slice="${CALIBRATION_TIME_SLICE}"
     Run Keyword If    '${PHASE1_TIME_SLICE}' != ''    Execute Command    $phase1_time_slice="${PHASE1_TIME_SLICE}"
     Run Keyword If    '${PHASE2_TIME_SLICE}' != ''    Execute Command    $phase2_time_slice="${PHASE2_TIME_SLICE}"
@@ -247,6 +253,8 @@ Run Runtime Fault Point
     Execute Command    $image_exec_sha256="${IMAGE_EXEC_SHA256}"
     Execute Command    $image_staging_sha256="${IMAGE_STAGING_SHA256}"
     Execute Command    $expected_exec_sha256="${EXPECTED_EXEC_SHA256}"
+    Execute Command    $expected_image_name="${EXPECTED_IMAGE_NAME}"
+    Execute Command    $allowed_image_hashes_b64="${ALLOWED_IMAGE_HASHES_B64}"
     Execute Command    $success_otadata_expect="${SUCCESS_OTADATA_EXPECT}"
     Execute Command    $success_otadata_expect_scope="${SUCCESS_OTADATA_EXPECT_SCOPE}"
     Execute Command    $success_checks_b64="${SUCCESS_CHECKS_B64}"

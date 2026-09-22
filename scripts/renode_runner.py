@@ -906,6 +906,7 @@ class CalibrationResult:
     trace_file_bin: Optional[str]
     erase_trace_file_bin: Optional[str]
     calibration_exec_hash: Optional[str] = None
+    calibration_matched_image: Optional[str] = None
     calibration_boot_outcome: Optional[str] = None
     stop_reason: Optional[str] = None
     emulated_s: Optional[float] = None
@@ -1026,6 +1027,7 @@ def run_calibration(
         trace_file_bin=data.get("trace_file_bin"),
         erase_trace_file_bin=data.get("erase_trace_file_bin"),
         calibration_exec_hash=data.get("calibration_exec_hash"),
+        calibration_matched_image=data.get("calibration_matched_image"),
         calibration_boot_outcome=data.get("calibration_boot_outcome"),
         stop_reason=stop_reason,
         emulated_s=data.get("calibration_emulated_s"),

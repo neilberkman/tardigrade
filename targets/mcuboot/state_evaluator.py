@@ -244,6 +244,8 @@ def predict_boot_outcome(
         marker_ok = int(marker_actual) == int(marker_value)
 
     hash_result = None
+    matched_image = None
+    actual_hash = None
     if bool(slot_config.get("image_hash")) and final_vector["valid"]:
         actual_hash = _hash_slot_bytes(
             final_slot["bytes"],
@@ -254,15 +256,34 @@ def predict_boot_outcome(
         exec_hash = str(slot_config.get("image_exec_sha256", "") or "")
         staging_hash = str(slot_config.get("image_staging_sha256", "") or "")
         expected_hash = str(slot_config.get("expected_exec_sha256", "") or "")
-        if actual_hash and actual_hash == exec_hash:
+        expected_name = str(slot_config.get("expected_image", "") or "")
+        allowed_entries = list(slot_config.get("allowed_image_hashes", []) or [])
+        for entry in allowed_entries:
+            if actual_hash == str(entry.get("sha256", "") or ""):
+                matched_image = str(entry.get("name", "") or "") or None
+                break
+        if matched_image is None and expected_hash and actual_hash == expected_hash:
+            matched_image = expected_name or "expected"
+        if matched_image is None and actual_hash and actual_hash == exec_hash:
+            matched_image = "exec"
+        if matched_image is None and actual_hash and actual_hash == staging_hash:
+            matched_image = "staging"
+        if matched_image == "exec":
             hash_result = "exec_image"
-        elif actual_hash and actual_hash == staging_hash:
+        elif matched_image == "staging":
             hash_result = "staging_image"
-        elif expected_hash and actual_hash == expected_hash:
+        elif matched_image is not None:
             hash_result = "expected_image"
         else:
             hash_result = "unknown"
-        marker_ok = marker_ok and (not expected_hash or actual_hash == expected_hash)
+        if allowed_entries:
+            hash_ok = any(
+                actual_hash == str(entry.get("sha256", "") or "")
+                for entry in allowed_entries
+            )
+        else:
+            hash_ok = not expected_hash or actual_hash == expected_hash
+        marker_ok = marker_ok and hash_ok
 
     expectations_met = bool(final_vector["valid"]) and vtor_ok and vtor_aligned and pc_ok and marker_ok
     if not final_vector["valid"]:
@@ -299,6 +320,10 @@ def predict_boot_outcome(
     }
     if hash_result is not None:
         signals["image_hash_match"] = hash_result
+    if actual_hash is not None:
+        signals["image_hash_actual"] = actual_hash
+    if matched_image is not None:
+        signals["matched_image"] = matched_image
     image_hash_slot = str(slot_config.get("image_hash_slot", "") or "")
     if image_hash_slot:
         signals["image_hash_slot"] = image_hash_slot

@@ -502,7 +502,7 @@ class TestSaveLoadCalibration(unittest.TestCase):
             payload = json.load(f)
 
         self.assertEqual(payload["cache_key"], "k")
-        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["version"], 3)
         self.assertEqual(payload["total_writes"], 100)
 
     def test_rejects_tampered_counter_and_trace(self):

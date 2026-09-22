@@ -2599,6 +2599,9 @@ def _main_single() -> int:
             "erases": total_erases,
             "coverage": calibration_coverage,
             "stop_reason": cal.stop_reason if cal is not None else None,
+            "matched_image": (
+                cal.calibration_matched_image if cal is not None else None
+            ),
             "emulated_s": cal.emulated_s if cal is not None else None,
             "elapsed_s": cal.elapsed_s if cal is not None else None,
             "pc": cal.pc if cal is not None else None,

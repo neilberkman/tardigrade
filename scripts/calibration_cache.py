@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional
 from renode_runner import CalibrationResult
 
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 MAX_CACHE_BYTES = 256 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
 MAX_COUNTER = 100_000_000
@@ -37,6 +37,7 @@ CACHE_FIELDS = {
     "total_writes",
     "total_erases",
     "calibration_exec_hash",
+    "calibration_matched_image",
     "calibration_boot_outcome",
     "stop_reason",
     "emulated_s",
@@ -280,7 +281,12 @@ def _validate_cache_payload(payload: Any) -> Dict[str, Any]:
         not isinstance(exec_hash, str) or not SHA256_RE.fullmatch(exec_hash)
     ):
         raise ValueError("calibration_exec_hash must be lowercase SHA-256 or null")
-    for name in ("calibration_boot_outcome", "stop_reason", "pc"):
+    for name in (
+        "calibration_matched_image",
+        "calibration_boot_outcome",
+        "stop_reason",
+        "pc",
+    ):
         value = payload[name]
         if value is not None and (
             not isinstance(value, str) or not value or len(value) > 256
@@ -439,6 +445,7 @@ def save_calibration(
         "total_writes": cal.total_writes,
         "total_erases": cal.total_erases,
         "calibration_exec_hash": cal.calibration_exec_hash,
+        "calibration_matched_image": cal.calibration_matched_image,
         "calibration_boot_outcome": cal.calibration_boot_outcome,
         "stop_reason": cal.stop_reason,
         "emulated_s": cal.emulated_s,
@@ -558,6 +565,7 @@ def load_calibration(
         trace_file_bin=trace_file_bin,
         erase_trace_file_bin=erase_trace_file_bin,
         calibration_exec_hash=payload.get("calibration_exec_hash"),
+        calibration_matched_image=payload.get("calibration_matched_image"),
         calibration_boot_outcome=payload.get("calibration_boot_outcome"),
         stop_reason=payload.get("stop_reason"),
         emulated_s=payload.get("emulated_s"),

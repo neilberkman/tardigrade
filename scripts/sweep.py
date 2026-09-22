@@ -317,6 +317,10 @@ def _build_mcuboot_state_slot_config(
         "image_exec_sha256": str(criteria_runtime.get("image_exec_sha256", "") or ""),
         "image_staging_sha256": str(criteria_runtime.get("image_staging_sha256", "") or ""),
         "expected_exec_sha256": str(criteria_runtime.get("expected_exec_sha256", "") or ""),
+        "expected_image": str(criteria_runtime.get("expected_image", "") or ""),
+        "allowed_image_hashes": list(
+            criteria_runtime.get("allowed_image_hashes", []) or []
+        ),
     }
 
 

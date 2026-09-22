@@ -567,6 +567,12 @@ def refresh_runtime_handles():
     global backend, bus, console_peripherals, console_peripheral_names
     bus = monitor.Machine.SystemBus
     backend['data'] = monitor.Machine[backend['backend_sysbus_name']]
+    if (
+        backend.get('kind') == 'mram'
+        and hasattr(backend['data'], 'ProgramAddressBase')
+        and backend.get('bus_base') is not None
+    ):
+        backend['data'].ProgramAddressBase = int(backend['bus_base'])
     if backend['ctrl_sysbus_name']:
         backend['controller'] = monitor.Machine[backend['ctrl_sysbus_name']]
     if backend.get('otp_sysbus_name'):
@@ -588,6 +594,8 @@ def _machine_reset():
     refresh_runtime_handles()
     _configure_tracking_start_address()
     _configure_python_tracking_gate(force=True)
+    if '_prepare_calibration_stop' in globals():
+        _prepare_calibration_stop()
     reset_sticky_handoff_state()
 
 
@@ -938,6 +946,8 @@ if backend_bus_base is None:
     log('WARNING: backend bus base not discovered; read_bit_flip will skip with backend_unsupported')
 backend['bus_base'] = backend_bus_base
 backend['bus_size'] = backend_bus_size
+if backend['kind'] == 'mram' and hasattr(backend['data'], 'ProgramAddressBase'):
+    backend['data'].ProgramAddressBase = int(backend_bus_base or 0)
 
 # Legacy alias retained for non-read-fault call sites (slot-fill residual
 # writes, timed_bit_corruption); do not use for read-fault address
@@ -1004,6 +1014,98 @@ success_image_hash_slot = str(monitor.GetVariable('success_image_hash_slot')).st
 image_exec_sha256 = str(monitor.GetVariable('image_exec_sha256')).strip()
 image_staging_sha256 = str(monitor.GetVariable('image_staging_sha256')).strip()
 expected_exec_sha256 = str(monitor.GetVariable('expected_exec_sha256')).strip()
+expected_image_name = get_optional_var('expected_image_name', '')
+allowed_image_hashes = []
+allowed_image_hashes_raw = get_optional_var('allowed_image_hashes_b64', '')
+if allowed_image_hashes_raw:
+    try:
+        decoded_allowed = json.loads(
+            base64.b64decode(allowed_image_hashes_raw).decode('utf-8')
+        )
+        if not isinstance(decoded_allowed, list):
+            raise ValueError('decoded value is not a list')
+        seen_allowed_names = set()
+        seen_allowed_hashes = set()
+        for index, entry in enumerate(decoded_allowed):
+            if not isinstance(entry, dict):
+                raise ValueError('entry {} is not a mapping'.format(index))
+            name = str(entry.get('name', '')).strip()
+            digest = str(entry.get('sha256', '')).strip().lower()
+            if not name or len(digest) != 64 or any(ch not in '0123456789abcdef' for ch in digest):
+                raise ValueError('entry {} has invalid name or SHA-256'.format(index))
+            if name in seen_allowed_names or digest in seen_allowed_hashes:
+                raise ValueError('entry {} duplicates an allowed name or digest'.format(index))
+            seen_allowed_names.add(name)
+            seen_allowed_hashes.add(digest)
+            allowed_image_hashes.append({'name': name, 'sha256': digest})
+    except Exception as exc:
+        raise RuntimeError('allowed_image_hashes_b64: {}'.format(exc))
+
+
+calibration_stop_address = get_optional_int_var('calibration_stop_address', 0) or 0
+if calibration_stop_address < 0 or calibration_stop_address > 0xFFFFFFFF:
+    raise RuntimeError('calibration_stop_address must be a 32-bit address')
+if calibration_stop_address and calibration_stop_address % 2:
+    raise RuntimeError('calibration_stop_address must be halfword-aligned')
+calibration_stop_on_success = get_optional_var(
+    'calibration_stop_on_success', 'false'
+).strip().lower() in ('1', 'true', 'yes')
+_calibration_stop_state = {
+    'cpu': None,
+    'hook_installed': False,
+    'address_hit': False,
+    'triggered': False,
+    'reason': None,
+    'writes': None,
+    'erases': None,
+    'matched_image': None,
+    'image_hash_actual': None,
+}
+
+
+def _calibration_stop_address_hook(cpu, addr):
+    if not calibration_mode or not calibration_stop_address:
+        return
+    _calibration_stop_state['address_hit'] = True
+    _calibration_stop_state['triggered'] = True
+    _calibration_stop_state['reason'] = 'address'
+    _calibration_stop_state['writes'] = int(get_total_writes())
+    _calibration_stop_state['erases'] = int(get_total_erases())
+    cpu.IsHalted = True
+
+
+def _prepare_calibration_stop():
+    state = _calibration_stop_state
+    old_cpu = state.get('cpu')
+    if state.get('hook_installed') and old_cpu is not None:
+        try:
+            old_cpu.RemoveHook(calibration_stop_address, _calibration_stop_address_hook)
+        except Exception:
+            pass
+    state.update({
+        'cpu': None,
+        'hook_installed': False,
+        'address_hit': False,
+        'triggered': False,
+        'reason': None,
+        'writes': None,
+        'erases': None,
+        'matched_image': None,
+        'image_hash_actual': None,
+    })
+    if not calibration_mode or not calibration_stop_address:
+        return
+    cpu = monitor.Machine['sysbus.cpu']
+    try:
+        cpu.AddHook(calibration_stop_address, _calibration_stop_address_hook)
+    except Exception as exc:
+        raise RuntimeError(
+            'failed to install calibration stop hook at 0x{:08X}: {}'.format(
+                calibration_stop_address, exc
+            )
+        )
+    state['cpu'] = cpu
+    state['hook_installed'] = True
 success_otadata_expect_raw = str(monitor.GetVariable('success_otadata_expect')).strip()
 success_otadata_expect_scope = str(monitor.GetVariable('success_otadata_expect_scope')).strip().lower()
 if success_otadata_expect_scope not in ('always', 'control'):
@@ -1084,6 +1186,8 @@ _base_phase_context = {
         'image_exec_sha256': image_exec_sha256,
         'image_staging_sha256': image_staging_sha256,
         'expected_exec_sha256': expected_exec_sha256,
+        'expected_image': expected_image_name,
+        'allowed_image_hashes': list(allowed_image_hashes),
         'otadata_expect': {},
         'otadata_expect_scope': success_otadata_expect_scope,
         'success_checks': success_checks_config,
@@ -1097,6 +1201,7 @@ def _apply_phase_context(phase=None):
     global success_marker_addr, success_marker_value
     global success_image_hash, success_image_hash_slot
     global image_exec_sha256, image_staging_sha256, expected_exec_sha256
+    global expected_image_name, allowed_image_hashes
     global success_otadata_expect, success_otadata_expect_scope
     global success_checks_config, success_checks_parse_error
 
@@ -1140,6 +1245,16 @@ def _apply_phase_context(phase=None):
     expected_exec_sha256 = str(
         criteria.get('expected_exec_sha256', _base_phase_context['success_criteria']['expected_exec_sha256']) or ''
     ).strip()
+    expected_image_name = str(
+        criteria.get('expected_image', _base_phase_context['success_criteria']['expected_image']) or ''
+    ).strip()
+    allowed_image_hashes = list(
+        criteria.get(
+            'allowed_image_hashes',
+            _base_phase_context['success_criteria']['allowed_image_hashes'],
+        )
+        or []
+    )
     success_otadata_expect = criteria.get(
         'otadata_expect',
         _base_phase_context['success_criteria']['otadata_expect'],
@@ -1233,6 +1348,10 @@ def get_effective_criteria(fault_type_code):
         'vtor_slot': success_vtor_slot,
         'image_hash': success_image_hash,
         'image_hash_slot': success_image_hash_slot,
+        'expected_image': expected_image_name,
+        'allowed_images': [
+            str(entry.get('name', '')) for entry in allowed_image_hashes
+        ],
     }
     if not _success_criteria_overrides or not fault_type_code:
         return global_criteria
@@ -1510,6 +1629,7 @@ if image_recovery_load_addr is not None:
     slot_load_addresses['recovery'] = image_recovery_load_addr
 
 _cached_update_sequence_fault_flash = None
+_update_sequence_phase_results = []
 
 
 def _update_sequence_summary():
@@ -1527,12 +1647,25 @@ def _update_sequence_summary():
             for phase in update_sequence_phases
             if not bool(phase.get('fault_injection'))
         ],
+        # Preserve semantic observations from preceding clean phases so the
+        # host-side transaction isolation invariant can compare state across
+        # cancel/reset boundaries.  Values are collected once while building
+        # the cached fault baseline and reused for every fault point.
+        'phase_records': [dict(record) for record in _update_sequence_phase_results],
     }
 
 
 def annotate_update_sequence_result(result):
     summary = _update_sequence_summary()
     if summary is not None and isinstance(result, dict):
+        # The fault phase is the final transaction in the sequence.  Its
+        # semantic state is already collected by the normal result epilogue.
+        if isinstance(result.get('semantic_state'), dict):
+            summary['phase_records'].append({
+                'phase_name': str(update_sequence_fault_phase.get('name', 'fault_phase')),
+                'fault_injection': True,
+                'semantic_state': result['semantic_state'],
+            })
         result['update_sequence'] = summary
     return result
 
@@ -5350,13 +5483,193 @@ def was_controller_fault_injected():
 def get_last_write_address():
     b = backend
     if b['kind'] == 'mram':
-        return 0  # MRAMMemory does not track fault address.
+        try:
+            return int(b['data'].LastFaultProgramAddress)
+        except Exception:
+            return 0
     if b['kind'] == 'fast':
         try:
             return int(b['data'].LastFaultAddress)
         except Exception:
             return 0
     return int(b['data'].Nvm.LastWriteAddress)
+
+
+def _decode_exact_program_bytes(value, width, field_name):
+    text = str(value or '').strip()
+    if len(text) != int(width) * 2:
+        raise ValueError(
+            '{} has {} hex characters; expected {} for width {}'.format(
+                field_name, len(text), int(width) * 2, width
+            )
+        )
+    if any(ch not in '0123456789abcdefABCDEF' for ch in text):
+        raise ValueError('{} is not hexadecimal'.format(field_name))
+    return bytearray(
+        int(text[index:index + 2], 16)
+        for index in range(0, len(text), 2)
+    )
+
+
+def _program_bytes_hex(values):
+    return ''.join('{:02x}'.format(int(value) & 0xFF) for value in values)
+
+
+def parse_mram_program_trace(trace_text, memory_size, bus_base):
+    """Parse the exact width-aware program stream exposed by NVMemory."""
+    events = []
+    previous_index = 0
+    for line_number, raw_line in enumerate(str(trace_text or '').splitlines(), 1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        fields = line.split(':')
+        if len(fields) != 7:
+            raise ValueError(
+                'program trace line {} has {} fields; expected 7'.format(
+                    line_number, len(fields)
+                )
+            )
+        index = int(fields[0], 10)
+        offset = int(fields[1], 10)
+        width = int(fields[2], 10)
+        if index <= previous_index:
+            raise ValueError(
+                'program trace indices are not strictly increasing at line {}'.format(
+                    line_number
+                )
+            )
+        if width <= 0:
+            raise ValueError('program trace width is not positive at line {}'.format(line_number))
+        if offset < 0 or offset > int(memory_size) - width:
+            raise ValueError('program trace range is outside MRAM at line {}'.format(line_number))
+        intended = _decode_exact_program_bytes(fields[3], width, 'intended bytes')
+        pre_program = _decode_exact_program_bytes(fields[4], width, 'pre-program bytes')
+        post_program = _decode_exact_program_bytes(fields[5], width, 'post-program bytes')
+        if fields[6] not in ('0', '1'):
+            raise ValueError('program trace fault marker is not 0 or 1 at line {}'.format(line_number))
+        events.append({
+            'write_index': index,
+            'program_address': fmt_u32(int(bus_base) + offset),
+            'offset': offset,
+            'program_width': width,
+            'intended_bytes': _program_bytes_hex(intended),
+            'pre_program_bytes': _program_bytes_hex(pre_program),
+            'post_program_bytes': _program_bytes_hex(post_program),
+            'faulted': fields[6] == '1',
+        })
+        previous_index = index
+    return events
+
+
+def collect_mram_fault_evidence(selected_write_index, expected_backend_index):
+    """Return validated MRAM evidence plus the peripheral's immediate snapshot."""
+    data = backend['data']
+    required = (
+        'FaultEvidenceExact', 'LastFaultWriteIndex', 'LastFaultProgramAddress',
+        'LastFaultOffset', 'LastFaultProgramWidth', 'LastFaultIntendedBytes',
+        'LastFaultPreProgramBytes', 'LastFaultPostFaultBytes',
+        'FaultMemorySnapshot', 'ProgramTraceCount', 'ProgramTraceToString',
+    )
+    missing = [name for name in required if not hasattr(data, name)]
+    evidence = {
+        'contract_version': 1,
+        'selected_write_index': int(selected_write_index),
+        'exact': False,
+    }
+    if missing:
+        evidence['capability_error'] = (
+            'MRAM backend lacks exact fault evidence capability: {}'.format(
+                ', '.join(missing)
+            )
+        )
+        return evidence, None, None
+    if backend.get('bus_base') is None:
+        evidence['capability_error'] = (
+            'MRAM backend bus base is unknown; absolute fault address cannot be proven'
+        )
+        return evidence, None, None
+    try:
+        if not bool(data.FaultEvidenceExact):
+            raise ValueError('backend marked its fault evidence inexact')
+        memory_size = int(data.Size)
+        bus_base = int(backend['bus_base'])
+        write_index = int(data.LastFaultWriteIndex)
+        offset = int(data.LastFaultOffset)
+        width = int(data.LastFaultProgramWidth)
+        program_address = int(data.LastFaultProgramAddress)
+        if write_index != int(expected_backend_index):
+            raise ValueError(
+                'fault write index {} does not match armed index {}'.format(
+                    write_index, expected_backend_index
+                )
+            )
+        if width <= 0:
+            raise ValueError('program width is not positive')
+        if offset < 0 or offset > memory_size - width:
+            raise ValueError('fault program range is outside MRAM')
+        expected_address = bus_base + offset
+        if program_address != expected_address:
+            raise ValueError(
+                'fault address {} does not equal bus base plus offset {}'.format(
+                    fmt_u32(program_address), fmt_u32(expected_address)
+                )
+            )
+        intended = to_py_bytes(data.LastFaultIntendedBytes)
+        pre_program = to_py_bytes(data.LastFaultPreProgramBytes)
+        post_fault = to_py_bytes(data.LastFaultPostFaultBytes)
+        for field_name, value in (
+            ('intended bytes', intended),
+            ('pre-program bytes', pre_program),
+            ('post-fault bytes', post_fault),
+        ):
+            if value is None or len(value) != width:
+                raise ValueError(
+                    '{} length does not equal program width {}'.format(field_name, width)
+                )
+        raw_snapshot = data.FaultMemorySnapshot
+        snapshot = to_py_bytes(raw_snapshot)
+        if snapshot is None or len(snapshot) != memory_size:
+            raise ValueError('immediate fault snapshot length does not equal MRAM size')
+        trace = parse_mram_program_trace(
+            data.ProgramTraceToString(), memory_size, bus_base
+        )
+        if len(trace) != int(data.ProgramTraceCount):
+            raise ValueError('program trace count does not match exported trace')
+        if not trace:
+            raise ValueError('program trace is empty')
+        fault_events = [event for event in trace if event.get('faulted')]
+        if len(fault_events) != 1:
+            raise ValueError(
+                'program trace contains {} faulted events; expected exactly one'.format(
+                    len(fault_events)
+                )
+            )
+        fault_event = fault_events[0]
+        if (
+            int(fault_event['write_index']) != write_index
+            or int(fault_event['offset']) != offset
+            or int(fault_event['program_width']) != width
+            or fault_event['intended_bytes'] != _program_bytes_hex(intended)
+            or fault_event['pre_program_bytes'] != _program_bytes_hex(pre_program)
+            or fault_event['post_program_bytes'] != _program_bytes_hex(post_fault)
+        ):
+            raise ValueError('faulted program trace event disagrees with fault evidence')
+        evidence.update({
+            'backend_write_index': write_index,
+            'program_address': fmt_u32(program_address),
+            'offset': offset,
+            'program_width': width,
+            'intended_bytes': _program_bytes_hex(intended),
+            'pre_program_bytes': _program_bytes_hex(pre_program),
+            'post_fault_bytes': _program_bytes_hex(post_fault),
+            'write_trace': trace,
+            'exact': True,
+        })
+        return evidence, snapshot, raw_snapshot
+    except Exception as exc:
+        evidence['capability_error'] = 'MRAM exact fault evidence rejected: {}'.format(exc)
+        return evidence, None, None
 
 def get_last_command_address():
     ctrl = backend['controller']
@@ -5672,6 +5985,8 @@ def reset_nvmc_for_sweep():
     b = backend
     if b['kind'] == 'mram':
         b['data'].TotalWordWrites = 0
+        if hasattr(b['data'], 'ProgramTraceClear'):
+            b['data'].ProgramTraceClear()
         b['data'].LastFaultInjected = False
         b['data'].FaultEverFired = False
         b['data'].WriteFaultMode = 0
@@ -5716,6 +6031,8 @@ def reset_nvmc_for_recovery():
     b = backend
     if b['kind'] == 'mram':
         b['data'].TotalWordWrites = 0
+        if hasattr(b['data'], 'ProgramTraceClear'):
+            b['data'].ProgramTraceClear()
         b['data'].LastFaultInjected = False
         b['data'].FaultEverFired = False
         b['data'].WriteFaultMode = 0
@@ -6147,6 +6464,23 @@ def _run_clean_update_phase(phase, phase_index):
                 '(expected={}, actual={})'.format(phase_name, expected_exec_sha256[:16], actual_hash[:16]))
             final_outcome = 'wrong_image'
 
+    # The final follow-up cycle is the durable observation for this clean
+    # transaction.  Retain it for cross-transaction state isolation checks.
+    phase_semantic_state = None
+    if cycle_records:
+        candidate_state = cycle_records[-1].get('semantic_state')
+        if isinstance(candidate_state, dict):
+            phase_semantic_state = candidate_state
+    if phase_semantic_state is None:
+        phase_semantic_state = collect_semantic_state({
+            'cycle': len(cycle_records),
+            'boot_outcome': final_outcome,
+            'boot_slot': final_slot,
+            'fault_injected': False,
+            'stage': 'update_sequence_phase',
+            'phase_name': phase_name,
+        })
+
     return {
         'phase_name': phase_name,
         'boot_outcome': boot_outcome,
@@ -6155,15 +6489,17 @@ def _run_clean_update_phase(phase, phase_index):
         'final_slot': final_slot,
         'stop_reason': status.get('reason') if status is not None else None,
         'multi_boot_analysis': multi_boot_analysis,
+        'semantic_state': phase_semantic_state,
     }
 
 
 def ensure_update_sequence_fault_baseline():
-    global _cached_update_sequence_fault_flash
+    global _cached_update_sequence_fault_flash, _update_sequence_phase_results
     if not update_sequence_enabled:
         return False
     if _cached_update_sequence_fault_flash is not None:
         return True
+    _update_sequence_phase_results = []
     for idx, phase in enumerate(update_sequence_phases):
         phase_name = str(phase.get('name', 'phase_{}'.format(idx)))
         if bool(phase.get('fault_injection')):
@@ -6173,6 +6509,13 @@ def ensure_update_sequence_fault_baseline():
             log('update_sequence: cached fault baseline for phase {}'.format(phase_name))
             return True
         clean_result = _run_clean_update_phase(phase, idx)
+        phase_record = {
+            'phase_name': phase_name,
+            'fault_injection': False,
+        }
+        if isinstance(clean_result.get('semantic_state'), dict):
+            phase_record['semantic_state'] = clean_result['semantic_state']
+        _update_sequence_phase_results.append(phase_record)
         log('update_sequence: clean phase {} boot={} final={}'.format(
             phase_name,
             clean_result.get('boot_outcome'),
@@ -6252,6 +6595,128 @@ def compute_slot_hash(slot_name='exec'):
 
 def compute_exec_slot_hash():
     return compute_slot_hash('exec')
+
+
+def _compact_differing_byte_ranges(actual, expected, base_address,
+                                    max_ranges=32, max_inline_bytes=32):
+    ranges = []
+    total_ranges = 0
+    differing_bytes = 0
+    index = 0
+    limit = min(len(actual), len(expected))
+    while index < limit:
+        if actual[index] == expected[index]:
+            index += 1
+            continue
+        start = index
+        while index < limit and actual[index] != expected[index]:
+            index += 1
+        end = index
+        total_ranges += 1
+        differing_bytes += end - start
+        if len(ranges) < max_ranges:
+            inline_end = min(end, start + max_inline_bytes)
+            ranges.append({
+                'offset': start,
+                'address': fmt_u32(int(base_address) + start),
+                'size': end - start,
+                'actual_hex': _program_bytes_hex(actual[start:inline_end]),
+                'expected_hex': _program_bytes_hex(expected[start:inline_end]),
+                'bytes_truncated': (end - start) > max_inline_bytes,
+            })
+    if len(actual) != len(expected):
+        start = limit
+        end = max(len(actual), len(expected))
+        total_ranges += 1
+        differing_bytes += end - start
+        if len(ranges) < max_ranges:
+            actual_end = min(len(actual), start + max_inline_bytes)
+            expected_end = min(len(expected), start + max_inline_bytes)
+            ranges.append({
+                'offset': start,
+                'address': fmt_u32(int(base_address) + start),
+                'size': end - start,
+                'actual_hex': _program_bytes_hex(actual[start:actual_end]),
+                'expected_hex': _program_bytes_hex(expected[start:expected_end]),
+                'bytes_truncated': (end - start) > max_inline_bytes,
+            })
+    return {
+        'differing_bytes': differing_bytes,
+        'differing_range_count': total_ranges,
+        'differing_ranges': ranges,
+        'ranges_truncated': total_ranges > len(ranges),
+    }
+
+
+def analyze_fault_snapshot(snapshot_bytes, boot_slot=None):
+    """Describe an immediate persistent-memory snapshot using declared images."""
+    import hashlib
+    snapshot = bytearray(snapshot_bytes or b'')
+    flash_base, flash_size = flash_geometry()
+    analysis = {
+        'sha256': hashlib.sha256(snapshot).hexdigest(),
+        'size': len(snapshot),
+    }
+    if len(snapshot) != int(flash_size):
+        analysis['analysis_error'] = (
+            'snapshot size {} does not match backend size {}'.format(
+                len(snapshot), flash_size
+            )
+        )
+        return analysis
+
+    target_slot = success_image_hash_slot
+    if target_slot not in slot_ranges:
+        target_slot = boot_slot if boot_slot in slot_ranges else 'exec'
+    slot_base, slot_end = slot_ranges[target_slot]
+    data_size = slot_end - slot_base
+    if data_size > 4096:
+        data_size -= 4096
+    slot_offset = int(slot_base) - int(flash_base)
+    if slot_offset < 0 or slot_offset > len(snapshot) - data_size:
+        analysis['analysis_error'] = 'identity slot lies outside the snapshot'
+        return analysis
+    actual = snapshot[slot_offset:slot_offset + data_size]
+    analysis['identity_slot'] = target_slot
+    analysis['identity_slot_base'] = fmt_u32(slot_base)
+    analysis['identity_slot_sha256'] = hashlib.sha256(actual).hexdigest()
+
+    image_paths = {
+        'exec': image_exec_path,
+        'staging': image_staging_path,
+        'tertiary': image_tertiary_path,
+        'recovery': image_recovery_path,
+    }
+    if globals().get('update_sequence_enabled'):
+        phase = globals().get('update_sequence_fault_phase')
+        if isinstance(phase, dict):
+            phase_images = phase.get('start_images') or {}
+            if isinstance(phase_images, dict):
+                image_paths.update(phase_images)
+    erase_fill = int(getattr(backend['data'], 'EraseFill', 0xFF)) & 0xFF
+    candidates = []
+    for image_name, image_path in image_paths.items():
+        if not image_path or not os.path.isfile(image_path):
+            continue
+        with open(image_path, 'rb') as image_file:
+            expected = bytearray(image_file.read(data_size))
+        if len(expected) < data_size:
+            expected.extend(bytearray([erase_fill]) * (data_size - len(expected)))
+        comparison = _compact_differing_byte_ranges(
+            actual, expected, slot_base
+        )
+        comparison.update({
+            'name': image_name,
+            'sha256': hashlib.sha256(expected).hexdigest(),
+            'exact': comparison['differing_bytes'] == 0,
+        })
+        candidates.append(comparison)
+    if not candidates:
+        analysis['analysis_error'] = 'no declared image artifacts are available'
+        return analysis
+    candidates.sort(key=lambda item: (item['differing_bytes'], item['name']))
+    analysis['closest_declared_image'] = candidates[0]
+    return analysis
 
 
 def evaluate_structured_success_checks():
@@ -6437,6 +6902,111 @@ def evaluate_structured_success_checks():
     return observations
 
 
+def _match_configured_image_hash(actual_hash):
+    """Return the exact declared image name for a computed slot digest."""
+    normalized = str(actual_hash or '').strip().lower()
+    for entry in allowed_image_hashes:
+        if normalized == str(entry.get('sha256', '')).strip().lower():
+            return str(entry.get('name', '')).strip() or None
+    if expected_exec_sha256 and normalized == expected_exec_sha256.lower():
+        return expected_image_name or 'expected'
+    if image_exec_sha256 and normalized == image_exec_sha256.lower():
+        return 'exec'
+    if image_staging_sha256 and normalized == image_staging_sha256.lower():
+        return 'staging'
+    return None
+
+
+def collect_recovery_execution_evidence(actual_vtor, pc_value, boot_slot, p2_status):
+    """Collect execution-failure evidence independently of content identity."""
+    if p2_status is None:
+        return {}
+    reason = str(p2_status.get('reason', '') or '')
+    evidence = {'stop_reason': reason}
+    try:
+        cfsr = as_int(bus.ReadDoubleWord(0xE000ED28)) & 0xFFFFFFFF
+        hfsr = as_int(bus.ReadDoubleWord(0xE000ED2C)) & 0xFFFFFFFF
+    except Exception:
+        cfsr = 0
+        hfsr = 0
+    evidence['cfsr'] = fmt_u32(cfsr)
+    evidence['hfsr'] = fmt_u32(hfsr)
+
+    vector_base = None
+    if boot_slot in slot_ranges:
+        _vector_lo, _vector_hi = slot_ranges[boot_slot]
+        if _vector_lo <= int(actual_vtor) < _vector_hi:
+            vector_base = int(actual_vtor)
+    elif success_vtor_slot in slot_ranges:
+        vector_base = int(slot_ranges[success_vtor_slot][0]) + int(success_vector_offset)
+    if vector_base is not None:
+        evidence['vector_base'] = fmt_u32(vector_base)
+        try:
+            initial_sp = as_int(bus.ReadDoubleWord(vector_base)) & 0xFFFFFFFF
+            reset_vector = as_int(bus.ReadDoubleWord(vector_base + 4)) & 0xFFFFFFFF
+            hardfault_vector = as_int(bus.ReadDoubleWord(vector_base + 12)) & 0xFFFFFFFF
+            reset_pc = reset_vector & ~1
+            reset_vector_valid = bool(
+                sram_start <= initial_sp <= sram_end
+                and (reset_vector & 1) == 1
+                and any(lo <= reset_pc < hi for lo, hi in slot_ranges.values())
+            )
+            hardfault_handler_active = bool(
+                hardfault_vector != 0
+                and (hardfault_vector & 1) == 1
+                and (int(pc_value) & ~1) == (hardfault_vector & ~1)
+            )
+            evidence.update({
+                'initial_sp': fmt_u32(initial_sp),
+                'reset_vector': fmt_u32(reset_vector),
+                'reset_vector_valid': reset_vector_valid,
+                'hardfault_vector': fmt_u32(hardfault_vector),
+                'hardfault_handler_active': hardfault_handler_active,
+            })
+        except Exception as exc:
+            evidence['vector_read_error'] = str(exc)
+    reason_lower = reason.lower()
+    evidence['hardfault_observed'] = bool(
+        cfsr != 0
+        or hfsr != 0
+        or evidence.get('hardfault_handler_active')
+        or 'hardfault' in reason_lower
+        or 'hard_fault' in reason_lower
+    )
+    evidence['fault_handler_loop'] = bool(
+        evidence.get('hardfault_handler_active')
+        and any(token in reason_lower for token in (
+            'stall', 'timeout', 'budget', 'no_progress', 'no_boot'
+        ))
+    )
+    return evidence
+
+
+def recovery_failure_outcome(execution_evidence, execution_observed):
+    """Return a primary execution failure before evaluating image identity."""
+    if not execution_evidence:
+        return None
+    reason = str(execution_evidence.get('stop_reason', '') or '').lower()
+    if execution_evidence.get('hardfault_observed'):
+        return 'hard_fault'
+    if 'busfault' in reason or 'bus_fault' in reason:
+        return 'bus_fault'
+    if (
+        execution_evidence.get('reset_vector_valid') is False
+        and not execution_observed
+    ):
+        return 'hard_fault'
+    if reason.startswith('wall_timeout'):
+        return 'timeout'
+    if reason == 'budget':
+        return 'no_boot'
+    if reason.startswith(('no_boot', 'no_progress', 'no_writes')):
+        return 'no_boot'
+    if reason.startswith('console_fatal'):
+        return 'no_boot'
+    return None
+
+
 def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_content_criteria=True, effective_criteria=None, p2_status=None):
     # Shared boot outcome evaluation for all execution modes.
     # When effective_criteria is provided, use its values instead of globals.
@@ -6497,6 +7067,7 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
 
     marker_ok = True
     hash_result = None
+    matched_image = None
     actual_marker_val = 0
     actual_hash = None
     if enforce_content_criteria:
@@ -6507,16 +7078,21 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
             if enforce_hash:
                 hash_slot = eff_image_hash_slot if eff_image_hash_slot not in ('', 'any') else boot_slot
                 actual_hash = compute_slot_hash(hash_slot)
-                if actual_hash == image_exec_sha256:
+                matched_image = _match_configured_image_hash(actual_hash)
+                if matched_image == 'exec':
                     hash_result = 'exec_image'
-                elif actual_hash == image_staging_sha256:
+                elif matched_image == 'staging':
                     hash_result = 'staging_image'
-                elif expected_exec_sha256 and actual_hash == expected_exec_sha256:
+                elif matched_image is not None:
                     hash_result = 'expected_image'
                 else:
                     hash_result = 'unknown'
-                # Success = exec slot matches the expected post-operation hash.
-                if expected_exec_sha256:
+                if allowed_image_hashes:
+                    marker_ok = any(
+                        actual_hash == str(entry.get('sha256', '')).strip().lower()
+                        for entry in allowed_image_hashes
+                    )
+                elif expected_exec_sha256:
                     marker_ok = (actual_hash == expected_exec_sha256)
                 else:
                     # No expected hash: any known image is success.
@@ -6531,7 +7107,8 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     # image is a rollback failure even if other checks pass. Detected via
     # image_hash: after upgrade, exec should contain the staging image.
     rollback_ok = True
-    if security_anti_rollback and enforce_content_criteria and hash_result is not None:
+    if (security_anti_rollback and enforce_content_criteria
+            and hash_result is not None and not allowed_image_hashes):
         expected_is_exec = bool(expected_exec_sha256) and expected_exec_sha256 == image_exec_sha256
         if expected_exec_sha256 and (not expected_is_exec) and hash_result == 'exec_image':
             rollback_ok = False
@@ -6556,6 +7133,14 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     }
     if hash_result is not None:
         signals['image_hash_match'] = hash_result
+    if actual_hash is not None:
+        signals['image_hash_actual'] = actual_hash
+    if matched_image is not None:
+        signals['matched_image'] = matched_image
+    if allowed_image_hashes:
+        signals['allowed_images'] = [
+            str(entry.get('name', '')) for entry in allowed_image_hashes
+        ]
     if eff_image_hash_slot:
         signals['image_hash_slot'] = eff_image_hash_slot
     if security_anti_rollback:
@@ -6640,9 +7225,32 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     expectations_met = vtor_ok and vtor_aligned and pc_ok and criteria_ok
     signals['expectations_met'] = expectations_met
 
+    execution_evidence = collect_recovery_execution_evidence(
+        actual_vtor, pc_value, boot_slot, p2_status
+    )
+    if execution_evidence:
+        signals['recovery_execution'] = execution_evidence
+    primary_execution_failure = recovery_failure_outcome(
+        execution_evidence, execution_observed
+    )
+    content_mismatch = bool(
+        enforce_content_criteria
+        and (
+            hash_result == 'unknown'
+            or not marker_ok
+            or not rollback_ok
+            or not structured_checks_ok
+        )
+    )
+    signals['content_mismatch'] = content_mismatch
+
     # Keep execution failures separate from expectation mismatches:
     # a boot into a real slot with the "wrong" image/slot is not "no_boot".
-    if not execution_observed:
+    if primary_execution_failure is not None:
+        boot_outcome = primary_execution_failure
+        if content_mismatch:
+            signals['supporting_outcomes'] = ['wrong_image']
+    elif not execution_observed:
         # A wall timeout is an incomplete observation even when no writes were
         # seen.  Only deliberate no_boot terminal reasons (for example
         # no_boot_stall) are evidence of a no-boot outcome.
@@ -6937,6 +7545,8 @@ def run_state_fault(fault_at):
         'actual_writes': actual_writes,
         'signals': signals,
     }
+    if signals.get('matched_image') is not None:
+        result['matched_image'] = signals.get('matched_image')
     if isinstance(signals.get('function_return_probes'), dict):
         result['function_return_probes'] = signals['function_return_probes']
     if eff_criteria is not None:
@@ -6944,6 +7554,32 @@ def run_state_fault(fault_at):
     if semantic_state is not None:
         result['semantic_state'] = semantic_state
     return result
+
+
+def _calibration_success_stop_observation(cpu_ref):
+    if not calibration_mode or not calibration_stop_on_success:
+        return None
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value,
+        pc_value,
+        fault_injected=False,
+        p2_status={'reason': 'calibration_success_poll'},
+    )
+    if outcome != 'success':
+        return None
+    _calibration_stop_state['triggered'] = True
+    _calibration_stop_state['reason'] = 'success_criteria'
+    _calibration_stop_state['writes'] = int(get_total_writes())
+    _calibration_stop_state['erases'] = int(get_total_erases())
+    _calibration_stop_state['matched_image'] = signals.get('matched_image')
+    _calibration_stop_state['image_hash_actual'] = signals.get('image_hash_actual')
+    return {
+        'boot_outcome': outcome,
+        'boot_slot': boot_slot,
+        'signals': signals,
+    }
 
 def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, label='',
                    expect_writes=True, stop_on_fault=True, op_trace=None, op_trace_limit=0,
@@ -7024,6 +7660,11 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     for iters in range(max_iters):
         monitor.Parse('emulation RunFor "{}"'.format(time_slice))
         emulated_s += slice_s
+        if calibration_mode and _calibration_stop_state.get('address_hit'):
+            reason = 'calibration_stop_address(0x{:08X})'.format(
+                calibration_stop_address
+            )
+            break
         console_fatal = check_console_fatal()
         if console_fatal:
             reason = 'console_fatal({})'.format(console_fatal)
@@ -7044,6 +7685,11 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                     sticky_vtor['slot'] = sn
                     sticky_vtor['captured'] = True
                     break
+        success_stop_observation = _calibration_success_stop_observation(cpu_ref)
+        if success_stop_observation is not None:
+            cpu_ref.IsHalted = True
+            reason = 'calibration_stop_success_criteria'
+            break
         if sticky_vtor['captured']:
             if vtor_settle_remaining < 0:
                 # First capture.
@@ -7258,7 +7904,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         label, reason, iters + 1, writes_now,
         fmt_u32(pc_now), elapsed))
     console_state = capture_console_state(include_recent=bool(console_fatal))
-    return {
+    status = {
         'iters': iters + 1,
         'reason': reason,
         'elapsed_s': round(elapsed, 6),
@@ -7276,6 +7922,9 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         'console_recent_logs': console_state.get('recent_logs', []),
         'console_fatal_pattern': console_fatal,
     }
+    if calibration_mode and _calibration_stop_state.get('triggered'):
+        status['calibration_stop'] = dict(_calibration_stop_state)
+    return status
 
 def parse_duration_seconds(default=2.0):
     try:
@@ -8503,8 +9152,22 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         'actual_writes': actual_writes,
         'signals': signals,
     }
+    if signals.get('matched_image') is not None:
+        result['matched_image'] = signals.get('matched_image')
     if isinstance(signals.get('function_return_probes'), dict):
         result['function_return_probes'] = signals['function_return_probes']
+    if fault_snapshot_bytes is not None:
+        snapshot_analysis = analyze_fault_snapshot(
+            fault_snapshot_bytes, boot_slot=boot_slot
+        )
+        result['fault_snapshot'] = snapshot_analysis
+        signals['fault_snapshot_sha256'] = snapshot_analysis.get('sha256')
+        closest_image = snapshot_analysis.get('closest_declared_image')
+        if isinstance(closest_image, dict):
+            signals['fault_snapshot_closest_image'] = closest_image.get('name')
+            signals['fault_snapshot_differing_bytes'] = closest_image.get(
+                'differing_bytes'
+            )
     # Shared execute epilogue: every result carries the configured/applied RC
     # injection contract and enforces require_applied fail-closed.
     _apply_rc_injection_result_contract(result, signals, fault_type, fault_injected)
@@ -8982,6 +9645,9 @@ def run_execute_fault(fault_at, fault_type='w'):
     fault_snapshot_bytes = None
     fault_semantic_state = None
     saved_flash = None
+    mram_fault_evidence = None
+    mram_fault_snapshot_raw = None
+    expected_backend_fault_index = None
     md_pre_snapshot = None
     fault_base = _base_fault_type_code(fault_type)
     is_erase_fault = fault_base in ('e', 'a')
@@ -9052,6 +9718,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         arm_at = base_writes + fault_at + 1
         if arm_at > base_writes + max_writes_cap:
             arm_at = base_writes + max_writes_cap + 1
+        expected_backend_fault_index = arm_at
         log('fp={} phase1_step write_arm_at={} mode={}'.format(fault_at, arm_at, write_mode))
         arm_fault(arm_at, write_fault_mode=write_mode)
         disarm_erase_fault()
@@ -9078,6 +9745,19 @@ def run_execute_fault(fault_at, fault_type='w'):
     else:
         fault_injected = was_fault_injected()
     fault_address = get_last_command_address() if is_command_fault else get_last_write_address()
+    if (
+        backend['kind'] == 'mram'
+        and fault_injected
+        and not (is_erase_fault or is_command_fault or is_i2c_fault or is_otp_fault)
+    ):
+        mram_fault_evidence, fault_snapshot_bytes, mram_fault_snapshot_raw = (
+            collect_mram_fault_evidence(
+                fault_at,
+                expected_backend_fault_index,
+            )
+        )
+        if mram_fault_evidence.get('program_address'):
+            fault_address = int(mram_fault_evidence['program_address'], 0)
     if is_erase_fault:
         phase1_ops = get_total_erases()
     elif is_command_fault:
@@ -9104,9 +9784,14 @@ def run_execute_fault(fault_at, fault_type='w'):
     if backend['kind'] != 'slow' and fault_injected:
         # Snapshot the faulted NVM state.
         if backend['kind'] == 'mram':
-            mram_size = int(backend['data'].Size)
-            saved_flash = backend['data'].ReadBytes(0, mram_size)
-            fault_snapshot_bytes = to_py_bytes(saved_flash)
+            if mram_fault_snapshot_raw is not None:
+                saved_flash = mram_fault_snapshot_raw
+            else:
+                # Recovery can proceed for diagnostics, but the result is
+                # failed closed below because this is not an immediate,
+                # backend-attested snapshot.
+                mram_size = int(backend['data'].Size)
+                saved_flash = backend['data'].ReadBytes(0, mram_size)
         else:
             flash_ref = backend['data'].Flash
             flash_size = int(backend['data'].FlashSize)
@@ -9376,6 +10061,8 @@ def run_execute_fault(fault_at, fault_type='w'):
         if debug_trailer is not None:
             extras['debug_trailer'] = debug_trailer
         extras['recovery_writes'] = recovery_writes
+    if mram_fault_evidence is not None:
+        extras['mram_fault_evidence'] = mram_fault_evidence
 
     result = _build_fault_result(
         fault_at, fault_type, fault_injected, fault_address,
@@ -9388,7 +10075,25 @@ def run_execute_fault(fault_at, fault_type='w'):
         extra_fields=extras,
         metadata_delta_pre_snapshot=md_pre_snapshot,
         fault_semantic_state=fault_semantic_state,
+        persist_snapshot=bool(
+            backend['kind'] == 'mram'
+            and fault_injected
+            and fault_snapshot_bytes is not None
+        ),
     )
+
+    if (
+        mram_fault_evidence is not None
+        and not mram_fault_evidence.get('exact')
+    ):
+        result['infrastructure_error'] = True
+        result['error_kind'] = 'mram_fault_evidence_incomplete'
+        result['error'] = mram_fault_evidence.get(
+            'capability_error',
+            'MRAM backend did not provide exact fault evidence',
+        )
+        result['boot_outcome'] = 'infra_error'
+        result['fault_class'] = 'infrastructure_error'
 
     # Release large .NET byte[] to prevent memory exhaustion in batch mode.
     if backend['kind'] == 'fast':
@@ -11334,10 +12039,16 @@ if calibration_mode:
         # It's enabled in phase 2 only if trace replay is needed. The write
         # count from get_total_writes() uses the peripheral counter, not trace.
         reset_nvmc_for_sweep()
+        _prepare_calibration_stop()
+        bounded_calibration = bool(
+            calibration_stop_address or calibration_stop_on_success
+        )
         if backend['kind'] == 'mram' and hasattr(backend['data'], 'WriteTraceToString'):
             # Direct memory interceptors can record the coarse calibration
             # cheaply.  Keeping this active also covers successful boots that
             # do not require the optional fine rerun.
+            _enable_fine_trace(backend['data'])
+        elif bounded_calibration and backend['kind'] == 'fast':
             _enable_fine_trace(backend['data'])
         log('calibration: starting step (fault_types={})'.format(fault_types_mode))
         base_writes = get_total_writes()
@@ -11354,9 +12065,14 @@ if calibration_mode:
         # This finds WHEN the boot completes without wasting time on 20ms
         # precision. For bootloaders that boot in <1 emulated second, this
         # takes ~5 iterations instead of 1,500.
-        coarse_slice_s = 1.0
+        coarse_slice_s = (
+            float(calibration_time_slice) if bounded_calibration else 1.0
+        )
         coarse_budget_s = float(run_duration)
-        coarse_max_iters = max(3, int(coarse_budget_s / coarse_slice_s) + 1)
+        coarse_max_iters = max(
+            3,
+            int(coarse_budget_s / max(0.001, coarse_slice_s)) + 1,
+        )
         coarse_wall_timeout = max(300, int(coarse_budget_s * 60))
         cal_settle = _copy_on_boot_vtor_settle_iters()
         log('calibration phase 1: coarse detection (slice={}s, max_iters={})'.format(
@@ -11389,7 +12105,7 @@ if calibration_mode:
             or fault_types_mode in ('erase', 'both')
             or (heuristic_trace_required and backend['kind'] == 'fast')
         )
-        if _calibration_phase2_trace_allowed(
+        if (not bounded_calibration) and _calibration_phase2_trace_allowed(
                 phase1_reason, trace_capable, semantic_trace_required):
             # Phase 2: Reset and re-run with fine slices, bounded by phase 1 time.
             fine_margin_s = max(1.0, phase1_emulated_s * 0.2)
@@ -11404,6 +12120,7 @@ if calibration_mode:
             if _hash_bypass_active:
                 apply_hash_bypass()
             reset_nvmc_for_sweep()
+            _prepare_calibration_stop()
             if trace_capable:
                 _enable_fine_trace(backend['data'])
             base_writes = get_total_writes()
@@ -11442,6 +12159,8 @@ if calibration_mode:
         # Export write trace if available.
         trace_file = None
         trace_file_bin = None
+        program_trace_file = None
+        calibration_last_program = None
         if trace_capable and backend['data'].WriteTraceEnabled:
             backend['data'].WriteTraceEnabled = False
             trace_count = backend['data'].WriteTraceCount
@@ -11509,6 +12228,48 @@ if calibration_mode:
                         len(parsed_trace), trace_file_bin))
                 else:
                     log('calibration: mixed-width trace; native binary replay disabled')
+
+        if backend['kind'] == 'mram' and hasattr(backend['data'], 'ProgramTraceToString'):
+            if backend.get('bus_base') is None:
+                raise RuntimeError(
+                    'MRAM calibration cannot export exact program addresses: '
+                    'backend bus base is unknown'
+                )
+            program_trace = parse_mram_program_trace(
+                backend['data'].ProgramTraceToString(),
+                int(backend['data'].Size),
+                int(backend['bus_base']),
+            )
+            if len(program_trace) != int(backend['data'].ProgramTraceCount):
+                raise RuntimeError(
+                    'MRAM calibration program trace count disagrees with exported trace'
+                )
+            if program_trace:
+                calibration_last_program = dict(program_trace[-1])
+                program_trace_file = result_file.replace(
+                    '.json', '_program_trace.csv'
+                )
+                with open(program_trace_file, 'w') as program_file:
+                    program_file.write(
+                        'write_index,program_address,offset,width,intended_hex,'
+                        'pre_program_hex,post_program_hex,faulted\n'
+                    )
+                    for event in program_trace:
+                        program_file.write(
+                            '{},{},{},{},{},{},{},{}\n'.format(
+                                event['write_index'],
+                                event['program_address'],
+                                event['offset'],
+                                event['program_width'],
+                                event['intended_bytes'],
+                                event['pre_program_bytes'],
+                                event['post_program_bytes'],
+                                'true' if event['faulted'] else 'false',
+                            )
+                        )
+                log('calibration: wrote {} exact MRAM program entries to {}'.format(
+                    len(program_trace), program_trace_file
+                ))
 
         # Export erase trace — always captured for trace replay correctness.
         erase_trace_file = None
@@ -11581,6 +12342,34 @@ if calibration_mode:
             'hash_bypass_symbols_raw': _hash_bypass_symbols_raw,
             'hash_bypass_symbols_resolved': list(dict.fromkeys(sym for _addr, sym in _hash_bypass_patches)),
             'durability_model': durability_model,
+        }
+        calibration_matched_image = calibration_signals.get('matched_image')
+        if calibration_matched_image is not None:
+            result['calibration_matched_image'] = calibration_matched_image
+        calibration_actual_hash = calibration_signals.get('image_hash_actual')
+        if calibration_actual_hash is not None:
+            result['calibration_image_hash_actual'] = calibration_actual_hash
+        if (
+            _calibration_stop_state.get('triggered')
+            and _calibration_stop_state.get('matched_image') is None
+        ):
+            _calibration_stop_state['matched_image'] = calibration_matched_image
+            _calibration_stop_state['image_hash_actual'] = calibration_actual_hash
+        result['calibration_stop'] = {
+            'configured': bounded_calibration,
+            'address': (
+                fmt_u32(calibration_stop_address)
+                if calibration_stop_address
+                else None
+            ),
+            'success_criteria': bool(calibration_stop_on_success),
+            'triggered': bool(_calibration_stop_state.get('triggered')),
+            'reason': _calibration_stop_state.get('reason'),
+            'writes': _calibration_stop_state.get('writes'),
+            'erases': _calibration_stop_state.get('erases'),
+            'matched_image': _calibration_stop_state.get('matched_image'),
+            'image_hash_actual': _calibration_stop_state.get('image_hash_actual'),
+            'last_program': calibration_last_program,
         }
         if 0x20000000 <= calibration_sp < 0x30000000:
             try:
@@ -11675,6 +12464,8 @@ if calibration_mode:
             result['trace_file'] = trace_file
         if trace_file_bin:
             result['trace_file_bin'] = trace_file_bin
+        if program_trace_file:
+            result['program_trace_file'] = program_trace_file
         if erase_trace_file:
             result['erase_trace_file'] = erase_trace_file
         if erase_trace_file_bin:

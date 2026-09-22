@@ -549,6 +549,9 @@ def annotate_result_checks(
         if candidate.get("is_control"):
             control_result = candidate
     for result in results:
+        signals = result.get("signals")
+        if isinstance(signals, dict) and signals.get("matched_image") is not None:
+            result["matched_image"] = signals.get("matched_image")
         contract_observation_failures = _evaluate_state_probe_contract(result, profile)
         semantic_failures, observation_failures = _evaluate_semantic_assertions(
             result, profile
