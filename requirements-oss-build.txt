@@ -21,7 +21,7 @@ jsonschema-specifications==2025.9.1
 license-expression==30.4.4
 MarkupSafe==3.0.3
 packaging==26.2
-patool==4.1.0
+patool==4.0.1
 progress==1.6.1
 psutil==7.2.2
 pycparser==3.0
