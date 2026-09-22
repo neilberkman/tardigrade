@@ -224,8 +224,36 @@ def categorize_failure(
         payload["severity"] = result.get("severity")
     if result.get("severity_rationale"):
         payload["severity_rationale"] = result.get("severity_rationale")
+    mram_evidence = result.get("mram_fault_evidence")
+    if isinstance(mram_evidence, dict):
+        payload["mram_fault_evidence"] = {
+            key: mram_evidence.get(key)
+            for key in (
+                "selected_write_index",
+                "backend_write_index",
+                "program_address",
+                "offset",
+                "program_width",
+                "intended_bytes",
+                "pre_program_bytes",
+                "post_fault_bytes",
+                "exact",
+                "capability_error",
+            )
+            if mram_evidence.get(key) is not None
+        }
+        trace = mram_evidence.get("write_trace")
+        if isinstance(trace, list):
+            payload["mram_fault_evidence"]["write_trace_events"] = len(trace)
+    snapshot = result.get("fault_snapshot")
+    if isinstance(snapshot, dict):
+        payload["fault_snapshot"] = snapshot
+    if result.get("fault_snapshot_file"):
+        payload["fault_snapshot_file"] = result.get("fault_snapshot_file")
     signals = result.get("signals") or {}
     if isinstance(signals, dict):
+        if signals.get("matched_image") is not None:
+            payload["matched_image"] = signals.get("matched_image")
         if signals.get("function_return_probes") is not None:
             payload["function_return_probes"] = signals.get("function_return_probes")
         if signals.get("verification_probe_classification") is not None:
@@ -452,6 +480,16 @@ def summarize_runtime_sweep(
     )
     invariant_issue_points = sum(1 for r in reportable_injected if r.get("invariant_violations"))
     metadata_delta_issue_points = sum(1 for r in reportable_injected if r.get("metadata_delta_violations"))
+    exact_mram_evidence_points = sum(
+        1 for r in injected
+        if isinstance(r.get("mram_fault_evidence"), dict)
+        and r["mram_fault_evidence"].get("exact") is True
+    )
+    incomplete_mram_evidence_points = sum(
+        1 for r in injected
+        if isinstance(r.get("mram_fault_evidence"), dict)
+        and r["mram_fault_evidence"].get("exact") is not True
+    )
     success_effect_issue_points = sum(
         1 for r in reportable_injected
         if any(
@@ -662,6 +700,8 @@ def summarize_runtime_sweep(
         "semantic_observation_points": semantic_observation_points,
         "invariant_issue_points": invariant_issue_points,
         "metadata_delta_issue_points": metadata_delta_issue_points,
+        "exact_mram_evidence_points": exact_mram_evidence_points,
+        "incomplete_mram_evidence_points": incomplete_mram_evidence_points,
         "success_implies_effect_issue_points": success_effect_issue_points,
         "bus_fault_points": bus_fault_points,
         "timeout_points": timeout_points,
@@ -724,6 +764,33 @@ def summarize_runtime_sweep(
             "complete": campaign_complete,
         },
     }
+    fault_evidence = []
+    for result in injected:
+        evidence = result.get("mram_fault_evidence")
+        snapshot = result.get("fault_snapshot")
+        if not isinstance(evidence, dict) and not isinstance(snapshot, dict):
+            continue
+        effective_outcome, _ = _effective_boot_result(result)
+        item: Dict[str, Any] = {
+            "fault_at": result.get("fault_at"),
+            "fault_address": result.get("fault_address"),
+            "boot_outcome": effective_outcome,
+        }
+        if isinstance(evidence, dict):
+            item["exact"] = evidence.get("exact") is True
+            item["program_width"] = evidence.get("program_width")
+            if evidence.get("capability_error"):
+                item["capability_error"] = evidence.get("capability_error")
+        if isinstance(snapshot, dict):
+            item["snapshot_sha256"] = snapshot.get("sha256")
+            closest = snapshot.get("closest_declared_image")
+            if isinstance(closest, dict):
+                item["closest_declared_image"] = closest.get("name")
+                item["differing_bytes"] = closest.get("differing_bytes")
+                item["differing_ranges"] = closest.get("differing_ranges")
+        fault_evidence.append(item)
+    if fault_evidence:
+        summary["fault_evidence"] = fault_evidence
     if rc_telemetry:
         first_rc = rc_telemetry[0]
         summary["rc_injection"] = {
@@ -770,6 +837,10 @@ def summarize_runtime_sweep(
             _fault_type_label(value)
             for value in (getattr(profile.fault_sweep, "fault_types", None) or [])
         ]
+        profile_success_criteria = getattr(profile, "success_criteria", None)
+        summary["allowed_images"] = list(
+            getattr(profile_success_criteria, "allowed_images", []) or []
+        )
     # Initial wall-clock timeouts are incomplete observations, not security
     # evidence.  Keep them out of the aggregate probe/layer counts just as
     # they are excluded from issue, brick, and validation aggregates above.
@@ -827,6 +898,8 @@ def summarize_runtime_sweep(
                 "otadata_expect_ok",
                 "anti_rollback_ok",
                 "reset_vector_offset_ok",
+                "matched_image",
+                "image_hash_actual",
             )
             if ctrl_signals.get(key) is not None
         }
