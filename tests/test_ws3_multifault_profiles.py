@@ -16,6 +16,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from fault_plan import CalibrationInputs, build_fault_plan
+from fault_inject import decode_multi_fault_sequence
 from profile_loader import load_profile, load_profile_raw
 from self_test import discover_profiles
 from sweep import run_multi_fault_phase
@@ -188,6 +189,163 @@ class WS3MultiFaultPhaseTests(unittest.TestCase):
         self.assertEqual(len(out.results), len(captured["fault_types_list"]))
         self.assertIn("fault_sequence", out.results[0])
         self.assertIn("sequence_rationale", out.results[0])
+
+    def test_stage_relative_fallback_retries_reachable_point_and_keeps_issue(self) -> None:
+        profile = load_profile(MOVE_MF_SELFTEST)
+        fallback_points = [0, 7, 7181, 7513, 15025]
+        sweep_results = [
+            {
+                "fault_at": point,
+                "fault_requested": point,
+                "fault_type": "w",
+                "fault_injected": True,
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "signals": {"expectations_met": True},
+            }
+            for point in fallback_points
+        ]
+        calls = []
+
+        def fake_run_runtime_sweep(**kwargs):
+            fault_types = list(kwargs["fault_types_list"])
+            calls.append(fault_types)
+            results = []
+            for fault_type in fault_types:
+                sequence = decode_multi_fault_sequence(fault_type)
+                if len(calls) == 1 and sequence == [7513, 15025]:
+                    results.append(
+                        {
+                            "fault_at": 7513,
+                            "fault_requested": 7513,
+                            "fault_type": fault_type,
+                            "fault_injected": False,
+                            "boot_outcome": "skipped",
+                            "boot_slot": None,
+                            "skip_reason": "stage2_fault_index_beyond_writes",
+                            "actual_writes": 10000,
+                            "signals": {
+                                "failed_stage": 2,
+                                "stage_max_writes": 10000,
+                            },
+                            "per_fault_states": [
+                                {
+                                    "stage": 1,
+                                    "fault_at": 7513,
+                                    "fault_injected": True,
+                                    "actual_writes": 7514,
+                                    "signals": {"stop_reason": "fault_fired"},
+                                },
+                                {
+                                    "stage": 2,
+                                    "fault_at": 15025,
+                                    "fault_injected": False,
+                                    "actual_writes": 10000,
+                                    "signals": {"stop_reason": "vtor_captured"},
+                                },
+                            ],
+                        }
+                    )
+                    continue
+
+                is_retry = len(calls) > 1
+                if is_retry:
+                    self.assertEqual(sequence[0], 7513)
+                    self.assertLess(sequence[1], 10000)
+                results.append(
+                    {
+                        "fault_at": sequence[0],
+                        "fault_requested": sequence[0],
+                        "fault_type": fault_type,
+                        "fault_injected": True,
+                        "fault_address": "0x00000000",
+                        "boot_outcome": "wrong_image" if is_retry else "success",
+                        "boot_slot": "staging" if is_retry else "exec",
+                        "actual_writes": 10000,
+                        "signals": {},
+                    }
+                )
+            return results
+
+        with tempfile.TemporaryDirectory(prefix="ws3_mf_stage_relative_") as td:
+            with mock.patch("sweep.run_runtime_sweep", side_effect=fake_run_runtime_sweep):
+                out = run_multi_fault_phase(
+                    profile=profile,
+                    sweep_results=sweep_results,
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    robot_vars=[],
+                    work_dir=Path(td),
+                    renode_remote_server_dir="",
+                    num_workers=1,
+                    max_batch_points=0,
+                    max_writes=15026,
+                    explain_only=False,
+                )
+
+        self.assertGreater(len(calls), 1)
+        self.assertTrue(out.summary["campaign_integrity"]["complete"])
+        self.assertEqual(out.summary["issue_points"], 1)
+        self.assertTrue(all(r["fault_injected"] for r in out.results))
+
+    def test_explicit_sequence_remains_exact_when_later_stage_is_unreachable(self) -> None:
+        profile = load_profile(MOVE_MF_SELFTEST)
+        profile.fault_sweep.multi_fault.strategy = "explicit"
+        profile.fault_sweep.multi_fault.sequences = [[10, 100]]
+        calls = []
+
+        def fake_run_runtime_sweep(**kwargs):
+            calls.append(list(kwargs["fault_types_list"]))
+            return [
+                {
+                    "fault_at": 10,
+                    "fault_requested": 10,
+                    "fault_type": "mf:10:100",
+                    "fault_injected": False,
+                    "boot_outcome": "skipped",
+                    "boot_slot": None,
+                    "skip_reason": "stage2_fault_index_beyond_writes",
+                    "actual_writes": 50,
+                    "signals": {"failed_stage": 2, "stage_max_writes": 50},
+                    "per_fault_states": [
+                        {
+                            "stage": 1,
+                            "fault_at": 10,
+                            "fault_injected": True,
+                            "actual_writes": 11,
+                            "signals": {"stop_reason": "fault_fired"},
+                        },
+                        {
+                            "stage": 2,
+                            "fault_at": 100,
+                            "fault_injected": False,
+                            "actual_writes": 50,
+                            "signals": {"stop_reason": "vtor_captured"},
+                        },
+                    ],
+                }
+            ]
+
+        with tempfile.TemporaryDirectory(prefix="ws3_mf_explicit_") as td:
+            with mock.patch("sweep.run_runtime_sweep", side_effect=fake_run_runtime_sweep):
+                out = run_multi_fault_phase(
+                    profile=profile,
+                    sweep_results=[],
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    robot_vars=[],
+                    work_dir=Path(td),
+                    renode_remote_server_dir="",
+                    num_workers=1,
+                    max_batch_points=0,
+                    max_writes=101,
+                )
+
+        self.assertEqual(calls, [["mf:10:100"]])
+        self.assertFalse(out.summary["campaign_integrity"]["complete"])
+        self.assertEqual(out.results[0]["fault_sequence"], [10, 100])
 
     def test_enabled_multifault_empty_plan_is_incomplete(self) -> None:
         profile = load_profile(MOVE_MF_SELFTEST)

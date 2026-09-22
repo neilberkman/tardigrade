@@ -25,6 +25,7 @@ from fault_classification import (
     finding_validation_disposition,
     finding_validation_stage,
     result_issue_reasons,
+    result_is_timeout,
 )
 from fault_inject import (
     AnnotatedSequence,
@@ -35,6 +36,7 @@ from fault_inject import (
     generate_multi_fault_sequences,
     multi_fault_plan_summary,
 )
+from multifault_retarget import retarget_unreachable_sequence
 from invariants import check_state_relations, default_invariants, run_invariants
 from fault_types import EXECUTE_ONLY_FAULT_TYPES, TRACE_REPLAY_WIRE_CODES
 from partial_staging import (
@@ -2363,6 +2365,142 @@ def run_multi_fault_phase(
         no_hash_bypass=no_hash_bypass,
         profile_initial_state_name=profile_initial_state_name,
     )
+
+    # The planner derives indices from the clean first-stage write trace, but
+    # each later sequence element applies to a successive recovery boot.  A
+    # recovery path can legitimately perform fewer writes.  Retry only a
+    # result that proves its requested stage index was out of range, using the
+    # last write observed for that stage.  Preserve the complete unreachable
+    # attempt so the adjustment never conceals evidence or a later issue.
+    retarget_plan_allowed = (
+        mf_config.strategy != "explicit"
+        and mf_plan.strategy == "boundary_pairs"
+        and not interesting_fps
+        and mf_plan.diagnostics.get("primary_reason") == "no_interesting_points"
+        and mf_plan.diagnostics.get("fallback_used") is True
+    )
+
+    def _validated_prior_stage_result(point: int) -> Optional[Dict[str, Any]]:
+        if not retarget_plan_allowed or expected_outcome != "success":
+            return None
+        candidates = []
+        for result in sweep_results:
+            try:
+                point_matches = int(result.get("fault_at", -1)) == int(point)
+            except (TypeError, ValueError):
+                point_matches = False
+            if (
+                point_matches
+                and not result.get("is_control", False)
+                and result.get("fault_injected") is True
+                and str(result.get("fault_type") or "") == "w"
+            ):
+                candidates.append(result)
+        if len(candidates) != 1:
+            return None
+        source = candidates[0]
+        signals = source.get("signals")
+        if not isinstance(signals, dict) or signals.get("expectations_met") is not True:
+            return None
+        if source.get("boot_outcome") != expected_outcome:
+            return None
+        if source.get("skip_reason") or result_is_timeout(source):
+            return None
+        if result_issue_reasons(source, expected_outcome):
+            return None
+        return source
+
+    for result_index, initial_result in enumerate(list(out.results)):
+        if not retarget_plan_allowed:
+            break
+        current_result = initial_result
+        original_type = str(current_result.get("fault_type") or "")
+        try:
+            original_sequence = decode_multi_fault_sequence(original_type)
+        except (TypeError, ValueError):
+            continue
+        unreachable_attempts: List[Dict[str, Any]] = []
+        adjustments: List[Dict[str, Any]] = []
+        adjusted_stages = set()
+        for retry_index in range(max(0, len(original_sequence) - 1)):
+            current_type = str(current_result.get("fault_type") or "")
+            try:
+                current_sequence = decode_multi_fault_sequence(current_type)
+            except (TypeError, ValueError):
+                break
+            prior_stage_source = _validated_prior_stage_result(
+                current_sequence[0],
+            )
+            proposal = retarget_unreachable_sequence(
+                current_sequence,
+                current_result,
+                validated_prior_stage=prior_stage_source is not None,
+            )
+            if proposal is None:
+                break
+            proposal["prior_stage_validation"] = {
+                "fault_at": int(prior_stage_source["fault_at"]),
+                "fault_type": str(prior_stage_source.get("fault_type") or ""),
+                "boot_outcome": prior_stage_source.get("boot_outcome"),
+                "boot_slot": prior_stage_source.get("boot_slot"),
+                "expectations_met": True,
+            }
+            if proposal["stage"] in adjusted_stages:
+                break
+            adjusted_stages.add(proposal["stage"])
+            unreachable_attempts.append(current_result)
+            adjustments.append({
+                key: value for key, value in proposal.items()
+                if key != "sequence"
+            })
+            adjusted_sequence = proposal["sequence"]
+            adjusted_type = encode_multi_fault_sequence(adjusted_sequence)
+            retry_results = run_runtime_sweep(
+                repo_root=repo_root,
+                renode_test=renode_test,
+                robot_suite=robot_suite,
+                profile=profile,
+                fault_points=[adjusted_sequence[0]],
+                robot_vars=robot_vars,
+                work_dir=(
+                    work_dir / "multi_fault_retarget_{}_{}".format(
+                        result_index, retry_index + 1,
+                    )
+                ),
+                renode_remote_server_dir=renode_remote_server_dir,
+                include_control=False,
+                num_workers=1,
+                evaluation_mode="execute",
+                max_batch_points=max_batch_points,
+                trace_file=None,
+                erase_trace_file=None,
+                trace_file_bin=None,
+                erase_trace_file_bin=None,
+                fault_types_list=[adjusted_type],
+                keep_run_artifacts=keep_run_artifacts,
+                no_hash_bypass=no_hash_bypass,
+                profile_initial_state_name=profile_initial_state_name,
+            )
+            if len(retry_results) != 1:
+                current_result["retarget_retry_cardinality_error"] = {
+                    "expected": 1,
+                    "actual": len(retry_results),
+                    "proposed_sequence": adjusted_sequence,
+                }
+                current_result["retarget_retry_results"] = retry_results
+                out.results.extend(retry_results)
+                break
+            current_result = retry_results[0]
+
+        if adjustments:
+            current_result["planned_fault_sequence"] = original_sequence
+            current_result["fault_sequence_adjustments"] = adjustments
+            current_result["unreachable_attempts"] = unreachable_attempts
+            rationale = _mf_rationale_lookup.get(original_type)
+            if rationale:
+                current_result["sequence_rationale"] = rationale
+            out.results[result_index] = current_result
+
     mf_wall_s = _time_mod.time() - mf_wall_t0
 
     for mf_r in out.results:

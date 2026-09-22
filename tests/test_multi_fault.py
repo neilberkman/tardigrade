@@ -24,6 +24,10 @@ from fault_inject import (
     multi_fault_plan_summary,
     parse_multi_fault_spec,
 )
+from multifault_retarget import (
+    last_reachable_fault_index,
+    retarget_unreachable_sequence,
+)
 from profile_loader import MultiFaultConfig, load_profile
 
 
@@ -53,6 +57,154 @@ class TestParseMultiFaultSpec(unittest.TestCase):
     def test_rejects_negative(self) -> None:
         with self.assertRaises(ValueError):
             parse_multi_fault_spec("-1,100")
+
+
+class TestStageRelativeRetarget(unittest.TestCase):
+    def test_retargets_later_stage_to_last_observed_write(self) -> None:
+        result = {
+            "fault_injected": False,
+            "boot_outcome": "skipped",
+            "skip_reason": "stage2_fault_index_beyond_writes",
+            "actual_writes": 7844,
+            "signals": {"failed_stage": 2, "stage_max_writes": 7844},
+            "per_fault_states": [
+                {
+                    "stage": 1,
+                    "fault_at": 7513,
+                    "fault_injected": True,
+                    "actual_writes": 7514,
+                    "signals": {"stop_reason": "fault_fired"},
+                },
+                {
+                    "stage": 2,
+                    "fault_at": 15025,
+                    "fault_injected": False,
+                    "actual_writes": 7844,
+                    "signals": {"stop_reason": "vtor_captured"},
+                },
+            ],
+        }
+        proposal = retarget_unreachable_sequence(
+            [7513, 15025], result, validated_prior_stage=True,
+        )
+        self.assertEqual(proposal["sequence"], [7513, 7843])
+        self.assertEqual(proposal["requested_fault_at"], 15025)
+        self.assertEqual(proposal["observed_writes"], 7844)
+        self.assertIsNone(retarget_unreachable_sequence([7513, 15025], result))
+
+    def test_does_not_hide_reachable_injection_failure(self) -> None:
+        self.assertIsNone(last_reachable_fault_index(100, 101))
+        result = {
+            "fault_injected": False,
+            "boot_outcome": "skipped",
+            "skip_reason": "stage2_fault_index_beyond_writes",
+            "signals": {"failed_stage": 2, "stage_max_writes": 101},
+            "per_fault_states": [
+                {
+                    "stage": 1,
+                    "fault_at": 10,
+                    "fault_injected": True,
+                    "actual_writes": 11,
+                    "signals": {"stop_reason": "fault_fired"},
+                },
+                {
+                    "stage": 2,
+                    "fault_at": 100,
+                    "fault_injected": False,
+                    "actual_writes": 101,
+                    "signals": {"stop_reason": "vtor_captured"},
+                },
+            ],
+        }
+        self.assertIsNone(
+            retarget_unreachable_sequence(
+                [10, 100], result, validated_prior_stage=True,
+            )
+        )
+
+    def test_does_not_retarget_first_stage_or_zero_write_stage(self) -> None:
+        first_stage = {
+            "fault_injected": False,
+            "boot_outcome": "skipped",
+            "skip_reason": "stage1_fault_index_beyond_writes",
+            "signals": {"failed_stage": 1, "stage_max_writes": 10},
+            "per_fault_states": [
+                {
+                    "stage": 1,
+                    "fault_at": 20,
+                    "fault_injected": False,
+                    "actual_writes": 10,
+                    "signals": {"stop_reason": "vtor_captured"},
+                },
+            ],
+        }
+        zero_write = {
+            "fault_injected": False,
+            "boot_outcome": "skipped",
+            "skip_reason": "stage2_fault_index_beyond_writes",
+            "signals": {"failed_stage": 2, "stage_max_writes": 0},
+            "per_fault_states": [
+                {
+                    "stage": 1,
+                    "fault_at": 20,
+                    "fault_injected": True,
+                    "actual_writes": 21,
+                    "signals": {"stop_reason": "fault_fired"},
+                },
+                {
+                    "stage": 2,
+                    "fault_at": 30,
+                    "fault_injected": False,
+                    "actual_writes": 0,
+                    "signals": {"stop_reason": "vtor_captured"},
+                },
+            ],
+        }
+        self.assertIsNone(
+            retarget_unreachable_sequence(
+                [20, 30], first_stage, validated_prior_stage=True,
+            )
+        )
+        self.assertIsNone(
+            retarget_unreachable_sequence(
+                [20, 30], zero_write, validated_prior_stage=True,
+            )
+        )
+
+    def test_rejects_timeout_and_contradictory_stage_evidence(self) -> None:
+        result = {
+            "fault_injected": False,
+            "boot_outcome": "skipped",
+            "skip_reason": "stage2_fault_index_beyond_writes",
+            "signals": {"failed_stage": 3, "stage_max_writes": 50},
+            "per_fault_states": [
+                {
+                    "stage": 1,
+                    "fault_at": 10,
+                    "fault_injected": True,
+                    "actual_writes": 11,
+                    "signals": {"stop_reason": "fault_fired"},
+                },
+                {
+                    "stage": 2,
+                    "fault_at": 100,
+                    "fault_injected": False,
+                    "actual_writes": 50,
+                    "signals": {"stop_reason": "wall_timeout(60s)"},
+                },
+            ],
+        }
+        self.assertIsNone(
+            retarget_unreachable_sequence(
+                [10, 100], result, validated_prior_stage=True,
+            )
+        )
+        result["signals"]["failed_stage"] = 2
+        self.assertIsNone(
+            retarget_unreachable_sequence(
+                [10, 100], result, validated_prior_stage=True,
+            )
+        )
 
 
 class TestMultiFaultEncoding(unittest.TestCase):
