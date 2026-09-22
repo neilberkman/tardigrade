@@ -214,6 +214,14 @@ def test_complete_multi_component_profile_rejects_component_level_typo(tmp_path)
         _load(tmp_path, _multi_component_profile(component_key_typo=True))
 
 
+def test_complete_multi_component_profile_rejects_container_typo(tmp_path):
+    text = _multi_component_profile().replace(
+        "multi_component:\n", "multi_component:\n  componentz: []\n"
+    )
+    with pytest.raises(ProfileError, match="unknown field.*componentz"):
+        _load(tmp_path, text)
+
+
 def test_nested_postmortem_partition_uses_explicit_containment(tmp_path):
     text = BASE_PROFILE.replace(
         "    staging: { base: 0x08003000, size: 0x2000 }",
@@ -302,6 +310,31 @@ def test_runtime_result_checks_consume_common_width_aware_write_evidence(tmp_pat
     assert violation["details"]["oob_spans"] == [
         {"start": 0x08005FFF, "end": 0x08006001, "width": 2}
     ]
+
+
+def test_runtime_write_log_is_checked_alongside_common_calibration_spans(tmp_path):
+    profile = _load(tmp_path)
+    profile.invariants = ["no_oob_writes"]
+    result = {
+        "is_control": True,
+        "fault_at": 0,
+        "boot_outcome": "success",
+        "boot_slot": "exec",
+        "write_log": [0x09000000],
+    }
+
+    annotate_result_checks(
+        [result],
+        profile,
+        write_spans=[(0x08001000, 4)],
+    )
+
+    violation = next(
+        item
+        for item in result["invariant_violations"]
+        if item["name"] == "no_oob_writes"
+    )
+    assert violation["details"]["oob_addresses"] == [0x09000000]
 
 
 def test_no_oob_runtime_check_fails_closed_without_write_evidence(tmp_path):

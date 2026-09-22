@@ -626,8 +626,15 @@ def check_no_oob_writes(
                     )
                 )
             spans.append((addr, width))
-    else:
-        spans = [(addr, write_width) for addr in (write_log or [])]
+    if write_log is not None:
+        for index, addr in enumerate(write_log):
+            if isinstance(addr, bool) or not isinstance(addr, int) or addr < 0:
+                raise ValueError(
+                    "no_oob_writes write_log[{}] has an invalid address".format(
+                        index
+                    )
+                )
+            spans.append((addr, write_width))
 
     oob_spans: List[Tuple[int, int]] = []
     for addr, width in spans:

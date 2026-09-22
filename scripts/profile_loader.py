@@ -7832,6 +7832,11 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         if raw_multi_component is not None:
             if not isinstance(raw_multi_component, dict):
                 raise ProfileError("multi_component: expected mapping")
+            _reject_unknown_keys(
+                raw_multi_component,
+                frozenset({"components", "fault_matrix"}),
+                "multi_component",
+            )
             raw_components = raw_multi_component.get("components")
             if not isinstance(raw_components, list):
                 raise ProfileError("multi_component.components: expected list")
