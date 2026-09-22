@@ -550,6 +550,7 @@ def _validate_write_fault(
     result: Dict[str, Any],
     *,
     expected_outcome: str,
+    rc_injection_severity_model: str = "security",
 ) -> Dict[str, Any]:
     signals = result.get("signals") or {}
     if not isinstance(signals, dict):
@@ -593,6 +594,35 @@ def _validate_write_fault(
             negative_evidence=negative_evidence,
             reasons=["non_power_write_fault_halted_phase1"],
             skeptical_summary="Dismissed: the fault acted like a stop/reset instead of a continue-after-fault write error.",
+        )
+
+    if (
+        base_code == "x"
+        and security_property == "availability"
+        and rc_injection_severity_model != "availability"
+    ):
+        negative_evidence.append(
+            "the injected storage return error caused fail-closed denial of service without booting untrusted firmware"
+        )
+        return _build_validation(
+            stage="dismissed",
+            disposition="dos_only",
+            fault_type=result.get("fault_type"),
+            expected_outcome=expected_outcome,
+            security_property=security_property,
+            glitch_models=glitch_models,
+            defense_in_depth="held",
+            inverse_validation=inverse_validation,
+            self_healing="unknown",
+            counterfactuals=counterfactuals,
+            negative_evidence=negative_evidence,
+            reasons=["rc_injection_fail_closed"],
+            skeptical_summary=(
+                "Dismissed under the security model: the injected storage "
+                "error failed closed and did not produce a boot-integrity "
+                "bypass. Select the availability severity model to retain "
+                "this denial of service as a finding."
+            ),
         )
 
     if bool(signals.get("phase1_continued_after_fault")):
@@ -676,11 +706,17 @@ def validate_runtime_findings(
             or "success"
         )
     instruction_skip_model = "security"
+    rc_injection_severity_model = "security"
     if getattr(profile, "fault_sweep", None) is not None:
         isc = getattr(profile.fault_sweep, "instruction_skip_config", None)
         if isc is not None:
             instruction_skip_model = (
                 getattr(isc, "severity_model", "security") or "security"
+            )
+        rci = getattr(profile.fault_sweep, "rc_injection_config", None)
+        if rci is not None:
+            rc_injection_severity_model = (
+                getattr(rci, "severity_model", "security") or "security"
             )
     fault_robot_vars = build_fault_robot_vars(
         robot_vars,
@@ -783,6 +819,7 @@ def validate_runtime_findings(
             validation = _validate_write_fault(
                 result,
                 expected_outcome=expected_outcome,
+                rc_injection_severity_model=rc_injection_severity_model,
             )
             _apply_validation(result, validation)
         else:

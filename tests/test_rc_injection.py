@@ -84,7 +84,8 @@ class RcInjectionFaultTypeTest(unittest.TestCase):
             "    symbols: [storage_write, security_state_write]\n"
             "    return_value: -42\n"
             "    return_register: 3\n"
-            "    require_applied: false\n",
+            "    require_applied: false\n"
+            "    severity_model: availability\n",
         )
         with tempfile.TemporaryDirectory() as td:
             profile_path = Path(td) / "profile.yaml"
@@ -97,6 +98,7 @@ class RcInjectionFaultTypeTest(unittest.TestCase):
         self.assertEqual(cfg.return_value, 0xFFFFFFD6)
         self.assertEqual(cfg.return_register, 3)
         self.assertFalse(cfg.require_applied)
+        self.assertEqual(cfg.severity_model, "availability")
         vars_by_key = dict(item.split(":", 1) for item in profile.robot_vars(ROOT))
         self.assertEqual(vars_by_key["RC_INJECTION_SYMBOLS"], "storage_write,security_state_write")
         self.assertEqual(vars_by_key["RC_INJECTION_RETURN_VALUE"], str(0xFFFFFFD6))
@@ -111,6 +113,7 @@ class RcInjectionFaultTypeTest(unittest.TestCase):
             ("return_value: -2147483649", "return_value"),
             ("return_register: 16", "return_register"),
             ("require_applied: 'yes'", "require_applied"),
+            ("severity_model: bogus", "severity_model"),
             ("unknown: true", "unknown field"),
         ]
         with tempfile.TemporaryDirectory() as td:
@@ -144,6 +147,7 @@ class RcInjectionFaultTypeTest(unittest.TestCase):
                 "return_value": 0xFFFFFFFB,
                 "return_register": 0,
                 "require_applied": True,
+                "severity_model": "security",
             },
         )
 
@@ -345,6 +349,7 @@ class RcInjectionFaultTypeTest(unittest.TestCase):
         )
         self.assertIn("storage_write", card)
         self.assertIn("storage_write@0x00000120", card)
+        self.assertIn("<span>policy</span> security", card)
 
 
 if __name__ == "__main__":

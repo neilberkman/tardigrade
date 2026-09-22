@@ -661,9 +661,12 @@ fault_sweep:
     return_value: -5          # signed or unsigned 32-bit integer
     return_register: 0        # Arm r0 by default
     require_applied: true     # missing entry/return hook is infrastructure failure
+    severity_model: security  # fail-closed denial of service is not a security finding
 ```
 
-The defaults preserve existing profiles: `symbols: [flash_area_write]`, `return_value: -5`, `return_register: 0`, and `require_applied: true`. `symbols` must be non-empty and contain unique ELF names. Nested calls are tracked independently, and the result contains configured symbols, resolved addresses, entered-call count, and the symbol/address where the return value was applied. An explicit symbol that cannot be resolved fails closed; it is never replaced with the default symbol.
+The defaults preserve existing profiles: `symbols: [flash_area_write]`, `return_value: -5`, `return_register: 0`, `require_applied: true`, and `severity_model: security`. `symbols` must be non-empty and contain unique ELF names. Nested calls are tracked independently, and the result contains configured symbols, resolved addresses, entered-call count, and the symbol/address where the return value was applied. An explicit symbol that cannot be resolved fails closed; it is never replaced with the default symbol.
+
+`severity_model` follows the same policy split as instruction-skip testing. Under `security`, a handled return error that fails closed without booting untrusted firmware is recorded as denial-of-service evidence but is not a security finding. Use `availability` when fail-stop behavior is itself in scope; integrity outcomes such as booting the wrong image remain findings under either model.
 
 ### Terminal-error escape campaigns
 

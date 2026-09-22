@@ -1261,7 +1261,13 @@ class RcInjectionConfig:
     Arm register number to overwrite on return.
     """
 
-    __slots__ = ("symbols", "return_value", "return_register", "require_applied")
+    __slots__ = (
+        "symbols",
+        "return_value",
+        "return_register",
+        "require_applied",
+        "severity_model",
+    )
 
     def __init__(
         self,
@@ -1269,6 +1275,7 @@ class RcInjectionConfig:
         return_value: int = -5,
         return_register: int = 0,
         require_applied: bool = True,
+        severity_model: str = "security",
     ) -> None:
         raw_symbols = symbols if symbols is not None else ["flash_area_write"]
         if not isinstance(raw_symbols, list):
@@ -1314,6 +1321,12 @@ class RcInjectionConfig:
                 "fault_sweep.rc_injection_config.require_applied: expected boolean"
             )
         self.require_applied = require_applied
+        self.severity_model = str(severity_model or "security").strip().lower()
+        if self.severity_model not in {"security", "availability"}:
+            raise ProfileError(
+                "fault_sweep.rc_injection_config.severity_model: expected "
+                "'security' or 'availability'"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1321,6 +1334,7 @@ class RcInjectionConfig:
             "return_value": self.return_value,
             "return_register": self.return_register,
             "require_applied": self.require_applied,
+            "severity_model": self.severity_model,
         }
 
     def to_runtime_dict(self) -> Dict[str, Any]:
@@ -5766,7 +5780,16 @@ def _parse_rc_injection_config(raw: Optional[Any]) -> RcInjectionConfig:
         return RcInjectionConfig()
     if not isinstance(raw, dict):
         raise ProfileError("fault_sweep.rc_injection_config: expected mapping")
-    unknown = sorted(set(raw) - {"symbols", "return_value", "return_register", "require_applied"})
+    unknown = sorted(
+        set(raw)
+        - {
+            "symbols",
+            "return_value",
+            "return_register",
+            "require_applied",
+            "severity_model",
+        }
+    )
     if unknown:
         raise ProfileError(
             "fault_sweep.rc_injection_config: unknown field(s): {}".format(
@@ -5809,6 +5832,7 @@ def _parse_rc_injection_config(raw: Optional[Any]) -> RcInjectionConfig:
             raw.get("require_applied", True),
             "fault_sweep.rc_injection_config.require_applied",
         ),
+        severity_model=raw.get("severity_model", "security"),
     )
 
 
@@ -7074,6 +7098,7 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
             },
             "rc_injection_config": {
                 "symbols", "return_value", "return_register", "require_applied",
+                "severity_model",
             },
         }
         for field_name, allowed in nested_fault_schemas.items():

@@ -20,6 +20,7 @@ fault_sweep:
     return_value: -5
     return_register: 0
     require_applied: true
+    severity_model: security
 ```
 
 Rules:
@@ -30,8 +31,12 @@ Rules:
 - `return_register` defaults to `0` for the existing Arm AAPCS behavior.
 - `require_applied` defaults to `true`. A run in which the requested function is
   never entered or its return hook never fires is an infrastructure failure.
+- `severity_model` accepts `security` or `availability` and defaults to
+  `security`. Fail-closed denial of service is retained as a finding only in
+  the availability model; boot-integrity failures remain findings in both.
 - Existing profiles without this block retain the current defaults:
-  `symbols: [flash_area_write]`, `return_value: -5`, `return_register: 0`.
+  `symbols: [flash_area_write]`, `return_value: -5`, `return_register: 0`,
+  `require_applied: true`, and `severity_model: security`.
 
 Pass the configuration through profile inheritance, scenario resolution,
 initial-state expansion, audit planning, Robot variables, and runtime telemetry.

@@ -440,12 +440,14 @@ def render_audit_card(path: Path, payload: Dict[str, Any]) -> Tuple[str, Dict[st
             "<code>configured / applied</code></div>"
             "<p class='path'><span>symbols</span> {} &nbsp; "
             "<span>return</span> 0x{:08X} / r{} &nbsp; "
+            "<span>policy</span> {} &nbsp; "
             "<span>applied</span> {} &nbsp; "
             "<span>function</span> {}</p>"
         ).format(
             html.escape(", ".join(str(value) for value in rc_cfg.get("symbols", []))),
             _as_int(rc_cfg.get("return_value")) & 0xFFFFFFFF,
             _as_int(rc_cfg.get("return_register")),
+            html.escape(str(rc_cfg.get("severity_model") or "security")),
             applied,
             html.escape(applied_text),
         )
