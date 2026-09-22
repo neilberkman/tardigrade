@@ -499,6 +499,7 @@ class TestActionSourceBoundaries(unittest.TestCase):
         self.assertIn('MCUBOOT_REF="${ref}"', source)
         self.assertIn('ZEPHYR_REF="${zephyr_ref}"', source)
         self.assertIn("MCUBOOT_BOOTSTRAP_SCOPE=head", source)
+        self.assertIn('python-version: "3.12"', source)
         self.assertIn("build_mcuboot_head_matrix.sh", source)
         for profile in (
             "mcuboot_head_move_nrf52_revert_full_fault_coverage.yaml",
