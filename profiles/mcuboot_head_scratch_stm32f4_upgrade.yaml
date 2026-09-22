@@ -38,9 +38,15 @@ fault_sweep:
   evaluation_mode: execute
   fault_types: [power_loss, swap_progress]
   max_writes: auto
-  max_writes_cap: 200000
+  # The mirrored-bank scratch swap currently performs about 295k writes.
+  # Keep the full calibrated operation in scope instead of truncating its tail.
+  max_writes_cap: 400000
   run_duration: "20.0"
-  max_step_limit: 200000000
+  # A clean swap reaches the application handoff at roughly 200M instructions.
+  # Leave enough room to observe the target boot after that boundary.
+  max_step_limit: 500000000
+  calibration_stop:
+    success_criteria: true
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 expect:
   should_find_issues: false

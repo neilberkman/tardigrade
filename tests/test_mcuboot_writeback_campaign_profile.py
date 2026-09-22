@@ -29,3 +29,6 @@ def test_mcuboot_scratch_stm32f4_writeback_profile() -> None:
     assert profile.fault_sweep.writeback.buffer_capacity == "auto"
     assert profile.fault_sweep.writeback.erase_flushes_domain is False
     assert profile.fault_sweep.writeback.barriers == []
+    assert profile.fault_sweep.max_writes_cap == 400000
+    assert profile.fault_sweep.max_step_limit == 500000000
+    assert profile.fault_sweep.calibration_stop.success_criteria is True
