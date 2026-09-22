@@ -77,6 +77,19 @@ def test_complete_profile_ownership_is_assessed_and_reused_at_runtime(tmp_path):
     assert trailer["parent"] == "slot:staging"
 
 
+def test_public_action_smoke_profile_asserts_complete_ownership():
+    profile = load_profile(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "profiles",
+            "mcuboot_head_move_nrf52_upgrade_verify_corrupt_staging_candidates.yaml",
+        ),
+        strict=True,
+    )
+    assert profile.ownership_plan["status"] == "assessed"
+
+
 def test_complete_profile_without_bootloader_ownership_fails_closed(tmp_path):
     text = BASE_PROFILE.replace(
         "bootloader_region: { base: 0x08000000, size: 0x1000 }\n", ""

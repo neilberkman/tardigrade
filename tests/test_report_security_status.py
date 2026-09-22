@@ -33,6 +33,39 @@ def _report(summary, *, verdict="PASS", should_find=False, mode="regression", **
     }
 
 
+def test_assessed_ownership_layout_is_supported_and_clean():
+    aggregate = build_security_aggregate(
+        _report({
+            "runtime_sweep": {"issue_points": 0, "brick_rate": 0.0},
+            "ownership_layout": {
+                "status": "assessed",
+                "complete": True,
+                "regions": [],
+            },
+        })
+    )
+    assert aggregate["status"] == "CLEAN"
+
+
+def test_unassessed_ownership_layout_is_inconclusive():
+    aggregate = build_security_aggregate(
+        _report({
+            "runtime_sweep": {"issue_points": 0, "brick_rate": 0.0},
+            "ownership_layout": {
+                "status": "not_assessed",
+                "complete": False,
+                "reason": "manifest completeness was not asserted",
+                "regions": [],
+            },
+        })
+    )
+    assert aggregate["status"] == "INCONCLUSIVE"
+    assert any(
+        "whole-device ownership was not assessed" in reason
+        for reason in aggregate["inconclusive_reasons"]
+    )
+
+
 @pytest.mark.parametrize(
     ("summary", "status", "issues"),
     [

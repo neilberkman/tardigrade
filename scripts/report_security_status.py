@@ -30,6 +30,7 @@ _KNOWN_SUMMARY_SECTIONS = {
     "initial_states",
     "multi_fault_plan",
     "multi_fault_runtime_sweep",
+    "ownership_layout",
     "partial_staging",
     "per_component",
     "persistent_state_layout",
@@ -315,6 +316,40 @@ def _coverage_check_required(
     return not isinstance(summary.get("runtime_sweep"), dict)
 
 
+def _collect_ownership_layout(
+    state: MutableMapping[str, Any],
+    value: Any,
+    context: str,
+) -> None:
+    layout = _mapping(value, context)
+    status = layout.get("status")
+    if status == "assessed":
+        if layout.get("complete") is not True:
+            _record_inconclusive(
+                state, "{} is assessed without a complete manifest".format(context)
+            )
+    elif status == "not_assessed":
+        reason = str(layout.get("reason") or "manifest completeness was not asserted")
+        _record_inconclusive(
+            state, "{} whole-device ownership was not assessed: {}".format(
+                context, reason
+            )
+        )
+    else:
+        raise ValueError("{} has unsupported status {!r}".format(context, status))
+
+    components = layout.get("components")
+    if components is None:
+        return
+    components = _mapping(components, "{}.components".format(context))
+    for name, component in components.items():
+        _collect_ownership_layout(
+            state,
+            component,
+            "{}.components.{}".format(context, name),
+        )
+
+
 def _collect_summary(
     state: MutableMapping[str, Any], summary_value: Any, *, prefix: str = "summary"
 ) -> None:
@@ -356,6 +391,12 @@ def _collect_summary(
             state,
             summary["multi_fault_runtime_sweep"],
             "{}.multi_fault_runtime_sweep".format(prefix),
+        )
+    if "ownership_layout" in summary:
+        _collect_ownership_layout(
+            state,
+            summary["ownership_layout"],
+            "{}.ownership_layout".format(prefix),
         )
 
     partial = summary.get("partial_staging")

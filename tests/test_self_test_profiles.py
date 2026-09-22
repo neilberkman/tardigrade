@@ -747,6 +747,53 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("incomplete or infrastructure-invalid", reason)
 
+    def test_check_verdict_preserves_unassessed_ownership_without_failing_fixture(self):
+        passed, reason = check_verdict(
+            profile_path=ROOT / "profiles" / "dummy.yaml",
+            profile_raw={},
+            report={
+                "verdict": "PASS — whole-device layout not assessed",
+                "security_aggregate": {
+                    "status": "INCONCLUSIVE",
+                    "inconclusive_reasons": [
+                        "summary.ownership_layout whole-device ownership was not assessed: "
+                        "manifest completeness was not asserted"
+                    ],
+                },
+                "summary": {
+                    "runtime_sweep": {
+                        "issue_points": 0,
+                        "bricks": 0,
+                        "brick_rate": 0.0,
+                        "control": {"effective_outcome": "success"},
+                    }
+                },
+            },
+            exit_code=0,
+        )
+        self.assertTrue(passed)
+        self.assertIn("whole-device ownership not assessed", reason)
+
+    def test_check_verdict_rejects_mixed_ownership_and_runtime_inconclusive(self):
+        passed, reason = check_verdict(
+            profile_path=ROOT / "profiles" / "dummy.yaml",
+            profile_raw={},
+            report={
+                "verdict": "PASS — whole-device layout not assessed",
+                "security_aggregate": {
+                    "status": "INCONCLUSIVE",
+                    "inconclusive_reasons": [
+                        "summary.ownership_layout whole-device ownership was not assessed: "
+                        "manifest completeness was not asserted",
+                        "summary.runtime_sweep campaign is incomplete",
+                    ],
+                },
+            },
+            exit_code=0,
+        )
+        self.assertFalse(passed)
+        self.assertIn("runtime_sweep campaign is incomplete", reason)
+
     def test_check_verdict_still_allows_assertion_exit_for_expected_fixture(self):
         passed, _reason = check_verdict(
             profile_path=ROOT / "profiles" / "dummy.yaml",

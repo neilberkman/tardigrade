@@ -84,13 +84,25 @@ def _report_integrity_failure_reason(report: Dict[str, Any]) -> Optional[str]:
         status = str(aggregate.get("status") or "").strip().upper()
         if status == "INCONCLUSIVE":
             reasons = aggregate.get("inconclusive_reasons")
-            detail = ""
-            if isinstance(reasons, list):
-                detail = "; ".join(str(reason).strip() for reason in reasons if str(reason).strip())
-            suffix = ": {}".format(detail) if detail else ""
-            return "Audit report security aggregate is inconclusive{}".format(
-                suffix
+            normalized_reasons = (
+                [str(reason).strip() for reason in reasons if str(reason).strip()]
+                if isinstance(reasons, list)
+                else []
             )
+            ownership_only = bool(normalized_reasons) and all(
+                " whole-device ownership was not assessed:" in reason
+                for reason in normalized_reasons
+            )
+            # The self-test harness verifies expected campaign behavior, not
+            # whole-device ownership coverage. Preserve that limitation in
+            # the result text below, while the public aggregate remains
+            # INCONCLUSIVE and mixed/other limitations still fail here.
+            if not ownership_only:
+                detail = "; ".join(normalized_reasons)
+                suffix = ": {}".format(detail) if detail else ""
+                return "Audit report security aggregate is inconclusive{}".format(
+                    suffix
+                )
 
     summary = report.get("summary")
     if not isinstance(summary, dict):
@@ -168,6 +180,22 @@ def _report_integrity_failure_reason(report: Dict[str, Any]) -> Optional[str]:
                 return "{} campaign integrity reports {}".format(label.capitalize(), field)
 
     return None
+
+
+def _ownership_not_assessed(report: Dict[str, Any]) -> bool:
+    """Return whether the report explicitly disclaims ownership coverage."""
+    aggregate = report.get("security_aggregate")
+    if not isinstance(aggregate, dict):
+        return False
+    reasons = aggregate.get("inconclusive_reasons")
+    return bool(
+        isinstance(reasons, list)
+        and reasons
+        and all(
+            " whole-device ownership was not assessed:" in str(reason)
+            for reason in reasons
+        )
+    )
 
 
 def load_runtime_manifest(
@@ -502,6 +530,14 @@ def check_verdict(
     integrity_reason = _report_integrity_failure_reason(report)
     if integrity_reason:
         return False, integrity_reason
+    ownership_note = (
+        " (whole-device ownership not assessed)"
+        if _ownership_not_assessed(report)
+        else ""
+    )
+
+    def accepted(reason: str) -> Tuple[bool, str]:
+        return True, reason + ownership_note
 
     expect = profile_raw.get("expect", {})
     brick_rate_min = float(expect.get("brick_rate_min", 0.0))
@@ -593,8 +629,10 @@ def check_verdict(
     if expectation_requires_findings(expect):
         if issue_points == 0:
             if control_only_issue:
-                return True, "Control exhibits expected {}, as intended".format(
-                    control_outcome
+                return accepted(
+                    "Control exhibits expected {}, as intended".format(
+                        control_outcome
+                    )
                 )
             return False, "Expected issues but found none"
         if brick_rate_min > 0 and brick_rate < brick_rate_min:
@@ -608,22 +646,28 @@ def check_verdict(
             if missing:
                 return False, "Missing expected issue reason(s): {}".format(", ".join(missing))
         if bricks > 0:
-            return True, "Found {} bricks ({:.1%}), as expected".format(bricks, brick_rate)
+            return accepted(
+                "Found {} bricks ({:.1%}), as expected".format(bricks, brick_rate)
+            )
         if not allow_semantic_only_issues:
             return False, (
                 "Expected boot-visible issues but only found semantic/invariant issue points; "
                 "set expect.allow_semantic_only_issues=true if that is intentional"
             )
-        return True, "Found {} semantic/invariant issue points, as expected".format(
-            issue_points
+        return accepted(
+            "Found {} semantic/invariant issue points, as expected".format(
+                issue_points
+            )
         )
     elif not is_exploratory_expectation(expect):
         if effective_issue_points > 0:
             return False, "Expected no issues but found {} point(s)".format(effective_issue_points)
-        return True, "No issues found, as expected"
+        return accepted("No issues found, as expected")
     else:
-        return True, "Exploratory campaign completed ({} issue point(s))".format(
-            effective_issue_points
+        return accepted(
+            "Exploratory campaign completed ({} issue point(s))".format(
+                effective_issue_points
+            )
         )
 
 

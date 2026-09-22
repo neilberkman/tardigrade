@@ -11,9 +11,13 @@ flash_backend: faultFlash
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_head_move_nrf52.elf
   entry: 0x00000000
+bootloader_region: { base: 0x00000000, size: 0x0000C000 }
+ownership_manifest_complete: true
 memory:
   sram: { start: 0x20000000, end: 0x20040000 }
   write_granularity: 4
+  erase_regions:
+    - { base: 0x00000000, size: 0x00100000, sector_size: 0x1000 }
   slots:
     exec: { base: 0x0000C000, size: 0x76000 }
     staging: { base: 0x00082000, size: 0x76000 }
