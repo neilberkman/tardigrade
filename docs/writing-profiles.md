@@ -895,7 +895,7 @@ fault_sweep:
   progress_stall_timeout_s: 10.0 # emulated-time threshold for zero-progress stall detection
 ```
 
-`phase2_time_slice` controls the emulation time per slice during Phase 2 recovery boot. Defaults to the calibration slice. Larger values mean fewer IPC round-trips but coarser progress detection. `phase2_wall_timeout_s` bounds the wall-clock time for each regular execute/replay recovery boot and defaults to 30 seconds. The outer Renode/Robot timeout remains the hard cap for the run. Specialized Phase 2 fault-injection paths may use their own larger budget. `progress_stall_timeout_s` is the amount of emulated time with no change in the tracked progress signals before the boot is considered stalled. A terminal `no_boot_stall(...)` or `no_progress_stall(...)` observation is treated as `no_boot` when no valid execution is observed. The separate wall-clock guard produces a `timeout` outcome, which marks the observation incomplete rather than treating it as evidence of a brick.
+`phase2_time_slice` controls the emulation time per slice during Phase 2 recovery boot. Defaults to the calibration slice. Larger values mean fewer IPC round-trips but coarser progress detection. `phase2_wall_timeout_s` bounds the wall-clock time for each regular execute/replay recovery boot and defaults to 30 seconds. The outer Renode/Robot timeout remains the hard cap for the run. Specialized Phase 2 fault-injection paths may use their own larger budget. `progress_stall_timeout_s` is the amount of emulated time with no change in the tracked progress signals before the boot is considered stalled. A terminal `no_boot_stall(...)` or `no_progress_stall(...)` observation is treated as `no_boot` when no valid execution is observed. Exhausting the configured emulation budget is not by itself a liveness failure: when execution was observed and configured liveness checks passed, classification continues through the remaining image and content criteria. The separate wall-clock guard produces a `timeout` outcome, which marks the observation incomplete rather than treating it as evidence of a brick.
 
 ### Write-back durability model
 
@@ -1759,7 +1759,10 @@ HardFault, active fault handler, invalid reset vector, or terminal liveness
 stall is reported as `hard_fault` or `no_boot`; an accompanying digest mismatch
 is retained in `signals.content_mismatch` and `signals.supporting_outcomes`
 instead of replacing the crash with `wrong_image`. A wall-clock timeout remains
-an incomplete observation rather than proof of a brick.
+an incomplete observation rather than proof of a brick. Likewise, configured
+emulation-budget exhaustion alone is not `no_boot` evidence. If valid execution
+and configured liveness were observed, the final outcome is determined by the
+remaining slot and content criteria.
 
 For injected MRAM programs, the backend contract is fail-closed. The per-point
 record includes `mram_fault_evidence` with the selected and backend write

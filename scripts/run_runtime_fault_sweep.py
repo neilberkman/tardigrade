@@ -6982,7 +6982,9 @@ def collect_recovery_execution_evidence(actual_vtor, pc_value, boot_slot, p2_sta
     return evidence
 
 
-def recovery_failure_outcome(execution_evidence, execution_observed):
+def recovery_failure_outcome(
+    execution_evidence, execution_observed, liveness_established=False
+):
     """Return a primary execution failure before evaluating image identity."""
     if not execution_evidence:
         return None
@@ -6991,14 +6993,13 @@ def recovery_failure_outcome(execution_evidence, execution_observed):
         return 'hard_fault'
     if 'busfault' in reason or 'bus_fault' in reason:
         return 'bus_fault'
-    if (
-        execution_evidence.get('reset_vector_valid') is False
-        and not execution_observed
-    ):
+    if execution_evidence.get('reset_vector_valid') is False:
         return 'hard_fault'
     if reason.startswith('wall_timeout'):
         return 'timeout'
-    if reason == 'budget':
+    if reason == 'budget' and (
+        not execution_observed or not liveness_established
+    ):
         return 'no_boot'
     if reason.startswith(('no_boot', 'no_progress', 'no_writes')):
         return 'no_boot'
@@ -7222,7 +7223,11 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
         and reset_vector_offset_ok
         and structured_checks_ok
     )
+    liveness_established = bool(
+        execution_observed and pc_ok and structured_checks_ok
+    )
     expectations_met = vtor_ok and vtor_aligned and pc_ok and criteria_ok
+    signals['liveness_established'] = liveness_established
     signals['expectations_met'] = expectations_met
 
     execution_evidence = collect_recovery_execution_evidence(
@@ -7231,7 +7236,7 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     if execution_evidence:
         signals['recovery_execution'] = execution_evidence
     primary_execution_failure = recovery_failure_outcome(
-        execution_evidence, execution_observed
+        execution_evidence, execution_observed, liveness_established
     )
     content_mismatch = bool(
         enforce_content_criteria

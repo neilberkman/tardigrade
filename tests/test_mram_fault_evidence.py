@@ -210,13 +210,13 @@ def test_execution_failures_precede_content_identity_failures() -> None:
     ns = _runtime_functions("recovery_failure_outcome")
 
     assert ns["recovery_failure_outcome"](
-        {"hardfault_observed": True, "stop_reason": "vtor_captured"}, True
+        {"hardfault_observed": True, "stop_reason": "vtor_captured"}, True, True
     ) == "hard_fault"
     assert ns["recovery_failure_outcome"](
-        {"hardfault_observed": False, "stop_reason": "no_progress_stall"}, True
+        {"hardfault_observed": False, "stop_reason": "no_progress_stall"}, True, True
     ) == "no_boot"
     assert ns["recovery_failure_outcome"](
-        {"hardfault_observed": False, "stop_reason": "wall_timeout(10s)"}, True
+        {"hardfault_observed": False, "stop_reason": "wall_timeout(10s)"}, True, True
     ) == "timeout"
 
 
