@@ -579,6 +579,7 @@ def result_has_initial_timeout(result: Dict[str, Any]) -> bool:
                         or result.get("initial_boot_outcome")
                     ),
                     "stop_reason": reason,
+                    "signals": signals,
                 }
             ):
                 return True

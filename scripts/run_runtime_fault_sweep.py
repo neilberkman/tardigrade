@@ -7003,7 +7003,9 @@ def recovery_failure_outcome(
     if reason == 'budget' and (
         not execution_observed or not liveness_established
     ):
-        return 'no_boot'
+        if execution_observed:
+            return 'no_boot'
+        return 'timeout'
     if reason.startswith(('no_boot', 'no_progress', 'no_writes')):
         return 'no_boot'
     if reason.startswith('console_fatal'):
@@ -8972,6 +8974,12 @@ def run_metadata_fault(fault_at, fault_type='w'):
 def classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=None):
     if boot_outcome == 'success':
         return 'recoverable'
+    if boot_outcome == 'timeout':
+        return 'incomplete'
+    if boot_outcome == 'infra_error':
+        return 'infrastructure_error'
+    if boot_outcome == 'skipped':
+        return 'skipped'
     if boot_outcome == 'wrong_image':
         eff_hash_slot = success_image_hash_slot
         eff_vtor = success_vtor_slot
@@ -10042,9 +10050,17 @@ def run_execute_fault(fault_at, fault_type='w'):
     # Read final state of the first boot.
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    # Non-halting fault models can consume the entire phase-1 emulation
+    # budget after the fault fires.  When there is no continuation phase,
+    # phase 1 is the authoritative initial observation status; otherwise a
+    # raw ``no_boot`` result would be reported as a target failure even though
+    # no terminal boot state was observed.
+    initial_observation_status = (
+        phase2_status if phase2_status is not None else phase1_status
+    )
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
         vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria,
-        p2_status=phase2_status,
+        p2_status=initial_observation_status,
     )
     signals['phase1_ms'] = phase1_ms
     signals['phase2_ms'] = phase2_ms
@@ -10076,7 +10092,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         fault_at, fault_type, fault_injected, fault_address,
         actual_writes, signals, boot_outcome=boot_outcome,
         boot_slot=boot_slot, eff_criteria=eff_criteria,
-        p2_status=phase2_status,
+        p2_status=initial_observation_status,
         followup_label='fp{}_followup'.format(fault_at),
         saved_flash=saved_flash if is_power_loss_fault else None,
         fault_snapshot_bytes=fault_snapshot_bytes,

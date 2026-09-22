@@ -13,6 +13,10 @@ def test_wall_timeout_is_not_no_boot_evidence() -> None:
     assert boot_outcome_after_stop("no_boot", "wall_timeout(30s)") == "timeout"
 
 
+def test_emulation_budget_is_not_no_boot_evidence() -> None:
+    assert boot_outcome_after_stop("no_boot", "budget") == "timeout"
+
+
 def test_no_boot_stall_remains_valid_no_boot_evidence() -> None:
     assert boot_outcome_after_stop("no_boot", "no_boot_stall(20s_emulated)") == "no_boot"
 

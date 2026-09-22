@@ -16,8 +16,9 @@ SUPPORTED_BOOT_OUTCOMES = DEVICE_BOOT_OUTCOMES | RUNNER_STATUS_OUTCOMES
 
 
 def boot_outcome_after_stop(boot_outcome, stop_reason):
-    """Promote an uncompleted wall-clock observation to the timeout status."""
-    if str(stop_reason or "").strip().startswith("wall_timeout"):
+    """Promote an exhausted observation budget to the timeout status."""
+    reason = str(stop_reason or "").strip()
+    if reason == "budget" or reason.startswith("wall_timeout"):
         return "timeout"
     return boot_outcome
 

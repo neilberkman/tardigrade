@@ -134,10 +134,10 @@ def test_budget_with_failed_configured_liveness_is_no_boot() -> None:
     assert signals["liveness_established"] is False
 
 
-def test_budget_without_observed_execution_is_no_boot() -> None:
+def test_budget_without_observed_execution_is_timeout() -> None:
     (outcome, slot, signals), _state = _evaluate(vtor=0, pc=0)
 
-    assert outcome == "no_boot"
+    assert outcome == "timeout"
     assert slot is None
     assert signals["execution_observed"] is False
 

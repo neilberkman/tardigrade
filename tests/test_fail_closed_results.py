@@ -287,6 +287,32 @@ def test_zero_write_phase_timeout_is_not_a_no_boot_finding() -> None:
     assert compute_verdict(summary, _expect()).startswith("FAIL")
 
 
+def test_emulation_budget_exhaustion_is_not_a_no_boot_finding() -> None:
+    results = [
+        _control(),
+        {
+            "is_control": False,
+            "fault_at": 24337,
+            "fault_requested": 24337,
+            "fault_type": "x",
+            "fault_injected": True,
+            "boot_outcome": "no_boot",
+            "boot_slot": None,
+            "signals": {
+                "phase1_stop_reason": "budget",
+                "execution_observed": False,
+            },
+        },
+    ]
+    summary = summarize_runtime_sweep(results, expected_fault_points=1)
+    assert summary["timeout_points"] == 1
+    assert summary["issue_points"] == 0
+    assert summary["bricks"] == 0
+    assert summary["incomplete_fault_points"] == 1
+    assert summary["campaign_complete"] is False
+    assert compute_verdict(summary, _expect()).startswith("FAIL")
+
+
 def test_followup_timeout_keeps_initial_stall_but_campaign_incomplete() -> None:
     results = [
         _control(),

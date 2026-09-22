@@ -116,11 +116,17 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("from boot_outcomes import boot_outcome_after_stop", text)
         self.assertIn("boot_outcome = boot_outcome_after_stop('no_boot', p2_reason)", text)
+        self.assertIn("if reason == 'budget'", text)
+        self.assertIn("return 'timeout'", text)
 
     def test_followup_observations_pass_stop_status_to_outcome_evaluator(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("p2_status=status,", text)
-        self.assertIn("p2_status=phase2_status,", text)
+        self.assertIn(
+            "phase2_status if phase2_status is not None else phase1_status",
+            text,
+        )
+        self.assertIn("p2_status=initial_observation_status,", text)
         self.assertIn("p2_status=final_status,", text)
 
     def test_multiboot_telemetry_uses_recorded_followups(self) -> None:

@@ -152,6 +152,57 @@ class BootCycleAnalysisTests(unittest.TestCase):
         self.assertEqual(analysis["status"], "single_boot")
         self.assertNotIn("timeout_cycles", analysis)
 
+    def test_emulation_budget_without_terminal_evidence_is_inconclusive(self) -> None:
+        analysis = analyze_boot_cycles(
+            [
+                {
+                    "cycle": 0,
+                    "boot_slot": None,
+                    "boot_outcome": "no_boot",
+                    "stop_reason": "budget",
+                    "signals": {"execution_observed": False},
+                },
+            ],
+            requested_cycles=1,
+        )
+        self.assertEqual(analysis["status"], "timeout")
+        self.assertEqual(analysis["timeout_cycles"], [0])
+
+    def test_terminal_fault_outranks_emulation_budget_reason(self) -> None:
+        analysis = analyze_boot_cycles(
+            [
+                {
+                    "cycle": 0,
+                    "boot_slot": None,
+                    "boot_outcome": "bus_fault",
+                    "stop_reason": "budget",
+                    "signals": {"cfsr": "0x00030000"},
+                },
+            ],
+            requested_cycles=1,
+        )
+        self.assertEqual(analysis["status"], "single_boot")
+        self.assertNotIn("timeout_cycles", analysis)
+
+    def test_observed_execution_with_failed_liveness_is_terminal(self) -> None:
+        analysis = analyze_boot_cycles(
+            [
+                {
+                    "cycle": 0,
+                    "boot_slot": "exec",
+                    "boot_outcome": "no_boot",
+                    "stop_reason": "budget",
+                    "signals": {
+                        "execution_observed": True,
+                        "liveness_established": False,
+                    },
+                },
+            ],
+            requested_cycles=1,
+        )
+        self.assertEqual(analysis["status"], "single_boot")
+        self.assertNotIn("timeout_cycles", analysis)
+
     def test_followup_wall_timeout_does_not_erase_initial_no_boot_stall(self) -> None:
         analysis = analyze_boot_cycles(
             [

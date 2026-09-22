@@ -28,15 +28,25 @@ _CONCRETE_TERMINAL_BOOT_OUTCOMES = frozenset(
 def cycle_has_unresolved_timeout(record):
     """Return whether a cycle ended without a concrete terminal outcome.
 
-    A wall-clock budget can expire during the emulator call that also captures
-    a terminal CPU or boot result.  In that case the terminal observation is
-    authoritative and the wall-budget reason remains supporting telemetry.
+    A wall-clock or emulation budget can expire during the emulator call that
+    also captures a terminal CPU or boot result.  In that case the terminal
+    observation is authoritative and the budget reason remains supporting
+    telemetry.
     """
     outcome = str(record.get("boot_outcome") or "").strip().lower()
     if outcome == "timeout":
         return True
-    reason = str(record.get("stop_reason") or "")
-    if not reason.startswith("wall_timeout"):
+    reason = str(record.get("stop_reason") or "").strip()
+    if reason != "budget" and not reason.startswith("wall_timeout"):
+        return False
+    signals = record.get("signals")
+    if (
+        reason == "budget"
+        and outcome == "no_boot"
+        and isinstance(signals, dict)
+        and signals.get("execution_observed") is True
+        and signals.get("liveness_established") is False
+    ):
         return False
     return outcome not in _CONCRETE_TERMINAL_BOOT_OUTCOMES
 

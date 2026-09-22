@@ -39,8 +39,8 @@ fault_sweep:
   evaluation_mode: execute
   max_writes: auto
   max_writes_cap: 200000
-  run_duration: "20.0"
-  max_step_limit: 200000000
+  run_duration: "60.0"
+  max_step_limit: 400000000
   fault_types:
     - power_loss
     - interrupted_erase
