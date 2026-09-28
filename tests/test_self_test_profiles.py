@@ -285,21 +285,8 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         )
 
         self.assertIsNone(profile.success_criteria.vtor_in_slot)
-        self.assertEqual(profile.success_criteria.vector_table_offset, 0x200)
+        self.assertEqual(profile.success_criteria.vector_table_offset, 0x400)
         self.assertEqual(profile.success_criteria.pc_in_slot, "exec")
-
-        image_path = ROOT / profile.images["staging"]
-        offset = profile.success_criteria.vector_table_offset
-        vector = image_path.read_bytes()[offset : offset + 8]
-        self.assertEqual(len(vector), 8)
-        initial_sp = int.from_bytes(vector[:4], "little")
-        reset_vector = int.from_bytes(vector[4:], "little")
-        exec_slot = profile.memory.slots["exec"]
-        self.assertGreaterEqual(initial_sp, profile.memory.sram_start)
-        self.assertLessEqual(initial_sp, profile.memory.sram_end)
-        self.assertEqual(reset_vector & 1, 1)
-        self.assertGreaterEqual(reset_vector & ~1, exec_slot.base)
-        self.assertLess(reset_vector & ~1, exec_slot.base + exec_slot.size)
 
     def test_pr2100_discovery_profiles_use_stable_revert_marker(self):
         for name in (

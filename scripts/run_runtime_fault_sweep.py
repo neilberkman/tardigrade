@@ -7664,26 +7664,54 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     instruction_previous = as_int(cpu_ref.ExecutedInstructions)
     instructions_executed = 0
     pc_handoff_slot = success_pc_slot if success_pc_slot in slot_ranges else None
+    pc_handoff_vector_offset = (
+        success_vector_offset if pc_handoff_slot is not None else 0
+    )
     pc_handoff_hook_addresses = []
+    pc_handoff_hook_candidates = []
+    pc_handoff_hook_hits = []
 
     def capture_pc_handoff(_cpu, address):
+        pc_handoff_hook_hits.append(fmt_u32(as_int(address) & ~1))
         capture_sticky_pc(address)
 
     if pc_handoff_slot is not None:
         target_lo, target_hi = slot_ranges[pc_handoff_slot]
         for _source_slot, (_source_lo, _source_hi) in slot_ranges.items():
+            candidate = {
+                'source_slot': _source_slot,
+                'vector_address': fmt_u32(
+                    _source_lo + pc_handoff_vector_offset
+                ),
+                'target_slot': pc_handoff_slot,
+                'installed': False,
+            }
             try:
+                initial_sp = as_int(
+                    bus.ReadDoubleWord(_source_lo + pc_handoff_vector_offset)
+                ) & 0xFFFFFFFF
+                reset_vector = as_int(
+                    bus.ReadDoubleWord(_source_lo + pc_handoff_vector_offset + 4)
+                ) & 0xFFFFFFFF
                 reset_handler = as_int(
-                    bus.ReadDoubleWord(_source_lo + success_vector_offset + 4)
+                    reset_vector
                 ) & ~1
+                candidate['initial_sp'] = fmt_u32(initial_sp)
+                candidate['reset_vector'] = fmt_u32(reset_vector)
+                candidate['reset_handler'] = fmt_u32(reset_handler)
+                candidate['target_match'] = bool(
+                    target_lo <= reset_handler < target_hi
+                )
                 if (
                     target_lo <= reset_handler < target_hi
                     and reset_handler not in pc_handoff_hook_addresses
                 ):
                     cpu_ref.AddHook(reset_handler, capture_pc_handoff)
                     pc_handoff_hook_addresses.append(reset_handler)
-            except Exception:
-                pass
+                    candidate['installed'] = True
+            except Exception as exc:
+                candidate['error'] = str(exc)
+            pc_handoff_hook_candidates.append(candidate)
     if op_trace is not None and op_trace_limit <= 0:
         op_trace_limit = 1024
     for iters in range(max_iters):
@@ -7960,6 +7988,15 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         'erases': erases_now,
         'pc': fmt_u32(pc_now),
         'pc_samples': pc_samples,
+        'pc_handoff_observation': {
+            'configured_slot': pc_handoff_slot,
+            'vector_table_offset': pc_handoff_vector_offset,
+            'candidates': pc_handoff_hook_candidates,
+            'installed_hooks': [
+                fmt_u32(address) for address in pc_handoff_hook_addresses
+            ],
+            'hits': pc_handoff_hook_hits,
+        },
         'op_trace_events': len(op_trace) if op_trace is not None else 0,
         'op_trace_truncated': bool(trace_limit_hit),
         'console_attached_names': console_state.get('attached_names', []),
@@ -12387,6 +12424,9 @@ if calibration_mode:
             'calibration_emulated_s': float(cal_status.get('emulated_s', 0)),
             'calibration_elapsed_s': float(cal_status.get('elapsed_s', 0)),
             'calibration_pc': cal_status.get('pc', '0x00000000'),
+            'pc_handoff_observation': cal_status.get(
+                'pc_handoff_observation', {}
+            ),
             'boot_outcome': calibration_boot_outcome,
             'boot_slot': calibration_boot_slot,
             'signals': calibration_signals,

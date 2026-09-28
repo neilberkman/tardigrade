@@ -11,7 +11,7 @@ success_criteria:
   # Observe execution in the slot directly, including transient execution
   # retained by the runtime reset-handler hook.
   vtor_in_slot:
-  vector_table_offset: 0x200
+  vector_table_offset: 0x400
   pc_in_slot: exec
 fault_sweep:
   mode: runtime

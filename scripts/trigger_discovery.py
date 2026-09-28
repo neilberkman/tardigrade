@@ -1046,6 +1046,7 @@ def _attempt_calibration_dict(data: Dict[str, Any]) -> Dict[str, Any]:
         "pc": data.get("calibration_pc"),
         "elapsed_s": data.get("calibration_elapsed_s"),
         "emulated_s": data.get("calibration_emulated_s"),
+        "pc_handoff_observation": data.get("pc_handoff_observation"),
     }
 
 

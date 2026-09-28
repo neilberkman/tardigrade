@@ -536,6 +536,27 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
         self.assertEqual(status["iters"], 1)
         self.assertEqual(status["executed_instructions"], 30)
         self.assertEqual(sticky_pc["slot"], "exec")
+        self.assertEqual(
+            status["pc_handoff_observation"],
+            {
+                "configured_slot": "exec",
+                "vector_table_offset": 0,
+                "candidates": [
+                    {
+                        "source_slot": "exec",
+                        "vector_address": "0x00002000",
+                        "target_slot": "exec",
+                        "installed": True,
+                        "initial_sp": "0x00000000",
+                        "reset_vector": "0x00002005",
+                        "reset_handler": "0x00002004",
+                        "target_match": True,
+                    }
+                ],
+                "installed_hooks": ["0x00002004"],
+                "hits": ["0x00002004"],
+            },
+        )
         self.assertEqual(state["hooks"], {})
 
 
