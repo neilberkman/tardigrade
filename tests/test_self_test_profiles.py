@@ -30,6 +30,7 @@ from self_test import (
     shard_costs_s,
     write_summary,
 )
+from profile_loader import load_profile
 
 
 class SelfTestProfileDiscoveryTests(unittest.TestCase):
@@ -277,6 +278,15 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
                 fault_types = raw.get("fault_sweep", {}).get("fault_types", [])
                 self.assertIn("power_loss", fault_types)
                 self.assertIn("swap_progress", fault_types)
+
+    def test_stm32_scratch_writeback_uses_pc_handoff_observation(self):
+        profile = load_profile(
+            ROOT / "profiles" / "mcuboot_head_scratch_stm32f4_writeback.yaml"
+        )
+
+        self.assertIsNone(profile.success_criteria.vtor_in_slot)
+        self.assertEqual(profile.success_criteria.vector_table_offset, 0x400)
+        self.assertEqual(profile.success_criteria.pc_in_slot, "exec")
 
     def test_pr2100_discovery_profiles_use_stable_revert_marker(self):
         for name in (

@@ -6,6 +6,13 @@ description: >
   MCUboot current-HEAD scratch upgrade on nucleo_f429zi with a writeback
   durability model. Inherits the established scratch geometry and artifacts;
   only power-loss cutpoints are selected.
+success_criteria:
+  # The STM32 application handoff does not leave VTOR in the executable slot.
+  # Observe execution in the slot directly, including transient execution
+  # retained by the runtime reset-handler hook.
+  vtor_in_slot:
+  vector_table_offset: 0x400
+  pc_in_slot: exec
 fault_sweep:
   mode: runtime
   evaluation_mode: execute

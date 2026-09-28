@@ -7663,31 +7663,34 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     pc_samples = []
     instruction_previous = as_int(cpu_ref.ExecutedInstructions)
     instructions_executed = 0
-    instruction_counter = {'count': 0}
-    instruction_counter_hooked = False
-
-    def count_executed_block(_pc, executed_instructions):
-        instruction_counter['count'] += as_int(executed_instructions)
-
-    try:
-        # TranslationCPU reports the exact instruction count for every
-        # completed block.  Unlike ExecutedInstructions, this accumulator is
-        # not reset when firmware resets the machine between polling slices.
-        cpu_ref.SetHookAtBlockEnd(count_executed_block)
-        instruction_counter_hooked = True
-    except Exception:
-        # Compatibility fallback for CPU models without block-end hooks.
-        instruction_counter_hooked = False
     pc_handoff_slot = success_pc_slot if success_pc_slot in slot_ranges else None
+    pc_handoff_hook_addresses = []
+
+    def capture_pc_handoff(_cpu, address):
+        capture_sticky_pc(address)
+
+    if pc_handoff_slot is not None:
+        target_lo, target_hi = slot_ranges[pc_handoff_slot]
+        for _source_slot, (_source_lo, _source_hi) in slot_ranges.items():
+            try:
+                reset_handler = as_int(
+                    bus.ReadDoubleWord(_source_lo + success_vector_offset + 4)
+                ) & ~1
+                if (
+                    target_lo <= reset_handler < target_hi
+                    and reset_handler not in pc_handoff_hook_addresses
+                ):
+                    cpu_ref.AddHook(reset_handler, capture_pc_handoff)
+                    pc_handoff_hook_addresses.append(reset_handler)
+            except Exception:
+                pass
     if op_trace is not None and op_trace_limit <= 0:
         op_trace_limit = 1024
     for iters in range(max_iters):
         monitor.Parse('emulation RunFor "{}"'.format(time_slice))
         emulated_s += slice_s
         instruction_now = as_int(cpu_ref.ExecutedInstructions)
-        if instruction_counter_hooked:
-            instructions_executed = instruction_counter['count']
-        elif instruction_now >= instruction_previous:
+        if instruction_now >= instruction_previous:
             instructions_executed += instruction_now - instruction_previous
         else:
             # Some CPU models reset the public counter during a machine reset.
@@ -7941,9 +7944,9 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         label, reason, iters + 1, writes_now,
         fmt_u32(pc_now), elapsed))
     console_state = capture_console_state(include_recent=bool(console_fatal))
-    if instruction_counter_hooked:
+    for hook_address in pc_handoff_hook_addresses:
         try:
-            cpu_ref.SetHookAtBlockEnd(None)
+            cpu_ref.RemoveHook(hook_address, capture_pc_handoff)
         except Exception:
             pass
     status = {

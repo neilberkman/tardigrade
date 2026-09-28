@@ -445,18 +445,28 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
         self.assertEqual(status["executed_instructions"], 400)
         self.assertEqual(status["instruction_limit"], 350)
 
-    def test_block_counter_survives_reset_to_same_public_count(self) -> None:
-        state = {"run_calls": 0, "instructions": 0, "block_hook": None}
+    def test_reset_handler_hook_preserves_transient_application_handoff(self) -> None:
+        state = {"run_calls": 0, "instructions": 0, "hooks": {}}
+        sticky_pc = {"captured": False, "value": 0, "slot": None}
+
+        def capture_sticky_pc(pc_value):
+            pc = int(pc_value) & ~1
+            if 0x2000 <= pc < 0x3000:
+                sticky_pc.update(captured=True, value=pc, slot="exec")
 
         class Monitor:
             def Parse(self, _command):
                 state["run_calls"] += 1
-                state["instructions"] = 300
-                state["block_hook"](0x1000, 150)
+                state["instructions"] += 30
+                # The application reset handler runs and returns to the
+                # bootloader before the polling slice ends.
+                state["hooks"][0x2004](None, 0x2004)
 
         class Bus:
             @staticmethod
-            def ReadDoubleWord(_address):
+            def ReadDoubleWord(address):
+                if address == 0x2004:
+                    return 0x2005
                 return 0
 
         class Cpu:
@@ -468,17 +478,23 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
 
             @staticmethod
             def GetRegisterUnsafe(_index):
-                return 0
+                return 0x1004
 
             @staticmethod
-            def SetHookAtBlockEnd(callback):
-                state["block_hook"] = callback
+            def AddHook(address, callback):
+                state["hooks"][address] = callback
+
+            @staticmethod
+            def RemoveHook(address, callback):
+                if state["hooks"].get(address) is callback:
+                    del state["hooks"][address]
 
         namespace = {
             "_time": SimpleNamespace(time=lambda: 0.0),
             "phase1_time_slice": "0.02",
-            "success_pc_slot": None,
-            "slot_ranges": {},
+            "success_pc_slot": "exec",
+            "success_vector_offset": 0,
+            "slot_ranges": {"exec": (0x2000, 0x3000)},
             "monitor": Monitor(),
             "calibration_mode": False,
             "_calibration_stop_state": {"address_hit": False},
@@ -487,12 +503,12 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
             "fault_requires_immediate_stop": lambda: False,
             "was_otp_fault_injected": lambda: False,
             "as_int": int,
-            "capture_sticky_pc": lambda _pc: None,
+            "capture_sticky_pc": capture_sticky_pc,
             "bus": Bus(),
             "sticky_vtor": {"captured": False, "value": 0, "slot": None},
-            "sticky_pc": {"captured": False, "value": 0, "slot": None},
+            "sticky_pc": sticky_pc,
             "_calibration_success_stop_observation": lambda _cpu: None,
-            "get_total_writes": lambda: 0,
+            "get_total_writes": lambda: 1,
             "get_total_erases": lambda: 0,
             "fmt_u32": lambda value: "0x{:08X}".format(int(value)),
             "log": lambda _message: None,
@@ -504,7 +520,7 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
                 "recent_logs": [],
             },
             "progress_stall_timeout_s": 0,
-            "max_step_limit": 350,
+            "max_step_limit": 1000,
             "_recovery_zero_vector_guard": False,
             "expect_control_outcome": "success",
             "no_boot_zero_write_slices": 10,
@@ -516,10 +532,11 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
             Cpu(), time_slice="0.02", max_iters=5
         )
 
-        self.assertEqual(status["reason"], "instruction_limit(450)")
-        self.assertEqual(status["iters"], 3)
-        self.assertEqual(status["executed_instructions"], 450)
-        self.assertIsNone(state["block_hook"])
+        self.assertEqual(status["reason"], "pc_captured")
+        self.assertEqual(status["iters"], 1)
+        self.assertEqual(status["executed_instructions"], 30)
+        self.assertEqual(sticky_pc["slot"], "exec")
+        self.assertEqual(state["hooks"], {})
 
 
 if __name__ == "__main__":

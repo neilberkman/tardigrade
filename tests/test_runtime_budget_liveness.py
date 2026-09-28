@@ -159,6 +159,7 @@ def test_runtime_loop_enforces_the_configured_instruction_limit() -> None:
     source = RUNTIME.read_text(encoding="utf-8")
 
     assert "cpu_ref.ExecutedInstructions" in source
+    assert "SetHookAtBlockEnd" not in source
     assert "instructions_executed >= max_step_limit" in source
     assert "reason = 'instruction_limit({})'" in source
 
