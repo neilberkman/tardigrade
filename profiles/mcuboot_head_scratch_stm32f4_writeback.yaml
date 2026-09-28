@@ -13,6 +13,9 @@ success_criteria:
   vtor_in_slot:
   vector_table_offset: 0x400
   pc_in_slot: exec
+  # STM32 maps flash at both 0x00000000 and 0x08000000. Renode reports the
+  # reset-handler hook through the low alias for this platform.
+  pc_hook_alias_offsets: [-0x08000000]
 fault_sweep:
   mode: runtime
   evaluation_mode: execute

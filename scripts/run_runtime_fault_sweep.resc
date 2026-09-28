@@ -55,6 +55,7 @@ $boundary_acceptance?=""
 $success_vtor_slot?="exec"
 $success_vector_offset?="0"
 $success_pc_slot?=""
+$success_pc_hook_alias_offsets?=""
 $success_marker_addr?=0
 $success_marker_value?=0
 $write_granularity?=8

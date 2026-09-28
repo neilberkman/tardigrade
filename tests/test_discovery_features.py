@@ -406,6 +406,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 success_criteria:
                   vtor_in_slot: exec
                   vector_table_offset: 0x200
+                  pc_hook_alias_offsets: [-0x10000000]
                 fault_sweep:
                   mode: runtime
                   evaluation_mode: execute
@@ -441,6 +442,10 @@ class DiscoveryFeaturesTest(unittest.TestCase):
                 "converged",
             )
             self.assertEqual(profile.success_criteria.vector_table_offset, 0x200)
+            self.assertEqual(
+                profile.success_criteria.pc_hook_alias_offsets,
+                [-0x10000000],
+            )
             robot_vars = profile.robot_vars(ROOT)
             self.assertIn("BOOT_CYCLES:3", robot_vars)
             self.assertIn("CALIBRATION_TIME_SLICE:0.11", robot_vars)
@@ -450,6 +455,9 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertIn("EXPECTED_ROLLBACK_AT_CYCLE:2", robot_vars)
             self.assertIn("STATE_PROBE:{}".format(probe), robot_vars)
             self.assertIn("SUCCESS_VECTOR_OFFSET:0x00000200", robot_vars)
+            self.assertIn(
+                "SUCCESS_PC_HOOK_ALIAS_OFFSETS:-268435456", robot_vars
+            )
 
     def test_phase2_wall_timeout_defaults_and_serializes(self) -> None:
         with tempfile.TemporaryDirectory() as td:

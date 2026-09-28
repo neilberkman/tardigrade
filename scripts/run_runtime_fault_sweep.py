@@ -1005,6 +1005,25 @@ if success_vector_offset < 0:
     success_vector_offset = 0
 success_pc_slot_raw = str(monitor.GetVariable('success_pc_slot')).strip()
 success_pc_slot = success_pc_slot_raw if success_pc_slot_raw else None
+success_pc_hook_alias_offsets_raw = get_optional_var(
+    'success_pc_hook_alias_offsets', ''
+)
+success_pc_hook_alias_offsets = []
+if success_pc_hook_alias_offsets_raw:
+    for _alias_index, _alias_token in enumerate(
+        success_pc_hook_alias_offsets_raw.split(',')
+    ):
+        _alias_token = _alias_token.strip()
+        if not _alias_token:
+            continue
+        try:
+            success_pc_hook_alias_offsets.append(int(_alias_token, 0))
+        except Exception:
+            raise RuntimeError(
+                'success_pc_hook_alias_offsets[{}]: invalid integer {!r}'.format(
+                    _alias_index, _alias_token
+                )
+            )
 
 success_marker_addr_raw = str(monitor.GetVariable('success_marker_addr')).strip()
 success_marker_value_raw = str(monitor.GetVariable('success_marker_value')).strip()
@@ -1182,6 +1201,7 @@ _base_phase_context = {
         'vtor_in_slot': success_vtor_slot,
         'vector_table_offset': int(success_vector_offset),
         'pc_in_slot': success_pc_slot or '',
+        'pc_hook_alias_offsets': list(success_pc_hook_alias_offsets),
         'marker_address': int(success_marker_addr),
         'marker_value': int(success_marker_value),
         'image_hash': bool(success_image_hash),
@@ -1201,6 +1221,7 @@ _base_phase_context = {
 def _apply_phase_context(phase=None):
     global boot_cycles, boot_cycle_hook, expected_rollback_at_cycle
     global success_vtor_slot, success_vector_offset, success_pc_slot
+    global success_pc_hook_alias_offsets
     global success_marker_addr, success_marker_value
     global success_image_hash, success_image_hash_slot
     global image_exec_sha256, image_staging_sha256, expected_exec_sha256
@@ -1227,6 +1248,12 @@ def _apply_phase_context(phase=None):
     success_pc_slot = str(
         criteria.get('pc_in_slot', _base_phase_context['success_criteria']['pc_in_slot']) or ''
     ).strip() or None
+    success_pc_hook_alias_offsets = list(
+        criteria.get(
+            'pc_hook_alias_offsets',
+            _base_phase_context['success_criteria']['pc_hook_alias_offsets'],
+        ) or []
+    )
     success_marker_addr = int(
         criteria.get('marker_address', _base_phase_context['success_criteria']['marker_address']) or 0
     )
@@ -7668,12 +7695,25 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         success_vector_offset if pc_handoff_slot is not None else 0
     )
     pc_handoff_hook_addresses = []
+    pc_handoff_hook_targets = {}
     pc_handoff_hook_candidates = []
     pc_handoff_hook_hits = []
+    pc_handoff_hook_hit_targets = []
+    pc_handoff_alias_offsets = list(
+        globals().get('success_pc_hook_alias_offsets', []) or []
+    )
 
     def capture_pc_handoff(_cpu, address):
-        pc_handoff_hook_hits.append(fmt_u32(as_int(address) & ~1))
-        capture_sticky_pc(address)
+        hook_address = as_int(address) & ~1
+        canonical_address = pc_handoff_hook_targets.get(
+            hook_address, hook_address
+        )
+        pc_handoff_hook_hits.append(fmt_u32(hook_address))
+        pc_handoff_hook_hit_targets.append({
+            'hook_address': fmt_u32(hook_address),
+            'canonical_address': fmt_u32(canonical_address),
+        })
+        capture_sticky_pc(canonical_address)
 
     if pc_handoff_slot is not None:
         target_lo, target_hi = slot_ranges[pc_handoff_slot]
@@ -7702,13 +7742,35 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 candidate['target_match'] = bool(
                     target_lo <= reset_handler < target_hi
                 )
-                if (
-                    target_lo <= reset_handler < target_hi
-                    and reset_handler not in pc_handoff_hook_addresses
-                ):
-                    cpu_ref.AddHook(reset_handler, capture_pc_handoff)
-                    pc_handoff_hook_addresses.append(reset_handler)
-                    candidate['installed'] = True
+                candidate['hook_addresses'] = []
+                candidate['invalid_hook_addresses'] = []
+                if target_lo <= reset_handler < target_hi:
+                    for alias_offset in [0] + pc_handoff_alias_offsets:
+                        hook_address = reset_handler + int(alias_offset)
+                        if hook_address < 0 or hook_address > 0xFFFFFFFF:
+                            candidate['invalid_hook_addresses'].append({
+                                'alias_offset': int(alias_offset),
+                                'address': str(hook_address),
+                            })
+                            continue
+                        existing_target = pc_handoff_hook_targets.get(hook_address)
+                        if (
+                            existing_target is not None
+                            and existing_target != reset_handler
+                        ):
+                            candidate.setdefault('hook_conflicts', []).append({
+                                'hook_address': fmt_u32(hook_address),
+                                'existing_target': fmt_u32(existing_target),
+                            })
+                            continue
+                        if hook_address not in pc_handoff_hook_addresses:
+                            cpu_ref.AddHook(hook_address, capture_pc_handoff)
+                            pc_handoff_hook_addresses.append(hook_address)
+                        pc_handoff_hook_targets[hook_address] = reset_handler
+                        candidate['hook_addresses'].append(
+                            fmt_u32(hook_address)
+                        )
+                    candidate['installed'] = bool(candidate['hook_addresses'])
             except Exception as exc:
                 candidate['error'] = str(exc)
             pc_handoff_hook_candidates.append(candidate)
@@ -7991,11 +8053,13 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         'pc_handoff_observation': {
             'configured_slot': pc_handoff_slot,
             'vector_table_offset': pc_handoff_vector_offset,
+            'alias_offsets': pc_handoff_alias_offsets,
             'candidates': pc_handoff_hook_candidates,
             'installed_hooks': [
                 fmt_u32(address) for address in pc_handoff_hook_addresses
             ],
             'hits': pc_handoff_hook_hits,
+            'hit_targets': pc_handoff_hook_hit_targets,
         },
         'op_trace_events': len(op_trace) if op_trace is not None else 0,
         'op_trace_truncated': bool(trace_limit_hit),

@@ -445,7 +445,7 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
         self.assertEqual(status["executed_instructions"], 400)
         self.assertEqual(status["instruction_limit"], 350)
 
-    def test_reset_handler_hook_preserves_transient_application_handoff(self) -> None:
+    def test_reset_handler_alias_hook_preserves_transient_application_handoff(self) -> None:
         state = {"run_calls": 0, "instructions": 0, "hooks": {}}
         sticky_pc = {"captured": False, "value": 0, "slot": None}
 
@@ -460,7 +460,7 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
                 state["instructions"] += 30
                 # The application reset handler runs and returns to the
                 # bootloader before the polling slice ends.
-                state["hooks"][0x2004](None, 0x2004)
+                state["hooks"][0x1004](None, 0x1004)
 
         class Bus:
             @staticmethod
@@ -494,6 +494,7 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
             "phase1_time_slice": "0.02",
             "success_pc_slot": "exec",
             "success_vector_offset": 0,
+            "success_pc_hook_alias_offsets": [-0x1000],
             "slot_ranges": {"exec": (0x2000, 0x3000)},
             "monitor": Monitor(),
             "calibration_mode": False,
@@ -541,6 +542,7 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
             {
                 "configured_slot": "exec",
                 "vector_table_offset": 0,
+                "alias_offsets": [-0x1000],
                 "candidates": [
                     {
                         "source_slot": "exec",
@@ -551,10 +553,18 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
                         "reset_vector": "0x00002005",
                         "reset_handler": "0x00002004",
                         "target_match": True,
+                        "hook_addresses": ["0x00002004", "0x00001004"],
+                        "invalid_hook_addresses": [],
                     }
                 ],
-                "installed_hooks": ["0x00002004"],
-                "hits": ["0x00002004"],
+                "installed_hooks": ["0x00002004", "0x00001004"],
+                "hits": ["0x00001004"],
+                "hit_targets": [
+                    {
+                        "hook_address": "0x00001004",
+                        "canonical_address": "0x00002004",
+                    }
+                ],
             },
         )
         self.assertEqual(state["hooks"], {})
