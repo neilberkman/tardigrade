@@ -376,7 +376,6 @@ class SuccessCriteria:
         "vtor_in_slot",
         "vector_table_offset",
         "pc_in_slot",
-        "pc_hook_alias_offsets",
         "marker_address",
         "marker_value",
         "image_hash",
@@ -397,7 +396,6 @@ class SuccessCriteria:
         vtor_in_slot: Optional[str] = None,
         vector_table_offset: int = 0,
         pc_in_slot: Optional[str] = None,
-        pc_hook_alias_offsets: Optional[List[int]] = None,
         marker_address: Optional[int] = None,
         marker_value: Optional[int] = None,
         image_hash: bool = False,
@@ -415,7 +413,6 @@ class SuccessCriteria:
         self.vtor_in_slot = vtor_in_slot
         self.vector_table_offset = max(0, int(vector_table_offset))
         self.pc_in_slot = pc_in_slot
-        self.pc_hook_alias_offsets = list(pc_hook_alias_offsets or [])
         self.marker_address = marker_address
         self.marker_value = marker_value
         self.image_hash = image_hash
@@ -2379,7 +2376,6 @@ class ProfileConfig:
             "vtor_in_slot": criteria.vtor_in_slot or "",
             "vector_table_offset": int(criteria.vector_table_offset),
             "pc_in_slot": criteria.pc_in_slot or "",
-            "pc_hook_alias_offsets": list(criteria.pc_hook_alias_offsets),
             "marker_address": criteria.marker_address,
             "marker_value": criteria.marker_value,
             "image_hash": bool(criteria.image_hash),
@@ -2742,12 +2738,6 @@ class ProfileConfig:
         )
         if sc.pc_in_slot:
             vars_list.append("SUCCESS_PC_SLOT:{}".format(sc.pc_in_slot))
-        if sc.pc_hook_alias_offsets:
-            vars_list.append(
-                "SUCCESS_PC_HOOK_ALIAS_OFFSETS:{}".format(
-                    ",".join(str(offset) for offset in sc.pc_hook_alias_offsets)
-                )
-            )
         if sc.marker_address is not None:
             vars_list.append("SUCCESS_MARKER_ADDR:0x{:08X}".format(sc.marker_address))
         if sc.marker_value is not None:
@@ -3541,9 +3531,6 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         vtor_in_slot=raw.get("vtor_in_slot"),
         vector_table_offset=_parse_int(raw.get("vector_table_offset", 0), "success_criteria.vector_table_offset"),
         pc_in_slot=raw.get("pc_in_slot"),
-        pc_hook_alias_offsets=_parse_pc_hook_alias_offsets(
-            raw.get("pc_hook_alias_offsets")
-        ),
         marker_address=_parse_int(raw["marker_address"], "success_criteria.marker_address") if "marker_address" in raw else None,
         marker_value=_parse_int(raw["marker_value"], "success_criteria.marker_value") if "marker_value" in raw else None,
         image_hash=image_hash,
@@ -3564,33 +3551,6 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         ),
         memory_checks=_parse_memory_checks(raw.get("memory_checks")),
     )
-
-
-def _parse_pc_hook_alias_offsets(raw: Optional[List[Any]]) -> List[int]:
-    if raw is None:
-        return []
-    if not isinstance(raw, list):
-        raise ProfileError(
-            "success_criteria.pc_hook_alias_offsets: expected list"
-        )
-    offsets: List[int] = []
-    seen = set()
-    for index, value in enumerate(raw):
-        field = "success_criteria.pc_hook_alias_offsets[{}]".format(index)
-        if isinstance(value, bool):
-            raise ProfileError("{}: expected integer, got {!r}".format(field, value))
-        offset = _parse_int(value, field)
-        if offset == 0:
-            raise ProfileError("{}: zero duplicates the canonical hook".format(field))
-        if offset < -0xFFFFFFFF or offset > 0xFFFFFFFF:
-            raise ProfileError("{}: offset is outside the 32-bit address space".format(field))
-        if offset & 1:
-            raise ProfileError("{}: offset must preserve instruction alignment".format(field))
-        if offset in seen:
-            raise ProfileError("{}: duplicate offset {}".format(field, offset))
-        seen.add(offset)
-        offsets.append(offset)
-    return offsets
 
 
 def _validate_success_image_names(
@@ -6960,8 +6920,7 @@ _STRICT_TOP_LEVEL_KEYS = frozenset(
 
 _STRICT_SUCCESS_CRITERIA_KEYS = frozenset(
     {
-        "vtor_in_slot", "vector_table_offset", "pc_in_slot",
-        "pc_hook_alias_offsets", "marker_address",
+        "vtor_in_slot", "vector_table_offset", "pc_in_slot", "marker_address",
         "marker_value", "image_hash", "expected_image", "allowed_images",
         "image_hash_slot",
         "otadata_expect", "otadata_expect_scope", "bootloader_integrity",

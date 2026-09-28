@@ -32,3 +32,6 @@ def test_mcuboot_scratch_stm32f4_writeback_profile() -> None:
     assert profile.fault_sweep.max_writes_cap == 400000
     assert profile.fault_sweep.max_step_limit == 500000000
     assert profile.fault_sweep.calibration_stop.success_criteria is True
+    assert profile.success_criteria.image_hash is True
+    assert profile.success_criteria.image_hash_slot == "exec"
+    assert profile.success_criteria.expected_image == "staging"

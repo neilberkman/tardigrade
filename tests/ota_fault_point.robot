@@ -44,7 +44,6 @@ ${BOUNDARY_ACCEPTANCE}        ${EMPTY}
 ${SUCCESS_VTOR_SLOT}           exec
 ${SUCCESS_VECTOR_OFFSET}       0
 ${SUCCESS_PC_SLOT}             ${EMPTY}
-${SUCCESS_PC_HOOK_ALIAS_OFFSETS}    ${EMPTY}
 ${SUCCESS_MARKER_ADDR}         0
 ${SUCCESS_MARKER_VALUE}        0
 ${FAULT_POINTS_CSV}            ${EMPTY}
@@ -222,7 +221,6 @@ Run Runtime Fault Point
     Execute Command    $success_vtor_slot="${SUCCESS_VTOR_SLOT}"
     Execute Command    $success_vector_offset=${SUCCESS_VECTOR_OFFSET}
     Execute Command    $success_pc_slot="${SUCCESS_PC_SLOT}"
-    Execute Command    $success_pc_hook_alias_offsets="${SUCCESS_PC_HOOK_ALIAS_OFFSETS}"
     Execute Command    $success_marker_addr=${SUCCESS_MARKER_ADDR}
     Execute Command    $success_marker_value=${SUCCESS_MARKER_VALUE}
     Execute Command    $fault_points_csv="${FAULT_POINTS_CSV}"

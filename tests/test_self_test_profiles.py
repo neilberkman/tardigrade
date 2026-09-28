@@ -287,10 +287,9 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertIsNone(profile.success_criteria.vtor_in_slot)
         self.assertEqual(profile.success_criteria.vector_table_offset, 0x400)
         self.assertEqual(profile.success_criteria.pc_in_slot, "exec")
-        self.assertEqual(
-            profile.success_criteria.pc_hook_alias_offsets,
-            [-0x08000000],
-        )
+        self.assertTrue(profile.success_criteria.image_hash)
+        self.assertEqual(profile.success_criteria.image_hash_slot, "exec")
+        self.assertEqual(profile.success_criteria.expected_image, "staging")
 
     def test_pr2100_discovery_profiles_use_stable_revert_marker(self):
         for name in (

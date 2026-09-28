@@ -8,14 +8,16 @@ description: >
   only power-loss cutpoints are selected.
 success_criteria:
   # The STM32 application handoff does not leave VTOR in the executable slot.
-  # Observe execution in the slot directly, including transient execution
-  # retained by the runtime reset-handler hook.
+  # Observe the handoff directly through either the reset-handler hook or an
+  # exact BX/BLX target match against the executable slot's reset vector.
   vtor_in_slot:
   vector_table_offset: 0x400
   pc_in_slot: exec
-  # STM32 maps flash at both 0x00000000 and 0x08000000. Renode reports the
-  # reset-handler hook through the low alias for this platform.
-  pc_hook_alias_offsets: [-0x08000000]
+  # A branch attempt alone is not enough after an injected interruption.
+  # Require the executable data region to match the staged image as well.
+  image_hash: true
+  image_hash_slot: exec
+  expected_image: staging
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
