@@ -80,6 +80,7 @@ def render_runtime_profile(
     boot_cycles: int | None = None,
     run_duration: str = "8.0",
     calibration_time_slice: str = "0.1",
+    progress_stall_timeout_s: float = 4.0,
     max_step_limit: int = 1_000_000_000,
     name: str = "nuttx_nxboot_real_update",
     fault_types: str = "",
@@ -119,6 +120,17 @@ def render_runtime_profile(
         if boot_cycles is None
         else int(boot_cycles)
     )
+    try:
+        observation_budget_s = float(run_duration)
+        stall_timeout_s = float(progress_stall_timeout_s)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "run_duration and progress_stall_timeout_s must be numeric"
+        ) from exc
+    if stall_timeout_s <= 0 or stall_timeout_s >= observation_budget_s:
+        raise ValueError(
+            "progress_stall_timeout_s must be positive and less than run_duration"
+        )
     durability_model = campaign_config.get("durability_model")
     writeback_block = ""
     if durability_model == "writeback":
@@ -168,6 +180,9 @@ fault_sweep:
   evaluation_mode: execute
   run_duration: "{run_duration}"
   calibration_time_slice: "{calibration_time_slice}"
+  # Keep the explicit no-progress observation inside the run budget so a
+  # stable recovery wait is terminal evidence, not generic budget exhaustion.
+  progress_stall_timeout_s: {progress_stall_timeout_s}
   max_step_limit: {max_step_limit}
   boot_cycles: {boot_cycles}{rollback_line}{fault_types_line}{instruction_skip_block}
 {writeback_block}
@@ -244,6 +259,7 @@ expect:
         campaign_description=campaign_config["description"],
         run_duration=str(run_duration),
         calibration_time_slice=str(calibration_time_slice),
+        progress_stall_timeout_s=stall_timeout_s,
         max_step_limit=int(max_step_limit),
     )
 
@@ -262,6 +278,15 @@ def main() -> int:
     )
     parser.add_argument("--run-duration", default="8.0")
     parser.add_argument("--calibration-time-slice", default="0.1")
+    parser.add_argument(
+        "--progress-stall-timeout-s",
+        type=float,
+        default=4.0,
+        help=(
+            "emulated no-progress interval used for terminal recovery evidence "
+            "(default: 4.0)"
+        ),
+    )
     parser.add_argument(
         "--max-step-limit",
         type=int,
@@ -289,6 +314,7 @@ def main() -> int:
         boot_cycles=args.boot_cycles,
         run_duration=args.run_duration,
         calibration_time_slice=args.calibration_time_slice,
+        progress_stall_timeout_s=args.progress_stall_timeout_s,
         max_step_limit=args.max_step_limit,
         name=args.name,
         fault_types=args.fault_types,

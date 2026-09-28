@@ -187,6 +187,7 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             self.assertEqual(profile.fault_sweep.expected_rollback_at_cycle, 1)
             self.assertEqual(profile.fault_sweep.run_duration, "8.0")
             self.assertEqual(profile.fault_sweep.calibration_time_slice, "0.1")
+            self.assertEqual(profile.fault_sweep.progress_stall_timeout_s, 4.0)
             self.assertEqual(profile.fault_sweep.max_step_limit, 1_000_000_000)
             self.assertEqual(profile.memory.page_size, 0x20000)
             self.assertEqual(
@@ -276,6 +277,28 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
                 ValueError, "larger than the declared nxboot slot"
             ):
                 render_runtime_profile(build_dir)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_render_profile_requires_terminal_stall_inside_run_budget(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_stall_budget_"))
+        try:
+            build_dir = temp_dir / "build"
+            images_dir = build_dir / "images"
+            images_dir.mkdir(parents=True)
+            (build_dir / "nxboot-loader.elf").write_bytes(b"ELF")
+            (images_dir / "nxboot-primary-v1-h400.img").write_bytes(b"P")
+            (images_dir / "nxboot-update-v2-h400.img").write_bytes(b"U")
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "progress_stall_timeout_s must be positive and less than run_duration",
+            ):
+                render_runtime_profile(
+                    build_dir,
+                    run_duration="4.0",
+                    progress_stall_timeout_s=4.0,
+                )
         finally:
             shutil.rmtree(temp_dir)
 
