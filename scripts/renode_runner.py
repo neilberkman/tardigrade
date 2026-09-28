@@ -29,6 +29,7 @@ from profile_loader import HeuristicConfig, ProfileConfig, load_profile
 DOCKER_RENODE_PREFIX = "docker://"
 CALIBRATION_INCOMPLETE_PREFIXES = (
     "wall_timeout(",
+    "instruction_limit(",
     "no_progress_stall(",
     "no_boot_stall(",
     "op_trace_limit",
@@ -1024,13 +1025,8 @@ def calibration_completed(
     if not stop_reason:
         return False
     if stop_reason == "budget":
-        # Budget exhaustion with NVM activity means the bootloader ran and
-        # wrote metadata/data before the step or time limit was reached.
-        # For direct-XIP bootloaders this IS the complete boot — there is
-        # no swap phase, so metadata writes are the only NVM activity.
-        # Treat as complete when writes or erases were observed.
-        if total_writes > 0 or total_erases > 0:
-            return True
+        # NVM activity proves only that an operation started.  It cannot prove
+        # that an update, metadata transition, or direct-XIP boot completed.
         return False
     if any(stop_reason.startswith(prefix) for prefix in CALIBRATION_INCOMPLETE_PREFIXES):
         return False

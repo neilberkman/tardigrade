@@ -80,6 +80,7 @@ def render_runtime_profile(
     boot_cycles: int | None = None,
     run_duration: str = "8.0",
     calibration_time_slice: str = "0.1",
+    max_step_limit: int = 1_000_000_000,
     name: str = "nuttx_nxboot_real_update",
     fault_types: str = "",
     campaign: str = "baseline",
@@ -167,6 +168,7 @@ fault_sweep:
   evaluation_mode: execute
   run_duration: "{run_duration}"
   calibration_time_slice: "{calibration_time_slice}"
+  max_step_limit: {max_step_limit}
   boot_cycles: {boot_cycles}{rollback_line}{fault_types_line}{instruction_skip_block}
 {writeback_block}
 state_probe:
@@ -242,6 +244,7 @@ expect:
         campaign_description=campaign_config["description"],
         run_duration=str(run_duration),
         calibration_time_slice=str(calibration_time_slice),
+        max_step_limit=int(max_step_limit),
     )
 
 
@@ -259,6 +262,12 @@ def main() -> int:
     )
     parser.add_argument("--run-duration", default="8.0")
     parser.add_argument("--calibration-time-slice", default="0.1")
+    parser.add_argument(
+        "--max-step-limit",
+        type=int,
+        default=1_000_000_000,
+        help="per-observation instruction ceiling (default: 1000000000)",
+    )
     parser.add_argument("--name", default="nuttx_nxboot_real_update")
     parser.add_argument(
         "--campaign",
@@ -280,6 +289,7 @@ def main() -> int:
         boot_cycles=args.boot_cycles,
         run_duration=args.run_duration,
         calibration_time_slice=args.calibration_time_slice,
+        max_step_limit=args.max_step_limit,
         name=args.name,
         fault_types=args.fault_types,
         campaign=args.campaign,

@@ -1330,6 +1330,9 @@ class DiscoveryFeaturesTest(unittest.TestCase):
         self.assertTrue(calibration_completed("vtor_captured"))
         self.assertFalse(calibration_completed("wall_timeout(600s)"))
         self.assertFalse(calibration_completed("budget"))
+        self.assertFalse(calibration_completed("budget", total_writes=13416))
+        self.assertFalse(calibration_completed("budget", total_erases=1))
+        self.assertFalse(calibration_completed("instruction_limit(500000)", total_writes=13416))
         self.assertFalse(calibration_completed("no_progress_stall(20.0s)"))
 
     def test_calibration_completed_no_boot_settled_writes(self) -> None:

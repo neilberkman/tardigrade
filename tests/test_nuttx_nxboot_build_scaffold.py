@@ -187,6 +187,7 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             self.assertEqual(profile.fault_sweep.expected_rollback_at_cycle, 1)
             self.assertEqual(profile.fault_sweep.run_duration, "8.0")
             self.assertEqual(profile.fault_sweep.calibration_time_slice, "0.1")
+            self.assertEqual(profile.fault_sweep.max_step_limit, 1_000_000_000)
             self.assertEqual(profile.memory.page_size, 0x20000)
             self.assertEqual(
                 [(region.base, region.size, region.sector_size) for region in profile.memory.erase_regions],
