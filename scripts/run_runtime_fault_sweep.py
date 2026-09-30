@@ -1132,16 +1132,52 @@ _calibration_stop_state = {
 def _calibration_stop_address_hook(cpu, addr):
     if not calibration_mode or not calibration_stop_address:
         return
+    if _calibration_stop_state.get('address_hit'):
+        return
     _calibration_stop_state['address_hit'] = True
     _calibration_stop_state['triggered'] = True
     _calibration_stop_state['reason'] = 'address'
     _calibration_stop_state['writes'] = int(get_total_writes())
     _calibration_stop_state['erases'] = int(get_total_erases())
-    # Pausing the sole CPU here prevents virtual time from reaching the end of
-    # an active ``emulation RunFor`` call, so Robot never regains control.
-    # Pause the machine instead; RunFor then returns immediately and the outer
-    # loop consumes the captured stop state.
-    monitor.Machine.Pause()
+    # Hooks run inside an active ``emulation RunFor`` call. Halting the CPU or
+    # pausing the machine here prevents that call from completing. Record the
+    # exact boundary and let the already-bounded time slice return normally.
+
+
+def _calibration_counter_at_stop(name, current, baseline):
+    boundary = int(current)
+    if _calibration_stop_state.get('triggered'):
+        captured = _calibration_stop_state.get(name)
+        if captured is not None:
+            boundary = int(captured)
+    baseline = int(baseline)
+    if boundary < baseline:
+        raise RuntimeError(
+            'calibration {} counter at stop ({}) precedes baseline ({})'.format(
+                name, boundary, baseline
+            )
+        )
+    return boundary - baseline
+
+
+def _calibration_event_within_stop(write_index=None, erase_index=None):
+    if not _calibration_stop_state.get('triggered'):
+        return True
+    stop_writes = _calibration_stop_state.get('writes')
+    stop_erases = _calibration_stop_state.get('erases')
+    if (
+        write_index is not None
+        and stop_writes is not None
+        and int(write_index) > int(stop_writes)
+    ):
+        return False
+    if (
+        erase_index is not None
+        and stop_erases is not None
+        and int(erase_index) > int(stop_erases)
+    ):
+        return False
+    return True
 
 
 def _prepare_calibration_stop():
@@ -12518,8 +12554,12 @@ if calibration_mode:
 
         progress_stall_timeout_s = saved_stall
         log('calibration: stop_reason={}'.format(cal_status.get('reason', '?')))
-        total_writes = get_total_writes() - base_writes
-        total_erases = get_total_erases() - base_erases
+        total_writes = _calibration_counter_at_stop(
+            'writes', get_total_writes(), base_writes
+        )
+        total_erases = _calibration_counter_at_stop(
+            'erases', get_total_erases(), base_erases
+        )
         cpu_ref.IsHalted = True
 
         # Calibration stops with the CPU halted.  Capture the resulting boot
@@ -12570,6 +12610,10 @@ if calibration_mode:
                     # events must not be truncated to the legacy word mask.
                     value = int(event[2])
                     width = int(event[3]) if len(event) >= 4 else None
+                    if not _calibration_event_within_stop(
+                        write_index=write_idx
+                    ):
+                        continue
                     if width is not None:
                         trace_has_width = True
                     parsed_trace.append((write_idx, flash_off, value, width))
@@ -12599,7 +12643,9 @@ if calibration_mode:
                             ))
                         else:
                             tf.write('{},{},{}\n'.format(write_idx, flash_off, value))
-                log('calibration: wrote {} trace entries to {}'.format(trace_count, trace_file))
+                log('calibration: wrote {} trace entries to {}'.format(
+                    len(parsed_trace), trace_file
+                ))
                 if trace_file_bin:
                     with open(trace_file_bin, 'wb') as tfb:
                         for write_idx, flash_off, value, _width in parsed_trace:
@@ -12617,15 +12663,21 @@ if calibration_mode:
                     'MRAM calibration cannot export exact program addresses: '
                     'backend bus base is unknown'
                 )
-            program_trace = parse_mram_program_trace(
+            raw_program_trace = parse_mram_program_trace(
                 backend['data'].ProgramTraceToString(),
                 int(backend['data'].Size),
                 int(backend['bus_base']),
             )
-            if len(program_trace) != int(backend['data'].ProgramTraceCount):
+            if len(raw_program_trace) != int(backend['data'].ProgramTraceCount):
                 raise RuntimeError(
                     'MRAM calibration program trace count disagrees with exported trace'
                 )
+            program_trace = [
+                event for event in raw_program_trace
+                if _calibration_event_within_stop(
+                    write_index=event['write_index']
+                )
+            ]
             if program_trace:
                 calibration_last_program = dict(program_trace[-1])
             program_trace_file = result_file.replace(
@@ -12674,6 +12726,11 @@ if calibration_mode:
                                 flash_off = int(parts[1]) & 0xFFFFFFFF
                                 writes_at = int(parts[2]) & 0xFFFFFFFF
                                 erase_sz = int(parts[3]) & 0xFFFFFFFF
+                                if not _calibration_event_within_stop(
+                                    write_index=writes_at,
+                                    erase_index=erase_idx,
+                                ):
+                                    continue
                                 ef.write('{},{},{},{}\n'.format(erase_idx, flash_off, writes_at, erase_sz))
                                 efb.write(struct.pack('<III', writes_at, flash_off, erase_sz))
                                 erase_bin_count += 1
@@ -12683,6 +12740,11 @@ if calibration_mode:
                                 flash_off = int(parts[1]) & 0xFFFFFFFF
                                 writes_at = int(parts[2]) & 0xFFFFFFFF
                                 fallback_sz = int(backend['data'].PageSize) & 0xFFFFFFFF
+                                if not _calibration_event_within_stop(
+                                    write_index=writes_at,
+                                    erase_index=erase_idx,
+                                ):
+                                    continue
                                 ef.write('{},{},{},{}\n'.format(erase_idx, flash_off, writes_at, fallback_sz))
                                 efb.write(struct.pack('<III', writes_at, flash_off, fallback_sz))
                                 erase_bin_count += 1

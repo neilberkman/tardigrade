@@ -160,18 +160,14 @@ class AllowedImagesProfileTests(unittest.TestCase):
                 with self.assertRaisesRegex(ProfileError, message):
                     load_profile(path, strict=True)
 
-    def test_calibration_address_hook_pauses_machine_without_halting_cpu(self) -> None:
+    def test_calibration_address_hook_only_records_first_boundary(self) -> None:
         class Machine:
-            def __init__(self):
-                self.pause_calls = 0
-
             def Pause(self):
-                self.pause_calls += 1
+                raise AssertionError("calibration hook must not pause the machine")
 
         class Cpu:
             IsHalted = False
 
-        machine = Machine()
         state = {"address_hit": False, "triggered": False}
         namespace = {
             "calibration_mode": True,
@@ -179,7 +175,7 @@ class AllowedImagesProfileTests(unittest.TestCase):
             "_calibration_stop_state": state,
             "get_total_writes": lambda: 1024,
             "get_total_erases": lambda: 0,
-            "monitor": SimpleNamespace(Machine=machine),
+            "monitor": SimpleNamespace(Machine=Machine()),
         }
         exec(_runtime_function("_calibration_stop_address_hook"), namespace)
 
@@ -191,8 +187,35 @@ class AllowedImagesProfileTests(unittest.TestCase):
         self.assertEqual(state["reason"], "address")
         self.assertEqual(state["writes"], 1024)
         self.assertEqual(state["erases"], 0)
-        self.assertEqual(machine.pause_calls, 1)
         self.assertFalse(cpu.IsHalted)
+
+        namespace["get_total_writes"] = lambda: 2048
+        namespace["get_total_erases"] = lambda: 3
+        namespace["_calibration_stop_address_hook"](cpu, 0x20000480)
+        self.assertEqual(state["writes"], 1024)
+        self.assertEqual(state["erases"], 0)
+
+    def test_calibration_stop_boundary_excludes_later_counters_and_trace(self) -> None:
+        state = {
+            "triggered": True,
+            "writes": 1024,
+            "erases": 2,
+        }
+        namespace = {"_calibration_stop_state": state}
+        exec(_runtime_function("_calibration_counter_at_stop"), namespace)
+        exec(_runtime_function("_calibration_event_within_stop"), namespace)
+
+        counter = namespace["_calibration_counter_at_stop"]
+        within = namespace["_calibration_event_within_stop"]
+        self.assertEqual(counter("writes", 1031, 24), 1000)
+        self.assertEqual(counter("erases", 4, 1), 1)
+        self.assertTrue(within(write_index=1024, erase_index=2))
+        self.assertFalse(within(write_index=1025))
+        self.assertFalse(within(erase_index=3))
+
+        state["triggered"] = False
+        self.assertEqual(counter("writes", 1031, 24), 1007)
+        self.assertTrue(within(write_index=9999, erase_index=9999))
 
     def test_reset_gated_success_terminal_parses_and_emits_runtime_variable(self) -> None:
         with tempfile.TemporaryDirectory() as td:
