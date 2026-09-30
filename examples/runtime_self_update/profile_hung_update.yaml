@@ -1,0 +1,6 @@
+base_profile: profile.yaml
+name: runtime_self_update_hung_update
+description: Negative reset-gated terminal fixture whose updated image never establishes liveness.
+images:
+  exec: examples/runtime_self_update/old.bin
+  staging: examples/runtime_self_update/hung_update.bin

@@ -44,6 +44,7 @@ jobs:
           make -C examples/naive_copy
           make -C examples/nxboot_style
           make -C examples/esp_idf_ota
+          make -C examples/runtime_self_update
           python3 examples/nxboot_style/gen_nxboot_images.py --output-dir examples/nxboot_style
 
       - name: Install latest Renode portable

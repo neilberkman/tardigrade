@@ -1,0 +1,47 @@
+schema_version: 1
+name: runtime_self_update
+description: Reset-gated success terminal for an application that updates itself in place.
+platform: platforms/cortex_m0_self_update.repl
+bootloader:
+  elf: examples/runtime_self_update/boot.elf
+  entry: 0x00000000
+bootloader_region: { base: 0x00000000, size: 0x1000 }
+memory:
+  sram: { start: 0x20000000, end: 0x20002000 }
+  volatile_regions:
+    - { name: runtime_sram, base: 0x20000000, size: 0x2000 }
+  write_granularity: 16
+  page_size: 0x1000
+  slots:
+    exec: { base: 0x10100000, size: 0x1000 }
+    staging: { base: 0x10101000, size: 0x1000 }
+images:
+  exec: examples/runtime_self_update/old.bin
+  staging: examples/runtime_self_update/update.bin
+pre_boot_state:
+  - { address: 0x10102000, u32: 1 }
+flash_backend: mram
+success_criteria:
+  pc_in_slot: exec
+  image_hash: true
+  image_hash_slot: exec
+  allowed_images: [exec, staging]
+  terminal_after_reset: true
+  memory_checks:
+    - { address: 0x20000200, expected_value: 1, op: eq }
+    - { address: 0x20000204, expected_value: 1, op: ge }
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  max_writes: auto
+  max_writes_cap: 4096
+  sweep_strategy: exhaustive
+  run_duration: "0.2"
+  calibration_time_slice: "0.01"
+  progress_stall_timeout_s: 0.2
+  tracking_start_address: 0x20000400
+  calibration_stop:
+    address: 0x20000460
+expect:
+  should_find_issues: true

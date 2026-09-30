@@ -1,0 +1,6 @@
+base_profile: profile.yaml
+name: runtime_self_update_no_reset
+description: Negative reset-gated terminal fixture that copies successfully but never resets.
+images:
+  exec: examples/runtime_self_update/no_reset.bin
+  staging: examples/runtime_self_update/update.bin
