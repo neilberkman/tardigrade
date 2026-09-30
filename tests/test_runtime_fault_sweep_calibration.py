@@ -4,15 +4,51 @@
 from __future__ import annotations
 
 import ast
+import sys
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PY_PATH = ROOT / "scripts" / "run_runtime_fault_sweep.py"
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import renode_runner  # noqa: E402
 
 
 class RuntimeFaultSweepCalibrationTests(unittest.TestCase):
+    def test_instruction_limit_error_names_profile_setting_and_value(self) -> None:
+        profile = SimpleNamespace(
+            expect=SimpleNamespace(control_outcome="success"),
+            fault_sweep=SimpleNamespace(max_writes_cap=1000),
+        )
+        result = {
+            "total_writes": 1176,
+            "total_erases": 0,
+            "calibration_stop_reason": "instruction_limit(9808060)",
+            "instruction_limit": 500000,
+            "instruction_limit_source": "profile",
+        }
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            renode_runner, "run_single_point", return_value=result
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"fault_sweep\.max_step_limit=500000",
+            ):
+                renode_runner.run_calibration(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    robot_vars=[],
+                    work_dir=Path(td),
+                    renode_remote_server_dir="",
+                )
+
     def test_phase2_trace_capture_reason_gate(self) -> None:
         """Fine tracing follows actual successful run_until_done outcomes."""
         tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))

@@ -307,6 +307,53 @@ def get_optional_int_var(names, default=None):
     return default
 
 
+def resolve_runtime_step_limit(configured_value, duration_value, cpu_ref):
+    """Resolve an explicit instruction ceiling or derive a safe default."""
+    configured = int(configured_value)
+    performance_source = 'cpu.PerformanceInMips'
+    try:
+        performance_mips = float(cpu_ref.PerformanceInMips)
+    except Exception:
+        performance_mips = 100.0
+        performance_source = 'fallback_100_mips'
+    if not (performance_mips > 0):
+        performance_mips = 100.0
+        performance_source = 'fallback_100_mips'
+
+    if configured > 0:
+        return {
+            'value': configured,
+            'configured': configured,
+            'source': 'profile',
+            'performance_mips': performance_mips,
+            'performance_source': performance_source,
+        }
+
+    try:
+        duration_s = max(0.02, float(duration_value))
+    except Exception:
+        duration_s = 0.5
+    # Execute-mode controls can use a four-second default budget even when
+    # run_duration is shorter. Keep the implicit ceiling above both that
+    # floor and the requested run, with two-times headroom for scheduler and
+    # emulator accounting variance.
+    budget_s = max(4.0, duration_s)
+    derived = int(
+        (budget_s * performance_mips * 1000000.0 * 2.0) + 0.999999
+    )
+    derived = max(1, min(2000000000, derived))
+    return {
+        'value': derived,
+        'configured': None,
+        'source': 'derived_run_duration_and_cpu_rate',
+        'duration_s': duration_s,
+        'budget_s': budget_s,
+        'headroom': 2.0,
+        'performance_mips': performance_mips,
+        'performance_source': performance_source,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Flash backend selection — unified backend object model.
 #
@@ -714,7 +761,20 @@ evaluation_mode = str(monitor.GetVariable('evaluation_mode')).strip().lower()
 if evaluation_mode not in ('execute', 'state'):
     evaluation_mode = 'state'
 run_duration = str(monitor.GetVariable('run_duration'))
-max_step_limit = int(monitor.GetVariable('max_step_limit'))
+max_step_limit_configured = int(monitor.GetVariable('max_step_limit'))
+max_step_limit_resolution = resolve_runtime_step_limit(
+    max_step_limit_configured,
+    run_duration,
+    monitor.Machine['sysbus.cpu'],
+)
+max_step_limit = int(max_step_limit_resolution['value'])
+log(
+    'fault_sweep.max_step_limit: value={} source={} cpu_mips={}'.format(
+        max_step_limit,
+        max_step_limit_resolution.get('source'),
+        max_step_limit_resolution.get('performance_mips'),
+    )
+)
 max_writes_cap = int(monitor.GetVariable('max_writes_cap'))
 progress_stall_timeout_raw = str(monitor.GetVariable('progress_stall_timeout_s')).strip()
 try:
@@ -1052,6 +1112,9 @@ if calibration_stop_address and calibration_stop_address % 2:
     raise RuntimeError('calibration_stop_address must be halfword-aligned')
 calibration_stop_on_success = get_optional_var(
     'calibration_stop_on_success', 'false'
+).strip().lower() in ('1', 'true', 'yes')
+success_terminal_after_reset = get_optional_var(
+    'success_terminal_after_reset', 'false'
 ).strip().lower() in ('1', 'true', 'yes')
 _calibration_stop_state = {
     'cpu': None,
@@ -3732,6 +3795,23 @@ def merge_stop_status_signals(signals, prefix, status):
         return
     signals[prefix + '_stop_reason'] = status.get('reason')
     signals[prefix + '_emulated_s'] = status.get('emulated_s')
+    signals[prefix + '_instruction_limit'] = status.get('instruction_limit')
+    signals[prefix + '_instruction_limit_configured'] = status.get(
+        'instruction_limit_configured'
+    )
+    signals[prefix + '_instruction_limit_source'] = status.get(
+        'instruction_limit_source'
+    )
+    if status.get('reset_observation') is not None:
+        signals[prefix + '_reset_observation'] = status.get(
+            'reset_observation'
+        )
+    if status.get('success_terminal') is not None:
+        signals[prefix + '_success_terminal'] = status.get('success_terminal')
+    if status.get('reset_gated_terminal') is not None:
+        signals[prefix + '_reset_gated_terminal'] = status.get(
+            'reset_gated_terminal'
+        )
     if status.get('pc_samples'):
         signals[prefix + '_pc_samples'] = status.get('pc_samples')
     if status.get('console_attached_names'):
@@ -4083,6 +4163,7 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
         wall_timeout=wall_timeout,
         stop_on_fault=False,
         time_slice=phase2_time_slice,
+        reset_already_observed=True,
     )
     disarm_vtor_watchpoint()
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
@@ -7588,9 +7669,40 @@ def _calibration_success_stop_observation(cpu_ref):
         'signals': signals,
     }
 
+
+def _reset_gated_success_stop_observation(cpu_ref, reset_observation):
+    if (
+        not success_terminal_after_reset
+        or not reset_observation.get('observed')
+    ):
+        return None
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value,
+        pc_value,
+        fault_injected=False,
+        p2_status={'reason': 'success_terminal_poll'},
+    )
+    # Success is the positive terminal. A fully observed, live boot with a
+    # content mismatch is also terminal evidence: continuing to an exhausted
+    # budget would incorrectly replace wrong_image with timeout.
+    if outcome == 'success':
+        pass
+    elif outcome == 'wrong_image' and signals.get('liveness_established'):
+        pass
+    else:
+        return None
+    return {
+        'boot_outcome': outcome,
+        'boot_slot': boot_slot,
+        'signals': signals,
+    }
+
 def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, label='',
                    expect_writes=True, stop_on_fault=True, op_trace=None, op_trace_limit=0,
-                   zero_writes_is_brick=True, vtor_settle_iters=0):
+                   zero_writes_is_brick=True, vtor_settle_iters=0,
+                   reset_already_observed=False):
     # Run CPU in continuous mode until it settles or budget exhausted.
     #
     # Uses `emulation RunFor` which runs in continuous mode — much faster
@@ -7609,6 +7721,14 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     #   6. (no_boot profiles) no writes + no VTOR for N slices/min emulated time
     #   7. (no_boot profiles) writes settled (>0 but unchanged) + no VTOR
     #   8. Iteration, instruction, or wall-clock limit exhausted
+    terminal_after_reset = bool(
+        globals().get('success_terminal_after_reset', False)
+    )
+    limit_resolution = globals().get('max_step_limit_resolution') or {
+        'configured': max_step_limit,
+        'source': 'profile',
+        'performance_mips': None,
+    }
     if _recovery_zero_vector_guard:
         try:
             cpu_ref.IsHalted = True
@@ -7672,6 +7792,29 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     pc_handoff_hook_hits = []
     pc_handoff_reset_vectors = {}
     pc_handoff_indirect_branches = []
+    success_terminal_observation = None
+    reset_entry_hook_address = None
+    reset_observation = {
+        'required_for_success_terminal': terminal_after_reset,
+        'observed': bool(reset_already_observed),
+        'sources': (
+            ['recovery_reset_before_observation']
+            if reset_already_observed else []
+        ),
+        'boot_entry_hits': 0,
+        'instruction_counter_resets': 0,
+        'hook_installed': False,
+    }
+
+    def mark_in_run_reset(source):
+        if source not in reset_observation['sources']:
+            reset_observation['sources'].append(source)
+        reset_observation['observed'] = True
+
+    def capture_boot_entry(_cpu, address):
+        reset_observation['boot_entry_hits'] += 1
+        if reset_observation['boot_entry_hits'] >= 2:
+            mark_in_run_reset('boot_entry_reentered')
 
     def capture_pc_handoff(_cpu, address):
         hook_address = as_int(address) & ~1
@@ -7737,6 +7880,23 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 pc_handoff_indirect_branches.append(observation)
             return False
 
+    if terminal_after_reset:
+        try:
+            reset_vector = as_int(
+                bus.ReadDoubleWord(int(bootloader_entry) + 4)
+            ) & 0xFFFFFFFF
+            reset_entry_hook_address = reset_vector & ~1
+            reset_observation['boot_entry_vector'] = fmt_u32(reset_vector)
+            reset_observation['boot_entry_handler'] = fmt_u32(
+                reset_entry_hook_address
+            )
+            if (reset_vector & 1) != 1:
+                raise RuntimeError('boot entry reset vector is not Thumb')
+            cpu_ref.AddHook(reset_entry_hook_address, capture_boot_entry)
+            reset_observation['hook_installed'] = True
+        except Exception as exc:
+            reset_observation['hook_error'] = str(exc)
+
     if pc_handoff_slot is not None:
         target_lo, target_hi = slot_ranges[pc_handoff_slot]
         for _source_slot, (_source_lo, _source_hi) in slot_ranges.items():
@@ -7796,6 +7956,8 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             # Some CPU models reset the public counter during a machine reset.
             # Preserve the instructions observed before that reset.
             instructions_executed += instruction_now
+            reset_observation['instruction_counter_resets'] += 1
+            mark_in_run_reset('instruction_counter_reset')
         instruction_previous = instruction_now
         if calibration_mode and _calibration_stop_state.get('address_hit'):
             reason = 'calibration_stop_address(0x{:08X})'.format(
@@ -7829,7 +7991,26 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             cpu_ref.IsHalted = True
             reason = 'calibration_stop_success_criteria'
             break
-        if sticky_vtor['captured']:
+        success_terminal_observation = None
+        if terminal_after_reset:
+            success_terminal_observation = (
+                _reset_gated_success_stop_observation(
+                    cpu_ref, reset_observation
+                )
+            )
+        if success_terminal_observation is not None:
+            cpu_ref.IsHalted = True
+            terminal_outcome = success_terminal_observation.get(
+                'boot_outcome', 'success'
+            )
+            if terminal_outcome == 'success':
+                reason = 'success_terminal_after_reset'
+            else:
+                reason = 'outcome_terminal_after_reset({})'.format(
+                    terminal_outcome
+                )
+            break
+        if sticky_vtor['captured'] and not terminal_after_reset:
             if vtor_settle_remaining < 0:
                 # First capture.
                 if vtor_settle_iters == 0:
@@ -7877,6 +8058,8 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                     reason = 'vtor_captured'
                 break
         if (
+            not terminal_after_reset
+            and
             pc_handoff_slot is not None
             and sticky_pc['captured']
             and sticky_pc.get('slot') == pc_handoff_slot
@@ -8051,6 +8234,13 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             cpu_ref.RemoveHook(hook_address, capture_pc_handoff)
         except Exception:
             pass
+    if reset_entry_hook_address is not None and reset_observation.get(
+        'hook_installed'
+    ):
+        try:
+            cpu_ref.RemoveHook(reset_entry_hook_address, capture_boot_entry)
+        except Exception:
+            pass
     status = {
         'iters': iters + 1,
         'reason': reason,
@@ -8058,6 +8248,13 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         'emulated_s': round(emulated_s, 6),
         'executed_instructions': instructions_executed,
         'instruction_limit': max_step_limit,
+        'instruction_limit_configured': limit_resolution.get(
+            'configured'
+        ),
+        'instruction_limit_source': limit_resolution.get('source'),
+        'cpu_performance_mips': limit_resolution.get(
+            'performance_mips'
+        ),
         'writes': writes_now,
         'erases': erases_now,
         'pc': fmt_u32(pc_now),
@@ -8080,7 +8277,12 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         'console_last_lines': console_state.get('last_lines', []),
         'console_recent_logs': console_state.get('recent_logs', []),
         'console_fatal_pattern': console_fatal,
+        'reset_observation': reset_observation,
     }
+    if success_terminal_observation is not None:
+        status['reset_gated_terminal'] = success_terminal_observation
+        if success_terminal_observation.get('boot_outcome') == 'success':
+            status['success_terminal'] = success_terminal_observation
     if calibration_mode and _calibration_stop_state.get('triggered'):
         status['calibration_stop'] = dict(_calibration_stop_state)
     return status
@@ -10091,6 +10293,7 @@ def run_execute_fault(fault_at, fault_type='w'):
                 wall_timeout=phase2_wall_timeout_s,
                 stop_on_fault=False,
                 time_slice=phase2_time_slice,
+                reset_already_observed=True,
             )
             disarm_vtor_watchpoint()
             recovery_writes = get_total_writes()
@@ -10151,6 +10354,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             wall_timeout=phase2_wall_timeout_s,
             stop_on_fault=False,
             time_slice=phase2_time_slice,
+            reset_already_observed=True,
         )
         disarm_vtor_watchpoint()
         recovery_writes = get_total_writes()
@@ -12496,6 +12700,14 @@ if calibration_mode:
             'base_writes': int(base_writes),
             'setup_writes': int(pre_boot_write_count),
             'calibration_stop_reason': cal_status.get('reason', '?'),
+            'instruction_limit': cal_status.get('instruction_limit'),
+            'instruction_limit_configured': cal_status.get(
+                'instruction_limit_configured'
+            ),
+            'instruction_limit_source': cal_status.get(
+                'instruction_limit_source'
+            ),
+            'cpu_performance_mips': cal_status.get('cpu_performance_mips'),
             'calibration_emulated_s': float(cal_status.get('emulated_s', 0)),
             'calibration_elapsed_s': float(cal_status.get('elapsed_s', 0)),
             'calibration_pc': cal_status.get('pc', '0x00000000'),

@@ -1088,10 +1088,17 @@ def run_calibration(
     total_erases = int(data.get("total_erases", 0))
     stop_reason = data.get("calibration_stop_reason")
     if not calibration_completed(stop_reason, profile.expect.control_outcome, total_writes, total_erases):
+        limit_detail = ""
+        if str(stop_reason or "").startswith("instruction_limit"):
+            limit_value = data.get("instruction_limit")
+            limit_source = data.get("instruction_limit_source") or "profile"
+            limit_detail = (
+                " fault_sweep.max_step_limit={} (source={})."
+            ).format(limit_value, limit_source)
         raise RuntimeError(
             "Calibration did not complete cleanly (reason={!r}, writes={}, erases={}). "
-            "Refusing to run a partial sweep.".format(
-                stop_reason, total_writes, total_erases
+            "Refusing to run a partial sweep.{}".format(
+                stop_reason, total_writes, total_erases, limit_detail
             )
         )
     if total_writes <= 0 and total_erases <= 0:

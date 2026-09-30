@@ -160,6 +160,34 @@ class AllowedImagesProfileTests(unittest.TestCase):
                 with self.assertRaisesRegex(ProfileError, message):
                     load_profile(path, strict=True)
 
+    def test_reset_gated_success_terminal_parses_and_emits_runtime_variable(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = self._profile(
+                Path(td),
+                """
+                pc_in_slot: exec
+                image_hash: true
+                image_hash_slot: exec
+                allowed_images: [exec, staging]
+                terminal_after_reset: true
+                """,
+            )
+            profile = load_profile(path, strict=True)
+            self.assertTrue(profile.success_criteria.terminal_after_reset)
+            variables = set(profile.robot_vars(path.parent))
+            self.assertIn("SUCCESS_TERMINAL_AFTER_RESET:true", variables)
+            self.assertIn("MAX_STEP_LIMIT:0", variables)
+
+    def test_reset_gated_success_terminal_requires_execute_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = self._profile(
+                Path(td),
+                "vtor_in_slot: exec\nterminal_after_reset: true",
+                "evaluation_mode: state",
+            )
+            with self.assertRaisesRegex(ProfileError, "requires execute"):
+                load_profile(path, strict=True)
+
     def test_result_checks_retain_exact_matched_image(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = self._profile(
@@ -253,6 +281,188 @@ class AllowedImagesDiscoveryTests(unittest.TestCase):
 
 
 class CalibrationRuntimeBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def _reset_terminal_runtime(*, reset: bool, checks_ok: bool, max_iters: int = 5):
+        state = {"run_calls": 0, "instructions": 0, "hooks": {}}
+        sticky_pc = {"captured": False, "value": 0, "slot": None}
+
+        class Monitor:
+            def Parse(self, _command):
+                state["run_calls"] += 1
+                state["instructions"] += 25
+                hook = state["hooks"].get(0x100)
+                if hook is not None and state["run_calls"] == 1:
+                    hook(Cpu(), 0x100)
+                if hook is not None and reset and state["run_calls"] == 2:
+                    hook(Cpu(), 0x100)
+
+        class Bus:
+            @staticmethod
+            def ReadDoubleWord(address):
+                if address == 4:
+                    return 0x101
+                return 0
+
+            @staticmethod
+            def ReadWord(_address):
+                return 0
+
+        class Cpu:
+            IsHalted = False
+
+            @property
+            def ExecutedInstructions(self):
+                return state["instructions"]
+
+            @staticmethod
+            def GetRegisterUnsafe(_index):
+                return 0x2100
+
+            @staticmethod
+            def AddHook(address, callback):
+                state["hooks"][address] = callback
+
+            @staticmethod
+            def RemoveHook(address, callback):
+                if state["hooks"].get(address) is callback:
+                    del state["hooks"][address]
+
+        def capture_sticky_pc(value):
+            sticky_pc.update(captured=True, value=int(value), slot="exec")
+
+        def success_terminal(_cpu, observation):
+            if observation.get("observed") and checks_ok:
+                return {
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "signals": {"memory_checks_ok": True},
+                }
+            return None
+
+        namespace = {
+            "_time": SimpleNamespace(time=lambda: 0.0),
+            "phase1_time_slice": "0.02",
+            "success_pc_slot": "exec",
+            "success_vector_offset": 0,
+            "success_terminal_after_reset": True,
+            "bootloader_entry": 0,
+            "slot_ranges": {"exec": (0x2000, 0x3000)},
+            "monitor": Monitor(),
+            "calibration_mode": False,
+            "_calibration_stop_state": {"address_hit": False},
+            "calibration_stop_address": 0,
+            "check_console_fatal": lambda: None,
+            "fault_requires_immediate_stop": lambda: False,
+            "was_otp_fault_injected": lambda: False,
+            "as_int": int,
+            "capture_sticky_pc": capture_sticky_pc,
+            "bus": Bus(),
+            "sticky_vtor": {"captured": False, "value": 0, "slot": None},
+            "sticky_pc": sticky_pc,
+            "_calibration_success_stop_observation": lambda _cpu: None,
+            "_reset_gated_success_stop_observation": success_terminal,
+            "get_total_writes": lambda: state["run_calls"],
+            "get_total_erases": lambda: 0,
+            "fmt_u32": lambda value: "0x{:08X}".format(int(value)),
+            "log": lambda _message: None,
+            "capture_console_state": lambda include_recent=False: {
+                "attached_names": [],
+                "attached_count": 0,
+                "last_line": None,
+                "last_lines": [],
+                "recent_logs": [],
+            },
+            "progress_stall_timeout_s": 0,
+            "max_step_limit": 1000,
+            "max_step_limit_resolution": {
+                "configured": 1000,
+                "source": "profile",
+                "performance_mips": 100.0,
+            },
+            "_recovery_zero_vector_guard": False,
+            "expect_control_outcome": "success",
+            "no_boot_zero_write_slices": 10,
+            "no_boot_min_emulated_s": 0.1,
+        }
+        exec(_runtime_function("run_until_done"), namespace)
+        status = namespace["run_until_done"](
+            Cpu(), time_slice="0.02", max_iters=max_iters
+        )
+        return status, state
+
+    def test_reset_gated_terminal_stops_on_full_success_after_reset(self) -> None:
+        short, short_state = self._reset_terminal_runtime(
+            reset=True, checks_ok=True, max_iters=5
+        )
+        long, long_state = self._reset_terminal_runtime(
+            reset=True, checks_ok=True, max_iters=50
+        )
+        self.assertEqual(short["reason"], "success_terminal_after_reset")
+        self.assertEqual(long["reason"], "success_terminal_after_reset")
+        self.assertEqual(short["iters"], 2)
+        self.assertEqual(long["iters"], 2)
+        self.assertEqual(short_state["run_calls"], 2)
+        self.assertEqual(long_state["run_calls"], 2)
+        self.assertTrue(short["reset_observation"]["observed"])
+        self.assertEqual(
+            short["reset_observation"]["sources"],
+            ["boot_entry_reentered"],
+        )
+
+    def test_reset_gated_terminal_rejects_missing_reset_or_liveness(self) -> None:
+        no_reset, _state = self._reset_terminal_runtime(
+            reset=False, checks_ok=True, max_iters=3
+        )
+        no_liveness, _state = self._reset_terminal_runtime(
+            reset=True, checks_ok=False, max_iters=3
+        )
+        self.assertEqual(no_reset["reason"], "budget")
+        self.assertFalse(no_reset["reset_observation"]["observed"])
+        self.assertEqual(no_liveness["reason"], "budget")
+        self.assertTrue(no_liveness["reset_observation"]["observed"])
+
+    def test_reset_gated_terminal_preserves_live_wrong_image_outcome(self) -> None:
+        namespace = {
+            "success_terminal_after_reset": True,
+            "bus": SimpleNamespace(ReadDoubleWord=lambda _address: 0),
+            "as_int": int,
+            "evaluate_boot_outcome": lambda *_args, **_kwargs: (
+                "wrong_image",
+                "exec",
+                {"liveness_established": True, "content_mismatch": True},
+            ),
+        }
+        exec(
+            _runtime_function("_reset_gated_success_stop_observation"),
+            namespace,
+        )
+
+        observation = namespace["_reset_gated_success_stop_observation"](
+            SimpleNamespace(GetRegisterUnsafe=lambda _index: 0),
+            {"observed": True},
+        )
+
+        self.assertEqual(observation["boot_outcome"], "wrong_image")
+
+    def test_implicit_step_limit_scales_with_runtime_and_cpu_rate(self) -> None:
+        namespace = {}
+        exec(_runtime_function("resolve_runtime_step_limit"), namespace)
+        resolve = namespace["resolve_runtime_step_limit"]
+        cpu = SimpleNamespace(PerformanceInMips=100)
+
+        automatic = resolve(0, "5.0", cpu)
+        default_duration = resolve(0, "0.5", cpu)
+        explicit = resolve(123456, "5.0", cpu)
+
+        self.assertEqual(automatic["value"], 1_000_000_000)
+        self.assertEqual(default_duration["value"], 800_000_000)
+        self.assertEqual(default_duration["budget_s"], 4.0)
+        self.assertEqual(
+            automatic["source"], "derived_run_duration_and_cpu_rate"
+        )
+        self.assertEqual(explicit["value"], 123456)
+        self.assertEqual(explicit["source"], "profile")
+
     def test_tracking_start_discards_writes_before_update(self) -> None:
         class Data:
             TrackingStartAddress = 0x10000100

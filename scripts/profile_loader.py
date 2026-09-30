@@ -389,6 +389,7 @@ class SuccessCriteria:
         "boot_register_values",
         "max_reset_vector_offset",
         "memory_checks",
+        "terminal_after_reset",
     )
 
     def __init__(
@@ -409,6 +410,7 @@ class SuccessCriteria:
         boot_register_values: Optional[Dict[str, int]] = None,
         max_reset_vector_offset: Optional[int] = None,
         memory_checks: Optional[List["MemoryCheck"]] = None,
+        terminal_after_reset: bool = False,
     ) -> None:
         self.vtor_in_slot = vtor_in_slot
         self.vector_table_offset = max(0, int(vector_table_offset))
@@ -434,6 +436,7 @@ class SuccessCriteria:
                 )
         self.max_reset_vector_offset = max_reset_vector_offset
         self.memory_checks = memory_checks or []
+        self.terminal_after_reset = bool(terminal_after_reset)
 
 
 
@@ -1436,7 +1439,7 @@ class FaultSweepConfig:
         max_writes: Any = "auto",
         max_otp_blows: Optional[int] = None,
         max_writes_cap: int = 100000,
-        max_step_limit: int = 500000,
+        max_step_limit: Optional[int] = None,
         run_duration: str = "0.5",
         calibration_time_slice: Optional[str] = None,
         phase1_time_slice: Optional[str] = None,
@@ -1520,8 +1523,16 @@ class FaultSweepConfig:
                     MAX_PROFILE_FAULT_POINTS
                 )
             )
-        self.max_step_limit = int(max_step_limit)
-        if self.max_step_limit < 1 or self.max_step_limit > MAX_PROFILE_STEP_LIMIT:
+        self.max_step_limit = (
+            None if max_step_limit is None else int(max_step_limit)
+        )
+        if (
+            self.max_step_limit is not None
+            and (
+                self.max_step_limit < 1
+                or self.max_step_limit > MAX_PROFILE_STEP_LIMIT
+            )
+        ):
             raise ProfileError(
                 "fault_sweep.max_step_limit must be between 1 and {}".format(
                     MAX_PROFILE_STEP_LIMIT
@@ -2591,7 +2602,9 @@ class ProfileConfig:
             "SRAM_END:0x{:08X}".format(mem.sram_end),
             "WRITE_GRANULARITY:{}".format(mem.write_granularity),
             "RUN_DURATION:{}".format(fs.run_duration),
-            "MAX_STEP_LIMIT:{}".format(fs.max_step_limit),
+            "MAX_STEP_LIMIT:{}".format(
+                fs.max_step_limit if fs.max_step_limit is not None else 0
+            ),
             "MAX_WRITES_CAP:{}".format(fs.max_writes_cap),
             "BOOT_CYCLES:{}".format(fs.boot_cycles),
             "VTOR_SETTLE_ITERS:{}".format(fs.vtor_settle_iters),
@@ -2738,6 +2751,8 @@ class ProfileConfig:
         )
         if sc.pc_in_slot:
             vars_list.append("SUCCESS_PC_SLOT:{}".format(sc.pc_in_slot))
+        if sc.terminal_after_reset:
+            vars_list.append("SUCCESS_TERMINAL_AFTER_RESET:true")
         if sc.marker_address is not None:
             vars_list.append("SUCCESS_MARKER_ADDR:0x{:08X}".format(sc.marker_address))
         if sc.marker_value is not None:
@@ -3550,6 +3565,10 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
             if "max_reset_vector_offset" in raw else None
         ),
         memory_checks=_parse_memory_checks(raw.get("memory_checks")),
+        terminal_after_reset=_parse_bool(
+            raw.get("terminal_after_reset", False),
+            "success_criteria.terminal_after_reset",
+        ),
     )
 
 
@@ -4064,7 +4083,11 @@ def _parse_fault_sweep(
             else int(raw.get("max_otp_blows"))
         ),
         max_writes_cap=int(raw.get("max_writes_cap", 100000)),
-        max_step_limit=int(raw.get("max_step_limit", 500000)),
+        max_step_limit=(
+            _parse_int(raw.get("max_step_limit"), "fault_sweep.max_step_limit")
+            if "max_step_limit" in raw
+            else None
+        ),
         run_duration=str(raw.get("run_duration", "0.5")),
         calibration_time_slice=raw.get("calibration_time_slice"),
         phase1_time_slice=raw.get("phase1_time_slice"),
@@ -6925,7 +6948,7 @@ _STRICT_SUCCESS_CRITERIA_KEYS = frozenset(
         "image_hash_slot",
         "otadata_expect", "otadata_expect_scope", "bootloader_integrity",
         "config_checks", "boot_register_values", "max_reset_vector_offset",
-        "memory_checks",
+        "memory_checks", "terminal_after_reset",
     }
 )
 
@@ -7924,6 +7947,31 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         raise ProfileError(
             "fault_sweep.calibration_stop requires execute evaluation mode"
         )
+    if (
+        success_criteria.terminal_after_reset
+        and str(fault_sweep.evaluation_mode or "").strip().lower() == "state"
+    ):
+        raise ProfileError(
+            "success_criteria.terminal_after_reset requires execute evaluation mode"
+        )
+    if success_criteria.terminal_after_reset and not any(
+        (
+            success_criteria.vtor_in_slot,
+            success_criteria.pc_in_slot,
+            success_criteria.marker_address is not None,
+            success_criteria.image_hash,
+            success_criteria.otadata_expect,
+            success_criteria.bootloader_integrity,
+            success_criteria.config_checks,
+            success_criteria.boot_register_values,
+            success_criteria.memory_checks,
+            success_criteria.max_reset_vector_offset is not None,
+        )
+    ):
+        raise ProfileError(
+            "success_criteria.terminal_after_reset requires an observable "
+            "success_criteria check"
+        )
     update_sequence = _parse_update_sequence(
         data.get("update_sequence"),
         images=images,
@@ -8277,6 +8325,7 @@ def main() -> int:
             for probe in profile.fault_sweep.function_return_probes
         ],
         "max_writes": profile.fault_sweep.max_writes,
+        "max_step_limit": profile.fault_sweep.max_step_limit,
         "boot_cycles": profile.fault_sweep.boot_cycles,
         "calibration_time_slice": profile.fault_sweep.calibration_time_slice,
         "phase1_time_slice": profile.fault_sweep.phase1_time_slice,
@@ -8311,6 +8360,7 @@ def main() -> int:
         "expected_image": profile.success_criteria.expected_image,
         "allowed_images": profile.success_criteria.allowed_images,
         "image_hash_slot": profile.success_criteria.image_hash_slot,
+        "terminal_after_reset": profile.success_criteria.terminal_after_reset,
         "calibration_stop": {
             "address": profile.fault_sweep.calibration_stop.address,
             "success_criteria": profile.fault_sweep.calibration_stop.success_criteria,

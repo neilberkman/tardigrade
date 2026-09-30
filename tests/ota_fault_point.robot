@@ -15,7 +15,7 @@ ${SRAM_START}                  0x20000000
 ${SRAM_END}                    0x20020000
 ${WRITE_GRANULARITY}           8
 ${RUN_DURATION}                0.005
-${MAX_STEP_LIMIT}              100000
+${MAX_STEP_LIMIT}              0
 ${MAX_WRITES_CAP}              512
 ${SLOT_EXEC_BASE}              0x10000000
 ${SLOT_EXEC_SIZE}              0x38000
@@ -64,6 +64,7 @@ ${HEURISTIC_TRACE_REQUIRED}    false
 ${CALIBRATION_TRACE_REQUIRED}  false
 ${CALIBRATION_STOP_ADDRESS}    ${EMPTY}
 ${CALIBRATION_STOP_ON_SUCCESS}    false
+${SUCCESS_TERMINAL_AFTER_RESET}    false
 ${CALIBRATION_TIME_SLICE}      ${EMPTY}
 ${PHASE1_TIME_SLICE}           ${EMPTY}
 ${PHASE2_TIME_SLICE}           ${EMPTY}
@@ -243,6 +244,7 @@ Run Runtime Fault Point
     Execute Command    $tracking_start_address="${TRACKING_START_ADDRESS}"
     Execute Command    $calibration_stop_address="${CALIBRATION_STOP_ADDRESS}"
     Execute Command    $calibration_stop_on_success="${CALIBRATION_STOP_ON_SUCCESS}"
+    Execute Command    $success_terminal_after_reset="${SUCCESS_TERMINAL_AFTER_RESET}"
     Run Keyword If    '${CALIBRATION_TIME_SLICE}' != ''    Execute Command    $calibration_time_slice="${CALIBRATION_TIME_SLICE}"
     Run Keyword If    '${PHASE1_TIME_SLICE}' != ''    Execute Command    $phase1_time_slice="${PHASE1_TIME_SLICE}"
     Run Keyword If    '${PHASE2_TIME_SLICE}' != ''    Execute Command    $phase2_time_slice="${PHASE2_TIME_SLICE}"

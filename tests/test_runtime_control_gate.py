@@ -113,6 +113,24 @@ class RuntimeControlGateTests(unittest.TestCase):
             self._run(self._profile(), failed, events)
         self.assertEqual(events, ["control"])
 
+    def test_instruction_limit_control_error_names_profile_setting(self) -> None:
+        events = []
+        failed = self._control_result()
+        failed["boot_outcome"] = "timeout"
+        failed["signals"].update(
+            {
+                "phase1_stop_reason": "instruction_limit(600000)",
+                "phase1_instruction_limit": 500000,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"fault_sweep\.max_step_limit=500000",
+        ):
+            self._run(self._profile(), failed, events)
+        self.assertEqual(events, ["control"])
+
     def test_wrong_slot_control_is_rejected_before_dispatch(self) -> None:
         events = []
         with self.assertRaisesRegex(RuntimeError, "requires slot 'exec'"):

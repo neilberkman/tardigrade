@@ -165,11 +165,22 @@ def _validate_runtime_control_result(
     observed_slot_name = str(observed_slot or "").strip().lower()
 
     if observed_outcome != expected_outcome:
+        limit_detail = ""
+        signals = result.get("signals")
+        if isinstance(signals, dict):
+            for prefix in ("phase1", "phase2"):
+                reason = str(signals.get(prefix + "_stop_reason") or "")
+                if reason.startswith("instruction_limit"):
+                    limit_detail = (
+                        " fault_sweep.max_step_limit={}."
+                    ).format(signals.get(prefix + "_instruction_limit"))
+                    break
         raise RuntimeError(
             "Clean control failed: expected outcome {!r}, observed {!r}. "
-            "Fault dispatch was aborted.".format(
+            "Fault dispatch was aborted.{}".format(
                 expected_outcome,
                 observed_outcome,
+                limit_detail,
             )
         )
 

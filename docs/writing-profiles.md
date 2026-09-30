@@ -492,6 +492,35 @@ success_criteria:
     - { address: 0x40002000, mask: 0x0F, expected_masked: 0x05 } # masked bits
 ```
 
+### Reset-gated success terminals
+
+An application that performs its own update can execute from the `exec` slot
+before copying starts. For these targets, an ordinary `pc_in_slot` terminal is
+premature. Require an in-run reset and the complete configured success checks:
+
+```yaml
+success_criteria:
+  pc_in_slot: exec
+  image_hash: true
+  image_hash_slot: exec
+  allowed_images: [exec, staging]
+  terminal_after_reset: true
+  memory_checks:
+    - { address: 0x20000200, expected_value: 1, op: eq }
+    - { address: 0x20000204, expected_value: 1, op: ge }
+```
+
+With `terminal_after_reset: true`, runtime execute-mode sweeps do not stop on
+pre-reset PC or VTOR evidence. Tardigrade must observe the boot entry being
+re-entered, or an instruction-counter reset, and then all existing content and
+liveness criteria must pass. A copied image that never requests reset, or a
+post-reset image that never establishes liveness, cannot reach this terminal.
+After a recovery reset, a live boot with a failed content check terminates as
+`wrong_image` instead of being overwritten by a later budget timeout.
+
+See `examples/runtime_self_update/profile.yaml` for a complete vendor-neutral
+fixture.
+
 ## Fault sweep configuration
 
 ### Basics
@@ -502,10 +531,17 @@ fault_sweep:
   evaluation_mode: execute # full recovery boot (vs "state" for NVM-only inference)
   max_writes: auto # calibrate automatically
   run_duration: "2.0" # seconds of emulation for calibration
-  max_step_limit: 20000000 # CPU instruction limit
+  max_step_limit: 20000000 # optional explicit CPU instruction limit
 ```
 
 `max_writes: auto` runs the firmware once and counts NVM writes. Set a fixed number if you know it. `max_writes_cap` (default 100000) is a safety limit.
+
+When `max_step_limit` is omitted, Tardigrade derives it at runtime from
+`run_duration` and the emulated CPU's `PerformanceInMips`, with two-times
+headroom and enough room for the runner's four-second control floor. An
+explicit value remains authoritative. If an explicit ceiling stops
+calibration or a clean control, the error names `fault_sweep.max_step_limit`
+and reports its value.
 
 To keep calibration bounded to the persistence operation of interest, add an
 address boundary, a success-observation boundary, or both:
