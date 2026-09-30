@@ -15,7 +15,9 @@ SECTIONS
     .ramfunc :
     {
         _sramfunc = .;
-        *(.ramfunc*)
+        KEEP(*(.ramfunc.copy))
+        . = ORIGIN(RAMFUNC) + 0x80;
+        KEEP(*(.ramfunc.reset))
         _eramfunc = .;
     } > RAMFUNC AT > APP
     _siramfunc = LOADADDR(.ramfunc);

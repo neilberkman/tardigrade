@@ -42,6 +42,6 @@ fault_sweep:
   progress_stall_timeout_s: 0.2
   tracking_start_address: 0x20000400
   calibration_stop:
-    address: 0x20000460
+    address: 0x20000480
 expect:
   should_find_issues: true

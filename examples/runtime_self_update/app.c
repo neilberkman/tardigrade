@@ -71,7 +71,7 @@ const void *vector_table[] = {
     Default_Handler,
 };
 
-__attribute__((noinline, section(".ramfunc")))
+__attribute__((noinline, section(".ramfunc.copy")))
 static void copy_update(void)
 {
     volatile uint32_t *destination = (volatile uint32_t *)EXEC_BASE;
@@ -95,7 +95,7 @@ static void copy_update(void)
     destination[4] = source[4];
 }
 
-__attribute__((noinline, noreturn, section(".ramfunc")))
+__attribute__((noinline, noreturn, section(".ramfunc.reset")))
 static void request_reset(void)
 {
 #if REQUEST_RESET

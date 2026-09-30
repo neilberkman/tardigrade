@@ -16,6 +16,17 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from profile_loader import load_profile  # noqa: E402
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _build_runtime_self_update_fixture():
+    if shutil.which("arm-none-eabi-gcc") is None:
+        pytest.skip("arm-none-eabi-gcc is not installed")
+    subprocess.run(
+        ["make", "-C", str(FIXTURE), "clean", "all"],
+        cwd=ROOT,
+        check=True,
+    )
+
+
 def _symbol_address(elf: Path, symbol: str) -> int:
     nm = shutil.which("arm-none-eabi-nm")
     if nm is None:
