@@ -200,8 +200,8 @@ jobs:
           tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
           python3 -m pip install --user \
             -c requirements-renode-constraints.txt \
-            -r "${RUNNER_TEMP}/renode/tests/requirements.txt" \
-            -r requirements.txt
+            -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+          python3 -m pip install --user -r requirements.txt
           echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
 
       - name: Build runtime self-update fixture
