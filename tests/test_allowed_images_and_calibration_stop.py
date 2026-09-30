@@ -160,6 +160,40 @@ class AllowedImagesProfileTests(unittest.TestCase):
                 with self.assertRaisesRegex(ProfileError, message):
                     load_profile(path, strict=True)
 
+    def test_calibration_address_hook_pauses_machine_without_halting_cpu(self) -> None:
+        class Machine:
+            def __init__(self):
+                self.pause_calls = 0
+
+            def Pause(self):
+                self.pause_calls += 1
+
+        class Cpu:
+            IsHalted = False
+
+        machine = Machine()
+        state = {"address_hit": False, "triggered": False}
+        namespace = {
+            "calibration_mode": True,
+            "calibration_stop_address": 0x20000480,
+            "_calibration_stop_state": state,
+            "get_total_writes": lambda: 1024,
+            "get_total_erases": lambda: 0,
+            "monitor": SimpleNamespace(Machine=machine),
+        }
+        exec(_runtime_function("_calibration_stop_address_hook"), namespace)
+
+        cpu = Cpu()
+        namespace["_calibration_stop_address_hook"](cpu, 0x20000480)
+
+        self.assertTrue(state["address_hit"])
+        self.assertTrue(state["triggered"])
+        self.assertEqual(state["reason"], "address")
+        self.assertEqual(state["writes"], 1024)
+        self.assertEqual(state["erases"], 0)
+        self.assertEqual(machine.pause_calls, 1)
+        self.assertFalse(cpu.IsHalted)
+
     def test_reset_gated_success_terminal_parses_and_emits_runtime_variable(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = self._profile(

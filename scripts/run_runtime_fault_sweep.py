@@ -1137,7 +1137,11 @@ def _calibration_stop_address_hook(cpu, addr):
     _calibration_stop_state['reason'] = 'address'
     _calibration_stop_state['writes'] = int(get_total_writes())
     _calibration_stop_state['erases'] = int(get_total_erases())
-    cpu.IsHalted = True
+    # Pausing the sole CPU here prevents virtual time from reaching the end of
+    # an active ``emulation RunFor`` call, so Robot never regains control.
+    # Pause the machine instead; RunFor then returns immediately and the outer
+    # loop consumes the captured stop state.
+    monitor.Machine.Pause()
 
 
 def _prepare_calibration_stop():
