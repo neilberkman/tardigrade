@@ -66,6 +66,7 @@ def test_negative_profiles_require_timeout(
     profile = load_profile(FIXTURE / profile_name, strict=True)
 
     assert profile.success_criteria.terminal_after_reset is True
+    assert profile.fault_sweep.max_step_limit == 2_000_000
     assert profile.images["exec"] == "examples/runtime_self_update/{}".format(
         exec_name
     )

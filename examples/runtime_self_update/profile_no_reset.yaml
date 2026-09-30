@@ -4,3 +4,5 @@ description: Negative reset-gated terminal fixture that copies successfully but 
 images:
   exec: examples/runtime_self_update/no_reset.bin
   staging: examples/runtime_self_update/update.bin
+fault_sweep:
+  max_step_limit: 2000000

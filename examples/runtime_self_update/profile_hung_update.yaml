@@ -4,3 +4,5 @@ description: Negative reset-gated terminal fixture whose updated image never est
 images:
   exec: examples/runtime_self_update/old.bin
   staging: examples/runtime_self_update/hung_update.bin
+fault_sweep:
+  max_step_limit: 2000000
