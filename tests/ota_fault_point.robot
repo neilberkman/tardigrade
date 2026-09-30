@@ -144,6 +144,7 @@ Load Runtime Scenario
     Execute Command    include "${ROOT}/peripherals/NVMemoryController.cs"
     Execute Command    include "${ROOT}/peripherals/GenericNvmController.cs"
     Execute Command    include "${ROOT}/peripherals/FaultTracker.cs"
+    Execute Command    include "${ROOT}/peripherals/MappedMRAMTracker.cs"
     Execute Command    include "${ROOT}/peripherals/An521NvmInterceptor.cs"
     Execute Command    include "${ROOT}/peripherals/NRF52NVMC.cs"
     Execute Command    include "${ROOT}/peripherals/NRF52UARTE.cs"

@@ -12,6 +12,8 @@ memory:
     - { name: runtime_sram, base: 0x20000000, size: 0x2000 }
   write_granularity: 16
   page_size: 0x1000
+  trace_address_map:
+    - { offset_start: 0x0, offset_end: 0x3000, address_addend: 0x10100000 }
   slots:
     exec: { base: 0x10100000, size: 0x1000 }
     staging: { base: 0x10101000, size: 0x1000 }
@@ -20,7 +22,7 @@ images:
   staging: examples/runtime_self_update/update.bin
 pre_boot_state:
   - { address: 0x10102000, u32: 1 }
-flash_backend: mram
+flash_backend: mramTracker
 success_criteria:
   pc_in_slot: exec
   image_hash: true

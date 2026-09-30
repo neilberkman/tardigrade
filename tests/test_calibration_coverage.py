@@ -506,6 +506,18 @@ def test_width_aware_clean_trace_is_preserved_in_operation_metadata(tmp_path: Pa
     assert ops[0]["width"] == 2
 
 
+def test_mram_program_unit_width_is_preserved_in_operation_metadata(tmp_path: Path) -> None:
+    trace_file = tmp_path / "mram-width.csv"
+    trace_file.write_text(
+        "write_index,flash_offset,value,width\n1,0,4660,16\n",
+        encoding="utf-8",
+    )
+    entries = load_clean_write_trace(str(trace_file))
+    assert entries[0]["width"] == 16
+    ops = build_clean_operation_trace(entries, [], 0x10100000)
+    assert ops[0]["width"] == 16
+
+
 @pytest.mark.parametrize(
     "rows",
     [

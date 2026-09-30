@@ -175,7 +175,7 @@ def _parse_trace_csv(
             raise ValueError("{} row {} exceeds uint32 range".format(name, line_number))
         if header == ["write_index", "flash_offset", "value", "width"]:
             width = values[3]
-            if width not in (1, 2, 4, 8):
+            if width not in (1, 2, 4, 8, 16):
                 raise ValueError(
                     "{} row {} has unsupported write width {}".format(
                         name, line_number, width

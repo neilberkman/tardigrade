@@ -17,6 +17,8 @@ def _load(path: str) -> Dict[str, Any]:
 
 
 def _controls(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if payload.get("is_control") is True:
+        return [payload]
     return [
         row
         for row in payload.get("runtime_sweep_results", [])

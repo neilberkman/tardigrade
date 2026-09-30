@@ -195,6 +195,61 @@ class AllowedImagesProfileTests(unittest.TestCase):
         self.assertEqual(state["writes"], 1024)
         self.assertEqual(state["erases"], 0)
 
+    def test_native_calibration_stop_imports_backend_snapshot(self) -> None:
+        state = {
+            "native": True,
+            "address_hit": False,
+            "triggered": False,
+        }
+        data = SimpleNamespace(
+            TrackingStopHit=True,
+            TrackingStopWrites=1024,
+            TrackingStopErases=0,
+        )
+        namespace = {
+            "_calibration_stop_state": state,
+            "backend": {"data": data},
+        }
+        exec(_runtime_function("_sync_native_calibration_stop"), namespace)
+
+        namespace["_sync_native_calibration_stop"]()
+        self.assertTrue(state["address_hit"])
+        self.assertTrue(state["triggered"])
+        self.assertEqual(state["reason"], "address")
+        self.assertEqual(state["writes"], 1024)
+        self.assertEqual(state["erases"], 0)
+
+    def test_native_calibration_stop_avoids_python_cpu_hook(self) -> None:
+        class Data:
+            TrackingStopAddress = 0
+            TrackingStopHit = False
+            TrackingStopWrites = 0
+            TrackingStopErases = 0
+
+        class Cpu:
+            @staticmethod
+            def AddHook(_address, _callback):
+                raise AssertionError("native stop must not install a Python hook")
+
+        state = {"cpu": None, "hook_installed": False}
+        namespace = {
+            "_calibration_stop_state": state,
+            "_calibration_stop_address_hook": lambda *_args: None,
+            "backend": {"data": Data()},
+            "calibration_mode": True,
+            "calibration_stop_address": 0x20000480,
+            "monitor": SimpleNamespace(Machine={"sysbus.cpu": Cpu()}),
+        }
+        exec(_runtime_function("_prepare_calibration_stop"), namespace)
+
+        namespace["_prepare_calibration_stop"]()
+        self.assertTrue(state["native"])
+        self.assertFalse(state["hook_installed"])
+        self.assertEqual(
+            namespace["backend"]["data"].TrackingStopAddress,
+            0x20000480,
+        )
+
     def test_calibration_stop_boundary_excludes_later_counters_and_trace(self) -> None:
         state = {
             "triggered": True,

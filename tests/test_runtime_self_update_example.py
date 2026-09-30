@@ -14,6 +14,7 @@ FIXTURE = ROOT / "examples" / "runtime_self_update"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from profile_loader import load_profile  # noqa: E402
+from verify_runtime_self_update_reports import _controls  # noqa: E402
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -49,6 +50,13 @@ def test_profile_uses_reset_gated_full_success_and_automatic_step_limit():
     assert len(profile.success_criteria.memory_checks) == 2
     assert profile.fault_sweep.max_step_limit is None
     assert profile.memory.write_granularity == 16
+    assert profile.memory.trace_address_map == [
+        {
+            "offset_start": 0,
+            "offset_end": 0x3000,
+            "address_addend": 0x10100000,
+        }
+    ]
     assert profile.bootloader_entry == 0
     assert "MAX_STEP_LIMIT:0" in profile.robot_vars(ROOT)
 
@@ -99,3 +107,9 @@ def test_fixture_images_preserve_reset_entry_but_change_noncritical_vectors():
     assert struct.unpack_from("<I", old, 16) != struct.unpack_from("<I", update, 16)
     assert (FIXTURE / "no_reset.bin").read_bytes() != update
     assert (FIXTURE / "hung_update.bin").read_bytes() != update
+
+
+def test_report_verifier_accepts_raw_and_embedded_controls():
+    raw = {"is_control": True, "boot_outcome": "timeout"}
+    assert _controls(raw) == [raw]
+    assert _controls({"runtime_sweep_results": [raw]}) == [raw]

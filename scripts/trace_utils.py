@@ -25,6 +25,7 @@ EXACT_PROGRAM_TRACE_FIELDS = (
     "faulted",
 )
 MAX_EXACT_PROGRAM_WIDTH = 1 << 20
+SUPPORTED_WRITE_TRACE_WIDTHS = (1, 2, 4, 8, 16)
 
 
 def flash_base_for_profile(profile: Any) -> int:
@@ -193,7 +194,7 @@ def load_clean_write_trace(
                         width = int(str(raw_width).strip(), 0)
                     except (TypeError, ValueError) as exc:
                         raise ValueError("malformed write width: {}".format(exc))
-                    if width not in (1, 2, 4, 8):
+                    if width not in SUPPORTED_WRITE_TRACE_WIDTHS:
                         raise ValueError("unsupported write width {}".format(width))
                     if capacity is not None and (
                         flash_offset > capacity or width > capacity - flash_offset

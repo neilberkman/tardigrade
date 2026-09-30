@@ -592,6 +592,11 @@ def _configure_python_tracking_gate(force=False):
     gate['started'] = address == 0
     if address == 0:
         return
+    if bool(getattr(backend['data'], 'NativeTrackingStartReliable', False)):
+        # This backend installs its CPU address hook and memory-access hook
+        # entirely in C#. Avoid mutating hook state from a Python callback
+        # while Renode is inside RunFor.
+        return
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.AddHook(address, _python_tracking_gate_hook)
     gate['cpu'] = cpu_ref
@@ -973,6 +978,19 @@ def _discover_backend_bus_base(backend_obj):
     explicit_size = get_optional_int_var('backend_bus_size', None)
     if explicit is not None and explicit_size is not None:
         return int(explicit), int(explicit_size)
+    # Sidecars over executable MappedMemory are registered at a control-only
+    # address. Their declared flash window is the authoritative storage range.
+    try:
+        modeled_base = int(backend_obj.FlashBaseAddress)
+        modeled_size = int(backend_obj.FlashSize)
+        modeled_flash = backend_obj.Flash
+        if modeled_flash is not None and modeled_size > 0:
+            return (
+                int(explicit) if explicit is not None else modeled_base,
+                int(explicit_size) if explicit_size is not None else modeled_size,
+            )
+    except Exception:
+        pass
     try:
         regs = monitor.Machine.SystemBus.GetRegistrationPoints(backend_obj)
     except Exception:
@@ -1119,6 +1137,7 @@ success_terminal_after_reset = get_optional_var(
 _calibration_stop_state = {
     'cpu': None,
     'hook_installed': False,
+    'native': False,
     'address_hit': False,
     'triggered': False,
     'reason': None,
@@ -1142,6 +1161,20 @@ def _calibration_stop_address_hook(cpu, addr):
     # Hooks run inside an active ``emulation RunFor`` call. Halting the CPU or
     # pausing the machine here prevents that call from completing. Record the
     # exact boundary and let the already-bounded time slice return normally.
+
+
+def _sync_native_calibration_stop():
+    state = _calibration_stop_state
+    if not state.get('native') or state.get('address_hit'):
+        return
+    data = backend['data']
+    if not bool(data.TrackingStopHit):
+        return
+    state['address_hit'] = True
+    state['triggered'] = True
+    state['reason'] = 'address'
+    state['writes'] = int(data.TrackingStopWrites)
+    state['erases'] = int(data.TrackingStopErases)
 
 
 def _calibration_counter_at_stop(name, current, baseline):
@@ -1191,6 +1224,7 @@ def _prepare_calibration_stop():
     state.update({
         'cpu': None,
         'hook_installed': False,
+        'native': False,
         'address_hit': False,
         'triggered': False,
         'reason': None,
@@ -1199,7 +1233,18 @@ def _prepare_calibration_stop():
         'matched_image': None,
         'image_hash_actual': None,
     })
+    data = backend['data']
+    if hasattr(data, 'TrackingStopAddress'):
+        data.TrackingStopAddress = 0
     if not calibration_mode or not calibration_stop_address:
+        return
+    native_members = (
+        'TrackingStopAddress', 'TrackingStopHit',
+        'TrackingStopWrites', 'TrackingStopErases',
+    )
+    if all(hasattr(data, member) for member in native_members):
+        data.TrackingStopAddress = calibration_stop_address
+        state['native'] = True
         return
     cpu = monitor.Machine['sysbus.cpu']
     try:
@@ -7989,6 +8034,9 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     for iters in range(max_iters):
         monitor.Parse('emulation RunFor "{}"'.format(time_slice))
         emulated_s += slice_s
+        native_stop_sync = globals().get('_sync_native_calibration_stop')
+        if native_stop_sync is not None:
+            native_stop_sync()
         instruction_now = as_int(cpu_ref.ExecutedInstructions)
         if instruction_now >= instruction_previous:
             instructions_executed += instruction_now - instruction_previous
