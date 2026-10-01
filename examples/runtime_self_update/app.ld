@@ -12,6 +12,7 @@ SECTIONS
     .isr_vector : { KEEP(*(.isr_vector)) } > APP
     .text.reset : { KEEP(*(.text.Reset_Handler)) } > APP
     .text : { *(.text*) *(.rodata*) } > APP
+    .app_version ORIGIN(APP) + 0x800 : { KEEP(*(.app_version)) } > APP
     .ramfunc :
     {
         _sramfunc = .;

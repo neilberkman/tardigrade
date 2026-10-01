@@ -165,6 +165,36 @@ EXIT_ASSERTION_FAILURE = 1
 EXIT_INFRA_FAILURE = 2
 
 
+def _calibration_stop_summary(
+    profile: ProfileConfig,
+    calibration: Optional[CalibrationResult],
+) -> Dict[str, Any]:
+    configured_address = profile.fault_sweep.calibration_stop.address
+    stop_reason = calibration.stop_reason if calibration is not None else None
+    return {
+        "configured_address": (
+            "0x{:08X}".format(int(configured_address))
+            if configured_address is not None
+            else None
+        ),
+        "success_criteria": bool(
+            profile.fault_sweep.calibration_stop.success_criteria
+        ),
+        "address_reached": bool(
+            configured_address is not None
+            and str(stop_reason or "").startswith("calibration_stop_address(")
+        ),
+        "success_before_address": bool(
+            configured_address is not None
+            and stop_reason == "calibration_stop_success_criteria"
+        ),
+        "success_reset_gate_required": bool(
+            profile.fault_sweep.calibration_stop.success_criteria
+            and profile.success_criteria.terminal_after_reset
+        ),
+    }
+
+
 def _trace_replay_eligible_fault_types(fault_types: List[str]) -> bool:
     normalized = {
         str(ft or "power_loss").split(":", 1)[0]
@@ -2640,6 +2670,9 @@ def _main_single() -> int:
             "program_trace_file": program_trace_file,
             "barrier_audit": cal.barrier_audit if cal is not None else None,
         }
+        payload["calibration"]["stop"] = _calibration_stop_summary(
+            profile, cal
+        )
         selected_target_boot_evidence = _selected_trigger_target_boot_evidence(discovery)
         if selected_target_boot_evidence is not None:
             # This is intentionally separate from ``coverage`` above.  The

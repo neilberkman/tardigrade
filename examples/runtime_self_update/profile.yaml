@@ -45,5 +45,6 @@ fault_sweep:
   tracking_start_address: 0x20000400
   calibration_stop:
     address: 0x20000480
+    success_criteria: true
 expect:
   should_find_issues: true

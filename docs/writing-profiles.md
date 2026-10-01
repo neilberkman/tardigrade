@@ -563,6 +563,14 @@ records the stop reason, counts, final hash, and exact matched image. This is
 execute-mode only. Omitting `calibration_stop` preserves the existing terminal
 condition.
 
+When `success_criteria.terminal_after_reset: true` is also configured, the
+calibration success stop inherits that reset gate. Pre-reset success evidence
+cannot truncate calibration; an address stop configured beside it can still
+close the operation at the exact pre-reset boundary. Reports expose
+`calibration.stop.success_before_address` when an ungated success stop wins
+before its configured address, because that count may cover only a prefix of
+the operation.
+
 OTP-only campaigns can declare an independent operation bound:
 
 ```yaml

@@ -1139,12 +1139,16 @@ _calibration_stop_state = {
     'hook_installed': False,
     'native': False,
     'address_hit': False,
+    'address_reached': False,
     'triggered': False,
     'reason': None,
     'writes': None,
     'erases': None,
     'matched_image': None,
     'image_hash_actual': None,
+    'success_before_address': False,
+    'success_reset_gate_required': bool(success_terminal_after_reset),
+    'success_reset_gate_satisfied': not bool(success_terminal_after_reset),
 }
 
 
@@ -1154,6 +1158,7 @@ def _calibration_stop_address_hook(cpu, addr):
     if _calibration_stop_state.get('address_hit'):
         return
     _calibration_stop_state['address_hit'] = True
+    _calibration_stop_state['address_reached'] = True
     _calibration_stop_state['triggered'] = True
     _calibration_stop_state['reason'] = 'address'
     _calibration_stop_state['writes'] = int(get_total_writes())
@@ -1171,6 +1176,7 @@ def _sync_native_calibration_stop():
     if not bool(data.TrackingStopHit):
         return
     state['address_hit'] = True
+    state['address_reached'] = True
     state['triggered'] = True
     state['reason'] = 'address'
     state['writes'] = int(data.TrackingStopWrites)
@@ -1215,6 +1221,9 @@ def _calibration_event_within_stop(write_index=None, erase_index=None):
 
 def _prepare_calibration_stop():
     state = _calibration_stop_state
+    reset_gate_required = bool(
+        globals().get('success_terminal_after_reset', False)
+    )
     old_cpu = state.get('cpu')
     if state.get('hook_installed') and old_cpu is not None:
         try:
@@ -1226,12 +1235,16 @@ def _prepare_calibration_stop():
         'hook_installed': False,
         'native': False,
         'address_hit': False,
+        'address_reached': False,
         'triggered': False,
         'reason': None,
         'writes': None,
         'erases': None,
         'matched_image': None,
         'image_hash_actual': None,
+        'success_before_address': False,
+        'success_reset_gate_required': reset_gate_required,
+        'success_reset_gate_satisfied': not reset_gate_required,
     })
     data = backend['data']
     if hasattr(data, 'TrackingStopAddress'):
@@ -7748,6 +7761,11 @@ def _calibration_success_stop_observation(cpu_ref):
     _calibration_stop_state['erases'] = int(get_total_erases())
     _calibration_stop_state['matched_image'] = signals.get('matched_image')
     _calibration_stop_state['image_hash_actual'] = signals.get('image_hash_actual')
+    address_reached = bool(_calibration_stop_state.get('address_hit'))
+    _calibration_stop_state['address_reached'] = address_reached
+    _calibration_stop_state['success_before_address'] = bool(
+        calibration_stop_address and not address_reached
+    )
     return {
         'boot_outcome': outcome,
         'boot_slot': boot_slot,
@@ -8074,7 +8092,21 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                     sticky_vtor['slot'] = sn
                     sticky_vtor['captured'] = True
                     break
-        success_stop_observation = _calibration_success_stop_observation(cpu_ref)
+        calibration_success_gate_satisfied = bool(
+            not terminal_after_reset or reset_observation.get('observed')
+        )
+        if calibration_mode:
+            _calibration_stop_state['success_reset_gate_required'] = bool(
+                terminal_after_reset
+            )
+            _calibration_stop_state['success_reset_gate_satisfied'] = bool(
+                calibration_success_gate_satisfied
+            )
+        success_stop_observation = None
+        if calibration_success_gate_satisfied:
+            success_stop_observation = _calibration_success_stop_observation(
+                cpu_ref
+            )
         if success_stop_observation is not None:
             cpu_ref.IsHalted = True
             reason = 'calibration_stop_success_criteria'
@@ -12602,6 +12634,13 @@ if calibration_mode:
 
         progress_stall_timeout_s = saved_stall
         log('calibration: stop_reason={}'.format(cal_status.get('reason', '?')))
+        if _calibration_stop_state.get('success_before_address'):
+            log(
+                'WARNING: calibration success criteria stopped execution before '
+                'configured address {} was reached'.format(
+                    fmt_u32(calibration_stop_address)
+                )
+            )
         total_writes = _calibration_counter_at_stop(
             'writes', get_total_writes(), base_writes
         )
@@ -12868,6 +12907,18 @@ if calibration_mode:
             'success_criteria': bool(calibration_stop_on_success),
             'triggered': bool(_calibration_stop_state.get('triggered')),
             'reason': _calibration_stop_state.get('reason'),
+            'address_reached': bool(
+                _calibration_stop_state.get('address_reached')
+            ),
+            'success_before_address': bool(
+                _calibration_stop_state.get('success_before_address')
+            ),
+            'success_reset_gate_required': bool(
+                _calibration_stop_state.get('success_reset_gate_required')
+            ),
+            'success_reset_gate_satisfied': bool(
+                _calibration_stop_state.get('success_reset_gate_satisfied')
+            ),
             'writes': _calibration_stop_state.get('writes'),
             'erases': _calibration_stop_state.get('erases'),
             'matched_image': _calibration_stop_state.get('matched_image'),

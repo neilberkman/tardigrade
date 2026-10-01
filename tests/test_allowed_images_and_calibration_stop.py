@@ -20,6 +20,8 @@ sys.path.insert(0, str(SCRIPTS))
 
 from profile_loader import ProfileError, load_profile  # noqa: E402
 from result_checks import annotate_result_checks  # noqa: E402
+from audit_bootloader import _calibration_stop_summary  # noqa: E402
+from renode_runner import CalibrationResult  # noqa: E402
 from trigger_discovery import (  # noqa: E402
     _image_digest_for_evidence,
     _trace_less_content_evidence,
@@ -300,6 +302,34 @@ class AllowedImagesProfileTests(unittest.TestCase):
             with self.assertRaisesRegex(ProfileError, "requires execute"):
                 load_profile(path, strict=True)
 
+    def test_report_marks_success_before_configured_address(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = self._profile(
+                Path(td),
+                "vtor_in_slot: exec",
+                """
+                calibration_stop:
+                  address: 0x10000120
+                  success_criteria: true
+                """,
+            )
+            profile = load_profile(path, strict=True)
+            calibration = CalibrationResult(
+                total_writes=64,
+                total_erases=0,
+                trace_file=None,
+                erase_trace_file=None,
+                trace_file_bin=None,
+                erase_trace_file_bin=None,
+                stop_reason="calibration_stop_success_criteria",
+            )
+
+            summary = _calibration_stop_summary(profile, calibration)
+
+            self.assertEqual(summary["configured_address"], "0x10000120")
+            self.assertFalse(summary["address_reached"])
+            self.assertTrue(summary["success_before_address"])
+
     def test_result_checks_retain_exact_matched_image(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = self._profile(
@@ -532,6 +562,136 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
         self.assertFalse(no_reset["reset_observation"]["observed"])
         self.assertEqual(no_liveness["reason"], "budget")
         self.assertTrue(no_liveness["reset_observation"]["observed"])
+
+    def test_reset_gated_calibration_success_waits_for_address_boundary(self) -> None:
+        state = {
+            "run_calls": 0,
+            "writes": 0,
+            "instructions": 0,
+            "hooks": {},
+            "success_polls": 0,
+        }
+        calibration_state = {
+            "address_hit": False,
+            "triggered": False,
+            "reason": None,
+            "writes": None,
+            "erases": None,
+        }
+
+        class Monitor:
+            def Parse(self, _command):
+                state["run_calls"] += 1
+                state["writes"] += 64
+                state["instructions"] += 25
+                boot_hook = state["hooks"].get(0x100)
+                if boot_hook is not None:
+                    boot_hook(Cpu(), 0x100)
+                if state["run_calls"] == 2:
+                    calibration_state.update(
+                        address_hit=True,
+                        triggered=True,
+                        reason="address",
+                        writes=state["writes"],
+                        erases=0,
+                    )
+
+        class Bus:
+            @staticmethod
+            def ReadDoubleWord(address):
+                if address == 4:
+                    return 0x101
+                return 0
+
+            @staticmethod
+            def ReadWord(_address):
+                return 0
+
+        class Cpu:
+            IsHalted = False
+
+            @property
+            def ExecutedInstructions(self):
+                return state["instructions"]
+
+            @staticmethod
+            def GetRegisterUnsafe(_index):
+                return 0x2100
+
+            @staticmethod
+            def AddHook(address, callback):
+                state["hooks"][address] = callback
+
+            @staticmethod
+            def RemoveHook(address, callback):
+                if state["hooks"].get(address) is callback:
+                    del state["hooks"][address]
+
+        def success_observation(_cpu):
+            state["success_polls"] += 1
+            calibration_state.update(
+                triggered=True,
+                reason="success_criteria",
+                writes=state["writes"],
+                erases=0,
+            )
+            return {"boot_outcome": "success", "signals": {}}
+
+        namespace = {
+            "_time": SimpleNamespace(time=lambda: 0.0),
+            "phase1_time_slice": "0.02",
+            "success_pc_slot": None,
+            "success_terminal_after_reset": True,
+            "bootloader_entry": 0,
+            "slot_ranges": {},
+            "monitor": Monitor(),
+            "calibration_mode": True,
+            "_calibration_stop_state": calibration_state,
+            "calibration_stop_address": 0x20000480,
+            "check_console_fatal": lambda: None,
+            "fault_requires_immediate_stop": lambda: False,
+            "was_otp_fault_injected": lambda: False,
+            "as_int": int,
+            "capture_sticky_pc": lambda _pc: None,
+            "bus": Bus(),
+            "sticky_vtor": {"captured": False, "value": 0, "slot": None},
+            "sticky_pc": {"captured": False, "value": 0, "slot": None},
+            "_calibration_success_stop_observation": success_observation,
+            "_reset_gated_success_stop_observation": lambda *_args: None,
+            "get_total_writes": lambda: state["writes"],
+            "get_total_erases": lambda: 0,
+            "fmt_u32": lambda value: "0x{:08X}".format(int(value)),
+            "log": lambda _message: None,
+            "capture_console_state": lambda include_recent=False: {
+                "attached_names": [],
+                "attached_count": 0,
+                "last_line": None,
+                "last_lines": [],
+                "recent_logs": [],
+            },
+            "progress_stall_timeout_s": 0,
+            "max_step_limit": 1000,
+            "max_step_limit_resolution": {
+                "configured": 1000,
+                "source": "profile",
+                "performance_mips": 100.0,
+            },
+            "_recovery_zero_vector_guard": False,
+            "expect_control_outcome": "success",
+            "no_boot_zero_write_slices": 10,
+            "no_boot_min_emulated_s": 0.1,
+        }
+        exec(_runtime_function("run_until_done"), namespace)
+
+        status = namespace["run_until_done"](
+            Cpu(), time_slice="0.02", max_iters=5
+        )
+
+        self.assertEqual(status["reason"], "calibration_stop_address(0x20000480)")
+        self.assertEqual(status["writes"], 128)
+        self.assertEqual(state["run_calls"], 2)
+        self.assertEqual(state["success_polls"], 0)
+        self.assertTrue(status["reset_observation"]["observed"])
 
     def test_reset_gated_terminal_preserves_live_wrong_image_outcome(self) -> None:
         namespace = {

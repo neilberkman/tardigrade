@@ -49,6 +49,7 @@ def test_profile_uses_reset_gated_full_success_and_automatic_step_limit():
     assert profile.success_criteria.allowed_images == ["exec", "staging"]
     assert len(profile.success_criteria.memory_checks) == 2
     assert profile.fault_sweep.max_step_limit is None
+    assert profile.fault_sweep.calibration_stop.success_criteria is True
     assert profile.memory.write_granularity == 16
     assert profile.memory.trace_address_map == [
         {
@@ -95,16 +96,18 @@ def test_fixture_boundaries_match_built_ram_functions():
     )
 
 
-def test_fixture_images_preserve_reset_entry_but_change_noncritical_vectors():
+def test_fixture_images_share_prefix_and_change_late_version_metadata():
     old = (FIXTURE / "old.bin").read_bytes()
     update = (FIXTURE / "update.bin").read_bytes()
 
     assert len(old) == 0x1000
     assert len(update) == 0x1000
     assert old != update
+    assert old[: 64 * 16] == update[: 64 * 16]
     assert struct.unpack_from("<I", old, 4) == struct.unpack_from("<I", update, 4)
-    assert struct.unpack_from("<I", old, 8) != struct.unpack_from("<I", update, 8)
-    assert struct.unpack_from("<I", old, 16) != struct.unpack_from("<I", update, 16)
+    assert struct.unpack_from("<I", old, 0x800) == (0,)
+    assert struct.unpack_from("<I", update, 0x800) == (1,)
+    assert old[:0x800] == update[:0x800]
     assert (FIXTURE / "no_reset.bin").read_bytes() != update
     assert (FIXTURE / "hung_update.bin").read_bytes() != update
 

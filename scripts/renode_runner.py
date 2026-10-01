@@ -1119,6 +1119,22 @@ def run_calibration(
             file=sys.stderr,
         )
         total_writes = cap
+    configured_stop_address = getattr(
+        getattr(profile.fault_sweep, "calibration_stop", None),
+        "address",
+        None,
+    )
+    if (
+        configured_stop_address is not None
+        and stop_reason == "calibration_stop_success_criteria"
+    ):
+        print(
+            "WARNING: Calibration stopped on success criteria before configured "
+            "address 0x{:08X} was reached; the operation count may be incomplete.".format(
+                int(configured_stop_address)
+            ),
+            file=sys.stderr,
+        )
     return CalibrationResult(
         total_writes=total_writes,
         total_erases=total_erases,

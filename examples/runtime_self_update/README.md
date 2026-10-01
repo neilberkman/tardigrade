@@ -10,6 +10,12 @@ the executable slot before the copy is therefore not a successful terminal;
 the runtime must observe an in-run reset and then satisfy the image hash and
 memory checks.
 
+The old and staged images deliberately share their first 64 16-byte program
+units and differ in version metadata later in the slot. Calibration enables
+both its success and address stops. The success stop inherits the reset gate,
+so an unchanged shared prefix cannot truncate the calibrated copy before the
+`request_reset` address boundary.
+
 Build the fixture with:
 
 ```sh

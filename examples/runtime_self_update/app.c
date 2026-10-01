@@ -29,26 +29,11 @@ extern uint32_t _eramfunc;
 
 void Reset_Handler(void);
 void Default_Handler(void);
-void Updated_NMI_Handler(void);
-void Updated_HardFault_Handler(void);
-void Updated_Aux_Handler(void);
+
+__attribute__((used, section(".app_version")))
+const uint32_t app_version = APP_VERSION;
 
 void Default_Handler(void)
-{
-    for(;;) { }
-}
-
-void Updated_NMI_Handler(void)
-{
-    for(;;) { }
-}
-
-void Updated_HardFault_Handler(void)
-{
-    for(;;) { }
-}
-
-void Updated_Aux_Handler(void)
 {
     for(;;) { }
 }
@@ -57,15 +42,9 @@ __attribute__((section(".isr_vector")))
 const void *vector_table[] = {
     &__stack_top,
     Reset_Handler,
-#if APP_VERSION
-    Updated_NMI_Handler,
-    Updated_HardFault_Handler,
-    Updated_Aux_Handler,
-#else
     Default_Handler,
     Default_Handler,
     Default_Handler,
-#endif
     Default_Handler,
     Default_Handler,
     Default_Handler,

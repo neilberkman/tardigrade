@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import io
 import sys
 import tempfile
 import unittest
@@ -20,6 +21,37 @@ import renode_runner  # noqa: E402
 
 
 class RuntimeFaultSweepCalibrationTests(unittest.TestCase):
+    def test_success_before_configured_address_is_reported(self) -> None:
+        profile = SimpleNamespace(
+            expect=SimpleNamespace(control_outcome="success"),
+            fault_sweep=SimpleNamespace(
+                max_writes_cap=1000,
+                calibration_stop=SimpleNamespace(address=0x20000480),
+            ),
+        )
+        result = {
+            "total_writes": 64,
+            "total_erases": 0,
+            "calibration_stop_reason": "calibration_stop_success_criteria",
+        }
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            renode_runner, "run_single_point", return_value=result
+        ), mock.patch("sys.stderr", stderr):
+            calibration = renode_runner.run_calibration(
+                repo_root=ROOT,
+                renode_test="renode-test",
+                robot_suite="tests/ota_fault_point.robot",
+                profile=profile,
+                robot_vars=[],
+                work_dir=Path(td),
+                renode_remote_server_dir="",
+            )
+
+        self.assertEqual(calibration.total_writes, 64)
+        self.assertIn("before configured address 0x20000480", stderr.getvalue())
+        self.assertIn("operation count may be incomplete", stderr.getvalue())
+
     def test_instruction_limit_error_names_profile_setting_and_value(self) -> None:
         profile = SimpleNamespace(
             expect=SimpleNamespace(control_outcome="success"),
