@@ -4324,6 +4324,7 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
 
 
 def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injected, label, effective_criteria=None, cycle_wall_timeout=None):
+    cycle_records = list(cycle_records or ())
     if cycle_wall_timeout is None:
         cycle_wall_timeout = phase2_wall_timeout_s
     b = backend
@@ -6663,6 +6664,7 @@ def _run_clean_update_phase(phase, phase_index):
         fault_injected=False,
         label='update_phase_{}_followup'.format(phase_name),
     )
+    cycle_records = list(cycle_records or ())
     final_outcome = boot_outcome
     final_slot = boot_slot
     if cycle_records:
@@ -6691,7 +6693,7 @@ def _run_clean_update_phase(phase, phase_index):
             phase_semantic_state = candidate_state
     if phase_semantic_state is None:
         phase_semantic_state = collect_semantic_state({
-            'cycle': len(cycle_records),
+            'cycle': len(cycle_records or ()),
             'boot_outcome': final_outcome,
             'boot_slot': final_slot,
             'fault_injected': False,

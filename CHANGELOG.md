@@ -69,6 +69,9 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- The runtime fault sweep normalizes missing follow-up cycle records to an
+  empty sequence before collecting state-probe observations for a single-cycle
+  clean update phase.
 - The clean-control gate requires `image_hash` evidence only from
   `evaluation_mode: execute` controls. State mode copies the staging slot
   itself and judges the vector table alone, so it never produced that
