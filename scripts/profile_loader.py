@@ -1434,6 +1434,8 @@ class FaultSweepConfig:
         "progress_stall_timeout_s",
         "boot_cycles",
         "boot_cycle_hook",
+        "_raw_boot_cycle_hook",
+        "_resolved_boot_cycle_hook",
         "vtor_settle_iters",
         "tracking_start_address",
         "calibration_stop",
@@ -1628,6 +1630,8 @@ class FaultSweepConfig:
                 )
             )
         self.boot_cycle_hook = str(boot_cycle_hook).strip() if boot_cycle_hook else None
+        self._raw_boot_cycle_hook = self.boot_cycle_hook
+        self._resolved_boot_cycle_hook = self.boot_cycle_hook
         self.expected_rollback_at_cycle = (
             None
             if expected_rollback_at_cycle is None
@@ -1844,6 +1848,8 @@ class UpdatePhase:
         "success_criteria",
         "boot_cycles",
         "boot_cycle_hook",
+        "_raw_boot_cycle_hook",
+        "_resolved_boot_cycle_hook",
         "expected_rollback_at_cycle",
         "fault_injection",
         "fault_types",
@@ -1879,6 +1885,8 @@ class UpdatePhase:
                 )
             )
         self.boot_cycle_hook = str(boot_cycle_hook).strip() if boot_cycle_hook else None
+        self._raw_boot_cycle_hook = self.boot_cycle_hook
+        self._resolved_boot_cycle_hook = self.boot_cycle_hook
         self.expected_rollback_at_cycle = (
             None
             if expected_rollback_at_cycle is None
@@ -2497,18 +2505,44 @@ class ProfileConfig:
             for slot_name, slot_cfg in self.memory.slots.items()
         }
 
+    def _raw_input_path(self, value: str) -> str:
+        fs = getattr(self, "fault_sweep", None)
+        if (
+            fs is not None
+            and getattr(fs, "_raw_boot_cycle_hook", None)
+            and value == getattr(fs, "_resolved_boot_cycle_hook", None)
+        ):
+            return str(fs._raw_boot_cycle_hook)
+        for phase in getattr(self, "update_sequence", ()) or ():
+            if (
+                getattr(phase, "_raw_boot_cycle_hook", None)
+                and value == getattr(phase, "_resolved_boot_cycle_hook", None)
+            ):
+                return str(phase._raw_boot_cycle_hook)
+        mc = getattr(self, "multi_component", None)
+        for comp in getattr(mc, "components", ()) or ():
+            comp_fs = getattr(comp, "fault_sweep", None)
+            if (
+                comp_fs is not None
+                and getattr(comp_fs, "_raw_boot_cycle_hook", None)
+                and value == getattr(comp_fs, "_resolved_boot_cycle_hook", None)
+            ):
+                return str(comp_fs._raw_boot_cycle_hook)
+        return value
+
+    def resolve_input_path(self, repo_root: Path, value: str) -> str:
+        """Resolve a profile input path across repo_root, cwd, and profile directory."""
+        raw_value = self._raw_input_path(value)
+        resolved = _resolve_profile_input_path(
+            raw_value,
+            repo_root=repo_root,
+            profile_path=self.profile_path,
+        )
+        return str(resolved)
+
     def resolve_path(self, repo_root: Path, value: str) -> str:
-        """Resolve a path relative to the repo root."""
-        p = Path(value)
-        if p.is_absolute():
-            return str(p)
-        # Use absolute() not resolve() to preserve symlinks — resolve()
-        # follows symlinks, breaking paths through /tmp symlinks used to
-        # avoid space-in-path issues on "External SSD" volumes.
-        result = repo_root / p
-        if not result.is_absolute():
-            result = Path.cwd() / result
-        return str(result)
+        """Resolve a path relative to repo_root, cwd, or the profile directory."""
+        return self.resolve_input_path(repo_root, value)
 
     def generate_pre_boot_bin(self) -> Optional[str]:
         """Write pre_boot_state entries to a temp .bin file.
@@ -4343,6 +4377,18 @@ def _parse_fault_sweep(
         raise ProfileError(
             "fault_sweep.confirm_cycle.enabled requires boot_cycle_hook to be set"
         )
+    raw_boot_cycle_hook = boot_cycle_hook
+    resolved_boot_cycle_hook = (
+        str(
+            _resolve_existing_profile_path(
+                boot_cycle_hook,
+                profile_path=profile_path,
+                ctx="fault_sweep.boot_cycle_hook",
+            )
+        )
+        if boot_cycle_hook is not None
+        else None
+    )
 
     durability_model = str(raw.get("durability_model", "direct"))
     if durability_model not in ("direct", "writeback"):
@@ -4378,7 +4424,7 @@ def _parse_fault_sweep(
             ),
         )
 
-    return FaultSweepConfig(
+    fs_cfg = FaultSweepConfig(
         mode=raw.get("mode", "runtime"),
         max_writes=raw.get("max_writes", "auto"),
         max_otp_blows=(
@@ -4419,7 +4465,7 @@ def _parse_fault_sweep(
         sweep_hash_bypass_symbols=sweep_hash_bypass,
         progress_stall_timeout_s=stall_timeout,
         boot_cycles=boot_cycles,
-        boot_cycle_hook=boot_cycle_hook,
+        boot_cycle_hook=resolved_boot_cycle_hook,
         vtor_settle_iters=int(raw.get("vtor_settle_iters", 0)),
         tracking_start_address=_parse_int(
             raw.get("tracking_start_address", 0),
@@ -4475,6 +4521,9 @@ def _parse_fault_sweep(
             raw.get("rc_injection_config")
         ),
     )
+    fs_cfg._raw_boot_cycle_hook = raw_boot_cycle_hook
+    fs_cfg._resolved_boot_cycle_hook = resolved_boot_cycle_hook
+    return fs_cfg
 
 
 def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
@@ -4756,27 +4805,70 @@ def _count_instruction_skip_fault_points(
     return len(range(start, stop, 2))
 
 
+def _profile_input_path_candidates(
+    value: str | Path,
+    *,
+    repo_root: Optional[Path] = None,
+    profile_path: Optional[Path] = None,
+) -> List[Path]:
+    candidate = Path(value)
+    if candidate.is_absolute():
+        return [candidate]
+    effective_repo_root = (
+        Path(repo_root)
+        if repo_root is not None
+        else Path(__file__).resolve().parent.parent
+    )
+    if not effective_repo_root.is_absolute():
+        effective_repo_root = Path.cwd() / effective_repo_root
+    candidates: List[Path] = [effective_repo_root / candidate]
+    cwd_candidate = Path.cwd() / candidate
+    if cwd_candidate not in candidates:
+        candidates.append(cwd_candidate)
+    if profile_path is not None:
+        profile_parent = Path(profile_path).parent
+        if not profile_parent.is_absolute():
+            profile_parent = Path.cwd() / profile_parent
+        profile_candidate = profile_parent / candidate
+        if profile_candidate not in candidates:
+            candidates.append(profile_candidate)
+    return candidates
+
+
+def _resolve_profile_input_path(
+    value: str | Path,
+    *,
+    repo_root: Optional[Path] = None,
+    profile_path: Optional[Path] = None,
+) -> Path:
+    candidates = _profile_input_path_candidates(
+        value,
+        repo_root=repo_root,
+        profile_path=profile_path,
+    )
+    for path_candidate in candidates:
+        if path_candidate.exists():
+            return path_candidate
+    return candidates[0]
+
+
 def _resolve_existing_profile_path(
     value: str,
     *,
+    repo_root: Optional[Path] = None,
     profile_path: Optional[Path],
     ctx: str,
 ) -> Path:
-    candidate = Path(value)
-    candidates: List[Path] = []
-    if candidate.is_absolute():
-        candidates.append(candidate)
-    else:
-        candidates.append(Path.cwd() / candidate)
-        if profile_path is not None:
-            profile_candidate = profile_path.parent / candidate
-            if profile_candidate not in candidates:
-                candidates.append(profile_candidate)
-    tried = []
+    candidates = _profile_input_path_candidates(
+        value,
+        repo_root=repo_root,
+        profile_path=profile_path,
+    )
+    tried: List[str] = []
     for path_candidate in candidates:
         tried.append(str(path_candidate))
-        if path_candidate.exists():
-            return path_candidate.resolve()
+        if path_candidate.is_file():
+            return path_candidate
     raise ProfileError(
         "{}: could not resolve path {!r}; tried {}".format(
             ctx,
@@ -6310,6 +6402,7 @@ def _parse_update_sequence(
     images: Dict[str, str],
     success_criteria: SuccessCriteria,
     fault_sweep: FaultSweepConfig,
+    profile_path: Optional[Path] = None,
 ) -> List[UpdatePhase]:
     if raw is None:
         return []
@@ -6352,8 +6445,12 @@ def _parse_update_sequence(
                 phase_hook = str(phase_hook_raw).strip()
                 if not phase_hook:
                     phase_hook = None
+            raw_phase_hook = phase_hook
         else:
             phase_hook = fault_sweep.boot_cycle_hook
+            raw_phase_hook = (
+                getattr(fault_sweep, "_raw_boot_cycle_hook", None) or phase_hook
+            )
         expected_rollback_at_cycle = entry.get(
             "expected_rollback_at_cycle",
             fault_sweep.expected_rollback_at_cycle,
@@ -6373,24 +6470,24 @@ def _parse_update_sequence(
             phase_setup_script = str(phase_setup_script).strip()
             if not phase_setup_script:
                 raise ProfileError("{}.setup_script: expected non-empty path".format(ctx))
-        phases.append(
-            UpdatePhase(
-                name=name,
-                description=str(entry.get("description", "")),
-                images=phase_images,
-                setup_script=phase_setup_script,
-                pre_boot_state=_parse_pre_boot_state(entry.get("pre_boot_state")),
-                success_criteria=phase_success,
-                boot_cycles=phase_boot_cycles,
-                boot_cycle_hook=phase_hook,
-                expected_rollback_at_cycle=expected_rollback_at_cycle,
-                fault_injection=_parse_bool(
-                    entry.get("fault_injection", False),
-                    "{}.fault_injection".format(ctx),
-                ),
-                fault_types=phase_fault_types,
-            )
+        phase_obj = UpdatePhase(
+            name=name,
+            description=str(entry.get("description", "")),
+            images=phase_images,
+            setup_script=phase_setup_script,
+            pre_boot_state=_parse_pre_boot_state(entry.get("pre_boot_state")),
+            success_criteria=phase_success,
+            boot_cycles=phase_boot_cycles,
+            boot_cycle_hook=phase_hook,
+            expected_rollback_at_cycle=expected_rollback_at_cycle,
+            fault_injection=_parse_bool(
+                entry.get("fault_injection", False),
+                "{}.fault_injection".format(ctx),
+            ),
+            fault_types=phase_fault_types,
         )
+        phase_obj._raw_boot_cycle_hook = raw_phase_hook
+        phases.append(phase_obj)
 
     faulted_indices = [idx for idx, phase in enumerate(phases) if phase.fault_injection]
     if len(faulted_indices) != 1:
@@ -6453,18 +6550,30 @@ def _parse_update_sequence(
 
         # Validate image paths exist at parse time.
         for slot_name, img_path in phase.images.items():
-            if not Path(img_path).is_file():
+            resolved_img = _resolve_profile_input_path(
+                img_path,
+                profile_path=profile_path,
+            )
+            if not resolved_img.is_file():
                 raise ProfileError(
                     "update_sequence[{}].images.{}: file not found: {}".format(
                         idx, slot_name, img_path
                     )
                 )
-        if phase.boot_cycle_hook and not Path(phase.boot_cycle_hook).is_file():
-            raise ProfileError(
-                "update_sequence[{}].boot_cycle_hook: file not found: {}".format(
-                    idx, phase.boot_cycle_hook
+        if phase.boot_cycle_hook:
+            raw_hook = (
+                getattr(phase, "_raw_boot_cycle_hook", None)
+                or phase.boot_cycle_hook
+            )
+            resolved_hook = str(
+                _resolve_existing_profile_path(
+                    raw_hook,
+                    profile_path=profile_path,
+                    ctx="update_sequence[{}].boot_cycle_hook".format(idx),
                 )
             )
+            phase.boot_cycle_hook = resolved_hook
+            phase._resolved_boot_cycle_hook = resolved_hook
 
     return phases
 
@@ -8301,6 +8410,7 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         images=images,
         success_criteria=success_criteria,
         fault_sweep=fault_sweep,
+        profile_path=path,
     )
     if fault_sweep.calibration_stop.success_criteria:
         stop_criteria = (
@@ -8576,6 +8686,14 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         profile.success_criteria = faulted_phase.success_criteria
         profile.fault_sweep.boot_cycles = int(faulted_phase.boot_cycles)
         profile.fault_sweep.boot_cycle_hook = faulted_phase.boot_cycle_hook
+        profile.fault_sweep._raw_boot_cycle_hook = getattr(
+            faulted_phase, "_raw_boot_cycle_hook", faulted_phase.boot_cycle_hook
+        )
+        profile.fault_sweep._resolved_boot_cycle_hook = getattr(
+            faulted_phase,
+            "_resolved_boot_cycle_hook",
+            faulted_phase.boot_cycle_hook,
+        )
         profile.fault_sweep.expected_rollback_at_cycle = (
             faulted_phase.expected_rollback_at_cycle
         )

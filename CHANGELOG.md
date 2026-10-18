@@ -69,6 +69,11 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- `fault_sweep.boot_cycle_hook` and per-phase `update_sequence` `boot_cycle_hook`
+  paths now resolve through the shared profile input path helper across
+  absolute paths, `repo_root`, the current working directory, and the profile
+  directory, and missing hooks raise `ProfileError` at load time listing every
+  tried path.
 - The clean-control gate requires `image_hash` evidence only from
   `evaluation_mode: execute` controls. State mode copies the staging slot
   itself and judges the vector table alone, so it never produced that

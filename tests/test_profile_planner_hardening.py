@@ -8,6 +8,7 @@ import ast
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import textwrap
@@ -705,6 +706,332 @@ success_criteria:
                 except Exception as exc:  # pragma: no cover - diagnostic payload
                     failures.append("{}: {}".format(path.name, exc))
         self.assertEqual(failures, [])
+
+    def test_boot_cycle_hook_resolves_relative_to_profile_directory_from_other_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            profile_dir = temp_root / "custom_profiles"
+            other_cwd = temp_root / "other_cwd"
+            hooks_dir = profile_dir / "hooks"
+            hooks_dir.mkdir(parents=True)
+            other_cwd.mkdir(parents=True)
+
+            local_hook = hooks_dir / "local_hook.py"
+            local_hook.write_text("pass\n", encoding="utf-8")
+            phase_hook = hooks_dir / "phase_hook.py"
+            phase_hook.write_text("pass\n", encoding="utf-8")
+            v1_img = profile_dir / "v1.bin"
+            v1_img.write_bytes(b"\x11" * 4096)
+            v2_img = profile_dir / "v2.bin"
+            v2_img.write_bytes(b"\x22" * 4096)
+
+            single_profile_path = profile_dir / "single.yaml"
+            single_profile_path.write_text(
+                textwrap.dedent(
+                    BASE_PROFILE
+                    + """
+fault_sweep:
+  mode: runtime
+  max_writes: 8
+  boot_cycles: 2
+  boot_cycle_hook: hooks/local_hook.py
+  fault_types: [power_loss]
+"""
+                ),
+                encoding="utf-8",
+            )
+
+            seq_profile_path = profile_dir / "sequence.yaml"
+            seq_profile_path.write_text(
+                textwrap.dedent(
+                    BASE_PROFILE
+                    + """
+images:
+  exec: v1.bin
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: 8
+  boot_cycles: 2
+  boot_cycle_hook: hooks/local_hook.py
+  fault_types: [power_loss]
+update_sequence:
+  - name: phase_one
+    images:
+      staging: v2.bin
+    success_criteria:
+      vtor_in_slot: exec
+      expected_image: staging
+    boot_cycles: 2
+    boot_cycle_hook: hooks/phase_hook.py
+    fault_injection: false
+  - name: phase_two
+    images:
+      staging: v1.bin
+    success_criteria:
+      vtor_in_slot: exec
+      expected_image: staging
+    boot_cycles: 2
+    fault_injection: true
+"""
+                ),
+                encoding="utf-8",
+            )
+
+            saved_cwd = Path.cwd()
+            try:
+                os.chdir(other_cwd)
+                single_profile = load_profile(single_profile_path)
+                self.assertEqual(
+                    Path(single_profile.fault_sweep.boot_cycle_hook).resolve(),
+                    local_hook.resolve(),
+                )
+                self.assertEqual(
+                    Path(
+                        single_profile.resolve_path(
+                            ROOT, single_profile.fault_sweep.boot_cycle_hook
+                        )
+                    ).resolve(),
+                    local_hook.resolve(),
+                )
+
+                seq_profile = load_profile(seq_profile_path)
+                self.assertEqual(
+                    Path(seq_profile.update_sequence[0].boot_cycle_hook).resolve(),
+                    phase_hook.resolve(),
+                )
+                self.assertEqual(
+                    Path(seq_profile.update_sequence[1].boot_cycle_hook).resolve(),
+                    local_hook.resolve(),
+                )
+                payload = seq_profile.update_sequence_runtime_payload(ROOT)
+                assert payload is not None
+                self.assertEqual(
+                    Path(payload["phases"][0]["boot_cycle_hook"]).resolve(),
+                    phase_hook.resolve(),
+                )
+                self.assertEqual(
+                    Path(payload["phases"][1]["boot_cycle_hook"]).resolve(),
+                    local_hook.resolve(),
+                )
+            finally:
+                os.chdir(saved_cwd)
+
+    def test_boot_cycle_hook_repo_root_precedence_wins_over_cwd_and_profile_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            profile_dir = temp_root / "custom_profiles"
+            other_cwd = temp_root / "other_cwd"
+            rel_hook = "examples/esp_idf_ota/hooks/confirm_pending_verify.py"
+            (profile_dir / rel_hook).parent.mkdir(parents=True, exist_ok=True)
+            (other_cwd / rel_hook).parent.mkdir(parents=True, exist_ok=True)
+            (profile_dir / rel_hook).write_text("# shadow in profile_dir\n", encoding="utf-8")
+            (other_cwd / rel_hook).write_text("# shadow in cwd\n", encoding="utf-8")
+            repo_hook = ROOT / rel_hook
+            self.assertTrue(repo_hook.is_file())
+
+            v1_img = profile_dir / "v1.bin"
+            v1_img.write_bytes(b"\x11" * 4096)
+            v2_img = profile_dir / "v2.bin"
+            v2_img.write_bytes(b"\x22" * 4096)
+
+            profile_path = profile_dir / "precedence.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    BASE_PROFILE
+                    + f"""
+images:
+  exec: v1.bin
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: 8
+  boot_cycles: 2
+  boot_cycle_hook: {rel_hook}
+  fault_types: [power_loss]
+update_sequence:
+  - name: phase_one
+    images:
+      staging: v2.bin
+    success_criteria:
+      vtor_in_slot: exec
+      expected_image: staging
+    boot_cycles: 2
+    boot_cycle_hook: {rel_hook}
+    fault_injection: true
+"""
+                ),
+                encoding="utf-8",
+            )
+
+            saved_cwd = Path.cwd()
+            try:
+                os.chdir(other_cwd)
+                profile = load_profile(profile_path)
+                self.assertEqual(
+                    Path(profile.fault_sweep.boot_cycle_hook).resolve(),
+                    repo_hook.resolve(),
+                )
+                self.assertEqual(
+                    Path(profile.update_sequence[0].boot_cycle_hook).resolve(),
+                    repo_hook.resolve(),
+                )
+                self.assertEqual(
+                    Path(
+                        profile.resolve_path(ROOT, profile.fault_sweep.boot_cycle_hook)
+                    ).resolve(),
+                    repo_hook.resolve(),
+                )
+            finally:
+                os.chdir(saved_cwd)
+
+    def test_missing_boot_cycle_hook_raises_profile_error_listing_tried_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            profile_dir = temp_root / "custom_profiles"
+            other_cwd = temp_root / "other_cwd"
+            profile_dir.mkdir(parents=True)
+            other_cwd.mkdir(parents=True)
+
+            missing_rel = "hooks/missing_boot_hook.py"
+            single_path = profile_dir / "missing_single.yaml"
+            single_path.write_text(
+                textwrap.dedent(
+                    BASE_PROFILE
+                    + f"""
+fault_sweep:
+  mode: runtime
+  max_writes: 8
+  boot_cycles: 2
+  boot_cycle_hook: {missing_rel}
+  fault_types: [power_loss]
+"""
+                ),
+                encoding="utf-8",
+            )
+
+            v1_img = profile_dir / "v1.bin"
+            v1_img.write_bytes(b"\x11" * 4096)
+            missing_phase_rel = "hooks/missing_phase_hook.py"
+            seq_path = profile_dir / "missing_seq.yaml"
+            seq_path.write_text(
+                textwrap.dedent(
+                    BASE_PROFILE
+                    + f"""
+images:
+  exec: v1.bin
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: 8
+  fault_types: [power_loss]
+update_sequence:
+  - name: faulted_phase
+    images:
+      staging: v1.bin
+    success_criteria:
+      vtor_in_slot: exec
+      expected_image: staging
+    boot_cycles: 2
+    boot_cycle_hook: {missing_phase_rel}
+    fault_injection: true
+"""
+                ),
+                encoding="utf-8",
+            )
+
+            saved_cwd = Path.cwd()
+            try:
+                os.chdir(other_cwd)
+                with self.assertRaises(ProfileError) as single_ctx:
+                    load_profile(single_path)
+                single_msg = str(single_ctx.exception)
+                self.assertIn("fault_sweep.boot_cycle_hook", single_msg)
+                self.assertIn(str(ROOT / missing_rel), single_msg)
+                self.assertIn(str(other_cwd / missing_rel), single_msg)
+                self.assertIn(str(profile_dir / missing_rel), single_msg)
+
+                with self.assertRaises(ProfileError) as seq_ctx:
+                    load_profile(seq_path)
+                seq_msg = str(seq_ctx.exception)
+                self.assertIn("update_sequence[0].boot_cycle_hook", seq_msg)
+                self.assertIn(str(ROOT / missing_phase_rel), seq_msg)
+                self.assertIn(str(other_cwd / missing_phase_rel), seq_msg)
+                self.assertIn(str(profile_dir / missing_phase_rel), seq_msg)
+            finally:
+                os.chdir(saved_cwd)
+
+    def test_profile_auxiliary_inputs_resolve_with_same_helper_and_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            profile_dir = temp_root / "custom_profiles"
+            other_cwd = temp_root / "other_cwd"
+            profile_dir.mkdir(parents=True)
+            other_cwd.mkdir(parents=True)
+
+            setup_file = profile_dir / "local_setup.resc"
+            setup_file.write_text("# setup\n", encoding="utf-8")
+            probe_file = profile_dir / "local_probe.py"
+            probe_file.write_text("pass\n", encoding="utf-8")
+            provider_file = profile_dir / "local_provider.py"
+            provider_file.write_text("INVARIANTS = {}\n", encoding="utf-8")
+            periph_file = profile_dir / "LocalPeripheral.cs"
+            periph_file.write_text("// cs\n", encoding="utf-8")
+
+            # Also shadow a repo-root file in profile_dir to verify repo_root wins.
+            repo_rel_probe = "targets/mcuboot/probe.py"
+            (profile_dir / "targets" / "mcuboot").mkdir(parents=True)
+            (profile_dir / repo_rel_probe).write_text("# shadow\n", encoding="utf-8")
+
+            profile_path = profile_dir / "aux_inputs.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    BASE_PROFILE
+                    + """
+setup_script: local_setup.resc
+state_probe:
+  script: local_probe.py
+invariant_providers:
+  - local_provider.py
+extra_peripherals:
+  - LocalPeripheral.cs
+"""
+                ),
+                encoding="utf-8",
+            )
+
+            saved_cwd = Path.cwd()
+            try:
+                os.chdir(other_cwd)
+                profile = load_profile(profile_path)
+                self.assertEqual(
+                    Path(profile.resolve_path(ROOT, profile.setup_script)).resolve(),
+                    setup_file.resolve(),
+                )
+                self.assertEqual(
+                    Path(
+                        profile.resolve_path(ROOT, profile.state_probe.script)
+                    ).resolve(),
+                    probe_file.resolve(),
+                )
+                self.assertEqual(
+                    Path(
+                        profile.resolve_path(ROOT, profile.invariant_providers[0])
+                    ).resolve(),
+                    provider_file.resolve(),
+                )
+                self.assertEqual(
+                    Path(
+                        profile.resolve_path(ROOT, profile.extra_peripherals[0])
+                    ).resolve(),
+                    periph_file.resolve(),
+                )
+                self.assertEqual(
+                    Path(profile.resolve_path(ROOT, repo_rel_probe)).resolve(),
+                    (ROOT / repo_rel_probe).resolve(),
+                )
+            finally:
+                os.chdir(saved_cwd)
 
 
 if __name__ == "__main__":
