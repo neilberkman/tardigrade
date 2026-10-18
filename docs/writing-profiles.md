@@ -449,6 +449,8 @@ the configured update effect.
 
 Both `ProfileConfig._compute_image_digests` and `compute_slot_hash` hash the MCUboot-validated image extent `ih_hdr_size + ih_img_size + ih_protect_tlv_size` plus the unprotected TLV area `it_tlv_tot` when the image or slot begins with `IMAGE_MAGIC = 0x96F3B83D` and carries a valid `IMAGE_TLV_INFO_MAGIC = 0x6907` header. When the slot does not start with a valid MCUboot header and TLV block, `resolve_slot_hash_extent` falls back to `slot_size` minus the size of the slot's last erase sector from `flash.sectors`, `flash.page_size`, or the platform `.repl` flash geometry, and uses `slot_size - 4096` only when neither an MCUboot header nor erase-sector geometry is available.
 
+`image_hash` is evaluated only in `fault_sweep.evaluation_mode: execute`. State mode, the default, performs the staging-to-exec copy itself and judges the result by its vector table alone, so a digest declared there produces no evidence. The loader warns about that combination, and the clean-control gate requires hash evidence only from execute-mode controls.
+
 ### Boot register values
 
 Capture and verify hardware register state at boot time. Useful for checking MPU configuration, peripheral lock bits, or clock settings:

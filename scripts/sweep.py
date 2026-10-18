@@ -226,7 +226,22 @@ def _validate_runtime_control_result(
                 )
             )
 
-    if bool(getattr(criteria, "image_hash", False)):
+    # State mode copies the staging slot itself and judges the result by its
+    # vector table alone, so it never produces image_hash evidence.  The
+    # digest contract is enforced when the bootloader executed, and also when
+    # the profile object carries no evaluation_mode at all, so an unknown mode
+    # fails closed rather than skipping the check.
+    fault_sweep = getattr(profile, "fault_sweep", None)
+    if fault_sweep is None or not hasattr(fault_sweep, "evaluation_mode"):
+        hash_evidence_expected = True
+    else:
+        hash_evidence_expected = (
+            str(getattr(fault_sweep, "evaluation_mode", None) or "state")
+            .strip()
+            .lower()
+            == "execute"
+        )
+    if bool(getattr(criteria, "image_hash", False)) and hash_evidence_expected:
         expected_hash_slot = str(
             getattr(criteria, "image_hash_slot", "") or ""
         ).strip().lower()

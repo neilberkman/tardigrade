@@ -69,6 +69,15 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- The clean-control gate requires `image_hash` evidence only from
+  `evaluation_mode: execute` controls. State mode copies the staging slot
+  itself and judges the vector table alone, so it never produced that
+  evidence and the gate rejected the thirteen state-mode profiles that declare
+  `image_hash`, five of them in the CI self-test. The loader now warns that
+  `image_hash` has no effect outside execute mode.
+- The Robot suites that load `platforms/mps2_an521.repl` include
+  `peripherals/TraceReplayEngine.cs` first, since the platform now declares a
+  `trace_replay` peripheral of that type.
 - Generated NuttX nxboot campaigns allow 120 seconds of recovery wall time,
   including clean-control follow-ups; control failures include phase and cycle
   stop reasons while remaining infrastructure failures.

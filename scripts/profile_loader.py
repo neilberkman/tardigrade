@@ -8487,6 +8487,25 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
     # which is outside the scope of the profile loader.
     _warn_fault_backend_compat(fault_sweep, platform, flash_backend, nvm_controller, otp_peripheral)
 
+    # image_hash is only evaluated when the bootloader executes.  State mode
+    # copies the staging slot itself and judges the vector table alone, so a
+    # digest contract declared there never produces evidence.
+    if (
+        success_criteria is not None
+        and bool(getattr(success_criteria, "image_hash", False))
+        and str(getattr(fault_sweep, "evaluation_mode", None) or "state")
+        .strip()
+        .lower()
+        != "execute"
+    ):
+        import warnings
+
+        warnings.warn(
+            "success_criteria.image_hash is only evaluated with "
+            "fault_sweep.evaluation_mode 'execute'. State mode checks the "
+            "vector table alone, so the digest contract has no effect."
+        )
+
     profile = ProfileConfig(
         schema_version=schema_version,
         name=name,

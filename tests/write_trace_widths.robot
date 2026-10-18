@@ -49,6 +49,7 @@ Create AN521 Machine
     Execute Command    include "${root}/peripherals/An521NvmInterceptor.cs"
     Execute Command    include "${root}/peripherals/Sse200MpcStub.cs"
     Execute Command    include "${root}/peripherals/CMSDKAPBWatchdog.cs"
+    Execute Command    include "${root}/peripherals/TraceReplayEngine.cs"
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${root}/platforms/mps2_an521.repl
 
