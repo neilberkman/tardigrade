@@ -532,12 +532,38 @@ if mram_torn_word not in ('half', 'untouched', 'erased', 'programmed'):
     )
 
 def _apply_mram_torn_word_mode():
+    """Set the torn-word mode on every backend object that exposes it.
+
+    Returns True when at least one object took the mode.
+    """
+    applied = False
     data = backend.get('data')
     if data is not None and hasattr(data, 'MramTornWordMode'):
         data.MramTornWordMode = mram_torn_word
+        applied = True
     nvm = getattr(data, 'Nvm', None) if data is not None else None
     if nvm is not None and hasattr(nvm, 'MramTornWordMode'):
         nvm.MramTornWordMode = mram_torn_word
+        applied = True
+    return applied
+
+def _require_mram_torn_word_support():
+    """Refuse a live MRAM power-loss fault whose torn-word mode the peripheral ignores.
+
+    Trace replay computes the torn word itself, so only live injection
+    depends on the peripheral honoring the mode.  A peripheral without a
+    MramTornWordMode property keeps its own behavior, which would run a
+    different fault than the profile declares.
+    """
+    if mram_torn_word == 'half' or backend.get('kind') != 'mram':
+        return
+    if not _apply_mram_torn_word_mode():
+        raise Exception(
+            'fault_sweep.mram_torn_word {!r} requires an MRAM peripheral with a '
+            'MramTornWordMode property; {} has none'.format(
+                mram_torn_word, backend.get('backend_sysbus_name')
+            )
+        )
 
 def _set_preserve_counters_across_reset(enabled):
     flag = bool(enabled)
@@ -5542,7 +5568,10 @@ def get_total_erases():
     return 0  # Slow path doesn't track erases.
 
 def arm_fault(absolute_write_index, write_fault_mode=0):
-    _apply_mram_torn_word_mode()
+    if write_fault_mode == 0:
+        _require_mram_torn_word_support()
+    else:
+        _apply_mram_torn_word_mode()
     b = backend
     if b['kind'] == 'otp':
         b['data'].BlowFaultMode = write_fault_mode

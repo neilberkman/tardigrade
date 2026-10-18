@@ -270,7 +270,10 @@ def test_mapped_mram_tracker_preserves_counters_across_firmware_reset_when_enabl
         encoding="utf-8"
     )
 
-    assert "bool PreserveCountersAcrossReset { get; set; }" in interface_cs
+    # The interface stays unchanged so third-party implementers keep compiling;
+    # the runner probes for the property instead.
+    assert "PreserveCountersAcrossReset" not in interface_cs
+    assert "MramTornWordMode" not in interface_cs
     assert "public bool PreserveCountersAcrossReset { get; set; }" in tracker_cs
     assert "if(trackingStopHit || FaultEverFired)" in tracker_cs
     assert "else if(PreserveCountersAcrossReset)" in tracker_cs
@@ -278,3 +281,37 @@ def test_mapped_mram_tracker_preserves_counters_across_firmware_reset_when_enabl
     assert "ResetCampaignObservability();" in tracker_cs
 
 
+
+
+def test_live_power_loss_refuses_a_torn_word_mode_the_mram_peripheral_ignores() -> None:
+    source = (ROOT / "scripts" / "run_runtime_fault_sweep.py").read_text(encoding="utf-8")
+    import ast
+
+    tree = ast.parse(source)
+    wanted = {"_apply_mram_torn_word_mode", "_require_mram_torn_word_support"}
+    funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+    assert {f.name for f in funcs} == wanted
+
+    class Bare:
+        pass
+
+    class Capable:
+        MramTornWordMode = "half"
+
+    def run(mode, data):
+        ns = {
+            "backend": {"kind": "mram", "data": data, "backend_sysbus_name": "mram"},
+            "mram_torn_word": mode,
+        }
+        exec(compile(ast.Module(body=funcs, type_ignores=[]), "rr", "exec"), ns)
+        ns["_require_mram_torn_word_support"]()
+        return data
+
+    run("half", Bare())
+    assert run("erased", Capable()).MramTornWordMode == "erased"
+    try:
+        run("erased", Bare())
+    except Exception as exc:
+        assert "MramTornWordMode" in str(exc)
+    else:
+        raise AssertionError("a non-default mode on a peripheral without the property must fail")

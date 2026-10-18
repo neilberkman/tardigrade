@@ -31,8 +31,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         int WriteFaultMode { get; set; }
         int EraseFaultMode { get; set; }
         uint CorruptionSeed { get; set; }
-        string MramTornWordMode { get; set; }
-        bool PreserveCountersAcrossReset { get; set; }
 
         int DiffLookahead { get; set; }
         bool SkipShadowScan { get; set; }

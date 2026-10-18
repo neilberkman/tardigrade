@@ -135,12 +135,15 @@ The format follows [common-changelog](https://common-changelog.org/).
 - Updated `scripts/run_runtime_fault_sweep.py` to count `rc_injection` points toward calibration write requirements and route `driver_error` and `rc_injection` through `fault_peripheral`, added `profiles/mcuboot_head_nrf52_driver_faults.yaml`, and recorded runs for all 12 MCUboot fault types in `docs/mcuboot-fault-type-coverage.md`.
 - Fixed the `FaultTracker` writeback overlay so erase operations evict overlapping uncommitted buffered writes instead of replaying stale pre-erase bytes, added `mcuboot_head_scratch_nrf52_writeback.yaml`, `mcuboot_head_move_nrf52_writeback.yaml`, and `mcuboot_head_move_stm32f4_writeback.yaml` with `docs/mcuboot-writeback-triage.md`, and ran exhaustive 100-branch sweeps across all 12 MCUboot instruction-skip profiles in `docs/mcuboot-instruction-skip-results.md`.
 - Raised `profiles/mcuboot_stm32f4_upgrade.yaml` to `run_duration: "3.3"` and `max_step_limit: 330000000` so STM32F4 128 KB swap-move calibration completes all 393,242 byte-program transitions instead of stopping at 100,000,000 instructions, enabled `quick_use_heuristic: true` on the four PR #2100 profiles, removed `sweep_hash_bypass_symbols` from `mcuboot_pr2109_scratch_broken.yaml` and `mcuboot_pr2109_scratch_fixed.yaml` so `bootutil_img_validate` executes on swap-scratch resume, and gated all 14 remaining `profiles/mcuboot_pr*.yaml` profiles under `--quick --workers 2` in `docs/mcuboot-differentials.md`.
-- `MappedMRAMTracker.Reset()` preserves `TotalWordWrites`, `TotalPageErases`,
-  write traces, shadow buffers, and active `TrackingStartAddress` state across
-  firmware-initiated resets when `PreserveCountersAcrossReset` is enabled,
-  while `run_runtime_fault_sweep.py` disables `PreserveCountersAcrossReset`
-  before issuing its own `machine Reset` for cold-reset preparation and Phase 2
-  recovery.
+- Write and erase counts no longer restart when the firmware resets the
+  machine during a run. Every bundled flash and MRAM peripheral gains
+  `PreserveCountersAcrossReset`, which the runtime sweep enables for the run
+  and disables around its own `machine Reset` for cold-reset preparation and
+  Phase 2 recovery. A fault index past a firmware-initiated reset now names
+  the write after the reset; before, the count restarted and the same index
+  named an earlier write. Campaigns whose firmware resets mid-run calibrate
+  to a larger write count. External peripherals keep the old behavior unless
+  they expose the property.
 
 ## [0.5.0] - 2026-07-10
 
