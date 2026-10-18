@@ -8,6 +8,7 @@ import ast
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import textwrap
@@ -705,6 +706,553 @@ success_criteria:
                 except Exception as exc:  # pragma: no cover - diagnostic payload
                     failures.append("{}: {}".format(path.name, exc))
         self.assertEqual(failures, [])
+
+    def test_boot_cycle_hook_resolves_relative_to_profile_directory_from_other_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            profile_dir = temp_root / "custom_profiles"
+            other_cwd = temp_root / "other_cwd"
+            hooks_dir = profile_dir / "hooks"
+            hooks_dir.mkdir(parents=True)
+            other_cwd.mkdir(parents=True)
+
+            local_hook = hooks_dir / "local_hook.py"
+            local_hook.write_text("pass\n", encoding="utf-8")
+            phase_hook = hooks_dir / "phase_hook.py"
+            phase_hook.write_text("pass\n", encoding="utf-8")
+            v1_img = profile_dir / "v1.bin"
+            v1_img.write_bytes(b"\x11" * 4096)
+            v2_img = profile_dir / "v2.bin"
+            v2_img.write_bytes(b"\x22" * 4096)
+
+            single_profile_path = profile_dir / "single.yaml"
+            single_profile_path.write_text(
+                textwrap.dedent(
+                    BASE_PROFILE
+                    + """
+fault_sweep:
+  mode: runtime
+  max_writes: 8
+  boot_cycles: 2
+  boot_cycle_hook: hooks/local_hook.py
+  fault_types: [power_loss]
+"""
+                ),
+                encoding="utf-8",
+            )
+
+            seq_profile_path = profile_dir / "sequence.yaml"
+            seq_profile_path.write_text(
+                textwrap.dedent(
+                    BASE_PROFILE
+                    + """
+images:
+  exec: v1.bin
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: 8
+  boot_cycles: 2
+  boot_cycle_hook: hooks/local_hook.py
+  fault_types: [power_loss]
+update_sequence:
+  - name: phase_one
+    images:
+      staging: v2.bin
+    success_criteria:
+      vtor_in_slot: exec
+      expected_image: staging
+    boot_cycles: 2
+    boot_cycle_hook: hooks/phase_hook.py
+    fault_injection: false
+  - name: phase_two
+    images:
+      staging: v1.bin
+    success_criteria:
+      vtor_in_slot: exec
+      expected_image: staging
+    boot_cycles: 2
+    fault_injection: true
+"""
+                ),
+                encoding="utf-8",
+            )
+
+            saved_cwd = Path.cwd()
+            try:
+                os.chdir(other_cwd)
+                single_profile = load_profile(single_profile_path)
+                self.assertEqual(
+                    Path(single_profile.fault_sweep.boot_cycle_hook).resolve(),
+                    local_hook.resolve(),
+                )
+                self.assertEqual(
+                    Path(
+                        single_profile.resolve_path(
+                            ROOT, single_profile.fault_sweep.boot_cycle_hook
+                        )
+                    ).resolve(),
+                    local_hook.resolve(),
+                )
+
+                seq_profile = load_profile(seq_profile_path)
+                self.assertEqual(
+                    Path(seq_profile.update_sequence[0].boot_cycle_hook).resolve(),
+                    phase_hook.resolve(),
+                )
+                self.assertEqual(
+                    Path(seq_profile.update_sequence[1].boot_cycle_hook).resolve(),
+                    local_hook.resolve(),
+                )
+                payload = seq_profile.update_sequence_runtime_payload(ROOT)
+                assert payload is not None
+                self.assertEqual(
+                    Path(payload["phases"][0]["boot_cycle_hook"]).resolve(),
+                    phase_hook.resolve(),
+                )
+                self.assertEqual(
+                    Path(payload["phases"][1]["boot_cycle_hook"]).resolve(),
+                    local_hook.resolve(),
+                )
+            finally:
+                os.chdir(saved_cwd)
+
+    def test_boot_cycle_hook_repo_root_precedence_wins_over_cwd_and_profile_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            profile_dir = temp_root / "custom_profiles"
+            other_cwd = temp_root / "other_cwd"
+            rel_hook = "examples/esp_idf_ota/hooks/confirm_pending_verify.py"
+            (profile_dir / rel_hook).parent.mkdir(parents=True, exist_ok=True)
+            (other_cwd / rel_hook).parent.mkdir(parents=True, exist_ok=True)
+            (profile_dir / rel_hook).write_text("# shadow in profile_dir\n", encoding="utf-8")
+            (other_cwd / rel_hook).write_text("# shadow in cwd\n", encoding="utf-8")
+            repo_hook = ROOT / rel_hook
+            self.assertTrue(repo_hook.is_file())
+
+            v1_img = profile_dir / "v1.bin"
+            v1_img.write_bytes(b"\x11" * 4096)
+            v2_img = profile_dir / "v2.bin"
+            v2_img.write_bytes(b"\x22" * 4096)
+
+            profile_path = profile_dir / "precedence.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    BASE_PROFILE
+                    + f"""
+images:
+  exec: v1.bin
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: 8
+  boot_cycles: 2
+  boot_cycle_hook: {rel_hook}
+  fault_types: [power_loss]
+update_sequence:
+  - name: phase_one
+    images:
+      staging: v2.bin
+    success_criteria:
+      vtor_in_slot: exec
+      expected_image: staging
+    boot_cycles: 2
+    boot_cycle_hook: {rel_hook}
+    fault_injection: true
+"""
+                ),
+                encoding="utf-8",
+            )
+
+            saved_cwd = Path.cwd()
+            try:
+                os.chdir(other_cwd)
+                profile = load_profile(profile_path)
+                self.assertEqual(
+                    Path(profile.fault_sweep.boot_cycle_hook).resolve(),
+                    repo_hook.resolve(),
+                )
+                self.assertEqual(
+                    Path(profile.update_sequence[0].boot_cycle_hook).resolve(),
+                    repo_hook.resolve(),
+                )
+                self.assertEqual(
+                    Path(
+                        profile.resolve_path(ROOT, profile.fault_sweep.boot_cycle_hook)
+                    ).resolve(),
+                    repo_hook.resolve(),
+                )
+            finally:
+                os.chdir(saved_cwd)
+
+    def test_boot_cycle_hook_resolves_against_load_repo_root_from_other_cwd(self) -> None:
+        """A hook relative to the caller's repo root loads when cwd is elsewhere."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            consumer = root / "consumer"
+            (consumer / "hooks").mkdir(parents=True)
+            (consumer / "profiles").mkdir()
+            elsewhere = root / "elsewhere"
+            elsewhere.mkdir()
+            (consumer / "hooks" / "h.py").write_text("x = 1\n")
+            import yaml
+
+            source = yaml.safe_load(
+                (ROOT / "profiles" / "mcuboot_pr2199_move_broken.yaml").read_text()
+            )
+            source["fault_sweep"]["boot_cycle_hook"] = "hooks/h.py"
+            source["platform"] = str(ROOT / source["platform"])
+            source["bootloader"]["elf"] = str(ROOT / source["bootloader"]["elf"])
+            source["images"] = {
+                name: str(ROOT / value) for name, value in source["images"].items()
+            }
+            probe = source.get("state_probe")
+            if isinstance(probe, dict) and probe.get("script"):
+                probe["script"] = str(ROOT / probe["script"])
+            profile_file = consumer / "profiles" / "p.yaml"
+            profile_file.write_text(yaml.safe_dump(source))
+            previous = os.getcwd()
+            os.chdir(elsewhere)
+            try:
+                with self.assertRaisesRegex(ProfileError, "could not resolve path"):
+                    load_profile(profile_file)
+                profile = load_profile(profile_file, repo_root=consumer)
+            finally:
+                os.chdir(previous)
+            self.assertEqual(
+                Path(profile.fault_sweep.boot_cycle_hook),
+                consumer / "hooks" / "h.py",
+            )
+            self.assertEqual(
+                Path(profile.resolve_path(consumer, profile.fault_sweep.boot_cycle_hook)),
+                consumer / "hooks" / "h.py",
+            )
+
+    def test_missing_boot_cycle_hook_raises_profile_error_listing_tried_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            profile_dir = temp_root / "custom_profiles"
+            other_cwd = temp_root / "other_cwd"
+            profile_dir.mkdir(parents=True)
+            other_cwd.mkdir(parents=True)
+
+            missing_rel = "hooks/missing_boot_hook.py"
+            single_path = profile_dir / "missing_single.yaml"
+            single_path.write_text(
+                textwrap.dedent(
+                    BASE_PROFILE
+                    + f"""
+fault_sweep:
+  mode: runtime
+  max_writes: 8
+  boot_cycles: 2
+  boot_cycle_hook: {missing_rel}
+  fault_types: [power_loss]
+"""
+                ),
+                encoding="utf-8",
+            )
+
+            v1_img = profile_dir / "v1.bin"
+            v1_img.write_bytes(b"\x11" * 4096)
+            missing_phase_rel = "hooks/missing_phase_hook.py"
+            seq_path = profile_dir / "missing_seq.yaml"
+            seq_path.write_text(
+                textwrap.dedent(
+                    BASE_PROFILE
+                    + f"""
+images:
+  exec: v1.bin
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: 8
+  fault_types: [power_loss]
+update_sequence:
+  - name: faulted_phase
+    images:
+      staging: v1.bin
+    success_criteria:
+      vtor_in_slot: exec
+      expected_image: staging
+    boot_cycles: 2
+    boot_cycle_hook: {missing_phase_rel}
+    fault_injection: true
+"""
+                ),
+                encoding="utf-8",
+            )
+
+            saved_cwd = Path.cwd()
+            try:
+                os.chdir(other_cwd)
+                with self.assertRaises(ProfileError) as single_ctx:
+                    load_profile(single_path)
+                single_msg = str(single_ctx.exception)
+                self.assertIn("fault_sweep.boot_cycle_hook", single_msg)
+                self.assertIn(str(ROOT / missing_rel), single_msg)
+                self.assertIn(str(other_cwd / missing_rel), single_msg)
+                self.assertIn(str(profile_dir / missing_rel), single_msg)
+
+                with self.assertRaises(ProfileError) as seq_ctx:
+                    load_profile(seq_path)
+                seq_msg = str(seq_ctx.exception)
+                self.assertIn("update_sequence[0].boot_cycle_hook", seq_msg)
+                self.assertIn(str(ROOT / missing_phase_rel), seq_msg)
+                self.assertIn(str(other_cwd / missing_phase_rel), seq_msg)
+                self.assertIn(str(profile_dir / missing_phase_rel), seq_msg)
+            finally:
+                os.chdir(saved_cwd)
+
+    def test_profile_auxiliary_inputs_resolve_with_same_helper_and_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            profile_dir = temp_root / "custom_profiles"
+            other_cwd = temp_root / "other_cwd"
+            profile_dir.mkdir(parents=True)
+            other_cwd.mkdir(parents=True)
+
+            setup_file = profile_dir / "local_setup.resc"
+            setup_file.write_text("# setup\n", encoding="utf-8")
+            probe_file = profile_dir / "local_probe.py"
+            probe_file.write_text("pass\n", encoding="utf-8")
+            provider_file = profile_dir / "local_provider.py"
+            provider_file.write_text("INVARIANTS = {}\n", encoding="utf-8")
+            periph_file = profile_dir / "LocalPeripheral.cs"
+            periph_file.write_text("// cs\n", encoding="utf-8")
+
+            # Also shadow a repo-root file in profile_dir to verify repo_root wins.
+            repo_rel_probe = "targets/mcuboot/probe.py"
+            (profile_dir / "targets" / "mcuboot").mkdir(parents=True)
+            (profile_dir / repo_rel_probe).write_text("# shadow\n", encoding="utf-8")
+
+            profile_path = profile_dir / "aux_inputs.yaml"
+            profile_path.write_text(
+                textwrap.dedent(
+                    BASE_PROFILE
+                    + """
+setup_script: local_setup.resc
+state_probe:
+  script: local_probe.py
+invariant_providers:
+  - local_provider.py
+extra_peripherals:
+  - LocalPeripheral.cs
+"""
+                ),
+                encoding="utf-8",
+            )
+
+            saved_cwd = Path.cwd()
+            try:
+                os.chdir(other_cwd)
+                profile = load_profile(profile_path)
+                self.assertEqual(
+                    Path(profile.resolve_path(ROOT, profile.setup_script)).resolve(),
+                    setup_file.resolve(),
+                )
+                self.assertEqual(
+                    Path(
+                        profile.resolve_path(ROOT, profile.state_probe.script)
+                    ).resolve(),
+                    probe_file.resolve(),
+                )
+                self.assertEqual(
+                    Path(
+                        profile.resolve_path(ROOT, profile.invariant_providers[0])
+                    ).resolve(),
+                    provider_file.resolve(),
+                )
+                self.assertEqual(
+                    Path(
+                        profile.resolve_path(ROOT, profile.extra_peripherals[0])
+                    ).resolve(),
+                    periph_file.resolve(),
+                )
+                self.assertEqual(
+                    Path(profile.resolve_path(ROOT, repo_rel_probe)).resolve(),
+                    (ROOT / repo_rel_probe).resolve(),
+                )
+            finally:
+                os.chdir(saved_cwd)
+
+    def test_strict_base_profile_allows_parent_segment_inside_strict_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_dir = Path(td) / "repo"
+            profiles_dir = repo_dir / "profiles"
+            sub_dir = profiles_dir / "sub"
+            sub_dir.mkdir(parents=True)
+
+            base_path = profiles_dir / "base.yaml"
+            base_path.write_text(
+                textwrap.dedent(BASE_PROFILE) + "strict_validation: true\n",
+                encoding="utf-8",
+            )
+            child_path = sub_dir / "child.yaml"
+            child_path.write_text(
+                "base_profile: ../base.yaml\nname: sub_child\n",
+                encoding="utf-8",
+            )
+
+            profile = load_profile(
+                child_path,
+                strict=True,
+                strict_root=repo_dir,
+            )
+            self.assertEqual(profile.name, "sub_child")
+            self.assertEqual(profile.platform, "platforms/cortex_m4_flash_fast.repl")
+
+    def test_strict_base_profile_rejects_parent_segment_escaping_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            outside_base = temp_root / "outside.yaml"
+            outside_base.write_text(
+                textwrap.dedent(BASE_PROFILE),
+                encoding="utf-8",
+            )
+            repo_dir = temp_root / "repo"
+            sub_dir = repo_dir / "profiles"
+            sub_dir.mkdir(parents=True)
+
+            child_path = sub_dir / "child.yaml"
+            child_path.write_text(
+                "base_profile: ../../outside.yaml\nname: escaping_child\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ProfileError,
+                "escapes strict profile boundary",
+            ):
+                load_profile(
+                    child_path,
+                    strict=True,
+                    strict_root=repo_dir,
+                )
+
+    def test_strict_base_profile_rejects_absolute_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_dir = Path(td) / "repo"
+            repo_dir.mkdir(parents=True)
+            base_path = repo_dir / "base.yaml"
+            base_path.write_text(
+                textwrap.dedent(BASE_PROFILE) + "strict_validation: true\n",
+                encoding="utf-8",
+            )
+            child_path = repo_dir / "child.yaml"
+            child_path.write_text(
+                "base_profile: {}\nname: abs_child\n".format(base_path.resolve()),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ProfileError,
+                "base_profile: strict validation requires a non-empty relative path",
+            ):
+                load_profile(child_path, strict=True, strict_root=repo_dir)
+
+            with self.assertRaisesRegex(
+                ProfileError,
+                "base_profile: strict validation requires a non-empty relative path",
+            ):
+                load_profile(child_path, strict=False, strict_root=repo_dir)
+
+    def test_strict_base_profile_default_boundary_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_dir = Path(td) / "repo"
+            sub_dir = repo_dir / "sub"
+            sub_dir.mkdir(parents=True)
+
+            base_path = repo_dir / "base.yaml"
+            base_path.write_text(
+                textwrap.dedent(BASE_PROFILE),
+                encoding="utf-8",
+            )
+            escaping_default = sub_dir / "child.yaml"
+            escaping_default.write_text(
+                "base_profile: ../base.yaml\nname: default_boundary_escape\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ProfileError,
+                "escapes strict profile boundary",
+            ):
+                load_profile(escaping_default, strict=True)
+
+            staying_inside_default = repo_dir / "root_child.yaml"
+            staying_inside_default.write_text(
+                "base_profile: sub/../base.yaml\nname: default_boundary_inside\n",
+                encoding="utf-8",
+            )
+            profile = load_profile(staying_inside_default, strict=True)
+            self.assertEqual(profile.name, "default_boundary_inside")
+
+    def test_audit_bootloader_passes_repo_root_as_strict_root_only_when_explicit(self) -> None:
+        import audit_bootloader
+
+        with tempfile.TemporaryDirectory() as td:
+            repo_dir = Path(td) / "repo"
+            sub_dir = repo_dir / "profiles" / "sub"
+            sub_dir.mkdir(parents=True)
+            child_path = sub_dir / "child.yaml"
+            child_path.write_text("schema_version: 1\n", encoding="utf-8")
+            out_path = Path(td) / "out.json"
+
+            observed_calls = []
+
+            observed_repo_roots = []
+
+            def fake_load_profile(path, *, strict=False, strict_root=None, repo_root=None):
+                observed_calls.append((Path(path), strict, strict_root))
+                observed_repo_roots.append(repo_root)
+                raise RuntimeError("stop after load_profile")
+
+            with mock.patch.object(
+                audit_bootloader, "load_profile", side_effect=fake_load_profile
+            ):
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "audit_bootloader.py",
+                        "--profile",
+                        str(child_path),
+                        "--output",
+                        str(out_path),
+                        "--strict-profile",
+                    ],
+                ):
+                    rc = audit_bootloader._main_single()
+                    self.assertEqual(rc, audit_bootloader.EXIT_INFRA_FAILURE)
+
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "audit_bootloader.py",
+                        "--profile",
+                        str(child_path),
+                        "--output",
+                        str(out_path),
+                        "--strict-profile",
+                        "--repo-root",
+                        str(repo_dir),
+                    ],
+                ):
+                    rc = audit_bootloader._main_single()
+                    self.assertEqual(rc, audit_bootloader.EXIT_INFRA_FAILURE)
+
+            self.assertEqual(
+                observed_calls,
+                [
+                    (child_path, True, None),
+                    (child_path, True, repo_dir),
+                ],
+            )
+            self.assertEqual(
+                observed_repo_roots,
+                [audit_bootloader.REPO_ROOT, repo_dir],
+            )
 
 
 if __name__ == "__main__":

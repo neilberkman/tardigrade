@@ -1540,10 +1540,16 @@ def run_fuzz_crash_campaign(
 def _main_single() -> int:
     args = parse_args()
     repo_root = Path(args.repo_root) if args.repo_root else REPO_ROOT
+    strict_root = repo_root if args.repo_root else None
     temp_ctx: Optional[tempfile.TemporaryDirectory[str]] = None
 
     try:
-        profile = load_profile(args.profile, strict=args.strict_profile)
+        profile = load_profile(
+            args.profile,
+            strict=args.strict_profile,
+            strict_root=strict_root,
+            repo_root=repo_root,
+        )
         if args.initial_state:
             matches = [
                 state
@@ -3202,8 +3208,15 @@ def main() -> int:
     args = parse_args()
     if args.initial_state:
         return _main_single()
+    repo_root = Path(args.repo_root) if args.repo_root else REPO_ROOT
+    strict_root = Path(args.repo_root) if args.repo_root else None
     try:
-        profile = load_profile(args.profile, strict=args.strict_profile)
+        profile = load_profile(
+            args.profile,
+            strict=args.strict_profile,
+            strict_root=strict_root,
+            repo_root=repo_root,
+        )
     except Exception:
         return _main_single()
     if not getattr(profile, "initial_states", None):
