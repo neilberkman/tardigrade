@@ -107,6 +107,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
         public string MramTornWordMode { get => tracker.MramTornWordMode; set => tracker.MramTornWordMode = value; }
+        public bool PreserveCountersAcrossReset { get => tracker.PreserveCountersAcrossReset; set => tracker.PreserveCountersAcrossReset = value; }
 
         public bool AnyFaultFired => tracker.AnyFaultFired;
         public bool FaultRequiresImmediateStop => tracker.FaultRequiresImmediateStop;

@@ -522,7 +522,10 @@ re-entered, or an instruction-counter reset, and then all existing content and
 liveness criteria must pass. A copied image that never requests reset, or a
 post-reset image that never establishes liveness, cannot reach this terminal.
 After a recovery reset, a live boot with a failed content check terminates as
-`wrong_image` instead of being overwritten by a later budget timeout.
+`wrong_image` instead of being overwritten by a later budget timeout. During an
+active calibration or fault run, `run_runtime_fault_sweep.py` enables
+`PreserveCountersAcrossReset` on the flash backend so write indices stay
+monotonic across the firmware's in-run reset.
 
 See `examples/runtime_self_update/profile.yaml` for a complete vendor-neutral
 fixture.
@@ -1525,6 +1528,10 @@ Load custom Renode C# peripherals (e.g., flash controllers with non-standard beh
 extra_peripherals:
   - peripherals/STM32H7FlashController.cs
 ```
+
+Third-party C# storage and bus peripherals loaded through `extra_peripherals` receive `Reset()` whenever the guest firmware triggers a software reset such as `SYSRESETREQ` during an active run, and again when `run_runtime_fault_sweep.py` issues `machine Reset` between runs or before Phase 2 recovery. In `Reset()`, external models must clear volatile controller registers, command state machines, status flags, and one-shot fault latches, while preserving durable backing storage.
+
+External fault-injectable models that implement `ITardigradeFaultInjectable` or expose write counters to `run_runtime_fault_sweep.py` should also expose `bool PreserveCountersAcrossReset { get; set; }`. `run_runtime_fault_sweep.py` sets `PreserveCountersAcrossReset = true` during active calibration and fault runs so `Reset()` keeps `TotalWordWrites`, `TotalPageErases`, write traces, shadow buffers, and an already-activated `TrackingStartAddress` state across a firmware-initiated reset while no fault has fired and `TrackingStopAddress` has not been hit. Before issuing its own `machine Reset` for cold-reset preparation or Phase 2 recovery, `run_runtime_fault_sweep.py` sets `PreserveCountersAcrossReset = false` and zeroes counters and traces so the next boot starts cleanly.
 
 ### NVM controller
 

@@ -84,6 +84,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
         public uint CorruptionSeed { get => tracker.CorruptionSeed; set => tracker.CorruptionSeed = value; }
         public string MramTornWordMode { get => tracker.MramTornWordMode; set => tracker.MramTornWordMode = value; }
+        public bool PreserveCountersAcrossReset { get => tracker.PreserveCountersAcrossReset; set => tracker.PreserveCountersAcrossReset = value; }
         public int DiffLookahead { get; set; } = 32;
         public bool SkipShadowScan { get; set; } = true;
         public bool PassthroughMode { get; set; }
@@ -213,8 +214,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 RemoveTrackingStartHook();
             }
             tracker.Reset();
-            flashShadow = null;
-            trackingStarted = trackingStartAddress == 0;
+            if(!PreserveCountersAcrossReset && !tracker.FaultFired && !tracker.EraseFaultFired)
+            {
+                flashShadow = null;
+                trackingStarted = trackingStartAddress == 0;
+            }
             UpdateMemoryAccessHook();
         }
 

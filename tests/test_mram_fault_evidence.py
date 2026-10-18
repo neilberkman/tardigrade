@@ -260,3 +260,21 @@ def test_summary_retains_concise_evidence_and_snapshot_identity() -> None:
             "differing_ranges": [{"offset": 4, "size": 2}],
         }
     ]
+
+
+def test_mapped_mram_tracker_preserves_counters_across_firmware_reset_when_enabled() -> None:
+    interface_cs = (ROOT / "peripherals" / "ITardigradeFaultInjectable.cs").read_text(
+        encoding="utf-8"
+    )
+    tracker_cs = (ROOT / "peripherals" / "MappedMRAMTracker.cs").read_text(
+        encoding="utf-8"
+    )
+
+    assert "bool PreserveCountersAcrossReset { get; set; }" in interface_cs
+    assert "public bool PreserveCountersAcrossReset { get; set; }" in tracker_cs
+    assert "if(trackingStopHit || FaultEverFired)" in tracker_cs
+    assert "else if(PreserveCountersAcrossReset)" in tracker_cs
+    assert "if(trackingStarted)\n                {\n                    trackingStartAddress = 0;\n                }" in tracker_cs
+    assert "ResetCampaignObservability();" in tracker_cs
+
+

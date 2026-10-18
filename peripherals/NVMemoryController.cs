@@ -40,18 +40,37 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             // Intentionally do NOT clear storage: this models non-volatile memory.
             WriteInProgress = false;
-            LastFaultInjected = false;
-            FaultEverFired = false;
-            DriverErrorFired = false;
-            if(configuredTrackingStartAddress != 0)
+            if(FaultEverFired)
             {
-                trackingStartAddress = configuredTrackingStartAddress;
+                trackingStartAddress = 0;
                 trackingStarted = false;
-                ResetCampaignObservability();
+            }
+            else if(PreserveCountersAcrossReset)
+            {
+                if(trackingStarted)
+                {
+                    trackingStartAddress = 0;
+                }
+                else
+                {
+                    trackingStartAddress = configuredTrackingStartAddress;
+                }
             }
             else
             {
-                trackingStarted = true;
+                LastFaultInjected = false;
+                FaultEverFired = false;
+                DriverErrorFired = false;
+                if(configuredTrackingStartAddress != 0)
+                {
+                    trackingStartAddress = configuredTrackingStartAddress;
+                    trackingStarted = false;
+                    ResetCampaignObservability();
+                }
+                else
+                {
+                    trackingStarted = true;
+                }
             }
             // Read-fault state is intentionally NOT cleared on Reset: the
             // sweep engine re-arms between iterations, and clearing here
@@ -613,6 +632,20 @@ namespace Antmicro.Renode.Peripherals.Memory
                         "MramTornWordMode must be half, untouched, erased, or programmed");
                 }
                 mramTornWordMode = normalized;
+            }
+        }
+
+        public bool PreserveCountersAcrossReset
+        {
+            get { return AliasTarget != null ? AliasTarget.PreserveCountersAcrossReset : preserveCountersAcrossReset; }
+            set
+            {
+                if(AliasTarget != null)
+                {
+                    AliasTarget.PreserveCountersAcrossReset = value;
+                    return;
+                }
+                preserveCountersAcrossReset = value;
             }
         }
 
@@ -1206,6 +1239,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         private byte[] storage;
         private uint corruptionSeed;
         private string mramTornWordMode = "half";
+        private bool preserveCountersAcrossReset;
         private readonly List<long> writeLog = new List<long>();
         private readonly List<WriteTraceEntry> writeTrace = new List<WriteTraceEntry>();
         private readonly List<ProgramTraceEntry> programTrace = new List<ProgramTraceEntry>();
@@ -1544,6 +1578,12 @@ namespace Antmicro.Renode.Peripherals
         {
             get { return Nvm != null ? Nvm.MramTornWordMode : "half"; }
             set { if(Nvm != null) { Nvm.MramTornWordMode = value; } }
+        }
+
+        public bool PreserveCountersAcrossReset
+        {
+            get { return Nvm != null && Nvm.PreserveCountersAcrossReset; }
+            set { if(Nvm != null) { Nvm.PreserveCountersAcrossReset = value; } }
         }
 
         public int DiffLookahead { get; set; }

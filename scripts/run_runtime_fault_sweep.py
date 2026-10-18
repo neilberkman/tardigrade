@@ -539,6 +539,18 @@ def _apply_mram_torn_word_mode():
     if nvm is not None and hasattr(nvm, 'MramTornWordMode'):
         nvm.MramTornWordMode = mram_torn_word
 
+def _set_preserve_counters_across_reset(enabled):
+    flag = bool(enabled)
+    data = backend.get('data')
+    if data is not None and hasattr(data, 'PreserveCountersAcrossReset'):
+        data.PreserveCountersAcrossReset = flag
+    nvm = getattr(data, 'Nvm', None) if data is not None else None
+    if nvm is not None and hasattr(nvm, 'PreserveCountersAcrossReset'):
+        nvm.PreserveCountersAcrossReset = flag
+    ctrl = backend.get('controller')
+    if ctrl is not None and hasattr(ctrl, 'PreserveCountersAcrossReset'):
+        ctrl.PreserveCountersAcrossReset = flag
+
 def _apply_tracking_start_address(data, backend_name, address):
     """Set the precise write-tracking boundary on capable backends."""
     if not hasattr(data, 'TrackingStartAddress'):
@@ -630,6 +642,7 @@ def _configure_python_tracking_gate(force=False):
     log('tracking_gate: python hook installed at 0x{:08X}'.format(address))
 
 _configure_tracking_start_address()
+_set_preserve_counters_across_reset(True)
 _configure_python_tracking_gate()
 
 _cached_erase_page = None
@@ -669,9 +682,11 @@ def refresh_runtime_handles():
 
 
 def _machine_reset():
+    _set_preserve_counters_across_reset(False)
     monitor.Parse('machine Reset')
     refresh_runtime_handles()
     _configure_tracking_start_address()
+    _set_preserve_counters_across_reset(True)
     _configure_python_tracking_gate(force=True)
     if '_prepare_calibration_stop' in globals():
         _prepare_calibration_stop()
@@ -6224,8 +6239,12 @@ def reset_nvmc_for_sweep():
     b = backend
     if b['kind'] == 'mram':
         b['data'].TotalWordWrites = 0
+        if hasattr(b['data'], 'WriteTraceClear'):
+            b['data'].WriteTraceClear()
         if hasattr(b['data'], 'ProgramTraceClear'):
             b['data'].ProgramTraceClear()
+        if hasattr(b['data'], 'InvalidateShadow'):
+            b['data'].InvalidateShadow()
         b['data'].LastFaultInjected = False
         b['data'].FaultEverFired = False
         b['data'].WriteFaultMode = 0
@@ -6258,6 +6277,7 @@ def reset_nvmc_for_sweep():
         b['data'].Nvm.FaultEverFired = False
         b['data'].Nvm.WriteFaultMode = 0
         b['data'].Nvm.DriverErrorFired = False
+    _set_preserve_counters_across_reset(True)
     # Reset controller fault state on all backends — command_drop can be
     # used with any backend via the separate nvm_controller field.
     disarm_controller_fault()
@@ -6270,12 +6290,17 @@ def reset_nvmc_for_recovery():
     b = backend
     if b['kind'] == 'mram':
         b['data'].TotalWordWrites = 0
+        if hasattr(b['data'], 'WriteTraceClear'):
+            b['data'].WriteTraceClear()
         if hasattr(b['data'], 'ProgramTraceClear'):
             b['data'].ProgramTraceClear()
+        if hasattr(b['data'], 'InvalidateShadow'):
+            b['data'].InvalidateShadow()
         b['data'].LastFaultInjected = False
         b['data'].FaultEverFired = False
         b['data'].WriteFaultMode = 0
         b['data'].DriverErrorFired = False
+        _set_preserve_counters_across_reset(True)
         disarm_fault()
         return
     if b['kind'] == 'fast':
@@ -6299,6 +6324,7 @@ def reset_nvmc_for_recovery():
         b['data'].Nvm.WriteFaultMode = 0
         b['data'].Nvm.DriverErrorFired = False
         disarm_fault()
+    _set_preserve_counters_across_reset(True)
     # Reset I2C fault state for recovery boot.
     disarm_i2c_fault()
 

@@ -30,6 +30,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int EraseFaultMode;
         public uint CorruptionSeed;
         public string MramTornWordMode = "half";
+        public bool PreserveCountersAcrossReset;
 
         public bool WriteTraceEnabled;
         public bool EraseTraceEnabled;
@@ -137,21 +138,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public void Reset()
         {
-            TotalWordWrites = 0;
-            TotalPageErases = 0;
-            FaultFired = false;
-            DriverErrorFired = false;
-            EraseFaultFired = false;
-            LastFaultAddress = 0;
-            FaultFlashSnapshot = null;
-            writeTrace.Clear();
-            eraseTrace.Clear();
+            if(!PreserveCountersAcrossReset && !FaultFired && !EraseFaultFired)
+            {
+                TotalWordWrites = 0;
+                TotalPageErases = 0;
+                FaultFired = false;
+                DriverErrorFired = false;
+                EraseFaultFired = false;
+                LastFaultAddress = 0;
+                FaultFlashSnapshot = null;
+                writeTrace.Clear();
+                eraseTrace.Clear();
+            }
             if(WritebackDomains != null)
             {
                 foreach(var d in WritebackDomains)
                 {
                     d.Discard();
-                    d.CommittedCount = 0;
+                    if(!PreserveCountersAcrossReset)
+                    {
+                        d.CommittedCount = 0;
+                    }
                 }
             }
         }
