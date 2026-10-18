@@ -1033,6 +1033,177 @@ extra_peripherals:
             finally:
                 os.chdir(saved_cwd)
 
+    def test_strict_base_profile_allows_parent_segment_inside_strict_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_dir = Path(td) / "repo"
+            profiles_dir = repo_dir / "profiles"
+            sub_dir = profiles_dir / "sub"
+            sub_dir.mkdir(parents=True)
+
+            base_path = profiles_dir / "base.yaml"
+            base_path.write_text(
+                textwrap.dedent(BASE_PROFILE) + "strict_validation: true\n",
+                encoding="utf-8",
+            )
+            child_path = sub_dir / "child.yaml"
+            child_path.write_text(
+                "base_profile: ../base.yaml\nname: sub_child\n",
+                encoding="utf-8",
+            )
+
+            profile = load_profile(
+                child_path,
+                strict=True,
+                strict_root=repo_dir,
+            )
+            self.assertEqual(profile.name, "sub_child")
+            self.assertEqual(profile.platform, "platforms/cortex_m4_flash_fast.repl")
+
+    def test_strict_base_profile_rejects_parent_segment_escaping_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            outside_base = temp_root / "outside.yaml"
+            outside_base.write_text(
+                textwrap.dedent(BASE_PROFILE),
+                encoding="utf-8",
+            )
+            repo_dir = temp_root / "repo"
+            sub_dir = repo_dir / "profiles"
+            sub_dir.mkdir(parents=True)
+
+            child_path = sub_dir / "child.yaml"
+            child_path.write_text(
+                "base_profile: ../../outside.yaml\nname: escaping_child\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ProfileError,
+                "escapes strict profile boundary",
+            ):
+                load_profile(
+                    child_path,
+                    strict=True,
+                    strict_root=repo_dir,
+                )
+
+    def test_strict_base_profile_rejects_absolute_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_dir = Path(td) / "repo"
+            repo_dir.mkdir(parents=True)
+            base_path = repo_dir / "base.yaml"
+            base_path.write_text(
+                textwrap.dedent(BASE_PROFILE) + "strict_validation: true\n",
+                encoding="utf-8",
+            )
+            child_path = repo_dir / "child.yaml"
+            child_path.write_text(
+                "base_profile: {}\nname: abs_child\n".format(base_path.resolve()),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ProfileError,
+                "base_profile: strict validation requires a non-empty relative path",
+            ):
+                load_profile(child_path, strict=True, strict_root=repo_dir)
+
+            with self.assertRaisesRegex(
+                ProfileError,
+                "base_profile: strict validation requires a non-empty relative path",
+            ):
+                load_profile(child_path, strict=False, strict_root=repo_dir)
+
+    def test_strict_base_profile_default_boundary_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_dir = Path(td) / "repo"
+            sub_dir = repo_dir / "sub"
+            sub_dir.mkdir(parents=True)
+
+            base_path = repo_dir / "base.yaml"
+            base_path.write_text(
+                textwrap.dedent(BASE_PROFILE),
+                encoding="utf-8",
+            )
+            escaping_default = sub_dir / "child.yaml"
+            escaping_default.write_text(
+                "base_profile: ../base.yaml\nname: default_boundary_escape\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ProfileError,
+                "escapes strict profile boundary",
+            ):
+                load_profile(escaping_default, strict=True)
+
+            staying_inside_default = repo_dir / "root_child.yaml"
+            staying_inside_default.write_text(
+                "base_profile: sub/../base.yaml\nname: default_boundary_inside\n",
+                encoding="utf-8",
+            )
+            profile = load_profile(staying_inside_default, strict=True)
+            self.assertEqual(profile.name, "default_boundary_inside")
+
+    def test_audit_bootloader_passes_repo_root_as_strict_root_only_when_explicit(self) -> None:
+        import audit_bootloader
+
+        with tempfile.TemporaryDirectory() as td:
+            repo_dir = Path(td) / "repo"
+            sub_dir = repo_dir / "profiles" / "sub"
+            sub_dir.mkdir(parents=True)
+            child_path = sub_dir / "child.yaml"
+            child_path.write_text("schema_version: 1\n", encoding="utf-8")
+            out_path = Path(td) / "out.json"
+
+            observed_calls = []
+
+            def fake_load_profile(path, *, strict=False, strict_root=None):
+                observed_calls.append((Path(path), strict, strict_root))
+                raise RuntimeError("stop after load_profile")
+
+            with mock.patch.object(
+                audit_bootloader, "load_profile", side_effect=fake_load_profile
+            ):
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "audit_bootloader.py",
+                        "--profile",
+                        str(child_path),
+                        "--output",
+                        str(out_path),
+                        "--strict-profile",
+                    ],
+                ):
+                    rc = audit_bootloader._main_single()
+                    self.assertEqual(rc, audit_bootloader.EXIT_INFRA_FAILURE)
+
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "audit_bootloader.py",
+                        "--profile",
+                        str(child_path),
+                        "--output",
+                        str(out_path),
+                        "--strict-profile",
+                        "--repo-root",
+                        str(repo_dir),
+                    ],
+                ):
+                    rc = audit_bootloader._main_single()
+                    self.assertEqual(rc, audit_bootloader.EXIT_INFRA_FAILURE)
+
+            self.assertEqual(
+                observed_calls,
+                [
+                    (child_path, True, None),
+                    (child_path, True, repo_dir),
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

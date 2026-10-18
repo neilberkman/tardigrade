@@ -112,6 +112,8 @@ expect:
 
 This inherits everything from `mcuboot_head_upgrade.yaml` (platform, memory layout, images, fault_sweep, etc.) and overrides only the fields specified. Chains are supported -- a base can itself declare a `base_profile`. Cycles are detected and rejected. Maximum chain depth is 10.
 
+`load_profile` and `ProfileConfig` resolve relative input paths such as slot images, setup scripts, `state_probe.script`, `invariant_providers`, `fuzz_corpus`, and `boot_cycle_hook` against the repository root first, then the current working directory, and finally the profile directory. If a configured `boot_cycle_hook` file does not exist at any of those locations, `load_profile` raises `ProfileError` and lists every candidate path it checked.
+
 ## Choosing a platform
 
 Tardigrade ships several platform backends. Pick the one that matches your NVM technology:
@@ -597,6 +599,8 @@ the YAML for CI-facing profiles. Strict validation rejects unknown core fields,
 requires at least one observable success criterion, and requires platform,
 firmware, image, setup, probe, provider, hook, component, and phase asset paths
 to be relative and remain beneath the selected repository root.
+
+For `base_profile`, strict validation rejects empty or absolute paths and checks that the resolved target stays within the active directory boundary. `load_profile` accepts an optional `strict_root` boundary and defaults to the directory containing the child profile when `strict_root` is `None`. Relative `base_profile` paths may use `..` segments when the resolved target remains inside that boundary. `audit_bootloader.py` passes `--repo-root` as `strict_root` only when `--repo-root` is given on the command line, which allows a profile in a subdirectory to inherit from a base profile higher in the same repository tree.
 
 ### Fault types
 

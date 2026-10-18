@@ -170,7 +170,11 @@ def _resolve_base_profile(
         raise ProfileError("PyYAML is required for profile loading.")
 
     if _strict_root is not None:
-        _validate_strict_relative_path(base_rel, "base_profile")
+        _validate_strict_relative_path(
+            base_rel,
+            "base_profile",
+            allow_parent_segments=True,
+        )
 
     # Resolve the base path relative to the directory of the current profile.
     base_path = (profile_path.parent / base_rel).resolve()
@@ -7580,15 +7584,26 @@ def _validate_strict_terminal_error_paths(raw: Any, context: str) -> None:
             _reject_unknown_keys(marker, marker_allowed, item_context + ".required_failure_marker")
 
 
-def _validate_strict_relative_path(value: Any, context: str) -> None:
+def _validate_strict_relative_path(
+    value: Any,
+    context: str,
+    *,
+    allow_parent_segments: bool = False,
+) -> None:
     text = str(value or "").strip()
     normalized = text.replace("\\", "/")
+    allow_parent = allow_parent_segments or context == "base_profile"
     if (
         not text
         or normalized.startswith("/")
         or re.match(r"^[A-Za-z]:/", normalized)
-        or ".." in normalized.split("/")
+        or (not allow_parent and ".." in normalized.split("/"))
     ):
+        if allow_parent:
+            raise ProfileError(
+                "{}: strict validation requires a non-empty relative path; "
+                "got {!r}".format(context, text)
+            )
         raise ProfileError(
             "{}: strict validation requires a non-empty relative path "
             "without '..'; got {!r}".format(context, text)
@@ -8164,7 +8179,12 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
         )
 
 
-def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
+def load_profile(
+    path: str | Path,
+    *,
+    strict: bool = False,
+    strict_root: Optional[str | Path] = None,
+) -> ProfileConfig:
     """Load and validate a YAML profile.
 
     Args:
@@ -8172,6 +8192,8 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         strict: Reject unknown fields and profiles without an observable
             success check. A profile may also opt in with
             ``strict_validation: true``.
+        strict_root: Optional directory boundary for strict ``base_profile``
+            resolution. Defaults to ``path.parent.resolve()``.
 
     Returns:
         A validated ProfileConfig.
@@ -8199,14 +8221,18 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
     if not isinstance(raw_strict_value, bool):
         raise ProfileError("strict_validation: expected boolean")
     strict_requested = strict or raw_strict_value
-    strict_root = path.parent.resolve()
+    resolved_strict_root = (
+        Path(strict_root).resolve()
+        if strict_root is not None
+        else path.parent.resolve()
+    )
 
     # Resolve base_profile inheritance before parsing fields.
     base_chain: List[Tuple[str, Path]] = []
     data = _resolve_base_profile(
         data,
         path,
-        _strict_root=strict_root if strict_requested else None,
+        _strict_root=resolved_strict_root if strict_requested else None,
         _base_chain=base_chain,
     )
 
@@ -8218,13 +8244,19 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         # complete resolved chain here so inherited strict mode cannot use a
         # symlink or an earlier reference to leave the caller's profile tree.
         for base_rel, base_path in base_chain:
-            _validate_strict_relative_path(base_rel, "base_profile")
+            _validate_strict_relative_path(
+                base_rel,
+                "base_profile",
+                allow_parent_segments=True,
+            )
             try:
-                base_path.relative_to(strict_root)
+                base_path.relative_to(resolved_strict_root)
             except ValueError as exc:
                 raise ProfileError(
                     "base_profile {!r} escapes strict profile boundary {} "
-                    "(resolved to {})".format(base_rel, strict_root, base_path)
+                    "(resolved to {})".format(
+                        base_rel, resolved_strict_root, base_path
+                    )
                 ) from exc
         _validate_strict_profile_data(data)
 

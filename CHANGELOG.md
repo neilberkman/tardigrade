@@ -41,6 +41,11 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Changed
 
+- `load_profile` accepts an optional `strict_root` directory boundary for strict
+  `base_profile` resolution, permits `..` segments in relative `base_profile`
+  paths when the resolved target remains inside that boundary, and
+  `audit_bootloader.py` forwards `--repo-root` as `strict_root` when `--repo-root`
+  is explicitly passed.
 - Fast and direct-MRAM recovery boots now derive the initial SP and PC from a
   restored faulted vector table when it resides in the backend array, exposing
   interrupted vector writes as boot failures instead of retaining clean-ELF
