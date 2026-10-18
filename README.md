@@ -29,17 +29,25 @@ A historical Tardigrade campaign against the upstream [NuttX nxboot bootloader](
 
 The FTL `O_DIRECT` bug affects all NuttX applications that write to MTD partitions expecting direct access, not just nxboot.
 
-### MCUboot -- retroactive validation
+### MCUboot retroactive validation
 
-These are retroactive tests against known MCUboot bugs, not discoveries. The point is showing that tardigrade's generic sweep catches real bug classes without target-specific tuning:
+Four MCUboot historical differential pairs separate broken from fixed firmware on their current profiles:
 
-| PR                                                      | Bug                                                                 | Historical broken run | Fixed control |
-| ------------------------------------------------------- | ------------------------------------------------------------------- | --------------------- | ------------- |
-| [#2100](https://github.com/mcu-tools/mcuboot/pull/2100) | Revert magic left in bad state (swap-move)                          | 3 bricks (9.7%)      | 0 bricks |
-| [#2109](https://github.com/mcu-tools/mcuboot/pull/2109) | Header reload from wrong slot after interrupted swap (swap-scratch) | 19 bricks (33.3%)    | 0 bricks |
-| [#2199](https://github.com/mcu-tools/mcuboot/pull/2199) | Stuck revert: primary trailer never cleared (swap-move)             | 1 wrong_image (100%) | 0 issues |
+| PR                                                      | Bug                                                                 | Broken revision result | Fixed revision result |
+| ------------------------------------------------------- | ------------------------------------------------------------------- | ---------------------- | --------------------- |
+| [#2100](https://github.com/mcu-tools/mcuboot/pull/2100) | Revert magic left in bad state in swap-move                         | 3 `wrong_image` issues across 277 heuristic points, 1.1%; 3 bricks across 31 points, 9.7% | 0 issues              |
+| [#2109](https://github.com/mcu-tools/mcuboot/pull/2109) | Header reload from wrong slot after interrupted swap in swap-scratch | 3 bricks across 6 quick points, 50.0%; 19 bricks across 57 points, 33.3%      | 0 bricks              |
+| [#2199](https://github.com/mcu-tools/mcuboot/pull/2199) | Stuck revert where primary trailer is never cleared in swap-move    | Control boot only, see note | 0 issues         |
+| [#2214](https://github.com/mcu-tools/mcuboot/pull/2214) | Off-by-one sector index in `find_last_idx` in swap-offset           | Control boot refuses upgrade | Swaps and boots staging |
 
-Additional differential profiles for PRs [#2205](https://github.com/mcu-tools/mcuboot/pull/2205), [#2206](https://github.com/mcu-tools/mcuboot/pull/2206), and [#2214](https://github.com/mcu-tools/mcuboot/pull/2214).
+PR #2199 note: no fault point detects this bug. `profiles/mcuboot_pr2199_move_broken.yaml` sets `expect.allow_control_only_issues: true`, and the stuck revert reproduces on the clean control boot with no injected fault. Detection comes from the MCUboot semantic state probe on that control boot: the primary trailer still holds GOOD magic with `copy_done` set and `image_ok` unset, which is the REVERT state that the fixed build clears.
+
+PR #2214 note: `profiles/mcuboot_pr2214_offset_broken.yaml` and `profiles/mcuboot_pr2214_offset_fixed.yaml` separate on the unfaulted control boot on an nRF52840 swap-offset layout where the secondary slot is one 4 KiB sector larger than the primary and the staged image has swap size `0x74000`. Broken commit `429e2fea` aborts with insufficient space and stays on the old image, while fixed commit `90fd59d2` completes the swap and boots the staged image. The STM32F429 mirrored-bank geometry pair `mcuboot_pr2214_offset_geom_broken.yaml` and `mcuboot_pr2214_offset_geom_fixed.yaml` also separates on the unfaulted control boot on a `0x18000` primary and `0x38000` secondary layout with swap size `0x8000`, while remaining tagged `expect.mode: exploratory` under [tardigrade#18](https://github.com/neilberkman/tardigrade/issues/18).
+
+Candidate pairs for PRs [#1597](https://github.com/mcu-tools/mcuboot/pull/1597), [#2205](https://github.com/mcu-tools/mcuboot/pull/2205), and [#2206](https://github.com/mcu-tools/mcuboot/pull/2206) were removed after trace analysis showed that PR #1597's 1-sector staged image never enters the broken `g_last_idx` swap branch while its transplanted fixed `swap_move.c` passes `0` as `NULL` to `boot_read_swap_size`, PR #2205 only adds an extra swap iteration on the erased upper 128 KiB sector while completing the upgrade and recovering on all 6 quick fault points across five STM32F4 layouts, and PR #2206's cycle-0 `wrong_image` verdict came from `compute_slot_hash` hashing across normal primary-slot swap-status bytes rather than scratch trailer corruption.
+
+See [`docs/mcuboot-differentials.md`](docs/mcuboot-differentials.md) for the status table, `--quick` differential gate, and trace analysis across the four retained MCUboot PR differential pairs and the three removed pairs.
+See [`docs/mcuboot-pr2214-swap-offset.md`](docs/mcuboot-pr2214-swap-offset.md) for the PR #2214 swap-offset sector-count derivation and STM32F4 geometry root cause.
 
 ## Integrations
 
@@ -123,9 +131,10 @@ reduction is target-dependent.
 
 ### Semantic assertions beyond boot/no-boot
 
-A device that boots to the wrong slot, confirms a corrupt image, or gets stuck in a revert loop is not "working." Tardigrade's state probes, semantic assertions, and composable invariant providers catch state-correctness bugs that pass a naive boot check. PR #2199 (stuck revert) is an example: the device boots, but it boots the wrong image permanently. Tardigrade catches it.
+A device that boots to the wrong slot, confirms a corrupt image, or gets stuck in a revert loop is not "working." Tardigrade's state probes, semantic assertions, and composable invariant providers catch state-correctness bugs that pass a naive boot check. MCUboot PR #2199 is an example: the device boots, but its primary trailer stays in the REVERT state on every boot. The state probe catches it on the unfaulted control boot.
 
 Instruction-skip sweeps can also attach verification bypass probes that record per-function return values instead of relying only on the final boot outcome. This lets tardigrade separate noisy CPU crashes from defense-in-depth catches and true full verification bypasses, which cuts down the false positives that otherwise show up in glitch-style campaigns.
+See [`docs/mcuboot-instruction-skip-results.md`](docs/mcuboot-instruction-skip-results.md) for the exhaustive 100-branch MCUboot instruction-skip sweep results across all 12 profiles.
 
 Execute-mode `rc_injection` rejects a selected write and forces a configured
 return value when a named wrapper returns. General `function_return_probes`
@@ -194,11 +203,14 @@ evidence is inconclusive rather than clean.
 
 Real storage stacks often buffer writes in RAM before committing to flash. A bootloader that assumes write-through durability can have latent bugs invisible to direct fault injection. The optional `durability_model: writeback` mode reconstructs the persisted Phase 2 snapshot from a bounded operation trace: writes remain pending until a configured barrier or capacity eviction commits them, and a power cut discards the rest. Phase 1 still observes the live write-through view, so the model evaluates recovery durability without claiming to reproduce same-boot stale reads. Ambiguous or unavailable trace evidence fails closed. Replay refuses a backend that explicitly declares `PerWriteAccurate=false`, because address-difference traces cannot establish operation ordering for durability reconstruction.
 
-Diagnostic annotations include a barrier audit (detects missing flush barriers between update phases), per-fault dirty-domain state, and a `commit_ratio` metric that quantifies how much of the write stream is uncommitted at each fault point. The validated barrier diagnostic is preserved in calibration caches and reported as `calibration.barrier_audit`.
+Diagnostic annotations include a barrier audit that detects missing flush barriers between update phases, per-fault dirty-domain state, and a `commit_ratio` metric that quantifies how much of the write stream is uncommitted at each fault point. The validated barrier diagnostic is preserved in calibration caches and reported as `calibration.barrier_audit`.
 
-The current-head MCUboot STM32F4 scratch entry point is
-[`profiles/mcuboot_head_scratch_stm32f4_writeback.yaml`](profiles/mcuboot_head_scratch_stm32f4_writeback.yaml).
-Run it with the normal audit CLI after the current-head assets are available:
+Current-head MCUboot writeback profiles cover both swap-scratch and swap-move across STM32F4 and nRF52840:
+[`profiles/mcuboot_head_scratch_stm32f4_writeback.yaml`](profiles/mcuboot_head_scratch_stm32f4_writeback.yaml),
+[`profiles/mcuboot_head_scratch_nrf52_writeback.yaml`](profiles/mcuboot_head_scratch_nrf52_writeback.yaml),
+[`profiles/mcuboot_head_move_nrf52_writeback.yaml`](profiles/mcuboot_head_move_nrf52_writeback.yaml), and
+[`profiles/mcuboot_head_move_stm32f4_writeback.yaml`](profiles/mcuboot_head_move_stm32f4_writeback.yaml).
+Run any of them with the normal audit CLI after the current-head assets are available:
 
 ```bash
 python3 scripts/audit_bootloader.py \
@@ -209,6 +221,7 @@ python3 scripts/audit_bootloader.py \
 For real NuttX nxboot artifacts, the runtime profile generator exposes the
 `sector_boundary_writeback` campaign; see the command in
 [`targets/nuttx_nxboot/README.md`](targets/nuttx_nxboot/README.md).
+See [`docs/mcuboot-writeback-triage.md`](docs/mcuboot-writeback-triage.md) for the MCUboot write-back durability triage across STM32F4 and nRF52840 swap-scratch and swap-move profiles.
 
 ## Quick start
 
@@ -359,7 +372,9 @@ flowchart TD
 
 ### Fault types
 
-28 implemented fault types and semantic selectors across 8 backend categories:
+28 fault types and semantic selectors are implemented across 8 backend
+categories. Implemented means the planner and runtime accept the type. Fewer
+types run against real upstream firmware; the coverage list follows the table.
 
 | Category        | Fault types                                                                                                                                                                                    | Backend requirement                         |
 | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
@@ -371,6 +386,32 @@ flowchart TD
 | Driver error    | `driver_error`, `rc_injection`                                                                                                                                                                 | Instrumented driver / Arm execute mode      |
 | I2C bus         | `i2c_nack`, `i2c_timeout`, `i2c_bit_flip`, `i2c_truncated`, `i2c_wrong_address`                                                                                                                | I2CFaultProxy                               |
 | OTP fuse        | `otp_partial_program`, `otp_stuck_bit`, `otp_read_disturb`, `otp_overblow`, `otp_blow_nop`                                                                                                     | OTPMemory                                   |
+
+Profile coverage by firmware provenance, counted from the effective
+`fault_types` of every `profiles/*.yaml` and from the presets in
+[`targets/nuttx_nxboot/generate_runtime_profile.py`](targets/nuttx_nxboot/generate_runtime_profile.py)
+and [`targets/tf_m_bl2/generate_runtime_profile.py`](targets/tf_m_bl2/generate_runtime_profile.py).
+Real upstream firmware means a bootloader ELF under
+`results/oss_validation/assets/` or a generated NuttX nxboot or TF-M BL2 AN521 profile.
+
+- Twelve types run in at least one profile against real upstream firmware and all twelve have recorded campaign reports:
+  `power_loss`, `swap_progress`, `bit_corruption`, `interrupted_erase`,
+  `silent_write_failure`, `write_disturb`, `write_rejection`,
+  `multi_sector_atomicity`, `wear_leveling_corruption`, `instruction_skip`,
+  `driver_error`, and `rc_injection`. MCUboot profiles cover and have recorded runs for all twelve. The
+  NuttX generator presets cover `power_loss`, `swap_progress`, and
+  `interrupted_erase`, the NuttX multi-fault canary also passes
+  `bit_corruption` and `instruction_skip` to the generator, and the TF-M BL2
+  AN521 generator presets cover `power_loss`.
+- Seven types run only against synthetic firmware under `examples/`:
+  `reset_at_time`, `command_drop`, `otp_partial_program`, `otp_stuck_bit`,
+  `otp_read_disturb`, `otp_blow_nop`, and `nvs_corruption`. The last one
+  appears only in `examples/nvs_config_migration/profile.yaml`.
+- Nine types appear in no profile and are exercised only by the pytest suites
+  under `tests/`: `security_state_erase`, `read_bit_flip`,
+  `timed_bit_corruption`, `otp_overblow`, and all five `i2c_*` types.
+
+See [`docs/mcuboot-fault-type-coverage.md`](docs/mcuboot-fault-type-coverage.md) for the recorded fault-type execution inventory and point-level outcomes across real upstream MCUboot profiles.
 
 Faults can be injected at different lifecycle stages: during the initial update write path, during pre-boot metadata/setup writes (`metadata_fault`), during between-boot confirm/accept hooks (`hook_fault`), during the recovery write path itself (`phase2_fault`), or as compound sequences (`multi_fault`). The optional `durability_model: writeback` currently supports ordinary trace-reconstructable write paths. Lifecycle/compound and erase-atomicity combinations are rejected as incomplete until their persisted-state provenance can be reconstructed safely.
 
@@ -413,14 +454,9 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the complete 
 
 ### Real upstream integrations
 
-**MCUboot** -- narrow canary profiles against MCUboot HEAD, retroactive differential profiles for 6 known bugs (broken/fixed pairs for PRs #2100, #2109, #2199, #2205, #2206, #2214), geometry-variant profiles, and multi-step exploratory scenarios with semantic probes and invariant checking. Platforms include nRF52840 (NVMC) and STM32F4. The MCUboot differentials cover three distinct fault-resilience bug classes (revert-magic corruption, header-reload-after-resume, stuck-revert-trailer) -- each was also checked against the other swap algorithms to test for cross-algorithm variants. See `profiles/mcuboot_*.yaml` and [`targets/mcuboot/`](targets/mcuboot/).
+**MCUboot** covers narrow canary profiles against MCUboot HEAD, retroactive broken and fixed differential profiles for 4 known bugs, geometry-variant profiles, and multi-step exploratory scenarios with semantic probes and invariant checking on nRF52840 NVMC and STM32F4. The four retained historical PR differentials separate broken from fixed firmware: `#2100` for revert-magic corruption, `#2109` for header reload after resume, `#2199` for a stuck revert trailer on the control boot, and `#2214` for swap-offset sector-index calculation, while the candidate pairs for `#1597`, `#2205`, and `#2206` were removed as documented in [`docs/mcuboot-differentials.md`](docs/mcuboot-differentials.md). Each validated bug class was also checked against the other swap algorithms to test for cross-algorithm variants. See `profiles/mcuboot_*.yaml` and [`targets/mcuboot/`](targets/mcuboot/).
 
-The current-head STM32F4 swap-scratch profiles use dedicated mirrored-bank
-assets. Their 2 MiB STM32F429 layout places 224 KiB slots at `0x08008000` and
-`0x08108000`, with a 128 KiB scratch sector at flash offset `0x40000`; the
-slots each span the final two of a bank's four 16 KiB sectors, its 64 KiB
-sector, and one 128 KiB sector. These assets are separate from the historical
-PR2205 images, which intentionally retain their older asymmetric layout.
+The current-head STM32F4 swap-scratch profiles use dedicated mirrored-bank STM32F429 assets. Their 2 MiB STM32F429 layout places 224 KiB slots at `0x08008000` and `0x08108000`, with a 128 KiB scratch sector at flash offset `0x40000`; the slots each span the final two of a bank's four 16 KiB sectors, its 64 KiB sector, and one 128 KiB sector.
 
 To rebuild the MCUboot matrix assets, make an Arm GNU toolchain available,
 bootstrap the pinned Zephyr and MCUboot workspace, and then run the matrix
@@ -432,29 +468,19 @@ export GNUARMEMB_TOOLCHAIN_PATH=/path/to/arm-gnu-toolchain
 ./scripts/build_mcuboot_head_matrix.sh
 ```
 
-The build script writes the generated ELFs and signed slot images under
-`results/oss_validation/assets/`. The normal and fast STM32F4 profiles share
-the current-head bootloader and mirrored slot images; the fast profile changes
-the Renode backend for execute-mode performance. The dedicated
-[`mcuboot_head_scratch_stm32f4_writeback.yaml`](profiles/mcuboot_head_scratch_stm32f4_writeback.yaml)
-profile applies the writeback durability model to this current-head geometry.
+`scripts/bootstrap_mcuboot_matrix_assets.sh` also accepts `BOOTSTRAP_SCOPE=full|head|pr2214|pr2214_geom|swaptable|stm32f4` for targeted rebuilds. The build scripts write the generated ELFs and signed slot images under `results/oss_validation/assets/`. [`scripts/check_mcuboot_swap_tables.py`](scripts/check_mcuboot_swap_tables.py) verifies the compiled `boot_flash_map` and `flash_map` tables across all 26 tracked MCUboot ELFs, and [`scripts/check_mcuboot_images.py`](scripts/check_mcuboot_images.py) verifies the MCUboot headers, reset vectors, and profile slot alignment across all 34 tracked `.bin` payloads and 94 MCUboot profiles. The normal and fast STM32F4 profiles share the current-head bootloader and mirrored slot images; the fast profile changes the Renode backend for execute-mode performance. The dedicated [`mcuboot_head_scratch_stm32f4_writeback.yaml`](profiles/mcuboot_head_scratch_stm32f4_writeback.yaml), [`mcuboot_head_scratch_nrf52_writeback.yaml`](profiles/mcuboot_head_scratch_nrf52_writeback.yaml), [`mcuboot_head_move_nrf52_writeback.yaml`](profiles/mcuboot_head_move_nrf52_writeback.yaml), and [`mcuboot_head_move_stm32f4_writeback.yaml`](profiles/mcuboot_head_move_stm32f4_writeback.yaml) profiles apply the writeback durability model across swap-scratch and swap-move on STM32F4 and nRF52840.
+See [`docs/mcuboot-asset-provenance.md`](docs/mcuboot-asset-provenance.md) for the MCUboot ELF flash-map and slot-image provenance audit and rebuild inventory.
 
-**NuttX nxboot** -- real upstream NuttX firmware built from source. Board configs are upstream ([apache/nuttx#18509](https://github.com/apache/nuttx/pull/18509)). Tardigrade found a power-loss recovery vulnerability (92/94 failure rate) that led to fixes in both the NuttX kernel ([#18552](https://github.com/apache/nuttx/pull/18552)) and nxboot itself ([nuttx-apps#3428](https://github.com/apache/nuttx-apps/pull/3428)). The target adapter (`targets/nuttx_nxboot/`) includes a build script, runtime profile generator, and state probe. See [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/).
-The generator's `--campaign sector_boundary_writeback` preset emits a
-three-boot, power-loss profile using the sector-boundary image and writeback
-durability settings; it is a campaign entry point, not a new upstream finding.
+**NuttX nxboot** runs real upstream NuttX firmware built from source with upstream board configs from [apache/nuttx#18509](https://github.com/apache/nuttx/pull/18509). Tardigrade found a power-loss recovery vulnerability with 92 bricks out of 94 fault points that led to fixes in both the NuttX kernel in [#18552](https://github.com/apache/nuttx/pull/18552) and nxboot in [nuttx-apps#3428](https://github.com/apache/nuttx-apps/pull/3428). The target adapter in [`targets/nuttx_nxboot/`](targets/nuttx_nxboot/) includes a build script, runtime profile generator, and state probe. All four generated canary presets `baseline`, `sector_boundary_resume`, `metadata_erase_resume`, and `sector_boundary_writeback` have 12 completed verification reports under `results/nuttx_canary_verification/`, including all four CI-mode asserting runs with 0 issues, 0 bricks, and 0 timeouts.
+See [`docs/nuttx-canary-verification.md`](docs/nuttx-canary-verification.md) for the 12-run verification matrix across all four NuttX nxboot canary profiles.
 
 **rustBoot** -- an independent state probe and invariant package for the public
 MIT-licensed rustBoot partition/trailer protocol. No rustBoot prebuilt firmware
 is distributed. See [`targets/rustboot/`](targets/rustboot/) and
 [`docs/rustboot-target.md`](docs/rustboot-target.md) for the adapter reference.
 
-**Trusted Firmware-M BL2** -- a four-slot probe, multi-image acceptance
-invariants, persisted-snapshot evaluator, and path-neutral native-run template
-for locally built dual-image TF-M BL2 on MPS2 AN521. No TF-M firmware binary is
-distributed. The AN521 platform currently provides update-state observation,
-fault instrumentation, and register-driver compatibility; it does not validate
-live SAU/MPC memory isolation. See [`targets/tf_m_bl2/`](targets/tf_m_bl2/).
+**Trusted Firmware-M BL2** provides a four-slot probe, multi-image acceptance invariants, persisted-snapshot evaluator, source build script [`targets/tf_m_bl2/build_public_target.sh`](targets/tf_m_bl2/build_public_target.sh), and runtime profile generator [`targets/tf_m_bl2/generate_runtime_profile.py`](targets/tf_m_bl2/generate_runtime_profile.py) for dual-image TF-M `TF-Mv2.3.1` with MCUboot `v2.4.0` on MPS2 AN521. No TF-M firmware binary is distributed. Under `SWAP_USING_MOVE`, unconfirmed upgrades fail 33 of 33 fault points because interrupted swaps revert to the initial image while the clean control boots the staged image without confirming it, whereas confirmed upgrades with `image_ok=1` in the staged trailer and `OVERWRITE_ONLY` upgrades pass 33 of 33 and 3 of 3 fault points with 0 bricks. The AN521 platform provides update-state observation, fault instrumentation, and register-driver compatibility; it does not validate live SAU or MPC memory isolation. See [`targets/tf_m_bl2/`](targets/tf_m_bl2/).
+See [`docs/tfm-bl2-an521.md`](docs/tfm-bl2-an521.md) for the TF-M v2.3.1 BL2 AN521 build reproduction and swap-move fault-sweep findings.
 
 ### Reference examples
 
@@ -506,7 +532,6 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the full repo
 - **CBMC bridge** ([`scripts/cbmc_to_profile.py`](scripts/cbmc_to_profile.py)) -- converts CBMC counterexamples into tardigrade replay profiles, bridging formal verification and empirical fault injection.
 - **Fuzzer bridge** ([`scripts/fuzz_crash_to_profile.py`](scripts/fuzz_crash_to_profile.py)) -- converts libFuzzer/AFL/honggfuzz crash inputs into regression profiles; supports batch mode, staging-image injection, and auto-detection of fuzzer types. Workflow helpers live in [`scripts/fuzz_corpus.py`](scripts/fuzz_corpus.py), with an end-to-end template in [`examples/fuzzer_harness/`](examples/fuzzer_harness/). Legacy converter: `scripts/fuzz_to_profile.py`.
 - **Fuzzer harness preflight** ([`scripts/fuzzer_harness.py`](scripts/fuzzer_harness.py)) -- validates a known-valid seed and known-invalid control before a parser campaign. Setup errors, aborts, timeouts, malformed evidence, and mismatched controls are infrastructure failures, never findings.
-- **Geometry matrix** ([`scripts/geometry_matrix.py`](scripts/geometry_matrix.py)) -- parametric slot-layout permutations to catch geometry-dependent bugs.
 - **State fuzzer** -- structured metadata-state fuzzing via the `state_fuzzer` profile block, plus the MCUboot-specific scenario generator in [`targets/mcuboot/state_fuzzer.py`](targets/mcuboot/state_fuzzer.py).
 - **Update-protocol analyzer** ([`scripts/update_protocol_analyzer.py`](scripts/update_protocol_analyzer.py)) -- checks declarative commit paths for required security gates, metadata bindings, and authenticated content.
 - **Authenticated-equivalence campaign** ([`scripts/authenticated_equivalence.py`](scripts/authenticated_equivalence.py)) -- supports legacy duplicate/reorder and declarative coupled post-authentication copy/patch/replace mutations, then compares canonical semantic outcomes while preserving the authenticated identity. Explicit before/after evidence can also expose persistent security-state changes caused by rejected mutants. See [`docs/authenticated-equivalence.md`](docs/authenticated-equivalence.md).
@@ -526,10 +551,13 @@ See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the full repo
 | `action-validation.yml`               | push, PR                 | Validates the reusable GitHub Action  |
 | `oss-validation.yml`                  | path-filtered push to `main`, schedule, dispatch | OSS validation guards |
 | `mcuboot-head-exploratory.yml`        | workflow_dispatch        | MCUboot exploratory scenario          |
+| `mcuboot-head-zero-day.yml`           | schedule, dispatch       | MCUboot HEAD zero-day fault sweeps    |
 | `nuttx-nxboot-real-exploratory.yml`   | workflow_dispatch        | Real NuttX nxboot exploratory sweep   |
 | `nuttx-nxboot-revert-canary.yml`      | schedule, dispatch       | NuttX revert property canary          |
 | `nuttx-nxboot-multi-fault-canary.yml` | schedule, dispatch       | NuttX nxboot multi-fault sweep canary |
 | `renode-latest-canary.yml`            | schedule, dispatch       | Tests against latest Renode build     |
+
+See [`docs/zero-day-results.md`](docs/zero-day-results.md) for the zero-day sweep results across all six profiles in `mcuboot-head-zero-day.yml`.
 
 ## Repository layout
 
@@ -551,7 +579,6 @@ tardigrade/
 │   ├── fault_inject.py               # Fault injection helpers
 │   ├── partial_staging.py            # Partial staging-image simulation
 │   ├── render_results_html.py        # HTML report renderer
-│   ├── geometry_matrix.py            # Parametric slot-layout generator
 │   ├── boundary_campaigns.py         # Security-counter boundary expansion
 │   ├── security_state_layout.py      # Persistent erase-domain analysis
 │   ├── terminal_error_escape.py      # Emitted-ELF terminal-path analysis

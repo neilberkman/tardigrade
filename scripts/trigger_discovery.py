@@ -742,6 +742,13 @@ def _slot_erase_segments(profile: ProfileConfig, slot_name: str) -> List[Dict[st
     return segments
 
 
+def _is_mcuboot_swap_offset_profile(profile: ProfileConfig) -> bool:
+    raw = getattr(profile, "bootloader_algorithm", None)
+    if not isinstance(raw, str):
+        return False
+    return raw.strip().lower().replace("_", "-") == "swap-offset"
+
+
 def validate_swap_sector_geometry(profile: ProfileConfig) -> Dict[str, Any]:
     """Check whether exec/staging share a discovery-friendly sector layout."""
     family = _detect_bootloader_family(profile)
@@ -761,21 +768,37 @@ def validate_swap_sector_geometry(profile: ProfileConfig) -> Dict[str, Any]:
 
     exec_layout = [(seg["erase_size"], seg["overlap_size"]) for seg in exec_segments]
     staging_layout = [(seg["erase_size"], seg["overlap_size"]) for seg in staging_segments]
-    if (
-        exec_layout != staging_layout
-        or any(seg["partial"] for seg in exec_segments)
+    has_partial = (
+        any(seg["partial"] for seg in exec_segments)
         or any(seg["partial"] for seg in staging_segments)
+    )
+    if not has_partial and exec_layout == staging_layout:
+        return {
+            "status": "match",
+            "reason": "exec/staging slots share the same erase-sector layout",
+            "exec_segments": exec_segments,
+            "staging_segments": staging_segments,
+        }
+    if (
+        not has_partial
+        and _is_mcuboot_swap_offset_profile(profile)
+        and len(staging_layout) == len(exec_layout) + 1
+        and staging_layout[1:] == exec_layout
+        and staging_layout[:-1] == exec_layout
     ):
         return {
-            "status": "mismatch",
-            "reason": "exec/staging slots do not map cleanly onto the same erase-sector layout",
+            "status": "match",
+            "reason": (
+                "staging slot is one erase sector larger than exec slot "
+                "as required by swap-offset"
+            ),
             "exec_segments": exec_segments,
             "staging_segments": staging_segments,
         }
 
     return {
-        "status": "match",
-        "reason": "exec/staging slots share the same erase-sector layout",
+        "status": "mismatch",
+        "reason": "exec/staging slots do not map cleanly onto the same erase-sector layout",
         "exec_segments": exec_segments,
         "staging_segments": staging_segments,
     }

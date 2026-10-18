@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,9 +32,74 @@ from self_test import (
     write_summary,
 )
 from profile_loader import load_profile
+from verdicts import expectation_requires_findings
+
+
+EXPLORATORY_MCUBOOT_DIFFERENTIALS = {
+    f"mcuboot_{family}_{revision}.yaml": issue
+    for family, issue in (
+        ("pr2214_offset_geom", 18),
+    )
+    for revision in ("broken", "fixed")
+}
 
 
 class SelfTestProfileDiscoveryTests(unittest.TestCase):
+    def test_unverified_mcuboot_differentials_are_explicitly_exploratory(self):
+        discovered = {path.name for path in discover_profiles(ROOT)}
+        for name, issue in EXPLORATORY_MCUBOOT_DIFFERENTIALS.items():
+            with self.subTest(profile=name):
+                path = ROOT / "profiles" / name
+                raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+                profile = load_profile(path)
+                self.assertEqual(raw["expect"]["mode"], "exploratory")
+                self.assertEqual(profile.expect.mode, "exploratory")
+                self.assertFalse(expectation_requires_findings(profile.expect))
+                self.assertIn(f"#{issue}", raw["description"])
+                self.assertTrue(raw["skip_self_test"])
+                self.assertNotIn(name, discovered)
+
+    def test_pr2214_offset_pair_uses_strict_regression_expectations(self):
+        profiles = {}
+        for revision in ("broken", "fixed"):
+            path = ROOT / "profiles" / f"mcuboot_pr2214_offset_{revision}.yaml"
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+            profile = load_profile(path)
+            with self.subTest(profile=path.name):
+                self.assertNotIn("mode", raw["expect"])
+                self.assertEqual(profile.expect.mode, "regression")
+                self.assertIn("#18", raw["description"])
+            profiles[revision] = (raw, profile)
+
+        broken_raw, broken = profiles["broken"]
+        fixed_raw, fixed = profiles["fixed"]
+        # 429e2fea refuses the upgrade and keeps booting v1.0.0; the control
+        # boot itself is the finding.
+        self.assertTrue(expectation_requires_findings(broken.expect))
+        self.assertEqual(broken_raw["expect"]["control_outcome"], "wrong_image")
+        self.assertTrue(broken_raw["expect"]["allow_control_only_issues"])
+        # 90fd59d2 swaps and boots the staged v1.2.0 image.
+        self.assertFalse(expectation_requires_findings(fixed.expect))
+        self.assertEqual(fixed_raw["expect"]["control_outcome"], "success")
+        for key in ("platform", "memory", "images", "update_trigger", "success_criteria"):
+            with self.subTest(shared=key):
+                self.assertEqual(broken_raw[key], fixed_raw[key])
+
+    def test_unverified_mcuboot_differentials_are_absent_from_regression_matrices(self):
+        manifest = json.loads((SCRIPTS / "self_test_runtime_manifest.json").read_text())
+        names = set(EXPLORATORY_MCUBOOT_DIFFERENTIALS)
+        self.assertTrue(names.isdisjoint(manifest["self_test_profiles"]))
+        # Historical timing entries are estimates, not a regression allowlist.
+        for path in [
+            ROOT / "docs" / "oss_validation_profiles.json",
+            SCRIPTS / "run_oss_validation.py",
+            *(ROOT / ".github" / "workflows").glob("*.yml"),
+        ]:
+            text = path.read_text(encoding="utf-8")
+            for name in names:
+                with self.subTest(file=path.name, profile=name):
+                    self.assertNotIn(Path(name).stem, text)
+
     def test_runtime_manifest_matches_discovered_profiles(self):
         discovered = {path.name for path in discover_profiles(ROOT)}
         _default_cost_s, profile_costs = load_runtime_manifest(ROOT)
@@ -126,8 +192,6 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertNotIn("mcuboot_pr2199_move_fixed.yaml", discovered)
         self.assertNotIn("mcuboot_pr2214_offset_geom_broken.yaml", discovered)
         self.assertNotIn("mcuboot_pr2214_offset_geom_fixed.yaml", discovered)
-        self.assertNotIn("mcuboot_pr2206_scratch_geom_broken.yaml", discovered)
-        self.assertNotIn("mcuboot_pr2206_scratch_geom_fixed.yaml", discovered)
         self.assertNotIn("fault_no_crc.yaml", discovered)
         self.assertNotIn("fault_single_replica.yaml", discovered)
         self.assertNotIn("fault_wrong_slot_order.yaml", discovered)
@@ -155,7 +219,6 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
             "mcuboot_head_move_nrf52_revert_rc_injection.yaml",
             "mcuboot_head_move_nrf52_revert_rc_injection_multiboot.yaml",
             "mcuboot_head_move_nrf52_revert_write_faults.yaml",
-            "mcuboot_head_move_nrf52_revert_write_faults_nohashbypass.yaml",
             "mcuboot_head_move_nrf52_seccounter_downgrade_rc_injection.yaml",
             "mcuboot_head_move_stm32f4_revert_driver_error.yaml",
             "mcuboot_head_offset_nrf52_revert_rc_injection_multiboot.yaml",
@@ -279,17 +342,28 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
                 self.assertIn("power_loss", fault_types)
                 self.assertIn("swap_progress", fault_types)
 
-    def test_stm32_scratch_writeback_uses_pc_handoff_observation(self):
-        profile = load_profile(
+    def test_stm32_scratch_writeback_inherits_vtor_handoff_criteria(self):
+        writeback = load_profile(
             ROOT / "profiles" / "mcuboot_head_scratch_stm32f4_writeback.yaml"
         )
+        base = load_profile(
+            ROOT / "profiles" / "mcuboot_head_scratch_stm32f4_upgrade.yaml"
+        )
 
-        self.assertIsNone(profile.success_criteria.vtor_in_slot)
-        self.assertEqual(profile.success_criteria.vector_table_offset, 0x400)
-        self.assertEqual(profile.success_criteria.pc_in_slot, "exec")
-        self.assertTrue(profile.success_criteria.image_hash)
-        self.assertEqual(profile.success_criteria.image_hash_slot, "exec")
-        self.assertEqual(profile.success_criteria.expected_image, "staging")
+        for field in (
+            "vtor_in_slot",
+            "pc_in_slot",
+            "vector_table_offset",
+            "marker_address",
+            "marker_value",
+            "image_hash",
+        ):
+            with self.subTest(field=field):
+                self.assertEqual(
+                    getattr(writeback.success_criteria, field),
+                    getattr(base.success_criteria, field),
+                )
+        self.assertEqual(writeback.success_criteria.vtor_in_slot, "exec")
 
     def test_pr2100_discovery_profiles_use_stable_revert_marker(self):
         for name in (

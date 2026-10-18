@@ -180,12 +180,111 @@ def _predict_final_source(exec_slot: Mapping[str, Any], staging_slot: Mapping[st
     return "exec"
 
 
-def _hash_slot_bytes(slot_bytes: bytes, *, slot_size: int, page_size: int, pad_byte: int) -> str:
-    data_size = None
-    if int(slot_size) > int(page_size):
-        data_size = int(slot_size) - int(page_size)
+MCUBOOT_TLV_INFO_MAGIC = 0x6907
+MCUBOOT_TLV_PROT_INFO_MAGIC = 0x6908
+
+
+def _mcuboot_validated_image_extent(blob: bytes, slot_size: int = 0) -> Optional[int]:
+    if not blob or len(blob) < 32:
+        return None
+    if _read_u32_le(blob, 0) != MCUBOOT_IMAGE_MAGIC:
+        return None
+    ih_hdr_size, ih_protect_tlv_size, ih_img_size = struct.unpack_from("<HHI", blob, 8)
+    if ih_hdr_size < 32:
+        return None
+    prot_off = int(ih_hdr_size) + int(ih_img_size)
+    unprot_off = prot_off + int(ih_protect_tlv_size)
+    if ih_protect_tlv_size > 0:
+        if ih_protect_tlv_size < 4 or prot_off + 4 > len(blob):
+            return None
+        prot_magic, prot_tot = struct.unpack_from("<HH", blob, prot_off)
+        if prot_magic != MCUBOOT_TLV_PROT_INFO_MAGIC or prot_tot != ih_protect_tlv_size:
+            return None
+    if unprot_off + 4 > len(blob):
+        return None
+    tlv_magic, tlv_tot = struct.unpack_from("<HH", blob, unprot_off)
+    if tlv_magic != MCUBOOT_TLV_INFO_MAGIC or tlv_tot < 4:
+        return None
+    extent = unprot_off + int(tlv_tot)
+    if extent <= 0:
+        return None
+    if int(slot_size) > 0 and extent > int(slot_size):
+        return None
+    return extent
+
+
+def resolve_slot_hash_extent(
+    slot_bytes: bytes,
+    *,
+    slot_size: int,
+    slot_base: int = 0,
+    erase_regions: Any = None,
+    declared_sector_size: Optional[int] = None,
+) -> tuple[int, str]:
+    slot_size = int(slot_size)
+    mcu_extent = _mcuboot_validated_image_extent(slot_bytes, slot_size=slot_size)
+    if mcu_extent is not None:
+        return mcu_extent, "mcuboot_header"
+    if slot_size > 0:
+        slot_end = int(slot_base) + slot_size
+        last_addr = slot_end - 1
+        for entry in erase_regions or ():
+            try:
+                if isinstance(entry, Mapping):
+                    region_base = int(entry["base"])
+                    region_size = int(entry["size"])
+                    sector_size = int(entry.get("sector_size", entry.get("erase_size")))
+                    region_end = region_base + region_size
+                elif hasattr(entry, "base") and hasattr(entry, "size"):
+                    region_base = int(entry.base)
+                    region_size = int(entry.size)
+                    sector_size = int(entry.sector_size)
+                    region_end = region_base + region_size
+                else:
+                    region_base, region_end, sector_size = (
+                        int(entry[0]),
+                        int(entry[1]),
+                        int(entry[2]),
+                    )
+            except Exception:
+                continue
+            if region_base < 0 or region_end <= region_base or sector_size <= 0:
+                continue
+            if region_base <= last_addr < region_end:
+                sector_start = (
+                    region_base + ((last_addr - region_base) // sector_size) * sector_size
+                )
+                last_sector = min(sector_size, slot_end - max(int(slot_base), sector_start))
+                if 0 < last_sector < slot_size:
+                    return slot_size - last_sector, "last_erase_sector"
+        if declared_sector_size is not None and 0 < int(declared_sector_size) < slot_size:
+            return slot_size - int(declared_sector_size), "last_erase_sector"
+    data_size = slot_size - 4096 if slot_size > 4096 else slot_size
+    return data_size, "fallback_4096"
+
+
+def _hash_slot_bytes(
+    slot_bytes: bytes,
+    *,
+    slot_size: int,
+    page_size: int = 4096,
+    pad_byte: int = 0xFF,
+    slot_base: int = 0,
+    erase_regions: Any = None,
+    declared_sector_size: Optional[int] = None,
+) -> str:
+    eff_sector_size = declared_sector_size
+    if eff_sector_size is None and int(page_size) != 4096:
+        eff_sector_size = int(page_size)
+    data_size, _path = resolve_slot_hash_extent(
+        slot_bytes,
+        slot_size=int(slot_size),
+        slot_base=int(slot_base),
+        erase_regions=erase_regions,
+        declared_sector_size=eff_sector_size,
+    )
     raw = bytes(slot_bytes)
-    if data_size is not None:
+    if data_size > 0:
         if len(raw) >= data_size:
             raw = raw[:data_size]
         else:
@@ -252,6 +351,9 @@ def predict_boot_outcome(
             slot_size=int(slots["exec"]["size"]),
             page_size=int(slot_config.get("page_size", 4096)),
             pad_byte=int(slot_config.get("pad_byte", 0xFF)),
+            slot_base=int(slots["exec"]["base"]),
+            erase_regions=slot_config.get("erase_regions"),
+            declared_sector_size=slot_config.get("declared_sector_size"),
         )
         exec_hash = str(slot_config.get("image_exec_sha256", "") or "")
         staging_hash = str(slot_config.get("image_staging_sha256", "") or "")

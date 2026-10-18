@@ -487,9 +487,10 @@ build_test_app() {
         "${mcuboot_overlay}" > "${app_overlay}"
 
     msg "Building hello_world for ${name} (board=${board})"
-    # CONFIG_BOOTLOADER_MCUBOOT=y reserves header space (0x200) in the binary
-    # and links code at slot0_base + 0x200. Do NOT also use --pad-header in
-    # imgtool or you get a double header.
+    # CONFIG_BOOTLOADER_MCUBOOT=y reserves CONFIG_ROM_START_OFFSET bytes of
+    # header space in the binary and links code at slot0_base plus that
+    # offset. Do NOT also use --pad-header in imgtool or you get a double
+    # header.
     (
         cd "${ZEPHYR_WS}"
         ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb \
@@ -510,6 +511,24 @@ build_test_app() {
     )
 }
 
+# MCUboot jumps through the vector table at ih_hdr_size, and Zephyr links the
+# application vector table at CONFIG_ROM_START_OFFSET. That offset is 0x200 on
+# the pinned Zephyr 3.7 workspace, but current Zephyr defaults every STM32
+# MCUboot application to 0x400. Signing with a smaller header makes MCUboot
+# read zero padding and branch to address 0.
+app_rom_start_offset() {
+    local config="$1"
+    local value
+
+    require_file "${config}"
+    value="$(sed -n 's/^CONFIG_ROM_START_OFFSET=//p' "${config}")"
+    if [[ ! "${value}" =~ ^0x[0-9a-fA-F]+$ ]]; then
+        echo "ERROR: ${config} has no hex CONFIG_ROM_START_OFFSET (got '${value}')" >&2
+        exit 1
+    fi
+    echo "${value}"
+}
+
 sign_image() {
     local name="$1"
     local slot_size="$2"
@@ -520,7 +539,10 @@ sign_image() {
 
     local hex="${BUILD_TMP}/hello_${name}/zephyr/zephyr.hex"
     local bin="${BUILD_TMP}/hello_${name}/zephyr/zephyr.bin"
+    local app_config="${BUILD_TMP}/hello_${name}/zephyr/.config"
     local out="${ASSETS_DIR}/${out_name}"
+    local header_size
+    header_size="$(app_rom_start_offset "${app_config}")"
 
     local sign_input="${bin}"
     if [[ -n "${payload_size}" ]]; then
@@ -536,18 +558,22 @@ sign_image() {
     fi
 
     # App binary built with CONFIG_BOOTLOADER_MCUBOOT=y already reserves
-    # 0x200 bytes for the header. Do NOT use --pad-header (double header).
+    # CONFIG_ROM_START_OFFSET bytes for the header. Do NOT use --pad-header
+    # (double header).
     # Do NOT use --pad (fills to slot size, makes image huge and swap slow).
     # Profile system handles update_trigger (trailer magic) separately.
     "${IMGTOOL_PYTHON}" "${IMGTOOL_PY}" sign \
       --key "${MCUBOOT_REPO}/root-rsa-2048.pem" \
       --align "${align}" \
-      --header-size 0x200 \
+      --header-size "${header_size}" \
       --slot-size "${slot_size}" \
       --version "${version}" \
       "${sign_input}" "${out}"
 
-    msg "Signed image: ${out} (slot=${slot_size}, align=${align})"
+    "${IMGTOOL_PYTHON}" "${SCRIPT_DIR}/check_mcuboot_image_vectors.py" \
+      --image "${out}" --app-config "${app_config}"
+
+    msg "Signed image: ${out} (slot=${slot_size}, align=${align}, header=${header_size})"
 }
 
 make_offset_slot_image() {

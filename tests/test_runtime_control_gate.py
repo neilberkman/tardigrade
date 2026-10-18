@@ -131,6 +131,42 @@ class RuntimeControlGateTests(unittest.TestCase):
             self._run(self._profile(), failed, events)
         self.assertEqual(events, ["control"])
 
+    def test_wall_and_emulated_limits_remain_infrastructure_failures(self) -> None:
+        for reason in ("wall_timeout(121s)", "budget"):
+            with self.subTest(reason=reason):
+                events = []
+                failed = self._control_result()
+                failed["boot_outcome"] = "timeout"
+                failed["signals"].update(
+                    phase1_stop_reason=reason,
+                    phase1_emulated_s=2.0,
+                )
+                with self.assertRaisesRegex(RuntimeError, "observed 'timeout'") as error:
+                    self._run(self._profile(), failed, events)
+                self.assertIn(f"stop={reason!r}, emulated_s=2.0", str(error.exception))
+                self.assertEqual(events, ["control"])
+
+    def test_followup_timeout_error_preserves_cycle_and_stop_reason(self) -> None:
+        events = []
+        failed = self._control_result()
+        failed["boot_outcome"] = "timeout"
+        failed["boot_cycles"] = [
+            {
+                "cycle": 1,
+                "signals": {
+                    "phase_followup_stop_reason": "wall_timeout(121s)",
+                    "phase_followup_emulated_s": 1.2,
+                },
+            }
+        ]
+        with self.assertRaisesRegex(RuntimeError, "observed 'timeout'") as error:
+            self._run(self._profile(), failed, events)
+        self.assertIn(
+            "cycle 1 phase_followup stop='wall_timeout(121s)', emulated_s=1.2",
+            str(error.exception),
+        )
+        self.assertEqual(events, ["control"])
+
     def test_wrong_slot_control_is_rejected_before_dispatch(self) -> None:
         events = []
         with self.assertRaisesRegex(RuntimeError, "requires slot 'exec'"):
@@ -150,6 +186,137 @@ class RuntimeControlGateTests(unittest.TestCase):
                 events,
             )
         self.assertEqual(events, ["control"])
+
+    def test_image_hash_control_without_marker_is_validated_by_hash_evidence(self) -> None:
+        events = []
+        profile = SimpleNamespace(
+            name="image_hash_only_control",
+            expect=SimpleNamespace(control_outcome="success"),
+            success_criteria=SimpleNamespace(
+                pc_in_slot="exec",
+                vtor_in_slot="exec",
+                marker_address=None,
+                marker_value=None,
+                image_hash=True,
+                image_hash_slot="exec",
+                expected_image="staging",
+                allowed_images=[],
+            ),
+            fault_sweep=SimpleNamespace(sweep_hash_bypass_symbols=[]),
+        )
+        control_result = {
+            "fault_at": 1000000,
+            "boot_outcome": "success",
+            "boot_slot": "exec",
+            "signals": {
+                "marker_ok": True,
+                "marker_actual": "0x00000000",
+                "image_hash_match": "staging_image",
+                "matched_image": "staging",
+            },
+        }
+
+        results = self._run(profile, control_result, events)
+
+        self.assertEqual(events, ["control", "state_evaluator", "fault_batch"])
+        self.assertEqual(len(results), 2)
+
+    def test_image_hash_control_without_marker_rejects_missing_or_wrong_hash_evidence(self) -> None:
+        profile = SimpleNamespace(
+            name="image_hash_only_control",
+            expect=SimpleNamespace(control_outcome="success"),
+            success_criteria=SimpleNamespace(
+                pc_in_slot="exec",
+                vtor_in_slot="exec",
+                marker_address=None,
+                marker_value=None,
+                image_hash=True,
+                image_hash_slot="exec",
+                expected_image="staging",
+                allowed_images=[],
+            ),
+            fault_sweep=SimpleNamespace(sweep_hash_bypass_symbols=[]),
+        )
+        invalid_signals = (
+            {"marker_ok": True, "marker_actual": "0x00000000"},
+            {
+                "marker_ok": False,
+                "marker_actual": "0x00000000",
+                "image_hash_match": "staging_image",
+            },
+            {
+                "marker_ok": True,
+                "marker_actual": "0x00000000",
+                "image_hash_match": "unknown",
+            },
+            {
+                "marker_ok": True,
+                "marker_actual": "0x00000000",
+                "image_hash_match": "exec_image",
+                "matched_image": "exec",
+            },
+        )
+
+        for signals in invalid_signals:
+            with self.subTest(signals=signals):
+                events = []
+                control_result = {
+                    "fault_at": 1000000,
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "signals": dict(signals),
+                }
+                with self.assertRaisesRegex(RuntimeError, "Clean control failed"):
+                    self._run(profile, control_result, events)
+                self.assertEqual(events, ["control"])
+
+    def test_declared_marker_requirement_is_kept_when_image_hash_is_enabled(self) -> None:
+        profile = SimpleNamespace(
+            name="image_hash_with_declared_marker",
+            expect=SimpleNamespace(control_outcome="success"),
+            success_criteria=SimpleNamespace(
+                pc_in_slot="exec",
+                vtor_in_slot="exec",
+                marker_address=0x20000000,
+                marker_value=0xA11CE001,
+                image_hash=True,
+                image_hash_slot="exec",
+                expected_image="staging",
+                allowed_images=[],
+            ),
+            fault_sweep=SimpleNamespace(sweep_hash_bypass_symbols=[]),
+        )
+        missing_marker = {
+            "fault_at": 1000000,
+            "boot_outcome": "success",
+            "boot_slot": "exec",
+            "signals": {
+                "marker_ok": True,
+                "marker_actual": "0x00000000",
+                "image_hash_match": "staging_image",
+                "matched_image": "staging",
+            },
+        }
+        events = []
+        with self.assertRaisesRegex(RuntimeError, "expected marker 0xA11CE001"):
+            self._run(profile, missing_marker, events)
+        self.assertEqual(events, ["control"])
+
+        confirmed_both = {
+            "fault_at": 1000000,
+            "boot_outcome": "success",
+            "boot_slot": "exec",
+            "signals": {
+                "marker_ok": True,
+                "marker_actual": "0xA11CE001",
+                "image_hash_match": "staging_image",
+                "matched_image": "staging",
+            },
+        }
+        events = []
+        results = self._run(profile, confirmed_both, events)
+        self.assertEqual(events, ["control", "state_evaluator", "fault_batch"])
+        self.assertEqual(len(results), 2)
 
 
 if __name__ == "__main__":

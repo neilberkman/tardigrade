@@ -1,0 +1,29 @@
+base_profile: mcuboot_head_scratch_nrf52_upgrade.yaml
+
+schema_version: 1
+name: mcuboot_head_scratch_nrf52_writeback
+description: >
+  MCUboot current-HEAD swap-scratch upgrade on nrf52840dk with a writeback
+  durability model. Inherits the swap-scratch geometry and artifacts; only
+  power-loss cutpoints are selected.
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: staging
+state_probe:
+  script: targets/mcuboot/probe.py
+  required_paths:
+    - semantic_state.target
+    - semantic_state.slots.exec.magic_state
+    - semantic_state.slots.staging.magic_state
+    - semantic_state.flags.any_partial_magic
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  durability_model: writeback
+  writeback:
+    buffer_capacity: auto
+    erase_flushes_domain: false
+expect:
+  should_find_issues: true
+skip_self_test: true

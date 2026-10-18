@@ -540,6 +540,98 @@ class DiscoveryFeaturesTest(unittest.TestCase):
         self.assertIn("${PHASE2_WALL_TIMEOUT_S}", robot)
         self.assertIn("$phase2_wall_timeout_s=", robot)
 
+    def test_phase1_wall_timeout_defaults_and_serializes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            common = """
+                schema_version: 1
+                name: phase1_timeout_profile
+                description: phase1 timeout
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: {{ start: 0x20000000, end: 0x20020000 }}
+                  write_granularity: 4
+                  slots:
+                    exec: {{ base: 0x10000000, size: 0x1000 }}
+                    staging: {{ base: 0x10001000, size: 0x1000 }}
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  phase1_wall_timeout_s: {timeout}
+                expect:
+                  should_find_issues: false
+                """
+            profile = load_profile(
+                self._write_profile(
+                    tempdir, common.format(timeout="30.0")
+                )
+            )
+            self.assertEqual(profile.fault_sweep.phase1_wall_timeout_s, 30.0)
+            self.assertIn("PHASE1_WALL_TIMEOUT_S:30.0", profile.robot_vars(ROOT))
+
+            default_profile = load_profile(
+                self._write_profile(
+                    tempdir,
+                    common.format(timeout="30.0").replace(
+                        "phase1_wall_timeout_s: 30.0", ""
+                    ),
+                )
+            )
+            self.assertIsNone(default_profile.fault_sweep.phase1_wall_timeout_s)
+            self.assertFalse(
+                any(
+                    v.startswith("PHASE1_WALL_TIMEOUT_S:")
+                    for v in default_profile.robot_vars(ROOT)
+                )
+            )
+
+    def test_phase1_wall_timeout_rejects_non_positive_values(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            body = """
+                schema_version: 1
+                name: invalid_phase1_timeout
+                description: phase1 timeout
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  phase1_wall_timeout_s: 0
+                expect:
+                  should_find_issues: false
+                """
+            with self.assertRaisesRegex(ProfileError, "phase1_wall_timeout_s"):
+                load_profile(self._write_profile(tempdir, body))
+
+        runtime = (ROOT / "scripts" / "run_runtime_fault_sweep.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "phase1_wall_timeout_raw = get_optional_var('phase1_wall_timeout_s', '').strip()",
+            runtime,
+        )
+        robot = (ROOT / "tests" / "ota_fault_point.robot").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("${PHASE1_WALL_TIMEOUT_S}", robot)
+        self.assertIn("$phase1_wall_timeout_s=", robot)
+
     def test_semantic_assertions_and_invariants_annotate_results(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
@@ -2389,6 +2481,26 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             )
             self.assertFalse((tempdir / "worker_0" / "chunk_0000" / ".dotnet_bundle").exists())
             self.assertFalse((tempdir / "worker_0" / "chunk_0001" / ".dotnet_bundle").exists())
+
+            calls.clear()
+            with mock.patch("renode_runner.run_batch", side_effect=fake_run_batch):
+                _run_batches_chunked(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    fault_points=[1, 2],
+                    robot_vars=[],
+                    work_dir=tempdir / "worker_1",
+                    renode_remote_server_dir="",
+                    max_batch_points=1,
+                    shared_bundle_dir=tempdir / ".dotnet_bundle",
+                )
+            expected_worker1_bundle = tempdir / "worker_1" / ".dotnet_bundle"
+            self.assertEqual(
+                [bundle for _work, bundle, _points in calls],
+                [expected_worker1_bundle, expected_worker1_bundle],
+            )
 
     def test_run_batch_scales_robot_timeout_with_batch_size(self) -> None:
         with tempfile.TemporaryDirectory() as td:

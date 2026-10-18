@@ -193,6 +193,47 @@ class DeepMergeInheritanceTests(unittest.TestCase):
             # Inherited
             self.assertEqual(profile.success_criteria.vtor_in_slot, "exec")
 
+    def test_child_image_hash_override_clears_inherited_marker_unless_declared(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir) / "base.yaml"
+            base_path.write_text(
+                _BASE_YAML.replace(
+                    "  image_hash: true\n  expected_image: staging\n",
+                    "  marker_address: 0x10000014\n  marker_value: 0x00000101\n",
+                ),
+                encoding="utf-8",
+            )
+
+            child_no_marker = Path(tmpdir) / "child_no_marker.yaml"
+            child_no_marker.write_text(textwrap.dedent("""\
+                base_profile: base.yaml
+                name: child_hash_only
+                success_criteria:
+                  image_hash: true
+                  expected_image: staging
+            """), encoding="utf-8")
+
+            profile = load_profile(child_no_marker)
+            self.assertTrue(profile.success_criteria.image_hash)
+            self.assertIsNone(profile.success_criteria.marker_address)
+            self.assertIsNone(profile.success_criteria.marker_value)
+
+            child_with_marker = Path(tmpdir) / "child_with_marker.yaml"
+            child_with_marker.write_text(textwrap.dedent("""\
+                base_profile: base.yaml
+                name: child_hash_and_marker
+                success_criteria:
+                  image_hash: true
+                  expected_image: staging
+                  marker_address: 0x10000014
+                  marker_value: 0x00000101
+            """), encoding="utf-8")
+
+            profile_with_marker = load_profile(child_with_marker)
+            self.assertTrue(profile_with_marker.success_criteria.image_hash)
+            self.assertEqual(profile_with_marker.success_criteria.marker_address, 0x10000014)
+            self.assertEqual(profile_with_marker.success_criteria.marker_value, 0x00000101)
+
 
 class ChainInheritanceTests(unittest.TestCase):
     """A -> B -> C chain: grandchild inherits from child which inherits from base."""

@@ -20,6 +20,11 @@ beyond what the generic MCUboot invariants cover:
 """
 
 from invariants import InvariantViolation
+from targets.tf_m_bl2.probe import (
+    _magic_state,
+    boot_magic_decode,
+    mcuboot_trailer_magic,
+)
 
 
 def _joint_version_policy(config):
@@ -102,9 +107,30 @@ def _check_joint_versions(result, s_exec, ns_exec, config):
     )
 
 
-def _semantic_slot(result, slot_name):
-    """Extract a named slot dict from result.nvm_state.slots."""
+def _resolve_post_recovery_state(result, context=None):
+    """Return post-recovery semantic state when result.nvm_state is a fault snapshot."""
     state = result.nvm_state or {}
+    if not isinstance(state, dict):
+        return state
+    if state.get("stage") != "fault_snapshot" or not isinstance(context, dict):
+        return state
+    result_dict = context.get("result_dict")
+    if isinstance(result_dict, dict):
+        for key in ("recovery_semantic_state", "semantic_state"):
+            candidate = result_dict.get(key)
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("stage") != "fault_snapshot"
+                and isinstance(candidate.get("slots"), dict)
+            ):
+                return candidate
+    return state
+
+
+def _semantic_slot(result, slot_name, state=None):
+    """Extract a named slot dict from result.nvm_state.slots."""
+    if state is None:
+        state = result.nvm_state or {}
     if not isinstance(state, dict):
         return {}
     slots = state.get("slots", {})
@@ -114,15 +140,62 @@ def _semantic_slot(result, slot_name):
     return slot if isinstance(slot, dict) else {}
 
 
-def _is_multi_image(result):
+def _is_multi_image(result, state=None):
     """Check if this result came from a multi-image TF-M configuration."""
-    state = result.nvm_state or {}
+    if state is None:
+        state = result.nvm_state or {}
     if not isinstance(state, dict):
         return False
     flags = state.get("flags", {})
     if not isinstance(flags, dict):
         return False
     return bool(flags.get("multi_image", False))
+
+
+def _slot_bounds(slot):
+    try:
+        base = int(str(slot.get("base")), 0)
+        size = int(str(slot.get("size")), 0)
+    except (TypeError, ValueError):
+        return None
+    if size <= 0:
+        return None
+    return base, base + size
+
+
+def _trace_wrote_both_primary_trailers(result, s_exec, ns_exec, context):
+    """Return True unless trace evidence shows the fault preceded one primary trailer."""
+    if not isinstance(context, dict):
+        return True
+    write_spans = context.get("write_spans")
+    write_log = context.get("write_log")
+    if write_spans is None and write_log is None:
+        return True
+    s_bounds = _slot_bounds(s_exec)
+    ns_bounds = _slot_bounds(ns_exec)
+    if s_bounds is None or ns_bounds is None:
+        return True
+    fault_at = getattr(result, "fault_at", -1)
+    if isinstance(fault_at, int) and fault_at >= 0:
+        limit = fault_at + 1
+    else:
+        limit = None
+    addresses = []
+    if isinstance(write_spans, list):
+        items = write_spans[:limit] if limit is not None else write_spans
+        for span in items:
+            if isinstance(span, (list, tuple)) and span:
+                addresses.append(int(span[0]))
+    elif isinstance(write_log, list):
+        items = write_log[:limit] if limit is not None else write_log
+        for addr in items:
+            addresses.append(int(addr))
+    trailer_window = 0x1000
+    s_trailer_start = max(s_bounds[0], s_bounds[1] - trailer_window)
+    ns_trailer_start = max(ns_bounds[0], ns_bounds[1] - trailer_window)
+    s_touched = any(s_trailer_start <= addr < s_bounds[1] for addr in addresses)
+    ns_touched = any(ns_trailer_start <= addr < ns_bounds[1] for addr in addresses)
+    return s_touched and ns_touched
 
 
 def check_tfm_multi_image_consistency(result, **context):
@@ -137,24 +210,71 @@ def check_tfm_multi_image_consistency(result, **context):
     This is a TF-M-specific risk because vanilla MCUboot with a single
     image cannot have this cross-image inconsistency.
     """
-    if not _is_multi_image(result):
+    state = _resolve_post_recovery_state(result, context)
+    if not _is_multi_image(result, state=state):
         return
 
-    s_exec = _semantic_slot(result, "secure_exec")
-    ns_exec = _semantic_slot(result, "ns_exec")
+    s_exec = _semantic_slot(result, "secure_exec", state=state)
+    ns_exec = _semantic_slot(result, "ns_exec", state=state)
 
     config = context.get("invariant_config") or {}
-    declared_policy = _joint_version_policy(config)
     if not s_exec or not ns_exec:
         raise ValueError(
             "multi-image consistency requires secure and non-secure slot evidence"
         )
 
+    if (
+        isinstance(state, dict)
+        and state.get("stage") == "fault_snapshot"
+        and not _trace_wrote_both_primary_trailers(result, s_exec, ns_exec, context)
+    ):
+        return
+
     s_copy_done = (s_exec.get("copy_done") or {}).get("state")
     ns_copy_done = (ns_exec.get("copy_done") or {}).get("state")
+    s_image_ok = (s_exec.get("image_ok") or {}).get("state")
+    ns_image_ok = (ns_exec.get("image_ok") or {}).get("state")
 
-    # If both are in the same state, no inconsistency.
+    # If both have matching copy_done state, check whether one slot completed
+    # a forward test swap (copy_done=set, image_ok=unset) while the other
+    # reverted to a confirmed image (copy_done=set, image_ok=set), then check
+    # any declared joint version policy.
     if s_copy_done == ns_copy_done:
+        if (
+            s_copy_done == "set"
+            and {s_image_ok, ns_image_ok} == {"set", "unset"}
+        ):
+            if s_image_ok == "unset":
+                inconsistent = (
+                    "secure slot completed forward test swap (image_ok=unset) "
+                    "while non-secure slot reverted (image_ok=set)"
+                )
+            else:
+                inconsistent = (
+                    "non-secure slot completed forward test swap (image_ok=unset) "
+                    "while secure slot reverted (image_ok=set)"
+                )
+            raise InvariantViolation(
+                invariant_name="tfm_multi_image_consistency",
+                description=(
+                    "Multi-image swap state inconsistency: {}. "
+                    "S and NS images are at different update stages, which may "
+                    "break the secure/non-secure interface contract.".format(
+                        inconsistent
+                    )
+                ),
+                result=result,
+                details={
+                    "secure_exec_copy_done": s_copy_done,
+                    "ns_exec_copy_done": ns_copy_done,
+                    "secure_exec_image_ok": s_image_ok,
+                    "ns_exec_image_ok": ns_image_ok,
+                    "secure_exec_magic": s_exec.get("magic_state"),
+                    "ns_exec_magic": ns_exec.get("magic_state"),
+                    "secure_exec_version": s_exec.get("version"),
+                    "ns_exec_version": ns_exec.get("version"),
+                },
+            )
         _check_joint_versions(
             result,
             s_exec,
@@ -263,15 +383,152 @@ def check_tfm_multi_image_acceptance_consistency(result, **context):
     )
 
 
-def check_tfm_no_partial_magic(result, **_):
-    """No slot should have partially-written trailer magic after recovery.
+def _parse_magic_bytes(raw_value):
+    if isinstance(raw_value, (bytes, bytearray)):
+        return bytes(raw_value)
+    if isinstance(raw_value, str):
+        text = raw_value.strip()
+        if text.lower().startswith("0x"):
+            text = text[2:]
+        if text and len(text) % 2 == 0:
+            try:
+                return bytes.fromhex(text)
+            except ValueError:
+                return None
+        return None
+    if isinstance(raw_value, (list, tuple)):
+        try:
+            return bytes(int(b) & 0xFF for b in raw_value)
+        except (TypeError, ValueError):
+            return None
+    return None
 
-    This is the same check as the vanilla MCUboot invariant but extended
-    to cover all 4 slots in multi-image mode. A partial magic write
-    indicates the power loss interrupted the atomic trailer update, and
-    the bootloader failed to detect/repair it on the recovery boot.
+
+def _slot_raw_magic(slot_data):
+    for key in ("magic_raw", "trailer_magic", "magic"):
+        if key in slot_data and slot_data[key] is not None:
+            parsed = _parse_magic_bytes(slot_data[key])
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _slot_mcuboot_magic(slot_data, align=8):
+    explicit = slot_data.get("mcuboot_magic")
+    if isinstance(explicit, str):
+        normalized = explicit.strip().lower()
+        if normalized in {"good", "bad", "unset"}:
+            return normalized
+    raw_bytes = _slot_raw_magic(slot_data)
+    if raw_bytes is not None:
+        return mcuboot_trailer_magic(raw_bytes, align=align)
+    magic_state = slot_data.get("magic_state")
+    if magic_state == "good":
+        return "good"
+    if magic_state == "unset":
+        return "unset"
+    return "bad"
+
+
+def _slot_has_partial_magic(slot_data, align=8):
+    if bool(slot_data.get("partial_magic", False)):
+        return True
+    raw_bytes = _slot_raw_magic(slot_data)
+    pad_bytes = _parse_magic_bytes(slot_data.get("magic_pad")) or b""
+    if raw_bytes is not None:
+        if _magic_state(raw_bytes, align=align, magic_pad=pad_bytes) not in {
+            "good",
+            "unset",
+        }:
+            return True
+    if "magic_state" in slot_data and slot_data.get("magic_state") is not None:
+        return slot_data.get("magic_state") not in {"good", "unset"}
+    if raw_bytes is not None:
+        return False
+    return _slot_mcuboot_magic(slot_data, align=align) not in {"good", "unset"}
+
+
+def _recovery_booted_valid_image_pair(result, state, context=None):
+    if getattr(result, "boot_outcome", None) != "success":
+        return False
+    result_dict = (
+        context.get("result_dict") if isinstance(context, dict) else None
+    )
+    if isinstance(result_dict, dict):
+        final_outcome = result_dict.get("final_boot_outcome")
+        if final_outcome is not None and final_outcome != "success":
+            return False
+    boot_cycles = (
+        context.get("boot_cycles") if isinstance(context, dict) else None
+    )
+    if boot_cycles is None and isinstance(result_dict, dict):
+        boot_cycles = result_dict.get("boot_cycles")
+    if isinstance(boot_cycles, list):
+        for cycle in boot_cycles:
+            if (
+                isinstance(cycle, dict)
+                and cycle.get("outcome") is not None
+                and cycle.get("outcome") != "success"
+            ):
+                return False
+    multi_boot = (
+        context.get("multi_boot_analysis")
+        if isinstance(context, dict)
+        else None
+    )
+    if multi_boot is None and isinstance(result_dict, dict):
+        multi_boot = result_dict.get("multi_boot_analysis")
+    if isinstance(multi_boot, dict) and multi_boot.get("all_succeeded") is False:
+        return False
+
+    slots = state.get("slots") if isinstance(state, dict) else None
+    if not isinstance(slots, dict):
+        return False
+    align = state.get("trailer_align", 8) if isinstance(state, dict) else 8
+    primary_names = (
+        ("secure_exec", "ns_exec")
+        if _is_multi_image(result, state=state)
+        else ("exec",)
+    )
+    for slot_name in primary_names:
+        slot = slots.get(slot_name)
+        if not isinstance(slot, dict):
+            return False
+        if (
+            _slot_has_partial_magic(slot, align=align)
+            or _slot_mcuboot_magic(slot, align=align) != "good"
+        ):
+            return False
+        version = slot.get("version")
+        if not isinstance(version, dict) or version.get("state") != "valid":
+            return False
+    if _is_multi_image(result, state=state) and isinstance(context, dict):
+        config = context.get("invariant_config") or {}
+        try:
+            _check_joint_versions(
+                result,
+                slots["secure_exec"],
+                slots["ns_exec"],
+                config,
+            )
+        except (InvariantViolation, ValueError):
+            return False
+    return True
+
+
+def check_tfm_no_partial_magic(result, **context):
+    """Flag partially-written trailer magic when decoded as good or blocking recovery.
+
+    MCUboot's boot_read_swap_state() reads the 16-byte magic at boot_magic_off()
+    (slot_end - 16) and classifies it as BOOT_MAGIC_UNSET if all 0xFF, or via
+    boot_magic_decode() (memcmp against BOOT_IMG_MAGIC) as BOOT_MAGIC_GOOD on an
+    exact 16-byte match and BOOT_MAGIC_BAD otherwise. In boot_find_status() and
+    boot_swap_tables(), BOOT_MAGIC_BAD is never accepted as a valid trailer magic
+    and does not trigger a swap. A half-written or half-erased magic that MCUboot
+    decodes as BOOT_MAGIC_BAD is therefore benign when recovery boots a valid
+    image pair.
     """
-    state = result.nvm_state or {}
+    state = _resolve_post_recovery_state(result, context)
     if not isinstance(state, dict):
         raise ValueError("TF-M trailer invariant requires nvm_state mapping")
 
@@ -281,7 +538,11 @@ def check_tfm_no_partial_magic(result, **_):
     if not isinstance(slots, dict):
         raise ValueError("TF-M trailer invariant requires a slots mapping")
 
+    align = state.get("trailer_align", 8)
+    recovery_ok = _recovery_booted_valid_image_pair(result, state, context)
+
     invalid_slots = []
+    slot_magic_details = {}
     for slot_name, slot_data in slots.items():
         if not isinstance(slot_data, dict):
             raise ValueError(
@@ -289,8 +550,15 @@ def check_tfm_no_partial_magic(result, **_):
                     slot_name
                 )
             )
-        if slot_data.get("magic_state") not in {"good", "unset"}:
+        if not _slot_has_partial_magic(slot_data, align=align):
+            continue
+        mcuboot_magic = _slot_mcuboot_magic(slot_data, align=align)
+        if mcuboot_magic == "good" or not recovery_ok:
             invalid_slots.append(slot_name)
+            slot_magic_details[slot_name] = {
+                "magic_state": slot_data.get("magic_state"),
+                "mcuboot_magic": mcuboot_magic,
+            }
 
     if not invalid_slots:
         return
@@ -299,14 +567,17 @@ def check_tfm_no_partial_magic(result, **_):
         invariant_name="tfm_no_partial_magic",
         description=(
             "TF-M BL2 trailer magic was invalid after recovery in slot(s): {}. "
-            "The bootloader did not leave a valid or erased trailer state.".format(
+            "The bootloader either decoded a partial trailer magic as good or "
+            "failed to boot a valid image pair.".format(
                 ", ".join(sorted(invalid_slots))
             )
         ),
         result=result,
         details={
             "invalid_slots": invalid_slots,
-            "multi_image": _is_multi_image(result),
+            "slot_magic": slot_magic_details,
+            "recovery_booted_valid_pair": recovery_ok,
+            "multi_image": _is_multi_image(result, state=state),
         },
     )
 

@@ -141,9 +141,170 @@ def test_self_test_check_verdict_accepts_control_issue_with_success_baseline():
     assert reason == "Control exhibits expected success, as intended"
 
 
+def _intentional_control_only_report(
+    outcome: str = "wrong_image",
+    *,
+    intentional_control_only: bool = True,
+    complete: bool = True,
+) -> dict:
+    sweep = _control_only_summary_with_issue(outcome)
+    sweep.update(
+        {
+            "campaign_complete": complete,
+            "campaign_intentionally_control_only": intentional_control_only,
+            "configured_fault_types": ["power_loss"],
+            "calibration_coverage": {
+                "status": "unavailable",
+                "reason": "No calibration write, exact program, or erase trace available.",
+            },
+            "campaign_integrity": {
+                "complete": complete,
+                "intentional_control_only": intentional_control_only,
+                "requested": 0,
+                "returned": 0,
+                "injected": 0,
+                "control_points": 1,
+                "expected_control_points": 1,
+                "control_timeouts": 0,
+                "control_infrastructure_errors": 0,
+                "control_skipped": 0,
+                "malformed_controls": 0,
+                "faulted_controls": 0,
+                "incomplete": 0,
+                "infrastructure_errors": 0,
+                "timeouts": 0,
+            },
+        }
+    )
+    return {
+        "verdict": "PASS — control exhibits expected {}".format(outcome),
+        "summary": {"runtime_sweep": sweep},
+    }
+
+
+def test_self_test_check_verdict_accepts_intentional_control_only_without_calibration():
+    profile_path = ROOT / "profiles" / "mcuboot_pr2214_offset_broken.yaml"
+    profile_raw = {
+        "fault_sweep": {
+            "mode": "runtime",
+            "evaluation_mode": "execute",
+            "max_writes": 0,
+            "fault_types": ["power_loss"],
+        },
+        "expect": {
+            "control_outcome": "wrong_image",
+            "allow_control_only_issues": True,
+            "should_find_issues": True,
+        },
+    }
+    passed, reason = check_verdict(
+        profile_path,
+        profile_raw,
+        _intentional_control_only_report("wrong_image"),
+        0,
+    )
+    assert passed is True
+    assert reason == "Control exhibits expected wrong_image, as intended"
+
+
+def test_self_test_check_verdict_rejects_intentional_control_only_outcome_mismatch():
+    profile_raw = {
+        "fault_sweep": {
+            "max_writes": 0,
+            "fault_types": ["power_loss"],
+        },
+        "expect": {
+            "control_outcome": "wrong_image",
+            "allow_control_only_issues": True,
+            "should_find_issues": True,
+        },
+    }
+    passed, reason = check_verdict(
+        ROOT / "profiles" / "mcuboot_pr2214_offset_broken.yaml",
+        profile_raw,
+        _intentional_control_only_report("success"),
+        0,
+    )
+    assert passed is False
+    assert reason == "Control outcome 'success' != expected 'wrong_image'"
+
+
+def test_self_test_check_verdict_rejects_unintentional_zero_calibration_for_power_loss():
+    profile_raw = {
+        "fault_sweep": {
+            "max_writes": "auto",
+            "fault_types": ["power_loss"],
+        },
+        "expect": {
+            "control_outcome": "wrong_image",
+            "allow_control_only_issues": True,
+            "should_find_issues": True,
+        },
+    }
+    passed, reason = check_verdict(
+        ROOT / "profiles" / "mcuboot_pr2214_offset_broken.yaml",
+        profile_raw,
+        _intentional_control_only_report(
+            "wrong_image",
+            intentional_control_only=False,
+        ),
+        0,
+    )
+    assert passed is False
+    assert "No calibration write" in reason
+
+
+def test_self_test_check_verdict_rejects_incomplete_or_invalid_control_only_reports():
+    profile_raw = {
+        "fault_sweep": {
+            "max_writes": 0,
+            "fault_types": ["power_loss"],
+        },
+        "expect": {
+            "control_outcome": "wrong_image",
+            "allow_control_only_issues": True,
+            "should_find_issues": True,
+        },
+    }
+    incomplete_report = _intentional_control_only_report(
+        "wrong_image",
+        complete=False,
+    )
+    passed, reason = check_verdict(
+        ROOT / "profiles" / "mcuboot_pr2214_offset_broken.yaml",
+        profile_raw,
+        incomplete_report,
+        0,
+    )
+    assert passed is False
+    assert "incomplete" in reason.lower()
+
+    infra_report = _intentional_control_only_report("wrong_image")
+    infra_report["summary"]["runtime_sweep"]["campaign_integrity"][
+        "control_infrastructure_errors"
+    ] = 1
+    passed, reason = check_verdict(
+        ROOT / "profiles" / "mcuboot_pr2214_offset_broken.yaml",
+        profile_raw,
+        infra_report,
+        0,
+    )
+    assert passed is False
+    assert "control_infrastructure_errors" in reason
+
+    passed, reason = check_verdict(
+        ROOT / "profiles" / "mcuboot_pr2214_offset_broken.yaml",
+        profile_raw,
+        _intentional_control_only_report("wrong_image"),
+        2,
+    )
+    assert passed is False
+    assert "infrastructure failure" in reason.lower()
+
+
 def test_self_test_check_verdict_requires_declared_issue_reason():
     passed, reason = check_verdict(
-        Path("profiles/mcuboot_pr2206_scratch_geom_broken.yaml"),
+        Path("profiles/synthetic_broken.yaml"),
         {
             "expect": {
                 "should_find_issues": True,

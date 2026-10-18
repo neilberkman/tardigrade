@@ -44,6 +44,7 @@ success_criteria:
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
+  quick_use_heuristic: true
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "20.0"

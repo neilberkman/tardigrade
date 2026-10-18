@@ -62,9 +62,16 @@ The format follows [common-changelog](https://common-changelog.org/).
   explicitly configured selectors remain fail-closed.
 - Renode-test receives the configured Robot timeout so healthy long-running
   controls are not terminated by its shorter default suite timeout.
+- The README states that MCUboot PR #2199 is detected by the control-boot
+  state probe rather than by a fault point, documents the four retained MCUboot
+  PR differentials and the removal of the PR #1597, PR #2205, and PR #2206
+  pairs, and lists which fault types run against real upstream firmware.
 
 ### Fixed
 
+- Generated NuttX nxboot campaigns allow 120 seconds of recovery wall time,
+  including clean-control follow-ups; control failures include phase and cycle
+  stop reasons while remaining infrastructure failures.
 - Heuristic sweeps now fail before planning when their selected backend lacks
   an address-bearing write trace, while direct word-write MRAM-style memory
   supplies width-aware traces for tiered planning and replay. Explicit
@@ -102,6 +109,20 @@ The format follows [common-changelog](https://common-changelog.org/).
   campaign reports before evaluating expected findings.
 - OSS validation initializes and verifies a clean managed source worktree
   before attributing a built target to its exact revision.
+- The MCUboot HEAD matrix build signs each test image with the application's
+  `CONFIG_ROM_START_OFFSET` instead of a fixed 0x200 header and fails when the
+  vector table at the signed header size is not a real handoff target. Current
+  Zephyr links STM32 MCUboot applications at 0x400, so the zero-day STM32F4
+  writeback sweep had been branching to address 0 and reporting
+  `INCONCLUSIVE -- could not trigger firmware update`. The writeback profile
+  again inherits the base VTOR and marker success criteria.
+- Verified all four NuttX nxboot canary presets across 12 runs in `docs/nuttx-canary-verification.md`.
+- Audited the MCUboot PR differential pairs in `docs/mcuboot-differentials.md`, verified all six profiles in `.github/workflows/mcuboot-head-zero-day.yml` in `docs/zero-day-results.md`, and removed the non-separating PR #1597, PR #2205, and PR #2206 pairs, their dedicated ELFs and images, and their helper scripts.
+- Added `scripts/check_mcuboot_swap_tables.py` and `scripts/check_mcuboot_images.py` with `docs/mcuboot-asset-provenance.md` and `docs/mcuboot-pr2214-swap-offset.md`, rebuilt the PR #2214 nRF52840 swap-offset ELFs and `0x74000`-padded slot-1 image so `mcuboot_pr2214_offset_broken.yaml` and `mcuboot_pr2214_offset_fixed.yaml` separate on the control boot, and rebuilt `mcuboot_pr2199_move_{broken,fixed}.elf`, `mcuboot_head_offset.elf`, `mcuboot_pr2214_offset_geom_{broken,fixed}.elf`, and the full-slot offset images.
+- Added `targets/tf_m_bl2/build_public_target.sh` and `targets/tf_m_bl2/generate_runtime_profile.py` for upstream `TF-Mv2.3.1` with MCUboot `v2.4.0` on MPS2 AN521, updated `scripts/run_runtime_fault_sweep.py` to preserve non-slot memory regions before Phase 1 when `erase_all_slots` is enabled, and documented the `SWAP_USING_MOVE` unconfirmed, confirmed, and `OVERWRITE_ONLY` findings in `docs/tfm-bl2-an521.md`.
+- Updated `scripts/run_runtime_fault_sweep.py` to count `rc_injection` points toward calibration write requirements and route `driver_error` and `rc_injection` through `fault_peripheral`, added `profiles/mcuboot_head_nrf52_driver_faults.yaml`, and recorded runs for all 12 MCUboot fault types in `docs/mcuboot-fault-type-coverage.md`.
+- Fixed the `FaultTracker` writeback overlay so erase operations evict overlapping uncommitted buffered writes instead of replaying stale pre-erase bytes, added `mcuboot_head_scratch_nrf52_writeback.yaml`, `mcuboot_head_move_nrf52_writeback.yaml`, and `mcuboot_head_move_stm32f4_writeback.yaml` with `docs/mcuboot-writeback-triage.md`, and ran exhaustive 100-branch sweeps across all 12 MCUboot instruction-skip profiles in `docs/mcuboot-instruction-skip-results.md`.
+- Raised `profiles/mcuboot_stm32f4_upgrade.yaml` to `run_duration: "3.3"` and `max_step_limit: 330000000` so STM32F4 128 KB swap-move calibration completes all 393,242 byte-program transitions instead of stopping at 100,000,000 instructions, enabled `quick_use_heuristic: true` on the four PR #2100 profiles, removed `sweep_hash_bypass_symbols` from `mcuboot_pr2109_scratch_broken.yaml` and `mcuboot_pr2109_scratch_fixed.yaml` so `bootutil_img_validate` executes on swap-scratch resume, and gated all 14 remaining `profiles/mcuboot_pr*.yaml` profiles under `--quick --workers 2` in `docs/mcuboot-differentials.md`.
 
 ## [0.5.0] - 2026-07-10
 

@@ -1371,24 +1371,72 @@ def run_batch(
             shutil.rmtree(temp_root, ignore_errors=True)
 
 
+def _group_fault_plan_by_type(
+    fault_points: List[int],
+    fault_types_list: Optional[List[str]],
+) -> List[Tuple[str, List[int], Optional[List[str]]]]:
+    """Group contiguous fault points that share the same base fault-type code."""
+    if not fault_points:
+        return []
+    if not fault_types_list:
+        return [("w", list(fault_points), None)]
+
+    runs: List[Tuple[str, List[int], Optional[List[str]]]] = []
+    for fp, ft in zip(fault_points, fault_types_list):
+        base_ft = _base_fault_type_code(ft) or "w"
+        if not runs or runs[-1][0] != base_ft:
+            runs.append((base_ft, [fp], [ft]))
+        else:
+            runs[-1][1].append(fp)
+            assert runs[-1][2] is not None
+            runs[-1][2].append(ft)
+    return runs
+
+
 def _split_batch_plan(
     fault_points: List[int],
     fault_types_list: Optional[List[str]],
     max_batch_points: int,
+    max_batch_points_by_type: Optional[Dict[str, int]] = None,
 ) -> List[Tuple[List[int], Optional[List[str]]]]:
-    """Split fault points/types into fixed-size batches."""
-    if max_batch_points <= 0 or len(fault_points) <= max_batch_points:
+    """Split fault points/types into batches without mixing base fault types."""
+    if not fault_points:
         return [(fault_points, fault_types_list)]
 
-    plan: List[Tuple[List[int], Optional[List[str]]]] = []
-    for i in range(0, len(fault_points), max_batch_points):
-        chunk_points = fault_points[i:i + max_batch_points]
-        chunk_types = (
-            fault_types_list[i:i + max_batch_points]
-            if fault_types_list
-            else None
+    runs = _group_fault_plan_by_type(fault_points, fault_types_list)
+    if len(runs) <= 1 and not max_batch_points_by_type:
+        if max_batch_points <= 0 or len(fault_points) <= max_batch_points:
+            return [(fault_points, fault_types_list)]
+
+        plan: List[Tuple[List[int], Optional[List[str]]]] = []
+        for i in range(0, len(fault_points), max_batch_points):
+            chunk_points = fault_points[i:i + max_batch_points]
+            chunk_types = (
+                fault_types_list[i:i + max_batch_points]
+                if fault_types_list
+                else None
+            )
+            plan.append((chunk_points, chunk_types))
+        return plan
+
+    plan = []
+    for base_ft, run_points, run_types in runs:
+        run_limit = (
+            max_batch_points_by_type.get(base_ft, max_batch_points)
+            if max_batch_points_by_type
+            else max_batch_points
         )
-        plan.append((chunk_points, chunk_types))
+        if run_limit <= 0 or len(run_points) <= run_limit:
+            plan.append((run_points, run_types))
+            continue
+        for i in range(0, len(run_points), run_limit):
+            chunk_points = run_points[i:i + run_limit]
+            chunk_types = (
+                run_types[i:i + run_limit]
+                if run_types
+                else None
+            )
+            plan.append((chunk_points, chunk_types))
     return plan
 
 
@@ -1574,12 +1622,19 @@ def _run_batches_chunked(
     erase_trace_file_bin: Optional[str] = None,
     fault_types_list: Optional[List[str]] = None,
     max_batch_points: int = 0,
+    max_batch_points_by_type: Optional[Dict[str, int]] = None,
     keep_run_artifacts: bool = False,
     progress_label: str = "",
     shared_bundle_dir: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """Run one or more fault batches with optional fixed-size chunking."""
-    if shared_bundle_dir is None:
+    if (
+        shared_bundle_dir is None
+        or (
+            work_dir.name.startswith("worker_")
+            and shared_bundle_dir == work_dir.parent / ".dotnet_bundle"
+        )
+    ):
         shared_bundle_dir = work_dir / ".dotnet_bundle"
     shared_bundle_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1587,14 +1642,20 @@ def _run_batches_chunked(
         fault_points=fault_points,
         fault_types_list=fault_types_list,
         max_batch_points=max_batch_points,
+        max_batch_points_by_type=max_batch_points_by_type,
     )
 
     label_prefix = "{} ".format(progress_label) if progress_label else ""
 
     if len(plan) > 1:
+        max_chunk_points = (
+            max(len(cp) for cp, _ in plan)
+            if max_batch_points_by_type
+            else max_batch_points
+        )
         _progress(
             "{}sub-batching {} points into {} chunks (max {} points/chunk).".format(
-                label_prefix, len(fault_points), len(plan), max_batch_points
+                label_prefix, len(fault_points), len(plan), max_chunk_points
             )
         )
 

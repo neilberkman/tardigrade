@@ -1,9 +1,12 @@
 schema_version: 1
 name: mcuboot_head_move_nrf52_revert_full_fault_coverage
-description: "Fast-backend NVM fault coverage: exercises injectable write, erase, and\
-  \ controller faults supported by MappedMemory. Zero-day hunt: MCUboot HEAD swap-move revert on nrf52840dk. Default\
-  \ geometry (448KB slots). Images swapped, upgrade unconfirmed \u2014 MCUboot should\
-  \ revert to original. Different-sized images.\n"
+description: >
+  MCUboot HEAD swap-move revert on nrf52840dk across 10 write, erase, and
+  controller fault types with bootutil_img_validate bypassed during post-fault
+  reboots. Verified quick sweep runs 30 points across 23815 writes and 42
+  erases in 990.6s and passes with 0 issue points and 0 bricks, with 1
+  rc_injection tail point at 23814 dismissed as dos_only. Kept out of
+  self_test because execute-only flash sweeps exceed 300s wall time.
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
 bootloader:

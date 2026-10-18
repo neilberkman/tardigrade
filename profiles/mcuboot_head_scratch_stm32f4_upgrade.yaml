@@ -31,6 +31,7 @@ images:
 update_trigger: auto
 success_criteria:
   vtor_in_slot: exec
+  vector_table_offset: 0x200
   marker_address: 0x08008014
   marker_value: 0x00000101
 fault_sweep:

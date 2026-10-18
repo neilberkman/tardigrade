@@ -1,10 +1,14 @@
 schema_version: 1
+skip_self_test: true
 name: mcuboot_pr2214_offset_geom_fixed
 description: >
-  MCUboot swap-offset geometry trigger for PR #2214 (fixed commit 90fd59d2).
-  Companion seeded STM32F4 resume-state profile for the interrupted
-  swap-offset upgrade. The fixed revision resumes cleanly and converges back
-  to success across repeated boots.
+  MCUboot swap-offset after PR #2214 at 90fd59d2, paired with
+  mcuboot_pr2214_offset_geom_broken on the same STM32F429 mirrored-bank
+  non-uniform sector layout and the same staged v2.1.0 image with swap size
+  0x8000 at secondary offset 0x4000. find_last_idx returns last index 1, which
+  is below the first primary trailer sector 2, so the swap runs and the control
+  boot hands off to v2.1.0. Issue #18 and docs/mcuboot-pr2214-swap-offset.md
+  record the derivation.
 
 platform: platforms/stm32f4.repl
 flash_backend: faultFlash
@@ -12,49 +16,40 @@ flash_backend: faultFlash
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_pr2214_offset_geom_fixed.elf
   entry: 0x08000000
+  algorithm: swap-offset
 
 memory:
   sram: { start: 0x20000000, end: 0x20040000 }
   write_granularity: 4
   slots:
-    exec: { base: 0x0800C000, size: 0x76000 }
-    staging: { base: 0x08082000, size: 0x76000 }
+    exec: { base: 0x08008000, size: 0x18000 }
+    staging: { base: 0x08108000, size: 0x38000 }
 
 images:
-  exec: results/oss_validation/assets/zephyr_head_offset_stm32f4_slot0.bin
+  exec: results/oss_validation/assets/zephyr_head_scratch_stm32f4_pr2206_slot0.bin
   staging: results/oss_validation/assets/zephyr_slot1_offset_geom_full_offsetslot.bin
 
-pre_boot_state:
-  - { address: 0x08081FF0, u32: 0x676523FB }
-  - { address: 0x08081FF4, u32: 0x27388D84 }
-  - { address: 0x08081FF8, u32: 0xF6CB3E6C }
-  - { address: 0x08081FFC, u32: 0xC702C279 }
-  - { address: 0x08081F80, u32: 0x00000002 }
-  - { address: 0x08081F60, u32: 20532 }
-  - { address: 0x08081BD4, u32: 0x00000001 }
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: staging
+  max_align: 32
 
 success_criteria:
   vtor_in_slot: exec
+  marker_address: 0x08008014
+  marker_value: 0x00000102
 
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
-  boot_cycles: 3
   max_writes: auto
   max_writes_cap: 200000
-  run_duration: "10.0"
-  max_step_limit: 20000000
+  run_duration: "20.0"
+  max_step_limit: 200000000
   fault_types: [power_loss]
-
-semantic_assertions:
-  control:
-    multi_boot_analysis.status: converged
-    multi_boot_analysis.final_outcome: success
-
-invariants:
-  - multi_boot_converges
+  sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 
 expect:
+  mode: exploratory
   control_outcome: success
   should_find_issues: false
-skip_self_test: true

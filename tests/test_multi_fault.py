@@ -206,6 +206,16 @@ class TestStageRelativeRetarget(unittest.TestCase):
             )
         )
 
+    def test_runtime_multi_fault_sequence_retargets_overlong_stage_in_place(self) -> None:
+        source = (SCRIPTS / "run_runtime_fault_sweep.py").read_text(encoding="utf-8")
+        start = source.index("def run_multi_fault_sequence(fault_sequence):")
+        end = source.index("def decode_multi_fault_sequence_local(encoded):", start)
+        fn_block = source[start:end]
+        self.assertIn("stage_wall_timeout = phase1_wall_timeout(default_s=4.0)", fn_block)
+        self.assertIn("retarget_unreachable", fn_block)
+        self.assertIn("arm_vtor_watchpoint()", fn_block)
+        self.assertIn("stage_state['retargeted'] = True", fn_block)
+
 
 class TestMultiFaultEncoding(unittest.TestCase):
     """Test encode/decode round-trip for multi-fault sequences."""

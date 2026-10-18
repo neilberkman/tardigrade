@@ -3,20 +3,24 @@
 
 from __future__ import annotations
 
+import fnmatch
+import io
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import unittest
 import re
 from pathlib import Path
 
+from elftools.elf.elffile import ELFFile
+from elftools.elf.sections import SymbolTableSection
 import yaml
 
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "bootstrap_mcuboot_matrix_assets.sh"
-GEOM_SCRIPT = ROOT / "scripts" / "bootstrap_mcuboot_geometry_assets.sh"
 HEAD_MATRIX_SCRIPT = ROOT / "scripts" / "build_mcuboot_head_matrix.sh"
 ASSETS = ROOT / "results" / "oss_validation" / "assets"
 
@@ -28,12 +32,6 @@ from profile_loader import load_profile  # noqa: E402
 
 
 PR_DIFFERENTIAL_PROFILES = [
-    "mcuboot_pr2205_scratch_broken.yaml",
-    "mcuboot_pr2205_scratch_fixed.yaml",
-    "mcuboot_pr2206_scratch_broken.yaml",
-    "mcuboot_pr2206_scratch_fixed.yaml",
-    "mcuboot_pr2206_scratch_geom_broken.yaml",
-    "mcuboot_pr2206_scratch_geom_fixed.yaml",
     "mcuboot_pr2214_offset_broken.yaml",
     "mcuboot_pr2214_offset_fixed.yaml",
     "mcuboot_pr2214_offset_geom_broken.yaml",
@@ -50,7 +48,7 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
 
     def test_script_has_valid_bash_syntax(self) -> None:
         proc = subprocess.run(
-            ["bash", "-n", str(SCRIPT), str(GEOM_SCRIPT)],
+            ["bash", "-n", str(SCRIPT)],
             capture_output=True,
             text=True,
             check=False,
@@ -85,63 +83,67 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
     def test_script_builds_pr_differential_assets(self) -> None:
         text = SCRIPT.read_text(encoding="utf-8")
         for sha in (
-            "c21c3909",
-            "bbd0ee1e",
-            "e35461d2",
-            "08985c96",
-            "429e2fea",
-            "90fd59d2",
+            "36940db938a8f4a1e919496793ed439850a221c2",
+            "25e2761c669035c991dff115f03e34f1505bd97a",
+            "33094fc5a50096c8cbb3d2f443c4162a0ff08ea8",
+            "b893d34f564f454f454f3643b05b1e18fb457e5c",
+            "429e2fea24518f178cd4d33928cb66fcb0205803",
+            "90fd59d2f9e45c24d0833dd391dcdc932b3b1908",
         ):
             self.assertIn(sha, text)
         for asset in (
-            "pr2205_scratch_broken",
-            "pr2205_scratch_fixed",
-            "pr2206_scratch_broken",
-            "pr2206_scratch_fixed",
-            "pr2206_scratch_geom_broken",
-            "pr2206_scratch_geom_fixed",
-            "pr2214_offset_broken",
-            "pr2214_offset_fixed",
+            "pr2199_move_broken",
+            "pr2199_move_fixed",
+            "head_offset",
+            "pr2214_offset_nrf52_broken",
+            "pr2214_offset_nrf52_fixed",
             "pr2214_offset_geom_broken",
             "pr2214_offset_geom_fixed",
             "zephyr_head_scratch_stm32f4_pr2206_slot1.bin",
-            "zephyr_head_offset_stm32f4_slot1.bin",
             "zephyr_slot0_padded.bin",
             "zephyr_slot1_padded.bin",
             "zephyr_slot1_max.bin",
-            "zephyr_slot1_scratch_geom_max.bin",
-            "zephyr_slot1_scratch_geom_pr2206_boundary.bin",
+            "zephyr_slot1_pr2214_swap_0x74000_offsetslot.bin",
             "zephyr_slot1_offset_geom_full.bin",
         ):
             self.assertIn(asset, text)
+        self.assertNotIn('build_pr_bootloader_variant "pr2214_offset_broken"', text)
+        self.assertNotIn('build_pr_bootloader_variant "pr2214_offset_fixed"', text)
         self.assertIn("build_pr_differential_assets", text)
+        self.assertIn("build_pr2214_offset_staging_image", text)
+        self.assertIn("build_pr2214_offset_geom_images", text)
+        self.assertIn("build_pr2214_offset_nrf52_elfs", text)
+        self.assertIn("build_swaptable_nrf52_elfs", text)
         self.assertIn("build_shared_nrf52_test_app", text)
         self.assertIn("build_shared_stm32f4_pr2206_test_app", text)
-        self.assertIn("write_stm32f4_pr2205_overlay", text)
-        self.assertIn("write_stm32f4_pr2206_overlay", text)
-        self.assertIn("stm32f4_pr2205_scratch.dts", text)
-        self.assertIn("stm32f4_pr2206_scratch.dts", text)
+        self.assertIn("build_shared_stm32f4_pr2214_geom_test_app", text)
+        self.assertIn("write_nrf52_pr2214_overlay", text)
+        self.assertIn("nrf52_pr2214_offset.dts", text)
         self.assertIn("write-block-size = <8>;", text)
         self.assertIn("nucleo_f429zi", text)
+        self.assertIn("nrf52840dk/nrf52840", text)
         self.assertIn("slot0_partition: partition@8000", text)
         self.assertIn("slot0_partition: partition@20000", text)
-        self.assertIn("CONFIG_BOOT_SWAP_USING_SCRATCH=y", text)
+        self.assertIn("slot0_partition: partition@c000", text)
+        self.assertIn("reg = <0x0c000 0x75000>;", text)
+        self.assertIn("slot1_partition: partition@81000", text)
+        self.assertIn("reg = <0x81000 0x76000>;", text)
+        self.assertIn("storage_partition: partition@f7000", text)
+        self.assertIn("reg = <0xf7000 0x09000>;", text)
+        self.assertIn('PR2214_SWAP_0X74000_PAYLOAD_SIZE="0x73CB0"', text)
+        self.assertIn('PR2214_PRIMARY_SLOT_SIZE="0x75000"', text)
+        self.assertIn('PR2214_STAGING_SLOT_SIZE="0x76000"', text)
+        self.assertIn('PR2214_SECTOR_SIZE="0x1000"', text)
+        self.assertIn('"1.2.0+0"', text)
+        self.assertIn('out_commit="${ASSETS_DIR}/oss_mcuboot_${name}_commit.txt"', text)
+        self.assertIn('git -C "${src}" rev-parse --verify HEAD^{commit} > "${out_commit}"', text)
         self.assertIn("CONFIG_BOOT_SWAP_USING_OFFSET=y", text)
         self.assertIn("CONFIG_BOOT_PREFER_SWAP_OFFSET=y", text)
         self.assertIn("PR_DIFF_GEOM_ALIGN=\"32\"", text)
         self.assertIn("PR_DIFF_GEOM_TRAILER_RESERVE=\"0x30a0\"", text)
         self.assertIn("PR_DIFF_GEOM_SIGN_OVERHEAD=\"0x400\"", text)
-        self.assertIn("PR2206_GEOM_WRITE_BLOCK_SIZE=\"8\"", text)
-        self.assertIn("PR2206_BOOT_MAX_IMG_SECTORS=\"2725\"", text)
-        self.assertIn("PR2206_GEOM_TRAILER_RESERVE '0x%x'", text)
-        self.assertIn('PR_DIFF_STM32F4_OFFSET_BASE="${ASSETS_DIR}/zephyr_head_offset_stm32f4_slot1.bin"', text)
+        self.assertIn('PR_DIFF_STM32F4_OFFSET_GEOM_APP="${stm32f4_pr2214_geom_app_bin}"', text)
         self.assertIn("make_offset_slot_image", text)
-        self.assertIn(
-            'PR_DIFF_STM32F4_SCRATCH_BASE="${ASSETS_DIR}/zephyr_head_scratch_stm32f4_pr2206_slot1.bin"', text
-        )
-        self.assertIn('PR_DIFF_STM32F4_PR2206_PRIMARY_SLOT_SIZE="0x18000"', text)
-        self.assertIn('PR_DIFF_STM32F4_PR2206_STAGING_SLOT_SIZE="0x18000"', text)
-        self.assertIn('PR2206_GEOM_TRAILER_RESERVE="${PR2206_GEOM_TRAILER_RESERVE}"', text)
         self.assertIn("PR_DIFF_BASE_IMAGE=\"${ASSETS_DIR}/zephyr_slot1_padded.bin\"", text)
         self.assertIn('ih_size = struct.unpack_from("<I", base, 0x0C)[0]', text)
         self.assertIn("payload = base[0x200:0x200 + ih_size]", text)
@@ -149,16 +151,14 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertNotIn('payload = app_bin.read_bytes()', text)
         self.assertIn("local align=\"${5:-${PR_DIFF_GEOM_ALIGN}}\"", text)
         self.assertIn("--align \"${align}\"", text)
-        self.assertIn('-DCONFIG_BOOT_MAX_IMG_SECTORS="${PR2206_BOOT_MAX_IMG_SECTORS}"', text)
         self.assert_no_imgtool_pad_header(text)
         self.assertNotIn("--confirm", text)
         self.assertIn("scratch_with_geom_partition.dts", text)
-        self.assertIn("stm32f4_pr2206_scratch.dts", text)
         self.assertIn("offset_with_geom_partition.dts", text)
         self.assertIn("slot0_partition: partition@8000", text)
         self.assertIn("slot1_partition: partition@108000", text)
         self.assertIn("slot1_partition: partition@78000", text)
-        self.assertIn("slot1_partition: partition@82000", text)
+        self.assertIn("reg = <0x108000 0x38000>;", text)
         self.assertIn("scratch_partition: partition@d0000", text)
         self.assertIn("storage_partition: partition@f8000", text)
         self.assertIn("scratch_partition: partition@120000", text)
@@ -168,7 +168,6 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertIn("return (slot_size - 0x200 - geom_trailer_reserve - geom_sign_overhead) & ~0x1F", text)
         self.assertIn("\"0x18000\"", text)
         self.assertIn("zephyr_head_scratch_stm32f4_pr2206_slot1.bin", text)
-        self.assertIn("zephyr_head_offset_stm32f4_slot1.bin", text)
         self.assertIn("zephyr_slot1_offset_geom_full_offsetslot.bin", text)
         self.assertIn("CONFIG_MINIMAL_LIBC=y", text)
         self.assertIn("CONFIG_PICOLIBC=n", text)
@@ -179,17 +178,6 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertIn("west_projects=(zephyr mcuboot hal_nordic hal_stm32 cmsis)", text)
         self.assertIn('update --narrow -o=--depth=1 "${west_projects[@]}"', text)
         self.assertIn('fetch --quiet mcu-tools "+refs/pull/${pr}/head:refs/pull/${pr}"', text)
-
-    def test_geometry_script_restores_header_gap_for_geom_payloads(self) -> None:
-        text = GEOM_SCRIPT.read_text(encoding="utf-8")
-        self.assertIn('path.write_bytes((b"\\x00" * 0x200) + body)', text)
-        self.assertIn("0x18000", text)
-        self.assertIn("0x76000", text)
-        self.assertIn("zephyr_head_scratch_stm32f4_pr2206_slot1.bin", text)
-        self.assertIn("zephyr_head_offset_stm32f4_slot1.bin", text)
-        self.assertIn("zephyr_slot1_offset_geom_full_offsetslot.bin", text)
-        self.assertIn('"0x1E000"', text)
-        self.assert_no_imgtool_pad_header(text)
 
     def test_head_matrix_script_signs_pr2206_head_images_with_align_32(self) -> None:
         text = HEAD_MATRIX_SCRIPT.read_text(encoding="utf-8")
@@ -287,27 +275,64 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
                     )
                 )
 
-        historical = yaml.safe_load(
-            (ROOT / "profiles" / "mcuboot_pr2205_scratch_broken.yaml").read_text(encoding="utf-8")
+    def test_head_matrix_signs_with_application_rom_start_offset(self) -> None:
+        text = HEAD_MATRIX_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("--header-size 0x200", text)
+        self.assertIn("s/^CONFIG_ROM_START_OFFSET=//p", text)
+        self.assertIn('local app_config="${BUILD_TMP}/hello_${name}/zephyr/.config"', text)
+        self.assertIn('header_size="$(app_rom_start_offset "${app_config}")"', text)
+        self.assertRegex(
+            text,
+            re.compile(
+                r'"\$\{IMGTOOL_PY\}" sign[\s\S]*?--header-size "\$\{header_size\}"[\s\S]*?'
+                r'check_mcuboot_image_vectors\.py" \\\n\s+--image "\$\{out\}" '
+                r'--app-config "\$\{app_config\}"'
+            ),
         )
-        current = yaml.safe_load(
-            (ROOT / "profiles" / "mcuboot_head_scratch_stm32f4_upgrade.yaml").read_text(encoding="utf-8")
-        )
-        self.assertNotEqual(current["images"], historical["images"])
-        self.assertNotEqual(
-            current["memory"]["slots"]["exec"]["base"],
-            historical["memory"]["slots"]["exec"]["base"],
-        )
-        self.assertTrue(
-            historical["images"]["exec"].endswith(
-                "zephyr_head_scratch_stm32f4_slot0.bin"
+
+    def test_zero_day_matrix_assets_are_rebuilt_and_uploaded(self) -> None:
+        workflow = yaml.safe_load(
+            (ROOT / ".github" / "workflows" / "mcuboot-head-zero-day.yml").read_text(
+                encoding="utf-8"
             )
         )
-        self.assertTrue(
-            historical["images"]["staging"].endswith(
-                "zephyr_head_scratch_stm32f4_slot1.bin"
+        upload = next(
+            step
+            for step in workflow["jobs"]["build"]["steps"]
+            if step.get("name") == "Upload current-head assets"
+        )
+        upload_globs = [
+            line.strip() for line in upload["with"]["path"].splitlines() if line.strip()
+        ]
+        text = HEAD_MATRIX_SCRIPT.read_text(encoding="utf-8")
+        produced = {
+            "oss_mcuboot_head_{}.elf".format(name)
+            for name in re.findall(r'^build_mcuboot "([a-z0-9_]+)"', text, re.M)
+        }
+        produced |= set(
+            re.findall(r'^sign_image "[^"]+" "[^"]+" "[^"]+" "([^"]+\.bin)"', text, re.M)
+        )
+        produced |= set(
+            re.findall(
+                r'^make_offset_slot_image \\\n\s+"[^"]+" \\\n\s+"\$\{ASSETS_DIR\}/([^"]+)"',
+                text,
+                re.M,
             )
         )
+
+        matrix = workflow["jobs"]["sweep"]["strategy"]["matrix"]["include"]
+        self.assertTrue(matrix)
+        for entry in matrix:
+            profile = load_profile(ROOT / entry["profile"])
+            for asset in (profile.bootloader_elf, *profile.images.values()):
+                with self.subTest(profile=entry["profile"], asset=asset):
+                    # A sweep asset that the build never rewrites would fall back
+                    # to the stale tracked copy without any error.
+                    self.assertIn(Path(asset).name, produced)
+                    self.assertTrue(
+                        any(fnmatch.fnmatch(asset, pattern) for pattern in upload_globs),
+                        asset,
+                    )
 
     def test_upgrade_differential_profiles_hash_exec_slot(self) -> None:
         for relpath in PR_DIFFERENTIAL_PROFILES:
@@ -319,12 +344,10 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
 
     def test_pr_differential_profiles_load_and_reference_existing_assets(self) -> None:
         bootstrap_matrix = (ROOT / "scripts" / "bootstrap_mcuboot_matrix_assets.sh").read_text(encoding="utf-8")
-        bootstrap_geom = (ROOT / "scripts" / "bootstrap_mcuboot_geometry_assets.sh").read_text(encoding="utf-8")
         head_matrix = (ROOT / "scripts" / "build_mcuboot_head_matrix.sh").read_text(encoding="utf-8")
         generated_assets = {
             "results/oss_validation/assets/zephyr_head_scratch_stm32f4_pr2206_slot0.bin",
             "results/oss_validation/assets/zephyr_head_scratch_stm32f4_pr2206_slot1.bin",
-            "results/oss_validation/assets/zephyr_slot1_scratch_geom_pr2206_boundary.bin",
         }
         for relpath in PR_DIFFERENTIAL_PROFILES:
             profile_path = ROOT / "profiles" / relpath
@@ -339,7 +362,7 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
                     self.assertIn(image_path, generated_assets)
                     asset_name = Path(image_path).name
                     self.assertTrue(
-                        asset_name in bootstrap_matrix or asset_name in bootstrap_geom or asset_name in head_matrix,
+                        asset_name in bootstrap_matrix or asset_name in head_matrix,
                         image_path,
                     )
 
@@ -380,6 +403,34 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIn("must be 'full' or 'head'", proc.stderr)
 
+    def test_script_builds_stm32f4_move_slot_images_from_rom_start_offset(self) -> None:
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("app_rom_start_offset()", text)
+        self.assertIn("CONFIG_ROM_START_OFFSET=", text)
+        self.assertIn('header_size="$(app_rom_start_offset "${app_config}")"', text)
+        self.assertIn('--header-size "${header_size}"', text)
+        self.assertIn("write_stm32f4_move_overlays()", text)
+        self.assertIn("build_shared_stm32f4_move_test_app()", text)
+        self.assertIn("build_stm32f4_move_images()", text)
+        self.assertIn("stm32f4_disco", text)
+        self.assertIn('"${ASSETS_DIR}/zephyr_stm32f4_slot0.bin"', text)
+        self.assertIn('"${ASSETS_DIR}/zephyr_stm32f4_slot1.bin"', text)
+        for name, expected_ver in (
+            ("zephyr_stm32f4_slot0.bin", (1, 0, 0, 0)),
+            ("zephyr_stm32f4_slot1.bin", (2, 0, 0, 0)),
+        ):
+            data = (ASSETS / name).read_bytes()
+            magic, _load, hdr_size, _prot, _img_size, _flags, maj, minor, rev, build = (
+                struct.unpack_from("<IIHHIIBBHI", data, 0)
+            )
+            self.assertEqual(magic, 0x96F3B83D)
+            self.assertEqual(hdr_size, 0x200)
+            self.assertEqual((maj, minor, rev, build), expected_ver)
+            sp, reset = struct.unpack_from("<II", data, hdr_size)
+            self.assertTrue(0x20000000 < sp <= 0x20040000, f"{name}: sp=0x{sp:08x}")
+            self.assertTrue(0x08020200 <= reset < 0x08080000, f"{name}: reset=0x{reset:08x}")
+            self.assertEqual(reset & 1, 1)
+
     def test_pr_differential_assets_are_tracked(self) -> None:
         tracked = subprocess.check_output(
             ["git", "ls-files", "results/oss_validation/assets"],
@@ -388,29 +439,31 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         ).splitlines()
         tracked_set = set(tracked)
         for relpath in (
-            "results/oss_validation/assets/oss_mcuboot_pr2205_scratch_broken.elf",
-            "results/oss_validation/assets/oss_mcuboot_pr2205_scratch_fixed.elf",
-            "results/oss_validation/assets/oss_mcuboot_pr2206_scratch_broken.elf",
-            "results/oss_validation/assets/oss_mcuboot_pr2206_scratch_fixed.elf",
-            "results/oss_validation/assets/oss_mcuboot_pr2206_scratch_geom_broken.elf",
-            "results/oss_validation/assets/oss_mcuboot_pr2206_scratch_geom_fixed.elf",
-            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_broken.elf",
-            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_fixed.elf",
             "results/oss_validation/assets/oss_mcuboot_pr2214_offset_geom_broken.elf",
+            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_geom_broken_commit.txt",
             "results/oss_validation/assets/oss_mcuboot_pr2214_offset_geom_fixed.elf",
-            "results/oss_validation/assets/zephyr_head_scratch_stm32f4_slot0.bin",
-            "results/oss_validation/assets/zephyr_head_scratch_stm32f4_slot1.bin",
+            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_geom_fixed_commit.txt",
+            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_nrf52_broken.elf",
+            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_nrf52_broken_commit.txt",
+            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_nrf52_fixed.elf",
+            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_nrf52_fixed_commit.txt",
+            "results/oss_validation/assets/zephyr_slot1_pr2214_swap_0x74000_offsetslot.bin",
             "results/oss_validation/assets/zephyr_head_offset_stm32f4_slot0.bin",
             "results/oss_validation/assets/zephyr_head_offset_stm32f4_slot1.bin",
             "results/oss_validation/assets/zephyr_head_offset_stm32f4_slot1_offsetslot.bin",
             "results/oss_validation/assets/zephyr_slot0_padded.bin",
             "results/oss_validation/assets/zephyr_slot1_padded.bin",
             "results/oss_validation/assets/zephyr_slot1_max.bin",
-            "results/oss_validation/assets/zephyr_slot1_scratch_geom_max.bin",
             "results/oss_validation/assets/zephyr_slot1_offset_geom_full.bin",
             "results/oss_validation/assets/zephyr_slot1_offset_geom_full_offsetslot.bin",
         ):
             self.assertIn(relpath, tracked_set)
+        for retired in (
+            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_broken.elf",
+            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_fixed.elf",
+        ):
+            self.assertNotIn(retired, tracked_set)
+            self.assertFalse((ROOT / retired).exists())
 
     def test_pr2214_geom_profiles_use_geom_offset_elfs(self) -> None:
         broken = yaml.safe_load(
@@ -431,112 +484,10 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertEqual(fixed["platform"], "platforms/stm32f4.repl")
         self.assertEqual(broken["bootloader"]["entry"], 0x08000000)
         self.assertEqual(fixed["bootloader"]["entry"], 0x08000000)
-        self.assertEqual(broken["memory"]["slots"]["exec"], {"base": 0x0800C000, "size": 0x76000})
-        self.assertEqual(fixed["memory"]["slots"]["exec"], {"base": 0x0800C000, "size": 0x76000})
-        self.assertEqual(broken["memory"]["slots"]["staging"], {"base": 0x08082000, "size": 0x76000})
-        self.assertEqual(fixed["memory"]["slots"]["staging"], {"base": 0x08082000, "size": 0x76000})
-        self.assertEqual(
-            broken["images"]["exec"], "results/oss_validation/assets/zephyr_head_offset_stm32f4_slot0.bin"
-        )
-        self.assertEqual(
-            fixed["images"]["exec"], "results/oss_validation/assets/zephyr_head_offset_stm32f4_slot0.bin"
-        )
-        self.assertEqual(
-            broken["images"]["staging"], "results/oss_validation/assets/zephyr_slot1_offset_geom_full_offsetslot.bin"
-        )
-        self.assertEqual(
-            fixed["images"]["staging"], "results/oss_validation/assets/zephyr_slot1_offset_geom_full_offsetslot.bin"
-        )
-        self.assertEqual(len(broken["pre_boot_state"]), 7)
-        self.assertEqual(len(fixed["pre_boot_state"]), 7)
-        self.assertEqual(broken["pre_boot_state"], fixed["pre_boot_state"])
-        self.assertEqual(broken["pre_boot_state"][0], {"address": 0x08081FF0, "u32": 0x676523FB})
-        self.assertEqual(broken["pre_boot_state"][-1], {"address": 0x08081BD4, "u32": 0x00000001})
-        self.assertEqual(broken["fault_sweep"]["boot_cycles"], 3)
-        self.assertEqual(fixed["fault_sweep"]["boot_cycles"], 3)
-        self.assertEqual(broken["fault_sweep"]["max_writes"], "auto")
-        self.assertEqual(fixed["fault_sweep"]["max_writes"], "auto")
-        self.assertNotIn("quick_use_heuristic", broken["fault_sweep"])
-        self.assertNotIn("quick_use_heuristic", fixed["fault_sweep"])
-        self.assertEqual(broken["expect"]["control_outcome"], "no_boot")
-        self.assertTrue(broken["expect"]["allow_control_only_issues"])
-        self.assertEqual(fixed["expect"]["control_outcome"], "success")
-        self.assertEqual(broken["semantic_assertions"]["control"]["multi_boot_analysis.final_outcome"], "no_boot")
-        self.assertEqual(fixed["semantic_assertions"]["control"]["multi_boot_analysis.final_outcome"], "success")
-        self.assertEqual(broken["success_criteria"], {"vtor_in_slot": "exec"})
-        self.assertEqual(fixed["success_criteria"], {"vtor_in_slot": "exec"})
-        self.assertTrue(broken.get("skip_self_test", False))
-        self.assertTrue(fixed.get("skip_self_test", False))
-
-    def test_pr2214_offset_profiles_use_stm32f4_offset_layout(self) -> None:
-        broken = yaml.safe_load((ROOT / "profiles" / "mcuboot_pr2214_offset_broken.yaml").read_text(encoding="utf-8"))
-        fixed = yaml.safe_load((ROOT / "profiles" / "mcuboot_pr2214_offset_fixed.yaml").read_text(encoding="utf-8"))
-        self.assertEqual(broken["platform"], "platforms/stm32f4.repl")
-        self.assertEqual(fixed["platform"], "platforms/stm32f4.repl")
-        self.assertEqual(broken["bootloader"]["entry"], 0x08000000)
-        self.assertEqual(fixed["bootloader"]["entry"], 0x08000000)
-        self.assertEqual(broken["memory"]["slots"]["exec"], {"base": 0x0800C000, "size": 0x76000})
-        self.assertEqual(fixed["memory"]["slots"]["exec"], {"base": 0x0800C000, "size": 0x76000})
-        self.assertEqual(broken["memory"]["slots"]["staging"], {"base": 0x08082000, "size": 0x76000})
-        self.assertEqual(fixed["memory"]["slots"]["staging"], {"base": 0x08082000, "size": 0x76000})
-        self.assertEqual(
-            broken["images"]["staging"], "results/oss_validation/assets/zephyr_slot1_offset_geom_full_offsetslot.bin"
-        )
-        self.assertEqual(
-            fixed["images"]["staging"], "results/oss_validation/assets/zephyr_slot1_offset_geom_full_offsetslot.bin"
-        )
-        self.assertEqual(len(broken["pre_boot_state"]), 7)
-        self.assertEqual(len(fixed["pre_boot_state"]), 7)
-        self.assertEqual(broken["pre_boot_state"], fixed["pre_boot_state"])
-        self.assertEqual(broken["pre_boot_state"][0]["address"], 0x08081FF0)
-        self.assertEqual(broken["pre_boot_state"][-1]["address"], 0x08081BD4)
-        self.assertEqual(broken["fault_sweep"]["boot_cycles"], 3)
-        self.assertEqual(fixed["fault_sweep"]["boot_cycles"], 3)
-        self.assertEqual(broken["fault_sweep"]["max_writes"], "auto")
-        self.assertEqual(fixed["fault_sweep"]["max_writes"], "auto")
-        self.assertEqual(broken["expect"]["control_outcome"], "no_boot")
-        self.assertTrue(broken["expect"]["allow_control_only_issues"])
-        self.assertEqual(fixed["expect"]["control_outcome"], "success")
-        self.assertEqual(
-            broken["success_criteria"],
-            {
-                "vtor_in_slot": "exec",
-                "marker_address": 0x0800C014,
-                "marker_value": 0x00000102,
-            },
-        )
-        self.assertEqual(
-            fixed["success_criteria"],
-            {
-                "vtor_in_slot": "exec",
-                "marker_address": 0x0800C014,
-                "marker_value": 0x00000102,
-            },
-        )
-
-    def test_pr2206_geom_profiles_use_geom_scratch_elfs(self) -> None:
-        broken = yaml.safe_load(
-            (ROOT / "profiles" / "mcuboot_pr2206_scratch_geom_broken.yaml").read_text(encoding="utf-8")
-        )
-        fixed = yaml.safe_load(
-            (ROOT / "profiles" / "mcuboot_pr2206_scratch_geom_fixed.yaml").read_text(encoding="utf-8")
-        )
-        self.assertEqual(
-            broken["bootloader"]["elf"],
-            "results/oss_validation/assets/oss_mcuboot_pr2206_scratch_geom_broken.elf",
-        )
-        self.assertEqual(
-            fixed["bootloader"]["elf"],
-            "results/oss_validation/assets/oss_mcuboot_pr2206_scratch_geom_fixed.elf",
-        )
-        self.assertEqual(broken["platform"], "platforms/stm32f4.repl")
-        self.assertEqual(fixed["platform"], "platforms/stm32f4.repl")
-        self.assertEqual(broken["bootloader"]["entry"], 0x08000000)
-        self.assertEqual(fixed["bootloader"]["entry"], 0x08000000)
         self.assertEqual(broken["memory"]["slots"]["exec"], {"base": 0x08008000, "size": 0x18000})
         self.assertEqual(fixed["memory"]["slots"]["exec"], {"base": 0x08008000, "size": 0x18000})
-        self.assertEqual(broken["memory"]["slots"]["staging"], {"base": 0x08108000, "size": 0x18000})
-        self.assertEqual(fixed["memory"]["slots"]["staging"], {"base": 0x08108000, "size": 0x18000})
+        self.assertEqual(broken["memory"]["slots"]["staging"], {"base": 0x08108000, "size": 0x38000})
+        self.assertEqual(fixed["memory"]["slots"]["staging"], {"base": 0x08108000, "size": 0x38000})
         self.assertEqual(
             broken["images"]["exec"], "results/oss_validation/assets/zephyr_head_scratch_stm32f4_pr2206_slot0.bin"
         )
@@ -544,50 +495,114 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
             fixed["images"]["exec"], "results/oss_validation/assets/zephyr_head_scratch_stm32f4_pr2206_slot0.bin"
         )
         self.assertEqual(
-            broken["images"]["staging"], "results/oss_validation/assets/zephyr_slot1_scratch_geom_pr2206_boundary.bin"
+            broken["images"]["staging"], "results/oss_validation/assets/zephyr_slot1_offset_geom_full_offsetslot.bin"
         )
         self.assertEqual(
-            fixed["images"]["staging"], "results/oss_validation/assets/zephyr_slot1_scratch_geom_pr2206_boundary.bin"
+            fixed["images"]["staging"], "results/oss_validation/assets/zephyr_slot1_offset_geom_full_offsetslot.bin"
         )
-        self.assertEqual(broken["fault_sweep"]["boot_cycles"], 3)
-        self.assertEqual(fixed["fault_sweep"]["boot_cycles"], 3)
-        self.assertEqual(broken["fault_sweep"]["run_duration"], "20.0")
-        self.assertEqual(fixed["fault_sweep"]["run_duration"], "20.0")
-        self.assertEqual(broken["fault_sweep"]["max_writes"], 1)
-        self.assertEqual(fixed["fault_sweep"]["max_writes"], 1)
+        full_bytes = (ASSETS / "zephyr_slot1_offset_geom_full.bin").read_bytes()
+        offset_bytes = (ASSETS / "zephyr_slot1_offset_geom_full_offsetslot.bin").read_bytes()
+        self.assertEqual(len(full_bytes), 0x8000)
+        self.assertEqual(offset_bytes[:0x4000], b"\xff" * 0x4000)
+        self.assertEqual(offset_bytes[0x4000:], full_bytes)
+        sp, reset = struct.unpack_from("<II", full_bytes, 0x200)
+        self.assertTrue(0x20000000 < sp <= 0x20040000, f"sp=0x{sp:08x}")
+        self.assertTrue(0x08008200 <= reset < 0x08020000, f"reset=0x{reset:08x}")
+        for profile in (broken, fixed):
+            self.assertEqual(
+                profile["update_trigger"],
+                {"type": "mcuboot_trailer_magic", "slot": "staging", "max_align": 32},
+            )
+            self.assertNotIn("pre_boot_state", profile)
+            self.assertEqual(
+                profile["success_criteria"],
+                {"vtor_in_slot": "exec", "marker_address": 0x08008014, "marker_value": 0x00000102},
+            )
+        self.assertEqual(broken["fault_sweep"]["max_writes"], 0)
+        self.assertEqual(fixed["fault_sweep"]["max_writes"], "auto")
         self.assertNotIn("quick_use_heuristic", broken["fault_sweep"])
         self.assertNotIn("quick_use_heuristic", fixed["fault_sweep"])
-        self.assertNotIn("sweep_hash_bypass_symbols", broken["fault_sweep"])
-        self.assertNotIn("sweep_hash_bypass_symbols", fixed["fault_sweep"])
-        self.assertEqual(broken["expect"]["control_outcome"], "success")
-        self.assertNotIn("allow_control_only_issues", broken["expect"])
-        self.assertTrue(broken["expect"]["allow_semantic_only_issues"])
-        self.assertEqual(broken["expect"]["required_issue_reasons"], ["boot_outcome"])
-        self.assertEqual(fixed["expect"]["control_outcome"], "no_boot")
-        self.assertEqual(broken["semantic_assertions"]["control"]["multi_boot_analysis.status"], "converged")
-        self.assertEqual(fixed["semantic_assertions"]["control"]["multi_boot_analysis.status"], "converged")
-        self.assertEqual(broken["semantic_assertions"]["control"]["multi_boot_analysis.final_outcome"], "success")
-        self.assertEqual(fixed["semantic_assertions"]["control"]["multi_boot_analysis.final_outcome"], "no_boot")
-        self.assertEqual(broken["success_criteria"]["expected_image"], "staging")
-        self.assertEqual(fixed["success_criteria"], {"vtor_in_slot": "exec"})
+        self.assertEqual(broken["expect"]["control_outcome"], "wrong_image")
+        self.assertTrue(broken["expect"]["allow_control_only_issues"])
+        self.assertEqual(fixed["expect"]["control_outcome"], "success")
         self.assertTrue(broken.get("skip_self_test", False))
         self.assertTrue(fixed.get("skip_self_test", False))
+
+    def test_pr2214_offset_profiles_use_nrf52_sector_plus_one_layout(self) -> None:
+        broken = yaml.safe_load((ROOT / "profiles" / "mcuboot_pr2214_offset_broken.yaml").read_text(encoding="utf-8"))
+        fixed = yaml.safe_load((ROOT / "profiles" / "mcuboot_pr2214_offset_fixed.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            broken["bootloader"]["elf"],
+            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_nrf52_broken.elf",
+        )
+        self.assertEqual(
+            fixed["bootloader"]["elf"],
+            "results/oss_validation/assets/oss_mcuboot_pr2214_offset_nrf52_fixed.elf",
+        )
+        for profile in (broken, fixed):
+            self.assertEqual(profile["platform"], "platforms/cortex_m4_flash_fast.repl")
+            self.assertEqual(profile["bootloader"]["entry"], 0x00000000)
+            self.assertEqual(profile["memory"]["slots"]["exec"], {"base": 0x0000C000, "size": 0x75000})
+            self.assertEqual(profile["memory"]["slots"]["staging"], {"base": 0x00081000, "size": 0x76000})
+            self.assertEqual(
+                profile["images"]["staging"],
+                "results/oss_validation/assets/zephyr_slot1_pr2214_swap_0x74000_offsetslot.bin",
+            )
+            self.assertEqual(profile["update_trigger"], {"type": "mcuboot_trailer_magic", "slot": "staging"})
+            self.assertNotIn("pre_boot_state", profile)
+            self.assertEqual(
+                profile["success_criteria"],
+                {"vtor_in_slot": "exec", "marker_address": 0x0000C014, "marker_value": 0x00000201},
+            )
+        self.assertEqual(broken["expect"]["control_outcome"], "wrong_image")
+        self.assertTrue(broken["expect"]["allow_control_only_issues"])
+        self.assertEqual(fixed["expect"]["control_outcome"], "success")
+        # The broken revision never moves image data, so its campaign is the
+        # control boot alone; the fixed revision sweeps the full swap.
+        self.assertEqual(broken["fault_sweep"]["max_writes"], 0)
+        self.assertEqual(fixed["fault_sweep"]["max_writes"], "auto")
+
+    def test_pr2214_offset_staging_image_hits_find_last_idx_boundary(self) -> None:
+        # docs/mcuboot-pr2214-swap-offset.md derives these numbers.
+        sector = 0x1000
+        primary_sectors = 0x75000 // sector
+        secondary_sectors = 0x76000 // sector
+        # boot_trailer_sz(4) for MIN_SECTOR_COUNT=118, two status states per
+        # sector and BOOT_MAX_ALIGN=8: 118 * 2 * 4 + 8 * 4 + 16.
+        trailer_sectors = -(-(118 * 2 * 4 + 8 * 4 + 16) // sector)
+        first_trailer_idx = primary_sectors - trailer_sectors
+
+        data = (ASSETS / "zephyr_slot1_pr2214_swap_0x74000_offsetslot.bin").read_bytes()
+        self.assertEqual(set(data[:sector]), {0xFF})
+        magic, _load, hdr_size, protect_tlv_size, img_size = struct.unpack_from("<IIHHI", data, sector)
+        self.assertEqual(magic, 0x96F3B83D)
+        tlv_magic, tlv_tot = struct.unpack_from("<HH", data, sector + hdr_size + img_size + protect_tlv_size)
+        self.assertEqual(tlv_magic, 0x6907)
+        swap_size = hdr_size + img_size + protect_tlv_size + tlv_tot
+        self.assertEqual(swap_size, 0x74000)
+        self.assertEqual(len(data), sector + swap_size)
+        # Version 1.2.0 is the success marker at exec base + 0x14.
+        self.assertEqual(struct.unpack_from("<I", data, sector + 0x14)[0], 0x00000201)
+
+        sectors_used = -(-swap_size // sector)
+        self.assertGreaterEqual(sectors_used, first_trailer_idx)  # 429e2fea aborts
+        self.assertLess(sectors_used - 1, first_trailer_idx)  # 90fd59d2 swaps
+        # The image ends before the secondary trailer sector, so validation
+        # accepts it on both revisions.
+        self.assertLessEqual(sector + swap_size, (secondary_sectors - trailer_sectors) * sector)
 
     def test_pr_differential_elfs_are_stripped(self) -> None:
         readelf = shutil.which("arm-none-eabi-readelf")
         if not readelf:
             self.skipTest("arm-none-eabi-readelf not installed")
         for name in (
-            "oss_mcuboot_pr2205_scratch_broken.elf",
-            "oss_mcuboot_pr2205_scratch_fixed.elf",
-            "oss_mcuboot_pr2206_scratch_broken.elf",
-            "oss_mcuboot_pr2206_scratch_fixed.elf",
-            "oss_mcuboot_pr2206_scratch_geom_broken.elf",
-            "oss_mcuboot_pr2206_scratch_geom_fixed.elf",
-            "oss_mcuboot_pr2214_offset_broken.elf",
-            "oss_mcuboot_pr2214_offset_fixed.elf",
+            "oss_mcuboot_head_offset.elf",
+            "oss_mcuboot_pr2199_move_broken.elf",
+            "oss_mcuboot_pr2199_move_fixed.elf",
             "oss_mcuboot_pr2214_offset_geom_broken.elf",
             "oss_mcuboot_pr2214_offset_geom_fixed.elf",
+            "oss_mcuboot_pr2214_offset_nrf52_broken.elf",
+            "oss_mcuboot_pr2214_offset_nrf52_fixed.elf",
         ):
             with self.subTest(elf=name):
                 proc = subprocess.run(
@@ -599,7 +614,79 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertNotIn(".debug_", proc.stdout)
                 self.assertNotIn(".zdebug_", proc.stdout)
+                self.assertIn(".symtab", proc.stdout)
+
+    def test_pr2214_profile_elfs_match_upstream_boot_swap_tables(self) -> None:
+        upstream_table = (
+            b"\x04\x01\x04\x03\x04\x02"  # ANY, GOOD, ANY, UNSET, ANY -> TEST
+            b"\x04\x01\x04\x01\x04\x03"  # ANY, GOOD, ANY, SET, ANY -> PERM
+            b"\x01\x03\x03\x04\x01\x04"  # GOOD, UNSET, UNSET, ANY, SET -> REVERT
+        )
+        expected_table_by_commit = {
+            "429e2fea24518f178cd4d33928cb66fcb0205803": upstream_table,
+            "90fd59d2f9e45c24d0833dd391dcdc932b3b1908": upstream_table,
+        }
+        tracked = set(
+            subprocess.check_output(
+                ["git", "ls-files", "results/oss_validation/assets"],
+                cwd=ROOT,
+                text=True,
+            ).splitlines()
+        )
+        profile_paths = sorted((ROOT / "profiles").glob("mcuboot_pr2214_*.yaml"))
+        self.assertEqual(len(profile_paths), 4)
+
+        for profile_path in profile_paths:
+            with self.subTest(profile=profile_path.name):
+                raw_profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+                elf_rel = raw_profile["bootloader"]["elf"]
+                elf_path = ROOT / elf_rel
+                commit_rel = str(Path(elf_rel).with_name(f"{Path(elf_rel).stem}_commit.txt"))
+                commit_path = ROOT / commit_rel
+
+                self.assertIn(elf_rel, tracked)
+                self.assertIn(commit_rel, tracked)
+                self.assertTrue(elf_path.is_file(), f"missing ELF {elf_rel}")
+                self.assertTrue(commit_path.is_file(), f"missing commit file {commit_rel}")
+
+                commit_sha = commit_path.read_text(encoding="utf-8").strip()
+                self.assertIn(commit_sha, expected_table_by_commit)
+
+                elf_bytes = elf_path.read_bytes()
+                self.assertIn(commit_sha[:12].encode("ascii"), elf_bytes)
+
+                elf = ELFFile(io.BytesIO(elf_bytes))
+                swap_table_bytes = None
+                for section in elf.iter_sections():
+                    if not isinstance(section, SymbolTableSection):
+                        continue
+                    symbols = section.get_symbol_by_name("boot_swap_tables")
+                    if not symbols:
+                        continue
+                    sym = symbols[0]
+                    target_sec = elf.get_section(sym["st_shndx"])
+                    offset = sym["st_value"] - target_sec["sh_addr"]
+                    swap_table_bytes = target_sec.data()[offset : offset + sym["st_size"]]
+                    break
+
+                self.assertIsNotNone(swap_table_bytes, f"boot_swap_tables symbol missing in {elf_rel}")
+                self.assertEqual(
+                    swap_table_bytes,
+                    expected_table_by_commit[commit_sha],
+                    f"boot_swap_tables mismatch in {elf_rel} for commit {commit_sha}",
+                )
+
+    def test_all_tracked_mcuboot_elfs_match_upstream_swap_tables(self) -> None:
+        import check_mcuboot_swap_tables as swap_check
+
+        results = swap_check.check_assets(repo_root=ROOT)
+        self.assertGreaterEqual(len(results), 25)
+        for res in results:
+            with self.subTest(elf=res.elf_path.name):
+                self.assertTrue(res.ok, res.message)
+                self.assertEqual(res.location, ".symtab", res.message)
 
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -180,6 +180,9 @@ fault_sweep:
   evaluation_mode: execute
   run_duration: "{run_duration}"
   calibration_time_slice: "{calibration_time_slice}"
+  # Allow cold JIT and flash recovery on slow hosts, including control follow-ups.
+  # This wall-clock limit does not extend emulated-time or instruction budgets.
+  phase2_wall_timeout_s: 120.0
   # Keep the explicit no-progress observation inside the run budget so a
   # stable recovery wait is terminal evidence, not generic budget exhaustion.
   progress_stall_timeout_s: {progress_stall_timeout_s}

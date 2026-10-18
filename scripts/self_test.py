@@ -581,19 +581,28 @@ def check_verdict(
     coverage_reason = str(coverage.get("reason", "") or "")
     configured_fault_types = _normalized_fault_types(profile_raw)
     fault_sweep_declared = isinstance(profile_raw.get("fault_sweep"), dict)
-    calibration_required = bool(
-        configured_fault_types & TRACE_COVERAGE_FAULT_TYPES
-    ) or (not fault_sweep_declared and bool(coverage))
+    campaign_integrity = sweep.get("campaign_integrity")
+    intentional_control_only = bool(
+        isinstance(campaign_integrity, dict)
+        and campaign_integrity.get("intentional_control_only") is True
+    )
+    calibration_required = (
+        bool(configured_fault_types & TRACE_COVERAGE_FAULT_TYPES)
+        or (not fault_sweep_declared and bool(coverage))
+    ) and not intentional_control_only
     coverage_blocks_clean = coverage_status in {
         "unavailable",
         "metadata_only",
         "outside_slots_only",
         "no_nvm_activity",
     } and calibration_required
-    swap_progress_required = "swap_progress" in configured_fault_types
+    swap_progress_required = (
+        "swap_progress" in configured_fault_types
+        and not intentional_control_only
+    )
     swap_progress = summary.get("swap_progress_inference")
     control_only_issue = (
-        allow_control_only_issues
+        (allow_control_only_issues or intentional_control_only)
         and control_outcome == expected_control_outcome
     )
 

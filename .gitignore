@@ -38,11 +38,14 @@ results/vulnerable_campaign.json
 
 # Audit run artifacts and result JSONs (generated, not committed)
 results/audit_runs/
+results/instruction_skip_run2/
 results/*.json
 
 # Build outputs
 results/oss_validation/build/
 results/oss_validation/worktrees/
+results/tfm_an521/
+results/tfm_an521_repro/
 
 # Third-party source checkouts
 third_party/

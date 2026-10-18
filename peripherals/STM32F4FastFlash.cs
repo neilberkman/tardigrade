@@ -54,6 +54,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
         public bool DriverErrorFired { get => tracker.DriverErrorFired; set => tracker.DriverErrorFired = value; }
+        public bool DriverErrorRequiresReturnHook => true;
 
         public bool PerWriteAccurate => true;
         // Diff-based tracing reconstructs the aligned dword affected by the
@@ -404,6 +405,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     if(tracker.IncrementWriteCount())
                     {
                         FaultFired = true;
+                        if(WriteFaultMode == 6)
+                        {
+                            DriverErrorFired = true;
+                        }
                         LastFaultAddress = 0;
                         FaultFlashSnapshot = Flash.ReadBytes(0, flashLen);
                     }
@@ -417,6 +422,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 if(tracker.IncrementWriteCount())
                 {
                     FaultFired = true;
+                    if(WriteFaultMode == 6)
+                    {
+                        DriverErrorFired = true;
+                    }
                     LastFaultAddress = 0;
                     FaultFlashSnapshot = Flash.ReadBytes(0, checked((int)FlashSize));
                 }

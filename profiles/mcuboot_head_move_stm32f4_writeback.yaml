@@ -1,0 +1,42 @@
+base_profile: mcuboot_head_move_stm32f4_upgrade.yaml
+
+schema_version: 1
+name: mcuboot_head_move_stm32f4_writeback
+description: >
+  MCUboot current-HEAD swap-move upgrade on nucleo_f429zi with a writeback
+  durability model. Inherits the non-uniform STM32F4 swap-move geometry and
+  artifacts; only power-loss cutpoints are selected.
+memory:
+  erase_regions:
+    - { base: 0x08000000, size: 0x10000, sector_size: 0x4000 }
+    - { base: 0x08010000, size: 0x10000, sector_size: 0x10000 }
+    - { base: 0x08020000, size: 0xE0000, sector_size: 0x20000 }
+    - { base: 0x08100000, size: 0x10000, sector_size: 0x4000 }
+    - { base: 0x08110000, size: 0x10000, sector_size: 0x10000 }
+    - { base: 0x08120000, size: 0xE0000, sector_size: 0x20000 }
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: staging
+state_probe:
+  script: targets/mcuboot/probe.py
+  required_paths:
+    - semantic_state.target
+    - semantic_state.slots.exec.magic_state
+    - semantic_state.slots.staging.magic_state
+    - semantic_state.flags.any_partial_magic
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  max_writes_cap: 500000
+  max_step_limit: 500000000
+  phase2_wall_timeout_s: 90
+  calibration_stop:
+    success_criteria: true
+  durability_model: writeback
+  writeback:
+    buffer_capacity: auto
+    erase_flushes_domain: false
+expect:
+  should_find_issues: true
+skip_self_test: true

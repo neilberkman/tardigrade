@@ -592,6 +592,10 @@ class TestActionSourceBoundaries(unittest.TestCase):
         self.assertIn("--no-assert-verdict", source)
         self.assertIn("require-conclusive-runtime-report", source)
         self.assertIn("mcuboot-zero-day-${{ matrix.slug }}", source)
+        self.assertIn(
+            "            results/oss_validation/assets/zephyr_head_commit.txt\n",
+            source.split("Upload sweep result", 1)[1],
+        )
         self.assertIn('cron: "0 9 * * 1"', source)
         self.assertIn("inputs.mcuboot_ref || 'main'", source)
         self.assertIn("inputs.zephyr_ref || 'main'", source)

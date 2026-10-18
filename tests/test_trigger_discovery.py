@@ -27,7 +27,7 @@ import sys
 
 sys.path.insert(0, str(SCRIPTS))
 
-from profile_loader import load_profile  # noqa: E402
+from profile_loader import ProfileError, load_profile  # noqa: E402
 from trigger_discovery import (  # noqa: E402
     TriggerStrategy,
     _build_mcuboot_strategies,
@@ -525,6 +525,135 @@ class TriggerDiscoveryTests(unittest.TestCase):
         self.assertEqual(check["status"], "match")
         self.assertEqual(len(check["exec_segments"]), len(check["staging_segments"]))
 
+    def test_validate_swap_sector_geometry_accepts_one_sector_larger_staging_for_swap_offset(self) -> None:
+        for algorithm in ("swap-offset", "swap_offset"):
+            with self.subTest(algorithm=algorithm):
+                profile = SimpleNamespace(
+                    name="mcuboot_offset_asymmetric",
+                    bootloader_entry=0x00000000,
+                    bootloader_elf="mcuboot.elf",
+                    bootloader_algorithm=algorithm,
+                    platform="platforms/cortex_m4_flash_fast.repl",
+                    memory=SimpleNamespace(
+                        page_size=0x1000,
+                        write_granularity=4,
+                        slots={
+                            "exec": SimpleNamespace(base=0x0000C000, size=0x75000),
+                            "staging": SimpleNamespace(base=0x00081000, size=0x76000),
+                        },
+                    ),
+                )
+                check = validate_swap_sector_geometry(profile)
+                self.assertEqual(check["status"], "match")
+                self.assertIn("swap-offset", check["reason"])
+                self.assertEqual(len(check["exec_segments"]) + 1, len(check["staging_segments"]))
+
+    def test_validate_swap_sector_geometry_rejects_other_asymmetry_or_non_swap_offset(self) -> None:
+        cases = (
+            ("undeclared_algorithm", None, 0x75000, 0x76000, "platforms/cortex_m4_flash_fast.repl"),
+            ("swap_move_algorithm", "swap-move", 0x75000, 0x76000, "platforms/cortex_m4_flash_fast.repl"),
+            ("swap_scratch_algorithm", "swap-scratch", 0x75000, 0x76000, "platforms/cortex_m4_flash_fast.repl"),
+            ("exec_larger_than_staging", "swap-offset", 0x76000, 0x75000, "platforms/cortex_m4_flash_fast.repl"),
+            ("staging_two_sectors_larger", "swap-offset", 0x75000, 0x77000, "platforms/cortex_m4_flash_fast.repl"),
+            ("partial_sector_staging", "swap-offset", 0x75000, 0x75800, "platforms/cortex_m4_flash_fast.repl"),
+        )
+        for label, algorithm, exec_size, staging_size, platform in cases:
+            with self.subTest(case=label):
+                profile = SimpleNamespace(
+                    name="mcuboot_{}".format(label),
+                    bootloader_entry=0x00000000,
+                    bootloader_elf="mcuboot.elf",
+                    bootloader_algorithm=algorithm,
+                    platform=platform,
+                    memory=SimpleNamespace(
+                        page_size=0x1000,
+                        write_granularity=4,
+                        slots={
+                            "exec": SimpleNamespace(base=0x0000C000, size=exec_size),
+                            "staging": SimpleNamespace(base=0x0000C000 + exec_size, size=staging_size),
+                        },
+                    ),
+                )
+                check = validate_swap_sector_geometry(profile)
+                self.assertEqual(check["status"], "mismatch")
+
+    def test_loader_validates_bootloader_algorithm(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            valid_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: algo_valid
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                  algorithm: swap_offset
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(valid_path, strict=True)
+            self.assertEqual(profile.bootloader_algorithm, "swap-offset")
+
+            for bad_value in ("unknown_algo", "123", "true"):
+                bad_path = self._write_profile(
+                    tempdir,
+                    f"""
+                    schema_version: 1
+                    name: algo_bad
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    bootloader:
+                      elf: examples/vulnerable_ota/firmware.elf
+                      entry: 0x10000000
+                      algorithm: {bad_value}
+                    memory:
+                      sram: {{ start: 0x20000000, end: 0x20020000 }}
+                      write_granularity: 4
+                      slots:
+                        exec: {{ base: 0x10000000, size: 0x1000 }}
+                        staging: {{ base: 0x10001000, size: 0x1000 }}
+                    images:
+                      staging: examples/vulnerable_ota/firmware.bin
+                    success_criteria:
+                      vtor_in_slot: exec
+                    expect:
+                      should_find_issues: false
+                    """,
+                )
+                with self.assertRaises(ProfileError):
+                    load_profile(bad_path)
+
+    def test_pr2214_offset_profiles_have_no_sector_geometry_advisory(self) -> None:
+        if not HAVE_PYYAML:
+            self.skipTest("PyYAML not installed")
+        for relpath in (
+            "profiles/mcuboot_pr2214_offset_broken.yaml",
+            "profiles/mcuboot_pr2214_offset_fixed.yaml",
+        ):
+            with self.subTest(profile=relpath):
+                profile = load_profile(ROOT / relpath)
+                self.assertEqual(profile.bootloader_algorithm, "swap-offset")
+                check = validate_compiled_flash_map(profile, ROOT)
+                if check["status"] == "unavailable":
+                    self.skipTest(check["reason"])
+                self.assertEqual(check["status"], "match")
+                self.assertEqual(check["sector_geometry"]["status"], "match")
+                self.assertNotIn("sector geometry advisory", check["reason"])
+
     def _write_profile(self, tempdir: Path, body: str) -> Path:
         path = tempdir / "profile.yaml"
         path.write_text(textwrap.dedent(body), encoding="utf-8")
@@ -681,7 +810,7 @@ class TriggerDiscoveryTests(unittest.TestCase):
     def test_validate_compiled_flash_map_keeps_sector_advisory_separate(self) -> None:
         if not HAVE_PYYAML:
             self.skipTest("PyYAML not installed")
-        profile = load_profile(ROOT / "profiles/mcuboot_pr2214_offset_fixed.yaml")
+        profile = load_profile(ROOT / "profiles/mcuboot_pr2214_offset_geom_fixed.yaml")
         check = validate_compiled_flash_map(profile, ROOT)
         if check["status"] == "unavailable":
             self.skipTest(check["reason"])
@@ -725,7 +854,7 @@ class TriggerDiscoveryTests(unittest.TestCase):
     def test_offset_strategy_uses_real_next_erase_boundary(self) -> None:
         if not HAVE_PYYAML:
             self.skipTest("PyYAML not installed")
-        profile = load_profile(ROOT / "profiles" / "mcuboot_pr2214_offset_fixed.yaml")
+        profile = load_profile(ROOT / "profiles" / "mcuboot_pr2214_offset_geom_fixed.yaml")
         strategy = TriggerStrategy(
             name="offset_image_swap_metadata_align8",
             trigger_fields={
@@ -740,7 +869,7 @@ class TriggerDiscoveryTests(unittest.TestCase):
         candidate, error = _clone_for_strategy(profile, ROOT, strategy)
         self.assertIsNone(error)
         assert candidate is not None
-        self.assertEqual(candidate.image_load_addresses["staging"], 0x080A0000)
+        self.assertEqual(candidate.image_load_addresses["staging"], 0x0810C000)
         self.assertTrue(candidate.images["staging"].endswith("zephyr_slot1_offset_geom_full.bin"))
 
     def test_discovery_selects_first_strategy_with_slot_activity(self) -> None:

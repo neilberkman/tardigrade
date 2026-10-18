@@ -332,7 +332,7 @@ When `pre_boot_state` is empty, tardigrade treats `update_trigger: auto` and a m
 4. Offset image placement + trailer magic
 5. Offset image placement + trailer metadata
 
-MCUboot profiles also get a compiled flash-map and erase-sector-layout preflight first. If the ELF's built-in slot layout does not match the profile's declared slots, tardigrade stops early instead of brute-forcing triggers against the wrong geometry. Nonuniform or partially covered erase-sector geometry is retained as an advisory diagnostic and may be intentional for geometry-specific regression profiles.
+MCUboot profiles also get a compiled flash-map and erase-sector-layout preflight first. If the ELF's built-in slot layout does not match the profile's declared slots, tardigrade stops early instead of brute-forcing triggers against the wrong geometry. Nonuniform or partially covered erase-sector geometry is retained as an advisory diagnostic and may be intentional for geometry-specific regression profiles. When a profile uses `MCUBOOT_SWAP_USING_OFFSET` and sizes `staging` one full erase sector larger than `exec`, set `bootloader.algorithm: swap-offset` so the sector-layout preflight accepts that one-sector-larger secondary slot without emitting the mismatch advisory while still flagging any other slot asymmetry. Supported `bootloader.algorithm` values are `swap-offset`, `swap-move`, `swap-scratch`, `overwrite-only`, `direct-xip`, and `ram-load`.
 
 This is coverage-gated. Trailer-only writes are not enough: a strategy only succeeds if calibration reaches slot data movement. If every strategy fails, tardigrade reports `INCONCLUSIVE -- could not trigger firmware update` rather than claiming a clean run.
 
@@ -358,6 +358,8 @@ success_criteria:
   vtor_in_slot: exec
   vector_table_offset: 0x400 # nxboot: 1KB image header
 ```
+
+When a profile declares `vector_table_offset`, the runtime runner checks that offset on the clean control and on every fault point in Phase 2. For `vtor_in_slot`, the runner requires the captured VTOR register to equal `slot_base + vector_table_offset` and records the expected and actual VTOR addresses in `signals.failure_reason` on mismatch. For `pc_in_slot`, the runner requires the captured sticky PC to fall at or above `slot_base + vector_table_offset` and below `slot_end`, rejecting any PC that lands inside the leading header bytes. When a profile omits `vector_table_offset`, the runner keeps the in-slot range check from `slot_base` to `slot_end` for both `vtor_in_slot` and `pc_in_slot`.
 
 The reset vector table is part of the fault surface when `bootloader.entry`
 lies inside the selected fast or direct-MRAM fault backend. On those paths,
@@ -444,6 +446,8 @@ the list and records the matched image name. A mixed or unknown image remains
 a failure. Trigger discovery also rejects an unchanged starting image when it
 is merely one member of the allowed set; discovery still has to demonstrate
 the configured update effect.
+
+Both `ProfileConfig._compute_image_digests` and `compute_slot_hash` hash the MCUboot-validated image extent `ih_hdr_size + ih_img_size + ih_protect_tlv_size` plus the unprotected TLV area `it_tlv_tot` when the image or slot begins with `IMAGE_MAGIC = 0x96F3B83D` and carries a valid `IMAGE_TLV_INFO_MAGIC = 0x6907` header. When the slot does not start with a valid MCUboot header and TLV block, `resolve_slot_hash_extent` falls back to `slot_size` minus the size of the slot's last erase sector from `flash.sectors`, `flash.page_size`, or the platform `.repl` flash geometry, and uses `slot_size - 4096` only when neither an MCUboot header nor erase-sector geometry is available.
 
 ### Boot register values
 
@@ -853,6 +857,10 @@ PASS — 0 security bypass points (253 DoS crash points, expected for glitch mod
 Only true bypasses such as `wrong_image`, `rollback_accepted`, or equivalent verification escapes fail the sweep.
 
 #### Verification probes
+
+See [MCUboot instruction-skip results](mcuboot-instruction-skip-results.md) for
+local campaign reports from the shipped MCUboot profiles, including probe
+classification counts and incomplete runs.
 
 `verification_probes` add deterministic layer-by-layer return-value capture to instruction-skip sweeps. This is useful when a skipped instruction might breach one verification function but a later function still catches the tampered image.
 
@@ -1380,6 +1388,25 @@ expect:
 ```
 
 For known-vulnerable code (differential testing), set `should_find_issues: true`. The self-test fails if the sweep doesn't find issues. Set `mode: exploratory` (or its `hunt` alias) for an explicit exploratory campaign where a complete zero-finding sweep is successful; findings remain useful evidence. Reports serialize both spellings as `exploratory`. The default `regression` mode preserves the strict requirement for profiles that genuinely require findings.
+
+The shipped `mcuboot_pr2214_offset_geom_*` broken/fixed pair uses
+`mode: exploratory`. [Issue #18](https://github.com/neilberkman/tardigrade/issues/18)
+tracks the PR2214 geometry pair, whose STM32F4 layout fails
+`boot_slots_compatible` before the off-by-one is reachable. That candidate setup
+has no recorded paired separation and is excluded from strict self-test and OSS
+regression matrices. `skip_self_test` controls discovery; `expect.mode`
+explicitly permits a complete zero-finding exploratory run. Neither setting
+turns incomplete or failed control evidence into a pass. The PR2205 and PR2206
+scratch differential pairs were removed; see
+[`docs/mcuboot-differentials.md`](mcuboot-differentials.md).
+
+The `mcuboot_pr2214_offset_broken` and `mcuboot_pr2214_offset_fixed` pair
+uses the default regression mode and sets `bootloader.algorithm: swap-offset`.
+On an nRF52840 layout whose secondary slot is one sector larger than the
+primary, a staged image with swap size 0x74000 makes the broken control boot
+stay on the old image and the fixed control boot hand off to the staged image.
+[mcuboot-pr2214-swap-offset.md](mcuboot-pr2214-swap-offset.md) derives the
+layout and the image size.
 
 ### Control-only issues
 
@@ -2106,16 +2133,6 @@ steps:
 python3 scripts/run_scenario.py \
   --scenario scenarios/mcuboot_upgrade_then_revert.yaml \
   --output /tmp/mcuboot_scenario.json
-```
-
-## Geometry matrix
-
-`scripts/geometry_matrix.py` generates parametric slot-layout permutations from a base profile to catch geometry-dependent bugs (e.g., different slot sizes, alignments, or offsets):
-
-```bash
-python3 scripts/geometry_matrix.py \
-    --base-profile profiles/mcuboot_head_upgrade.yaml \
-    --output-dir /tmp/geometry_profiles/
 ```
 
 ## Running sweeps

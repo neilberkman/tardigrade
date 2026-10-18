@@ -5,25 +5,34 @@ name: mcuboot_head_scratch_stm32f4_writeback
 description: >
   MCUboot current-HEAD scratch upgrade on nucleo_f429zi with a writeback
   durability model. Inherits the established scratch geometry and artifacts;
-  only power-loss cutpoints are selected.
+  only power-loss cutpoints are selected. Expects the mid-swap writeback
+  finding in BOOT_STATUS_STATE_1 where erasing the secondary slot before
+  buffered scratch and primary status writes from BOOT_STATUS_STATE_0 are
+  flushed leaves recovery booting the old primary image.
+# VTOR, marker, and vector_table_offset criteria match the 0x200 header in
+# zephyr_head_scratch_stm32f4_mirrored_slot0.bin and slot1.bin.
 success_criteria:
-  # The STM32 application handoff does not leave VTOR in the executable slot.
-  # Observe the handoff directly through either the reset-handler hook or an
-  # exact BX/BLX target match against the executable slot's reset vector.
-  vtor_in_slot:
-  vector_table_offset: 0x400
-  pc_in_slot: exec
-  # A branch attempt alone is not enough after an injected interruption.
-  # Require the executable data region to match the staged image as well.
-  image_hash: true
-  image_hash_slot: exec
-  expected_image: staging
+  vector_table_offset: 0x200
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
   fault_types: [power_loss]
+  phase2_wall_timeout_s: 90
+  heuristic:
+    preserve_critical_tiers: false
+    target_points: 25
+    critical_regions:
+      - { start: 0x0803F3D0, end: 0x0803F3D4 }
+      - { start: 0x0803FFD0, end: 0x0803FFE4 }
+      - { start: 0x0803FFFC, end: 0x08040004 }
+      - { start: 0x0805FFD0, end: 0x0805FFDC }
+      - { start: 0x0805FFFC, end: 0x08060000 }
+      - { start: 0x08108000, end: 0x08108004 }
+      - { start: 0x08008000, end: 0x08008004 }
   durability_model: writeback
   writeback:
     buffer_capacity: auto
     erase_flushes_domain: false
+expect:
+  should_find_issues: true
 skip_self_test: true

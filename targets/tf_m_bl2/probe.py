@@ -38,6 +38,23 @@ MCUBOOT_GOOD_MAGIC = struct.pack(
     0x0F505235,
     0x8079B62C,
 )
+MCUBOOT_ALIGNED_MAGIC_SUFFIX = struct.pack(
+    "<14B",
+    0x2D,
+    0xE1,
+    0x5D,
+    0x29,
+    0x41,
+    0x0B,
+    0x8D,
+    0x77,
+    0x67,
+    0x9C,
+    0x11,
+    0x0F,
+    0x1F,
+    0x8A,
+)
 
 # The image header is common to MCUboot's signed image formats.  The version
 # starts after magic, load address, header/protected-TLV sizes, image size,
@@ -46,6 +63,36 @@ MCUBOOT_GOOD_MAGIC = struct.pack(
 MCUBOOT_IMAGE_MAGIC = 0x96F3B83D
 MCUBOOT_IMAGE_HEADER_SIZE = 32
 MCUBOOT_IMAGE_VERSION_OFFSET = 20
+
+
+def mcuboot_expected_magic(align=8):
+    """Return the 16-byte BOOT_IMG_MAGIC for a given BOOT_MAX_ALIGN."""
+    align = _as_int(align, 8)
+    if align <= 0 or align == 8:
+        return MCUBOOT_GOOD_MAGIC
+    return struct.pack("<H", align & 0xFFFF) + MCUBOOT_ALIGNED_MAGIC_SUFFIX
+
+
+def boot_magic_decode(raw, align=8):
+    """Decode a trailer magic slice using MCUboot's boot_magic_decode rule."""
+    if raw is None or len(raw) < 16:
+        return "bad"
+    magic_bytes = raw[-16:]
+    if (
+        magic_bytes == mcuboot_expected_magic(align)
+        or magic_bytes == MCUBOOT_GOOD_MAGIC
+    ):
+        return "good"
+    return "bad"
+
+
+def mcuboot_trailer_magic(raw, align=8):
+    """Classify a trailer magic slice using MCUboot's boot_read_swap_state rule."""
+    if raw is None or len(raw) < 16:
+        return "bad"
+    if raw[-16:] == (b"\xFF" * 16):
+        return "unset"
+    return boot_magic_decode(raw, align=align)
 
 
 def _as_int(value, default=0):
@@ -80,12 +127,21 @@ def _read_flag(bus, addr):
     }
 
 
-def _magic_state(raw):
-    if raw == MCUBOOT_GOOD_MAGIC:
+def _magic_state(raw, align=8, magic_pad=b""):
+    raw_bytes = raw if raw is not None else b""
+    pad_bytes = magic_pad if magic_pad is not None else b""
+    if len(raw_bytes) > 16 and not pad_bytes:
+        pad_bytes = raw_bytes[:-16]
+        raw_bytes = raw_bytes[-16:]
+    if mcuboot_trailer_magic(raw_bytes, align=align) == "good":
+        if pad_bytes and pad_bytes != (b"\xFF" * len(pad_bytes)):
+            return "partial"
         return "good"
-    if raw == (b"\xFF" * 16):
+    if raw_bytes == (b"\xFF" * 16):
+        if pad_bytes and pad_bytes != (b"\xFF" * len(pad_bytes)):
+            return "partial"
         return "unset"
-    if raw[:8] == MCUBOOT_GOOD_MAGIC[:8] and raw[8:] == (b"\xFF" * 8):
+    if raw_bytes[:8] == MCUBOOT_GOOD_MAGIC[:8] and raw_bytes[8:] == (b"\xFF" * 8):
         return "partial"
     return "other"
 
@@ -135,11 +191,18 @@ def _slot_probe(bus, base, size, align):
     """Probe a single MCUboot slot trailer for magic, image_ok, copy_done."""
     base = int(base)
     size = int(size)
+    align = int(align) if int(align) > 0 else 8
     slot_end = base + size
     magic_addr = slot_end - 16
-    image_ok_addr = slot_end - 16 - align
-    copy_done_addr = slot_end - 16 - (2 * align)
+    magic_align_size = ((16 + align - 1) // align) * align if align > 16 else 16
+    image_ok_addr = slot_end - magic_align_size - align
+    copy_done_addr = slot_end - magic_align_size - (2 * align)
     magic = _read_bytes(bus, magic_addr, 16)
+    magic_pad = b""
+    if magic_align_size > 16 and size >= magic_align_size:
+        magic_pad = _read_bytes(
+            bus, slot_end - magic_align_size, magic_align_size - 16
+        )
     if base >= 0 and size >= MCUBOOT_IMAGE_HEADER_SIZE:
         try:
             version = _parse_image_version(
@@ -149,14 +212,22 @@ def _slot_probe(bus, base, size, align):
             version = _empty_image_version("invalid")
     else:
         version = _empty_image_version("invalid")
-    return {
+    magic_state = _magic_state(magic, align=align, magic_pad=magic_pad)
+    mcuboot_magic = mcuboot_trailer_magic(magic, align=align)
+    slot_info = {
         "base": "0x{:08X}".format(base),
         "size": "0x{:08X}".format(size),
         "version": version,
-        "magic_state": _magic_state(magic),
+        "magic_state": magic_state,
+        "magic_raw": "0x"
+        + "".join("{:02x}".format(int(b) & 0xFF) for b in bytearray(magic)),
+        "mcuboot_magic": mcuboot_magic,
         "image_ok": _read_flag(bus, image_ok_addr),
         "copy_done": _read_flag(bus, copy_done_addr),
     }
+    if magic_pad and magic_pad != (b"\xFF" * len(magic_pad)):
+        slot_info["partial_magic"] = True
+    return slot_info
 
 
 def _get_monitor_var(monitor, name, default=None):

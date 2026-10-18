@@ -33,6 +33,9 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
+    outputs:
+      mcuboot_commit: ${{ steps.build_matrix.outputs.mcuboot_commit }}
+      zephyr_commit: ${{ steps.build_matrix.outputs.zephyr_commit }}
     env:
       TOOLCHAIN_VERSION: 13.2.1-1.1
       TOOLCHAIN_URL: https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v13.2.1-1.1/xpack-arm-none-eabi-gcc-13.2.1-1.1-linux-x64.tar.gz
@@ -71,6 +74,7 @@ jobs:
         run: python3 -m pip install --user -r requirements-oss-build.txt
 
       - name: Build current MCUboot matrix
+        id: build_matrix
         env:
           MCUBOOT_REF_INPUT: ${{ inputs.mcuboot_ref || 'main' }}
           ZEPHYR_REF_INPUT: ${{ inputs.zephyr_ref || 'main' }}
@@ -84,8 +88,12 @@ jobs:
           ZEPHYR_REF="${zephyr_ref}" MCUBOOT_BOOTSTRAP_SCOPE=head \
             ./scripts/bootstrap_mcuboot_matrix_assets.sh
           MCUBOOT_REF="${ref}" ./scripts/build_mcuboot_head_matrix.sh
-          echo "Built MCUboot $(cat results/oss_validation/assets/mcuboot_head_commit.txt)"
-          echo "Against Zephyr $(cat results/oss_validation/assets/zephyr_head_commit.txt)"
+          mcuboot_commit="$(cat results/oss_validation/assets/mcuboot_head_commit.txt)"
+          zephyr_commit="$(cat results/oss_validation/assets/zephyr_head_commit.txt)"
+          echo "Built MCUboot ${mcuboot_commit}"
+          echo "Against Zephyr ${zephyr_commit}"
+          echo "mcuboot_commit=${mcuboot_commit}" >> "${GITHUB_OUTPUT}"
+          echo "zephyr_commit=${zephyr_commit}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload current-head assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -173,27 +181,61 @@ jobs:
         env:
           PROFILE_INPUT: ${{ matrix.profile }}
         run: |
+          set -euo pipefail
           slug="$(basename "${PROFILE_INPUT}" .yaml)"
-          result="results/${slug}.json"
-          if [ -f "${result}" ]; then
-            python3 - "${result}" <<'PY'
-          import json, os, sys
-          report = json.load(open(sys.argv[1]))
-          summary = report.get("summary", {}).get("runtime_sweep", {})
-          print("MCUboot:", open("results/oss_validation/assets/mcuboot_head_commit.txt").read().strip())
-          print("Profile:", report.get("profile"))
-          print("Verdict:", report.get("verdict"))
-          print("Points:", summary.get("total_fault_points"))
-          print("Issues:", summary.get("issue_points", 0))
-          print("Bricks:", summary.get("bricks", 0))
-          PY
-          fi
+          python3 scripts/zero_day_summary.py \
+            --report "results/${slug}.json" \
+            --profile "${PROFILE_INPUT}" \
+            --mcuboot-commit-file results/oss_validation/assets/mcuboot_head_commit.txt \
+            --zephyr-commit-file results/oss_validation/assets/zephyr_head_commit.txt \
+            --jsonl "results/${slug}.jsonl"
 
       - name: Upload sweep result
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: mcuboot-zero-day-${{ matrix.slug }}
+          name: mcuboot-zero-day-${{ matrix.slug }}-${{ needs.build.outputs.mcuboot_commit }}
+          retention-days: 90
           path: |
             results/*.json
+            results/*.jsonl
             results/oss_validation/assets/mcuboot_head_commit.txt
+            results/oss_validation/assets/zephyr_head_commit.txt
+
+  results:
+    needs:
+      - build
+      - sweep
+    if: always()
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Download sweep artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: mcuboot-zero-day-*
+          merge-multiple: true
+          path: results/collected
+
+      - name: Combine JSON lines
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p results/collected
+          shopt -s nullglob
+          files=(results/collected/*.jsonl)
+          if [ "${#files[@]}" -gt 0 ]; then
+            cat "${files[@]}" > results/collected/zero_day_summary.jsonl
+          fi
+
+      - name: Upload commit zero-day artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mcuboot-zero-day-${{ needs.build.outputs.mcuboot_commit }}
+          retention-days: 90
+          path: |
+            results/collected/*.json
+            results/collected/*.jsonl
+            results/collected/oss_validation/assets/mcuboot_head_commit.txt
+            results/collected/oss_validation/assets/zephyr_head_commit.txt

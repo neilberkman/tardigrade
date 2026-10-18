@@ -1,10 +1,15 @@
 schema_version: 1
 name: mcuboot_pr2214_offset_geom_broken
 description: >
-  MCUboot swap-offset geometry trigger for PR #2214 (broken commit 429e2fea).
-  Seeded STM32F4 resume-state profile for an interrupted swap-offset upgrade.
-  The broken revision resumes with the wrong last-sector index and converges
-  to no_boot instead of completing the staged update.
+  MCUboot swap-offset before PR #2214 at 429e2fea on STM32F429 mirrored-bank
+  non-uniform sectors: a 0x18000 primary slot at 0x08008000 with two 16 KiB
+  sectors and one 64 KiB trailer sector, and a 0x38000 secondary slot at
+  0x08108000 with two 16 KiB sectors, one 64 KiB sector, and one 128 KiB
+  trailer sector. The staged v2.1.0 image at secondary offset 0x4000 has swap
+  size 0x8000, so find_last_idx returns sector count 2 instead of last index 1,
+  swap_run logs "Not enough free space to run swap upgrade", and the control
+  boot stays on v1.0.0. Issue #18 and docs/mcuboot-pr2214-swap-offset.md record
+  the derivation.
 
 platform: platforms/stm32f4.repl
 flash_backend: faultFlash
@@ -12,50 +17,42 @@ flash_backend: faultFlash
 bootloader:
   elf: results/oss_validation/assets/oss_mcuboot_pr2214_offset_geom_broken.elf
   entry: 0x08000000
+  algorithm: swap-offset
 
 memory:
   sram: { start: 0x20000000, end: 0x20040000 }
   write_granularity: 4
   slots:
-    exec: { base: 0x0800C000, size: 0x76000 }
-    staging: { base: 0x08082000, size: 0x76000 }
+    exec: { base: 0x08008000, size: 0x18000 }
+    staging: { base: 0x08108000, size: 0x38000 }
 
 images:
-  exec: results/oss_validation/assets/zephyr_head_offset_stm32f4_slot0.bin
+  exec: results/oss_validation/assets/zephyr_head_scratch_stm32f4_pr2206_slot0.bin
   staging: results/oss_validation/assets/zephyr_slot1_offset_geom_full_offsetslot.bin
 
-pre_boot_state:
-  - { address: 0x08081FF0, u32: 0x676523FB }
-  - { address: 0x08081FF4, u32: 0x27388D84 }
-  - { address: 0x08081FF8, u32: 0xF6CB3E6C }
-  - { address: 0x08081FFC, u32: 0xC702C279 }
-  - { address: 0x08081F80, u32: 0x00000002 }
-  - { address: 0x08081F60, u32: 20532 }
-  - { address: 0x08081BD4, u32: 0x00000001 }
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: staging
+  max_align: 32
 
 success_criteria:
   vtor_in_slot: exec
+  marker_address: 0x08008014
+  marker_value: 0x00000102
 
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
-  boot_cycles: 3
-  max_writes: auto
+  max_writes: 0
   max_writes_cap: 200000
-  run_duration: "10.0"
-  max_step_limit: 20000000
+  run_duration: "20.0"
+  max_step_limit: 200000000
   fault_types: [power_loss]
+  sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 
-semantic_assertions:
-  control:
-    multi_boot_analysis.status: converged
-    multi_boot_analysis.final_outcome: no_boot
-
-invariants:
-  - multi_boot_converges
-
+skip_self_test: true
 expect:
-  control_outcome: no_boot
+  mode: exploratory
+  control_outcome: wrong_image
   allow_control_only_issues: true
   should_find_issues: true
-skip_self_test: true

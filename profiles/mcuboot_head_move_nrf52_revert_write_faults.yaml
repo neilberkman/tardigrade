@@ -1,11 +1,12 @@
 schema_version: 1
 name: mcuboot_head_move_nrf52_revert_write_faults
 description: >
-  Retroactive validation negative control for the old MCUboot HEAD
-  swap-move revert write-fault hypothesis on nrf52840dk. These write-class
-  faults now exercise the continue-after-fault and self-healing validator
-  path; they should not produce reportable issues unless the corrupted data
-  survives to the final security outcome.
+  MCUboot HEAD swap-move revert on nrf52840dk across write_rejection,
+  silent_write_failure, write_disturb, and wear_leveling_corruption with
+  bootutil_img_validate bypassed during post-fault reboots. Verified quick
+  sweep runs 12 points across 23815 writes in 575.7s and passes with 0 issue
+  points and 0 bricks. Kept out of self_test because execute-only write sweeps
+  exceed 300s wall time.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash

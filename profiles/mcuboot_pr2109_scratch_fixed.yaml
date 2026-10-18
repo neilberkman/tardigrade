@@ -44,7 +44,6 @@ fault_sweep:
   fault_types:
     - power_loss
     - interrupted_erase
-  sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 
 expect:
   should_find_issues: false

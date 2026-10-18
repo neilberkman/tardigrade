@@ -33,12 +33,15 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
+using Antmicro.Renode.Logging.Profiling;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Memory;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
@@ -253,6 +256,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // Used in SkipShadowScan mode to find the changed byte at fault time.
         private byte[] preFaultSnapshot;
 
+        // CPU write range observed during the current PG=1 window.
+        // Avoids scanning 2 MiB of flash when firmware writes 0xFF to an
+        // already-erased byte (where no byte differs from flashShadow).
+        private int pgWriteMinOffset = int.MaxValue;
+        private int pgWriteMaxOffset = -1;
+        private bool memoryAccessHookInstalled;
+
         // FLASH_CR bit definitions.
         private const uint PG_BIT    = 1U << 0;
         private const uint SER_BIT   = 1U << 1;
@@ -425,8 +435,58 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             genericStorage.Clear();
             flashShadow = null;
             preFaultSnapshot = null;
+            pgWriteMinOffset = int.MaxValue;
+            pgWriteMaxOffset = -1;
+            memoryAccessHookInstalled = false;
+            UpdateMemoryAccessHook(false);
             Array.Clear(localityCache, 0, LocalityCacheSize);
             localityCacheIdx = 0;
+        }
+
+        private void UpdateMemoryAccessHook(bool enabled)
+        {
+            if(!machine.IsRegistered(this))
+            {
+                memoryAccessHookInstalled = false;
+                return;
+            }
+            var cpus = machine.GetSystemBus(this).GetCPUs().OfType<ICPUWithMemoryAccessHooks>();
+            foreach(var cpu in cpus)
+            {
+                cpu.SetHookAtMemoryAccess(enabled ? (MemoryAccessHook)OnCpuMemoryWrite : null);
+            }
+            memoryAccessHookInstalled = enabled;
+        }
+
+        private void OnCpuMemoryWrite(ulong pc, MemoryOperation operation, ulong virtualAddress,
+                                      ulong physicalAddress, uint width, ulong value)
+        {
+            if(!PgActive || operation != MemoryOperation.MemoryWrite || FlashSize <= 0)
+            {
+                return;
+            }
+            long addr = (long)physicalAddress;
+            int off = -1;
+            if(addr >= FlashBaseAddress && addr < FlashBaseAddress + FlashSize)
+            {
+                off = (int)(addr - FlashBaseAddress);
+            }
+            else if(addr >= 0 && addr < FlashSize)
+            {
+                off = (int)addr;
+            }
+            if(off >= 0)
+            {
+                if(off < pgWriteMinOffset)
+                {
+                    pgWriteMinOffset = off;
+                }
+                int endOff = off + (int)Math.Max(1U, width);
+                if(endOff > pgWriteMaxOffset)
+                {
+                    pgWriteMaxOffset = endOff;
+                }
+            }
         }
 
         private uint RccCrWithReadyBits()
@@ -445,6 +505,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // FLASH register handlers.
         // ---------------------------------------------------------------
 
+        private bool NeedsCpuWriteHook =>
+            !PassthroughMode && (!SkipShadowScan || WriteTraceEnabled);
+
         private void HandleKeyr(uint key)
         {
             if(keySequence == 0 && key == KEY1)
@@ -456,6 +519,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 locked = false;
                 crValue &= ~LOCK_BIT;
                 keySequence = 0;
+                UpdateMemoryAccessHook(NeedsCpuWriteHook);
             }
             else
             {
@@ -476,6 +540,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     HandlePgDeactivation();
                     hadDirectWrite = false;
                 }
+                UpdateMemoryAccessHook(false);
                 return;
             }
 
@@ -492,6 +557,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(!wasPgActive && PgActive)
             {
                 hadDirectWrite = false;
+                pgWriteMinOffset = int.MaxValue;
+                pgWriteMaxOffset = -1;
+                bool faultTargetWrite = SkipShadowScan && !AnyFaultFired
+                    && Flash != null && FlashSize > 0
+                    && TotalWordWrites + 1 == FaultAtWordWrite;
+                if(NeedsCpuWriteHook || faultTargetWrite)
+                {
+                    if(!memoryAccessHookInstalled)
+                    {
+                        UpdateMemoryAccessHook(true);
+                    }
+                }
+                else if(memoryAccessHookInstalled)
+                {
+                    UpdateMemoryAccessHook(false);
+                }
 
                 // Trace mode needs a pre-write shadow so the first PG
                 // transition can be located.  Without this, the lazy shadow
@@ -654,6 +735,28 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private int FindChangedByte(int flashLen)
         {
+            if(pgWriteMaxOffset >= 0 && pgWriteMinOffset < flashLen)
+            {
+                int lo = Math.Max(0, pgWriteMinOffset & ~3);
+                int hi = Math.Min(flashLen, (pgWriteMaxOffset + 3) & ~3);
+                int len = hi - lo;
+                if(len > 0)
+                {
+                    var data = Flash.ReadBytes(lo, len);
+                    for(int i = 0; i < len; i++)
+                    {
+                        if(data[i] != flashShadow[lo + i])
+                        {
+                            int found = lo + i;
+                            localityCache[localityCacheIdx] = found + 1;
+                            localityCacheIdx = (localityCacheIdx + 1) % LocalityCacheSize;
+                            return found;
+                        }
+                    }
+                    return -1;
+                }
+            }
+
             const int window = 128;
 
             // Check all cached locality windows first.

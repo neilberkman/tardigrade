@@ -1,10 +1,16 @@
 schema_version: 1
 name: mcuboot_head_move_nrf52_revert_write_faults_nohashbypass
 description: >
-  Retroactive validation negative control for the MCUboot HEAD swap-move
-  revert write-fault hypothesis without hash bypass. Full SHA-256
-  validation stays enabled, and the validator should reject any candidate
-  that does not survive as a reportable end-to-end failure.
+  MCUboot HEAD swap-move revert on nrf52840dk across write_rejection,
+  silent_write_failure, write_disturb, and wear_leveling_corruption with full
+  SHA-256 validation enabled in bootutil_img_validate. Verified quick sweep
+  runs 12 points across 23815 writes in 563.7s and finds 4 issue points and 4
+  bricks at write index 11907 at address 0x0000D860. In boot_copy_region in
+  boot/bootutil/src/loader.c, MCUboot writes sector payload bytes via
+  flash_area_write without read-back verification, completes the swap, and
+  erases the swap status trailer, so bootutil_img_validate rejects the
+  corrupted primary slot with BOOT_EBADIMAGE on reboot and main enters
+  FIH_PANIC.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
@@ -38,7 +44,7 @@ fault_sweep:
   max_writes_cap: 200000
   run_duration: "20.0"
   max_step_limit: 200000000
-  # NO hash bypass — full SHA-256 validation in emulation
+  # NO hash bypass: full SHA-256 validation in emulation
 expect:
-  should_find_issues: false
+  should_find_issues: true
 skip_self_test: true

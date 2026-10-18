@@ -1,65 +1,62 @@
 schema_version: 1
 name: mcuboot_pr2214_offset_broken
 description: >
-  MCUboot swap-offset BEFORE PR #2214 find_last_idx fix (broken commit 429e2fea).
-  Seeded STM32F4 resume-state profile for an interrupted swap-offset upgrade.
-  The broken revision resumes with the wrong last-sector index and converges
-  to no_boot instead of completing the staged update.
+  MCUboot swap-offset before PR #2214 at 429e2fea. nRF52840 layout with
+  4 KiB sectors: a 0x75000 primary slot at 0xC000 and a 0x76000 secondary
+  slot at 0x81000, one sector larger as swap-offset expects. The staged
+  v1.2.0 image has swap size 0x74000, so it ends exactly where the primary
+  trailer sector begins. find_last_idx returns the sector count 116 instead
+  of the last index 115, swap_run logs "Not enough free space to run swap
+  upgrade", and the control boot stays on v1.0.0. Issue #18 and
+  docs/mcuboot-pr2214-swap-offset.md record the derivation.
 
-platform: platforms/stm32f4.repl
+platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
 
 bootloader:
-  elf: results/oss_validation/assets/oss_mcuboot_pr2214_offset_broken.elf
-  entry: 0x08000000
+  elf: results/oss_validation/assets/oss_mcuboot_pr2214_offset_nrf52_broken.elf
+  entry: 0x00000000
+  algorithm: swap-offset
 
 memory:
   sram: { start: 0x20000000, end: 0x20040000 }
   write_granularity: 4
   slots:
-    exec: { base: 0x0800C000, size: 0x76000 }
-    staging: { base: 0x08082000, size: 0x76000 }
+    exec: { base: 0x0000C000, size: 0x75000 }
+    staging: { base: 0x00081000, size: 0x76000 }
 
+# The staging file starts with one erased 4 KiB sector, so the image header
+# sits at secondary-slot offset 0x1000 where swap-offset expects it.
 images:
-  exec: results/oss_validation/assets/zephyr_head_offset_stm32f4_slot0.bin
-  staging: results/oss_validation/assets/zephyr_slot1_offset_geom_full_offsetslot.bin
+  exec: results/oss_validation/assets/zephyr_slot0_padded.bin
+  staging: results/oss_validation/assets/zephyr_slot1_pr2214_swap_0x74000_offsetslot.bin
 
-pre_boot_state:
-  - { address: 0x08081FF0, u32: 0x676523FB }
-  - { address: 0x08081FF4, u32: 0x27388D84 }
-  - { address: 0x08081FF8, u32: 0xF6CB3E6C }
-  - { address: 0x08081FFC, u32: 0xC702C279 }
-  - { address: 0x08081F80, u32: 0x00000002 }
-  - { address: 0x08081F60, u32: 20532 }
-  - { address: 0x08081BD4, u32: 0x00000001 }
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: staging
 
 success_criteria:
   vtor_in_slot: exec
-  # A successful handoff must be the staged v2.1.0 image, not the old v1
-  # image already present in exec.  The offset payload's header is at the
-  # executable slot base and carries version 0x00000102 at +0x14.
-  marker_address: 0x0800C014
-  marker_value: 0x00000102
+  # Header version of the staged image: 1.2.0 at exec base + 0x14.
+  marker_address: 0x0000C014
+  marker_value: 0x00000201
 
+# 429e2fea refuses the upgrade before swap_run moves any image data. Its only
+# flash write is copy_done at 0x80FE0 in the primary trailer, and a power
+# loss there also boots v1.0.0. The control boot is the regression signal,
+# so zero fault points makes this an intentional control-only campaign.
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
-  boot_cycles: 3
-  max_writes: auto
+  max_writes: 0
   max_writes_cap: 200000
-  run_duration: "10.0"
-  max_step_limit: 20000000
+  run_duration: "20.0"
+  max_step_limit: 200000000
   fault_types: [power_loss]
+  sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 
-semantic_assertions:
-  control:
-    multi_boot_analysis.status: converged
-    multi_boot_analysis.final_outcome: no_boot
-
-invariants:
-  - multi_boot_converges
-
+skip_self_test: true
 expect:
-  control_outcome: no_boot
+  control_outcome: wrong_image
   allow_control_only_issues: true
   should_find_issues: true

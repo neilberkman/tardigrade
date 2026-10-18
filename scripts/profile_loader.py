@@ -224,8 +224,20 @@ def _resolve_base_profile(
         _base_chain=_base_chain,
     )
 
+    child_criteria = data.get("success_criteria")
+
     # Deep-merge: child overrides base.
-    return _deep_merge_profile_data(base_data, data)
+    merged = _deep_merge_profile_data(base_data, data)
+    if (
+        isinstance(child_criteria, dict)
+        and child_criteria.get("image_hash") is True
+        and "marker_address" not in child_criteria
+        and "marker_value" not in child_criteria
+        and isinstance(merged.get("success_criteria"), dict)
+    ):
+        merged["success_criteria"].pop("marker_address", None)
+        merged["success_criteria"].pop("marker_value", None)
+    return merged
 
 class ProfileError(Exception):
     """Raised when a profile is invalid or unsupported."""
@@ -274,6 +286,7 @@ class MemoryConfig:
         "sram_end",
         "write_granularity",
         "page_size",
+        "page_size_explicit",
         "slots",
         "bootloader_region",
         "trace_address_map",
@@ -294,11 +307,17 @@ class MemoryConfig:
         erase_regions: Optional[List[MemoryRegionConfig]] = None,
         postmortem_partitions: Optional[List[MemoryRegionConfig]] = None,
         volatile_regions: Optional[List[MemoryRegionConfig]] = None,
+        page_size_explicit: Optional[bool] = None,
     ) -> None:
         self.sram_start = sram_start
         self.sram_end = sram_end
         self.write_granularity = write_granularity
         self.page_size = page_size
+        self.page_size_explicit = (
+            bool(page_size != 4096)
+            if page_size_explicit is None
+            else bool(page_size_explicit)
+        )
         self.slots = slots
         self.bootloader_region = bootloader_region
         # Optional mapping from backend trace offsets to CPU-visible absolute
@@ -866,6 +885,7 @@ class ComponentConfig:
         "platform",
         "bootloader_elf",
         "bootloader_entry",
+        "bootloader_algorithm",
         "memory",
         "images",
         "pre_boot_state",
@@ -890,11 +910,16 @@ class ComponentConfig:
         success_criteria: Optional["SuccessCriteria"] = None,
         fault_sweep: Optional["FaultSweepConfig"] = None,
         flash_backend: Optional[str] = None,
+        bootloader_algorithm: Optional[str] = None,
     ) -> None:
         self.name = name
         self.platform = platform
         self.bootloader_elf = bootloader_elf
         self.bootloader_entry = bootloader_entry
+        self.bootloader_algorithm = _parse_bootloader_algorithm(
+            bootloader_algorithm,
+            "bootloader.algorithm",
+        )
         self.memory = memory
         self.images = images
         self.pre_boot_state = pre_boot_state
@@ -949,6 +974,11 @@ class ComponentConfig:
             platform=self.platform,
             bootloader_elf=self.bootloader_elf,
             bootloader_entry=self.bootloader_entry,
+            bootloader_algorithm=(
+                self.bootloader_algorithm
+                if self.bootloader_algorithm is not None
+                else getattr(parent, "bootloader_algorithm", None)
+            ),
             memory=self.memory,
             images=self.images,
             pre_boot_state=component_pre_boot_state,
@@ -1394,6 +1424,7 @@ class FaultSweepConfig:
         "calibration_time_slice",
         "phase1_time_slice",
         "phase2_time_slice",
+        "phase1_wall_timeout_s",
         "phase2_wall_timeout_s",
         "fault_types",
         "evaluation_mode",
@@ -1480,6 +1511,7 @@ class FaultSweepConfig:
         durability_model: str = "direct",
         writeback: Optional["WritebackConfig"] = None,
         rc_injection_config: Optional["RcInjectionConfig"] = None,
+        phase1_wall_timeout_s: Optional[float] = None,
         phase2_wall_timeout_s: Optional[float] = 30.0,
     ) -> None:
         self.mode = mode
@@ -1557,6 +1589,18 @@ class FaultSweepConfig:
         self.phase2_time_slice = (
             str(phase2_time_slice).strip() if phase2_time_slice else None
         )
+        if phase1_wall_timeout_s is not None:
+            try:
+                phase1_wall_timeout_s = float(phase1_wall_timeout_s)
+            except (TypeError, ValueError) as exc:
+                raise ProfileError(
+                    "fault_sweep.phase1_wall_timeout_s: expected positive number"
+                ) from exc
+            if not math.isfinite(phase1_wall_timeout_s) or phase1_wall_timeout_s <= 0:
+                raise ProfileError(
+                    "fault_sweep.phase1_wall_timeout_s: expected positive number"
+                )
+        self.phase1_wall_timeout_s = phase1_wall_timeout_s
         if phase2_wall_timeout_s is None:
             phase2_wall_timeout_s = 30.0
         try:
@@ -1933,7 +1977,159 @@ def _align_down(value: int, align: int) -> int:
     return value - (value % align)
 
 
+MCUBOOT_IMAGE_MAGIC = 0x96F3B83D
+MCUBOOT_TLV_INFO_MAGIC = 0x6907
+MCUBOOT_TLV_PROT_INFO_MAGIC = 0x6908
+
+
+def mcuboot_validated_image_extent(blob: bytes, slot_size: int = 0) -> Optional[int]:
+    """Return the byte extent validated by MCUboot's bootutil_img_validate, or None."""
+    if not blob or len(blob) < 32:
+        return None
+    ih_magic = struct.unpack_from("<I", blob, 0)[0]
+    if ih_magic != MCUBOOT_IMAGE_MAGIC:
+        return None
+    ih_hdr_size, ih_protect_tlv_size, ih_img_size = struct.unpack_from(
+        "<HHI", blob, 8
+    )
+    if ih_hdr_size < 32:
+        return None
+    prot_off = int(ih_hdr_size) + int(ih_img_size)
+    unprot_off = prot_off + int(ih_protect_tlv_size)
+    if ih_protect_tlv_size > 0:
+        if ih_protect_tlv_size < 4 or prot_off + 4 > len(blob):
+            return None
+        prot_magic, prot_tot = struct.unpack_from("<HH", blob, prot_off)
+        if prot_magic != MCUBOOT_TLV_PROT_INFO_MAGIC or prot_tot != ih_protect_tlv_size:
+            return None
+    if unprot_off + 4 > len(blob):
+        return None
+    tlv_magic, tlv_tot = struct.unpack_from("<HH", blob, unprot_off)
+    if tlv_magic != MCUBOOT_TLV_INFO_MAGIC or tlv_tot < 4:
+        return None
+    extent = unprot_off + int(tlv_tot)
+    if extent <= 0:
+        return None
+    if int(slot_size) > 0 and extent > int(slot_size):
+        return None
+    return extent
+
+
+def last_erase_sector_reserve(
+    slot_base: int,
+    slot_size: int,
+    erase_regions: Any = None,
+    declared_sector_size: Optional[int] = None,
+) -> Optional[int]:
+    """Return the size of the slot's last erase sector when declared, else None."""
+    slot_size = int(slot_size)
+    if slot_size <= 0:
+        return None
+    slot_base = int(slot_base)
+    slot_end = slot_base + slot_size
+    last_addr = slot_end - 1
+    for entry in erase_regions or ():
+        try:
+            if isinstance(entry, dict):
+                region_base = int(entry["base"])
+                region_size = int(entry["size"])
+                sector_size = int(entry.get("sector_size", entry.get("erase_size")))
+                region_end = region_base + region_size
+            elif hasattr(entry, "base") and hasattr(entry, "size"):
+                region_base = int(entry.base)
+                region_size = int(entry.size)
+                sector_size = int(entry.sector_size)
+                region_end = region_base + region_size
+            elif hasattr(entry, "start") and hasattr(entry, "end"):
+                region_base = int(entry.start)
+                region_end = int(entry.end)
+                sector_size = int(entry.sector_size)
+            else:
+                region_base, region_end, sector_size = (
+                    int(entry[0]),
+                    int(entry[1]),
+                    int(entry[2]),
+                )
+        except Exception:
+            continue
+        if region_base < 0 or region_end <= region_base or sector_size <= 0:
+            continue
+        if region_base <= last_addr < region_end:
+            sector_start = (
+                region_base + ((last_addr - region_base) // sector_size) * sector_size
+            )
+            last_sector = min(
+                sector_size,
+                slot_end - max(slot_base, sector_start),
+            )
+            if 0 < last_sector < slot_size:
+                return last_sector
+    if declared_sector_size is not None:
+        sector_sz = int(declared_sector_size)
+        if 0 < sector_sz < slot_size:
+            return sector_sz
+    return None
+
+
+def resolve_slot_hash_extent(
+    blob: bytes,
+    slot_size: int,
+    *,
+    slot_base: int = 0,
+    erase_regions: Any = None,
+    declared_sector_size: Optional[int] = None,
+) -> Tuple[int, str]:
+    """Resolve `(extent_bytes, path_name)` for slot/image hashing."""
+    slot_size = int(slot_size)
+    mcu_extent = mcuboot_validated_image_extent(blob, slot_size=slot_size)
+    if mcu_extent is not None:
+        return mcu_extent, "mcuboot_header"
+    reserve = last_erase_sector_reserve(
+        slot_base,
+        slot_size,
+        erase_regions=erase_regions,
+        declared_sector_size=declared_sector_size,
+    )
+    if reserve is not None:
+        return slot_size - reserve, "last_erase_sector"
+    data_size = slot_size - 4096 if slot_size > 4096 else slot_size
+    return data_size, "fallback_4096"
+
+
 VALID_SCENARIOS = {"runtime"}
+
+VALID_BOOTLOADER_ALGORITHMS = frozenset(
+    {
+        "swap-offset",
+        "swap-move",
+        "swap-scratch",
+        "overwrite-only",
+        "direct-xip",
+        "ram-load",
+    }
+)
+
+
+def _parse_bootloader_algorithm(
+    raw: Any,
+    context: str = "bootloader.algorithm",
+) -> Optional[str]:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ProfileError(
+            "{}: expected string, got {}".format(context, type(raw).__name__)
+        )
+    normalized = raw.strip().lower().replace("_", "-")
+    if normalized == "overwrite":
+        normalized = "overwrite-only"
+    if not normalized or normalized not in VALID_BOOTLOADER_ALGORITHMS:
+        raise ProfileError(
+            "{}: invalid algorithm {!r}. Valid: {}".format(
+                context, raw, sorted(VALID_BOOTLOADER_ALGORITHMS)
+            )
+        )
+    return normalized
 
 
 def _build_profile_ownership_plan(profile: "ProfileConfig") -> Dict[str, Any]:
@@ -2084,6 +2280,7 @@ class ProfileConfig:
         boundary_previous_value: Optional[int] = None,
         target_source: Optional[TargetSourceConfig] = None,
         ownership_manifest_complete: bool = False,
+        bootloader_algorithm: Optional[str] = None,
 
     ) -> None:
         self.schema_version = schema_version
@@ -2092,6 +2289,10 @@ class ProfileConfig:
         self.platform = platform
         self.bootloader_elf = bootloader_elf
         self.bootloader_entry = bootloader_entry
+        self.bootloader_algorithm = _parse_bootloader_algorithm(
+            bootloader_algorithm,
+            "bootloader.algorithm",
+        )
         self.memory = memory
         self.images = images
         self.pre_boot_state = pre_boot_state
@@ -2234,6 +2435,7 @@ class ProfileConfig:
             schema_version=self.schema_version, name="{}/{}".format(self.name, state.name),
             description=state.description or self.description, platform=self.platform,
             bootloader_elf=self.bootloader_elf, bootloader_entry=self.bootloader_entry,
+            bootloader_algorithm=self.bootloader_algorithm,
             memory=self.memory, images=self.images, pre_boot_state=new_pre_boot,
             setup_script=new_setup, extra_peripherals=self.extra_peripherals,
             success_criteria=self.success_criteria, fault_sweep=self.fault_sweep,
@@ -2329,6 +2531,103 @@ class ProfileConfig:
         tmp.close()
         return tmp.name
 
+    def _platform_erase_geometry(
+        self,
+        repo_root: Path,
+    ) -> Tuple[List[Dict[str, int]], Optional[int]]:
+        """Extract declared erase-sector geometry from the platform REPL when available."""
+        if str(self.flash_backend or "").strip().lower() == "mram":
+            return [], None
+        if not self.platform:
+            return [], None
+        try:
+            repl_path = Path(self.resolve_path(repo_root, self.platform))
+            if not repl_path.is_file():
+                return [], None
+            text = repl_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return [], None
+
+        if "STM32F4FastFlash" in text or "STM32F4FlashController" in text:
+            base = 0x08000000
+            flash_size = 0x200000
+            base_match = re.search(r"FlashBaseAddress:\s*(0x[0-9a-fA-F]+|\d+)", text)
+            if base_match:
+                base = int(base_match.group(1), 0)
+            size_match = re.search(r"FlashSize:\s*(0x[0-9a-fA-F]+|\d+)", text)
+            if size_match:
+                flash_size = int(size_match.group(1), 0)
+            bank = [0x4000, 0x4000, 0x4000, 0x4000, 0x10000] + [0x20000] * 7
+            regions: List[Dict[str, int]] = []
+            offset = 0
+            for sector_size in bank + bank:
+                if offset >= flash_size:
+                    break
+                size = min(sector_size, flash_size - offset)
+                regions.append(
+                    {
+                        "base": base + offset,
+                        "size": size,
+                        "sector_size": size,
+                    }
+                )
+                offset += size
+            return regions, None
+
+        page_match = re.search(r"PageSize:\s*(0x[0-9a-fA-F]+|\d+)", text)
+        if page_match:
+            try:
+                parsed_page = int(page_match.group(1), 0)
+                if parsed_page > 0:
+                    return [], parsed_page
+            except ValueError:
+                pass
+        return [], None
+
+    def _resolve_slot_hash_extent(
+        self,
+        repo_root: Path,
+        raw_bytes: bytes,
+        slot_name: Optional[str] = None,
+    ) -> Tuple[Optional[int], str]:
+        target_name = slot_name
+        if not target_name and self.success_criteria is not None:
+            candidate_slot = str(self.success_criteria.image_hash_slot or "").strip()
+            if candidate_slot and candidate_slot in self.memory.slots:
+                target_name = candidate_slot
+        target_slot = (
+            self.memory.slots.get(target_name or "exec")
+            or self.memory.slots.get("exec")
+        )
+        slot_size = int(target_slot.size) if target_slot is not None else 0
+        slot_base = int(target_slot.base) if target_slot is not None else 0
+
+        mcu_extent = mcuboot_validated_image_extent(raw_bytes, slot_size=slot_size)
+        if mcu_extent is not None:
+            return mcu_extent, "mcuboot_header"
+
+        if target_slot is None or slot_size <= 0:
+            return None, "fallback_4096"
+
+        erase_regions: List[Any] = list(self.memory.erase_regions)
+        if not erase_regions and self.persistent_state_layout is not None:
+            erase_regions = list(self.persistent_state_layout.erase_regions)
+        declared_sector_size: Optional[int] = (
+            int(self.memory.page_size) if self.memory.page_size_explicit else None
+        )
+        if not erase_regions and declared_sector_size is None:
+            plat_regions, plat_page_size = self._platform_erase_geometry(repo_root)
+            erase_regions = plat_regions
+            declared_sector_size = plat_page_size
+
+        return resolve_slot_hash_extent(
+            raw_bytes,
+            slot_size,
+            slot_base=slot_base,
+            erase_regions=erase_regions,
+            declared_sector_size=declared_sector_size,
+        )
+
     def _compute_image_digests(
         self,
         repo_root: Path,
@@ -2336,17 +2635,15 @@ class ProfileConfig:
     ) -> Dict[str, str]:
         import hashlib
 
-        exec_slot = self.memory.slots.get("exec")
-        page_size = 4096
-        data_size = None
-        if exec_slot is not None and exec_slot.size > page_size:
-            data_size = exec_slot.size - page_size
         pad_byte = 0x00 if str(self.flash_backend or "").strip().lower() == "mram" else 0xFF
         digests: Dict[str, str] = {}
         for img_name, img_path in images.items():
             resolved = self.resolve_path(repo_root, img_path)
             with open(resolved, "rb") as fh:
                 raw = fh.read()
+            data_size, _extent_path = self._resolve_slot_hash_extent(
+                repo_root, raw
+            )
             if data_size is not None:
                 if len(raw) >= data_size:
                     raw = raw[:data_size]
@@ -2653,6 +2950,10 @@ class ProfileConfig:
             vars_list.append("PHASE1_TIME_SLICE:{}".format(fs.phase1_time_slice))
         if fs.phase2_time_slice:
             vars_list.append("PHASE2_TIME_SLICE:{}".format(fs.phase2_time_slice))
+        if fs.phase1_wall_timeout_s is not None:
+            vars_list.append(
+                "PHASE1_WALL_TIMEOUT_S:{}".format(fs.phase1_wall_timeout_s)
+            )
         vars_list.append(
             "PHASE2_WALL_TIMEOUT_S:{}".format(fs.phase2_wall_timeout_s)
         )
@@ -2774,8 +3075,8 @@ class ProfileConfig:
         # Postmortem evidence layout.  Base64-encoded JSON keeps nested
         # geometry and optional non-image partitions safe across Robot and
         # Renode command parsing.  Empty layouts are omitted for compatibility.
-        if mem.erase_regions or mem.postmortem_partitions:
-            layout = {
+        if mem.erase_regions or mem.postmortem_partitions or mem.page_size_explicit:
+            layout: Dict[str, Any] = {
                 "contract_version": 1,
                 "erase_regions": [
                     {
@@ -2795,6 +3096,8 @@ class ProfileConfig:
                     for region in mem.postmortem_partitions
                 ],
             }
+            if mem.page_size_explicit:
+                layout["page_size"] = int(mem.page_size)
             encoded_layout = base64.b64encode(
                 json.dumps(layout, sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).decode("ascii")
@@ -3489,6 +3792,7 @@ def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
         erase_regions=erase_regions,
         postmortem_partitions=postmortem_partitions,
         volatile_regions=volatile_regions,
+        page_size_explicit=("page_size" in raw),
     )
 
 
@@ -4092,6 +4396,14 @@ def _parse_fault_sweep(
         calibration_time_slice=raw.get("calibration_time_slice"),
         phase1_time_slice=raw.get("phase1_time_slice"),
         phase2_time_slice=raw.get("phase2_time_slice"),
+        phase1_wall_timeout_s=(
+            None
+            if raw.get("phase1_wall_timeout_s") is None
+            else _parse_positive_float(
+                raw.get("phase1_wall_timeout_s"),
+                "fault_sweep.phase1_wall_timeout_s",
+            )
+        ),
         phase2_wall_timeout_s=(
             30.0
             if raw.get("phase2_wall_timeout_s") is None
@@ -6329,6 +6641,10 @@ def _parse_component(
         _require(bootloader, "entry", "{}.bootloader".format(ctx)),
         "{}.bootloader.entry".format(ctx),
     )
+    bootloader_algorithm = _parse_bootloader_algorithm(
+        bootloader.get("algorithm") if isinstance(bootloader, dict) else None,
+        "{}.bootloader.algorithm".format(ctx),
+    )
 
     memory = _parse_memory(_require(raw, "memory", ctx))
 
@@ -6378,6 +6694,7 @@ def _parse_component(
         success_criteria=success_criteria,
         fault_sweep=fault_sweep,
         flash_backend=flash_backend,
+        bootloader_algorithm=bootloader_algorithm,
     )
 
 
@@ -6956,7 +7273,8 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
     {
         "mode", "max_writes", "max_otp_blows", "max_writes_cap",
         "max_step_limit", "run_duration", "calibration_time_slice",
-        "phase1_time_slice", "phase2_time_slice", "phase2_wall_timeout_s",
+        "phase1_time_slice", "phase2_time_slice", "phase1_wall_timeout_s",
+        "phase2_wall_timeout_s",
         "fault_types",
         "evaluation_mode", "sweep_strategy", "sweep_hash_bypass_symbols",
         "progress_stall_timeout_s", "boot_cycles", "boot_cycle_hook",
@@ -7014,7 +7332,9 @@ def _reject_unknown_keys(
 
 
 def _validate_strict_bootloader(raw: Any, context: str) -> None:
-    _reject_unknown_keys(raw, frozenset({"elf", "entry"}), context)
+    _reject_unknown_keys(raw, frozenset({"elf", "entry", "algorithm"}), context)
+    if "algorithm" in raw:
+        _parse_bootloader_algorithm(raw.get("algorithm"), "{}.algorithm".format(context))
 
 
 def _validate_strict_memory(raw: Any, context: str) -> None:
@@ -7820,6 +8140,10 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
     bootloader_entry = _parse_int(
         _require(bootloader, "entry", "bootloader"), "bootloader.entry"
     )
+    bootloader_algorithm = _parse_bootloader_algorithm(
+        bootloader.get("algorithm") if isinstance(bootloader, dict) else None,
+        "bootloader.algorithm",
+    )
 
     ownership_manifest_complete = data.get("ownership_manifest_complete", False)
     if not isinstance(ownership_manifest_complete, bool):
@@ -8170,6 +8494,7 @@ def load_profile(path: str | Path, *, strict: bool = False) -> ProfileConfig:
         platform=platform,
         bootloader_elf=bootloader_elf,
         bootloader_entry=bootloader_entry,
+        bootloader_algorithm=bootloader_algorithm,
         memory=memory,
         images=images,
         pre_boot_state=pre_boot_state,
@@ -8312,6 +8637,7 @@ def main() -> int:
         "platform": profile.platform,
         "bootloader_elf": profile.bootloader_elf,
         "bootloader_entry": "0x{:08X}".format(profile.bootloader_entry),
+        "bootloader_algorithm": profile.bootloader_algorithm,
         "slots": {
             name: {"base": "0x{:08X}".format(s.base), "size": "0x{:08X}".format(s.size)}
             for name, s in profile.memory.slots.items()
@@ -8330,6 +8656,7 @@ def main() -> int:
         "calibration_time_slice": profile.fault_sweep.calibration_time_slice,
         "phase1_time_slice": profile.fault_sweep.phase1_time_slice,
         "phase2_time_slice": profile.fault_sweep.phase2_time_slice,
+        "phase1_wall_timeout_s": profile.fault_sweep.phase1_wall_timeout_s,
         "phase2_wall_timeout_s": profile.fault_sweep.phase2_wall_timeout_s,
         "boot_cycle_hook": profile.fault_sweep.boot_cycle_hook,
         "expected_rollback_at_cycle": profile.fault_sweep.expected_rollback_at_cycle,

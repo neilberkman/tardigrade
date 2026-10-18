@@ -92,6 +92,8 @@ the selected boundary state, while final-state assertions remain unchanged.
 
 ## Files
 
+- `build_public_target.sh` -- reproducible build and signing script for TF-M BL2 on AN521 inside `tardigrade-oss-validation:latest`
+- `generate_runtime_profile.py` -- renders `tf_m_bl2_an521_native.yaml` from the AN521 headers and built artifacts
 - `probe.py` -- state collection from MCUboot trailers, extended for
   multi-image TF-M layouts (4 slots)
 - `invariants.py` -- TF-M-specific postcondition checks:
@@ -103,3 +105,5 @@ the selected boundary state, while final-state assertions remain unchanged.
     `invariant_config.tfm_joint_acceptance: true`
   - `tfm_no_partial_magic` -- every recovered trailer has valid or erased magic
   - `tfm_secure_slot_not_empty` -- secure slot must never be erased after fault
+
+See `docs/tfm-bl2-an521.md` for the pinned upstream revisions, container build and signing commands, generated runtime profile, control and sweep outcomes, and issue-point analysis.

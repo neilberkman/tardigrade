@@ -49,6 +49,7 @@ from partial_staging import (
 from profile_loader import ProfileConfig, load_profile
 from renode_runner import (
     RenodeTimeoutError,
+    _group_fault_plan_by_type,
     _progress,
     _run_batches_chunked,
     _base_fault_type_code,
@@ -166,12 +167,25 @@ def _validate_runtime_control_result(
 
     if observed_outcome != expected_outcome:
         limit_detail = ""
-        signals = result.get("signals")
-        if isinstance(signals, dict):
+        observations = [("control", result.get("signals"))]
+        for cycle in result.get("boot_cycles") or []:
+            if isinstance(cycle, dict):
+                observations.append(
+                    ("cycle {}".format(cycle.get("cycle")), cycle.get("signals"))
+                )
+        for label, signals in observations:
+            if not isinstance(signals, dict):
+                continue
+            for prefix in ("phase1", "phase2", "phase_followup"):
+                reason = str(signals.get(prefix + "_stop_reason") or "")
+                if reason:
+                    limit_detail += " {} {} stop={!r}, emulated_s={}.".format(
+                        label, prefix, reason, signals.get(prefix + "_emulated_s")
+                    )
             for prefix in ("phase1", "phase2"):
                 reason = str(signals.get(prefix + "_stop_reason") or "")
                 if reason.startswith("instruction_limit"):
-                    limit_detail = (
+                    limit_detail += (
                         " fault_sweep.max_step_limit={}."
                     ).format(signals.get(prefix + "_instruction_limit"))
                     break
@@ -211,6 +225,75 @@ def _validate_runtime_control_result(
                     observed_slot_name or None,
                 )
             )
+
+    if bool(getattr(criteria, "image_hash", False)):
+        expected_hash_slot = str(
+            getattr(criteria, "image_hash_slot", "") or ""
+        ).strip().lower()
+        if (
+            expected_hash_slot
+            and expected_hash_slot != "any"
+            and observed_slot_name != expected_hash_slot
+        ):
+            raise RuntimeError(
+                "Clean control failed: success_criteria.image_hash_slot requires slot {!r}, "
+                "observed {!r}. Fault dispatch was aborted.".format(
+                    expected_hash_slot,
+                    observed_slot_name or None,
+                )
+            )
+
+        signals = result.get("signals")
+        if not isinstance(signals, dict) or signals.get("marker_ok") is not True:
+            raise RuntimeError(
+                "Clean control failed: configured image_hash was not confirmed. "
+                "Fault dispatch was aborted."
+            )
+
+        hash_match = str(signals.get("image_hash_match") or "").strip().lower()
+        matched_image = str(signals.get("matched_image") or "").strip()
+        hash_actual = str(signals.get("image_hash_actual") or "").strip().lower()
+        has_valid_digest = len(hash_actual) == 64 and all(
+            ch in "0123456789abcdef" for ch in hash_actual
+        )
+        if hash_match in ("unknown", "skipped") or (
+            hash_match not in ("exec_image", "staging_image", "expected_image")
+            and not matched_image
+            and not has_valid_digest
+        ):
+            raise RuntimeError(
+                "Clean control failed: configured image_hash was not confirmed. "
+                "Fault dispatch was aborted."
+            )
+
+        inferred_image = matched_image or {
+            "exec_image": "exec",
+            "staging_image": "staging",
+        }.get(hash_match, "")
+        allowed_images = [
+            str(name).strip()
+            for name in (getattr(criteria, "allowed_images", None) or ())
+            if str(name).strip()
+        ]
+        expected_image = str(getattr(criteria, "expected_image", "") or "").strip()
+        if allowed_images:
+            if inferred_image and inferred_image not in allowed_images:
+                raise RuntimeError(
+                    "Clean control failed: expected image in {!r}, observed {!r}. "
+                    "Fault dispatch was aborted.".format(
+                        allowed_images,
+                        inferred_image,
+                    )
+                )
+        elif expected_image:
+            if inferred_image and inferred_image != expected_image:
+                raise RuntimeError(
+                    "Clean control failed: expected image {!r}, observed {!r}. "
+                    "Fault dispatch was aborted.".format(
+                        expected_image,
+                        inferred_image,
+                    )
+                )
 
     marker_address = getattr(criteria, "marker_address", None)
     if marker_address in (None, 0):
@@ -308,6 +391,26 @@ def _build_mcuboot_state_slot_config(
         profile.success_criteria,
         profile.images,
     )
+    erase_regions = [
+        {
+            "base": int(region.base),
+            "size": int(region.size),
+            "sector_size": int(region.sector_size),
+        }
+        for region in getattr(profile.memory, "erase_regions", ()) or ()
+        if getattr(region, "sector_size", None) is not None
+    ]
+    declared_sector_size: Optional[int] = (
+        int(profile.memory.page_size)
+        if getattr(profile.memory, "page_size_explicit", False)
+        else None
+    )
+    if not erase_regions and declared_sector_size is None:
+        plat_fn = getattr(profile, "_platform_erase_geometry", None)
+        if callable(plat_fn):
+            plat_regions, plat_page_size = plat_fn(repo_root)
+            erase_regions = list(plat_regions or [])
+            declared_sector_size = plat_page_size
     return {
         "flash_base": int(flash_base),
         "flash_end": int(flash_end),
@@ -321,6 +424,8 @@ def _build_mcuboot_state_slot_config(
         "trailer_align": 8,
         "trailer_window": int(getattr(profile.memory, "page_size", 4096) or 4096),
         "page_size": int(getattr(profile.memory, "page_size", 4096) or 4096),
+        "erase_regions": erase_regions,
+        "declared_sector_size": declared_sector_size,
         "pad_byte": 0x00
         if str(getattr(profile, "flash_backend", "") or "").strip().lower() == "mram"
         else 0xFF,
@@ -551,6 +656,15 @@ def _auto_execute_batch_points(
         batch_budget_s = 180.0
         point_budget_s = max(30.0, batch_budget_s - update_sequence_overhead_s)
         point_cost_s = 1.25 if is_stm32f4 else 0.9
+        raw_duration = str(
+            getattr(getattr(profile, "fault_sweep", None), "run_duration", "") or ""
+        ).strip()
+        try:
+            run_duration_s = float(raw_duration) if raw_duration else 0.0
+        except ValueError:
+            run_duration_s = 0.0
+        if run_duration_s > 5.0:
+            point_cost_s = max(point_cost_s, 2.75 + run_duration_s * 0.1375)
         max_per_batch = 192 if is_stm32f4 else 128
         computed = max(8, int(point_budget_s // point_cost_s))
         chosen = max(1, min(max_per_batch, computed, len(fault_points)))
@@ -630,6 +744,39 @@ def _auto_execute_batch_points(
         return chosen
 
     return max_batch_points
+
+
+def _auto_execute_batch_points_by_type(
+    *,
+    profile: ProfileConfig,
+    evaluation_mode: str,
+    fault_points: List[int],
+    fault_types_list: Optional[List[str]],
+    max_batch_points: int,
+    trace_file: Optional[str],
+    trace_file_bin: Optional[str],
+) -> Optional[Dict[str, int]]:
+    if max_batch_points > 0 or not fault_points or not fault_types_list:
+        return None
+    runs = _group_fault_plan_by_type(fault_points, fault_types_list)
+    if len(runs) <= 1:
+        return None
+    by_type: Dict[str, int] = {}
+    for base_ft, run_points, run_types in runs:
+        chosen = _auto_execute_batch_points(
+            profile=profile,
+            evaluation_mode=evaluation_mode,
+            fault_points=run_points,
+            fault_types_list=run_types,
+            max_batch_points=0,
+            trace_file=trace_file,
+            trace_file_bin=trace_file_bin,
+        )
+        if base_ft in by_type:
+            by_type[base_ft] = min(by_type[base_ft], chosen)
+        else:
+            by_type[base_ft] = chosen
+    return by_type
 
 
 def _select_mcuboot_state_evaluator_points(
@@ -762,6 +909,7 @@ def _run_batch_worker(
     erase_trace_file_bin: Optional[str] = None,
     fault_types_list: Optional[List[str]] = None,
     max_batch_points: int = 0,
+    max_batch_points_by_type: Optional[Dict[str, int]] = None,
     keep_run_artifacts: bool = False,
     profile_component_name: Optional[str] = None,
     profile_initial_state_name: Optional[str] = None,
@@ -832,6 +980,10 @@ def _run_batch_worker(
             )
         profile = matches[0].to_profile_config(profile)
 
+    chunk_kwargs: Dict[str, Any] = {}
+    if max_batch_points_by_type is not None:
+        chunk_kwargs["max_batch_points_by_type"] = max_batch_points_by_type
+
     results = _run_batches_chunked(
         repo_root=repo_root,
         renode_test=renode_test,
@@ -850,6 +1002,7 @@ def _run_batch_worker(
         keep_run_artifacts=keep_run_artifacts,
         progress_label="worker {}".format(worker_id),
         shared_bundle_dir=shared_bundle,
+        **chunk_kwargs,
     )
     _progress("worker {} complete: {} results.".format(worker_id, len(results)))
     return results
@@ -1313,7 +1466,7 @@ def run_runtime_sweep(
             )
         )
 
-    max_batch_points = _auto_execute_batch_points(
+    max_batch_points_by_type = _auto_execute_batch_points_by_type(
         profile=profile,
         evaluation_mode=evaluation_mode,
         fault_points=execute_fault_points,
@@ -1322,6 +1475,18 @@ def run_runtime_sweep(
         trace_file=trace_file,
         trace_file_bin=trace_file_bin,
     )
+    if max_batch_points_by_type is None:
+        max_batch_points = _auto_execute_batch_points(
+            profile=profile,
+            evaluation_mode=evaluation_mode,
+            fault_points=execute_fault_points,
+            fault_types_list=execute_fault_types_list,
+            max_batch_points=max_batch_points,
+            trace_file=trace_file,
+            trace_file_bin=trace_file_bin,
+        )
+    elif max_batch_points <= 0:
+        max_batch_points = max(max_batch_points_by_type.values())
 
     if execute_fault_points and num_workers > 1:
         # Interleave fault points across workers for load balancing.
@@ -1362,6 +1527,7 @@ def run_runtime_sweep(
                     erase_trace_file_bin=erase_trace_file_bin,
                     fault_types_list=ft_chunks[wid] if wid < len(ft_chunks) else None,
                     max_batch_points=max_batch_points,
+                    max_batch_points_by_type=max_batch_points_by_type,
                     keep_run_artifacts=keep_run_artifacts,
                     profile_component_name=profile_component_name,
                     profile_initial_state_name=profile_initial_state_name,
@@ -1382,6 +1548,9 @@ def run_runtime_sweep(
                     _progress("Worker {} FAILED: {}".format(wid, exc))
                     raise
     elif execute_fault_points:
+        chunk_kwargs: Dict[str, Any] = {}
+        if max_batch_points_by_type is not None:
+            chunk_kwargs["max_batch_points_by_type"] = max_batch_points_by_type
         batch_results = _run_batches_chunked(
             repo_root=repo_root,
             renode_test=renode_test,
@@ -1398,6 +1567,7 @@ def run_runtime_sweep(
             fault_types_list=execute_fault_types_list,
             max_batch_points=max_batch_points,
             keep_run_artifacts=keep_run_artifacts,
+            **chunk_kwargs,
         )
     else:
         batch_results = []

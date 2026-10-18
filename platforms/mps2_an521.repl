@@ -149,6 +149,11 @@ faultFlash: Miscellaneous.An521NvmInterceptor @ {
     EraseFill: 0xFF
     PageSize: 0x20000
 
+// Native trace replay helper for high-speed sweep reconstruction.
+trace_replay: Memory.TraceReplayEngine @ sysbus 0x5800A000
+    Target: ssram1
+    TargetBaseAddress: 0x00000000
+
 sysbus:
     init:
         // Stub peripherals that BL2 doesn't need for signature verification

@@ -485,6 +485,12 @@ def resolve_backend():
         else:
             supports_i2c_fault = True
 
+    driver_error_requires_return_hook = bool(
+        getattr(backend_obj, 'DriverErrorRequiresReturnHook', False)
+        or 'NRF52NVMC' in str(type(backend_obj))
+        or 'STM32F4FastFlash' in str(type(backend_obj))
+    )
+
     return {
         'kind': kind,
         'data': backend_obj,
@@ -493,6 +499,7 @@ def resolve_backend():
         'write_trace_width_explicit': write_trace_width_explicit,
         'legacy_write_trace_width': legacy_write_trace_width,
         'per_write_accurate': per_write_accurate,
+        'driver_error_requires_return_hook': driver_error_requires_return_hook,
         'ctrl_sysbus_name': ctrl_sysbus_name,
         'supports_command_fault': supports_command_fault,
         'command_fault_reason': command_fault_reason,
@@ -869,6 +876,15 @@ zero_point_execute_control = get_optional_var(
 ).strip().lower() in ('1', 'true', 'yes')
 phase1_time_slice = get_optional_var('phase1_time_slice', '0.02')
 phase2_time_slice = get_optional_var('phase2_time_slice', '0.05')
+phase1_wall_timeout_raw = get_optional_var('phase1_wall_timeout_s', '').strip()
+phase1_wall_timeout_s = None
+if phase1_wall_timeout_raw:
+    try:
+        _parsed_phase1_wall_timeout_s = float(phase1_wall_timeout_raw)
+        if _parsed_phase1_wall_timeout_s > 0:
+            phase1_wall_timeout_s = _parsed_phase1_wall_timeout_s
+    except Exception:
+        phase1_wall_timeout_s = None
 phase2_wall_timeout_raw = get_optional_var('phase2_wall_timeout_s', '30')
 try:
     phase2_wall_timeout_s = float(phase2_wall_timeout_raw)
@@ -2366,9 +2382,24 @@ def rc_injection_telemetry():
         ),
     }
 
+def _fault_uses_rc_injection_return_hook(fault_type):
+    """Return whether this execute fault forces a non-zero wrapper return code."""
+    base_code = _base_fault_type_code(fault_type)
+    if base_code == 'x':
+        return True
+    return bool(
+        base_code == 'g'
+        and (globals().get('backend') or {}).get('driver_error_requires_return_hook')
+    )
+
 def _apply_rc_injection_result_contract(result, signals, fault_type, fault_injected):
     """Attach telemetry and enforce require_applied on one execute result."""
-    if _base_fault_type_code(fault_type) != 'x':
+    base_code = _base_fault_type_code(fault_type)
+    driver_error_uses_rc = bool(
+        base_code == 'g'
+        and (globals().get('backend') or {}).get('driver_error_requires_return_hook')
+    )
+    if base_code != 'x' and not driver_error_uses_rc:
         return result
     telemetry = rc_injection_telemetry()
     result['rc_injection'] = telemetry
@@ -3788,6 +3819,11 @@ def normalize_signal_token(value):
 def to_py_bytes(raw):
     if raw is None:
         return None
+    if not isinstance(raw, str):
+        try:
+            return bytearray(raw)
+        except Exception:
+            pass
     result = bytearray()
     for value in raw:
         try:
@@ -6757,21 +6793,146 @@ def reload_images_cached():
         apply_pre_boot_state()
         cache_initial_flash()
 
+def resolve_slot_hash_extent(
+    slot_base,
+    slot_size,
+    slot_bytes=None,
+    erase_regions=None,
+    declared_sector_size=None,
+):
+    import struct as _struct
+
+    slot_base = int(slot_base)
+    slot_size = int(slot_size)
+
+    def _mcu_extent(blob):
+        if blob is None or len(blob) < 32:
+            return None
+        ih_magic = _struct.unpack_from('<I', blob, 0)[0]
+        if ih_magic != 0x96F3B83D:
+            return None
+        ih_hdr_size, ih_protect_tlv_size, ih_img_size = _struct.unpack_from(
+            '<HHI', blob, 8
+        )
+        if ih_hdr_size < 32:
+            return None
+        prot_off = int(ih_hdr_size) + int(ih_img_size)
+        unprot_off = prot_off + int(ih_protect_tlv_size)
+        if ih_protect_tlv_size > 0:
+            if ih_protect_tlv_size < 4 or prot_off + 4 > len(blob):
+                return None
+            prot_magic, prot_tot = _struct.unpack_from('<HH', blob, prot_off)
+            if prot_magic != 0x6908 or prot_tot != ih_protect_tlv_size:
+                return None
+        if unprot_off + 4 > len(blob):
+            return None
+        tlv_magic, tlv_tot = _struct.unpack_from('<HH', blob, unprot_off)
+        if tlv_magic != 0x6907 or tlv_tot < 4:
+            return None
+        extent = unprot_off + int(tlv_tot)
+        if extent <= 0:
+            return None
+        if slot_size > 0 and extent > slot_size:
+            return None
+        return extent
+
+    if slot_bytes is not None:
+        mcu_ext = _mcu_extent(slot_bytes)
+        if mcu_ext is not None:
+            return mcu_ext, 'mcuboot_header'
+    elif 'read_flash_bytes' in globals() and slot_size >= 32:
+        hdr_bytes = read_flash_bytes(slot_base, 32)
+        if hdr_bytes is not None and len(hdr_bytes) >= 32:
+            ih_magic = _struct.unpack_from('<I', hdr_bytes, 0)[0]
+            if ih_magic == 0x96F3B83D:
+                ih_hdr_size, ih_protect_tlv_size, ih_img_size = _struct.unpack_from(
+                    '<HHI', hdr_bytes, 8
+                )
+                unprot_off = int(ih_hdr_size) + int(ih_img_size) + int(ih_protect_tlv_size)
+                if ih_hdr_size >= 32 and unprot_off + 4 <= slot_size:
+                    probe = read_flash_bytes(slot_base, unprot_off + 4)
+                    mcu_ext = _mcu_extent(probe)
+                    if mcu_ext is not None:
+                        return mcu_ext, 'mcuboot_header'
+
+    if erase_regions is None:
+        _layout = globals().get('postmortem_layout')
+        if isinstance(_layout, dict):
+            erase_regions = _layout.get('erase_regions')
+        if not erase_regions and 'known_erase_regions' in globals():
+            erase_regions = known_erase_regions()
+
+    if declared_sector_size is None:
+        _layout = globals().get('postmortem_layout')
+        if isinstance(_layout, dict) and _layout.get('page_size') is not None:
+            try:
+                declared_sector_size = int(_layout.get('page_size'))
+            except Exception:
+                declared_sector_size = None
+        if declared_sector_size is None:
+            _b = globals().get('backend')
+            if isinstance(_b, dict) and _b.get('kind') != 'mram':
+                try:
+                    _ps = int(getattr(_b.get('data'), 'PageSize', 0) or 0)
+                    if _ps > 0:
+                        declared_sector_size = _ps
+                except Exception:
+                    pass
+
+    if slot_size > 0:
+        slot_end = slot_base + slot_size
+        last_addr = slot_end - 1
+        for entry in erase_regions or ():
+            try:
+                if isinstance(entry, dict):
+                    region_base = int(entry['base'])
+                    region_size = int(entry['size'])
+                    sector_size = int(entry.get('sector_size', entry.get('erase_size')))
+                    region_end = region_base + region_size
+                else:
+                    region_base, region_end, sector_size = (
+                        int(entry[0]),
+                        int(entry[1]),
+                        int(entry[2]),
+                    )
+            except Exception:
+                continue
+            if region_base < 0 or region_end <= region_base or sector_size <= 0:
+                continue
+            if region_base <= last_addr < region_end:
+                sector_start = (
+                    region_base + ((last_addr - region_base) // sector_size) * sector_size
+                )
+                last_sector = min(sector_size, slot_end - max(slot_base, sector_start))
+                if 0 < last_sector < slot_size:
+                    return slot_size - last_sector, 'last_erase_sector'
+        if declared_sector_size is not None and 0 < int(declared_sector_size) < slot_size:
+            return slot_size - int(declared_sector_size), 'last_erase_sector'
+
+    data_size = slot_size - 4096 if slot_size > 4096 else slot_size
+    return data_size, 'fallback_4096'
+
+
 def compute_slot_hash(slot_name='exec'):
-    # Compute SHA-256 of the selected slot image data (excluding trailer page).
-    # Bootloaders modify trailer fields during swap, so the full-slot hash
-    # won't match the original binary. Hashing only the data portion
-    # (everything except the last page) avoids this problem.
+    # Compute SHA-256 of the selected slot image data:
+    # 1. Exact MCUboot-validated image + TLV extent when an MCUboot header is present.
+    # 2. Slot minus its last erase sector when sector geometry is declared.
+    # 3. Slot minus 4096 bytes as the final fallback.
     import hashlib
     slot_key = str(slot_name or 'exec')
     if slot_key not in slot_ranges:
         slot_key = 'exec'
     slot_base, slot_end = slot_ranges[slot_key]
     slot_size = slot_end - slot_base
-    page_size = 4096
-    data_size = slot_size - page_size
+    data_size, extent_path = resolve_slot_hash_extent(slot_base, slot_size)
     if data_size <= 0:
         data_size = slot_size
+    if 'log' in globals():
+        log(
+            'compute_slot_hash({}): path={} extent=0x{:X} slot_size=0x{:X}'.format(
+                slot_key, extent_path, int(data_size), int(slot_size)
+            )
+        )
     data = read_flash_bytes(slot_base, data_size)
     return hashlib.sha256(data).hexdigest()
 
@@ -6851,16 +7012,26 @@ def analyze_fault_snapshot(snapshot_bytes, boot_slot=None):
     if target_slot not in slot_ranges:
         target_slot = boot_slot if boot_slot in slot_ranges else 'exec'
     slot_base, slot_end = slot_ranges[target_slot]
-    data_size = slot_end - slot_base
-    if data_size > 4096:
-        data_size -= 4096
+    slot_size = slot_end - slot_base
     slot_offset = int(slot_base) - int(flash_base)
-    if slot_offset < 0 or slot_offset > len(snapshot) - data_size:
+    if slot_offset < 0 or slot_offset > len(snapshot) - slot_size:
         analysis['analysis_error'] = 'identity slot lies outside the snapshot'
         return analysis
+    slot_view = snapshot[slot_offset:slot_offset + slot_size]
+    if 'resolve_slot_hash_extent' in globals():
+        data_size, extent_path = resolve_slot_hash_extent(
+            slot_base, slot_size, slot_bytes=slot_view
+        )
+    else:
+        data_size = slot_size - 4096 if slot_size > 4096 else slot_size
+        extent_path = 'fallback_4096'
+    if data_size <= 0:
+        data_size = slot_size
     actual = snapshot[slot_offset:slot_offset + data_size]
     analysis['identity_slot'] = target_slot
     analysis['identity_slot_base'] = fmt_u32(slot_base)
+    analysis['identity_slot_extent'] = int(data_size)
+    analysis['identity_slot_extent_path'] = extent_path
     analysis['identity_slot_sha256'] = hashlib.sha256(actual).hexdigest()
 
     image_paths = {
@@ -6881,9 +7052,21 @@ def analyze_fault_snapshot(snapshot_bytes, boot_slot=None):
         if not image_path or not os.path.isfile(image_path):
             continue
         with open(image_path, 'rb') as image_file:
-            expected = bytearray(image_file.read(data_size))
-        if len(expected) < data_size:
-            expected.extend(bytearray([erase_fill]) * (data_size - len(expected)))
+            raw_candidate = bytearray(image_file.read(slot_size))
+        cand_extent = None
+        if 'resolve_slot_hash_extent' in globals():
+            cand_ext, cand_path = resolve_slot_hash_extent(
+                slot_base, slot_size, slot_bytes=raw_candidate
+            )
+            if cand_path == 'mcuboot_header':
+                cand_extent = cand_ext
+                raw_candidate = raw_candidate[:cand_extent]
+        if extent_path == 'mcuboot_header' and cand_extent is not None:
+            expected = raw_candidate
+        else:
+            expected = raw_candidate[:data_size]
+            if len(expected) < data_size:
+                expected.extend(bytearray([erase_fill]) * (data_size - len(expected)))
         comparison = _compact_differing_byte_ranges(
             actual, expected, slot_base
         )
@@ -7192,10 +7375,20 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     # Shared boot outcome evaluation for all execution modes.
     # When effective_criteria is provided, use its values instead of globals.
     eff_vtor_slot = success_vtor_slot
+    eff_pc_slot = success_pc_slot
+    eff_vector_offset = max(0, as_int(globals().get('success_vector_offset', 0) or 0))
     eff_image_hash = success_image_hash
     eff_image_hash_slot = success_image_hash_slot
     if effective_criteria is not None:
         eff_vtor_slot = effective_criteria.get('vtor_slot', success_vtor_slot)
+        eff_pc_slot = effective_criteria.get('pc_slot', success_pc_slot)
+        if (
+            'vector_table_offset' in effective_criteria
+            and effective_criteria.get('vector_table_offset') is not None
+        ):
+            eff_vector_offset = max(
+                0, as_int(effective_criteria.get('vector_table_offset') or 0)
+            )
         eff_image_hash = effective_criteria.get('image_hash', success_image_hash)
         eff_image_hash_slot = effective_criteria.get('image_hash_slot', success_image_hash_slot)
 
@@ -7229,22 +7422,139 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
         and not no_boot_phase_without_vtor
     ):
         boot_slot = sticky_pc_slot
+    if (
+        boot_slot is None
+        and not no_boot_phase_without_vtor
+        and eff_pc_slot
+        and eff_pc_slot in slot_ranges
+    ):
+        _pc_norm = as_int(pc_value) & ~1
+        _s_lo, _s_hi = slot_ranges[eff_pc_slot]
+        if _s_lo <= _pc_norm < _s_hi:
+            boot_slot = eff_pc_slot
     execution_observed = boot_slot is not None
 
     vtor_ok = not bool(eff_vtor_slot)
+    vtor_expected_value = None
+    vtor_failure_reason = None
     if eff_vtor_slot == 'any':
         # Any defined slot is acceptable.
-        vtor_ok = vtor_in_known_slot
+        if eff_vector_offset > 0:
+            if boot_slot in slot_ranges:
+                s_lo, _s_hi = slot_ranges[boot_slot]
+                vtor_expected_value = s_lo + eff_vector_offset
+                vtor_ok = (actual_vtor == vtor_expected_value)
+                if not vtor_ok:
+                    vtor_failure_reason = (
+                        'vtor_in_slot(any): expected VTOR {} (slot {} base {} + vector_table_offset 0x{:X}), got actual VTOR {}'.format(
+                            fmt_u32(vtor_expected_value),
+                            boot_slot,
+                            fmt_u32(s_lo),
+                            eff_vector_offset,
+                            fmt_u32(actual_vtor),
+                        )
+                    )
+            else:
+                vtor_ok = False
+                expected_any = ', '.join(
+                    '{}:{}'.format(sn, fmt_u32(lo + eff_vector_offset))
+                    for sn, (lo, _hi) in sorted(slot_ranges.items())
+                )
+                vtor_failure_reason = (
+                    'vtor_in_slot(any): expected VTOR at slot_base + 0x{:X} ({}), got actual VTOR {}'.format(
+                        eff_vector_offset,
+                        expected_any,
+                        fmt_u32(actual_vtor),
+                    )
+                )
+        else:
+            vtor_ok = vtor_in_known_slot
+            if not vtor_ok:
+                expected_any = ', '.join(
+                    '{}[{}..{})'.format(sn, fmt_u32(lo), fmt_u32(hi))
+                    for sn, (lo, hi) in sorted(slot_ranges.items())
+                )
+                vtor_failure_reason = (
+                    'vtor_in_slot(any): expected VTOR in known slot ({}), got actual VTOR {}'.format(
+                        expected_any,
+                        fmt_u32(actual_vtor),
+                    )
+                )
     elif eff_vtor_slot and eff_vtor_slot in slot_ranges:
         s_lo, s_hi = slot_ranges[eff_vtor_slot]
-        vtor_ok = (s_lo <= actual_vtor < s_hi)
+        if eff_vector_offset > 0:
+            vtor_expected_value = s_lo + eff_vector_offset
+            vtor_ok = (s_lo <= actual_vtor < s_hi) and (actual_vtor == vtor_expected_value)
+            if not vtor_ok:
+                vtor_failure_reason = (
+                    'vtor_in_slot({}): expected VTOR {} (slot_base {} + vector_table_offset 0x{:X}), got actual VTOR {}'.format(
+                        eff_vtor_slot,
+                        fmt_u32(vtor_expected_value),
+                        fmt_u32(s_lo),
+                        eff_vector_offset,
+                        fmt_u32(actual_vtor),
+                    )
+                )
+        else:
+            vtor_ok = (s_lo <= actual_vtor < s_hi)
+            if not vtor_ok:
+                vtor_failure_reason = (
+                    'vtor_in_slot({}): expected VTOR in [{}..{}), got actual VTOR {}'.format(
+                        eff_vtor_slot,
+                        fmt_u32(s_lo),
+                        fmt_u32(s_hi),
+                        fmt_u32(actual_vtor),
+                    )
+                )
 
     pc_ok = True
-    if success_pc_slot and success_pc_slot in slot_ranges:
-        s_lo, s_hi = slot_ranges[success_pc_slot]
-        pc_ok = (s_lo <= (pc_value & ~1) < s_hi)
-        if sticky_pc_slot == success_pc_slot and not no_boot_phase_without_vtor:
-            pc_ok = True
+    pc_expected_range = None
+    pc_failure_reason = None
+    if eff_pc_slot and eff_pc_slot in slot_ranges:
+        s_lo, s_hi = slot_ranges[eff_pc_slot]
+        pc_lo = s_lo + eff_vector_offset
+        pc_expected_range = (pc_lo, s_hi)
+        pc_norm = as_int(pc_value) & ~1
+        sticky_pc_norm = as_int(sticky_pc.get('value', 0)) & ~1
+        if eff_vector_offset > 0:
+            if sticky_pc.get('captured') and not no_boot_phase_without_vtor:
+                actual_pc_checked = sticky_pc_norm
+                pc_ok = (
+                    sticky_pc_slot == eff_pc_slot
+                    and (pc_lo <= actual_pc_checked < s_hi)
+                )
+            else:
+                actual_pc_checked = pc_norm
+                pc_ok = (pc_lo <= actual_pc_checked < s_hi)
+            if not pc_ok:
+                pc_failure_reason = (
+                    'pc_in_slot({}): expected sticky PC in [{}..{}) (slot_base {} + vector_table_offset 0x{:X}), got actual PC {}'.format(
+                        eff_pc_slot,
+                        fmt_u32(pc_lo),
+                        fmt_u32(s_hi),
+                        fmt_u32(s_lo),
+                        eff_vector_offset,
+                        fmt_u32(actual_pc_checked),
+                    )
+                )
+        else:
+            pc_ok = (s_lo <= pc_norm < s_hi)
+            if sticky_pc_slot == eff_pc_slot and not no_boot_phase_without_vtor:
+                pc_ok = True
+            if not pc_ok:
+                actual_pc_checked = (
+                    sticky_pc_norm
+                    if (sticky_pc.get('captured') and not no_boot_phase_without_vtor)
+                    else pc_norm
+                )
+                pc_failure_reason = (
+                    'pc_in_slot({}): expected PC in [{}..{}), got actual PC {}'.format(
+                        eff_pc_slot,
+                        fmt_u32(s_lo),
+                        fmt_u32(s_hi),
+                        fmt_u32(actual_pc_checked),
+                    )
+                )
 
     marker_ok = True
     hash_result = None
@@ -7280,9 +7590,9 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
                     marker_ok = (hash_result != 'unknown')
             else:
                 hash_result = 'skipped'
-        elif success_marker_addr != 0:
+        if success_marker_addr != 0:
             actual_marker_val = as_int(bus.ReadDoubleWord(success_marker_addr))
-            marker_ok = (actual_marker_val == success_marker_value)
+            marker_ok = marker_ok and (actual_marker_val == success_marker_value)
 
     # Anti-rollback: when enabled, a boot that lands on the old (pre-upgrade)
     # image is a rollback failure even if other checks pass. Detected via
@@ -7312,6 +7622,25 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
         'marker_ok': marker_ok,
         'marker_actual': fmt_u32(actual_marker_val),
     }
+    if eff_vector_offset > 0:
+        signals['vector_table_offset'] = int(eff_vector_offset)
+    if vtor_expected_value is not None:
+        signals['vtor_expected'] = fmt_u32(vtor_expected_value)
+    if pc_expected_range is not None:
+        signals['pc_expected_range'] = [
+            fmt_u32(pc_expected_range[0]),
+            fmt_u32(pc_expected_range[1]),
+        ]
+    if vtor_failure_reason is not None:
+        signals['vtor_failure_reason'] = vtor_failure_reason
+    if pc_failure_reason is not None:
+        signals['pc_failure_reason'] = pc_failure_reason
+    failure_reasons = [
+        reason for reason in (pc_failure_reason, vtor_failure_reason)
+        if reason is not None
+    ]
+    if failure_reasons:
+        signals['failure_reason'] = '; '.join(failure_reasons)
     if hash_result is not None:
         signals['image_hash_match'] = hash_result
     if actual_hash is not None:
@@ -9066,7 +9395,11 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
     # the default phase1_wall_timeout floor.  With 36 fault points per batch,
     # ~2s overhead per point (cold reset + ELF reload), and a 3-minute Robot
     # timeout, the boot phase must stay under ~3s (targets ~4s/fault, 144s/batch).
-    _skip_p1_wall_s = 2.0
+    _skip_p1_wall_s = (
+        phase1_wall_timeout_s
+        if phase1_wall_timeout_s is not None
+        else 2.0
+    )
     # Tighten stall detection to 1 emulated second: no write + no VTOR for
     # 1s emulated is a reliable bricked-boot indicator; exits at ~2.5s real.
     saved_stall_s = progress_stall_timeout_s
@@ -10028,7 +10361,7 @@ def run_execute_fault(fault_at, fault_type='w'):
                 'skip_reason': skip_reason,
             }
 
-    if fault_type == 'x':
+    if _fault_uses_rc_injection_return_hook(fault_type):
         preflight = ensure_rc_injection_preflight()
         if not preflight.get('supported'):
             raise RuntimeError(
@@ -10150,7 +10483,7 @@ def run_execute_fault(fault_at, fault_type='w'):
 
     # Capture metadata fields before fault injection for delta tracking.
     md_pre_snapshot = capture_metadata_delta_snapshot()
-    reset_rc_injection_state(enabled=(fault_base == 'x'))
+    reset_rc_injection_state(enabled=_fault_uses_rc_injection_return_hook(fault_type))
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
 
@@ -10546,7 +10879,11 @@ def run_execute_fault(fault_at, fault_type='w'):
         signals['phase1_continued_after_fault'] = True
     if fault_injected and fault_type == 'g':
         signals['driver_error_flag_set'] = driver_error_flag_set()
-        signals['driver_error_model'] = 'peripheral_status_flag'
+        signals['driver_error_model'] = (
+            'software_return_code'
+            if _fault_uses_rc_injection_return_hook(fault_type)
+            else 'peripheral_status_flag'
+        )
     if phase2_status is not None:
         merge_stop_status_signals(signals, 'phase2', phase2_status)
 
@@ -11085,9 +11422,11 @@ def run_multi_fault_sequence(fault_sequence):
     saved_flash = None
     sequence_injected = True
 
+    stage_wall_timeout = phase1_wall_timeout(default_s=4.0)
     for idx, fault_at in enumerate(seq):
         stage_t0 = _time.time()
         stage_label = 'mf{}_{}'.format(idx + 1, fault_at)
+        stage_input_flash = saved_flash
         if idx == 0:
             log('mf seq={} phase1_setup'.format(seq))
             restore_phase1_baseline()
@@ -11095,7 +11434,7 @@ def run_multi_fault_sequence(fault_sequence):
             cpu_ref.IsHalted = False
         else:
             log('mf seq={} restore_stage{}'.format(seq, idx + 1))
-            restore_flash_and_boot(saved_flash)
+            restore_flash_and_boot(stage_input_flash)
             if _hash_bypass_active:
                 apply_hash_bypass()
         reset_nvmc_for_sweep()
@@ -11106,17 +11445,60 @@ def run_multi_fault_sequence(fault_sequence):
             arm_at = base_writes + max_writes_cap + 1
         arm_fault(arm_at)
         disarm_erase_fault()
+        arm_vtor_watchpoint()
 
         status = run_until_done(
             cpu_ref,
             label=stage_label,
             stop_on_fault=True,
-            wall_timeout=60 if idx > 0 else phase1_wall_timeout(default_s=4.0),
+            wall_timeout=stage_wall_timeout,
             time_slice=phase2_time_slice if idx > 0 else '0.02',
         )
+        disarm_vtor_watchpoint()
         disarm_fault()
         injected = was_write_fault_injected()
         actual_writes = get_total_writes()
+        retargeted_from = None
+        observed_stage_writes = None
+        if (
+            idx > 0
+            and not injected
+            and actual_writes > 0
+            and fault_at >= actual_writes
+            and status is not None
+            and status.get('reason') in ('vtor_captured', 'pc_captured')
+        ):
+            retargeted_from = fault_at
+            observed_stage_writes = actual_writes
+            fault_at = actual_writes - 1
+            log(
+                'mf seq={} stage={} retarget_unreachable requested={} observed_writes={} retargeted={}'.format(
+                    seq, idx + 1, retargeted_from, observed_stage_writes, fault_at
+                )
+            )
+            restore_flash_and_boot(stage_input_flash)
+            if _hash_bypass_active:
+                apply_hash_bypass()
+            reset_nvmc_for_sweep()
+            base_writes = get_total_writes()
+            arm_at = base_writes + fault_at + 1
+            if arm_at > base_writes + max_writes_cap:
+                arm_at = base_writes + max_writes_cap + 1
+            arm_fault(arm_at)
+            disarm_erase_fault()
+            arm_vtor_watchpoint()
+            status = run_until_done(
+                cpu_ref,
+                label='{}_retarget_{}'.format(stage_label, fault_at),
+                stop_on_fault=True,
+                wall_timeout=stage_wall_timeout,
+                time_slice=phase2_time_slice,
+            )
+            disarm_vtor_watchpoint()
+            disarm_fault()
+            injected = was_write_fault_injected()
+            actual_writes = get_total_writes()
+
         stage_ms = int((_time.time() - stage_t0) * 1000)
         log('mf seq={} stage={} fault_at={} injected={} writes={}'.format(
             seq, idx + 1, fault_at, injected, actual_writes))
@@ -11132,6 +11514,10 @@ def run_multi_fault_sequence(fault_sequence):
                 'emulated_s': status.get('emulated_s') if status is not None else None,
             },
         }
+        if retargeted_from is not None:
+            stage_state['requested_fault_at'] = retargeted_from
+            stage_state['observed_writes'] = observed_stage_writes
+            stage_state['retargeted'] = True
 
         if not injected:
             sequence_injected = False
@@ -11979,6 +12365,13 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     # snapshot captured above, then reload the bootloader ELF.
     t_reset = _time.time()
     restore_flash_and_boot(faulted_flash)
+    fault_semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': 'power_loss_boundary',
+        'boot_slot': None,
+        'fault_injected': bool(fault_injected),
+        'stage': 'fault_snapshot',
+    })
     if _hash_bypass_active:
         apply_hash_bypass()
     reset_ms = int((_time.time() - t_reset) * 1000)
@@ -12049,6 +12442,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         followup_label='fp{}_native_followup'.format(fault_at),
         saved_flash=faulted_flash, fault_snapshot_bytes=fault_snapshot_bytes,
         metadata_delta_pre_snapshot=md_pre_snapshot,
+        fault_semantic_state=fault_semantic_state,
     )
 
 def run_trace_replay_fault(fault_at, fault_type='w'):
@@ -12230,6 +12624,13 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     # snapshot captured above, then reload the bootloader ELF.
     t_reset = _time.time()
     restore_flash_and_boot(faulted_flash)
+    fault_semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': 'power_loss_boundary',
+        'boot_slot': None,
+        'fault_injected': bool(fault_injected),
+        'stage': 'fault_snapshot',
+    })
     if _hash_bypass_active:
         apply_hash_bypass()
     reset_ms = int((_time.time() - t_reset) * 1000)
@@ -12303,6 +12704,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         followup_label='fp{}_python_followup'.format(fault_at),
         saved_flash=faulted_flash, fault_snapshot_bytes=fault_snapshot_bytes,
         metadata_delta_pre_snapshot=md_pre_snapshot,
+        fault_semantic_state=fault_semantic_state,
     )
 
 # ---------------------------------------------------------------------------

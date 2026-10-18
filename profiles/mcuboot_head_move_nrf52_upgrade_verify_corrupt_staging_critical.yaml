@@ -54,4 +54,5 @@ fault_sweep:
   max_writes: auto
   max_writes_cap: 200000
   run_duration: "20.0"
+  phase1_wall_timeout_s: 30.0
   max_step_limit: 200000000

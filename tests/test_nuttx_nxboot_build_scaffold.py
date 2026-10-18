@@ -25,6 +25,7 @@ from targets.nuttx_nxboot.build_public_target import (  # noqa: E402
     verify_nxboot_support,
 )
 from targets.nuttx_nxboot.generate_runtime_profile import (  # noqa: E402
+    CAMPAIGNS,
     render_runtime_profile,
 )
 from profile_loader import load_profile  # noqa: E402
@@ -234,6 +235,65 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
             self.assertEqual(profile.fault_sweep.expected_rollback_at_cycle, 1)
         finally:
             shutil.rmtree(temp_dir)
+
+    def test_all_campaigns_allow_slow_recovery_without_extending_emulation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            build_dir = Path(td) / "build"
+            images_dir = build_dir / "images"
+            images_dir.mkdir(parents=True)
+            (build_dir / "nxboot-loader.elf").write_bytes(b"ELF")
+            for suffix in ("", "-sector-boundary"):
+                for image in ("nxboot-primary-v1-h400", "nxboot-update-v2-h400"):
+                    (images_dir / f"{image}{suffix}.img").write_bytes(b"I")
+            for campaign in CAMPAIGNS:
+                with self.subTest(campaign=campaign):
+                    profile_path = Path(td) / "profile.yaml"
+                    rendered = render_runtime_profile(build_dir, campaign=campaign)
+                    self.assertIn("phase2_wall_timeout_s: 120.0\n", rendered)
+                    self.assertIn("max_step_limit: 1000000000\n", rendered)
+                    profile_path.write_text(rendered)
+                    profile = load_profile(profile_path)
+                    self.assertEqual(profile.fault_sweep.phase2_wall_timeout_s, 120.0)
+                    self.assertIn("PHASE2_WALL_TIMEOUT_S:120.0", profile.robot_vars(ROOT))
+                    self.assertIn("MAX_STEP_LIMIT:1000000000", profile.robot_vars(ROOT))
+                    self.assertEqual(profile.fault_sweep.run_duration, "8.0")
+                    self.assertEqual(profile.fault_sweep.progress_stall_timeout_s, 4.0)
+                    self.assertEqual(profile.fault_sweep.max_step_limit, 1_000_000_000)
+
+    def test_canary_fault_type_profiles_pin_recovery_budget_and_max_step_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            build_dir = Path(td) / "build"
+            images_dir = build_dir / "images"
+            images_dir.mkdir(parents=True)
+            (build_dir / "nxboot-loader.elf").write_bytes(b"ELF")
+            (images_dir / "nxboot-primary-v1-h400.img").write_bytes(b"P")
+            (images_dir / "nxboot-update-v2-h400.img").write_bytes(b"U")
+            for fault_type in ("", "power_loss", "bit_corruption", "instruction_skip"):
+                with self.subTest(fault_type=fault_type or "revert_canary"):
+                    rendered = render_runtime_profile(
+                        build_dir,
+                        fault_max_writes="auto",
+                        boot_cycles=2,
+                        fault_types=fault_type,
+                        name=f"nuttx_nxboot_{fault_type or 'real_update'}",
+                    )
+                    self.assertIn("phase2_wall_timeout_s: 120.0\n", rendered)
+                    self.assertIn("max_step_limit: 1000000000\n", rendered)
+                    profile_path = Path(td) / f"profile_{fault_type or 'revert'}.yaml"
+                    profile_path.write_text(rendered)
+                    fake_symbols = [
+                        ("validate_image", 0x08001000, 0x08001020),
+                        ("copy_partition", 0x08001100, 0x08001120),
+                        ("perform_update", 0x08001200, 0x08001220),
+                        ("get_update_type", 0x08001300, 0x08001320),
+                    ]
+                    with mock.patch("profile_loader._load_elf_function_symbols", return_value=fake_symbols):
+                        profile = load_profile(profile_path)
+                    self.assertEqual(profile.fault_sweep.phase2_wall_timeout_s, 120.0)
+                    self.assertEqual(profile.fault_sweep.max_step_limit, 1_000_000_000)
+                    robot_vars = profile.robot_vars(ROOT)
+                    self.assertIn("PHASE2_WALL_TIMEOUT_S:120.0", robot_vars)
+                    self.assertIn("MAX_STEP_LIMIT:1000000000", robot_vars)
 
     def test_render_sector_boundary_resume_campaign_requires_distinct_images(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_campaign_"))

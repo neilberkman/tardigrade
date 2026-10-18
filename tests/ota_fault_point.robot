@@ -68,6 +68,7 @@ ${SUCCESS_TERMINAL_AFTER_RESET}    false
 ${CALIBRATION_TIME_SLICE}      ${EMPTY}
 ${PHASE1_TIME_SLICE}           ${EMPTY}
 ${PHASE2_TIME_SLICE}           ${EMPTY}
+${PHASE1_WALL_TIMEOUT_S}       ${EMPTY}
 ${PHASE2_WALL_TIMEOUT_S}       30
 ${VOLATILE_REGIONS_B64}        ${EMPTY}
 ${ZERO_POINT_EXECUTE_CONTROL}  false
@@ -249,6 +250,7 @@ Run Runtime Fault Point
     Run Keyword If    '${CALIBRATION_TIME_SLICE}' != ''    Execute Command    $calibration_time_slice="${CALIBRATION_TIME_SLICE}"
     Run Keyword If    '${PHASE1_TIME_SLICE}' != ''    Execute Command    $phase1_time_slice="${PHASE1_TIME_SLICE}"
     Run Keyword If    '${PHASE2_TIME_SLICE}' != ''    Execute Command    $phase2_time_slice="${PHASE2_TIME_SLICE}"
+    Run Keyword If    '${PHASE1_WALL_TIMEOUT_S}' != ''    Execute Command    $phase1_wall_timeout_s="${PHASE1_WALL_TIMEOUT_S}"
     Execute Command    $phase2_wall_timeout_s="${PHASE2_WALL_TIMEOUT_S}"
     Execute Command    $zero_point_execute_control="${ZERO_POINT_EXECUTE_CONTROL}"
     Run Keyword If    '${BOOT_CYCLE_HOOK}' != ''    Execute Command    $boot_cycle_hook="${BOOT_CYCLE_HOOK}"
