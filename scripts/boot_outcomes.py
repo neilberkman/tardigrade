@@ -29,7 +29,7 @@ def boot_outcome_after_stop(boot_outcome, stop_reason):
 
 def count_followup_boot_cycles(cycle_records):
     """Return recorded follow-up boot attempts, excluding the initial cycle."""
-    if not isinstance(cycle_records, list):
+    if not isinstance(cycle_records, (list, tuple)):
         return 0
     return max(0, len(cycle_records) - 1)
 

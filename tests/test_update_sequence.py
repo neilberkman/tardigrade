@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -474,6 +476,100 @@ class UpdateSequenceSchemaTest(unittest.TestCase):
             self.assertIn(f"IMAGE_EXEC_SHA256:{zero_digest}", robot_vars)
             self.assertIn(f"EXPECTED_EXEC_SHA256:{zero_digest}", robot_vars)
 
+    def test_clean_update_phase_single_boot_cycle_collects_semantic_state(self) -> None:
+        source = (ROOT / "scripts" / "run_runtime_fault_sweep.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        wanted = {
+            "build_cycle_record",
+            "_continue_followup_boot_cycles",
+            "run_followup_boot_cycles",
+            "_run_clean_update_phase",
+        }
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in wanted
+        ]
+        observed_contexts: list[dict] = []
+
+        def _collect_semantic_state(context):
+            observed_contexts.append(dict(context))
+            return {
+                "target": "mcuboot",
+                "stage": context.get("stage"),
+                "cycle": context.get("cycle"),
+            }
+
+        namespace = {
+            "_apply_phase_context": lambda _phase: None,
+            "_prepare_update_phase_start_state": lambda _phase, _idx: None,
+            "_snapshot_current_flash": lambda: b"\xff" * 64,
+            "restore_flash_and_boot": lambda _flash: None,
+            "_apply_update_phase_pre_boot": lambda _phase: None,
+            "_hash_bypass_active": False,
+            "apply_hash_bypass": lambda: None,
+            "monitor": SimpleNamespace(
+                Machine={
+                    "sysbus.cpu": SimpleNamespace(
+                        IsHalted=False,
+                        GetRegisterUnsafe=lambda _reg: 0x000103E8,
+                    )
+                }
+            ),
+            "reset_nvmc_for_recovery": lambda: None,
+            "disarm_fault": lambda: None,
+            "arm_vtor_watchpoint": lambda: None,
+            "phase1_wall_timeout": lambda default_s=4.0: default_s,
+            "phase1_max_iters": lambda default_s=4.0: 10,
+            "run_until_done": lambda *_args, **_kwargs: {
+                "reason": "vtor_captured",
+                "iters": 1,
+                "emulated_s": 0.5,
+                "elapsed_s": 0.5,
+            },
+            "_copy_on_boot_vtor_settle_iters": lambda: 0,
+            "disarm_vtor_watchpoint": lambda: None,
+            "as_int": int,
+            "bus": SimpleNamespace(ReadDoubleWord=lambda _addr: 0x0000C000),
+            "evaluate_boot_outcome": lambda *_args, **_kwargs: (
+                "success",
+                "exec",
+                {"expectations_met": True},
+            ),
+            "_time": SimpleNamespace(time=lambda: 0.0),
+            "boot_cycles": 1,
+            "backend": {"kind": "fast"},
+            "phase2_wall_timeout_s": 4.0,
+            "success_image_hash": False,
+            "expected_exec_sha256": "",
+            "success_image_hash_slot": "exec",
+            "compute_slot_hash": lambda _slot: "",
+            "log": lambda _msg: None,
+            "collect_semantic_state": _collect_semantic_state,
+        }
+        module = ast.Module(body=functions, type_ignores=[])
+        exec(compile(module, "run_runtime_fault_sweep.py", "exec"), namespace)
+
+        result = namespace["_run_clean_update_phase"]({"name": "clean_phase"}, 0)
+
+        self.assertEqual(result["phase_name"], "clean_phase")
+        self.assertEqual(result["final_outcome"], "success")
+        self.assertEqual(result["final_slot"], "exec")
+        self.assertIsNone(result["multi_boot_analysis"])
+        self.assertEqual(
+            result["semantic_state"],
+            {
+                "target": "mcuboot",
+                "stage": "update_sequence_phase",
+                "cycle": 0,
+            },
+        )
+        self.assertEqual(observed_contexts[-1]["stage"], "update_sequence_phase")
+        self.assertEqual(observed_contexts[-1]["cycle"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
