@@ -1058,6 +1058,283 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(state["hooks"], {})
 
+    def test_machine_reset_disables_counter_preservation_during_runner_reset_and_restores_it(
+        self,
+    ) -> None:
+        class Data:
+            PreserveCountersAcrossReset = True
+            TotalWordWrites = 1024
+            TrackingStartAddress = 0
+            configured_tracking_start = 0x200003C0
+            tracking_started = True
+            shadow_preserved = True
+
+            def Reset(self):
+                if self.PreserveCountersAcrossReset:
+                    return
+                self.TotalWordWrites = 0
+                self.TrackingStartAddress = self.configured_tracking_start
+                self.tracking_started = False
+                self.shadow_preserved = False
+
+        class Controller:
+            PreserveCountersAcrossReset = True
+            CommandExecutions = 9
+
+            def Reset(self):
+                if not self.PreserveCountersAcrossReset:
+                    self.CommandExecutions = 0
+
+        data = Data()
+        ctrl = Controller()
+        reset_observations = []
+
+        class Monitor:
+            def Parse(self, command):
+                if command == "machine Reset":
+                    reset_observations.append(
+                        (
+                            data.PreserveCountersAcrossReset,
+                            ctrl.PreserveCountersAcrossReset,
+                        )
+                    )
+                    data.Reset()
+                    ctrl.Reset()
+
+        namespace = {
+            "backend": {
+                "kind": "mram",
+                "data": data,
+                "controller": ctrl,
+                "backend_sysbus_name": "sysbus.mram_tracker",
+            },
+            "monitor": Monitor(),
+            "refresh_runtime_handles": lambda: None,
+            "_configure_tracking_start_address": lambda: setattr(
+                data, "TrackingStartAddress", 0x200003C0
+            ),
+            "_configure_python_tracking_gate": lambda force=False: None,
+            "_prepare_calibration_stop": lambda: None,
+            "reset_sticky_handoff_state": lambda: None,
+        }
+        exec(_runtime_function("_set_preserve_counters_across_reset"), namespace)
+        exec(_runtime_function("_machine_reset"), namespace)
+
+        namespace["_machine_reset"]()
+
+        self.assertEqual(reset_observations, [(False, False)])
+        self.assertEqual(data.TotalWordWrites, 0)
+        self.assertEqual(ctrl.CommandExecutions, 0)
+        self.assertFalse(data.shadow_preserved)
+        self.assertEqual(data.TrackingStartAddress, 0x200003C0)
+        self.assertTrue(data.PreserveCountersAcrossReset)
+        self.assertTrue(ctrl.PreserveCountersAcrossReset)
+
+    def test_reset_nvmc_for_sweep_and_recovery_clear_counters_and_enable_in_run_preservation(
+        self,
+    ) -> None:
+        class Data:
+            PreserveCountersAcrossReset = False
+            TotalWordWrites = 1025
+            LastFaultInjected = True
+            FaultEverFired = True
+            WriteFaultMode = 2
+            DriverErrorFired = True
+            FaultAtWordWrite = 7
+            write_trace_clears = 0
+            program_trace_clears = 0
+            shadow_invalidations = 0
+
+            def WriteTraceClear(self):
+                self.write_trace_clears += 1
+
+            def ProgramTraceClear(self):
+                self.program_trace_clears += 1
+
+            def InvalidateShadow(self):
+                self.shadow_invalidations += 1
+
+        data = Data()
+        namespace = {
+            "backend": {
+                "kind": "mram",
+                "data": data,
+                "controller": None,
+                "backend_sysbus_name": "sysbus.mram_tracker",
+            },
+            "_DISARM_SENTINEL": 0x7FFFFFFF,
+            "_configure_tracking_start_address": lambda: None,
+            "disarm_controller_fault": lambda: None,
+            "disarm_i2c_fault": lambda: None,
+        }
+        exec(_runtime_function("_set_preserve_counters_across_reset"), namespace)
+        exec(_runtime_function("disarm_fault"), namespace)
+        exec(_runtime_function("reset_nvmc_for_sweep"), namespace)
+        exec(_runtime_function("reset_nvmc_for_recovery"), namespace)
+
+        namespace["reset_nvmc_for_sweep"]()
+        self.assertEqual(data.TotalWordWrites, 0)
+        self.assertEqual(data.write_trace_clears, 1)
+        self.assertEqual(data.program_trace_clears, 1)
+        self.assertEqual(data.shadow_invalidations, 1)
+        self.assertTrue(data.PreserveCountersAcrossReset)
+        self.assertFalse(data.FaultEverFired)
+
+        data.TotalWordWrites = 512
+        data.PreserveCountersAcrossReset = False
+        data.FaultEverFired = True
+        namespace["reset_nvmc_for_recovery"]()
+        self.assertEqual(data.TotalWordWrites, 0)
+        self.assertEqual(data.write_trace_clears, 2)
+        self.assertEqual(data.program_trace_clears, 2)
+        self.assertEqual(data.shadow_invalidations, 2)
+        self.assertTrue(data.PreserveCountersAcrossReset)
+        self.assertFalse(data.FaultEverFired)
+        self.assertEqual(data.FaultAtWordWrite, 0x7FFFFFFF)
+
+    def test_in_run_firmware_reset_preserves_monotonic_writes_and_reaches_post_reset_fault_index(
+        self,
+    ) -> None:
+        class Tracker:
+            def __init__(self):
+                self.PreserveCountersAcrossReset = True
+                self.TotalWordWrites = 0
+                self.FaultAtWordWrite = 1025
+                self.FaultEverFired = False
+                self.LastFaultWriteIndex = 0
+                self.LastFaultProgramAddress = 0
+                self.TrackingStartAddress = 0
+                self.tracking_started = True
+                self.program_trace = []
+
+            def record_write(self, address):
+                if not self.tracking_started or self.FaultEverFired:
+                    return
+                self.TotalWordWrites += 1
+                faulted = self.TotalWordWrites == self.FaultAtWordWrite
+                self.program_trace.append((self.TotalWordWrites, address, faulted))
+                if faulted:
+                    self.FaultEverFired = True
+                    self.LastFaultWriteIndex = self.TotalWordWrites
+                    self.LastFaultProgramAddress = address
+
+            def Reset(self):
+                preserve = self.PreserveCountersAcrossReset and not self.FaultEverFired
+                if not preserve:
+                    self.TotalWordWrites = 0
+                    self.program_trace.clear()
+                    self.tracking_started = False
+                self.FaultEverFired = False
+
+        tracker = Tracker()
+        state = {"run_calls": 0, "instructions": 0, "hooks": {}}
+
+        class Monitor:
+            def Parse(self, _command):
+                state["run_calls"] += 1
+                state["instructions"] += 50
+                hook = state["hooks"].get(0x100)
+                if state["run_calls"] == 1:
+                    if hook is not None:
+                        hook(Cpu(), 0x100)
+                    for index in range(1024):
+                        tracker.record_write(0x10100000 + index * 4)
+                    tracker.Reset()
+                elif state["run_calls"] == 2:
+                    if hook is not None:
+                        hook(Cpu(), 0x100)
+                    tracker.record_write(0x10102000)
+
+        class Bus:
+            @staticmethod
+            def ReadDoubleWord(address):
+                if address == 4:
+                    return 0x101
+                return 0
+
+            @staticmethod
+            def ReadWord(_address):
+                return 0
+
+        class Cpu:
+            IsHalted = False
+
+            @property
+            def ExecutedInstructions(self):
+                return state["instructions"]
+
+            @staticmethod
+            def GetRegisterUnsafe(_index):
+                return 0x10100100
+
+            @staticmethod
+            def AddHook(address, callback):
+                state["hooks"][address] = callback
+
+            @staticmethod
+            def RemoveHook(address, callback):
+                if state["hooks"].get(address) is callback:
+                    del state["hooks"][address]
+
+        namespace = {
+            "_time": SimpleNamespace(time=lambda: 0.0),
+            "phase1_time_slice": "0.02",
+            "success_pc_slot": "exec",
+            "success_vector_offset": 0,
+            "success_terminal_after_reset": True,
+            "bootloader_entry": 0,
+            "slot_ranges": {"exec": (0x10100000, 0x10101000)},
+            "monitor": Monitor(),
+            "calibration_mode": False,
+            "_calibration_stop_state": {"address_hit": False},
+            "calibration_stop_address": 0,
+            "check_console_fatal": lambda: None,
+            "fault_requires_immediate_stop": lambda: tracker.FaultEverFired,
+            "was_otp_fault_injected": lambda: False,
+            "as_int": int,
+            "capture_sticky_pc": lambda _pc: None,
+            "bus": Bus(),
+            "sticky_vtor": {"captured": False, "value": 0, "slot": None},
+            "sticky_pc": {"captured": False, "value": 0, "slot": None},
+            "_calibration_success_stop_observation": lambda _cpu: None,
+            "_reset_gated_success_stop_observation": lambda *_args: None,
+            "get_total_writes": lambda: tracker.TotalWordWrites,
+            "get_total_erases": lambda: 0,
+            "fmt_u32": lambda value: "0x{:08X}".format(int(value)),
+            "log": lambda _message: None,
+            "capture_console_state": lambda include_recent=False: {
+                "attached_names": [],
+                "attached_count": 0,
+                "last_line": None,
+                "last_lines": [],
+                "recent_logs": [],
+            },
+            "progress_stall_timeout_s": 0,
+            "max_step_limit": 1000,
+            "max_step_limit_resolution": {
+                "configured": 1000,
+                "source": "profile",
+                "performance_mips": 100.0,
+            },
+            "_recovery_zero_vector_guard": False,
+            "expect_control_outcome": "success",
+            "no_boot_zero_write_slices": 10,
+            "no_boot_min_emulated_s": 0.1,
+        }
+        exec(_runtime_function("run_until_done"), namespace)
+
+        status = namespace["run_until_done"](
+            Cpu(), time_slice="0.02", max_iters=5
+        )
+
+        self.assertEqual(status["reason"], "fault_fired")
+        self.assertEqual(status["writes"], 1025)
+        self.assertTrue(status["reset_observation"]["observed"])
+        self.assertEqual(tracker.LastFaultWriteIndex, 1025)
+        self.assertEqual(tracker.LastFaultProgramAddress, 0x10102000)
+        self.assertEqual(len(tracker.program_trace), 1025)
+        self.assertEqual(tracker.program_trace[-1], (1025, 0x10102000, True))
+
 
 if __name__ == "__main__":
     unittest.main()

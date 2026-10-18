@@ -524,7 +524,10 @@ re-entered, or an instruction-counter reset, and then all existing content and
 liveness criteria must pass. A copied image that never requests reset, or a
 post-reset image that never establishes liveness, cannot reach this terminal.
 After a recovery reset, a live boot with a failed content check terminates as
-`wrong_image` instead of being overwritten by a later budget timeout.
+`wrong_image` instead of being overwritten by a later budget timeout. During an
+active calibration or fault run, `run_runtime_fault_sweep.py` enables
+`PreserveCountersAcrossReset` on the flash backend so write indices stay
+monotonic across the firmware's in-run reset.
 
 See `examples/runtime_self_update/profile.yaml` for a complete vendor-neutral
 fixture.
@@ -1017,6 +1020,22 @@ fault_sweep:
 ```
 
 `warm` does `machine Reset` (CPU reset, NVM persists). `cold` saves NVM state, resets the entire machine, then restores NVM — models a full power cycle where volatile state (SRAM, peripheral registers) is lost.
+
+### MRAM torn-word mode
+
+```yaml
+fault_sweep:
+  mram_torn_word: half # half, untouched, erased, or programmed
+```
+
+`mram_torn_word` selects the post-fault word bytes persisted when a `power_loss` fault interrupts an MRAM program in `MappedMRAMTracker`, `NVMemory`, or MRAM trace replay:
+
+- `half`: default mode. The lower half of the programmed word receives the new bytes and the upper half receives `EraseFill`.
+- `untouched`: the faulted word keeps the bytes that were in storage before the interrupted program began.
+- `erased`: the faulted word is filled with `EraseFill`.
+- `programmed`: the faulted word receives the full intended program bytes before the CPU stops.
+
+`profile_loader.py` rejects unknown `mram_torn_word` values and rejects `mram_torn_word` on non-MRAM backends. At runtime, `run_runtime_fault_sweep.py` sets `MramTornWordMode` on the backend peripheral only when the peripheral exposes that property.
 
 ### Phase 2 timing
 
@@ -1513,6 +1532,10 @@ Load custom Renode C# peripherals (e.g., flash controllers with non-standard beh
 extra_peripherals:
   - peripherals/STM32H7FlashController.cs
 ```
+
+Third-party C# storage and bus peripherals loaded through `extra_peripherals` receive `Reset()` whenever the guest firmware triggers a software reset such as `SYSRESETREQ` during an active run, and again when `run_runtime_fault_sweep.py` issues `machine Reset` between runs or before Phase 2 recovery. In `Reset()`, external models must clear volatile controller registers, command state machines, status flags, and one-shot fault latches, while preserving durable backing storage.
+
+External fault-injectable models that implement `ITardigradeFaultInjectable` or expose write counters to `run_runtime_fault_sweep.py` should also expose `bool PreserveCountersAcrossReset { get; set; }`. `run_runtime_fault_sweep.py` sets `PreserveCountersAcrossReset = true` during active calibration and fault runs so `Reset()` keeps `TotalWordWrites`, `TotalPageErases`, write traces, shadow buffers, and an already-activated `TrackingStartAddress` state across a firmware-initiated reset while no fault has fired and `TrackingStopAddress` has not been hit. Before issuing its own `machine Reset` for cold-reset preparation or Phase 2 recovery, `run_runtime_fault_sweep.py` sets `PreserveCountersAcrossReset = false` and zeroes counters and traces so the next boot starts cleanly.
 
 ### NVM controller
 

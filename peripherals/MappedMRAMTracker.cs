@@ -105,6 +105,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
         public int EraseFaultMode { get; set; }
         public uint CorruptionSeed { get; set; }
+        public string MramTornWordMode
+        {
+            get { return mramTornWordMode; }
+            set
+            {
+                var normalized = (value ?? "half").Trim().ToLowerInvariant();
+                if(normalized != "half" && normalized != "untouched"
+                   && normalized != "erased" && normalized != "programmed")
+                {
+                    throw new ArgumentOutOfRangeException(
+                        nameof(value),
+                        "MramTornWordMode must be half, untouched, erased, or programmed");
+                }
+                mramTornWordMode = normalized;
+            }
+        }
+        public bool PreserveCountersAcrossReset { get; set; }
         public int DiffLookahead { get; set; } = 32;
         public bool SkipShadowScan { get; set; } = true;
         public bool PassthroughMode { get; set; }
@@ -298,7 +315,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             RemoveStartHook();
             RemoveStopHook();
-            flashShadow = null;
 
             if(trackingStopHit || FaultEverFired)
             {
@@ -307,11 +323,28 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // returns, so clearing here would make an injected fault look
                 // like an out-of-range request. The runner explicitly resets
                 // campaign state before the next boot.
+                flashShadow = null;
                 trackingStartAddress = 0;
                 trackingStarted = false;
             }
+            else if(PreserveCountersAcrossReset)
+            {
+                // Preserve campaign counters, traces, and shadow bytes across
+                // a firmware-initiated reset within one run. When tracking has
+                // already started, keep it active without re-arming the start
+                // address hook so post-reset writes advance the same counter.
+                if(trackingStarted)
+                {
+                    trackingStartAddress = 0;
+                }
+                else
+                {
+                    trackingStartAddress = configuredTrackingStartAddress;
+                }
+            }
             else
             {
+                flashShadow = null;
                 trackingStartAddress = configuredTrackingStartAddress;
                 trackingStarted = trackingStartAddress == 0;
                 ResetCampaignObservability();
@@ -420,10 +453,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             else
             {
-                var partial = ProgramUnitSize / 2;
-                for(var index = partial; index < ProgramUnitSize; index++)
+                switch(mramTornWordMode)
                 {
-                    result[index] = EraseFill;
+                    case "untouched":
+                        result = CloneBytes(preProgram);
+                        break;
+                    case "erased":
+                        for(var index = 0; index < ProgramUnitSize; index++)
+                        {
+                            result[index] = EraseFill;
+                        }
+                        break;
+                    case "programmed":
+                        result = CloneBytes(intended);
+                        break;
+                    default:
+                        var partial = ProgramUnitSize / 2;
+                        for(var index = partial; index < ProgramUnitSize; index++)
+                        {
+                            result[index] = EraseFill;
+                        }
+                        break;
                 }
             }
             return result;
@@ -436,6 +486,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             trackingStarted = true;
             ResetCampaignObservability();
             UpdateHooks();
+            if(memoryAccessHookInstalled)
+            {
+                EnsureShadow();
+            }
         }
 
         private void OnTrackingStop(ICpuSupportingGdb cpu, ulong address)
@@ -634,6 +688,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private ulong programAddressBase;
         private ulong faultAtWordWrite = ulong.MaxValue;
         private int writeFaultMode;
+        private string mramTornWordMode = "half";
         private bool writeTraceEnabled;
         private byte[] flashShadow;
         private ulong configuredTrackingStartAddress;

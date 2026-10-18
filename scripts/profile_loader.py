@@ -100,6 +100,82 @@ MAX_MULTI_FAULT_PAIRS = 100_000
 MAX_MULTI_FAULTS_PER_RUN = 64
 MAX_BOOT_CYCLES = 1_000
 
+VALID_MRAM_TORN_WORD_MODES: FrozenSet[str] = frozenset(
+    {"half", "untouched", "erased", "programmed"}
+)
+
+
+def _is_mram_backend(
+    platform: Optional[str],
+    flash_backend: Optional[str],
+    extra_peripherals: Optional[List[str]] = None,
+    profile_path: Optional[Path] = None,
+) -> bool:
+    backend_lower = str(flash_backend or "").strip().lower()
+    platform_lower = str(platform or "").strip().lower()
+    peripherals_lower = [str(p).strip().lower() for p in (extra_peripherals or [])]
+    has_mram_peripheral = any("mram" in p for p in peripherals_lower)
+    non_mram_backends = {
+        "fast",
+        "faultflash",
+        "nvmc",
+        "nvm_ctrl",
+        "flash",
+        "stm32f4",
+        "stm32h7",
+    }
+    if backend_lower:
+        if "mram" in backend_lower:
+            return True
+        if backend_lower in non_mram_backends:
+            return False
+        if has_mram_peripheral:
+            return True
+    if "mram" in platform_lower or has_mram_peripheral:
+        return True
+    if platform:
+        repo_root = Path(__file__).resolve().parents[1]
+        candidates = []
+        if profile_path is not None:
+            candidates.append(Path(profile_path).resolve().parent / platform)
+        candidates.append(repo_root / platform)
+        candidates.append(Path(platform))
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    repl_text = candidate.read_text(encoding="utf-8", errors="ignore").lower()
+                    if "mram" in repl_text:
+                        return True
+            except OSError:
+                continue
+    return False
+
+
+def _validate_mram_torn_word_backend(
+    fs: Optional["FaultSweepConfig"],
+    platform: Optional[str],
+    flash_backend: Optional[str],
+    extra_peripherals: Optional[List[str]] = None,
+    profile_path: Optional[Path] = None,
+) -> None:
+    if fs is None:
+        return
+    if (
+        not getattr(fs, "mram_torn_word_explicit", False)
+        and getattr(fs, "mram_torn_word", "half") == "half"
+    ):
+        return
+    if not _is_mram_backend(
+        platform, flash_backend, extra_peripherals, profile_path=profile_path
+    ):
+        raise ProfileError(
+            "fault_sweep.mram_torn_word is only supported on MRAM backends "
+            "(got flash_backend='{}', platform='{}')".format(
+                flash_backend or "", platform or ""
+            )
+        )
+
+
 _MAX_INHERITANCE_DEPTH = 10
 
 # GCC clone suffixes, in the order the compiler appends them.
@@ -1468,6 +1544,8 @@ class FaultSweepConfig:
         "durability_model",
         "writeback",
         "rc_injection_config",
+        "mram_torn_word",
+        "mram_torn_word_explicit",
     )
 
     def __init__(
@@ -1519,6 +1597,8 @@ class FaultSweepConfig:
         rc_injection_config: Optional["RcInjectionConfig"] = None,
         phase1_wall_timeout_s: Optional[float] = None,
         phase2_wall_timeout_s: Optional[float] = 30.0,
+        mram_torn_word: str = "half",
+        mram_torn_word_explicit: bool = False,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -1682,6 +1762,20 @@ class FaultSweepConfig:
         self.durability_model = durability_model
         self.writeback = writeback
         self.rc_injection_config = rc_injection_config or RcInjectionConfig()
+        if (
+            not isinstance(mram_torn_word, str)
+            or isinstance(mram_torn_word, bool)
+            or mram_torn_word not in VALID_MRAM_TORN_WORD_MODES
+        ):
+            raise ProfileError(
+                "Invalid fault_sweep.mram_torn_word '{}'. Valid: {}".format(
+                    mram_torn_word, sorted(VALID_MRAM_TORN_WORD_MODES)
+                )
+            )
+        self.mram_torn_word = mram_torn_word
+        self.mram_torn_word_explicit = bool(mram_torn_word_explicit) or (
+            mram_torn_word != "half"
+        )
 
 
 class StateFuzzerConfig:
@@ -2379,6 +2473,14 @@ class ProfileConfig:
         self.boundary_previous_value = boundary_previous_value
         self.target_source: Optional[TargetSourceConfig] = target_source
         self.ownership_manifest_complete = ownership_manifest_complete
+        if self.multi_component is None:
+            _validate_mram_torn_word_backend(
+                self.fault_sweep,
+                self.platform,
+                self.flash_backend,
+                self.extra_peripherals,
+                profile_path=self.profile_path,
+            )
         self.ownership_plan: Dict[str, Any] = _build_profile_ownership_plan(self)
         if isinstance(self.multi_component, MultiComponentConfig):
             self.ownership_plan["components"] = {
@@ -2944,6 +3046,7 @@ class ProfileConfig:
             "BOOT_CYCLES:{}".format(fs.boot_cycles),
             "VTOR_SETTLE_ITERS:{}".format(fs.vtor_settle_iters),
             "TRACKING_START_ADDRESS:0x{:08X}".format(fs.tracking_start_address),
+            "MRAM_TORN_WORD:{}".format(fs.mram_torn_word),
             "HEURISTIC_TRACE_REQUIRED:{}".format(
                 str(
                     fs.sweep_strategy == "heuristic"
@@ -4524,6 +4627,8 @@ def _parse_fault_sweep(
         rc_injection_config=_parse_rc_injection_config(
             raw.get("rc_injection_config")
         ),
+        mram_torn_word=raw.get("mram_torn_word", "half"),
+        mram_torn_word_explicit="mram_torn_word" in raw,
     )
     fs_cfg._raw_boot_cycle_hook = raw_boot_cycle_hook
     fs_cfg._resolved_boot_cycle_hook = resolved_boot_cycle_hook
@@ -7409,6 +7514,7 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
         "quick_use_heuristic", "reset_mode", "i2c_fault_config",
         "durability_model", "writeback",
         "rc_injection_config",
+        "mram_torn_word",
     }
 )
 

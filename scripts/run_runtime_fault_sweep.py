@@ -521,6 +521,62 @@ if tracking_start_address_config < 0 or tracking_start_address_config > 0xFFFFFF
         )
     )
 
+mram_torn_word = get_optional_var('mram_torn_word', 'half').strip().lower()
+if not mram_torn_word:
+    mram_torn_word = 'half'
+if mram_torn_word not in ('half', 'untouched', 'erased', 'programmed'):
+    raise Exception(
+        'mram_torn_word must be half, untouched, erased, or programmed, got {}'.format(
+            mram_torn_word
+        )
+    )
+
+def _apply_mram_torn_word_mode():
+    """Set the torn-word mode on every backend object that exposes it.
+
+    Returns True when at least one object took the mode.
+    """
+    applied = False
+    data = backend.get('data')
+    if data is not None and hasattr(data, 'MramTornWordMode'):
+        data.MramTornWordMode = mram_torn_word
+        applied = True
+    nvm = getattr(data, 'Nvm', None) if data is not None else None
+    if nvm is not None and hasattr(nvm, 'MramTornWordMode'):
+        nvm.MramTornWordMode = mram_torn_word
+        applied = True
+    return applied
+
+def _require_mram_torn_word_support():
+    """Refuse a live MRAM power-loss fault whose torn-word mode the peripheral ignores.
+
+    Trace replay computes the torn word itself, so only live injection
+    depends on the peripheral honoring the mode.  A peripheral without a
+    MramTornWordMode property keeps its own behavior, which would run a
+    different fault than the profile declares.
+    """
+    if mram_torn_word == 'half' or backend.get('kind') != 'mram':
+        return
+    if not _apply_mram_torn_word_mode():
+        raise Exception(
+            'fault_sweep.mram_torn_word {!r} requires an MRAM peripheral with a '
+            'MramTornWordMode property; {} has none'.format(
+                mram_torn_word, backend.get('backend_sysbus_name')
+            )
+        )
+
+def _set_preserve_counters_across_reset(enabled):
+    flag = bool(enabled)
+    data = backend.get('data')
+    if data is not None and hasattr(data, 'PreserveCountersAcrossReset'):
+        data.PreserveCountersAcrossReset = flag
+    nvm = getattr(data, 'Nvm', None) if data is not None else None
+    if nvm is not None and hasattr(nvm, 'PreserveCountersAcrossReset'):
+        nvm.PreserveCountersAcrossReset = flag
+    ctrl = backend.get('controller')
+    if ctrl is not None and hasattr(ctrl, 'PreserveCountersAcrossReset'):
+        ctrl.PreserveCountersAcrossReset = flag
+
 def _apply_tracking_start_address(data, backend_name, address):
     """Set the precise write-tracking boundary on capable backends."""
     if not hasattr(data, 'TrackingStartAddress'):
@@ -534,6 +590,7 @@ def _apply_tracking_start_address(data, backend_name, address):
 
 def _configure_tracking_start_address():
     """Apply the optional precise tracking boundary to the active backend."""
+    _apply_mram_torn_word_mode()
     _apply_tracking_start_address(
         backend['data'], backend['backend_sysbus_name'], tracking_start_address_config
     )
@@ -611,6 +668,7 @@ def _configure_python_tracking_gate(force=False):
     log('tracking_gate: python hook installed at 0x{:08X}'.format(address))
 
 _configure_tracking_start_address()
+_set_preserve_counters_across_reset(True)
 _configure_python_tracking_gate()
 
 _cached_erase_page = None
@@ -626,6 +684,7 @@ def refresh_runtime_handles():
     global backend, bus, console_peripherals, console_peripheral_names
     bus = monitor.Machine.SystemBus
     backend['data'] = monitor.Machine[backend['backend_sysbus_name']]
+    _apply_mram_torn_word_mode()
     if (
         backend.get('kind') == 'mram'
         and hasattr(backend['data'], 'ProgramAddressBase')
@@ -649,9 +708,11 @@ def refresh_runtime_handles():
 
 
 def _machine_reset():
+    _set_preserve_counters_across_reset(False)
     monitor.Parse('machine Reset')
     refresh_runtime_handles()
     _configure_tracking_start_address()
+    _set_preserve_counters_across_reset(True)
     _configure_python_tracking_gate(force=True)
     if '_prepare_calibration_stop' in globals():
         _prepare_calibration_stop()
@@ -5508,6 +5569,10 @@ def get_total_erases():
     return 0  # Slow path doesn't track erases.
 
 def arm_fault(absolute_write_index, write_fault_mode=0):
+    if write_fault_mode == 0:
+        _require_mram_torn_word_support()
+    else:
+        _apply_mram_torn_word_mode()
     b = backend
     if b['kind'] == 'otp':
         b['data'].BlowFaultMode = write_fault_mode
@@ -6204,8 +6269,12 @@ def reset_nvmc_for_sweep():
     b = backend
     if b['kind'] == 'mram':
         b['data'].TotalWordWrites = 0
+        if hasattr(b['data'], 'WriteTraceClear'):
+            b['data'].WriteTraceClear()
         if hasattr(b['data'], 'ProgramTraceClear'):
             b['data'].ProgramTraceClear()
+        if hasattr(b['data'], 'InvalidateShadow'):
+            b['data'].InvalidateShadow()
         b['data'].LastFaultInjected = False
         b['data'].FaultEverFired = False
         b['data'].WriteFaultMode = 0
@@ -6238,6 +6307,7 @@ def reset_nvmc_for_sweep():
         b['data'].Nvm.FaultEverFired = False
         b['data'].Nvm.WriteFaultMode = 0
         b['data'].Nvm.DriverErrorFired = False
+    _set_preserve_counters_across_reset(True)
     # Reset controller fault state on all backends — command_drop can be
     # used with any backend via the separate nvm_controller field.
     disarm_controller_fault()
@@ -6250,12 +6320,17 @@ def reset_nvmc_for_recovery():
     b = backend
     if b['kind'] == 'mram':
         b['data'].TotalWordWrites = 0
+        if hasattr(b['data'], 'WriteTraceClear'):
+            b['data'].WriteTraceClear()
         if hasattr(b['data'], 'ProgramTraceClear'):
             b['data'].ProgramTraceClear()
+        if hasattr(b['data'], 'InvalidateShadow'):
+            b['data'].InvalidateShadow()
         b['data'].LastFaultInjected = False
         b['data'].FaultEverFired = False
         b['data'].WriteFaultMode = 0
         b['data'].DriverErrorFired = False
+        _set_preserve_counters_across_reset(True)
         disarm_fault()
         return
     if b['kind'] == 'fast':
@@ -6279,6 +6354,7 @@ def reset_nvmc_for_recovery():
         b['data'].Nvm.WriteFaultMode = 0
         b['data'].Nvm.DriverErrorFired = False
         disarm_fault()
+    _set_preserve_counters_across_reset(True)
     # Reset I2C fault state for recovery boot.
     disarm_i2c_fault()
 
@@ -12073,13 +12149,35 @@ def _trace_replay_erase_region(image, offset, size, erase_fill):
         image[index] = fill
 
 
-def _trace_replay_mram_torn_value(value, width, erase_fill):
+def _trace_replay_mram_torn_value(
+    value, width, erase_fill, mode='half', previous_value=None
+):
     """Return the word persisted by NVMemory power loss mid-program."""
     width = int(width)
     if width not in (1, 2, 4, 8):
         raise ValueError('MRAM torn replay requires a supported write width')
-    half = width // 2
+    normalized_mode = str(mode or 'half').strip().lower()
+    if normalized_mode not in ('half', 'untouched', 'erased', 'programmed'):
+        raise ValueError(
+            'MRAM torn replay mode must be half, untouched, erased, or programmed'
+        )
     fill = int(erase_fill) & 0xFF
+    mask = (1 << (8 * width)) - 1
+    if normalized_mode == 'programmed':
+        return int(value) & mask
+    if normalized_mode == 'erased':
+        erased = 0
+        for byte_index in range(width):
+            erased |= fill << (8 * byte_index)
+        return erased
+    if normalized_mode == 'untouched':
+        if previous_value is not None:
+            return int(previous_value) & mask
+        untouched = 0
+        for byte_index in range(width):
+            untouched |= fill << (8 * byte_index)
+        return untouched
+    half = width // 2
     torn = 0
     for byte_index in range(width):
         byte_value = (
@@ -12534,6 +12632,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 
     fault_snapshot_word = None
     mram_power_loss_torn = False
+    mram_power_loss_width = 4
 
     if is_non_power_write_fault:
         faulted_flash, fault_injected, fault_address, writes_applied, fault_snapshot_word = \
@@ -12594,8 +12693,20 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
                 fault_injected = True
                 fault_address = flash_off + flash_base_addr
                 if backend['kind'] == 'mram':
+                    existing_bytes = to_py_bytes(
+                        _replay_storage_read_bytes(flash_off, width)
+                    )
+                    previous_value = 0
+                    for byte_index, byte_val in enumerate(existing_bytes):
+                        previous_value |= (int(byte_val) & 0xFF) << (
+                            8 * byte_index
+                        )
                     torn_value = _trace_replay_mram_torn_value(
-                        value, width, erase_fill
+                        value,
+                        width,
+                        erase_fill,
+                        mode=mram_torn_word,
+                        previous_value=previous_value,
                     )
                     b = System.Array.CreateInstance(System.Byte, width)
                     for byte_index in range(width):
@@ -12605,6 +12716,8 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
                     _replay_storage_write_bytes(flash_off, b)
                     writes_applied += 1
                     mram_power_loss_torn = True
+                    mram_power_loss_width = int(width)
+                    fault_snapshot_word = torn_value
                 break
 
         while erase_idx < len(pending_erases) and pending_erases[erase_idx][0] <= fault_at:
@@ -12686,6 +12799,12 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     signals['trace_replay_mode'] = 'python'
     if mram_power_loss_torn:
         signals['trace_replay_power_loss_semantics'] = 'mram_torn_word'
+        signals['mram_torn_word_mode'] = mram_torn_word
+        if fault_snapshot_word is not None:
+            signals['fault_snapshot_word'] = '0x{:0{}x}'.format(
+                int(fault_snapshot_word),
+                max(2, int(mram_power_loss_width) * 2),
+            )
     signals['multiboot_cycles_run'] = _multiboot_cycles_run
     merge_stop_status_signals(signals, 'phase2', p2_status)
     if is_non_power_write_fault:
