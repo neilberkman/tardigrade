@@ -81,6 +81,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int WriteFaultMode { get => tracker.WriteFaultMode; set => tracker.WriteFaultMode = value; }
         public uint CorruptionSeed { get => tracker.CorruptionSeed; set => tracker.CorruptionSeed = value; }
         public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
+        public string MramTornWordMode { get => tracker.MramTornWordMode; set => tracker.MramTornWordMode = value; }
 
         public bool AnyFaultFired => tracker.AnyFaultFired;
         public bool FaultRequiresImmediateStop => tracker.FaultRequiresImmediateStop;

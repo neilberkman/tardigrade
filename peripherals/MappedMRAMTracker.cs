@@ -105,6 +105,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
         public int EraseFaultMode { get; set; }
         public uint CorruptionSeed { get; set; }
+        public string MramTornWordMode
+        {
+            get { return mramTornWordMode; }
+            set
+            {
+                var normalized = (value ?? "half").Trim().ToLowerInvariant();
+                if(normalized != "half" && normalized != "untouched"
+                   && normalized != "erased" && normalized != "programmed")
+                {
+                    throw new ArgumentOutOfRangeException(
+                        nameof(value),
+                        "MramTornWordMode must be half, untouched, erased, or programmed");
+                }
+                mramTornWordMode = normalized;
+            }
+        }
         public int DiffLookahead { get; set; } = 32;
         public bool SkipShadowScan { get; set; } = true;
         public bool PassthroughMode { get; set; }
@@ -420,10 +436,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             else
             {
-                var partial = ProgramUnitSize / 2;
-                for(var index = partial; index < ProgramUnitSize; index++)
+                switch(mramTornWordMode)
                 {
-                    result[index] = EraseFill;
+                    case "untouched":
+                        result = CloneBytes(preProgram);
+                        break;
+                    case "erased":
+                        for(var index = 0; index < ProgramUnitSize; index++)
+                        {
+                            result[index] = EraseFill;
+                        }
+                        break;
+                    case "programmed":
+                        result = CloneBytes(intended);
+                        break;
+                    default:
+                        var partial = ProgramUnitSize / 2;
+                        for(var index = partial; index < ProgramUnitSize; index++)
+                        {
+                            result[index] = EraseFill;
+                        }
+                        break;
                 }
             }
             return result;
@@ -634,6 +667,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private ulong programAddressBase;
         private ulong faultAtWordWrite = ulong.MaxValue;
         private int writeFaultMode;
+        private string mramTornWordMode = "half";
         private bool writeTraceEnabled;
         private byte[] flashShadow;
         private ulong configuredTrackingStartAddress;

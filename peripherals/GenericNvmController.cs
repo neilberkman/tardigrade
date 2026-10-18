@@ -347,6 +347,12 @@ namespace Antmicro.Renode.Peripherals.Memory
             set { if(Nvm != null) { Nvm.CorruptionSeed = value; } }
         }
 
+        public string MramTornWordMode
+        {
+            get { return Nvm != null ? Nvm.MramTornWordMode : "half"; }
+            set { if(Nvm != null) { Nvm.MramTornWordMode = value; } }
+        }
+
         // No shadow/diff engine: these are inert.
         public int DiffLookahead { get; set; }
         public bool SkipShadowScan { get; set; }

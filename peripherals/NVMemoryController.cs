@@ -594,6 +594,28 @@ namespace Antmicro.Renode.Peripherals.Memory
         // Deterministic PRNG seed for bit corruption. Advanced on each corrupted byte.
         public uint CorruptionSeed { get; set; }
 
+        public string MramTornWordMode
+        {
+            get { return AliasTarget != null ? AliasTarget.MramTornWordMode : mramTornWordMode; }
+            set
+            {
+                if(AliasTarget != null)
+                {
+                    AliasTarget.MramTornWordMode = value;
+                    return;
+                }
+                var normalized = (value ?? "half").Trim().ToLowerInvariant();
+                if(normalized != "half" && normalized != "untouched"
+                   && normalized != "erased" && normalized != "programmed")
+                {
+                    throw new ArgumentOutOfRangeException(
+                        nameof(value),
+                        "MramTornWordMode must be half, untouched, erased, or programmed");
+                }
+                mramTornWordMode = normalized;
+            }
+        }
+
         public uint WriteLatencyMicros { get; set; }
 
         public bool WriteInProgress { get; private set; }
@@ -785,14 +807,33 @@ namespace Antmicro.Renode.Peripherals.Memory
                         }
                         else
                         {
-                            // Power-loss: corrupt second half of faulted word with EraseFill.
-                            var half = WordSize / 2;
-                            for(var i = wordStart + half; i < wordStart + WordSize; i++)
+                            switch(mramTornWordMode)
                             {
-                                if(i >= offset && i < offset + data.Length)
-                                {
-                                    storage[i] = EraseFill;
-                                }
+                                case "untouched":
+                                    for(var i = 0; i < (int)WordSize; i++)
+                                    {
+                                        storage[wordStart + i] = previousWord[i];
+                                    }
+                                    break;
+                                case "erased":
+                                    for(var i = 0L; i < WordSize; i++)
+                                    {
+                                        storage[wordStart + i] = EraseFill;
+                                    }
+                                    break;
+                                case "programmed":
+                                    break;
+                                default:
+                                    // Power-loss: corrupt second half of faulted word with EraseFill.
+                                    var half = WordSize / 2;
+                                    for(var i = wordStart + half; i < wordStart + WordSize; i++)
+                                    {
+                                        if(i >= offset && i < offset + data.Length)
+                                        {
+                                            storage[i] = EraseFill;
+                                        }
+                                    }
+                                    break;
                             }
                         }
                         LastFaultInjected = true;
@@ -875,16 +916,36 @@ namespace Antmicro.Renode.Peripherals.Memory
                         }
                         else
                         {
-                            // Power-loss: partial write (first half only).
-                            var partialBytes = WordSize / 2;
-                            for(var i = 0L; i < partialBytes; i++)
+                            switch(mramTornWordMode)
                             {
-                                storage[wordStart + i] = mergedWord[i];
-                            }
+                                case "untouched":
+                                    for(var i = 0; i < (int)WordSize; i++)
+                                    {
+                                        storage[wordStart + i] = previousWord[i];
+                                    }
+                                    break;
+                                case "erased":
+                                    for(var i = 0L; i < WordSize; i++)
+                                    {
+                                        storage[wordStart + i] = EraseFill;
+                                    }
+                                    break;
+                                case "programmed":
+                                    ProgramWord(wordStart, mergedWord);
+                                    break;
+                                default:
+                                    // Power-loss: partial write (first half only).
+                                    var partialBytes = WordSize / 2;
+                                    for(var i = 0L; i < partialBytes; i++)
+                                    {
+                                        storage[wordStart + i] = mergedWord[i];
+                                    }
 
-                            for(var i = partialBytes; i < WordSize; i++)
-                            {
-                                storage[wordStart + i] = EraseFill;
+                                    for(var i = partialBytes; i < WordSize; i++)
+                                    {
+                                        storage[wordStart + i] = EraseFill;
+                                    }
+                                    break;
                             }
                         }
 
@@ -1144,6 +1205,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         private long wordSize;
         private byte[] storage;
         private uint corruptionSeed;
+        private string mramTornWordMode = "half";
         private readonly List<long> writeLog = new List<long>();
         private readonly List<WriteTraceEntry> writeTrace = new List<WriteTraceEntry>();
         private readonly List<ProgramTraceEntry> programTrace = new List<ProgramTraceEntry>();
@@ -1476,6 +1538,12 @@ namespace Antmicro.Renode.Peripherals
         {
             get { return Nvm != null ? Nvm.CorruptionSeed : 0U; }
             set { if(Nvm != null) { Nvm.CorruptionSeed = value; } }
+        }
+
+        public string MramTornWordMode
+        {
+            get { return Nvm != null ? Nvm.MramTornWordMode : "half"; }
+            set { if(Nvm != null) { Nvm.MramTornWordMode = value; } }
         }
 
         public int DiffLookahead { get; set; }

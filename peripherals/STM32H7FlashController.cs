@@ -137,6 +137,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public uint CorruptionSeed { get => tracker.CorruptionSeed; set => tracker.CorruptionSeed = value; }
 
+        public string MramTornWordMode { get => tracker.MramTornWordMode; set => tracker.MramTornWordMode = value; }
+
         public bool WriteTraceEnabled { get => tracker.WriteTraceEnabled; set => tracker.WriteTraceEnabled = value; }
 
         public int WriteTraceCount => tracker.WriteTraceCount;

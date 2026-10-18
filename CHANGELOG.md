@@ -38,6 +38,9 @@ The format follows [common-changelog](https://common-changelog.org/).
   explicit exploratory and hunt campaigns.
 - Authenticated-equivalence campaigns can use explicit before/after evidence
   to detect persistent security-state changes caused by rejected mutants.
+- Configurable MRAM torn-word modes via `fault_sweep.mram_torn_word` and the
+  `MramTornWordMode` peripheral property across live MRAM backends and trace
+  replay for `half`, `untouched`, `erased`, and `programmed`.
 
 ### Changed
 

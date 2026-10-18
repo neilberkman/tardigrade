@@ -83,6 +83,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
         public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
         public uint CorruptionSeed { get => tracker.CorruptionSeed; set => tracker.CorruptionSeed = value; }
+        public string MramTornWordMode { get => tracker.MramTornWordMode; set => tracker.MramTornWordMode = value; }
         public int DiffLookahead { get; set; } = 32;
         public bool SkipShadowScan { get; set; } = true;
         public bool PassthroughMode { get; set; }

@@ -29,6 +29,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int WriteFaultMode;
         public int EraseFaultMode;
         public uint CorruptionSeed;
+        public string MramTornWordMode = "half";
 
         public bool WriteTraceEnabled;
         public bool EraseTraceEnabled;

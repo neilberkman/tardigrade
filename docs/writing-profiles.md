@@ -1014,6 +1014,22 @@ fault_sweep:
 
 `warm` does `machine Reset` (CPU reset, NVM persists). `cold` saves NVM state, resets the entire machine, then restores NVM — models a full power cycle where volatile state (SRAM, peripheral registers) is lost.
 
+### MRAM torn-word mode
+
+```yaml
+fault_sweep:
+  mram_torn_word: half # half, untouched, erased, or programmed
+```
+
+`mram_torn_word` selects the post-fault word bytes persisted when a `power_loss` fault interrupts an MRAM program in `MappedMRAMTracker`, `NVMemory`, or MRAM trace replay:
+
+- `half`: default mode. The lower half of the programmed word receives the new bytes and the upper half receives `EraseFill`.
+- `untouched`: the faulted word keeps the bytes that were in storage before the interrupted program began.
+- `erased`: the faulted word is filled with `EraseFill`.
+- `programmed`: the faulted word receives the full intended program bytes before the CPU stops.
+
+`profile_loader.py` rejects unknown `mram_torn_word` values and rejects `mram_torn_word` on non-MRAM backends. At runtime, `run_runtime_fault_sweep.py` sets `MramTornWordMode` on the backend peripheral only when the peripheral exposes that property.
+
 ### Phase 2 timing
 
 ```yaml

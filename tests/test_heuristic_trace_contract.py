@@ -188,6 +188,148 @@ def test_mram_power_loss_replay_matches_half_word_programming() -> None:
     assert torn == 0x0000000044332211
 
 
+@pytest.mark.parametrize(
+    ("width", "value", "previous", "expected_half_zero", "expected_half_ff", "expected_erased_ff"),
+    [
+        (1, 0xAB, 0x55, 0x00, 0xFF, 0xFF),
+        (2, 0xBEEF, 0x1234, 0x00EF, 0xFFEF, 0xFFFF),
+        (4, 0xDEADBEEF, 0xCAFEBABE, 0x0000BEEF, 0xFFFFBEEF, 0xFFFFFFFF),
+        (
+            8,
+            0x8877665544332211,
+            0xFEDCBA9876543210,
+            0x0000000044332211,
+            0xFFFFFFFF44332211,
+            0xFFFFFFFFFFFFFFFF,
+        ),
+    ],
+)
+def test_mram_torn_word_replay_modes_across_widths(
+    width: int,
+    value: int,
+    previous: int,
+    expected_half_zero: int,
+    expected_half_ff: int,
+    expected_erased_ff: int,
+) -> None:
+    runtime_path = ROOT / "scripts" / "run_runtime_fault_sweep.py"
+    tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_trace_replay_mram_torn_value"
+    )
+    namespace: dict = {}
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), str(runtime_path), "exec"),
+        namespace,
+    )
+    fn = namespace["_trace_replay_mram_torn_value"]
+
+    assert fn(value, width, 0x00, "half", previous) == expected_half_zero
+    assert fn(value, width, 0xFF, "half", previous) == expected_half_ff
+    assert fn(value, width, 0x00, "untouched", previous) == previous
+    assert fn(value, width, 0xFF, "untouched", None) == expected_erased_ff
+    assert fn(value, width, 0x00, "erased", previous) == 0
+    assert fn(value, width, 0xFF, "erased", previous) == expected_erased_ff
+    assert fn(value, width, 0x00, "programmed", previous) == value
+    assert fn(value, width, 0xFF, "programmed", previous) == value
+
+
+@pytest.mark.parametrize("mode", ["half", "untouched", "erased", "programmed"])
+def test_mram_torn_word_loader_accepts_valid_modes_on_mram_backend(
+    tmp_path: Path, mode: str
+) -> None:
+    (tmp_path / "platform.repl").write_text(
+        "mram: Memory.MappedMRAMTracker @ sysbus 0x10000000\n    size: 0x2000\n",
+        encoding="utf-8",
+    )
+    profile_path = tmp_path / "profile.yaml"
+    profile_path.write_text(
+        f"""
+schema_version: 1
+name: mram_torn_word_{mode}
+platform: platform.repl
+bootloader: {{ elf: firmware.elf, entry: 0x10000000 }}
+memory:
+  sram: {{ start: 0x20000000, end: 0x20001000 }}
+  slots:
+    exec: {{ base: 0x10000000, size: 0x1000 }}
+    staging: {{ base: 0x10001000, size: 0x1000 }}
+images: {{ staging: firmware.bin }}
+success_criteria: {{ vtor_in_slot: exec }}
+fault_sweep:
+  mram_torn_word: {mode}
+""",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(profile_path, strict=True)
+    assert profile.fault_sweep.mram_torn_word == mode
+    assert profile.fault_sweep.mram_torn_word_explicit is True
+    assert f"MRAM_TORN_WORD:{mode}" in profile.robot_vars(tmp_path)
+
+
+def test_mram_torn_word_loader_rejects_unknown_mode(tmp_path: Path) -> None:
+    (tmp_path / "platform.repl").write_text(
+        "mram: Memory.MappedMRAMTracker @ sysbus 0x10000000\n    size: 0x2000\n",
+        encoding="utf-8",
+    )
+    profile_path = tmp_path / "profile.yaml"
+    profile_path.write_text(
+        """
+schema_version: 1
+name: mram_torn_word_invalid
+platform: platform.repl
+bootloader: { elf: firmware.elf, entry: 0x10000000 }
+memory:
+  sram: { start: 0x20000000, end: 0x20001000 }
+  slots:
+    exec: { base: 0x10000000, size: 0x1000 }
+    staging: { base: 0x10001000, size: 0x1000 }
+images: { staging: firmware.bin }
+success_criteria: { vtor_in_slot: exec }
+fault_sweep:
+  mram_torn_word: invalid_mode
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProfileError, match="fault_sweep.mram_torn_word"):
+        load_profile(profile_path)
+
+
+def test_mram_torn_word_loader_rejects_non_mram_backend(tmp_path: Path) -> None:
+    (tmp_path / "platform.repl").write_text(
+        "flash: Memory.STM32F4FastFlash @ sysbus 0x08000000\n    size: 0x100000\n",
+        encoding="utf-8",
+    )
+    profile_path = tmp_path / "profile.yaml"
+    profile_path.write_text(
+        """
+schema_version: 1
+name: mram_torn_word_non_mram
+platform: platform.repl
+flash_backend: fast
+bootloader: { elf: firmware.elf, entry: 0x08000000 }
+memory:
+  sram: { start: 0x20000000, end: 0x20020000 }
+  slots:
+    exec: { base: 0x08020000, size: 0x20000 }
+    staging: { base: 0x08060000, size: 0x20000 }
+images: { staging: firmware.bin }
+success_criteria: { vtor_in_slot: exec }
+fault_sweep:
+  mram_torn_word: erased
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProfileError, match="fault_sweep.mram_torn_word.*MRAM"):
+        load_profile(profile_path)
+
+
 def test_explicit_bounded_mode_caps_structural_overwrite_tier() -> None:
     from write_trace_heuristic import classify_trace
 
@@ -205,3 +347,4 @@ def test_explicit_bounded_mode_caps_structural_overwrite_tier() -> None:
     assert len(result["fault_points"]) == 8
     assert result["fault_points"][0] == 0
     assert result["fault_points"][-1] == 63
+

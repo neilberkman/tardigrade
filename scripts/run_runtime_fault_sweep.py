@@ -521,6 +521,24 @@ if tracking_start_address_config < 0 or tracking_start_address_config > 0xFFFFFF
         )
     )
 
+mram_torn_word = get_optional_var('mram_torn_word', 'half').strip().lower()
+if not mram_torn_word:
+    mram_torn_word = 'half'
+if mram_torn_word not in ('half', 'untouched', 'erased', 'programmed'):
+    raise Exception(
+        'mram_torn_word must be half, untouched, erased, or programmed, got {}'.format(
+            mram_torn_word
+        )
+    )
+
+def _apply_mram_torn_word_mode():
+    data = backend.get('data')
+    if data is not None and hasattr(data, 'MramTornWordMode'):
+        data.MramTornWordMode = mram_torn_word
+    nvm = getattr(data, 'Nvm', None) if data is not None else None
+    if nvm is not None and hasattr(nvm, 'MramTornWordMode'):
+        nvm.MramTornWordMode = mram_torn_word
+
 def _apply_tracking_start_address(data, backend_name, address):
     """Set the precise write-tracking boundary on capable backends."""
     if not hasattr(data, 'TrackingStartAddress'):
@@ -534,6 +552,7 @@ def _apply_tracking_start_address(data, backend_name, address):
 
 def _configure_tracking_start_address():
     """Apply the optional precise tracking boundary to the active backend."""
+    _apply_mram_torn_word_mode()
     _apply_tracking_start_address(
         backend['data'], backend['backend_sysbus_name'], tracking_start_address_config
     )
@@ -626,6 +645,7 @@ def refresh_runtime_handles():
     global backend, bus, console_peripherals, console_peripheral_names
     bus = monitor.Machine.SystemBus
     backend['data'] = monitor.Machine[backend['backend_sysbus_name']]
+    _apply_mram_torn_word_mode()
     if (
         backend.get('kind') == 'mram'
         and hasattr(backend['data'], 'ProgramAddressBase')
@@ -5507,6 +5527,7 @@ def get_total_erases():
     return 0  # Slow path doesn't track erases.
 
 def arm_fault(absolute_write_index, write_fault_mode=0):
+    _apply_mram_torn_word_mode()
     b = backend
     if b['kind'] == 'otp':
         b['data'].BlowFaultMode = write_fault_mode
@@ -12071,13 +12092,35 @@ def _trace_replay_erase_region(image, offset, size, erase_fill):
         image[index] = fill
 
 
-def _trace_replay_mram_torn_value(value, width, erase_fill):
+def _trace_replay_mram_torn_value(
+    value, width, erase_fill, mode='half', previous_value=None
+):
     """Return the word persisted by NVMemory power loss mid-program."""
     width = int(width)
     if width not in (1, 2, 4, 8):
         raise ValueError('MRAM torn replay requires a supported write width')
-    half = width // 2
+    normalized_mode = str(mode or 'half').strip().lower()
+    if normalized_mode not in ('half', 'untouched', 'erased', 'programmed'):
+        raise ValueError(
+            'MRAM torn replay mode must be half, untouched, erased, or programmed'
+        )
     fill = int(erase_fill) & 0xFF
+    mask = (1 << (8 * width)) - 1
+    if normalized_mode == 'programmed':
+        return int(value) & mask
+    if normalized_mode == 'erased':
+        erased = 0
+        for byte_index in range(width):
+            erased |= fill << (8 * byte_index)
+        return erased
+    if normalized_mode == 'untouched':
+        if previous_value is not None:
+            return int(previous_value) & mask
+        untouched = 0
+        for byte_index in range(width):
+            untouched |= fill << (8 * byte_index)
+        return untouched
+    half = width // 2
     torn = 0
     for byte_index in range(width):
         byte_value = (
@@ -12532,6 +12575,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 
     fault_snapshot_word = None
     mram_power_loss_torn = False
+    mram_power_loss_width = 4
 
     if is_non_power_write_fault:
         faulted_flash, fault_injected, fault_address, writes_applied, fault_snapshot_word = \
@@ -12592,8 +12636,20 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
                 fault_injected = True
                 fault_address = flash_off + flash_base_addr
                 if backend['kind'] == 'mram':
+                    existing_bytes = to_py_bytes(
+                        _replay_storage_read_bytes(flash_off, width)
+                    )
+                    previous_value = 0
+                    for byte_index, byte_val in enumerate(existing_bytes):
+                        previous_value |= (int(byte_val) & 0xFF) << (
+                            8 * byte_index
+                        )
                     torn_value = _trace_replay_mram_torn_value(
-                        value, width, erase_fill
+                        value,
+                        width,
+                        erase_fill,
+                        mode=mram_torn_word,
+                        previous_value=previous_value,
                     )
                     b = System.Array.CreateInstance(System.Byte, width)
                     for byte_index in range(width):
@@ -12603,6 +12659,8 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
                     _replay_storage_write_bytes(flash_off, b)
                     writes_applied += 1
                     mram_power_loss_torn = True
+                    mram_power_loss_width = int(width)
+                    fault_snapshot_word = torn_value
                 break
 
         while erase_idx < len(pending_erases) and pending_erases[erase_idx][0] <= fault_at:
@@ -12684,6 +12742,12 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     signals['trace_replay_mode'] = 'python'
     if mram_power_loss_torn:
         signals['trace_replay_power_loss_semantics'] = 'mram_torn_word'
+        signals['mram_torn_word_mode'] = mram_torn_word
+        if fault_snapshot_word is not None:
+            signals['fault_snapshot_word'] = '0x{:0{}x}'.format(
+                int(fault_snapshot_word),
+                max(2, int(mram_power_loss_width) * 2),
+            )
     signals['multiboot_cycles_run'] = _multiboot_cycles_run
     merge_stop_status_signals(signals, 'phase2', p2_status)
     if is_non_power_write_fault:
