@@ -4809,6 +4809,11 @@ def _count_instruction_skip_fault_points(
     return len(range(start, stop, 2))
 
 
+# Repository root of the load_profile call in progress.  Load-time checks of
+# relative inputs try it first, the same order run-time resolution uses.
+_LOAD_REPO_ROOT: Optional[Path] = None
+
+
 def _profile_input_path_candidates(
     value: str | Path,
     *,
@@ -4818,6 +4823,8 @@ def _profile_input_path_candidates(
     candidate = Path(value)
     if candidate.is_absolute():
         return [candidate]
+    if repo_root is None:
+        repo_root = _LOAD_REPO_ROOT
     effective_repo_root = (
         Path(repo_root)
         if repo_root is not None
@@ -7592,7 +7599,7 @@ def _validate_strict_relative_path(
 ) -> None:
     text = str(value or "").strip()
     normalized = text.replace("\\", "/")
-    allow_parent = allow_parent_segments or context == "base_profile"
+    allow_parent = allow_parent_segments
     if (
         not text
         or normalized.startswith("/")
@@ -8180,6 +8187,28 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
 
 
 def load_profile(
+    path: str | Path,
+    *,
+    strict: bool = False,
+    strict_root: Optional[str | Path] = None,
+    repo_root: Optional[str | Path] = None,
+) -> ProfileConfig:
+    """Load and validate a YAML profile; see _load_profile for arguments.
+
+    ``repo_root`` is the root that relative profile inputs resolve against
+    first, as ``ProfileConfig.resolve_path`` does at run time.  It defaults
+    to this checkout.
+    """
+    global _LOAD_REPO_ROOT
+    previous = _LOAD_REPO_ROOT
+    _LOAD_REPO_ROOT = Path(repo_root) if repo_root is not None else None
+    try:
+        return _load_profile(path, strict=strict, strict_root=strict_root)
+    finally:
+        _LOAD_REPO_ROOT = previous
+
+
+def _load_profile(
     path: str | Path,
     *,
     strict: bool = False,

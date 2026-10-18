@@ -885,6 +885,49 @@ update_sequence:
             finally:
                 os.chdir(saved_cwd)
 
+    def test_boot_cycle_hook_resolves_against_load_repo_root_from_other_cwd(self) -> None:
+        """A hook relative to the caller's repo root loads when cwd is elsewhere."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            consumer = root / "consumer"
+            (consumer / "hooks").mkdir(parents=True)
+            (consumer / "profiles").mkdir()
+            elsewhere = root / "elsewhere"
+            elsewhere.mkdir()
+            (consumer / "hooks" / "h.py").write_text("x = 1\n")
+            import yaml
+
+            source = yaml.safe_load(
+                (ROOT / "profiles" / "mcuboot_pr2199_move_broken.yaml").read_text()
+            )
+            source["fault_sweep"]["boot_cycle_hook"] = "hooks/h.py"
+            source["platform"] = str(ROOT / source["platform"])
+            source["bootloader"]["elf"] = str(ROOT / source["bootloader"]["elf"])
+            source["images"] = {
+                name: str(ROOT / value) for name, value in source["images"].items()
+            }
+            probe = source.get("state_probe")
+            if isinstance(probe, dict) and probe.get("script"):
+                probe["script"] = str(ROOT / probe["script"])
+            profile_file = consumer / "profiles" / "p.yaml"
+            profile_file.write_text(yaml.safe_dump(source))
+            previous = os.getcwd()
+            os.chdir(elsewhere)
+            try:
+                with self.assertRaisesRegex(ProfileError, "could not resolve path"):
+                    load_profile(profile_file)
+                profile = load_profile(profile_file, repo_root=consumer)
+            finally:
+                os.chdir(previous)
+            self.assertEqual(
+                Path(profile.fault_sweep.boot_cycle_hook),
+                consumer / "hooks" / "h.py",
+            )
+            self.assertEqual(
+                Path(profile.resolve_path(consumer, profile.fault_sweep.boot_cycle_hook)),
+                consumer / "hooks" / "h.py",
+            )
+
     def test_missing_boot_cycle_hook_raises_profile_error_listing_tried_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             temp_root = Path(td)
@@ -1157,8 +1200,11 @@ extra_peripherals:
 
             observed_calls = []
 
-            def fake_load_profile(path, *, strict=False, strict_root=None):
+            observed_repo_roots = []
+
+            def fake_load_profile(path, *, strict=False, strict_root=None, repo_root=None):
                 observed_calls.append((Path(path), strict, strict_root))
+                observed_repo_roots.append(repo_root)
                 raise RuntimeError("stop after load_profile")
 
             with mock.patch.object(
@@ -1202,6 +1248,10 @@ extra_peripherals:
                     (child_path, True, None),
                     (child_path, True, repo_dir),
                 ],
+            )
+            self.assertEqual(
+                observed_repo_roots,
+                [audit_bootloader.REPO_ROOT, repo_dir],
             )
 
 
