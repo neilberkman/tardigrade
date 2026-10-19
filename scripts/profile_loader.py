@@ -101,7 +101,7 @@ MAX_MULTI_FAULTS_PER_RUN = 64
 MAX_BOOT_CYCLES = 1_000
 
 VALID_MRAM_TORN_WORD_MODES: FrozenSet[str] = frozenset(
-    {"half", "untouched", "erased", "programmed"}
+    {"half", "half_retain", "untouched", "erased", "programmed"}
 )
 
 

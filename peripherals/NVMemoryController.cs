@@ -624,12 +624,13 @@ namespace Antmicro.Renode.Peripherals.Memory
                     return;
                 }
                 var normalized = (value ?? "half").Trim().ToLowerInvariant();
-                if(normalized != "half" && normalized != "untouched"
-                   && normalized != "erased" && normalized != "programmed")
+                if(normalized != "half" && normalized != "half_retain"
+                   && normalized != "untouched" && normalized != "erased"
+                   && normalized != "programmed")
                 {
                     throw new ArgumentOutOfRangeException(
                         nameof(value),
-                        "MramTornWordMode must be half, untouched, erased, or programmed");
+                        "MramTornWordMode must be half, half_retain, untouched, erased, or programmed");
                 }
                 mramTornWordMode = normalized;
             }
@@ -842,6 +843,18 @@ namespace Antmicro.Renode.Peripherals.Memory
                         {
                             switch(mramTornWordMode)
                             {
+                                case "half_retain":
+                                    var retainSplit = WordSize / 2;
+                                    for(var i = 0L; i < retainSplit; i++)
+                                    {
+                                        storage[wordStart + i] = intendedWord[i];
+                                    }
+
+                                    for(var i = retainSplit; i < WordSize; i++)
+                                    {
+                                        storage[wordStart + i] = previousWord[i];
+                                    }
+                                    break;
                                 case "untouched":
                                     for(var i = 0; i < (int)WordSize; i++)
                                     {
@@ -951,6 +964,18 @@ namespace Antmicro.Renode.Peripherals.Memory
                         {
                             switch(mramTornWordMode)
                             {
+                                case "half_retain":
+                                    var retainSplit = WordSize / 2;
+                                    for(var i = 0L; i < retainSplit; i++)
+                                    {
+                                        storage[wordStart + i] = mergedWord[i];
+                                    }
+
+                                    for(var i = retainSplit; i < WordSize; i++)
+                                    {
+                                        storage[wordStart + i] = previousWord[i];
+                                    }
+                                    break;
                                 case "untouched":
                                     for(var i = 0; i < (int)WordSize; i++)
                                     {

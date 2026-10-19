@@ -524,9 +524,15 @@ if tracking_start_address_config < 0 or tracking_start_address_config > 0xFFFFFF
 mram_torn_word = get_optional_var('mram_torn_word', 'half').strip().lower()
 if not mram_torn_word:
     mram_torn_word = 'half'
-if mram_torn_word not in ('half', 'untouched', 'erased', 'programmed'):
+if mram_torn_word not in (
+    'half',
+    'half_retain',
+    'untouched',
+    'erased',
+    'programmed',
+):
     raise Exception(
-        'mram_torn_word must be half, untouched, erased, or programmed, got {}'.format(
+        'mram_torn_word must be half, half_retain, untouched, erased, or programmed, got {}'.format(
             mram_torn_word
         )
     )
@@ -12157,9 +12163,15 @@ def _trace_replay_mram_torn_value(
     if width not in (1, 2, 4, 8):
         raise ValueError('MRAM torn replay requires a supported write width')
     normalized_mode = str(mode or 'half').strip().lower()
-    if normalized_mode not in ('half', 'untouched', 'erased', 'programmed'):
+    if normalized_mode not in (
+        'half',
+        'half_retain',
+        'untouched',
+        'erased',
+        'programmed',
+    ):
         raise ValueError(
-            'MRAM torn replay mode must be half, untouched, erased, or programmed'
+            'MRAM torn replay mode must be half, half_retain, untouched, erased, or programmed'
         )
     fill = int(erase_fill) & 0xFF
     mask = (1 << (8 * width)) - 1
@@ -12178,6 +12190,17 @@ def _trace_replay_mram_torn_value(
             untouched |= fill << (8 * byte_index)
         return untouched
     half = width // 2
+    if normalized_mode == 'half_retain':
+        torn = 0
+        for byte_index in range(width):
+            if byte_index < half:
+                byte_value = (int(value) >> (8 * byte_index)) & 0xFF
+            elif previous_value is not None:
+                byte_value = (int(previous_value) >> (8 * byte_index)) & 0xFF
+            else:
+                byte_value = fill
+            torn |= byte_value << (8 * byte_index)
+        return torn
     torn = 0
     for byte_index in range(width):
         byte_value = (

@@ -111,12 +111,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             set
             {
                 var normalized = (value ?? "half").Trim().ToLowerInvariant();
-                if(normalized != "half" && normalized != "untouched"
-                   && normalized != "erased" && normalized != "programmed")
+                if(normalized != "half" && normalized != "half_retain"
+                   && normalized != "untouched" && normalized != "erased"
+                   && normalized != "programmed")
                 {
                     throw new ArgumentOutOfRangeException(
                         nameof(value),
-                        "MramTornWordMode must be half, untouched, erased, or programmed");
+                        "MramTornWordMode must be half, half_retain, untouched, erased, or programmed");
                 }
                 mramTornWordMode = normalized;
             }
@@ -455,6 +456,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 switch(mramTornWordMode)
                 {
+                    case "half_retain":
+                        var retainSplit = ProgramUnitSize / 2;
+                        for(var index = retainSplit; index < ProgramUnitSize; index++)
+                        {
+                            result[index] = preProgram[index];
+                        }
+                        break;
                     case "untouched":
                         result = CloneBytes(preProgram);
                         break;

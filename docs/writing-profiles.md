@@ -1025,12 +1025,13 @@ fault_sweep:
 
 ```yaml
 fault_sweep:
-  mram_torn_word: half # half, untouched, erased, or programmed
+  mram_torn_word: half # half, half_retain, untouched, erased, or programmed
 ```
 
 `mram_torn_word` selects the post-fault word bytes persisted when a `power_loss` fault interrupts an MRAM program in `MappedMRAMTracker`, `NVMemory`, or MRAM trace replay:
 
 - `half`: default mode. The lower half of the programmed word receives the new bytes and the upper half receives `EraseFill`.
+- `half_retain`: the lower half of the programmed word receives the new bytes and the upper half keeps the bytes that were in storage before the interrupted program began.
 - `untouched`: the faulted word keeps the bytes that were in storage before the interrupted program began.
 - `erased`: the faulted word is filled with `EraseFill`.
 - `programmed`: the faulted word receives the full intended program bytes before the CPU stops.

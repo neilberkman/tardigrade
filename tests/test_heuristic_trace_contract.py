@@ -189,17 +189,34 @@ def test_mram_power_loss_replay_matches_half_word_programming() -> None:
 
 
 @pytest.mark.parametrize(
-    ("width", "value", "previous", "expected_half_zero", "expected_half_ff", "expected_erased_ff"),
+    (
+        "width",
+        "value",
+        "previous",
+        "expected_half_zero",
+        "expected_half_ff",
+        "expected_half_retain",
+        "expected_erased_ff",
+    ),
     [
-        (1, 0xAB, 0x55, 0x00, 0xFF, 0xFF),
-        (2, 0xBEEF, 0x1234, 0x00EF, 0xFFEF, 0xFFFF),
-        (4, 0xDEADBEEF, 0xCAFEBABE, 0x0000BEEF, 0xFFFFBEEF, 0xFFFFFFFF),
+        (1, 0xAB, 0x55, 0x00, 0xFF, 0x55, 0xFF),
+        (2, 0xBEEF, 0x1234, 0x00EF, 0xFFEF, 0x12EF, 0xFFFF),
+        (
+            4,
+            0xDEADBEEF,
+            0xCAFEBABE,
+            0x0000BEEF,
+            0xFFFFBEEF,
+            0xCAFEBEEF,
+            0xFFFFFFFF,
+        ),
         (
             8,
             0x8877665544332211,
             0xFEDCBA9876543210,
             0x0000000044332211,
             0xFFFFFFFF44332211,
+            0xFEDCBA9844332211,
             0xFFFFFFFFFFFFFFFF,
         ),
     ],
@@ -210,6 +227,7 @@ def test_mram_torn_word_replay_modes_across_widths(
     previous: int,
     expected_half_zero: int,
     expected_half_ff: int,
+    expected_half_retain: int,
     expected_erased_ff: int,
 ) -> None:
     runtime_path = ROOT / "scripts" / "run_runtime_fault_sweep.py"
@@ -229,15 +247,23 @@ def test_mram_torn_word_replay_modes_across_widths(
 
     assert fn(value, width, 0x00, "half", previous) == expected_half_zero
     assert fn(value, width, 0xFF, "half", previous) == expected_half_ff
+    assert fn(value, width, 0x00, "half_retain", previous) == expected_half_retain
+    assert fn(value, width, 0xFF, "half_retain", previous) == expected_half_retain
+    assert fn(value, width, 0x00, "half_retain", None) == expected_half_zero
+    assert fn(value, width, 0xFF, "half_retain", None) == expected_half_ff
     assert fn(value, width, 0x00, "untouched", previous) == previous
     assert fn(value, width, 0xFF, "untouched", None) == expected_erased_ff
     assert fn(value, width, 0x00, "erased", previous) == 0
     assert fn(value, width, 0xFF, "erased", previous) == expected_erased_ff
     assert fn(value, width, 0x00, "programmed", previous) == value
     assert fn(value, width, 0xFF, "programmed", previous) == value
+    with pytest.raises(ValueError, match="half_retain"):
+        fn(value, width, 0x00, "invalid_mode", previous)
 
 
-@pytest.mark.parametrize("mode", ["half", "untouched", "erased", "programmed"])
+@pytest.mark.parametrize(
+    "mode", ["half", "half_retain", "untouched", "erased", "programmed"]
+)
 def test_mram_torn_word_loader_accepts_valid_modes_on_mram_backend(
     tmp_path: Path, mode: str
 ) -> None:
