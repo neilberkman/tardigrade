@@ -20,6 +20,7 @@ from audit_bootloader import (  # noqa: E402
     _can_fallback_to_control_only_calibration,
 )
 from profile_loader import load_profile  # noqa: E402
+from report_security_status import build_security_aggregate  # noqa: E402
 from self_test import check_verdict  # noqa: E402
 
 
@@ -300,6 +301,40 @@ def test_self_test_check_verdict_rejects_incomplete_or_invalid_control_only_repo
     )
     assert passed is False
     assert "infrastructure failure" in reason.lower()
+
+
+def test_security_aggregate_accepts_intentional_control_only_without_calibration_warning():
+    report = _intentional_control_only_report("wrong_image")
+    report["expect"] = {
+        "control_outcome": "wrong_image",
+        "allow_control_only_issues": True,
+        "should_find_issues": True,
+        "mode": "regression",
+    }
+    aggregate = build_security_aggregate(report)
+    assert aggregate["status"] == "FINDINGS"
+    assert aggregate["issue_points"] == 1
+    assert aggregate["finding_sources"] == {"summary.runtime_sweep": 1}
+    assert aggregate["inconclusive_reasons"] == []
+
+
+def test_security_aggregate_keeps_calibration_inconclusive_when_not_intentional_control_only():
+    report = _intentional_control_only_report(
+        "wrong_image",
+        intentional_control_only=False,
+    )
+    report["expect"] = {
+        "control_outcome": "wrong_image",
+        "allow_control_only_issues": True,
+        "should_find_issues": True,
+        "mode": "regression",
+    }
+    aggregate = build_security_aggregate(report)
+    assert aggregate["status"] == "FINDINGS"
+    assert any(
+        "calibration coverage is unavailable" in reason
+        for reason in aggregate["inconclusive_reasons"]
+    )
 
 
 def test_self_test_check_verdict_requires_declared_issue_reason():

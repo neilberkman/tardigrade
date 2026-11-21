@@ -1448,24 +1448,22 @@ expect:
 
 For known-vulnerable code (differential testing), set `should_find_issues: true`. The self-test fails if the sweep doesn't find issues. Set `mode: exploratory` (or its `hunt` alias) for an explicit exploratory campaign where a complete zero-finding sweep is successful; findings remain useful evidence. Reports serialize both spellings as `exploratory`. The default `regression` mode preserves the strict requirement for profiles that genuinely require findings.
 
-The shipped `mcuboot_pr2214_offset_geom_*` broken/fixed pair uses
-`mode: exploratory`. [Issue #18](https://github.com/neilberkman/tardigrade/issues/18)
-tracks the PR2214 geometry pair, whose STM32F4 layout fails
-`boot_slots_compatible` before the off-by-one is reachable. That candidate setup
-has no recorded paired separation and is excluded from strict self-test and OSS
-regression matrices. `skip_self_test` controls discovery; `expect.mode`
-explicitly permits a complete zero-finding exploratory run. Neither setting
-turns incomplete or failed control evidence into a pass. The PR2205 and PR2206
-scratch differential pairs were removed; see
-[`docs/mcuboot-differentials.md`](mcuboot-differentials.md).
-
-The `mcuboot_pr2214_offset_broken` and `mcuboot_pr2214_offset_fixed` pair
-uses the default regression mode and sets `bootloader.algorithm: swap-offset`.
-On an nRF52840 layout whose secondary slot is one sector larger than the
-primary, a staged image with swap size 0x74000 makes the broken control boot
-stay on the old image and the fixed control boot hand off to the staged image.
-[mcuboot-pr2214-swap-offset.md](mcuboot-pr2214-swap-offset.md) derives the
-layout and the image size.
+Both PR #2214 swap-offset pairs (`mcuboot_pr2214_offset_{broken,fixed}` on
+nRF52840 sector+1 and `mcuboot_pr2214_offset_geom_{broken,fixed}` on STM32F429
+mirrored-bank geometry) use the default strict `regression` mode, set
+`bootloader.algorithm: swap-offset`, and run in `scripts/self_test.py` via
+`scripts/self_test_runtime_manifest.json`. On both layouts, the secondary slot
+has one more erase sector than the primary (`0x75000`/`0x76000` with
+`swap_size = 0x74000` on nRF52840; `0x18000`/`0x38000` with `swap_size = 0x8000`
+on STM32F429), so the broken `429e2fea` control boot aborts with `wrong_image`
+and stays on the old image while the fixed `90fd59d2` control boot swaps and
+boots the staged image. `skip_self_test` controls discovery; `expect.mode`
+explicitly permits a complete zero-finding exploratory run when desired, and
+neither setting turns incomplete or failed control evidence into a pass. See
+[mcuboot-pr2214-swap-offset.md](mcuboot-pr2214-swap-offset.md) for the layout
+and image-size derivation, and
+[`docs/mcuboot-differentials.md`](mcuboot-differentials.md) for the removed
+PR2205 and PR2206 scratch differential pairs.
 
 ### Control-only issues
 

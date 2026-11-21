@@ -120,7 +120,7 @@ completing and "Image version: v1.2.0".
 | `oss_mcuboot_pr2214_offset_nrf52_fixed.elf` | MCUboot `v2.1.0-247-g90fd59d2f9e4` |
 | `zephyr_slot1_pr2214_swap_0x74000_offsetslot.bin` | one erased 4 KiB sector, then a signed v1.2.0 image with swap size 0x74000 |
 
-Running `BOOTSTRAP_SCOPE=pr2214 bash scripts/bootstrap_mcuboot_matrix_assets.sh`
+Running `MCUBOOT_BOOTSTRAP_SCOPE=pr2214 bash scripts/bootstrap_mcuboot_matrix_assets.sh`
 builds both ELFs, writes `oss_mcuboot_pr2214_offset_nrf52_{broken,fixed}_commit.txt`,
 and signs `zephyr_slot1_pr2214_swap_0x74000_offsetslot.bin`. `build_pr_bootloader_variant`
 builds each ELF for board `nrf52840dk/nrf52840` with
@@ -187,20 +187,23 @@ power loss there also boots v1.0.0. With fault points enabled the audit
 verdict is "control checks failed", because the expected control issue is
 accepted only when no fault point reports one.
 
-Runs on `docker://tardigrade-oss-validation:latest` with `--workers 2`:
+Runs with `--quick --strict-profile` and `scripts/self_test.py --quick` (Renode v1.16.1, rebuilt `zephyr_slot1_pr2214_swap_0x74000_offsetslot.bin`):
 
-| Profile | Mode | Wall time | Result |
-| --- | --- | --- | --- |
-| `mcuboot_pr2214_offset_broken` | `--quick` and full | 36 s each | `PASS`, control exhibits expected `wrong_image`, marker 0x00000001 |
-| `mcuboot_pr2214_offset_fixed` | `--quick` | 1027 s | `PASS`, control marker 0x00000201, 124196 calibrated writes, 3 power-loss points at writes 0, 62098 and 124195 all recover to v1.2.0 |
+| Profile | Mode | Result |
+| --- | --- | --- |
+| `mcuboot_pr2214_offset_broken` | `--quick --strict-profile` & `self_test.py --quick` | `PASS`, control exhibits expected `wrong_image` (`actual_writes=1`, marker `0x00000001`, `security_aggregate.status=FINDINGS`, `issue_points=1`), sweep wall time 44.6 s |
+| `mcuboot_pr2214_offset_fixed` | `--quick --strict-profile` & `self_test.py --quick` | `PASS`, control `success` (marker `0x00000201`), 124196 calibrated writes / 124 erases (409.9 s calibration), 3 power-loss points at writes `0` (`0x00080FD8`), `62098` (`0x000437A0`), and `124195` (`0x00080FE0`) all recover to v1.2.0 (52.8 s sweep wall time) |
 
 The fixed full sweep has not been run. Its quick run exceeds ten minutes
-because calibration emulates the whole 116-sector swap.
+because calibration emulates the whole 116-sector swap (and the historical
+Docker run took 1027 s total).
 
-`scripts/self_test.py` `check_verdict` does not accept the broken report
-yet. It requires calibration coverage whenever `power_loss` is configured,
-and a zero-point campaign skips calibration. Both profiles keep
-`skip_self_test: true`, so the self-test matrix does not run them.
+`scripts/self_test.py` `check_verdict` and `scripts/report_security_status.py`
+both recognize intentional zero-point control-only campaigns
+(`campaign_integrity.intentional_control_only: true`), so all four PR #2214
+profiles (`mcuboot_pr2214_offset_{broken,fixed}.yaml` and
+`mcuboot_pr2214_offset_geom_{broken,fixed}.yaml`) run as strict regression
+self-tests in `scripts/self_test_runtime_manifest.json`.
 
 ## Historical equal-slot `90fd59d2` diagnostic boot
 
@@ -355,12 +358,12 @@ unreferenced and retired.
 
 ## STM32F4 geometry pair and `0x0800C000` slot images
 
-The exploratory `mcuboot_pr2214_offset_geom_broken` and
-`mcuboot_pr2214_offset_geom_fixed` profiles remain in the repository after the
-nRF52840 rework because commit `4687d75` moved two STM32F4 non-uniform-sector
-trigger-discovery tests in `tests/test_trigger_discovery.py` onto
-`mcuboot_pr2214_offset_geom_fixed.yaml`, and `tests/test_self_test_profiles.py`
-lists `pr2214_offset_geom` in `EXPLORATORY_MCUBOOT_DIFFERENTIALS`. The nRF52840
+The `mcuboot_pr2214_offset_geom_broken` and `mcuboot_pr2214_offset_geom_fixed`
+profiles were originally retained as exploratory after the nRF52840 rework
+(and `tests/test_trigger_discovery.py` also uses
+`mcuboot_pr2214_offset_geom_fixed.yaml` for non-uniform STM32F4 sector tests)
+before being reworked onto the mirrored-bank STM32F429 layout below and
+promoted to strict regression self-tests. The nRF52840
 pair uses uniform 4 KiB sectors where `sector_geometry.status` is `match` and
 the next erase boundary is `0x1000` bytes ahead of the secondary slot base. On
 `mcuboot_pr2214_offset_geom_fixed.yaml`, `validate_compiled_flash_map` matches
@@ -452,16 +455,16 @@ The inconsistency lies in `offset_with_geom_partition.dts` and the `0x1E000`-pad
 
 Placing `slot0_partition` in STM32F429 Bank 1 at `0x08008000` with size `0x18000` and `slot1_partition` in Bank 2 at `0x08108000` with size `0x38000` satisfies `boot_slots_compatible` and separates `429e2fea24518f178cd4d33928cb66fcb0205803` from `90fd59d2f9e45c24d0833dd391dcdc932b3b1908` at `swap_size = 0x8000`:
 
-- `slot0_partition` at `0x08008000..0x08020000` spans three Bank 1 hardware sectors: two `16 KiB` sectors at `0x08008000` and `0x0800C000` and one `64 KiB` trailer sector at `0x08010000`. Here `N_pri = 3`, `S = 0x4000`, `trailer_sz = 0x450` for `write-block-size = <4>` and `MCUBOOT_BOOT_MAX_ALIGN = 32`, `k = 1`, and `first_trailer_idx = 2`.
+- `slot0_partition` at `0x08008000..0x08020000` spans three Bank 1 hardware sectors: two `16 KiB` sectors at `0x08008000` and `0x0800C000` and one `64 KiB` trailer sector at `0x08010000`. Here `N_pri = 3`, `S = 0x4000`, `trailer_sz = 128 * 2 * 4 + 32 * 4 + 32 = 1184 = 0x4A0` for `BOOT_MAX_IMG_SECTORS = 128`, `write-block-size = <4>`, and `MCUBOOT_BOOT_MAX_ALIGN = 32`, `k = 1`, and `first_trailer_idx = 2`.
 - `slot1_partition` at `0x08108000..0x08140000` spans four Bank 2 hardware sectors: two `16 KiB` sectors at `0x08108000` and `0x0810C000`, one `64 KiB` sector at `0x08110000`, and one `128 KiB` trailer sector at `0x08120000`. Here `N_sec = 4 = N_pri + 1`, and secondary sectors `0..2` match primary sector sizes `16 KiB`, `16 KiB`, and `64 KiB`, so `boot_slots_compatible` succeeds.
 - `zephyr_slot1_offset_geom_full.bin` is a `32,768`-byte or `0x8000` signed `v2.1.0` image built for `slot0_partition` at `0x08008000` with reset vector `0x08009131`, `0x200` header, `0x7CB0` payload, and `0x150` TLVs. `zephyr_slot1_offset_geom_full_offsetslot.bin` prepends `0x4000` bytes of `0xFF` for secondary sector `0` at `0x08108000`, placing the staged image at `0x0810C000..0x08114000` across secondary sector `1` of `16 KiB` and the first `16 KiB` of secondary sector `2` of `64 KiB`.
 - Setting `write-block-size = <4>` in `offset_with_geom_partition.dts` matches `memory.write_granularity: 4` on `platforms/stm32f4.repl` so each STM32F4 flash write increments `FaultInjectableFlash.writeCount` by one 32-bit word during trace replay.
 - At `swap_size = 0x8000`, pre-fix `429e2fea` computes `last_idx = 2 >= first_trailer_idx = 2`, logs `W: Not enough free space to run swap upgrade` and `W: required 49152 bytes but only 32768 are available`, writes only `copy_done` at `0x0801FFE0`, and boots `v1.0.0` at `0x08008000`. Post-fix `90fd59d2` computes `last_idx = 1 < first_trailer_idx = 2`, swaps sectors `0` and `1`, and boots `v2.1.0` at `0x08008000`.
 
-Quick audit runs on the mirrored-bank layout with `--quick --workers 2 --no-assert-verdict`:
+Quick audit and self-test runs on the mirrored-bank layout with `--quick --strict-profile` and `scripts/self_test.py --quick` (Renode v1.16.1, rebuilt `zephyr_slot1_offset_geom_full{,_offsetslot}.bin`):
 
-| Profile | Exit code | Wall time | Calibrated writes | Observed control outcome | Fault points | Recoveries | Issue points |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `mcuboot_pr2214_offset_geom_broken` | 0 | 19.6 s | 0 | `wrong_image`, marker `0x00000001` | 0 | 0 | 0 |
-| `mcuboot_pr2214_offset_geom_fixed` | 0 | 104.4 s | 12330 | `success`, marker `0x00000102` | 3 | 3 | 0 |
+| Profile | Exit code | Sweep wall time | Calibrated writes / erases | Observed control outcome | Fault points | Recoveries | Control / sweep issues | Verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `mcuboot_pr2214_offset_geom_broken` | 0 | 21.8 s | 0 / 0 (`actual_writes=1`) | `wrong_image`, marker `0x00000001` | 0 | 0 | 1 / 0 (`security_aggregate.status=FINDINGS`) | `PASS` |
+| `mcuboot_pr2214_offset_geom_fixed` | 0 | 42.1 s (2.7 s cal) | 12330 / 6 | `success`, marker `0x00000102` | 3 (`0`, `6165`, `12329`) | 3 | 0 / 0 | `PASS` |
 

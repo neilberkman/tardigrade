@@ -1,5 +1,4 @@
 schema_version: 1
-skip_self_test: true
 name: mcuboot_pr2214_offset_geom_fixed
 description: >
   MCUboot swap-offset after PR #2214 at 90fd59d2, paired with
@@ -50,6 +49,5 @@ fault_sweep:
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 
 expect:
-  mode: exploratory
   control_outcome: success
   should_find_issues: false

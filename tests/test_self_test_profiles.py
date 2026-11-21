@@ -35,13 +35,7 @@ from profile_loader import load_profile
 from verdicts import expectation_requires_findings
 
 
-EXPLORATORY_MCUBOOT_DIFFERENTIALS = {
-    f"mcuboot_{family}_{revision}.yaml": issue
-    for family, issue in (
-        ("pr2214_offset_geom", 18),
-    )
-    for revision in ("broken", "fixed")
-}
+EXPLORATORY_MCUBOOT_DIFFERENTIALS: dict[str, int] = {}
 
 
 class SelfTestProfileDiscoveryTests(unittest.TestCase):
@@ -60,30 +54,41 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
                 self.assertNotIn(name, discovered)
 
     def test_pr2214_offset_pair_uses_strict_regression_expectations(self):
-        profiles = {}
-        for revision in ("broken", "fixed"):
-            path = ROOT / "profiles" / f"mcuboot_pr2214_offset_{revision}.yaml"
-            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-            profile = load_profile(path)
-            with self.subTest(profile=path.name):
-                self.assertNotIn("mode", raw["expect"])
-                self.assertEqual(profile.expect.mode, "regression")
-                self.assertIn("#18", raw["description"])
-            profiles[revision] = (raw, profile)
+        discovered = {path.name for path in discover_profiles(ROOT)}
+        for family, expected_marker in (
+            ("pr2214_offset", 0x00000201),
+            ("pr2214_offset_geom", 0x00000102),
+        ):
+            profiles = {}
+            for revision in ("broken", "fixed"):
+                name = f"mcuboot_{family}_{revision}.yaml"
+                path = ROOT / "profiles" / name
+                raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+                profile = load_profile(path)
+                with self.subTest(profile=name):
+                    self.assertNotIn("mode", raw["expect"])
+                    self.assertEqual(profile.expect.mode, "regression")
+                    self.assertIn("#18", raw["description"])
+                    self.assertFalse(raw.get("skip_self_test", False))
+                    self.assertIn(name, discovered)
+                profiles[revision] = (raw, profile)
 
-        broken_raw, broken = profiles["broken"]
-        fixed_raw, fixed = profiles["fixed"]
-        # 429e2fea refuses the upgrade and keeps booting v1.0.0; the control
-        # boot itself is the finding.
-        self.assertTrue(expectation_requires_findings(broken.expect))
-        self.assertEqual(broken_raw["expect"]["control_outcome"], "wrong_image")
-        self.assertTrue(broken_raw["expect"]["allow_control_only_issues"])
-        # 90fd59d2 swaps and boots the staged v1.2.0 image.
-        self.assertFalse(expectation_requires_findings(fixed.expect))
-        self.assertEqual(fixed_raw["expect"]["control_outcome"], "success")
-        for key in ("platform", "memory", "images", "update_trigger", "success_criteria"):
-            with self.subTest(shared=key):
-                self.assertEqual(broken_raw[key], fixed_raw[key])
+            broken_raw, broken = profiles["broken"]
+            fixed_raw, fixed = profiles["fixed"]
+            # 429e2fea refuses the upgrade and keeps booting v1.0.0; the control
+            # boot itself is the finding.
+            self.assertTrue(expectation_requires_findings(broken.expect))
+            self.assertEqual(broken_raw["expect"]["control_outcome"], "wrong_image")
+            self.assertTrue(broken_raw["expect"]["allow_control_only_issues"])
+            # 90fd59d2 swaps and boots the staged image.
+            self.assertFalse(expectation_requires_findings(fixed.expect))
+            self.assertEqual(fixed_raw["expect"]["control_outcome"], "success")
+            self.assertEqual(
+                broken_raw["success_criteria"]["marker_value"], expected_marker
+            )
+            for key in ("platform", "memory", "images", "update_trigger", "success_criteria"):
+                with self.subTest(family=family, shared=key):
+                    self.assertEqual(broken_raw[key], fixed_raw[key])
 
     def test_unverified_mcuboot_differentials_are_absent_from_regression_matrices(self):
         manifest = json.loads((SCRIPTS / "self_test_runtime_manifest.json").read_text())
@@ -190,8 +195,6 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
         self.assertNotIn("mcuboot_head_move_nrf52_verify_instruction_skip.yaml", discovered)
         self.assertNotIn("mcuboot_pr2199_move_broken.yaml", discovered)
         self.assertNotIn("mcuboot_pr2199_move_fixed.yaml", discovered)
-        self.assertNotIn("mcuboot_pr2214_offset_geom_broken.yaml", discovered)
-        self.assertNotIn("mcuboot_pr2214_offset_geom_fixed.yaml", discovered)
         self.assertNotIn("fault_no_crc.yaml", discovered)
         self.assertNotIn("fault_single_replica.yaml", discovered)
         self.assertNotIn("fault_wrong_slot_order.yaml", discovered)

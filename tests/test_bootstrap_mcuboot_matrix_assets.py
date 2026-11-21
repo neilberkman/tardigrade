@@ -524,9 +524,11 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertNotIn("quick_use_heuristic", fixed["fault_sweep"])
         self.assertEqual(broken["expect"]["control_outcome"], "wrong_image")
         self.assertTrue(broken["expect"]["allow_control_only_issues"])
+        self.assertNotIn("mode", broken["expect"])
         self.assertEqual(fixed["expect"]["control_outcome"], "success")
-        self.assertTrue(broken.get("skip_self_test", False))
-        self.assertTrue(fixed.get("skip_self_test", False))
+        self.assertNotIn("mode", fixed["expect"])
+        self.assertFalse(broken.get("skip_self_test", False))
+        self.assertFalse(fixed.get("skip_self_test", False))
 
     def test_pr2214_offset_profiles_use_nrf52_sector_plus_one_layout(self) -> None:
         broken = yaml.safe_load((ROOT / "profiles" / "mcuboot_pr2214_offset_broken.yaml").read_text(encoding="utf-8"))
@@ -557,10 +559,76 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         self.assertEqual(broken["expect"]["control_outcome"], "wrong_image")
         self.assertTrue(broken["expect"]["allow_control_only_issues"])
         self.assertEqual(fixed["expect"]["control_outcome"], "success")
+        self.assertFalse(broken.get("skip_self_test", False))
+        self.assertFalse(fixed.get("skip_self_test", False))
         # The broken revision never moves image data, so its campaign is the
         # control boot alone; the fixed revision sweeps the full swap.
         self.assertEqual(broken["fault_sweep"]["max_writes"], 0)
         self.assertEqual(fixed["fault_sweep"]["max_writes"], "auto")
+
+    @staticmethod
+    def _evaluate_pr2214_swap_offset_boundary(
+        *,
+        swap_size: int,
+        prefix_bytes: int,
+        sector0_size: int,
+        primary_sector_sizes: tuple[int, ...],
+        secondary_sector_sizes: tuple[int, ...],
+        trailer_size: int,
+    ) -> dict[str, int | bool]:
+        """Model MCUboot PR #2214 find_last_idx + swap_run + validation limits.
+
+        Mirrors ``boot/bootutil/src/swap_offset.c`` at ``429e2fea`` (broken) and
+        ``90fd59d2`` (fixed) and ``bootutil_max_image_size`` in
+        ``boot/bootutil/src/bootutil_misc.c``.
+        """
+        if swap_size <= 0:
+            raise ValueError("swap_size must be positive")
+
+        # find_last_idx steps by boot_img_sector_size(state, BOOT_PRIMARY_SLOT, 0).
+        sectors_used = (swap_size + sector0_size - 1) // sector0_size
+        broken_last_idx = sectors_used      # 429e2fea increments before break
+        fixed_last_idx = sectors_used - 1   # 90fd59d2 increments after break
+
+        # swap_run counts trailer sectors from primary_sectors - 1 using sector0_size.
+        trailer_sectors = (trailer_size + sector0_size - 1) // sector0_size
+        first_trailer_idx = len(primary_sector_sizes) - trailer_sectors
+
+        def _max_image_size(sector_sizes: tuple[int, ...]) -> int:
+            slot_size = sum(sector_sizes)
+            status_off = slot_size - trailer_size
+            off = 0
+            for sz in sector_sizes:
+                if off <= status_off < off + sz:
+                    return off
+                off += sz
+            raise ValueError("boot_status_off fell outside slot geometry")
+
+        pri_max_image_size = _max_image_size(primary_sector_sizes)
+        sec_max_image_size = _max_image_size(secondary_sector_sizes)
+
+        broken_aborts = broken_last_idx >= first_trailer_idx
+        fixed_swaps = fixed_last_idx < first_trailer_idx
+        sec_validation_ok = (prefix_bytes + swap_size) <= sec_max_image_size
+        pri_validation_ok = swap_size <= pri_max_image_size
+        return {
+            "sectors_used": sectors_used,
+            "broken_last_idx": broken_last_idx,
+            "fixed_last_idx": fixed_last_idx,
+            "first_trailer_idx": first_trailer_idx,
+            "pri_max_image_size": pri_max_image_size,
+            "sec_max_image_size": sec_max_image_size,
+            "broken_aborts": broken_aborts,
+            "fixed_swaps": fixed_swaps,
+            "sec_validation_ok": sec_validation_ok,
+            "pri_validation_ok": pri_validation_ok,
+            "separates": (
+                broken_aborts
+                and fixed_swaps
+                and sec_validation_ok
+                and pri_validation_ok
+            ),
+        }
 
     def test_pr2214_offset_staging_image_hits_find_last_idx_boundary(self) -> None:
         # docs/mcuboot-pr2214-swap-offset.md derives these numbers.
@@ -568,9 +636,9 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         primary_sectors = 0x75000 // sector
         secondary_sectors = 0x76000 // sector
         # boot_trailer_sz(4) for MIN_SECTOR_COUNT=118, two status states per
-        # sector and BOOT_MAX_ALIGN=8: 118 * 2 * 4 + 8 * 4 + 16.
-        trailer_sectors = -(-(118 * 2 * 4 + 8 * 4 + 16) // sector)
-        first_trailer_idx = primary_sectors - trailer_sectors
+        # sector and BOOT_MAX_ALIGN=8: 118 * 2 * 4 + 8 * 4 + 16 = 0x3E0.
+        trailer_size = 118 * 2 * 4 + 8 * 4 + 16
+        self.assertEqual(trailer_size, 0x3E0)
 
         data = (ASSETS / "zephyr_slot1_pr2214_swap_0x74000_offsetslot.bin").read_bytes()
         self.assertEqual(set(data[:sector]), {0xFF})
@@ -584,12 +652,121 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         # Version 1.2.0 is the success marker at exec base + 0x14.
         self.assertEqual(struct.unpack_from("<I", data, sector + 0x14)[0], 0x00000201)
 
-        sectors_used = -(-swap_size // sector)
-        self.assertGreaterEqual(sectors_used, first_trailer_idx)  # 429e2fea aborts
-        self.assertLess(sectors_used - 1, first_trailer_idx)  # 90fd59d2 swaps
-        # The image ends before the secondary trailer sector, so validation
-        # accepts it on both revisions.
-        self.assertLessEqual(sector + swap_size, (secondary_sectors - trailer_sectors) * sector)
+        boundary = self._evaluate_pr2214_swap_offset_boundary(
+            swap_size=swap_size,
+            prefix_bytes=sector,
+            sector0_size=sector,
+            primary_sector_sizes=(sector,) * primary_sectors,
+            secondary_sector_sizes=(sector,) * secondary_sectors,
+            trailer_size=trailer_size,
+        )
+        self.assertEqual(boundary["first_trailer_idx"], 116)
+        self.assertEqual(boundary["broken_last_idx"], 116)
+        self.assertEqual(boundary["fixed_last_idx"], 115)
+        self.assertTrue(boundary["broken_aborts"])  # 429e2fea aborts
+        self.assertTrue(boundary["fixed_swaps"])  # 90fd59d2 swaps
+        self.assertTrue(boundary["sec_validation_ok"])
+        self.assertTrue(boundary["pri_validation_ok"])
+        self.assertTrue(boundary["separates"])
+
+    def test_pr2214_offset_geom_staging_image_hits_find_last_idx_boundary(self) -> None:
+        # STM32F429 mirrored-bank geometry:
+        #   primary (0x08008000, 0x18000): 16 KiB, 16 KiB, 64 KiB
+        #   secondary (0x08108000, 0x38000): 16 KiB, 16 KiB, 64 KiB, 128 KiB
+        # boot_trailer_sz(4) for BOOT_MAX_IMG_SECTORS=128, BOOT_MAX_ALIGN=32:
+        #   128 * 2 * 4 + 32 * 4 + 32 = 1184 = 0x4A0.
+        sector0 = 0x4000
+        primary_sector_sizes = (0x4000, 0x4000, 0x10000)
+        secondary_sector_sizes = (0x4000, 0x4000, 0x10000, 0x20000)
+        trailer_size = 128 * 2 * 4 + 32 * 4 + 32
+        self.assertEqual(trailer_size, 0x4A0)
+
+        full_bytes = (ASSETS / "zephyr_slot1_offset_geom_full.bin").read_bytes()
+        offset_bytes = (ASSETS / "zephyr_slot1_offset_geom_full_offsetslot.bin").read_bytes()
+        self.assertEqual(set(offset_bytes[:sector0]), {0xFF})
+        self.assertEqual(offset_bytes[sector0:], full_bytes)
+
+        magic, _load, hdr_size, protect_tlv_size, img_size = struct.unpack_from("<IIHHI", offset_bytes, sector0)
+        self.assertEqual(magic, 0x96F3B83D)
+        tlv_magic, tlv_tot = struct.unpack_from(
+            "<HH", offset_bytes, sector0 + hdr_size + img_size + protect_tlv_size
+        )
+        self.assertEqual(tlv_magic, 0x6907)
+        swap_size = hdr_size + img_size + protect_tlv_size + tlv_tot
+        self.assertEqual(swap_size, 0x8000)
+        self.assertEqual(len(full_bytes), swap_size)
+        self.assertEqual(len(offset_bytes), sector0 + swap_size)
+        # Version 2.1.0 is the success marker at exec base + 0x14.
+        self.assertEqual(struct.unpack_from("<I", offset_bytes, sector0 + 0x14)[0], 0x00000102)
+
+        boundary = self._evaluate_pr2214_swap_offset_boundary(
+            swap_size=swap_size,
+            prefix_bytes=sector0,
+            sector0_size=sector0,
+            primary_sector_sizes=primary_sector_sizes,
+            secondary_sector_sizes=secondary_sector_sizes,
+            trailer_size=trailer_size,
+        )
+        self.assertEqual(boundary["first_trailer_idx"], 2)
+        self.assertEqual(boundary["broken_last_idx"], 2)
+        self.assertEqual(boundary["fixed_last_idx"], 1)
+        self.assertEqual(boundary["pri_max_image_size"], 0x8000)
+        self.assertEqual(boundary["sec_max_image_size"], 0x18000)
+        self.assertTrue(boundary["broken_aborts"])  # 429e2fea aborts
+        self.assertTrue(boundary["fixed_swaps"])  # 90fd59d2 swaps
+        self.assertTrue(boundary["sec_validation_ok"])
+        self.assertTrue(boundary["pri_validation_ok"])
+        self.assertTrue(boundary["separates"])
+
+    def test_pr2214_boundary_model_rejects_under_boundary_and_over_ceiling_drift(self) -> None:
+        # nRF52840 sector+1 layout separates only for 0x73000 < swap_size <= 0x74000.
+        nrf_kwargs = dict(
+            prefix_bytes=0x1000,
+            sector0_size=0x1000,
+            primary_sector_sizes=(0x1000,) * 117,
+            secondary_sector_sizes=(0x1000,) * 118,
+            trailer_size=0x3E0,
+        )
+        under_nrf = self._evaluate_pr2214_swap_offset_boundary(swap_size=0x73000, **nrf_kwargs)
+        self.assertFalse(under_nrf["broken_aborts"])
+        self.assertFalse(under_nrf["separates"])
+
+        just_in_nrf = self._evaluate_pr2214_swap_offset_boundary(swap_size=0x73001, **nrf_kwargs)
+        self.assertTrue(just_in_nrf["separates"])
+
+        over_nrf = self._evaluate_pr2214_swap_offset_boundary(swap_size=0x74001, **nrf_kwargs)
+        self.assertFalse(over_nrf["fixed_swaps"])
+        self.assertFalse(over_nrf["sec_validation_ok"])
+        self.assertFalse(over_nrf["separates"])
+
+        # Equal-slot nRF52840 (118 / 118 sectors) can never separate at any size.
+        for candidate in (0x74000, 0x74350, 0x75150, 0x75350):
+            equal = self._evaluate_pr2214_swap_offset_boundary(
+                swap_size=candidate,
+                prefix_bytes=0x1000,
+                sector0_size=0x1000,
+                primary_sector_sizes=(0x1000,) * 118,
+                secondary_sector_sizes=(0x1000,) * 118,
+                trailer_size=0x3E0,
+            )
+            self.assertFalse(equal["separates"], f"equal-slot unexpectedly separated at 0x{candidate:x}")
+
+        # STM32F429 mirrored-bank layout separates only for 0x4000 < swap_size <= 0x8000.
+        stm_kwargs = dict(
+            prefix_bytes=0x4000,
+            sector0_size=0x4000,
+            primary_sector_sizes=(0x4000, 0x4000, 0x10000),
+            secondary_sector_sizes=(0x4000, 0x4000, 0x10000, 0x20000),
+            trailer_size=0x4A0,
+        )
+        under_stm = self._evaluate_pr2214_swap_offset_boundary(swap_size=0x4000, **stm_kwargs)
+        self.assertFalse(under_stm["broken_aborts"])
+        self.assertFalse(under_stm["separates"])
+
+        over_stm = self._evaluate_pr2214_swap_offset_boundary(swap_size=0x8001, **stm_kwargs)
+        self.assertFalse(over_stm["fixed_swaps"])
+        self.assertFalse(over_stm["pri_validation_ok"])
+        self.assertFalse(over_stm["separates"])
 
     def test_pr_differential_elfs_are_stripped(self) -> None:
         readelf = shutil.which("arm-none-eabi-readelf")

@@ -50,9 +50,7 @@ fault_sweep:
   fault_types: [power_loss]
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
 
-skip_self_test: true
 expect:
-  mode: exploratory
   control_outcome: wrong_image
   allow_control_only_issues: true
   should_find_issues: true

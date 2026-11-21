@@ -44,6 +44,14 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Changed
 
+- Re-enabled all four MCUboot PR #2214 swap-offset differential profiles
+  (`mcuboot_pr2214_offset_{broken,fixed}.yaml` and
+  `mcuboot_pr2214_offset_geom_{broken,fixed}.yaml`) as strict regression
+  self-tests in `scripts/self_test_runtime_manifest.json`, regenerated their
+  boundary-hitting staging binaries (`swap_size=0x74000` on nRF52840 sector+1
+  and `swap_size=0x8000` on mirrored-bank STM32F429) with `imgtool verify`
+  enabled for both scopes, and added boundary-drift regression tests modeling
+  `find_last_idx` at `429e2fea` versus `90fd59d2`.
 - `load_profile` accepts an optional `strict_root` directory boundary for strict
   `base_profile` resolution, permits `..` segments in relative `base_profile`
   paths when the resolved target remains inside that boundary, and
@@ -77,6 +85,11 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- `scripts/report_security_status.py` no longer appends a spurious
+  `summary.runtime_sweep calibration coverage is unavailable` inconclusive
+  reason to verified intentional zero-point control-only campaigns
+  (`campaign_integrity.intentional_control_only: true`), aligning security
+  aggregation with `scripts/audit_report.py` and `scripts/self_test.py`.
 - The runtime fault sweep normalizes missing follow-up cycle records to an
   empty sequence before collecting state-probe observations for a single-cycle
   clean update phase.

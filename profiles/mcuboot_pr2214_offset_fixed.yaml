@@ -1,5 +1,4 @@
 schema_version: 1
-skip_self_test: true
 name: mcuboot_pr2214_offset_fixed
 description: >
   MCUboot swap-offset after PR #2214 at 90fd59d2, paired with

@@ -869,6 +869,9 @@ PY
         --version "2.1.0+0" \
         "${BUILD_ROOT}/zephyr_slot1_offset_geom_stm32f4_payload.bin" \
         "${ASSETS_DIR}/zephyr_slot1_offset_geom_full.bin"
+    "${PYTHON_BIN}" "${IMGTOOL_PY}" verify \
+        --key "${IMGTOOL_KEY}" \
+        "${ASSETS_DIR}/zephyr_slot1_offset_geom_full.bin"
     make_offset_slot_image \
         "${ASSETS_DIR}/zephyr_slot1_offset_geom_full.bin" \
         "${ASSETS_DIR}/zephyr_slot1_offset_geom_full_offsetslot.bin" \

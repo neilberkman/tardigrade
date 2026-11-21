@@ -366,8 +366,19 @@ def _collect_summary(
         runtime = _mapping(summary["runtime_sweep"], "{}.runtime_sweep".format(prefix))
         configured = _configured_fault_types(summary)
         coverage = runtime.get("calibration_coverage")
+        integrity = runtime.get("campaign_integrity")
+        intentional_control_only = bool(
+            isinstance(integrity, dict)
+            and integrity.get("intentional_control_only") is True
+            and integrity.get("complete") is True
+            and integrity.get("requested") == 0
+            and isinstance(integrity.get("control_points"), int)
+            and not isinstance(integrity.get("control_points"), bool)
+            and integrity.get("control_points", 0) >= 1
+        )
         if (
-            configured is not None
+            not intentional_control_only
+            and configured is not None
             and configured & TRACE_COVERAGE_FAULT_TYPES
             and coverage is None
         ):
@@ -375,12 +386,17 @@ def _collect_summary(
                 state,
                 "{}.runtime_sweep calibration coverage is missing".format(prefix),
             )
-        if isinstance(coverage, dict) and coverage.get("status") in {
-            "unavailable",
-            "metadata_only",
-            "outside_slots_only",
-            "no_nvm_activity",
-        } and _coverage_check_required(summary, "calibration"):
+        if (
+            not intentional_control_only
+            and isinstance(coverage, dict)
+            and coverage.get("status") in {
+                "unavailable",
+                "metadata_only",
+                "outside_slots_only",
+                "no_nvm_activity",
+            }
+            and _coverage_check_required(summary, "calibration")
+        ):
             _record_inconclusive(
                 state,
                 "{}.runtime_sweep calibration coverage is {}".format(
