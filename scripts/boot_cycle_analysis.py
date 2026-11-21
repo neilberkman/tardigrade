@@ -13,6 +13,7 @@ _CONCRETE_TERMINAL_BOOT_OUTCOMES = frozenset(
     {
         "success",
         "wrong_image",
+        "memory_checks_unmet",
         "hard_fault",
         "bus_fault",
         "wrong_pc",

@@ -157,6 +157,20 @@ The format follows [common-changelog](https://common-changelog.org/).
   named an earlier write. Campaigns whose firmware resets mid-run calibrate
   to a larger write count. External peripherals keep the old behavior unless
   they expose the property.
+- Reset-gated runtime sweeps (`success_criteria.terminal_after_reset: true`)
+  now observe resets directly via Renode's `IMachine.MachineReset` and
+  `IMachine.PeripheralReset` events (keeping `boot_entry_reentered` and
+  `instruction_counter_reset` as corroboration) and separate decisive content
+  evidence from reachable `memory_checks`. Content mismatches after reset
+  remain immediately terminal `wrong_image`, whereas unmet `memory_checks`
+  continue polling across post-reset slices until everything holds (`success`)
+  or the emulation/instruction budget ends with valid content, reporting the
+  dedicated `memory_checks_unmet` outcome and naming every failed check.
+  Reports now record exact reset virtual time and post-reset check latency in
+  `phase1_reset_observation`, `phase2_reset_observation`,
+  `calibration.stop.reset_observation`, and `summary.runtime_sweep.control`.
+  Added the direct-reset delayed-liveness fixture under
+  `examples/runtime_self_update_delayed/`.
 
 ## [0.5.0] - 2026-07-10
 

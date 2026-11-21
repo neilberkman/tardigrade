@@ -712,6 +712,8 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
         return "wrong_image"
     if outcome == "success":
         return "recoverable"
+    if outcome == "memory_checks_unmet":
+        return "memory_checks_unmet"
     if outcome == "bus_fault":
         return "unrecoverable" if availability_rc else "safe_dos"
     if outcome == "wrong_image":

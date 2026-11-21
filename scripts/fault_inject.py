@@ -410,13 +410,10 @@ def classify_multi_component_outcome(
         outcomes[name] = outcome
 
     all_success = all(o in success_outcomes for o in outcomes.values())
-    all_failed = all(
-        o in brick_outcomes or o == "wrong_image" for o in outcomes.values()
-    )
+    failed_outcomes = brick_outcomes | {"wrong_image", "memory_checks_unmet"}
+    all_failed = all(o in failed_outcomes for o in outcomes.values())
     any_success = any(o in success_outcomes for o in outcomes.values())
-    any_failed = any(
-        o in brick_outcomes or o == "wrong_image" for o in outcomes.values()
-    )
+    any_failed = any(o in failed_outcomes for o in outcomes.values())
 
     if all_success:
         return "success"

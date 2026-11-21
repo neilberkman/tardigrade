@@ -519,18 +519,48 @@ success_criteria:
 ```
 
 With `terminal_after_reset: true`, runtime execute-mode sweeps do not stop on
-pre-reset PC or VTOR evidence. Tardigrade must observe the boot entry being
-re-entered, or an instruction-counter reset, and then all existing content and
-liveness criteria must pass. A copied image that never requests reset, or a
-post-reset image that never establishes liveness, cannot reach this terminal.
-After a recovery reset, a live boot with a failed content check terminates as
-`wrong_image` instead of being overwritten by a later budget timeout. During an
-active calibration or fault run, `run_runtime_fault_sweep.py` enables
-`PreserveCountersAcrossReset` on the flash backend so write indices stay
-monotonic across the firmware's in-run reset.
+pre-reset PC or VTOR evidence. Tardigrade subscribes directly to Renode's
+`IMachine.MachineReset` (`machine_reset`) and `IMachine.PeripheralReset`
+(`cpu_reset` when the reset peripheral is `sysbus.cpu`) events so a reset is
+observed regardless of whether the CPU restarts through `bootloader.entry` or
+directly from an application vector table, and regardless of `phase1_time_slice`.
+Boot-entry re-entry (`boot_entry_reentered`), instruction-counter drops
+(`instruction_counter_reset`), and pre-observation recovery resets
+(`recovery_reset_before_observation`) remain active as corroborating sources,
+and any pre-reset sticky PC/VTOR state is cleared when an in-run reset fires.
 
-See `examples/runtime_self_update/profile.yaml` for a complete vendor-neutral
-fixture.
+After the reset is observed, Tardigrade separates decisive content evidence
+from reachable `memory_checks`:
+
+- **Content evidence** (image hash, markers, rollback state, otadata
+  expectations, reset-vector offset, config checks, and bootloader integrity)
+  remains terminal as soon as post-reset execution is live: a content mismatch
+  stops immediately with `wrong_image` (`outcome_terminal_after_reset(wrong_image)`)
+  instead of being masked by a later budget timeout.
+- **Reachable `memory_checks`** are polled on every sample after the reset. The
+  run stops with `success` (`success_terminal_after_reset`) on the first sample
+  where both content criteria and all `memory_checks` hold. If the emulation or
+  instruction budget expires with valid content and `memory_checks` never all
+  true, the run ends with `post_reset_checks_unmet` and reports the dedicated
+  `memory_checks_unmet` outcome naming every failed check in
+  `signals.unmet_memory_checks`, `signals.failed_memory_checks`, and
+  `signals.failure_reason` (neither `wrong_image` nor `timeout`).
+
+Reports expose reset and post-reset check timing in
+`phase1_reset_observation` / `phase2_reset_observation` (and in
+`summary.runtime_sweep.control`): `reset_emulated_s` (exact virtual time of the
+reset event), `observed_at_iter` / `observed_at_emulated_s` (first sample after
+reset), `post_reset_samples`, `checks_first_held_at_iter` /
+`checks_first_held_at_emulated_s`, `checks_held_after_reset_s`, and
+`checks_held_after_reset_observed_s`. During an active calibration or fault
+run, `run_runtime_fault_sweep.py` enables `PreserveCountersAcrossReset` on the
+flash backend so write indices stay monotonic across the firmware's in-run
+reset.
+
+See `examples/runtime_self_update/profile.yaml` and
+`examples/runtime_self_update_delayed/profile.yaml` for complete vendor-neutral
+fixtures (including direct application-vector reset and delayed post-reset
+liveness).
 
 ## Fault sweep configuration
 
@@ -575,12 +605,15 @@ execute-mode only. Omitting `calibration_stop` preserves the existing terminal
 condition.
 
 When `success_criteria.terminal_after_reset: true` is also configured, the
-calibration success stop inherits that reset gate. Pre-reset success evidence
-cannot truncate calibration; an address stop configured beside it can still
-close the operation at the exact pre-reset boundary. Reports expose
-`calibration.stop.success_before_address` when an ungated success stop wins
-before its configured address, because that count may cover only a prefix of
-the operation.
+calibration success stop inherits that reset gate and the same post-reset
+polling behavior for `memory_checks`: pre-reset success evidence cannot
+truncate calibration, unmet post-reset `memory_checks` continue polling across
+slices until all checks hold (stopping with `calibration_stop_success_criteria`),
+and `calibration.stop.reset_observation` records the reset and check timing. An
+address stop configured beside it can still close the operation at the exact
+pre-reset boundary. Reports expose `calibration.stop.success_before_address`
+when an ungated success stop wins before its configured address, because that
+count may cover only a prefix of the operation.
 
 OTP-only campaigns can declare an independent operation bound:
 
@@ -1922,23 +1955,29 @@ For write/erase-style campaigns, a clean `PASS` also requires calibration covera
 
 Each fault point produces one of:
 
-| Outcome       | Meaning                                                 |
-| ------------- | ------------------------------------------------------- |
-| `success`     | Device booted to the correct slot                       |
-| `wrong_image` | Device booted but to the wrong slot or with wrong image |
-| `no_boot`     | Device did not reach any valid vector table             |
-| `wrong_pc`    | PC ended up outside all known slots                     |
-| `hard_fault`  | Recovery fault evidence or an invalid reset vector was observed |
-| `timeout`     | An emulation, instruction, or wall-clock limit expired; evidence is incomplete |
+| Outcome               | Meaning                                                                             |
+| --------------------- | ----------------------------------------------------------------------------------- |
+| `success`             | Device booted to the correct slot and satisfied all configured checks               |
+| `wrong_image`         | Device booted to the wrong slot or with mismatched image/content criteria           |
+| `memory_checks_unmet` | Device booted valid image content, but one or more `memory_checks` never all held before the budget ended |
+| `no_boot`             | Device did not reach any valid vector table                                         |
+| `wrong_pc`            | PC ended up outside all known slots                                                 |
+| `hard_fault`          | Recovery fault evidence or an invalid reset vector was observed                     |
+| `timeout`             | An emulation, instruction, or wall-clock limit expired; evidence is incomplete      |
 
 Execution failure has precedence over content identity. An observed recovery
 HardFault, active fault handler, invalid reset vector, or terminal liveness
 stall is reported as `hard_fault` or `no_boot`; an accompanying digest mismatch
 is retained in `signals.content_mismatch` and `signals.supporting_outcomes`
 instead of replacing the crash with `wrong_image`. Exhausting an emulation,
-instruction, or wall-clock limit remains an incomplete observation even if
-image bytes differ. Captured execution is progress evidence, not terminal
-`no_boot` or successful-boot evidence.
+instruction, or wall-clock limit remains an incomplete observation (`timeout`)
+even if image bytes differ — except when a reset-gated run completes its
+emulation or instruction budget with valid post-reset content and unmet
+`memory_checks`, which reports `memory_checks_unmet` and names the failing
+checks in `signals.unmet_memory_checks`, `signals.failed_memory_checks`, and
+`signals.failure_reason` (a wall-clock timeout still remains `timeout`).
+Captured execution is progress evidence, not terminal `no_boot` or
+successful-boot evidence.
 
 For injected MRAM programs, the backend contract is fail-closed. The per-point
 record includes `mram_fault_evidence` with the selected and backend write
@@ -1953,12 +1992,13 @@ an infrastructure error and cannot contribute valid campaign evidence.
 
 Outcomes are grouped into classes:
 
-| Class               | Meaning                                                |
-| ------------------- | ------------------------------------------------------ |
-| `recoverable`       | Device booted successfully to the expected slot        |
-| `wrong_image`       | Booted but with wrong firmware — state-correctness bug |
-| `silent_corruption` | Booted successfully but invariant/assertion violated   |
-| `unrecoverable`     | Device did not boot — brick                            |
+| Class                 | Meaning                                                                         |
+| --------------------- | ------------------------------------------------------------------------------- |
+| `recoverable`         | Device booted successfully to the expected slot                                 |
+| `wrong_image`         | Booted but with wrong firmware or content mismatch — state-correctness bug      |
+| `memory_checks_unmet` | Booted valid firmware content, but required runtime `memory_checks` never held  |
+| `silent_corruption`   | Booted successfully but invariant/assertion violated                            |
+| `unrecoverable`       | Device did not boot — brick                                                     |
 
 ### Report JSON structure
 

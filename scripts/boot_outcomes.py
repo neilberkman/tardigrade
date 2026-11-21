@@ -4,6 +4,7 @@ DEVICE_BOOT_OUTCOMES = frozenset(
     {
         "bus_fault",
         "hard_fault",
+        "memory_checks_unmet",
         "misaligned_vtor",
         "no_boot",
         "success",

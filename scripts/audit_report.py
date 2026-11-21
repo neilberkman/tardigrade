@@ -299,6 +299,18 @@ def categorize_failure(
     if isinstance(signals, dict):
         if signals.get("matched_image") is not None:
             payload["matched_image"] = signals.get("matched_image")
+        if signals.get("unmet_memory_checks"):
+            payload["unmet_memory_checks"] = signals.get("unmet_memory_checks")
+        if signals.get("failed_memory_checks"):
+            payload["failed_memory_checks"] = signals.get("failed_memory_checks")
+        if signals.get("phase1_reset_observation") is not None:
+            payload["phase1_reset_observation"] = signals.get(
+                "phase1_reset_observation"
+            )
+        if signals.get("phase2_reset_observation") is not None:
+            payload["phase2_reset_observation"] = signals.get(
+                "phase2_reset_observation"
+            )
         if signals.get("function_return_probes") is not None:
             payload["function_return_probes"] = signals.get("function_return_probes")
         if signals.get("verification_probe_classification") is not None:
@@ -942,8 +954,10 @@ def summarize_runtime_sweep(
             for key in (
                 "phase1_stop_reason",
                 "phase1_emulated_s",
+                "phase1_reset_observation",
                 "phase2_stop_reason",
                 "phase2_emulated_s",
+                "phase2_reset_observation",
                 "phase3_stop_reason",
                 "phase3_ms",
                 "trace_replay_mode",
@@ -961,6 +975,12 @@ def summarize_runtime_sweep(
                 "pc",
                 "marker_ok",
                 "marker_actual",
+                "content_criteria_ok",
+                "content_mismatch",
+                "memory_checks_ok",
+                "unmet_memory_checks",
+                "failed_memory_checks",
+                "failure_reason",
                 "expectations_met",
                 "vtor_ok",
                 "vtor_aligned",

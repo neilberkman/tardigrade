@@ -225,6 +225,7 @@ def status_class(value: Any) -> str:
     if normalized.startswith("fail") or normalized in {
         "error",
         "hard_fault",
+        "memory_checks_unmet",
         "no_boot",
         "wrong_image",
     }:

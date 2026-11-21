@@ -96,8 +96,8 @@ README for its separate `security-status` and regression mode.
 The `runtime_sweep_results` array contains one entry per fault point with:
 
 - `fault_at` -- which NVM write was interrupted
-- `boot_outcome` -- `success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, or `timeout`
-- `fault_class` -- `recoverable`, `wrong_image`, `silent_corruption`, or `unrecoverable`
+- `boot_outcome` -- `success`, `wrong_image`, `memory_checks_unmet`, `no_boot`, `wrong_pc`, `hard_fault`, or `timeout`
+- `fault_class` -- `recoverable`, `wrong_image`, `memory_checks_unmet`, `silent_corruption`, or `unrecoverable`
 
 For a visual report, render the JSON as HTML:
 

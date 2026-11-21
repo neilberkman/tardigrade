@@ -84,9 +84,10 @@ def _classify_combined_outcome(outcomes: Mapping[str, Any]) -> str:
     values = {_normalise_outcome(value) for value in outcomes.values()}
     success = values == {"success"}
     brick = {"no_boot", "hard_fault", "wrong_pc", "misaligned_vtor"}
-    all_failed = all(value in brick or value == "wrong_image" for value in values)
+    failed = brick | {"wrong_image", "memory_checks_unmet"}
+    all_failed = all(value in failed for value in values)
     any_success = "success" in values
-    any_failed = any(value in brick or value == "wrong_image" for value in values)
+    any_failed = any(value in failed for value in values)
     if success:
         return "success"
     if all_failed:

@@ -1032,6 +1032,8 @@ def calibration_completed(
         return False
     if stop_reason in {"no_boot_no_writes", "no_boot_settled_writes", "no_writes_brick", "vtor_captured_hardfault"}:
         return expected_control_outcome == "no_boot"
+    if stop_reason == "post_reset_checks_unmet":
+        return expected_control_outcome == "memory_checks_unmet"
     return True
 
 

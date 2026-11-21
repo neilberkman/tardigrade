@@ -368,7 +368,7 @@ flowchart TD
 5. **Phase 1** -- replay the clean trace where supported, or execute the CPU to the selected cutpoint, then inject the fault. Trace replay eliminates O(N^2) prefix re-emulation for eligible power-loss points.
 6. **Phase 2** -- `execute` mode resets the CPU and performs a full recovery boot from faulted NVM; `state` mode infers the outcome from NVM contents alone.
 7. **Follow-up cycles / hooks** -- optional repeated boots and between-cycle hook actions model confirm-or-rollback flows and staged recovery.
-8. **Classification** -- boot outcomes (`success`, `wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`) and failure classes (`recoverable`, `wrong_image`, `silent_corruption`, `unrecoverable`). Recovery faults and liveness stalls take precedence over a simultaneous image mismatch, which remains supporting evidence. MRAM program faults retain exact address/width/byte telemetry plus an immediate snapshot and compact image diff. A `timeout` means an emulation, instruction, or wall-clock limit expired before a terminal result -- this is not counted as a failure.
+8. **Classification** -- boot outcomes (`success`, `wrong_image`, `memory_checks_unmet`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`) and failure classes (`recoverable`, `wrong_image`, `memory_checks_unmet`, `silent_corruption`, `unrecoverable`). Recovery faults and liveness stalls take precedence over a simultaneous image mismatch, which remains supporting evidence. Under `terminal_after_reset`, content mismatches remain terminal `wrong_image` immediately, while reachable `memory_checks` are polled across post-reset slices until they hold (`success`) or the budget ends with valid content and unmet checks (`memory_checks_unmet`, naming the failed checks). MRAM program faults retain exact address/width/byte telemetry plus an immediate snapshot and compact image diff. A `timeout` means an emulation, instruction, or wall-clock limit expired before a terminal result -- this is not counted as a failure.
 
 ### Fault types
 
@@ -503,6 +503,8 @@ and trace fixtures for engine validation and self-testing:
 | `cbmc_bridge`            | Formal-counterexample and crash-input conversion fixtures          |
 | `fuzzer_harness`         | End-to-end parser fuzzing and regression-profile example           |
 | `persistent_state_fail_closed` | Failed persistent-state read/write outcome fixtures          |
+| `runtime_self_update`    | Reset-gated in-place self-update fixture and negative variants     |
+| `runtime_self_update_delayed` | Direct-reset self-update fixture with delayed post-reset liveness |
 
 ## Report structure
 
@@ -515,11 +517,11 @@ evidence. The GitHub Action combines both values into its binary `verdict`
 output and requires `CLEAN` unless `regression-mode` is explicitly enabled.
 
 For runtime sweeps, `bricks` counts unrecoverable failures, `issue_points`
-includes broader mismatches (wrong slot, semantic assertions, and invariant
+includes broader mismatches (wrong slot, unmet memory checks, semantic assertions, and invariant
 violations), and `timeout_points` counts points where an emulation,
 instruction, or wall-clock limit expired without a terminal result. Timeouts
 are not failures; increase the relevant profile limit to resolve them. Common boot outcomes are `success`,
-`wrong_image`, `no_boot`, `wrong_pc`, `hard_fault`, and `timeout`. Clean runtime
+`wrong_image`, `memory_checks_unmet`, `no_boot`, `wrong_pc`, `hard_fault`, and `timeout`. Clean runtime
 evidence also requires calibration coverage: if the bootloader never moves
 slot data during calibration, tardigrade reports an incomplete setup rather
 than claiming the bootloader is clean.

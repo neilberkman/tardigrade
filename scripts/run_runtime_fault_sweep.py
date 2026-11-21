@@ -7742,6 +7742,10 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     signals.update(collect_otadata_signals())
 
     structured_checks_ok = True
+    memory_checks_requested = False
+    memory_checks_ok = True
+    non_memory_structured_ok = True
+    failed_memory_checks = []
     if enforce_content_criteria:
         structured_observations = evaluate_structured_success_checks()
         if structured_observations.get('requested'):
@@ -7752,6 +7756,95 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
                 'bootloader_integrity_ok'
             )
             structured_checks_ok = bool(structured_observations.get('all_ok'))
+            raw_memory_checks = structured_observations.get('memory_checks')
+            memory_checks_requested = bool(
+                (isinstance(raw_memory_checks, list) and len(raw_memory_checks) > 0)
+                or structured_observations.get('memory_checks_error')
+                or (
+                    'memory_checks_ok' in structured_observations
+                    and structured_observations.get('memory_checks_ok') is False
+                )
+            )
+            memory_checks_ok = bool(structured_observations.get('memory_checks_ok', True))
+            non_memory_structured_ok = bool(
+                structured_observations.get('config_checks_ok', True)
+                and structured_observations.get('bootloader_integrity_ok', True)
+                and not structured_observations.get('transport_error')
+            )
+            if not structured_checks_ok and memory_checks_ok:
+                non_memory_structured_ok = False
+            if not memory_checks_ok:
+                if structured_observations.get('memory_checks_error'):
+                    err_text = str(structured_observations.get('memory_checks_error'))
+                    failed_memory_checks.append({
+                        'index': None,
+                        'error': err_text,
+                        'summary': 'memory_checks: {}'.format(err_text),
+                    })
+                if isinstance(raw_memory_checks, list):
+                    for check in raw_memory_checks:
+                        if not isinstance(check, dict) or check.get('ok'):
+                            continue
+                        idx = check.get('index')
+                        addr_str = check.get('address') or 'unknown'
+                        op_str = str(check.get('op') or 'eq')
+                        if check.get('error'):
+                            summary = 'memory_check[{}] @ {}: {}'.format(
+                                idx, addr_str, check.get('error')
+                            )
+                        elif op_str == 'nonzero':
+                            summary = (
+                                'memory_check[{}] @ {}: actual {} ({}) is zero '
+                                '(expected nonzero)'
+                            ).format(
+                                idx,
+                                addr_str,
+                                check.get('actual_hex', check.get('actual')),
+                                check.get('actual'),
+                            )
+                        else:
+                            summary = (
+                                'memory_check[{}] @ {}: actual {} ({}) does not '
+                                'satisfy {} {}'
+                            ).format(
+                                idx,
+                                addr_str,
+                                check.get('actual_hex', check.get('actual')),
+                                check.get('actual'),
+                                op_str,
+                                check.get('expected'),
+                            )
+                        entry = {
+                            'index': idx,
+                            'address': addr_str,
+                            'op': op_str,
+                            'actual': check.get('actual'),
+                            'actual_hex': check.get('actual_hex'),
+                            'mask': check.get('mask'),
+                            'summary': summary,
+                        }
+                        if 'expected' in check:
+                            entry['expected'] = check.get('expected')
+                        if check.get('error'):
+                            entry['error'] = check.get('error')
+                        failed_memory_checks.append(entry)
+                if not failed_memory_checks:
+                    failed_memory_checks.append({
+                        'index': None,
+                        'summary': 'memory_checks: one or more checks did not hold',
+                    })
+                signals['failed_memory_checks'] = failed_memory_checks
+                signals['unmet_memory_checks'] = [
+                    item['summary'] for item in failed_memory_checks
+                ]
+                memory_checks_failure_reason = '; '.join(signals['unmet_memory_checks'])
+                signals['memory_checks_failure_reason'] = memory_checks_failure_reason
+                if signals.get('failure_reason'):
+                    signals['failure_reason'] = (
+                        signals['failure_reason'] + '; ' + memory_checks_failure_reason
+                    )
+                else:
+                    signals['failure_reason'] = memory_checks_failure_reason
 
     otadata_expect_ok = True
     otadata_mismatches = []
@@ -7809,18 +7902,20 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
             reset_vector_offset_ok = False
     signals['reset_vector_offset_ok'] = reset_vector_offset_ok
 
-    criteria_ok = (
+    content_criteria_ok = (
         marker_ok
         and otadata_expect_ok
         and rollback_ok
         and reset_vector_offset_ok
-        and structured_checks_ok
+        and non_memory_structured_ok
     )
+    criteria_ok = content_criteria_ok and memory_checks_ok
     # Liveness is execution progress, not content correctness. Structured
-    # success checks contribute to wrong_image/content evidence below, but a
-    # failed memory/configuration check does not prove execution stopped.
+    # memory checks are conditions the restarted target must reach rather than
+    # image-content mismatches.
     liveness_established = bool(execution_observed and pc_ok)
     expectations_met = vtor_ok and vtor_aligned and pc_ok and criteria_ok
+    signals['content_criteria_ok'] = content_criteria_ok
     signals['liveness_established'] = liveness_established
     signals['expectations_met'] = expectations_met
 
@@ -7838,17 +7933,54 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
             hash_result == 'unknown'
             or not marker_ok
             or not rollback_ok
-            or not structured_checks_ok
+            or not otadata_expect_ok
+            or not reset_vector_offset_ok
+            or not non_memory_structured_ok
         )
     )
     signals['content_mismatch'] = content_mismatch
 
+    reset_obs = (
+        p2_status.get('reset_observation')
+        if isinstance(p2_status, dict)
+        and isinstance(p2_status.get('reset_observation'), dict)
+        else None
+    )
+    reset_observed_for_status = bool(
+        reset_obs is not None and reset_obs.get('observed')
+    )
+    terminal_after_reset_active = bool(
+        globals().get('success_terminal_after_reset', False)
+        or (
+            reset_obs is not None
+            and reset_obs.get('required_for_success_terminal')
+        )
+    )
+    post_reset_checks_unmet_ready = bool(
+        execution_observed
+        and vtor_aligned
+        and pc_ok
+        and vtor_ok
+        and content_criteria_ok
+        and memory_checks_requested
+        and not memory_checks_ok
+    )
+    budget_exhausted_with_unmet_checks = bool(
+        post_reset_checks_unmet_ready
+        and terminal_after_reset_active
+        and reset_observed_for_status
+        and primary_execution_failure == 'timeout'
+        and not str(p2_reason).lower().startswith('wall_timeout')
+    )
+
     # Keep execution failures separate from expectation mismatches:
     # a boot into a real slot with the "wrong" image/slot is not "no_boot".
-    if primary_execution_failure is not None:
+    if primary_execution_failure is not None and not budget_exhausted_with_unmet_checks:
         boot_outcome = primary_execution_failure
         if content_mismatch:
             signals['supporting_outcomes'] = ['wrong_image']
+        elif post_reset_checks_unmet_ready:
+            signals['supporting_outcomes'] = ['memory_checks_unmet']
     elif not execution_observed:
         # A wall timeout is an incomplete observation even when no writes were
         # seen.  Only deliberate no_boot terminal reasons (for example
@@ -7858,8 +7990,10 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
         boot_outcome = 'misaligned_vtor'
     elif not pc_ok:
         boot_outcome = 'wrong_pc'
-    elif not vtor_ok or not criteria_ok:
+    elif not vtor_ok or not content_criteria_ok:
         boot_outcome = 'wrong_image'
+    elif not memory_checks_ok:
+        boot_outcome = 'memory_checks_unmet'
     else:
         boot_outcome = 'success'
 
@@ -8201,13 +8335,24 @@ def _reset_gated_success_stop_observation(cpu_ref, reset_observation):
         p2_status={'reason': 'success_terminal_poll'},
     )
     # Success is the positive terminal. A fully observed, live boot with a
-    # content mismatch is also terminal evidence: continuing to an exhausted
-    # budget would incorrectly replace wrong_image with timeout.
+    # decisive content mismatch (wrong image hash, marker, rollback, or VTOR)
+    # is also terminal immediately so a later budget expiry cannot mask it.
+    # Reachable memory_checks remain pending so subsequent slices can observe
+    # them become true before the run budget ends.
     if outcome == 'success':
-        pass
+        reset_observation['post_reset_checks_pending'] = False
+        reset_observation.pop('last_unmet_memory_checks', None)
     elif outcome == 'wrong_image' and signals.get('liveness_established'):
-        pass
+        reset_observation['post_reset_checks_pending'] = False
+        reset_observation.pop('last_unmet_memory_checks', None)
+    elif outcome == 'memory_checks_unmet' and signals.get('liveness_established'):
+        reset_observation['post_reset_checks_pending'] = True
+        reset_observation['last_unmet_memory_checks'] = list(
+            signals.get('unmet_memory_checks') or []
+        )
+        return None
     else:
+        reset_observation['post_reset_checks_pending'] = False
         return None
     return {
         'boot_outcome': outcome,
@@ -8310,6 +8455,40 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     pc_handoff_indirect_branches = []
     success_terminal_observation = None
     reset_entry_hook_address = None
+    machine_ref = getattr(monitor, 'Machine', None)
+    machine_reset_delegate = None
+    peripheral_reset_delegate = None
+
+    def _read_machine_virtual_s(m_ref):
+        if m_ref is None:
+            return None
+        try:
+            evt = getattr(m_ref, 'ElapsedVirtualTime', None)
+            if evt is None:
+                return None
+            time_elapsed = getattr(evt, 'TimeElapsed', evt)
+            total_us = getattr(time_elapsed, 'TotalMicroseconds', None)
+            if total_us is not None:
+                return float(total_us) / 1000000.0
+            total_s = getattr(time_elapsed, 'TotalSeconds', None)
+            if total_s is not None:
+                return float(total_s)
+            to_timespan = getattr(time_elapsed, 'ToTimeSpan', None)
+            if callable(to_timespan):
+                return float(to_timespan().TotalSeconds)
+        except Exception:
+            return None
+        return None
+
+    virtual_start_s = _read_machine_virtual_s(machine_ref)
+
+    def _current_rel_virtual_s(m_ref=None):
+        target = m_ref if m_ref is not None else machine_ref
+        now_v = _read_machine_virtual_s(target)
+        if virtual_start_s is None or now_v is None:
+            return None
+        return round(max(0.0, now_v - virtual_start_s), 6)
+
     reset_observation = {
         'required_for_success_terminal': terminal_after_reset,
         'observed': bool(reset_already_observed),
@@ -8317,20 +8496,87 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             ['recovery_reset_before_observation']
             if reset_already_observed else []
         ),
+        'machine_resets': 0,
+        'cpu_resets': 0,
         'boot_entry_hits': 0,
         'instruction_counter_resets': 0,
         'hook_installed': False,
+        'machine_reset_hook_installed': False,
+        'cpu_reset_hook_installed': False,
+        'reset_emulated_s': 0.0 if reset_already_observed else None,
+        'observed_at_iter': 0 if reset_already_observed else None,
+        'observed_at_emulated_s': 0.0 if reset_already_observed else None,
+        'post_reset_samples': 0,
+        'post_reset_checks_pending': False,
+        'checks_first_held_at_iter': None,
+        'checks_first_held_at_emulated_s': None,
+        'checks_held_after_reset_s': None,
+        'checks_held_after_reset_observed_s': None,
     }
 
-    def mark_in_run_reset(source):
+    def clear_pre_reset_sticky_state():
+        sticky_vtor['value'] = 0
+        sticky_vtor['slot'] = None
+        sticky_vtor['captured'] = False
+        sticky_pc['value'] = 0
+        sticky_pc['slot'] = None
+        sticky_pc['captured'] = False
+
+    def mark_in_run_reset(source, event_machine=None, clear_sticky=False):
         if source not in reset_observation['sources']:
             reset_observation['sources'].append(source)
         reset_observation['observed'] = True
+        if clear_sticky:
+            clear_pre_reset_sticky_state()
+        event_v = _current_rel_virtual_s(event_machine)
+        if event_v is not None:
+            if reset_observation['reset_emulated_s'] is None:
+                reset_observation['reset_emulated_s'] = event_v
+            if (
+                source != 'instruction_counter_reset'
+                or 'last_reset_emulated_s' not in reset_observation
+            ):
+                reset_observation['last_reset_emulated_s'] = event_v
+
+    def record_checks_held(iter_index, sample_emulated_s):
+        if not reset_observation.get('observed'):
+            return
+        if reset_observation['checks_first_held_at_iter'] is not None:
+            return
+        sample_v = _current_rel_virtual_s()
+        held_s = sample_v if sample_v is not None else round(sample_emulated_s, 6)
+        reset_observation['checks_first_held_at_iter'] = iter_index + 1
+        reset_observation['checks_first_held_at_emulated_s'] = round(
+            sample_emulated_s, 6
+        )
+        reset_ref_s = reset_observation.get('reset_emulated_s')
+        if reset_ref_s is not None:
+            reset_observation['checks_held_after_reset_s'] = round(
+                max(0.0, held_s - float(reset_ref_s)), 6
+            )
+        obs_ref_s = reset_observation.get('observed_at_emulated_s')
+        if obs_ref_s is not None:
+            reset_observation['checks_held_after_reset_observed_s'] = round(
+                max(0.0, round(sample_emulated_s, 6) - float(obs_ref_s)), 6
+            )
+
+    def on_machine_reset(event_machine):
+        reset_observation['machine_resets'] += 1
+        mark_in_run_reset(
+            'machine_reset', event_machine=event_machine, clear_sticky=True
+        )
+
+    def on_peripheral_reset(event_machine, peripheral):
+        if peripheral is cpu_ref or peripheral == cpu_ref:
+            reset_observation['cpu_resets'] += 1
+            mark_in_run_reset(
+                'cpu_reset', event_machine=event_machine, clear_sticky=True
+            )
 
     def capture_boot_entry(_cpu, address):
         reset_observation['boot_entry_hits'] += 1
         if reset_observation['boot_entry_hits'] >= 2:
-            mark_in_run_reset('boot_entry_reentered')
+            mark_in_run_reset('boot_entry_reentered', clear_sticky=True)
 
     def capture_pc_handoff(_cpu, address):
         hook_address = as_int(address) & ~1
@@ -8397,6 +8643,35 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             return False
 
     if terminal_after_reset:
+        if machine_ref is not None and hasattr(machine_ref, 'MachineReset'):
+            try:
+                try:
+                    from System import Action as _NetAction
+                    from Antmicro.Renode.Core import IMachine as _NetIMachine
+                    machine_reset_delegate = _NetAction[_NetIMachine](on_machine_reset)
+                except Exception:
+                    machine_reset_delegate = on_machine_reset
+                machine_ref.MachineReset += machine_reset_delegate
+                reset_observation['machine_reset_hook_installed'] = True
+            except Exception as exc:
+                machine_reset_delegate = None
+                reset_observation['machine_reset_hook_error'] = str(exc)
+        if machine_ref is not None and hasattr(machine_ref, 'PeripheralReset'):
+            try:
+                try:
+                    from System import Action as _NetAction
+                    from Antmicro.Renode.Core import IMachine as _NetIMachine
+                    from Antmicro.Renode.Peripherals import IPeripheral as _NetIPeripheral
+                    peripheral_reset_delegate = _NetAction[_NetIMachine, _NetIPeripheral](
+                        on_peripheral_reset
+                    )
+                except Exception:
+                    peripheral_reset_delegate = on_peripheral_reset
+                machine_ref.PeripheralReset += peripheral_reset_delegate
+                reset_observation['cpu_reset_hook_installed'] = True
+            except Exception as exc:
+                peripheral_reset_delegate = None
+                reset_observation['cpu_reset_hook_error'] = str(exc)
         try:
             reset_vector = as_int(
                 bus.ReadDoubleWord(int(bootloader_entry) + 4)
@@ -8462,98 +8737,139 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             pc_handoff_hook_candidates.append(candidate)
     if op_trace is not None and op_trace_limit <= 0:
         op_trace_limit = 1024
-    for iters in range(max_iters):
-        monitor.Parse('emulation RunFor "{}"'.format(time_slice))
-        emulated_s += slice_s
-        native_stop_sync = globals().get('_sync_native_calibration_stop')
-        if native_stop_sync is not None:
-            native_stop_sync()
-        instruction_now = as_int(cpu_ref.ExecutedInstructions)
-        if instruction_now >= instruction_previous:
-            instructions_executed += instruction_now - instruction_previous
-        else:
-            # Some CPU models reset the public counter during a machine reset.
-            # Preserve the instructions observed before that reset.
-            instructions_executed += instruction_now
-            reset_observation['instruction_counter_resets'] += 1
-            mark_in_run_reset('instruction_counter_reset')
-        instruction_previous = instruction_now
-        if calibration_mode and _calibration_stop_state.get('address_hit'):
-            reason = 'calibration_stop_address(0x{:08X})'.format(
-                calibration_stop_address
-            )
-            break
-        console_fatal = check_console_fatal()
-        if console_fatal:
-            reason = 'console_fatal({})'.format(console_fatal)
-            break
-        if stop_on_fault and (fault_requires_immediate_stop() or was_otp_fault_injected()):
-            reason = 'fault_fired'
-            break
-        pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
-        capture_sticky_pc(pc_now)
-        if pc_handoff_slot is not None and not sticky_pc['captured']:
-            observe_indirect_pc_handoff(cpu_ref, pc_now)
-        # Early exit: check if VTOR has been set to a valid slot.
-        # Bus watchpoints don't fire for SCB (CPU-private), so we poll.
-        # Always poll — even after capture — so vtor_settle can update.
-        vtor_now = as_int(bus.ReadDoubleWord(0xE000ED08))
-        if vtor_now != 0:
-            for sn, (s_lo, s_hi) in slot_ranges.items():
-                if s_lo <= vtor_now < s_hi:
-                    sticky_vtor['value'] = vtor_now
-                    sticky_vtor['slot'] = sn
-                    sticky_vtor['captured'] = True
-                    break
-        calibration_success_gate_satisfied = bool(
-            not terminal_after_reset or reset_observation.get('observed')
-        )
-        if calibration_mode:
-            _calibration_stop_state['success_reset_gate_required'] = bool(
-                terminal_after_reset
-            )
-            _calibration_stop_state['success_reset_gate_satisfied'] = bool(
-                calibration_success_gate_satisfied
-            )
-        success_stop_observation = None
-        if calibration_success_gate_satisfied:
-            success_stop_observation = _calibration_success_stop_observation(
-                cpu_ref
-            )
-        if success_stop_observation is not None:
-            cpu_ref.IsHalted = True
-            reason = 'calibration_stop_success_criteria'
-            break
-        success_terminal_observation = None
-        if terminal_after_reset:
-            success_terminal_observation = (
-                _reset_gated_success_stop_observation(
-                    cpu_ref, reset_observation
-                )
-            )
-        if success_terminal_observation is not None:
-            cpu_ref.IsHalted = True
-            terminal_outcome = success_terminal_observation.get(
-                'boot_outcome', 'success'
-            )
-            if terminal_outcome == 'success':
-                reason = 'success_terminal_after_reset'
+    try:
+        for iters in range(max_iters):
+            monitor.Parse('emulation RunFor "{}"'.format(time_slice))
+            emulated_s += slice_s
+            native_stop_sync = globals().get('_sync_native_calibration_stop')
+            if native_stop_sync is not None:
+                native_stop_sync()
+            instruction_now = as_int(cpu_ref.ExecutedInstructions)
+            if instruction_now >= instruction_previous:
+                instructions_executed += instruction_now - instruction_previous
             else:
-                reason = 'outcome_terminal_after_reset({})'.format(
-                    terminal_outcome
+                # Some CPU models reset the public counter during a machine reset.
+                # Preserve the instructions observed before that reset.
+                instructions_executed += instruction_now
+                reset_observation['instruction_counter_resets'] += 1
+                mark_in_run_reset('instruction_counter_reset')
+            instruction_previous = instruction_now
+            if reset_observation.get('observed'):
+                if reset_observation['observed_at_iter'] is None:
+                    reset_observation['observed_at_iter'] = iters + 1
+                    reset_observation['observed_at_emulated_s'] = round(
+                        emulated_s, 6
+                    )
+                    if reset_observation['reset_emulated_s'] is None:
+                        reset_observation['reset_emulated_s'] = round(
+                            emulated_s, 6
+                        )
+                reset_observation['post_reset_samples'] += 1
+            if calibration_mode and _calibration_stop_state.get('address_hit'):
+                reason = 'calibration_stop_address(0x{:08X})'.format(
+                    calibration_stop_address
                 )
-            break
-        if sticky_vtor['captured'] and not terminal_after_reset:
-            if vtor_settle_remaining < 0:
-                # First capture.
-                if vtor_settle_iters == 0:
-                    # Immediate stop (default/sweep behavior).
+                break
+            console_fatal = check_console_fatal()
+            if console_fatal:
+                reason = 'console_fatal({})'.format(console_fatal)
+                break
+            if stop_on_fault and (fault_requires_immediate_stop() or was_otp_fault_injected()):
+                reason = 'fault_fired'
+                break
+            pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
+            capture_sticky_pc(pc_now)
+            if pc_handoff_slot is not None and not sticky_pc['captured']:
+                observe_indirect_pc_handoff(cpu_ref, pc_now)
+            # Early exit: check if VTOR has been set to a valid slot.
+            # Bus watchpoints don't fire for SCB (CPU-private), so we poll.
+            # Always poll — even after capture — so vtor_settle can update.
+            vtor_now = as_int(bus.ReadDoubleWord(0xE000ED08))
+            if vtor_now != 0:
+                for sn, (s_lo, s_hi) in slot_ranges.items():
+                    if s_lo <= vtor_now < s_hi:
+                        sticky_vtor['value'] = vtor_now
+                        sticky_vtor['slot'] = sn
+                        sticky_vtor['captured'] = True
+                        break
+            calibration_success_gate_satisfied = bool(
+                not terminal_after_reset or reset_observation.get('observed')
+            )
+            if calibration_mode:
+                _calibration_stop_state['success_reset_gate_required'] = bool(
+                    terminal_after_reset
+                )
+                _calibration_stop_state['success_reset_gate_satisfied'] = bool(
+                    calibration_success_gate_satisfied
+                )
+            success_stop_observation = None
+            if calibration_success_gate_satisfied:
+                success_stop_observation = _calibration_success_stop_observation(
+                    cpu_ref
+                )
+            if success_stop_observation is not None:
+                record_checks_held(iters, emulated_s)
+                cpu_ref.IsHalted = True
+                reason = 'calibration_stop_success_criteria'
+                break
+            success_terminal_observation = None
+            if terminal_after_reset:
+                success_terminal_observation = (
+                    _reset_gated_success_stop_observation(
+                        cpu_ref, reset_observation
+                    )
+                )
+            if success_terminal_observation is not None:
+                cpu_ref.IsHalted = True
+                terminal_outcome = success_terminal_observation.get(
+                    'boot_outcome', 'success'
+                )
+                if terminal_outcome == 'success':
+                    record_checks_held(iters, emulated_s)
+                    reason = 'success_terminal_after_reset'
+                else:
+                    reason = 'outcome_terminal_after_reset({})'.format(
+                        terminal_outcome
+                    )
+                break
+            if sticky_vtor['captured'] and not terminal_after_reset:
+                if vtor_settle_remaining < 0:
+                    # First capture.
+                    if vtor_settle_iters == 0:
+                        # Immediate stop (default/sweep behavior).
+                        monitor.Parse('emulation RunFor "0.005"')
+                        cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
+                        if cfsr != 0:
+                            # CFSR non-zero after VTOR capture. Only flag as hardfault if
+                            # VTOR is NOT in the expected slot — post-handoff CFSR is the
+                            # app's problem, not the bootloader's.
+                            _vtor_expected = False
+                            if success_vtor_slot == 'any':
+                                _vtor_expected = sticky_vtor.get('slot') is not None
+                            elif success_vtor_slot and success_vtor_slot in slot_ranges:
+                                _vtor_expected = sticky_vtor.get('slot') == success_vtor_slot
+                            reason = 'vtor_captured' if _vtor_expected else 'vtor_captured_hardfault'
+                        else:
+                            reason = 'vtor_captured'
+                        break
+                    else:
+                        # Start settle countdown.
+                        vtor_settle_remaining = vtor_settle_iters
+                elif vtor_settle_remaining > 0:
+                    vtor_settle_remaining -= 1
+                else:
+                    # Settle countdown done — re-read VTOR to capture the
+                    # actual final value (may have changed during settle).
+                    vtor_final = as_int(bus.ReadDoubleWord(0xE000ED08))
+                    if vtor_final != 0:
+                        for sn, (s_lo, s_hi) in slot_ranges.items():
+                            if s_lo <= vtor_final < s_hi:
+                                sticky_vtor['value'] = vtor_final
+                                sticky_vtor['slot'] = sn
+                                break
                     monitor.Parse('emulation RunFor "0.005"')
                     cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
                     if cfsr != 0:
-                        # CFSR non-zero after VTOR capture. Only flag as hardfault if
-                        # VTOR is NOT in the expected slot — post-handoff CFSR is the
-                        # app's problem, not the bootloader's.
                         _vtor_expected = False
                         if success_vtor_slot == 'any':
                             _vtor_expected = sticky_vtor.get('slot') is not None
@@ -8563,197 +8879,213 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                     else:
                         reason = 'vtor_captured'
                     break
-                else:
-                    # Start settle countdown.
-                    vtor_settle_remaining = vtor_settle_iters
-            elif vtor_settle_remaining > 0:
-                vtor_settle_remaining -= 1
+            if (
+                not terminal_after_reset
+                and
+                pc_handoff_slot is not None
+                and sticky_pc['captured']
+                and sticky_pc.get('slot') == pc_handoff_slot
+                and not sticky_vtor['captured']
+            ):
+                reason = 'pc_captured'
+                break
+            cur_writes = get_total_writes()
+            cur_erases = get_total_erases()
+            if (
+                (not expect_writes)
+                and cur_writes == 0
+                and not sticky_vtor['captured']
+                and not sticky_pc['captured']
+            ):
+                pc_fmt = fmt_u32(pc_now)
+                if not pc_samples or pc_samples[-1] != pc_fmt:
+                    pc_samples.append(pc_fmt)
+                    if len(pc_samples) > 32:
+                        pc_samples = pc_samples[-32:]
+            if op_trace is not None:
+                if cur_writes < trace_prev_writes:
+                    trace_prev_writes = cur_writes
+                while trace_prev_writes < cur_writes:
+                    trace_prev_writes += 1
+                    op_trace.append({
+                        'seq': len(op_trace) + 1,
+                        'op': 'write',
+                        'index': trace_prev_writes,
+                        'pc': fmt_u32(pc_now),
+                        'emulated_s': round(emulated_s, 6),
+                    })
+                    if len(op_trace) >= op_trace_limit:
+                        reason = 'op_trace_limit'
+                        trace_limit_hit = True
+                        break
+                if trace_limit_hit:
+                    break
+                if cur_erases < trace_prev_erases:
+                    trace_prev_erases = cur_erases
+                while trace_prev_erases < cur_erases:
+                    trace_prev_erases += 1
+                    op_trace.append({
+                        'seq': len(op_trace) + 1,
+                        'op': 'erase',
+                        'index': trace_prev_erases,
+                        'pc': fmt_u32(pc_now),
+                        'emulated_s': round(emulated_s, 6),
+                    })
+                    if len(op_trace) >= op_trace_limit:
+                        reason = 'op_trace_limit'
+                        trace_limit_hit = True
+                        break
+                if trace_limit_hit:
+                    break
+            pc_progress = None
+            if (not expect_writes) and cur_writes == 0 and not sticky_vtor['captured']:
+                pc_progress = pc_now
+            progress_key = (
+                cur_writes,
+                cur_erases,
+                bool(sticky_vtor['captured']),
+                pc_progress,
+            )
+            now = _time.time()
+            if (
+                prev_progress_key is None
+                or progress_key != prev_progress_key
+                or reset_observation.get('post_reset_checks_pending')
+                or (
+                    reset_observation.get('observed')
+                    and reset_observation.get('post_reset_samples') == 1
+                )
+            ):
+                prev_progress_key = progress_key
+                last_progress_t = now
+                last_progress_emulated_s = emulated_s
+            elif progress_stall_timeout_s > 0:
+                # Use EMULATED time for stall detection, not wall clock.
+                # Wall-clock stall detection is non-deterministic: a slow CI
+                # runner fires the stall timeout during CPU-intensive operations
+                # (e.g. SHA-256 hash validation) while a fast runner does not,
+                # producing different flash states and false-positive findings.
+                emulated_stall = emulated_s - last_progress_emulated_s
+                if emulated_stall >= progress_stall_timeout_s:
+                    if cur_writes == 0:
+                        reason = 'no_boot_stall({:.2f}s_emulated)'.format(emulated_stall)
+                    else:
+                        reason = 'no_progress_stall({:.2f}s_emulated)'.format(emulated_stall)
+                    break
+            if cur_writes == 0 and not sticky_vtor['captured']:
+                no_boot_zero_write_count += 1
             else:
-                # Settle countdown done — re-read VTOR to capture the
-                # actual final value (may have changed during settle).
-                vtor_final = as_int(bus.ReadDoubleWord(0xE000ED08))
-                if vtor_final != 0:
-                    for sn, (s_lo, s_hi) in slot_ranges.items():
-                        if s_lo <= vtor_final < s_hi:
-                            sticky_vtor['value'] = vtor_final
-                            sticky_vtor['slot'] = sn
-                            break
-                monitor.Parse('emulation RunFor "0.005"')
-                cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
-                if cfsr != 0:
-                    _vtor_expected = False
-                    if success_vtor_slot == 'any':
-                        _vtor_expected = sticky_vtor.get('slot') is not None
-                    elif success_vtor_slot and success_vtor_slot in slot_ranges:
-                        _vtor_expected = sticky_vtor.get('slot') == success_vtor_slot
-                    reason = 'vtor_captured' if _vtor_expected else 'vtor_captured_hardfault'
-                else:
-                    reason = 'vtor_captured'
+                no_boot_zero_write_count = 0
+            if (
+                (not reset_observation.get('post_reset_checks_pending'))
+                and (not expect_writes)
+                and cur_writes == 0
+                and not sticky_vtor['captured']
+                and not sticky_pc['captured']
+                and progress_stall_timeout_s > 0
+                and emulated_s >= progress_stall_timeout_s
+            ):
+                reason = 'no_boot_stall({:.2f}s_emulated)'.format(emulated_s)
                 break
-        if (
-            not terminal_after_reset
-            and
-            pc_handoff_slot is not None
-            and sticky_pc['captured']
-            and sticky_pc.get('slot') == pc_handoff_slot
-            and not sticky_vtor['captured']
-        ):
-            reason = 'pc_captured'
-            break
-        cur_writes = get_total_writes()
-        cur_erases = get_total_erases()
-        if (
-            (not expect_writes)
-            and cur_writes == 0
-            and not sticky_vtor['captured']
-            and not sticky_pc['captured']
-        ):
-            pc_fmt = fmt_u32(pc_now)
-            if not pc_samples or pc_samples[-1] != pc_fmt:
-                pc_samples.append(pc_fmt)
-                if len(pc_samples) > 32:
-                    pc_samples = pc_samples[-32:]
-        if op_trace is not None:
-            if cur_writes < trace_prev_writes:
-                trace_prev_writes = cur_writes
-            while trace_prev_writes < cur_writes:
-                trace_prev_writes += 1
-                op_trace.append({
-                    'seq': len(op_trace) + 1,
-                    'op': 'write',
-                    'index': trace_prev_writes,
-                    'pc': fmt_u32(pc_now),
-                    'emulated_s': round(emulated_s, 6),
-                })
-                if len(op_trace) >= op_trace_limit:
-                    reason = 'op_trace_limit'
-                    trace_limit_hit = True
+            if (
+                expect_control_outcome == 'no_boot'
+                and no_boot_zero_write_count >= no_boot_zero_write_slices
+                and emulated_s >= no_boot_min_emulated_s
+            ):
+                reason = 'no_boot_no_writes'
+                break
+            # No-boot with settled writes: bootloader wrote metadata (e.g. marking
+            # a slot invalid) but then entered a recovery loop with no further
+            # writes and no VTOR capture.  Detect by counting consecutive slices
+            # where writes > 0 but unchanged and VTOR not captured.
+            if (
+                expect_control_outcome == 'no_boot'
+                and cur_writes > 0
+                and cur_writes == prev_writes
+                and not sticky_vtor['captured']
+            ):
+                no_boot_settled_count += 1
+            else:
+                no_boot_settled_count = 0
+            if (
+                no_boot_settled_count >= no_boot_zero_write_slices
+                and emulated_s >= no_boot_min_emulated_s
+            ):
+                reason = 'no_boot_settled_writes'
+                break
+            # Bricked device detection: no writes at all after several slices.
+            # Some clean follow-up boots are legitimately read-only and should not
+            # be cut off by this heuristic.
+            if zero_writes_is_brick and cur_writes == 0 and not expect_writes:
+                zero_writes_count += 1
+                if zero_writes_count >= 5:
+                    reason = 'no_writes_brick'
                     break
-            if trace_limit_hit:
+            else:
+                zero_writes_count = 0
+            prev_writes = cur_writes
+            if instructions_executed >= max_step_limit:
+                reason = 'instruction_limit({})'.format(instructions_executed)
                 break
-            if cur_erases < trace_prev_erases:
-                trace_prev_erases = cur_erases
-            while trace_prev_erases < cur_erases:
-                trace_prev_erases += 1
-                op_trace.append({
-                    'seq': len(op_trace) + 1,
-                    'op': 'erase',
-                    'index': trace_prev_erases,
-                    'pc': fmt_u32(pc_now),
-                    'emulated_s': round(emulated_s, 6),
-                })
-                if len(op_trace) >= op_trace_limit:
-                    reason = 'op_trace_limit'
-                    trace_limit_hit = True
-                    break
-            if trace_limit_hit:
+            # Wall-clock timeout.
+            elapsed = now - t0
+            if elapsed > wall_timeout:
+                reason = 'wall_timeout({:.0f}s)'.format(elapsed)
                 break
-        pc_progress = None
-        if (not expect_writes) and cur_writes == 0 and not sticky_vtor['captured']:
-            pc_progress = pc_now
-        progress_key = (
-            cur_writes,
-            cur_erases,
-            bool(sticky_vtor['captured']),
-            pc_progress,
-        )
-        now = _time.time()
-        if prev_progress_key is None or progress_key != prev_progress_key:
-            prev_progress_key = progress_key
-            last_progress_t = now
-            last_progress_emulated_s = emulated_s
-        elif progress_stall_timeout_s > 0:
-            # Use EMULATED time for stall detection, not wall clock.
-            # Wall-clock stall detection is non-deterministic: a slow CI
-            # runner fires the stall timeout during CPU-intensive operations
-            # (e.g. SHA-256 hash validation) while a fast runner does not,
-            # producing different flash states and false-positive findings.
-            emulated_stall = emulated_s - last_progress_emulated_s
-            if emulated_stall >= progress_stall_timeout_s:
-                if cur_writes == 0:
-                    reason = 'no_boot_stall({:.2f}s_emulated)'.format(emulated_stall)
-                else:
-                    reason = 'no_progress_stall({:.2f}s_emulated)'.format(emulated_stall)
-                break
-        if cur_writes == 0 and not sticky_vtor['captured']:
-            no_boot_zero_write_count += 1
-        else:
-            no_boot_zero_write_count = 0
+        # If we hit max_iters while mid-settle, finalize the VTOR capture.
+        if reason == 'budget' and vtor_settle_remaining >= 0 and sticky_vtor['captured']:
+            vtor_final = as_int(bus.ReadDoubleWord(0xE000ED08))
+            if vtor_final != 0:
+                for sn, (s_lo, s_hi) in slot_ranges.items():
+                    if s_lo <= vtor_final < s_hi:
+                        sticky_vtor['value'] = vtor_final
+                        sticky_vtor['slot'] = sn
+                        break
+            monitor.Parse('emulation RunFor "0.005"')
+            cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
+            if cfsr != 0:
+                _vtor_expected = False
+                if success_vtor_slot == 'any':
+                    _vtor_expected = sticky_vtor.get('slot') is not None
+                elif success_vtor_slot and success_vtor_slot in slot_ranges:
+                    _vtor_expected = sticky_vtor.get('slot') == success_vtor_slot
+                reason = 'vtor_captured' if _vtor_expected else 'vtor_captured_hardfault'
+            else:
+                reason = 'vtor_captured'
         if (
-            (not expect_writes)
-            and cur_writes == 0
-            and not sticky_vtor['captured']
-            and not sticky_pc['captured']
-            and progress_stall_timeout_s > 0
-            and emulated_s >= progress_stall_timeout_s
+            terminal_after_reset
+            and reset_observation.get('observed')
+            and reset_observation.get('post_reset_checks_pending')
+            and (
+                reason == 'budget'
+                or str(reason).startswith('instruction_limit')
+            )
         ):
-            reason = 'no_boot_stall({:.2f}s_emulated)'.format(emulated_s)
-            break
-        if (
-            expect_control_outcome == 'no_boot'
-            and no_boot_zero_write_count >= no_boot_zero_write_slices
-            and emulated_s >= no_boot_min_emulated_s
+            reset_observation['budget_exhausted_reason'] = reason
+            reason = 'post_reset_checks_unmet'
+    finally:
+        for hook_address in pc_handoff_hook_addresses:
+            try:
+                cpu_ref.RemoveHook(hook_address, capture_pc_handoff)
+            except Exception:
+                pass
+        if reset_entry_hook_address is not None and reset_observation.get(
+            'hook_installed'
         ):
-            reason = 'no_boot_no_writes'
-            break
-        # No-boot with settled writes: bootloader wrote metadata (e.g. marking
-        # a slot invalid) but then entered a recovery loop with no further
-        # writes and no VTOR capture.  Detect by counting consecutive slices
-        # where writes > 0 but unchanged and VTOR not captured.
-        if (
-            expect_control_outcome == 'no_boot'
-            and cur_writes > 0
-            and cur_writes == prev_writes
-            and not sticky_vtor['captured']
-        ):
-            no_boot_settled_count += 1
-        else:
-            no_boot_settled_count = 0
-        if (
-            no_boot_settled_count >= no_boot_zero_write_slices
-            and emulated_s >= no_boot_min_emulated_s
-        ):
-            reason = 'no_boot_settled_writes'
-            break
-        # Bricked device detection: no writes at all after several slices.
-        # Some clean follow-up boots are legitimately read-only and should not
-        # be cut off by this heuristic.
-        if zero_writes_is_brick and cur_writes == 0 and not expect_writes:
-            zero_writes_count += 1
-            if zero_writes_count >= 5:
-                reason = 'no_writes_brick'
-                break
-        else:
-            zero_writes_count = 0
-        prev_writes = cur_writes
-        if instructions_executed >= max_step_limit:
-            reason = 'instruction_limit({})'.format(instructions_executed)
-            break
-        # Wall-clock timeout.
-        elapsed = now - t0
-        if elapsed > wall_timeout:
-            reason = 'wall_timeout({:.0f}s)'.format(elapsed)
-            break
-    # If we hit max_iters while mid-settle, finalize the VTOR capture.
-    if reason == 'budget' and vtor_settle_remaining >= 0 and sticky_vtor['captured']:
-        vtor_final = as_int(bus.ReadDoubleWord(0xE000ED08))
-        if vtor_final != 0:
-            for sn, (s_lo, s_hi) in slot_ranges.items():
-                if s_lo <= vtor_final < s_hi:
-                    sticky_vtor['value'] = vtor_final
-                    sticky_vtor['slot'] = sn
-                    break
-        monitor.Parse('emulation RunFor "0.005"')
-        cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
-        if cfsr != 0:
-            _vtor_expected = False
-            if success_vtor_slot == 'any':
-                _vtor_expected = sticky_vtor.get('slot') is not None
-            elif success_vtor_slot and success_vtor_slot in slot_ranges:
-                _vtor_expected = sticky_vtor.get('slot') == success_vtor_slot
-            reason = 'vtor_captured' if _vtor_expected else 'vtor_captured_hardfault'
-        else:
-            reason = 'vtor_captured'
+            try:
+                cpu_ref.RemoveHook(reset_entry_hook_address, capture_boot_entry)
+            except Exception:
+                pass
+        if machine_reset_delegate is not None and machine_ref is not None:
+            try:
+                machine_ref.MachineReset -= machine_reset_delegate
+            except Exception:
+                pass
+        if peripheral_reset_delegate is not None and machine_ref is not None:
+            try:
+                machine_ref.PeripheralReset -= peripheral_reset_delegate
+            except Exception:
+                pass
     elapsed = _time.time() - t0
     writes_now = get_total_writes()
     erases_now = get_total_erases()
@@ -8762,18 +9094,6 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         label, reason, iters + 1, writes_now,
         fmt_u32(pc_now), elapsed))
     console_state = capture_console_state(include_recent=bool(console_fatal))
-    for hook_address in pc_handoff_hook_addresses:
-        try:
-            cpu_ref.RemoveHook(hook_address, capture_pc_handoff)
-        except Exception:
-            pass
-    if reset_entry_hook_address is not None and reset_observation.get(
-        'hook_installed'
-    ):
-        try:
-            cpu_ref.RemoveHook(reset_entry_hook_address, capture_boot_entry)
-        except Exception:
-            pass
     status = {
         'iters': iters + 1,
         'reason': reason,
@@ -9862,6 +10182,8 @@ def run_metadata_fault(fault_at, fault_type='w'):
 def classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=None):
     if boot_outcome == 'success':
         return 'recoverable'
+    if boot_outcome == 'memory_checks_unmet':
+        return 'memory_checks_unmet'
     if boot_outcome == 'timeout':
         return 'incomplete'
     if boot_outcome == 'infra_error':
@@ -12513,6 +12835,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         zero_writes_is_brick=False,
         wall_timeout=phase2_wall_timeout_s,
         time_slice=phase2_time_slice,
+        reset_already_observed=True,
     )
     emulation_ms = int((_time.time() - t_emu) * 1000)
     disarm_vtor_watchpoint()
@@ -12787,6 +13110,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         zero_writes_is_brick=False,
         wall_timeout=phase2_wall_timeout_s,
         time_slice=phase2_time_slice,
+        reset_already_observed=True,
     )
     emulation_ms = int((_time.time() - t_emu) * 1000)
     disarm_vtor_watchpoint()
@@ -13210,6 +13534,10 @@ if calibration_mode:
                 p2_status=cal_status,
             )
         )
+        if cal_status.get('reset_observation') is not None:
+            calibration_signals['phase1_reset_observation'] = cal_status.get(
+                'reset_observation'
+            )
 
         # Export write trace if available.
         trace_file = None
@@ -13470,6 +13798,7 @@ if calibration_mode:
             'matched_image': _calibration_stop_state.get('matched_image'),
             'image_hash_actual': _calibration_stop_state.get('image_hash_actual'),
             'last_program': calibration_last_program,
+            'reset_observation': cal_status.get('reset_observation'),
         }
         if 0x20000000 <= calibration_sp < 0x30000000:
             try:

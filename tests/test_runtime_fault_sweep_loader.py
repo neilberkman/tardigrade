@@ -417,11 +417,13 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
                 r"\s+\)\n"
             ),
         )
-        self.assertIn(
-            "and not sticky_pc['captured']\n"
-            "            and progress_stall_timeout_s > 0\n"
-            "            and emulated_s >= progress_stall_timeout_s",
+        self.assertRegex(
             text,
+            re.compile(
+                r"and not sticky_pc\['captured'\]\n"
+                r"\s+and progress_stall_timeout_s > 0\n"
+                r"\s+and emulated_s >= progress_stall_timeout_s"
+            ),
         )
 
     def test_run_until_done_can_stop_on_configured_pc_handoff(self) -> None:
