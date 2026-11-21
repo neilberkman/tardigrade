@@ -1,0 +1,75 @@
+schema_version: 1
+name: mcuboot_pr2206_scratch_geom_broken
+description: >
+  MCUboot PR #2206 align-32 multi-sector trailer erase bug (commit 66d41e73,
+  immediately before PR #2206's multi-sector trailer erase fix d1a3b953;
+  tracked in tardigrade#19). On mirrored-bank STM32F429 slots (16K/16K/64K)
+  with write-block-size=4, MCUBOOT_BOOT_MAX_ALIGN=32, and
+  CONFIG_BOOT_MAX_IMG_SECTORS=5450, boot_trailer_sz(4)=0x10018 spans all of
+  sector 2 (64K) and 0x18 bytes of sector 1 (16K). During revert of an
+  unconfirmed 0x7D50 image extending into sector 1, swap_scratch coalesces
+  sectors 0 and 1 through the 128K scratch sector but omits
+  swap_erase_trailer_sectors, leaving stale copy_done=1 at 0x0801FFA0 in
+  sector 2. Power loss at the final image_ok write (0x0801FFC0) leaves
+  magic=GOOD, copy_done=SET, image_ok=UNSET so Phase 2 triggers a second
+  revert and boots the rejected v2.0.0 image (wrong_image).
+
+platform: platforms/stm32f4.repl
+flash_backend: faultFlash
+
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_pr2206_scratch_geom_broken.elf
+  entry: 0x08000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  erase_regions:
+    - { base: 0x08000000, size: 0x10000, sector_size: 0x4000 }
+    - { base: 0x08010000, size: 0x10000, sector_size: 0x10000 }
+    - { base: 0x08020000, size: 0xE0000, sector_size: 0x20000 }
+    - { base: 0x08100000, size: 0x10000, sector_size: 0x4000 }
+    - { base: 0x08110000, size: 0x10000, sector_size: 0x10000 }
+    - { base: 0x08120000, size: 0xE0000, sector_size: 0x20000 }
+  postmortem_partitions:
+    - { name: scratch, base: 0x08120000, size: 0x20000 }
+  slots:
+    exec: { base: 0x08008000, size: 0x18000 }
+    staging: { base: 0x08108000, size: 0x18000 }
+
+images:
+  exec: results/oss_validation/assets/zephyr_slot1_scratch_geom_pr2206.bin
+  staging: results/oss_validation/assets/zephyr_head_scratch_stm32f4_pr2206_slot0.bin
+
+pre_boot_state:
+  - { address: 0x0801FFF0, u32: 0xE12D0020 }
+  - { address: 0x0801FFF4, u32: 0x0B41295D }
+  - { address: 0x0801FFF8, u32: 0x9C67778D }
+  - { address: 0x0801FFFC, u32: 0x8A1F0F11 }
+  - { address: 0x0801FFA0, u32: 0xFFFFFF01 }
+
+success_criteria:
+  vtor_in_slot: exec
+  marker_address: 0x08008014
+  marker_value: 0x00000001
+  image_hash: true
+  image_hash_slot: exec
+  expected_image: staging
+
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "20.0"
+  max_step_limit: 200000000
+  fault_types:
+    - power_loss
+    - swap_progress
+
+expect:
+  control_outcome: success
+  allow_semantic_only_issues: true
+  required_issue_reasons:
+    - boot_outcome
+  should_find_issues: true

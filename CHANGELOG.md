@@ -41,6 +41,12 @@ The format follows [common-changelog](https://common-changelog.org/).
 - Configurable MRAM torn-word modes via `fault_sweep.mram_torn_word` and the
   `MramTornWordMode` peripheral property across live MRAM backends and trace
   replay for `half`, `half_retain`, `untouched`, `erased`, and `programmed`.
+- Strict MCUboot PR #2206 align-32 multi-sector swap-scratch trailer erase
+  regression pair (`profiles/mcuboot_pr2206_scratch_geom_broken.yaml` at
+  commit `66d41e73` vs `profiles/mcuboot_pr2206_scratch_geom_fixed.yaml` at
+  PR #2206 head `d00b11dc`), tracked STM32F429 ELFs and signed `0x7D50`
+  revert image, `MCUBOOT_BOOTSTRAP_SCOPE=pr2206_geom` rebuild support, and
+  inclusion in the default CI self-test corpus.
 
 ### Changed
 

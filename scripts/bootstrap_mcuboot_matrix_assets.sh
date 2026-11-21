@@ -7,9 +7,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BOOTSTRAP_SCOPE="${MCUBOOT_BOOTSTRAP_SCOPE:-full}"
 case "${BOOTSTRAP_SCOPE}" in
-    full|head|pr2214|pr2214_geom|swaptable|stm32f4) ;;
+    full|head|pr2206_geom|pr2214|pr2214_geom|swaptable|stm32f4) ;;
     *)
-        echo "ERROR: MCUBOOT_BOOTSTRAP_SCOPE must be 'full' or 'head' (or 'pr2214', 'pr2214_geom', 'swaptable', or 'stm32f4')" >&2
+        echo "ERROR: MCUBOOT_BOOTSTRAP_SCOPE must be 'full' or 'head' (or 'pr2206_geom', 'pr2214', 'pr2214_geom', 'swaptable', or 'stm32f4')" >&2
         exit 2
         ;;
 esac
@@ -44,6 +44,10 @@ MODULE_YML="${MCUBOOT_DIR}/zephyr/module.yml"
 
 PR2199_BROKEN="25e2761c669035c991dff115f03e34f1505bd97a"
 PR2199_FIXED="33094fc5a50096c8cbb3d2f443c4162a0ff08ea8"
+PR2206_BROKEN="66d41e73a2676beca20e26a957dbc07a9b907879"
+PR2206_FIXED="d00b11dc234caee267eb12376e2279ed57c35d5d"
+PR2206_BOOT_MAX_IMG_SECTORS="5450"
+PR2206_REVERT_PAYLOAD_SIZE="0x7A00"
 HEAD_OFFSET_COMMIT="b893d34f564f454f454f3643b05b1e18fb457e5c"
 PR2214_BROKEN="429e2fea24518f178cd4d33928cb66fcb0205803"
 PR2214_FIXED="90fd59d2f9e45c24d0833dd391dcdc932b3b1908"
@@ -603,6 +607,49 @@ write_stm32f4_pr2206_overlay() {
 EOF
 }
 
+write_stm32f4_pr2206_geom_overlay() {
+    mkdir -p "${GENERATED_DIR}"
+    cat > "${GENERATED_DIR}/stm32f4_pr2206_geom_scratch.dts" <<'EOF'
+&flash0 {
+    write-block-size = <4>;
+    /delete-node/ partitions;
+
+    partitions {
+        compatible = "fixed-partitions";
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        boot_partition: partition@0 {
+            label = "mcuboot";
+            reg = <0x0 0x08000>;
+        };
+        slot0_partition: partition@8000 {
+            label = "image-0";
+            reg = <0x08000 0x18000>;
+        };
+        slot1_partition: partition@108000 {
+            label = "image-1";
+            reg = <0x108000 0x18000>;
+        };
+        scratch_partition: partition@120000 {
+            label = "image-scratch";
+            reg = <0x120000 0x20000>;
+        };
+        storage_partition: partition@140000 {
+            label = "storage";
+            reg = <0x140000 0xC0000>;
+        };
+    };
+};
+
+/ {
+    chosen {
+        zephyr,code-partition = &boot_partition;
+    };
+};
+EOF
+}
+
 write_stm32f4_move_overlays() {
     mkdir -p "${GENERATED_DIR}"
     cat > "${GENERATED_DIR}/stm32f4_move_bootloader.overlay" <<'EOF'
@@ -663,7 +710,7 @@ ensure_mcuboot_history() {
     git -C "${repo}" fetch --quiet fork 2>/dev/null || true
     git -C "${repo}" fetch --quiet upstream 2>/dev/null || true
     # Fetch PR branches — topic branch commits aren't on main and live on mcu-tools.
-    for pr in 2199 2214; do
+    for pr in 2199 2206 2214; do
         git -C "${repo}" fetch --quiet mcu-tools "+refs/pull/${pr}/head:refs/pull/${pr}" 2>/dev/null || \
             git -C "${repo}" fetch --quiet fork "+refs/pull/${pr}/head:refs/pull/${pr}" 2>/dev/null || \
             git -C "${repo}" fetch --quiet upstream "+refs/pull/${pr}/head:refs/pull/${pr}" 2>/dev/null || true
@@ -929,6 +976,91 @@ build_pr2214_offset_geom_assets() {
     build_pr2214_offset_geom_elfs
 }
 
+build_pr2206_scratch_geom_images() {
+    local stm32f4_pr2206_app_bin app_config header_size
+
+    require_file "${WEST}"
+    require_file "${PYTHON_BIN}"
+    require_file "${IMGTOOL_PY}"
+    require_file "${IMGTOOL_KEY}"
+
+    mkdir -p "${ASSETS_DIR}" "${BUILD_ROOT}" "${GENERATED_DIR}"
+    stm32f4_pr2206_app_bin="$(build_shared_stm32f4_pr2206_test_app)"
+    app_config="$(dirname "${stm32f4_pr2206_app_bin}")/.config"
+    header_size="$(app_rom_start_offset "${app_config}")"
+
+    msg "Generating STM32F4 PR2206 align-32 scratch-geom revert image"
+    PR_DIFF_STM32F4_PR2206_APP="${stm32f4_pr2206_app_bin}" \
+    PR_DIFF_STM32F4_PR2206_HEADER_SIZE="${header_size}" \
+    PR_DIFF_TMP="${BUILD_ROOT}" \
+    PR2206_PAYLOAD_SIZE="${PR2206_REVERT_PAYLOAD_SIZE}" \
+    python3 - <<'PY'
+from pathlib import Path
+import os
+
+app_bin = Path(os.environ["PR_DIFF_STM32F4_PR2206_APP"]).read_bytes()
+header_size = int(os.environ["PR_DIFF_STM32F4_PR2206_HEADER_SIZE"], 0)
+tmp_root = Path(os.environ["PR_DIFF_TMP"])
+target_size = int(os.environ["PR2206_PAYLOAD_SIZE"], 0)
+payload = app_bin[header_size:]
+if len(payload) >= target_size:
+    body = payload[:target_size]
+else:
+    body = payload + (b"\xA5" * (target_size - len(payload)))
+(tmp_root / "zephyr_slot1_scratch_geom_pr2206_payload.bin").write_bytes(
+    (b"\x00" * header_size) + body
+)
+PY
+
+    "${PYTHON_BIN}" "${IMGTOOL_PY}" sign \
+        --key "${IMGTOOL_KEY}" \
+        --align "${PR_DIFF_GEOM_ALIGN}" \
+        --header-size "${header_size}" \
+        --slot-size "0x18000" \
+        --version "2.0.0+0" \
+        "${BUILD_ROOT}/zephyr_slot1_scratch_geom_pr2206_payload.bin" \
+        "${ASSETS_DIR}/zephyr_slot1_scratch_geom_pr2206.bin"
+    "${PYTHON_BIN}" "${IMGTOOL_PY}" verify \
+        --key "${IMGTOOL_KEY}" \
+        "${ASSETS_DIR}/zephyr_slot1_scratch_geom_pr2206.bin"
+}
+
+build_pr2206_scratch_geom_elfs() {
+    local toolchain_path strip_bin gdb_bin
+    toolchain_path="$(detect_toolchain_path)"
+    strip_bin="${toolchain_path}/bin/arm-none-eabi-strip"
+    gdb_bin="${toolchain_path}/bin/arm-none-eabi-gdb"
+
+    require_file "${WEST}"
+    require_file "${PYTHON_BIN}"
+    require_file "${strip_bin}"
+    require_file "${gdb_bin}"
+
+    mkdir -p "${ASSETS_DIR}" "${BUILD_ROOT}" "${GENERATED_DIR}"
+    write_stm32f4_pr2206_geom_overlay
+    ensure_mcuboot_history "${MCUBOOT_DIR}"
+    for sha in "${PR2206_BROKEN}" "${PR2206_FIXED}"; do
+        require_mcuboot_commit "${MCUBOOT_DIR}" "${sha}" || die "missing PR2206 commit ${sha}"
+    done
+
+    local scratch_geom_overlay="${GENERATED_DIR}/stm32f4_pr2206_geom_scratch.dts"
+    build_mcuboot_checkout_variant "pr2206_scratch_geom_broken" "${PR2206_BROKEN}" "nucleo_f429zi" "${scratch_geom_overlay}" \
+        -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
+        -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
+        -DCONFIG_BOOT_MAX_IMG_SECTORS="${PR2206_BOOT_MAX_IMG_SECTORS}" \
+        "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}"
+    build_mcuboot_checkout_variant "pr2206_scratch_geom_fixed" "${PR2206_FIXED}" "nucleo_f429zi" "${scratch_geom_overlay}" \
+        -DCONFIG_BOOT_SWAP_USING_SCRATCH=y \
+        -DCONFIG_BOOT_MAX_IMG_SECTORS_AUTO=n \
+        -DCONFIG_BOOT_MAX_IMG_SECTORS="${PR2206_BOOT_MAX_IMG_SECTORS}" \
+        "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}"
+}
+
+build_pr2206_scratch_geom_assets() {
+    build_pr2206_scratch_geom_images
+    build_pr2206_scratch_geom_elfs
+}
+
 build_pr_differential_images() {
     local toolchain_path strip_bin gdb_bin
     local app_bin stm32f4_pr2206_app_bin
@@ -1008,6 +1140,7 @@ PY
         "${ASSETS_DIR}/zephyr_slot1_offset_geom_full.bin"
     build_pr2214_offset_staging_image
     build_pr2214_offset_geom_images
+    build_pr2206_scratch_geom_images
 }
 
 build_pr_bootloader_variant() {
@@ -1221,6 +1354,7 @@ build_pr_differential_elfs() {
         -DCONFIG_BOOT_PREFER_SWAP_OFFSET=y \
         "-DCMAKE_C_FLAGS=-DMCUBOOT_BOOT_MAX_ALIGN=${PR_DIFF_GEOM_ALIGN}"
     build_swaptable_nrf52_elfs
+    build_pr2206_scratch_geom_elfs
 }
 
 build_pr_differential_assets() {
@@ -1359,6 +1493,8 @@ fi
 git -C "${MCUBOOT_DIR}" fetch --quiet upstream
 if [[ "${BOOTSTRAP_SCOPE}" == "full" ]]; then
     patch_mcuboot_module_yml
+elif [[ "${BOOTSTRAP_SCOPE}" == "pr2206_geom" ]]; then
+    patch_mcuboot_module_yml
 elif [[ "${BOOTSTRAP_SCOPE}" == "pr2214" ]]; then
     patch_mcuboot_module_yml
 elif [[ "${BOOTSTRAP_SCOPE}" == "pr2214_geom" ]]; then
@@ -1383,6 +1519,8 @@ fi
 if [[ "${BOOTSTRAP_SCOPE}" == "full" ]]; then
     build_seccounter_assets
     build_pr_differential_assets
+elif [[ "${BOOTSTRAP_SCOPE}" == "pr2206_geom" ]]; then
+    build_pr2206_scratch_geom_assets
 elif [[ "${BOOTSTRAP_SCOPE}" == "pr2214" ]]; then
     build_pr2214_assets
 elif [[ "${BOOTSTRAP_SCOPE}" == "pr2214_geom" ]]; then

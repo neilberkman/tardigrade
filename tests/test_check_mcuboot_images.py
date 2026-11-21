@@ -118,7 +118,7 @@ class CheckMcubootImagesTests(unittest.TestCase):
             ).splitlines()
         )
         image_paths = img_check.discover_tracked_images(ROOT)
-        self.assertEqual(len(image_paths), 34)
+        self.assertEqual(len(image_paths), 35)
         for path in image_paths:
             rel = str(path.relative_to(ROOT))
             with self.subTest(image=rel):
@@ -126,7 +126,7 @@ class CheckMcubootImagesTests(unittest.TestCase):
                 self.assertIn(path.name, img_check.PROVENANCE_SPECS)
 
         results = img_check.check_assets(repo_root=ROOT)
-        self.assertEqual(len(results), 34)
+        self.assertEqual(len(results), 35)
         ok_count = 0
         allowlisted_count = 0
         for res in results:
@@ -146,7 +146,7 @@ class CheckMcubootImagesTests(unittest.TestCase):
                     self.assertTrue(res.hash_matches)
                     self.assertTrue(res.signature_verified)
 
-        self.assertEqual(ok_count, 28)
+        self.assertEqual(ok_count, 29)
         self.assertEqual(allowlisted_count, 6)
 
         stdout = io.StringIO()
@@ -203,14 +203,14 @@ class CheckMcubootImagesTests(unittest.TestCase):
 
     def test_profile_vector_crosscheck_identifies_expected_mismatches(self) -> None:
         profiles = img_check.discover_mcuboot_profiles(ROOT)
-        self.assertEqual(len(profiles), 94)
+        self.assertEqual(len(profiles), 96)
 
         results = img_check.check_all_profile_vectors(profiles, repo_root=ROOT)
-        self.assertEqual(len(results), 94)
+        self.assertEqual(len(results), 96)
 
         ok_profiles = {r.profile_path.name: r for r in results if r.ok}
         mismatch_map = {r.profile_path.name: r for r in results if not r.ok}
-        self.assertEqual(len(ok_profiles), 94)
+        self.assertEqual(len(ok_profiles), 96)
         self.assertEqual(set(mismatch_map.keys()), set())
 
         for name in (
@@ -220,6 +220,8 @@ class CheckMcubootImagesTests(unittest.TestCase):
             self.assertIn("hdr=0x200,vec=0x200,reset=0x0802110d", ok_profiles[name].message)
 
         for name in (
+            "mcuboot_pr2206_scratch_geom_broken.yaml",
+            "mcuboot_pr2206_scratch_geom_fixed.yaml",
             "mcuboot_pr2214_offset_geom_broken.yaml",
             "mcuboot_pr2214_offset_geom_fixed.yaml",
         ):
@@ -241,7 +243,7 @@ class CheckMcubootImagesTests(unittest.TestCase):
             rc_report = img_check.main(["--check-profiles", "--report-only"])
         self.assertEqual(rc_report, 0)
         self.assertEqual(stderr_report.getvalue(), "")
-        self.assertEqual(len(stdout_report.getvalue().strip().splitlines()), 94)
+        self.assertEqual(len(stdout_report.getvalue().strip().splitlines()), 96)
 
 
 if __name__ == "__main__":

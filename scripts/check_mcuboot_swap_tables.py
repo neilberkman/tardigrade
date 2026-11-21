@@ -76,6 +76,8 @@ POST_OFFSET_COMMITS: frozenset[str] = frozenset(
     {
         "25e2761c669035c991dff115f03e34f1505bd97a",  # PR #2199 broken
         "33094fc5a50096c8cbb3d2f443c4162a0ff08ea8",  # PR #2199 fixed
+        "66d41e73a2676beca20e26a957dbc07a9b907879",  # PR #2206 scratch geom broken
+        "d00b11dc234caee267eb12376e2279ed57c35d5d",  # PR #2206 scratch geom fixed
         "7253f01c06e19d2c5d7b146fedcf4473200b6b0d",  # scratch erase broken
         "f76fba706a66ce08d733468b47f89e26d59b3de5",  # scratch erase fixed
         "b893d34f564f454f454f3643b05b1e18fb457e5c",  # head_offset

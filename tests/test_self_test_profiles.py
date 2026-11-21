@@ -90,6 +90,101 @@ class SelfTestProfileDiscoveryTests(unittest.TestCase):
                 with self.subTest(family=family, shared=key):
                     self.assertEqual(broken_raw[key], fixed_raw[key])
 
+    def test_pr2206_scratch_geom_pair_is_strict_self_test_regression(self):
+        discovered = {path.name for path in discover_profiles(ROOT)}
+        profiles = {}
+        for revision in ("broken", "fixed"):
+            name = f"mcuboot_pr2206_scratch_geom_{revision}.yaml"
+            path = ROOT / "profiles" / name
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+            profile = load_profile(path)
+            with self.subTest(profile=name):
+                self.assertIn(name, discovered)
+                self.assertFalse(raw.get("skip_self_test", False))
+                self.assertNotIn("mode", raw["expect"])
+                self.assertEqual(profile.expect.mode, "regression")
+                self.assertIn("#19", raw["description"])
+                self.assertEqual(raw["expect"]["control_outcome"], "success")
+            profiles[revision] = (path, raw, profile)
+
+        broken_path, broken_raw, broken = profiles["broken"]
+        fixed_path, fixed_raw, fixed = profiles["fixed"]
+        self.assertTrue(expectation_requires_findings(broken.expect))
+        self.assertTrue(broken_raw["expect"]["should_find_issues"])
+        self.assertTrue(broken_raw["expect"]["allow_semantic_only_issues"])
+        self.assertEqual(broken_raw["expect"]["required_issue_reasons"], ["boot_outcome"])
+        self.assertFalse(broken_raw["expect"].get("allow_control_only_issues", False))
+        self.assertFalse(expectation_requires_findings(fixed.expect))
+        self.assertFalse(fixed_raw["expect"]["should_find_issues"])
+
+        for key in (
+            "platform",
+            "flash_backend",
+            "memory",
+            "images",
+            "pre_boot_state",
+            "success_criteria",
+            "fault_sweep",
+        ):
+            with self.subTest(shared=key):
+                self.assertEqual(broken_raw[key], fixed_raw[key])
+
+        boot_outcome_report = {
+            "verdict": "PASS",
+            "summary": {
+                "swap_progress_inference": {"status": "inferred", "source": "erase_trace"},
+                "runtime_sweep": {
+                    "issue_points": 1,
+                    "bricks": 0,
+                    "brick_rate": 0.0,
+                    "issue_reasons": {"boot_outcome": 1, "content_criteria": 1},
+                    "control": {"effective_outcome": "success", "issue_count": 0},
+                    "calibration_coverage": {"status": "slot_activity"},
+                },
+            },
+        }
+        clean_report = {
+            "verdict": "PASS",
+            "summary": {
+                "swap_progress_inference": {"status": "inferred", "source": "erase_trace"},
+                "runtime_sweep": {
+                    "issue_points": 0,
+                    "bricks": 0,
+                    "brick_rate": 0.0,
+                    "issue_reasons": {},
+                    "control": {"effective_outcome": "success", "issue_count": 0},
+                    "calibration_coverage": {"status": "slot_activity"},
+                },
+            },
+        }
+        vtor_only_report = {
+            "verdict": "PASS",
+            "summary": {
+                "swap_progress_inference": {"status": "inferred", "source": "erase_trace"},
+                "runtime_sweep": {
+                    "issue_points": 1,
+                    "bricks": 0,
+                    "brick_rate": 0.0,
+                    "issue_reasons": {"vtor_expectation": 1},
+                    "control": {"effective_outcome": "success", "issue_count": 0},
+                    "calibration_coverage": {"status": "slot_activity"},
+                },
+            },
+        }
+
+        passed, _ = check_verdict(broken_path, broken_raw, boot_outcome_report, 0)
+        self.assertTrue(passed)
+        passed, _ = check_verdict(broken_path, broken_raw, clean_report, 0)
+        self.assertFalse(passed)
+        passed, reason = check_verdict(broken_path, broken_raw, vtor_only_report, 0)
+        self.assertFalse(passed)
+        self.assertIn("boot_outcome", reason)
+
+        passed, _ = check_verdict(fixed_path, fixed_raw, clean_report, 0)
+        self.assertTrue(passed)
+        passed, _ = check_verdict(fixed_path, fixed_raw, boot_outcome_report, 0)
+        self.assertFalse(passed)
+
     def test_unverified_mcuboot_differentials_are_absent_from_regression_matrices(self):
         manifest = json.loads((SCRIPTS / "self_test_runtime_manifest.json").read_text())
         names = set(EXPLORATORY_MCUBOOT_DIFFERENTIALS)

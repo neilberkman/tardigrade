@@ -368,6 +368,14 @@ PROVENANCE_SPECS: dict[str, ImageProvenanceSpec] = {
         slot_size=0x76000,
         build_source="scripts/bootstrap_mcuboot_matrix_assets.sh:697-709",
     ),
+    "zephyr_slot1_scratch_geom_pr2206.bin": ImageProvenanceSpec(
+        family="pr2206_scratch_geom",
+        expected_key="root-rsa-2048.pem",
+        expected_header_size=0x200,
+        align=32,
+        slot_size=0x18000,
+        build_source="scripts/bootstrap_mcuboot_matrix_assets.sh:build_pr2206_scratch_geom_images",
+    ),
     "zephyr_stm32f4_slot0.bin": ImageProvenanceSpec(
         family="legacy_stm32f4",
         expected_key="root-rsa-2048.pem",

@@ -481,3 +481,68 @@ def test_allow_expected_control_only_issues_accepts_success_baseline_when_opted_
     profile = load_profile(ROOT / "tests" / "fixtures" / "profiles" / "control_only_issue_profile.yaml")
     profile.expect.control_outcome = "success"
     assert _allow_expected_control_only_issues(profile) is True
+
+
+def test_pr2206_scratch_geom_broken_rejects_control_only_and_requires_boot_outcome():
+    import yaml
+
+    broken_path = ROOT / "profiles" / "mcuboot_pr2206_scratch_geom_broken.yaml"
+    fixed_path = ROOT / "profiles" / "mcuboot_pr2206_scratch_geom_fixed.yaml"
+    broken_raw = yaml.safe_load(broken_path.read_text(encoding="utf-8"))
+    fixed_raw = yaml.safe_load(fixed_path.read_text(encoding="utf-8"))
+
+    # Control-only issues must NOT satisfy PR #2206 broken.
+    control_only_sweep = _control_only_summary_with_issue("success")
+    control_only_sweep["calibration_coverage"] = {"status": "slot_activity"}
+    passed, reason = check_verdict(
+        broken_path,
+        broken_raw,
+        {
+            "summary": {
+                "swap_progress_inference": {"status": "inferred", "source": "erase_trace"},
+                "runtime_sweep": control_only_sweep,
+            }
+        },
+        0,
+    )
+    assert passed is False
+    assert reason == "Expected issues but found none"
+
+    # Semantic/vtor-only issues without boot_outcome must NOT satisfy PR #2206 broken.
+    passed, reason = check_verdict(
+        broken_path,
+        broken_raw,
+        {
+            "summary": {
+                "swap_progress_inference": {"status": "inferred", "source": "erase_trace"},
+                "runtime_sweep": {
+                    "issue_points": 1,
+                    "bricks": 0,
+                    "issue_reasons": {"vtor_expectation": 1},
+                    "control": {"effective_outcome": "success", "issue_count": 0},
+                    "calibration_coverage": {"status": "slot_activity"},
+                },
+            }
+        },
+        0,
+    )
+    assert passed is False
+    assert reason == "Missing expected issue reason(s): boot_outcome"
+
+    # Real boot_outcome fault point satisfies broken and fails fixed.
+    boot_outcome_report = {
+        "summary": {
+            "swap_progress_inference": {"status": "inferred", "source": "erase_trace"},
+            "runtime_sweep": {
+                "issue_points": 1,
+                "bricks": 0,
+                "issue_reasons": {"boot_outcome": 1, "content_criteria": 1},
+                "control": {"effective_outcome": "success", "issue_count": 0},
+                "calibration_coverage": {"status": "slot_activity"},
+            },
+        }
+    }
+    passed, _ = check_verdict(broken_path, broken_raw, boot_outcome_report, 0)
+    assert passed is True
+    passed, _ = check_verdict(fixed_path, fixed_raw, boot_outcome_report, 0)
+    assert passed is False
