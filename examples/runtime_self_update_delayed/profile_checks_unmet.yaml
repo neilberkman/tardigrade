@@ -1,0 +1,10 @@
+base_profile: profile.yaml
+name: runtime_self_update_delayed_checks_unmet
+description: Negative variant whose updated image matches allowed content after reset but never raises its progress counter.
+images:
+  exec: examples/runtime_self_update_delayed/old.bin
+  staging: examples/runtime_self_update_delayed/never_ready.bin
+fault_sweep:
+  run_duration: "1.0"
+  phase1_time_slice: "0.1"
+  max_step_limit: 50000000

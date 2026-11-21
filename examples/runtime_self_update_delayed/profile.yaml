@@ -1,0 +1,50 @@
+schema_version: 1
+name: runtime_self_update_delayed
+description: Self-updating application whose SYSRESETREQ restarts directly from the app vector table and raises a progress counter after a start-up delay.
+platform: platforms/cortex_m0_self_update_direct_reset.repl
+bootloader:
+  elf: examples/runtime_self_update_delayed/boot.elf
+  entry: 0x10200000
+bootloader_region: { base: 0x10200000, size: 0x1000 }
+memory:
+  sram: { start: 0x20000000, end: 0x20002000 }
+  volatile_regions:
+    - { name: runtime_sram, base: 0x20000000, size: 0x2000 }
+  write_granularity: 16
+  page_size: 0x1000
+  trace_address_map:
+    - { offset_start: 0x0, offset_end: 0x3000, address_addend: 0x10100000 }
+  slots:
+    exec: { base: 0x10100000, size: 0x1000 }
+    staging: { base: 0x10101000, size: 0x1000 }
+images:
+  exec: examples/runtime_self_update_delayed/old.bin
+  staging: examples/runtime_self_update_delayed/update.bin
+pre_boot_state:
+  - { address: 0x10102000, u32: 1 }
+flash_backend: mramTracker
+success_criteria:
+  pc_in_slot: exec
+  image_hash: true
+  image_hash_slot: exec
+  allowed_images: [exec, staging]
+  terminal_after_reset: true
+  memory_checks:
+    - { address: 0x20000200, expected_value: 1, op: ge }
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  max_writes: auto
+  max_writes_cap: 4096
+  sweep_strategy: exhaustive
+  run_duration: "4.0"
+  phase1_time_slice: "0.1"
+  calibration_time_slice: "0.05"
+  progress_stall_timeout_s: 2.0
+  tracking_start_address: 0x20000400
+  calibration_stop:
+    address: 0x20000480
+    success_criteria: true
+expect:
+  should_find_issues: true
