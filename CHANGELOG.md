@@ -91,6 +91,15 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- Short-image digest padding (in `ProfileConfig._compute_image_digests`,
+  `scripts/sweep.py`, `scripts/trigger_discovery.py`, and writeback
+  reconstruction) now supports an optional `memory.erase_fill` byte and
+  otherwise classifies MRAM backends via `_is_mram_backend` (`0x00` for MRAM
+  backends including `mramTracker`, `0xFF` for non-MRAM backends) instead of
+  matching only the literal `flash_backend: mram`. At runtime, before images
+  load, `run_runtime_fault_sweep.py` stops with a clear error naming
+  `memory.erase_fill` and both values if the padding byte differs from the
+  live backend's `EraseFill`.
 - `scripts/report_security_status.py` no longer appends a spurious
   `summary.runtime_sweep calibration coverage is unavailable` inconclusive
   reason to verified intentional zero-point control-only campaigns

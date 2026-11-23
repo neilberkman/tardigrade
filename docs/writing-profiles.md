@@ -159,6 +159,8 @@ memory:
 
 `page_size` is the effective erase unit used by state evaluation and as a fallback geometry hint for semantic cutpoints like `swap_progress`. On uniform flash, this is usually the real sector size. On non-uniform flash, calibration erase traces are preferred because they provide the actual per-sector map; `page_size` is only a fallback.
 
+`erase_fill` is an optional single-byte value (`0x00`–`0xFF`) that overrides the default erased-memory byte used to pad short images for digest checks and writeback reconstruction. Set it when a backend erases to a non-default byte (for example, `memory.erase_fill: 0xFF` for an MRAM peripheral with `EraseFill: 0xFF`). At runtime, before images load, the sweep compares the padding byte in use against the live backend's `EraseFill` and stops with an error if they differ.
+
 ### Postmortem flash evidence
 
 For no-boot diagnostics, declare non-uniform erase geometry and optional
@@ -450,6 +452,12 @@ is merely one member of the allowed set; discovery still has to demonstrate
 the configured update effect.
 
 Both `ProfileConfig._compute_image_digests` and `compute_slot_hash` hash the MCUboot-validated image extent `ih_hdr_size + ih_img_size + ih_protect_tlv_size` plus the unprotected TLV area `it_tlv_tot` when the image or slot begins with `IMAGE_MAGIC = 0x96F3B83D` and carries a valid `IMAGE_TLV_INFO_MAGIC = 0x6907` header. When the slot does not start with a valid MCUboot header and TLV block, `resolve_slot_hash_extent` falls back to `slot_size` minus the size of the slot's last erase sector from `flash.sectors`, `flash.page_size`, or the platform `.repl` flash geometry, and uses `slot_size - 4096` only when neither an MCUboot header nor erase-sector geometry is available.
+
+When an image binary is shorter than the slot's hash extent, image digests (in the loader, `sweep.py`, `trigger_discovery.py`, and writeback reconstruction) pad the tail with the erased-memory byte:
+
+1. If `memory.erase_fill` (`0x00`–`0xFF`) is set in the profile, that byte is used.
+2. Otherwise, MRAM backends (`mram`, `mramTracker`, or any platform/peripheral resolved as MRAM) pad with `0x00` (the bundled MRAM peripherals' default), and all other backends pad with `0xFF`.
+3. At runtime, before images load, `run_runtime_fault_sweep.py` compares the active padding byte against the live backend's `EraseFill` and stops with an error naming `memory.erase_fill` and both values if they differ.
 
 `image_hash` is evaluated only in `fault_sweep.evaluation_mode: execute`. State mode, the default, performs the staging-to-exec copy itself and judges the result by its vector table alone, so a digest declared there produces no evidence. The loader warns about that combination, and the clean-control gate requires hash evidence only from execute-mode controls.
 
