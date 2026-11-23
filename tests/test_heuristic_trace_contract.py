@@ -232,15 +232,15 @@ def test_mram_torn_word_replay_modes_across_widths(
 ) -> None:
     runtime_path = ROOT / "scripts" / "run_runtime_fault_sweep.py"
     tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
-    function = next(
+    wanted = {"_corrupt_mram_torn_bytes", "_trace_replay_mram_torn_value"}
+    functions = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_trace_replay_mram_torn_value"
-    )
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
+    ]
     namespace: dict = {}
     exec(
-        compile(ast.Module(body=[function], type_ignores=[]), str(runtime_path), "exec"),
+        compile(ast.Module(body=functions, type_ignores=[]), str(runtime_path), "exec"),
         namespace,
     )
     fn = namespace["_trace_replay_mram_torn_value"]
@@ -253,16 +253,36 @@ def test_mram_torn_word_replay_modes_across_widths(
     assert fn(value, width, 0xFF, "half_retain", None) == expected_half_ff
     assert fn(value, width, 0x00, "untouched", previous) == previous
     assert fn(value, width, 0xFF, "untouched", None) == expected_erased_ff
+    assert fn(value, width, 0x00, "uncorrectable", previous) == previous
+    assert fn(value, width, 0xFF, "uncorrectable", None) == expected_erased_ff
     assert fn(value, width, 0x00, "erased", previous) == 0
     assert fn(value, width, 0xFF, "erased", previous) == expected_erased_ff
     assert fn(value, width, 0x00, "programmed", previous) == value
     assert fn(value, width, 0xFF, "programmed", previous) == value
-    with pytest.raises(ValueError, match="half_retain"):
+    corrupted_a = fn(
+        value, width, 0x00, "corrupted", previous, seed=0x12345678, write_index=1, offset=0
+    )
+    corrupted_b = fn(
+        value, width, 0x00, "corrupted", previous, seed=0x12345678, write_index=1, offset=0
+    )
+    assert corrupted_a == corrupted_b
+    flipped_bits = bin(corrupted_a ^ value).count("1")
+    assert 3 <= flipped_bits <= 5
+    with pytest.raises(ValueError, match="uncorrectable"):
         fn(value, width, 0x00, "invalid_mode", previous)
 
 
 @pytest.mark.parametrize(
-    "mode", ["half", "half_retain", "untouched", "erased", "programmed"]
+    "mode",
+    [
+        "half",
+        "half_retain",
+        "untouched",
+        "erased",
+        "programmed",
+        "uncorrectable",
+        "corrupted",
+    ],
 )
 def test_mram_torn_word_loader_accepts_valid_modes_on_mram_backend(
     tmp_path: Path, mode: str
@@ -286,7 +306,9 @@ memory:
 images: {{ staging: firmware.bin }}
 success_criteria: {{ vtor_in_slot: exec }}
 fault_sweep:
+  evaluation_mode: execute
   mram_torn_word: {mode}
+  mram_torn_word_seed: 42
 """,
         encoding="utf-8",
     )
@@ -294,7 +316,67 @@ fault_sweep:
     profile = load_profile(profile_path, strict=True)
     assert profile.fault_sweep.mram_torn_word == mode
     assert profile.fault_sweep.mram_torn_word_explicit is True
-    assert f"MRAM_TORN_WORD:{mode}" in profile.robot_vars(tmp_path)
+    assert profile.fault_sweep.mram_torn_word_seed == 42
+    robot_vars = profile.robot_vars(tmp_path)
+    assert f"MRAM_TORN_WORD:{mode}" in robot_vars
+    assert "MRAM_TORN_WORD_SEED:42" in robot_vars
+
+
+def test_mram_torn_word_uncorrectable_rejected_in_state_and_writeback_modes(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "platform.repl").write_text(
+        "mram: Memory.NVMemory @ sysbus 0x10100000\n    Size: 0x2000\n",
+        encoding="utf-8",
+    )
+    state_profile = tmp_path / "state.yaml"
+    state_profile.write_text(
+        """
+schema_version: 1
+name: mram_uncorrectable_state
+platform: platform.repl
+flash_backend: mram
+bootloader: { elf: firmware.elf, entry: 0x10000000 }
+memory:
+  sram: { start: 0x20000000, end: 0x20001000 }
+  slots:
+    exec: { base: 0x10100000, size: 0x1000 }
+    staging: { base: 0x10101000, size: 0x1000 }
+images: { staging: firmware.bin }
+success_criteria: { vtor_in_slot: exec }
+fault_sweep:
+  evaluation_mode: state
+  mram_torn_word: uncorrectable
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ProfileError, match="uncorrectable.*execute"):
+        load_profile(state_profile)
+
+    wb_profile = tmp_path / "writeback.yaml"
+    wb_profile.write_text(
+        """
+schema_version: 1
+name: mram_uncorrectable_wb
+platform: platform.repl
+flash_backend: mram
+bootloader: { elf: firmware.elf, entry: 0x10000000 }
+memory:
+  sram: { start: 0x20000000, end: 0x20001000 }
+  slots:
+    exec: { base: 0x10100000, size: 0x1000 }
+    staging: { base: 0x10101000, size: 0x1000 }
+images: { staging: firmware.bin }
+success_criteria: { vtor_in_slot: exec }
+fault_sweep:
+  evaluation_mode: execute
+  durability_model: writeback
+  mram_torn_word: uncorrectable
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ProfileError, match="uncorrectable.*writeback"):
+        load_profile(wb_profile)
 
 
 def test_mram_torn_word_loader_rejects_unknown_mode(tmp_path: Path) -> None:

@@ -1066,18 +1066,29 @@ fault_sweep:
 
 ```yaml
 fault_sweep:
-  mram_torn_word: half # half, half_retain, untouched, erased, or programmed
+  mram_torn_word: half # half, half_retain, untouched, erased, programmed, uncorrectable, or corrupted
+  mram_torn_word_seed: 0 # optional 32-bit PRNG seed for corrupted mode (default: 0)
 ```
 
-`mram_torn_word` selects the post-fault word bytes persisted when a `power_loss` fault interrupts an MRAM program in `MappedMRAMTracker`, `NVMemory`, or MRAM trace replay:
+`mram_torn_word` selects what a `power_loss` fault leaves in an MRAM program word when it interrupts a program in `MappedMRAMTracker`, `NVMemory`, or MRAM trace replay:
 
 - `half`: default mode. The lower half of the programmed word receives the new bytes and the upper half receives `EraseFill`.
 - `half_retain`: the lower half of the programmed word receives the new bytes and the upper half keeps the bytes that were in storage before the interrupted program began.
 - `untouched`: the faulted word keeps the bytes that were in storage before the interrupted program began.
 - `erased`: the faulted word is filled with `EraseFill`.
 - `programmed`: the faulted word receives the full intended program bytes before the CPU stops.
+- `uncorrectable`: models an embedded MRAM macro whose word-level ECC rejects a partially programmed codeword. Storage retains the pre-program bytes (`untouched`) and the word is marked unreadable. Any CPU read overlapping a marked word raises a bus error to the CPU (BusFault on ARMv7-M/v8-M when `SHCSR.BUSFAULTENA` is enabled, otherwise HardFault) so the target's fault handler runs. Programming or erasing the word clears the mark. Tooling reads (snapshots, image hashing, memory checks) still return the stored bytes without raising and report the marked word(s). Recovery observations record the marked word's address and whether the target `recovered`, `stalled`, or `faulted`.
+- `corrupted`: models the ECC miscorrection or missed multi-bit error case. The word stores the intended bytes with 3 to 5 distinct bits flipped deterministically from `mram_torn_word_seed` (or `CorruptionSeed`, mixed with the write index and word offset), and reads return the corrupted bytes with no bus error.
 
-`profile_loader.py` rejects unknown `mram_torn_word` values and rejects `mram_torn_word` on non-MRAM backends. At runtime, `run_runtime_fault_sweep.py` sets `MramTornWordMode` on the backend peripheral only when the peripheral exposes that property.
+#### Choosing a mode for parts with and without word ECC
+
+- **Parts with built-in word ECC** (common on embedded MRAM macros that compute parity over the whole program word and write data and parity together): a power cut mid-program produces a partially programmed codeword, never a clean split between lower and upper data halves. Do **not** rely on `half` or `half_retain` for such parts. Instead, use:
+  - `uncorrectable` (primary): tests that recovery code handles the bus error raised when reading a record that was mid-program at power loss rather than crashing in an unhandled HardFault/BusFault.
+  - `programmed` / `untouched`: bounds the benign cases where the interrupted codeword either corrected silently to the intended word or never left the previous valid codeword.
+  - `corrupted`: tests that integrity checks (CRCs, hashes, sequence/commit markers) reject wrong data if a multi-bit error escapes or miscorrects through ECC without raising a bus fault.
+- **Parts without word ECC** (or where the write path splits a word into sub-word bus/program phases without whole-word parity): `half`, `half_retain`, `untouched`, `erased`, and `programmed` model byte-level tearing directly.
+
+`profile_loader.py` rejects unknown `mram_torn_word` values, rejects `mram_torn_word` (and `mram_torn_word_seed`) on non-MRAM backends, and rejects `uncorrectable` when `evaluation_mode: state` or `durability_model: writeback` is configured (neither can model live CPU read faults on an interrupted MRAM word). At runtime, `run_runtime_fault_sweep.py` sets `MramTornWordMode` (and `MramTornWordSeed`) on the backend peripheral when exposed and refuses `uncorrectable` or non-default live modes when the peripheral lacks support.
 
 ### Phase 2 timing
 

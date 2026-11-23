@@ -422,8 +422,20 @@ def _run_mapped_mram_tracker_case(
     pre_program: bytes,
     intended: bytes,
     erase_fill: int,
-) -> bytes:
+    *,
+    write_index: int = 1,
+    unit_offset: int = 0,
+    seed: int = 0,
+) -> tuple[bytes, list[int]]:
     code = _translate_csharp_case_to_python(cases.get(mode, cases["default"]))
+    marked: list[int] = []
+    corrupt_ns = _runtime_functions("_corrupt_mram_torn_bytes")
+
+    def _apply_corrupted(buf: bytearray, wi: int, off: int, seed_val: int) -> None:
+        buf[:] = corrupt_ns["_corrupt_mram_torn_bytes"](
+            bytes(buf), wi, off, seed_val
+        )
+
     ns = {
         "ProgramUnitSize": len(intended),
         "preProgram": bytearray(pre_program),
@@ -431,9 +443,14 @@ def _run_mapped_mram_tracker_case(
         "result": bytearray(intended),
         "EraseFill": erase_fill,
         "CloneBytes": lambda b: bytearray(b),
+        "unitOffset": unit_offset,
+        "TotalWordWrites": write_index,
+        "MarkWordUncorrectableInternal": lambda off: marked.append(int(off)),
+        "EffectiveMramTornWordSeed": lambda: seed,
+        "ApplyCorruptedTornWord": _apply_corrupted,
     }
     exec(code, ns, ns)
-    return bytes(ns["result"])
+    return bytes(ns["result"]), marked
 
 
 def _run_nvmemory_case(
@@ -444,42 +461,73 @@ def _run_nvmemory_case(
     erase_fill: int,
     *,
     enforce_word_semantics: bool,
-) -> bytes:
+    write_index: int = 1,
+    word_start: int = 0,
+    seed: int = 0,
+) -> tuple[bytes, list[int]]:
     code = _translate_csharp_case_to_python(cases.get(mode, cases["default"]))
     initial_storage = (
         bytearray([erase_fill] * len(new_word))
         if enforce_word_semantics
         else bytearray(new_word)
     )
+    marked: list[int] = []
+    corrupt_ns = _runtime_functions("_corrupt_mram_torn_bytes")
 
-    def _program_word(word_start: int, merged: bytearray) -> None:
-        initial_storage[word_start : word_start + len(merged)] = merged
+    def _program_word(ws: int, merged: bytearray) -> None:
+        initial_storage[ws : ws + len(merged)] = merged
+
+    def _apply_corrupted_at(ws: int, intended_buf: bytearray, wi: int) -> None:
+        initial_storage[ws : ws + len(intended_buf)] = corrupt_ns[
+            "_corrupt_mram_torn_bytes"
+        ](bytes(intended_buf), wi, ws, seed)
 
     ns = {
         "WordSize": len(new_word),
-        "wordStart": 0,
-        "offset": 0,
+        "wordStart": word_start,
+        "offset": word_start,
         "data": bytearray(new_word),
         "previousWord": bytearray(previous_word),
         "intendedWord": bytearray(new_word),
         "mergedWord": bytearray(new_word),
+        "currentWriteIndex": write_index,
         "storage": initial_storage,
         "EraseFill": erase_fill,
         "ProgramWord": _program_word,
+        "MarkWordUncorrectableInternal": lambda off: marked.append(int(off)),
+        "ClearUncorrectableWordInternal": lambda off: marked.remove(int(off))
+        if int(off) in marked
+        else None,
+        "ApplyCorruptedWordAt": _apply_corrupted_at,
+        "lastFaultMarkedUncorrectable": False,
+        "true": True,
+        "false": False,
     }
     exec(code, ns, ns)
-    return bytes(ns["storage"])
+    return bytes(ns["storage"]), marked
 
 
 def test_mram_torn_word_modes_across_trace_replay_and_csharp_peripherals() -> None:
-    modes = ("half", "half_retain", "untouched", "erased", "programmed")
+    modes = (
+        "half",
+        "half_retain",
+        "untouched",
+        "erased",
+        "programmed",
+        "uncorrectable",
+        "corrupted",
+    )
     pre_program = bytes.fromhex("10111213141516172021222324252627")
     intended = bytes.fromhex("a0a1a2a3a4a5a6a7b0b1b2b3b4b5b6b7")
     assert pre_program[8:] != intended[8:]
+    test_seed = 0x12345678
 
-    # 1. Verify trace replay across all five modes with distinct old and new upper halves.
-    replay_ns = _runtime_functions("_trace_replay_mram_torn_value")
+    # 1. Verify trace replay across all seven modes with distinct old and new upper halves.
+    replay_ns = _runtime_functions(
+        "_corrupt_mram_torn_bytes", "_trace_replay_mram_torn_value"
+    )
     replay_fn = replay_ns["_trace_replay_mram_torn_value"]
+    corrupt_bytes_fn = replay_ns["_corrupt_mram_torn_bytes"]
     prev_u64 = int.from_bytes(pre_program[:4] + pre_program[8:12], "little")
     new_u64 = int.from_bytes(intended[:4] + intended[8:12], "little")
     expected_half_retain_u64 = int.from_bytes(
@@ -497,8 +545,16 @@ def test_mram_torn_word_modes_across_trace_replay_and_csharp_peripherals() -> No
         == expected_half_retain_u64
     )
     assert replay_fn(new_u64, 8, 0xFF, "untouched", prev_u64) == prev_u64
+    assert replay_fn(new_u64, 8, 0xFF, "uncorrectable", prev_u64) == prev_u64
     assert replay_fn(new_u64, 8, 0xFF, "erased", prev_u64) == 0xFFFFFFFFFFFFFFFF
     assert replay_fn(new_u64, 8, 0xFF, "programmed", prev_u64) == new_u64
+    corrupted_u64 = replay_fn(
+        new_u64, 8, 0xFF, "corrupted", prev_u64, seed=test_seed, write_index=1, offset=0
+    )
+    assert 3 <= bin(corrupted_u64 ^ new_u64).count("1") <= 5
+    assert corrupted_u64 == int.from_bytes(
+        corrupt_bytes_fn(new_u64.to_bytes(8, "little"), 1, 0, test_seed), "little"
+    )
 
     # 2. Verify MappedMRAMTracker.cs and NVMemoryController.cs word images for all modes.
     tracker_cs = (ROOT / "peripherals" / "MappedMRAMTracker.cs").read_text(
@@ -511,10 +567,11 @@ def test_mram_torn_word_modes_across_trace_replay_and_csharp_peripherals() -> No
         assert (
             'if(normalized != "half" && normalized != "half_retain"\n'
             '                   && normalized != "untouched" && normalized != "erased"\n'
-            '                   && normalized != "programmed")'
+            '                   && normalized != "programmed" && normalized != "uncorrectable"\n'
+            '                   && normalized != "corrupted")'
         ) in cs_text
         assert (
-            '"MramTornWordMode must be half, half_retain, untouched, erased, or programmed"'
+            '"MramTornWordMode must be half, half_retain, untouched, erased, programmed, uncorrectable, or corrupted"'
             in cs_text
         )
 
@@ -529,6 +586,9 @@ def test_mram_torn_word_modes_across_trace_replay_and_csharp_peripherals() -> No
     nvm_fast_cases = _parse_csharp_switch_cases(nvm_switches[0])
     nvm_word_cases = _parse_csharp_switch_cases(nvm_switches[1])
 
+    expected_corrupted = corrupt_bytes_fn(intended, 1, 0, test_seed)
+    assert 3 <= sum(bin(a ^ b).count("1") for a, b in zip(intended, expected_corrupted)) <= 5
+
     for erase_fill in (0x00, 0xFF):
         expected_by_mode = {
             "half": intended[:8] + bytes([erase_fill] * 8),
@@ -536,37 +596,41 @@ def test_mram_torn_word_modes_across_trace_replay_and_csharp_peripherals() -> No
             "untouched": pre_program,
             "erased": bytes([erase_fill] * 16),
             "programmed": intended,
+            "uncorrectable": pre_program,
+            "corrupted": expected_corrupted,
         }
         for mode in modes:
             expected_word = expected_by_mode[mode]
-            assert (
-                _run_mapped_mram_tracker_case(
-                    tracker_cases, mode, pre_program, intended, erase_fill
-                )
-                == expected_word
+            expected_marked = [0] if mode == "uncorrectable" else []
+            t_word, t_marked = _run_mapped_mram_tracker_case(
+                tracker_cases, mode, pre_program, intended, erase_fill, seed=test_seed
             )
-            assert (
-                _run_nvmemory_case(
-                    nvm_fast_cases,
-                    mode,
-                    pre_program,
-                    intended,
-                    erase_fill,
-                    enforce_word_semantics=False,
-                )
-                == expected_word
+            assert t_word == expected_word
+            assert t_marked == expected_marked
+
+            nf_word, nf_marked = _run_nvmemory_case(
+                nvm_fast_cases,
+                mode,
+                pre_program,
+                intended,
+                erase_fill,
+                enforce_word_semantics=False,
+                seed=test_seed,
             )
-            assert (
-                _run_nvmemory_case(
-                    nvm_word_cases,
-                    mode,
-                    pre_program,
-                    intended,
-                    erase_fill,
-                    enforce_word_semantics=True,
-                )
-                == expected_word
+            assert nf_word == expected_word
+            assert nf_marked == expected_marked
+
+            nw_word, nw_marked = _run_nvmemory_case(
+                nvm_word_cases,
+                mode,
+                pre_program,
+                intended,
+                erase_fill,
+                enforce_word_semantics=True,
+                seed=test_seed,
             )
+            assert nw_word == expected_word
+            assert nw_marked == expected_marked
 
     # 3. Verify every C# peripheral that exposes MramTornWordMode forwards or stores it.
     forwarding_peripherals = {
@@ -584,7 +648,8 @@ def test_mram_torn_word_modes_across_trace_replay_and_csharp_peripherals() -> No
         assert "public string MramTornWordMode" in cs_source
         assert expected_forwarding in cs_source
 
-    # 4. Verify collect_mram_fault_evidence preserves the half_retain post-fault word.
+    # 4. Verify collect_mram_fault_evidence preserves the half_retain post-fault word
+    #    and records word_marked_uncorrectable when set by the backend.
     post_half_retain = intended[:8] + pre_program[8:]
     snapshot = post_half_retain + bytes(48)
     trace = "1:0:16:{}:{}:{}:1\n".format(
@@ -599,6 +664,7 @@ def test_mram_torn_word_modes_across_trace_replay_and_csharp_peripherals() -> No
         LastFaultIntendedBytes=intended,
         LastFaultPreProgramBytes=pre_program,
         LastFaultPostFaultBytes=post_half_retain,
+        LastFaultMarkedUncorrectable=True,
         FaultMemorySnapshot=snapshot,
         ProgramTraceCount=1,
         ProgramTraceToString=lambda: trace,
@@ -622,6 +688,8 @@ def test_mram_torn_word_modes_across_trace_replay_and_csharp_peripherals() -> No
     assert evidence["pre_program_bytes"] == pre_program.hex()
     assert evidence["intended_bytes"] == intended.hex()
     assert evidence["post_fault_bytes"] == post_half_retain.hex()
+    assert evidence["word_marked_uncorrectable"] is True
+    assert evidence["uncorrectable_word_address"] == "0x10000000"
     assert bytes(observed_snapshot[:16]) == post_half_retain
 
 
@@ -640,6 +708,24 @@ def test_live_power_loss_refuses_a_torn_word_mode_the_mram_peripheral_ignores() 
     class Capable:
         MramTornWordMode = "half"
 
+    class UncorrectableCapable(Capable):
+        UncorrectableReadCount = 0
+
+        def MarkWordUncorrectable(self, _offset):
+            pass
+
+        def ClearUncorrectableWords(self):
+            pass
+
+        def ClearUncorrectableReadLog(self):
+            pass
+
+        def UncorrectableWordsToString(self):
+            return ""
+
+        def UncorrectableReadsToString(self):
+            return ""
+
     def run(mode, data):
         ns = {
             "backend": {"kind": "mram", "data": data, "backend_sysbus_name": "mram"},
@@ -650,7 +736,7 @@ def test_live_power_loss_refuses_a_torn_word_mode_the_mram_peripheral_ignores() 
         return data
 
     run("half", Bare())
-    for mode in ("half_retain", "untouched", "erased", "programmed"):
+    for mode in ("half_retain", "untouched", "erased", "programmed", "corrupted"):
         assert run(mode, Capable()).MramTornWordMode == mode
         try:
             run(mode, Bare())
@@ -660,4 +746,138 @@ def test_live_power_loss_refuses_a_torn_word_mode_the_mram_peripheral_ignores() 
             raise AssertionError(
                 "a non-default mode on a peripheral without the property must fail"
             )
+
+    # uncorrectable additionally requires uncorrectable-word tracking methods.
+    assert run("uncorrectable", UncorrectableCapable()).MramTornWordMode == "uncorrectable"
+    try:
+        run("uncorrectable", Capable())
+    except Exception as exc:
+        assert "uncorrectable" in str(exc)
+    else:
+        raise AssertionError(
+            "uncorrectable mode must fail when peripheral lacks uncorrectable tracking"
+        )
+
+
+def test_uncorrectable_read_observation_and_sweep_summary_distinguish_handled_vs_faulted() -> None:
+    def _make_obs(boot_outcome, exec_ev, p2_status, remaining_text):
+        data = SimpleNamespace(
+            UncorrectableReadCount=1,
+            LastUncorrectableReadWordAddress=0x10100200,
+            MarkWordUncorrectable=lambda _o: None,
+            UncorrectableReadsToString=lambda: "1:512:0x10100200:0x10100200:4:0x10000090\n",
+            UncorrectableWordsToString=lambda: remaining_text,
+        )
+        ns = _runtime_functions(
+            "_mram_uncorrectable_target",
+            "_parse_uncorrectable_words_table",
+            "_parse_uncorrectable_reads_table",
+            "_snapshot_mram_uncorrectable_addresses",
+            "collect_uncorrectable_read_observation",
+            globals_dict={
+                "backend": {"data": data, "bus_base": 0x10100000},
+                "fmt_u32": lambda value: "0x{:08X}".format(value),
+            },
+        )
+        return ns["collect_uncorrectable_read_observation"](
+            boot_outcome,
+            execution_evidence=exec_ev,
+            p2_status=p2_status,
+            marked_at_fault=["0x10100200"],
+        )
+
+    handled_obs = _make_obs(
+        "success", {"hardfault_observed": False, "ipsr": 0}, {"reason": "vtor_captured"}, ""
+    )
+    assert handled_obs["read_observed"] is True
+    assert handled_obs["word_address"] == "0x10100200"
+    assert handled_obs["outcome"] == "recovered"
+    assert handled_obs["handled"] is True
+    assert handled_obs["cleared_by_recovery"] is True
+
+    faulted_obs = _make_obs(
+        "hard_fault",
+        {"hardfault_observed": True, "fault_exception_active": True, "ipsr": 3},
+        {"reason": "no_boot_stall(0.10s_emulated)"},
+        "512:0x10100200\n",
+    )
+    assert faulted_obs["outcome"] == "faulted"
+    assert faulted_obs["handled"] is False
+    assert faulted_obs["cleared_by_recovery"] is False
+
+    stalled_obs = _make_obs(
+        "no_boot",
+        {"hardfault_observed": False, "fault_exception_active": False, "ipsr": 0},
+        {"reason": "no_boot_stall(0.10s_emulated)"},
+        "512:0x10100200\n",
+    )
+    assert stalled_obs["outcome"] == "stalled"
+    assert stalled_obs["handled"] is False
+
+    summary = summarize_runtime_sweep(
+        [
+            {
+                "is_control": False,
+                "fault_at": 0,
+                "fault_requested": 0,
+                "fault_address": "0x10100200",
+                "fault_injected": True,
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "fault_class": "recoverable",
+                "mram_fault_evidence": {
+                    "exact": True,
+                    "program_width": 8,
+                    "word_marked_uncorrectable": True,
+                    "uncorrectable_word_address": "0x10100200",
+                },
+                "signals": {
+                    "uncorrectable_words_at_fault": ["0x10100200"],
+                    "uncorrectable_read": handled_obs,
+                },
+            },
+            {
+                "is_control": False,
+                "fault_at": 1,
+                "fault_requested": 1,
+                "fault_address": "0x10100208",
+                "fault_injected": True,
+                "boot_outcome": "hard_fault",
+                "boot_slot": None,
+                "fault_class": "unrecoverable",
+                "mram_fault_evidence": {
+                    "exact": True,
+                    "program_width": 8,
+                    "word_marked_uncorrectable": True,
+                    "uncorrectable_word_address": "0x10100208",
+                },
+                "signals": {
+                    "uncorrectable_words_at_fault": ["0x10100208"],
+                    "uncorrectable_read": faulted_obs,
+                },
+            },
+            {
+                "is_control": False,
+                "fault_at": 2,
+                "fault_requested": 2,
+                "fault_address": "0x10100210",
+                "fault_injected": True,
+                "boot_outcome": "no_boot",
+                "boot_slot": None,
+                "fault_class": "unrecoverable",
+                "signals": {
+                    "uncorrectable_words_at_fault": ["0x10100210"],
+                    "uncorrectable_read": stalled_obs,
+                },
+            },
+        ],
+        expected_control_points=0,
+    )
+    uncorr_summary = summary["mram_uncorrectable_reads"]
+    assert uncorr_summary["marked_points"] == 3
+    assert uncorr_summary["read_points"] == 3
+    assert uncorr_summary["handled_points"] == 1
+    assert uncorr_summary["faulted_points"] == 1
+    assert uncorr_summary["stalled_points"] == 1
+    assert len(uncorr_summary["observations"]) == 3
 
