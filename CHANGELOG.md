@@ -100,6 +100,11 @@ The format follows [common-changelog](https://common-changelog.org/).
   load, `run_runtime_fault_sweep.py` stops with a clear error naming
   `memory.erase_fill` and both values if the padding byte differs from the
   live backend's `EraseFill`.
+- `_warn_fault_backend_compat` in `scripts/profile_loader.py` now matches
+  platform heuristics against the platform filename (`Path(platform).name`)
+  rather than the full path string, preventing spurious MRAM
+  backend-compatibility warnings when a non-MRAM platform path passes through a
+  directory whose name contains `mram`.
 - `scripts/report_security_status.py` no longer appends a spurious
   `summary.runtime_sweep calibration coverage is unavailable` inconclusive
   reason to verified intentional zero-point control-only campaigns

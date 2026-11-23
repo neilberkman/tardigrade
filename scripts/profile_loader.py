@@ -4271,7 +4271,7 @@ def _warn_fault_backend_compat(
     if fs.metadata_fault:
         all_types.update(fs.metadata_fault.fault_types)
 
-    platform_lower = platform.lower()
+    platform_lower = Path(platform).name.lower()
     backend_lower = flash_backend.lower() if flash_backend else ""
 
     # read_bit_flip: supported on NVMemory (slow-path) and MRAMMemory --

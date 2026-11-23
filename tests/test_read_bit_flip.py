@@ -615,6 +615,100 @@ class BackendCompatWarningTest(unittest.TestCase):
         read_warnings = [x for x in w if "read_bit_flip" in str(x.message)]
         self.assertEqual(read_warnings, [])
 
+    # -- Platform-name matching ignores directory segments --
+
+    def test_mram_directory_in_platform_path_does_not_trigger_erase_warning(
+        self,
+    ) -> None:
+        import warnings
+
+        with tempfile.TemporaryDirectory() as td:
+            mram_dir = Path(td) / "mram-experiments" / "platforms"
+            mram_dir.mkdir(parents=True)
+            non_mram_platform = mram_dir / "cortex_m4_flash_fast.repl"
+            non_mram_platform.write_text("", encoding="utf-8")
+
+            other_dir = Path(td) / "plain-checkout" / "platforms"
+            other_dir.mkdir(parents=True)
+            mram_platform = other_dir / "cortex_m0_mram.repl"
+            mram_platform.write_text("", encoding="utf-8")
+
+            profile_template = textwrap.dedent(
+                """\
+                schema_version: 1
+                name: {name}
+                platform: {platform}
+                {backend_line}
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: {{ start: 0x20000000, end: 0x20020000 }}
+                  write_granularity: 4
+                  slots:
+                    exec: {{ base: 0x10000000, size: 0x1000 }}
+                    staging: {{ base: 0x10001000, size: 0x1000 }}
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  fault_types: [interrupted_erase, multi_sector_atomicity]
+                """
+            )
+
+            for name, backend_line in (
+                ("non_mram_no_backend", ""),
+                ("non_mram_fast_backend", "flash_backend: faultFlash"),
+            ):
+                profile_path = Path(td) / f"{name}.yaml"
+                profile_path.write_text(
+                    profile_template.format(
+                        name=name,
+                        platform=non_mram_platform,
+                        backend_line=backend_line,
+                    ),
+                    encoding="utf-8",
+                )
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    load_profile(profile_path)
+                erase_warnings = [
+                    x for x in caught if "appears to be MRAM" in str(x.message)
+                ]
+                self.assertEqual(erase_warnings, [])
+
+            mram_profile_path = Path(td) / "mram_profile.yaml"
+            mram_profile_path.write_text(
+                profile_template.format(
+                    name="mram_profile",
+                    platform=mram_platform,
+                    backend_line="",
+                ),
+                encoding="utf-8",
+            )
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                load_profile(mram_profile_path)
+            erase_warnings = [
+                x for x in caught if "appears to be MRAM" in str(x.message)
+            ]
+            self.assertEqual(len(erase_warnings), 1)
+
+    def test_mram_directory_does_not_suppress_read_bit_flip_warning(self) -> None:
+        fs = self._make_fs(["read_bit_flip"])
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _warn_fault_backend_compat(
+                fs,
+                "/tmp/mram-experiments/platforms/cortex_m4_flash_fast.repl",
+                None,
+            )
+        read_warnings = [x for x in caught if "read_bit_flip" in str(x.message)]
+        self.assertEqual(len(read_warnings), 1)
+
 
 class ReadFaultPlanWithoutCalibrationTest(unittest.TestCase):
     """Execute-only read faults can derive points without write calibration."""
