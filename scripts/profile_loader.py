@@ -101,7 +101,15 @@ MAX_MULTI_FAULTS_PER_RUN = 64
 MAX_BOOT_CYCLES = 1_000
 
 VALID_MRAM_TORN_WORD_MODES: FrozenSet[str] = frozenset(
-    {"half", "half_retain", "untouched", "erased", "programmed"}
+    {
+        "half",
+        "half_retain",
+        "untouched",
+        "erased",
+        "programmed",
+        "uncorrectable",
+        "corrupted",
+    }
 )
 
 
@@ -165,9 +173,12 @@ def _validate_mram_torn_word_backend(
 ) -> None:
     if fs is None:
         return
+    torn_word_mode = getattr(fs, "mram_torn_word", "half")
+    torn_word_seed = int(getattr(fs, "mram_torn_word_seed", 0) or 0)
     if (
         not getattr(fs, "mram_torn_word_explicit", False)
-        and getattr(fs, "mram_torn_word", "half") == "half"
+        and torn_word_mode == "half"
+        and torn_word_seed == 0
     ):
         return
     if not _is_mram_backend(
@@ -179,6 +190,22 @@ def _validate_mram_torn_word_backend(
                 flash_backend or "", platform or ""
             )
         )
+    if torn_word_mode == "uncorrectable":
+        eval_mode = str(getattr(fs, "evaluation_mode", None) or "").strip().lower()
+        if eval_mode == "state":
+            raise ProfileError(
+                "fault_sweep.mram_torn_word 'uncorrectable' requires "
+                "evaluation_mode 'execute' (state mode does not execute the "
+                "CPU and cannot model a bus error on read)"
+            )
+        durability = (
+            str(getattr(fs, "durability_model", None) or "direct").strip().lower()
+        )
+        if durability == "writeback":
+            raise ProfileError(
+                "fault_sweep.mram_torn_word 'uncorrectable' is not supported "
+                "with durability_model 'writeback'"
+            )
 
 
 _MAX_INHERITANCE_DEPTH = 10
@@ -1571,6 +1598,7 @@ class FaultSweepConfig:
         "rc_injection_config",
         "mram_torn_word",
         "mram_torn_word_explicit",
+        "mram_torn_word_seed",
     )
 
     def __init__(
@@ -1624,6 +1652,7 @@ class FaultSweepConfig:
         phase2_wall_timeout_s: Optional[float] = 30.0,
         mram_torn_word: str = "half",
         mram_torn_word_explicit: bool = False,
+        mram_torn_word_seed: int = 0,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -1801,6 +1830,19 @@ class FaultSweepConfig:
         self.mram_torn_word_explicit = bool(mram_torn_word_explicit) or (
             mram_torn_word != "half"
         )
+        if isinstance(mram_torn_word_seed, bool):
+            raise ProfileError("fault_sweep.mram_torn_word_seed must be an integer")
+        try:
+            parsed_seed = int(mram_torn_word_seed)
+        except (TypeError, ValueError) as exc:
+            raise ProfileError(
+                "fault_sweep.mram_torn_word_seed must be an integer"
+            ) from exc
+        if parsed_seed < 0 or parsed_seed > 0xFFFFFFFF:
+            raise ProfileError(
+                "fault_sweep.mram_torn_word_seed must be between 0 and 0xFFFFFFFF"
+            )
+        self.mram_torn_word_seed = parsed_seed
 
 
 class StateFuzzerConfig:
@@ -3098,6 +3140,7 @@ class ProfileConfig:
             "TRACKING_START_ADDRESS:0x{:08X}".format(fs.tracking_start_address),
             "MRAM_TORN_WORD:{}".format(fs.mram_torn_word),
             "IMAGE_PAD_BYTE:0x{:02X}".format(self.image_pad_byte(repo_root)),
+            "MRAM_TORN_WORD_SEED:{}".format(fs.mram_torn_word_seed),
             "HEURISTIC_TRACE_REQUIRED:{}".format(
                 str(
                     fs.sweep_strategy == "heuristic"
@@ -4689,6 +4732,7 @@ def _parse_fault_sweep(
         ),
         mram_torn_word=raw.get("mram_torn_word", "half"),
         mram_torn_word_explicit="mram_torn_word" in raw,
+        mram_torn_word_seed=raw.get("mram_torn_word_seed", 0),
     )
     fs_cfg._raw_boot_cycle_hook = raw_boot_cycle_hook
     fs_cfg._resolved_boot_cycle_hook = resolved_boot_cycle_hook
@@ -7575,6 +7619,7 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
         "durability_model", "writeback",
         "rc_injection_config",
         "mram_torn_word",
+        "mram_torn_word_seed",
     }
 )
 

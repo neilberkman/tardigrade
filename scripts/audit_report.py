@@ -282,6 +282,8 @@ def categorize_failure(
                 "intended_bytes",
                 "pre_program_bytes",
                 "post_fault_bytes",
+                "word_marked_uncorrectable",
+                "uncorrectable_word_address",
                 "exact",
                 "capability_error",
             )
@@ -297,6 +299,8 @@ def categorize_failure(
         payload["fault_snapshot_file"] = result.get("fault_snapshot_file")
     signals = result.get("signals") or {}
     if isinstance(signals, dict):
+        if signals.get("uncorrectable_read") is not None:
+            payload["uncorrectable_read"] = signals.get("uncorrectable_read")
         if signals.get("matched_image") is not None:
             payload["matched_image"] = signals.get("matched_image")
         if signals.get("unmet_memory_checks"):
@@ -861,10 +865,18 @@ def summarize_runtime_sweep(
         if isinstance(evidence, dict):
             item["exact"] = evidence.get("exact") is True
             item["program_width"] = evidence.get("program_width")
+            if evidence.get("word_marked_uncorrectable") is True:
+                item["word_marked_uncorrectable"] = True
+            if evidence.get("uncorrectable_word_address"):
+                item["uncorrectable_word_address"] = evidence.get(
+                    "uncorrectable_word_address"
+                )
             if evidence.get("capability_error"):
                 item["capability_error"] = evidence.get("capability_error")
         if isinstance(snapshot, dict):
             item["snapshot_sha256"] = snapshot.get("sha256")
+            if snapshot.get("uncorrectable_words"):
+                item["uncorrectable_words"] = list(snapshot.get("uncorrectable_words"))
             closest = snapshot.get("closest_declared_image")
             if isinstance(closest, dict):
                 item["closest_declared_image"] = closest.get("name")
@@ -873,6 +885,64 @@ def summarize_runtime_sweep(
         fault_evidence.append(item)
     if fault_evidence:
         summary["fault_evidence"] = fault_evidence
+
+    uncorr_marked_points = 0
+    uncorr_read_points = 0
+    uncorr_handled_points = 0
+    uncorr_faulted_points = 0
+    uncorr_stalled_points = 0
+    uncorr_other_failed_points = 0
+    uncorr_observations: List[Dict[str, Any]] = []
+    for result in injected:
+        signals = result.get("signals")
+        if not isinstance(signals, dict):
+            signals = {}
+        evidence = result.get("mram_fault_evidence")
+        if not isinstance(evidence, dict):
+            evidence = {}
+        marked_at_fault = bool(
+            evidence.get("word_marked_uncorrectable")
+            or signals.get("uncorrectable_words_at_fault")
+        )
+        if marked_at_fault:
+            uncorr_marked_points += 1
+        uncorr_read = signals.get("uncorrectable_read")
+        if isinstance(uncorr_read, dict) and uncorr_read.get("read_observed"):
+            uncorr_read_points += 1
+            disp = str(uncorr_read.get("outcome") or "").strip().lower()
+            if disp == "recovered":
+                uncorr_handled_points += 1
+            elif disp == "faulted":
+                uncorr_faulted_points += 1
+            elif disp == "stalled":
+                uncorr_stalled_points += 1
+            else:
+                uncorr_other_failed_points += 1
+            effective_outcome, _ = _effective_boot_result(result)
+            obs_item: Dict[str, Any] = {
+                "fault_at": result.get("fault_at"),
+                "word_address": uncorr_read.get("word_address"),
+                "word_addresses": list(uncorr_read.get("word_addresses") or []),
+                "read_count": int(uncorr_read.get("read_count") or 0),
+                "outcome": disp,
+                "handled": bool(uncorr_read.get("handled")),
+                "boot_outcome": effective_outcome,
+            }
+            if uncorr_read.get("cleared_by_recovery") is not None:
+                obs_item["cleared_by_recovery"] = bool(
+                    uncorr_read.get("cleared_by_recovery")
+                )
+            uncorr_observations.append(obs_item)
+    if uncorr_marked_points > 0 or uncorr_read_points > 0:
+        summary["mram_uncorrectable_reads"] = {
+            "marked_points": uncorr_marked_points,
+            "read_points": uncorr_read_points,
+            "handled_points": uncorr_handled_points,
+            "faulted_points": uncorr_faulted_points,
+            "stalled_points": uncorr_stalled_points,
+            "other_failed_points": uncorr_other_failed_points,
+            "observations": uncorr_observations,
+        }
     if rc_telemetry:
         first_rc = rc_telemetry[0]
         summary["rc_injection"] = {

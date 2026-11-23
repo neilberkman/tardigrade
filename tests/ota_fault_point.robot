@@ -61,6 +61,7 @@ ${BOOT_CYCLES}                 1
 ${VTOR_SETTLE_ITERS}           0
 ${TRACKING_START_ADDRESS}      0
 ${MRAM_TORN_WORD}              half
+${MRAM_TORN_WORD_SEED}         0
 ${HEURISTIC_TRACE_REQUIRED}    false
 ${CALIBRATION_TRACE_REQUIRED}  false
 ${CALIBRATION_STOP_ADDRESS}    ${EMPTY}
@@ -248,6 +249,7 @@ Run Runtime Fault Point
     Execute Command    $vtor_settle_iters="${VTOR_SETTLE_ITERS}"
     Execute Command    $tracking_start_address="${TRACKING_START_ADDRESS}"
     Execute Command    $mram_torn_word="${MRAM_TORN_WORD}"
+    Execute Command    $mram_torn_word_seed="${MRAM_TORN_WORD_SEED}"
     Execute Command    $calibration_stop_address="${CALIBRATION_STOP_ADDRESS}"
     Execute Command    $calibration_stop_on_success="${CALIBRATION_STOP_ON_SUCCESS}"
     Execute Command    $success_terminal_after_reset="${SUCCESS_TERMINAL_AFTER_RESET}"

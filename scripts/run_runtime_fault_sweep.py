@@ -530,36 +530,44 @@ if mram_torn_word not in (
     'untouched',
     'erased',
     'programmed',
+    'uncorrectable',
+    'corrupted',
 ):
     raise Exception(
-        'mram_torn_word must be half, half_retain, untouched, erased, or programmed, got {}'.format(
+        'mram_torn_word must be half, half_retain, untouched, erased, programmed, uncorrectable, or corrupted, got {}'.format(
             mram_torn_word
         )
     )
+mram_torn_word_seed = get_optional_int_var('mram_torn_word_seed', 0) & 0xFFFFFFFF
 
 def _apply_mram_torn_word_mode():
-    """Set the torn-word mode on every backend object that exposes it.
+    """Set the torn-word mode (and optional seed) on every backend object that exposes it.
 
     Returns True when at least one object took the mode.
     """
     applied = False
+    seed_val = int(globals().get('mram_torn_word_seed', 0) or 0) & 0xFFFFFFFF
     data = backend.get('data')
     if data is not None and hasattr(data, 'MramTornWordMode'):
         data.MramTornWordMode = mram_torn_word
         applied = True
+    if data is not None and hasattr(data, 'MramTornWordSeed'):
+        data.MramTornWordSeed = seed_val
     nvm = getattr(data, 'Nvm', None) if data is not None else None
     if nvm is not None and hasattr(nvm, 'MramTornWordMode'):
         nvm.MramTornWordMode = mram_torn_word
         applied = True
+    if nvm is not None and hasattr(nvm, 'MramTornWordSeed'):
+        nvm.MramTornWordSeed = seed_val
     return applied
 
 def _require_mram_torn_word_support():
     """Refuse a live MRAM power-loss fault whose torn-word mode the peripheral ignores.
 
-    Trace replay computes the torn word itself, so only live injection
-    depends on the peripheral honoring the mode.  A peripheral without a
-    MramTornWordMode property keeps its own behavior, which would run a
-    different fault than the profile declares.
+    Trace replay computes the torn word itself for non-faulting modes, while
+    live injection and ``uncorrectable`` mode depend on the peripheral honoring
+    the mode.  A peripheral without a MramTornWordMode property keeps its own
+    behavior, which would run a different fault than the profile declares.
     """
     if mram_torn_word == 'half' or backend.get('kind') != 'mram':
         return
@@ -570,6 +578,215 @@ def _require_mram_torn_word_support():
                 mram_torn_word, backend.get('backend_sysbus_name')
             )
         )
+    if mram_torn_word == 'uncorrectable':
+        data = backend.get('data')
+        nvm = getattr(data, 'Nvm', None) if data is not None else None
+        target = (
+            data
+            if data is not None and hasattr(data, 'MarkWordUncorrectable')
+            else (nvm if nvm is not None and hasattr(nvm, 'MarkWordUncorrectable') else None)
+        )
+        required = (
+            'MarkWordUncorrectable',
+            'ClearUncorrectableWords',
+            'ClearUncorrectableReadLog',
+            'UncorrectableWordsToString',
+            'UncorrectableReadsToString',
+            'UncorrectableReadCount',
+        )
+        if target is None or any(not hasattr(target, attr) for attr in required):
+            raise Exception(
+                "fault_sweep.mram_torn_word 'uncorrectable' requires an MRAM peripheral "
+                'with uncorrectable word tracking and read-fault support; {} lacks it'.format(
+                    backend.get('backend_sysbus_name')
+                )
+            )
+
+def _mram_uncorrectable_target():
+    data = backend.get('data')
+    if data is not None and hasattr(data, 'MarkWordUncorrectable'):
+        return data
+    nvm = getattr(data, 'Nvm', None) if data is not None else None
+    if nvm is not None and hasattr(nvm, 'MarkWordUncorrectable'):
+        return nvm
+    return None
+
+def _require_mram_uncorrectable_support():
+    if mram_torn_word != 'uncorrectable':
+        return
+    target = _mram_uncorrectable_target()
+    required = (
+        'MarkWordUncorrectable',
+        'ClearUncorrectableWords',
+        'ClearUncorrectableReadLog',
+        'UncorrectableWordsToString',
+        'UncorrectableReadsToString',
+        'UncorrectableReadCount',
+    )
+    if target is None or any(not hasattr(target, attr) for attr in required):
+        raise Exception(
+            "fault_sweep.mram_torn_word 'uncorrectable' requires an MRAM peripheral "
+            'with uncorrectable word tracking and read-fault support; {} lacks it'.format(
+                backend.get('backend_sysbus_name')
+            )
+        )
+
+def _clear_mram_uncorrectable_words():
+    target = _mram_uncorrectable_target()
+    if target is not None and hasattr(target, 'ClearUncorrectableWords'):
+        target.ClearUncorrectableWords()
+
+def _clear_mram_uncorrectable_read_log():
+    target = _mram_uncorrectable_target()
+    if target is not None and hasattr(target, 'ClearUncorrectableReadLog'):
+        target.ClearUncorrectableReadLog()
+
+def _parse_uncorrectable_words_table(raw_text, bus_base=0):
+    entries = []
+    if not raw_text:
+        return entries
+    for raw_line in str(raw_text).splitlines():
+        line = raw_line.strip()
+        if not line or ':' not in line:
+            continue
+        parts = line.split(':', 1)
+        try:
+            offset = int(parts[0], 0)
+            addr_val = int(parts[1], 0)
+            if addr_val == offset and bus_base:
+                addr_val = int(bus_base) + offset
+            entries.append({
+                'offset': offset,
+                'address': fmt_u32(addr_val),
+                'address_int': addr_val,
+            })
+        except Exception:
+            continue
+    return entries
+
+def _parse_uncorrectable_reads_table(raw_text, bus_base=0):
+    entries = []
+    if not raw_text:
+        return entries
+    for raw_line in str(raw_text).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(':')
+        if len(parts) < 6:
+            continue
+        try:
+            word_offset = int(parts[1], 0)
+            word_addr = int(parts[2], 0)
+            access_addr = int(parts[3], 0)
+            width = int(parts[4], 0)
+            pc = int(parts[5], 0)
+            if word_addr == word_offset and bus_base:
+                word_addr = int(bus_base) + word_offset
+            if access_addr < int(bus_base) and bus_base:
+                access_addr = int(bus_base) + access_addr
+            entries.append({
+                'index': int(parts[0], 0),
+                'word_offset': word_offset,
+                'word_address': fmt_u32(word_addr),
+                'access_address': fmt_u32(access_addr),
+                'width': width,
+                'pc': fmt_u32(pc),
+            })
+        except Exception:
+            continue
+    return entries
+
+def _snapshot_mram_uncorrectable_offsets():
+    target = _mram_uncorrectable_target()
+    if target is None or not hasattr(target, 'UncorrectableWordsToString'):
+        return []
+    bus_base = int(backend.get('bus_base') or 0)
+    return [
+        entry['offset']
+        for entry in _parse_uncorrectable_words_table(
+            target.UncorrectableWordsToString(), bus_base=bus_base
+        )
+    ]
+
+def _snapshot_mram_uncorrectable_addresses():
+    target = _mram_uncorrectable_target()
+    if target is None or not hasattr(target, 'UncorrectableWordsToString'):
+        return []
+    bus_base = int(backend.get('bus_base') or 0)
+    return [
+        entry['address']
+        for entry in _parse_uncorrectable_words_table(
+            target.UncorrectableWordsToString(), bus_base=bus_base
+        )
+    ]
+
+def _snapshot_mram_fault_uncorrectable_entries():
+    target = _mram_uncorrectable_target()
+    if target is None:
+        return []
+    bus_base = int(backend.get('bus_base') or 0)
+    if hasattr(target, 'FaultUncorrectableWordsToString'):
+        entries = _parse_uncorrectable_words_table(
+            target.FaultUncorrectableWordsToString(), bus_base=bus_base
+        )
+        if entries:
+            return entries
+    if hasattr(target, 'UncorrectableWordsToString'):
+        return _parse_uncorrectable_words_table(
+            target.UncorrectableWordsToString(), bus_base=bus_base
+        )
+    return []
+
+def _snapshot_mram_fault_uncorrectable_offsets():
+    return [entry['offset'] for entry in _snapshot_mram_fault_uncorrectable_entries()]
+
+def _snapshot_mram_fault_uncorrectable_addresses():
+    return [entry['address'] for entry in _snapshot_mram_fault_uncorrectable_entries()]
+
+def _restore_mram_uncorrectable_offsets(offsets):
+    if not offsets:
+        return
+    target = _mram_uncorrectable_target()
+    if target is None:
+        return
+    if hasattr(target, 'ClearUncorrectableWords'):
+        target.ClearUncorrectableWords()
+    for off in offsets:
+        target.MarkWordUncorrectable(int(off))
+
+def _mram_address_is_uncorrectable(bus_address):
+    target = _mram_uncorrectable_target()
+    if target is None or not hasattr(target, 'UncorrectableWordsToString'):
+        return None
+    bus_base = int(backend.get('bus_base') or 0)
+    word_size = int(getattr(target, 'WordSize', getattr(target, 'ProgramUnitSize', 8)) or 8)
+    addr_int = int(bus_address)
+    for entry in _parse_uncorrectable_words_table(
+        target.UncorrectableWordsToString(), bus_base=bus_base
+    ):
+        w_start = entry['address_int']
+        if w_start <= addr_int < w_start + word_size:
+            return entry['address']
+    return None
+
+def _mram_uncorrectable_words_in_range(range_start, range_end):
+    target = _mram_uncorrectable_target()
+    if target is None or not hasattr(target, 'UncorrectableWordsToString'):
+        return []
+    bus_base = int(backend.get('bus_base') or 0)
+    word_size = int(getattr(target, 'WordSize', getattr(target, 'ProgramUnitSize', 8)) or 8)
+    lo = int(range_start)
+    hi = int(range_end)
+    hits = []
+    for entry in _parse_uncorrectable_words_table(
+        target.UncorrectableWordsToString(), bus_base=bus_base
+    ):
+        w_start = entry['address_int']
+        w_end = w_start + word_size
+        if w_end > lo and w_start < hi:
+            hits.append(entry['address'])
+    return hits
 
 def _set_preserve_counters_across_reset(enabled):
     flag = bool(enabled)
@@ -4362,6 +4579,7 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
     if wall_timeout is None:
         wall_timeout = phase2_wall_timeout_s
     cpu_ref = monitor.Machine['sysbus.cpu']
+    marked_offsets = _snapshot_mram_uncorrectable_offsets() if backend.get('kind') == 'mram' else []
     reset_nvmc_for_recovery()
     arm_vtor_watchpoint()
     status = run_until_done(
@@ -4385,6 +4603,8 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
         effective_criteria=effective_criteria,
         p2_status=status,
     )
+    if marked_offsets:
+        _attach_uncorrectable_read_signals(signals, boot_outcome, marked_offsets=marked_offsets)
     signals['followup_cycle'] = int(cycle_index)
     signals['phase_followup_stop_reason'] = status.get('reason')
     signals['phase_followup_emulated_s'] = status.get('emulated_s')
@@ -4419,11 +4639,14 @@ def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injec
 
     for cycle_index in range(int(start_cycle_index), int(boot_cycles)):
         run_boot_cycle_hook(cycle_index, cycle_records)
+        followup_uncorr = _snapshot_mram_uncorrectable_offsets() if b['kind'] == 'mram' else []
         if b['kind'] == 'mram':
             current_flash = b['data'].ReadBytes(0, flash_size)
         else:
             current_flash = b['data'].Flash.ReadBytes(0, flash_size)
         restore_flash_and_boot(current_flash)
+        if followup_uncorr:
+            _restore_mram_uncorrectable_offsets(followup_uncorr)
         if _hash_bypass_active:
             apply_hash_bypass()
         cycle_records.append(_boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=effective_criteria, wall_timeout=cycle_wall_timeout))
@@ -5964,6 +6187,9 @@ def collect_mram_fault_evidence(selected_write_index, expected_backend_index):
             'write_trace': trace,
             'exact': True,
         })
+        if bool(getattr(data, 'LastFaultMarkedUncorrectable', False)):
+            evidence['word_marked_uncorrectable'] = True
+            evidence['uncorrectable_word_address'] = fmt_u32(program_address)
         return evidence, snapshot, raw_snapshot
     except Exception as exc:
         evidence['capability_error'] = 'MRAM exact fault evidence rejected: {}'.format(exc)
@@ -6280,6 +6506,9 @@ def restore_hw_init():
 def reset_nvmc_for_sweep():
     # Reset NVM counters and prepare for fault-injected run.
     _configure_tracking_start_address()
+    _clear_uncorr_fn = globals().get('_clear_mram_uncorrectable_words')
+    if _clear_uncorr_fn is not None:
+        _clear_uncorr_fn()
     b = backend
     if b['kind'] == 'mram':
         b['data'].TotalWordWrites = 0
@@ -6331,6 +6560,9 @@ def reset_nvmc_for_sweep():
 def reset_nvmc_for_recovery():
     # Reset NVM for recovery boot: no write counting needed, fast mode.
     _configure_tracking_start_address()
+    _clear_read_log_fn = globals().get('_clear_mram_uncorrectable_read_log')
+    if _clear_read_log_fn is not None:
+        _clear_read_log_fn()
     b = backend
     if b['kind'] == 'mram':
         b['data'].TotalWordWrites = 0
@@ -6428,6 +6660,7 @@ def prepare_clean_phase1_state():
     monitor.Parse('machine Pause')
     restore_hw_init()
     needs_pre_boot = restore_initial_flash_cache()
+    _clear_mram_uncorrectable_words()
     if needs_pre_boot:
         apply_pre_boot_state()
     restore_initial_otp_cache()
@@ -6550,6 +6783,7 @@ def reload_images_from_map(images_map):
     b = backend
     if b['kind'] == 'mram':
         # MRAM erased state: fill with EraseFill byte (typically 0x00).
+        _clear_mram_uncorrectable_words()
         mram_size = int(b['data'].Size)
         import System
         erase_fill = int(b['data'].EraseFill)
@@ -7145,7 +7379,7 @@ def _compact_differing_byte_ranges(actual, expected, base_address,
     }
 
 
-def analyze_fault_snapshot(snapshot_bytes, boot_slot=None):
+def analyze_fault_snapshot(snapshot_bytes, boot_slot=None, uncorrectable_words=None):
     """Describe an immediate persistent-memory snapshot using declared images."""
     import hashlib
     snapshot = bytearray(snapshot_bytes or b'')
@@ -7154,6 +7388,8 @@ def analyze_fault_snapshot(snapshot_bytes, boot_slot=None):
         'sha256': hashlib.sha256(snapshot).hexdigest(),
         'size': len(snapshot),
     }
+    if uncorrectable_words:
+        analysis['uncorrectable_words'] = list(uncorrectable_words)
     if len(snapshot) != int(flash_size):
         analysis['analysis_error'] = (
             'snapshot size {} does not match backend size {}'.format(
@@ -7307,6 +7543,13 @@ def evaluate_structured_success_checks():
                 'op': op,
                 'ok': bool(ok),
             })
+            _addr_uncorr_fn = globals().get('_mram_address_is_uncorrectable')
+            marked_word_addr = (
+                _addr_uncorr_fn(address) if _addr_uncorr_fn is not None else None
+            )
+            if marked_word_addr is not None:
+                detail['uncorrectable'] = True
+                detail['uncorrectable_word_address'] = marked_word_addr
         except Exception as exc:
             detail['error'] = str(exc)
             ok = False
@@ -7451,6 +7694,17 @@ def collect_recovery_execution_evidence(actual_vtor, pc_value, boot_slot, p2_sta
     evidence['cfsr'] = fmt_u32(cfsr)
     evidence['hfsr'] = fmt_u32(hfsr)
 
+    active_exception = 0
+    try:
+        _cpu_obs = monitor.Machine['sysbus.cpu']
+        _xpsr = as_int(getattr(_cpu_obs, 'XProgramStatusRegister', 0)) & 0xFFFFFFFF
+        active_exception = _xpsr & 0x1FF
+        evidence['ipsr'] = active_exception
+    except Exception:
+        active_exception = 0
+    fault_exception_active = active_exception in (3, 4, 5, 6)
+    evidence['fault_exception_active'] = fault_exception_active
+
     vector_base = None
     if boot_slot in slot_ranges:
         _vector_lo, _vector_hi = slot_ranges[boot_slot]
@@ -7464,6 +7718,7 @@ def collect_recovery_execution_evidence(actual_vtor, pc_value, boot_slot, p2_sta
             initial_sp = as_int(bus.ReadDoubleWord(vector_base)) & 0xFFFFFFFF
             reset_vector = as_int(bus.ReadDoubleWord(vector_base + 4)) & 0xFFFFFFFF
             hardfault_vector = as_int(bus.ReadDoubleWord(vector_base + 12)) & 0xFFFFFFFF
+            busfault_vector = as_int(bus.ReadDoubleWord(vector_base + 20)) & 0xFFFFFFFF
             reset_pc = reset_vector & ~1
             reset_vector_valid = bool(
                 sram_start <= initial_sp <= sram_end
@@ -7471,9 +7726,17 @@ def collect_recovery_execution_evidence(actual_vtor, pc_value, boot_slot, p2_sta
                 and any(lo <= reset_pc < hi for lo, hi in slot_ranges.values())
             )
             hardfault_handler_active = bool(
-                hardfault_vector != 0
-                and (hardfault_vector & 1) == 1
-                and (int(pc_value) & ~1) == (hardfault_vector & ~1)
+                (
+                    hardfault_vector != 0
+                    and (hardfault_vector & 1) == 1
+                    and (int(pc_value) & ~1) == (hardfault_vector & ~1)
+                )
+                or (
+                    busfault_vector != 0
+                    and (busfault_vector & 1) == 1
+                    and (int(pc_value) & ~1) == (busfault_vector & ~1)
+                )
+                or fault_exception_active
             )
             evidence.update({
                 'initial_sp': fmt_u32(initial_sp),
@@ -7484,10 +7747,13 @@ def collect_recovery_execution_evidence(actual_vtor, pc_value, boot_slot, p2_sta
             })
         except Exception as exc:
             evidence['vector_read_error'] = str(exc)
+    elif fault_exception_active:
+        evidence['hardfault_handler_active'] = True
     reason_lower = reason.lower()
     evidence['hardfault_observed'] = bool(
         cfsr != 0
         or hfsr != 0
+        or fault_exception_active
         or evidence.get('hardfault_handler_active')
         or 'hardfault' in reason_lower
         or 'hard_fault' in reason_lower
@@ -7499,6 +7765,110 @@ def collect_recovery_execution_evidence(actual_vtor, pc_value, boot_slot, p2_sta
         ))
     )
     return evidence
+
+
+def collect_uncorrectable_read_observation(
+    boot_outcome, execution_evidence=None, p2_status=None, marked_at_fault=None
+):
+    """Collect post-recovery telemetry when the target read a marked MRAM word."""
+    target = _mram_uncorrectable_target()
+    if target is None:
+        return None
+    bus_base = int(backend.get('bus_base') or 0)
+    try:
+        read_count = int(getattr(target, 'UncorrectableReadCount', 0) or 0)
+    except Exception:
+        read_count = 0
+    raw_reads = ''
+    if hasattr(target, 'UncorrectableReadsToString'):
+        try:
+            raw_reads = target.UncorrectableReadsToString()
+        except Exception:
+            raw_reads = ''
+    reads = _parse_uncorrectable_reads_table(raw_reads, bus_base=bus_base)
+    remaining_words = _snapshot_mram_uncorrectable_addresses()
+    marked_list = list(marked_at_fault or [])
+
+    if read_count <= 0 and not reads:
+        return None
+
+    word_addresses = []
+    for entry in reads:
+        waddr = entry.get('word_address')
+        if waddr and waddr not in word_addresses:
+            word_addresses.append(waddr)
+    if not word_addresses:
+        last_word = int(getattr(target, 'LastUncorrectableReadWordAddress', 0) or 0)
+        if last_word:
+            word_addresses.append(fmt_u32(last_word))
+        elif marked_list:
+            word_addresses.append(marked_list[0])
+
+    exec_ev = execution_evidence if isinstance(execution_evidence, dict) else {}
+    reason = str((p2_status or {}).get('reason', '') or '').lower()
+    outcome_norm = str(boot_outcome or '').strip().lower()
+    if outcome_norm == 'success':
+        disposition = 'recovered'
+    elif (
+        outcome_norm in ('hard_fault', 'bus_fault')
+        or bool(exec_ev.get('hardfault_observed'))
+        or bool(exec_ev.get('fault_exception_active'))
+    ):
+        disposition = 'faulted'
+    elif outcome_norm in ('no_boot', 'timeout') or any(
+        tok in reason for tok in ('stall', 'timeout', 'budget', 'no_progress', 'no_boot')
+    ):
+        disposition = 'stalled'
+    else:
+        disposition = 'failed'
+
+    cleared_by_recovery = bool(
+        word_addresses and all(addr not in remaining_words for addr in word_addresses)
+    )
+    obs = {
+        'read_observed': True,
+        'read_count': max(read_count, len(reads)),
+        'word_address': word_addresses[0] if word_addresses else None,
+        'word_addresses': word_addresses,
+        'reads': [
+            {
+                'word_address': e['word_address'],
+                'access_address': e['access_address'],
+                'width': e['width'],
+                'pc': e['pc'],
+            }
+            for e in reads[:16]
+        ],
+        'outcome': disposition,
+        'handled': disposition == 'recovered',
+        'remaining_marked_words': remaining_words,
+        'cleared_by_recovery': cleared_by_recovery,
+    }
+    if exec_ev.get('ipsr'):
+        obs['active_exception'] = int(exec_ev['ipsr'])
+    return obs
+
+
+def _attach_uncorrectable_read_signals(
+    signals, boot_outcome, p2_status=None, marked_at_fault=None
+):
+    if not isinstance(signals, dict):
+        return
+    marked_list = list(marked_at_fault or [])
+    remaining = _snapshot_mram_uncorrectable_addresses()
+    if marked_list:
+        signals['mram_torn_word_mode'] = mram_torn_word
+        signals['uncorrectable_words_at_fault'] = marked_list
+        signals['uncorrectable_words_remaining'] = remaining
+    exec_ev = signals.get('recovery_execution')
+    obs = collect_uncorrectable_read_observation(
+        boot_outcome,
+        execution_evidence=exec_ev,
+        p2_status=p2_status,
+        marked_at_fault=marked_list,
+    )
+    if obs is not None:
+        signals['uncorrectable_read'] = obs
 
 
 def recovery_failure_outcome(
@@ -7715,6 +8085,7 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     matched_image = None
     actual_marker_val = 0
     actual_hash = None
+    image_hash_uncorrectable_words = []
     if enforce_content_criteria:
         if eff_image_hash:
             enforce_hash = True
@@ -7723,6 +8094,10 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
             if enforce_hash:
                 hash_slot = eff_image_hash_slot if eff_image_hash_slot not in ('', 'any') else boot_slot
                 actual_hash = compute_slot_hash(hash_slot)
+                _range_uncorr_fn = globals().get('_mram_uncorrectable_words_in_range')
+                if _range_uncorr_fn is not None and hash_slot in slot_ranges:
+                    _hs_lo, _hs_hi = slot_ranges[hash_slot]
+                    image_hash_uncorrectable_words = _range_uncorr_fn(_hs_lo, _hs_hi)
                 matched_image = _match_configured_image_hash(actual_hash)
                 if matched_image == 'exec':
                     hash_result = 'exec_image'
@@ -7799,6 +8174,9 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
         signals['image_hash_match'] = hash_result
     if actual_hash is not None:
         signals['image_hash_actual'] = actual_hash
+    if image_hash_uncorrectable_words:
+        signals['image_hash_contains_uncorrectable'] = True
+        signals['image_hash_uncorrectable_words'] = list(image_hash_uncorrectable_words)
     if matched_image is not None:
         signals['matched_image'] = matched_image
     if allowed_image_hashes:
@@ -10349,7 +10727,8 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
                         extra_fields=None, metadata_delta_pre_snapshot=None,
                         fault_semantic_state=None,
                         persist_snapshot=False, cycle_wall_timeout=None,
-                        skip_followup_if_failed=False):
+                        skip_followup_if_failed=False,
+                        fault_uncorrectable_words=None):
     # Shared epilogue for all fault runners.
     #
     # Handles: classify_fault_result, run_followup_boot_cycles, semantic state
@@ -10454,7 +10833,9 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         result['function_return_probes'] = signals['function_return_probes']
     if fault_snapshot_bytes is not None:
         snapshot_analysis = analyze_fault_snapshot(
-            fault_snapshot_bytes, boot_slot=boot_slot
+            fault_snapshot_bytes,
+            boot_slot=boot_slot,
+            uncorrectable_words=fault_uncorrectable_words,
         )
         result['fault_snapshot'] = snapshot_analysis
         signals['fault_snapshot_sha256'] = snapshot_analysis.get('sha256')
@@ -10943,6 +11324,8 @@ def run_execute_fault(fault_at, fault_type='w'):
     saved_flash = None
     mram_fault_evidence = None
     mram_fault_snapshot_raw = None
+    fault_uncorrectable_offsets = []
+    fault_uncorrectable_addresses = []
     expected_backend_fault_index = None
     md_pre_snapshot = None
     fault_base = _base_fault_type_code(fault_type)
@@ -11054,6 +11437,9 @@ def run_execute_fault(fault_at, fault_type='w'):
         )
         if mram_fault_evidence.get('program_address'):
             fault_address = int(mram_fault_evidence['program_address'], 0)
+    if fault_injected and is_power_loss_fault:
+        fault_uncorrectable_offsets = _snapshot_mram_fault_uncorrectable_offsets()
+        fault_uncorrectable_addresses = _snapshot_mram_fault_uncorrectable_addresses()
     if is_erase_fault:
         phase1_ops = get_total_erases()
     elif is_command_fault:
@@ -11211,6 +11597,9 @@ def run_execute_fault(fault_at, fault_type='w'):
             if _hash_bypass_active:
                 apply_hash_bypass()
             reset_nvmc_for_recovery()
+            if fault_uncorrectable_offsets:
+                _restore_mram_uncorrectable_offsets(fault_uncorrectable_offsets)
+                _clear_mram_uncorrectable_read_log()
 
             log('fp={} phase2_step'.format(fault_at))
             arm_vtor_watchpoint()
@@ -11272,6 +11661,9 @@ def run_execute_fault(fault_at, fault_type='w'):
         if _hash_bypass_active:
             apply_hash_bypass()
         reset_nvmc_for_recovery()
+        if fault_uncorrectable_offsets:
+            _restore_mram_uncorrectable_offsets(fault_uncorrectable_offsets)
+            _clear_mram_uncorrectable_read_log()
 
         log('fp={} phase2_step (slow path)'.format(fault_at))
         arm_vtor_watchpoint()
@@ -11344,6 +11736,12 @@ def run_execute_fault(fault_at, fault_type='w'):
         vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria,
         p2_status=initial_observation_status,
     )
+    _attach_uncorrectable_read_signals(
+        signals,
+        boot_outcome,
+        p2_status=initial_observation_status,
+        marked_at_fault=fault_uncorrectable_addresses,
+    )
     signals['phase1_ms'] = phase1_ms
     signals['phase2_ms'] = phase2_ms
     signals['phase1_ops_total'] = phase1_ops
@@ -11390,6 +11788,7 @@ def run_execute_fault(fault_at, fault_type='w'):
             and fault_injected
             and fault_snapshot_bytes is not None
         ),
+        fault_uncorrectable_words=fault_uncorrectable_addresses,
     )
 
     if (
@@ -12547,8 +12946,42 @@ def _trace_replay_erase_region(image, offset, size, erase_fill):
         image[index] = fill
 
 
+def _corrupt_mram_torn_bytes(intended_bytes, write_index, offset, seed=0):
+    """Return intended bytes with 3-5 deterministic bits flipped (ECC miscorrection)."""
+    buf = bytearray(intended_bytes)
+    total_bits = len(buf) * 8
+    if total_bits <= 0:
+        return bytes(buf)
+    state = int(seed) & 0xFFFFFFFF
+    if state == 0:
+        state = 0x5A3C96A5
+    state ^= ((int(write_index) & 0xFFFFFFFF) * 2654435761) & 0xFFFFFFFF
+    state ^= ((int(offset) & 0xFFFFFFFF) * 2246822519) & 0xFFFFFFFF
+    state &= 0xFFFFFFFF
+    if state == 0:
+        state = 0x9E3779B9
+    state = (state * 1103515245 + 12345) & 0xFFFFFFFF
+    flip_count = min(total_bits, 3 + (state % 3))
+    flipped = [False] * total_bits
+    for _ in range(flip_count):
+        state = (state * 1103515245 + 12345) & 0xFFFFFFFF
+        bit_pos = state % total_bits
+        while flipped[bit_pos]:
+            bit_pos = (bit_pos + 1) % total_bits
+        flipped[bit_pos] = True
+        buf[bit_pos // 8] ^= (1 << (bit_pos % 8))
+    return bytes(buf)
+
+
 def _trace_replay_mram_torn_value(
-    value, width, erase_fill, mode='half', previous_value=None
+    value,
+    width,
+    erase_fill,
+    mode='half',
+    previous_value=None,
+    seed=0,
+    write_index=0,
+    offset=0,
 ):
     """Return the word persisted by NVMemory power loss mid-program."""
     width = int(width)
@@ -12561,20 +12994,33 @@ def _trace_replay_mram_torn_value(
         'untouched',
         'erased',
         'programmed',
+        'uncorrectable',
+        'corrupted',
     ):
         raise ValueError(
-            'MRAM torn replay mode must be half, half_retain, untouched, erased, or programmed'
+            'MRAM torn replay mode must be half, half_retain, untouched, erased, programmed, uncorrectable, or corrupted'
         )
     fill = int(erase_fill) & 0xFF
     mask = (1 << (8 * width)) - 1
     if normalized_mode == 'programmed':
         return int(value) & mask
+    if normalized_mode == 'corrupted':
+        raw = bytearray(width)
+        for byte_index in range(width):
+            raw[byte_index] = (int(value) >> (8 * byte_index)) & 0xFF
+        corrupted_bytes = _corrupt_mram_torn_bytes(
+            raw, write_index, offset, seed=seed
+        )
+        out = 0
+        for byte_index, bval in enumerate(bytearray(corrupted_bytes)):
+            out |= (int(bval) & 0xFF) << (8 * byte_index)
+        return out & mask
     if normalized_mode == 'erased':
         erased = 0
         for byte_index in range(width):
             erased |= fill << (8 * byte_index)
         return erased
-    if normalized_mode == 'untouched':
+    if normalized_mode in ('untouched', 'uncorrectable'):
         if previous_value is not None:
             return int(previous_value) & mask
         untouched = 0
@@ -13049,6 +13495,8 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     fault_snapshot_word = None
     mram_power_loss_torn = False
     mram_power_loss_width = 4
+    fault_uncorrectable_offsets = []
+    fault_uncorrectable_addresses = []
 
     if is_non_power_write_fault:
         faulted_flash, fault_injected, fault_address, writes_applied, fault_snapshot_word = \
@@ -13063,6 +13511,10 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         fault_snapshot_bytes = None
         actual_writes = max(0, int(fault_at)) if fault_injected else writes_applied
     elif writeback_active():
+        if mram_torn_word == 'uncorrectable':
+            raise Exception(
+                "fault_sweep.mram_torn_word 'uncorrectable' is not supported in writeback trace replay"
+            )
         # Writeback mode: only committed writes go to flash.
         writes_applied, fault_injected, fault_address, _wb_discarded = \
             writeback_apply_to_trace_snapshot(
@@ -13123,6 +13575,9 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
                         erase_fill,
                         mode=mram_torn_word,
                         previous_value=previous_value,
+                        seed=mram_torn_word_seed,
+                        write_index=write_idx,
+                        offset=flash_off,
                     )
                     b = System.Array.CreateInstance(System.Byte, width)
                     for byte_index in range(width):
@@ -13130,6 +13585,12 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
                             torn_value >> (8 * byte_index)
                         ) & 0xFF
                     _replay_storage_write_bytes(flash_off, b)
+                    if mram_torn_word == 'uncorrectable':
+                        _require_mram_uncorrectable_support()
+                        fault_uncorrectable_offsets = [int(flash_off)]
+                        fault_uncorrectable_addresses = [
+                            fmt_u32(int(flash_off) + int(flash_base_addr))
+                        ]
                     writes_applied += 1
                     mram_power_loss_torn = True
                     mram_power_loss_width = int(width)
@@ -13168,6 +13629,9 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 
     t_setup = _time.time()
     reset_nvmc_for_recovery()
+    if fault_uncorrectable_offsets:
+        _restore_mram_uncorrectable_offsets(fault_uncorrectable_offsets)
+        _clear_mram_uncorrectable_read_log()
     setup_ms = int((_time.time() - t_setup) * 1000)
 
     cpu_ref.IsHalted = False
@@ -13203,6 +13667,12 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
         vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria,
         p2_status=p2_status,
+    )
+    _attach_uncorrectable_read_signals(
+        signals,
+        boot_outcome,
+        p2_status=p2_status,
+        marked_at_fault=fault_uncorrectable_addresses,
     )
     signals['phase1_ms'] = phase1_ms
     signals['phase2_ms'] = phase2_ms
@@ -13243,6 +13713,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         saved_flash=faulted_flash, fault_snapshot_bytes=fault_snapshot_bytes,
         metadata_delta_pre_snapshot=md_pre_snapshot,
         fault_semantic_state=fault_semantic_state,
+        fault_uncorrectable_words=fault_uncorrectable_addresses,
     )
 
 # ---------------------------------------------------------------------------
