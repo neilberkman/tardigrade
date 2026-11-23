@@ -4232,6 +4232,8 @@ def merge_stop_status_signals(signals, prefix, status):
         signals[prefix + '_reset_observation'] = status.get(
             'reset_observation'
         )
+    if status.get('fault_timing') is not None:
+        signals[prefix + '_fault_timing'] = status.get('fault_timing')
     if status.get('success_terminal') is not None:
         signals[prefix + '_success_terminal'] = status.get('success_terminal')
     if status.get('reset_gated_terminal') is not None:
@@ -4591,6 +4593,9 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
         stop_on_fault=False,
         time_slice=phase2_time_slice,
         reset_already_observed=True,
+        effective_criteria=effective_criteria,
+        enforce_content_criteria=False,
+        fault_injected=fault_injected,
     )
     disarm_vtor_watchpoint()
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
@@ -7710,6 +7715,24 @@ def collect_recovery_execution_evidence(actual_vtor, pc_value, boot_slot, p2_sta
     fault_exception_active = active_exception in (3, 4, 5, 6)
     evidence['fault_exception_active'] = fault_exception_active
 
+    fault_timing = (
+        p2_status.get('fault_timing')
+        if isinstance(p2_status, dict)
+        and isinstance(p2_status.get('fault_timing'), dict)
+        else None
+    )
+    checks_held_before_fault = bool(
+        fault_timing is not None
+        and fault_timing.get('checks_held_before_fault') is True
+        and not fault_timing.get('uncorrectable_read_triggered_fault')
+    )
+    if fault_timing is not None:
+        evidence['fault_timing'] = dict(fault_timing)
+        evidence['checks_held_before_fault'] = checks_held_before_fault
+    fault_exception_fatal = bool(
+        fault_exception_active and not checks_held_before_fault
+    )
+
     vector_base = None
     if boot_slot in slot_ranges:
         _vector_lo, _vector_hi = slot_ranges[boot_slot]
@@ -7737,11 +7760,12 @@ def collect_recovery_execution_evidence(actual_vtor, pc_value, boot_slot, p2_sta
                     and (int(pc_value) & ~1) == (hardfault_vector & ~1)
                 )
                 or (
-                    busfault_vector != 0
+                    not checks_held_before_fault
+                    and busfault_vector != 0
                     and (busfault_vector & 1) == 1
                     and (int(pc_value) & ~1) == (busfault_vector & ~1)
                 )
-                or fault_exception_active
+                or fault_exception_fatal
             )
             evidence.update({
                 'initial_sp': fmt_u32(initial_sp),
@@ -7752,13 +7776,13 @@ def collect_recovery_execution_evidence(actual_vtor, pc_value, boot_slot, p2_sta
             })
         except Exception as exc:
             evidence['vector_read_error'] = str(exc)
-    elif fault_exception_active:
+    elif fault_exception_fatal:
         evidence['hardfault_handler_active'] = True
     reason_lower = reason.lower()
     evidence['hardfault_observed'] = bool(
         cfsr != 0
         or hfsr != 0
-        or fault_exception_active
+        or fault_exception_fatal
         or evidence.get('hardfault_handler_active')
         or 'hardfault' in reason_lower
         or 'hard_fault' in reason_lower
@@ -8375,6 +8399,16 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     execution_evidence = collect_recovery_execution_evidence(
         actual_vtor, pc_value, boot_slot, p2_status
     )
+    if (
+        execution_evidence
+        and execution_evidence.get('fault_exception_active')
+        and execution_evidence.get('checks_held_before_fault')
+        and not (execution_observed and expectations_met)
+    ):
+        execution_evidence['checks_held_before_fault'] = False
+        execution_evidence['checks_broken_after_fault'] = True
+        execution_evidence['hardfault_handler_active'] = True
+        execution_evidence['hardfault_observed'] = True
     if execution_evidence:
         signals['recovery_execution'] = execution_evidence
     primary_execution_failure = recovery_failure_outcome(
@@ -8742,16 +8776,19 @@ def run_state_fault(fault_at):
     return result
 
 
-def _calibration_success_stop_observation(cpu_ref):
+def _calibration_success_stop_observation(cpu_ref, fault_timing=None):
     if not calibration_mode or not calibration_stop_on_success:
         return None
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    poll_status = {'reason': 'calibration_success_poll'}
+    if fault_timing is not None:
+        poll_status['fault_timing'] = fault_timing
     outcome, boot_slot, signals = evaluate_boot_outcome(
         vtor_value,
         pc_value,
         fault_injected=False,
-        p2_status={'reason': 'calibration_success_poll'},
+        p2_status=poll_status,
     )
     if outcome != 'success':
         return None
@@ -8773,7 +8810,9 @@ def _calibration_success_stop_observation(cpu_ref):
     }
 
 
-def _reset_gated_success_stop_observation(cpu_ref, reset_observation):
+def _reset_gated_success_stop_observation(
+    cpu_ref, reset_observation, fault_timing=None
+):
     if (
         not success_terminal_after_reset
         or not reset_observation.get('observed')
@@ -8781,11 +8820,14 @@ def _reset_gated_success_stop_observation(cpu_ref, reset_observation):
         return None
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    poll_status = {'reason': 'success_terminal_poll'}
+    if fault_timing is not None:
+        poll_status['fault_timing'] = fault_timing
     outcome, boot_slot, signals = evaluate_boot_outcome(
         vtor_value,
         pc_value,
         fault_injected=False,
-        p2_status={'reason': 'success_terminal_poll'},
+        p2_status=poll_status,
     )
     # Success is the positive terminal. A fully observed, live boot with a
     # decisive content mismatch (wrong image hash, marker, rollback, or VTOR)
@@ -8813,10 +8855,46 @@ def _reset_gated_success_stop_observation(cpu_ref, reset_observation):
         'signals': signals,
     }
 
+
+_interrupt_begin_hook_cpus = []
+_active_interrupt_begin_observer = [None]
+
+
+def _dispatch_interrupt_begin(exc_idx):
+    observer = _active_interrupt_begin_observer[0]
+    if observer is None:
+        return
+    try:
+        observer(exc_idx)
+    except Exception:
+        pass
+
+
+def _ensure_interrupt_begin_hook(cpu_ref):
+    """Install a single persistent interrupt-begin dispatcher on cpu_ref."""
+    if cpu_ref is None or not hasattr(cpu_ref, 'AddHookAtInterruptBegin'):
+        return False
+    for existing in _interrupt_begin_hook_cpus:
+        if existing is cpu_ref or existing == cpu_ref:
+            return True
+    try:
+        try:
+            from System import Action as _NetAction, UInt64 as _NetUInt64
+            delegate = _NetAction[_NetUInt64](_dispatch_interrupt_begin)
+        except Exception:
+            delegate = _dispatch_interrupt_begin
+        cpu_ref.AddHookAtInterruptBegin(delegate)
+        _interrupt_begin_hook_cpus.append(cpu_ref)
+        return True
+    except Exception:
+        return False
+
+
 def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, label='',
                    expect_writes=True, stop_on_fault=True, op_trace=None, op_trace_limit=0,
                    zero_writes_is_brick=True, vtor_settle_iters=0,
-                   reset_already_observed=False):
+                   reset_already_observed=False, effective_criteria=None,
+                   enforce_content_criteria=True, fault_injected=False):
     # Run CPU in continuous mode until it settles or budget exhausted.
     #
     # Uses `emulation RunFor` which runs in continuous mode — much faster
@@ -8974,6 +9052,318 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         sticky_pc['value'] = 0
         sticky_pc['slot'] = None
         sticky_pc['captured'] = False
+        fault_timing_state['checks_first_held'] = None
+        fault_timing_state['fault_first_active'] = None
+        fault_timing_state['checks_held_before_fault'] = None
+        fault_timing_state['uncorrectable_read_triggered_fault'] = False
+
+    def _read_cpu_ipsr(c_ref):
+        try:
+            xpsr = as_int(getattr(c_ref, 'XProgramStatusRegister', 0)) & 0xFFFFFFFF
+            return xpsr & 0x1FF
+        except Exception:
+            return 0
+
+    def _read_cpu_pc_fast(c_ref):
+        try:
+            pc_attr = getattr(c_ref, 'PC', None)
+            if pc_attr is not None:
+                return as_int(pc_attr)
+        except Exception:
+            pass
+        return as_int(c_ref.GetRegisterUnsafe(15))
+
+    def _current_uncorrectable_read_count():
+        fn = globals().get('_mram_uncorrectable_target')
+        if fn is None:
+            return 0
+        try:
+            target = fn()
+            if target is None:
+                return 0
+            return int(getattr(target, 'UncorrectableReadCount', 0) or 0)
+        except Exception:
+            return 0
+
+    def _resolve_nvic(m_ref):
+        if m_ref is None:
+            return None
+        for nvic_name in ('sysbus.nvic', 'nvic'):
+            try:
+                return m_ref[nvic_name]
+            except Exception:
+                pass
+        return None
+
+    nvic_ref = _resolve_nvic(machine_ref)
+    fault_timing_state = {
+        'seq': 0,
+        'current_iter': 0,
+        'seen_uncorrectable_reads': _current_uncorrectable_read_count(),
+        'checks_first_held': None,
+        'fault_first_active': None,
+        'checks_held_before_fault': None,
+        'uncorrectable_read_triggered_fault': False,
+        'interrupt_hook_installed': False,
+        'evaluating': False,
+    }
+    timing_counters = {
+        'emulated_s': 0.0,
+        'instructions_executed': 0,
+        'instruction_previous': instruction_previous,
+    }
+
+    def _next_timing_seq():
+        fault_timing_state['seq'] += 1
+        return fault_timing_state['seq']
+
+    def _current_instructions_now():
+        try:
+            cur = as_int(cpu_ref.ExecutedInstructions)
+        except Exception:
+            return timing_counters['instructions_executed']
+        prev = timing_counters['instruction_previous']
+        acc = timing_counters['instructions_executed']
+        if cur >= prev:
+            return acc + (cur - prev)
+        return acc + cur
+
+    def _current_timing_emulated_s():
+        rel_v = _current_rel_virtual_s()
+        if rel_v is not None:
+            return rel_v
+        return round(timing_counters['emulated_s'], 6)
+
+    def _accepts_fault_timing_kwarg(fn):
+        code = getattr(fn, '__code__', None) or getattr(fn, 'func_code', None)
+        if code is None:
+            return False
+        return 'fault_timing' in getattr(code, 'co_varnames', ())
+
+    def _success_checks_hold_now(vtor_val, pc_val):
+        if terminal_after_reset and not reset_observation.get('observed'):
+            return False
+        if fault_timing_state['evaluating']:
+            return False
+        eval_boot_fn = globals().get('evaluate_boot_outcome')
+        if eval_boot_fn is None:
+            return False
+        actual_v = sticky_vtor['value'] if sticky_vtor['captured'] else vtor_val
+        vtor_in_slot = any(
+            s_lo <= actual_v < s_hi for s_lo, s_hi in slot_ranges.values()
+        )
+        pc_norm = as_int(pc_val) & ~1
+        pc_in_slot = bool(sticky_pc.get('captured')) or any(
+            s_lo <= pc_norm < s_hi for s_lo, s_hi in slot_ranges.values()
+        )
+        if not vtor_in_slot and not pc_in_slot:
+            return False
+        if enforce_content_criteria:
+            marker_addr = globals().get('success_marker_addr', 0)
+            if marker_addr:
+                marker_val = globals().get('success_marker_value', 0)
+                try:
+                    if as_int(bus.ReadDoubleWord(marker_addr)) != marker_val:
+                        return False
+                except Exception:
+                    return False
+            struct_cfg = globals().get('success_checks_config')
+            if isinstance(struct_cfg, dict) and (
+                struct_cfg.get('memory_checks')
+                or struct_cfg.get('config_checks')
+                or struct_cfg.get('bootloader_integrity')
+            ):
+                eval_struct_fn = globals().get('evaluate_structured_success_checks')
+                if eval_struct_fn is not None:
+                    try:
+                        if not eval_struct_fn().get('all_ok'):
+                            return False
+                    except Exception:
+                        return False
+        fault_timing_state['evaluating'] = True
+        try:
+            outcome, _slot, _sig = eval_boot_fn(
+                vtor_val,
+                pc_val,
+                fault_injected=bool(fault_injected),
+                enforce_content_criteria=bool(enforce_content_criteria),
+                effective_criteria=effective_criteria,
+                p2_status=None,
+            )
+            return outcome == 'success'
+        except Exception:
+            return False
+        finally:
+            fault_timing_state['evaluating'] = False
+
+    def _on_interrupt_begin_for_timing(exc_idx):
+        try:
+            exc_num = int(exc_idx)
+        except Exception:
+            return
+        if exc_num != 5:
+            return
+        if nvic_ref is None:
+            return
+        try:
+            pending = int(nvic_ref.FindPendingInterrupt())
+        except Exception:
+            return
+        if pending not in (3, 4, 5, 6):
+            return
+        current_ipsr = _read_cpu_ipsr(cpu_ref)
+        if current_ipsr in (3, 4, 5, 6):
+            return
+        now_s = _current_timing_emulated_s()
+        now_insns = _current_instructions_now()
+        now_iter = fault_timing_state['current_iter']
+        uncorr_now = _current_uncorrectable_read_count()
+        uncorr_triggered = bool(
+            uncorr_now > fault_timing_state['seen_uncorrectable_reads']
+        )
+        if uncorr_now > fault_timing_state['seen_uncorrectable_reads']:
+            fault_timing_state['seen_uncorrectable_reads'] = uncorr_now
+        reset_gate_ok = bool(
+            not terminal_after_reset or reset_observation.get('observed')
+        )
+        if (
+            reset_gate_ok
+            and fault_timing_state['checks_first_held'] is None
+            and not uncorr_triggered
+        ):
+            pc_now_hook = _read_cpu_pc_fast(cpu_ref)
+            vtor_now_hook = as_int(bus.ReadDoubleWord(0xE000ED08))
+            capture_sticky_pc(pc_now_hook)
+            if vtor_now_hook != 0:
+                for _sn, (_s_lo, _s_hi) in slot_ranges.items():
+                    if _s_lo <= vtor_now_hook < _s_hi:
+                        sticky_vtor['value'] = vtor_now_hook
+                        sticky_vtor['slot'] = _sn
+                        sticky_vtor['captured'] = True
+                        break
+            if _success_checks_hold_now(vtor_now_hook, pc_now_hook):
+                fault_timing_state['checks_first_held'] = {
+                    'emulated_s': now_s,
+                    'instructions': now_insns,
+                    'iter': now_iter,
+                    'ipsr': current_ipsr,
+                    'source': 'pre_fault_entry',
+                    'seq': _next_timing_seq(),
+                    'before_fault_entry': True,
+                }
+        checks_held_at_entry = bool(
+            fault_timing_state['checks_first_held'] is not None
+            and not uncorr_triggered
+        )
+        fault_timing_state['fault_first_active'] = {
+            'emulated_s': now_s,
+            'instructions': now_insns,
+            'iter': now_iter,
+            'exception': pending,
+            'source': 'interrupt_begin',
+            'seq': _next_timing_seq(),
+            'checks_held_at_entry': checks_held_at_entry,
+            'uncorrectable_read_triggered': uncorr_triggered,
+        }
+        fault_timing_state['uncorrectable_read_triggered_fault'] = uncorr_triggered
+
+    def _record_slice_fault_timing(iter_index, sample_emulated_s, vtor_val, pc_val):
+        ipsr_now = _read_cpu_ipsr(cpu_ref)
+        now_s = _current_rel_virtual_s()
+        if now_s is None:
+            now_s = round(sample_emulated_s, 6)
+        now_insns = timing_counters['instructions_executed']
+        uncorr_now = _current_uncorrectable_read_count()
+        if ipsr_now in (3, 4, 5, 6):
+            if fault_timing_state['fault_first_active'] is None:
+                uncorr_triggered = bool(
+                    uncorr_now > fault_timing_state['seen_uncorrectable_reads']
+                )
+                if uncorr_now > fault_timing_state['seen_uncorrectable_reads']:
+                    fault_timing_state['seen_uncorrectable_reads'] = uncorr_now
+                checks_held_at_entry = bool(
+                    fault_timing_state['checks_first_held'] is not None
+                    and not uncorr_triggered
+                )
+                fault_timing_state['fault_first_active'] = {
+                    'emulated_s': now_s,
+                    'instructions': now_insns,
+                    'iter': iter_index + 1,
+                    'exception': ipsr_now,
+                    'source': 'slice_poll',
+                    'seq': _next_timing_seq(),
+                    'checks_held_at_entry': checks_held_at_entry,
+                    'uncorrectable_read_triggered': uncorr_triggered,
+                }
+                fault_timing_state['uncorrectable_read_triggered_fault'] = uncorr_triggered
+        else:
+            if fault_timing_state['fault_first_active'] is not None:
+                # Previous fault exception returned to non-fault execution.
+                fault_timing_state['fault_first_active'] = None
+                fault_timing_state['uncorrectable_read_triggered_fault'] = False
+            if uncorr_now > fault_timing_state['seen_uncorrectable_reads']:
+                fault_timing_state['seen_uncorrectable_reads'] = uncorr_now
+            if fault_timing_state['checks_first_held'] is None:
+                if _success_checks_hold_now(vtor_val, pc_val):
+                    fault_timing_state['checks_first_held'] = {
+                        'emulated_s': now_s,
+                        'instructions': now_insns,
+                        'iter': iter_index + 1,
+                        'ipsr': ipsr_now,
+                        'source': 'slice_poll',
+                        'seq': _next_timing_seq(),
+                    }
+
+    def _build_fault_timing_snapshot(current_ipsr_now=None):
+        ipsr_val = (
+            int(current_ipsr_now)
+            if current_ipsr_now is not None
+            else _read_cpu_ipsr(cpu_ref)
+        )
+        checks_rec = fault_timing_state['checks_first_held']
+        fault_rec = fault_timing_state['fault_first_active']
+        fault_active_now = ipsr_val in (3, 4, 5, 6)
+        uncorr_triggered = bool(
+            fault_timing_state['uncorrectable_read_triggered_fault']
+        )
+        if not fault_active_now:
+            checks_held_before_fault = None
+        elif fault_rec is not None and fault_rec.get('uncorrectable_read_triggered'):
+            checks_held_before_fault = False
+            uncorr_triggered = True
+        elif checks_rec is None:
+            checks_held_before_fault = False
+        elif checks_rec.get('ipsr', 0) in (3, 4, 5, 6):
+            checks_held_before_fault = False
+        elif fault_rec is None:
+            uncorr_now = _current_uncorrectable_read_count()
+            if uncorr_now > fault_timing_state['seen_uncorrectable_reads']:
+                checks_held_before_fault = False
+                uncorr_triggered = True
+            else:
+                checks_held_before_fault = True
+        else:
+            c_key = (
+                float(checks_rec.get('emulated_s', 0.0)),
+                int(checks_rec.get('instructions', 0)),
+                int(checks_rec.get('seq', 0)),
+            )
+            f_key = (
+                float(fault_rec.get('emulated_s', 0.0)),
+                int(fault_rec.get('instructions', 0)),
+                int(fault_rec.get('seq', 0)),
+            )
+            checks_held_before_fault = bool(c_key < f_key)
+        return {
+            'checks_first_held': dict(checks_rec) if checks_rec is not None else None,
+            'fault_first_active': dict(fault_rec) if fault_rec is not None else None,
+            'checks_held_before_fault': checks_held_before_fault,
+            'fault_exception_active_at_stop': fault_active_now,
+            'uncorrectable_read_triggered_fault': uncorr_triggered,
+            'interrupt_hook_installed': bool(
+                fault_timing_state['interrupt_hook_installed']
+            ),
+        }
 
     def mark_in_run_reset(source, event_machine=None, clear_sticky=False):
         if source not in reset_observation['sources']:
@@ -9190,10 +9580,26 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             pc_handoff_hook_candidates.append(candidate)
     if op_trace is not None and op_trace_limit <= 0:
         op_trace_limit = 1024
+    _observer_slot = globals().get('_active_interrupt_begin_observer')
+    _ensure_irq_hook_fn = globals().get('_ensure_interrupt_begin_hook')
+    _prev_interrupt_observer = None
+    if _observer_slot is not None and _ensure_irq_hook_fn is not None:
+        if _ensure_irq_hook_fn(cpu_ref):
+            _prev_interrupt_observer = _observer_slot[0]
+            _observer_slot[0] = _on_interrupt_begin_for_timing
+            fault_timing_state['interrupt_hook_installed'] = True
+    elif hasattr(cpu_ref, 'AddHookAtInterruptBegin'):
+        try:
+            cpu_ref.AddHookAtInterruptBegin(_on_interrupt_begin_for_timing)
+            fault_timing_state['interrupt_hook_installed'] = True
+        except Exception:
+            pass
     try:
         for iters in range(max_iters):
+            fault_timing_state['current_iter'] = iters + 1
             monitor.Parse('emulation RunFor "{}"'.format(time_slice))
             emulated_s += slice_s
+            timing_counters['emulated_s'] = emulated_s
             native_stop_sync = globals().get('_sync_native_calibration_stop')
             if native_stop_sync is not None:
                 native_stop_sync()
@@ -9207,6 +9613,8 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 reset_observation['instruction_counter_resets'] += 1
                 mark_in_run_reset('instruction_counter_reset')
             instruction_previous = instruction_now
+            timing_counters['instructions_executed'] = instructions_executed
+            timing_counters['instruction_previous'] = instruction_previous
             if reset_observation.get('observed'):
                 if reset_observation['observed_at_iter'] is None:
                     reset_observation['observed_at_iter'] = iters + 1
@@ -9245,6 +9653,8 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                         sticky_vtor['slot'] = sn
                         sticky_vtor['captured'] = True
                         break
+            _record_slice_fault_timing(iters, emulated_s, vtor_now, pc_now)
+            _slice_fault_timing = _build_fault_timing_snapshot()
             calibration_success_gate_satisfied = bool(
                 not terminal_after_reset or reset_observation.get('observed')
             )
@@ -9257,9 +9667,14 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 )
             success_stop_observation = None
             if calibration_success_gate_satisfied:
-                success_stop_observation = _calibration_success_stop_observation(
-                    cpu_ref
-                )
+                if _accepts_fault_timing_kwarg(_calibration_success_stop_observation):
+                    success_stop_observation = _calibration_success_stop_observation(
+                        cpu_ref, fault_timing=_slice_fault_timing
+                    )
+                else:
+                    success_stop_observation = _calibration_success_stop_observation(
+                        cpu_ref
+                    )
             if success_stop_observation is not None:
                 record_checks_held(iters, emulated_s)
                 cpu_ref.IsHalted = True
@@ -9267,11 +9682,20 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 break
             success_terminal_observation = None
             if terminal_after_reset:
-                success_terminal_observation = (
-                    _reset_gated_success_stop_observation(
-                        cpu_ref, reset_observation
+                if _accepts_fault_timing_kwarg(_reset_gated_success_stop_observation):
+                    success_terminal_observation = (
+                        _reset_gated_success_stop_observation(
+                            cpu_ref,
+                            reset_observation,
+                            fault_timing=_slice_fault_timing,
+                        )
                     )
-                )
+                else:
+                    success_terminal_observation = (
+                        _reset_gated_success_stop_observation(
+                            cpu_ref, reset_observation
+                        )
+                    )
             if success_terminal_observation is not None:
                 cpu_ref.IsHalted = True
                 terminal_outcome = success_terminal_observation.get(
@@ -9517,6 +9941,8 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             reset_observation['budget_exhausted_reason'] = reason
             reason = 'post_reset_checks_unmet'
     finally:
+        if _observer_slot is not None and fault_timing_state.get('interrupt_hook_installed'):
+            _observer_slot[0] = _prev_interrupt_observer
         for hook_address in pc_handoff_hook_addresses:
             try:
                 cpu_ref.RemoveHook(hook_address, capture_pc_handoff)
@@ -9584,6 +10010,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         'console_recent_logs': console_state.get('recent_logs', []),
         'console_fatal_pattern': console_fatal,
         'reset_observation': reset_observation,
+        'fault_timing': _build_fault_timing_snapshot(),
     }
     if success_terminal_observation is not None:
         status['reset_gated_terminal'] = success_terminal_observation
@@ -11417,6 +11844,8 @@ def run_execute_fault(fault_at, fault_type='w'):
         max_iters=p1_max_iters,
         wall_timeout=p1_wall_timeout,
         vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
+        effective_criteria=eff_criteria,
+        fault_injected=True,
     )
     disarm_vtor_watchpoint()
     phase1_ms = int((_time.time() - fp_t0) * 1000)
@@ -11617,6 +12046,8 @@ def run_execute_fault(fault_at, fault_type='w'):
                 stop_on_fault=False,
                 time_slice=phase2_time_slice,
                 reset_already_observed=True,
+                effective_criteria=eff_criteria,
+                fault_injected=fault_injected,
             )
             disarm_vtor_watchpoint()
             recovery_writes = get_total_writes()
@@ -11681,6 +12112,8 @@ def run_execute_fault(fault_at, fault_type='w'):
             stop_on_fault=False,
             time_slice=phase2_time_slice,
             reset_already_observed=True,
+            effective_criteria=eff_criteria,
+            fault_injected=fault_injected,
         )
         disarm_vtor_watchpoint()
         recovery_writes = get_total_writes()
@@ -13346,6 +13779,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     reset_nvmc_for_recovery()
     setup_ms = int((_time.time() - t_setup) * 1000)
 
+    eff_criteria = get_effective_criteria(fault_type)
     cpu_ref.IsHalted = False
     arm_vtor_watchpoint()
     t_emu = _time.time()
@@ -13357,6 +13791,8 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         wall_timeout=phase2_wall_timeout_s,
         time_slice=phase2_time_slice,
         reset_already_observed=True,
+        effective_criteria=eff_criteria,
+        fault_injected=fault_injected,
     )
     emulation_ms = int((_time.time() - t_emu) * 1000)
     disarm_vtor_watchpoint()
@@ -13375,7 +13811,6 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
 
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
-    eff_criteria = get_effective_criteria(fault_type)
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
         vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria,
         p2_status=p2_status,
@@ -13639,6 +14074,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         _clear_mram_uncorrectable_read_log()
     setup_ms = int((_time.time() - t_setup) * 1000)
 
+    eff_criteria = get_effective_criteria(fault_type)
     cpu_ref.IsHalted = False
     arm_vtor_watchpoint()
     t_emu = _time.time()
@@ -13650,6 +14086,8 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         wall_timeout=phase2_wall_timeout_s,
         time_slice=phase2_time_slice,
         reset_already_observed=True,
+        effective_criteria=eff_criteria,
+        fault_injected=fault_injected,
     )
     emulation_ms = int((_time.time() - t_emu) * 1000)
     disarm_vtor_watchpoint()
@@ -13668,7 +14106,6 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
-    eff_criteria = get_effective_criteria(fault_type)
     boot_outcome, boot_slot, signals = evaluate_boot_outcome(
         vtor_value, pc_value, fault_injected=fault_injected, effective_criteria=eff_criteria,
         p2_status=p2_status,

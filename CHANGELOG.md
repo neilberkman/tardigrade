@@ -95,6 +95,17 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- `run_until_done` and `collect_recovery_execution_evidence` in
+  `scripts/run_runtime_fault_sweep.py` now record when success checks first hold
+  and when a fault exception (`IPSR` 3–6) becomes active (via an interrupt-begin
+  hook and slice-boundary tracking) and compare their ordering. A fault
+  exception that becomes active only after the run's success checks have already
+  held (and continue to hold at stop, without being triggered by an
+  uncorrectable MRAM read) no longer overrides success via `IPSR`, restoring
+  pre-`c7c20c0` (`ca02138`) classification for firmware that deliberately enters
+  a fault handler to record a crash report while keeping `hard_fault` detection
+  (including `IPSR` and `mram_torn_word: uncorrectable`) for runs that fault
+  before their success checks hold.
 - `_boot_followup_cycle` in `scripts/run_runtime_fault_sweep.py` now passes
   `marked_at_fault=` (with formatted uncorrectable word addresses) and
   `p2_status=status` to `_attach_uncorrectable_read_signals` instead of the
