@@ -353,6 +353,28 @@ namespace Antmicro.Renode.Peripherals.Memory
             set { if(Nvm != null) { Nvm.MramTornWordMode = value; } }
         }
 
+        public uint MramTornWordSeed
+        {
+            get { return Nvm != null ? Nvm.MramTornWordSeed : 0U; }
+            set { if(Nvm != null) { Nvm.MramTornWordSeed = value; } }
+        }
+
+        public int UncorrectableWordCount => Nvm != null ? Nvm.UncorrectableWordCount : 0;
+        public bool LastFaultMarkedUncorrectable => Nvm != null && Nvm.LastFaultMarkedUncorrectable;
+        public ulong UncorrectableReadCount => Nvm != null ? Nvm.UncorrectableReadCount : 0UL;
+        public ulong LastUncorrectableReadWordAddress => Nvm != null ? Nvm.LastUncorrectableReadWordAddress : 0UL;
+        public ulong LastUncorrectableReadAddress => Nvm != null ? Nvm.LastUncorrectableReadAddress : 0UL;
+        public ulong LastUncorrectableReadPC => Nvm != null ? Nvm.LastUncorrectableReadPC : 0UL;
+        public bool IsWordUncorrectable(long offset) => Nvm != null && Nvm.IsWordUncorrectable(offset);
+        public bool IsAddressUncorrectable(ulong busAddress) => Nvm != null && Nvm.IsAddressUncorrectable(busAddress);
+        public void MarkWordUncorrectable(long offset) { Nvm?.MarkWordUncorrectable(offset); }
+        public void ClearUncorrectableWord(long offset) { Nvm?.ClearUncorrectableWord(offset); }
+        public void ClearUncorrectableWords() { Nvm?.ClearUncorrectableWords(); }
+        public string UncorrectableWordsToString() => Nvm != null ? Nvm.UncorrectableWordsToString() : string.Empty;
+        public string FaultUncorrectableWordsToString() => Nvm != null ? Nvm.FaultUncorrectableWordsToString() : string.Empty;
+        public string UncorrectableReadsToString() => Nvm != null ? Nvm.UncorrectableReadsToString() : string.Empty;
+        public void ClearUncorrectableReadLog() { Nvm?.ClearUncorrectableReadLog(); }
+
         public bool PreserveCountersAcrossReset
         {
             get { return Nvm != null && Nvm.PreserveCountersAcrossReset; }

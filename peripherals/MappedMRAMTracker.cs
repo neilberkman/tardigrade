@@ -14,6 +14,7 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.CPU;
+using Antmicro.Renode.Peripherals.IRQControllers;
 using Antmicro.Renode.Peripherals.Memory;
 using Antmicro.Renode.Logging.Profiling;
 
@@ -105,6 +106,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
         public int EraseFaultMode { get; set; }
         public uint CorruptionSeed { get; set; }
+        public uint MramTornWordSeed { get; set; }
         public string MramTornWordMode
         {
             get { return mramTornWordMode; }
@@ -113,14 +115,137 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var normalized = (value ?? "half").Trim().ToLowerInvariant();
                 if(normalized != "half" && normalized != "half_retain"
                    && normalized != "untouched" && normalized != "erased"
-                   && normalized != "programmed")
+                   && normalized != "programmed" && normalized != "uncorrectable"
+                   && normalized != "corrupted")
                 {
                     throw new ArgumentOutOfRangeException(
                         nameof(value),
-                        "MramTornWordMode must be half, half_retain, untouched, erased, or programmed");
+                        "MramTornWordMode must be half, half_retain, untouched, erased, programmed, uncorrectable, or corrupted");
                 }
                 mramTornWordMode = normalized;
             }
+        }
+        public int UncorrectableWordCount => uncorrectableWords.Count;
+        public bool LastFaultMarkedUncorrectable => lastFaultMarkedUncorrectable;
+        public ulong UncorrectableReadCount => uncorrectableReadCount;
+        public ulong LastUncorrectableReadWordAddress => lastUncorrectableReadWordAddress;
+        public ulong LastUncorrectableReadAddress => lastUncorrectableReadAddress;
+        public ulong LastUncorrectableReadPC => lastUncorrectableReadPC;
+
+        public bool IsWordUncorrectable(long offset)
+        {
+            if(offset < 0 || offset >= Size)
+            {
+                return false;
+            }
+            return uncorrectableWords.Contains(AlignDown(offset, ProgramUnitSize));
+        }
+
+        public bool IsAddressUncorrectable(ulong busAddress)
+        {
+            long offset;
+            if(!TryResolveBusAddress(busAddress, out offset))
+            {
+                return false;
+            }
+            return IsWordUncorrectable(offset);
+        }
+
+        public void MarkWordUncorrectable(long offset)
+        {
+            if(offset < 0 || offset >= Size)
+            {
+                return;
+            }
+            MarkWordUncorrectableInternal(AlignDown(offset, ProgramUnitSize));
+            UpdateHooks();
+        }
+
+        public void ClearUncorrectableWord(long offset)
+        {
+            if(offset < 0 || offset >= Size)
+            {
+                return;
+            }
+            if(uncorrectableWords.Remove(AlignDown(offset, ProgramUnitSize)))
+            {
+                UpdateHooks();
+            }
+        }
+
+        public void ClearUncorrectableWords()
+        {
+            var hadWords = uncorrectableWords.Count > 0;
+            uncorrectableWords.Clear();
+            ClearUncorrectableReadLog();
+            if(hadWords)
+            {
+                UpdateHooks();
+            }
+        }
+
+        public string UncorrectableWordsToString()
+        {
+            return FormatWordOffsets(uncorrectableWords);
+        }
+
+        public string FaultUncorrectableWordsToString()
+        {
+            return FormatWordOffsets(faultUncorrectableWords);
+        }
+
+        private string FormatWordOffsets(IEnumerable<long> offsets)
+        {
+            var sorted = new List<long>(offsets);
+            if(sorted.Count == 0)
+            {
+                return string.Empty;
+            }
+            sorted.Sort();
+            var result = new StringBuilder(sorted.Count * 24);
+            foreach(var unitOffset in sorted)
+            {
+                result.Append(unitOffset);
+                result.Append(':');
+                result.Append("0x");
+                result.Append((ProgramAddressBase + (ulong)unitOffset).ToString("X8"));
+                result.Append('\n');
+            }
+            return result.ToString();
+        }
+
+        public string UncorrectableReadsToString()
+        {
+            if(uncorrectableReads.Count == 0)
+            {
+                return string.Empty;
+            }
+            var result = new StringBuilder(uncorrectableReads.Count * 64);
+            foreach(var entry in uncorrectableReads)
+            {
+                result.Append(entry.Index);
+                result.Append(':');
+                result.Append(entry.WordOffset);
+                result.Append(":0x");
+                result.Append(entry.WordBusAddress.ToString("X8"));
+                result.Append(":0x");
+                result.Append(entry.AccessBusAddress.ToString("X8"));
+                result.Append(':');
+                result.Append(entry.Width);
+                result.Append(":0x");
+                result.Append(entry.PC.ToString("X8"));
+                result.Append('\n');
+            }
+            return result.ToString();
+        }
+
+        public void ClearUncorrectableReadLog()
+        {
+            uncorrectableReads.Clear();
+            uncorrectableReadCount = 0;
+            lastUncorrectableReadWordAddress = 0;
+            lastUncorrectableReadAddress = 0;
+            lastUncorrectableReadPC = 0;
         }
         public bool PreserveCountersAcrossReset { get; set; }
         public int DiffLookahead { get; set; } = 32;
@@ -284,13 +409,26 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // Host-side setup and snapshot restoration intentionally bypass
         // campaign accounting. CPU writes are observed through the native
         // memory-access hook below.
-        public void WriteByte(long offset, byte value) => BackingMemory.WriteByte(offset, value);
-        public void WriteWord(long offset, ushort value) => BackingMemory.WriteWord(offset, value);
-        public void WriteDoubleWord(long offset, uint value) => BackingMemory.WriteDoubleWord(offset, value);
+        public void WriteByte(long offset, byte value)
+        {
+            BackingMemory.WriteByte(offset, value);
+            ClearUncorrectableRange(offset, 1);
+        }
+        public void WriteWord(long offset, ushort value)
+        {
+            BackingMemory.WriteWord(offset, value);
+            ClearUncorrectableRange(offset, 2);
+        }
+        public void WriteDoubleWord(long offset, uint value)
+        {
+            BackingMemory.WriteDoubleWord(offset, value);
+            ClearUncorrectableRange(offset, 4);
+        }
         public void WriteQuadWord(long offset, ulong value)
         {
             BackingMemory.WriteDoubleWord(offset, (uint)value);
             BackingMemory.WriteDoubleWord(offset + 4, (uint)(value >> 32));
+            ClearUncorrectableRange(offset, 8);
         }
         public byte[] ReadBytes(long offset, int count, IPeripheral context = null)
         {
@@ -309,6 +447,53 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
             BackingMemory.WriteBytes(offset, array, startingIndex, count);
+            ClearUncorrectableRange(offset, count);
+            flashShadow = null;
+        }
+
+        public void EraseWord(long offset)
+        {
+            if(offset < 0 || offset >= Size)
+            {
+                return;
+            }
+            var unitOffset = AlignDown(offset, ProgramUnitSize);
+            if(!ValidRange(unitOffset, ProgramUnitSize))
+            {
+                return;
+            }
+            var erased = new byte[ProgramUnitSize];
+            if(EraseFill != 0)
+            {
+                for(var i = 0; i < erased.Length; i++)
+                {
+                    erased[i] = EraseFill;
+                }
+            }
+            BackingMemory.WriteBytes(unitOffset, erased, 0, erased.Length);
+            ClearUncorrectableRange(unitOffset, ProgramUnitSize);
+            if(flashShadow != null)
+            {
+                WriteShadowUnit(unitOffset, erased);
+            }
+        }
+
+        public void EraseSector(long offset, int sectorSize)
+        {
+            if(sectorSize <= 0 || !ValidRange(offset, sectorSize))
+            {
+                return;
+            }
+            var erased = new byte[sectorSize];
+            if(EraseFill != 0)
+            {
+                for(var i = 0; i < erased.Length; i++)
+                {
+                    erased[i] = EraseFill;
+                }
+            }
+            BackingMemory.WriteBytes(offset, erased, 0, erased.Length);
+            ClearUncorrectableRange(offset, sectorSize);
             flashShadow = null;
         }
 
@@ -361,11 +546,52 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public ulong ReadFaultSkipCount { get; set; }
         public ulong ReadFaultTotalReads { get; set; }
 
-        private void OnMemoryWrite(ulong virtualPC, MemoryOperation operation,
-                                   ulong virtualAddress, ulong physicalAddress,
-                                   uint width, ulong value)
+        private void OnMemoryAccess(ulong virtualPC, MemoryOperation operation,
+                                    ulong virtualAddress, ulong physicalAddress,
+                                    uint width, ulong value)
         {
-            if(operation != MemoryOperation.MemoryWrite || width == 0 || !trackingStarted)
+            if(operation == MemoryOperation.MemoryRead
+               || operation == MemoryOperation.MemoryIORead
+               || operation == MemoryOperation.InsnFetch)
+            {
+                if(uncorrectableWords.Count == 0)
+                {
+                    return;
+                }
+                long readOffset;
+                if(!TryResolveAddress((long)virtualAddress, out readOffset))
+                {
+                    return;
+                }
+                var accessWidth = Math.Max(1, (int)Math.Min(width == 0 ? 1u : width, (uint)sizeof(ulong)));
+                var firstUnit = AlignDown(readOffset, ProgramUnitSize);
+                var lastUnit = AlignDown(readOffset + accessWidth - 1, ProgramUnitSize);
+                long hitUnit = -1;
+                for(var unit = firstUnit; unit <= lastUnit; unit += ProgramUnitSize)
+                {
+                    if(uncorrectableWords.Contains(unit))
+                    {
+                        hitUnit = unit;
+                        break;
+                    }
+                }
+                if(hitUnit >= 0)
+                {
+                    RecordUncorrectableRead(hitUnit, readOffset, accessWidth, virtualPC);
+                    ICPU cpu;
+                    var bus = machine.GetSystemBus(this);
+                    if(!bus.TryGetCurrentCPU(out cpu) || cpu == null)
+                    {
+                        cpu = bus.GetCPUs().FirstOrDefault();
+                    }
+                    RaiseBusError(cpu);
+                }
+                return;
+            }
+
+            if((operation != MemoryOperation.MemoryWrite
+                && operation != MemoryOperation.MemoryIOWrite)
+               || width == 0)
             {
                 return;
             }
@@ -375,8 +601,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
-            EnsureShadow();
             var byteCount = (int)Math.Min(width, sizeof(ulong));
+            if(!trackingStarted)
+            {
+                // Programming a marked MRAM word clears its ECC error even
+                // outside the campaign tracking gate.
+                ClearUncorrectableRange(offset, byteCount);
+                return;
+            }
+
+            EnsureShadow();
             var cursor = 0;
             while(cursor < byteCount)
             {
@@ -403,7 +637,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 byte[] postProgram;
                 if(faulted)
                 {
+                    var markedBefore = uncorrectableWords.Contains(unitOffset);
+                    lastFaultMarkedUncorrectable = false;
                     postProgram = ApplyFault(unitOffset, preProgram, intended);
+                    if(WriteFaultMode == 0 && mramTornWordMode == "uncorrectable")
+                    {
+                        lastFaultMarkedUncorrectable = true;
+                    }
+                    else if(WriteFaultMode != 6 && WriteFaultMode != 3 && markedBefore)
+                    {
+                        uncorrectableWords.Remove(unitOffset);
+                    }
                     LastFaultInjected = true;
                     FaultEverFired = true;
                     FaultFired = true;
@@ -411,12 +655,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     WriteBackingUnit(unitOffset, postProgram);
                     CaptureFaultEvidence(
                         writeIndex, unitOffset, intended, preProgram, postProgram);
+                    if(lastFaultMarkedUncorrectable)
+                    {
+                        UpdateHooks();
+                    }
                 }
                 else
                 {
                     // MappedMemory has already committed the CPU write. The
                     // full intended unit is its modeled post-program state.
                     postProgram = intended;
+                    uncorrectableWords.Remove(unitOffset);
                 }
 
                 programTrace.Add(new ProgramTraceEntry(
@@ -475,6 +724,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     case "programmed":
                         result = CloneBytes(intended);
                         break;
+                    case "uncorrectable":
+                        result = CloneBytes(preProgram);
+                        MarkWordUncorrectableInternal(unitOffset);
+                        break;
+                    case "corrupted":
+                        result = CloneBytes(intended);
+                        ApplyCorruptedTornWord(result, TotalWordWrites, unitOffset, EffectiveMramTornWordSeed());
+                        break;
                     default:
                         var partial = ProgramUnitSize / 2;
                         for(var index = partial; index < ProgramUnitSize; index++)
@@ -518,14 +775,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 return;
             }
-            var enabled = trackingStarted || WriteTraceEnabled
-                || FaultAtWordWrite != ulong.MaxValue;
+            var writeTrackingActive = trackingStarted;
+            var hookNeeded = writeTrackingActive || uncorrectableWords.Count > 0;
             var cpus = machine.GetSystemBus(this).GetCPUs()
                 .OfType<ICPUWithMemoryAccessHooks>();
             foreach(var cpu in cpus)
             {
                 cpu.SetHookAtMemoryAccess(
-                    enabled && trackingStarted ? (MemoryAccessHook)OnMemoryWrite : null);
+                    hookNeeded ? (MemoryAccessHook)OnMemoryAccess : null);
                 var hookCpu = cpu as ICPUWithHooks;
                 if(hookCpu == null)
                 {
@@ -542,7 +799,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     stopHookInstalled = true;
                 }
             }
-            memoryAccessHookInstalled = enabled && trackingStarted;
+            memoryAccessHookInstalled = hookNeeded;
         }
 
         private void RemoveStartHook()
@@ -626,6 +883,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             lastFaultPreProgramBytes = CloneBytes(preProgram);
             lastFaultPostFaultBytes = CloneBytes(postFault);
             faultMemorySnapshot = BackingMemory.ReadBytes(0, checked((int)Size));
+            faultUncorrectableWords.Clear();
+            faultUncorrectableWords.AddRange(uncorrectableWords);
         }
 
         private void ResetCampaignObservability()
@@ -652,6 +911,138 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             lastFaultPreProgramBytes = null;
             lastFaultPostFaultBytes = null;
             faultMemorySnapshot = null;
+            lastFaultMarkedUncorrectable = false;
+            faultUncorrectableWords.Clear();
+        }
+
+        private bool TryResolveBusAddress(ulong busAddress, out long offset)
+        {
+            var baseAddr = ProgramAddressBase;
+            if(busAddress >= baseAddr && busAddress < baseAddr + (ulong)Size)
+            {
+                offset = checked((long)(busAddress - baseAddr));
+                return true;
+            }
+            return TryResolveAddress(checked((long)busAddress), out offset);
+        }
+
+        private uint EffectiveMramTornWordSeed()
+        {
+            return MramTornWordSeed != 0 ? MramTornWordSeed : CorruptionSeed;
+        }
+
+        private static void ApplyCorruptedTornWord(byte[] wordBytes, ulong writeIndex,
+                                                   long wordOffset, uint seedValue)
+        {
+            var totalBits = wordBytes.Length * 8;
+            if(totalBits <= 0)
+            {
+                return;
+            }
+            var seed = seedValue != 0 ? seedValue : 0x5A3C96A5u;
+            seed ^= unchecked((uint)writeIndex * 2654435761u);
+            seed ^= unchecked((uint)wordOffset * 2246822519u);
+            if(seed == 0)
+            {
+                seed = 0x9E3779B9u;
+            }
+            seed = unchecked(seed * 1103515245u + 12345u);
+            var flipCount = Math.Min(totalBits, 3 + (int)(seed % 3u));
+            var flipped = new bool[totalBits];
+            for(var i = 0; i < flipCount; i++)
+            {
+                seed = unchecked(seed * 1103515245u + 12345u);
+                var bitPos = (int)(seed % (uint)totalBits);
+                while(flipped[bitPos])
+                {
+                    bitPos = (bitPos + 1) % totalBits;
+                }
+                flipped[bitPos] = true;
+                wordBytes[bitPos / 8] ^= (byte)(1 << (bitPos % 8));
+            }
+        }
+
+        private void MarkWordUncorrectableInternal(long unitOffset)
+        {
+            uncorrectableWords.Add(AlignDown(unitOffset, ProgramUnitSize));
+        }
+
+        private void ClearUncorrectableRange(long offset, int count)
+        {
+            if(uncorrectableWords.Count == 0 || count <= 0 || offset < 0)
+            {
+                return;
+            }
+            var firstUnit = AlignDown(offset, ProgramUnitSize);
+            var lastUnit = AlignDown(offset + count - 1, ProgramUnitSize);
+            var removed = false;
+            for(var unit = firstUnit; unit <= lastUnit; unit += ProgramUnitSize)
+            {
+                if(uncorrectableWords.Remove(unit))
+                {
+                    removed = true;
+                }
+            }
+            if(removed && uncorrectableWords.Count == 0)
+            {
+                UpdateHooks();
+            }
+        }
+
+        private void RecordUncorrectableRead(long wordOffset, long accessOffset, int width, ulong pc)
+        {
+            var wordBusAddr = ProgramAddressBase + (ulong)wordOffset;
+            var accessBusAddr = ProgramAddressBase + (ulong)accessOffset;
+            uncorrectableReadCount++;
+            lastUncorrectableReadWordAddress = wordBusAddr;
+            lastUncorrectableReadAddress = accessBusAddr;
+            lastUncorrectableReadPC = pc;
+            if(uncorrectableReads.Count < 256)
+            {
+                uncorrectableReads.Add(new UncorrectableReadEntry(
+                    uncorrectableReadCount, wordOffset, wordBusAddr, accessBusAddr, width, pc));
+            }
+        }
+
+        private void RaiseBusError(ICPU cpu)
+        {
+            if(cpu == null || machine == null)
+            {
+                return;
+            }
+            var cortexM = cpu as CortexM;
+            if(cortexM != null)
+            {
+                var nvic = machine.GetPeripheralsOfType<NVIC>().FirstOrDefault();
+                if(nvic != null)
+                {
+                    var model = (cortexM.Model ?? string.Empty).ToLowerInvariant();
+                    var isArmv6M = model.Contains("m0");
+                    int exceptionNumber = 3; // HardFault
+                    if(!isArmv6M)
+                    {
+                        // PRECISERR (CFSR bit 9): precise data bus error.
+                        cortexM.FaultStatus |= 0x00000200u;
+                        var shcsr = nvic.ReadDoubleWord(0xD24);
+                        if((shcsr & (1u << 17)) != 0
+                           && cortexM.PRIMASK.RawValue == 0
+                           && cortexM.FAULTMASK.RawValue == 0)
+                        {
+                            exceptionNumber = 5; // BusFault
+                        }
+                    }
+                    nvic.SetPendingIRQ(exceptionNumber);
+                    cortexM.RaiseException(5); // tlib EXCP_IRQ -> dispatches pending NVIC exception
+                    return;
+                }
+                cortexM.RaiseException(4);
+                return;
+            }
+            var tcpu = cpu as TranslationCPU;
+            if(tcpu != null)
+            {
+                tcpu.RaiseException(4);
+            }
         }
 
         private static long AlignDown(long value, int alignment)
@@ -692,6 +1083,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly IMachine machine;
         private readonly List<WriteTraceEntry> writeTrace = new List<WriteTraceEntry>();
         private readonly List<ProgramTraceEntry> programTrace = new List<ProgramTraceEntry>();
+        private readonly HashSet<long> uncorrectableWords = new HashSet<long>();
+        private readonly List<UncorrectableReadEntry> uncorrectableReads = new List<UncorrectableReadEntry>();
         private int programUnitSize = 16;
         private ulong programAddressBase;
         private ulong faultAtWordWrite = ulong.MaxValue;
@@ -717,6 +1110,32 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private byte[] lastFaultPreProgramBytes;
         private byte[] lastFaultPostFaultBytes;
         private byte[] faultMemorySnapshot;
+        private bool lastFaultMarkedUncorrectable;
+        private readonly List<long> faultUncorrectableWords = new List<long>();
+        private ulong uncorrectableReadCount;
+        private ulong lastUncorrectableReadWordAddress;
+        private ulong lastUncorrectableReadAddress;
+        private ulong lastUncorrectableReadPC;
+
+        private sealed class UncorrectableReadEntry
+        {
+            public UncorrectableReadEntry(ulong index, long wordOffset, ulong wordBusAddress,
+                                          ulong accessBusAddress, int width, ulong pc)
+            {
+                Index = index;
+                WordOffset = wordOffset;
+                WordBusAddress = wordBusAddress;
+                AccessBusAddress = accessBusAddress;
+                Width = width;
+                PC = pc;
+            }
+            public readonly ulong Index;
+            public readonly long WordOffset;
+            public readonly ulong WordBusAddress;
+            public readonly ulong AccessBusAddress;
+            public readonly int Width;
+            public readonly ulong PC;
+        }
 
         private sealed class WriteTraceEntry
         {
