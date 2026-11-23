@@ -110,8 +110,11 @@ def _is_mram_backend(
     flash_backend: Optional[str],
     extra_peripherals: Optional[List[str]] = None,
     profile_path: Optional[Path] = None,
+    repo_root: Optional[Path] = None,
 ) -> bool:
     backend_lower = str(flash_backend or "").strip().lower()
+    if backend_lower.startswith("sysbus."):
+        backend_lower = backend_lower[len("sysbus."):]
     platform_lower = str(platform or "").strip().lower()
     peripherals_lower = [str(p).strip().lower() for p in (extra_peripherals or [])]
     has_mram_peripheral = any("mram" in p for p in peripherals_lower)
@@ -131,14 +134,16 @@ def _is_mram_backend(
             return False
         if has_mram_peripheral:
             return True
-    if "mram" in platform_lower or has_mram_peripheral:
+    if "mram" in Path(platform_lower).name or has_mram_peripheral:
         return True
     if platform:
-        repo_root = Path(__file__).resolve().parents[1]
+        default_root = Path(__file__).resolve().parents[1]
         candidates = []
         if profile_path is not None:
             candidates.append(Path(profile_path).resolve().parent / platform)
-        candidates.append(repo_root / platform)
+        if repo_root is not None:
+            candidates.append(Path(repo_root) / platform)
+        candidates.append(default_root / platform)
         candidates.append(Path(platform))
         for candidate in candidates:
             try:
@@ -360,6 +365,19 @@ class MemoryRegionConfig:
         self.parent = str(parent) if parent is not None else None
 
 
+def _parse_erase_fill_byte(value: Any, field: str = "memory.erase_fill") -> int:
+    if isinstance(value, bool):
+        raise ProfileError(
+            "{}: expected integer byte 0x00-0xFF, got {!r}".format(field, value)
+        )
+    parsed = _parse_int(value, field)
+    if not (0 <= parsed <= 0xFF):
+        raise ProfileError(
+            "{} must be 0x00-0xFF, got 0x{:X}".format(field, parsed)
+        )
+    return parsed
+
+
 class MemoryConfig:
     __slots__ = (
         "sram_start",
@@ -367,6 +385,7 @@ class MemoryConfig:
         "write_granularity",
         "page_size",
         "page_size_explicit",
+        "erase_fill",
         "slots",
         "bootloader_region",
         "trace_address_map",
@@ -388,6 +407,7 @@ class MemoryConfig:
         postmortem_partitions: Optional[List[MemoryRegionConfig]] = None,
         volatile_regions: Optional[List[MemoryRegionConfig]] = None,
         page_size_explicit: Optional[bool] = None,
+        erase_fill: Optional[int] = None,
     ) -> None:
         self.sram_start = sram_start
         self.sram_end = sram_end
@@ -397,6 +417,11 @@ class MemoryConfig:
             bool(page_size != 4096)
             if page_size_explicit is None
             else bool(page_size_explicit)
+        )
+        self.erase_fill = (
+            _parse_erase_fill_byte(erase_fill, "memory.erase_fill")
+            if erase_fill is not None
+            else None
         )
         self.slots = slots
         self.bootloader_region = bootloader_region
@@ -2671,12 +2696,37 @@ class ProfileConfig:
         tmp.close()
         return tmp.name
 
+    def image_pad_byte(self, repo_root: Optional[Path] = None) -> int:
+        """Return the erased-memory byte used to pad short images for digesting.
+
+        Uses ``memory.erase_fill`` when set; otherwise ``0x00`` for MRAM
+        backends and ``0xFF`` for all other backends.
+        """
+        declared = getattr(self.memory, "erase_fill", None)
+        if declared is not None:
+            return int(declared) & 0xFF
+        if _is_mram_backend(
+            self.platform,
+            self.flash_backend,
+            self.extra_peripherals,
+            profile_path=self.profile_path,
+            repo_root=repo_root,
+        ):
+            return 0x00
+        return 0xFF
+
     def _platform_erase_geometry(
         self,
         repo_root: Path,
     ) -> Tuple[List[Dict[str, int]], Optional[int]]:
         """Extract declared erase-sector geometry from the platform REPL when available."""
-        if str(self.flash_backend or "").strip().lower() == "mram":
+        if _is_mram_backend(
+            self.platform,
+            self.flash_backend,
+            self.extra_peripherals,
+            profile_path=self.profile_path,
+            repo_root=repo_root,
+        ):
             return [], None
         if not self.platform:
             return [], None
@@ -2775,7 +2825,7 @@ class ProfileConfig:
     ) -> Dict[str, str]:
         import hashlib
 
-        pad_byte = 0x00 if str(self.flash_backend or "").strip().lower() == "mram" else 0xFF
+        pad_byte = self.image_pad_byte(repo_root)
         digests: Dict[str, str] = {}
         for img_name, img_path in images.items():
             resolved = self.resolve_path(repo_root, img_path)
@@ -3047,6 +3097,7 @@ class ProfileConfig:
             "VTOR_SETTLE_ITERS:{}".format(fs.vtor_settle_iters),
             "TRACKING_START_ADDRESS:0x{:08X}".format(fs.tracking_start_address),
             "MRAM_TORN_WORD:{}".format(fs.mram_torn_word),
+            "IMAGE_PAD_BYTE:0x{:02X}".format(self.image_pad_byte(repo_root)),
             "HEURISTIC_TRACE_REQUIRED:{}".format(
                 str(
                     fs.sweep_strategy == "heuristic"
@@ -3060,6 +3111,8 @@ class ProfileConfig:
             ),
             "RUNTIME_MODE:true",
         ]
+        if mem.erase_fill is not None:
+            vars_list.append("MEMORY_ERASE_FILL:0x{:02X}".format(mem.erase_fill))
         if mem.volatile_regions:
             volatile_payload = [
                 {
@@ -3855,6 +3908,12 @@ def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
     page_size = _parse_int(raw.get("page_size", 4096), "memory.page_size")
     if page_size <= 0:
         raise ProfileError("memory.page_size must be > 0")
+    raw_erase_fill = raw.get("erase_fill")
+    erase_fill = (
+        _parse_erase_fill_byte(raw_erase_fill, "memory.erase_fill")
+        if raw_erase_fill is not None
+        else None
+    )
     slots = _parse_slots(_require(raw, "slots", "memory"))
     bootloader_region = _parse_bootloader_region(raw.get("bootloader_region"))
     erase_regions = _parse_memory_regions(
@@ -3934,6 +3993,7 @@ def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
         postmortem_partitions=postmortem_partitions,
         volatile_regions=volatile_regions,
         page_size_explicit=("page_size" in raw),
+        erase_fill=erase_fill,
     )
 
 
@@ -7568,7 +7628,7 @@ def _validate_strict_memory(raw: Any, context: str) -> None:
         raw,
         frozenset(
             {
-                "sram", "write_granularity", "page_size", "slots",
+                "sram", "write_granularity", "page_size", "erase_fill", "slots",
                 "bootloader_region", "trace_address_map", "erase_regions",
                 "postmortem_partitions", "volatile_regions",
             }

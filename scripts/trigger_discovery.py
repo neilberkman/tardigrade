@@ -1256,11 +1256,15 @@ def _image_digest_for_evidence(
         page_size = 4096
         data_size = int(exec_slot.size) - page_size
         if data_size > 0:
-            pad_byte = (
-                0x00
-                if str(getattr(profile, "flash_backend", "")).lower() == "mram"
-                else 0xFF
-            )
+            pad_byte_fn = getattr(profile, "image_pad_byte", None)
+            if callable(pad_byte_fn):
+                pad_byte = pad_byte_fn(repo_root)
+            else:
+                pad_byte = (
+                    0x00
+                    if str(getattr(profile, "flash_backend", "")).lower() == "mram"
+                    else 0xFF
+                )
             raw = raw[:data_size].ljust(data_size, bytes([pad_byte]))
         return hashlib.sha256(raw).hexdigest()
     except (OSError, TypeError, ValueError):

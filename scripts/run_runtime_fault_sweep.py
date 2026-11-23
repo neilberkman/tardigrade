@@ -1179,6 +1179,12 @@ image_exec_sha256 = str(monitor.GetVariable('image_exec_sha256')).strip()
 image_staging_sha256 = str(monitor.GetVariable('image_staging_sha256')).strip()
 expected_exec_sha256 = str(monitor.GetVariable('expected_exec_sha256')).strip()
 expected_image_name = get_optional_var('expected_image_name', '')
+image_pad_byte = get_optional_int_var('image_pad_byte', None)
+if image_pad_byte is not None and not (0 <= image_pad_byte <= 0xFF):
+    raise RuntimeError('image_pad_byte must be 0x00-0xFF, got {}'.format(image_pad_byte))
+memory_erase_fill = get_optional_int_var('memory_erase_fill', None)
+if memory_erase_fill is not None and not (0 <= memory_erase_fill <= 0xFF):
+    raise RuntimeError('memory_erase_fill must be 0x00-0xFF, got {}'.format(memory_erase_fill))
 allowed_image_hashes = []
 allowed_image_hashes_raw = get_optional_var('allowed_image_hashes_b64', '')
 if allowed_image_hashes_raw:
@@ -3575,8 +3581,10 @@ def writeback_apply_to_trace_snapshot(flash_ref, trace_data, erase_trace, fault_
                 if not (boff < e_off + e_sz and e_off < boff + bwidth)
             ]
         erase_buf = System.Array.CreateInstance(System.Byte, e_sz)
-        for bi in range(e_sz):
-            erase_buf[bi] = 0xFF
+        fill = _runtime_erase_fill_byte()
+        if fill != 0:
+            for bi in range(e_sz):
+                erase_buf[bi] = fill
         _replay_storage_write_bytes(int(e_off), erase_buf)
 
     for write_idx, flash_off, value, width in trace_events:
@@ -3748,7 +3756,7 @@ def _writeback_strip_uncommitted_from_snapshot_legacy(snapshot_bytes, trace_data
         else:
             # No committed write to this offset — restore to initial/erased state.
             # MRAM erases to 0x00, NOR flash to 0xFF.
-            erase_byte = 0x00 if backend['kind'] == 'mram' else 0xFF
+            erase_byte = _runtime_erase_fill_byte()
             for byte_i in range(4):
                 if boff + byte_i < len(committed):
                     committed[boff + byte_i] = erase_byte
@@ -3814,7 +3822,7 @@ def writeback_strip_uncommitted_from_snapshot(
             page_size,
             writeback_capacity(),
             barriers=_writeback_barriers,
-            erase_fill=(0x00 if backend['kind'] == 'mram' else 0xFF),
+            erase_fill=_runtime_erase_fill_byte(),
             erase_flushes_domain=writeback_erase_flushes,
         )
     except Exception as exc:
@@ -7022,6 +7030,68 @@ def compute_slot_hash(slot_name='exec'):
 
 def compute_exec_slot_hash():
     return compute_slot_hash('exec')
+
+
+def _runtime_erase_fill_byte():
+    """Return the active erased-memory fill byte for runtime reconstruction."""
+    if memory_erase_fill is not None:
+        return int(memory_erase_fill) & 0xFF
+    if image_pad_byte is not None:
+        return int(image_pad_byte) & 0xFF
+    data = backend.get('data')
+    default = 0x00 if backend.get('kind') == 'mram' else 0xFF
+    if data is not None and hasattr(data, 'EraseFill'):
+        return int(data.EraseFill) & 0xFF
+    return default
+
+
+def _validate_image_pad_byte():
+    """Stop before loading images if digest padding disagrees with live EraseFill."""
+    pad = memory_erase_fill if memory_erase_fill is not None else image_pad_byte
+    if pad is None:
+        return
+    data = backend.get('data')
+    if data is not None and hasattr(data, 'EraseFill'):
+        actual_erase_fill = int(data.EraseFill) & 0xFF
+    elif backend.get('kind') == 'fast':
+        actual_erase_fill = 0xFF
+    else:
+        return
+    if actual_erase_fill == pad:
+        return
+    any_image_hash = bool(success_image_hash) or any(
+        isinstance(phase, dict)
+        and isinstance(phase.get('success_criteria'), dict)
+        and bool(phase['success_criteria'].get('image_hash'))
+        for phase in update_sequence_phases
+    )
+    if (
+        memory_erase_fill is None
+        and backend.get('kind') == 'slow'
+        and not ((evaluation_mode == 'execute' and any_image_hash) or writeback_active())
+    ):
+        return
+    if memory_erase_fill is not None:
+        msg = (
+            'memory.erase_fill (0x{:02X}) disagrees with runtime backend {} '
+            'EraseFill (0x{:02X})'.format(
+                memory_erase_fill,
+                backend.get('backend_sysbus_name', 'unknown'),
+                actual_erase_fill,
+            )
+        )
+    else:
+        msg = (
+            'image digest pad byte (0x{:02X}) disagrees with runtime backend {} '
+            'EraseFill (0x{:02X}); set memory.erase_fill: 0x{:02X} in the profile'.format(
+                pad,
+                backend.get('backend_sysbus_name', 'unknown'),
+                actual_erase_fill,
+                actual_erase_fill,
+            )
+        )
+    log(msg)
+    raise RuntimeError(msg)
 
 
 def _compact_differing_byte_ranges(actual, expected, base_address,
@@ -13311,6 +13381,8 @@ if (not calibration_mode and writeback_active()
     _writeback_preflight_before_machine_writes = _preflight_writeback_trace()
     if _writeback_preflight_before_machine_writes is not None:
         log(_writeback_preflight_before_machine_writes)
+
+_validate_image_pad_byte()
 
 if backend['kind'] in ('fast', 'mram') and _writeback_preflight_before_machine_writes is None:
     if update_sequence_enabled:

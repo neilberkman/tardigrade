@@ -441,9 +441,15 @@ def _build_mcuboot_state_slot_config(
         "page_size": int(getattr(profile.memory, "page_size", 4096) or 4096),
         "erase_regions": erase_regions,
         "declared_sector_size": declared_sector_size,
-        "pad_byte": 0x00
-        if str(getattr(profile, "flash_backend", "") or "").strip().lower() == "mram"
-        else 0xFF,
+        "pad_byte": (
+            profile.image_pad_byte(repo_root)
+            if callable(getattr(profile, "image_pad_byte", None))
+            else (
+                0x00
+                if str(getattr(profile, "flash_backend", "") or "").strip().lower() == "mram"
+                else 0xFF
+            )
+        ),
         "marker_address": profile.success_criteria.marker_address,
         "marker_value": profile.success_criteria.marker_value,
         "image_hash": bool(profile.success_criteria.image_hash),

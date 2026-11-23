@@ -82,6 +82,8 @@ ${IMAGE_STAGING_SHA256}        ${EMPTY}
 ${EXPECTED_EXEC_SHA256}        ${EMPTY}
 ${EXPECTED_IMAGE_NAME}         ${EMPTY}
 ${ALLOWED_IMAGE_HASHES_B64}    ${EMPTY}
+${IMAGE_PAD_BYTE}              ${EMPTY}
+${MEMORY_ERASE_FILL}           ${EMPTY}
 ${SUCCESS_OTADATA_EXPECT}      ${EMPTY}
 ${SUCCESS_OTADATA_EXPECT_SCOPE}    always
 ${SUCCESS_CHECKS_B64}         ${EMPTY}
@@ -264,6 +266,8 @@ Run Runtime Fault Point
     Execute Command    $expected_exec_sha256="${EXPECTED_EXEC_SHA256}"
     Execute Command    $expected_image_name="${EXPECTED_IMAGE_NAME}"
     Execute Command    $allowed_image_hashes_b64="${ALLOWED_IMAGE_HASHES_B64}"
+    Execute Command    $image_pad_byte="${IMAGE_PAD_BYTE}"
+    Execute Command    $memory_erase_fill="${MEMORY_ERASE_FILL}"
     Execute Command    $success_otadata_expect="${SUCCESS_OTADATA_EXPECT}"
     Execute Command    $success_otadata_expect_scope="${SUCCESS_OTADATA_EXPECT_SCOPE}"
     Execute Command    $success_checks_b64="${SUCCESS_CHECKS_B64}"
