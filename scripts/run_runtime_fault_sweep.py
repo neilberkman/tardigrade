@@ -4579,7 +4579,7 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
     if wall_timeout is None:
         wall_timeout = phase2_wall_timeout_s
     cpu_ref = monitor.Machine['sysbus.cpu']
-    marked_offsets = _snapshot_mram_uncorrectable_offsets() if backend.get('kind') == 'mram' else []
+    marked_addresses = _snapshot_mram_uncorrectable_addresses() if backend.get('kind') == 'mram' else []
     reset_nvmc_for_recovery()
     arm_vtor_watchpoint()
     status = run_until_done(
@@ -4603,8 +4603,13 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
         effective_criteria=effective_criteria,
         p2_status=status,
     )
-    if marked_offsets:
-        _attach_uncorrectable_read_signals(signals, boot_outcome, marked_offsets=marked_offsets)
+    if marked_addresses:
+        _attach_uncorrectable_read_signals(
+            signals,
+            boot_outcome,
+            p2_status=status,
+            marked_at_fault=marked_addresses,
+        )
     signals['followup_cycle'] = int(cycle_index)
     signals['phase_followup_stop_reason'] = status.get('reason')
     signals['phase_followup_emulated_s'] = status.get('emulated_s')

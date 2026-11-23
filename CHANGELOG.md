@@ -95,6 +95,12 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- `_boot_followup_cycle` in `scripts/run_runtime_fault_sweep.py` now passes
+  `marked_at_fault=` (with formatted uncorrectable word addresses) and
+  `p2_status=status` to `_attach_uncorrectable_read_signals` instead of the
+  invalid `marked_offsets=` keyword, preventing a `TypeError` on follow-up boot
+  cycles in `mram_torn_word: uncorrectable` mode when a marked word survives
+  cycle 0.
 - Short-image digest padding (in `ProfileConfig._compute_image_digests`,
   `scripts/sweep.py`, `scripts/trigger_discovery.py`, and writeback
   reconstruction) now supports an optional `memory.erase_fill` byte and

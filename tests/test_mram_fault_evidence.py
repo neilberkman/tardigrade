@@ -881,3 +881,254 @@ def test_uncorrectable_read_observation_and_sweep_summary_distinguish_handled_vs
     assert uncorr_summary["stalled_points"] == 1
     assert len(uncorr_summary["observations"]) == 3
 
+
+def test_uncorrectable_followup_boot_cycle_records_read_observation() -> None:
+    """Follow-up cycles in uncorrectable mode must not crash when marked words survive cycle 0."""
+    bus_base = 0x10100000
+    marked_offset = 0x200
+    marked_addr = "0x{:08X}".format(bus_base + marked_offset)
+
+    class FakeMram:
+        Size = 0x1000
+
+        def __init__(self) -> None:
+            self.storage = bytearray(self.Size)
+            self.marked_offsets = {marked_offset}
+            self.reads = [
+                (1, marked_offset, bus_base + marked_offset, bus_base + marked_offset, 4, 0x10000090)
+            ]
+
+        @property
+        def UncorrectableReadCount(self) -> int:
+            return len(self.reads)
+
+        @property
+        def LastUncorrectableReadWordAddress(self) -> int:
+            return self.reads[-1][2] if self.reads else 0
+
+        def ReadBytes(self, offset: int, size: int) -> bytes:
+            return bytes(self.storage[offset : offset + size])
+
+        def WriteBytes(self, offset: int, data: bytes, src_offset: int, count: int) -> None:
+            self.storage[offset : offset + count] = data[src_offset : src_offset + count]
+            self.marked_offsets.clear()
+
+        def MarkWordUncorrectable(self, offset: int) -> None:
+            self.marked_offsets.add(int(offset))
+
+        def ClearUncorrectableWords(self) -> None:
+            self.marked_offsets.clear()
+            self.reads.clear()
+
+        def ClearUncorrectableReadLog(self) -> None:
+            self.reads.clear()
+
+        def UncorrectableWordsToString(self) -> str:
+            return "".join(
+                "{}:0x{:08X}\n".format(off, bus_base + off)
+                for off in sorted(self.marked_offsets)
+            )
+
+        def UncorrectableReadsToString(self) -> str:
+            return "".join(
+                "{}:{}:0x{:08X}:0x{:08X}:{}:0x{:08X}\n".format(*row)
+                for row in self.reads
+            )
+
+    def _run_scenario(
+        *,
+        clear_on_cycle1: bool,
+        cycle1_outcome: str,
+        cycle1_exec_ev: dict,
+        cycle1_reason: str,
+    ):
+        mram = FakeMram()
+        followup_calls = []
+
+        def _restore_flash_and_boot(saved_flash: bytes) -> None:
+            mram.WriteBytes(0, saved_flash, 0, len(saved_flash))
+
+        def _reset_nvmc_for_recovery() -> None:
+            ns["_clear_mram_uncorrectable_read_log"]()
+
+        def _run_until_done(_cpu_ref, **kwargs):
+            # Cycle 0's read log must be cleared while the surviving marked word remains marked.
+            assert mram.marked_offsets == {marked_offset}
+            assert mram.UncorrectableReadCount == 0
+            followup_calls.append(kwargs.get("label"))
+            mram.reads.append(
+                (
+                    1,
+                    marked_offset,
+                    bus_base + marked_offset,
+                    bus_base + marked_offset + 4,
+                    4,
+                    0x10000094,
+                )
+            )
+            if clear_on_cycle1:
+                mram.marked_offsets.clear()
+            return {
+                "reason": cycle1_reason,
+                "emulated_s": 0.1,
+                "elapsed_s": 0.05,
+                "iters": 2,
+            }
+
+        ns = _runtime_functions(
+            "_mram_uncorrectable_target",
+            "_parse_uncorrectable_words_table",
+            "_parse_uncorrectable_reads_table",
+            "_snapshot_mram_uncorrectable_offsets",
+            "_snapshot_mram_uncorrectable_addresses",
+            "_restore_mram_uncorrectable_offsets",
+            "_clear_mram_uncorrectable_read_log",
+            "collect_uncorrectable_read_observation",
+            "_attach_uncorrectable_read_signals",
+            "build_cycle_record",
+            "_boot_followup_cycle",
+            "_continue_followup_boot_cycles",
+            "run_followup_boot_cycles",
+            globals_dict={
+                "backend": {"kind": "mram", "data": mram, "bus_base": bus_base},
+                "mram_torn_word": "uncorrectable",
+                "boot_cycles": 2,
+                "phase2_wall_timeout_s": 5.0,
+                "phase2_time_slice": "0.05",
+                "_hash_bypass_active": False,
+                "apply_hash_bypass": lambda: None,
+                "run_boot_cycle_hook": lambda _idx, _records: None,
+                "restore_flash_and_boot": _restore_flash_and_boot,
+                "reset_nvmc_for_recovery": _reset_nvmc_for_recovery,
+                "arm_vtor_watchpoint": lambda: None,
+                "disarm_vtor_watchpoint": lambda: None,
+                "run_until_done": _run_until_done,
+                "monitor": SimpleNamespace(
+                    Machine={
+                        "sysbus.cpu": SimpleNamespace(
+                            GetRegisterUnsafe=lambda _reg: 0x10000060
+                        )
+                    }
+                ),
+                "bus": SimpleNamespace(ReadDoubleWord=lambda _addr: 0x10000000),
+                "as_int": int,
+                "fmt_u32": lambda value: "0x{:08X}".format(value),
+                "evaluate_boot_outcome": lambda *_args, **_kwargs: (
+                    cycle1_outcome,
+                    "exec" if cycle1_outcome == "success" else None,
+                    {"recovery_execution": dict(cycle1_exec_ev)},
+                ),
+                "collect_semantic_state": lambda _ctx: None,
+                "analyze_boot_cycles": lambda records: {
+                    "requested_cycles": 2,
+                    "completed_cycles": len(records),
+                },
+                "_time": SimpleNamespace(time=lambda: 0.0),
+            },
+        )
+        cycle_records, analysis, _ms = ns["run_followup_boot_cycles"](
+            "hard_fault",
+            None,
+            {"uncorrectable_words_at_fault": [marked_addr]},
+            initial_status={"reason": "no_boot_stall(0.10s_emulated)"},
+            fault_injected=True,
+            label="fp0_followup",
+        )
+        return cycle_records, analysis, followup_calls
+
+    # 1. Surviving marked word read again on cycle 1 and still faulted/unhandled.
+    records, analysis, labels = _run_scenario(
+        clear_on_cycle1=False,
+        cycle1_outcome="hard_fault",
+        cycle1_exec_ev={
+            "hardfault_observed": True,
+            "fault_exception_active": True,
+            "ipsr": 3,
+        },
+        cycle1_reason="no_boot_stall(0.10s_emulated)",
+    )
+    assert labels == ["fp0_followup_1"]
+    assert analysis["completed_cycles"] == 2
+    assert len(records) == 2
+    c1 = records[1]
+    assert c1["cycle"] == 1
+    assert c1["boot_outcome"] == "hard_fault"
+    c1_sig = c1["signals"]
+    assert c1_sig["followup_cycle"] == 1
+    assert c1_sig["mram_torn_word_mode"] == "uncorrectable"
+    assert c1_sig["uncorrectable_words_at_fault"] == [marked_addr]
+    assert c1_sig["uncorrectable_words_remaining"] == [marked_addr]
+    obs = c1_sig["uncorrectable_read"]
+    assert obs["read_observed"] is True
+    assert obs["read_count"] == 1
+    assert obs["word_address"] == marked_addr
+    assert obs["word_addresses"] == [marked_addr]
+    assert obs["reads"] == [
+        {
+            "word_address": marked_addr,
+            "access_address": "0x{:08X}".format(bus_base + marked_offset + 4),
+            "width": 4,
+            "pc": "0x10000094",
+        }
+    ]
+    assert obs["outcome"] == "faulted"
+    assert obs["handled"] is False
+    assert obs["cleared_by_recovery"] is False
+    assert obs["remaining_marked_words"] == [marked_addr]
+    assert obs["active_exception"] == 3
+
+    # 2. Surviving marked word read on cycle 1 and cleared during recovery.
+    rec_records, _rec_analysis, _rec_labels = _run_scenario(
+        clear_on_cycle1=True,
+        cycle1_outcome="success",
+        cycle1_exec_ev={"hardfault_observed": False, "ipsr": 0},
+        cycle1_reason="vtor_captured",
+    )
+    rec_sig = rec_records[1]["signals"]
+    assert rec_sig["uncorrectable_words_at_fault"] == [marked_addr]
+    assert rec_sig["uncorrectable_words_remaining"] == []
+    rec_obs = rec_sig["uncorrectable_read"]
+    assert rec_obs["read_observed"] is True
+    assert rec_obs["outcome"] == "recovered"
+    assert rec_obs["handled"] is True
+    assert rec_obs["cleared_by_recovery"] is True
+    assert rec_obs["remaining_marked_words"] == []
+
+    # 3. Follow-up stop status is forwarded so stall reasons classify as stalled.
+    stall_records, _stall_analysis, _stall_labels = _run_scenario(
+        clear_on_cycle1=False,
+        cycle1_outcome="wrong_slot",
+        cycle1_exec_ev={"hardfault_observed": False, "ipsr": 0},
+        cycle1_reason="no_progress_stall(0.10s_emulated)",
+    )
+    stall_obs = stall_records[1]["signals"]["uncorrectable_read"]
+    assert stall_obs["read_observed"] is True
+    assert stall_obs["outcome"] == "stalled"
+    assert stall_obs["handled"] is False
+    assert stall_obs["cleared_by_recovery"] is False
+
+
+def test_attach_uncorrectable_read_signals_call_sites_match_signature() -> None:
+    tree = ast.parse(RUNTIME.read_text(encoding="utf-8"), filename=str(RUNTIME))
+    attach_def = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_attach_uncorrectable_read_signals"
+    )
+    allowed_kwargs = {arg.arg for arg in attach_def.args.args}
+    attach_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_attach_uncorrectable_read_signals"
+    ]
+    assert len(attach_calls) == 3
+    for call in attach_calls:
+        kw_names = [kw.arg for kw in call.keywords if kw.arg is not None]
+        assert set(kw_names) <= allowed_kwargs
+        assert "marked_at_fault" in kw_names
+        assert "marked_offsets" not in kw_names
+
+
