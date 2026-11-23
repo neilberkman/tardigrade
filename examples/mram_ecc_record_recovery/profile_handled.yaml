@@ -1,0 +1,39 @@
+schema_version: 1
+name: mram_ecc_record_recovery_handled
+description: Dual-record MRAM update whose recovery catches ECC read bus faults on Record B and falls back to Record A.
+platform: platforms/cortex_m0_mram.repl
+bootloader:
+  elf: examples/mram_ecc_record_recovery/firmware_handled.elf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x20000000, end: 0x20002000 }
+  volatile_regions:
+    - { name: runtime_sram, base: 0x20000000, size: 0x2000 }
+  write_granularity: 8
+  page_size: 0x1000
+  trace_address_map:
+    - { offset_start: 0x0, offset_end: 0x4000, address_addend: 0x10100000 }
+  slots:
+    exec: { base: 0x10100000, size: 0x2000 }
+    staging: { base: 0x10102000, size: 0x2000 }
+images:
+  exec: examples/mram_ecc_record_recovery/initial_mram.bin
+pre_boot_state:
+  - { address: 0x20000400, u32: 0x55504431 }
+flash_backend: mram
+success_criteria:
+  vtor_in_slot: exec
+  marker_address: 0x20000100
+  marker_value: 0x5245434F
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  mram_torn_word: uncorrectable
+  max_writes: auto
+  max_writes_cap: 32
+  sweep_strategy: exhaustive
+  run_duration: "0.1"
+  progress_stall_timeout_s: 0.1
+expect:
+  should_find_issues: false

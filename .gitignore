@@ -20,6 +20,8 @@ __pycache__/
 !examples/esp_idf_ota/*.bin
 !examples/firmware_otp_harness/*.elf
 !examples/firmware_otp_harness/*.bin
+!examples/mram_ecc_record_recovery/*.elf
+!examples/mram_ecc_record_recovery/*.bin
 !results/oss_validation/assets/*.elf
 !results/oss_validation/assets/*.bin
 
