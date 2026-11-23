@@ -1,0 +1,45 @@
+schema_version: 1
+name: deliberate_crash_report
+description: Firmware that satisfies its scheduler/tick success checks, then deliberately takes a fault to write a persistent MRAM crash record and spins in the handler.
+platform: platforms/cortex_m0_self_update.repl
+bootloader:
+  elf: examples/deliberate_crash_report/boot.elf
+  entry: 0x00000000
+bootloader_region: { base: 0x00000000, size: 0x1000 }
+memory:
+  sram: { start: 0x20000000, end: 0x20002000 }
+  volatile_regions:
+    - { name: runtime_sram, base: 0x20000000, size: 0x2000 }
+  write_granularity: 16
+  page_size: 0x1000
+  trace_address_map:
+    - { offset_start: 0x0, offset_end: 0x3000, address_addend: 0x10100000 }
+  slots:
+    exec: { base: 0x10100000, size: 0x1000 }
+    staging: { base: 0x10101000, size: 0x1000 }
+images:
+  exec: examples/deliberate_crash_report/app.bin
+pre_boot_state:
+  - { address: 0x20000400, u32: 0xC0A50001 }
+flash_backend: mramTracker
+success_criteria:
+  pc_in_slot: exec
+  image_hash: true
+  image_hash_slot: exec
+  expected_image: exec
+  memory_checks:
+    - { address: 0x20000200, expected_value: 1, op: eq }
+    - { address: 0x20000204, expected_value: 5, op: ge }
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  max_writes: auto
+  max_writes_cap: 32
+  sweep_strategy: exhaustive
+  run_duration: "0.2"
+  phase1_time_slice: "0.02"
+  calibration_time_slice: "0.02"
+  progress_stall_timeout_s: 0.2
+expect:
+  should_find_issues: true

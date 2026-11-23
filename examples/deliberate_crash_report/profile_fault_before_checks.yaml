@@ -1,0 +1,11 @@
+base_profile: profile.yaml
+name: deliberate_crash_report_fault_before_checks
+description: Negative variant whose firmware faults and spins in the handler before its memory success checks ever hold.
+images:
+  exec: examples/deliberate_crash_report/fault_before_checks.bin
+fault_sweep:
+  max_writes: 0
+expect:
+  control_outcome: hard_fault
+  allow_control_only_issues: true
+  should_find_issues: true
