@@ -121,12 +121,19 @@ def analyze_boot_cycles(
                     break
         return analysis
 
+    transitions = sum(
+        1 for index in range(1, len(pairs)) if pairs[index] != pairs[index - 1]
+    )
+    initial_outcome = str(analysis.get("initial_outcome") or "").strip().lower()
+    final_outcome = str(analysis.get("final_outcome") or "").strip().lower()
+
     generic_status = "oscillating"
     converged_at_cycle = None
-    if all(pair == pairs[0] for pair in pairs):
+    recovered_at_cycle = None
+    if transitions == 0:
         generic_status = "converged"
         converged_at_cycle = 0
-    elif len(pairs) >= 2 and pairs[-1] == pairs[-2]:
+    elif len(pairs) >= 3 and pairs[-1] == pairs[-2]:
         generic_status = "converged"
         converged_at = len(pairs) - 2
         final_pair = pairs[-1]
@@ -136,9 +143,22 @@ def analyze_boot_cycles(
             else:
                 break
         converged_at_cycle = converged_at
+    elif transitions == 1:
+        # Two observations (or a single change on the final observation) cannot
+        # establish oscillation: report a failure-then-success transition
+        # directly, and mark other single transitions as unconfirmed.
+        if initial_outcome != "success" and final_outcome == "success":
+            generic_status = "recovered_after_failure"
+            recovered_at_cycle = int(
+                cycle_records[-1].get("cycle", len(cycle_records) - 1)
+            )
+        else:
+            generic_status = "changed_unconfirmed"
 
     if converged_at_cycle is not None:
         analysis["converged_at_cycle"] = converged_at_cycle
+    if recovered_at_cycle is not None:
+        analysis["recovered_at_cycle"] = recovered_at_cycle
 
     if expected_rollback_at_cycle is None:
         analysis["status"] = generic_status
@@ -176,6 +196,14 @@ def analyze_boot_cycles(
         and analysis.get("final_slot") == target_slot
     ):
         analysis["status"] = "rollback_converged"
+        return analysis
+
+    if generic_status == "recovered_after_failure":
+        analysis["status"] = "recovered_after_failure"
+        return analysis
+
+    if generic_status == "changed_unconfirmed":
+        analysis["status"] = "rollback_observed_unconfirmed"
         return analysis
 
     analysis["status"] = "rollback_observed_oscillating"

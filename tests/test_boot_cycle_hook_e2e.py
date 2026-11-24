@@ -97,7 +97,10 @@ class BootCycleHookE2ETests(unittest.TestCase):
         self.assertEqual(without_hook_control.get("boot_outcome"), "success")
         self.assertEqual(without_hook_multi.get("final_slot"), "exec")
         self.assertEqual(without_hook_multi.get("slots_observed"), ["staging", "exec"])
-        self.assertIn(without_hook_multi.get("status"), {"oscillating", "rollback_converged"})
+        self.assertIn(
+            without_hook_multi.get("status"),
+            {"changed_unconfirmed", "rollback_converged"},
+        )
 
 
 if __name__ == "__main__":
