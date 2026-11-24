@@ -97,6 +97,8 @@ def _build_harness(
     success_otadata_expect: dict | None = None,
     boot_cycle_hook: str = "",
     uncorrectable_target=None,
+    cpu_model: str | None = None,
+    platform_repl_path: str = "",
 ):
     sticky_vtor = {"captured": False, "value": 0, "slot": None}
     sticky_pc = {"captured": False, "value": 0, "slot": None}
@@ -123,6 +125,7 @@ def _build_harness(
 
     class FakeCpu:
         IsHalted = False
+        Model = cpu_model
 
         @property
         def ExecutedInstructions(self):
@@ -225,6 +228,10 @@ def _build_harness(
             sticky_pc.update(captured=True, value=pc, slot="exec")
 
     ns = _load_runtime_functions(
+        "_extract_cpu_type_from_repl",
+        "_is_armv6m_cpu_model",
+        "_resolve_cpu_model",
+        "_cpu_supports_fault_status_registers",
         "evaluate_structured_success_checks",
         "collect_recovery_execution_evidence",
         "recovery_failure_outcome",
@@ -235,6 +242,11 @@ def _build_harness(
         "_ensure_interrupt_begin_hook",
         "run_until_done",
         extra_namespace={
+            "os": __import__("os"),
+            "re": __import__("re"),
+            "_resolved_repl_cpu_models": {},
+            "platform_repl_path": platform_repl_path,
+            "platform_repl": platform_repl_path.lower(),
             "_interrupt_begin_hook_cpus": [],
             "_active_interrupt_begin_observer": [None],
             "_time": SimpleNamespace(time=lambda: 0.0),
@@ -1434,3 +1446,221 @@ def test_deliberate_crash_report_fixture_builds_and_profiles_validate() -> None:
     assert neg_before.expect.allow_control_only_issues is True
     assert neg_forges.expect.control_outcome == "hard_fault"
     assert neg_forges.expect.allow_control_only_issues is True
+
+
+def test_armv6m_cpu_detection_from_cpu_model_and_platform_repl() -> None:
+    ns = _load_runtime_functions(
+        "_extract_cpu_type_from_repl",
+        "_is_armv6m_cpu_model",
+        "_resolve_cpu_model",
+        "_cpu_supports_fault_status_registers",
+        extra_namespace={
+            "os": __import__("os"),
+            "re": __import__("re"),
+            "_resolved_repl_cpu_models": {},
+            "platform_repl_path": "",
+            "platform_repl": "",
+        },
+    )
+    is_v6m = ns["_is_armv6m_cpu_model"]
+    for model in ("cortex-m0", "cortex-m0+", "Cortex-M0+", "cortex-m0plus", "cortex-m1", "armv6-m"):
+        assert is_v6m(model) is True, model
+    for model in ("cortex-m3", "cortex-m4", "cortex-m4f", "cortex-m7", "cortex-m33", "cortex-a9", "", None):
+        assert is_v6m(model) is False, model
+
+    # Extract cpuType directly from repo .repl files, including `using` indirection.
+    m0_repl = str(ROOT / "platforms" / "cortex_m0_self_update.repl")
+    m4_repl = str(ROOT / "platforms" / "cortex_m4_flash.repl")
+    m7_using_repl = str(ROOT / "platforms" / "nucleo_h753zi_tardigrade.repl")
+    m33_repl = str(ROOT / "platforms" / "mps2_an521.repl")
+    assert ns["_extract_cpu_type_from_repl"](m0_repl) == "cortex-m0+"
+    assert ns["_extract_cpu_type_from_repl"](m4_repl) == "cortex-m4"
+    assert ns["_extract_cpu_type_from_repl"](m7_using_repl) == "cortex-m7"
+    assert ns["_extract_cpu_type_from_repl"](m33_repl) == "cortex-m33"
+
+    # Live cpu.Model takes precedence over .repl fallback; .repl fallback works when Model is absent.
+    ns["platform_repl_path"] = m0_repl
+    assert ns["_cpu_supports_fault_status_registers"](SimpleNamespace(Model=None)) is False
+    assert ns["_cpu_supports_fault_status_registers"](SimpleNamespace(Model="cortex-m4")) is True
+    ns["platform_repl_path"] = m4_repl
+    assert ns["_cpu_supports_fault_status_registers"](SimpleNamespace(Model="cortex-m0+")) is False
+    assert ns["_cpu_supports_fault_status_registers"](SimpleNamespace(Model=None)) is True
+
+
+def test_armv6m_ignores_renode_cfsr_hfsr_for_post_success_spin_and_recovered_fault() -> None:
+    # 1. Post-success spin on HardFault vector entry WITHOUT clearing CFSR/HFSR:
+    #    Renode leaves sticky CFSR/HFSR set, but ARMv6-M has neither register.
+    def spin_step(state, _machine, cpu, mem, fire_fault):
+        hook = state["hooks"].get(0x10100020)
+        if hook is not None:
+            hook(cpu, 0x10100020)
+        state["pc"] = 0x10100060
+        mem[0x20000200] = 1
+        mem[0x20000204] = 5
+        state["instructions"] = 500
+        state["virtual_time"].seconds = 0.005
+        fire_fault(3, set_cfsr=0x00010000, set_hfsr=0x40000000)
+        state["pc"] = 0x10100080  # exact HardFault vector entry
+        state["virtual_time"].seconds = 0.020
+
+    # On ARMv6-M (cortex-m0+), sticky CFSR/HFSR is ignored -> success.
+    ns_m0, state_m0, _m0, cpu_m0 = _build_harness(
+        step_fn=spin_step,
+        memory_specs=CHECKS,
+        mem_values={0x20000200: 0, 0x20000204: 0},
+        initial_vtor=0x10100000,
+        allow_fault_after_success=True,
+        cpu_model="cortex-m0+",
+    )
+    st_m0 = ns_m0["run_until_done"](cpu_m0, time_slice="0.02", max_iters=5)
+    out_m0, slot_m0, sig_m0 = ns_m0["evaluate_boot_outcome"](
+        state_m0["vtor"], state_m0["pc"], fault_injected=False, p2_status=st_m0
+    )
+    assert out_m0 == "success"
+    assert slot_m0 == "exec"
+    rec_m0 = sig_m0["recovery_execution"]
+    assert rec_m0["cpu_model"] == "cortex-m0+"
+    assert rec_m0["fault_status_registers_supported"] is False
+    assert rec_m0["cfsr"] == "0x00000000"
+    assert rec_m0["hfsr"] == "0x00000000"
+    assert rec_m0["hardfault_observed"] is False
+
+    # Same run on ARMv6-M WITHOUT allow_fault_after_success still classifies as
+    # hard_fault via IPSR == 3.
+    ns_m0_no, state_m0_no, _m0n, cpu_m0_no = _build_harness(
+        step_fn=spin_step,
+        memory_specs=CHECKS,
+        mem_values={0x20000200: 0, 0x20000204: 0},
+        initial_vtor=0x10100000,
+        allow_fault_after_success=False,
+        cpu_model="cortex-m0+",
+    )
+    st_m0_no = ns_m0_no["run_until_done"](cpu_m0_no, time_slice="0.02", max_iters=5)
+    out_m0_no, _s, sig_m0_no = ns_m0_no["evaluate_boot_outcome"](
+        state_m0_no["vtor"], state_m0_no["pc"], fault_injected=False, p2_status=st_m0_no
+    )
+    assert out_m0_no == "hard_fault"
+    assert sig_m0_no["recovery_execution"]["ipsr"] == 3
+    assert sig_m0_no["recovery_execution"]["hardfault_observed"] is True
+
+    # 2. Same sticky CFSR/HFSR on ARMv7-M (cortex-m4) and ARMv8-M (cortex-m33)
+    #    MUST preserve existing behavior and classify as hard_fault!
+    for model in ("cortex-m4", "cortex-m33"):
+        ns_v7, state_v7, _m7, cpu_v7 = _build_harness(
+            step_fn=spin_step,
+            memory_specs=CHECKS,
+            mem_values={0x20000200: 0, 0x20000204: 0},
+            initial_vtor=0x10100000,
+            allow_fault_after_success=True,
+            cpu_model=model,
+        )
+        st_v7 = ns_v7["run_until_done"](cpu_v7, time_slice="0.02", max_iters=5)
+        out_v7, _s7, sig_v7 = ns_v7["evaluate_boot_outcome"](
+            state_v7["vtor"], state_v7["pc"], fault_injected=False, p2_status=st_v7
+        )
+        assert out_v7 == "hard_fault", model
+        rec_v7 = sig_v7["recovery_execution"]
+        assert rec_v7["fault_status_registers_supported"] is True
+        assert rec_v7["cfsr"] == "0x00010000"
+        assert rec_v7["hfsr"] == "0x40000000"
+        assert rec_v7["hardfault_observed"] is True
+
+    # 3. Recovered fault (handler returns to thread mode IPSR=0) with Renode
+    #    leaving sticky CFSR/HFSR: ARMv6-M sees success, ARMv7-M sees hard_fault.
+    def recovered_step(state, _machine, cpu, mem, _fire_fault):
+        hook = state["hooks"].get(0x10100020)
+        if hook is not None:
+            hook(cpu, 0x10100020)
+        mem[0x20000200] = 1
+        mem[0x20000204] = 5
+        state["cfsr"] = 0x00010000
+        state["hfsr"] = 0x40000000
+        state["ipsr"] = 0
+        state["pc"] = 0x10100060
+        state["instructions"] = 500
+        state["virtual_time"].seconds = 0.020
+
+    ns_rec_m0, st_rec_m0, _mr0, cpu_rec_m0 = _build_harness(
+        step_fn=recovered_step,
+        memory_specs=CHECKS,
+        mem_values={0x20000200: 0, 0x20000204: 0},
+        platform_repl_path=str(ROOT / "platforms" / "cortex_m0_self_update.repl"),
+    )
+    s0 = ns_rec_m0["run_until_done"](cpu_rec_m0, time_slice="0.02", max_iters=5)
+    out0, _sl0, sig0 = ns_rec_m0["evaluate_boot_outcome"](
+        st_rec_m0["vtor"], st_rec_m0["pc"], fault_injected=False, p2_status=s0
+    )
+    assert out0 == "success"
+    assert sig0["recovery_execution"]["fault_status_registers_supported"] is False
+    assert sig0["recovery_execution"]["hardfault_observed"] is False
+
+    ns_rec_m4, st_rec_m4, _mr4, cpu_rec_m4 = _build_harness(
+        step_fn=recovered_step,
+        memory_specs=CHECKS,
+        mem_values={0x20000200: 0, 0x20000204: 0},
+        platform_repl_path=str(ROOT / "platforms" / "cortex_m4_flash.repl"),
+    )
+    s4 = ns_rec_m4["run_until_done"](cpu_rec_m4, time_slice="0.02", max_iters=5)
+    out4, _sl4, sig4 = ns_rec_m4["evaluate_boot_outcome"](
+        st_rec_m4["vtor"], st_rec_m4["pc"], fault_injected=False, p2_status=s4
+    )
+    assert out4 == "hard_fault"
+    assert sig4["recovery_execution"]["fault_status_registers_supported"] is True
+    assert sig4["recovery_execution"]["hardfault_observed"] is True
+
+
+def test_armv6m_lockup_remains_hard_fault_without_cfsr_hfsr() -> None:
+    def lockup_step(state, _machine, cpu, mem, _fire_fault):
+        state["pc"] = 0xEFFFFFFE
+        state["ipsr"] = 3
+        state["cfsr"] = 0
+        state["hfsr"] = 0
+        state["instructions"] = 100
+        state["virtual_time"].seconds = 0.010
+
+    ns, state, _m, cpu = _build_harness(
+        step_fn=lockup_step,
+        memory_specs=CHECKS,
+        mem_values={0x20000200: 1, 0x20000204: 5},
+        allow_fault_after_success=True,
+        cpu_model="cortex-m0+",
+    )
+    status = ns["run_until_done"](cpu, time_slice="0.02", max_iters=5)
+    assert status["reason"] == "cpu_lockup"
+    outcome, _slot, signals = ns["evaluate_boot_outcome"](
+        state["vtor"], state["pc"], fault_injected=True, p2_status=status
+    )
+    assert outcome == "hard_fault"
+    assert signals["recovery_execution"]["fault_status_registers_supported"] is False
+    assert signals["recovery_execution"]["lockup_observed"] is True
+    assert signals["recovery_execution"]["hardfault_observed"] is True
+
+
+def test_armv6m_vtor_capture_ignores_bogus_cfsr_while_armv7m_flags_it() -> None:
+    def vtor_step(state, _machine, _cpu, _mem, _fire_fault):
+        state["vtor"] = 0x10100000
+        state["cfsr"] = 0x00010000
+        state["ipsr"] = 0
+        state["instructions"] = 100
+        state["virtual_time"].seconds = 0.010
+
+    # VTOR captured in unexpected slot ('exec' when expecting 'staging') with
+    # bogus sticky CFSR and IPSR=0: ARMv6-M returns vtor_captured, ARMv7-M returns
+    # vtor_captured_hardfault.
+    ns_m0, _s0, _m0, cpu_m0 = _build_harness(
+        step_fn=vtor_step,
+        success_vtor_slot="staging",
+        success_pc_slot="",
+        cpu_model="cortex-m0+",
+    )
+    st0 = ns_m0["run_until_done"](cpu_m0, time_slice="0.02", max_iters=5)
+    assert st0["reason"] == "vtor_captured"
+
+    ns_m4, _s4, _m4, cpu_m4 = _build_harness(
+        step_fn=vtor_step,
+        success_vtor_slot="staging",
+        success_pc_slot="",
+        cpu_model="cortex-m4",
+    )
+    st4 = ns_m4["run_until_done"](cpu_m4, time_slice="0.02", max_iters=5)
+    assert st4["reason"] == "vtor_captured_hardfault"

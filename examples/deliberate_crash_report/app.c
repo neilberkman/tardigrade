@@ -64,22 +64,12 @@ void HardFault_Spin(void)
 {
     /* Installed at vector_table[3] (HardFault) — and aliased at [6] only so
      * Renode 1.16.1's non-ARMv6-M UsageFault routing reaches the same entry.
-     * On first entry APSR.Z is 0 (cleared before udf #0), so `beq 1b` falls
-     * through once to clear sticky CFSR/HFSR bits, then sets Z=1 and branches
-     * back to spin on the exact HardFault vector-entry instruction:
-     * (pc & ~1) == (hardfault_vector & ~1). */
+     * ARMv6-M has no CFSR/HFSR registers, so this handler simply spins on its
+     * own entry instruction: (pc & ~1) == (hardfault_vector & ~1). */
     __asm volatile(
         ".syntax unified\n"
         "1:\n"
-        "beq 1b\n"
-        "ldr r0, =0xE000ED28\n"
-        "ldr r1, [r0, #0]\n"
-        "str r1, [r0, #0]\n"
-        "ldr r1, [r0, #4]\n"
-        "str r1, [r0, #4]\n"
-        "movs r0, #0\n"
         "b 1b\n"
-        ".ltorg\n"
     );
 }
 #else
@@ -131,18 +121,7 @@ const void *vector_table[] = {
 
 static void trigger_deliberate_fault(void)
 {
-#if FAULT_HANDLER_VECTOR_ENTRY_SPIN
-    /* Clear APSR.Z before faulting so HardFault_Spin's entry `beq 1b` falls
-     * through once to clear sticky CFSR/HFSR bits before latching Z=1. */
-    __asm volatile(
-        ".syntax unified\n"
-        "movs r0, #1\n"
-        "udf #0\n"
-        ::: "r0", "cc", "memory"
-    );
-#else
     __asm volatile("udf #0");
-#endif
     for(;;)
     {
         __asm volatile("wfi");

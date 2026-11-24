@@ -1269,8 +1269,98 @@ if volatile_regions_b64:
         })
 bootloader_entry = int(str(monitor.GetVariable('bootloader_entry')), 0)
 bootloader_elf = str(monitor.GetVariable('bootloader_elf')).strip()
-platform_repl = get_optional_var('platform_repl', '').strip().lower()
+platform_repl_path = get_optional_var('platform_repl', '').strip()
+platform_repl = platform_repl_path.lower()
 write_granularity = int(str(monitor.GetVariable('write_granularity')).strip())
+_resolved_repl_cpu_models = {}
+
+
+def _extract_cpu_type_from_repl(repl_path, _seen=None):
+    """Parse cpuType from a Renode .repl file (following local `using` directives)."""
+    if not repl_path:
+        return None
+    cache = globals().get('_resolved_repl_cpu_models')
+    norm_key = str(repl_path).strip()
+    if isinstance(cache, dict) and _seen is None and norm_key in cache:
+        return cache[norm_key]
+    if _seen is None:
+        _seen = set()
+    abs_path = os.path.abspath(norm_key)
+    if abs_path in _seen or not os.path.isfile(abs_path):
+        return None
+    _seen.add(abs_path)
+    found_cpu = None
+    using_paths = []
+    try:
+        with open(abs_path, 'r') as fh:
+            for raw_line in fh:
+                line = raw_line.split('//', 1)[0].strip()
+                if not line:
+                    continue
+                m_cpu = re.search(r'\bcpuType\s*:\s*["\']([^"\']+)["\']', line, re.IGNORECASE)
+                if m_cpu:
+                    found_cpu = m_cpu.group(1).strip().lower()
+                    break
+                m_using = re.match(r'^using\s+"([^"]+)"', line, re.IGNORECASE)
+                if m_using:
+                    using_paths.append(m_using.group(1).strip())
+    except Exception:
+        return None
+    if found_cpu is None:
+        base_dir = os.path.dirname(abs_path)
+        for rel in using_paths:
+            candidate = rel if os.path.isabs(rel) else os.path.normpath(os.path.join(base_dir, rel))
+            if os.path.isfile(candidate):
+                found_cpu = _extract_cpu_type_from_repl(candidate, _seen=_seen)
+                if found_cpu is not None:
+                    break
+    if isinstance(cache, dict) and len(_seen) == 1:
+        cache[norm_key] = found_cpu
+    return found_cpu
+
+
+def _is_armv6m_cpu_model(cpu_model):
+    """Return True iff cpu_model identifies an ARMv6-M core (no CFSR/HFSR)."""
+    normalized = str(cpu_model or '').strip().lower().replace('_', '-')
+    return normalized in (
+        'cortex-m0',
+        'cortex-m0+',
+        'cortex-m0plus',
+        'cortex-m1',
+        'armv6-m',
+        'armv6m',
+    )
+
+
+def _resolve_cpu_model(cpu_ref=None):
+    """Identify the Cortex-M CPU model from the live CPU object or platform .repl."""
+    target_cpu = cpu_ref
+    if target_cpu is None:
+        try:
+            target_cpu = monitor.Machine['sysbus.cpu']
+        except Exception:
+            target_cpu = None
+    if target_cpu is not None:
+        try:
+            model = getattr(target_cpu, 'Model', None)
+            if model:
+                text = str(model).strip().lower()
+                if text:
+                    return text
+        except Exception:
+            pass
+    repl_candidate = globals().get('platform_repl_path') or globals().get('platform_repl') or ''
+    if repl_candidate:
+        extractor = globals().get('_extract_cpu_type_from_repl')
+        if callable(extractor):
+            return extractor(repl_candidate)
+    return None
+
+
+def _cpu_supports_fault_status_registers(cpu_ref=None):
+    """Return False on ARMv6-M targets (which lack CFSR/HFSR), True otherwise."""
+    model = _resolve_cpu_model(cpu_ref)
+    return not _is_armv6m_cpu_model(model)
 
 def _discover_backend_bus_base(backend_obj):
     """Return the bus base address the emulator has the backend mapped at.
@@ -7785,14 +7875,6 @@ def collect_recovery_execution_evidence(
         allow_fault_after_success = bool(allow_fault_after_success)
     reason = str(p2_status.get('reason', '') or '')
     evidence = {'stop_reason': reason}
-    try:
-        cfsr = as_int(bus.ReadDoubleWord(0xE000ED28)) & 0xFFFFFFFF
-        hfsr = as_int(bus.ReadDoubleWord(0xE000ED2C)) & 0xFFFFFFFF
-    except Exception:
-        cfsr = 0
-        hfsr = 0
-    evidence['cfsr'] = fmt_u32(cfsr)
-    evidence['hfsr'] = fmt_u32(hfsr)
 
     active_exception = 0
     _cpu_obs = None
@@ -7805,6 +7887,41 @@ def collect_recovery_execution_evidence(
         active_exception = 0
     fault_exception_active = active_exception in (3, 4, 5, 6)
     evidence['fault_exception_active'] = fault_exception_active
+
+    _resolve_model_fn = globals().get('_resolve_cpu_model')
+    if callable(_resolve_model_fn):
+        _cpu_model = _resolve_model_fn(_cpu_obs)
+    else:
+        _raw_model = getattr(_cpu_obs, 'Model', None) if _cpu_obs is not None else None
+        _cpu_model = str(_raw_model).strip().lower() if _raw_model else None
+    _armv6m_fn = globals().get('_is_armv6m_cpu_model')
+    if callable(_armv6m_fn):
+        _is_armv6m = bool(_armv6m_fn(_cpu_model))
+    else:
+        _is_armv6m = str(_cpu_model or '').strip().lower().replace('_', '-') in (
+            'cortex-m0', 'cortex-m0+', 'cortex-m0plus', 'cortex-m1', 'armv6-m', 'armv6m'
+        )
+    has_fault_status_regs = not _is_armv6m
+    if _cpu_model:
+        evidence['cpu_model'] = _cpu_model
+    evidence['fault_status_registers_supported'] = has_fault_status_regs
+
+    # ARMv6-M cores (Cortex-M0, M0+, M1) do not implement CFSR (0xE000ED28) or
+    # HFSR (0xE000ED2C); those addresses are reserved and read as zero on real
+    # silicon. Renode models them anyway, so ignore them on ARMv6-M and base
+    # fault evidence on IPSR and lockup only.
+    if has_fault_status_regs:
+        try:
+            cfsr = as_int(bus.ReadDoubleWord(0xE000ED28)) & 0xFFFFFFFF
+            hfsr = as_int(bus.ReadDoubleWord(0xE000ED2C)) & 0xFFFFFFFF
+        except Exception:
+            cfsr = 0
+            hfsr = 0
+    else:
+        cfsr = 0
+        hfsr = 0
+    evidence['cfsr'] = fmt_u32(cfsr)
+    evidence['hfsr'] = fmt_u32(hfsr)
 
     lockup_obs = (
         p2_status.get('lockup_observation')
@@ -7908,8 +8025,7 @@ def collect_recovery_execution_evidence(
     elif fault_exception_fatal:
         evidence['hardfault_handler_active'] = True
     evidence['hardfault_observed'] = bool(
-        cfsr != 0
-        or hfsr != 0
+        (has_fault_status_regs and (cfsr != 0 or hfsr != 0))
         or lockup_observed
         or fault_exception_fatal
         or evidence.get('hardfault_handler_active')
@@ -9378,6 +9494,44 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         return None
 
     nvic_ref = _resolve_nvic(machine_ref)
+    _fsr_check_fn = globals().get('_cpu_supports_fault_status_registers')
+    if callable(_fsr_check_fn):
+        _has_fault_status_regs = bool(_fsr_check_fn(cpu_ref))
+    else:
+        _raw_cpu_model = getattr(cpu_ref, 'Model', None)
+        _has_fault_status_regs = str(_raw_cpu_model or '').strip().lower().replace('_', '-') not in (
+            'cortex-m0', 'cortex-m0+', 'cortex-m0plus', 'cortex-m1', 'armv6-m', 'armv6m'
+        )
+
+    def _post_vtor_fault_active():
+        if _has_fault_status_regs:
+            return as_int(bus.ReadDoubleWord(0xE000ED28)) != 0
+        # ARMv6-M has no CFSR/HFSR; base fault detection on IPSR and lockup only.
+        try:
+            if bool(getattr(cpu_ref, 'IsLockedUp', False)):
+                return True
+        except Exception:
+            pass
+        if (_read_cpu_pc_fast(cpu_ref) & ~1) == 0xEFFFFFFE:
+            return True
+        ipsr_now = _read_cpu_ipsr(cpu_ref)
+        if ipsr_now in (3, 4, 5, 6):
+            _allow_post_fault = bool(
+                (effective_criteria or {}).get(
+                    'allow_fault_after_success',
+                    globals().get('success_allow_fault_after_success', False),
+                )
+            )
+            if _allow_post_fault:
+                _ft_now = _build_fault_timing_snapshot(current_ipsr_now=ipsr_now)
+                if (
+                    _ft_now.get('checks_held_before_fault') is True
+                    and not _ft_now.get('uncorrectable_read_triggered_fault')
+                ):
+                    return False
+            return True
+        return False
+
     lockup_state = {
         'detected': False,
         'erased_vector_lockup': False,
@@ -10168,10 +10322,9 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                     if vtor_settle_iters == 0:
                         # Immediate stop (default/sweep behavior).
                         monitor.Parse('emulation RunFor "0.005"')
-                        cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
-                        if cfsr != 0:
-                            # CFSR non-zero after VTOR capture. Only flag as hardfault if
-                            # VTOR is NOT in the expected slot — post-handoff CFSR is the
+                        if _post_vtor_fault_active():
+                            # Fault active after VTOR capture. Only flag as hardfault if
+                            # VTOR is NOT in the expected slot — post-handoff fault is the
                             # app's problem, not the bootloader's.
                             _vtor_expected = False
                             if success_vtor_slot == 'any':
@@ -10198,8 +10351,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                                 sticky_vtor['slot'] = sn
                                 break
                     monitor.Parse('emulation RunFor "0.005"')
-                    cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
-                    if cfsr != 0:
+                    if _post_vtor_fault_active():
                         _vtor_expected = False
                         if success_vtor_slot == 'any':
                             _vtor_expected = sticky_vtor.get('slot') is not None
@@ -10372,8 +10524,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                         sticky_vtor['slot'] = sn
                         break
             monitor.Parse('emulation RunFor "0.005"')
-            cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
-            if cfsr != 0:
+            if _post_vtor_fault_active():
                 _vtor_expected = False
                 if success_vtor_slot == 'any':
                     _vtor_expected = sticky_vtor.get('slot') is not None
@@ -11177,32 +11328,42 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
     # denial-of-service (HardFault/BusFault on real silicon) from real
     # security bypasses.
     #
-    # On Cortex-M3/M4/M7, CFSR bits [15:8] (BFSR) indicate BusFault
-    # specifically.  On Cortex-M0/M0+ there is no CFSR — all faults
-    # escalate to HardFault generically, so we can only check if PC
-    # ended up in the HardFault handler.
-    #
-    # Note: Renode silently drops unmapped accesses (CFSR stays 0), so
-    # the BFSR check only catches faults the emulator actually models.
-    # The HardFault PC check catches cases where the bootloader has its
-    # own fault handler that Renode vectored into.
-    cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
-    bfsr = (cfsr >> 8) & 0xFF  # BusFault Status Register is bits [15:8]
-    ufsr = (cfsr >> 16) & 0xFFFF  # UsageFault Status Register
+    # On Cortex-M3/M4/M7/M33 (ARMv7-M / ARMv8-M), CFSR bits [15:8] (BFSR) and
+    # [31:16] (UFSR) indicate BusFault/UsageFault specifically. On ARMv6-M
+    # (Cortex-M0, M0+, M1) CFSR does not exist on silicon (reserved, reads 0),
+    # though Renode models it anyway — ignore CFSR on ARMv6-M and rely on IPSR,
+    # lockup, and HardFault vector-entry PC instead.
+    _skip_fsr_fn = globals().get('_cpu_supports_fault_status_registers')
+    if callable(_skip_fsr_fn):
+        _skip_has_fsr = bool(_skip_fsr_fn(cpu_ref))
+    else:
+        _raw_skip_model = getattr(cpu_ref, 'Model', None)
+        _skip_has_fsr = str(_raw_skip_model or '').strip().lower().replace('_', '-') not in (
+            'cortex-m0', 'cortex-m0+', 'cortex-m0plus', 'cortex-m1', 'armv6-m', 'armv6m'
+        )
+    signals['fault_status_registers_supported'] = _skip_has_fsr
+    if _skip_has_fsr:
+        cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
+        bfsr = (cfsr >> 8) & 0xFF  # BusFault Status Register is bits [15:8]
+        ufsr = (cfsr >> 16) & 0xFFFF  # UsageFault Status Register
+    else:
+        cfsr = 0
+        bfsr = 0
+        ufsr = 0
     signals['cfsr'] = fmt_u32(cfsr)
     signals['bfsr'] = '0x{:02X}'.format(bfsr)
 
     bus_fault_detected = False
-    if bfsr != 0:
+    if _skip_has_fsr and bfsr != 0:
         # Definitive BusFault on M3+ — safe DoS on real silicon.
         bus_fault_detected = True
-    elif ufsr != 0:
+    elif _skip_has_fsr and ufsr != 0:
         # UsageFault (e.g. undefined instruction) — also safe DoS.
         bus_fault_detected = True
 
-    # Check if PC landed in the HardFault handler.  Use the initial
-    # vector table (address 0x0) since the bootloader may have changed
-    # VTOR during execution.
+    # Check if PC landed in the HardFault handler, an active fault exception is
+    # executing (IPSR), or the core locked up.  Use the initial vector table
+    # (address 0x0) since the bootloader may have changed VTOR during execution.
     hardfault_entered = False
     try:
         initial_hardfault_handler = as_int(bus.ReadDoubleWord(0x0C))
@@ -11210,8 +11371,22 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
             hardfault_entered = True
     except Exception:
         pass
+    try:
+        _skip_ipsr = as_int(getattr(cpu_ref, 'XProgramStatusRegister', 0)) & 0x1FF
+        if _skip_ipsr in (3, 4, 5, 6):
+            hardfault_entered = True
+    except Exception:
+        pass
+    try:
+        if bool(getattr(cpu_ref, 'IsLockedUp', False)) or (pc_value & ~1) == 0xEFFFFFFE:
+            hardfault_entered = True
+    except Exception:
+        pass
     # Also check phase1 stop reason.
-    if phase1_status is not None and phase1_status.get('reason') == 'vtor_captured_hardfault':
+    if phase1_status is not None and (
+        phase1_status.get('reason') == 'vtor_captured_hardfault'
+        or 'lockup' in str(phase1_status.get('reason', '') or '').lower()
+    ):
         hardfault_entered = True
 
     signals['hardfault_entered'] = hardfault_entered

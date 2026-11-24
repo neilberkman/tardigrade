@@ -32,9 +32,10 @@ startup recovery.
 - `profile_vector_entry_spin.yaml` (`vector_entry_spin.bin`): keeps `VTOR` at
   `exec` (`0x10100000`), publishes the success checks and writes the 4-unit
   crash record in normal code, and then triggers a fault into `HardFault_Spin`
-  at `vector_table[3]`, which clears `CFSR`/`HFSR` and spins on its exact
-  vector-entry instruction (`beq .`) with `allow_fault_after_success: true`.
-  Must classify as `success` (and `hard_fault` without the opt-in).
+  at `vector_table[3]`, which spins directly on its exact vector-entry
+  instruction (`b .`) without touching ARMv7-M `CFSR`/`HFSR` registers, with
+  `allow_fault_after_success: true`. Must classify as `success` (and
+  `hard_fault` without the opt-in).
 - `profile_followup_fault_before_checks.yaml`
   (`followup_fault_before_checks.bin`): boots cleanly on cycle 0 (writing a
   persistent marker word to MRAM), then faults on follow-up boot cycles before

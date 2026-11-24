@@ -99,6 +99,15 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- ARMv6-M targets (Cortex-M0, M0+, M1 — identified automatically from the
+  platform's CPU type via `cpu.Model` and `.repl` `cpuType`, with no new
+  profile key) now ignore `CFSR` (`0xE000ED28`) and `HFSR` (`0xE000ED2C`),
+  which do not exist on ARMv6-M silicon even though Renode models them. Fault
+  classification on ARMv6-M relies on the active exception number (`IPSR`),
+  HardFault handler entry, and lockup only, while ARMv7-M and ARMv8-M keep
+  full `CFSR`/`HFSR` checks. Simplified `HardFault_Spin` in
+  `examples/deliberate_crash_report/app.c` to spin directly on `b .` without
+  clearing nonexistent `CFSR`/`HFSR` bits.
 - Erased Cortex-M exception vectors (`0xFFFFFFFF`, or `0xFFFFFFF0..0xFFFFFFFF`
   in the `EXC_RETURN` range) no longer trap Renode in an infinite zero-progress
   exception-return loop until wall-clock timeout. `prime_bootloader_entry` and
