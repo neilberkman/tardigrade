@@ -549,6 +549,7 @@ class RecoveryWriteTrackingGateTests(unittest.TestCase):
                 "_python_tracking_gate": gate_state,
                 "_python_tracking_gate_hook": lambda *_args: None,
                 "_apply_mram_torn_word_mode": lambda: None,
+                "_require_mram_torn_word_support": lambda: None,
                 "refresh_runtime_handles": lambda: None,
                 "reset_sticky_handoff_state": lambda: None,
                 "_DISARM_SENTINEL": 0x7FFFFFFF,
@@ -577,13 +578,364 @@ class RecoveryWriteTrackingGateTests(unittest.TestCase):
         self.assertEqual(data.TrackingStartAddress, 0x20000400)
         self.assertEqual(cpu.hooks, [0x20000400])
 
-        # reset_nvmc_for_recovery disables both gates and zeroes counters.
+        # reset_nvmc_for_recovery disables both gates by default and zeroes counters.
         data.TotalWordWrites = 9
         ns["reset_nvmc_for_recovery"]()
         self.assertEqual(data.TrackingStartAddress, 0)
         self.assertEqual(cpu.hooks, [])
         self.assertEqual(data.TotalWordWrites, 0)
         self.assertTrue(gate_state["started"])
+
+        # Passing enable_tracking_gate=True (used by clean control Phase 1) keeps
+        # both backend and Python CPU tracking gates armed while zeroing counters.
+        data.TotalWordWrites = 6
+        ns["reset_nvmc_for_recovery"](enable_tracking_gate=True)
+        self.assertEqual(data.TrackingStartAddress, 0x20000400)
+        self.assertEqual(cpu.hooks, [0x20000400])
+        self.assertEqual(data.TotalWordWrites, 0)
+        self.assertTrue(gate_state["installed"])
+        self.assertFalse(gate_state["started"])
+
+    def test_control_phase1_is_gated_like_calibration_while_recovery_counts_ungated(
+        self,
+    ) -> None:
+        """Control Phase 1 excludes pre-gate NVM writes while recovery stays ungated."""
+        gate_addr = 0x20000400
+
+        class SimulatedMram:
+            def __init__(self) -> None:
+                self.Size = 64
+                self._tracking_start_address = 0
+                self.TrackingStarted = True
+                self.TotalWordWrites = 0
+                self.FaultAtWordWrite = 0x7FFFFFFF
+                self.LastFaultInjected = False
+                self.FaultEverFired = False
+                self.WriteFaultMode = 0
+                self.DriverErrorFired = False
+                self.PreserveCountersAcrossReset = False
+                self.PassthroughMode = False
+                self.SkipShadowScan = True
+                self.DiffLookahead = 32
+                self.backing = bytearray(64)
+
+            @property
+            def TrackingStartAddress(self) -> int:
+                return self._tracking_start_address
+
+            @TrackingStartAddress.setter
+            def TrackingStartAddress(self, value: int) -> None:
+                self._tracking_start_address = int(value)
+                self.TrackingStarted = self._tracking_start_address == 0
+
+            def write_nvm(self) -> bool:
+                """Simulate one firmware NVM write; returns True if fault fired."""
+                if not self.TrackingStarted:
+                    return False
+                self.TotalWordWrites += 1
+                if self.TotalWordWrites == self.FaultAtWordWrite:
+                    self.LastFaultInjected = True
+                    self.FaultEverFired = True
+                    return True
+                return False
+
+            def ReadBytes(self, offset: int, size: int) -> bytes:
+                return bytes(self.backing[offset : offset + size])
+
+            def WriteBytes(self, offset: int, buf: bytes, src: int, length: int) -> None:
+                self.backing[offset : offset + length] = buf[src : src + length]
+
+            def WriteTraceClear(self) -> None:
+                pass
+
+            def ProgramTraceClear(self) -> None:
+                pass
+
+            def InvalidateShadow(self) -> None:
+                pass
+
+        class SimulatedCpu:
+            def __init__(self) -> None:
+                self.IsHalted = False
+                self.hooks: dict[int, list] = {}
+
+            def AddHook(self, address: int, callback) -> None:
+                self.hooks.setdefault(int(address), []).append(callback)
+
+            def RemoveHook(self, address: int, callback) -> None:
+                cbs = self.hooks.get(int(address), [])
+                if callback in cbs:
+                    cbs.remove(callback)
+                if not cbs and int(address) in self.hooks:
+                    del self.hooks[int(address)]
+
+            def step_to(self, address: int) -> None:
+                for cb in list(self.hooks.get(int(address), ())):
+                    cb(self, address)
+
+            def GetRegisterUnsafe(self, _reg: int) -> int:
+                return 0x10100100
+
+        data = SimulatedMram()
+        cpu = SimulatedCpu()
+        machine = {"sysbus.cpu": cpu}
+        gate_state = {"address": 0, "cpu": None, "installed": False, "started": False}
+        observed_phases: list[dict] = []
+
+        def fake_parse(cmd: str) -> None:
+            if cmd == "machine Reset":
+                cpu.hooks.clear()
+                if not data.PreserveCountersAcrossReset:
+                    data.TotalWordWrites = 0
+                data.TrackingStartAddress = gate_addr
+
+        def run_firmware_boot(*, label: str, pre_gate_writes: int, post_gate_writes: int, hit_gate: bool) -> dict:
+            observed_phases.append(
+                {
+                    "label": label,
+                    "tracking_start": data.TrackingStartAddress,
+                    "tracking_started": data.TrackingStarted,
+                    "hook_installed": gate_addr in cpu.hooks,
+                }
+            )
+            for _ in range(pre_gate_writes):
+                if data.write_nvm():
+                    return {"reason": "fault_fired", "emulated_s": 0.01, "iters": 1}
+            if hit_gate:
+                cpu.step_to(gate_addr)
+            for _ in range(post_gate_writes):
+                if data.write_nvm():
+                    return {"reason": "fault_fired", "emulated_s": 0.02, "iters": 2}
+            return {"reason": "pc_captured", "emulated_s": 0.05, "iters": 3}
+
+        def fake_run_control_phase1(_cpu_ref, label="control_p1", **_kwargs) -> dict:
+            # Firmware writes 1 pre-gate word (e.g. UPDATE_TRIGGER = 0) before
+            # entering gate_addr, then 5 post-gate record writes.
+            return run_firmware_boot(
+                label=label, pre_gate_writes=1, post_gate_writes=5, hit_gate=True
+            )
+
+        def fake_run_until_done(_cpu_ref, label="run", **_kwargs) -> dict:
+            if label.endswith("_p1"):
+                return run_firmware_boot(
+                    label=label, pre_gate_writes=1, post_gate_writes=5, hit_gate=True
+                )
+            if label.endswith("_p2"):
+                # Recovery boot writes 3 repair words without ever hitting gate_addr.
+                status = run_firmware_boot(
+                    label=label, pre_gate_writes=3, post_gate_writes=0, hit_gate=False
+                )
+                return status
+            # Control / fault follow-up boot writes 2 words without hitting gate_addr.
+            status = run_firmware_boot(
+                label=label, pre_gate_writes=2, post_gate_writes=0, hit_gate=False
+            )
+            observed_phases[-1]["writes_after_boot"] = data.TotalWordWrites
+            return status
+
+        def fake_restore_phase1_baseline() -> None:
+            ns["_machine_reset"]()
+
+        def fake_restore_flash_and_boot(saved_flash: bytes) -> None:
+            ns["_machine_reset"](apply_tracking_gate=False)
+            data.WriteBytes(0, saved_flash, 0, len(saved_flash))
+
+        def fake_build_fault_result(
+            fault_at,
+            fault_type,
+            fault_injected,
+            fault_address,
+            actual_writes,
+            signals,
+            boot_outcome=None,
+            boot_slot=None,
+            eff_criteria=None,
+            p2_status=None,
+            followup_label="followup",
+            extra_fields=None,
+            **_kwargs,
+        ):
+            cycles, analysis, _ms = ns["run_followup_boot_cycles"](
+                boot_outcome,
+                boot_slot,
+                signals,
+                initial_status=p2_status,
+                fault_injected=fault_injected,
+                label=followup_label,
+                effective_criteria=eff_criteria,
+            )
+            res = {
+                "fault_at": fault_at,
+                "fault_type": fault_type,
+                "fault_injected": fault_injected,
+                "fault_address": fault_address,
+                "actual_writes": actual_writes,
+                "boot_outcome": boot_outcome,
+                "boot_slot": boot_slot,
+                "signals": signals,
+                "boot_cycles": cycles,
+                "multi_boot_analysis": analysis,
+            }
+            if extra_fields:
+                res.update(extra_fields)
+            return res
+
+        ns = _load_runtime_functions(
+            "_base_fault_type_code",
+            "_apply_tracking_start_address",
+            "_configure_tracking_start_address",
+            "_python_tracking_gate_hook",
+            "_configure_python_tracking_gate",
+            "_set_preserve_counters_across_reset",
+            "_machine_reset",
+            "get_total_writes",
+            "arm_fault",
+            "disarm_fault",
+            "disarm_erase_fault",
+            "was_fault_injected",
+            "was_controller_fault_injected",
+            "reset_nvmc_for_sweep",
+            "reset_nvmc_for_recovery",
+            "_boot_followup_cycle",
+            "_continue_followup_boot_cycles",
+            "run_followup_boot_cycles",
+            "run_execute_fault",
+            extra_ns={
+                "backend": {
+                    "kind": "mram",
+                    "data": data,
+                    "controller": None,
+                    "backend_sysbus_name": "sysbus.mramTracker",
+                },
+                "monitor": SimpleNamespace(Machine=machine, Parse=fake_parse),
+                "bus": SimpleNamespace(ReadDoubleWord=lambda _addr: 0x20000100),
+                "as_int": int,
+                "fmt_u32": lambda value: "0x{:08X}".format(int(value)),
+                "_time": SimpleNamespace(time=lambda: 0.0),
+                "tracking_start_address_config": gate_addr,
+                "_python_tracking_gate": gate_state,
+                "_apply_mram_torn_word_mode": lambda: None,
+                "_require_mram_torn_word_support": lambda: None,
+                "refresh_runtime_handles": lambda: None,
+                "reset_sticky_handoff_state": lambda: None,
+                "_DISARM_SENTINEL": 0x7FFFFFFF,
+                "_WRITE_FAULT_MODE": {"w": 0},
+                "_I2C_WIRE_CODE_TO_FAULT_TYPE": {},
+                "_OTP_WIRE_CODES": frozenset(),
+                "max_writes_cap": 32,
+                "boot_cycles": 2,
+                "phase2_wall_timeout_s": 5.0,
+                "phase2_time_slice": "0.02",
+                "slot_staging_base": 0x10101000,
+                "slot_staging_size": 0x1000,
+                "effective_page_size": lambda: 0x1000,
+                "success_marker_addr": 0,
+                "zero_point_execute_control": False,
+                "boundary_setup_env": "",
+                "boundary_durable_state_file": "",
+                "calibration_mode": False,
+                "boundary_phase": "",
+                "_hash_bypass_active": False,
+                "apply_hash_bypass": lambda: None,
+                "writeback_active": lambda: False,
+                "get_effective_criteria": lambda _ft: None,
+                "reset_verification_probes": lambda: None,
+                "restore_phase1_baseline": fake_restore_phase1_baseline,
+                "restore_flash_and_boot": fake_restore_flash_and_boot,
+                "capture_pre_boot_state_debug": lambda: None,
+                "capture_slot_header_debug": lambda _addr: None,
+                "capture_metadata_delta_snapshot": lambda: None,
+                "reset_rc_injection_state": lambda **_kw: None,
+                "_fault_uses_rc_injection_return_hook": lambda _ft: False,
+                "disarm_controller_fault": lambda: None,
+                "disarm_i2c_fault": lambda: None,
+                "arm_vtor_watchpoint": lambda: None,
+                "disarm_vtor_watchpoint": lambda: None,
+                "_copy_on_boot_vtor_settle_iters": lambda: 0,
+                "phase1_wall_timeout": lambda default_s=4.0: default_s,
+                "phase1_max_iters": lambda default_s=4.0: 10,
+                "run_control_phase1": fake_run_control_phase1,
+                "run_until_done": fake_run_until_done,
+                "get_last_write_address": lambda: 0x10102008,
+                "collect_mram_fault_evidence": lambda _fp, _idx: (
+                    {"exact": True, "program_address": "0x10102008"},
+                    bytes(data.backing),
+                    bytes(data.backing),
+                ),
+                "_snapshot_mram_fault_uncorrectable_offsets": lambda: [],
+                "_snapshot_mram_fault_uncorrectable_addresses": lambda: [],
+                "_snapshot_mram_uncorrectable_offsets": lambda: [],
+                "_snapshot_mram_uncorrectable_addresses": lambda: [],
+                "_restore_mram_uncorrectable_offsets": lambda _offs: None,
+                "_clear_mram_uncorrectable_read_log": lambda: None,
+                "collect_semantic_state": lambda _ctx: None,
+                "evaluate_boot_outcome": lambda *_args, **_kwargs: (
+                    "success",
+                    "exec",
+                    {},
+                ),
+                "_attach_uncorrectable_read_signals": lambda *_args, **_kwargs: None,
+                "merge_verification_probe_signals": lambda _signals: None,
+                "merge_stop_status_signals": lambda *_args, **_kwargs: None,
+                "add_boundary_contract_signals": lambda _signals: None,
+                "run_boot_cycle_hook": lambda _idx, _records: None,
+                "build_cycle_record": lambda idx, outcome, slot, signals, **_kw: {
+                    "cycle": idx,
+                    "boot_outcome": outcome,
+                    "boot_slot": slot,
+                    "signals": signals,
+                },
+                "analyze_boot_cycles": lambda records: {
+                    "status": "converged",
+                    "completed_cycles": len(records),
+                },
+                "_build_fault_result": fake_build_fault_result,
+                "log": lambda _msg: None,
+            },
+        )
+
+        # 1. Calibration-equivalent Phase 1 setup: gated, counts only the 5 post-gate writes.
+        ns["_machine_reset"]()
+        ns["reset_nvmc_for_sweep"]()
+        ns["disarm_fault"]()
+        run_firmware_boot(
+            label="calibration_p1", pre_gate_writes=1, post_gate_writes=5, hit_gate=True
+        )
+        calibration_writes = ns["get_total_writes"]()
+        self.assertEqual(calibration_writes, 5)
+
+        # 2. Clean control run (fault_at = -1): Phase 1 must stay behind the gate
+        #    (matching calibration) while its follow-up recovery boot runs ungated.
+        control_result = ns["run_execute_fault"](-1, "control")
+        self.assertEqual(control_result["actual_writes"], calibration_writes)
+        self.assertEqual(control_result["signals"]["phase1_ops_total"], calibration_writes)
+
+        # 3. Fault point (fault_at = 2): Phase 1 stays gated (fault hits the 3rd
+        #    post-gate write), and Phase 2 recovery still counts all 3 recovery writes.
+        fault_result = ns["run_execute_fault"](2, "w")
+        self.assertTrue(fault_result["fault_injected"])
+        self.assertEqual(fault_result["actual_writes"], 2)
+        self.assertEqual(fault_result["signals"]["phase1_ops_total"], 3)
+        self.assertEqual(fault_result["recovery_writes"], 3)
+
+        by_label = {entry["label"]: entry for entry in observed_phases}
+        self.assertEqual(by_label["calibration_p1"]["tracking_start"], gate_addr)
+        self.assertTrue(by_label["calibration_p1"]["hook_installed"])
+
+        self.assertEqual(by_label["control_p1"]["tracking_start"], gate_addr)
+        self.assertFalse(by_label["control_p1"]["tracking_started"])
+        self.assertTrue(by_label["control_p1"]["hook_installed"])
+
+        self.assertEqual(by_label["control_followup_1"]["tracking_start"], 0)
+        self.assertTrue(by_label["control_followup_1"]["tracking_started"])
+        self.assertFalse(by_label["control_followup_1"]["hook_installed"])
+        self.assertEqual(by_label["control_followup_1"]["writes_after_boot"], 2)
+
+        self.assertEqual(by_label["fp2_p1"]["tracking_start"], gate_addr)
+        self.assertTrue(by_label["fp2_p1"]["hook_installed"])
+        self.assertEqual(by_label["fp2_p2"]["tracking_start"], 0)
+        self.assertTrue(by_label["fp2_p2"]["tracking_started"])
+        self.assertFalse(by_label["fp2_p2"]["hook_installed"])
 
     def test_trace_replay_paths_record_recovery_writes(self) -> None:
         source = RUNTIME_PATH.read_text(encoding="utf-8")

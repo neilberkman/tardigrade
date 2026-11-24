@@ -515,7 +515,15 @@ class TfmBl2ProbeSlotCompatibilityTest(unittest.TestCase):
             runtime,
         )
         self.assertIn(
-            "_configure_python_tracking_gate(force=True, enable_tracking_gate=False)",
+            "def reset_nvmc_for_recovery(enable_tracking_gate=False):",
+            runtime,
+        )
+        self.assertIn(
+            "_configure_python_tracking_gate(force=True, enable_tracking_gate=enable_tracking_gate)",
+            runtime,
+        )
+        self.assertIn(
+            "reset_nvmc_for_recovery(enable_tracking_gate=True)",
             runtime,
         )
         self.assertIn("cpu_ref.AddHook(address, _python_tracking_gate_hook)", runtime)

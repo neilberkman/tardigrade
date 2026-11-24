@@ -6588,12 +6588,14 @@ def reset_nvmc_for_sweep(enable_tracking_gate=True):
     # Reset I2C fault state.
     disarm_i2c_fault()
 
-def reset_nvmc_for_recovery():
+def reset_nvmc_for_recovery(enable_tracking_gate=False):
     # Reset NVM for recovery boot: count recovery writes regardless of any
-    # Phase 1 tracking_start_address gate so recovery_writes and Phase 2
-    # write-progress observation remain active.
-    _configure_tracking_start_address(enable_tracking_gate=False)
-    _configure_python_tracking_gate(force=True, enable_tracking_gate=False)
+    # Phase 1 tracking_start_address gate by default so recovery_writes and
+    # Phase 2 write-progress observation remain active.  The clean control run
+    # passes enable_tracking_gate=True so its Phase 1 stays behind the same
+    # tracking gate as calibration.
+    _configure_tracking_start_address(enable_tracking_gate=enable_tracking_gate)
+    _configure_python_tracking_gate(force=True, enable_tracking_gate=enable_tracking_gate)
     _clear_read_log_fn = globals().get('_clear_mram_uncorrectable_read_log')
     if _clear_read_log_fn is not None:
         _clear_read_log_fn()
@@ -11892,7 +11894,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         cpu_ref = monitor.Machine['sysbus.cpu']
         cpu_ref.IsHalted = False
 
-        reset_nvmc_for_recovery()
+        reset_nvmc_for_recovery(enable_tracking_gate=True)
         disarm_fault()
 
         arm_vtor_watchpoint()

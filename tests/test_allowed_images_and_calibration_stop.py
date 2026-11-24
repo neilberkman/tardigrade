@@ -1219,6 +1219,13 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
         self.assertEqual(tracking_gate_calls, [True, False])
         self.assertEqual(python_gate_calls, [(True, True), (True, False)])
 
+        data.TotalWordWrites = 17
+        namespace["reset_nvmc_for_recovery"](enable_tracking_gate=True)
+        self.assertEqual(data.TotalWordWrites, 0)
+        self.assertEqual(data.FaultAtWordWrite, 0x7FFFFFFF)
+        self.assertEqual(tracking_gate_calls, [True, False, True])
+        self.assertEqual(python_gate_calls, [(True, True), (True, False), (True, True)])
+
     def test_in_run_firmware_reset_preserves_monotonic_writes_and_reaches_post_reset_fault_index(
         self,
     ) -> None:

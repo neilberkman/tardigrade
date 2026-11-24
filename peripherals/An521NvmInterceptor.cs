@@ -247,6 +247,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var mask = width == 4 ? 0xFFFFFFFFU : ((1U << (width * 8)) - 1U) << shift;
             result = (result & ~mask) | ((value & (mask >> shift)) << shift);
 
+            if(!trackingStarted)
+            {
+                // A precise instruction hook will arm tracking at the
+                // requested boundary; preserve earlier boot writes normally.
+                WriteResult(aligned, offset, width, result);
+                WriteShadowWord(aligned, result);
+                return;
+            }
+
             if(PassthroughMode)
             {
                 // Recovery boots preserve write accounting for diagnostics, but
@@ -256,14 +265,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 WriteResult(aligned, offset, width, result);
                 tracker.IncrementWriteCount();
                 WriteShadowWord(aligned, result);
-                return;
-            }
-
-            if(!trackingStarted)
-            {
-                // A precise instruction hook will arm tracking at the
-                // requested boundary; preserve earlier boot writes normally.
-                WriteResult(aligned, offset, width, result);
                 return;
             }
 

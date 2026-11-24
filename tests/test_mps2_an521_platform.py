@@ -193,6 +193,11 @@ class Mps2An521PlatformTest(unittest.TestCase):
             self.nvm,
         )
         self.assertIn("RemoveTrackingStartHook", self.nvm)
+        write_access = self.nvm[self.nvm.index("private void WriteAccess") :]
+        self.assertLess(
+            write_access.index("if(!trackingStarted)"),
+            write_access.index("if(PassthroughMode)"),
+        )
 
     def test_nvm_rejects_unsupported_write_modes_explicitly(self):
         self.assertIn("value < 0 || value > 6", self.nvm)
