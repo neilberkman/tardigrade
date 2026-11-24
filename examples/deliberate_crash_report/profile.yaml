@@ -27,6 +27,7 @@ success_criteria:
   image_hash: true
   image_hash_slot: exec
   expected_image: exec
+  allow_fault_after_success: true
   memory_checks:
     - { address: 0x20000200, expected_value: 1, op: eq }
     - { address: 0x20000204, expected_value: 5, op: ge }

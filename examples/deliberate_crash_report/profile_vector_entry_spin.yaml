@@ -1,0 +1,8 @@
+base_profile: profile.yaml
+name: deliberate_crash_report_vector_entry_spin
+description: Opted-in variant whose Fault_Handler spins on the HardFault vector entry instruction itself while VTOR points to the exec slot.
+images:
+  exec: examples/deliberate_crash_report/vector_entry_spin.bin
+expect:
+  control_outcome: success
+  should_find_issues: true

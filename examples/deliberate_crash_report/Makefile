@@ -10,7 +10,8 @@ APP_PAD_TO := 0x10101000
 
 .PHONY: all clean
 
-all: boot.elf app.bin fault_before_checks.bin fault_forges_checks.bin
+all: boot.elf app.bin fault_before_checks.bin fault_forges_checks.bin \
+	vector_entry_spin.bin followup_fault_before_checks.bin
 
 boot.elf: boot.c boot.ld
 	$(CC) $(CFLAGS) $(BOOT_LDFLAGS) -o $@ boot.c
@@ -24,9 +25,17 @@ fault_before_checks.elf: app.c app.ld
 fault_forges_checks.elf: app.c app.ld
 	$(CC) $(CFLAGS) $(APP_LDFLAGS) -DFAULT_BEFORE_CHECKS=1 -DFAULT_HANDLER_FORGES_CHECKS=1 -o $@ app.c
 
+vector_entry_spin.elf: app.c app.ld
+	$(CC) $(CFLAGS) $(APP_LDFLAGS) -DFAULT_HANDLER_VECTOR_ENTRY_SPIN=1 -o $@ app.c
+
+followup_fault_before_checks.elf: app.c app.ld
+	$(CC) $(CFLAGS) $(APP_LDFLAGS) -DFAULT_ON_SECOND_BOOT_BEFORE_CHECKS=1 -o $@ app.c
+
 %.bin: %.elf
 	$(OBJCOPY) -O binary --gap-fill 0xFF --pad-to $(APP_PAD_TO) $< $@
 
 clean:
 	rm -f boot.elf app.elf fault_before_checks.elf fault_forges_checks.elf \
-		app.bin fault_before_checks.bin fault_forges_checks.bin
+		vector_entry_spin.elf followup_fault_before_checks.elf \
+		app.bin fault_before_checks.bin fault_forges_checks.bin \
+		vector_entry_spin.bin followup_fault_before_checks.bin

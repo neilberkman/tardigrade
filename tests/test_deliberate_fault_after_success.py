@@ -78,12 +78,24 @@ def _build_harness(
     *,
     step_fn,
     memory_specs: list[dict] | None = None,
+    config_specs: list[dict] | None = None,
+    bootloader_integrity: bool = False,
     mem_values: dict[int, int] | None = None,
     terminal_after_reset: bool = False,
+    allow_fault_after_success: bool = False,
     supports_interrupt_hook: bool = True,
     initial_vtor: int = 0x20000100,
     success_vtor_slot: str = "",
     success_pc_slot: str = "exec",
+    success_image_hash: bool = True,
+    expected_exec_sha256: str = ALLOWED_HASH,
+    image_exec_sha256: str = ALLOWED_HASH,
+    image_staging_sha256: str = "",
+    slot_hash_fn=None,
+    success_marker_addr: int = 0,
+    success_marker_value: int = 0,
+    success_otadata_expect: dict | None = None,
+    boot_cycle_hook: str = "",
     uncorrectable_target=None,
 ):
     sticky_vtor = {"captured": False, "value": 0, "slot": None}
@@ -230,33 +242,46 @@ def _build_harness(
             "success_vtor_slot": success_vtor_slot,
             "success_vector_offset": 0,
             "success_pc_slot": success_pc_slot,
-            "success_image_hash": True,
+            "success_image_hash": success_image_hash,
             "success_image_hash_slot": "exec",
             "success_terminal_after_reset": terminal_after_reset,
+            "success_allow_fault_after_success": allow_fault_after_success,
+            "boot_cycle_hook": boot_cycle_hook,
+            "update_sequence_enabled": False,
+            "volatile_regions": [{"name": "sram", "base": 0x20000000, "size": 0x2000}],
             "bootloader_entry": 0x00000000,
             "slot_ranges": {"exec": (0x10100000, 0x10101000)},
             "allowed_image_hashes": [],
-            "expected_exec_sha256": ALLOWED_HASH,
+            "expected_exec_sha256": expected_exec_sha256,
             "expected_image_name": "exec",
-            "image_exec_sha256": ALLOWED_HASH,
-            "image_staging_sha256": "",
-            "success_marker_addr": 0,
-            "success_marker_value": 0,
+            "image_exec_sha256": image_exec_sha256,
+            "image_staging_sha256": image_staging_sha256,
+            "success_marker_addr": success_marker_addr,
+            "success_marker_value": success_marker_value,
             "security_anti_rollback": False,
-            "success_otadata_expect": {},
+            "success_otadata_expect": dict(success_otadata_expect or {}),
             "success_otadata_expect_scope": "always",
             "max_reset_vector_offset": None,
             "success_checks_config": {
                 "memory_checks": list(memory_specs or []),
-                "config_checks": [],
-                "bootloader_integrity": False,
+                "config_checks": list(config_specs or []),
+                "bootloader_integrity": bool(bootloader_integrity),
+                "bootloader_region": {"base": 0x00000000, "size": 0x1000},
             },
             "success_checks_parse_error": None,
             "sram_start": 0x20000000,
             "sram_end": 0x20002000,
-            "compute_slot_hash": lambda _slot: ALLOWED_HASH,
+            "compute_slot_hash": slot_hash_fn or (lambda _slot: expected_exec_sha256),
             "_match_configured_image_hash": (
-                lambda digest: "exec" if digest == ALLOWED_HASH else None
+                lambda digest: (
+                    "exec"
+                    if image_exec_sha256 and digest == image_exec_sha256
+                    else (
+                        "staging"
+                        if image_staging_sha256 and digest == image_staging_sha256
+                        else ("expected" if expected_exec_sha256 and digest == expected_exec_sha256 else None)
+                    )
+                )
             ),
             "collect_otadata_signals": lambda: {},
             "normalize_signal_token": lambda value: str(value or "").strip().lower(),
@@ -336,6 +361,7 @@ def test_deliberate_fault_after_checks_in_single_slice_classifies_as_success() -
         step_fn=step,
         memory_specs=CHECKS,
         mem_values={0x20000200: 0, 0x20000204: 0},
+        allow_fault_after_success=True,
     )
     status = ns["run_until_done"](cpu, time_slice="0.02", max_iters=5)
     assert status["reason"] == "pc_captured"
@@ -355,7 +381,98 @@ def test_deliberate_fault_after_checks_in_single_slice_classifies_as_success() -
     assert rec["ipsr"] == 3
     assert rec["fault_exception_active"] is True
     assert rec["checks_held_before_fault"] is True
+    assert rec["allow_fault_after_success"] is True
+    assert rec["post_success_fault_suppressed"] is True
     assert rec["hardfault_observed"] is False
+
+
+def test_fault_after_checks_without_opt_in_classifies_as_hard_fault() -> None:
+    def step(state, _machine, cpu, mem, fire_fault):
+        hook = state["hooks"].get(0x10100020)
+        if hook is not None:
+            hook(cpu, 0x10100020)
+        state["pc"] = 0x10100060
+        state["instructions"] = 500
+        state["virtual_time"].seconds = 0.005
+        mem[0x20000200] = 1
+        mem[0x20000204] = 5
+        state["instructions"] = 1000
+        state["virtual_time"].seconds = 0.010
+        fire_fault(3)
+        state["pc"] = 0x10100090
+        state["virtual_time"].seconds = 0.020
+
+    ns, state, _machine, cpu = _build_harness(
+        step_fn=step,
+        memory_specs=CHECKS,
+        mem_values={0x20000200: 0, 0x20000204: 0},
+        allow_fault_after_success=False,
+    )
+    status = ns["run_until_done"](cpu, time_slice="0.02", max_iters=5)
+    assert status["fault_timing"]["checks_held_before_fault"] is True
+
+    outcome, slot, signals = ns["evaluate_boot_outcome"](
+        state["vtor"], state["pc"], fault_injected=False, p2_status=status
+    )
+    assert outcome == "hard_fault"
+    assert slot == "exec"
+    rec = signals["recovery_execution"]
+    assert rec["fault_exception_active"] is True
+    assert rec["checks_held_before_fault"] is True
+    assert rec["allow_fault_after_success"] is False
+    assert rec["post_success_fault_suppressed"] is False
+    assert rec["hardfault_observed"] is True
+
+
+def test_vector_entry_spin_after_checks_respects_opt_in() -> None:
+    def step(state, _machine, cpu, mem, fire_fault):
+        hook = state["hooks"].get(0x10100020)
+        if hook is not None:
+            hook(cpu, 0x10100020)
+        state["pc"] = 0x10100060
+        state["instructions"] = 500
+        state["virtual_time"].seconds = 0.005
+        mem[0x20000200] = 1
+        mem[0x20000204] = 5
+        state["instructions"] = 1000
+        state["virtual_time"].seconds = 0.010
+        fire_fault(3)
+        # HardFault vector at 0x1010000C is 0x10100081 -> spin at 0x10100080.
+        state["pc"] = 0x10100080
+        state["virtual_time"].seconds = 0.020
+
+    ns_opt, state_opt, _m, cpu_opt = _build_harness(
+        step_fn=step,
+        memory_specs=CHECKS,
+        mem_values={0x20000200: 0, 0x20000204: 0},
+        initial_vtor=0x10100000,
+        allow_fault_after_success=True,
+    )
+    status_opt = ns_opt["run_until_done"](cpu_opt, time_slice="0.02", max_iters=5)
+    outcome_opt, slot_opt, signals_opt = ns_opt["evaluate_boot_outcome"](
+        state_opt["vtor"], state_opt["pc"], fault_injected=False, p2_status=status_opt
+    )
+    assert outcome_opt == "success"
+    assert slot_opt == "exec"
+    assert signals_opt["recovery_execution"]["hardfault_vector"] == "0x10100081"
+    assert signals_opt["recovery_execution"]["hardfault_handler_active"] is False
+    assert signals_opt["recovery_execution"]["hardfault_observed"] is False
+
+    # Without opt-in, spinning at the vector entry instruction is hard_fault.
+    ns_no, state_no, _m2, cpu_no = _build_harness(
+        step_fn=step,
+        memory_specs=CHECKS,
+        mem_values={0x20000200: 0, 0x20000204: 0},
+        initial_vtor=0x10100000,
+        allow_fault_after_success=False,
+    )
+    status_no = ns_no["run_until_done"](cpu_no, time_slice="0.02", max_iters=5)
+    outcome_no, _slot_no, signals_no = ns_no["evaluate_boot_outcome"](
+        state_no["vtor"], state_no["pc"], fault_injected=False, p2_status=status_no
+    )
+    assert outcome_no == "hard_fault"
+    assert signals_no["recovery_execution"]["hardfault_handler_active"] is True
+    assert signals_no["recovery_execution"]["hardfault_observed"] is True
 
 
 def test_fault_before_checks_hold_remains_hard_fault() -> None:
@@ -448,6 +565,7 @@ def test_cross_slice_checks_then_fault_without_interrupt_hook_passes() -> None:
         initial_vtor=0x10100000,
         success_vtor_slot="exec",
         success_pc_slot="",
+        allow_fault_after_success=True,
     )
     # Settle 1 slice after VTOR capture so slice 1 observes checks with IPSR=0
     # and slice 2 observes IPSR=3.
@@ -559,6 +677,7 @@ def test_handled_uncorrectable_read_then_checks_then_deliberate_fault_passes() -
         memory_specs=CHECKS,
         mem_values={0x20000200: 0, 0x20000204: 0},
         uncorrectable_target=mram,
+        allow_fault_after_success=True,
     )
     status = ns["run_until_done"](cpu, time_slice="0.02", max_iters=5)
     ft = status["fault_timing"]
@@ -591,6 +710,7 @@ def test_post_fault_check_corruption_revokes_suppression() -> None:
         step_fn=step,
         memory_specs=CHECKS,
         mem_values={0x20000200: 0, 0x20000204: 0},
+        allow_fault_after_success=True,
     )
     status = ns["run_until_done"](cpu, time_slice="0.02", max_iters=5)
     outcome, _slot, signals = ns["evaluate_boot_outcome"](
@@ -662,6 +782,7 @@ def test_terminal_after_reset_clears_pre_reset_timing_and_accepts_post_reset_del
         memory_specs=CHECKS,
         mem_values={0x20000200: 0, 0x20000204: 0},
         terminal_after_reset=True,
+        allow_fault_after_success=True,
     )
     status = ns["run_until_done"](cpu, time_slice="0.02", max_iters=5)
     assert status["reason"] == "success_terminal_after_reset"
@@ -674,6 +795,417 @@ def test_terminal_after_reset_clears_pre_reset_timing_and_accepts_post_reset_del
     assert slot == "exec"
 
 
+def test_uncorrectable_read_after_checks_remains_hard_fault_even_with_opt_in() -> None:
+    mram = SimpleNamespace(UncorrectableReadCount=0)
+
+    def step(state, _machine, cpu, mem, fire_fault):
+        hook = state["hooks"].get(0x10100020)
+        if hook is not None:
+            hook(cpu, 0x10100020)
+        state["pc"] = 0x10100060
+        mem[0x20000200] = 1
+        mem[0x20000204] = 5
+        state["instructions"] = 200
+        state["virtual_time"].seconds = 0.005
+        # Checks already hold, then an uncorrectable MRAM read faults and spins
+        # on the HardFault vector entry instruction.
+        mram.UncorrectableReadCount = 1
+        state["instructions"] = 400
+        state["virtual_time"].seconds = 0.010
+        fire_fault(3)
+        state["pc"] = 0x10100080
+        state["virtual_time"].seconds = 0.020
+
+    ns, state, _machine, cpu = _build_harness(
+        step_fn=step,
+        memory_specs=CHECKS,
+        mem_values={0x20000200: 0, 0x20000204: 0},
+        initial_vtor=0x10100000,
+        uncorrectable_target=mram,
+        allow_fault_after_success=True,
+    )
+    status = ns["run_until_done"](cpu, time_slice="0.02", max_iters=5)
+    assert status["fault_timing"]["uncorrectable_read_triggered_fault"] is True
+    assert status["fault_timing"]["checks_held_before_fault"] is False
+
+    outcome, _slot, signals = ns["evaluate_boot_outcome"](
+        state["vtor"], state["pc"], fault_injected=True, p2_status=status
+    )
+    assert outcome == "hard_fault"
+    assert signals["recovery_execution"]["post_success_fault_suppressed"] is False
+    assert signals["recovery_execution"]["hardfault_observed"] is True
+
+
+def test_followup_cycle_evaluates_memory_checks_and_rejects_early_fault() -> None:
+    def step(state, _machine, cpu, _mem, fire_fault):
+        hook = state["hooks"].get(0x10100020)
+        if hook is not None:
+            hook(cpu, 0x10100020)
+        state["pc"] = 0x10100050
+        state["instructions"] = 100
+        state["virtual_time"].seconds = 0.001
+        fire_fault(3)
+        state["pc"] = 0x10100090
+        state["virtual_time"].seconds = 0.020
+
+    ns, state, _machine, cpu = _build_harness(
+        step_fn=step,
+        memory_specs=CHECKS,
+        mem_values={0x20000200: 0, 0x20000204: 0},
+        allow_fault_after_success=True,
+    )
+    status = ns["run_until_done"](
+        cpu,
+        time_slice="0.02",
+        max_iters=5,
+        enforce_content_criteria=True,
+        followup_cycle=True,
+    )
+    assert status["fault_timing"]["checks_held_before_fault"] is False
+    assert status["fault_timing"]["checks_first_held"] is None
+
+    outcome, _slot, signals = ns["evaluate_boot_outcome"](
+        state["vtor"],
+        state["pc"],
+        fault_injected=False,
+        enforce_content_criteria=True,
+        p2_status=status,
+        followup_cycle=True,
+    )
+    assert outcome == "hard_fault"
+    assert signals["memory_checks_ok"] is False
+    assert signals["recovery_execution"]["hardfault_observed"] is True
+
+
+def test_followup_cycle_evaluates_volatile_marker_and_structured_checks() -> None:
+    def step(state, _machine, cpu, _mem, fire_fault):
+        hook = state["hooks"].get(0x10100020)
+        if hook is not None:
+            hook(cpu, 0x10100020)
+        state["pc"] = 0x10100050
+        state["instructions"] = 100
+        state["virtual_time"].seconds = 0.001
+        fire_fault(3)
+        state["pc"] = 0x10100090
+        state["virtual_time"].seconds = 0.020
+
+    ns, state, _machine, cpu = _build_harness(
+        step_fn=step,
+        memory_specs=[],
+        config_specs=[{"address": 0x20000300, "expected": 0xCAFEBABE}],
+        bootloader_integrity=True,
+        mem_values={0x20000100: 0, 0x20000300: 0, 0x00000000: 0x20002000},
+        success_marker_addr=0x20000100,
+        success_marker_value=0x5245434F,
+        allow_fault_after_success=True,
+    )
+    status = ns["run_until_done"](
+        cpu,
+        time_slice="0.02",
+        max_iters=5,
+        enforce_content_criteria=True,
+        followup_cycle=True,
+    )
+    assert status["fault_timing"]["checks_held_before_fault"] is False
+
+    outcome, _slot, signals = ns["evaluate_boot_outcome"](
+        state["vtor"],
+        state["pc"],
+        fault_injected=False,
+        enforce_content_criteria=True,
+        p2_status=status,
+        followup_cycle=True,
+    )
+    assert outcome == "hard_fault"
+    assert signals["marker_ok"] is False
+    assert signals["config_checks_ok"] is False
+
+
+def test_followup_cycle_unconfirmed_in_slot_marker_revert_passes_cleanly_but_never_counts_as_held() -> None:
+    # Models scenarios/mcuboot_head_exploratory.yaml (mcuboot_head_upgrade +
+    # boot_cycles=3, no confirm hook): static in-slot header marker at
+    # 0x10100014 reverts to slot0's version word on cycle 1.
+    def clean_step(state, _machine, cpu, _mem, _fire_fault):
+        hook = state["hooks"].get(0x10100020)
+        if hook is not None:
+            hook(cpu, 0x10100020)
+        state["pc"] = 0x10100060
+        state["instructions"] = 500
+        state["virtual_time"].seconds = 0.010
+
+    ns_clean, state_clean, _m, cpu_clean = _build_harness(
+        step_fn=clean_step,
+        memory_specs=[],
+        mem_values={0x10100014: 0x00000001},
+        success_image_hash=False,
+        success_marker_addr=0x10100014,
+        success_marker_value=0x00010001,
+        boot_cycle_hook="",
+        allow_fault_after_success=True,
+    )
+    status_clean = ns_clean["run_until_done"](
+        cpu_clean, time_slice="0.02", max_iters=5, followup_cycle=True
+    )
+    outcome_clean, _slot, signals_clean = ns_clean["evaluate_boot_outcome"](
+        state_clean["vtor"],
+        state_clean["pc"],
+        fault_injected=False,
+        p2_status=status_clean,
+        followup_cycle=True,
+    )
+    assert outcome_clean == "success"
+    assert signals_clean["followup_skipped_criteria"] == ["marker_address"]
+
+    # If the firmware faults on that follow-up cycle, the skipped marker must
+    # NOT count as held even when allow_fault_after_success=True.
+    def fault_step(state, _machine, cpu, _mem, fire_fault):
+        hook = state["hooks"].get(0x10100020)
+        if hook is not None:
+            hook(cpu, 0x10100020)
+        state["pc"] = 0x10100060
+        state["instructions"] = 500
+        state["virtual_time"].seconds = 0.010
+        fire_fault(3)
+        state["pc"] = 0x10100090
+        state["virtual_time"].seconds = 0.020
+
+    ns_fault, state_fault, _m2, cpu_fault = _build_harness(
+        step_fn=fault_step,
+        memory_specs=[],
+        mem_values={0x10100014: 0x00000001},
+        success_image_hash=False,
+        success_marker_addr=0x10100014,
+        success_marker_value=0x00010001,
+        boot_cycle_hook="",
+        allow_fault_after_success=True,
+    )
+    status_fault = ns_fault["run_until_done"](
+        cpu_fault, time_slice="0.02", max_iters=5, followup_cycle=True
+    )
+    assert status_fault["fault_timing"]["checks_held_before_fault"] is False
+    outcome_fault, _slot2, _sig2 = ns_fault["evaluate_boot_outcome"](
+        state_fault["vtor"],
+        state_fault["pc"],
+        fault_injected=False,
+        p2_status=status_fault,
+        followup_cycle=True,
+    )
+    assert outcome_fault == "hard_fault"
+
+
+def test_followup_cycle_skipped_otadata_and_unconfirmed_hash_never_count_as_held() -> None:
+    exec_hash = "11" * 32
+    staging_hash = "22" * 32
+    corrupt_hash = "33" * 32
+
+    def fault_step(state, _machine, cpu, _mem, fire_fault):
+        hook = state["hooks"].get(0x10100020)
+        if hook is not None:
+            hook(cpu, 0x10100020)
+        state["pc"] = 0x10100060
+        state["instructions"] = 500
+        state["virtual_time"].seconds = 0.010
+        fire_fault(3)
+        state["pc"] = 0x10100090
+        state["virtual_time"].seconds = 0.020
+
+    # Skipped otadata_expect on follow-up cycle cannot count as held.
+    ns_ota, state_ota, _m, cpu_ota = _build_harness(
+        step_fn=fault_step,
+        memory_specs=[],
+        success_image_hash=False,
+        success_otadata_expect={"otadata1_state_name": ["pending_verify"]},
+        allow_fault_after_success=True,
+    )
+    status_ota = ns_ota["run_until_done"](
+        cpu_ota, time_slice="0.02", max_iters=5, followup_cycle=True
+    )
+    assert status_ota["fault_timing"]["checks_held_before_fault"] is False
+    outcome_ota, _s, sig_ota = ns_ota["evaluate_boot_outcome"](
+        state_ota["vtor"],
+        state_ota["pc"],
+        fault_injected=False,
+        p2_status=status_ota,
+        followup_cycle=True,
+    )
+    assert outcome_ota == "hard_fault"
+    assert sig_ota["followup_skipped_criteria"] == ["otadata_expect"]
+
+    # Unconfirmed upgrade reverted to exec_hash: clean cycle succeeds (with
+    # skipped restriction noted), corrupt flash fails with wrong_image, and
+    # faulting cycle stays hard_fault (never counts as held).
+    def clean_step(state, _machine, cpu, _mem, _fire_fault):
+        hook = state["hooks"].get(0x10100020)
+        if hook is not None:
+            hook(cpu, 0x10100020)
+        state["pc"] = 0x10100060
+        state["instructions"] = 500
+        state["virtual_time"].seconds = 0.010
+
+    ns_rev, state_rev, _m2, cpu_rev = _build_harness(
+        step_fn=clean_step,
+        memory_specs=[],
+        success_image_hash=True,
+        expected_exec_sha256=staging_hash,
+        image_exec_sha256=exec_hash,
+        image_staging_sha256=staging_hash,
+        slot_hash_fn=lambda _slot: exec_hash,
+        boot_cycle_hook="",
+        allow_fault_after_success=True,
+    )
+    status_rev = ns_rev["run_until_done"](
+        cpu_rev, time_slice="0.02", max_iters=5, followup_cycle=True
+    )
+    out_rev, _s2, sig_rev = ns_rev["evaluate_boot_outcome"](
+        state_rev["vtor"],
+        state_rev["pc"],
+        fault_injected=False,
+        p2_status=status_rev,
+        followup_cycle=True,
+    )
+    assert out_rev == "success"
+    assert sig_rev["followup_skipped_criteria"] == ["image_hash_expected_image"]
+
+    ns_corrupt, state_corrupt, _m3, cpu_corrupt = _build_harness(
+        step_fn=clean_step,
+        memory_specs=[],
+        success_image_hash=True,
+        expected_exec_sha256=staging_hash,
+        image_exec_sha256=exec_hash,
+        image_staging_sha256=staging_hash,
+        slot_hash_fn=lambda _slot: corrupt_hash,
+        boot_cycle_hook="",
+        allow_fault_after_success=True,
+    )
+    status_corrupt = ns_corrupt["run_until_done"](
+        cpu_corrupt, time_slice="0.02", max_iters=5, followup_cycle=True
+    )
+    out_corrupt, _s3, _sig3 = ns_corrupt["evaluate_boot_outcome"](
+        state_corrupt["vtor"],
+        state_corrupt["pc"],
+        fault_injected=False,
+        p2_status=status_corrupt,
+        followup_cycle=True,
+    )
+    assert out_corrupt == "wrong_image"
+
+    ns_rev_fault, state_rev_fault, _m4, cpu_rev_fault = _build_harness(
+        step_fn=fault_step,
+        memory_specs=[],
+        success_image_hash=True,
+        expected_exec_sha256=staging_hash,
+        image_exec_sha256=exec_hash,
+        image_staging_sha256=staging_hash,
+        slot_hash_fn=lambda _slot: exec_hash,
+        boot_cycle_hook="",
+        allow_fault_after_success=True,
+    )
+    status_rev_fault = ns_rev_fault["run_until_done"](
+        cpu_rev_fault, time_slice="0.02", max_iters=5, followup_cycle=True
+    )
+    assert status_rev_fault["fault_timing"]["checks_held_before_fault"] is False
+    out_rev_fault, _s4, _sig4 = ns_rev_fault["evaluate_boot_outcome"](
+        state_rev_fault["vtor"],
+        state_rev_fault["pc"],
+        fault_injected=False,
+        p2_status=status_rev_fault,
+        followup_cycle=True,
+    )
+    assert out_rev_fault == "hard_fault"
+
+
+def test_boot_followup_cycle_passes_content_criteria_and_followup_flag() -> None:
+    calls: dict[str, dict] = {}
+
+    def fake_run_until_done(_cpu, **kwargs):
+        calls["run_until_done"] = dict(kwargs)
+        return {"reason": "pc_captured", "emulated_s": 0.02, "iters": 1}
+
+    def fake_evaluate_boot_outcome(_vtor, _pc, **kwargs):
+        calls["evaluate_boot_outcome"] = dict(kwargs)
+        return ("hard_fault", "exec", {"memory_checks_ok": False})
+
+    ns = _load_runtime_functions(
+        "_boot_followup_cycle",
+        extra_namespace={
+            "phase2_wall_timeout_s": 10.0,
+            "phase2_time_slice": "0.02",
+            "backend": {"kind": "fast"},
+            "monitor": SimpleNamespace(
+                Machine={
+                    "sysbus.cpu": SimpleNamespace(
+                        GetRegisterUnsafe=lambda _idx: 0x10100080
+                    )
+                }
+            ),
+            "bus": SimpleNamespace(ReadDoubleWord=lambda _addr: 0x10100000),
+            "as_int": int,
+            "reset_nvmc_for_recovery": lambda: None,
+            "arm_vtor_watchpoint": lambda: None,
+            "disarm_vtor_watchpoint": lambda: None,
+            "run_until_done": fake_run_until_done,
+            "evaluate_boot_outcome": fake_evaluate_boot_outcome,
+            "build_cycle_record": lambda cycle_index, outcome, slot, signals, **_kw: {
+                "cycle": cycle_index,
+                "boot_outcome": outcome,
+                "boot_slot": slot,
+                "signals": signals,
+            },
+        },
+    )
+    record = ns["_boot_followup_cycle"](1, False, "control_followup")
+    assert record["boot_outcome"] == "hard_fault"
+    assert calls["run_until_done"]["enforce_content_criteria"] is True
+    assert calls["run_until_done"]["followup_cycle"] is True
+    assert calls["evaluate_boot_outcome"]["enforce_content_criteria"] is True
+    assert calls["evaluate_boot_outcome"]["followup_cycle"] is True
+
+
+def test_allow_fault_after_success_profile_schema_and_transport(tmp_path: Path) -> None:
+    from boundary_reserved import BOUNDARY_RESERVED_VARIABLES
+    from profile_loader import ProfileError
+
+    assert "SUCCESS_ALLOW_FAULT_AFTER_SUCCESS" in BOUNDARY_RESERVED_VARIABLES
+    assert '$success_allow_fault_after_success?="false"' in (
+        ROOT / "scripts" / "run_runtime_fault_sweep.resc"
+    ).read_text(encoding="utf-8")
+    robot_text = (ROOT / "tests" / "ota_fault_point.robot").read_text(encoding="utf-8")
+    assert "${SUCCESS_ALLOW_FAULT_AFTER_SUCCESS}    false" in robot_text
+    assert '$success_allow_fault_after_success="${SUCCESS_ALLOW_FAULT_AFTER_SUCCESS}"' in robot_text
+
+    # State mode must reject allow_fault_after_success: true.
+    bad_state = tmp_path / "bad_state.yaml"
+    bad_state.write_text(
+        (FIXTURE / "profile.yaml")
+        .read_text(encoding="utf-8")
+        .replace("evaluation_mode: execute", "evaluation_mode: state"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ProfileError, match="execute evaluation mode"):
+        load_profile(bad_state, strict=True)
+
+    # Runtime dict and robot_vars propagate the opt-in cleanly.
+    pos = load_profile(FIXTURE / "profile.yaml", strict=True)
+    assert pos.success_criteria.allow_fault_after_success is True
+    assert "SUCCESS_ALLOW_FAULT_AFTER_SUCCESS:true" in pos.robot_vars(ROOT)
+    assert (
+        pos._success_criteria_runtime_dict(ROOT, pos.success_criteria, pos.images)[
+            "allow_fault_after_success"
+        ]
+        is True
+    )
+
+    no_opt = load_profile(FIXTURE / "profile_no_opt_in.yaml", strict=True)
+    assert no_opt.success_criteria.allow_fault_after_success is False
+    assert "SUCCESS_ALLOW_FAULT_AFTER_SUCCESS:true" not in no_opt.robot_vars(ROOT)
+    assert (
+        no_opt._success_criteria_runtime_dict(
+            ROOT, no_opt.success_criteria, no_opt.images
+        )["allow_fault_after_success"]
+        is False
+    )
+
+
 def test_deliberate_crash_report_fixture_builds_and_profiles_validate() -> None:
     if shutil.which("arm-none-eabi-gcc") is None:
         pytest.skip("arm-none-eabi-gcc is not installed")
@@ -683,6 +1215,11 @@ def test_deliberate_crash_report_fixture_builds_and_profiles_validate() -> None:
         check=True,
     )
     pos = load_profile(FIXTURE / "profile.yaml", strict=True)
+    no_opt = load_profile(FIXTURE / "profile_no_opt_in.yaml", strict=True)
+    vec_spin = load_profile(FIXTURE / "profile_vector_entry_spin.yaml", strict=True)
+    followup = load_profile(
+        FIXTURE / "profile_followup_fault_before_checks.yaml", strict=True
+    )
     neg_before = load_profile(
         FIXTURE / "profile_fault_before_checks.yaml", strict=True
     )
@@ -693,7 +1230,17 @@ def test_deliberate_crash_report_fixture_builds_and_profiles_validate() -> None:
     assert pos.expect.control_outcome == "success"
     assert pos.expect.should_find_issues is True
     assert pos.success_criteria.pc_in_slot == "exec"
+    assert pos.success_criteria.allow_fault_after_success is True
     assert len(pos.success_criteria.memory_checks) == 2
+    assert no_opt.success_criteria.allow_fault_after_success is False
+    assert no_opt.expect.control_outcome == "hard_fault"
+    assert no_opt.expect.allow_control_only_issues is True
+    assert vec_spin.success_criteria.allow_fault_after_success is True
+    assert vec_spin.expect.control_outcome == "success"
+    assert followup.success_criteria.allow_fault_after_success is True
+    assert followup.fault_sweep.boot_cycles == 3
+    assert followup.expect.control_outcome == "hard_fault"
+    assert followup.expect.allow_control_only_issues is True
     assert neg_before.expect.control_outcome == "hard_fault"
     assert neg_before.expect.allow_control_only_issues is True
     assert neg_forges.expect.control_outcome == "hard_fault"

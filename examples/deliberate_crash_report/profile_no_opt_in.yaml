@@ -1,0 +1,11 @@
+base_profile: profile.yaml
+name: deliberate_crash_report_no_opt_in
+description: Variant that faults after its success checks hold without opting in to allow_fault_after_success; must classify as hard_fault.
+success_criteria:
+  allow_fault_after_success: false
+fault_sweep:
+  max_writes: 0
+expect:
+  control_outcome: hard_fault
+  allow_control_only_issues: true
+  should_find_issues: true

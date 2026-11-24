@@ -1,0 +1,12 @@
+base_profile: profile.yaml
+name: deliberate_crash_report_followup_fault_before_checks
+description: Variant that boots cleanly on cycle 0, then faults on follow-up boot cycles before its memory success checks hold; must classify as hard_fault even with allow_fault_after_success enabled.
+images:
+  exec: examples/deliberate_crash_report/followup_fault_before_checks.bin
+fault_sweep:
+  boot_cycles: 3
+  max_writes: 0
+expect:
+  control_outcome: hard_fault
+  allow_control_only_issues: true
+  should_find_issues: true
