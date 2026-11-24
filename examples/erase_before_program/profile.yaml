@@ -1,0 +1,43 @@
+schema_version: 1
+name: erase_before_program
+description: NVMemoryController firmware that erases a persistent record sector before reprogramming it (include_erase_fault_points defaults off).
+platform: platforms/cortex_m0_hybrid_nvm.repl
+bootloader:
+  elf: examples/erase_before_program/firmware.elf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x20000000, end: 0x20002000 }
+  volatile_regions:
+    - { name: runtime_sram, base: 0x20000000, size: 0x2000 }
+  write_granularity: 4
+  page_size: 0x1000
+  trace_address_map:
+    - { offset_start: 0x0, offset_end: 0x4000, address_addend: 0x10100000 }
+  slots:
+    exec: { base: 0x10100000, size: 0x2000 }
+    staging: { base: 0x10102000, size: 0x2000 }
+pre_boot_state:
+  - { address: 0x10100000, u32: 0x20002000 }
+  - { address: 0x10100004, u32: 0x10100041 }
+  - { address: 0x10100008, u32: 0x10100041 }
+  - { address: 0x1010000C, u32: 0x10100041 }
+  - { address: 0x10100040, u32: 0xE7FEE7FE }
+  - { address: 0x10101000, u32: 0x52454331 }
+  - { address: 0x10101800, u32: 0x444F4E45 }
+  - { address: 0x20000030, u32: 0x55504431 }
+flash_backend: nvm_ctrl
+success_criteria:
+  vtor_in_slot: exec
+  marker_address: 0x20000020
+  marker_value: 0xB007C0DE
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  max_writes: auto
+  max_writes_cap: 16
+  sweep_strategy: exhaustive
+  run_duration: "0.1"
+  progress_stall_timeout_s: 0.1
+expect:
+  should_find_issues: true

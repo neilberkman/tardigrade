@@ -8,6 +8,18 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Added
 
+- Opt-in erase fault points via `fault_sweep.include_erase_fault_points`
+  (defaults to `false` so existing profiles' fault indices and outcomes remain
+  identical). When enabled, calibration tracks erases and the fault planner
+  injects interrupted-erase fault points across built-in NVM and flash backends
+  (`MappedMRAMTracker`, `NVMemoryController` / `NVMemory`,
+  `GenericNvmController`, `An521NvmInterceptor`, `NRF52NVMC`, `STM32*`, and
+  `CFIFlash`). Interrupted erases follow the backend's torn-word modes
+  (`half`/`half_retain`, `untouched`, `erased`/`programmed`, `uncorrectable`,
+  `corrupted`), and every NVM fault point result, categorized failure, and
+  sweep summary now reports `operation_kind` (`program` or `erase`). Added the
+  `examples/erase_before_program/` fixture, `tests/erase_fault_points.robot`,
+  and `tests/test_erase_fault_points.py`.
 - Configurable function-return fault injection and per-call return probes.
 - Success-implies-effect, atomic-state, monotonic-state, and cross-component
   security invariants.

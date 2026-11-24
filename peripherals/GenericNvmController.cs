@@ -183,6 +183,8 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         // Handshake values.
         public uint WriteCommandValue { get; set; } = 0x2;
+        public uint EraseCommandValue { get; set; } = 0x3;
+        public uint EraseWordCommandValue { get; set; } = 0x4;
         public uint SuccessStatusValue { get; set; } = 0x4;
 
         // Observability.
@@ -309,19 +311,32 @@ namespace Antmicro.Renode.Peripherals.Memory
             get { return true; }
         }
 
-        // Page-erase faults are not modelled by this controller.
-        public ulong TotalPageErases { get; set; }
-        public ulong FaultAtPageErase { get; set; } = ulong.MaxValue;
-        public bool EraseFaultFired { get; set; }
+        public ulong TotalPageErases
+        {
+            get { return Nvm != null ? Nvm.TotalPageErases : 0UL; }
+            set { if(Nvm != null) { Nvm.TotalPageErases = value; } }
+        }
+
+        public ulong FaultAtPageErase
+        {
+            get { return Nvm != null ? Nvm.FaultAtPageErase : ulong.MaxValue; }
+            set { if(Nvm != null) { Nvm.FaultAtPageErase = value; } }
+        }
+
+        public bool EraseFaultFired
+        {
+            get { return Nvm != null && Nvm.EraseFaultFired; }
+            set { if(Nvm != null) { Nvm.EraseFaultFired = value; } }
+        }
 
         public bool AnyFaultFired
         {
-            get { return Nvm != null && Nvm.FaultEverFired; }
+            get { return Nvm != null && Nvm.AnyFaultFired; }
         }
 
         public bool FaultRequiresImmediateStop
         {
-            get { return Nvm != null && Nvm.FaultEverFired; }
+            get { return Nvm != null && Nvm.FaultRequiresImmediateStop; }
         }
 
         public bool DriverErrorFired
@@ -330,8 +345,17 @@ namespace Antmicro.Renode.Peripherals.Memory
             set { if(Nvm != null) { Nvm.DriverErrorFired = value; } }
         }
 
-        public uint LastFaultAddress { get; set; }
-        public byte[] FaultFlashSnapshot { get; set; }
+        public uint LastFaultAddress
+        {
+            get { return Nvm != null ? Nvm.LastFaultAddress : 0U; }
+            set { if(Nvm != null) { Nvm.LastFaultAddress = value; } }
+        }
+
+        public byte[] FaultFlashSnapshot
+        {
+            get { return Nvm != null ? Nvm.FaultFlashSnapshot : null; }
+            set { if(Nvm != null) { Nvm.FaultFlashSnapshot = value; } }
+        }
 
         public int WriteFaultMode
         {
@@ -339,7 +363,11 @@ namespace Antmicro.Renode.Peripherals.Memory
             set { if(Nvm != null) { Nvm.WriteFaultMode = value; } }
         }
 
-        public int EraseFaultMode { get; set; }
+        public int EraseFaultMode
+        {
+            get { return Nvm != null ? Nvm.EraseFaultMode : 0; }
+            set { if(Nvm != null) { Nvm.EraseFaultMode = value; } }
+        }
 
         public uint CorruptionSeed
         {
@@ -397,10 +425,14 @@ namespace Antmicro.Renode.Peripherals.Memory
         public int WriteTraceCount { get { return Nvm != null ? Nvm.WriteTraceCount : 0; } }
         public string WriteTraceToString() { return Nvm != null ? Nvm.WriteTraceToString() : string.Empty; }
         public void WriteTraceClear() { Nvm?.WriteTraceClear(); }
-        public bool EraseTraceEnabled { get; set; }
-        public int EraseTraceCount { get { return 0; } }
-        public string EraseTraceToString() { return string.Empty; }
-        public void EraseTraceClear() { }
+        public bool EraseTraceEnabled
+        {
+            get { return Nvm != null && Nvm.EraseTraceEnabled; }
+            set { if(Nvm != null) { Nvm.EraseTraceEnabled = value; } }
+        }
+        public int EraseTraceCount { get { return Nvm != null ? Nvm.EraseTraceCount : 0; } }
+        public string EraseTraceToString() { return Nvm != null ? Nvm.EraseTraceToString() : string.Empty; }
+        public void EraseTraceClear() { Nvm?.EraseTraceClear(); }
 
         // Read-fault injection is modelled by NVMemory (CPU reads flow through
         // the peripheral), so forward directly.
@@ -448,7 +480,10 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         private void ExecuteIfWriteCommand()
         {
-            if(commandRegisterValue != WriteCommandValue)
+            var isWrite = commandRegisterValue == WriteCommandValue;
+            var isSectorErase = commandRegisterValue == EraseCommandValue;
+            var isWordErase = commandRegisterValue == EraseWordCommandValue;
+            if(!isWrite && !isSectorErase && !isWordErase)
             {
                 return;
             }
@@ -463,12 +498,12 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return;
             }
 
-            // Cross-suppression: if any fault has already fired (write fault on
+            // Cross-suppression: if any fault has already fired (write or erase fault on
             // the underlying NVMemory, or a command-drop fault on this controller),
             // silently drop all subsequent commands.  This matches the behavior of
             // NRF52NVMC and STM32F4FlashController which suppress all operations
             // after AnyFaultFired.
-            if(Nvm.FaultEverFired || commandFaultFired)
+            if(Nvm.AnyFaultFired || commandFaultFired)
             {
                 statusRegisterValue = SuccessStatusValue;
                 registers[StatusRegisterOffset] = statusRegisterValue;
@@ -490,7 +525,23 @@ namespace Antmicro.Renode.Peripherals.Memory
                 registers[StatusRegisterOffset] = statusRegisterValue;
                 return;
             }
-            Nvm.WriteDoubleWord(nvmOffset, dataRegisterValue);
+            if(Nvm.ProgramAddressBase == 0UL && NvmBaseAddress > 0)
+            {
+                Nvm.ProgramAddressBase = (ulong)NvmBaseAddress;
+            }
+            if(isWrite)
+            {
+                Nvm.WriteDoubleWord(nvmOffset, dataRegisterValue);
+            }
+            else if(isSectorErase)
+            {
+                var sectorLen = PageSize > 0 ? PageSize : 0x1000;
+                Nvm.EraseSector(nvmOffset, sectorLen);
+            }
+            else
+            {
+                Nvm.EraseWord(nvmOffset);
+            }
             statusRegisterValue = SuccessStatusValue;
             illegalOperation = false;
 

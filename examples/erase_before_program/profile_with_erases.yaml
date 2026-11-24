@@ -1,0 +1,7 @@
+base_profile: profile.yaml
+name: erase_before_program_with_erases
+description: Cuts both erase and program operations (default half torn-erase mode).
+fault_sweep:
+  include_erase_fault_points: true
+expect:
+  should_find_issues: true

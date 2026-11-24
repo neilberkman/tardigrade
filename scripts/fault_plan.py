@@ -576,8 +576,13 @@ def build_fault_plan(
     include_power_loss = "power_loss" in fault_types
     include_swap_progress = "swap_progress" in fault_types
     include_security_state_erase = "security_state_erase" in fault_types
+    include_erase_fault_points = bool(
+        getattr(profile.fault_sweep, "include_erase_fault_points", False)
+    )
     include_erases = (
-        "interrupted_erase" in fault_types or "multi_sector_atomicity" in fault_types
+        "interrupted_erase" in fault_types
+        or "multi_sector_atomicity" in fault_types
+        or include_erase_fault_points
     )
     include_multi_sector_atomicity = "multi_sector_atomicity" in fault_types
     include_bit_corruption = "bit_corruption" in fault_types
@@ -920,7 +925,8 @@ def build_fault_plan(
         )
         erase_count = 0
         atomicity_count = 0
-        if include_erases and total_erases > 0 and not is_mram_backend:
+        allow_erase_points = include_erase_fault_points or not is_mram_backend
+        if include_erases and total_erases > 0 and allow_erase_points:
             erase_fps = list(range(0, total_erases))
             erase_fps = _slice_explicit_points(
                 erase_fps,
@@ -930,13 +936,13 @@ def build_fault_plan(
             )
             if quick and not quick_use_heuristic:
                 erase_fps = quick_subset(erase_fps)
-            if "interrupted_erase" in fault_types:
+            if "interrupted_erase" in fault_types or include_erase_fault_points:
                 combined.extend((ep, 'e') for ep in erase_fps)
                 erase_count = len(erase_fps)
             if include_multi_sector_atomicity:
                 combined.extend((ep, 'a') for ep in erase_fps)
                 atomicity_count = len(erase_fps)
-        elif include_erases and is_mram_backend:
+        elif include_erases and is_mram_backend and not include_erase_fault_points:
             print(
                 "Skipping erase fault points: MRAM backend '{}' has no "
                 "page erases.".format(profile.flash_backend),

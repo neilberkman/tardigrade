@@ -44,7 +44,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             // Intentionally do NOT clear storage: this models non-volatile memory.
             WriteInProgress = false;
-            if(FaultEverFired)
+            if(FaultEverFired || EraseFaultFired)
             {
                 trackingStartAddress = 0;
                 trackingStarted = false;
@@ -64,6 +64,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             {
                 LastFaultInjected = false;
                 FaultEverFired = false;
+                EraseFaultFired = false;
                 DriverErrorFired = false;
                 if(configuredTrackingStartAddress != 0)
                 {
@@ -869,6 +870,123 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         public ulong TotalWordWrites { get; set; }
 
+        public ulong TotalPageErases
+        {
+            get { return AliasTarget != null ? AliasTarget.TotalPageErases : totalPageErases; }
+            set
+            {
+                if(AliasTarget != null) AliasTarget.TotalPageErases = value;
+                else totalPageErases = value;
+            }
+        }
+
+        public ulong FaultAtPageErase
+        {
+            get { return AliasTarget != null ? AliasTarget.FaultAtPageErase : faultAtPageErase; }
+            set
+            {
+                if(AliasTarget != null) AliasTarget.FaultAtPageErase = value;
+                else faultAtPageErase = value;
+            }
+        }
+
+        public bool EraseFaultFired
+        {
+            get { return AliasTarget != null ? AliasTarget.EraseFaultFired : eraseFaultFired; }
+            set
+            {
+                if(AliasTarget != null) AliasTarget.EraseFaultFired = value;
+                else eraseFaultFired = value;
+            }
+        }
+
+        public int EraseFaultMode
+        {
+            get { return AliasTarget != null ? AliasTarget.EraseFaultMode : eraseFaultMode; }
+            set
+            {
+                if(AliasTarget != null) AliasTarget.EraseFaultMode = value;
+                else eraseFaultMode = value;
+            }
+        }
+
+        public bool EraseTraceEnabled
+        {
+            get { return AliasTarget != null ? AliasTarget.EraseTraceEnabled : eraseTraceEnabled; }
+            set
+            {
+                if(AliasTarget != null) AliasTarget.EraseTraceEnabled = value;
+                else eraseTraceEnabled = value;
+            }
+        }
+
+        public int EraseTraceCount
+        {
+            get { return AliasTarget != null ? AliasTarget.EraseTraceCount : eraseTrace.Count; }
+        }
+
+        public string EraseTraceToString()
+        {
+            if(AliasTarget != null) return AliasTarget.EraseTraceToString();
+            if(eraseTrace.Count == 0)
+            {
+                return string.Empty;
+            }
+            var result = new StringBuilder(eraseTrace.Count * 32);
+            foreach(var entry in eraseTrace)
+            {
+                result.Append(entry.Index);
+                result.Append(':');
+                result.Append(entry.Offset);
+                result.Append(':');
+                result.Append(entry.WritesAt);
+                result.Append(':');
+                result.Append(entry.EraseSize);
+                result.Append('\n');
+            }
+            return result.ToString();
+        }
+
+        public void EraseTraceClear()
+        {
+            if(AliasTarget != null) AliasTarget.EraseTraceClear();
+            else eraseTrace.Clear();
+        }
+
+        public uint LastFaultAddress
+        {
+            get { return AliasTarget != null ? AliasTarget.LastFaultAddress : lastFaultAddress; }
+            set
+            {
+                if(AliasTarget != null) AliasTarget.LastFaultAddress = value;
+                else lastFaultAddress = value;
+            }
+        }
+
+        public byte[] FaultFlashSnapshot
+        {
+            get { return AliasTarget != null ? AliasTarget.FaultFlashSnapshot : CloneBytes(faultMemorySnapshot); }
+            set
+            {
+                if(AliasTarget != null) AliasTarget.FaultFlashSnapshot = value;
+                else faultMemorySnapshot = CloneBytes(value);
+            }
+        }
+
+        public bool AnyFaultFired
+        {
+            get { return AliasTarget != null ? AliasTarget.AnyFaultFired : (FaultEverFired || eraseFaultFired); }
+        }
+
+        public bool FaultRequiresImmediateStop
+        {
+            get
+            {
+                if(AliasTarget != null) return AliasTarget.FaultRequiresImmediateStop;
+                return eraseFaultFired || (FaultEverFired && WriteFaultMode == 0);
+            }
+        }
+
         public long LastWriteAddress { get; private set; }
 
         public List<long> WriteLog { get { return writeLog; } }
@@ -903,15 +1021,15 @@ namespace Antmicro.Renode.Peripherals.Memory
         // Total reads counted against the armed address (for diagnostics).
         public ulong ReadFaultTotalReads { get; set; }
 
-        public void EraseSector(long offset, int sectorSize)
+        public void EraseSectorRaw(long offset, int sectorSize)
         {
             if(AliasTarget != null)
             {
-                AliasTarget.EraseSector(offset, sectorSize);
+                AliasTarget.EraseSectorRaw(offset, sectorSize);
                 return;
             }
 
-            if(!TryValidateRange(offset, sectorSize))
+            if(sectorSize <= 0 || !TryValidateRange(offset, sectorSize))
             {
                 LogOutOfRangeWrite(offset, sectorSize);
                 return;
@@ -921,6 +1039,58 @@ namespace Antmicro.Renode.Peripherals.Memory
                 storage[offset + i] = EraseFill;
             }
             ClearUncorrectableRangeInternal(offset, sectorSize);
+        }
+
+        public void WriteSpanRaw(long offset, byte[] data)
+        {
+            if(AliasTarget != null)
+            {
+                AliasTarget.WriteSpanRaw(offset, data);
+                return;
+            }
+
+            if(data == null || data.Length == 0 || !TryValidateRange(offset, data.Length))
+            {
+                if(data != null && data.Length > 0)
+                {
+                    LogOutOfRangeWrite(offset, data.Length);
+                }
+                return;
+            }
+            Array.Copy(data, 0, storage, offset, data.Length);
+            ClearUncorrectableRangeInternal(offset, data.Length);
+        }
+
+        public void RestoreSnapshotRaw(byte[] snapshot)
+        {
+            if(AliasTarget != null)
+            {
+                AliasTarget.RestoreSnapshotRaw(snapshot);
+                return;
+            }
+            if(snapshot == null || snapshot.Length == 0)
+            {
+                return;
+            }
+            var count = Math.Min(storage.Length, snapshot.Length);
+            Array.Copy(snapshot, 0, storage, 0, count);
+            ClearUncorrectableRangeInternal(0, count);
+        }
+
+        public void EraseSector(long offset, int sectorSize)
+        {
+            if(AliasTarget != null)
+            {
+                AliasTarget.EraseSector(offset, sectorSize);
+                return;
+            }
+
+            if(sectorSize <= 0 || !TryValidateRange(offset, sectorSize))
+            {
+                LogOutOfRangeWrite(offset, sectorSize);
+                return;
+            }
+            EraseSpanInternal(offset, sectorSize);
         }
 
         public void EraseWord(long offset)
@@ -937,8 +1107,142 @@ namespace Antmicro.Renode.Peripherals.Memory
                 LogOutOfRangeWrite(aligned, WordSize);
                 return;
             }
-            EraseWordStorage(aligned);
-            ClearUncorrectableWordInternal(aligned);
+            EraseSpanInternal(aligned, checked((int)WordSize));
+        }
+
+        private void EraseSpanInternal(long offset, int spanSize)
+        {
+            if(!TrackingStarted)
+            {
+                EraseSectorRaw(offset, spanSize);
+                return;
+            }
+
+            if(eraseFaultFired)
+            {
+                // Power has already been cut during an erase; suppress further erases.
+                return;
+            }
+
+            var currentEraseIndex = totalPageErases + 1;
+            totalPageErases = currentEraseIndex;
+            if(eraseTraceEnabled)
+            {
+                eraseTrace.Add(new EraseTraceEntry(
+                    currentEraseIndex, offset, TotalWordWrites, spanSize));
+            }
+
+            if(currentEraseIndex == faultAtPageErase)
+            {
+                var preErase = new byte[spanSize];
+                Array.Copy(storage, offset, preErase, 0, spanSize);
+                lastFaultMarkedUncorrectable = false;
+
+                ApplyTornEraseToStorage(offset, spanSize, preErase, currentEraseIndex);
+
+                eraseFaultFired = true;
+                LastFaultInjected = true;
+                LastFaultPattern = EraseFill;
+                lastFaultAddress = unchecked((uint)(programAddressBase + (ulong)offset));
+                lastFaultOffset = offset;
+                lastFaultProgramAddress = programAddressBase + (ulong)offset;
+                lastFaultProgramWidth = spanSize;
+                faultMemorySnapshot = CloneBytes(storage);
+                faultUncorrectableWords.Clear();
+                faultUncorrectableWords.AddRange(uncorrectableWords);
+                return;
+            }
+
+            EraseSectorRaw(offset, spanSize);
+        }
+
+        private void ApplyTornEraseToStorage(long offset, int spanSize, byte[] preErase, ulong eraseIndex)
+        {
+            if(eraseFaultMode == 1)
+            {
+                var halfSpan = Math.Max(1, spanSize / 2);
+                for(var i = 0; i < halfSpan; i++)
+                {
+                    storage[offset + i] = EraseFill;
+                }
+                ClearUncorrectableRangeInternal(offset, halfSpan);
+                var quarterSpan = Math.Max(1, spanSize / 4);
+                var neighbor = offset + spanSize;
+                if(TryValidateRange(neighbor, quarterSpan))
+                {
+                    for(var i = 0; i < quarterSpan; i++)
+                    {
+                        storage[neighbor + i] = EraseFill;
+                    }
+                    ClearUncorrectableRangeInternal(neighbor, quarterSpan);
+                }
+                return;
+            }
+
+            var mode = mramTornWordMode;
+            switch(mode)
+            {
+                case "untouched":
+                    // Power cut before erase took effect: retain pre-erase bytes and marks.
+                    break;
+                case "erased":
+                case "programmed":
+                    // Erase completed immediately before power cut (cuts between erase and program).
+                    for(var i = 0; i < spanSize; i++)
+                    {
+                        storage[offset + i] = EraseFill;
+                    }
+                    ClearUncorrectableRangeInternal(offset, spanSize);
+                    break;
+                case "uncorrectable":
+                    // Interrupted erase leaves every affected program unit with an uncorrectable ECC error.
+                    var firstUnit = AlignDown(offset, WordSize);
+                    var lastUnit = AlignDown(offset + spanSize - 1, WordSize);
+                    for(var unit = firstUnit; unit <= lastUnit; unit += WordSize)
+                    {
+                        MarkWordUncorrectableInternal(unit);
+                    }
+                    lastFaultMarkedUncorrectable = true;
+                    break;
+                case "corrupted":
+                    // Erased fill with deterministic multi-bit corruption across each affected unit.
+                    for(var i = 0; i < spanSize; i++)
+                    {
+                        storage[offset + i] = EraseFill;
+                    }
+                    ClearUncorrectableRangeInternal(offset, spanSize);
+                    var cFirst = AlignDown(offset, WordSize);
+                    var cLast = AlignDown(offset + spanSize - 1, WordSize);
+                    for(var unit = cFirst; unit <= cLast; unit += WordSize)
+                    {
+                        var unitLen = (int)Math.Min(WordSize, size - unit);
+                        var unitBytes = new byte[unitLen];
+                        Array.Copy(storage, unit, unitBytes, 0, unitLen);
+                        ApplyCorruptedTornWord(unitBytes, eraseIndex, unit, EffectiveMramTornWordSeed());
+                        Array.Copy(unitBytes, 0, storage, unit, unitLen);
+                    }
+                    break;
+                default:
+                    // half / half_retain: first half erased to EraseFill, second half retains pre-erase bytes.
+                    var half = spanSize / 2;
+                    if(half <= 0 && spanSize > 0)
+                    {
+                        half = spanSize;
+                    }
+                    for(var i = 0; i < half; i++)
+                    {
+                        storage[offset + i] = EraseFill;
+                    }
+                    for(var i = half; i < spanSize; i++)
+                    {
+                        storage[offset + i] = preErase[i];
+                    }
+                    if(half > 0)
+                    {
+                        ClearUncorrectableRangeInternal(offset, half);
+                    }
+                    break;
+            }
         }
 
         public void ClearWriteLog()
@@ -1020,6 +1324,12 @@ namespace Antmicro.Renode.Peripherals.Memory
             if(!TrackingStarted)
             {
                 ProgramWithoutCampaignTracking(offset, data);
+                return;
+            }
+
+            if(eraseFaultFired)
+            {
+                // Power has already been cut during an erase; suppress post-cut writes.
                 return;
             }
 
@@ -1659,12 +1969,16 @@ namespace Antmicro.Renode.Peripherals.Memory
         private void ResetCampaignObservability()
         {
             TotalWordWrites = 0;
+            totalPageErases = 0;
             writeLog.Clear();
             writeTrace.Clear();
+            eraseTrace.Clear();
             programTrace.Clear();
             ClearFaultEvidence();
             LastFaultInjected = false;
             FaultEverFired = false;
+            eraseFaultFired = false;
+            lastFaultAddress = 0;
             DriverErrorFired = false;
         }
 
@@ -1712,10 +2026,17 @@ namespace Antmicro.Renode.Peripherals.Memory
         private bool preserveCountersAcrossReset;
         private readonly List<long> writeLog = new List<long>();
         private readonly List<WriteTraceEntry> writeTrace = new List<WriteTraceEntry>();
+        private readonly List<EraseTraceEntry> eraseTrace = new List<EraseTraceEntry>();
         private readonly List<ProgramTraceEntry> programTrace = new List<ProgramTraceEntry>();
         private readonly HashSet<long> uncorrectableWords = new HashSet<long>();
         private readonly List<UncorrectableReadEntry> uncorrectableReads = new List<UncorrectableReadEntry>();
         private bool writeTraceEnabled;
+        private bool eraseTraceEnabled;
+        private ulong totalPageErases;
+        private ulong faultAtPageErase = ulong.MaxValue;
+        private bool eraseFaultFired;
+        private int eraseFaultMode;
+        private uint lastFaultAddress;
         private ulong trackingStartAddress;
         private ulong configuredTrackingStartAddress;
         private bool trackingStarted = true;
@@ -1770,6 +2091,22 @@ namespace Antmicro.Renode.Peripherals.Memory
             public readonly long Offset;
             public readonly ulong Value;
             public readonly int Width;
+        }
+
+        private sealed class EraseTraceEntry
+        {
+            public EraseTraceEntry(ulong index, long offset, ulong writesAt, int eraseSize)
+            {
+                Index = index;
+                Offset = offset;
+                WritesAt = writesAt;
+                EraseSize = eraseSize;
+            }
+
+            public readonly ulong Index;
+            public readonly long Offset;
+            public readonly ulong WritesAt;
+            public readonly int EraseSize;
         }
 
         private sealed class ProgramTraceEntry
@@ -1827,6 +2164,7 @@ namespace Antmicro.Renode.Peripherals
             nvmCfg.Value = 0;
             nvmOverride.Value = 0;
             nvmCtrlWriteableBits = 0;
+            nvmEraseSizeValue = 0;
             nvmUe.Value = 0;
 
             for(var i = 0; i < eccCounters.Length; i++)
@@ -1905,7 +2243,7 @@ namespace Antmicro.Renode.Peripherals
 
             var half = sectorSize / 2;
             // Erase first half of sector, leave second half intact.
-            Nvm.EraseSector(normalized, half);
+            Nvm.EraseSectorRaw(normalized, half);
         }
 
         public bool WriteInProgress
@@ -2036,18 +2374,32 @@ namespace Antmicro.Renode.Peripherals
             get { return true; }
         }
 
-        public ulong TotalPageErases { get; set; }
-        public ulong FaultAtPageErase { get; set; } = ulong.MaxValue;
-        public bool EraseFaultFired { get; set; }
+        public ulong TotalPageErases
+        {
+            get { return Nvm != null ? Nvm.TotalPageErases : 0UL; }
+            set { if(Nvm != null) { Nvm.TotalPageErases = value; } }
+        }
+
+        public ulong FaultAtPageErase
+        {
+            get { return Nvm != null ? Nvm.FaultAtPageErase : ulong.MaxValue; }
+            set { if(Nvm != null) { Nvm.FaultAtPageErase = value; } }
+        }
+
+        public bool EraseFaultFired
+        {
+            get { return Nvm != null && Nvm.EraseFaultFired; }
+            set { if(Nvm != null) { Nvm.EraseFaultFired = value; } }
+        }
 
         public bool AnyFaultFired
         {
-            get { return Nvm != null && Nvm.FaultEverFired; }
+            get { return Nvm != null && Nvm.AnyFaultFired; }
         }
 
         public bool FaultRequiresImmediateStop
         {
-            get { return Nvm != null && Nvm.FaultEverFired; }
+            get { return Nvm != null && Nvm.FaultRequiresImmediateStop; }
         }
 
         public bool DriverErrorFired
@@ -2056,8 +2408,17 @@ namespace Antmicro.Renode.Peripherals
             set { if(Nvm != null) { Nvm.DriverErrorFired = value; } }
         }
 
-        public uint LastFaultAddress { get; set; }
-        public byte[] FaultFlashSnapshot { get; set; }
+        public uint LastFaultAddress
+        {
+            get { return Nvm != null ? Nvm.LastFaultAddress : 0U; }
+            set { if(Nvm != null) { Nvm.LastFaultAddress = value; } }
+        }
+
+        public byte[] FaultFlashSnapshot
+        {
+            get { return Nvm != null ? Nvm.FaultFlashSnapshot : null; }
+            set { if(Nvm != null) { Nvm.FaultFlashSnapshot = value; } }
+        }
 
         public int WriteFaultMode
         {
@@ -2065,7 +2426,11 @@ namespace Antmicro.Renode.Peripherals
             set { if(Nvm != null) { Nvm.WriteFaultMode = value; } }
         }
 
-        public int EraseFaultMode { get; set; }
+        public int EraseFaultMode
+        {
+            get { return Nvm != null ? Nvm.EraseFaultMode : 0; }
+            set { if(Nvm != null) { Nvm.EraseFaultMode = value; } }
+        }
 
         public uint CorruptionSeed
         {
@@ -2121,10 +2486,14 @@ namespace Antmicro.Renode.Peripherals
         public int WriteTraceCount { get { return Nvm != null ? Nvm.WriteTraceCount : 0; } }
         public string WriteTraceToString() { return Nvm != null ? Nvm.WriteTraceToString() : string.Empty; }
         public void WriteTraceClear() { Nvm?.WriteTraceClear(); }
-        public bool EraseTraceEnabled { get; set; }
-        public int EraseTraceCount { get { return 0; } }
-        public string EraseTraceToString() { return string.Empty; }
-        public void EraseTraceClear() { }
+        public bool EraseTraceEnabled
+        {
+            get { return Nvm != null && Nvm.EraseTraceEnabled; }
+            set { if(Nvm != null) { Nvm.EraseTraceEnabled = value; } }
+        }
+        public int EraseTraceCount { get { return Nvm != null ? Nvm.EraseTraceCount : 0; } }
+        public string EraseTraceToString() { return Nvm != null ? Nvm.EraseTraceToString() : string.Empty; }
+        public void EraseTraceClear() { Nvm?.EraseTraceClear(); }
 
         public bool ReadFaultEnabled
         {
@@ -2205,6 +2574,49 @@ namespace Antmicro.Renode.Peripherals
                         // Writable bits: ECC_BYPASS[0], ERASE_EN[2:1], PROG_EN[3].
                         nvmCtrlWriteableBits = (uint)(value & 0xF);
                     });
+
+            Registers.NvmEraseSize.Define(this)
+                .WithValueField(0, 32,
+                    valueProviderCallback: _ => nvmEraseSizeValue,
+                    writeCallback: (_, value) => nvmEraseSizeValue = (uint)value);
+
+            Registers.NvmEraseAddr.Define(this)
+                .WithValueField(0, 32, FieldMode.Write, writeCallback: (_, value) =>
+                {
+                    if(Nvm == null)
+                    {
+                        illegalOperation = true;
+                        return;
+                    }
+                    // Gated by NvmCtrl ERASE_EN[2:1]:
+                    //   bit 1 (0x2) = word erase, bit 2 (0x4) = sector erase.
+                    var eraseBits = (nvmCtrlWriteableBits >> 1) & 0x3U;
+                    if(eraseBits == 0U)
+                    {
+                        illegalOperation = true;
+                        return;
+                    }
+                    if(!TryNormalizeAddress((long)value, out var normalized))
+                    {
+                        illegalOperation = true;
+                        return;
+                    }
+                    if(Nvm.ProgramAddressBase == 0UL && NvmBaseAddress > 0)
+                    {
+                        Nvm.ProgramAddressBase = (ulong)NvmBaseAddress;
+                    }
+                    if((eraseBits & 0x2U) != 0U)
+                    {
+                        var sectorLen = nvmEraseSizeValue != 0U
+                            ? checked((int)nvmEraseSizeValue)
+                            : (PageSize > 0 ? PageSize : 0x1000);
+                        Nvm.EraseSector(normalized, sectorLen);
+                    }
+                    else
+                    {
+                        Nvm.EraseWord(normalized);
+                    }
+                });
 
             Registers.NvmEc0.Define(this)
                 .WithValueField(0, 32, valueProviderCallback: _ => eccCounters[0], writeCallback: (_, value) => eccCounters[0] = (uint)value);
@@ -2307,6 +2719,7 @@ namespace Antmicro.Renode.Peripherals
         private IValueRegisterField nvmUe;
 
         private uint nvmCtrlWriteableBits;
+        private uint nvmEraseSizeValue;
         private readonly uint[] eccCounters = new uint[4];
         private bool illegalOperation;
 
@@ -2322,6 +2735,8 @@ namespace Antmicro.Renode.Peripherals
             NvmCfg = 0x20,
             NvmOverride = 0x24,
             NvmCtrl = 0x30,
+            NvmEraseSize = 0x34,
+            NvmEraseAddr = 0x38,
             NvmEc0 = 0x40,
             NvmEc1 = 0x44,
             NvmEc2 = 0x48,

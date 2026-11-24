@@ -540,6 +540,10 @@ if mram_torn_word not in (
         )
     )
 mram_torn_word_seed = get_optional_int_var('mram_torn_word_seed', 0) & 0xFFFFFFFF
+include_erase_fault_points = (
+    get_optional_var('include_erase_fault_points', '').strip().lower()
+    in ('1', 'true', 'yes', 'on')
+)
 
 def _apply_mram_torn_word_mode():
     """Set the torn-word mode (and optional seed) on every backend object that exposes it.
@@ -1270,7 +1274,7 @@ if volatile_regions_b64:
 bootloader_entry = int(str(monitor.GetVariable('bootloader_entry')), 0)
 bootloader_elf = str(monitor.GetVariable('bootloader_elf')).strip()
 platform_repl_path = get_optional_var('platform_repl', '').strip()
-platform_repl = platform_repl_path.lower()
+platform_repl = get_optional_var('platform_repl', '').strip().lower()
 write_granularity = int(str(monitor.GetVariable('write_granularity')).strip())
 _resolved_repl_cpu_models = {}
 
@@ -5389,7 +5393,8 @@ def flash_geometry():
     if b['kind'] == 'fast':
         return int(b['data'].FlashBaseAddress), int(b['data'].FlashSize)
     try:
-        return int(slot_exec_base), int(b['data'].Nvm.Size)
+        nvm_base = int(getattr(b['data'], 'NvmBaseAddress', 0) or 0)
+        return (nvm_base if nvm_base > 0 else int(slot_exec_base)), int(b['data'].Nvm.Size)
     except Exception:
         flash_base = min(slot_bases)
         flash_end = max(slot_ends)
@@ -5924,11 +5929,12 @@ def get_total_erases():
     b = backend
     if b['kind'] == 'otp':
         return 0  # OTP has no page erases.
-    if b['kind'] == 'mram':
-        return 0  # MRAM has no page erases.
-    if b['kind'] == 'fast':
-        return int(b['data'].TotalPageErases)
-    return 0  # Slow path doesn't track erases.
+    if b['kind'] in ('mram', 'fast'):
+        return int(getattr(b['data'], 'TotalPageErases', 0))
+    nvm = getattr(b['data'], 'Nvm', None)
+    if nvm is not None and hasattr(nvm, 'TotalPageErases'):
+        return int(nvm.TotalPageErases)
+    return int(getattr(b['data'], 'TotalPageErases', 0))
 
 def arm_fault(absolute_write_index, write_fault_mode=0):
     if write_fault_mode == 0:
@@ -5969,17 +5975,27 @@ def arm_controller_fault(absolute_command_index, command_fault_mode=1):
         pass
 
 def arm_erase_fault(absolute_erase_index, erase_fault_mode=0):
+    _apply_mram_torn_word_mode()
+    if mram_torn_word == 'uncorrectable':
+        _require_mram_uncorrectable_support()
     b = backend
     if b['kind'] == 'otp':
         log('WARNING: erase fault requested on OTP backend (no page erases)')
         return  # OTP has no page erases.
-    if b['kind'] == 'mram':
-        log('WARNING: erase fault requested on MRAM backend (no page erases)')
-        return  # MRAM has no page erases.
-    elif b['kind'] == 'fast':
+    if b['kind'] in ('mram', 'fast'):
         b['data'].EraseFaultMode = erase_fault_mode
         b['data'].FaultAtPageErase = absolute_erase_index
         b['data'].EraseFaultFired = False
+        if b['kind'] == 'mram' and hasattr(b['data'], 'LastFaultInjected'):
+            b['data'].LastFaultInjected = False
+    else:
+        nvm = getattr(b['data'], 'Nvm', None)
+        target = nvm if nvm is not None and hasattr(nvm, 'FaultAtPageErase') else b['data']
+        target.EraseFaultMode = erase_fault_mode
+        target.FaultAtPageErase = absolute_erase_index
+        target.EraseFaultFired = False
+        if hasattr(target, 'LastFaultInjected'):
+            target.LastFaultInjected = False
 
 def disarm_fault():
     b = backend
@@ -5987,11 +6003,17 @@ def disarm_fault():
         b['data'].FaultAtBlow = _DISARM_SENTINEL
     elif b['kind'] == 'mram':
         b['data'].FaultAtWordWrite = _DISARM_SENTINEL
+        if hasattr(b['data'], 'FaultAtPageErase'):
+            b['data'].FaultAtPageErase = _DISARM_SENTINEL
     elif b['kind'] == 'fast':
         b['data'].FaultAtWordWrite = _DISARM_SENTINEL
         b['data'].FaultAtPageErase = _DISARM_SENTINEL
     else:
         b['data'].Nvm.FaultAtWordWrite = _DISARM_SENTINEL
+        if hasattr(b['data'].Nvm, 'FaultAtPageErase'):
+            b['data'].Nvm.FaultAtPageErase = _DISARM_SENTINEL
+        elif hasattr(b['data'], 'FaultAtPageErase'):
+            b['data'].FaultAtPageErase = _DISARM_SENTINEL
     disarm_controller_fault()
 
 def disarm_write_fault():
@@ -6009,10 +6031,15 @@ def disarm_erase_fault():
     b = backend
     if b['kind'] == 'otp':
         pass  # OTP has no page erases.
-    elif b['kind'] == 'mram':
-        pass  # MRAM has no page erases.
-    elif b['kind'] == 'fast':
-        b['data'].FaultAtPageErase = _DISARM_SENTINEL
+    elif b['kind'] in ('mram', 'fast'):
+        if hasattr(b['data'], 'FaultAtPageErase'):
+            b['data'].FaultAtPageErase = _DISARM_SENTINEL
+    else:
+        nvm = getattr(b['data'], 'Nvm', None)
+        if nvm is not None and hasattr(nvm, 'FaultAtPageErase'):
+            nvm.FaultAtPageErase = _DISARM_SENTINEL
+        elif hasattr(b['data'], 'FaultAtPageErase'):
+            b['data'].FaultAtPageErase = _DISARM_SENTINEL
 
 _OTP_WIRE_CODES = frozenset(('op', 'os', 'od', 'oo', 'on'))
 
@@ -6058,18 +6085,27 @@ def was_fault_injected():
     if b['kind'] == 'otp':
         return bool(b['data'].BlowFaultFired) or was_controller_fault_injected()
     if b['kind'] == 'mram':
-        # FaultEverFired is a sticky flag set when any write fault fires
-        # and never cleared by subsequent writes or disarm_fault().
-        return bool(b['data'].FaultEverFired) or was_controller_fault_injected()
+        # FaultEverFired / EraseFaultFired are sticky flags set when a fault fires.
+        return (
+            bool(b['data'].FaultEverFired)
+            or bool(getattr(b['data'], 'EraseFaultFired', False))
+            or was_controller_fault_injected()
+        )
     if b['kind'] == 'fast':
         return bool(b['data'].FaultFired) or bool(b['data'].EraseFaultFired) or was_controller_fault_injected()
-    return bool(b['data'].Nvm.FaultEverFired) or was_controller_fault_injected()
+    return (
+        bool(b['data'].Nvm.FaultEverFired)
+        or bool(getattr(b['data'].Nvm, 'EraseFaultFired', False))
+        or was_controller_fault_injected()
+    )
 
 def fault_requires_immediate_stop():
     b = backend
     if b['kind'] == 'otp':
         return bool(b['data'].BlowFaultFired) or was_controller_fault_injected()
     if b['kind'] == 'mram':
+        if bool(getattr(b['data'], 'EraseFaultFired', False)):
+            return True
         return (bool(b['data'].FaultEverFired) and int(getattr(b['data'], 'WriteFaultMode', 0)) == 0) or was_controller_fault_injected()
     if b['kind'] == 'fast':
         try:
@@ -6078,6 +6114,8 @@ def fault_requires_immediate_stop():
             write_fault_fired = bool(b['data'].FaultFired)
             write_fault_mode = int(getattr(b['data'], 'WriteFaultMode', 0))
             return bool(b['data'].EraseFaultFired) or (write_fault_fired and write_fault_mode == 0) or was_controller_fault_injected()
+    if bool(getattr(b['data'].Nvm, 'EraseFaultFired', False)):
+        return True
     return (bool(b['data'].Nvm.FaultEverFired) and int(getattr(b['data'].Nvm, 'WriteFaultMode', 0)) == 0) or was_controller_fault_injected()
 
 def was_write_fault_injected():
@@ -6111,11 +6149,12 @@ def was_erase_fault_injected():
     b = backend
     if b['kind'] == 'otp':
         return False  # OTP has no page erases.
-    if b['kind'] == 'mram':
-        return False  # MRAM has no page erases.
-    if b['kind'] == 'fast':
-        return bool(b['data'].EraseFaultFired)
-    return False
+    if b['kind'] in ('mram', 'fast'):
+        return bool(getattr(b['data'], 'EraseFaultFired', False))
+    nvm = getattr(b['data'], 'Nvm', None)
+    if nvm is not None and hasattr(nvm, 'EraseFaultFired'):
+        return bool(nvm.EraseFaultFired)
+    return bool(getattr(b['data'], 'EraseFaultFired', False))
 
 def was_controller_fault_injected():
     ctrl = backend['controller']
@@ -6130,6 +6169,10 @@ def get_last_write_address():
     b = backend
     if b['kind'] == 'mram':
         try:
+            if was_erase_fault_injected():
+                addr = int(getattr(b['data'], 'LastFaultAddress', 0) or 0)
+                if addr != 0:
+                    return addr
             return int(b['data'].LastFaultProgramAddress)
         except Exception:
             return 0
@@ -6138,6 +6181,13 @@ def get_last_write_address():
             return int(b['data'].LastFaultAddress)
         except Exception:
             return 0
+    if was_erase_fault_injected():
+        try:
+            addr = int(getattr(b['data'], 'LastFaultAddress', 0) or 0)
+            if addr != 0:
+                return addr
+        except Exception:
+            pass
     return int(b['data'].Nvm.LastWriteAddress)
 
 
@@ -6691,16 +6741,28 @@ def reset_nvmc_for_sweep(enable_tracking_gate=True):
     b = backend
     if b['kind'] == 'mram':
         b['data'].TotalWordWrites = 0
+        if hasattr(b['data'], 'TotalPageErases'):
+            b['data'].TotalPageErases = 0
         if hasattr(b['data'], 'WriteTraceClear'):
             b['data'].WriteTraceClear()
+        if hasattr(b['data'], 'EraseTraceClear'):
+            b['data'].EraseTraceClear()
         if hasattr(b['data'], 'ProgramTraceClear'):
             b['data'].ProgramTraceClear()
         if hasattr(b['data'], 'InvalidateShadow'):
             b['data'].InvalidateShadow()
         b['data'].LastFaultInjected = False
         b['data'].FaultEverFired = False
+        if hasattr(b['data'], 'EraseFaultFired'):
+            b['data'].EraseFaultFired = False
         b['data'].WriteFaultMode = 0
+        if hasattr(b['data'], 'EraseFaultMode'):
+            b['data'].EraseFaultMode = 0
         b['data'].DriverErrorFired = False
+        if hasattr(b['data'], 'LastFaultAddress'):
+            b['data'].LastFaultAddress = 0
+        if hasattr(b['data'], 'PassthroughMode'):
+            b['data'].PassthroughMode = False
     elif b['kind'] == 'fast':
         # Keep default as full diff for index precision, but allow profile/CLI
         # overrides for performance experiments.
@@ -6726,8 +6788,18 @@ def reset_nvmc_for_sweep(enable_tracking_gate=True):
         b['data'].PassthroughMode = False
     else:
         b['data'].Nvm.TotalWordWrites = 0
+        if hasattr(b['data'].Nvm, 'TotalPageErases'):
+            b['data'].Nvm.TotalPageErases = 0
+        if hasattr(b['data'].Nvm, 'EraseTraceClear'):
+            b['data'].Nvm.EraseTraceClear()
         b['data'].Nvm.FaultEverFired = False
+        if hasattr(b['data'].Nvm, 'EraseFaultFired'):
+            b['data'].Nvm.EraseFaultFired = False
         b['data'].Nvm.WriteFaultMode = 0
+        if hasattr(b['data'].Nvm, 'EraseFaultMode'):
+            b['data'].Nvm.EraseFaultMode = 0
+        if hasattr(b['data'].Nvm, 'LastFaultAddress'):
+            b['data'].Nvm.LastFaultAddress = 0
         b['data'].Nvm.DriverErrorFired = False
     _set_preserve_counters_across_reset(True)
     # Reset controller fault state on all backends — command_drop can be
@@ -6750,16 +6822,28 @@ def reset_nvmc_for_recovery(enable_tracking_gate=False):
     b = backend
     if b['kind'] == 'mram':
         b['data'].TotalWordWrites = 0
+        if hasattr(b['data'], 'TotalPageErases'):
+            b['data'].TotalPageErases = 0
         if hasattr(b['data'], 'WriteTraceClear'):
             b['data'].WriteTraceClear()
+        if hasattr(b['data'], 'EraseTraceClear'):
+            b['data'].EraseTraceClear()
         if hasattr(b['data'], 'ProgramTraceClear'):
             b['data'].ProgramTraceClear()
         if hasattr(b['data'], 'InvalidateShadow'):
             b['data'].InvalidateShadow()
         b['data'].LastFaultInjected = False
         b['data'].FaultEverFired = False
+        if hasattr(b['data'], 'EraseFaultFired'):
+            b['data'].EraseFaultFired = False
         b['data'].WriteFaultMode = 0
+        if hasattr(b['data'], 'EraseFaultMode'):
+            b['data'].EraseFaultMode = 0
         b['data'].DriverErrorFired = False
+        if hasattr(b['data'], 'LastFaultAddress'):
+            b['data'].LastFaultAddress = 0
+        if hasattr(b['data'], 'PassthroughMode'):
+            b['data'].PassthroughMode = False
         _set_preserve_counters_across_reset(True)
         disarm_fault()
         return
@@ -6780,8 +6864,18 @@ def reset_nvmc_for_recovery(enable_tracking_gate=False):
         disarm_fault()
     else:
         b['data'].Nvm.TotalWordWrites = 0
+        if hasattr(b['data'].Nvm, 'TotalPageErases'):
+            b['data'].Nvm.TotalPageErases = 0
+        if hasattr(b['data'].Nvm, 'EraseTraceClear'):
+            b['data'].Nvm.EraseTraceClear()
         b['data'].Nvm.FaultEverFired = False
+        if hasattr(b['data'].Nvm, 'EraseFaultFired'):
+            b['data'].Nvm.EraseFaultFired = False
         b['data'].Nvm.WriteFaultMode = 0
+        if hasattr(b['data'].Nvm, 'EraseFaultMode'):
+            b['data'].Nvm.EraseFaultMode = 0
+        if hasattr(b['data'].Nvm, 'LastFaultAddress'):
+            b['data'].Nvm.LastFaultAddress = 0
         b['data'].Nvm.DriverErrorFired = False
         disarm_fault()
     _set_preserve_counters_across_reset(True)
@@ -6846,6 +6940,17 @@ def prepare_clean_phase1_state():
     needs_pre_boot = restore_initial_flash_cache()
     _clear_mram_uncorrectable_words()
     if needs_pre_boot:
+        b = backend
+        if b['kind'] == 'slow':
+            b['data'].Nvm.FaultEverFired = False
+            if hasattr(b['data'].Nvm, 'EraseFaultFired'):
+                b['data'].Nvm.EraseFaultFired = False
+            b['data'].Nvm.LastFaultInjected = False
+        elif b['kind'] == 'mram':
+            b['data'].FaultEverFired = False
+            if hasattr(b['data'], 'EraseFaultFired'):
+                b['data'].EraseFaultFired = False
+            b['data'].LastFaultInjected = False
         apply_pre_boot_state()
     restore_initial_otp_cache()
     if _hash_bypass_active:
@@ -7001,12 +7106,16 @@ def reload_images_from_map(images_map):
                     partial[i] = 0xFF
                 flash_ref.WriteBytes(offset, partial)
     else:
-        # Slow path: use NVMemory.EraseSector.
+        # Slow path: use raw NVMemory erase so host image reload never increments TotalPageErases.
         nvm_size = int(b['data'].Nvm.Size)
         sector = 4096
+        erase_raw = getattr(b['data'].Nvm, 'EraseSectorRaw', None)
         for offset in range(0, nvm_size, sector):
             chunk = min(sector, nvm_size - offset)
-            b['data'].Nvm.EraseSector(offset, chunk)
+            if erase_raw is not None:
+                erase_raw(offset, chunk)
+            else:
+                b['data'].Nvm.EraseSector(offset, chunk)
     _bus_load_elf(bootloader_elf)
     _load_images_mapping(images_map)
 
@@ -11784,6 +11893,32 @@ def _finalize_recovery_marker_precondition_result(result):
     return result
 
 
+def _operation_kind_for_fault_type(fault_type):
+    raw = str(fault_type or '').strip().lower()
+    if not raw or raw == 'control':
+        return None
+    leaf = raw
+    for prefix in ('m:', 'h:', 'p2:', 'cc:', 'c:'):
+        if leaf.startswith(prefix):
+            leaf = leaf.rsplit(':', 1)[-1]
+            break
+    base = leaf.split(':', 1)[0]
+    if base in ('e', 'a', 'interrupted_erase', 'multi_sector_atomicity'):
+        return 'erase'
+    if base in (
+        'w', 'b', 's', 'g', 'x', 'd', 'l', 'r', 'k',
+        'op', 'os', 'od', 'oo', 'on',
+        'power_loss', 'swap_progress', 'security_state_erase',
+        'bit_corruption', 'bit_corruption_clustered', 'silent_write_failure',
+        'driver_error', 'rc_injection', 'write_disturb',
+        'wear_leveling_corruption', 'write_rejection', 'command_drop',
+        'otp_partial_program', 'otp_stuck_bit', 'otp_read_disturb',
+        'otp_overblow', 'otp_blow_nop',
+    ):
+        return 'program'
+    return None
+
+
 def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
                         actual_writes, signals, boot_outcome=None,
                         boot_slot=None, eff_criteria=None,
@@ -11892,6 +12027,22 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         'actual_writes': actual_writes,
         'signals': signals,
     }
+    _op_kind_fn = globals().get('_operation_kind_for_fault_type')
+    if callable(_op_kind_fn):
+        _op_kind = _op_kind_fn(fault_type)
+    else:
+        _ft_raw = str(fault_type or '').strip().lower()
+        _ft_leaf = _ft_raw.rsplit(':', 1)[-1] if _ft_raw.startswith(('m:', 'h:', 'p2:', 'cc:', 'c:')) else _ft_raw
+        _ft_base = _ft_leaf.split(':', 1)[0]
+        if _ft_base in ('e', 'a', 'interrupted_erase', 'multi_sector_atomicity'):
+            _op_kind = 'erase'
+        elif _ft_base in ('w', 'b', 's', 'g', 'x', 'd', 'l', 'r', 'k', 'op', 'os', 'od', 'oo', 'on'):
+            _op_kind = 'program'
+        else:
+            _op_kind = None
+    if _op_kind is not None:
+        result['operation_kind'] = _op_kind
+        signals['operation_kind'] = _op_kind
     if signals.get('matched_image') is not None:
         result['matched_image'] = signals.get('matched_image')
     if isinstance(signals.get('function_return_probes'), dict):
@@ -12535,6 +12686,14 @@ def run_execute_fault(fault_at, fault_type='w'):
         if backend['kind'] == 'mram':
             if mram_fault_snapshot_raw is not None:
                 saved_flash = mram_fault_snapshot_raw
+            elif is_erase_fault:
+                saved_flash = getattr(backend['data'], 'FaultMemorySnapshot', None)
+                if saved_flash is None:
+                    saved_flash = getattr(backend['data'], 'FaultFlashSnapshot', None)
+                if saved_flash is None:
+                    mram_size = int(backend['data'].Size)
+                    saved_flash = backend['data'].ReadBytes(0, mram_size)
+                fault_snapshot_bytes = to_py_bytes(saved_flash)
             else:
                 # Recovery can proceed for diagnostics, but the result is
                 # failed closed below because this is not an immediate,
@@ -12713,9 +12872,16 @@ def run_execute_fault(fault_at, fault_type='w'):
             phase2_ms = int((_time.time() - phase2_t0) * 1000)
     elif backend['kind'] == 'slow' and fault_injected and is_power_loss_fault and phase1_stopped_on_fault:
         # Slow path power-loss: NVMemory is non-volatile and retains the
-        # faulted write across machine Reset.  Reset CPU, reload bootloader
-        # ELF and slot images (MappedMemory regions are cleared by reset,
-        # but NVMemory preserves faulted metadata), then run Phase 2.
+        # faulted state across machine Reset.  For erase faults, capture the
+        # backend snapshot before reset and restore it after ELF/image loading
+        # so an interrupted erase overlapping the bootloader/slot region is
+        # preserved verbatim for Phase 2 recovery.
+        if is_erase_fault:
+            saved_flash = getattr(backend['data'], 'FaultFlashSnapshot', None)
+            if saved_flash is None:
+                saved_flash = getattr(backend['data'].Nvm, 'FaultMemorySnapshot', None)
+            if saved_flash is not None:
+                fault_snapshot_bytes = to_py_bytes(saved_flash)
         phase2_t0 = _time.time()
         _capture_recovery_marker_precondition()
         _machine_reset(apply_tracking_gate=False)
@@ -12727,6 +12893,11 @@ def run_execute_fault(fault_at, fault_type='w'):
             _bus_load_binary(image_exec_path, slot_load_addresses.get('exec', slot_exec_base))
         if image_staging_path:
             _bus_load_binary(image_staging_path, slot_load_addresses.get('staging', slot_staging_base))
+        if is_erase_fault and saved_flash is not None:
+            restore_raw = getattr(backend['data'].Nvm, 'RestoreSnapshotRaw', None)
+            if restore_raw is not None:
+                restore_raw(saved_flash)
+        prime_bootloader_entry()
         if _hash_bypass_active:
             apply_hash_bypass()
         reset_nvmc_for_recovery()
@@ -12818,6 +12989,9 @@ def run_execute_fault(fault_at, fault_type='w'):
     signals['phase1_ops_total'] = phase1_ops
     signals['trace_replay_mode'] = 'execute'
     signals['multiboot_cycles_run'] = _multiboot_cycles_run
+    if fault_injected and is_erase_fault:
+        signals['erase_fault_mode'] = 1 if fault_type == 'a' else 0
+        signals['mram_torn_word_mode'] = mram_torn_word
     if phase1_status is not None:
         merge_stop_status_signals(signals, 'phase1', phase1_status)
     if fault_injected and is_non_power_write_fault and not phase1_stopped_on_fault:
@@ -15039,6 +15213,13 @@ if calibration_mode:
             _enable_fine_trace(backend['data'])
         elif bounded_calibration and backend['kind'] == 'fast':
             _enable_fine_trace(backend['data'])
+        elif (
+            (fault_types_mode in ('erase', 'both') or include_erase_fault_points)
+            and hasattr(backend['data'], 'EraseTraceEnabled')
+        ):
+            if hasattr(backend['data'], 'EraseTraceClear'):
+                backend['data'].EraseTraceClear()
+            backend['data'].EraseTraceEnabled = True
         log('calibration: starting step (fault_types={})'.format(fault_types_mode))
         base_writes = get_total_writes()
         base_erases = get_total_erases()
@@ -15288,12 +15469,13 @@ if calibration_mode:
                 len(program_trace), program_trace_file
             ))
 
-        # Export erase trace — always captured for trace replay correctness.
+        # Export erase trace — captured across fast, mram, and slow backends when supported.
         erase_trace_file = None
         erase_trace_file_bin = None
-        if backend['kind'] == 'fast':
-            backend['data'].EraseTraceEnabled = False
-            erase_count = backend['data'].EraseTraceCount
+        if hasattr(backend['data'], 'EraseTraceToString') and hasattr(backend['data'], 'EraseTraceCount'):
+            if hasattr(backend['data'], 'EraseTraceEnabled'):
+                backend['data'].EraseTraceEnabled = False
+            erase_count = int(backend['data'].EraseTraceCount)
             if erase_count > 0:
                 erase_trace_file = result_file.replace('.json', '_erase_trace.csv')
                 erase_trace_file_bin = result_file.replace('.json', '_erase_trace.bin')
@@ -15322,7 +15504,7 @@ if calibration_mode:
                                 erase_idx = int(parts[0]) & 0xFFFFFFFF
                                 flash_off = int(parts[1]) & 0xFFFFFFFF
                                 writes_at = int(parts[2]) & 0xFFFFFFFF
-                                fallback_sz = int(backend['data'].PageSize) & 0xFFFFFFFF
+                                fallback_sz = int(getattr(backend['data'], 'PageSize', 0) or effective_page_size()) & 0xFFFFFFFF
                                 if not _calibration_event_within_stop(
                                     write_index=writes_at,
                                     erase_index=erase_idx,

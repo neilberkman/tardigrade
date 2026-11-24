@@ -181,9 +181,13 @@ def _validate_mram_torn_word_backend(
         and torn_word_seed == 0
     ):
         return
-    if not _is_mram_backend(
+    is_mram = _is_mram_backend(
         platform, flash_backend, extra_peripherals, profile_path=profile_path
-    ):
+    )
+    include_erase_fault_points = bool(
+        getattr(fs, "include_erase_fault_points", False)
+    )
+    if not is_mram and not include_erase_fault_points:
         raise ProfileError(
             "fault_sweep.mram_torn_word is only supported on MRAM backends "
             "(got flash_backend='{}', platform='{}')".format(
@@ -191,6 +195,21 @@ def _validate_mram_torn_word_backend(
             )
         )
     if torn_word_mode == "uncorrectable":
+        backend_lower = str(flash_backend or "").strip().lower()
+        platform_name_lower = Path(str(platform or "")).name.lower()
+        supports_uncorrectable = is_mram or (
+            "nvm" in backend_lower and "nvmc" not in backend_lower
+        ) or (
+            "nvm" in platform_name_lower and "nvmc" not in platform_name_lower
+        )
+        if not supports_uncorrectable:
+            raise ProfileError(
+                "fault_sweep.mram_torn_word 'uncorrectable' requires an MRAM "
+                "or NVMemory backend with uncorrectable read-fault support "
+                "(got flash_backend='{}', platform='{}')".format(
+                    flash_backend or "", platform or ""
+                )
+            )
         eval_mode = str(getattr(fs, "evaluation_mode", None) or "").strip().lower()
         if eval_mode == "state":
             raise ProfileError(
@@ -1602,6 +1621,7 @@ class FaultSweepConfig:
         "mram_torn_word",
         "mram_torn_word_explicit",
         "mram_torn_word_seed",
+        "include_erase_fault_points",
     )
 
     def __init__(
@@ -1656,6 +1676,7 @@ class FaultSweepConfig:
         mram_torn_word: str = "half",
         mram_torn_word_explicit: bool = False,
         mram_torn_word_seed: int = 0,
+        include_erase_fault_points: bool = False,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -1846,6 +1867,7 @@ class FaultSweepConfig:
                 "fault_sweep.mram_torn_word_seed must be between 0 and 0xFFFFFFFF"
             )
         self.mram_torn_word_seed = parsed_seed
+        self.include_erase_fault_points = bool(include_erase_fault_points)
 
 
 class StateFuzzerConfig:
@@ -3145,6 +3167,9 @@ class ProfileConfig:
             "MRAM_TORN_WORD:{}".format(fs.mram_torn_word),
             "IMAGE_PAD_BYTE:0x{:02X}".format(self.image_pad_byte(repo_root)),
             "MRAM_TORN_WORD_SEED:{}".format(fs.mram_torn_word_seed),
+            "INCLUDE_ERASE_FAULT_POINTS:{}".format(
+                "true" if fs.include_erase_fault_points else "false"
+            ),
             "HEURISTIC_TRACE_REQUIRED:{}".format(
                 str(
                     fs.sweep_strategy == "heuristic"
@@ -4351,10 +4376,10 @@ def _warn_fault_backend_compat(
                 "nothing.".format(platform, flash_backend or "(not set)")
             )
 
-    # interrupted_erase / multi_sector_atomicity: MRAM has no page erases.
-    # Erase faults will silently no-op on MRAM backends.
+    # interrupted_erase / multi_sector_atomicity: warn on MRAM platforms unless
+    # include_erase_fault_points explicitly opts into cutting NVM erase operations.
     erase_types = {"interrupted_erase", "multi_sector_atomicity"}
-    if all_types & erase_types:
+    if (all_types & erase_types) and not getattr(fs, "include_erase_fault_points", False):
         is_mram = "mram" in platform_lower or "mram" in backend_lower
         if is_mram:
             warnings.warn(
@@ -4743,6 +4768,10 @@ def _parse_fault_sweep(
         mram_torn_word=raw.get("mram_torn_word", "half"),
         mram_torn_word_explicit="mram_torn_word" in raw,
         mram_torn_word_seed=raw.get("mram_torn_word_seed", 0),
+        include_erase_fault_points=_parse_bool(
+            raw.get("include_erase_fault_points", False),
+            "fault_sweep.include_erase_fault_points",
+        ),
     )
     fs_cfg._raw_boot_cycle_hook = raw_boot_cycle_hook
     fs_cfg._resolved_boot_cycle_hook = resolved_boot_cycle_hook
@@ -7630,6 +7659,7 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
         "rc_injection_config",
         "mram_torn_word",
         "mram_torn_word_seed",
+        "include_erase_fault_points",
     }
 )
 

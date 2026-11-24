@@ -1865,9 +1865,13 @@ def _main_single() -> int:
         control_only_calibration_fallback: Optional[str] = None
         # Determine whether erase-trace capture is needed during calibration.
         fault_types = profile.fault_sweep.fault_types
+        include_erase_fault_points = bool(
+            getattr(profile.fault_sweep, "include_erase_fault_points", False)
+        )
         include_erases = (
             "interrupted_erase" in fault_types
             or "multi_sector_atomicity" in fault_types
+            or include_erase_fault_points
         )
         include_erase_trace = include_erases or "swap_progress" in fault_types
         include_erase_trace = include_erase_trace or "security_state_erase" in fault_types

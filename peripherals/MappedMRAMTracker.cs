@@ -83,8 +83,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool FaultEverFired { get; set; }
         public bool DriverErrorFired { get; set; }
         public bool PerWriteAccurate => true;
-        public bool AnyFaultFired => FaultEverFired;
-        public bool FaultRequiresImmediateStop => FaultEverFired && WriteFaultMode == 0;
+        public bool AnyFaultFired => FaultEverFired || EraseFaultFired;
+        public bool FaultRequiresImmediateStop => EraseFaultFired || (FaultEverFired && WriteFaultMode == 0);
         public uint LastFaultAddress { get; set; }
         public byte[] FaultFlashSnapshot
         {
@@ -253,12 +253,51 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool PassthroughMode { get; set; }
 
         public ulong TotalPageErases { get; set; }
-        public ulong FaultAtPageErase { get; set; } = ulong.MaxValue;
+        public ulong FaultAtPageErase
+        {
+            get { return faultAtPageErase; }
+            set
+            {
+                faultAtPageErase = value;
+                if(value != ulong.MaxValue && trackingStarted)
+                {
+                    EnsureShadow();
+                }
+            }
+        }
         public bool EraseFaultFired { get; set; }
         public bool EraseTraceEnabled { get; set; }
-        public int EraseTraceCount => 0;
-        public string EraseTraceToString() { return string.Empty; }
-        public void EraseTraceClear() { }
+        public int EraseTraceCount => eraseTrace.Count;
+        public string EraseTraceToString()
+        {
+            if(eraseTrace.Count == 0)
+            {
+                return string.Empty;
+            }
+            var result = new StringBuilder(eraseTrace.Count * 32);
+            foreach(var entry in eraseTrace)
+            {
+                result.Append(entry.Index);
+                result.Append(':');
+                result.Append(entry.Offset);
+                result.Append(':');
+                result.Append(entry.WritesAt);
+                result.Append(':');
+                result.Append(entry.EraseSize);
+                result.Append('\n');
+            }
+            return result.ToString();
+        }
+        public void EraseTraceClear()
+        {
+            eraseTrace.Clear();
+        }
+
+        // Optional MMIO erase trigger registers (disabled by default at -1 so
+        // existing direct-memory sidecar accesses remain completely unchanged).
+        public long EraseSizeRegisterOffset { get; set; } = -1;
+        public long EraseAddressRegisterOffset { get; set; } = -1;
+        public long EraseWordRegisterOffset { get; set; } = -1;
 
         public bool WriteTraceEnabled
         {
@@ -421,6 +460,30 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
         public void WriteDoubleWord(long offset, uint value)
         {
+            if(EraseSizeRegisterOffset >= 0 && offset == EraseSizeRegisterOffset)
+            {
+                mmioEraseSize = value;
+                return;
+            }
+            if(EraseAddressRegisterOffset >= 0 && offset == EraseAddressRegisterOffset)
+            {
+                if(TryResolveBusAddress((ulong)value, out var targetOffset))
+                {
+                    var sectorLen = mmioEraseSize != 0U
+                        ? checked((int)mmioEraseSize)
+                        : (PageSize > 0 ? PageSize : 0x1000);
+                    EraseSector(targetOffset, sectorLen);
+                }
+                return;
+            }
+            if(EraseWordRegisterOffset >= 0 && offset == EraseWordRegisterOffset)
+            {
+                if(TryResolveBusAddress((ulong)value, out var wordOffset))
+                {
+                    EraseWord(wordOffset);
+                }
+                return;
+            }
             BackingMemory.WriteDoubleWord(offset, value);
             ClearUncorrectableRange(offset, 4);
         }
@@ -462,20 +525,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 return;
             }
-            var erased = new byte[ProgramUnitSize];
-            if(EraseFill != 0)
-            {
-                for(var i = 0; i < erased.Length; i++)
-                {
-                    erased[i] = EraseFill;
-                }
-            }
-            BackingMemory.WriteBytes(unitOffset, erased, 0, erased.Length);
-            ClearUncorrectableRange(unitOffset, ProgramUnitSize);
-            if(flashShadow != null)
-            {
-                WriteShadowUnit(unitOffset, erased);
-            }
+            EraseSpan(unitOffset, ProgramUnitSize);
         }
 
         public void EraseSector(long offset, int sectorSize)
@@ -484,7 +534,64 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 return;
             }
-            var erased = new byte[sectorSize];
+            EraseSpan(offset, sectorSize);
+        }
+
+        private void EraseSpan(long offset, int spanSize)
+        {
+            if(!trackingStarted)
+            {
+                WriteErasedSpanRaw(offset, spanSize);
+                return;
+            }
+
+            if(!PassthroughMode && EraseFaultFired)
+            {
+                // Power has already been cut during an erase; suppress further erases.
+                return;
+            }
+
+            var eraseIndex = TotalPageErases + 1;
+            TotalPageErases = eraseIndex;
+            if(EraseTraceEnabled)
+            {
+                eraseTrace.Add(new EraseTraceEntry(
+                    eraseIndex, offset, TotalWordWrites, spanSize));
+            }
+
+            if(!PassthroughMode && eraseIndex == faultAtPageErase)
+            {
+                EnsureShadow();
+                var preErase = BackingMemory.ReadBytes(offset, spanSize);
+                lastFaultMarkedUncorrectable = false;
+                var postErase = ApplyTornEraseSpan(offset, spanSize, preErase, eraseIndex);
+                BackingMemory.WriteBytes(offset, postErase, 0, postErase.Length);
+                if(flashShadow != null)
+                {
+                    Array.Copy(postErase, 0, flashShadow, checked((int)offset), postErase.Length);
+                }
+                EraseFaultFired = true;
+                LastFaultInjected = true;
+                LastFaultAddress = checked((uint)(ProgramAddressBase + (ulong)offset));
+                lastFaultOffset = offset;
+                lastFaultProgramAddress = ProgramAddressBase + (ulong)offset;
+                lastFaultProgramWidth = spanSize;
+                faultMemorySnapshot = BackingMemory.ReadBytes(0, checked((int)Size));
+                faultUncorrectableWords.Clear();
+                faultUncorrectableWords.AddRange(uncorrectableWords);
+                if(lastFaultMarkedUncorrectable)
+                {
+                    UpdateHooks();
+                }
+                return;
+            }
+
+            WriteErasedSpanRaw(offset, spanSize);
+        }
+
+        private void WriteErasedSpanRaw(long offset, int spanSize)
+        {
+            var erased = new byte[spanSize];
             if(EraseFill != 0)
             {
                 for(var i = 0; i < erased.Length; i++)
@@ -493,14 +600,110 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             }
             BackingMemory.WriteBytes(offset, erased, 0, erased.Length);
-            ClearUncorrectableRange(offset, sectorSize);
-            flashShadow = null;
+            ClearUncorrectableRange(offset, spanSize);
+            if(flashShadow != null)
+            {
+                Array.Copy(erased, 0, flashShadow, checked((int)offset), erased.Length);
+            }
+        }
+
+        private byte[] ApplyTornEraseSpan(long offset, int spanSize, byte[] preErase, ulong eraseIndex)
+        {
+            if(EraseFaultMode == 1)
+            {
+                var multiResult = CloneBytes(preErase);
+                var halfSpan = Math.Max(1, spanSize / 2);
+                for(var i = 0; i < halfSpan; i++)
+                {
+                    multiResult[i] = EraseFill;
+                }
+                ClearUncorrectableRange(offset, halfSpan);
+                var quarterSpan = Math.Max(1, spanSize / 4);
+                var neighbor = offset + spanSize;
+                if(ValidRange(neighbor, quarterSpan))
+                {
+                    WriteErasedSpanRaw(neighbor, quarterSpan);
+                }
+                return multiResult;
+            }
+
+            var mode = mramTornWordMode;
+            byte[] result;
+            switch(mode)
+            {
+                case "untouched":
+                    result = CloneBytes(preErase);
+                    break;
+                case "erased":
+                case "programmed":
+                    result = new byte[spanSize];
+                    if(EraseFill != 0)
+                    {
+                        for(var i = 0; i < spanSize; i++)
+                        {
+                            result[i] = EraseFill;
+                        }
+                    }
+                    ClearUncorrectableRange(offset, spanSize);
+                    break;
+                case "uncorrectable":
+                    result = CloneBytes(preErase);
+                    var firstUnit = AlignDown(offset, ProgramUnitSize);
+                    var lastUnit = AlignDown(offset + spanSize - 1, ProgramUnitSize);
+                    for(var unit = firstUnit; unit <= lastUnit; unit += ProgramUnitSize)
+                    {
+                        MarkWordUncorrectableInternal(unit);
+                    }
+                    lastFaultMarkedUncorrectable = true;
+                    break;
+                case "corrupted":
+                    result = new byte[spanSize];
+                    if(EraseFill != 0)
+                    {
+                        for(var i = 0; i < spanSize; i++)
+                        {
+                            result[i] = EraseFill;
+                        }
+                    }
+                    ClearUncorrectableRange(offset, spanSize);
+                    var cFirst = AlignDown(offset, ProgramUnitSize);
+                    var cLast = AlignDown(offset + spanSize - 1, ProgramUnitSize);
+                    for(var unit = cFirst; unit <= cLast; unit += ProgramUnitSize)
+                    {
+                        var segStart = Math.Max(offset, unit);
+                        var segEnd = Math.Min(offset + spanSize, unit + ProgramUnitSize);
+                        var segLen = checked((int)(segEnd - segStart));
+                        var unitBytes = new byte[segLen];
+                        Array.Copy(result, checked((int)(segStart - offset)), unitBytes, 0, segLen);
+                        ApplyCorruptedTornWord(unitBytes, eraseIndex, unit, EffectiveMramTornWordSeed());
+                        Array.Copy(unitBytes, 0, result, checked((int)(segStart - offset)), segLen);
+                    }
+                    break;
+                default:
+                    result = CloneBytes(preErase);
+                    var half = spanSize / 2;
+                    if(half <= 0 && spanSize > 0)
+                    {
+                        half = spanSize;
+                    }
+                    for(var i = 0; i < half; i++)
+                    {
+                        result[i] = EraseFill;
+                    }
+                    if(half > 0)
+                    {
+                        ClearUncorrectableRange(offset, half);
+                    }
+                    break;
+            }
+            return result;
         }
 
         public void Reset()
         {
             RemoveStartHook();
             RemoveStopHook();
+            mmioEraseSize = 0;
 
             if(trackingStopHit || FaultEverFired)
             {
@@ -509,6 +712,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // returns, so clearing here would make an injected fault look
                 // like an out-of-range request. The runner explicitly resets
                 // campaign state before the next boot.
+                flashShadow = null;
+                trackingStartAddress = 0;
+                trackingStarted = false;
+            }
+            else if(EraseFaultFired)
+            {
                 flashShadow = null;
                 trackingStartAddress = 0;
                 trackingStarted = false;
@@ -611,6 +820,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
 
             EnsureShadow();
+            if(!PassthroughMode && EraseFaultFired)
+            {
+                // Power has already been cut during an erase; revert the fast-path
+                // CPU write back to the pre-write shadow bytes and suppress counting.
+                var revertFirst = AlignDown(offset, ProgramUnitSize);
+                var revertLast = AlignDown(offset + byteCount - 1, ProgramUnitSize);
+                for(var rUnit = revertFirst; rUnit <= revertLast; rUnit += ProgramUnitSize)
+                {
+                    WriteBackingUnit(rUnit, ReadShadowUnit(rUnit));
+                }
+                return;
+            }
             var cursor = 0;
             while(cursor < byteCount)
             {
@@ -892,10 +1113,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             TotalWordWrites = 0;
             TotalPageErases = 0;
             FaultFired = false;
+            EraseFaultFired = false;
             LastFaultInjected = false;
             FaultEverFired = false;
             DriverErrorFired = false;
+            LastFaultAddress = 0;
             writeTrace.Clear();
+            eraseTrace.Clear();
             programTrace.Clear();
             ClearFaultEvidence();
             flashShadow = null;
@@ -1082,12 +1306,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private readonly IMachine machine;
         private readonly List<WriteTraceEntry> writeTrace = new List<WriteTraceEntry>();
+        private readonly List<EraseTraceEntry> eraseTrace = new List<EraseTraceEntry>();
         private readonly List<ProgramTraceEntry> programTrace = new List<ProgramTraceEntry>();
         private readonly HashSet<long> uncorrectableWords = new HashSet<long>();
         private readonly List<UncorrectableReadEntry> uncorrectableReads = new List<UncorrectableReadEntry>();
         private int programUnitSize = 16;
         private ulong programAddressBase;
         private ulong faultAtWordWrite = ulong.MaxValue;
+        private ulong faultAtPageErase = ulong.MaxValue;
+        private uint mmioEraseSize;
         private int writeFaultMode;
         private string mramTornWordMode = "half";
         private bool writeTraceEnabled;
@@ -1150,6 +1377,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             public readonly long Offset;
             public readonly ulong Value;
             public readonly int Width;
+        }
+
+        private sealed class EraseTraceEntry
+        {
+            public EraseTraceEntry(ulong index, long offset, ulong writesAt, int eraseSize)
+            {
+                Index = index;
+                Offset = offset;
+                WritesAt = writesAt;
+                EraseSize = eraseSize;
+            }
+            public readonly ulong Index;
+            public readonly long Offset;
+            public readonly ulong WritesAt;
+            public readonly int EraseSize;
         }
 
         private sealed class ProgramTraceEntry

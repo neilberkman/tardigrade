@@ -84,6 +84,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
         public uint CorruptionSeed { get => tracker.CorruptionSeed; set => tracker.CorruptionSeed = value; }
         public string MramTornWordMode { get => tracker.MramTornWordMode; set => tracker.MramTornWordMode = value; }
+        public uint MramTornWordSeed { get => tracker.MramTornWordSeed; set => tracker.MramTornWordSeed = value; }
         public bool PreserveCountersAcrossReset { get => tracker.PreserveCountersAcrossReset; set => tracker.PreserveCountersAcrossReset = value; }
         public int DiffLookahead { get; set; } = 32;
         public bool SkipShadowScan { get; set; } = true;
@@ -140,13 +141,135 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public string WriteTraceToString() => tracker.WriteTraceToString();
         public void WriteTraceClear() => tracker.WriteTraceClear();
 
-        // Erase is not part of AN521's RAM-backed flash path.  These members
-        // are intentionally inert so generic fault tooling can bind without
-        // pretending that this view implements a hardware erase operation.
+        // Erase tracking and fault injection for AN521 flash sectors/words.
         public bool EraseTraceEnabled { get => tracker.EraseTraceEnabled; set => tracker.EraseTraceEnabled = value; }
         public int EraseTraceCount => tracker.EraseTraceCount;
         public string EraseTraceToString() => tracker.EraseTraceToString();
         public void EraseTraceClear() => tracker.EraseTraceClear();
+
+        public void EraseWord(long offset)
+        {
+            if(BackingMemory == null || offset < 0)
+            {
+                return;
+            }
+            var aligned = offset & ~3L;
+            if(aligned > BackingMemory.Size - 4)
+            {
+                return;
+            }
+            EraseSpan(aligned, 4);
+        }
+
+        public void EraseSector(long offset, int sectorSize)
+        {
+            if(BackingMemory == null || sectorSize <= 0 || offset < 0 || offset > BackingMemory.Size - sectorSize)
+            {
+                return;
+            }
+            EraseSpan(offset, sectorSize);
+        }
+
+        private void EraseSpan(long offset, int spanSize)
+        {
+            if(!trackingStarted)
+            {
+                WriteErasedSpanRaw(offset, spanSize);
+                return;
+            }
+
+            if(PassthroughMode)
+            {
+                WriteErasedSpanRaw(offset, spanSize);
+                tracker.RecordEraseAndCheckFault(offset, spanSize);
+                return;
+            }
+
+            if(tracker.AnyFaultFired)
+            {
+                // Power has already been cut; suppress subsequent erase operations.
+                return;
+            }
+
+            EnsureShadow();
+            if(tracker.RecordEraseAndCheckFault(offset, spanSize))
+            {
+                EraseFaultFired = true;
+                LastFaultAddress = (uint)(FlashBaseAddress + offset);
+                var preErase = BackingMemory.ReadBytes(offset, spanSize);
+                ApplyTornEraseSpan(offset, spanSize, preErase);
+                FaultFlashSnapshot = BackingMemory.ReadBytes(0, checked((int)FlashSize));
+                return;
+            }
+
+            WriteErasedSpanRaw(offset, spanSize);
+        }
+
+        private void WriteErasedSpanRaw(long offset, int spanSize)
+        {
+            var erased = new byte[spanSize];
+            if(EraseFill != 0)
+            {
+                for(var i = 0; i < erased.Length; i++)
+                {
+                    erased[i] = EraseFill;
+                }
+            }
+            BackingMemory.WriteBytes(offset, erased, 0, erased.Length);
+            if(flashShadow != null)
+            {
+                Array.Copy(erased, 0, flashShadow, checked((int)offset), erased.Length);
+            }
+        }
+
+        private void ApplyTornEraseSpan(long offset, int spanSize, byte[] preErase)
+        {
+            if(EraseFaultMode == 1)
+            {
+                var halfSpan = Math.Max(1, spanSize / 2);
+                WriteErasedSpanRaw(offset, halfSpan);
+                var quarterSpan = Math.Max(1, spanSize / 4);
+                var neighbor = offset + spanSize;
+                if(neighbor >= 0 && neighbor <= BackingMemory.Size - quarterSpan)
+                {
+                    WriteErasedSpanRaw(neighbor, quarterSpan);
+                }
+                return;
+            }
+
+            var mode = (MramTornWordMode ?? "half").Trim().ToLowerInvariant();
+            switch(mode)
+            {
+                case "untouched":
+                    // Power cut before erase took effect: retain pre-erase bytes.
+                    break;
+                case "erased":
+                case "programmed":
+                    // Erase completed immediately before power cut.
+                    WriteErasedSpanRaw(offset, spanSize);
+                    break;
+                case "corrupted":
+                    var corrupted = tracker.BuildCorruptedErasedSpan(offset, spanSize, EraseFill, 4);
+                    BackingMemory.WriteBytes(offset, corrupted, 0, corrupted.Length);
+                    if(flashShadow != null)
+                    {
+                        Array.Copy(corrupted, 0, flashShadow, checked((int)offset), corrupted.Length);
+                    }
+                    break;
+                default:
+                    // half / half_retain: first half erased to EraseFill, second half retained.
+                    var half = spanSize / 2;
+                    if(half <= 0 && spanSize > 0)
+                    {
+                        half = spanSize;
+                    }
+                    if(half > 0)
+                    {
+                        WriteErasedSpanRaw(offset, half);
+                    }
+                    break;
+            }
+        }
 
         // Reads are deliberately transparent.  The non-secure alias must be
         // executable and must see exactly the bytes stored in secure SSRAM1.
@@ -345,6 +468,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
 
             EnsureShadow();
+            if(tracker.AnyFaultFired)
+            {
+                // Power has already been cut (write or erase fault); revert the
+                // committed MappedMemory fast-path bytes back to the shadow.
+                var revertBytes = (int)Math.Min(width, sizeof(ulong));
+                for(var rc = 0; rc < revertBytes;)
+                {
+                    var rChunk = offset + rc;
+                    var rAligned = rChunk & ~3L;
+                    var rInWord = (int)(rChunk - rAligned);
+                    var rTake = Math.Min(4 - rInWord, revertBytes - rc);
+                    WriteBackingWord(rAligned, ReadShadowWord(rAligned));
+                    rc += rTake;
+                }
+                return;
+            }
             var byteCount = (int)Math.Min(width, sizeof(ulong));
             for(var cursor = 0; cursor < byteCount;)
             {
@@ -548,9 +687,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             trackingStarted = true;
             tracker.TotalWordWrites = 0;
+            tracker.TotalPageErases = 0;
             tracker.FaultFired = false;
+            tracker.EraseFaultFired = false;
             tracker.DriverErrorFired = false;
             tracker.WriteTraceClear();
+            tracker.EraseTraceClear();
             flashShadow = null;
             UpdateMemoryAccessHook();
         }

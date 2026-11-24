@@ -1,0 +1,8 @@
+base_profile: profile.yaml
+name: erase_before_program_erase_erased
+description: Cuts erase operations in erased mode (power lost between erase completion and first program).
+fault_sweep:
+  include_erase_fault_points: true
+  mram_torn_word: erased
+expect:
+  should_find_issues: true

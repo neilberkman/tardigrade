@@ -82,6 +82,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public uint CorruptionSeed { get => tracker.CorruptionSeed; set => tracker.CorruptionSeed = value; }
         public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
         public string MramTornWordMode { get => tracker.MramTornWordMode; set => tracker.MramTornWordMode = value; }
+        public uint MramTornWordSeed { get => tracker.MramTornWordSeed; set => tracker.MramTornWordSeed = value; }
         public bool PreserveCountersAcrossReset { get => tracker.PreserveCountersAcrossReset; set => tracker.PreserveCountersAcrossReset = value; }
 
         public bool AnyFaultFired => tracker.AnyFaultFired;
@@ -576,8 +577,25 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 else
                 {
-                    // Interrupted erase: first half erased, second half untouched.
-                    EraseWithFill(Flash, sector.Offset, halfSize);
+                    var tornMode = (MramTornWordMode ?? "half").Trim().ToLowerInvariant();
+                    if(tornMode == "untouched")
+                    {
+                        // Power cut before erase took effect.
+                    }
+                    else if(tornMode == "erased" || tornMode == "programmed")
+                    {
+                        EraseWithFill(Flash, sector.Offset, sector.Size);
+                    }
+                    else if(tornMode == "corrupted")
+                    {
+                        var corrupted = tracker.BuildCorruptedErasedSpan(sector.Offset, sector.Size, EraseFill, 4);
+                        Flash.WriteBytes(sector.Offset, corrupted, 0, corrupted.Length);
+                    }
+                    else
+                    {
+                        // Interrupted erase (half / half_retain): first half erased, second half untouched.
+                        EraseWithFill(Flash, sector.Offset, halfSize);
+                    }
                 }
 
                 FaultFlashSnapshot = Flash.ReadBytes(0, checked((int)FlashSize));

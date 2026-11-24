@@ -30,6 +30,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int EraseFaultMode;
         public uint CorruptionSeed;
         public string MramTornWordMode = "half";
+        public uint MramTornWordSeed;
         public bool PreserveCountersAcrossReset;
 
         public bool WriteTraceEnabled;
@@ -177,6 +178,44 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             seed ^= (uint)offset;
             seed ^= (uint)(TotalPageErases * 2654435761UL);
             return seed;
+        }
+
+        public byte[] BuildCorruptedErasedSpan(long offset, int spanSize, byte eraseFill, int wordUnitBytes = 4)
+        {
+            var corrupted = new byte[Math.Max(0, spanSize)];
+            if(spanSize <= 0)
+            {
+                return corrupted;
+            }
+            if(eraseFill != 0)
+            {
+                for(var i = 0; i < spanSize; i++)
+                {
+                    corrupted[i] = eraseFill;
+                }
+            }
+            var unitBytes = Math.Max(1, wordUnitBytes);
+            var seed = MramTornWordSeed != 0
+                ? (MramTornWordSeed ^ (uint)offset ^ (uint)(TotalPageErases * 2654435761UL))
+                : BuildFaultSeed((int)offset);
+            for(var wordPos = 0; wordPos < spanSize; wordPos += unitBytes)
+            {
+                var wordLen = Math.Min(unitBytes, spanSize - wordPos);
+                var totalBits = wordLen * 8;
+                var flips = Math.Min(totalBits, 3 + (int)(NextLcg(ref seed) % 3U));
+                var used = new HashSet<int>();
+                var attempts = 0;
+                while(used.Count < flips && attempts < totalBits * 4)
+                {
+                    attempts++;
+                    var bit = (int)(NextLcg(ref seed) % (uint)totalBits);
+                    if(used.Add(bit))
+                    {
+                        corrupted[wordPos + (bit / 8)] ^= (byte)(1 << (bit % 8));
+                    }
+                }
+            }
+            return corrupted;
         }
 
         public static byte[] WordToBytes(uint value)

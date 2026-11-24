@@ -1137,7 +1137,30 @@ fault_sweep:
   - `corrupted`: tests that integrity checks (CRCs, hashes, sequence/commit markers) reject wrong data if a multi-bit error escapes or miscorrects through ECC without raising a bus fault.
 - **Parts without word ECC** (or where the write path splits a word into sub-word bus/program phases without whole-word parity): `half`, `half_retain`, `untouched`, `erased`, and `programmed` model byte-level tearing directly.
 
-`profile_loader.py` rejects unknown `mram_torn_word` values, rejects `mram_torn_word` (and `mram_torn_word_seed`) on non-MRAM backends, and rejects `uncorrectable` when `evaluation_mode: state` or `durability_model: writeback` is configured (neither can model live CPU read faults on an interrupted MRAM word). At runtime, `run_runtime_fault_sweep.py` sets `MramTornWordMode` (and `MramTornWordSeed`) on the backend peripheral when exposed and refuses `uncorrectable` or non-default live modes when the peripheral lacks support.
+`profile_loader.py` rejects unknown `mram_torn_word` values, rejects `mram_torn_word` (and `mram_torn_word_seed`) on non-MRAM backends unless `include_erase_fault_points: true` is configured, rejects `uncorrectable` on backends without uncorrectable read-fault support, and rejects `uncorrectable` when `evaluation_mode: state` or `durability_model: writeback` is configured (neither can model live CPU read faults on an interrupted word). At runtime, `run_runtime_fault_sweep.py` sets `MramTornWordMode` (and `MramTornWordSeed`) on the backend peripheral when exposed and refuses `uncorrectable` or non-default live modes when the peripheral lacks support.
+
+### Erase fault points
+
+```yaml
+fault_sweep:
+  fault_types: [power_loss]
+  include_erase_fault_points: true # default: false
+  mram_torn_word: half # half, half_retain, untouched, erased, programmed, uncorrectable, or corrupted
+```
+
+By default (`include_erase_fault_points: false`), a `power_loss` sweep cuts power only during program/write operations, keeping existing profiles' fault indices and results unchanged.
+
+When `include_erase_fault_points: true` is set:
+
+- Calibration counts erase operations (`total_erases`) and captures an erase trace across all built-in NVM and flash backends (`MappedMRAMTracker`, `NVMemoryController` / `NVMemory`, `GenericNvmController`, `An521NvmInterceptor`, `NRF52NVMC`, `STM32F4*`, `STM32H7*`, and `CFIFlash`).
+- The fault planner appends one interrupted-erase fault point (`fault_type: "e"`) for every calibrated erase operation (deduplicated if `interrupted_erase` is also listed in `fault_types`), in addition to program fault points.
+- Each fault point result, categorized failure, and runtime sweep summary reports its operation kind (`operation_kind`: `"program"` or `"erase"`, plus `operation_kind_points` / `operation_kind_issue_points` / `operation_kind_bricks` counts in the sweep summary).
+- What an interrupted erase leaves in the erased span `[offset .. offset + size)` is defined by the backend's torn-word mode (`mram_torn_word`, defaulting to `half`; `CFIFlash` does not implement torn-word modes and always retains pre-erase bytes when interrupted):
+  - `half` / `half_retain` (default): the first half of the erased span is filled with `EraseFill` and the second half retains the pre-erase bytes (matching partial-page flash erases).
+  - `untouched`: the entire span retains its pre-erase bytes unchanged (power cut just before the erase commits).
+  - `erased` / `programmed`: the entire span is filled with `EraseFill` (erase completed immediately before power failed — tests power cuts between an erase and the subsequent program).
+  - `uncorrectable` (on `MappedMRAMTracker` and `NVMemory` / `NVMemoryController` / `GenericNvmController`): storage retains pre-erase bytes and every program unit in the interrupted erase span is marked uncorrectable so subsequent CPU reads raise a bus error / HardFault.
+  - `corrupted`: the span is filled with `EraseFill` with deterministic multi-bit flips per program unit seeded from `mram_torn_word_seed`.
 
 ### Phase 2 timing
 

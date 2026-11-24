@@ -1,0 +1,7 @@
+base_profile: profile_erased_vector.yaml
+name: recovery_vector_fault_erased_vector_with_erase_points
+description: Erased-vector rewrite fixture with include_erase_fault_points enabled (cuts both the page erase and the 4 vector writes).
+fault_sweep:
+  include_erase_fault_points: true
+expect:
+  should_find_issues: true

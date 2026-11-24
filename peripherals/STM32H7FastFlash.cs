@@ -95,6 +95,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public uint CorruptionSeed { get => tracker.CorruptionSeed; set => tracker.CorruptionSeed = value; }
         public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
         public string MramTornWordMode { get => tracker.MramTornWordMode; set => tracker.MramTornWordMode = value; }
+        public uint MramTornWordSeed { get => tracker.MramTornWordSeed; set => tracker.MramTornWordSeed = value; }
         public bool PreserveCountersAcrossReset { get => tracker.PreserveCountersAcrossReset; set => tracker.PreserveCountersAcrossReset = value; }
 
         public bool AnyFaultFired => tracker.AnyFaultFired;
@@ -614,7 +615,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 else
                 {
-                    EraseWithFill(flash, offset, halfSize);
+                    var tornMode = (MramTornWordMode ?? "half").Trim().ToLowerInvariant();
+                    if(tornMode == "untouched")
+                    {
+                        // Power cut before erase took effect.
+                    }
+                    else if(tornMode == "erased" || tornMode == "programmed")
+                    {
+                        EraseWithFill(flash, offset, SectorSize);
+                    }
+                    else if(tornMode == "corrupted")
+                    {
+                        var corrupted = tracker.BuildCorruptedErasedSpan(offset, SectorSize, EraseFill, 4);
+                        flash.WriteBytes(offset, corrupted, 0, corrupted.Length);
+                    }
+                    else
+                    {
+                        EraseWithFill(flash, offset, halfSize);
+                    }
                 }
 
                 FaultFlashSnapshot = flash.ReadBytes(0, checked((int)FlashSize));

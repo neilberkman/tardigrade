@@ -1,0 +1,8 @@
+base_profile: profile.yaml
+name: erase_before_program_erase_untouched
+description: Cuts erase operations in untouched mode (retains valid pre-erase record).
+fault_sweep:
+  include_erase_fault_points: true
+  mram_torn_word: untouched
+expect:
+  should_find_issues: true

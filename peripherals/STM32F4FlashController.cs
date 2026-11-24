@@ -107,6 +107,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
         public string MramTornWordMode { get => tracker.MramTornWordMode; set => tracker.MramTornWordMode = value; }
+        public uint MramTornWordSeed { get => tracker.MramTornWordSeed; set => tracker.MramTornWordSeed = value; }
         public bool PreserveCountersAcrossReset { get => tracker.PreserveCountersAcrossReset; set => tracker.PreserveCountersAcrossReset = value; }
 
         public bool AnyFaultFired => tracker.AnyFaultFired;
@@ -926,7 +927,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 else
                 {
-                    EraseWithFill(Flash, sector.Offset, halfSize);
+                    var tornMode = (MramTornWordMode ?? "half").Trim().ToLowerInvariant();
+                    if(tornMode == "untouched")
+                    {
+                        // Power cut before erase took effect.
+                    }
+                    else if(tornMode == "erased" || tornMode == "programmed")
+                    {
+                        EraseWithFill(Flash, sector.Offset, sector.Size);
+                    }
+                    else if(tornMode == "corrupted")
+                    {
+                        var corrupted = tracker.BuildCorruptedErasedSpan(sector.Offset, sector.Size, EraseFill, 4);
+                        Flash.WriteBytes(sector.Offset, corrupted, 0, corrupted.Length);
+                    }
+                    else
+                    {
+                        EraseWithFill(Flash, sector.Offset, halfSize);
+                    }
                 }
 
                 FaultFlashSnapshot = Flash.ReadBytes(0, checked((int)FlashSize));
@@ -939,10 +957,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // Update shadow after erase.
             if(flashShadow != null)
             {
-                int eraseLen = (TotalPageErases == FaultAtPageErase) ? sector.Size / 2 : sector.Size;
-                for(int i = 0; i < eraseLen && sector.Offset + i < flashShadow.Length; i++)
+                var updated = Flash.ReadBytes(sector.Offset, sector.Size);
+                var copyLen = Math.Min(updated.Length, Math.Max(0, flashShadow.Length - (int)sector.Offset));
+                if(copyLen > 0)
                 {
-                    flashShadow[sector.Offset + i] = EraseFill;
+                    Array.Copy(updated, 0, flashShadow, (int)sector.Offset, copyLen);
                 }
             }
         }

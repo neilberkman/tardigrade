@@ -234,3 +234,67 @@ def _fault_type_label(code: Any) -> str:
     if code.startswith("mf:"):
         return "multi_fault_sequence"
     return mapping.get(code, code)
+
+
+_ERASE_OPERATION_CODES = frozenset(
+    {
+        "e",
+        "a",
+        "interrupted_erase",
+        "multi_sector_atomicity",
+    }
+)
+
+_PROGRAM_OPERATION_CODES = frozenset(
+    {
+        "w",
+        "b",
+        "s",
+        "g",
+        "x",
+        "d",
+        "l",
+        "r",
+        "k",
+        "op",
+        "os",
+        "od",
+        "oo",
+        "on",
+        "power_loss",
+        "swap_progress",
+        "security_state_erase",
+        "bit_corruption",
+        "bit_corruption_clustered",
+        "silent_write_failure",
+        "driver_error",
+        "rc_injection",
+        "write_disturb",
+        "wear_leveling_corruption",
+        "write_rejection",
+        "command_drop",
+        "otp_partial_program",
+        "otp_stuck_bit",
+        "otp_read_disturb",
+        "otp_overblow",
+        "otp_blow_nop",
+    }
+)
+
+
+def operation_kind_for_fault_type(fault_type: Any):
+    """Return 'program', 'erase', or None for a fault type code or name."""
+    raw = str(fault_type or "").strip().lower()
+    if not raw or raw == "control":
+        return None
+    leaf = raw
+    for prefix in ("m:", "h:", "p2:", "cc:", "c:"):
+        if leaf.startswith(prefix):
+            leaf = leaf.rsplit(":", 1)[-1]
+            break
+    base = leaf.split(":", 1)[0]
+    if base in _ERASE_OPERATION_CODES:
+        return "erase"
+    if base in _PROGRAM_OPERATION_CODES:
+        return "program"
+    return None

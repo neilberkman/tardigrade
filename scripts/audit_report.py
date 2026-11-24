@@ -42,7 +42,11 @@ from bypass_probe import (
     build_defense_in_depth_layers,
     classify_probe_result,
 )
-from fault_types import TRACE_COVERAGE_FAULT_TYPES, _fault_type_label
+from fault_types import (
+    TRACE_COVERAGE_FAULT_TYPES,
+    _fault_type_label,
+    operation_kind_for_fault_type,
+)
 from profile_loader import ProfileConfig
 from read_fault_translation import (
     ReadFaultStats,
@@ -235,6 +239,11 @@ def categorize_failure(
         "phase": phase,
         "position_pct": round(pct * 100, 2),
     }
+    op_kind = result.get("operation_kind") or operation_kind_for_fault_type(
+        result.get("fault_type")
+    )
+    if op_kind is not None:
+        payload["operation_kind"] = op_kind
     issue_reasons = result_issue_reasons(
         result,
         getattr(profile.expect, "control_outcome", "success") if profile else "success",
@@ -682,6 +691,9 @@ def summarize_runtime_sweep(
     fault_type_counts: Dict[str, int] = {}
     fault_type_issue_counts: Dict[str, int] = {}
     fault_type_brick_counts: Dict[str, int] = {}
+    operation_kind_counts: Dict[str, int] = {}
+    operation_kind_issue_counts: Dict[str, int] = {}
+    operation_kind_brick_counts: Dict[str, int] = {}
     validation_dispositions: Dict[str, int] = {}
     validation_stages: Dict[str, int] = {}
     glitch_realism_counts: Dict[str, int] = {}
@@ -700,6 +712,9 @@ def summarize_runtime_sweep(
             instruction_skip_points += 1
         ft_name = _fault_type_label(r.get("fault_type"))
         fault_type_counts[ft_name] = fault_type_counts.get(ft_name, 0) + 1
+        op_kind = r.get("operation_kind") or operation_kind_for_fault_type(r.get("fault_type"))
+        if op_kind is not None:
+            operation_kind_counts[op_kind] = operation_kind_counts.get(op_kind, 0) + 1
         if result_has_initial_timeout(r):
             continue
         iskip = classify_instruction_skip_severity(r, expected_outcome=expected_outcome)
@@ -745,8 +760,12 @@ def summarize_runtime_sweep(
             )
         if result_is_brick(r):
             fault_type_brick_counts[ft_name] = fault_type_brick_counts.get(ft_name, 0) + 1
+            if op_kind is not None:
+                operation_kind_brick_counts[op_kind] = operation_kind_brick_counts.get(op_kind, 0) + 1
         if result_has_issues(r, expected_outcome):
             fault_type_issue_counts[ft_name] = fault_type_issue_counts.get(ft_name, 0) + 1
+            if op_kind is not None:
+                operation_kind_issue_counts[op_kind] = operation_kind_issue_counts.get(op_kind, 0) + 1
     for r in failures:
         eff_out, _ = _effective_boot_result(r)
         if eff_out != expected_outcome:
@@ -837,6 +856,9 @@ def summarize_runtime_sweep(
         "fault_type_points": fault_type_counts,
         "fault_type_issue_points": fault_type_issue_counts,
         "fault_type_bricks": fault_type_brick_counts,
+        "operation_kind_points": operation_kind_counts,
+        "operation_kind_issue_points": operation_kind_issue_counts,
+        "operation_kind_bricks": operation_kind_brick_counts,
         "instruction_skip_points": instruction_skip_points,
         "security_bypass_points": security_bypass_points,
         "terminal_error_escape_points": len(terminal_escape_results),
