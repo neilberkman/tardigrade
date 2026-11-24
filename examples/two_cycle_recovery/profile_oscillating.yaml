@@ -1,0 +1,7 @@
+base_profile: profile.yaml
+name: two_cycle_recovery_oscillating
+description: Three-cycle variant whose torn-record recovery alternates between hard_fault and success across reboots.
+images:
+  exec: examples/two_cycle_recovery/oscillating.bin
+fault_sweep:
+  boot_cycles: 3

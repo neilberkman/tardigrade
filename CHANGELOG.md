@@ -51,6 +51,10 @@ The format follows [common-changelog](https://common-changelog.org/).
   PR #2206 head `d00b11dc`), tracked STM32F429 ELFs and signed `0x7D50`
   revert image, `MCUBOOT_BOOTSTRAP_SCOPE=pr2206_geom` rebuild support, and
   inclusion in the default CI self-test corpus.
+- Two-cycle recovery and three-cycle oscillating fixture
+  (`examples/two_cycle_recovery/`) exercising `boot_cycles: 2` failure-then-
+  success recovery, `boot_cycles: 3` alternation, `memory_checks`, and
+  non-zero `tracking_start_address` recovery-write accounting.
 
 ### Changed
 
@@ -95,6 +99,33 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- `analyze_boot_cycles` in `scripts/boot_cycle_analysis.py` no longer labels a
+  two-cycle observation `[X, Y]` with `X != Y` as `oscillating`. Single-transition
+  failure-then-success runs (such as `['hard_fault', 'success']`) now report
+  `recovered_after_failure` (with `recovered_at_cycle`), other unconfirmed
+  single-transition changes report `changed_unconfirmed` (or
+  `rollback_observed_unconfirmed` under an expected rollback schedule), and
+  `oscillating` is reserved for three or more cycles with at least two
+  transitions (`len(pairs) >= 3` and `transitions >= 2`).
+- `scripts/fault_classification.py` and `scripts/audit_report.py` now read
+  per-boot criteria signals from the effective boot cycle
+  (`_effective_boot_signals`, matching `_effective_boot_result`) instead of
+  leaking stale cycle-0 failures onto a promoted final cycle, explicitly
+  classify cycle-0 failure followed by final-cycle recovery via
+  `result_recovered_after_failure`, and partition every issue point into a
+  mutually exclusive `issue_breakdown` (`boot_mismatch`,
+  `recovered_after_failure`, `semantic`, `invariant`, `metadata_delta`,
+  `confirm_cycle`, `terminal_error_escape`, `other`) so `compute_verdict`
+  always sums to `issue_points` (including a `recovered after failure`
+  category when present).
+- Recovery resets (`prepare_recovery_shell_state`, `reset_nvmc_for_recovery`,
+  and slow-path Phase 2 resets in `scripts/run_runtime_fault_sweep.py`) now
+  bypass `tracking_start_address` (`TrackingStartAddress = 0` and Python
+  tracking-gate hook removed) so `recovery_writes` and Phase 2 write-progress
+  observation count NVM writes performed during recovery regardless of the
+  profile's Phase 1 tracking gate. Trace-replay fault runners
+  (`run_trace_replay_fault_native` and `run_trace_replay_fault`) now also
+  record `recovery_writes` in their result payloads.
 - Scoped post-success fault suppression in `scripts/run_runtime_fault_sweep.py`
   and `scripts/profile_loader.py` behind an explicit
   `success_criteria.allow_fault_after_success: true` opt-in (default `false`),
