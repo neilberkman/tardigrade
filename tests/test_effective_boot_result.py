@@ -17,7 +17,9 @@ if str(SCRIPTS) not in sys.path:
 
 from fault_classification import (
     _effective_boot_result,
+    _effective_boot_signals,
     classify_failure_class,
+    classify_issue_category,
     result_has_issues,
     result_is_brick,
     result_is_timeout,
@@ -155,6 +157,167 @@ class EffectiveBootResultTests(unittest.TestCase):
         }
         self.assertEqual(_effective_boot_result(result), ("success", "exec"))
         self.assertFalse(result_is_brick(result))
+
+    def test_failed_after_success_promotes_failing_cycle_and_signals(self):
+        for outcome, slot, is_brick, failure_class, expected_reasons in (
+            (
+                "hard_fault",
+                None,
+                True,
+                "unrecoverable",
+                ["boot_outcome", "memory_check"],
+            ),
+            (
+                "no_boot",
+                None,
+                True,
+                "unrecoverable",
+                ["boot_outcome"],
+            ),
+            (
+                "memory_checks_unmet",
+                "exec",
+                False,
+                "memory_checks_unmet",
+                ["boot_outcome", "memory_check"],
+            ),
+        ):
+            with self.subTest(outcome=outcome):
+                c0_signals = {"expectations_met": True, "memory_checks_ok": True}
+                c1_signals = (
+                    {"expectations_met": False, "memory_checks_ok": False}
+                    if outcome != "no_boot"
+                    else {"execution_observed": False}
+                )
+                result = {
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "fault_class": "recoverable",
+                    "initial_boot_outcome": "success",
+                    "initial_boot_slot": "exec",
+                    "final_boot_outcome": outcome,
+                    "final_boot_slot": slot,
+                    "signals": dict(c0_signals),
+                    "boot_cycles": [
+                        {
+                            "cycle": 0,
+                            "boot_outcome": "success",
+                            "boot_slot": "exec",
+                            "signals": dict(c0_signals),
+                        },
+                        {
+                            "cycle": 1,
+                            "boot_outcome": outcome,
+                            "boot_slot": slot,
+                            "signals": dict(c1_signals),
+                        },
+                    ],
+                    "multi_boot_analysis": {
+                        "status": "failed_after_success",
+                        "failed_at_cycle": 1,
+                        "initial_outcome": "success",
+                        "final_outcome": outcome,
+                        "final_slot": slot,
+                    },
+                }
+                self.assertEqual(_effective_boot_result(result), (outcome, slot))
+                self.assertEqual(_effective_boot_signals(result), c1_signals)
+                self.assertEqual(result_is_brick(result), is_brick)
+                self.assertTrue(result_has_issues(result, "success"))
+                self.assertEqual(result_issue_reasons(result, "success"), expected_reasons)
+                self.assertEqual(classify_issue_category(result, "success"), "boot_mismatch")
+                self.assertEqual(classify_failure_class(result), failure_class)
+
+    def test_changed_unconfirmed_revert_stays_unpromoted(self):
+        for final_outcome in ("success", "wrong_image"):
+            with self.subTest(final_outcome=final_outcome):
+                result = {
+                    "boot_outcome": "success",
+                    "boot_slot": "staging",
+                    "initial_boot_outcome": "success",
+                    "initial_boot_slot": "staging",
+                    "final_boot_outcome": final_outcome,
+                    "final_boot_slot": "exec",
+                    "signals": {"expectations_met": True, "vtor_ok": True},
+                    "boot_cycles": [
+                        {
+                            "cycle": 0,
+                            "boot_outcome": "success",
+                            "boot_slot": "staging",
+                            "signals": {"expectations_met": True, "vtor_ok": True},
+                        },
+                        {
+                            "cycle": 1,
+                            "boot_outcome": final_outcome,
+                            "boot_slot": "exec",
+                            "signals": {
+                                "expectations_met": final_outcome == "success",
+                                "vtor_ok": final_outcome == "success",
+                            },
+                        },
+                    ],
+                    "multi_boot_analysis": {
+                        "status": "changed_unconfirmed",
+                        "initial_outcome": "success",
+                        "final_outcome": final_outcome,
+                        "final_slot": "exec",
+                    },
+                }
+                self.assertEqual(_effective_boot_result(result), ("success", "staging"))
+                self.assertTrue(_effective_boot_signals(result)["vtor_ok"])
+                self.assertFalse(result_is_brick(result))
+                self.assertFalse(result_has_issues(result, "success"))
+
+    def test_oscillating_ending_in_failure_after_initial_success_is_promoted(self):
+        result = {
+            "boot_outcome": "success",
+            "boot_slot": "exec",
+            "initial_boot_outcome": "success",
+            "initial_boot_slot": "exec",
+            "final_boot_outcome": "hard_fault",
+            "final_boot_slot": None,
+            "signals": {"expectations_met": True, "memory_checks_ok": True},
+            "boot_cycles": [
+                {
+                    "cycle": 0,
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "signals": {"expectations_met": True, "memory_checks_ok": True},
+                },
+                {
+                    "cycle": 1,
+                    "boot_outcome": "hard_fault",
+                    "boot_slot": None,
+                    "signals": {"expectations_met": False, "memory_checks_ok": False},
+                },
+                {
+                    "cycle": 2,
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "signals": {"expectations_met": True, "memory_checks_ok": True},
+                },
+                {
+                    "cycle": 3,
+                    "boot_outcome": "hard_fault",
+                    "boot_slot": None,
+                    "signals": {"expectations_met": False, "memory_checks_ok": False},
+                },
+            ],
+            "multi_boot_analysis": {
+                "status": "oscillating",
+                "initial_outcome": "success",
+                "final_outcome": "hard_fault",
+                "final_slot": None,
+            },
+        }
+        self.assertEqual(_effective_boot_result(result), ("hard_fault", None))
+        self.assertFalse(_effective_boot_signals(result)["memory_checks_ok"])
+        self.assertTrue(result_is_brick(result))
+        self.assertEqual(
+            result_issue_reasons(result, "success"),
+            ["boot_outcome", "memory_check"],
+        )
+        self.assertEqual(classify_issue_category(result, "success"), "boot_mismatch")
 
     def test_converged_with_no_final_outcome_returns_raw(self):
         result = {

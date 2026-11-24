@@ -34,6 +34,22 @@ Phase 2 NVM write counting when `fault_sweep.tracking_start_address` is set.
     `multi_boot_analysis.status = "oscillating"`. Because non-success
     multi-boot statuses are not promoted, `_effective_boot_result` retains
     cycle 0's `hard_fault` and all 4 failing fault points remain bricks.
+- `profile_fail_second_boot.yaml` (`fail_second_boot.bin`, `boot_cycles: 2`):
+  - Fault points 2, 3, and 4 boot cleanly on cycle 0 (`success`, latching
+    `SECOND_BOOT_FLAG = 1` in MRAM) and fault before memory checks hold on
+    cycle 1 (`hard_fault`). Those 3 points report `multi_boot_analysis.status =
+    "failed_after_success"` (`failed_at_cycle = 1`), promote cycle 1's
+    `hard_fault` and signals, and count alongside fault point 1 as 4 bricks
+    and 4 boot mismatches in the verdict breakdown.
+- `profile_unmet_checks_second_boot.yaml` (`unmet_checks_second_boot.bin`,
+  `boot_cycles: 2`):
+  - Fault points 2, 3, and 4 boot cleanly on cycle 0 (`success`) and remain
+    alive in `exec` on cycle 1 without raising `SCHEDULER_FLAG` or
+    `TICK_COUNT` (`memory_checks_unmet`). Those 3 points report
+    `multi_boot_analysis.status = "failed_after_success"` (`failed_at_cycle =
+    1`), promote cycle 1's `memory_checks_unmet` and signals (`memory_check`
+    reason), and count alongside fault point 1 as 4 boot mismatches (1 brick,
+    3 `memory_checks_unmet`) in the verdict breakdown.
 
 ## Build
 

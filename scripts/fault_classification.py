@@ -9,7 +9,10 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Dict, List, Optional, Tuple
 
-from boot_cycle_analysis import cycle_has_unresolved_timeout
+from boot_cycle_analysis import (
+    _FAILURE_BOOT_OUTCOMES,
+    cycle_has_unresolved_timeout,
+)
 from fault_types import FAULT_TYPE_NAME_TO_CODE
 
 
@@ -17,6 +20,10 @@ from fault_types import FAULT_TYPE_NAME_TO_CODE
 # effective boot result.
 _MULTI_BOOT_SUCCESS_STATUSES = frozenset(
     {"converged", "rollback_converged", "recovered_after_failure"}
+)
+_MULTI_BOOT_FAILURE_STATUSES = frozenset({"failed_after_success"})
+_MULTI_BOOT_PROMOTED_STATUSES = (
+    _MULTI_BOOT_SUCCESS_STATUSES | _MULTI_BOOT_FAILURE_STATUSES
 )
 _RECOVERED_AFTER_FAILURE_STATUSES = frozenset({"recovered_after_failure"})
 _INITIAL_FAILURE_OUTCOMES = frozenset(
@@ -354,20 +361,41 @@ def annotate_instruction_skip_severity(
     return severity_info
 
 
+def _should_promote_multi_boot_final(
+    mba: Dict[str, Any],
+    raw_outcome: Any,
+    final_outcome: Any,
+) -> bool:
+    """Return whether ``multi_boot_analysis`` should promote the final cycle."""
+    status = mba.get("status")
+    if status in _MULTI_BOOT_PROMOTED_STATUSES:
+        return True
+    if status == "oscillating":
+        raw_norm = str(raw_outcome or "").strip().lower()
+        final_norm = str(final_outcome or "").strip().lower()
+        if raw_norm == "success" and final_norm in _FAILURE_BOOT_OUTCOMES:
+            return True
+    return False
+
+
 def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     """Return (effective_outcome, effective_slot) accounting for multi-boot.
 
-    When ``multi_boot_analysis`` is present, only statuses in
-    ``_MULTI_BOOT_SUCCESS_STATUSES`` (``converged``, ``rollback_converged``,
-    ``recovered_after_failure``) promote the final cycle's outcome/slot over
-    the initial boot outcome.  When promoted, explicit top-level
+    When ``multi_boot_analysis`` is present, statuses in
+    ``_MULTI_BOOT_PROMOTED_STATUSES`` (``converged``, ``rollback_converged``,
+    ``recovered_after_failure``, ``failed_after_success``) promote the final
+    cycle's outcome/slot over the initial boot outcome; an ``oscillating``
+    sequence whose initial boot succeeded and whose final boot ended in a
+    failure outcome is also promoted so a later failure cannot be hidden behind
+    cycle 0's success.  When promoted, explicit top-level
     ``final_boot_outcome`` / ``final_boot_slot`` are preferred over
     ``multi_boot_analysis["final_outcome"]`` / ``["final_slot"]``.  When
     ``multi_boot_analysis`` is absent (legacy single-span payloads without
     multi-boot analysis), explicit ``final_boot_outcome`` /
     ``final_boot_slot`` are still honored.
 
-    Statuses that are NOT promoted:
+    Statuses that are NOT promoted (except ``oscillating`` ending in failure
+    after an initial ``success``):
       - initial_no_boot_recovered
       - rollback_missing
       - rollback_late
@@ -384,16 +412,14 @@ def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
         return ("timeout", raw_slot)
     mba = result.get("multi_boot_analysis")
     if isinstance(mba, dict):
-        status = mba.get("status")
-        if status not in _MULTI_BOOT_SUCCESS_STATUSES:
-            return (raw_outcome, raw_slot)
         final_outcome = result.get("final_boot_outcome")
         final_slot = result.get("final_boot_slot")
-        if final_outcome is not None:
-            return (final_outcome, final_slot)
-        final_outcome = mba.get("final_outcome")
-        final_slot = mba.get("final_slot")
         if final_outcome is None:
+            final_outcome = mba.get("final_outcome")
+            final_slot = mba.get("final_slot")
+        if final_outcome is None:
+            return (raw_outcome, raw_slot)
+        if not _should_promote_multi_boot_final(mba, raw_outcome, final_outcome):
             return (raw_outcome, raw_slot)
         return (final_outcome, final_slot)
     final_outcome = result.get("final_boot_outcome")
@@ -412,15 +438,14 @@ def _effective_boot_cycle_is_final(result: Dict[str, Any]) -> bool:
     raw_outcome = result.get("initial_boot_outcome") or result.get("boot_outcome") or "unknown"
     raw_slot = result.get("initial_boot_slot") or result.get("boot_slot")
     if isinstance(mba, dict):
-        status = mba.get("status")
-        if status not in _MULTI_BOOT_SUCCESS_STATUSES:
-            return False
         final_outcome = result.get("final_boot_outcome")
         final_slot = result.get("final_boot_slot")
         if final_outcome is None:
             final_outcome = mba.get("final_outcome")
             final_slot = mba.get("final_slot")
         if final_outcome is None:
+            return False
+        if not _should_promote_multi_boot_final(mba, raw_outcome, final_outcome):
             return False
         if isinstance(boot_cycles, list) and len(boot_cycles) >= 2:
             return True
@@ -895,8 +920,18 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
       - toctou_corruption: corruption injected between validation and execution
     """
     availability_rc = rc_injection_availability_model(result)
+    eff_outcome, _ = _effective_boot_result(result)
+    eff_outcome_norm = str(eff_outcome or "unknown").strip().lower()
     raw = str(result.get("fault_class", "") or "").strip().lower()
-    if raw and not (availability_rc and raw == "safe_dos"):
+    if (
+        raw
+        and not (availability_rc and raw == "safe_dos")
+        and not (
+            raw == "recoverable"
+            and _effective_boot_cycle_is_final(result)
+            and eff_outcome_norm in _FAILURE_BOOT_OUTCOMES
+        )
+    ):
         return raw
 
     disposition = finding_validation_disposition(result)

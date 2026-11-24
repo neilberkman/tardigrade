@@ -276,18 +276,118 @@ class BootCycleAnalysisTests(unittest.TestCase):
         self.assertEqual(analysis["status"], "recovered_after_failure")
         self.assertEqual(analysis["recovered_at_cycle"], 1)
 
-    def test_two_cycle_success_then_fault_is_changed_unconfirmed_not_oscillating(
+    def test_two_cycle_success_then_failure_is_failed_after_success(
+        self,
+    ) -> None:
+        for outcome, slot in (
+            ("hard_fault", None),
+            ("no_boot", None),
+            ("memory_checks_unmet", "exec"),
+            ("wrong_pc", None),
+            ("misaligned_vtor", None),
+            ("bus_fault", None),
+            ("config_crash", None),
+            ("config_lost", "exec"),
+            ("rollback_accepted", "exec"),
+            ("toctou_corruption", "exec"),
+        ):
+            with self.subTest(outcome=outcome):
+                analysis = analyze_boot_cycles(
+                    [
+                        {"cycle": 0, "boot_slot": "exec", "boot_outcome": "success"},
+                        {"cycle": 1, "boot_slot": slot, "boot_outcome": outcome},
+                    ],
+                    requested_cycles=2,
+                )
+                self.assertEqual(analysis["status"], "failed_after_success")
+                self.assertEqual(analysis["failed_at_cycle"], 1)
+                self.assertEqual(analysis["initial_outcome"], "success")
+                self.assertEqual(analysis["final_outcome"], outcome)
+                self.assertEqual(analysis["final_slot"], slot)
+                self.assertNotIn("recovered_at_cycle", analysis)
+                self.assertNotIn("converged_at_cycle", analysis)
+
+    def test_three_cycle_two_successes_then_failure_is_failed_after_success(
         self,
     ) -> None:
         analysis = analyze_boot_cycles(
             [
                 {"cycle": 0, "boot_slot": "exec", "boot_outcome": "success"},
+                {"cycle": 1, "boot_slot": "exec", "boot_outcome": "success"},
+                {"cycle": 2, "boot_slot": None, "boot_outcome": "hard_fault"},
+            ],
+            requested_cycles=3,
+        )
+        self.assertEqual(analysis["status"], "failed_after_success")
+        self.assertEqual(analysis["failed_at_cycle"], 2)
+        self.assertNotIn("converged_at_cycle", analysis)
+
+    def test_three_cycle_success_then_two_faults_remains_converged(self) -> None:
+        analysis = analyze_boot_cycles(
+            [
+                {"cycle": 0, "boot_slot": "exec", "boot_outcome": "success"},
+                {"cycle": 1, "boot_slot": None, "boot_outcome": "hard_fault"},
+                {"cycle": 2, "boot_slot": None, "boot_outcome": "hard_fault"},
+            ],
+            requested_cycles=3,
+        )
+        self.assertEqual(analysis["status"], "converged")
+        self.assertEqual(analysis["converged_at_cycle"], 1)
+        self.assertNotIn("failed_at_cycle", analysis)
+
+    def test_unconfirmed_revert_and_failure_to_failure_stay_changed_unconfirmed(
+        self,
+    ) -> None:
+        cases = (
+            (
+                {"cycle": 0, "boot_slot": "staging", "boot_outcome": "success"},
+                {"cycle": 1, "boot_slot": "exec", "boot_outcome": "success"},
+            ),
+            (
+                {"cycle": 0, "boot_slot": "staging", "boot_outcome": "success"},
+                {"cycle": 1, "boot_slot": "exec", "boot_outcome": "wrong_image"},
+            ),
+            (
+                {"cycle": 0, "boot_slot": "exec", "boot_outcome": "success"},
+                {"cycle": 1, "boot_slot": "exec", "boot_outcome": "wrong_image"},
+            ),
+            (
+                {"cycle": 0, "boot_slot": None, "boot_outcome": "hard_fault"},
+                {"cycle": 1, "boot_slot": "exec", "boot_outcome": "memory_checks_unmet"},
+            ),
+        )
+        for c0, c1 in cases:
+            with self.subTest(c0=c0, c1=c1):
+                analysis = analyze_boot_cycles([c0, c1], requested_cycles=2)
+                self.assertEqual(analysis["status"], "changed_unconfirmed")
+                self.assertNotIn("failed_at_cycle", analysis)
+                self.assertNotIn("recovered_at_cycle", analysis)
+
+    def test_expected_rollback_statuses_unchanged_when_second_boot_fails(self) -> None:
+        missing = analyze_boot_cycles(
+            [
+                {"cycle": 0, "boot_slot": "staging", "boot_outcome": "success"},
                 {"cycle": 1, "boot_slot": None, "boot_outcome": "hard_fault"},
             ],
             requested_cycles=2,
+            target_slot="exec",
+            expected_rollback_at_cycle=1,
         )
-        self.assertEqual(analysis["status"], "changed_unconfirmed")
-        self.assertNotIn("recovered_at_cycle", analysis)
+        self.assertEqual(missing["status"], "rollback_missing")
+        self.assertNotIn("failed_at_cycle", missing)
+
+        already_on_target = analyze_boot_cycles(
+            [
+                {"cycle": 0, "boot_slot": "exec", "boot_outcome": "success"},
+                {"cycle": 1, "boot_slot": None, "boot_outcome": "hard_fault"},
+            ],
+            requested_cycles=2,
+            target_slot="exec",
+            expected_rollback_at_cycle=1,
+        )
+        self.assertEqual(already_on_target["status"], "failed_after_success")
+        self.assertEqual(already_on_target["failed_at_cycle"], 1)
+        self.assertTrue(already_on_target["rollback_skipped"])
 
     def test_two_cycle_slot_switch_without_third_cycle_is_not_oscillating(self) -> None:
         analysis = analyze_boot_cycles(

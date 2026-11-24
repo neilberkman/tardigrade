@@ -99,6 +99,23 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- `analyze_boot_cycles` in `scripts/boot_cycle_analysis.py` now labels a
+  single-transition sequence whose initial boot succeeded and whose follow-up
+  boot ended in a failure outcome (`hard_fault`, `no_boot`,
+  `memory_checks_unmet`, `bus_fault`, `wrong_pc`, `misaligned_vtor`,
+  `config_crash`, `config_lost`, `rollback_accepted`, `toctou_corruption`) as
+  `failed_after_success` (with `failed_at_cycle`), rather than
+  `changed_unconfirmed`. Unconfirmed slot/image reverts (`changed_unconfirmed`)
+  and rollback statuses keep their existing treatment.
+- `_effective_boot_result`, `_effective_boot_cycle_is_final`, and
+  `classify_failure_class` in `scripts/fault_classification.py` now promote
+  `failed_after_success` (and `oscillating` sequences that start with `success`
+  and end in a failure outcome) to the failing cycle's outcome, slot, signals,
+  and failure class so second-boot failures count as bricks or `boot_mismatch`
+  issues in the verdict breakdown instead of disappearing behind cycle 0's
+  `success`. Added second-boot fault (`profile_fail_second_boot.yaml`) and
+  second-boot unmet-checks (`profile_unmet_checks_second_boot.yaml`) companion
+  fixtures to `examples/two_cycle_recovery/`.
 - `analyze_boot_cycles` in `scripts/boot_cycle_analysis.py` no longer labels a
   two-cycle observation `[X, Y]` with `X != Y` as `oscillating`. Single-transition
   failure-then-success runs (such as `['hard_fault', 'success']`) now report

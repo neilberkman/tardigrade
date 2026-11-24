@@ -1,0 +1,11 @@
+base_profile: profile.yaml
+name: two_cycle_recovery_unmet_checks_second_boot
+description: >
+  Two-cycle companion whose torn-record fault points boot cleanly on cycle 0
+  and stay alive in exec on cycle 1 without satisfying memory_checks
+  (status=failed_after_success). Must count those points as boot_mismatch
+  issues with memory_check reasons using cycle 1's signals.
+images:
+  exec: examples/two_cycle_recovery/unmet_checks_second_boot.bin
+fault_sweep:
+  boot_cycles: 2

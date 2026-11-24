@@ -4,6 +4,14 @@
 #define OSCILLATE_ON_TORN 0
 #endif
 
+#ifndef FAIL_ON_SECOND_BOOT
+#define FAIL_ON_SECOND_BOOT 0
+#endif
+
+#ifndef UNMET_CHECKS_ON_SECOND_BOOT
+#define UNMET_CHECKS_ON_SECOND_BOOT 0
+#endif
+
 #define EXEC_BASE           ((uintptr_t)0x10100000u)
 #define RECORD_BASE         ((uintptr_t)0x10102000u)
 #define SRAM_VECTORS        ((volatile uint32_t *)0x20000100u)
@@ -32,6 +40,7 @@
  * range (plus clearing REC_MAGIC and REC_HDR). */
 #define REPAIR_LOG          (*(volatile uint32_t *)(RECORD_BASE + 0x60u))
 #define OSCILLATE_FLAG      (*(volatile uint32_t *)(RECORD_BASE + 0x70u))
+#define SECOND_BOOT_FLAG    (*(volatile uint32_t *)(RECORD_BASE + 0x70u))
 #define UPDATE_TRIGGER      (*(volatile uint32_t *)(RECORD_BASE + 0x80u))
 
 #define REC_MAGIC_VAL       0x52454331u /* "REC1" */
@@ -140,6 +149,26 @@ void Reset_Handler(void)
             trigger_fault();
         }
         OSCILLATE_FLAG = 0u;
+#elif FAIL_ON_SECOND_BOOT
+        /* Deferred failure: cycle 0 boots cleanly (success) and latches a
+         * persistent flag; cycle 1 faults before memory checks hold. */
+        if(SECOND_BOOT_FLAG != 0u)
+        {
+            trigger_fault();
+        }
+        SECOND_BOOT_FLAG = 1u;
+#elif UNMET_CHECKS_ON_SECOND_BOOT
+        /* Deferred memory-check failure: cycle 0 boots cleanly (success) and
+         * latches a persistent flag; cycle 1 stays alive in exec without
+         * raising SCHEDULER_FLAG or TICK_COUNT (memory_checks_unmet). */
+        if(SECOND_BOOT_FLAG != 0u)
+        {
+            for(;;)
+            {
+                __asm volatile("nop");
+            }
+        }
+        SECOND_BOOT_FLAG = 1u;
 #else
         /* Repairable torn payload: perform 3 MRAM recovery writes to scrub the
          * torn record and log the repair, then fault on cycle 0 so cycle 1

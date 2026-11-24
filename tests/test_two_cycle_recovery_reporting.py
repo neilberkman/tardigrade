@@ -22,6 +22,7 @@ from boot_cycle_analysis import analyze_boot_cycles  # noqa: E402
 from fault_classification import (  # noqa: E402
     _effective_boot_result,
     _effective_boot_signals,
+    classify_failure_class,
     classify_issue_category,
     result_has_issues,
     result_is_brick,
@@ -365,6 +366,201 @@ class SignalCycleConsistencyTests(unittest.TestCase):
             ["boot_outcome", "memory_check"],
         )
         self.assertEqual(classify_issue_category(result, "success"), "boot_mismatch")
+
+    def test_two_cycle_success_then_hard_fault_is_brick_and_boot_mismatch(self) -> None:
+        cycles = [
+            {
+                "cycle": 0,
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "signals": {
+                    "expectations_met": True,
+                    "vtor_ok": True,
+                    "pc_ok": True,
+                    "memory_checks_ok": True,
+                },
+            },
+            {
+                "cycle": 1,
+                "boot_outcome": "hard_fault",
+                "boot_slot": None,
+                "signals": {
+                    "expectations_met": False,
+                    "vtor_ok": False,
+                    "pc_ok": False,
+                    "memory_checks_ok": False,
+                    "unmet_memory_checks": ["scheduler_flag", "tick_count"],
+                },
+            },
+        ]
+        analysis = analyze_boot_cycles(cycles, requested_cycles=2)
+        self.assertEqual(analysis["status"], "failed_after_success")
+        self.assertEqual(analysis["failed_at_cycle"], 1)
+        result = {
+            "fault_at": 2,
+            "fault_type": "w",
+            "is_control": False,
+            "fault_injected": True,
+            "boot_outcome": "success",
+            "boot_slot": "exec",
+            "fault_class": "recoverable",
+            "initial_boot_outcome": "success",
+            "initial_boot_slot": "exec",
+            "final_boot_outcome": "hard_fault",
+            "final_boot_slot": None,
+            "signals": dict(cycles[0]["signals"]),
+            "boot_cycles": cycles,
+            "multi_boot_analysis": analysis,
+        }
+        self.assertEqual(_effective_boot_result(result), ("hard_fault", None))
+        self.assertFalse(_effective_boot_signals(result)["memory_checks_ok"])
+        self.assertTrue(result_is_brick(result))
+        self.assertFalse(result_recovered_after_failure(result, "success"))
+        self.assertFalse(result_is_recovery(result, "success"))
+        self.assertEqual(
+            result_issue_reasons(result, "success"),
+            ["boot_outcome", "memory_check", "vtor_expectation", "pc_expectation"],
+        )
+        self.assertEqual(classify_issue_category(result, "success"), "boot_mismatch")
+        self.assertEqual(classify_failure_class(result), "unrecoverable")
+
+        summary = summarize_runtime_sweep(
+            [_control_result(), _brick_result(1), result],
+            expected_fault_points=2,
+        )
+        self.assertEqual(summary["bricks"], 2)
+        self.assertEqual(summary["issue_points"], 2)
+        self.assertEqual(summary["recoveries"], 0)
+        self.assertEqual(summary["issue_breakdown"]["boot_mismatch"], 2)
+        self.assertEqual(sum(summary["issue_breakdown"].values()), 2)
+        verdict = compute_verdict(summary, ExpectConfig(should_find_issues=False))
+        self.assertEqual(
+            verdict,
+            "FAIL — found 2 issue points (2 boot mismatches, 0 semantic, 0 invariant)",
+        )
+
+    def test_two_cycle_success_then_memory_checks_unmet_is_boot_mismatch(self) -> None:
+        cycles = [
+            {
+                "cycle": 0,
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "signals": {
+                    "expectations_met": True,
+                    "vtor_ok": True,
+                    "pc_ok": True,
+                    "memory_checks_ok": True,
+                },
+            },
+            {
+                "cycle": 1,
+                "boot_outcome": "memory_checks_unmet",
+                "boot_slot": "exec",
+                "signals": {
+                    "expectations_met": False,
+                    "vtor_ok": True,
+                    "pc_ok": True,
+                    "memory_checks_ok": False,
+                    "unmet_memory_checks": ["scheduler_flag", "tick_count"],
+                },
+            },
+        ]
+        analysis = analyze_boot_cycles(cycles, requested_cycles=2)
+        self.assertEqual(analysis["status"], "failed_after_success")
+        self.assertEqual(analysis["failed_at_cycle"], 1)
+        result = {
+            "fault_at": 3,
+            "fault_type": "w",
+            "is_control": False,
+            "fault_injected": True,
+            "boot_outcome": "success",
+            "boot_slot": "exec",
+            "fault_class": "recoverable",
+            "initial_boot_outcome": "success",
+            "initial_boot_slot": "exec",
+            "final_boot_outcome": "memory_checks_unmet",
+            "final_boot_slot": "exec",
+            "signals": dict(cycles[0]["signals"]),
+            "boot_cycles": cycles,
+            "multi_boot_analysis": analysis,
+        }
+        self.assertEqual(_effective_boot_result(result), ("memory_checks_unmet", "exec"))
+        self.assertFalse(_effective_boot_signals(result)["memory_checks_ok"])
+        self.assertFalse(result_is_brick(result))
+        self.assertFalse(result_recovered_after_failure(result, "success"))
+        self.assertFalse(result_is_recovery(result, "success"))
+        self.assertEqual(
+            result_issue_reasons(result, "success"),
+            ["boot_outcome", "memory_check"],
+        )
+        self.assertEqual(classify_issue_category(result, "success"), "boot_mismatch")
+        self.assertEqual(classify_failure_class(result), "memory_checks_unmet")
+
+        summary = summarize_runtime_sweep(
+            [_control_result(), _brick_result(1), result],
+            expected_fault_points=2,
+        )
+        self.assertEqual(summary["bricks"], 1)
+        self.assertEqual(summary["issue_points"], 2)
+        self.assertEqual(summary["recoveries"], 0)
+        self.assertEqual(summary["issue_breakdown"]["boot_mismatch"], 2)
+        self.assertEqual(
+            summary["failure_outcomes"],
+            {"hard_fault": 1, "memory_checks_unmet": 1},
+        )
+        self.assertEqual(
+            summary["failure_classes"],
+            {"unrecoverable": 1, "memory_checks_unmet": 1},
+        )
+        self.assertEqual(sum(summary["issue_breakdown"].values()), 2)
+        verdict = compute_verdict(summary, ExpectConfig(should_find_issues=False))
+        self.assertEqual(
+            verdict,
+            "FAIL — found 2 issue points (2 boot mismatches, 0 semantic, 0 invariant)",
+        )
+
+    def test_two_cycle_unconfirmed_revert_remains_unchanged(self) -> None:
+        for final_outcome in ("success", "wrong_image"):
+            with self.subTest(final_outcome=final_outcome):
+                cycles = [
+                    {
+                        "cycle": 0,
+                        "boot_outcome": "success",
+                        "boot_slot": "staging",
+                        "signals": {"expectations_met": True, "vtor_ok": True},
+                    },
+                    {
+                        "cycle": 1,
+                        "boot_outcome": final_outcome,
+                        "boot_slot": "exec",
+                        "signals": {
+                            "expectations_met": final_outcome == "success",
+                            "vtor_ok": final_outcome == "success",
+                        },
+                    },
+                ]
+                analysis = analyze_boot_cycles(cycles, requested_cycles=2)
+                self.assertEqual(analysis["status"], "changed_unconfirmed")
+                result = {
+                    "fault_at": 1,
+                    "fault_type": "w",
+                    "is_control": False,
+                    "fault_injected": True,
+                    "boot_outcome": "success",
+                    "boot_slot": "staging",
+                    "initial_boot_outcome": "success",
+                    "initial_boot_slot": "staging",
+                    "final_boot_outcome": final_outcome,
+                    "final_boot_slot": "exec",
+                    "signals": dict(cycles[0]["signals"]),
+                    "boot_cycles": cycles,
+                    "multi_boot_analysis": analysis,
+                }
+                self.assertEqual(_effective_boot_result(result), ("success", "staging"))
+                self.assertTrue(_effective_boot_signals(result)["vtor_ok"])
+                self.assertFalse(result_is_brick(result))
+                self.assertFalse(result_has_issues(result, "success"))
+                self.assertTrue(result_is_recovery(result, "success"))
 
 
 class VerdictBreakdownSumTests(unittest.TestCase):
@@ -977,7 +1173,24 @@ class TwoCycleRecoveryFixtureTests(unittest.TestCase):
         self.assertEqual(osc4_profile.fault_sweep.boot_cycles, 4)
         self.assertEqual(osc4_profile.fault_sweep.tracking_start_address, 0x20000400)
 
-        for elf_name in ("app.elf", "oscillating.elf"):
+        fail2_profile = load_profile(
+            fixture_dir / "profile_fail_second_boot.yaml", strict=True
+        )
+        self.assertEqual(fail2_profile.fault_sweep.boot_cycles, 2)
+        self.assertEqual(fail2_profile.fault_sweep.tracking_start_address, 0x20000400)
+
+        unmet2_profile = load_profile(
+            fixture_dir / "profile_unmet_checks_second_boot.yaml", strict=True
+        )
+        self.assertEqual(unmet2_profile.fault_sweep.boot_cycles, 2)
+        self.assertEqual(unmet2_profile.fault_sweep.tracking_start_address, 0x20000400)
+
+        for elf_name in (
+            "app.elf",
+            "oscillating.elf",
+            "fail_second_boot.elf",
+            "unmet_checks_second_boot.elf",
+        ):
             nm = subprocess.run(
                 ["arm-none-eabi-nm", "-n", str(fixture_dir / elf_name)],
                 check=True,

@@ -25,6 +25,25 @@ _CONCRETE_TERMINAL_BOOT_OUTCOMES = frozenset(
     }
 )
 
+# Terminal boot failure outcomes that turn a successful initial boot into a
+# failure when observed on a follow-up cycle.  ``success`` and ``wrong_image``
+# are intentionally excluded so an unconfirmed slot or image revert retains
+# ``changed_unconfirmed`` / rollback treatment.
+_FAILURE_BOOT_OUTCOMES = frozenset(
+    {
+        "no_boot",
+        "hard_fault",
+        "bus_fault",
+        "wrong_pc",
+        "misaligned_vtor",
+        "config_crash",
+        "config_lost",
+        "memory_checks_unmet",
+        "rollback_accepted",
+        "toctou_corruption",
+    }
+)
+
 
 def cycle_has_unresolved_timeout(record):
     """Return whether a cycle ended without a concrete terminal outcome.
@@ -130,6 +149,7 @@ def analyze_boot_cycles(
     generic_status = "oscillating"
     converged_at_cycle = None
     recovered_at_cycle = None
+    failed_at_cycle = None
     if transitions == 0:
         generic_status = "converged"
         converged_at_cycle = 0
@@ -146,10 +166,17 @@ def analyze_boot_cycles(
     elif transitions == 1:
         # Two observations (or a single change on the final observation) cannot
         # establish oscillation: report a failure-then-success transition
-        # directly, and mark other single transitions as unconfirmed.
+        # directly, report a success-then-failure transition as
+        # failed_after_success, and mark other single transitions (such as an
+        # unconfirmed slot or image revert) as changed_unconfirmed.
         if initial_outcome != "success" and final_outcome == "success":
             generic_status = "recovered_after_failure"
             recovered_at_cycle = int(
+                cycle_records[-1].get("cycle", len(cycle_records) - 1)
+            )
+        elif initial_outcome == "success" and final_outcome in _FAILURE_BOOT_OUTCOMES:
+            generic_status = "failed_after_success"
+            failed_at_cycle = int(
                 cycle_records[-1].get("cycle", len(cycle_records) - 1)
             )
         else:
@@ -159,6 +186,12 @@ def analyze_boot_cycles(
         analysis["converged_at_cycle"] = converged_at_cycle
     if recovered_at_cycle is not None:
         analysis["recovered_at_cycle"] = recovered_at_cycle
+    if failed_at_cycle is not None and (
+        expected_rollback_at_cycle is None
+        or target_slot is None
+        or target_slot == analysis.get("initial_slot")
+    ):
+        analysis["failed_at_cycle"] = failed_at_cycle
 
     if expected_rollback_at_cycle is None:
         analysis["status"] = generic_status
