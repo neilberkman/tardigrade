@@ -10918,44 +10918,19 @@ def run_control_phase1(cpu_ref, label='control_p1', vtor_settle_iters=0):
     finally:
         progress_stall_timeout_s = saved_stall_timeout_s
 
-def run_read_bit_flip_fault(fault_at):
-    # read_bit_flip: storage is correct, but a specific word returns
-    # corrupted data on the FIRST read during boot.  Models transient
-    # single-event upsets (SEU) on the NVM read bus.
-    #
-    # Only supported on native paths (NVMemory, MRAMMemory) where the
-    # peripheral can intercept individual CPU reads.  Fast-path targets
-    # (MappedMemory + NVMC) cannot intercept reads -- the CPU hits the
-    # backing array directly -- so we skip with a clear diagnostic.
-    eff_criteria = get_effective_criteria('f')
-    cpu_ref = monitor.Machine['sysbus.cpu']
-    fp_t0 = _time.time()
-    log('fp={} type=f phase1_setup'.format(fault_at))
-
-    # Use profile read_fault_config if available, else derive from fault_at.
-    fault_word_offset = int(fault_at) * write_granularity
+def _arm_read_bit_flip(fault_at):
+    # Arm a one-shot read bit flip for fault_at on the current machine state.
+    # Returns skip_reason=None when armed, otherwise the reason it was not.
     base_seed = read_fault_seed if read_fault_seed else (0xBEEF ^ (int(fault_at) * 2654435761 & 0xFFFFFFFF))
     # Per-point seed: mix base seed with fault_at for uniqueness across points.
     fault_seed = (base_seed ^ (int(fault_at) * 2654435761)) & 0xFFFFFFFF
     fault_bit_flips = read_fault_bit_flips
     should_arm = _read_fault_should_arm(fault_seed, read_fault_probability)
-
-    restore_phase1_baseline()
-    cpu_ref = monitor.Machine['sysbus.cpu']
-    cpu_ref.IsHalted = False
-    reset_nvmc_for_sweep()
-    disarm_fault()
-    reset_verification_probes()
-
     read_fault_address = 0
     original_word = 0
     corrupted_word = 0
-    fault_injected = False
-    read_fault_actually_fired = False
     skip_reason = None
     preflight = ensure_read_fault_preflight()
-
-    read_fault_stats.record_planned()
 
     # Map fault_at into the configured read-fault regions (an absolute
     # bus-address span) and then translate to a backend-relative offset
@@ -10975,40 +10950,10 @@ def run_read_bit_flip_fault(fault_at):
         skip_reason = 'probability_gate'
         log('fp={} type=f SKIP: probability gate did not arm fault (p={})'.format(
             fault_at, read_fault_probability))
-    elif skip_reason is None and backend['kind'] == 'mram':
-        read_fault_address = target_address
-        _rf_data = backend['data']
-        backend_size_runtime = backend.get('bus_size') or int(_rf_data.Size)
-        nvm_offset, addr_skip = translate_bus_address_to_backend_offset(
-            read_fault_address,
-            backend.get('bus_base'),
-            backend_size_runtime)
-        if addr_skip is not None:
-            skip_reason = addr_skip
-            log('fp={} type=f SKIP: {} address=0x{:X} backend_base={} backend_size={}'.format(
-                fault_at, addr_skip, read_fault_address,
-                backend.get('bus_base'), backend_size_runtime))
-        elif 0 <= nvm_offset < int(_rf_data.Size):
-            original_word = as_int(bus.ReadDoubleWord(read_fault_address))
-            _rf_data.ReadFaultEnabled = True
-            _rf_data.ReadFaultAddress = nvm_offset
-            _rf_data.ReadFaultSeed = fault_seed & 0xFFFFFFFF
-            _rf_data.ReadFaultFired = False
-            _rf_data.ReadFaultSkipCount = 0
-            _rf_data.ReadFaultTotalReads = 0
-            if hasattr(_rf_data, 'ReadFaultBitFlips'):
-                _rf_data.ReadFaultBitFlips = fault_bit_flips if fault_bit_flips > 0 else 1
-            corrupted_word = _compute_read_bit_flip(original_word, fault_seed, fault_bit_flips)
-            log('fp={} type=f armed nvm_offset=0x{:X} orig=0x{:08X} expected_corrupt=0x{:08X}'.format(
-                fault_at, nvm_offset, original_word, corrupted_word))
-        else:
-            skip_reason = 'address_outside_backend_mapping'
-            log('fp={} type=f WARNING: fault address 0x{:X} outside NVM'.format(
-                fault_at, read_fault_address))
     elif skip_reason is None:
         read_fault_address = target_address
-        nvm_ref = backend['data'].Nvm
-        backend_size_runtime = backend.get('bus_size') or int(nvm_ref.Size)
+        rf_periph = backend['data'] if backend['kind'] == 'mram' else backend['data'].Nvm
+        backend_size_runtime = backend.get('bus_size') or int(rf_periph.Size)
         nvm_offset, addr_skip = translate_bus_address_to_backend_offset(
             read_fault_address,
             backend.get('bus_base'),
@@ -11018,16 +10963,16 @@ def run_read_bit_flip_fault(fault_at):
             log('fp={} type=f SKIP: {} address=0x{:X} backend_base={} backend_size={}'.format(
                 fault_at, addr_skip, read_fault_address,
                 backend.get('bus_base'), backend_size_runtime))
-        elif 0 <= nvm_offset < int(nvm_ref.Size):
+        elif 0 <= nvm_offset < int(rf_periph.Size):
             original_word = as_int(bus.ReadDoubleWord(read_fault_address))
-            nvm_ref.ReadFaultEnabled = True
-            nvm_ref.ReadFaultAddress = nvm_offset
-            nvm_ref.ReadFaultSeed = fault_seed & 0xFFFFFFFF
-            nvm_ref.ReadFaultFired = False
-            nvm_ref.ReadFaultSkipCount = 0
-            nvm_ref.ReadFaultTotalReads = 0
-            if hasattr(nvm_ref, 'ReadFaultBitFlips'):
-                nvm_ref.ReadFaultBitFlips = fault_bit_flips if fault_bit_flips > 0 else 1
+            rf_periph.ReadFaultEnabled = True
+            rf_periph.ReadFaultAddress = nvm_offset
+            rf_periph.ReadFaultSeed = fault_seed & 0xFFFFFFFF
+            rf_periph.ReadFaultFired = False
+            rf_periph.ReadFaultSkipCount = 0
+            rf_periph.ReadFaultTotalReads = 0
+            if hasattr(rf_periph, 'ReadFaultBitFlips'):
+                rf_periph.ReadFaultBitFlips = fault_bit_flips if fault_bit_flips > 0 else 1
             corrupted_word = _compute_read_bit_flip(original_word, fault_seed, fault_bit_flips)
             log('fp={} type=f armed nvm_offset=0x{:X} orig=0x{:08X} expected_corrupt=0x{:08X}'.format(
                 fault_at, nvm_offset, original_word, corrupted_word))
@@ -11035,6 +10980,43 @@ def run_read_bit_flip_fault(fault_at):
             skip_reason = 'address_outside_backend_mapping'
             log('fp={} type=f WARNING: fault address 0x{:X} outside NVM'.format(
                 fault_at, read_fault_address))
+    return {
+        'skip_reason': skip_reason,
+        'read_fault_address': read_fault_address,
+        'original_word': original_word,
+        'corrupted_word': corrupted_word,
+    }
+
+
+def run_read_bit_flip_fault(fault_at):
+    # read_bit_flip: storage is correct, but a specific word returns
+    # corrupted data on the FIRST read during boot.  Models transient
+    # single-event upsets (SEU) on the NVM read bus.
+    #
+    # Only supported on native paths (NVMemory, MRAMMemory) where the
+    # peripheral can intercept individual CPU reads.  Fast-path targets
+    # (MappedMemory + NVMC) cannot intercept reads -- the CPU hits the
+    # backing array directly -- so we skip with a clear diagnostic.
+    eff_criteria = get_effective_criteria('f')
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    fp_t0 = _time.time()
+    log('fp={} type=f phase1_setup'.format(fault_at))
+
+    restore_phase1_baseline()
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = False
+    reset_nvmc_for_sweep()
+    disarm_fault()
+    reset_verification_probes()
+
+    read_fault_stats.record_planned()
+    armed = _arm_read_bit_flip(fault_at)
+    skip_reason = armed['skip_reason']
+    read_fault_address = armed['read_fault_address']
+    original_word = armed['original_word']
+    corrupted_word = armed['corrupted_word']
+    fault_injected = False
+    read_fault_actually_fired = False
 
     if skip_reason is None:
         read_fault_stats.record_armed()
@@ -13621,19 +13603,139 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     return result
 
 
-def run_multi_fault_sequence(fault_sequence):
+# Stage wire codes run_multi_fault_sequence can arm.  Keep in sync with
+# fault_types.MULTI_FAULT_STAGE_FAULT_TYPES.  Power loss and erase stages halt
+# the stage boot at the fault; the others let it run to completion.
+_MF_STAGE_WRITE_CODES = frozenset(('w', 'b', 's', 'g', 'x', 'd', 'l', 'r'))
+_MF_STAGE_ERASE_CODES = frozenset(('e', 'a'))
+_MF_STAGE_CODES = _MF_STAGE_WRITE_CODES | _MF_STAGE_ERASE_CODES | frozenset(('f',))
+_MF_STAGE_HALTING_CODES = frozenset(('w', 'e', 'a'))
+
+
+def _multi_fault_stage_unsupported_reason(code):
+    # Return why the selected backend cannot apply a stage code, or None.
+    if code not in _MF_STAGE_CODES:
+        return 'fault type is not supported in a multi-fault stage'
+    if code in _MF_STAGE_ERASE_CODES and backend['kind'] == 'otp':
+        return 'backend otp has no page erases'
+    if code == 'f':
+        preflight = ensure_read_fault_preflight()
+        if not preflight.get('supported'):
+            return 'backend {} cannot inject read faults ({})'.format(
+                backend['kind'], preflight.get('reason') or 'unsupported')
+    if _fault_uses_rc_injection_return_hook(code):
+        preflight = ensure_rc_injection_preflight()
+        if not preflight.get('supported'):
+            return 'rc_injection return hook unavailable ({})'.format(
+                preflight.get('reason') or 'symbol_resolution_failed')
+    return None
+
+
+def _multi_fault_stage_state(idx, fault_at, code):
+    return {
+        'stage': idx + 1,
+        'fault_at': fault_at,
+        'fault_type': _FAULT_CODE_TO_NAME.get(code, code),
+        'fault_code': code,
+    }
+
+
+def _multi_fault_stage_error(seq, stage_codes, per_fault_states, idx, reason, seq_t0):
+    # A stage that cannot run as its own fault type fails the sequence as an
+    # infrastructure error.  It is never re-run as power loss.
+    label = _FAULT_CODE_TO_NAME.get(stage_codes[idx], stage_codes[idx])
+    message = 'multi-fault stage {} ({}) at fault index {}: {}'.format(
+        idx + 1, label, seq[idx], reason)
+    log('mf seq={} ERROR {}'.format(seq, message))
+    states = list(per_fault_states)
+    for other in range(len(states), len(seq)):
+        state = _multi_fault_stage_state(other, seq[other], stage_codes[other])
+        state['fault_injected'] = False
+        state['outcome'] = 'not_run'
+        if other == idx:
+            state['outcome'] = 'unsupported'
+            state['error'] = reason
+        states.append(state)
+    return {
+        'fault_at': seq[0],
+        'fault_requested': seq[0],
+        'fault_type': 'mf',
+        'fault_sequence': seq,
+        'fault_stage_codes': list(stage_codes),
+        'fault_injected': False,
+        'infrastructure_error': True,
+        'error_kind': 'multi_fault_stage_unsupported',
+        'error': message,
+        'fault_address': '0x00000000',
+        'boot_outcome': 'infra_error',
+        'boot_slot': None,
+        'fault_class': 'infrastructure_error',
+        'actual_writes': 0,
+        'per_fault_states': states,
+        'signals': {
+            'multi_fault_count': len(seq),
+            'failed_stage': idx + 1,
+            'trace_replay_mode': 'execute',
+            'sequence_elapsed_s': round(_time.time() - seq_t0, 1),
+        },
+    }
+
+
+def _arm_multi_fault_stage(code, fault_at):
+    # Arm one stage as its own fault type.  Returns a read-fault skip reason
+    # when a read bit flip could not be armed, otherwise None.
+    reset_rc_injection_state(enabled=_fault_uses_rc_injection_return_hook(code))
+    if code in _MF_STAGE_ERASE_CODES:
+        arm_erase_fault(
+            get_total_erases() + fault_at + 1,
+            erase_fault_mode=1 if code == 'a' else 0,
+        )
+        disarm_write_fault()
+        return None
+    if code == 'f':
+        disarm_fault()
+        return _arm_read_bit_flip(fault_at)['skip_reason']
+    base_writes = get_total_writes()
+    arm_at = base_writes + fault_at + 1
+    if arm_at > base_writes + max_writes_cap:
+        arm_at = base_writes + max_writes_cap + 1
+    arm_fault(arm_at, write_fault_mode=_WRITE_FAULT_MODE.get(code, 0))
+    disarm_erase_fault()
+    return None
+
+
+def _multi_fault_stage_fired(code):
+    if code == 'f':
+        rf_periph = backend['data'] if backend['kind'] == 'mram' else backend['data'].Nvm
+        rf_periph.ReadFaultEnabled = False
+        return bool(rf_periph.ReadFaultFired)
+    if code in _MF_STAGE_ERASE_CODES:
+        return was_fault_injected()
+    return was_write_fault_injected()
+
+
+def run_multi_fault_sequence(fault_sequence, stage_codes=None):
     cpu_ref = monitor.Machine['sysbus.cpu']
     seq = [int(x) for x in fault_sequence]
     if len(seq) < 2:
         raise ValueError('multi-fault sequence needs >= 2 fault points')
+    stage_codes = list(stage_codes or ['w'] * len(seq))
+    if len(stage_codes) != len(seq):
+        raise ValueError('multi-fault stage codes must match the sequence length')
 
     seq_t0 = _time.time()
     per_fault_states = []
     saved_flash = None
     sequence_injected = True
 
+    for idx, code in enumerate(stage_codes):
+        reason = _multi_fault_stage_unsupported_reason(code)
+        if reason is not None:
+            return _multi_fault_stage_error(seq, stage_codes, [], idx, reason, seq_t0)
+
     stage_wall_timeout = phase1_wall_timeout(default_s=4.0)
     for idx, fault_at in enumerate(seq):
+        code = stage_codes[idx]
         stage_t0 = _time.time()
         stage_label = 'mf{}_{}'.format(idx + 1, fault_at)
         stage_input_flash = saved_flash
@@ -13649,12 +13751,13 @@ def run_multi_fault_sequence(fault_sequence):
                 apply_hash_bypass()
         reset_nvmc_for_sweep(enable_tracking_gate=(idx == 0))
 
-        base_writes = get_total_writes()
-        arm_at = base_writes + fault_at + 1
-        if arm_at > base_writes + max_writes_cap:
-            arm_at = base_writes + max_writes_cap + 1
-        arm_fault(arm_at)
-        disarm_erase_fault()
+        log('mf seq={} stage={} type={} arm fault_at={}'.format(
+            seq, idx + 1, _FAULT_CODE_TO_NAME.get(code, code), fault_at))
+        arm_skip = _arm_multi_fault_stage(code, fault_at)
+        if arm_skip is not None:
+            return _multi_fault_stage_error(
+                seq, stage_codes, per_fault_states, idx,
+                'read fault not armed ({})'.format(arm_skip), seq_t0)
         arm_vtor_watchpoint()
 
         status = run_until_done(
@@ -13665,13 +13768,14 @@ def run_multi_fault_sequence(fault_sequence):
             time_slice=phase2_time_slice if idx > 0 else '0.02',
         )
         disarm_vtor_watchpoint()
+        injected = _multi_fault_stage_fired(code)
         disarm_fault()
-        injected = was_write_fault_injected()
         actual_writes = get_total_writes()
         retargeted_from = None
         observed_stage_writes = None
         if (
             idx > 0
+            and code == 'w'
             and not injected
             and actual_writes > 0
             and fault_at >= actual_writes
@@ -13690,12 +13794,7 @@ def run_multi_fault_sequence(fault_sequence):
             if _hash_bypass_active:
                 apply_hash_bypass()
             reset_nvmc_for_sweep(enable_tracking_gate=False)
-            base_writes = get_total_writes()
-            arm_at = base_writes + fault_at + 1
-            if arm_at > base_writes + max_writes_cap:
-                arm_at = base_writes + max_writes_cap + 1
-            arm_fault(arm_at)
-            disarm_erase_fault()
+            _arm_multi_fault_stage(code, fault_at)
             arm_vtor_watchpoint()
             status = run_until_done(
                 cpu_ref,
@@ -13705,25 +13804,33 @@ def run_multi_fault_sequence(fault_sequence):
                 time_slice=phase2_time_slice,
             )
             disarm_vtor_watchpoint()
+            injected = _multi_fault_stage_fired(code)
             disarm_fault()
-            injected = was_write_fault_injected()
             actual_writes = get_total_writes()
+        rc_telemetry = None
+        if _fault_uses_rc_injection_return_hook(code):
+            rc_telemetry = rc_injection_telemetry()
+        reset_rc_injection_state(enabled=False)
 
         stage_ms = int((_time.time() - stage_t0) * 1000)
-        log('mf seq={} stage={} fault_at={} injected={} writes={}'.format(
-            seq, idx + 1, fault_at, injected, actual_writes))
+        log('mf seq={} stage={} type={} fault_at={} injected={} writes={}'.format(
+            seq, idx + 1, code, fault_at, injected, actual_writes))
 
-        stage_state = {
-            'stage': idx + 1,
-            'fault_at': fault_at,
+        stage_state = _multi_fault_stage_state(idx, fault_at, code)
+        stage_state.update({
             'fault_injected': bool(injected),
+            'outcome': 'injected' if injected else 'not_injected',
             'actual_writes': actual_writes,
             'signals': {
                 'stage_ms': stage_ms,
                 'stop_reason': status.get('reason') if status is not None else None,
                 'emulated_s': status.get('emulated_s') if status is not None else None,
             },
-        }
+        })
+        if code in _MF_STAGE_ERASE_CODES:
+            stage_state['actual_erases'] = get_total_erases()
+        if rc_telemetry is not None:
+            stage_state['rc_injection'] = rc_telemetry
         if retargeted_from is not None:
             stage_state['requested_fault_at'] = retargeted_from
             stage_state['observed_writes'] = observed_stage_writes
@@ -13738,7 +13845,12 @@ def run_multi_fault_sequence(fault_sequence):
             mram_size = int(backend['data'].Size)
             saved_flash = backend['data'].ReadBytes(0, mram_size)
         else:
-            saved_flash = backend['data'].FaultFlashSnapshot
+            # A halting fault leaves the persisted state in the fault-time
+            # snapshot; a non-halting fault's stage boot ran to completion,
+            # so the next stage starts from the flash it left behind.
+            saved_flash = None
+            if code in _MF_STAGE_HALTING_CODES:
+                saved_flash = backend['data'].FaultFlashSnapshot
             if saved_flash is None:
                 flash_ref = backend['data'].Flash
                 flash_size = int(backend['data'].FlashSize)
@@ -13748,14 +13860,22 @@ def run_multi_fault_sequence(fault_sequence):
 
     if not sequence_injected:
         failed_stage = len(per_fault_states)
+        failed_code = stage_codes[failed_stage - 1]
         max_writes = per_fault_states[-1].get('actual_writes', 0) if per_fault_states else 0
+        if failed_code in _MF_STAGE_ERASE_CODES:
+            skip_unit = 'erases'
+        elif failed_code == 'f':
+            skip_unit = 'reads'
+        else:
+            skip_unit = 'writes'
         return {
             'fault_at': seq[0],
             'fault_requested': seq[0],
             'fault_type': 'mf',
             'fault_sequence': seq,
+            'fault_stage_codes': list(stage_codes),
             'fault_injected': False,
-            'skip_reason': 'stage{}_fault_index_beyond_writes'.format(failed_stage),
+            'skip_reason': 'stage{}_fault_index_beyond_{}'.format(failed_stage, skip_unit),
             'fault_address': '0x00000000',
             'boot_outcome': 'skipped',
             'boot_slot': None,
@@ -13829,6 +13949,7 @@ def run_multi_fault_sequence(fault_sequence):
         'fault_requested': seq[0],
         'fault_type': 'mf',
         'fault_sequence': seq,
+        'fault_stage_codes': list(stage_codes),
         'fault_injected': True,
         'fault_address': '0x00000000',
         'boot_outcome': boot_outcome,
@@ -14213,7 +14334,9 @@ def _native_erase_trace_is_safe():
         raise ValueError('native erase trace binary does not match its CSV companion')
 
 
-def decode_multi_fault_sequence_local(encoded):
+def decode_multi_fault_stages_local(encoded):
+    # 'mf:<fault_at>[@<code>]:...' -> ([fault_at, ...], [code, ...]).
+    # A stage without '@<code>' is power loss.
     if not encoded.startswith('mf:'):
         raise ValueError('not a multi-fault encoding: {!r}'.format(encoded))
     parts = encoded.split(':')
@@ -14221,7 +14344,13 @@ def decode_multi_fault_sequence_local(encoded):
         raise ValueError(
             'multi-fault encoding needs >= 2 fault points: {!r}'.format(encoded)
         )
-    return [int(p) for p in parts[1:]]
+    points = []
+    codes = []
+    for token in parts[1:]:
+        point, _, code = token.partition('@')
+        points.append(int(point))
+        codes.append(code or 'w')
+    return points, codes
 
 _TRACE_REPLAY_WRITE_FAULT_TYPES = frozenset(('b', 's', 'r', 'd', 'l'))
 _TRACE_REPLAY_SUPPORTED_FAULT_TYPES = frozenset(('w',))
@@ -15122,7 +15251,8 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
         return run_phase2_fault(p1_at, p2_at, p1_type, p2_type)
 
     if ft.startswith('mf:'):
-        return run_multi_fault_sequence(decode_multi_fault_sequence_local(ft))
+        mf_points, mf_codes = decode_multi_fault_stages_local(ft)
+        return run_multi_fault_sequence(mf_points, mf_codes)
 
     if ft.startswith('nv:'):
         variant_idx = int(ft.split(':')[1])

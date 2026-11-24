@@ -30,15 +30,22 @@ from fault_classification import (
 from fault_inject import (
     AnnotatedSequence,
     MultiFaultPlan,
+    assign_multi_fault_stage_types,
     classify_multi_component_outcome,
     decode_multi_fault_sequence,
+    decode_multi_fault_stage_types,
     encode_multi_fault_sequence,
     generate_multi_fault_sequences,
     multi_fault_plan_summary,
 )
 from multifault_retarget import retarget_unreachable_sequence
 from invariants import check_state_relations, default_invariants, run_invariants
-from fault_types import EXECUTE_ONLY_FAULT_TYPES, TRACE_REPLAY_WIRE_CODES
+from fault_types import (
+    EXECUTE_ONLY_FAULT_TYPES,
+    TRACE_REPLAY_WIRE_CODES,
+    _fault_type_label,
+    multi_fault_stage_code,
+)
 from partial_staging import (
     PartialStagingConfig,
     PartialStagingResult,
@@ -2507,6 +2514,23 @@ def run_multi_fault_phase(
         ],
         point_provenance=point_provenance,
     )
+    if mf_config.strategy != "explicit":
+        # Each stage runs as the fault type of the single-fault result(s)
+        # that selected its point.  Explicit sequences name no type and stay
+        # power loss.
+        point_fault_types: Dict[int, set] = {}
+        if mf_plan.diagnostics.get("fallback_used"):
+            for r in sweep_results:
+                if r.get("fault_injected", False) and not r.get("is_control", False):
+                    point_fault_types.setdefault(int(r.get("fault_at", 0)), set()).add(
+                        multi_fault_stage_code(r.get("fault_type"))
+                    )
+        else:
+            for p in interesting_pts:
+                point_fault_types.setdefault(p.fault_at, set()).update(p.fault_types)
+        mf_plan = assign_multi_fault_stage_types(
+            mf_plan, point_fault_types, mf_config.max_pairs,
+        )
     out.plan = mf_plan
     out.plan_data = multi_fault_plan_summary(mf_plan)
     print(
@@ -2631,7 +2655,11 @@ def run_multi_fault_phase(
         original_type = str(current_result.get("fault_type") or "")
         try:
             original_sequence = decode_multi_fault_sequence(original_type)
+            original_stage_types = decode_multi_fault_stage_types(original_type)
         except (TypeError, ValueError):
+            continue
+        # Retargeting is validated only against power-loss stage evidence.
+        if any(code != "w" for code in original_stage_types):
             continue
         unreachable_attempts: List[Dict[str, Any]] = []
         adjustments: List[Dict[str, Any]] = []
@@ -2722,6 +2750,10 @@ def run_multi_fault_phase(
         if isinstance(ft, str) and ft.startswith("mf:"):
             try:
                 mf_r["fault_sequence"] = decode_multi_fault_sequence(ft)
+                mf_r["fault_stage_types"] = [
+                    _fault_type_label(code)
+                    for code in decode_multi_fault_stage_types(ft)
+                ]
             except (ValueError, TypeError):
                 pass
             _rat = _mf_rationale_lookup.get(ft)

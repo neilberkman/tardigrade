@@ -1651,6 +1651,29 @@ preceding single-fault sweep. If the single-fault campaign finds no interesting
 points, the default fallback is `boundary_pairs`, which still exercises the
 multi-fault runtime path using boundary points from the original sweep.
 
+Each stage runs as the fault type of the single-fault result that selected its
+point, so a sweep over `[bit_corruption, interrupted_erase]` plans sequences
+such as `mf:5@b:30@e`: a bit corruption at write 5, then an interrupted erase
+at erase 30 of the recovery boot. A bare index is a power-loss stage. A point
+flagged by several fault types yields one sequence per type combination,
+capped at `max_pairs`. Explicit `sequences` name no type and run as power
+loss.
+
+Supported stage types are `power_loss` (including the `swap_progress` and
+`security_state_erase` selectors), `bit_corruption`, `silent_write_failure`,
+`driver_error`, `rc_injection`, `write_disturb`, `wear_leveling_corruption`,
+`write_rejection`, `interrupted_erase`, `multi_sector_atomicity`, and
+`read_bit_flip`. `read_bit_flip` stages need a read-intercepting backend and
+`read_fault_config.regions`, `rc_injection` stages need the configured return
+symbols, and erase stages need a backend with page erases. A stage that cannot
+be applied (for example `instruction_skip`, or `read_bit_flip` on a fast-path
+backend) fails its sequence as an `infra_error` whose `error` names the stage
+and type, for example `multi-fault stage 2 (instruction_skip) at fault index
+9: fault type is not supported in a multi-fault stage`. It is never re-run as
+power loss. Each result's `per_fault_states` records every stage's
+`fault_type` and `outcome` (`injected`, `not_injected`, `unsupported`, or
+`not_run`).
+
 Reference smoke profiles:
 
 - `profiles/mcuboot_head_move_nrf52_revert_phase2fault_selftest.yaml`

@@ -79,6 +79,21 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Changed
 
+- Multi-fault stages now run as their own fault types instead of all as power
+  loss. Each stage takes the fault type of the single-fault result that
+  selected its point (`mf:5@b:30@e` is a bit corruption at write 5, then an
+  interrupted erase at erase 30 of the recovery boot; a bare index stays power
+  loss). Stages support `power_loss`, `bit_corruption`,
+  `silent_write_failure`, `driver_error`, `rc_injection`, `write_disturb`,
+  `wear_leveling_corruption`, `write_rejection`, `interrupted_erase`,
+  `multi_sector_atomicity`, and `read_bit_flip`. A stage the backend cannot
+  apply, or whose type multi-fault does not support, fails its sequence as an
+  `infra_error` that names the stage and type. Each result's
+  `per_fault_states` and each finding's `fault_stages` record every stage's
+  fault type and outcome. A point that single-fault runs of several types
+  flagged yields one sequence per type combination, capped at `max_pairs`.
+  Explicit `sequences` remain power loss, and stage-relative retargeting
+  applies only to all-power-loss sequences.
 - Re-enabled all four MCUboot PR #2214 swap-offset differential profiles
   (`mcuboot_pr2214_offset_{broken,fixed}.yaml` and
   `mcuboot_pr2214_offset_geom_{broken,fixed}.yaml`) as strict regression

@@ -264,6 +264,16 @@ def categorize_failure(
         payload["metadata_delta_violations"] = result.get("metadata_delta_violations")
     if result.get("fault_sequence"):
         payload["fault_sequence"] = result["fault_sequence"]
+    stages = result.get("per_fault_states")
+    if isinstance(stages, list) and stages:
+        payload["fault_stages"] = [
+            {
+                key: stage.get(key)
+                for key in ("stage", "fault_at", "fault_type", "outcome")
+            }
+            for stage in stages
+            if isinstance(stage, dict)
+        ]
     window = result.get("fault_window")
     if isinstance(window, dict):
         payload["fault_window"] = window

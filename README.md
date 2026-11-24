@@ -420,7 +420,7 @@ Real upstream firmware means a bootloader ELF under
 
 See [`docs/mcuboot-fault-type-coverage.md`](docs/mcuboot-fault-type-coverage.md) for the recorded fault-type execution inventory and point-level outcomes across real upstream MCUboot profiles.
 
-Faults can be injected at different lifecycle stages: during the initial update write path, during pre-boot metadata/setup writes (`metadata_fault`), during between-boot confirm/accept hooks (`hook_fault`), during the recovery write path itself (`phase2_fault`), or as compound sequences (`multi_fault`). The optional `durability_model: writeback` currently supports ordinary trace-reconstructable write paths. Lifecycle/compound and erase-atomicity combinations are rejected as incomplete until their persisted-state provenance can be reconstructed safely.
+Faults can be injected at different lifecycle stages: during the initial update write path, during pre-boot metadata/setup writes (`metadata_fault`), during between-boot confirm/accept hooks (`hook_fault`), during the recovery write path itself (`phase2_fault`), or as compound sequences (`multi_fault`), where each stage runs as the fault type of the single-fault result that selected it. The optional `durability_model: writeback` currently supports ordinary trace-reconstructable write paths. Lifecycle/compound and erase-atomicity combinations are rejected as incomplete until their persisted-state provenance can be reconstructed safely.
 
 `swap_progress` uses calibration erase data to find real sector-boundary transitions in slot traffic, then reuses the normal power-cut replay path at those boundaries. On platforms where an erase trace is unavailable, tardigrade falls back to uniform `memory.page_size` buckets, which is usable on uniform flash and only approximate on non-uniform layouts. `security_state_erase` is also a semantic power-loss selector; it targets erase and restoration boundaries for declared persistent security fields.
 
@@ -644,7 +644,6 @@ tardigrade/
 - Storage power-loss faults operate at write/erase-operation granularity, not analog brownout simulation.
 - The primary fault-sweep path is first-class for Cortex-M; auxiliary Cortex-A boot helpers are not integrated fault-sweep targets.
 - Some fault types are backend-specific: `read_bit_flip` requires a backend that intercepts CPU reads (NVMemory or MRAMMemory -- fast-path backends like NVMC/STM32 expose flash via MappedMemory that the CPU reads directly); `command_drop` requires GenericNvmController; I2C faults require the I2CFaultProxy peripheral; OTP faults require the OTPMemory peripheral. The loader emits heuristic warnings for several obvious backend mismatches; runtime evidence remains coverage-gated.
-- Multi-fault sweeps currently execute all stages as power-loss faults regardless of the original fault type.
 - Runtime semantic bugs that do not change boot outcome require explicit target instrumentation or trace evidence.
 - Campaign time varies substantially with target, fault types, recovery cycles, and worker count; the bundled power-loss profiles are reference points, not a general runtime guarantee.
 - Declarative and static analyzers are evidence-limited and do not prove that a supplied model matches deployed firmware.

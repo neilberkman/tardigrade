@@ -13,7 +13,7 @@ from boot_cycle_analysis import (
     _FAILURE_BOOT_OUTCOMES,
     cycle_has_unresolved_timeout,
 )
-from fault_types import FAULT_TYPE_NAME_TO_CODE
+from fault_types import FAULT_TYPE_NAME_TO_CODE, multi_fault_stage_code
 
 
 # Multi-boot statuses that promote the final cycle's outcome/slot as the
@@ -1039,6 +1039,8 @@ class InterestingPoint:
     reason: str  # "brick", "wrong_image", "semantic", "invariant", "issue"
     boot_outcome: str
     fault_address: Optional[str] = None
+    # Multi-fault stage codes of every issue-producing result at this point.
+    fault_types: Tuple[str, ...] = ("w",)
 
 
 def _interesting_multi_fault_points(
@@ -1053,6 +1055,7 @@ def _interesting_multi_fault_points(
     """
     _REASON_SEVERITY = {"brick": 0, "wrong_image": 1, "semantic": 2, "invariant": 3, "issue": 4}
     points: Dict[int, InterestingPoint] = {}
+    point_types: Dict[int, set] = {}
     for result in results:
         if result.get("is_control", False):
             continue
@@ -1075,6 +1078,9 @@ def _interesting_multi_fault_points(
                 else:
                     reason = "issue"
                 key = int(fp)
+                point_types.setdefault(key, set()).add(
+                    multi_fault_stage_code(result.get("fault_type"))
+                )
                 existing = points.get(key)
                 if existing is None or _REASON_SEVERITY[reason] < _REASON_SEVERITY[existing.reason]:
                     points[key] = InterestingPoint(
@@ -1083,4 +1089,10 @@ def _interesting_multi_fault_points(
                         boot_outcome=eff_outcome_str,
                         fault_address=result.get("fault_address"),
                     )
-    return sorted(points.values(), key=lambda p: p.fault_at)
+    return sorted(
+        (
+            dataclasses.replace(point, fault_types=tuple(sorted(point_types[key])))
+            for key, point in points.items()
+        ),
+        key=lambda p: p.fault_at,
+    )

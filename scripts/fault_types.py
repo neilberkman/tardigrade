@@ -140,6 +140,39 @@ PHASE2_FAULT_TYPES = frozenset(
     }
 )
 
+# Fault types a multi-fault stage can apply.  Each stage of a sequential
+# multi-fault run is armed as its own type; a stage naming any other type is
+# reported as an infrastructure error, never re-run as power loss.  Semantic
+# power-loss selectors (``swap_progress``, ``security_state_erase``) and
+# clustered bit corruption reduce to their base wire code for a stage.
+MULTI_FAULT_STAGE_FAULT_TYPES = frozenset(
+    {
+        "power_loss",
+        "bit_corruption",
+        "silent_write_failure",
+        "driver_error",
+        "rc_injection",
+        "write_disturb",
+        "wear_leveling_corruption",
+        "write_rejection",
+        "interrupted_erase",
+        "multi_sector_atomicity",
+        "read_bit_flip",
+    }
+)
+
+
+def multi_fault_stage_code(fault_type: Any) -> str:
+    """Return the multi-fault stage wire code for a single-fault result type.
+
+    The stage code is the base wire code (``w:sp`` -> ``w``, ``b:7`` -> ``b``,
+    ``i:0x100`` -> ``i``).  Unsupported codes are returned unchanged so the
+    runtime can name them in its error.
+    """
+    raw = str(fault_type or "w").strip() or "w"
+    return raw.split(":", 1)[0]
+
+
 # Public peripheral mode registries.  These values mirror the open-source
 # peripheral implementations and are re-exported by profile_loader for
 # compatibility with existing callers.

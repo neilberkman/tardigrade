@@ -8,7 +8,9 @@ import itertools
 import math
 import random
 import struct as _struct
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from fault_types import _fault_type_label
 
 
 @dataclasses.dataclass
@@ -436,16 +438,34 @@ class AnnotatedSequence:
     fault_points: Tuple[int, ...]
     rationale: str
     selection_basis: Optional[Dict[str, Any]] = None
+    # Per-stage wire codes; ``None`` means every stage is power loss.
+    fault_types: Optional[Tuple[str, ...]] = None
 
     def __init__(
         self,
         fault_points: Any,
         rationale: str,
         selection_basis: Optional[Dict[str, Any]] = None,
+        fault_types: Optional[Any] = None,
     ) -> None:
         object.__setattr__(self, "fault_points", tuple(fault_points))
         object.__setattr__(self, "rationale", rationale)
         object.__setattr__(self, "selection_basis", selection_basis)
+        if fault_types is not None:
+            fault_types = tuple(str(code) for code in fault_types)
+            if len(fault_types) != len(self.fault_points):
+                raise ValueError(
+                    "fault_types has {} entries for {} fault points".format(
+                        len(fault_types), len(self.fault_points)
+                    )
+                )
+        object.__setattr__(self, "fault_types", fault_types)
+
+    def stage_codes(self) -> Tuple[str, ...]:
+        """Return the wire code of every stage, defaulting to power loss."""
+        if self.fault_types is None:
+            return ("w",) * len(self.fault_points)
+        return self.fault_types
 
     # -- list-like compatibility so existing code that treats sequences as
     #    List[int] keeps working unchanged. ----------------------------------
@@ -461,13 +481,16 @@ class AnnotatedSequence:
 
     def __eq__(self, other: object) -> bool:  # noqa: D105
         if isinstance(other, AnnotatedSequence):
-            return self.fault_points == other.fault_points
+            return (
+                self.fault_points == other.fault_points
+                and self.stage_codes() == other.stage_codes()
+            )
         if isinstance(other, (list, tuple)):
             return self.fault_points == tuple(other)
         return NotImplemented
 
     def __hash__(self) -> int:  # noqa: D105
-        return hash(self.fault_points)
+        return hash((self.fault_points, self.stage_codes()))
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-serializable representation."""
@@ -477,6 +500,7 @@ class AnnotatedSequence:
         }
         if self.selection_basis is not None:
             d["selection_basis"] = self.selection_basis
+        d["fault_types"] = [_fault_type_label(code) for code in self.stage_codes()]
         return d
 
 
@@ -978,21 +1002,101 @@ def maybe_apply_fallback(
 # ---------------------------------------------------------------------------
 
 
-def encode_multi_fault_sequence(seq: List[int]) -> str:
-    """Encode a multi-fault sequence as 'mf:<fp1>:<fp2>:...'."""
+def encode_multi_fault_sequence(
+    seq: Sequence[int],
+    stage_types: Optional[Sequence[str]] = None,
+) -> str:
+    """Encode a multi-fault sequence as 'mf:<stage1>:<stage2>:...'.
+
+    Each stage is ``<fault_at>`` for power loss or ``<fault_at>@<code>`` for
+    any other stage wire code.  ``stage_types`` defaults to the sequence's own
+    stage codes when it is an :class:`AnnotatedSequence`.
+    """
     if len(seq) < 2:
         raise ValueError("multi-fault sequence must have >= 2 points")
-    return "mf:" + ":".join(str(x) for x in seq)
+    if stage_types is None and isinstance(seq, AnnotatedSequence):
+        stage_types = seq.stage_codes()
+    if stage_types is None:
+        stage_types = ["w"] * len(seq)
+    if len(stage_types) != len(seq):
+        raise ValueError("multi-fault stage types must match the sequence length")
+    tokens = []
+    for point, code in zip(seq, stage_types):
+        code = str(code or "w")
+        if not code or ":" in code or "@" in code:
+            raise ValueError("invalid multi-fault stage code: {!r}".format(code))
+        tokens.append(str(int(point)) if code == "w" else "{}@{}".format(int(point), code))
+    return "mf:" + ":".join(tokens)
 
 
-def decode_multi_fault_sequence(encoded: str) -> List[int]:
-    """Decode 'mf:<fp1>:<fp2>:...' back to a list of ints."""
+def _decode_multi_fault_stages(encoded: str) -> List[Tuple[int, str]]:
     if not encoded.startswith("mf:"):
         raise ValueError("not a multi-fault encoding: {!r}".format(encoded))
     parts = encoded.split(":")
     if len(parts) < 3:  # "mf" + at least 2 points
         raise ValueError("multi-fault encoding needs >= 2 fault points: {!r}".format(encoded))
-    return [int(p) for p in parts[1:]]
+    stages = []
+    for token in parts[1:]:
+        point, _, code = token.partition("@")
+        stages.append((int(point), code or "w"))
+    return stages
+
+
+def decode_multi_fault_sequence(encoded: str) -> List[int]:
+    """Decode 'mf:<stage1>:<stage2>:...' to the list of stage fault indices."""
+    return [point for point, _ in _decode_multi_fault_stages(encoded)]
+
+
+def decode_multi_fault_stage_types(encoded: str) -> List[str]:
+    """Decode 'mf:<stage1>:<stage2>:...' to the per-stage wire codes."""
+    return [code for _, code in _decode_multi_fault_stages(encoded)]
+
+
+def assign_multi_fault_stage_types(
+    plan: MultiFaultPlan,
+    point_fault_types: Dict[int, Sequence[str]],
+    max_sequences: int,
+) -> MultiFaultPlan:
+    """Give every planned stage the fault type its point came from.
+
+    ``point_fault_types`` maps a single-fault point to the stage codes of the
+    single-fault results that selected it.  A point selected by several types
+    yields one sequence per type combination, in plan order, capped at
+    ``max_sequences``.  Points without an entry stay power loss.
+    """
+    typed: List[AnnotatedSequence] = []
+    capped = False
+    for seq in plan.sequences:
+        choices = [
+            sorted(set(point_fault_types.get(int(point)) or ("w",)))
+            for point in seq
+        ]
+        rationale = seq.rationale if isinstance(seq, AnnotatedSequence) else ""
+        basis = seq.selection_basis if isinstance(seq, AnnotatedSequence) else None
+        for codes in itertools.product(*choices):
+            if len(typed) >= max_sequences:
+                capped = True
+                break
+            typed.append(AnnotatedSequence(
+                fault_points=list(seq),
+                rationale=rationale,
+                selection_basis=basis,
+                fault_types=codes,
+            ))
+        if capped:
+            break
+    diagnostics = dict(plan.diagnostics)
+    diagnostics["stage_types_from_single_fault_results"] = True
+    if capped:
+        diagnostics["stage_type_variants_capped_at"] = max_sequences
+    return MultiFaultPlan(
+        sequences=typed,
+        strategy=plan.strategy,
+        interesting_point_count=plan.interesting_point_count,
+        max_faults_per_run=plan.max_faults_per_run,
+        seed=plan.seed,
+        diagnostics=diagnostics,
+    )
 
 
 def multi_fault_plan_summary(plan: Optional[MultiFaultPlan]) -> Optional[Dict[str, Any]]:

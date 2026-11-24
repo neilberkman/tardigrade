@@ -525,15 +525,19 @@ def _fault_type_semantically_matches(
 
     if len(expected_parts) >= 3 and expected_parts[0] == "mf":
         sequence = result.get("fault_sequence")
-        expected_sequence = [_wire_int(value) for value in expected_parts[1:]]
+        expected_stages = [token.partition("@") for token in expected_parts[1:]]
+        expected_sequence = [_wire_int(point) for point, _, _ in expected_stages]
+        expected_codes = [code or "w" for _, _, code in expected_stages]
         try:
             observed_sequence = [int(value) for value in sequence]
         except (TypeError, ValueError):
             return False
+        observed_codes = result.get("fault_stage_codes", ["w"] * len(expected_codes))
         return bool(
             observed == "mf"
             and all(value is not None for value in expected_sequence)
             and observed_sequence == expected_sequence
+            and list(observed_codes) == expected_codes
         )
 
     if len(expected_parts) >= 2 and expected_parts[0] == "i":
