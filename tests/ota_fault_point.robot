@@ -67,6 +67,7 @@ ${CALIBRATION_TRACE_REQUIRED}  false
 ${CALIBRATION_STOP_ADDRESS}    ${EMPTY}
 ${CALIBRATION_STOP_ON_SUCCESS}    false
 ${SUCCESS_TERMINAL_AFTER_RESET}    false
+${SUCCESS_ALLOW_FAULT_AFTER_SUCCESS}    false
 ${CALIBRATION_TIME_SLICE}      ${EMPTY}
 ${PHASE1_TIME_SLICE}           ${EMPTY}
 ${PHASE2_TIME_SLICE}           ${EMPTY}
@@ -253,6 +254,7 @@ Run Runtime Fault Point
     Execute Command    $calibration_stop_address="${CALIBRATION_STOP_ADDRESS}"
     Execute Command    $calibration_stop_on_success="${CALIBRATION_STOP_ON_SUCCESS}"
     Execute Command    $success_terminal_after_reset="${SUCCESS_TERMINAL_AFTER_RESET}"
+    Execute Command    $success_allow_fault_after_success="${SUCCESS_ALLOW_FAULT_AFTER_SUCCESS}"
     Run Keyword If    '${CALIBRATION_TIME_SLICE}' != ''    Execute Command    $calibration_time_slice="${CALIBRATION_TIME_SLICE}"
     Run Keyword If    '${PHASE1_TIME_SLICE}' != ''    Execute Command    $phase1_time_slice="${PHASE1_TIME_SLICE}"
     Run Keyword If    '${PHASE2_TIME_SLICE}' != ''    Execute Command    $phase2_time_slice="${PHASE2_TIME_SLICE}"

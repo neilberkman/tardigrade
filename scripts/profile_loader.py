@@ -541,6 +541,7 @@ class SuccessCriteria:
         "max_reset_vector_offset",
         "memory_checks",
         "terminal_after_reset",
+        "allow_fault_after_success",
     )
 
     def __init__(
@@ -562,6 +563,7 @@ class SuccessCriteria:
         max_reset_vector_offset: Optional[int] = None,
         memory_checks: Optional[List["MemoryCheck"]] = None,
         terminal_after_reset: bool = False,
+        allow_fault_after_success: bool = False,
     ) -> None:
         self.vtor_in_slot = vtor_in_slot
         self.vector_table_offset = max(0, int(vector_table_offset))
@@ -588,6 +590,7 @@ class SuccessCriteria:
         self.max_reset_vector_offset = max_reset_vector_offset
         self.memory_checks = memory_checks or []
         self.terminal_after_reset = bool(terminal_after_reset)
+        self.allow_fault_after_success = bool(allow_fault_after_success)
 
 
 
@@ -2928,6 +2931,7 @@ class ProfileConfig:
             "expected_exec_sha256": expected_exec_sha256,
             "otadata_expect": criteria.otadata_expect,
             "otadata_expect_scope": criteria.otadata_expect_scope or "always",
+            "allow_fault_after_success": bool(criteria.allow_fault_after_success),
             "success_checks": self._success_checks_runtime_dict(criteria),
         }
 
@@ -3291,6 +3295,8 @@ class ProfileConfig:
             vars_list.append("SUCCESS_PC_SLOT:{}".format(sc.pc_in_slot))
         if sc.terminal_after_reset:
             vars_list.append("SUCCESS_TERMINAL_AFTER_RESET:true")
+        if sc.allow_fault_after_success:
+            vars_list.append("SUCCESS_ALLOW_FAULT_AFTER_SUCCESS:true")
         if sc.marker_address is not None:
             vars_list.append("SUCCESS_MARKER_ADDR:0x{:08X}".format(sc.marker_address))
         if sc.marker_value is not None:
@@ -4116,6 +4122,10 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         terminal_after_reset=_parse_bool(
             raw.get("terminal_after_reset", False),
             "success_criteria.terminal_after_reset",
+        ),
+        allow_fault_after_success=_parse_bool(
+            raw.get("allow_fault_after_success", False),
+            "success_criteria.allow_fault_after_success",
         ),
     )
 
@@ -7594,7 +7604,7 @@ _STRICT_SUCCESS_CRITERIA_KEYS = frozenset(
         "image_hash_slot",
         "otadata_expect", "otadata_expect_scope", "bootloader_integrity",
         "config_checks", "boot_register_values", "max_reset_vector_offset",
-        "memory_checks", "terminal_after_reset",
+        "memory_checks", "terminal_after_reset", "allow_fault_after_success",
     }
 )
 
@@ -8677,6 +8687,31 @@ def _load_profile(
             "success_criteria.terminal_after_reset requires an observable "
             "success_criteria check"
         )
+    if (
+        success_criteria.allow_fault_after_success
+        and str(fault_sweep.evaluation_mode or "").strip().lower() == "state"
+    ):
+        raise ProfileError(
+            "success_criteria.allow_fault_after_success requires execute evaluation mode"
+        )
+    if success_criteria.allow_fault_after_success and not any(
+        (
+            success_criteria.vtor_in_slot,
+            success_criteria.pc_in_slot,
+            success_criteria.marker_address is not None,
+            success_criteria.image_hash,
+            success_criteria.otadata_expect,
+            success_criteria.bootloader_integrity,
+            success_criteria.config_checks,
+            success_criteria.boot_register_values,
+            success_criteria.memory_checks,
+            success_criteria.max_reset_vector_offset is not None,
+        )
+    ):
+        raise ProfileError(
+            "success_criteria.allow_fault_after_success requires an observable "
+            "success_criteria check"
+        )
     update_sequence = _parse_update_sequence(
         data.get("update_sequence"),
         images=images,
@@ -9097,6 +9132,7 @@ def main() -> int:
         "allowed_images": profile.success_criteria.allowed_images,
         "image_hash_slot": profile.success_criteria.image_hash_slot,
         "terminal_after_reset": profile.success_criteria.terminal_after_reset,
+        "allow_fault_after_success": profile.success_criteria.allow_fault_after_success,
         "calibration_stop": {
             "address": profile.fault_sweep.calibration_stop.address,
             "success_criteria": profile.fault_sweep.calibration_stop.success_criteria,

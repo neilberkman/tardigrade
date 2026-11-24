@@ -95,6 +95,20 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- Scoped post-success fault suppression in `scripts/run_runtime_fault_sweep.py`
+  and `scripts/profile_loader.py` behind an explicit
+  `success_criteria.allow_fault_after_success: true` opt-in (default `false`),
+  restored content-criteria evaluation (`memory_checks`, `config_checks`,
+  `bootloader_integrity`, volatile/non-slot `marker_address`, `image_hash`, and
+  `anti_rollback`) on follow-up boot cycles in `_boot_followup_cycle` (skipping
+  only cycle-0-only assertions — `otadata_expect`, unconfirmed static in-slot
+  header markers, and unconfirmed staging-only hash restrictions — without ever
+  letting a skipped criterion count as held), and gated the `HardFault`
+  vector-entry PC check in `collect_recovery_execution_evidence` identically to
+  the `BusFault` vector-entry and `IPSR` checks when opted in. Uncorrectable
+  MRAM reads remain `hard_fault` regardless of `allow_fault_after_success`.
+  Updated `examples/deliberate_crash_report` to opt in and added no-opt-in,
+  vector-entry-spin, and follow-up-cycle-before-checks fixture variants.
 - `run_until_done` and `collect_recovery_execution_evidence` in
   `scripts/run_runtime_fault_sweep.py` now record when success checks first hold
   and when a fault exception (`IPSR` 3–6) becomes active (via an interrupt-begin

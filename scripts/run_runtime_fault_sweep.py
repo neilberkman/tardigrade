@@ -1440,6 +1440,9 @@ calibration_stop_on_success = get_optional_var(
 success_terminal_after_reset = get_optional_var(
     'success_terminal_after_reset', 'false'
 ).strip().lower() in ('1', 'true', 'yes')
+success_allow_fault_after_success = get_optional_var(
+    'success_allow_fault_after_success', 'false'
+).strip().lower() in ('1', 'true', 'yes')
 _calibration_stop_state = {
     'cpu': None,
     'hook_installed': False,
@@ -1660,6 +1663,7 @@ _base_phase_context = {
         'allowed_image_hashes': list(allowed_image_hashes),
         'otadata_expect': {},
         'otadata_expect_scope': success_otadata_expect_scope,
+        'allow_fault_after_success': bool(success_allow_fault_after_success),
         'success_checks': success_checks_config,
     },
 }
@@ -1673,6 +1677,7 @@ def _apply_phase_context(phase=None):
     global image_exec_sha256, image_staging_sha256, expected_exec_sha256
     global expected_image_name, allowed_image_hashes
     global success_otadata_expect, success_otadata_expect_scope
+    global success_allow_fault_after_success
     global success_checks_config, success_checks_parse_error
 
     context = _base_phase_context if phase is None else phase
@@ -1738,6 +1743,12 @@ def _apply_phase_context(phase=None):
     ).strip().lower()
     if success_otadata_expect_scope not in ('always', 'control'):
         success_otadata_expect_scope = 'always'
+    success_allow_fault_after_success = bool(
+        criteria.get(
+            'allow_fault_after_success',
+            _base_phase_context['success_criteria']['allow_fault_after_success'],
+        )
+    )
     success_checks_config = criteria.get(
         'success_checks',
         _base_phase_context['success_criteria']['success_checks'],
@@ -1822,6 +1833,7 @@ def get_effective_criteria(fault_type_code):
         'allowed_images': [
             str(entry.get('name', '')) for entry in allowed_image_hashes
         ],
+        'allow_fault_after_success': bool(success_allow_fault_after_success),
     }
     if not _success_criteria_overrides or not fault_type_code:
         return global_criteria
@@ -1839,6 +1851,10 @@ def get_effective_criteria(fault_type_code):
         effective['image_hash'] = str(overrides['image_hash']).lower() in ('1', 'true', 'yes')
     if 'image_hash_slot' in overrides:
         effective['image_hash_slot'] = str(overrides['image_hash_slot'])
+    if 'allow_fault_after_success' in overrides:
+        effective['allow_fault_after_success'] = (
+            str(overrides['allow_fault_after_success']).lower() in ('1', 'true', 'yes')
+        )
     return effective
 
 
@@ -4594,8 +4610,9 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
         time_slice=phase2_time_slice,
         reset_already_observed=True,
         effective_criteria=effective_criteria,
-        enforce_content_criteria=False,
+        enforce_content_criteria=True,
         fault_injected=fault_injected,
+        followup_cycle=True,
     )
     disarm_vtor_watchpoint()
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
@@ -4604,9 +4621,10 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
         vtor_value,
         pc_value,
         fault_injected=fault_injected,
-        enforce_content_criteria=False,
+        enforce_content_criteria=True,
         effective_criteria=effective_criteria,
         p2_status=status,
+        followup_cycle=True,
     )
     if marked_addresses:
         _attach_uncorrectable_read_signals(
@@ -7006,10 +7024,8 @@ def _run_clean_update_phase(phase, phase_index):
         final_outcome = last_cycle.get('boot_outcome', final_outcome)
         final_slot = last_cycle.get('boot_slot', final_slot)
 
-    # Content verification: followup cycles skip content criteria
-    # (enforce_content_criteria=False) so a rollback could be hidden behind
-    # a passing VTOR check.  Re-verify the final flash state with full
-    # content criteria to catch this.
+    # Defensive final content check after follow-up cycles so an unexpected
+    # rollback inside a clean update_sequence phase cannot slip past.
     if final_outcome == 'success' and success_image_hash and expected_exec_sha256:
         hash_slot = success_image_hash_slot if success_image_hash_slot not in ('', 'any') else final_slot
         actual_hash = compute_slot_hash(hash_slot)
@@ -7689,10 +7705,18 @@ def _match_configured_image_hash(actual_hash):
     return None
 
 
-def collect_recovery_execution_evidence(actual_vtor, pc_value, boot_slot, p2_status):
+def collect_recovery_execution_evidence(
+    actual_vtor, pc_value, boot_slot, p2_status, allow_fault_after_success=None
+):
     """Collect execution-failure evidence independently of content identity."""
     if p2_status is None:
         return {}
+    if allow_fault_after_success is None:
+        allow_fault_after_success = bool(
+            globals().get('success_allow_fault_after_success', False)
+        )
+    else:
+        allow_fault_after_success = bool(allow_fault_after_success)
     reason = str(p2_status.get('reason', '') or '')
     evidence = {'stop_reason': reason}
     try:
@@ -7726,11 +7750,18 @@ def collect_recovery_execution_evidence(actual_vtor, pc_value, boot_slot, p2_sta
         and fault_timing.get('checks_held_before_fault') is True
         and not fault_timing.get('uncorrectable_read_triggered_fault')
     )
+    suppress_post_success_fault = bool(
+        allow_fault_after_success and checks_held_before_fault
+    )
     if fault_timing is not None:
         evidence['fault_timing'] = dict(fault_timing)
         evidence['checks_held_before_fault'] = checks_held_before_fault
+        evidence['allow_fault_after_success'] = allow_fault_after_success
+        evidence['post_success_fault_suppressed'] = bool(
+            fault_exception_active and suppress_post_success_fault
+        )
     fault_exception_fatal = bool(
-        fault_exception_active and not checks_held_before_fault
+        fault_exception_active and not suppress_post_success_fault
     )
 
     vector_base = None
@@ -7755,12 +7786,13 @@ def collect_recovery_execution_evidence(actual_vtor, pc_value, boot_slot, p2_sta
             )
             hardfault_handler_active = bool(
                 (
-                    hardfault_vector != 0
+                    not suppress_post_success_fault
+                    and hardfault_vector != 0
                     and (hardfault_vector & 1) == 1
                     and (int(pc_value) & ~1) == (hardfault_vector & ~1)
                 )
                 or (
-                    not checks_held_before_fault
+                    not suppress_post_success_fault
                     and busfault_vector != 0
                     and (busfault_vector & 1) == 1
                     and (int(pc_value) & ~1) == (busfault_vector & ~1)
@@ -7924,14 +7956,30 @@ def recovery_failure_outcome(
     return None
 
 
-def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_content_criteria=True, effective_criteria=None, p2_status=None):
+def evaluate_boot_outcome(
+    vtor_value,
+    pc_value,
+    fault_injected=False,
+    enforce_content_criteria=True,
+    effective_criteria=None,
+    p2_status=None,
+    followup_cycle=False,
+):
     # Shared boot outcome evaluation for all execution modes.
     # When effective_criteria is provided, use its values instead of globals.
+    followup_cycle = bool(followup_cycle)
+    followup_skipped_criteria = []
+    _hook_configured = bool(str(globals().get('boot_cycle_hook', '') or '').strip())
+    _update_seq_active = bool(globals().get('update_sequence_enabled', False))
+    _vol_regions = globals().get('volatile_regions') or []
     eff_vtor_slot = success_vtor_slot
     eff_pc_slot = success_pc_slot
     eff_vector_offset = max(0, as_int(globals().get('success_vector_offset', 0) or 0))
     eff_image_hash = success_image_hash
     eff_image_hash_slot = success_image_hash_slot
+    eff_allow_fault_after_success = bool(
+        globals().get('success_allow_fault_after_success', False)
+    )
     if effective_criteria is not None:
         eff_vtor_slot = effective_criteria.get('vtor_slot', success_vtor_slot)
         eff_pc_slot = effective_criteria.get('pc_slot', success_pc_slot)
@@ -7944,6 +7992,10 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
             )
         eff_image_hash = effective_criteria.get('image_hash', success_image_hash)
         eff_image_hash_slot = effective_criteria.get('image_hash_slot', success_image_hash_slot)
+        if 'allow_fault_after_success' in effective_criteria:
+            eff_allow_fault_after_success = bool(
+                effective_criteria.get('allow_fault_after_success')
+            )
 
     # Prioritize 'sticky' VTOR captured by watchpoint during the run.
     actual_vtor = vtor_value
@@ -8142,15 +8194,70 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
                         for entry in allowed_image_hashes
                     )
                 elif expected_exec_sha256:
-                    marker_ok = (actual_hash == expected_exec_sha256)
+                    # On an unconfirmed multi-boot upgrade (no boot_cycle_hook,
+                    # no anti-rollback, not inside update_sequence) whose
+                    # expected_image targets staging rather than the starting
+                    # exec image, cycle 1+ legitimately reverts exec back to
+                    # image_exec_sha256 (original motivation for 9e99398).
+                    # Still reject unknown/corrupted flash; relax only the
+                    # staging-only match to accept the known initial exec image
+                    # and record it as skipped so it never counts as held.
+                    allow_unconfirmed_revert_hash = bool(
+                        followup_cycle
+                        and not _hook_configured
+                        and not security_anti_rollback
+                        and not _update_seq_active
+                        and image_exec_sha256
+                        and expected_exec_sha256 != image_exec_sha256
+                    )
+                    if actual_hash == expected_exec_sha256:
+                        marker_ok = True
+                    elif allow_unconfirmed_revert_hash and actual_hash == image_exec_sha256:
+                        marker_ok = True
+                        followup_skipped_criteria.append('image_hash_expected_image')
+                    else:
+                        marker_ok = False
                 else:
                     # No expected hash: any known image is success.
                     marker_ok = (hash_result != 'unknown')
             else:
                 hash_result = 'skipped'
         if success_marker_addr != 0:
+            _marker_end = success_marker_addr + 4
+            _marker_in_volatile = bool(
+                (sram_start <= success_marker_addr and _marker_end <= sram_end)
+                or any(
+                    int(r['base']) <= success_marker_addr
+                    and _marker_end <= int(r['base']) + int(r['size'])
+                    for r in _vol_regions
+                )
+            )
+            _marker_in_slot = any(
+                s_lo <= success_marker_addr < s_hi
+                for s_lo, s_hi in slot_ranges.values()
+            )
+            # Static image-header markers inside a flash slot (for example
+            # MCUboot ih_ver at 0x0000C014 in profiles/mcuboot_head_upgrade.yaml
+            # under scenarios/mcuboot_head_exploratory.yaml) assert the cycle-0
+            # test-swap image. Without a boot_cycle_hook to confirm that test
+            # swap, cycle 1+ legitimately reverts the slot to the pre-upgrade
+            # image (original motivation for 9e99398). Skip only that static
+            # in-slot header comparison on unconfirmed follow-up cycles (never
+            # volatile RAM markers or non-slot runtime markers) and record it
+            # as skipped so it never counts as held.
+            skip_in_slot_marker_followup = bool(
+                followup_cycle
+                and _marker_in_slot
+                and not _marker_in_volatile
+                and not _hook_configured
+                and not _update_seq_active
+            )
             actual_marker_val = as_int(bus.ReadDoubleWord(success_marker_addr))
-            marker_ok = marker_ok and (actual_marker_val == success_marker_value)
+            if skip_in_slot_marker_followup:
+                if actual_marker_val != success_marker_value:
+                    followup_skipped_criteria.append('marker_address')
+            else:
+                marker_ok = marker_ok and (actual_marker_val == success_marker_value)
 
     # Anti-rollback: when enabled, a boot that lands on the old (pre-upgrade)
     # image is a rollback failure even if other checks pass. Detected via
@@ -8327,9 +8434,18 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     otadata_mismatches = []
     enforce_otadata_expect = False
     if enforce_content_criteria:
-        enforce_otadata_expect = bool(success_otadata_expect)
+        would_enforce_otadata = bool(success_otadata_expect)
         if success_otadata_expect_scope == 'control':
-            enforce_otadata_expect = not bool(fault_injected)
+            would_enforce_otadata = would_enforce_otadata and not bool(fault_injected)
+        if would_enforce_otadata and followup_cycle:
+            # otadata_expect checks the cycle-0 ESP-IDF otadata state (such as
+            # PENDING_VERIFY). Follow-up cycles transition otadata to VALID
+            # (via boot_cycle_hook) or ABORTED (on unconfirmed reboot), so
+            # skip only otadata_expect on follow-up cycles and never let it
+            # count as held.
+            followup_skipped_criteria.append('otadata_expect')
+        else:
+            enforce_otadata_expect = would_enforce_otadata
 
     if enforce_otadata_expect:
         for key, expected_values in success_otadata_expect.items():
@@ -8348,6 +8464,8 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     signals['otadata_expect_ok'] = otadata_expect_ok
     if otadata_mismatches:
         signals['otadata_expect_mismatches'] = ';'.join(otadata_mismatches)
+    if followup_skipped_criteria:
+        signals['followup_skipped_criteria'] = list(followup_skipped_criteria)
 
     reg_snapshot = capture_boot_registers()
     if reg_snapshot is not None:
@@ -8396,16 +8514,29 @@ def evaluate_boot_outcome(vtor_value, pc_value, fault_injected=False, enforce_co
     signals['liveness_established'] = liveness_established
     signals['expectations_met'] = expectations_met
 
-    execution_evidence = collect_recovery_execution_evidence(
-        actual_vtor, pc_value, boot_slot, p2_status
+    _ev_code = getattr(collect_recovery_execution_evidence, '__code__', None) or getattr(
+        collect_recovery_execution_evidence, 'func_code', None
     )
+    if _ev_code is not None and 'allow_fault_after_success' in getattr(_ev_code, 'co_varnames', ()):
+        execution_evidence = collect_recovery_execution_evidence(
+            actual_vtor,
+            pc_value,
+            boot_slot,
+            p2_status,
+            allow_fault_after_success=eff_allow_fault_after_success,
+        )
+    else:
+        execution_evidence = collect_recovery_execution_evidence(
+            actual_vtor, pc_value, boot_slot, p2_status
+        )
     if (
         execution_evidence
         and execution_evidence.get('fault_exception_active')
-        and execution_evidence.get('checks_held_before_fault')
+        and execution_evidence.get('post_success_fault_suppressed')
         and not (execution_observed and expectations_met)
     ):
         execution_evidence['checks_held_before_fault'] = False
+        execution_evidence['post_success_fault_suppressed'] = False
         execution_evidence['checks_broken_after_fault'] = True
         execution_evidence['hardfault_handler_active'] = True
         execution_evidence['hardfault_observed'] = True
@@ -8811,7 +8942,12 @@ def _calibration_success_stop_observation(cpu_ref, fault_timing=None):
 
 
 def _reset_gated_success_stop_observation(
-    cpu_ref, reset_observation, fault_timing=None
+    cpu_ref,
+    reset_observation,
+    fault_timing=None,
+    effective_criteria=None,
+    fault_injected=False,
+    followup_cycle=False,
 ):
     if (
         not success_terminal_after_reset
@@ -8823,12 +8959,27 @@ def _reset_gated_success_stop_observation(
     poll_status = {'reason': 'success_terminal_poll'}
     if fault_timing is not None:
         poll_status['fault_timing'] = fault_timing
-    outcome, boot_slot, signals = evaluate_boot_outcome(
-        vtor_value,
-        pc_value,
-        fault_injected=False,
-        p2_status=poll_status,
+    _eval_code = getattr(evaluate_boot_outcome, '__code__', None) or getattr(
+        evaluate_boot_outcome, 'func_code', None
     )
+    _eval_vars = getattr(_eval_code, 'co_varnames', ()) if _eval_code is not None else ()
+    if 'followup_cycle' in _eval_vars:
+        outcome, boot_slot, signals = evaluate_boot_outcome(
+            vtor_value,
+            pc_value,
+            fault_injected=bool(fault_injected),
+            effective_criteria=effective_criteria,
+            p2_status=poll_status,
+            followup_cycle=bool(followup_cycle),
+        )
+    else:
+        outcome, boot_slot, signals = evaluate_boot_outcome(
+            vtor_value,
+            pc_value,
+            fault_injected=bool(fault_injected),
+            effective_criteria=effective_criteria,
+            p2_status=poll_status,
+        )
     # Success is the positive terminal. A fully observed, live boot with a
     # decisive content mismatch (wrong image hash, marker, rollback, or VTOR)
     # is also terminal immediately so a later budget expiry cannot mask it.
@@ -8894,7 +9045,8 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                    expect_writes=True, stop_on_fault=True, op_trace=None, op_trace_limit=0,
                    zero_writes_is_brick=True, vtor_settle_iters=0,
                    reset_already_observed=False, effective_criteria=None,
-                   enforce_content_criteria=True, fault_injected=False):
+                   enforce_content_criteria=True, fault_injected=False,
+                   followup_cycle=False):
     # Run CPU in continuous mode until it settles or budget exhausted.
     #
     # Uses `emulation RunFor` which runs in continuous mode — much faster
@@ -9134,11 +9286,14 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             return rel_v
         return round(timing_counters['emulated_s'], 6)
 
-    def _accepts_fault_timing_kwarg(fn):
+    def _accepts_kwarg(fn, kwarg_name):
         code = getattr(fn, '__code__', None) or getattr(fn, 'func_code', None)
         if code is None:
             return False
-        return 'fault_timing' in getattr(code, 'co_varnames', ())
+        return kwarg_name in getattr(code, 'co_varnames', ())
+
+    def _accepts_fault_timing_kwarg(fn):
+        return _accepts_kwarg(fn, 'fault_timing')
 
     def _success_checks_hold_now(vtor_val, pc_val):
         if terminal_after_reset and not reset_observation.get('observed'):
@@ -9148,6 +9303,29 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         eval_boot_fn = globals().get('evaluate_boot_outcome')
         if eval_boot_fn is None:
             return False
+        # Never let a skipped content criterion count as held.
+        if not enforce_content_criteria:
+            struct_cfg_skip = globals().get('success_checks_config')
+            has_struct_skip = bool(
+                isinstance(struct_cfg_skip, dict) and (
+                    struct_cfg_skip.get('memory_checks')
+                    or struct_cfg_skip.get('config_checks')
+                    or struct_cfg_skip.get('bootloader_integrity')
+                )
+            )
+            eff_hash_skip = (
+                effective_criteria.get('image_hash', globals().get('success_image_hash', False))
+                if isinstance(effective_criteria, dict)
+                else globals().get('success_image_hash', False)
+            )
+            has_otadata_skip = bool(globals().get('success_otadata_expect'))
+            if (
+                globals().get('success_marker_addr', 0)
+                or eff_hash_skip
+                or has_struct_skip
+                or has_otadata_skip
+            ):
+                return False
         actual_v = sticky_vtor['value'] if sticky_vtor['captured'] else vtor_val
         vtor_in_slot = any(
             s_lo <= actual_v < s_hi for s_lo, s_hi in slot_ranges.values()
@@ -9182,14 +9360,27 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                         return False
         fault_timing_state['evaluating'] = True
         try:
-            outcome, _slot, _sig = eval_boot_fn(
-                vtor_val,
-                pc_val,
-                fault_injected=bool(fault_injected),
-                enforce_content_criteria=bool(enforce_content_criteria),
-                effective_criteria=effective_criteria,
-                p2_status=None,
-            )
+            if _accepts_kwarg(eval_boot_fn, 'followup_cycle'):
+                outcome, _slot, _sig = eval_boot_fn(
+                    vtor_val,
+                    pc_val,
+                    fault_injected=bool(fault_injected),
+                    enforce_content_criteria=bool(enforce_content_criteria),
+                    effective_criteria=effective_criteria,
+                    p2_status=None,
+                    followup_cycle=bool(followup_cycle),
+                )
+            else:
+                outcome, _slot, _sig = eval_boot_fn(
+                    vtor_val,
+                    pc_val,
+                    fault_injected=bool(fault_injected),
+                    enforce_content_criteria=bool(enforce_content_criteria),
+                    effective_criteria=effective_criteria,
+                    p2_status=None,
+                )
+            if isinstance(_sig, dict) and _sig.get('followup_skipped_criteria'):
+                return False
             return outcome == 'success'
         except Exception:
             return False
@@ -9682,7 +9873,18 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 break
             success_terminal_observation = None
             if terminal_after_reset:
-                if _accepts_fault_timing_kwarg(_reset_gated_success_stop_observation):
+                if _accepts_kwarg(_reset_gated_success_stop_observation, 'followup_cycle'):
+                    success_terminal_observation = (
+                        _reset_gated_success_stop_observation(
+                            cpu_ref,
+                            reset_observation,
+                            fault_timing=_slice_fault_timing,
+                            effective_criteria=effective_criteria,
+                            fault_injected=bool(fault_injected),
+                            followup_cycle=bool(followup_cycle),
+                        )
+                    )
+                elif _accepts_fault_timing_kwarg(_reset_gated_success_stop_observation):
                     success_terminal_observation = (
                         _reset_gated_success_stop_observation(
                             cpu_ref,

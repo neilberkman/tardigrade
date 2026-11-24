@@ -570,6 +570,55 @@ See `examples/runtime_self_update/profile.yaml` and
 fixtures (including direct application-vector reset and delayed post-reset
 liveness).
 
+### Deliberate fault after success
+
+By default, an active Cortex-M fault exception (`IPSR` 3–6) or a CPU stopped at
+the `HardFault`/`BusFault` vector entry classifies the boot as `hard_fault` on
+every cycle, even if the profile's success checks had already held before the
+fault. This catches delayed crashes from lazy data reads or post-boot
+corruption.
+
+If a firmware deliberately enters a fault handler after its success checks have
+held (for example to write a persistent crash record and spin), opt in
+explicitly under `success_criteria`:
+
+```yaml
+success_criteria:
+  pc_in_slot: exec
+  image_hash: true
+  image_hash_slot: exec
+  expected_image: exec
+  allow_fault_after_success: true
+  memory_checks:
+    - { address: 0x20000200, expected_value: 1, op: eq }
+    - { address: 0x20000204, expected_value: 5, op: ge }
+```
+
+`allow_fault_after_success: true` requires `evaluation_mode: execute` and at
+least one observable `success_criteria` check. When opted in, Tardigrade
+suppresses the `IPSR` 3–6 and `HardFault`/`BusFault` vector-entry escalation
+only when **all** of the following hold:
+
+- Every configured success check held outside a fault exception before the
+  active fault began (and no configured criterion was skipped on a follow-up
+  cycle).
+- All configured success checks still hold at run end.
+- `CFSR` and `HFSR` are zero at run end.
+- The active fault was not triggered by an `uncorrectable` MRAM read (uncorrectable
+  NVM reads are never suppressed).
+
+Follow-up boot cycles (`boot_cycles > 1`) evaluate the same per-boot criteria
+(`memory_checks`, `config_checks`, `bootloader_integrity`, volatile/non-slot
+markers, and `image_hash`) as cycle 0. Only cycle-0-specific state assertions
+that legitimately change on an unconfirmed reboot (`otadata_expect`, a static
+in-slot header `marker_address` without `boot_cycle_hook`, or the staging-only
+restriction of `image_hash` when an unconfirmed upgrade reverts to the initial
+`exec` image) are relaxed on follow-up cycles, and a skipped criterion never
+counts as held for post-success fault suppression.
+
+See `examples/deliberate_crash_report/profile.yaml` and its companion variant
+profiles for complete examples.
+
 ## Fault sweep configuration
 
 ### Basics

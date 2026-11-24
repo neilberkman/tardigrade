@@ -371,7 +371,7 @@ flowchart TD
 5. **Phase 1** -- replay the clean trace where supported, or execute the CPU to the selected cutpoint, then inject the fault. Trace replay eliminates O(N^2) prefix re-emulation for eligible power-loss points.
 6. **Phase 2** -- `execute` mode resets the CPU and performs a full recovery boot from faulted NVM; `state` mode infers the outcome from NVM contents alone.
 7. **Follow-up cycles / hooks** -- optional repeated boots and between-cycle hook actions model confirm-or-rollback flows and staged recovery.
-8. **Classification** -- boot outcomes (`success`, `wrong_image`, `memory_checks_unmet`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`) and failure classes (`recoverable`, `wrong_image`, `memory_checks_unmet`, `silent_corruption`, `unrecoverable`). Recovery faults and liveness stalls take precedence over a simultaneous image mismatch, which remains supporting evidence. Under `terminal_after_reset`, content mismatches remain terminal `wrong_image` immediately, while reachable `memory_checks` are polled across post-reset slices until they hold (`success`) or the budget ends with valid content and unmet checks (`memory_checks_unmet`, naming the failed checks). MRAM program faults retain exact address/width/byte telemetry plus an immediate snapshot and compact image diff. A `timeout` means an emulation, instruction, or wall-clock limit expired before a terminal result -- this is not counted as a failure.
+8. **Classification** -- boot outcomes (`success`, `wrong_image`, `memory_checks_unmet`, `no_boot`, `wrong_pc`, `hard_fault`, `timeout`) and failure classes (`recoverable`, `wrong_image`, `memory_checks_unmet`, `silent_corruption`, `unrecoverable`). Recovery faults and liveness stalls take precedence over a simultaneous image mismatch, which remains supporting evidence. Fault exceptions (`IPSR` 3--6) and fault-handler vector entry classify as `hard_fault` by default on every boot cycle (including follow-up cycles and crashes after success checks hold); profiles whose firmware deliberately enters a fault handler after success checks hold (for example to write a crash report) must opt in with `success_criteria.allow_fault_after_success: true`, and uncorrectable NVM reads are never suppressed. Under `terminal_after_reset`, content mismatches remain terminal `wrong_image` immediately, while reachable `memory_checks` are polled across post-reset slices until they hold (`success`) or the budget ends with valid content and unmet checks (`memory_checks_unmet`, naming the failed checks). MRAM program faults retain exact address/width/byte telemetry plus an immediate snapshot and compact image diff. A `timeout` means an emulation, instruction, or wall-clock limit expired before a terminal result -- this is not counted as a failure.
 
 ### Fault types
 
@@ -449,7 +449,7 @@ Sweeps are profile-driven YAML -- describe the memory layout, slots, images, and
 
 Use `target_source` when a target artifact comes from another checkout so its explicitly supplied revision is retained in reports, including containerized runs. Use `expect.mode: exploratory` or `hunt` for campaigns that are intended to explore rather than require findings.
 
-For upgrade-style profiles, the preferred starting point is minimal: ELF, slot layout, images, and success criteria. If you omit `pre_boot_state` and either omit `update_trigger` or set `update_trigger: auto`, tardigrade will try to discover the update trigger automatically before the real sweep.
+For upgrade-style profiles, the preferred starting point is minimal: ELF, slot layout, images, and success criteria. If you omit `pre_boot_state` and either omit `update_trigger` or set `update_trigger: auto`, tardigrade will try to discover the update trigger automatically before the real sweep. Set `success_criteria.allow_fault_after_success: true` (default `false`) only when firmware deliberately enters a fault handler after success checks hold; otherwise any active fault exception or fault-vector spin classifies as `hard_fault` on every boot cycle.
 
 See **[`docs/writing-profiles.md`](docs/writing-profiles.md)** for the complete profile-writing guide: field-by-field reference, platform selection, success criteria options, invariant configuration, and result interpretation.
 
@@ -508,6 +508,8 @@ and trace fixtures for engine validation and self-testing:
 | `persistent_state_fail_closed` | Failed persistent-state read/write outcome fixtures          |
 | `runtime_self_update`    | Reset-gated in-place self-update fixture and negative variants     |
 | `runtime_self_update_delayed` | Direct-reset self-update fixture with delayed post-reset liveness |
+| `deliberate_crash_report` | Deliberate post-success crash-dump fixture (`allow_fault_after_success`) and negative/follow-up variants |
+| `mram_ecc_record_recovery` | MRAM ECC `uncorrectable` torn-word handled and unhandled recovery fixtures |
 
 ## Report structure
 
