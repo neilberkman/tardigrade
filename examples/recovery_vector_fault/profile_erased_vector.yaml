@@ -1,0 +1,32 @@
+schema_version: 1
+name: recovery_vector_fault_erased_vector
+description: Interrupted vector-table rewrite after page erase, leaving the Reset or HardFault vector erased (0xFFFFFFFF).
+platform: platforms/cortex_m0_mapped_faultctrl.repl
+bootloader:
+  elf: examples/recovery_vector_fault/erased_vector.elf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x20000000, end: 0x20002000 }
+  write_granularity: 4
+  page_size: 0x1000
+  slots:
+    exec: { base: 0x10000000, size: 0x2000 }
+    staging: { base: 0x10002000, size: 0x2000 }
+images:
+  staging: examples/recovery_vector_fault/erased_vector.bin
+flash_backend: faultFlash
+success_criteria:
+  vtor_in_slot: exec
+  marker_address: 0x20000020
+  marker_value: 0xB007C0DE
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  max_writes: auto
+  max_writes_cap: 8
+  sweep_strategy: exhaustive
+  run_duration: "0.1"
+  progress_stall_timeout_s: 0.1
+expect:
+  should_find_issues: true

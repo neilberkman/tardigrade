@@ -122,6 +122,7 @@ def _json_dump_text(value):
 bus = monitor.Machine.SystemBus
 _pre_boot_state_debug = []
 _recovery_zero_vector_guard = False
+_recovery_erased_vector_lockup = None
 
 
 def _snapshot_artifact_path(fault_at, fault_type):
@@ -941,6 +942,8 @@ def _machine_reset(apply_tracking_gate=True):
     _configure_python_tracking_gate(force=True, enable_tracking_gate=apply_tracking_gate)
     if '_prepare_calibration_stop' in globals():
         _prepare_calibration_stop()
+    globals()['_recovery_zero_vector_guard'] = False
+    globals()['_recovery_erased_vector_lockup'] = None
     reset_sticky_handoff_state()
 
 
@@ -4252,6 +4255,8 @@ def merge_stop_status_signals(signals, prefix, status):
         )
     if status.get('fault_timing') is not None:
         signals[prefix + '_fault_timing'] = status.get('fault_timing')
+    if status.get('lockup_observation') is not None:
+        signals[prefix + '_lockup_observation'] = status.get('lockup_observation')
     if status.get('success_terminal') is not None:
         signals[prefix + '_success_terminal'] = status.get('success_terminal')
     if status.get('reset_gated_terminal') is not None:
@@ -6297,6 +6302,7 @@ _I2C_WIRE_CODE_TO_FAULT_TYPE = {
 def prime_bootloader_entry():
     global _recovery_zero_vector_guard
     _recovery_zero_vector_guard = False
+    globals()['_recovery_erased_vector_lockup'] = None
     # Some Cortex-M platforms do not reliably restore SP/PC from the loaded
     # bootloader image after machine Reset. Re-prime the core from the vector
     # table so execution starts from the bootloader entry on the next RunFor.
@@ -6339,10 +6345,62 @@ def prime_bootloader_entry():
                     continue
         zero_vector_guard = initial_sp == 0 and initial_pc == 0
         _recovery_zero_vector_guard = zero_vector_guard
+        erased_vector_lockup = None
+        if (int(initial_pc) & 0xFFFFFFF0) == 0xFFFFFFF0:
+            hardfault_vec = None
+            usagefault_vec = None
+            try:
+                hardfault_vec = (
+                    as_int(bus.ReadDoubleWord(int(bootloader_entry) + 12)) & 0xFFFFFFFF
+                )
+            except Exception:
+                hardfault_vec = None
+            try:
+                usagefault_vec = (
+                    as_int(bus.ReadDoubleWord(int(bootloader_entry) + 24)) & 0xFFFFFFFF
+                )
+            except Exception:
+                usagefault_vec = None
+            nvic_obj = None
+            try:
+                nvic_obj = monitor.Machine['sysbus.nvic']
+            except Exception:
+                nvic_obj = None
+            has_nvic_lockup = bool(
+                nvic_obj is not None and hasattr(nvic_obj, 'SetLockupState')
+            )
+            hf_erased = (
+                hardfault_vec is not None
+                and (hardfault_vec & 0xFFFFFFF0) == 0xFFFFFFF0
+            )
+            uf_erased = (
+                usagefault_vec is not None
+                and (usagefault_vec & 0xFFFFFFF0) == 0xFFFFFFF0
+            )
+            if hf_erased or (not has_nvic_lockup and uf_erased):
+                erased_vector_lockup = {
+                    'detected': True,
+                    'erased_vector_lockup': True,
+                    'architectural_lockup': False,
+                    'exception': 3 if hf_erased else 6,
+                    'vector': fmt_u32(hardfault_vec if hf_erased else usagefault_vec),
+                    'reset_vector': fmt_u32(initial_pc),
+                    'hardfault_vector': (
+                        fmt_u32(hardfault_vec) if hardfault_vec is not None else None
+                    ),
+                    'vtor': fmt_u32(int(bootloader_entry)),
+                    'pc': fmt_u32(initial_pc),
+                    'ipsr': 3 if hf_erased else 6,
+                    'instructions': 0,
+                    'source': 'prime_bootloader_entry',
+                }
+        globals()['_recovery_erased_vector_lockup'] = erased_vector_lockup
         if zero_vector_guard:
             prime_method = 'halted_zero_vectors'
+        elif erased_vector_lockup is not None:
+            prime_method = 'halted_erased_vector_lockup'
         try:
-            cpu_ref.IsHalted = zero_vector_guard
+            cpu_ref.IsHalted = bool(zero_vector_guard or erased_vector_lockup)
         except Exception:
             pass
         try:
@@ -7737,6 +7795,7 @@ def collect_recovery_execution_evidence(
     evidence['hfsr'] = fmt_u32(hfsr)
 
     active_exception = 0
+    _cpu_obs = None
     try:
         _cpu_obs = monitor.Machine['sysbus.cpu']
         _xpsr = as_int(getattr(_cpu_obs, 'XProgramStatusRegister', 0)) & 0xFFFFFFFF
@@ -7746,6 +7805,36 @@ def collect_recovery_execution_evidence(
         active_exception = 0
     fault_exception_active = active_exception in (3, 4, 5, 6)
     evidence['fault_exception_active'] = fault_exception_active
+
+    lockup_obs = (
+        p2_status.get('lockup_observation')
+        if isinstance(p2_status, dict)
+        and isinstance(p2_status.get('lockup_observation'), dict)
+        else None
+    )
+    cpu_locked_up_now = False
+    if _cpu_obs is not None:
+        try:
+            cpu_locked_up_now = bool(getattr(_cpu_obs, 'IsLockedUp', False))
+        except Exception:
+            cpu_locked_up_now = False
+    if (int(pc_value) & ~1) == 0xEFFFFFFE:
+        cpu_locked_up_now = True
+    reason_lower = reason.lower()
+    lockup_observed = bool(
+        (lockup_obs is not None and lockup_obs.get('detected'))
+        or cpu_locked_up_now
+        or 'lockup' in reason_lower
+    )
+    erased_vector_lockup = bool(
+        (lockup_obs is not None and lockup_obs.get('erased_vector_lockup'))
+        or 'lockup_erased_vector' in reason_lower
+    )
+    evidence['lockup_observed'] = lockup_observed
+    if erased_vector_lockup:
+        evidence['erased_vector_lockup'] = True
+    if lockup_obs is not None and lockup_obs.get('detected'):
+        evidence['lockup_observation'] = dict(lockup_obs)
 
     fault_timing = (
         p2_status.get('fault_timing')
@@ -7818,10 +7907,10 @@ def collect_recovery_execution_evidence(
             evidence['vector_read_error'] = str(exc)
     elif fault_exception_fatal:
         evidence['hardfault_handler_active'] = True
-    reason_lower = reason.lower()
     evidence['hardfault_observed'] = bool(
         cfsr != 0
         or hfsr != 0
+        or lockup_observed
         or fault_exception_fatal
         or evidence.get('hardfault_handler_active')
         or 'hardfault' in reason_lower
@@ -7947,6 +8036,8 @@ def recovery_failure_outcome(
     if not execution_evidence:
         return None
     reason = str(execution_evidence.get('stop_reason', '') or '').lower()
+    if execution_evidence.get('lockup_observed'):
+        return 'hard_fault'
     if execution_evidence.get('hardfault_observed'):
         return 'hard_fault'
     if 'busfault' in reason or 'bus_fault' in reason:
@@ -9110,6 +9201,37 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             'console_recent_logs': console_state.get('recent_logs', []),
             'console_fatal_pattern': None,
         }
+    _erased_lockup_boot = globals().get('_recovery_erased_vector_lockup')
+    if isinstance(_erased_lockup_boot, dict) and _erased_lockup_boot.get('detected'):
+        try:
+            cpu_ref.IsHalted = True
+        except Exception:
+            pass
+        writes_now = get_total_writes()
+        erases_now = get_total_erases()
+        pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
+        console_state = capture_console_state(include_recent=False)
+        log('run_done [{}]: reason=lockup_erased_vector iters=0 writes={} pc={} elapsed=0.0s'.format(
+            label, writes_now, fmt_u32(pc_now)))
+        return {
+            'iters': 0,
+            'reason': 'lockup_erased_vector',
+            'elapsed_s': 0.0,
+            'emulated_s': 0.0,
+            'writes': writes_now,
+            'erases': erases_now,
+            'pc': fmt_u32(pc_now),
+            'pc_samples': [],
+            'op_trace_events': 0,
+            'op_trace_truncated': False,
+            'console_attached_names': console_state.get('attached_names', []),
+            'console_attached_count': console_state.get('attached_count', 0),
+            'console_last_line': console_state.get('last_line'),
+            'console_last_lines': console_state.get('last_lines', []),
+            'console_recent_logs': console_state.get('recent_logs', []),
+            'console_fatal_pattern': None,
+            'lockup_observation': dict(_erased_lockup_boot),
+        }
     if time_slice is None:
         time_slice = phase1_time_slice
     t0 = _time.time()
@@ -9256,6 +9378,20 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         return None
 
     nvic_ref = _resolve_nvic(machine_ref)
+    lockup_state = {
+        'detected': False,
+        'erased_vector_lockup': False,
+        'architectural_lockup': False,
+        'exception': None,
+        'vector': None,
+        'vtor': None,
+        'pc': None,
+        'ipsr': None,
+        'instructions': None,
+        'source': None,
+        'erased_vector_hits': 0,
+        'last_erased_insns': None,
+    }
     fault_timing_state = {
         'seq': 0,
         'current_iter': 0,
@@ -9405,9 +9541,66 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         if nvic_ref is None:
             return
         try:
-            pending = int(nvic_ref.FindPendingInterrupt())
+            raw_pending = nvic_ref.FindPendingInterrupt()
+            if raw_pending is None:
+                return
+            pending = int(raw_pending)
         except Exception:
             return
+        if 0 < pending < 256 and not lockup_state['detected']:
+            target_vec = None
+            vtor_irq = 0
+            try:
+                vtor_irq = as_int(bus.ReadDoubleWord(0xE000ED08)) & 0xFFFFFFFF
+                target_vec = (
+                    as_int(bus.ReadDoubleWord(vtor_irq + pending * 4)) & 0xFFFFFFFF
+                )
+            except Exception:
+                target_vec = None
+            if target_vec is not None and (target_vec & 0xFFFFFFF0) == 0xFFFFFFF0:
+                hf_vec = 0
+                try:
+                    hf_vec = as_int(bus.ReadDoubleWord(vtor_irq + 12)) & 0xFFFFFFFF
+                except Exception:
+                    hf_vec = 0
+                current_ipsr_irq = _read_cpu_ipsr(cpu_ref)
+                now_insns_irq = _current_instructions_now()
+                has_nvic_lockup = hasattr(nvic_ref, 'SetLockupState')
+                hf_erased = (hf_vec & 0xFFFFFFF0) == 0xFFFFFFF0
+                same_insn_repeat = (
+                    lockup_state['last_erased_insns'] is not None
+                    and now_insns_irq == lockup_state['last_erased_insns']
+                )
+                lockup_state['erased_vector_hits'] += 1
+                lockup_state['last_erased_insns'] = now_insns_irq
+                should_lockup = bool(
+                    pending in (2, 3)
+                    or current_ipsr_irq in (2, 3)
+                    or hf_erased
+                    or same_insn_repeat
+                    or not has_nvic_lockup
+                )
+                if should_lockup:
+                    lockup_state['detected'] = True
+                    lockup_state['erased_vector_lockup'] = True
+                    lockup_state['architectural_lockup'] = False
+                    lockup_state['exception'] = int(pending)
+                    lockup_state['vector'] = fmt_u32(target_vec)
+                    lockup_state['vtor'] = fmt_u32(vtor_irq)
+                    lockup_state['pc'] = fmt_u32(_read_cpu_pc_fast(cpu_ref))
+                    lockup_state['ipsr'] = int(current_ipsr_irq)
+                    lockup_state['instructions'] = int(now_insns_irq)
+                    lockup_state['source'] = 'interrupt_begin_erased_vector'
+                    if hasattr(nvic_ref, 'AcknowledgeIRQ'):
+                        try:
+                            nvic_ref.AcknowledgeIRQ()
+                        except Exception:
+                            pass
+                    try:
+                        cpu_ref.IsHalted = True
+                    except Exception:
+                        pass
+                    return
         if pending not in (3, 4, 5, 6):
             return
         current_ipsr = _read_cpu_ipsr(cpu_ref)
@@ -9804,11 +9997,13 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 native_stop_sync()
             instruction_now = as_int(cpu_ref.ExecutedInstructions)
             if instruction_now >= instruction_previous:
-                instructions_executed += instruction_now - instruction_previous
+                instruction_delta = instruction_now - instruction_previous
+                instructions_executed += instruction_delta
             else:
                 # Some CPU models reset the public counter during a machine reset.
                 # Preserve the instructions observed before that reset.
-                instructions_executed += instruction_now
+                instruction_delta = instruction_now
+                instructions_executed += instruction_delta
                 reset_observation['instruction_counter_resets'] += 1
                 mark_in_run_reset('instruction_counter_reset')
             instruction_previous = instruction_now
@@ -9837,7 +10032,55 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             if stop_on_fault and (fault_requires_immediate_stop() or was_otp_fault_injected()):
                 reason = 'fault_fired'
                 break
+            if lockup_state.get('detected'):
+                try:
+                    cpu_ref.IsHalted = True
+                except Exception:
+                    pass
+                reason = (
+                    'lockup_erased_vector'
+                    if lockup_state.get('erased_vector_lockup')
+                    else 'cpu_lockup'
+                )
+                break
             pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
+            _cpu_locked_up = False
+            try:
+                _cpu_locked_up = bool(getattr(cpu_ref, 'IsLockedUp', False))
+            except Exception:
+                _cpu_locked_up = False
+            if not _cpu_locked_up and (pc_now & ~1) == 0xEFFFFFFE:
+                _cpu_locked_up = True
+            if _cpu_locked_up:
+                lockup_state['detected'] = True
+                lockup_state['architectural_lockup'] = True
+                lockup_state['erased_vector_lockup'] = False
+                lockup_state['pc'] = fmt_u32(pc_now)
+                lockup_state['ipsr'] = int(_read_cpu_ipsr(cpu_ref))
+                lockup_state['vtor'] = fmt_u32(as_int(bus.ReadDoubleWord(0xE000ED08)))
+                lockup_state['instructions'] = int(instructions_executed)
+                lockup_state['source'] = 'cpu_lockup'
+                try:
+                    cpu_ref.IsHalted = True
+                except Exception:
+                    pass
+                reason = 'cpu_lockup'
+                break
+            if (pc_now & 0xFFFFFFF0) == 0xFFFFFFF0 and instruction_delta == 0:
+                lockup_state['detected'] = True
+                lockup_state['erased_vector_lockup'] = True
+                lockup_state['architectural_lockup'] = False
+                lockup_state['pc'] = fmt_u32(pc_now)
+                lockup_state['ipsr'] = int(_read_cpu_ipsr(cpu_ref))
+                lockup_state['vtor'] = fmt_u32(as_int(bus.ReadDoubleWord(0xE000ED08)))
+                lockup_state['instructions'] = int(instructions_executed)
+                lockup_state['source'] = 'exc_return_zero_progress_loop'
+                try:
+                    cpu_ref.IsHalted = True
+                except Exception:
+                    pass
+                reason = 'lockup_erased_vector'
+                break
             capture_sticky_pc(pc_now)
             if pc_handoff_slot is not None and not sticky_pc['captured']:
                 observe_indirect_pc_handoff(cpu_ref, pc_now)
@@ -10226,6 +10469,11 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         status['reset_gated_terminal'] = success_terminal_observation
         if success_terminal_observation.get('boot_outcome') == 'success':
             status['success_terminal'] = success_terminal_observation
+    if lockup_state.get('detected'):
+        status['lockup_observation'] = {
+            k: v for k, v in lockup_state.items()
+            if k not in ('erased_vector_hits', 'last_erased_insns')
+        }
     if calibration_mode and _calibration_stop_state.get('triggered'):
         status['calibration_stop'] = dict(_calibration_stop_state)
     return status

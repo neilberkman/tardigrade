@@ -99,6 +99,15 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- Erased Cortex-M exception vectors (`0xFFFFFFFF`, or `0xFFFFFFF0..0xFFFFFFFF`
+  in the `EXC_RETURN` range) no longer trap Renode in an infinite zero-progress
+  exception-return loop until wall-clock timeout. `prime_bootloader_entry` and
+  `run_until_done` in `scripts/run_runtime_fault_sweep.py` now detect erased
+  Reset and runtime exception vectors (as well as architectural `cpu_lockup`
+  states on Renode 1.17.0+), halt cleanly, record `lockup_observed` /
+  `erased_vector_lockup` evidence, and classify the run as `hard_fault` (the
+  same outcome a real lockup gets). Added the erased-vector fixture
+  (`examples/recovery_vector_fault/profile_erased_vector.yaml`).
 - `analyze_boot_cycles` in `scripts/boot_cycle_analysis.py` now labels a
   single-transition sequence whose initial boot succeeded and whose follow-up
   boot ended in a failure outcome (`hard_fault`, `no_boot`,
