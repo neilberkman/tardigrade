@@ -16,6 +16,7 @@ from fault_classification import (
     annotate_instruction_skip_severity,
     classify_failure_class,
     classify_instruction_skip_severity,
+    classify_issue_category,
     finding_glitch_realism,
     finding_validation_stage,
     finding_validation_disposition,
@@ -27,6 +28,7 @@ from fault_classification import (
     result_is_recovery,
     result_is_timeout,
     result_issue_reasons,
+    result_recovered_after_failure,
     writeback_reconstruction_is_valid,
 )
 from fault_inject import (
@@ -555,6 +557,22 @@ def summarize_runtime_sweep(
     reportable_injected = [r for r in injected if not result_has_initial_timeout(r)]
     boot_failures = [r for r in reportable_injected if result_is_brick(r)]
     failures = [r for r in reportable_injected if result_has_issues(r, expected_outcome)]
+    recovered_after_failure_points = sum(
+        1 for r in failures if result_recovered_after_failure(r, expected_outcome)
+    )
+    issue_breakdown: Dict[str, int] = {
+        "boot_mismatch": 0,
+        "recovered_after_failure": 0,
+        "semantic": 0,
+        "invariant": 0,
+        "metadata_delta": 0,
+        "confirm_cycle": 0,
+        "terminal_error_escape": 0,
+        "other": 0,
+    }
+    for r in failures:
+        category = classify_issue_category(r, expected_outcome) or "other"
+        issue_breakdown[category] = issue_breakdown.get(category, 0) + 1
     recoveries = sum(
         1 for r in injected
         if result_is_recovery(r, expected_outcome)
@@ -782,6 +800,8 @@ def summarize_runtime_sweep(
         "total_fault_points": total,
         "bricks": len(boot_failures),
         "issue_points": len(failures),
+        "recovered_after_failure_points": recovered_after_failure_points,
+        "issue_breakdown": issue_breakdown,
         "semantic_issue_points": semantic_issue_points,
         "semantic_observation_points": semantic_observation_points,
         "invariant_issue_points": invariant_issue_points,
@@ -1484,15 +1504,25 @@ def compute_verdict(
         and not profile_expect.should_find_issues
         and found_issues
     ):
-        total_issues = sweep_summary.get("issue_points", 0)
-        if multi_fault_summary:
-            total_issues += int(
+        sweep_issues = int(
+            sweep_summary.get("issue_points", sweep_summary.get("bricks", 0)) or 0
+        )
+        mf_issues = (
+            int(
                 multi_fault_summary.get(
                     "issue_points", multi_fault_summary.get("bricks", 0)
                 )
+                or 0
             )
-        if partial_staging_summary:
-            total_issues += int(partial_staging_summary.get("issue_count", 0))
+            if multi_fault_summary
+            else 0
+        )
+        ps_issues = (
+            int(partial_staging_summary.get("issue_count", 0) or 0)
+            if partial_staging_summary
+            else 0
+        )
+        total_issues = sweep_issues + mf_issues + ps_issues
         non_instruction_issues = max(0, int(total_issues) - int(security_bypass_points))
         if security_bypass_points > 0 and non_instruction_issues == 0:
             verdict = "FAIL \u2014 found {} security bypass points".format(
@@ -1519,18 +1549,71 @@ def compute_verdict(
                 ", ".join(parts),
             )
             return _append_warnings(verdict)
-        metadata_delta_observations = int(
-            sweep_summary.get("metadata_delta_issue_points", 0)
-        )
-        parts_fmt = [
-            "{} boot mismatches".format(sweep_summary.get("bricks", 0)),
-            "{} semantic".format(sweep_summary.get("semantic_issue_points", 0)),
-            "{} invariant".format(invariant_observations),
-        ]
-        if metadata_delta_observations > 0:
-            parts_fmt.append(
-                "{} metadata_delta".format(metadata_delta_observations)
+        raw_breakdown = sweep_summary.get("issue_breakdown")
+        if isinstance(raw_breakdown, dict):
+            boot_mismatches = int(raw_breakdown.get("boot_mismatch", 0) or 0)
+            recovered_after_failure = int(
+                raw_breakdown.get("recovered_after_failure", 0) or 0
             )
+            semantic_count = int(raw_breakdown.get("semantic", 0) or 0)
+            invariant_count = int(raw_breakdown.get("invariant", 0) or 0)
+            metadata_delta_count = int(raw_breakdown.get("metadata_delta", 0) or 0)
+            confirm_cycle_count = int(raw_breakdown.get("confirm_cycle", 0) or 0)
+            terminal_error_count = int(
+                raw_breakdown.get("terminal_error_escape", 0) or 0
+            )
+            other_count = int(raw_breakdown.get("other", 0) or 0)
+        else:
+            boot_mismatches = int(sweep_summary.get("bricks", 0) or 0)
+            recovered_after_failure = int(
+                sweep_summary.get("recovered_after_failure_points", 0) or 0
+            )
+            semantic_count = int(sweep_summary.get("semantic_issue_points", 0) or 0)
+            invariant_count = int(invariant_observations)
+            metadata_delta_count = int(
+                sweep_summary.get("metadata_delta_issue_points", 0) or 0
+            )
+            confirm_cycle_count = 0
+            terminal_error_count = 0
+            accounted = (
+                boot_mismatches
+                + recovered_after_failure
+                + semantic_count
+                + invariant_count
+                + metadata_delta_count
+            )
+            other_count = max(0, sweep_issues - accounted)
+        parts_fmt = [
+            "{} boot mismatches".format(boot_mismatches),
+        ]
+        if recovered_after_failure > 0:
+            parts_fmt.append(
+                "{} recovered after failure".format(recovered_after_failure)
+            )
+        parts_fmt.extend(
+            [
+                "{} semantic".format(semantic_count),
+                "{} invariant".format(invariant_count),
+            ]
+        )
+        if metadata_delta_count > 0:
+            parts_fmt.append(
+                "{} metadata_delta".format(metadata_delta_count)
+            )
+        if confirm_cycle_count > 0:
+            parts_fmt.append(
+                "{} confirm_cycle".format(confirm_cycle_count)
+            )
+        if terminal_error_count > 0:
+            parts_fmt.append(
+                "{} terminal_error_escape".format(terminal_error_count)
+            )
+        if mf_issues > 0:
+            parts_fmt.append("{} multi-fault".format(mf_issues))
+        if ps_issues > 0:
+            parts_fmt.append("{} partial staging".format(ps_issues))
+        if other_count > 0:
+            parts_fmt.append("{} other".format(other_count))
         verdict = (
             "FAIL \u2014 found {} issue points ({})"
         ).format(total_issues, ", ".join(parts_fmt))

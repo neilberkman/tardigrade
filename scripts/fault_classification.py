@@ -15,6 +15,44 @@ from fault_types import FAULT_TYPE_NAME_TO_CODE
 
 # Multi-boot statuses that represent a successful final state.
 _MULTI_BOOT_SUCCESS_STATUSES = frozenset({"converged", "rollback_converged"})
+_RECOVERED_AFTER_FAILURE_STATUSES = frozenset(
+    {"recovered_after_failure", "initial_no_boot_recovered"}
+)
+_INITIAL_FAILURE_OUTCOMES = frozenset(
+    {
+        "no_boot",
+        "hard_fault",
+        "wrong_pc",
+        "misaligned_vtor",
+        "config_crash",
+        "config_lost",
+        "memory_checks_unmet",
+        "rollback_accepted",
+        "toctou_corruption",
+    }
+)
+_BOOT_MISMATCH_ISSUE_REASONS = frozenset(
+    {
+        "boot_outcome",
+        "content_criteria",
+        "otadata_expect",
+        "anti_rollback",
+        "reset_vector_offset",
+        "memory_check",
+        "config_check",
+        "bootloader_integrity",
+        "vtor_expectation",
+        "vtor_alignment",
+        "pc_expectation",
+    }
+)
+_CONFIRM_CYCLE_ISSUE_REASONS = frozenset(
+    {
+        "confirm_incomplete",
+        "rollback_not_ratcheted",
+        "metadata_inconsistent_after_confirm",
+    }
+)
 _NON_REPORTABLE_VALIDATION_DISPOSITIONS = frozenset(
     {
         "harness_artifact",
@@ -109,7 +147,7 @@ def selected_unexpected_boot_slot(result: Dict[str, Any]) -> bool:
     if expected is not None:
         return observed != expected
 
-    signals = result.get("signals")
+    signals = _effective_boot_signals(result)
     if isinstance(signals, dict):
         return signals.get("vtor_ok") is False
 
@@ -237,8 +275,8 @@ def is_instruction_skip_nonsecurity_wrong_image(result: Dict[str, Any]) -> bool:
     if str(eff_outcome or "unknown").strip().lower() != "wrong_image":
         return False
 
-    signals = result.get("signals")
-    if not isinstance(signals, dict):
+    signals = _effective_boot_signals(result)
+    if not isinstance(signals, dict) or not signals:
         return False
     if signals.get("anti_rollback_ok") is False:
         return False
@@ -326,7 +364,10 @@ def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     Statuses that are NOT promoted:
       - rollback_missing
       - rollback_late
+      - rollback_observed_unconfirmed
       - rollback_observed_oscillating
+      - recovered_after_failure
+      - changed_unconfirmed
       - stuck_revert
       - oscillating
     """
@@ -354,6 +395,80 @@ def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     if final_outcome is None:
         return (raw_outcome, raw_slot)
     return (final_outcome, final_slot)
+
+
+def _effective_boot_cycle_is_final(result: Dict[str, Any]) -> bool:
+    """Return whether ``_effective_boot_result`` resolves to the final boot cycle."""
+    if result.get("timeout", False):
+        return False
+    mba = result.get("multi_boot_analysis")
+    if isinstance(mba, dict) and mba.get("status") == "timeout":
+        return False
+    raw_outcome = result.get("initial_boot_outcome") or result.get("boot_outcome") or "unknown"
+    raw_slot = result.get("initial_boot_slot") or result.get("boot_slot")
+    final_outcome = result.get("final_boot_outcome")
+    final_slot = result.get("final_boot_slot")
+    boot_cycles = result.get("boot_cycles")
+    if final_outcome is not None:
+        if isinstance(boot_cycles, list) and len(boot_cycles) >= 2:
+            return True
+        if isinstance(mba, dict) and int(mba.get("completed_cycles") or 0) >= 2:
+            return True
+        if (raw_outcome, raw_slot) != (final_outcome, final_slot):
+            return True
+        return False
+    if not isinstance(mba, dict):
+        return False
+    status = mba.get("status")
+    if status not in _MULTI_BOOT_SUCCESS_STATUSES:
+        return False
+    return mba.get("final_outcome") is not None
+
+
+def _effective_boot_signals(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the signal dict belonging to the effective boot cycle.
+
+    Standard runtime sweeps store cycle 0's signals in top-level
+    ``result["signals"]`` and each cycle's own signals in
+    ``boot_cycles[i]["signals"]``.  Aligning per-boot signal checks with
+    ``_effective_boot_result`` prevents stale cycle-0 failures (for example
+    ``memory_checks_ok=False``) from leaking onto a result whose final cycle
+    succeeded; transient initial failures are classified explicitly via
+    ``result_recovered_after_failure``.
+    """
+    top_signals = result.get("signals")
+    top_dict = top_signals if isinstance(top_signals, dict) else {}
+    boot_cycles = result.get("boot_cycles")
+    if _effective_boot_cycle_is_final(result):
+        if isinstance(boot_cycles, list) and len(boot_cycles) >= 2:
+            final_cycle = boot_cycles[-1]
+            if isinstance(final_cycle, dict):
+                final_signals = final_cycle.get("signals")
+                if isinstance(final_signals, dict):
+                    return final_signals
+                return {}
+        raw_outcome = result.get("initial_boot_outcome") or result.get("boot_outcome") or "unknown"
+        raw_slot = result.get("initial_boot_slot") or result.get("boot_slot")
+        eff_outcome, eff_slot = _effective_boot_result(result)
+        if (raw_outcome, raw_slot) != (eff_outcome, eff_slot):
+            return {}
+        return top_dict
+    if isinstance(boot_cycles, list) and boot_cycles:
+        first_cycle = boot_cycles[0]
+        if isinstance(first_cycle, dict) and isinstance(first_cycle.get("signals"), dict):
+            return first_cycle["signals"]
+    return top_dict
+
+
+def _initial_boot_signals(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return cycle 0's signal dictionary when available."""
+    boot_cycles = result.get("boot_cycles")
+    if isinstance(boot_cycles, list) and boot_cycles:
+        first_cycle = boot_cycles[0]
+        if isinstance(first_cycle, dict) and isinstance(first_cycle.get("signals"), dict):
+            return first_cycle["signals"]
+    top_signals = result.get("signals")
+    return top_signals if isinstance(top_signals, dict) else {}
 
 
 def finding_validation_disposition(result: Dict[str, Any]) -> Optional[str]:
@@ -427,7 +542,96 @@ def is_resilient_rollback(result: Dict[str, Any]) -> bool:
     return eff_outcome == "wrong_image"
 
 
+def result_recovered_after_failure(
+    result: Dict[str, Any],
+    expected_outcome: str = "success",
+) -> bool:
+    """Return True when cycle 0 failed but the effective/final cycle recovered.
+
+    Distinguishes transient recovery failures (for example ``['hard_fault',
+    'success']`` or ``['memory_checks_unmet', 'success']``) from permanent
+    bricks and from expected ``rollback_converged`` transitions.
+    """
+    if result_is_invalidated_finding(result):
+        return False
+    if result_has_initial_timeout(result):
+        return False
+    iskip = classify_instruction_skip_severity(result, expected_outcome=expected_outcome)
+    model = instruction_skip_severity_model(result)
+    if iskip is not None and model == "security" and iskip["severity"] in {"dos_crash", "dos_recovery"}:
+        return False
+    eff_outcome, eff_slot = _effective_boot_result(result)
+    eff = str(eff_outcome or "unknown").strip().lower()
+    expected = str(expected_outcome or "success").strip().lower()
+    if eff != expected or selected_unexpected_boot_slot(result):
+        return False
+    mba = result.get("multi_boot_analysis")
+    mba_status = (
+        str(mba.get("status") or "").strip().lower()
+        if isinstance(mba, dict)
+        else ""
+    )
+    if mba_status == "rollback_converged":
+        return False
+    if mba_status in _RECOVERED_AFTER_FAILURE_STATUSES:
+        return True
+    if not _effective_boot_cycle_is_final(result):
+        return False
+    boot_cycles = result.get("boot_cycles")
+    if (
+        isinstance(boot_cycles, list)
+        and len(boot_cycles) >= 2
+        and isinstance(boot_cycles[0], dict)
+    ):
+        initial_outcome = str(boot_cycles[0].get("boot_outcome") or "").strip().lower()
+        initial_slot = _normalize_slot_name(boot_cycles[0].get("boot_slot"))
+    else:
+        initial_outcome = str(
+            result.get("initial_boot_outcome")
+            or (mba.get("initial_outcome") if isinstance(mba, dict) else None)
+            or result.get("boot_outcome")
+            or ""
+        ).strip().lower()
+        initial_slot = _normalize_slot_name(
+            result.get("initial_boot_slot")
+            or (mba.get("initial_slot") if isinstance(mba, dict) else None)
+            or result.get("boot_slot")
+        )
+    if initial_outcome in _INITIAL_FAILURE_OUTCOMES:
+        return True
+    if initial_outcome == "bus_fault" and rc_injection_availability_model(result):
+        return True
+    if initial_outcome == "wrong_image" and initial_slot == _normalize_slot_name(eff_slot):
+        init_signals = _initial_boot_signals(result)
+        if (
+            init_signals.get("memory_checks_ok") is False
+            or init_signals.get("config_checks_ok") is False
+            or init_signals.get("bootloader_integrity_ok") is False
+        ):
+            return True
+    return False
+
+
 def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[str]:
+    """Return all issue reasons for *result* using consistent cycle semantics.
+
+    Cycle-signal contract:
+    - ``boot_outcome`` and per-boot criteria signals (``content_criteria``,
+      ``otadata_expect``, ``anti_rollback``, ``reset_vector_offset``,
+      ``memory_check``, ``config_check``, ``bootloader_integrity``,
+      ``vtor_expectation``, ``vtor_alignment``, ``pc_expectation``) read the
+      effective cycle (final cycle when promoted, cycle 0 on single-boot runs
+      or when a follow-up cycle timed out).
+    - ``recovered_after_failure`` compares cycle 0 against the effective/final
+      cycle (cross-cycle).
+    - ``semantic_assertion`` reflects the final cycle's semantic state.
+    - ``invariant`` reflects profile invariants (final/configured stage for
+      state invariants, all cycles for multi-boot invariants).
+    - ``metadata_delta`` reflects pre-fault -> cycle 0 (before follow-up boots).
+    - ``terminal_error_path_escape`` checks effective or run-wide top-level
+      signals.
+    - ``confirm_*`` reflects the post-confirm cycle.
+    """
     reasons: List[str] = []
     if result_is_invalidated_finding(result):
         return reasons
@@ -469,7 +673,7 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
         # issue.
         if not is_resilient_rollback(result) and not safe_instruction_skip_divergence:
             reasons.append("boot_outcome")
-    signals = result.get("signals") or {}
+    signals = _effective_boot_signals(result)
     if isinstance(signals, dict):
         if signals.get("marker_ok") is False and not safe_instruction_skip_divergence:
             reasons.append("content_criteria")
@@ -494,14 +698,19 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
                 reasons.append("vtor_alignment")
             if signals.get("pc_ok") is False:
                 reasons.append("pc_expectation")
+    if result_recovered_after_failure(result, expected_outcome):
+        reasons.append("recovered_after_failure")
     if result.get("semantic_assertion_failures"):
         reasons.append("semantic_assertion")
     if result.get("invariant_violations"):
         reasons.append("invariant")
     if result.get("metadata_delta_violations"):
         reasons.append("metadata_delta")
-    signals = result.get("signals") or {}
-    if isinstance(signals, dict) and signals.get("terminal_error_escaped"):
+    top_signals = result.get("signals") or {}
+    if (
+        (isinstance(signals, dict) and signals.get("terminal_error_escaped"))
+        or (isinstance(top_signals, dict) and top_signals.get("terminal_error_escaped"))
+    ):
         reasons.append("terminal_error_path_escape")
     # Confirm-cycle specific finding categories.
     confirm_meta = result.get("confirm_cycle")
@@ -522,6 +731,32 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
         seen.add(reason)
         deduped.append(reason)
     return deduped
+
+
+def classify_issue_category(
+    result: Dict[str, Any],
+    expected_outcome: str = "success",
+) -> Optional[str]:
+    """Return one mutually exclusive primary category for an issue point."""
+    reasons = result_issue_reasons(result, expected_outcome)
+    if not reasons:
+        return None
+    reason_set = set(reasons)
+    if result_is_brick(result) or bool(reason_set & _BOOT_MISMATCH_ISSUE_REASONS):
+        return "boot_mismatch"
+    if "recovered_after_failure" in reason_set:
+        return "recovered_after_failure"
+    if "semantic_assertion" in reason_set:
+        return "semantic"
+    if "invariant" in reason_set:
+        return "invariant"
+    if "metadata_delta" in reason_set:
+        return "metadata_delta"
+    if bool(reason_set & _CONFIRM_CYCLE_ISSUE_REASONS):
+        return "confirm_cycle"
+    if "terminal_error_path_escape" in reason_set:
+        return "terminal_error_escape"
+    return "other"
 
 
 def result_has_issues(result: Dict[str, Any], expected_outcome: str) -> bool:
@@ -719,12 +954,22 @@ def classify_failure_class(result: Dict[str, Any]) -> str:
     if outcome == "wrong_image":
         if is_resilient_rollback(result):
             return "resilient_rollback"
-        signals = result.get("signals", {})
-        if not isinstance(signals, dict):
-            signals = {}
-        hash_match = str(signals.get("image_hash_match", "") or "").strip().lower()
-        expected_slot = str(signals.get("image_hash_slot", "") or "").strip().lower()
-        boot_slot = str(result.get("boot_slot", "") or "").strip().lower()
+        signals = _effective_boot_signals(result)
+        top_signals = result.get("signals")
+        if not isinstance(top_signals, dict):
+            top_signals = {}
+        hash_match = str(
+            signals.get("image_hash_match")
+            or top_signals.get("image_hash_match")
+            or ""
+        ).strip().lower()
+        expected_slot = str(
+            signals.get("image_hash_slot")
+            or top_signals.get("image_hash_slot")
+            or ""
+        ).strip().lower()
+        _, eff_slot = _effective_boot_result(result)
+        boot_slot = str(eff_slot or result.get("boot_slot", "") or "").strip().lower()
         if hash_match == "unknown" and (
             not expected_slot or expected_slot == "any" or boot_slot == expected_slot
         ):
