@@ -46,7 +46,9 @@ extern uint32_t __stack_top;
 
 void Reset_Handler(void);
 void Default_Handler(void);
+#if !FAULT_HANDLER_VECTOR_ENTRY_SPIN
 void Fault_Handler(void);
+#endif
 
 void Default_Handler(void)
 {
@@ -60,12 +62,27 @@ void Default_Handler(void)
 __attribute__((naked, noreturn))
 void HardFault_Spin(void)
 {
-    /* Shared halt stub installed at vector_table[3] (HardFault) so PC stops on
-     * the exact vector entry instruction (pc & ~1) == (hardfault_vector & ~1). */
-    __asm volatile("b .");
+    /* Installed at vector_table[3] (HardFault) — and aliased at [6] only so
+     * Renode 1.16.1's non-ARMv6-M UsageFault routing reaches the same entry.
+     * On first entry APSR.Z is 0 (cleared before udf #0), so `beq 1b` falls
+     * through once to clear sticky CFSR/HFSR bits, then sets Z=1 and branches
+     * back to spin on the exact HardFault vector-entry instruction:
+     * (pc & ~1) == (hardfault_vector & ~1). */
+    __asm volatile(
+        ".syntax unified\n"
+        "1:\n"
+        "beq 1b\n"
+        "ldr r0, =0xE000ED28\n"
+        "ldr r1, [r0, #0]\n"
+        "str r1, [r0, #0]\n"
+        "ldr r1, [r0, #4]\n"
+        "str r1, [r0, #4]\n"
+        "movs r0, #0\n"
+        "b 1b\n"
+        ".ltorg\n"
+    );
 }
-#endif
-
+#else
 void Fault_Handler(void)
 {
     uint32_t saved_cfsr = CFSR;
@@ -86,15 +103,12 @@ void Fault_Handler(void)
     CRASH_REC_COMMIT = CRASH_RECORD_COMMIT;
 #endif
 
-#if FAULT_HANDLER_VECTOR_ENTRY_SPIN
-    HardFault_Spin();
-#else
     for(;;)
     {
         __asm volatile("wfi");
     }
-#endif
 }
+#endif
 
 __attribute__((section(".isr_vector")))
 const void *vector_table[] = {
@@ -103,18 +117,32 @@ const void *vector_table[] = {
     Default_Handler, /* NMI */
 #if FAULT_HANDLER_VECTOR_ENTRY_SPIN
     HardFault_Spin,  /* HardFault */
+    Default_Handler, /* MemManage (reserved on ARMv6-M) */
+    Default_Handler, /* BusFault (reserved on ARMv6-M) */
+    HardFault_Spin,  /* UsageFault (reserved on ARMv6-M; Renode 1.16.1 compat) */
 #else
     Fault_Handler,   /* HardFault */
-#endif
     Fault_Handler,   /* MemManage */
     Fault_Handler,   /* BusFault */
     Fault_Handler,   /* UsageFault */
+#endif
     Default_Handler,
 };
 
 static void trigger_deliberate_fault(void)
 {
+#if FAULT_HANDLER_VECTOR_ENTRY_SPIN
+    /* Clear APSR.Z before faulting so HardFault_Spin's entry `beq 1b` falls
+     * through once to clear sticky CFSR/HFSR bits before latching Z=1. */
+    __asm volatile(
+        ".syntax unified\n"
+        "movs r0, #1\n"
+        "udf #0\n"
+        ::: "r0", "cc", "memory"
+    );
+#else
     __asm volatile("udf #0");
+#endif
     for(;;)
     {
         __asm volatile("wfi");
@@ -172,6 +200,12 @@ void Reset_Handler(void)
     if(CRASH_REQUEST == CRASH_REQUEST_MAGIC)
     {
         CRASH_REQUEST = 0u;
+#if FAULT_HANDLER_VECTOR_ENTRY_SPIN
+        CRASH_REC_MAGIC = CRASH_RECORD_MAGIC;
+        CRASH_REC_CFSR = 0u;
+        CRASH_REC_TICKS = TICK_COUNT;
+        CRASH_REC_COMMIT = CRASH_RECORD_COMMIT;
+#endif
         trigger_deliberate_fault();
     }
 #endif

@@ -30,10 +30,11 @@ startup recovery.
   firmware with `allow_fault_after_success: false`. Must classify as
   `hard_fault`.
 - `profile_vector_entry_spin.yaml` (`vector_entry_spin.bin`): keeps `VTOR` at
-  `exec` (`0x10100000`), clears `CFSR`/`HFSR` and writes the crash record in
-  `Fault_Handler`, and then branches to the shared `HardFault` vector entry
-  instruction (`b .`) after checks hold with `allow_fault_after_success: true`.
-  Must classify as `success`.
+  `exec` (`0x10100000`), publishes the success checks and writes the 4-unit
+  crash record in normal code, and then triggers a fault into `HardFault_Spin`
+  at `vector_table[3]`, which clears `CFSR`/`HFSR` and spins on its exact
+  vector-entry instruction (`beq .`) with `allow_fault_after_success: true`.
+  Must classify as `success` (and `hard_fault` without the opt-in).
 - `profile_followup_fault_before_checks.yaml`
   (`followup_fault_before_checks.bin`): boots cleanly on cycle 0 (writing a
   persistent marker word to MRAM), then faults on follow-up boot cycles before
