@@ -107,6 +107,16 @@ The format follows [common-changelog](https://common-changelog.org/).
   `rollback_observed_unconfirmed` under an expected rollback schedule), and
   `oscillating` is reserved for three or more cycles with at least two
   transitions (`len(pairs) >= 3` and `transitions >= 2`).
+- `_effective_boot_result` and `_effective_boot_cycle_is_final` in
+  `scripts/fault_classification.py` now check `multi_boot_analysis["status"]`
+  before honoring `final_boot_outcome` / `final_boot_slot`, promoting only
+  success statuses (`converged`, `rollback_converged`,
+  `recovered_after_failure`). Non-success multi-boot statuses (`oscillating`,
+  `changed_unconfirmed`, `initial_no_boot_recovered`, `rollback_missing`,
+  `rollback_late`, `rollback_observed_unconfirmed`,
+  `rollback_observed_oscillating`, `stuck_revert`, `timeout`) are no longer
+  promoted to their last cycle's outcome even after `annotate_boot_span_result`
+  populates `final_boot_outcome`.
 - `scripts/fault_classification.py` and `scripts/audit_report.py` now read
   per-boot criteria signals from the effective boot cycle
   (`_effective_boot_signals`, matching `_effective_boot_result`) instead of

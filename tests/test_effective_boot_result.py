@@ -105,6 +105,57 @@ class EffectiveBootResultTests(unittest.TestCase):
         self.assertEqual(outcome, "wrong_image")
         self.assertEqual(slot, "staging")
 
+    def test_annotated_non_success_statuses_are_not_promoted(self):
+        """annotate_boot_span_result copies final_boot_outcome regardless of status;
+        _effective_boot_result must still refuse to promote non-success statuses."""
+        non_promoted = (
+            "oscillating",
+            "rollback_missing",
+            "rollback_late",
+            "rollback_observed_unconfirmed",
+            "rollback_observed_oscillating",
+            "changed_unconfirmed",
+            "stuck_revert",
+            "initial_no_boot_recovered",
+            "timeout",
+        )
+        for status in non_promoted:
+            with self.subTest(status=status):
+                result = {
+                    "boot_outcome": "hard_fault",
+                    "boot_slot": None,
+                    "initial_boot_outcome": "hard_fault",
+                    "initial_boot_slot": None,
+                    "final_boot_outcome": "success",
+                    "final_boot_slot": "exec",
+                    "multi_boot_analysis": {
+                        "status": status,
+                        "initial_outcome": "hard_fault",
+                        "final_outcome": "success",
+                        "final_slot": "exec",
+                    },
+                }
+                self.assertEqual(_effective_boot_result(result), ("hard_fault", None))
+                self.assertTrue(result_is_brick(result))
+
+    def test_recovered_after_failure_is_promoted(self):
+        result = {
+            "boot_outcome": "hard_fault",
+            "boot_slot": None,
+            "initial_boot_outcome": "hard_fault",
+            "initial_boot_slot": None,
+            "final_boot_outcome": "success",
+            "final_boot_slot": "exec",
+            "multi_boot_analysis": {
+                "status": "recovered_after_failure",
+                "initial_outcome": "hard_fault",
+                "final_outcome": "success",
+                "final_slot": "exec",
+            },
+        }
+        self.assertEqual(_effective_boot_result(result), ("success", "exec"))
+        self.assertFalse(result_is_brick(result))
+
     def test_converged_with_no_final_outcome_returns_raw(self):
         result = {
             "boot_outcome": "wrong_image",

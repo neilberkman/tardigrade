@@ -13,11 +13,12 @@ from boot_cycle_analysis import cycle_has_unresolved_timeout
 from fault_types import FAULT_TYPE_NAME_TO_CODE
 
 
-# Multi-boot statuses that represent a successful final state.
-_MULTI_BOOT_SUCCESS_STATUSES = frozenset({"converged", "rollback_converged"})
-_RECOVERED_AFTER_FAILURE_STATUSES = frozenset(
-    {"recovered_after_failure", "initial_no_boot_recovered"}
+# Multi-boot statuses that promote the final cycle's outcome/slot as the
+# effective boot result.
+_MULTI_BOOT_SUCCESS_STATUSES = frozenset(
+    {"converged", "rollback_converged", "recovered_after_failure"}
 )
+_RECOVERED_AFTER_FAILURE_STATUSES = frozenset({"recovered_after_failure"})
 _INITIAL_FAILURE_OUTCOMES = frozenset(
     {
         "no_boot",
@@ -356,45 +357,50 @@ def annotate_instruction_skip_severity(
 def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     """Return (effective_outcome, effective_slot) accounting for multi-boot.
 
-    Prefer explicit top-level ``final_boot_outcome`` / ``final_boot_slot`` when
-    present. Otherwise fall back to ``multi_boot_analysis`` promotion for
-    backwards compatibility, and finally to the raw initial ``boot_outcome`` /
-    ``boot_slot``.
+    When ``multi_boot_analysis`` is present, only statuses in
+    ``_MULTI_BOOT_SUCCESS_STATUSES`` (``converged``, ``rollback_converged``,
+    ``recovered_after_failure``) promote the final cycle's outcome/slot over
+    the initial boot outcome.  When promoted, explicit top-level
+    ``final_boot_outcome`` / ``final_boot_slot`` are preferred over
+    ``multi_boot_analysis["final_outcome"]`` / ``["final_slot"]``.  When
+    ``multi_boot_analysis`` is absent (legacy single-span payloads without
+    multi-boot analysis), explicit ``final_boot_outcome`` /
+    ``final_boot_slot`` are still honored.
 
     Statuses that are NOT promoted:
+      - initial_no_boot_recovered
       - rollback_missing
       - rollback_late
       - rollback_observed_unconfirmed
       - rollback_observed_oscillating
-      - recovered_after_failure
       - changed_unconfirmed
       - stuck_revert
       - oscillating
+      - timeout
     """
     raw_outcome = result.get("initial_boot_outcome") or result.get("boot_outcome") or "unknown"
     raw_slot = result.get("initial_boot_slot") or result.get("boot_slot")
     if result.get("timeout", False):
         return ("timeout", raw_slot)
     mba = result.get("multi_boot_analysis")
-    if isinstance(mba, dict) and mba.get("status") == "timeout":
-        # Keep a concrete initial result authoritative; the follow-up timeout
-        # makes the campaign incomplete, but must not turn an initial
-        # no_boot-stall observation into a synthetic convergence.
-        return (raw_outcome, raw_slot)
+    if isinstance(mba, dict):
+        status = mba.get("status")
+        if status not in _MULTI_BOOT_SUCCESS_STATUSES:
+            return (raw_outcome, raw_slot)
+        final_outcome = result.get("final_boot_outcome")
+        final_slot = result.get("final_boot_slot")
+        if final_outcome is not None:
+            return (final_outcome, final_slot)
+        final_outcome = mba.get("final_outcome")
+        final_slot = mba.get("final_slot")
+        if final_outcome is None:
+            return (raw_outcome, raw_slot)
+        return (final_outcome, final_slot)
     final_outcome = result.get("final_boot_outcome")
     final_slot = result.get("final_boot_slot")
     if final_outcome is not None:
         return (final_outcome, final_slot)
-    if not isinstance(mba, dict):
-        return (raw_outcome, raw_slot)
-    status = mba.get("status")
-    if status not in _MULTI_BOOT_SUCCESS_STATUSES:
-        return (raw_outcome, raw_slot)
-    final_outcome = mba.get("final_outcome")
-    final_slot = mba.get("final_slot")
-    if final_outcome is None:
-        return (raw_outcome, raw_slot)
-    return (final_outcome, final_slot)
+    return (raw_outcome, raw_slot)
 
 
 def _effective_boot_cycle_is_final(result: Dict[str, Any]) -> bool:
@@ -402,27 +408,32 @@ def _effective_boot_cycle_is_final(result: Dict[str, Any]) -> bool:
     if result.get("timeout", False):
         return False
     mba = result.get("multi_boot_analysis")
-    if isinstance(mba, dict) and mba.get("status") == "timeout":
-        return False
+    boot_cycles = result.get("boot_cycles")
     raw_outcome = result.get("initial_boot_outcome") or result.get("boot_outcome") or "unknown"
     raw_slot = result.get("initial_boot_slot") or result.get("boot_slot")
-    final_outcome = result.get("final_boot_outcome")
-    final_slot = result.get("final_boot_slot")
-    boot_cycles = result.get("boot_cycles")
-    if final_outcome is not None:
+    if isinstance(mba, dict):
+        status = mba.get("status")
+        if status not in _MULTI_BOOT_SUCCESS_STATUSES:
+            return False
+        final_outcome = result.get("final_boot_outcome")
+        final_slot = result.get("final_boot_slot")
+        if final_outcome is None:
+            final_outcome = mba.get("final_outcome")
+            final_slot = mba.get("final_slot")
+        if final_outcome is None:
+            return False
         if isinstance(boot_cycles, list) and len(boot_cycles) >= 2:
             return True
-        if isinstance(mba, dict) and int(mba.get("completed_cycles") or 0) >= 2:
+        if int(mba.get("completed_cycles") or 0) >= 2:
             return True
-        if (raw_outcome, raw_slot) != (final_outcome, final_slot):
-            return True
+        return (raw_outcome, raw_slot) != (final_outcome, final_slot)
+    final_outcome = result.get("final_boot_outcome")
+    final_slot = result.get("final_boot_slot")
+    if final_outcome is None:
         return False
-    if not isinstance(mba, dict):
-        return False
-    status = mba.get("status")
-    if status not in _MULTI_BOOT_SUCCESS_STATUSES:
-        return False
-    return mba.get("final_outcome") is not None
+    if isinstance(boot_cycles, list) and len(boot_cycles) >= 2:
+        return True
+    return (raw_outcome, raw_slot) != (final_outcome, final_slot)
 
 
 def _effective_boot_signals(result: Dict[str, Any]) -> Dict[str, Any]:

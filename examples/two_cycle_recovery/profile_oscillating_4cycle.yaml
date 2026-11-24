@@ -1,0 +1,9 @@
+base_profile: profile_oscillating.yaml
+name: two_cycle_recovery_oscillating_4cycle
+description: >
+  Four-cycle alternating companion whose torn-record fault points alternate
+  hard_fault -> success -> hard_fault -> success (status=oscillating). Because
+  oscillating is not a promoted success status, _effective_boot_result retains
+  cycle 0's hard_fault even though the final cycle succeeded.
+fault_sweep:
+  boot_cycles: 4

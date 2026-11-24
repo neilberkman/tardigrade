@@ -310,6 +310,62 @@ class SignalCycleConsistencyTests(unittest.TestCase):
         self.assertTrue(result_is_brick(result))
         self.assertFalse(result_recovered_after_failure(result, "success"))
 
+    def test_four_cycle_oscillating_ending_in_success_is_not_promoted_and_stays_brick(
+        self,
+    ) -> None:
+        cycles = [
+            {
+                "cycle": 0,
+                "boot_outcome": "hard_fault",
+                "boot_slot": None,
+                "signals": {"expectations_met": False, "memory_checks_ok": False},
+            },
+            {
+                "cycle": 1,
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "signals": {"expectations_met": True, "memory_checks_ok": True},
+            },
+            {
+                "cycle": 2,
+                "boot_outcome": "hard_fault",
+                "boot_slot": None,
+                "signals": {"expectations_met": False},
+            },
+            {
+                "cycle": 3,
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "signals": {"expectations_met": True},
+            },
+        ]
+        analysis = analyze_boot_cycles(cycles, requested_cycles=4)
+        self.assertEqual(analysis["status"], "oscillating")
+        result = {
+            "fault_at": 2,
+            "fault_type": "w",
+            "is_control": False,
+            "fault_injected": True,
+            "boot_outcome": "hard_fault",
+            "boot_slot": None,
+            "initial_boot_outcome": "hard_fault",
+            "initial_boot_slot": None,
+            "final_boot_outcome": "success",
+            "final_boot_slot": "exec",
+            "signals": dict(cycles[0]["signals"]),
+            "boot_cycles": cycles,
+            "multi_boot_analysis": analysis,
+        }
+        self.assertEqual(_effective_boot_result(result), ("hard_fault", None))
+        self.assertFalse(_effective_boot_signals(result)["memory_checks_ok"])
+        self.assertTrue(result_is_brick(result))
+        self.assertFalse(result_recovered_after_failure(result, "success"))
+        self.assertEqual(
+            result_issue_reasons(result, "success"),
+            ["boot_outcome", "memory_check"],
+        )
+        self.assertEqual(classify_issue_category(result, "success"), "boot_mismatch")
+
 
 class VerdictBreakdownSumTests(unittest.TestCase):
     def test_verdict_breakdown_sums_with_bricks_and_recovered_after_failure(self) -> None:
@@ -562,6 +618,12 @@ class TwoCycleRecoveryFixtureTests(unittest.TestCase):
         osc_profile = load_profile(fixture_dir / "profile_oscillating.yaml", strict=True)
         self.assertEqual(osc_profile.fault_sweep.boot_cycles, 3)
         self.assertEqual(osc_profile.fault_sweep.tracking_start_address, 0x20000400)
+
+        osc4_profile = load_profile(
+            fixture_dir / "profile_oscillating_4cycle.yaml", strict=True
+        )
+        self.assertEqual(osc4_profile.fault_sweep.boot_cycles, 4)
+        self.assertEqual(osc4_profile.fault_sweep.tracking_start_address, 0x20000400)
 
         for elf_name in ("app.elf", "oscillating.elf"):
             nm = subprocess.run(

@@ -26,7 +26,14 @@ Phase 2 NVM write counting when `fault_sweep.tracking_start_address` is set.
 - `profile_oscillating.yaml` (`oscillating.bin`, `boot_cycles: 3`):
   - Fault points 2, 3, and 4 toggle `OSCILLATE_FLAG` in MRAM on each boot,
     producing `['hard_fault', 'success', 'hard_fault']` across 3 cycles, which
-    reports `multi_boot_analysis.status = "oscillating"`.
+    reports `multi_boot_analysis.status = "oscillating"` and
+    `recovery_writes = 1`.
+- `profile_oscillating_4cycle.yaml` (`oscillating.bin`, `boot_cycles: 4`):
+  - Extends the oscillating fixture to 4 cycles (`['hard_fault', 'success',
+    'hard_fault', 'success']`) so the final cycle succeeds while
+    `multi_boot_analysis.status = "oscillating"`. Because non-success
+    multi-boot statuses are not promoted, `_effective_boot_result` retains
+    cycle 0's `hard_fault` and all 4 failing fault points remain bricks.
 
 ## Build
 
