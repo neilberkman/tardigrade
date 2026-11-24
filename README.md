@@ -52,18 +52,9 @@ Candidate pairs for PRs [#1597](https://github.com/mcu-tools/mcuboot/pull/1597) 
 See [`docs/mcuboot-differentials.md`](docs/mcuboot-differentials.md) for the status table, `--quick` differential gate, and trace analysis across the five retained MCUboot PR differential pairs and the two removed pairs.
 See [`docs/mcuboot-pr2214-swap-offset.md`](docs/mcuboot-pr2214-swap-offset.md) for the PR #2214 swap-offset sector-count derivation and STM32F4 geometry root cause.
 
-### MCUboot upstream: torn-write simulator test
+### MCUboot upstream
 
-[mcu-tools/mcuboot#2648](https://github.com/mcu-tools/mcuboot/pull/2648) proposed interrupted-OTA coverage for swap-move at two layers: a torn-write mode in MCUboot's simulator, where the interrupted write is left partly programmed instead of not written at all, and a CI canary running tardigrade's power-loss sweeps against Zephyr-built MCUboot under Renode. With the PR #2100 fix reverted, the simulator's new torn-write revert sweep fails at the `fixup_revert` magic write, while the existing whole-operation `revert_with_fails` sweep still passes.
-
-#2648 was closed on 2026-11-24 in favor of [mcu-tools/mcuboot#3011](https://github.com/mcu-tools/mcuboot/pull/3011), which takes the simulator commit unchanged and builds a second sweep on it: power is cut at each flash operation of the boot that starts a revert, then again within the first 16 operations of the boot that resumes it, with clean and torn cuts, for every swap mode (gated behind `MCUBOOT_RUN_SLOW_TESTS`). That sweep reproduces two revert bugs, and #3011 fixes both:
-
-| Issue                                                       | Swap mode         | Bug                                                                                                                       |
-| ----------------------------------------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| [#3009](https://github.com/mcu-tools/mcuboot/issues/3009) | swap-move         | Torn fixup magic write reads as bad, the fixup is not redone, and after a second power loss the unconfirmed image keeps booting |
-| [#3010](https://github.com/mcu-tools/mcuboot/issues/3010) | swap-using-offset | Revert fixup re-runs on resume; a second power loss leaves the device asserting in `boot_swap_image` on every boot         |
-
-#3011 was open and awaiting review on 2026-11-24. #2648's CI canary commit is not part of it; the maintainer asked for that commit to be proposed as a separate PR if pursued.
+Tardigrade's torn-write power-loss model is proposed for MCUboot's simulator in [mcu-tools/mcuboot#3011](https://github.com/mcu-tools/mcuboot/pull/3011). A two-power-loss revert sweep built on it found two revert bugs: [#3009](https://github.com/mcu-tools/mcuboot/issues/3009) (swap-move: the revert is lost and the unconfirmed image keeps booting) and [#3010](https://github.com/mcu-tools/mcuboot/issues/3010) (swap-using-offset: the device asserts on every boot).
 
 ## Integrations
 
