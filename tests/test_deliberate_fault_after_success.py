@@ -1184,8 +1184,28 @@ def test_allow_fault_after_success_profile_schema_and_transport(tmp_path: Path) 
     with pytest.raises(ProfileError, match="execute evaluation mode"):
         load_profile(bad_state, strict=True)
 
-    # Runtime dict and robot_vars propagate the opt-in cleanly.
-    pos = load_profile(FIXTURE / "profile.yaml", strict=True)
+    # Runtime dict and robot_vars propagate the opt-in cleanly without requiring
+    # prebuilt example binaries on a clean checkout.
+    dummy_bin = tmp_path / "app.bin"
+    dummy_bin.write_bytes(b"\xff" * 64)
+    profile_text = (FIXTURE / "profile.yaml").read_text(encoding="utf-8")
+    pos_yaml = tmp_path / "pos.yaml"
+    pos_yaml.write_text(
+        profile_text.replace("examples/deliberate_crash_report/app.bin", "app.bin"),
+        encoding="utf-8",
+    )
+    no_opt_yaml = tmp_path / "no_opt.yaml"
+    no_opt_yaml.write_text(
+        pos_yaml.read_text(encoding="utf-8").replace(
+            "allow_fault_after_success: true", "allow_fault_after_success: false"
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_profile(FIXTURE / "profile.yaml", strict=True).success_criteria.allow_fault_after_success is True
+    assert load_profile(FIXTURE / "profile_no_opt_in.yaml", strict=True).success_criteria.allow_fault_after_success is False
+
+    pos = load_profile(pos_yaml, strict=True)
     assert pos.success_criteria.allow_fault_after_success is True
     assert "SUCCESS_ALLOW_FAULT_AFTER_SUCCESS:true" in pos.robot_vars(ROOT)
     assert (
@@ -1195,7 +1215,7 @@ def test_allow_fault_after_success_profile_schema_and_transport(tmp_path: Path) 
         is True
     )
 
-    no_opt = load_profile(FIXTURE / "profile_no_opt_in.yaml", strict=True)
+    no_opt = load_profile(no_opt_yaml, strict=True)
     assert no_opt.success_criteria.allow_fault_after_success is False
     assert "SUCCESS_ALLOW_FAULT_AFTER_SUCCESS:true" not in no_opt.robot_vars(ROOT)
     assert (
@@ -1203,6 +1223,175 @@ def test_allow_fault_after_success_profile_schema_and_transport(tmp_path: Path) 
             ROOT, no_opt.success_criteria, no_opt.images
         )["allow_fault_after_success"]
         is False
+    )
+
+
+def test_followup_memory_checks_compose_with_cycle_signal_contract() -> None:
+    """Verify follow-up memory_checks enforcement composes with cycle-signal reporting."""
+    from audit_report import compute_verdict, summarize_runtime_sweep
+    from boot_cycle_analysis import analyze_boot_cycles
+    from fault_classification import (
+        _effective_boot_result,
+        _effective_boot_signals,
+        classify_issue_category,
+        result_is_brick,
+        result_issue_reasons,
+        result_recovered_after_failure,
+    )
+    from profile_loader import ExpectConfig
+
+    annotate_ns = _load_runtime_functions("annotate_boot_span_result")
+    annotate = annotate_ns["annotate_boot_span_result"]
+
+    def _run_followup_eval(mem_values: dict[int, int], *, early_fault: bool = False) -> dict:
+        def step(state, _machine, cpu, _mem, fire_fault):
+            hook = state["hooks"].get(0x10100020)
+            if hook is not None:
+                hook(cpu, 0x10100020)
+            state["pc"] = 0x10100050
+            state["instructions"] = 100
+            state["virtual_time"].seconds = 0.001
+            if early_fault:
+                fire_fault(3)
+                state["pc"] = 0x10100090
+            state["virtual_time"].seconds = 0.020
+
+        ns, state, _machine, cpu = _build_harness(
+            step_fn=step,
+            memory_specs=CHECKS,
+            mem_values=mem_values,
+            allow_fault_after_success=True,
+        )
+        status = ns["run_until_done"](
+            cpu,
+            time_slice="0.02",
+            max_iters=5,
+            enforce_content_criteria=True,
+            followup_cycle=True,
+        )
+        outcome, slot, signals = ns["evaluate_boot_outcome"](
+            state["vtor"],
+            state["pc"],
+            fault_injected=True,
+            enforce_content_criteria=True,
+            p2_status=status,
+            followup_cycle=True,
+        )
+        return {"boot_outcome": outcome, "boot_slot": slot, "signals": signals}
+
+    # Case A: cycle 0 hard_fault (memory_checks_ok=False) -> cycle 1 passes
+    # memory_checks on follow-up -> recovered_after_failure, effective signals
+    # read cycle 1 (memory_checks_ok=True), non-brick, verdict sums cleanly.
+    c0_fail = {
+        "cycle": 0,
+        "boot_outcome": "hard_fault",
+        "boot_slot": None,
+        "signals": {"expectations_met": False, "memory_checks_ok": False},
+    }
+    c1_pass = _run_followup_eval({0x20000200: 1, 0x20000204: 5})
+    assert c1_pass["boot_outcome"] == "success"
+    assert c1_pass["signals"]["memory_checks_ok"] is True
+    cycles_a = [c0_fail, {"cycle": 1, **c1_pass}]
+    res_a = annotate({
+        "fault_at": 2,
+        "fault_type": "w",
+        "is_control": False,
+        "fault_injected": True,
+        "boot_outcome": c0_fail["boot_outcome"],
+        "boot_slot": c0_fail["boot_slot"],
+        "signals": dict(c0_fail["signals"]),
+        "boot_cycles": cycles_a,
+        "multi_boot_analysis": analyze_boot_cycles(cycles_a, requested_cycles=2),
+    })
+    assert res_a["multi_boot_analysis"]["status"] == "recovered_after_failure"
+    assert _effective_boot_result(res_a) == ("success", "exec")
+    assert _effective_boot_signals(res_a)["memory_checks_ok"] is True
+    assert result_is_brick(res_a) is False
+    assert result_recovered_after_failure(res_a, "success") is True
+    assert result_issue_reasons(res_a, "success") == ["recovered_after_failure"]
+    assert classify_issue_category(res_a, "success") == "recovered_after_failure"
+
+    # Case B: cycle 0 hard_fault -> cycle 1 lands in exec without faulting, but
+    # follow-up memory_checks fail -> memory_checks_unmet (not success), status
+    # is changed_unconfirmed (not promoted), stays brick / boot_mismatch.
+    c1_unmet = _run_followup_eval({0x20000200: 0, 0x20000204: 0})
+    assert c1_unmet["boot_outcome"] == "memory_checks_unmet"
+    assert c1_unmet["signals"]["memory_checks_ok"] is False
+    cycles_b = [c0_fail, {"cycle": 1, **c1_unmet}]
+    res_b = annotate({
+        "fault_at": 3,
+        "fault_type": "w",
+        "is_control": False,
+        "fault_injected": True,
+        "boot_outcome": c0_fail["boot_outcome"],
+        "boot_slot": c0_fail["boot_slot"],
+        "signals": dict(c0_fail["signals"]),
+        "boot_cycles": cycles_b,
+        "multi_boot_analysis": analyze_boot_cycles(cycles_b, requested_cycles=2),
+    })
+    assert res_b["multi_boot_analysis"]["status"] == "changed_unconfirmed"
+    assert _effective_boot_result(res_b) == ("hard_fault", None)
+    assert _effective_boot_signals(res_b)["memory_checks_ok"] is False
+    assert result_is_brick(res_b) is True
+    assert result_recovered_after_failure(res_b, "success") is False
+    assert classify_issue_category(res_b, "success") == "boot_mismatch"
+
+    # Case C: cycle 0 clean success -> cycles 1 & 2 fault before checks hold
+    # (even with allow_fault_after_success=True) -> converges on hard_fault,
+    # effective signals read final cycle's memory_checks_ok=False, brick.
+    c0_ok = {
+        "cycle": 0,
+        "boot_outcome": "success",
+        "boot_slot": "exec",
+        "signals": {"expectations_met": True, "memory_checks_ok": True},
+    }
+    c1_fault = _run_followup_eval({0x20000200: 0, 0x20000204: 0}, early_fault=True)
+    c2_fault = _run_followup_eval({0x20000200: 0, 0x20000204: 0}, early_fault=True)
+    assert c1_fault["boot_outcome"] == "hard_fault"
+    assert c1_fault["signals"]["memory_checks_ok"] is False
+    cycles_c = [c0_ok, {"cycle": 1, **c1_fault}, {"cycle": 2, **c2_fault}]
+    res_c = annotate({
+        "fault_at": 4,
+        "fault_type": "w",
+        "is_control": False,
+        "fault_injected": True,
+        "boot_outcome": c0_ok["boot_outcome"],
+        "boot_slot": c0_ok["boot_slot"],
+        "signals": dict(c0_ok["signals"]),
+        "boot_cycles": cycles_c,
+        "multi_boot_analysis": analyze_boot_cycles(cycles_c, requested_cycles=3),
+    })
+    assert res_c["multi_boot_analysis"]["status"] == "converged"
+    assert _effective_boot_result(res_c) == ("hard_fault", "exec")
+    assert _effective_boot_signals(res_c)["memory_checks_ok"] is False
+    assert result_is_brick(res_c) is True
+    assert classify_issue_category(res_c, "success") == "boot_mismatch"
+
+    # Summarize all three points together with a clean control and confirm the
+    # verdict breakdown sums exactly (2 boot mismatches + 1 recovered = 3).
+    ctrl = {
+        "fault_at": 0,
+        "fault_type": "w",
+        "is_control": True,
+        "fault_injected": False,
+        "boot_outcome": "success",
+        "boot_slot": "exec",
+        "signals": {"expectations_met": True, "memory_checks_ok": True},
+    }
+    summary = summarize_runtime_sweep([ctrl, res_a, res_b, res_c])
+    assert summary["issue_points"] == 3
+    assert summary["bricks"] == 2
+    assert summary["recovered_after_failure_points"] == 1
+    assert summary["issue_breakdown"]["boot_mismatch"] == 2
+    assert summary["issue_breakdown"]["recovered_after_failure"] == 1
+    assert sum(summary["issue_breakdown"].values()) == summary["issue_points"]
+    verdict = compute_verdict(
+        sweep_summary=summary,
+        profile_expect=ExpectConfig(should_find_issues=False),
+    )
+    assert (
+        verdict
+        == "FAIL — found 3 issue points (2 boot mismatches, 1 recovered after failure, 0 semantic, 0 invariant)"
     )
 
 
