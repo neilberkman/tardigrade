@@ -506,8 +506,18 @@ class TfmBl2ProbeSlotCompatibilityTest(unittest.TestCase):
         self.assertIn("TrackingStartAddress", runtime)
         self.assertIn("_apply_tracking_start_address", runtime)
         self.assertIn("requires backend", runtime)
-        self.assertIn("def _configure_python_tracking_gate(force=False)", runtime)
-        self.assertIn("_configure_python_tracking_gate(force=True)", runtime)
+        self.assertIn(
+            "def _configure_python_tracking_gate(force=False, enable_tracking_gate=True)",
+            runtime,
+        )
+        self.assertIn(
+            "_configure_python_tracking_gate(force=True, enable_tracking_gate=apply_tracking_gate)",
+            runtime,
+        )
+        self.assertIn(
+            "_configure_python_tracking_gate(force=True, enable_tracking_gate=False)",
+            runtime,
+        )
         self.assertIn("cpu_ref.AddHook(address, _python_tracking_gate_hook)", runtime)
         self.assertIn("_runtime_slot_geometry", runtime)
         self.assertIn("slot_geometry", runtime)

@@ -1101,6 +1101,8 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
                     data.Reset()
                     ctrl.Reset()
 
+        tracking_gate_calls = []
+        python_gate_calls = []
         namespace = {
             "backend": {
                 "kind": "mram",
@@ -1110,10 +1112,17 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
             },
             "monitor": Monitor(),
             "refresh_runtime_handles": lambda: None,
-            "_configure_tracking_start_address": lambda: setattr(
-                data, "TrackingStartAddress", 0x200003C0
+            "_configure_tracking_start_address": lambda enable_tracking_gate=True: (
+                tracking_gate_calls.append(enable_tracking_gate),
+                setattr(
+                    data,
+                    "TrackingStartAddress",
+                    0x200003C0 if enable_tracking_gate else 0,
+                ),
             ),
-            "_configure_python_tracking_gate": lambda force=False: None,
+            "_configure_python_tracking_gate": lambda force=False, enable_tracking_gate=True: python_gate_calls.append(
+                (force, enable_tracking_gate)
+            ),
             "_prepare_calibration_stop": lambda: None,
             "reset_sticky_handoff_state": lambda: None,
         }
@@ -1127,8 +1136,15 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
         self.assertEqual(ctrl.CommandExecutions, 0)
         self.assertFalse(data.shadow_preserved)
         self.assertEqual(data.TrackingStartAddress, 0x200003C0)
+        self.assertEqual(tracking_gate_calls, [True])
+        self.assertEqual(python_gate_calls, [(True, True)])
         self.assertTrue(data.PreserveCountersAcrossReset)
         self.assertTrue(ctrl.PreserveCountersAcrossReset)
+
+        namespace["_machine_reset"](apply_tracking_gate=False)
+        self.assertEqual(data.TrackingStartAddress, 0)
+        self.assertEqual(tracking_gate_calls, [True, False])
+        self.assertEqual(python_gate_calls, [(True, True), (True, False)])
 
     def test_reset_nvmc_for_sweep_and_recovery_clear_counters_and_enable_in_run_preservation(
         self,
@@ -1155,6 +1171,8 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
                 self.shadow_invalidations += 1
 
         data = Data()
+        tracking_gate_calls = []
+        python_gate_calls = []
         namespace = {
             "backend": {
                 "kind": "mram",
@@ -1163,7 +1181,12 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
                 "backend_sysbus_name": "sysbus.mram_tracker",
             },
             "_DISARM_SENTINEL": 0x7FFFFFFF,
-            "_configure_tracking_start_address": lambda: None,
+            "_configure_tracking_start_address": lambda enable_tracking_gate=True: tracking_gate_calls.append(
+                enable_tracking_gate
+            ),
+            "_configure_python_tracking_gate": lambda force=False, enable_tracking_gate=True: python_gate_calls.append(
+                (force, enable_tracking_gate)
+            ),
             "disarm_controller_fault": lambda: None,
             "disarm_i2c_fault": lambda: None,
         }
@@ -1179,6 +1202,8 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
         self.assertEqual(data.shadow_invalidations, 1)
         self.assertTrue(data.PreserveCountersAcrossReset)
         self.assertFalse(data.FaultEverFired)
+        self.assertEqual(tracking_gate_calls, [True])
+        self.assertEqual(python_gate_calls, [(True, True)])
 
         data.TotalWordWrites = 512
         data.PreserveCountersAcrossReset = False
@@ -1191,6 +1216,8 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
         self.assertTrue(data.PreserveCountersAcrossReset)
         self.assertFalse(data.FaultEverFired)
         self.assertEqual(data.FaultAtWordWrite, 0x7FFFFFFF)
+        self.assertEqual(tracking_gate_calls, [True, False])
+        self.assertEqual(python_gate_calls, [(True, True), (True, False)])
 
     def test_in_run_firmware_reset_preserves_monotonic_writes_and_reaches_post_reset_fault_index(
         self,

@@ -87,7 +87,7 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
 
     def test_runtime_runner_routes_resets_through_refreshing_helper(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
-        self.assertIn("def _machine_reset():", text)
+        self.assertIn("def _machine_reset(apply_tracking_gate=True):", text)
         self.assertIn("refresh_runtime_handles()", text)
         self.assertEqual(
             text.count("monitor.Parse('machine Reset')"),

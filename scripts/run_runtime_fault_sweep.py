@@ -811,14 +811,16 @@ def _apply_tracking_start_address(data, backend_name, address):
         return
     data.TrackingStartAddress = address
 
-def _configure_tracking_start_address():
-    """Apply the optional precise tracking boundary to the active backend."""
+def _configure_tracking_start_address(enable_tracking_gate=True):
+    """Apply or bypass the optional precise tracking boundary on the active backend."""
     _apply_mram_torn_word_mode()
+    effective_address = tracking_start_address_config if enable_tracking_gate else 0
     _apply_tracking_start_address(
-        backend['data'], backend['backend_sysbus_name'], tracking_start_address_config
+        backend['data'], backend['backend_sysbus_name'], effective_address
     )
-    log('tracking_gate: requested=0x{:08X} actual=0x{:08X} started={} start_hook={} memory_hook={}'.format(
+    log('tracking_gate: requested=0x{:08X} effective=0x{:08X} actual=0x{:08X} started={} start_hook={} memory_hook={}'.format(
         tracking_start_address_config,
+        effective_address,
         int(getattr(backend['data'], 'TrackingStartAddress', 0)),
         getattr(backend['data'], 'TrackingStarted', 'unknown'),
         getattr(backend['data'], 'StartHookInstalled', 'unknown'),
@@ -862,8 +864,8 @@ def _python_tracking_gate_hook(cpu, addr):
         pass
     log('tracking_gate: python activation at 0x{:08X}'.format(current))
 
-def _configure_python_tracking_gate(force=False):
-    address = tracking_start_address_config & 0xFFFFFFFF
+def _configure_python_tracking_gate(force=False, enable_tracking_gate=True):
+    address = (tracking_start_address_config & 0xFFFFFFFF) if enable_tracking_gate else 0
     gate = _python_tracking_gate
     if (not force and gate['installed'] and gate['address'] == address and
             gate['cpu'] is monitor.Machine['sysbus.cpu']):
@@ -930,13 +932,13 @@ def refresh_runtime_handles():
     log('console_peripherals_refresh: {}'.format(','.join(console_peripheral_names) if console_peripheral_names else 'none'))
 
 
-def _machine_reset():
+def _machine_reset(apply_tracking_gate=True):
     _set_preserve_counters_across_reset(False)
     monitor.Parse('machine Reset')
     refresh_runtime_handles()
-    _configure_tracking_start_address()
+    _configure_tracking_start_address(enable_tracking_gate=apply_tracking_gate)
     _set_preserve_counters_across_reset(True)
-    _configure_python_tracking_gate(force=True)
+    _configure_python_tracking_gate(force=True, enable_tracking_gate=apply_tracking_gate)
     if '_prepare_calibration_stop' in globals():
         _prepare_calibration_stop()
     reset_sticky_handoff_state()
@@ -6531,9 +6533,10 @@ def restore_hw_init():
     bus.WriteDoubleWord(0x40000100, 0x1)
     bus.WriteDoubleWord(0x40000418, 0x10001)
 
-def reset_nvmc_for_sweep():
+def reset_nvmc_for_sweep(enable_tracking_gate=True):
     # Reset NVM counters and prepare for fault-injected run.
-    _configure_tracking_start_address()
+    _configure_tracking_start_address(enable_tracking_gate=enable_tracking_gate)
+    _configure_python_tracking_gate(force=True, enable_tracking_gate=enable_tracking_gate)
     _clear_uncorr_fn = globals().get('_clear_mram_uncorrectable_words')
     if _clear_uncorr_fn is not None:
         _clear_uncorr_fn()
@@ -6586,8 +6589,11 @@ def reset_nvmc_for_sweep():
     disarm_i2c_fault()
 
 def reset_nvmc_for_recovery():
-    # Reset NVM for recovery boot: no write counting needed, fast mode.
-    _configure_tracking_start_address()
+    # Reset NVM for recovery boot: count recovery writes regardless of any
+    # Phase 1 tracking_start_address gate so recovery_writes and Phase 2
+    # write-progress observation remain active.
+    _configure_tracking_start_address(enable_tracking_gate=False)
+    _configure_python_tracking_gate(force=True, enable_tracking_gate=False)
     _clear_read_log_fn = globals().get('_clear_mram_uncorrectable_read_log')
     if _clear_read_log_fn is not None:
         _clear_read_log_fn()
@@ -6724,16 +6730,16 @@ def restore_phase1_baseline():
 
 def prepare_recovery_shell_state():
     if reset_mode == 'cold':
-        prepare_cold_reset()
+        prepare_cold_reset(apply_tracking_gate=False)
     else:
-        _machine_reset()
+        _machine_reset(apply_tracking_gate=False)
     monitor.Parse('machine Pause')
     _clear_volatile_memory()
     _verify_recovery_marker_cleared()
     _bus_load_elf(bootloader_elf)
     restore_hw_init()
 
-def prepare_cold_reset():
+def prepare_cold_reset(apply_tracking_gate=True):
     # Cold reset: save NVM, destroy and recreate machine, restore NVM.
     # This exercises the full hardware init path, catching issues that
     # warm reset (which preserves peripheral state) would miss.
@@ -6749,7 +6755,7 @@ def prepare_cold_reset():
     # teardown/recreate (which would invalidate all peripheral references).
     # The NVM save/restore ensures we at least clear any cached peripheral
     # state that survives a normal reset.
-    _machine_reset()
+    _machine_reset(apply_tracking_gate=apply_tracking_gate)
     # Restore the NVM contents that were saved before reset.
     if b['kind'] == 'mram':
         b['data'].WriteBytes(0, nvm_snapshot, 0, len(nvm_snapshot))
@@ -11032,7 +11038,7 @@ def run_timed_reset_fault(fault_at):
     else:
         saved_flash = None
         fault_snapshot_bytes = None
-        _machine_reset()
+        _machine_reset(apply_tracking_gate=False)
         monitor.Parse('machine Pause')
         _bus_load_elf(bootloader_elf)
         restore_hw_init()
@@ -12287,7 +12293,7 @@ def run_execute_fault(fault_at, fault_type='w'):
         # but NVMemory preserves faulted metadata), then run Phase 2.
         phase2_t0 = _time.time()
         _capture_recovery_marker_precondition()
-        _machine_reset()
+        _machine_reset(apply_tracking_gate=False)
         monitor.Parse('machine Pause')
         _clear_volatile_memory()
         _verify_recovery_marker_cleared()
@@ -12522,7 +12528,7 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
     restore_flash_and_boot(saved_flash)
 
     # Reset counters and arm erase fault for recovery boot.
-    reset_nvmc_for_sweep()
+    reset_nvmc_for_sweep(enable_tracking_gate=False)
     disarm_write_fault()
     arm_erase_fault(erase_fault_at + 1)  # 0-indexed → 1-indexed
 
@@ -12750,7 +12756,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     if _hash_bypass_active:
         apply_hash_bypass()
 
-    reset_nvmc_for_sweep()
+    reset_nvmc_for_sweep(enable_tracking_gate=False)
 
     if is_p2_timed:
         # Timed reset during recovery: run for a fractional duration of
@@ -12952,7 +12958,7 @@ def run_multi_fault_sequence(fault_sequence):
             restore_flash_and_boot(stage_input_flash)
             if _hash_bypass_active:
                 apply_hash_bypass()
-        reset_nvmc_for_sweep()
+        reset_nvmc_for_sweep(enable_tracking_gate=(idx == 0))
 
         base_writes = get_total_writes()
         arm_at = base_writes + fault_at + 1
@@ -12994,7 +13000,7 @@ def run_multi_fault_sequence(fault_sequence):
             restore_flash_and_boot(stage_input_flash)
             if _hash_bypass_active:
                 apply_hash_bypass()
-            reset_nvmc_for_sweep()
+            reset_nvmc_for_sweep(enable_tracking_gate=False)
             base_writes = get_total_writes()
             arm_at = base_writes + fault_at + 1
             if arm_at > base_writes + max_writes_cap:
@@ -13998,6 +14004,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     )
     emulation_ms = int((_time.time() - t_emu) * 1000)
     disarm_vtor_watchpoint()
+    recovery_writes = get_total_writes()
 
     # Cycle-0 outcome is evaluated below from the sticky VTOR/PC captured
     # during the first boot.  Follow-up boot cycles are owned exclusively by
@@ -14045,6 +14052,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         boot_slot=boot_slot, eff_criteria=eff_criteria, p2_status=p2_status,
         followup_label='fp{}_native_followup'.format(fault_at),
         saved_flash=faulted_flash, fault_snapshot_bytes=fault_snapshot_bytes,
+        extra_fields={'recovery_writes': recovery_writes},
         metadata_delta_pre_snapshot=md_pre_snapshot,
         fault_semantic_state=fault_semantic_state,
     )
@@ -14293,6 +14301,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     )
     emulation_ms = int((_time.time() - t_emu) * 1000)
     disarm_vtor_watchpoint()
+    recovery_writes = get_total_writes()
 
     # Cycle-0 outcome is evaluated below from the sticky VTOR/PC captured
     # during the first boot.  Follow-up boot cycles are owned exclusively by
@@ -14355,6 +14364,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         boot_slot=boot_slot, eff_criteria=eff_criteria, p2_status=p2_status,
         followup_label='fp{}_python_followup'.format(fault_at),
         saved_flash=faulted_flash, fault_snapshot_bytes=fault_snapshot_bytes,
+        extra_fields={'recovery_writes': recovery_writes},
         metadata_delta_pre_snapshot=md_pre_snapshot,
         fault_semantic_state=fault_semantic_state,
         fault_uncorrectable_words=fault_uncorrectable_addresses,
