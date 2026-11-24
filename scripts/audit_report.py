@@ -244,6 +244,8 @@ def categorize_failure(
     )
     if op_kind is not None:
         payload["operation_kind"] = op_kind
+    if result.get("mram_torn_word") is not None:
+        payload["mram_torn_word"] = result["mram_torn_word"]
     issue_reasons = result_issue_reasons(
         result,
         getattr(profile.expect, "control_outcome", "success") if profile else "success",
@@ -904,6 +906,8 @@ def summarize_runtime_sweep(
             "fault_address": result.get("fault_address"),
             "boot_outcome": effective_outcome,
         }
+        if result.get("mram_torn_word") is not None:
+            item["mram_torn_word"] = result["mram_torn_word"]
         if isinstance(evidence, dict):
             item["exact"] = evidence.get("exact") is True
             item["program_width"] = evidence.get("program_width")

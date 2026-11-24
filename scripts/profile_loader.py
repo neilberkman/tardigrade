@@ -164,6 +164,56 @@ def _is_mram_backend(
     return False
 
 
+def _parse_mram_torn_word(value: Any) -> Tuple[str, Tuple[Tuple[str, int], ...]]:
+    """Return (first mode, per-cut choices) for ``fault_sweep.mram_torn_word``.
+
+    A string names one mode for every cut and returns no choices.  A list draws
+    each cut's mode from its entries; an entry is a mode name (weight 1) or a
+    one-key mapping ``{mode: weight}``.
+    """
+    if isinstance(value, str):
+        if value not in VALID_MRAM_TORN_WORD_MODES:
+            raise ProfileError(
+                "Invalid fault_sweep.mram_torn_word '{}'. Valid: {}".format(
+                    value, sorted(VALID_MRAM_TORN_WORD_MODES)
+                )
+            )
+        return value, ()
+    if not isinstance(value, list) or not value:
+        raise ProfileError(
+            "fault_sweep.mram_torn_word must be a mode name or a non-empty list "
+            "of modes, got {!r}".format(value)
+        )
+    choices: List[Tuple[str, int]] = []
+    for entry in value:
+        if isinstance(entry, str):
+            mode, weight = entry, 1
+        elif isinstance(entry, dict) and len(entry) == 1:
+            mode, weight = next(iter(entry.items()))
+        else:
+            raise ProfileError(
+                "fault_sweep.mram_torn_word list entries must be a mode name or "
+                "a one-key mapping {{mode: weight}}, got {!r}".format(entry)
+            )
+        if not isinstance(mode, str) or mode not in VALID_MRAM_TORN_WORD_MODES:
+            raise ProfileError(
+                "Invalid fault_sweep.mram_torn_word '{}'. Valid: {}".format(
+                    mode, sorted(VALID_MRAM_TORN_WORD_MODES)
+                )
+            )
+        if any(mode == seen for seen, _ in choices):
+            raise ProfileError(
+                "fault_sweep.mram_torn_word lists '{}' more than once".format(mode)
+            )
+        if isinstance(weight, bool) or not isinstance(weight, int) or weight <= 0:
+            raise ProfileError(
+                "fault_sweep.mram_torn_word weight for '{}' must be a positive "
+                "integer, got {!r}".format(mode, weight)
+            )
+        choices.append((mode, weight))
+    return choices[0][0], tuple(choices)
+
+
 def _validate_mram_torn_word_backend(
     fs: Optional["FaultSweepConfig"],
     platform: Optional[str],
@@ -174,6 +224,9 @@ def _validate_mram_torn_word_backend(
     if fs is None:
         return
     torn_word_mode = getattr(fs, "mram_torn_word", "half")
+    torn_word_modes = {torn_word_mode} | {
+        mode for mode, _ in getattr(fs, "mram_torn_word_choices", ())
+    }
     torn_word_seed = int(getattr(fs, "mram_torn_word_seed", 0) or 0)
     if (
         not getattr(fs, "mram_torn_word_explicit", False)
@@ -194,7 +247,7 @@ def _validate_mram_torn_word_backend(
                 flash_backend or "", platform or ""
             )
         )
-    if torn_word_mode == "uncorrectable":
+    if "uncorrectable" in torn_word_modes:
         backend_lower = str(flash_backend or "").strip().lower()
         platform_name_lower = Path(str(platform or "")).name.lower()
         supports_uncorrectable = is_mram or (
@@ -1621,6 +1674,7 @@ class FaultSweepConfig:
         "mram_torn_word",
         "mram_torn_word_explicit",
         "mram_torn_word_seed",
+        "mram_torn_word_choices",
         "include_erase_fault_points",
     )
 
@@ -1673,7 +1727,7 @@ class FaultSweepConfig:
         rc_injection_config: Optional["RcInjectionConfig"] = None,
         phase1_wall_timeout_s: Optional[float] = None,
         phase2_wall_timeout_s: Optional[float] = 30.0,
-        mram_torn_word: str = "half",
+        mram_torn_word: Any = "half",
         mram_torn_word_explicit: bool = False,
         mram_torn_word_seed: int = 0,
         include_erase_fault_points: bool = False,
@@ -1840,19 +1894,13 @@ class FaultSweepConfig:
         self.durability_model = durability_model
         self.writeback = writeback
         self.rc_injection_config = rc_injection_config or RcInjectionConfig()
-        if (
-            not isinstance(mram_torn_word, str)
-            or isinstance(mram_torn_word, bool)
-            or mram_torn_word not in VALID_MRAM_TORN_WORD_MODES
-        ):
-            raise ProfileError(
-                "Invalid fault_sweep.mram_torn_word '{}'. Valid: {}".format(
-                    mram_torn_word, sorted(VALID_MRAM_TORN_WORD_MODES)
-                )
-            )
-        self.mram_torn_word = mram_torn_word
-        self.mram_torn_word_explicit = bool(mram_torn_word_explicit) or (
-            mram_torn_word != "half"
+        self.mram_torn_word, self.mram_torn_word_choices = _parse_mram_torn_word(
+            mram_torn_word
+        )
+        self.mram_torn_word_explicit = (
+            bool(mram_torn_word_explicit)
+            or self.mram_torn_word != "half"
+            or bool(self.mram_torn_word_choices)
         )
         if isinstance(mram_torn_word_seed, bool):
             raise ProfileError("fault_sweep.mram_torn_word_seed must be an integer")
@@ -3183,6 +3231,15 @@ class ProfileConfig:
             ),
             "RUNTIME_MODE:true",
         ]
+        if fs.mram_torn_word_choices:
+            vars_list.append(
+                "MRAM_TORN_WORD_CHOICES:{}".format(
+                    ",".join(
+                        "{}:{}".format(mode, weight)
+                        for mode, weight in fs.mram_torn_word_choices
+                    )
+                )
+            )
         if mem.erase_fill is not None:
             vars_list.append("MEMORY_ERASE_FILL:0x{:02X}".format(mem.erase_fill))
         if mem.volatile_regions:

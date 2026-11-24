@@ -8,6 +8,15 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Added
 
+- Per-cut torn-word outcomes: `fault_sweep.mram_torn_word` also accepts a list
+  of modes with optional integer weights (`- half_retain: 3`, `- untouched`).
+  Each fault point draws its mode from a SplitMix64 hash of
+  `mram_torn_word_seed` and its fault index, so runs are reproducible and a
+  single point replays with the same outcome. The drawn mode is recorded as
+  `mram_torn_word` on each point result, categorized failure, and
+  `fault_evidence` entry. The string form is unchanged. Works on every backend
+  that honors `mram_torn_word` (MRAM and NVMemory program cuts, plus erase cuts
+  on the flash controllers). New Robot variable `MRAM_TORN_WORD_CHOICES`.
 - Opt-in erase fault points via `fault_sweep.include_erase_fault_points`
   (defaults to `false` so existing profiles' fault indices and outcomes remain
   identical). When enabled, calibration tracks erases and the fault planner

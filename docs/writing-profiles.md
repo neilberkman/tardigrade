@@ -1139,6 +1139,32 @@ fault_sweep:
 
 `profile_loader.py` rejects unknown `mram_torn_word` values, rejects `mram_torn_word` (and `mram_torn_word_seed`) on non-MRAM backends unless `include_erase_fault_points: true` is configured, rejects `uncorrectable` on backends without uncorrectable read-fault support, and rejects `uncorrectable` when `evaluation_mode: state` or `durability_model: writeback` is configured (neither can model live CPU read faults on an interrupted word). At runtime, `run_runtime_fault_sweep.py` sets `MramTornWordMode` (and `MramTornWordSeed`) on the backend peripheral when exposed and refuses `uncorrectable` or non-default live modes when the peripheral lacks support.
 
+#### Per-cut torn-word outcomes
+
+A single mode applies the same outcome to every cut. On real parts the state a cut leaves varies from cut to cut, so a profile can instead list modes and have each fault point draw one:
+
+```yaml
+fault_sweep:
+  mram_torn_word: # each cut draws one; a bare name has weight 1
+    - half_retain: 3
+    - untouched
+    - corrupted: 2
+  mram_torn_word_seed: 7 # seeds the draw (and corrupted-mode bit flips)
+```
+
+- The draw for a point depends only on `mram_torn_word_seed` and the point's fault index (a SplitMix64 hash of the pair, reduced over the summed weights). The same profile and seed give the same outcome per point on every run, independent of point order, heuristic pruning, or sharding, and a single point replayed with the same seed and fault index gets the same outcome.
+- Weights are positive integers; a mode's share of points tends to its weight over the total. Each mode may appear once. A one-entry list draws every point from that mode but still records it.
+- The string form (`mram_torn_word: untouched`) keeps its existing meaning: one mode for every cut, no per-point draw, and no new result fields.
+- Every listed mode is validated as if it were set alone: `uncorrectable` anywhere in the list is rejected under `evaluation_mode: state`, `durability_model: writeback`, or a backend without uncorrectable read-fault support.
+- The drawn mode is recorded on every non-control fault point result as `mram_torn_word`, and carried into each categorized failure (`failures[]`) and `fault_evidence[]` entry of the sweep summary, so an issue point names the outcome that produced it. Points whose fault type does not use torn words (for example `bit_corruption`) still record the mode the backend held for that point.
+- The draw is per fault point. Compound points that cut power more than once (`phase2_fault`, `multi_fault`, cascading write/erase) use the point's one drawn mode for all their cuts.
+- The profile loader passes the list to the sweep as the Robot variable `MRAM_TORN_WORD_CHOICES` (`mode:weight,...`), alongside `MRAM_TORN_WORD` (set to the first listed mode) and `MRAM_TORN_WORD_SEED`. Leaving `MRAM_TORN_WORD_CHOICES` empty runs single-mode.
+
+Backends that take a per-cut mode are the ones that honor `mram_torn_word` today, since the sweep sets `MramTornWordMode` on the backend before each point:
+
+- Program (write) cuts: `MappedMRAMTracker`, `NVMemory` (directly or through `NVMemoryController` / `GenericNvmController`), and MRAM Python trace replay.
+- Erase cuts (`include_erase_fault_points: true` or `interrupted_erase`): the MRAM and NVMemory backends above, plus `An521NvmInterceptor`, `NRF52NVMC`, `STM32F4FlashController`, `STM32F4FastFlash`, `STM32H7FlashController`, and `STM32H7FastFlash`. `CFIFlash` has no torn-word modes.
+
 ### Erase fault points
 
 ```yaml

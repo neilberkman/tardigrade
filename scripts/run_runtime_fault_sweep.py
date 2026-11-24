@@ -540,6 +540,75 @@ if mram_torn_word not in (
         )
     )
 mram_torn_word_seed = get_optional_int_var('mram_torn_word_seed', 0) & 0xFFFFFFFF
+
+
+def _parse_mram_torn_word_choices(text):
+    """Parse ``mode:weight,mode:weight`` into a list of (mode, weight) pairs.
+
+    An empty string means a single-mode run and returns an empty list.
+    """
+    valid = (
+        'half',
+        'half_retain',
+        'untouched',
+        'erased',
+        'programmed',
+        'uncorrectable',
+        'corrupted',
+    )
+    choices = []
+    seen = set()
+    for item in str(text or '').split(','):
+        item = item.strip().lower()
+        if not item:
+            continue
+        mode, _, weight_text = item.partition(':')
+        mode = mode.strip()
+        weight_text = weight_text.strip() or '1'
+        if mode not in valid:
+            raise Exception(
+                'mram_torn_word_choices: unknown mode {!r}; valid: {}'.format(
+                    mode, ', '.join(valid)
+                )
+            )
+        if mode in seen:
+            raise Exception('mram_torn_word_choices: duplicate mode {!r}'.format(mode))
+        if not weight_text.isdigit() or int(weight_text) <= 0:
+            raise Exception(
+                'mram_torn_word_choices: weight for {!r} must be a positive integer, '
+                'got {!r}'.format(mode, weight_text)
+            )
+        seen.add(mode)
+        choices.append((mode, int(weight_text)))
+    return choices
+
+
+def _mram_torn_word_for_point(fault_at, choices, seed):
+    """Draw the torn-word mode for one fault point.
+
+    The draw depends only on (seed, fault_at), so any point can be replayed
+    alone with the same seed, and a run's outcomes do not depend on which
+    points it contains or their order.  SplitMix64 finalizer over the packed
+    pair; the same arithmetic in IronPython and CPython.
+    """
+    mask64 = 0xFFFFFFFFFFFFFFFF
+    x = (((int(seed) & 0xFFFFFFFF) << 32) | (int(fault_at) & 0xFFFFFFFF)) & mask64
+    x = (x + 0x9E3779B97F4A7C15) & mask64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & mask64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & mask64
+    x = x ^ (x >> 31)
+    total = sum(weight for _, weight in choices)
+    pick = x % total
+    for mode, weight in choices:
+        if pick < weight:
+            return mode
+        pick -= weight
+    return choices[-1][0]
+
+
+mram_torn_word_choices = _parse_mram_torn_word_choices(
+    get_optional_var('mram_torn_word_choices', '')
+)
 include_erase_fault_points = (
     get_optional_var('include_erase_fault_points', '').strip().lower()
     in ('1', 'true', 'yes', 'on')
@@ -565,6 +634,27 @@ def _apply_mram_torn_word_mode():
     if nvm is not None and hasattr(nvm, 'MramTornWordSeed'):
         nvm.MramTornWordSeed = seed_val
     return applied
+
+def _select_point_mram_torn_word(fault_at):
+    """Set the torn-word mode for one fault point when the run draws per cut.
+
+    Returns the drawn mode, or None for a single-mode run (the mode set at
+    startup stays in force).
+    """
+    global mram_torn_word
+    if not mram_torn_word_choices:
+        return None
+    mram_torn_word = _mram_torn_word_for_point(
+        fault_at, mram_torn_word_choices, mram_torn_word_seed
+    )
+    _apply_mram_torn_word_mode()
+    return mram_torn_word
+
+def _record_point_mram_torn_word(result, mode):
+    """Record a drawn torn-word mode on a fault point's result."""
+    if mode is not None and isinstance(result, dict) and not result.get('is_control'):
+        result['mram_torn_word'] = mode
+    return result
 
 def _require_mram_torn_word_support():
     """Refuse a live MRAM power-loss fault whose torn-word mode the peripheral ignores.
@@ -15757,6 +15847,7 @@ else:
             ft = fault_type_list[idx]
         if ft == 'f':
             ensure_read_fault_preflight()
+        point_torn_word = _select_point_mram_torn_word(fp)
         result = annotate_boot_span_result(
             annotate_update_sequence_result(
                 _finalize_recovery_marker_precondition_result(
@@ -15764,6 +15855,7 @@ else:
                 )
             )
         )
+        _record_point_mram_torn_word(result, point_torn_word)
         results.append(result)
 
         # Force .NET GC periodically to prevent memory exhaustion.
