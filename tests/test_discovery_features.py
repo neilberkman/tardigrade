@@ -2973,6 +2973,9 @@ class Phase2FaultTest(unittest.TestCase):
                       - power_loss
                       - interrupted_erase
                     max_points: 50
+                    pairs:
+                      - [3, 7]
+                      - [4, 0]
                 """,
             )
             profile = load_profile(profile_path)
@@ -2980,10 +2983,85 @@ class Phase2FaultTest(unittest.TestCase):
             self.assertTrue(p2f.enabled)
             self.assertEqual(p2f.max_points, 50)
             self.assertEqual(p2f.fault_types, ["power_loss", "interrupted_erase"])
+            self.assertEqual(p2f.pairs, [(3, 7), (4, 0)])
 
             robot_vars = profile.robot_vars(ROOT)
             self.assertIn("PHASE2_FAULT_ENABLED:true", robot_vars)
             self.assertIn("PHASE2_FAULT_MAX_POINTS:50", robot_vars)
+
+    def test_phase2_fault_invalid_pairs_rejected(self) -> None:
+        from profile_loader import ProfileError
+
+        invalid_pairs = ("3", "[3]", "[3, -1]", "[true, 1]", "[[3, 4, 5]]")
+        for pairs in invalid_pairs:
+            with self.subTest(pairs=pairs), tempfile.TemporaryDirectory() as td:
+                path = self._write_profile(
+                    Path(td),
+                    """
+                    schema_version: 1
+                    name: bad_phase2_pairs
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    flash_backend: faultFlash
+                    bootloader:
+                      elf: examples/vulnerable_ota/firmware.elf
+                      entry: 0x10000000
+                    memory:
+                      sram: {{ start: 0x20000000, end: 0x20020000 }}
+                      write_granularity: 4
+                      slots:
+                        exec: {{ base: 0x10000000, size: 0x1000 }}
+                        staging: {{ base: 0x10001000, size: 0x1000 }}
+                    images:
+                      staging: examples/vulnerable_ota/firmware.bin
+                    success_criteria:
+                      vtor_in_slot: exec
+                    fault_sweep:
+                      mode: runtime
+                      phase2_fault:
+                        enabled: true
+                        pairs: {}
+                    """.format(pairs),
+                )
+                with self.assertRaisesRegex(ProfileError, "phase2_fault.pairs"):
+                    load_profile(path)
+
+    def test_phase2_fault_pairs_require_enabled(self) -> None:
+        from profile_loader import ProfileError
+
+        with tempfile.TemporaryDirectory() as td:
+            path = self._write_profile(
+                Path(td),
+                """
+                schema_version: 1
+                name: disabled_phase2_pairs
+                platform: platforms/cortex_m4_flash_fast.repl
+                flash_backend: faultFlash
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  mode: runtime
+                  fault_types: [power_loss, bit_corruption]
+                  phase2_fault:
+                    enabled: false
+                    pairs: [[3, 0]]
+                """,
+            )
+            with self.assertRaisesRegex(
+                ProfileError,
+                r"fault_sweep\.phase2_fault\.pairs: requires phase2_fault\.enabled",
+            ):
+                load_profile(path)
 
     def test_phase2_fault_enabled_no_max_points(self) -> None:
         """phase2_fault enabled without max_points omits that var."""

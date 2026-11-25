@@ -799,7 +799,8 @@ def build_fault_plan(
     security_state_erase_summary: Optional[Dict[str, Any]] = None
     if has_mixed_types:
         write_fps: List[Tuple[int, str]] = []
-        if include_power_loss:
+        p2_config = profile.fault_sweep.phase2_fault
+        if include_power_loss and not (p2_config.enabled and p2_config.pairs):
             write_fps = [(fp, 'w') for fp in fault_points] if max_writes > 0 else []
         combined = _BoundedFaultPointList(write_fps)
         swap_progress_count = 0
@@ -1330,9 +1331,8 @@ def build_fault_plan(
                     confirm_count += 1
 
         # Phase 2 recovery fault injection.
-        p2_config = profile.fault_sweep.phase2_fault
         phase2_count = 0
-        if p2_config.enabled and (write_fps or include_reset_at_time):
+        if p2_config.enabled and (write_fps or include_reset_at_time or p2_config.pairs):
             p2_max = p2_config.max_points if p2_config.max_points > 0 else min(50, max(max_writes, 1))
             p2_type_codes = [
                 FAULT_TYPE_NAME_TO_CODE[ft] for ft in p2_config.fault_types
@@ -1341,7 +1341,15 @@ def build_fault_plan(
             p2_timed_codes = [c for c in p2_type_codes if c == "t"]
             p2_write_codes = [c for c in p2_type_codes if c != "t"]
 
-            if p2_write_codes and write_fps:
+            if p2_config.pairs:
+                for p1_fp, p2_fp in p2_config.pairs:
+                    for p2_code in p2_type_codes:
+                        enc = "p2:{}:{}:w:{}".format(
+                            p1_fp, p2_fp, p2_code
+                        )
+                        combined.append((p1_fp, enc))
+                        phase2_count += 1
+            elif p2_write_codes and write_fps:
                 if quick_use_heuristic:
                     p1_representatives = [fp for fp, _ in write_fps]
                 else:
@@ -1356,7 +1364,7 @@ def build_fault_plan(
                             combined.append((p1_fp, enc))
                             phase2_count += 1
 
-            if p2_timed_codes:
+            if p2_timed_codes and not p2_config.pairs:
                 timed_p1_fps = list(fault_points) if fault_points else [0]
                 if quick_use_heuristic:
                     timed_p1_reps = timed_p1_fps

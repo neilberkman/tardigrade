@@ -1637,6 +1637,27 @@ points (first/middle/last from the main write plan) and then sweeps recovery
 indices across `max_points`. This keeps the execute-mode search bounded while
 still exercising the second-stage recovery machinery.
 
+For a calibrated boundary that needs exact phase-1 and recovery operation
+indices, provide `pairs`. Each entry is `[first_write_index,
+recovery_operation_index]`. The recovery index counts writes for write fault
+types and erases for `interrupted_erase` or `multi_sector_atomicity`:
+
+```yaml
+fault_sweep:
+  phase2_fault:
+    enabled: true
+    fault_types: [interrupted_erase]
+    pairs:
+      - [100, 3]
+```
+
+`pairs` requires `phase2_fault.enabled: true`; a profile that supplies pairs
+while disabling phase-two fault injection is rejected at load time.
+
+Explicit pairs replace the representative grid and are unchanged by
+`--quick`, `max_points`, and the main sweep's range options. The configured
+recovery fault types still apply to every listed pair.
+
 ### Multi-fault sweeps
 
 Test compound failures (two sequential faults):

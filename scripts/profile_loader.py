@@ -717,17 +717,19 @@ class MultiFaultConfig:
 class Phase2FaultConfig:
     """Configuration for injecting faults during Phase 2 recovery writes."""
 
-    __slots__ = ("enabled", "fault_types", "max_points")
+    __slots__ = ("enabled", "fault_types", "max_points", "pairs")
 
     def __init__(
         self,
         enabled: bool = False,
         fault_types: Optional[List[str]] = None,
         max_points: int = 0,
+        pairs: Optional[List[Tuple[int, int]]] = None,
     ) -> None:
         self.enabled = enabled
         self.fault_types = ["power_loss"] if fault_types is None else list(fault_types)
         self.max_points = max(0, int(max_points))
+        self.pairs = list(pairs or [])
         if self.max_points > MAX_PROFILE_FAULT_POINTS:
             raise ProfileError(
                 "fault_sweep.phase2_fault.max_points exceeds safety limit {}".format(
@@ -4916,10 +4918,39 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
         raise ProfileError(
             "fault_sweep.phase2_fault.max_points: expected non-negative integer"
         )
+    pairs_raw = raw.get("pairs", [])
+    if not isinstance(pairs_raw, list):
+        raise ProfileError("fault_sweep.phase2_fault.pairs: expected list")
+    pairs: List[Tuple[int, int]] = []
+    for index, pair_raw in enumerate(pairs_raw):
+        field = "fault_sweep.phase2_fault.pairs[{}]".format(index)
+        if not isinstance(pair_raw, list) or len(pair_raw) != 2:
+            raise ProfileError(
+                "{}: expected [first_write_index, recovery_operation_index]".format(
+                    field
+                )
+            )
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in pair_raw):
+            raise ProfileError("{}: indices must be integers".format(field))
+        first_index, second_index = (int(value) for value in pair_raw)
+        if first_index < 0 or second_index < 0:
+            raise ProfileError("{}: indices must be non-negative".format(field))
+        pairs.append((first_index, second_index))
+    if len(pairs) > MAX_PROFILE_FAULT_POINTS:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.pairs exceeds safety limit {}".format(
+                MAX_PROFILE_FAULT_POINTS
+            )
+        )
+    if pairs and not enabled:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.pairs: requires phase2_fault.enabled"
+        )
     return Phase2FaultConfig(
         enabled=enabled,
         fault_types=fault_types,
         max_points=max_points,
+        pairs=pairs,
     )
 
 
@@ -8052,7 +8083,7 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
                 "fault_sweep.sweep_strategy is 'heuristic'"
             )
         nested_fault_schemas = {
-            "phase2_fault": {"enabled", "fault_types", "max_points"},
+            "phase2_fault": {"enabled", "fault_types", "max_points", "pairs"},
             "hook_fault": {"enabled", "fault_types", "max_points"},
             "confirm_cycle": {
                 "enabled", "confirm_function", "post_confirm_assertions",
@@ -9260,6 +9291,7 @@ def main() -> int:
         "phase2_fault_enabled": profile.fault_sweep.phase2_fault.enabled,
         "phase2_fault_max_points": profile.fault_sweep.phase2_fault.max_points,
         "phase2_fault_types": profile.fault_sweep.phase2_fault.fault_types,
+        "phase2_fault_pairs": profile.fault_sweep.phase2_fault.pairs,
         "sweep_hash_bypass_symbols": profile.fault_sweep.sweep_hash_bypass_symbols,
         "hook_fault_enabled": profile.fault_sweep.hook_fault.enabled,
         "hook_fault_max_points": profile.fault_sweep.hook_fault.max_points,

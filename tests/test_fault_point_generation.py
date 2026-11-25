@@ -244,6 +244,114 @@ class SwapProgressFaultPointGenerationTest(unittest.TestCase):
             self.assertEqual(plan.swap_progress_summary["source"], "erase_trace")
             self.assertEqual(plan.swap_progress_summary["inferred_sector_sizes"], ["0x1000"])
 
+
+class Phase2FaultPairGenerationTest(unittest.TestCase):
+    def test_disabled_pairs_do_not_remove_ordinary_power_loss_points(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_profile(td, textwrap.dedent("""\
+                fault_sweep:
+                  mode: runtime
+                  max_writes: auto
+                  fault_types: [power_loss, bit_corruption]
+            """))
+            profile = load_profile(path)
+            profile.fault_sweep.phase2_fault.pairs = [(3, 0)]
+
+            plan = build_fault_plan(
+                profile=profile,
+                calibration=CalibrationInputs(max_writes=6),
+                quick=False,
+            )
+
+            self.assertEqual(
+                sum(fault_type == "w" for fault_type in plan.fault_types_list or []),
+                6,
+            )
+            self.assertEqual(len(plan.fault_points), 12)
+
+    def test_legacy_phase2_grid_is_unchanged_without_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_profile(td, textwrap.dedent("""\
+                fault_sweep:
+                  mode: runtime
+                  max_writes: auto
+                  fault_types: [power_loss]
+                  phase2_fault:
+                    enabled: true
+                    fault_types: [power_loss]
+                    max_points: 12
+            """))
+            profile = load_profile(path)
+
+            full = build_fault_plan(
+                profile=profile,
+                calibration=CalibrationInputs(max_writes=12),
+                quick=False,
+            )
+            quick = build_fault_plan(
+                profile=profile,
+                calibration=CalibrationInputs(max_writes=12),
+                quick=True,
+            )
+
+            full_phase2 = [
+                fault_type
+                for fault_type in full.fault_types_list or []
+                if fault_type.startswith("p2:")
+            ]
+            quick_phase2 = [
+                fault_type
+                for fault_type in quick.fault_types_list or []
+                if fault_type.startswith("p2:")
+            ]
+            self.assertEqual(
+                full_phase2,
+                [
+                    f"p2:{p1}:{p2}:w:w"
+                    for p1 in (0, 6, 11)
+                    for p2 in range(12)
+                ],
+            )
+            self.assertEqual(
+                quick_phase2,
+                [
+                    f"p2:{p1}:{p2}:w:w"
+                    for p1 in (0, 6, 11)
+                    for p2 in (0, 6, 11)
+                ],
+            )
+
+    def test_explicit_pairs_replace_grid_and_survive_quick(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_profile(td, textwrap.dedent("""\
+                fault_sweep:
+                  mode: runtime
+                  max_writes: auto
+                  fault_types: [power_loss]
+                  phase2_fault:
+                    enabled: true
+                    fault_types: [interrupted_erase]
+                    max_points: 12
+                    pairs:
+                      - [3, 0]
+                      - [7, 1]
+            """))
+            profile = load_profile(path)
+            expected_points = [3, 7]
+            expected_types = [
+                "p2:3:0:w:e",
+                "p2:7:1:w:e",
+            ]
+            for quick in (False, True):
+                with self.subTest(quick=quick):
+                    plan = build_fault_plan(
+                        profile=profile,
+                        calibration=CalibrationInputs(max_writes=19),
+                        quick=quick,
+                    )
+                    self.assertEqual(plan.fault_points, expected_points)
+                    self.assertEqual(plan.fault_types_list, expected_types)
+
     def test_swap_progress_fault_points_inferred_without_erase_trace(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = _write_profile(td, textwrap.dedent("""\
