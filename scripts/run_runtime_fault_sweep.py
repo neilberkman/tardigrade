@@ -13312,6 +13312,10 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     is_p2_timed = p2_fault_type == 't'
     p1_status = None
     p2_status = None
+    p1_fault_address = 0
+    p2_fault_address = 0
+    p2_write_trace = []
+    p2_erase_trace = []
     log('p2fault p1={}/{} p2={}/{} phase1_setup'.format(
         p1_fault_at, p1_fault_type, p2_fault_at, p2_fault_type))
 
@@ -13351,6 +13355,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         disarm_fault()
         p1_injected = was_fault_injected()
         p1_ops = get_total_erases()
+        p1_fault_address = get_last_write_address()
     else:
         write_mode = _WRITE_FAULT_MODE.get(p1_fault_type, 0)
         base_writes = get_total_writes()
@@ -13372,6 +13377,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         disarm_fault()
         p1_injected = was_fault_injected()
         p1_ops = get_total_writes()
+        p1_fault_address = get_last_write_address()
 
     phase1_ms = int((_time.time() - fp_t0) * 1000)
 
@@ -13404,6 +13410,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
                 'p2_fault_type': p2_fault_type,
                 'p1_injected': False,
                 'p2_injected': False,
+                'p1_fault_address': fmt_u32(p1_fault_address),
+                'p2_fault_address': fmt_u32(0),
                 'skip_reason': phase2_skip_reason,
                 'p2_total_ops': 0,
                 'p2_max_fault_index': -1,
@@ -13428,6 +13436,18 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         apply_hash_bypass()
 
     reset_nvmc_for_sweep(enable_tracking_gate=False)
+    p2_trace_enabled = (
+        backend['kind'] == 'fast'
+        and all(hasattr(backend['data'], member) for member in (
+            'WriteTraceClear', 'WriteTraceEnabled', 'WriteTraceToString',
+            'EraseTraceClear', 'EraseTraceEnabled', 'EraseTraceToString',
+        ))
+    )
+    if p2_trace_enabled:
+        backend['data'].WriteTraceClear()
+        backend['data'].EraseTraceClear()
+        backend['data'].WriteTraceEnabled = True
+        backend['data'].EraseTraceEnabled = True
 
     if is_p2_timed:
         # Timed reset during recovery: run for a fractional duration of
@@ -13459,6 +13479,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         disarm_fault()
         p2_injected = was_fault_injected()
         p2_ops = get_total_erases()
+        p2_fault_address = get_last_write_address()
     else:
         write_mode = _WRITE_FAULT_MODE.get(p2_fault_type, 0)
         base_writes = get_total_writes()
@@ -13478,6 +13499,21 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         disarm_fault()
         p2_injected = was_fault_injected()
         p2_ops = get_total_writes()
+        p2_fault_address = get_last_write_address()
+
+    if p2_trace_enabled:
+        backend['data'].WriteTraceEnabled = False
+        backend['data'].EraseTraceEnabled = False
+        p2_write_map = parse_write_trace_map(backend['data'].WriteTraceToString())
+        p2_erase_map = parse_erase_trace_map(backend['data'].EraseTraceToString())
+        p2_write_trace = [
+            dict({'write_index': index}, **p2_write_map[index])
+            for index in sorted(p2_write_map)
+        ]
+        p2_erase_trace = [
+            dict({'erase_index': index}, **p2_erase_map[index])
+            for index in sorted(p2_erase_map)
+        ]
 
     phase2_ms = int((_time.time() - phase2_t0) * 1000)
 
@@ -13562,7 +13598,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         'fault_requested': p1_fault_at,
         'fault_type': 'p2',
         'fault_injected': p1_injected and p2_injected,
-        'fault_address': '0x00000000',
+        'fault_address': fmt_u32(p2_fault_address),
         'boot_outcome': boot_outcome,
         'boot_slot': boot_slot,
         'fault_class': fault_class,
@@ -13575,6 +13611,10 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
             'p2_fault_type': p2_fault_type,
             'p1_injected': p1_injected,
             'p2_injected': p2_injected,
+            'p1_fault_address': fmt_u32(p1_fault_address),
+            'p2_fault_address': fmt_u32(p2_fault_address),
+            'p2_write_trace': p2_write_trace,
+            'p2_erase_trace': p2_erase_trace,
             'p2_ops': p2_ops,
             'p2_total_ops': p2_ops,
             'p2_max_fault_index': (p2_ops - 1) if p2_ops > 0 else -1,
