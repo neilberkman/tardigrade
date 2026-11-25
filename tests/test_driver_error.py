@@ -105,7 +105,7 @@ class DriverErrorFaultTypeTest(unittest.TestCase):
 
     def test_existing_mcuboot_revert_profiles_include_driver_error(self) -> None:
         profile_paths = [
-            ROOT / "profiles" / "mcuboot_head_move_nrf52_revert_full_fault_coverage.yaml",
+            ROOT / "profiles" / "mcuboot_head_move_nrf52_revert_power_and_controller_faults.yaml",
             ROOT / "profiles" / "mcuboot_head_move_nrf52_revert_full_fault_coverage_nohashbypass.yaml",
             ROOT / "profiles" / "mcuboot_head_move_stm32f4_revert_driver_error.yaml",
         ]

@@ -79,6 +79,20 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Changed
 
+- The weekly MCUboot HEAD bypass canary for swap-move revert on nRF52 no
+  longer runs the payload-corrupting non-power types `bit_corruption`,
+  `silent_write_failure`, `write_disturb`, `wear_leveling_corruption`, and
+  `write_rejection` (on `NRF52NVMC` it keeps the old word and reports
+  success). With `bootutil_img_validate` bypassed, their outcomes are
+  artifacts: MCUboot jumps to an image real MCUboot refuses. The profile is
+  renamed from `mcuboot_head_move_nrf52_revert_full_fault_coverage` to
+  `mcuboot_head_move_nrf52_revert_power_and_controller_faults` and keeps the
+  `move-nrf52-revert` slug. The five types now run weekly with validation on
+  in `mcuboot_head_move_nrf52_revert_full_fault_coverage_nohashbypass`, added
+  to `.github/workflows/mcuboot-head-zero-day.yml` as
+  `move-nrf52-revert-nohashbypass` and to `scripts/zero_day_results.py`.
+  Artifacts that carry the old profile name still render in the
+  `move-nrf52-revert` column.
 - A `driver_error` point that reached firmware as a software return code
   (`rc_injection_model: software_return_code`, the `NRF52NVMC` and
   `STM32F4FastFlash` path) is now classified as an `rc_injection` point is.
@@ -87,7 +101,7 @@ The format follows [common-changelog](https://common-changelog.org/).
   (`rc_injection_fail_closed`); under `availability` it stays a finding and a
   brick. A status-flag `driver_error`, or one where the return hook did not
   apply, keeps its earlier classification. This changes `g` counts in
-  `mcuboot_head_move_nrf52_revert_full_fault_coverage`,
+  `mcuboot_head_move_nrf52_revert_power_and_controller_faults`,
   `mcuboot_head_move_nrf52_revert_full_fault_coverage_nohashbypass`, and the
   two `mcuboot_head_move_stm32f4_revert_driver_error` profiles. On MCUboot HEAD
   the move-nrf52-revert `g` points at the final `image_ok` write and, with

@@ -1,0 +1,73 @@
+schema_version: 1
+name: mcuboot_head_move_nrf52_revert_power_and_controller_faults
+description: >
+  MCUboot HEAD swap-move revert on nrf52840dk across 5 power, erase, and
+  controller fault types (power_loss, interrupted_erase, driver_error,
+  rc_injection, multi_sector_atomicity) with bootutil_img_validate bypassed
+  during post-fault reboots. The 5 payload-corrupting types bit_corruption,
+  silent_write_failure, write_disturb, wear_leveling_corruption, and
+  write_rejection are not run here: with validation bypassed, MCUboot jumps
+  to an image real MCUboot refuses, so their outcomes are artifacts.
+  write_rejection belongs with them because NRF52NVMC keeps the old word and
+  reports success. They run with validation on in
+  mcuboot_head_move_nrf52_revert_full_fault_coverage_nohashbypass, which the
+  weekly MCUboot HEAD workflow also runs. Verified quick sweep on MCUboot
+  725d63c9d5bc with Zephyr c3f7bba9ada5 runs 15 points across 24366
+  writes and 42 erases in 327s and passes with 0 issue points
+  and 0 bricks; the driver_error and rc_injection points at 24365 (the final
+  image_ok write at 0x00081FE0) fail closed and are dismissed as dos_only.
+  Kept out of self_test because execute-only flash sweeps exceed 300s wall
+  time.
+platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_head_move_nrf52.elf
+  entry: 0
+memory:
+  sram:
+    start: 536870912
+    end: 537133056
+  write_granularity: 4
+  slots:
+    exec:
+      base: 49152
+      size: 483328
+    staging:
+      base: 532480
+      size: 483328
+images:
+  exec: results/oss_validation/assets/zephyr_head_move_nrf52_slot1.bin
+  staging: results/oss_validation/assets/zephyr_head_move_nrf52_slot0.bin
+pre_boot_state:
+- address: 532464
+  u32: 4086678135
+- address: 532468
+  u32: 2146423392
+- address: 532472
+  u32: 256922165
+- address: 532476
+  u32: 2155460140
+- address: 532448
+  u32: 1
+success_criteria:
+  vtor_in_slot: exec
+  marker_address: 49172
+  marker_value: 1
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: '60.0'
+  max_step_limit: 400000000
+  sweep_hash_bypass_symbols:
+  - bootutil_img_validate
+  fault_types:
+  - power_loss
+  - interrupted_erase
+  - driver_error
+  - rc_injection
+  - multi_sector_atomicity
+expect:
+  should_find_issues: false
+skip_self_test: true

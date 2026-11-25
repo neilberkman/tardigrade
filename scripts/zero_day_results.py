@@ -25,7 +25,11 @@ DEFAULT_WORKFLOW = "mcuboot-head-zero-day.yml"
 DEFAULT_OUTPUT = Path("docs/zero-day-results.md")
 
 CANONICAL_PROFILES: tuple[tuple[str, str], ...] = (
-    ("mcuboot_head_move_nrf52_revert_full_fault_coverage", "move-nrf52-revert"),
+    ("mcuboot_head_move_nrf52_revert_power_and_controller_faults", "move-nrf52-revert"),
+    (
+        "mcuboot_head_move_nrf52_revert_full_fault_coverage_nohashbypass",
+        "move-nrf52-revert-nohashbypass",
+    ),
     ("mcuboot_head_move_nrf52_upgrade_extended", "move-nrf52-upgrade"),
     ("mcuboot_head_offset_nrf52_revert_extended", "offset-nrf52-revert"),
     ("mcuboot_head_offset_nrf52_upgrade_multifault", "offset-nrf52-upgrade"),
@@ -39,6 +43,14 @@ for _profile_name, _slug in CANONICAL_PROFILES:
     PROFILE_TO_SLUG[_profile_name] = _slug
     PROFILE_TO_SLUG[f"profiles/{_profile_name}.yaml"] = _slug
     PROFILE_TO_SLUG[_slug] = _slug
+
+# Earlier names of canonical profiles, so older run artifacts still land in
+# their column.
+for _profile_name, _slug in (
+    ("mcuboot_head_move_nrf52_revert_full_fault_coverage", "move-nrf52-revert"),
+):
+    PROFILE_TO_SLUG[_profile_name] = _slug
+    PROFILE_TO_SLUG[f"profiles/{_profile_name}.yaml"] = _slug
 
 COMMIT_SUFFIX_RE = re.compile(r"([0-9a-f]{7,40})$")
 
@@ -436,7 +448,7 @@ def render_results_markdown(
     lines: list[str] = [
         "# MCUboot HEAD zero-day canary results",
         "",
-        "In `.github/workflows/mcuboot-head-zero-day.yml`, `scripts/zero_day_summary.py` records the upstream MCUboot commit, the paired Zephyr commit, and the seven zero-day canary profile verdicts, and `scripts/zero_day_results.py` formats one row per MCUboot commit with a link to the workflow run.",
+        "In `.github/workflows/mcuboot-head-zero-day.yml`, `scripts/zero_day_summary.py` records the upstream MCUboot commit, the paired Zephyr commit, and the eight zero-day canary profile verdicts, and `scripts/zero_day_results.py` formats one row per MCUboot commit with a link to the workflow run.",
         "",
     ]
 

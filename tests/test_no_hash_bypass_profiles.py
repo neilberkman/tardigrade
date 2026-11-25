@@ -17,16 +17,30 @@ from profile_loader import load_profile, load_profile_raw  # noqa: E402
 
 
 class NoHashBypassProfileTests(unittest.TestCase):
-    def test_full_fault_coverage_nohashbypass_matches_source_without_bypass_symbols(self) -> None:
+    def test_full_fault_coverage_nohashbypass_matches_bypass_canary_plus_payload_faults(self) -> None:
         source = load_profile(
-            ROOT / "profiles" / "mcuboot_head_move_nrf52_revert_full_fault_coverage.yaml"
+            ROOT / "profiles" / "mcuboot_head_move_nrf52_revert_power_and_controller_faults.yaml"
         )
         variant = load_profile(
             ROOT / "profiles" / "mcuboot_head_move_nrf52_revert_full_fault_coverage_nohashbypass.yaml"
         )
 
+        # The bypass canary leaves out the payload-corrupting types; this
+        # profile runs them with validation on. On NRF52NVMC,
+        # write_rejection keeps the old word and reports success.
+        payload_corrupting = [
+            "bit_corruption",
+            "silent_write_failure",
+            "write_disturb",
+            "wear_leveling_corruption",
+            "write_rejection",
+        ]
+        for fault_type in payload_corrupting:
+            with self.subTest(fault_type=fault_type):
+                self.assertNotIn(fault_type, source.fault_sweep.fault_types)
+                self.assertIn(fault_type, variant.fault_sweep.fault_types)
         self.assertEqual(
-            variant.fault_sweep.fault_types,
+            [t for t in variant.fault_sweep.fault_types if t not in payload_corrupting],
             source.fault_sweep.fault_types,
         )
         self.assertEqual(variant.bootloader_elf, source.bootloader_elf)

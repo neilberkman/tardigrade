@@ -22,6 +22,41 @@ import zero_day_results  # noqa: E402
 import zero_day_summary  # noqa: E402
 
 
+class TestCanonicalProfileSlug(unittest.TestCase):
+    def test_workflow_matrix_matches_canonical_profiles(self) -> None:
+        workflow = yaml.safe_load(
+            (ROOT / ".github" / "workflows" / "mcuboot-head-zero-day.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        matrix = workflow["jobs"]["sweep"]["strategy"]["matrix"]["include"]
+        self.assertEqual(
+            [(Path(entry["profile"]).stem, entry["slug"]) for entry in matrix],
+            list(zero_day_results.CANONICAL_PROFILES),
+        )
+        for entry in matrix:
+            with self.subTest(profile=entry["profile"]):
+                self.assertTrue((ROOT / entry["profile"]).is_file())
+
+    def test_renamed_bypass_canary_keeps_its_column(self) -> None:
+        for name in (
+            "mcuboot_head_move_nrf52_revert_full_fault_coverage",
+            "profiles/mcuboot_head_move_nrf52_revert_full_fault_coverage.yaml",
+            "mcuboot_head_move_nrf52_revert_power_and_controller_faults",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    zero_day_results.canonical_profile_slug(name),
+                    "move-nrf52-revert",
+                )
+        self.assertEqual(
+            zero_day_results.canonical_profile_slug(
+                "mcuboot_head_move_nrf52_revert_full_fault_coverage_nohashbypass"
+            ),
+            "move-nrf52-revert-nohashbypass",
+        )
+
+
 class TestZeroDaySummary(unittest.TestCase):
     def test_extracts_summary_and_writes_step_summary_and_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -243,7 +278,7 @@ class TestZeroDayResults(unittest.TestCase):
                             {
                                 "mcuboot_commit": "f84b9d3fd019fb1945e532924bee7a9c03c77373",
                                 "zephyr_commit": "36940db938a8f4a1e919496793ed439850a221c2",
-                                "profile": "mcuboot_head_move_nrf52_revert_full_fault_coverage",
+                                "profile": "mcuboot_head_move_nrf52_revert_power_and_controller_faults",
                                 "verdict": "PASS",
                                 "security_status": "CLEAN",
                                 "points": 3,

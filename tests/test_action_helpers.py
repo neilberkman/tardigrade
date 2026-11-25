@@ -578,7 +578,8 @@ class TestActionSourceBoundaries(unittest.TestCase):
         self.assertIn('python-version: "3.12"', source)
         self.assertIn("build_mcuboot_head_matrix.sh", source)
         for profile in (
-            "mcuboot_head_move_nrf52_revert_full_fault_coverage.yaml",
+            "mcuboot_head_move_nrf52_revert_power_and_controller_faults.yaml",
+            "mcuboot_head_move_nrf52_revert_full_fault_coverage_nohashbypass.yaml",
             "mcuboot_head_move_nrf52_upgrade_extended.yaml",
             "mcuboot_head_offset_nrf52_revert_extended.yaml",
             "mcuboot_head_offset_nrf52_upgrade_multifault.yaml",

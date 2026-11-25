@@ -168,7 +168,7 @@ class RcInjectionFaultTypeTest(unittest.TestCase):
 
     def test_existing_mcuboot_revert_profiles_include_rc_injection(self) -> None:
         profile_paths = [
-            ROOT / "profiles" / "mcuboot_head_move_nrf52_revert_full_fault_coverage.yaml",
+            ROOT / "profiles" / "mcuboot_head_move_nrf52_revert_power_and_controller_faults.yaml",
             ROOT / "profiles" / "mcuboot_head_move_nrf52_revert_full_fault_coverage_nohashbypass.yaml",
         ]
         for profile_path in profile_paths:

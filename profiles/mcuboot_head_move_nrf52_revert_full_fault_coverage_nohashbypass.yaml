@@ -3,15 +3,21 @@ name: mcuboot_head_move_nrf52_revert_full_fault_coverage_nohashbypass
 description: >
   MCUboot HEAD swap-move revert on nrf52840dk across 10 write, erase, and
   controller fault types with full SHA-256 validation enabled in
-  bootutil_img_validate. Verified quick sweep runs 30 points in 1150.9s and
-  finds 7 issue points and 7 bricks: 6 at write index 11907 at address
-  0x0000D860 under bit_corruption, silent_write_failure, driver_error,
-  write_disturb, wear_leveling_corruption, and write_rejection when corrupted
-  primary-slot payload bytes fail bootutil_img_validate on reboot, plus 1 at
-  write index 23814 at address 0x00081FE0 under driver_error when
-  boot_write_image_ok receives a non-zero flash_area_write return code and
-  aborts Phase 1. Kept out of self_test because execute-only flash sweeps
-  exceed 300s wall time.
+  bootutil_img_validate. Runs weekly in the MCUboot HEAD workflow as
+  move-nrf52-revert-nohashbypass and is the weekly coverage for the 5
+  payload-corrupting types (bit_corruption, silent_write_failure,
+  write_disturb, wear_leveling_corruption, write_rejection) that the bypass
+  canary mcuboot_head_move_nrf52_revert_power_and_controller_faults leaves
+  out.
+  Verified quick sweep on MCUboot 725d63c9d5bc with Zephyr c3f7bba9ada5 runs
+  30 points across 24366 writes and 42 erases in 958s and finds 5 issue
+  points and 5 bricks, all at write index 12183 at address 0x0000DCB8 under
+  bit_corruption, silent_write_failure, write_disturb,
+  wear_leveling_corruption, and write_rejection, when corrupted primary-slot
+  payload bytes fail bootutil_img_validate on reboot. driver_error and
+  rc_injection at 12183 and 24365 reach flash_area_write as a non-zero
+  return code, fail closed, and are dismissed as dos_only. Kept out of
+  self_test because execute-only flash sweeps exceed 300s wall time.
 
 platform: platforms/cortex_m4_flash_fast.repl
 flash_backend: faultFlash
