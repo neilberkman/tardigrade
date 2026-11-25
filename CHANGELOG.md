@@ -8,6 +8,9 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Added
 
+- Explicit phase-two fault pairs and an MCUboot PR #3011 swap-move
+  double-power-loss differential for issue #3009, with tracked pre-fix and
+  fixed nRF52840 assets and exact trailer-write regression profiles.
 - Per-cut torn-word outcomes: `fault_sweep.mram_torn_word` also accepts a list
   of modes with optional integer weights (`- half_retain: 3`, `- untouched`).
   Each fault point draws its mode from a SplitMix64 hash of

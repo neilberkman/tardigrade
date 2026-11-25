@@ -80,6 +80,8 @@ POST_OFFSET_COMMITS: frozenset[str] = frozenset(
         "d00b11dc234caee267eb12376e2279ed57c35d5d",  # PR #2206 scratch geom fixed
         "7253f01c06e19d2c5d7b146fedcf4473200b6b0d",  # scratch erase broken
         "f76fba706a66ce08d733468b47f89e26d59b3de5",  # scratch erase fixed
+        "cf36068c20053e9802df72096e3f1600ab9af5a0",  # PR #3011 parent
+        "e7114f7b6251830b3d39a1d6fae53b3cc9fa74b3",  # PR #3011 fixed
         "b893d34f564f454f454f3643b05b1e18fb457e5c",  # head_offset
         "f84b9d3fd019fb1945e532924bee7a9c03c77373",  # head matrix
     }

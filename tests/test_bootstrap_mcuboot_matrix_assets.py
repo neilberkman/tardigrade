@@ -32,6 +32,8 @@ from profile_loader import load_profile  # noqa: E402
 
 
 PR_DIFFERENTIAL_PROFILES = [
+    "mcuboot_pr3011_move_broken.yaml",
+    "mcuboot_pr3011_move_fixed.yaml",
     "mcuboot_pr2206_scratch_geom_broken.yaml",
     "mcuboot_pr2206_scratch_geom_fixed.yaml",
     "mcuboot_pr2214_offset_broken.yaml",
@@ -450,6 +452,10 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         ).splitlines()
         tracked_set = set(tracked)
         for relpath in (
+            "results/oss_validation/assets/oss_mcuboot_pr3011_move_broken.elf",
+            "results/oss_validation/assets/oss_mcuboot_pr3011_move_broken_commit.txt",
+            "results/oss_validation/assets/oss_mcuboot_pr3011_move_fixed.elf",
+            "results/oss_validation/assets/oss_mcuboot_pr3011_move_fixed_commit.txt",
             "results/oss_validation/assets/oss_mcuboot_pr2206_scratch_geom_broken.elf",
             "results/oss_validation/assets/oss_mcuboot_pr2206_scratch_geom_broken_commit.txt",
             "results/oss_validation/assets/oss_mcuboot_pr2206_scratch_geom_fixed.elf",
@@ -480,6 +486,47 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
         ):
             self.assertNotIn(retired, tracked_set)
             self.assertFalse((ROOT / retired).exists())
+
+    def test_pr3011_move_profiles_cover_exact_fixup_revert_windows(self) -> None:
+        broken = yaml.safe_load(
+            (ROOT / "profiles" / "mcuboot_pr3011_move_broken.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        fixed = yaml.safe_load(
+            (ROOT / "profiles" / "mcuboot_pr3011_move_fixed.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertEqual(
+            broken["bootloader"]["elf"],
+            "results/oss_validation/assets/oss_mcuboot_pr3011_move_broken.elf",
+        )
+        self.assertEqual(
+            fixed["bootloader"]["elf"],
+            "results/oss_validation/assets/oss_mcuboot_pr3011_move_fixed.elf",
+        )
+        self.assertEqual(
+            broken["fault_sweep"]["phase2_fault"]["pairs"],
+            [[2, p2] for p2 in range(6, 13)]
+            + [[p1, p2] for p1 in range(3, 6) for p2 in range(7)],
+        )
+        self.assertEqual(
+            fixed["fault_sweep"]["phase2_fault"]["pairs"],
+            [[p1, p2] for p1 in range(2, 6) for p2 in range(6, 13)],
+        )
+        self.assertTrue(broken["expect"]["should_find_issues"])
+        self.assertFalse(fixed["expect"]["should_find_issues"])
+        self.assertTrue(broken["skip_self_test"])
+        self.assertTrue(fixed["skip_self_test"])
+
+        for name, commit in (
+            ("broken", "cf36068c20053e9802df72096e3f1600ab9af5a0"),
+            ("fixed", "e7114f7b6251830b3d39a1d6fae53b3cc9fa74b3"),
+        ):
+            commit_path = ASSETS / f"oss_mcuboot_pr3011_move_{name}_commit.txt"
+            self.assertEqual(commit_path.read_text(encoding="utf-8").strip(), commit)
 
     def test_pr2214_geom_profiles_use_geom_offset_elfs(self) -> None:
         broken = yaml.safe_load(

@@ -203,14 +203,14 @@ class CheckMcubootImagesTests(unittest.TestCase):
 
     def test_profile_vector_crosscheck_identifies_expected_mismatches(self) -> None:
         profiles = img_check.discover_mcuboot_profiles(ROOT)
-        self.assertEqual(len(profiles), 96)
+        self.assertEqual(len(profiles), 98)
 
         results = img_check.check_all_profile_vectors(profiles, repo_root=ROOT)
-        self.assertEqual(len(results), 96)
+        self.assertEqual(len(results), 98)
 
         ok_profiles = {r.profile_path.name: r for r in results if r.ok}
         mismatch_map = {r.profile_path.name: r for r in results if not r.ok}
-        self.assertEqual(len(ok_profiles), 96)
+        self.assertEqual(len(ok_profiles), 98)
         self.assertEqual(set(mismatch_map.keys()), set())
 
         for name in (
@@ -243,7 +243,7 @@ class CheckMcubootImagesTests(unittest.TestCase):
             rc_report = img_check.main(["--check-profiles", "--report-only"])
         self.assertEqual(rc_report, 0)
         self.assertEqual(stderr_report.getvalue(), "")
-        self.assertEqual(len(stdout_report.getvalue().strip().splitlines()), 96)
+        self.assertEqual(len(stdout_report.getvalue().strip().splitlines()), 98)
 
 
 if __name__ == "__main__":

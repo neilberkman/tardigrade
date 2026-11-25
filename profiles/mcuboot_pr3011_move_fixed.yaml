@@ -1,0 +1,74 @@
+schema_version: 1
+name: mcuboot_pr3011_move_fixed
+description: >
+  MCUboot swap-using-move at PR #3011 (commit e7114f7b). Exercises #3009's
+  four secondary fixup magic-word cuts and each primary swap_status_init
+  write after the repaired fixup; every pair must recover the old image.
+
+platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_pr3011_move_fixed.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x76000 }
+    staging: { base: 0x00082000, size: 0x76000 }
+images:
+  exec: results/oss_validation/assets/zephyr_head_move_nrf52_slot1.bin
+  staging: results/oss_validation/assets/zephyr_head_move_nrf52_slot0.bin
+pre_boot_state:
+  - { address: 0x00081FF0, u32: 0xF395C277 }
+  - { address: 0x00081FF4, u32: 0x7FEFD260 }
+  - { address: 0x00081FF8, u32: 0x0F505235 }
+  - { address: 0x00081FFC, u32: 0x8079B62C }
+  - { address: 0x00081FE0, u32: 0x00000001 }
+success_criteria:
+  vtor_in_slot: exec
+  marker_address: 0x0000C014
+  marker_value: 0x00000001
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "20.0"
+  max_step_limit: 200000000
+  sweep_hash_bypass_symbols: ["bootutil_img_validate"]
+  phase2_fault:
+    enabled: true
+    fault_types: [power_loss]
+    pairs:
+      - [2, 6]
+      - [2, 7]
+      - [2, 8]
+      - [2, 9]
+      - [2, 10]
+      - [2, 11]
+      - [2, 12]
+      - [3, 6]
+      - [3, 7]
+      - [3, 8]
+      - [3, 9]
+      - [3, 10]
+      - [3, 11]
+      - [3, 12]
+      - [4, 6]
+      - [4, 7]
+      - [4, 8]
+      - [4, 9]
+      - [4, 10]
+      - [4, 11]
+      - [4, 12]
+      - [5, 6]
+      - [5, 7]
+      - [5, 8]
+      - [5, 9]
+      - [5, 10]
+      - [5, 11]
+      - [5, 12]
+skip_self_test: true
+expect:
+  should_find_issues: false
