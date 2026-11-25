@@ -64,12 +64,17 @@ MCUBOOT_REMOTE="${MCUBOOT_REMOTE:-upstream}"
 MCUBOOT_REF="${MCUBOOT_REF:-f84b9d3fd019fb1945e532924bee7a9c03c77373}"
 ORIGINAL_MCUBOOT_HEAD="$(git -C "${MCUBOOT_REPO}" rev-parse HEAD)"
 MCUBOOT_CHECKED_OUT=false
+ZEPHYR_PARTITIONS_COMPAT="${ZEPHYR_WS}/zephyr/include/zephyr/devicetree/partitions.h"
+ZEPHYR_PARTITIONS_COMPAT_CREATED=false
 
 cleanup() {
     if [[ "${MCUBOOT_CHECKED_OUT}" == "true" ]]; then
         git -C "${MCUBOOT_REPO}" restore --worktree -- \
             zephyr/module.yml boot/zephyr/Kconfig >/dev/null 2>&1 || true
         git -C "${MCUBOOT_REPO}" checkout --quiet --detach "${ORIGINAL_MCUBOOT_HEAD}" || true
+    fi
+    if [[ "${ZEPHYR_PARTITIONS_COMPAT_CREATED}" == "true" ]]; then
+        rm -f "${ZEPHYR_PARTITIONS_COMPAT}"
     fi
     rm -f "${MCUBOOT_REPO}/zephyr/module.yml.bak"
     rm -rf "${OVERLAY_DIR}" "${BUILD_TMP}"
@@ -105,6 +110,12 @@ fi
 LEGACY_ZEPHYR_CMAKE=()
 if (( ZEPHYR_MAJOR < 4 )); then
     LEGACY_ZEPHYR_CMAKE=(-DCONFIG_BOOTLOADER_SRAM_SIZE=64)
+    if [[ ! -e "${ZEPHYR_PARTITIONS_COMPAT}" ]]; then
+        msg "Installing Zephyr 3.7 fixed-partition compatibility header"
+        cp "${SCRIPT_DIR}/compat/zephyr-3.7/partitions.h" \
+            "${ZEPHYR_PARTITIONS_COMPAT}"
+        ZEPHYR_PARTITIONS_COMPAT_CREATED=true
+    fi
 fi
 
 # Resolve and check out the current public MCUboot head, then record the exact
@@ -152,6 +163,40 @@ if (( ZEPHYR_MAJOR < 4 )) && \
     msg "Adding Zephyr 3.7 type compatibility for MBEDTLS_CONFIG_FILE"
     sed -i.bak '/^config MBEDTLS_CONFIG_FILE$/a\
     string "Mbed TLS configuration header"' "${MCUBOOT_KCONFIG}"
+    rm -f "${MCUBOOT_KCONFIG}.bak"
+fi
+
+# Current MCUboot extends symbols supplied by newer Zephyr USB and Mbed TLS
+# Kconfig trees.  Zephyr 3.7 does not declare them, so give the extensions the
+# same types before configuring a current MCUboot checkout.  These declarations
+# only make the newer defaults parseable; the matrix build options still choose
+# the same TinyCrypt/signature-none configuration as the tracked corpus.
+if (( ZEPHYR_MAJOR < 4 )) && \
+   grep -q '^config USBD_DFU_NUMOF_IMAGES$' "${MCUBOOT_KCONFIG}" && \
+   ! awk '
+       /^config USBD_DFU_NUMOF_IMAGES$/ { in_symbol = 1; next }
+       in_symbol && /^config / { exit }
+       in_symbol && /^[[:space:]]*(bool|string|int|hex|tristate)([[:space:]]|$)/ {
+           found = 1; exit
+       }
+       END { exit found ? 0 : 1 }
+   ' "${MCUBOOT_KCONFIG}"; then
+    msg "Adding Zephyr 3.7 types for current USB DFU defaults"
+    sed -i.bak '/^config USBD_DFU_NUMOF_IMAGES$/a\
+    int' "${MCUBOOT_KCONFIG}"
+    sed -i.bak '/^config USBD_DFU_ENABLE_UPLOAD$/a\
+    bool' "${MCUBOOT_KCONFIG}"
+    sed -i.bak '/^config USBD_DFU_FLASH_SLOT0$/a\
+    bool' "${MCUBOOT_KCONFIG}"
+    rm -f "${MCUBOOT_KCONFIG}.bak"
+fi
+
+if (( ZEPHYR_MAJOR < 4 )) && \
+   grep -q '^choice MBEDTLS_PSA_CRYPTO_RNG_SOURCE$' "${MCUBOOT_KCONFIG}"; then
+    msg "Removing inactive newer-Zephyr Mbed TLS PSA RNG choice"
+    sed -i.bak \
+        '/^choice MBEDTLS_PSA_CRYPTO_RNG_SOURCE$/,/^endchoice$/d' \
+        "${MCUBOOT_KCONFIG}"
     rm -f "${MCUBOOT_KCONFIG}.bak"
 fi
 
