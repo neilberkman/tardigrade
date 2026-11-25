@@ -18,13 +18,14 @@ RunFor Completes With Built-In MappedMemory
     Execute Command    emulation RunFor "0.001"
     ${pc}=    Execute Command    cpu PC
     Log    MappedMemory PC after RunFor: ${pc}    console=True
-    Should Not Be Equal As Strings    ${pc.strip()}    0x0    CPU should have executed
+    Should Be Equal As Integers    ${pc.strip()}    0x0000000a    CPU should be spinning in the loop at 0xa
 
 RunFor Completes With Dynamically Compiled Peripheral On Fetch Path
-    [Documentation]    Regression test for native-AOT Renode deadlock.
-    ...    emulation RunFor hangs when instruction fetches hit a dynamically
-    ...    compiled C# peripheral (loaded via include). Works with built-in
-    ...    MappedMemory and on Mono/.NET Renode. Deadlocks on native-AOT.
+    [Documentation]    Instruction fetches from a dynamically compiled C# memory
+    ...    peripheral (NVMemory, loaded via include). The CPU never executes the
+    ...    first instruction: Renode 1.16.1 (.NET) hangs inside RunFor, 1.17.0
+    ...    aborts the machine, and 1.17.1 raises a BusFault and locks up at
+    ...    0xeffffffe. The test passes only once the CPU is spinning in the loop.
     [Timeout]    30s
     Execute Command    include "${ROOT}/peripherals/ITardigradeFaultInjectable.cs"
     Execute Command    include "${ROOT}/peripherals/NVMemoryController.cs"
@@ -42,4 +43,4 @@ RunFor Completes With Dynamically Compiled Peripheral On Fetch Path
     Execute Command    emulation RunFor "0.001"
     ${pc}=    Execute Command    cpu PC
     Log    PC after RunFor: ${pc}    console=True
-    Should Not Be Equal As Strings    ${pc.strip()}    0x0    CPU should have executed
+    Should Be Equal As Integers    ${pc.strip()}    0x1000000a    CPU should be spinning in the loop at 0x1000000a

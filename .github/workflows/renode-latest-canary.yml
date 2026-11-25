@@ -66,7 +66,11 @@ jobs:
       - name: Install Python dependencies
         run: python3 -m pip install -r requirements.txt
 
-      - name: Native-AOT RunFor regression test (expected FAIL)
+      # tests/nativeaot_runfor_bug.robot runs code from the dynamically compiled NVMemory peripheral. No Renode
+      # release executes it yet: 1.16.1 hangs in RunFor, 1.17.0 aborts the machine, and 1.17.1 raises a BusFault and
+      # locks up. The test asserts the loop PC, so a fault no longer counts as having executed. When this step fails
+      # with "unexpectedly succeeded", the latest release can execute from NVMemory and the step should expect PASS.
+      - name: NVMemory fetch-path RunFor test (expected FAIL)
         run: |
           set -euo pipefail
           report_dir="${RUNNER_TEMP}/nativeaot_runfor_report"
@@ -97,7 +101,7 @@ jobs:
             fi
           done
           if [ -z "${report}" ]; then
-            echo "::error::Native-AOT regression produced no trustworthy Robot report"
+            echo "::error::NVMemory fetch-path test produced no trustworthy Robot report"
             tail -200 "${report_dir}/console.log" || true
             exit 1
           fi
@@ -110,7 +114,7 @@ jobs:
           try:
               root = ET.parse(report_path).getroot()
           except (OSError, ET.ParseError) as exc:
-              raise SystemExit("Native-AOT Robot report is unreadable: {}".format(exc))
+              raise SystemExit("NVMemory fetch-path Robot report is unreadable: {}".format(exc))
 
           tests = {
               test.get("name"): test
@@ -122,7 +126,7 @@ jobs:
           missing = [name for name in (control_name, regression_name) if name not in tests]
           if missing:
               raise SystemExit(
-                  "Native-AOT Robot report is missing expected test(s): {}".format(
+                  "NVMemory fetch-path Robot report is missing expected test(s): {}".format(
                       ", ".join(missing)
                   )
               )
@@ -134,15 +138,15 @@ jobs:
           control_status = status(tests[control_name])
           regression_status = status(tests[regression_name])
           print(
-              "Native-AOT expected failure: process_status={}, control={}, regression={}".format(
+              "NVMemory fetch-path expected failure: process_status={}, control={}, regression={}".format(
                   process_status, control_status, regression_status
               )
           )
           if process_status == 0:
-              raise SystemExit("Native-AOT regression unexpectedly succeeded")
+              raise SystemExit("NVMemory fetch-path test unexpectedly succeeded")
           if control_status != "PASS" or regression_status != "FAIL":
               raise SystemExit(
-                  "Native-AOT report did not show the expected control PASS / regression FAIL"
+                  "NVMemory fetch-path report did not show the expected control PASS / regression FAIL"
               )
           PY
 

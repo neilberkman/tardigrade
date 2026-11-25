@@ -135,6 +135,13 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- `tests/nativeaot_runfor_bug.robot` now asserts the loop PC instead of any
+  nonzero PC. Renode 1.17.1 raises a BusFault on the NVMemory fetch and locks
+  up at `0xeffffffe`, which the old check counted as executing. The fetch path
+  is not Native-AOT specific: 1.16.1 (.NET) hangs in `RunFor`, 1.17.0 aborts
+  the machine, and 1.17.1 faults. The `renode-latest-canary` step is renamed
+  "NVMemory fetch-path RunFor test (expected FAIL)" and still expects the
+  control to pass and the fetch-path test to fail.
 - ARMv6-M targets (Cortex-M0, M0+, M1 — identified automatically from the
   platform's CPU type via `cpu.Model` and `.repl` `cpuType`, with no new
   profile key) now ignore `CFSR` (`0xE000ED28`) and `HFSR` (`0xE000ED2C`),
