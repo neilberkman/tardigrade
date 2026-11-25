@@ -1899,7 +1899,9 @@ def check_profile_vectors(
 
     sc = merged.get("success_criteria") or {}
     raw_vto = sc.get("vector_table_offset")
-    prof_vto = int(raw_vto) if raw_vto is not None else None
+    # "image_header" takes the value from ih_hdr_size, which the per-image
+    # header/vector comparison below already checks.
+    prof_vto = int(raw_vto) if raw_vto not in (None, "image_header") else None
 
     images = merged.get("images") or {}
     mismatches: list[str] = []

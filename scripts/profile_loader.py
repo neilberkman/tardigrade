@@ -598,6 +598,7 @@ class SuccessCriteria:
     __slots__ = (
         "vtor_in_slot",
         "vector_table_offset",
+        "vector_table_offset_source",
         "pc_in_slot",
         "marker_address",
         "marker_value",
@@ -636,9 +637,13 @@ class SuccessCriteria:
         memory_checks: Optional[List["MemoryCheck"]] = None,
         terminal_after_reset: bool = False,
         allow_fault_after_success: bool = False,
+        vector_table_offset_source: Optional[str] = None,
     ) -> None:
         self.vtor_in_slot = vtor_in_slot
         self.vector_table_offset = max(0, int(vector_table_offset))
+        # "image_header" until resolve_image_header_vector_offset() replaces
+        # vector_table_offset with the expected image's ih_hdr_size.
+        self.vector_table_offset_source = vector_table_offset_source
         self.pc_in_slot = pc_in_slot
         self.marker_address = marker_address
         self.marker_value = marker_value
@@ -2226,6 +2231,49 @@ def _align_down(value: int, align: int) -> int:
 MCUBOOT_IMAGE_MAGIC = 0x96F3B83D
 MCUBOOT_TLV_INFO_MAGIC = 0x6907
 MCUBOOT_TLV_PROT_INFO_MAGIC = 0x6908
+VECTOR_TABLE_OFFSET_IMAGE_HEADER = "image_header"
+
+
+def resolve_image_header_vector_offset(
+    criteria: SuccessCriteria,
+    images: Dict[str, str],
+    *,
+    profile_path: Optional[Path],
+    ctx: str,
+) -> None:
+    """Set ``vector_table_offset`` from the expected image's MCUboot header.
+
+    Zephyr links an MCUboot application's vector table at
+    CONFIG_ROM_START_OFFSET, which is also the signed ih_hdr_size.  That
+    value depends on the Zephyr release that built the image (0x200 on 3.7,
+    0x400 for STM32 on current main), so a profile shared by both builds
+    reads it from the image instead of pinning one release's value.
+    """
+    if criteria.vector_table_offset_source != VECTOR_TABLE_OFFSET_IMAGE_HEADER:
+        return
+    name = criteria.expected_image or "staging"
+    field = ctx + ".vector_table_offset"
+    if name not in images:
+        raise ProfileError(
+            "{}: image_header needs images.{} (the image expected to boot)".format(
+                field, name
+            )
+        )
+    image_path = _resolve_existing_profile_path(
+        images[name],
+        repo_root=Path(__file__).resolve().parents[1],
+        profile_path=profile_path,
+        ctx=field,
+    )
+    blob = image_path.read_bytes()
+    start = 0
+    while start < len(blob) and blob[start] == 0xFF:
+        start += 1
+    if start + 12 > len(blob) or struct.unpack_from("<I", blob, start)[0] != MCUBOOT_IMAGE_MAGIC:
+        raise ProfileError(
+            "{}: {} has no MCUboot image header".format(field, image_path)
+        )
+    criteria.vector_table_offset = int(struct.unpack_from("<H", blob, start + 8)[0])
 
 
 def mcuboot_validated_image_extent(blob: bytes, slot_size: int = 0) -> Optional[int]:
@@ -4180,7 +4228,16 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         )
     return SuccessCriteria(
         vtor_in_slot=raw.get("vtor_in_slot"),
-        vector_table_offset=_parse_int(raw.get("vector_table_offset", 0), "success_criteria.vector_table_offset"),
+        vector_table_offset=(
+            0
+            if raw.get("vector_table_offset") == VECTOR_TABLE_OFFSET_IMAGE_HEADER
+            else _parse_int(raw.get("vector_table_offset", 0), "success_criteria.vector_table_offset")
+        ),
+        vector_table_offset_source=(
+            VECTOR_TABLE_OFFSET_IMAGE_HEADER
+            if raw.get("vector_table_offset") == VECTOR_TABLE_OFFSET_IMAGE_HEADER
+            else None
+        ),
         pc_in_slot=raw.get("pc_in_slot"),
         marker_address=_parse_int(raw["marker_address"], "success_criteria.marker_address") if "marker_address" in raw else None,
         marker_value=_parse_int(raw["marker_value"], "success_criteria.marker_value") if "marker_value" in raw else None,
@@ -7093,6 +7150,12 @@ def _parse_component(
 
     success_criteria = _parse_success_criteria(raw.get("success_criteria"))
     _validate_success_image_names(success_criteria, images, ctx + ".success_criteria")
+    resolve_image_header_vector_offset(
+        success_criteria,
+        images,
+        profile_path=profile_path,
+        ctx=ctx + ".success_criteria",
+    )
     fault_sweep = (
         _parse_fault_sweep(
             raw.get("fault_sweep"),
@@ -8734,6 +8797,9 @@ def _load_profile(
             images,
             "success_criteria",
         )
+    resolve_image_header_vector_offset(
+        success_criteria, images, profile_path=path, ctx="success_criteria"
+    )
     success_criteria_overrides = _parse_success_criteria_overrides(
         data.get("success_criteria_overrides")
     )

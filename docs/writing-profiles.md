@@ -363,6 +363,8 @@ success_criteria:
   vector_table_offset: 0x400 # nxboot: 1KB image header
 ```
 
+When the same profile runs against images built by different toolchains, `vector_table_offset: image_header` reads the offset from the MCUboot `ih_hdr_size` of the image expected to boot (`success_criteria.expected_image`, otherwise `images.staging`) when the profile loads. Zephyr links an MCUboot application's vector table at `CONFIG_ROM_START_OFFSET`, which is also the signed header size: `0x200` on Zephyr 3.7, `0x400` for STM32 on current Zephyr. Loading fails if that image is missing or has no MCUboot header.
+
 When a profile declares `vector_table_offset`, the runtime runner checks that offset on the clean control and on every fault point in Phase 2. For `vtor_in_slot`, the runner requires the captured VTOR register to equal `slot_base + vector_table_offset` and records the expected and actual VTOR addresses in `signals.failure_reason` on mismatch. For `pc_in_slot`, the runner requires the captured sticky PC to fall at or above `slot_base + vector_table_offset` and below `slot_end`, rejecting any PC that lands inside the leading header bytes. When a profile omits `vector_table_offset`, the runner keeps the in-slot range check from `slot_base` to `slot_end` for both `vtor_in_slot` and `pc_in_slot`.
 
 The reset vector table is part of the fault surface when `bootloader.entry`
