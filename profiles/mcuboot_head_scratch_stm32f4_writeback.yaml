@@ -9,15 +9,14 @@ description: >
   finding in BOOT_STATUS_STATE_1 where erasing the secondary slot before
   buffered scratch and primary status writes from BOOT_STATUS_STATE_0 are
   flushed leaves recovery booting the old primary image.
-# VTOR, marker, and vector_table_offset criteria match the 0x200 header in
-# zephyr_head_scratch_stm32f4_mirrored_slot0.bin and slot1.bin.
-success_criteria:
-  vector_table_offset: 0x200
 fault_sweep:
   mode: runtime
   evaluation_mode: execute
   fault_types: [power_loss]
-  phase2_wall_timeout_s: 90
+  # A cut at write 0 makes recovery redo the whole swap (0.75s emulated, the
+  # same work as calibration): 70-86s wall on a loaded host, and one run
+  # reached only 0.5s emulated within 90s.
+  phase2_wall_timeout_s: 300
   heuristic:
     preserve_critical_tiers: false
     target_points: 25

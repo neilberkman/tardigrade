@@ -142,6 +142,18 @@ The format follows [common-changelog](https://common-changelog.org/).
   the machine, and 1.17.1 faults. The `renode-latest-canary` step is renamed
   "NVMemory fetch-path RunFor test (expected FAIL)" and still expects the
   control to pass and the fetch-path test to fail.
+- The weekly MCUboot-HEAD zero-day job no longer reports
+  `mcuboot_head_scratch_stm32f4_writeback.yaml` as `INCONCLUSIVE -- could not
+  trigger firmware update.` The job builds against Zephyr `main`, which signs
+  STM32 MCUboot applications with a `0x400` header, but the profile pinned
+  the Zephyr 3.7 value `vector_table_offset: 0x200`, so every trigger-discovery
+  calibration failed the exact VTOR check. `success_criteria.vector_table_offset`
+  now accepts `image_header`, which reads `ih_hdr_size` from the expected
+  image when the profile loads. `mcuboot_head_scratch_stm32f4_upgrade.yaml` and
+  the writeback profile that inherits it use it. The writeback profile's
+  `phase2_wall_timeout_s` rises from 90 to 300: recovering from a cut at the
+  first write redoes the whole swap, which took 70-86 s wall on a loaded host,
+  and one run hit the 90 s limit and left the campaign incomplete.
 - ARMv6-M targets (Cortex-M0, M0+, M1 — identified automatically from the
   platform's CPU type via `cpu.Model` and `.repl` `cpuType`, with no new
   profile key) now ignore `CFSR` (`0xE000ED28`) and `HFSR` (`0xE000ED2C`),

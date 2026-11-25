@@ -3,15 +3,17 @@
 
 from __future__ import annotations
 
+import struct
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from profile_loader import load_profile  # noqa: E402
+from profile_loader import ProfileError, load_profile  # noqa: E402
 
 
 def test_mcuboot_scratch_stm32f4_writeback_profile() -> None:
@@ -31,11 +33,13 @@ def test_mcuboot_scratch_stm32f4_writeback_profile() -> None:
     assert profile.fault_sweep.writeback.barriers == []
     assert profile.fault_sweep.max_writes_cap == 400000
     assert profile.fault_sweep.max_step_limit == 500000000
+    assert profile.fault_sweep.phase2_wall_timeout_s == 300
     assert profile.fault_sweep.calibration_stop.success_criteria is True
-    # VTOR, vector_table_offset, and staged-version marker match the 0x200
-    # header of the mirrored STM32F4 slot images.
-    assert raw.get("success_criteria") == {"vector_table_offset": 0x200}
+    # The base profile reads vector_table_offset from the staged image header;
+    # the tracked Zephyr 3.7 slot images use 0x200.
+    assert "success_criteria" not in raw
     assert profile.success_criteria.vtor_in_slot == "exec"
+    assert profile.success_criteria.vector_table_offset_source == "image_header"
     assert profile.success_criteria.vector_table_offset == 0x200
     assert profile.success_criteria.marker_address == 0x08008014
     assert profile.success_criteria.marker_value == 0x00000101
@@ -43,6 +47,59 @@ def test_mcuboot_scratch_stm32f4_writeback_profile() -> None:
     assert profile.success_criteria.pc_in_slot is None
     assert profile.expect.should_find_issues is True
     assert "BOOT_STATUS_STATE_1" in profile.description
+
+
+def _signed_image_stub(path: Path, header_size: int) -> None:
+    header = struct.pack("<IIHHII", 0x96F3B83D, 0, header_size, 0, 0x100, 0)
+    path.write_bytes(header.ljust(header_size, b"\x00") + b"\x00" * 0x100)
+
+
+@pytest.mark.parametrize("header_size", [0x200, 0x400])
+def test_stm32_scratch_vector_offset_follows_staged_image_header(
+    tmp_path: Path, header_size: int
+) -> None:
+    """Current Zephyr signs STM32 MCUboot images with a 0x400 header.
+
+    The weekly MCUboot-HEAD job builds against Zephyr main, so a profile that
+    pins the Zephyr 3.7 value (0x200) expects VTOR 0x08008200 while the staged
+    image sets 0x08008400, and trigger discovery rejects every calibration.
+    """
+    raw = yaml.safe_load(
+        (ROOT / "profiles" / "mcuboot_head_scratch_stm32f4_upgrade.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    for role in ("exec", "staging"):
+        image = tmp_path / "{}.bin".format(role)
+        _signed_image_stub(image, header_size)
+        raw["images"][role] = str(image)
+    raw["bootloader"]["elf"] = str(ROOT / raw["bootloader"]["elf"])
+    raw["platform"] = str(ROOT / raw["platform"])
+    profile_path = tmp_path / "profile.yaml"
+    profile_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    profile = load_profile(profile_path)
+
+    assert profile.success_criteria.vector_table_offset == header_size
+
+
+def test_image_header_vector_offset_rejects_non_mcuboot_image(tmp_path: Path) -> None:
+    raw = yaml.safe_load(
+        (ROOT / "profiles" / "mcuboot_head_scratch_stm32f4_upgrade.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    for role in ("exec", "staging"):
+        image = tmp_path / "{}.bin".format(role)
+        image.write_bytes(b"\x00" * 0x400)
+        raw["images"][role] = str(image)
+    raw["bootloader"]["elf"] = str(ROOT / raw["bootloader"]["elf"])
+    raw["platform"] = str(ROOT / raw["platform"])
+    profile_path = tmp_path / "profile.yaml"
+    profile_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    with pytest.raises(ProfileError, match="no MCUboot image header"):
+        load_profile(profile_path)
 
 
 def _build_runtime_outcome_harness(

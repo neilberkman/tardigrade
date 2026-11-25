@@ -31,7 +31,9 @@ images:
 update_trigger: auto
 success_criteria:
   vtor_in_slot: exec
-  vector_table_offset: 0x200
+  # The weekly HEAD build signs with current Zephyr's 0x400 STM32 header; the
+  # tracked Zephyr 3.7 images use 0x200. Read it from the staged image.
+  vector_table_offset: image_header
   marker_address: 0x08008014
   marker_value: 0x00000101
 fault_sweep:
