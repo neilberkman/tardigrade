@@ -20,6 +20,7 @@ from fault_classification import (
     result_has_initial_timeout,
     result_has_issues,
     result_is_brick,
+    result_is_software_return_code_fault,
 )
 from renode_runner import merge_robot_vars, run_single_point
 from result_checks import annotate_result_checks
@@ -556,11 +557,14 @@ def _validate_write_fault(
     if not isinstance(signals, dict):
         signals = {}
     base_code = _base_fault_type_code(result.get("fault_type"))
-    if base_code == "x":
+    # rc_injection, and driver_error delivered through the same return hook,
+    # share one classification: a forced non-zero storage return code.
+    return_code_fault = result_is_software_return_code_fault(result)
+    if return_code_fault:
         result["rc_injection_severity_model"] = rc_injection_severity_model
     glitch_models = {
         "nop": "not_applicable",
-        "register_zero": "observed" if base_code == "x" else "not_applicable",
+        "register_zero": "observed" if return_code_fault else "not_applicable",
         "branch_invert": "not_applicable",
         "arbitrary_patch": "not_applicable",
     }
@@ -575,7 +579,7 @@ def _validate_write_fault(
     self_healing = "not_applicable"
     inverse_validation = "not_applicable"
     retain_availability_failure = bool(
-        base_code == "x"
+        return_code_fault
         and security_property == "availability"
         and rc_injection_severity_model == "availability"
     )
@@ -604,7 +608,7 @@ def _validate_write_fault(
         )
 
     if (
-        base_code == "x"
+        return_code_fault
         and security_property == "availability"
         and rc_injection_severity_model != "availability"
     ):
@@ -765,7 +769,7 @@ def validate_runtime_findings(
         if not result.get("fault_injected", False):
             continue
         base_code = _base_fault_type_code(result.get("fault_type"))
-        if base_code == "x":
+        if result_is_software_return_code_fault(result):
             result["rc_injection_severity_model"] = rc_injection_severity_model
         # A wall-clock timeout is an incomplete observation, not a terminal
         # security outcome.  Leave an initial timeout unvalidated; a concrete

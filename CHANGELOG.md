@@ -79,6 +79,19 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Changed
 
+- A `driver_error` point that reached firmware as a software return code
+  (`rc_injection_model: software_return_code`, the `NRF52NVMC` and
+  `STM32F4FastFlash` path) is now classified as an `rc_injection` point is.
+  Under the default `rc_injection_config.severity_model: security`, a
+  fail-closed availability outcome is dismissed as `dos_only`
+  (`rc_injection_fail_closed`); under `availability` it stays a finding and a
+  brick. A status-flag `driver_error`, or one where the return hook did not
+  apply, keeps its earlier classification. This changes `g` counts in
+  `mcuboot_head_move_nrf52_revert_full_fault_coverage`,
+  `mcuboot_head_move_nrf52_revert_full_fault_coverage_nohashbypass`, and the
+  two `mcuboot_head_move_stm32f4_revert_driver_error` profiles. On MCUboot HEAD
+  the move-nrf52-revert `g` points at the final `image_ok` write and, with
+  validation on, at the payload midpoint are no longer bricks.
 - Multi-fault stages now run as their own fault types instead of all as power
   loss. Each stage takes the fault type of the single-fault result that
   selected its point (`mf:5@b:30@e` is a bit corruption at write 5, then an

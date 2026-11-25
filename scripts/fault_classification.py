@@ -169,10 +169,35 @@ def _base_fault_type_code(result: Dict[str, Any]) -> str:
     return raw.split(":", 1)[0]
 
 
+def result_is_software_return_code_fault(result: Dict[str, Any]) -> bool:
+    """Return whether the fault reached the target as a forced return code.
+
+    ``rc_injection`` (``x``) always does.  ``driver_error`` (``g``) does only
+    when the backend routed it through the ``rc_injection`` return hook
+    (``rc_injection_model: software_return_code``) and the hook applied the
+    value; otherwise it stays a peripheral status-flag fault.
+    """
+    base = _base_fault_type_code(result)
+    if base == "x":
+        return True
+    if base != "g":
+        return False
+    signals = result.get("signals")
+    if not isinstance(signals, dict):
+        return False
+    if signals.get("rc_injection_model") != "software_return_code":
+        return False
+    telemetry = result.get("rc_injection")
+    applied = signals.get("rc_injection_applied")
+    if applied is None and isinstance(telemetry, dict):
+        applied = telemetry.get("applied")
+    return applied is True
+
+
 def rc_injection_availability_model(result: Dict[str, Any]) -> bool:
-    """Return whether an RC injection is being judged for availability."""
+    """Return whether a return-code injection is judged for availability."""
     return bool(
-        _base_fault_type_code(result) == "x"
+        result_is_software_return_code_fault(result)
         and str(result.get("rc_injection_severity_model") or "security")
         .strip()
         .lower()

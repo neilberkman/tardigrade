@@ -275,6 +275,126 @@ class WriteFaultValidationTests(unittest.TestCase):
         self.assertEqual(validation["security_property"], "availability")
 
 
+def _driver_error_result(*, model, applied=True, boot_outcome="hard_fault"):
+    """A g point shaped like move-nrf52-revert fault 24365 on MCUboot HEAD."""
+    signals = {
+        "phase1_continued_after_fault": True,
+        "fault_word_changed_post_boot": False,
+        "driver_error_model": model,
+    }
+    result = {
+        "is_control": False,
+        "fault_type": "g",
+        "fault_at": 24365,
+        "fault_injected": True,
+        "boot_outcome": boot_outcome,
+        "boot_slot": None,
+        "signals": signals,
+    }
+    if model == "software_return_code":
+        signals["rc_injection_model"] = "software_return_code"
+        signals["rc_injection_applied"] = applied
+        result["rc_injection"] = {"applied": applied}
+    return result
+
+
+def _validate_in_sweep(result, *, severity_model=None):
+    rc_cfg = (
+        None
+        if severity_model is None
+        else SimpleNamespace(severity_model=severity_model, require_applied=True)
+    )
+    profile = SimpleNamespace(
+        memory=_profile_stub().memory,
+        expect=SimpleNamespace(control_outcome="success"),
+        fault_sweep=SimpleNamespace(
+            instruction_skip_config=None,
+            rc_injection_config=rc_cfg,
+        ),
+    )
+    with mock.patch("finding_validator.build_fault_robot_vars", return_value=[]), \
+         mock.patch("finding_validator._make_single_point_runner"):
+        validate_runtime_findings(
+            results=[result],
+            profile=profile,
+            repo_root=ROOT,
+            renode_test="renode-test",
+            robot_suite="suite.robot",
+            robot_vars=[],
+            work_dir=ROOT,
+            renode_remote_server_dir="/tmp",
+        )
+    return summarize_runtime_sweep([result], profile=profile)
+
+
+class DriverErrorReturnCodeTests(unittest.TestCase):
+    """driver_error delivered through the return hook is classified as x."""
+
+    def test_return_hook_driver_error_fail_closed_is_dos_only(self) -> None:
+        result = _driver_error_result(model="software_return_code")
+
+        validation = _validate_write_fault(result, expected_outcome="success")
+        self.assertEqual(validation["stage"], "dismissed")
+        self.assertEqual(validation["disposition"], "dos_only")
+        self.assertEqual(validation["reasons"], ["rc_injection_fail_closed"])
+        self.assertEqual(validation["glitch_models"]["register_zero"], "observed")
+
+    def test_return_hook_driver_error_is_not_a_brick_in_the_sweep(self) -> None:
+        result = _driver_error_result(model="software_return_code")
+
+        summary = _validate_in_sweep(result)
+        self.assertEqual(result["finding_validation"]["disposition"], "dos_only")
+        self.assertEqual(result["rc_injection_severity_model"], "security")
+        self.assertEqual(summary["bricks"], 0)
+        self.assertEqual(summary["issue_points"], 0)
+        self.assertEqual(classify_failure_class(result), "safe_dos")
+
+    def test_return_hook_driver_error_availability_model_retains_brick(self) -> None:
+        result = _driver_error_result(model="software_return_code")
+
+        summary = _validate_in_sweep(result, severity_model="availability")
+        self.assertEqual(result["finding_validation"]["disposition"], "confirmed")
+        self.assertEqual(result["rc_injection_severity_model"], "availability")
+        self.assertEqual(summary["bricks"], 1)
+        self.assertEqual(summary["issue_points"], 1)
+
+    def test_return_hook_driver_error_availability_bus_fault_is_a_brick(self) -> None:
+        result = _driver_error_result(
+            model="software_return_code", boot_outcome="bus_fault"
+        )
+        result["rc_injection_severity_model"] = "availability"
+
+        self.assertTrue(result_has_issues(result, "success"))
+        self.assertTrue(result_is_brick(result))
+
+    def test_status_flag_driver_error_keeps_its_classification(self) -> None:
+        result = _driver_error_result(model="peripheral_status_flag")
+
+        validation = _validate_write_fault(result, expected_outcome="success")
+        self.assertEqual(validation["stage"], "validated")
+        self.assertEqual(validation["disposition"], "confirmed")
+        self.assertEqual(validation["glitch_models"]["register_zero"], "not_applicable")
+        self.assertNotIn("rc_injection_severity_model", result)
+
+        summary = _validate_in_sweep(_driver_error_result(model="peripheral_status_flag"))
+        self.assertEqual(summary["bricks"], 1)
+
+    def test_status_flag_driver_error_ignores_availability_model(self) -> None:
+        result = _driver_error_result(
+            model="peripheral_status_flag", boot_outcome="bus_fault"
+        )
+        result["rc_injection_severity_model"] = "availability"
+
+        self.assertFalse(result_is_brick(result))
+
+    def test_unapplied_return_hook_driver_error_keeps_its_classification(self) -> None:
+        result = _driver_error_result(model="software_return_code", applied=False)
+
+        validation = _validate_write_fault(result, expected_outcome="success")
+        self.assertEqual(validation["stage"], "validated")
+        self.assertEqual(validation["disposition"], "confirmed")
+
+
 class ValidationClassificationTests(unittest.TestCase):
     def test_initial_wall_timeout_is_detected_even_when_raw_outcome_is_no_boot(self) -> None:
         result = {

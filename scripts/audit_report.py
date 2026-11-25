@@ -29,6 +29,7 @@ from fault_classification import (
     result_is_timeout,
     result_issue_reasons,
     result_recovered_after_failure,
+    result_is_software_return_code_fault,
     writeback_reconstruction_is_valid,
 )
 from fault_inject import (
@@ -563,7 +564,7 @@ def summarize_runtime_sweep(
         if rci is not None and rc_injection_severity_model is None:
             rc_injection_severity_model = getattr(rci, "severity_model", "security") or "security"
     for r in injected:
-        if _fault_type_base_code(r.get("fault_type")) == "x":
+        if result_is_software_return_code_fault(r):
             if rc_injection_severity_model is not None:
                 r["rc_injection_severity_model"] = rc_injection_severity_model
             else:
