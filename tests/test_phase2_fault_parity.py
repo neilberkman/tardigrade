@@ -4,15 +4,19 @@
 from __future__ import annotations
 
 import ast
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "run_runtime_fault_sweep.py"
+PROFILE = ROOT / "profiles" / "nxboot_style_update_phase2fault.yaml"
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from fault_plan import CalibrationInputs, build_fault_plan  # noqa: E402
+from profile_loader import load_profile  # noqa: E402
 
 
 def _load_phase2_fault(namespace: dict) -> None:
@@ -41,16 +45,22 @@ class _FakeMram:
         self.fault_marks: set[int] = set()
         self.reads: list[dict] = []
         self.Nvm = self
-        self.Flash = self
-        self.FlashSize = self.Size
 
     def ReadBytes(self, offset: int, count: int) -> bytes:
         return bytes(count)
 
 
+class _FakeController:
+    """Only the backing-NVM member needed from the real controller API."""
+
+    def __init__(self, nvm: _FakeMram) -> None:
+        self.Nvm = nvm
+
+
 class _Phase2Runtime:
     def __init__(self, *, boot_cycles: int = 1, backend_kind: str = "mram") -> None:
-        self.data = _FakeMram()
+        self.nvm = _FakeMram()
+        self.data = self.nvm if backend_kind == "mram" else _FakeController(self.nvm)
         self.cpu = SimpleNamespace(
             IsHalted=False,
             GetRegisterUnsafe=lambda _reg: 0x10000001,
@@ -78,8 +88,8 @@ class _Phase2Runtime:
             "disarm_write_fault": lambda: None,
             "disarm_erase_fault": lambda: None,
             "was_fault_injected": lambda: True,
-            "get_total_writes": lambda: self.data.TotalWordWrites,
-            "get_total_erases": lambda: self.data.TotalPageErases,
+            "get_total_writes": lambda: self.nvm.TotalWordWrites,
+            "get_total_erases": lambda: self.nvm.TotalPageErases,
             "get_last_write_address": lambda: 0x10000000 + self.current_cut * 8,
             "run_until_done": self._run_until_done,
             "arm_vtor_watchpoint": lambda: None,
@@ -111,7 +121,7 @@ class _Phase2Runtime:
             "_snapshot_mram_fault_uncorrectable_addresses": self._fault_addresses,
             "_snapshot_mram_uncorrectable_addresses": self._addresses,
             "_restore_mram_uncorrectable_offsets": self._restore_offsets,
-            "_clear_mram_uncorrectable_read_log": self.data.reads.clear,
+            "_clear_mram_uncorrectable_read_log": self.nvm.reads.clear,
             "_attach_uncorrectable_read_signals": self._attach_uncorrectable,
             "mram_torn_word": "half",
             "mram_torn_word_choices": [],
@@ -121,44 +131,44 @@ class _Phase2Runtime:
         _load_phase2_fault(self.ns)
 
     def _restore_phase1(self) -> None:
-        self.data.marks.clear()
-        self.data.fault_marks.clear()
-        self.data.reads.clear()
-        self.data.TotalWordWrites = 0
+        self.nvm.marks.clear()
+        self.nvm.fault_marks.clear()
+        self.nvm.reads.clear()
+        self.nvm.TotalWordWrites = 0
 
     def _restore_flash_and_boot(self, _saved_flash: bytes) -> None:
         # A reset/reload drops peripheral-only ECC metadata.
-        self.data.marks.clear()
-        self.data.fault_marks.clear()
-        self.data.reads.clear()
+        self.nvm.marks.clear()
+        self.nvm.fault_marks.clear()
+        self.nvm.reads.clear()
 
     def _arm_fault(self, *_args, **_kwargs) -> None:
         self.current_cut += 1
         self.modes_at_cut.append(self.ns["mram_torn_word"])
 
     def _run_until_done(self, _cpu, *, label: str, **_kwargs) -> dict:
-        self.marks_seen_by_boot[label] = set(self.data.marks)
+        self.marks_seen_by_boot[label] = set(self.nvm.marks)
         if "_p1_" in label:
-            self.data.TotalWordWrites = 1
+            self.nvm.TotalWordWrites = 1
             self._apply_cut(8)
             return {"reason": "fault_fired", "emulated_s": 0.01}
         if "_p2_" in label:
             # The recovery boot observes cut one's word and then repairs it
             # before cut two interrupts a different program operation.
-            if 8 in self.data.marks:
-                self.data.reads.append(
+            if 8 in self.nvm.marks:
+                self.nvm.reads.append(
                     {"word_address": "0x10000008", "pc": "0x10000040"}
                 )
-            self.data.marks.discard(8)
-            self.data.TotalWordWrites = 1
+            self.nvm.marks.discard(8)
+            self.nvm.TotalWordWrites = 1
             self._apply_cut(16)
             return {"reason": "fault_fired", "emulated_s": 0.02}
         return {"reason": "vtor_captured", "emulated_s": 0.03}
 
     def _apply_cut(self, offset: int) -> None:
         if self.ns["mram_torn_word"] == "uncorrectable":
-            self.data.marks.add(offset)
-        self.data.fault_marks = set(self.data.marks)
+            self.nvm.marks.add(offset)
+        self.nvm.fault_marks = set(self.nvm.marks)
 
     def _evaluate_boot_outcome(self, *_args, **_kwargs):
         return "success", "exec", {"expectations_met": True}
@@ -173,7 +183,7 @@ class _Phase2Runtime:
             "stage": context["stage"],
             "cycle": context.get("cycle"),
             "phase2_cut": context.get("phase2_cut"),
-            "uncorrectable_offsets": sorted(self.data.marks),
+            "uncorrectable_offsets": sorted(self.nvm.marks),
         }
 
     def _run_followup_boot_cycles(self, outcome, slot, signals, **kwargs):
@@ -206,26 +216,26 @@ class _Phase2Runtime:
         signals["multiboot_cycles_run"] = max(0, len(records or []) - 1)
 
     def _fault_offsets(self) -> list[int]:
-        return sorted(self.data.fault_marks)
+        return sorted(self.nvm.fault_marks)
 
     def _fault_addresses(self) -> list[str]:
         return ["0x{:08x}".format(0x10000000 + off) for off in self._fault_offsets()]
 
     def _addresses(self) -> list[str]:
-        return ["0x{:08x}".format(0x10000000 + off) for off in sorted(self.data.marks)]
+        return ["0x{:08x}".format(0x10000000 + off) for off in sorted(self.nvm.marks)]
 
     def _restore_offsets(self, offsets) -> None:
-        self.data.marks = {int(offset) for offset in offsets}
+        self.nvm.marks = {int(offset) for offset in offsets}
 
     def _attach_uncorrectable(self, signals, _outcome, **kwargs) -> None:
         marked = list(kwargs.get("marked_at_fault") or [])
         if marked:
             signals["uncorrectable_words_at_fault"] = marked
-        if self.data.reads:
+        if self.nvm.reads:
             signals["uncorrectable_read"] = {
-                "read_count": len(self.data.reads),
-                "word_addresses": [entry["word_address"] for entry in self.data.reads],
-                "reads": list(self.data.reads),
+                "read_count": len(self.nvm.reads),
+                "word_addresses": [entry["word_address"] for entry in self.nvm.reads],
+                "reads": list(self.nvm.reads),
             }
 
     def _select_mode(self, fault_at: int):
@@ -240,11 +250,47 @@ class _Phase2Runtime:
         return self.ns["run_phase2_fault"](p1, p2)
 
 
-@pytest.mark.parametrize("backend_kind", ["mram", "slow"])
-def test_phase2_fault_restores_uncorrectable_words_for_both_later_boots(
-    backend_kind: str,
-) -> None:
-    runtime = _Phase2Runtime(backend_kind=backend_kind)
+def test_phase2_fault_skips_controller_backend_before_first_cut() -> None:
+    runtime = _Phase2Runtime(backend_kind="slow")
+
+    result = runtime.run()
+
+    assert not hasattr(runtime.data, "Flash")
+    assert not hasattr(runtime.data, "FlashSize")
+    assert runtime.data.Nvm is runtime.nvm
+    assert runtime.current_cut == 0
+    assert runtime.modes_at_cut == []
+    assert result["fault_injected"] is False
+    assert result["skip_reason"] == "phase2_unsupported_backend"
+    assert result["phase2_fault"]["p1_injected"] is False
+    assert result["phase2_fault"]["p2_injected"] is False
+
+
+def test_nxboot_controller_profile_plans_nine_early_skips() -> None:
+    profile = load_profile(PROFILE)
+    plan = build_fault_plan(
+        profile,
+        CalibrationInputs(max_writes=profile.fault_sweep.max_writes),
+        quick=True,
+    )
+    phase2_types = [
+        fault_type
+        for fault_type in plan.fault_types_list or []
+        if fault_type.startswith("p2:")
+    ]
+
+    assert profile.flash_backend == "nvm_ctrl"
+    assert len(phase2_types) == 9
+    for fault_type in phase2_types:
+        _, p1_raw, p2_raw, _, _ = fault_type.split(":")
+        runtime = _Phase2Runtime(backend_kind="slow")
+        result = runtime.run(int(p1_raw), int(p2_raw))
+        assert result["skip_reason"] == "phase2_unsupported_backend"
+        assert runtime.current_cut == 0
+
+
+def test_phase2_fault_restores_uncorrectable_words_for_both_later_boots() -> None:
+    runtime = _Phase2Runtime()
     runtime.ns["mram_torn_word"] = "uncorrectable"
 
     result = runtime.run()

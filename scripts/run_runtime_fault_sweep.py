@@ -7108,6 +7108,7 @@ def prepare_cold_reset(apply_tracking_gate=True):
         flash_ref = b['data'].Flash
         flash_ref.WriteBytes(0, nvm_snapshot)
 
+
 def restore_flash_and_boot(saved_flash):
     # Common pattern: restore a cached post-reset machine shell, then overlay
     # the faulted flash snapshot.  This preserves semantics while avoiding
@@ -13306,6 +13307,33 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
 # Phase 3: boot from double-faulted state, validate recovery
 # ---------------------------------------------------------------------------
 def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type='w'):
+    if backend['kind'] == 'slow':
+        return {
+            'fault_at': p1_fault_at,
+            'fault_requested': p1_fault_at,
+            'fault_type': 'p2',
+            'fault_injected': False,
+            'skip_reason': 'phase2_unsupported_backend',
+            'fault_address': '0x00000000',
+            'boot_outcome': 'skipped',
+            'boot_slot': None,
+            'fault_class': 'skipped',
+            'actual_writes': 0,
+            'signals': {'phase1_ms': 0, 'phase2_ms': 0, 'phase3_ms': 0},
+            'phase2_fault': {
+                'p1_fault_at': p1_fault_at,
+                'p2_fault_at': p2_fault_at,
+                'p1_fault_type': p1_fault_type,
+                'p2_fault_type': p2_fault_type,
+                'p1_injected': False,
+                'p2_injected': False,
+                'p1_fault_address': '0x00000000',
+                'p2_fault_address': '0x00000000',
+                'skip_reason': 'unsupported_backend',
+                'p2_total_ops': 0,
+                'p2_max_fault_index': -1,
+            },
+        }
     eff_criteria = get_effective_criteria('p2')
     cpu_ref = monitor.Machine['sysbus.cpu']
     fp_t0 = _time.time()
