@@ -1,6 +1,6 @@
 # MCUboot Historical PR Differentials
 
-Six of the eight MCUboot historical differential pairs remain tracked: PR 2100, PR 2109, PR 2206, and PR 3011 separate under the fault sweep (PR 2100, PR 2109, and PR 3011 on nRF52840, PR 2206 on mirrored-bank STM32F429), PR 2199 separates on the control boot and fault sweep via `targets/mcuboot/probe.py` trailer-state assertions on nRF52840, and PR 2214 separates on the control boot on both nRF52840 sector+1 and STM32F429 mirrored-bank swap-offset geometries, documented in `docs/mcuboot-pr2214-swap-offset.md`. PR 1597 and PR 2205 remain removed because neither produces a crash or corruption resilience differential on target firmware.
+Seven of the nine MCUboot historical differential pairs remain tracked: PR 2100, PR 2109, PR 2206, and both PR 3011 issues separate under the fault sweep (PR 2100, PR 2109, and PR 3011 on nRF52840, PR 2206 on mirrored-bank STM32F429), PR 2199 separates on the control boot and fault sweep via `targets/mcuboot/probe.py` trailer-state assertions on nRF52840, and PR 2214 separates on the control boot on both nRF52840 sector+1 and STM32F429 mirrored-bank swap-offset geometries, documented in `docs/mcuboot-pr2214-swap-offset.md`. PR 1597 and PR 2205 remain removed because neither produces a crash or corruption resilience differential on target firmware.
 
 | PR | Bug Class | Platform and Geometry | How the Pair Separates | Self-Test Status | Where the Evidence Lives |
 | --- | --- | --- | --- | --- | --- |
@@ -12,6 +12,7 @@ Six of the eight MCUboot historical differential pairs remain tracked: PR 2100, 
 | PR 2206, commits `66d41e73` and `d00b11dc` | Swap-scratch `boot_swap_sectors` omits `swap_erase_trailer_sectors` before commit `d1a3b953` when `bs->use_scratch` is true and an align-32 multi-sector trailer spills `0x18` bytes into sector 1 (`write_sz = 4`, `BOOT_MAX_ALIGN = 32`, `BOOT_MAX_IMG_SECTORS = 5450`, `boot_trailer_sz(4) = 0x10018`), leaving stale `copy_done = 1` at `0x0801FFA0` in primary sector 2 during revert | `platforms/stm32f4.repl`, STM32F429 mirrored non-uniform sectors (`write_granularity = 4`) with `exec` at `0x08008000` size `0x18000` and `staging` at `0x08108000` size `0x18000` across two 16 KB sectors and one 64 KB sector, and `scratch` at `0x08120000` size `0x20000` | Fault sweep (`power_loss`, `swap_progress`) reverting an unconfirmed `0x7D50` v2.0.0 image to v1.0.0: broken `66d41e73` produces 1 `wrong_image` (`boot_outcome`) issue point at the final `image_ok` write `w=16291` (`0x0801FFC0`) across both 5 `--quick` points (20.0 percent) and 854 heuristic points (0.1 percent, 1,235 s) because Phase 2 sees stale `copy_done = 1` and reverts the revert back to v2.0.0; fixed `d00b11dc` erases primary sector 2 (`8` erases vs `6`) and produces 0 issues across all 6 `--quick` points and all 862 heuristic points (1,427 s) | Promoted to strict CI self-test in `scripts/self_test_runtime_manifest.json` (`self_test_profiles` and `profiles` cost table at 180 s each); `mcuboot_pr2206_scratch_geom_broken.yaml` requires `required_issue_reasons: [boot_outcome]` with `allow_semantic_only_issues: true` | `README.md`, `profiles/mcuboot_pr2206_scratch_geom_broken.yaml`, `profiles/mcuboot_pr2206_scratch_geom_fixed.yaml`, `docs/mcuboot-differentials.md` |
 | PR 2214, commits `429e2fea` and `90fd59d2` | Swap-offset `find_last_idx` off-by-one sector index calculation during swap-offset upgrade | `platforms/cortex_m4_flash_fast.repl`, nRF52840 swap-offset geometry with `exec` at `0x0000C000` size `0x75000` and `staging` at `0x00081000` size `0x76000`, plus STM32F4 `exec` `0x08008000` size `0x18000` and `staging` `0x08108000` size `0x38000` | Control boot on nRF52840 swap-offset geometry and STM32F4 mirrored-bank geometry, where broken `429e2fea` refuses the upgrade on the control boot with `wrong_image` while fixed `90fd59d2` completes the upgrade | All four profiles (`mcuboot_pr2214_offset_{broken,fixed}.yaml` and `mcuboot_pr2214_offset_geom_{broken,fixed}.yaml`) run as strict regression self-tests in `self_test_profiles` in `scripts/self_test_runtime_manifest.json` | `docs/mcuboot-pr2214-swap-offset.md`, `profiles/mcuboot_pr2214_offset_broken.yaml`, `profiles/mcuboot_pr2214_offset_fixed.yaml`, `profiles/mcuboot_pr2214_offset_geom_broken.yaml`, `profiles/mcuboot_pr2214_offset_geom_fixed.yaml` |
 | PR 3011 / issue 3009, commits `cf36068c` and `e7114f7b` | Swap-move `fixup_revert` repairs only `BOOT_MAGIC_UNSET`, not a secondary trailer whose four-word magic was interrupted and now reads `BOOT_MAGIC_BAD` | `platforms/cortex_m4_flash_fast.repl`, uniform nRF52840 4 KB sectors, `exec` at `0x0000C000` and `staging` at `0x00082000` with size `0x76000` | Two-cut fault sweep: broken produces 21 `wrong_image` findings across 28 explicit pairs after cuts at secondary magic words `w=3..5` and any primary `swap_status_init` write `w=0..6`; fixed repairs every bad magic and produces 0 findings across the corresponding 28 pairs at recovery writes `w=6..12` | Both profiles set `skip_self_test: true`; they remain targeted differential profiles rather than default self-tests | `profiles/mcuboot_pr3011_move_broken.yaml`, `profiles/mcuboot_pr3011_move_fixed.yaml`, `docs/mcuboot-differentials.md` |
+| PR 3011 / issue 3010, commits `725d63c9` and `e7114f7b` | Swap-offset repeats `fixup_revert`, then an interrupted trailer erase leaves a half-swapped primary whose image size cannot be read on the third boot | `platforms/cortex_m4_flash_fast.repl`, uniform nRF52840 4 KB sectors, `exec` at `0x0000C000` and `staging` at `0x00082000` with size `0x76000`; 5,712-byte v1.0.0 and 5,968-byte v1.1.0 images each occupy two sectors | Exact pair `(w484, e3)`: v2.5.0 with assertions reaches the assertion path after `boot_read_image_size()` rejects the primary; PR #3011 commit `e7114f7b` accepts the same pair and boots the reverted image | Both profiles set `skip_self_test: true`; they remain targeted differential profiles rather than default self-tests | `profiles/mcuboot_pr3011_offset_broken.yaml`, `profiles/mcuboot_pr3011_offset_fixed.yaml`, `docs/mcuboot-differentials.md` |
 
 ## PR 3011 repeated-power-loss revert differential
 
@@ -32,6 +33,29 @@ recovery indices `6..12`; all 28 targeted pairs recover the old image. The
 broken profile carries the 7 passing first-word pairs plus the 21 failing
 later-word pairs, while the fixed profile carries the same four first-cut
 addresses and seven second-cut addresses after the repaired fixup.
+
+## PR 3011 swap-offset image-size differential
+
+The issue #3010 pair uses a two-sector image pair so the first sector step has
+already altered the primary while index 0 remains at its first stored state.
+The first cut at `w484` interrupts the first primary data write after the
+primary sector erase. Recovery repeats eight `fixup_revert` trailer writes at
+`0x000F7FE0`, `0x000F7FD8`, `0x000F7FC8`, `0x000F7FD0`, and
+`0x000F7FF0..0x000F7FFC`; the second cut interrupts the following sector erase
+`e3` at `0x000F7000`.
+
+On v2.5.0 commit `725d63c9`, the third boot begins a fresh revert on the
+half-swapped primary. `boot_read_image_size()` rejects the primary because the
+newer header points to a TLV offset occupied by older-image signature bytes;
+the assertion build then enters Zephyr's halt loop. Commit `89601034`, between
+v2.5.0 and the later pre-fix `cf36068c`, replaces that assertion path with an
+invalid-image return and changes the recovery path. Fixed `e7114f7b` does not
+repeat the fixup; the same numerical `e3` is its primary-sector erase at
+`0x0000D000`, and the build completes the pair. Both tracked ELFs retain
+`assert_post_action`, eliminating an assertion-configuration mismatch between
+the differential endpoints. The v2.5.0 build with assertions compiled out
+also completes the pair because that release ignores the failed size read
+when the assertion is absent.
 
 # Differential gate
 

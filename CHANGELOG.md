@@ -8,6 +8,9 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Added
 
+- An MCUboot PR #3011 swap-offset differential for issue #3010, with tracked
+  assertion-enabled v2.5.0 and fixed nRF52840 ELFs, two-sector 6 kB revert
+  images, and the exact interrupted-fixup-erase regression pair.
 - Explicit phase-two fault pairs and an MCUboot PR #3011 swap-move
   double-power-loss differential for issue #3009, with tracked pre-fix and
   fixed nRF52840 assets and exact trailer-write regression profiles.

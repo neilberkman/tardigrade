@@ -312,6 +312,22 @@ PROVENANCE_SPECS: dict[str, ImageProvenanceSpec] = {
         slot_size=0x18000,
         build_source="scripts/build_mcuboot_head_matrix.sh:620; scripts/bootstrap_mcuboot_matrix_assets.sh:743-745",
     ),
+    "zephyr_pr3011_offset_6k_slot0.bin": ImageProvenanceSpec(
+        family="pr3011_offset_6k",
+        expected_key="root-rsa-2048.pem",
+        expected_header_size=0x200,
+        align=8,
+        slot_size=0x76000,
+        build_source="docs/mcuboot-asset-provenance.md (PR #3011 swap-offset image pair)",
+    ),
+    "zephyr_pr3011_offset_6k_slot1.bin": ImageProvenanceSpec(
+        family="pr3011_offset_6k",
+        expected_key="root-rsa-2048.pem",
+        expected_header_size=0x200,
+        align=8,
+        slot_size=0x76000,
+        build_source="docs/mcuboot-asset-provenance.md (PR #3011 swap-offset image pair)",
+    ),
     "zephyr_slot0_padded.bin": ImageProvenanceSpec(
         family="pr_differential_nrf52",
         expected_key="root-rsa-2048.pem",

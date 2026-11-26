@@ -1,6 +1,6 @@
 # MCUboot Asset Provenance and Swap-Table Verification
 
-All 30 tracked `results/oss_validation/assets/oss_mcuboot_*.elf` bootloader binaries carry a `.symtab` symbol table, have an adjacent `<stem>_commit.txt` file recording their 40-character upstream MCUboot commit SHA, and match the upstream `boot_swap_tables` bytes from `boot/bootutil/src/bootutil_public.c` for their commit and swap algorithm. For the earlier PR #2214 swap-offset investigation and the diagnosis of the unrecorded `boot_swap_tables` modification in repository commit `4295e59`, see [docs/mcuboot-pr2214-swap-offset.md](mcuboot-pr2214-swap-offset.md).
+All 32 tracked `results/oss_validation/assets/oss_mcuboot_*.elf` bootloader binaries carry a `.symtab` symbol table, have an adjacent `<stem>_commit.txt` file recording their 40-character upstream MCUboot commit SHA, and match the upstream `boot_swap_tables` bytes from `boot/bootutil/src/bootutil_public.c` for their commit and swap algorithm. For the earlier PR #2214 swap-offset investigation and the diagnosis of the unrecorded `boot_swap_tables` modification in repository commit `4295e59`, see [docs/mcuboot-pr2214-swap-offset.md](mcuboot-pr2214-swap-offset.md).
 
 ## Swap-table generations
 
@@ -10,7 +10,7 @@ Upstream MCUboot `boot/bootutil/src/bootutil_public.c` defines `boot_swap_tables
 | --- | --- | --- | --- |
 | `gen1` | 18 B | `040104030402040104010403010303040104` | Pre-PR #2100 commits `fb2cf0ec3da3`, `172694eac08d`, `c50b332ba794`, and `2ac797677ef0`, plus detached-worktree builds `429e2fea2451` and `90fd59d2f9e4` where `west build` links `libmcuboot_util.a` from the Zephyr v3.7.0 workspace module at `fb2cf0ec3da3687b93f28e556ab682bdd4b85223` |
 | `gen2` | 18 B | `040104030402040104010403010403040104` | Post-PR #2100 move and scratch builds at `4f3935638e3e`, `664093d07023`, `25e2761c6690`, `33094fc5a500`, `66d41e73a267`, `d00b11dc234c`, `7253f01c06e1`, `f76fba706a66`, `cf36068c2005`, `e7114f7b6251`, and `f84b9d3fd019` where entry 2 sets `magic_secondary_slot` to `BOOT_MAGIC_ANY` |
-| `gen3` | 28 B | `04010403040104040104030404020401040104040301040304010404` | Swap-offset builds at `b893d34f564f` and `f84b9d3fd019` compiled with `MCUBOOT_SWAP_USING_OFFSET=1`, adding `copy_done_secondary_slot` to each 7-byte struct and prepending the 4th secondary `copy_done` revert entry |
+| `gen3` | 28 B | `04010403040104040104030404020401040104040301040304010404` | Swap-offset builds at `725d63c9d5bc`, `e7114f7b6251`, `b893d34f564f`, and `f84b9d3fd019` compiled with `MCUBOOT_SWAP_USING_OFFSET=1`, adding `copy_done_secondary_slot` to each 7-byte struct and prepending the 4th secondary `copy_done` revert entry |
 
 ## Tracked MCUboot ELF inventory
 
@@ -45,6 +45,8 @@ Every tracked `oss_mcuboot_*.elf` has an adjacent `oss_mcuboot_*_commit.txt` fil
 | `oss_mcuboot_pr2214_offset_nrf52_fixed.elf` | `90fd59d2f9e45c24d0833dd391dcdc932b3b1908` | `offset` | `nrf52840dk/nrf52840` | yes | `0x00006290` | yes, `gen1` |
 | `oss_mcuboot_pr3011_move_broken.elf` | `cf36068c20053e9802df72096e3f1600ab9af5a0` | `move` | `nrf52840dk/nrf52840` | yes | `0x00006565` | yes, `gen2` |
 | `oss_mcuboot_pr3011_move_fixed.elf` | `e7114f7b6251830b3d39a1d6fae53b3cc9fa74b3` | `move` | `nrf52840dk/nrf52840` | yes | `0x00006565` | yes, `gen2` |
+| `oss_mcuboot_pr3011_offset_broken.elf` | `725d63c9d5bc1bb572d802e7a768daf504186daf` | `offset` | `nrf52840dk/nrf52840` | yes | `0x00007d18` | yes, `gen3` |
+| `oss_mcuboot_pr3011_offset_fixed.elf` | `e7114f7b6251830b3d39a1d6fae53b3cc9fa74b3` | `offset` | `nrf52840dk/nrf52840` | yes | `0x00007d04` | yes, `gen3` |
 | `oss_mcuboot_scratch_broken.elf` | `7253f01c06e19d2c5d7b146fedcf4473200b6b0d` | `scratch` | `nrf52840dk/nrf52840` | yes | `0x00006231` | yes, `gen2` |
 | `oss_mcuboot_scratch_fixed.elf` | `f76fba706a66ce08d733468b47f89e26d59b3de5` | `scratch` | `nrf52840dk/nrf52840` | yes | `0x00006231` | yes, `gen2` |
 | `oss_mcuboot_stm32f4.elf` | `fb2cf0ec3da3687b93f28e556ab682bdd4b85223` | `move` | `nucleo_f429zi` | yes | `0x08005d8a` | yes, `gen1` |
@@ -55,6 +57,13 @@ Zephyr commit `36940db938a8f4a1e919496793ed439850a221c2`, using GNU Arm Embedded
 difference is the requested commit (`cf36068c2005` or `e7114f7b6251`). Both
 ELFs have `CONFIG_ASSERT` unset (`CONFIG_ASSERT_VERBOSE=y` remains present),
 so Zephyr assertions are compiled out.
+
+The issue #3010 swap-offset pair uses the same Zephyr commit and GNU Arm
+13.2.1 toolchain. The broken ELF is MCUboot v2.5.0 commit `725d63c9d5bc`;
+the fixed ELF is PR #3011 commit `e7114f7b6251`. Both use the tracked offset
+configuration with `CONFIG_ASSERT=y`, `CONFIG_ASSERT_LEVEL=2`, and
+`CONFIG_ASSERT_VERBOSE=y`. Their `assert_post_action` symbols are at
+`0x0000573e` and `0x0000547c`, respectively.
 
 ## Rebuilt ELFs restoring `.symtab`
 
@@ -88,7 +97,7 @@ Quick audit results before and after replacing the three ELFs under `docker://ta
 
 ## Application image families and signing keys
 
-Thirty-four of the 35 tracked `results/oss_validation/assets/*.bin` application images are signed with `third_party/zephyr_ws/bootloader/mcuboot/root-rsa-2048.pem` using `RSA2048_PSS` TLV `0x20`, `KEYHASH` TLV `0x01` value `fc5701dc6135e1323847bdc40f04d2e5bee5833b23c29f93593d00018cfa9994`, and `ih_hdr_size=0x200`. One file is an all-`0xff` erased slot binary.
+Thirty-six of the 37 tracked `results/oss_validation/assets/*.bin` application images are signed with `third_party/zephyr_ws/bootloader/mcuboot/root-rsa-2048.pem` using `RSA2048_PSS` TLV `0x20`, `KEYHASH` TLV `0x01` value `fc5701dc6135e1323847bdc40f04d2e5bee5833b23c29f93593d00018cfa9994`, and `ih_hdr_size=0x200`. One file is an all-`0xff` erased slot binary.
 
 | Family | Image count | Signing key | Header size `ih_hdr_size` | `--align` | `--slot-size` | Tracked images |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -104,15 +113,24 @@ Thirty-four of the 35 tracked `results/oss_validation/assets/*.bin` application 
 | `head_scratch_small` | 2 | `root-rsa-2048.pem` | `0x200` | `8` | `0x20000` | `zephyr_head_scratch_small_slot0.bin`, `zephyr_head_scratch_small_slot1.bin` |
 | `head_scratch_stm32f4` | 2 | `root-rsa-2048.pem` | `0x200` | `8` | `0x38000` | `zephyr_head_scratch_stm32f4_mirrored_slot0.bin`, `zephyr_head_scratch_stm32f4_mirrored_slot1.bin` |
 | `head_scratch_stm32f4_pr2206` | 2 | `root-rsa-2048.pem` | `0x200` | `32` | `0x18000` | `zephyr_head_scratch_stm32f4_pr2206_slot0.bin`, `zephyr_head_scratch_stm32f4_pr2206_slot1.bin` |
+| `pr3011_offset_6k` | 2 | `root-rsa-2048.pem` | `0x200` | `8` | `0x76000` | `zephyr_pr3011_offset_6k_slot0.bin`, `zephyr_pr3011_offset_6k_slot1.bin` |
 | `pr_differential_nrf52` | 3 | `root-rsa-2048.pem` | `0x200` | `8` | `0x6e000` | `zephyr_slot0_padded.bin`, `zephyr_slot1_large.bin`, `zephyr_slot1_padded.bin` |
 | `pr_differential_geom` | 3 | `root-rsa-2048.pem` | `0x200` | `8` | `0x76000` | `zephyr_slot1_max.bin`, `zephyr_slot1_offset_geom_full.bin`, `zephyr_slot1_offset_geom_full_offsetslot.bin` |
 | `pr2206_scratch_geom` | 1 | `root-rsa-2048.pem` | `0x200` | `32` | `0x18000` | `zephyr_slot1_scratch_geom_pr2206.bin` |
 | `pr2214_offset_nrf52` | 1 | `root-rsa-2048.pem` | `0x200` | `4` | `0x76000` | `zephyr_slot1_pr2214_swap_0x74000_offsetslot.bin` |
 | `legacy_stm32f4` | 2 | `root-rsa-2048.pem` | `0x200` | `8` | `0x60000` | `zephyr_stm32f4_slot0.bin`, `zephyr_stm32f4_slot1.bin` |
 
+The PR #3011 swap-offset pair was prepared from one Zephyr `hello_world`
+build. The inputs retain 5,376 and 5,632 bytes, respectively, and replace the
+reset target with a 16-byte Thumb stub at input offset `0x400` that writes
+`0x0000C200` to VTOR and loops. MCUboot v2.5.0 `imgtool.py` then signed them
+as versions `1.0.0+0` and `1.1.0+0` with the repository RSA root key, align
+8, header size `0x200`, slot size `0x76000`, and no header padding. The
+resulting 5,712-byte and 5,968-byte files each occupy two nRF52840 sectors.
+
 ## Tracked MCUboot application image inventory
 
-Twenty-nine of the 35 tracked `.bin` files pass standard MCUboot header, `SHA256` TLV `0x10`, `KEYHASH` TLV `0x01`, and `RSA2048_PSS` TLV `0x20` verification at offset `0x0`, and 6 pass under explicit allowlist rules in `scripts/check_mcuboot_images.py`. The two `head_move_nrf52_seccounter` images also carry protected TLV `0x50` `SEC_CNT` values `1` and `2` inside a 12-byte protected TLV area `ih_protect_tlv_size=0xc`.
+Thirty-one of the 37 tracked `.bin` files pass standard MCUboot header, `SHA256` TLV `0x10`, `KEYHASH` TLV `0x01`, and `RSA2048_PSS` TLV `0x20` verification at offset `0x0`, and 6 pass under explicit allowlist rules in `scripts/check_mcuboot_images.py`. The two `head_move_nrf52_seccounter` images also carry protected TLV `0x50` `SEC_CNT` values `1` and `2` inside a 12-byte protected TLV area `ih_protect_tlv_size=0xc`.
 
 | Image | Family | Status | Slot offset | Magic | `ih_hdr_size` | `ih_img_size` | `ih_protect_tlv_size` | Version | `SHA256` TLV prefix | Signature TLV and key | Vector offset and reset vector | Build source | Direct profile references |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -141,6 +159,8 @@ Twenty-nine of the 35 tracked `.bin` files pass standard MCUboot header, `SHA256
 | `zephyr_head_scratch_stm32f4_mirrored_slot1.bin` | `head_scratch_stm32f4` | `ok` | `0x0` | `0x96f3b83d` | `0x200` | `0x8e00` | `0x0` | `1.1.0+0` | `3f77a895ab76989a` match | `RSA-2048-PSS` `root-rsa-2048.pem` | `0x200` / `0x08009131` | `scripts/build_mcuboot_head_matrix.sh:613` | `mcuboot_head_scratch_stm32f4_fast_upgrade`, `mcuboot_head_scratch_stm32f4_upgrade`, `mcuboot_head_scratch_stm32f4_writeback` |
 | `zephyr_head_scratch_stm32f4_pr2206_slot0.bin` | `head_scratch_stm32f4_pr2206` | `ok` | `0x0` | `0x96f3b83d` | `0x200` | `0x3d4c` | `0x0` | `1.0.0+0` | `5df9697ac160679e` match | `RSA-2048-PSS` `root-rsa-2048.pem` | `0x200` / `0x08009131` | `scripts/build_mcuboot_head_matrix.sh:619; scripts/bootstrap_mcuboot_matrix_assets.sh:740-742` | `mcuboot_pr2206_scratch_geom_broken`, `mcuboot_pr2206_scratch_geom_fixed`, `mcuboot_pr2214_offset_geom_broken`, `mcuboot_pr2214_offset_geom_fixed` |
 | `zephyr_head_scratch_stm32f4_pr2206_slot1.bin` | `head_scratch_stm32f4_pr2206` | `ok` | `0x0` | `0x96f3b83d` | `0x200` | `0x8e00` | `0x0` | `1.1.0+0` | `3f77a895ab76989a` match | `RSA-2048-PSS` `root-rsa-2048.pem` | `0x200` / `0x08009131` | `scripts/build_mcuboot_head_matrix.sh:620; scripts/bootstrap_mcuboot_matrix_assets.sh:743-745` | unreferenced |
+| `zephyr_pr3011_offset_6k_slot0.bin` | `pr3011_offset_6k` | `ok` | `0x0` | `0x96f3b83d` | `0x200` | `0x1300` | `0x0` | `1.0.0+0` | `351a0b86d002aa0e` match | `RSA-2048-PSS` `root-rsa-2048.pem` | `0x200` / `0x0000c401` | `docs/mcuboot-asset-provenance.md` PR #3011 swap-offset image pair | `mcuboot_pr3011_offset_broken`, `mcuboot_pr3011_offset_fixed` |
+| `zephyr_pr3011_offset_6k_slot1.bin` | `pr3011_offset_6k` | `ok` | `0x0` | `0x96f3b83d` | `0x200` | `0x1400` | `0x0` | `1.1.0+0` | `462dd59f50761058` match | `RSA-2048-PSS` `root-rsa-2048.pem` | `0x200` / `0x0000c401` | `docs/mcuboot-asset-provenance.md` PR #3011 swap-offset image pair | `mcuboot_pr3011_offset_broken`, `mcuboot_pr3011_offset_fixed` |
 | `zephyr_slot0_padded.bin` | `pr_differential_nrf52` | `ok` | `0x0` | `0x96f3b83d` | `0x200` | `0x4d94` | `0x0` | `1.0.0+0` | `c3957e6b54c9c89d` match | `RSA-2048-PSS` `root-rsa-2048.pem` | `0x200` / `0x0000d1e5` | `scripts/bootstrap_mcuboot_matrix_assets.sh:734-736` | `mcuboot_head_revert`, `mcuboot_head_upgrade`, `mcuboot_offset_revert`, `mcuboot_offset_upgrade`, `mcuboot_partial_staging`, `mcuboot_pr2100_broken`, `mcuboot_pr2100_broken_discovery`, `mcuboot_pr2100_fixed`, `mcuboot_pr2100_fixed_discovery`, `mcuboot_pr2109_scratch_broken`, `mcuboot_pr2109_scratch_fixed`, `mcuboot_pr2109_scratch_fixed_bit_corruption`, `mcuboot_pr2109_scratch_fixed_silent`, `mcuboot_pr2199_move_broken`, `mcuboot_pr2199_move_fixed`, `mcuboot_pr2214_offset_broken`, `mcuboot_pr2214_offset_fixed`, `mcuboot_scratch_broken`, `mcuboot_scratch_broken_discovery`, `mcuboot_scratch_fixed`, `mcuboot_scratch_fixed_discovery`, `mcuboot_swap_current` |
 | `zephyr_slot1_large.bin` | `pr_differential_nrf52` | `allowlisted` | `0x0` | `0x96f3b83d` | `0x200` | `0x8a78` | `0x0` | `1.0.1+0` | `df8a5cd555b76a62` match | `RSA-2048-PSS` `root-rsa-2048.pem` | `0x200` / `0x0000c81d` | `profiles/mcuboot_pr2109_scratch_broken.yaml:26 commit 4295e59` | `mcuboot_pr2109_scratch_broken`, `mcuboot_pr2109_scratch_fixed`, `mcuboot_pr2109_scratch_fixed_bit_corruption`, `mcuboot_pr2109_scratch_fixed_silent` |
 | `zephyr_slot1_max.bin` | `pr_differential_geom` | `ok` | `0x0` | `0x96f3b83d` | `0x200` | `0x74000` | `0x0` | `1.0.1+0` | `1ba1f83ac671586f` match | `RSA-2048-PSS` `root-rsa-2048.pem` | `0x200` / `0x0000d1e5` | `scripts/bootstrap_mcuboot_matrix_assets.sh:778,783-785` | unreferenced |
@@ -167,7 +187,7 @@ Six tracked `.bin` files in `results/oss_validation/assets/` are allowlisted in 
 
 ## Profile image header and vector table cross-check
 
-All 98 MCUboot profiles in `profiles/*.yaml` match on bootloader ELF `slot0_partition` base, profile `memory.slots.exec.base`, image `ih_hdr_size`, image vector table offset, and application reset vector range when checked with `python3 scripts/check_mcuboot_images.py --check-profiles`:
+All 100 MCUboot profiles in `profiles/*.yaml` match on bootloader ELF `slot0_partition` base, profile `memory.slots.exec.base`, image `ih_hdr_size`, image vector table offset, and application reset vector range when checked with `python3 scripts/check_mcuboot_images.py --check-profiles`:
 
 | Profile | Bootloader ELF | ELF `slot0_partition` base / size | Profile `exec` base / size | Profile `vector_table_offset` | `exec` image `ih_hdr_size` / vec / reset | `staging` image `ih_hdr_size` / vec / reset | Cross-check status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -259,6 +279,8 @@ All 98 MCUboot profiles in `profiles/*.yaml` match on bootloader ELF `slot0_part
 | `mcuboot_pr2214_offset_geom_fixed.yaml` | `oss_mcuboot_pr2214_offset_geom_fixed.elf` | `0x08008000` / `0x18000` | `0x08008000` / `0x18000` | default `0x200` | `zephyr_head_scratch_stm32f4_pr2206_slot0.bin`: `0x200` / `0x200` / `0x08009131` | `zephyr_slot1_offset_geom_full_offsetslot.bin` at `0x4000`: `0x200` / `0x200` / `0x08009131` | `ok` |
 | `mcuboot_pr3011_move_broken.yaml` | `oss_mcuboot_pr3011_move_broken.elf` | `0x0000c000` / `0x76000` | `0x0000c000` / `0x76000` | default `0x200` | `zephyr_head_move_nrf52_slot1.bin`: `0x200` / `0x200` / `0x0000d1e5` | `zephyr_head_move_nrf52_slot0.bin`: `0x200` / `0x200` / `0x0000d1e5` | `ok` |
 | `mcuboot_pr3011_move_fixed.yaml` | `oss_mcuboot_pr3011_move_fixed.elf` | `0x0000c000` / `0x76000` | `0x0000c000` / `0x76000` | default `0x200` | `zephyr_head_move_nrf52_slot1.bin`: `0x200` / `0x200` / `0x0000d1e5` | `zephyr_head_move_nrf52_slot0.bin`: `0x200` / `0x200` / `0x0000d1e5` | `ok` |
+| `mcuboot_pr3011_offset_broken.yaml` | `oss_mcuboot_pr3011_offset_broken.elf` | `0x0000c000` / `0x76000` | `0x0000c000` / `0x76000` | default `0x200` | `zephyr_pr3011_offset_6k_slot1.bin`: `0x200` / `0x200` / `0x0000c401` | `zephyr_pr3011_offset_6k_slot0.bin`: `0x200` / `0x200` / `0x0000c401` | `ok` |
+| `mcuboot_pr3011_offset_fixed.yaml` | `oss_mcuboot_pr3011_offset_fixed.elf` | `0x0000c000` / `0x76000` | `0x0000c000` / `0x76000` | default `0x200` | `zephyr_pr3011_offset_6k_slot1.bin`: `0x200` / `0x200` / `0x0000c401` | `zephyr_pr3011_offset_6k_slot0.bin`: `0x200` / `0x200` / `0x0000c401` | `ok` |
 | `mcuboot_scratch_broken.yaml` | `oss_mcuboot_scratch_broken.elf` | `0x0000c000` / `0x6e000` | `0x0000c000` / `0x6e000` | default `0x200` | `zephyr_slot0_padded.bin`: `0x200` / `0x200` / `0x0000d1e5` | `zephyr_slot1_padded.bin`: `0x200` / `0x200` / `0x0000d1e5` | `ok` |
 | `mcuboot_scratch_broken_discovery.yaml` | `oss_mcuboot_scratch_broken.elf` | `0x0000c000` / `0x6e000` | `0x0000c000` / `0x6e000` | default `0x200` | `zephyr_slot0_padded.bin`: `0x200` / `0x200` / `0x0000d1e5` | `zephyr_slot1_padded.bin`: `0x200` / `0x200` / `0x0000d1e5` | `ok` |
 | `mcuboot_scratch_fixed.yaml` | `oss_mcuboot_scratch_fixed.elf` | `0x0000c000` / `0x6e000` | `0x0000c000` / `0x6e000` | default `0x200` | `zephyr_slot0_padded.bin`: `0x200` / `0x200` / `0x0000d1e5` | `zephyr_slot1_padded.bin`: `0x200` / `0x200` / `0x0000d1e5` | `ok` |
@@ -299,7 +321,7 @@ for name in mcuboot_pr2199_move_broken mcuboot_pr2199_move_fixed mcuboot_offset_
 done
 ```
 
-Verify all 35 tracked MCUboot application `.bin` images under `results/oss_validation/assets/` against their family signing keys, `SHA256` TLVs, and allowlist rules:
+Verify all 37 tracked MCUboot application `.bin` images under `results/oss_validation/assets/` against their family signing keys, `SHA256` TLVs, and allowlist rules:
 
 ```bash
 python3 scripts/check_mcuboot_images.py

@@ -34,6 +34,8 @@ from profile_loader import load_profile  # noqa: E402
 PR_DIFFERENTIAL_PROFILES = [
     "mcuboot_pr3011_move_broken.yaml",
     "mcuboot_pr3011_move_fixed.yaml",
+    "mcuboot_pr3011_offset_broken.yaml",
+    "mcuboot_pr3011_offset_fixed.yaml",
     "mcuboot_pr2206_scratch_geom_broken.yaml",
     "mcuboot_pr2206_scratch_geom_fixed.yaml",
     "mcuboot_pr2214_offset_broken.yaml",
@@ -456,6 +458,12 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
             "results/oss_validation/assets/oss_mcuboot_pr3011_move_broken_commit.txt",
             "results/oss_validation/assets/oss_mcuboot_pr3011_move_fixed.elf",
             "results/oss_validation/assets/oss_mcuboot_pr3011_move_fixed_commit.txt",
+            "results/oss_validation/assets/oss_mcuboot_pr3011_offset_broken.elf",
+            "results/oss_validation/assets/oss_mcuboot_pr3011_offset_broken_commit.txt",
+            "results/oss_validation/assets/oss_mcuboot_pr3011_offset_fixed.elf",
+            "results/oss_validation/assets/oss_mcuboot_pr3011_offset_fixed_commit.txt",
+            "results/oss_validation/assets/zephyr_pr3011_offset_6k_slot0.bin",
+            "results/oss_validation/assets/zephyr_pr3011_offset_6k_slot1.bin",
             "results/oss_validation/assets/oss_mcuboot_pr2206_scratch_geom_broken.elf",
             "results/oss_validation/assets/oss_mcuboot_pr2206_scratch_geom_broken_commit.txt",
             "results/oss_validation/assets/oss_mcuboot_pr2206_scratch_geom_fixed.elf",
@@ -526,6 +534,58 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
             ("fixed", "e7114f7b6251830b3d39a1d6fae53b3cc9fa74b3"),
         ):
             commit_path = ASSETS / f"oss_mcuboot_pr3011_move_{name}_commit.txt"
+            self.assertEqual(commit_path.read_text(encoding="utf-8").strip(), commit)
+
+    def test_pr3011_offset_profiles_cover_issue_3010_pair(self) -> None:
+        profiles = {
+            name: yaml.safe_load(
+                (ROOT / "profiles" / f"mcuboot_pr3011_offset_{name}.yaml").read_text(
+                    encoding="utf-8"
+                )
+            )
+            for name in ("broken", "fixed")
+        }
+
+        for name, profile in profiles.items():
+            with self.subTest(profile=name):
+                self.assertEqual(
+                    profile["bootloader"]["elf"],
+                    f"results/oss_validation/assets/oss_mcuboot_pr3011_offset_{name}.elf",
+                )
+                self.assertEqual(
+                    profile["fault_sweep"]["phase2_fault"],
+                    {
+                        "enabled": True,
+                        "fault_types": ["interrupted_erase"],
+                        "pairs": [[484, 3]],
+                    },
+                )
+                self.assertEqual(profile["fault_sweep"]["phase2_time_slice"], "0.005")
+                self.assertEqual(
+                    profile["images"],
+                    {
+                        "exec": "results/oss_validation/assets/zephyr_pr3011_offset_6k_slot1.bin",
+                        "staging": "results/oss_validation/assets/zephyr_pr3011_offset_6k_slot0.bin",
+                    },
+                )
+                self.assertTrue(profile["skip_self_test"])
+
+                elf = ELFFile(io.BytesIO((ROOT / profile["bootloader"]["elf"]).read_bytes()))
+                symbol_names = {
+                    symbol.name
+                    for section in elf.iter_sections()
+                    if isinstance(section, SymbolTableSection)
+                    for symbol in section.iter_symbols()
+                }
+                self.assertIn("assert_post_action", symbol_names)
+
+        self.assertTrue(profiles["broken"]["expect"]["should_find_issues"])
+        self.assertFalse(profiles["fixed"]["expect"]["should_find_issues"])
+        for name, commit in (
+            ("broken", "725d63c9d5bc1bb572d802e7a768daf504186daf"),
+            ("fixed", "e7114f7b6251830b3d39a1d6fae53b3cc9fa74b3"),
+        ):
+            commit_path = ASSETS / f"oss_mcuboot_pr3011_offset_{name}_commit.txt"
             self.assertEqual(commit_path.read_text(encoding="utf-8").strip(), commit)
 
     def test_pr2214_geom_profiles_use_geom_offset_elfs(self) -> None:
