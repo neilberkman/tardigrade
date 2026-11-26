@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT / "scripts"
@@ -59,6 +61,46 @@ class TestValidationWorkflowInputs(unittest.TestCase):
 
         self.assertGreaterEqual(workflow.count("docker/oss-validation.Dockerfile"), 2)
         self.assertGreaterEqual(workflow.count("requirements*.txt"), 2)
+        self.assertGreaterEqual(
+            workflow.count(".github/actions/setup-oss-validation"), 3
+        )
+
+    def test_expensive_profiles_run_in_parallel_without_bypassing_bootstrap(self):
+        workflow = yaml.safe_load(
+            (ROOT / ".github" / "workflows" / "oss-validation.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        jobs = workflow["jobs"]
+
+        guards = jobs["bootstrapped-guards"]
+        guard_steps = guards["steps"]
+        guard_names = [step.get("name") for step in guard_steps]
+        current_index = guard_names.index("Run MCUboot current guard (must pass)")
+        broken_index = guard_names.index(
+            "Run MCUboot PR2100 broken guard (must detect issues)"
+        )
+        fixed_index = guard_names.index("Run MCUboot PR2100 fixed control (must pass)")
+        self.assertLess(current_index, broken_index)
+        self.assertLess(broken_index, fixed_index)
+        current_run = guard_steps[current_index]["run"]
+        self.assertLess(
+            current_run.index("bootstrap_mcuboot_matrix_assets.sh"),
+            current_run.index("run_oss_validation.py"),
+        )
+
+        recovery = jobs["recovery-state"]
+        self.assertEqual(recovery["needs"], "recent-activity")
+        self.assertFalse(recovery["strategy"]["fail-fast"])
+        self.assertEqual(
+            recovery["strategy"]["matrix"]["variant"], ["broken", "fixed"]
+        )
+        upload = next(
+            step
+            for step in recovery["steps"]
+            if step.get("name") == "Upload recovery-state artifacts"
+        )
+        self.assertIn("matrix.variant", upload["with"]["name"])
 
 
 class TestValidationContainerArchitecture(unittest.TestCase):

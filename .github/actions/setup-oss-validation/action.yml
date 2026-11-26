@@ -1,0 +1,115 @@
+name: Set up OSS validation
+description: Install the pinned build and Renode dependencies used by validation jobs
+
+inputs:
+  install-host-packages:
+    description: Install host packages needed to build MCUboot assets
+    required: false
+    default: "false"
+  install-toolchain:
+    description: Install the pinned Arm GNU toolchain
+    required: false
+    default: "false"
+  install-renode:
+    description: Install the pinned Renode portable archive and its Python dependencies
+    required: false
+    default: "true"
+  python-requirements:
+    description: Space-separated requirement files to install, or an empty string for none
+    required: false
+    default: requirements.txt
+  toolchain-version:
+    description: Pinned xPack Arm GNU toolchain version
+    required: false
+    default: 13.2.1-1.1
+  toolchain-url:
+    description: Pinned xPack Arm GNU toolchain archive URL
+    required: false
+    default: https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v13.2.1-1.1/xpack-arm-none-eabi-gcc-13.2.1-1.1-linux-x64.tar.gz
+  toolchain-sha256:
+    description: SHA-256 for the pinned xPack Arm GNU toolchain archive
+    required: false
+    default: 1252a8cafe9237de27a765376697230368eec21db44dc3f1edeb8d838dabd530
+  renode-url:
+    description: Pinned Renode portable archive URL
+    required: false
+    default: https://github.com/renode/renode/releases/download/v1.16.1/renode-1.16.1.linux-dotnet.tar.gz
+  renode-sha256:
+    description: SHA-256 for the pinned Renode portable archive
+    required: false
+    default: 62629caa331ed4bd4eb7abe13ee2e4834fbcaa70de492db3965fafa4edc5694f
+
+runs:
+  using: composite
+  steps:
+    - name: Install host dependencies
+      if: inputs.install-host-packages == 'true'
+      shell: bash
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential \
+          cmake \
+          curl \
+          device-tree-compiler \
+          git \
+          make \
+          ninja-build \
+          python3 \
+          python3-pip \
+          python3-venv \
+          xz-utils
+
+    - name: Install pinned Arm GNU toolchain
+      if: inputs.install-toolchain == 'true'
+      shell: bash
+      env:
+        TOOLCHAIN_VERSION: ${{ inputs.toolchain-version }}
+        TOOLCHAIN_URL: ${{ inputs.toolchain-url }}
+        TOOLCHAIN_SHA256: ${{ inputs.toolchain-sha256 }}
+      run: |
+        set -euxo pipefail
+        tarball="${RUNNER_TEMP}/arm-toolchain.tar.gz"
+        curl --fail --location --proto '=https' --tlsv1.2 \
+          "${TOOLCHAIN_URL}" -o "${tarball}"
+        echo "${TOOLCHAIN_SHA256}  ${tarball}" | sha256sum -c -
+        tar -xzf "${tarball}" -C "${RUNNER_TEMP}"
+        mkdir -p "$HOME/tools"
+        ln -s "${RUNNER_TEMP}/xpack-arm-none-eabi-gcc-${TOOLCHAIN_VERSION}" \
+          "$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major"
+        echo "$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major/bin" >> "${GITHUB_PATH}"
+        "$HOME/tools/gcc-arm-none-eabi-8-2018-q4-major/bin/arm-none-eabi-gcc" --version
+
+    - name: Install Renode portable
+      if: inputs.install-renode == 'true'
+      shell: bash
+      env:
+        RENODE_URL: ${{ inputs.renode-url }}
+        RENODE_SHA256: ${{ inputs.renode-sha256 }}
+      run: |
+        set -euxo pipefail
+        tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
+        python3 scripts/action_helpers.py download-renode \
+          --url "${RENODE_URL}" --sha256 "${RENODE_SHA256}" --output "${tarball}"
+        mkdir -p "${RUNNER_TEMP}/renode"
+        tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
+        python3 -m pip install --user \
+          -c requirements-renode-constraints.txt \
+          -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
+        echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
+        "${RUNNER_TEMP}/renode/renode-test" --help >/dev/null
+
+    - name: Install Python dependencies
+      if: inputs.python-requirements != ''
+      shell: bash
+      env:
+        REQUIREMENT_FILES: ${{ inputs.python-requirements }}
+      run: |
+        set -euxo pipefail
+        read -r -a files <<< "${REQUIREMENT_FILES}"
+        args=()
+        for file in "${files[@]}"; do
+          args+=(-r "${file}")
+        done
+        python3 -m pip install --user "${args[@]}"
