@@ -492,7 +492,9 @@ def summarize_runtime_sweep(
         result["error_kind"] = "writeback_reconstruction"
         result["error"] = "writeback durability observation incomplete: {}".format(reason)
         result["boot_outcome"] = "infra_error"
-    injected = [r for r in non_control if r.get("fault_injected") is True]
+    injected_with_infrastructure = [
+        r for r in non_control if r.get("fault_injected") is True
+    ]
     timeout_results = [r for r in non_control if result_is_timeout(r)]
     infrastructure_errors = [
         r for r in non_control
@@ -519,6 +521,10 @@ def summarize_runtime_sweep(
     ]
     timeout_result_ids = {id(r) for r in timeout_results}
     infrastructure_error_ids = {id(r) for r in infrastructure_errors}
+    injected = [
+        r for r in injected_with_infrastructure
+        if id(r) not in infrastructure_error_ids
+    ]
     skipped_result_ids = {id(r) for r in skipped_results}
     intentionally_skipped = [
         r for r in non_control
@@ -661,7 +667,6 @@ def summarize_runtime_sweep(
         1 for r in infrastructure_errors
         if str(r.get("error_kind") or "") == "runner_error"
     )
-
     control_signals = control[-1].get("signals") if control else None
     explicit_zero_point_control = bool(
         isinstance(control_signals, dict)

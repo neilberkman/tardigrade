@@ -455,6 +455,14 @@ def format_profile_cell(record: Mapping[str, Any] | None) -> str:
         )
         if not rows:
             parts.append("no requested or returned points")
+        cross_checks = point_counts.get("trace_replay_cross_checks") or {}
+        parts.append(
+            "trace replay cross-checks: run {}, passed {}, failed {}".format(
+                int(cross_checks.get("run", 0) or 0),
+                int(cross_checks.get("passed", 0) or 0),
+                int(cross_checks.get("failed", 0) or 0),
+            )
+        )
     else:
         parts.append(
             f"{issues} main-runtime issues/{points} injected main-runtime points"

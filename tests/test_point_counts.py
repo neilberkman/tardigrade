@@ -22,6 +22,7 @@ from audit_report import summarize_runtime_sweep  # noqa: E402
 from point_counts import (  # noqa: E402
     POINT_KIND_LABELS,
     build_point_counts,
+    merge_point_counts,
     point_count_rows,
     render_point_counts_markdown,
     render_point_counts_text,
@@ -510,6 +511,78 @@ def test_renderer_rows_lead_with_nonzero_kinds() -> None:
     )
     assert "### Calibration operation coverage" in markdown
     assert "| Operation | Calibrated | Planned range |" in markdown
+
+
+def test_passing_and_failing_replay_cross_checks_use_canonical_accounting() -> None:
+    counts = build_point_counts(
+        [
+            {
+                "fault_at": 0,
+                "fault_type": "w",
+                "fault_injected": True,
+                "boot_outcome": "success",
+                "trace_replay_cross_check": {
+                    "checked": True,
+                    "matched": True,
+                },
+            },
+            {
+                "fault_at": 1,
+                "fault_type": "w",
+                "fault_injected": True,
+                "boot_outcome": "infra_error",
+                "infrastructure_error": True,
+                "error_kind": "trace_replay_cross_check_mismatch",
+                "trace_replay_cross_check": {
+                    "checked": True,
+                    "matched": False,
+                },
+            },
+        ],
+        planned_fault_types=["w", "w"],
+        expected_control_points=0,
+    )
+
+    assert counts["schema_version"] == 2
+    assert counts["trace_replay_cross_checks"] == {
+        "run": 2,
+        "passed": 1,
+        "failed": 1,
+    }
+    program = counts["kinds"]["single_cut_program"]
+    assert program["requested"] == 2
+    assert program["run"] == 2
+    assert program["evaluated"] == 1
+    assert program["infrastructure_error"] == 1
+    assert counts["totals"]["run"] == 2
+    assert counts["totals"]["infrastructure_error"] == 1
+    merged = merge_point_counts(counts, counts)
+    assert merged["trace_replay_cross_checks"] == {
+        "run": 4,
+        "passed": 2,
+        "failed": 2,
+    }
+    assert merged["kinds"]["single_cut_program"]["run"] == 4
+    assert merged["kinds"]["single_cut_program"]["infrastructure_error"] == 2
+
+    text = render_point_counts_text(counts)
+    assert "Trace replay cross-checks (run / passed / failed): 2 / 1 / 1" in text
+    markdown = render_point_counts_markdown(counts)
+    assert "### Trace replay cross-checks" in markdown
+    assert "| 2 | 1 | 1 |" in markdown
+    html = render_point_counts_panel(
+        {"summary": {"runtime_sweep": {"point_counts": counts}}}
+    )
+    assert "trace replay cross-checks" in html
+    assert "<td>2</td><td>1</td><td>1</td>" in html
+    profile_cell = format_profile_cell(
+        {
+            "verdict": "INCONCLUSIVE",
+            "security_status": "INCONCLUSIVE",
+            "point_counts": counts,
+        }
+    )
+    assert "trace replay cross-checks: run 2, passed 1, failed 1" in profile_cell
 
 
 def test_json_summary_and_html_render_from_the_same_count_block() -> None:

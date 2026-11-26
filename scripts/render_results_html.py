@@ -463,6 +463,15 @@ def render_point_counts_panel(payload: Dict[str, Any]) -> str:
     if not rows:
         rows.append("<tr><td colspan='11'>No requested or returned points.</td></tr>")
 
+    cross_checks = block.get("trace_replay_cross_checks") or {}
+    cross_check_row = (
+        "<tr>"
+        f"<td>{_as_int(cross_checks.get('run'))}</td>"
+        f"<td>{_as_int(cross_checks.get('passed'))}</td>"
+        f"<td>{_as_int(cross_checks.get('failed'))}</td>"
+        "</tr>"
+    )
+
     calibration_rows = []
     calibration = block.get("calibration") or {}
     for operation, label in (("program", "writes"), ("erase", "erases")):
@@ -489,6 +498,11 @@ def render_point_counts_panel(payload: Dict[str, Any]) -> str:
         "<th>Skipped</th><th>Infrastructure error</th><th>Timeout</th>"
         "<th>Reused</th><th>Missing</th><th>Issues</th><th>Skip reasons</th>"
         "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
+        "<div class='telemetry-heading'><span>trace replay cross-checks</span>"
+        "<code>separate from fault-point counts</code></div>"
+        "<div class='table-wrap'><table><thead><tr>"
+        "<th>Run</th><th>Passed</th><th>Failed</th>"
+        "</tr></thead><tbody>" + cross_check_row + "</tbody></table></div>"
         "<div class='telemetry-heading'><span>calibration operation coverage</span>"
         "<code>direct cuts and representation</code></div>"
         "<div class='table-wrap'><table><thead><tr>"

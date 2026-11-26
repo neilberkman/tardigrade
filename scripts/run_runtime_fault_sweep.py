@@ -39,11 +39,21 @@ from writeback_reconstruction import (
     is_known_writeback_fault_type,
     is_unsupported_writeback_fault_type,
 )
-from recovery_state import PersistentState, merge_operation_traces
+from recovery_state import (
+    PersistentState,
+    apply_completed_operation,
+    apply_interrupted_operation,
+    merge_operation_traces,
+)
 from recovery_search import (
     RecoveryStateExplorer,
     first_persistent_difference,
     select_first_cuts,
+)
+from replay_cross_check import (
+    first_pre_cut_trace_difference,
+    format_replay_cross_check_error,
+    replay_cross_check_selected,
 )
 
 
@@ -665,6 +675,11 @@ include_erase_fault_points = (
     get_optional_var('include_erase_fault_points', '').strip().lower()
     in ('1', 'true', 'yes', 'on')
 )
+trace_replay_cross_check_every = get_optional_int_var(
+    'trace_replay_cross_check_every', 100
+)
+if trace_replay_cross_check_every < 0:
+    raise Exception('trace_replay_cross_check_every must be non-negative')
 
 
 def _apply_torn_word_mode():
@@ -12568,7 +12583,341 @@ def run_resume_trace_from_snapshot(snapshot_flash, fault_at, fault_type):
         'nvm_operations': enriched_ops,
     }
 
-def run_execute_fault(fault_at, fault_type='w'):
+
+def _enable_replay_cross_check_live_trace():
+    target = backend.get('data')
+    required = (
+        'WriteTraceClear', 'WriteTraceEnabled', 'WriteTraceToString',
+        'EraseTraceClear', 'EraseTraceEnabled', 'EraseTraceToString',
+    )
+    missing = [name for name in required if not hasattr(target, name)]
+    if missing:
+        raise RuntimeError(
+            'trace replay cross-check requires operation tracing; {} lacks {}'.format(
+                backend.get('backend_sysbus_name'), ', '.join(missing)
+            )
+        )
+    saved = {}
+    for name in (
+        'WriteTraceEnabled', 'EraseTraceEnabled', 'DiffLookahead',
+        'SkipShadowScan', 'PassthroughMode',
+    ):
+        if hasattr(target, name):
+            saved[name] = getattr(target, name)
+    if hasattr(target, 'DiffLookahead'):
+        target.DiffLookahead = 2147483647
+    if hasattr(target, 'SkipShadowScan'):
+        target.SkipShadowScan = False
+    if hasattr(target, 'PassthroughMode'):
+        target.PassthroughMode = False
+    target.WriteTraceClear()
+    target.EraseTraceClear()
+    target.WriteTraceEnabled = True
+    target.EraseTraceEnabled = True
+    return {'target': target, 'saved': saved}
+
+
+def _finish_replay_cross_check_live_trace(context):
+    target = context['target']
+    try:
+        write_map = parse_write_trace_map(str(target.WriteTraceToString()))
+        erase_map = parse_erase_trace_map(str(target.EraseTraceToString()))
+    finally:
+        target.WriteTraceEnabled = False
+        target.EraseTraceEnabled = False
+        for name, value in context['saved'].items():
+            setattr(target, name, value)
+    writes = []
+    for index in sorted(write_map):
+        item = write_map[index]
+        writes.append((
+            int(index),
+            int(item['flash_offset']),
+            int(str(item['value']), 0),
+            int(item.get('width', 4)),
+        ))
+    erases = []
+    for index in sorted(erase_map):
+        item = erase_map[index]
+        erases.append({
+            'erase_index': int(index),
+            'flash_offset': int(item['flash_offset']),
+            'writes_at_this_point': int(item['writes_at_this_point']),
+            'erase_size': int(item['erase_size']),
+        })
+    return {'writes': writes, 'erases': erases}
+
+
+def _replay_cross_check_expected_traces():
+    global trace_data_loaded, erase_trace_loaded
+    if trace_data_loaded is None:
+        trace_data_loaded = load_trace_data(trace_file_path)
+    writes = _validated_writeback_trace(trace_data_loaded)
+    if erase_trace_loaded is None:
+        if erase_trace_file_path and os.path.exists(erase_trace_file_path):
+            erase_trace_loaded = load_erase_trace_data(
+                erase_trace_file_path,
+                require_replay_metadata=writeback_active(),
+            )
+        else:
+            erase_trace_loaded = []
+    return writes, erase_trace_loaded
+
+
+def _evaluate_replay_cross_check_live_cut(
+        fault_at, fault_type, expected_state, fault_injected,
+        live_snapshot_bytes, live_uncorrectable_offsets, live_trace,
+        replay_mode):
+    fault_base = _base_fault_type_code(fault_type)
+    cut_kind = 'erase' if fault_base in ('e', 'a') else 'write'
+    status = {
+        'checked': True,
+        'matched': False,
+        'cut': {
+            'kind': cut_kind,
+            'index': int(fault_at),
+            'fault_type': str(fault_type),
+        },
+        'replay_mode': str(replay_mode),
+        'live_fault_injected': bool(fault_injected),
+    }
+    if not fault_injected:
+        status['error_kind'] = 'live_cut_not_injected'
+        status['error'] = (
+            'trace replay cross-check could not inject live {} cut {} ({})'.format(
+                cut_kind, fault_at, fault_type
+            )
+        )
+        return status
+    if live_snapshot_bytes is None:
+        status['error_kind'] = 'live_snapshot_unavailable'
+        status['error'] = (
+            'trace replay cross-check has no immediate live snapshot for '
+            '{} cut {} ({})'.format(cut_kind, fault_at, fault_type)
+        )
+        return status
+
+    expected_writes, expected_erases = _replay_cross_check_expected_traces()
+    divergence = first_pre_cut_trace_difference(
+        cut_kind,
+        fault_at,
+        expected_writes,
+        live_trace.get('writes', ()),
+        expected_erases,
+        live_trace.get('erases', ()),
+    )
+    mismatch = first_persistent_difference(
+        expected_state,
+        {'nvm': bytearray(live_snapshot_bytes)},
+        tuple(('nvm', int(offset)) for offset in live_uncorrectable_offsets),
+        {},
+    )
+    status['live_trace_writes'] = len(live_trace.get('writes', ()))
+    status['live_trace_erases'] = len(live_trace.get('erases', ()))
+    difference = divergence if divergence is not None else mismatch
+    if difference is not None:
+        status['first_difference'] = difference
+        status['error_kind'] = (
+            'pre_cut_execution_diverged'
+            if divergence is not None
+            else 'persistent_state_mismatch'
+        )
+        status['error'] = format_replay_cross_check_error(
+            cut_kind, fault_at, fault_type, difference
+        )
+        return status
+    status['matched'] = True
+    return status
+
+
+def _run_replay_cross_check_live_cut(
+        fault_at, fault_type, replay_snapshot_bytes,
+        replay_uncorrectable_offsets, replay_mode):
+    global _writeback_snapshot_reconstruction_status
+    if not replay_cross_check_selected(
+            fault_at, trace_replay_cross_check_every):
+        return None
+    flash_base, _flash_size, _page_size, _erase_fill = _replay_storage_geometry()
+    expected_state = PersistentState.from_bytes(
+        bytearray(replay_snapshot_bytes),
+        name='nvm',
+        base_address=flash_base,
+        uncorrectable_words=tuple(
+            ('nvm', int(offset)) for offset in replay_uncorrectable_offsets
+        ),
+    )
+    previous_reconstruction_status = _writeback_snapshot_reconstruction_status
+    started = _time.time()
+    try:
+        check_result = run_execute_fault(
+            fault_at,
+            fault_type=fault_type,
+            replay_cross_check_expected=expected_state,
+            replay_cross_check_mode=replay_mode,
+        )
+        status = check_result.get('trace_replay_cross_check')
+        if not isinstance(status, dict):
+            raise RuntimeError('live cut returned no cross-check status')
+    except Exception as exc:
+        fault_base = _base_fault_type_code(fault_type)
+        cut_kind = 'erase' if fault_base in ('e', 'a') else 'write'
+        status = {
+            'checked': True,
+            'matched': False,
+            'cut': {
+                'kind': cut_kind,
+                'index': int(fault_at),
+                'fault_type': str(fault_type),
+            },
+            'replay_mode': str(replay_mode),
+            'error_kind': 'live_check_error',
+            'error': 'trace replay cross-check failed for {} cut {} ({}): {}'.format(
+                cut_kind, fault_at, fault_type, exc
+            ),
+        }
+    finally:
+        _writeback_snapshot_reconstruction_status = previous_reconstruction_status
+        # The live Phase 1 is evidence for this check only. Do not let its
+        # function-call observations leak into the replayed point's recovery
+        # verdict.
+        reset_verification_probes()
+    status['wall_time_ms'] = int((_time.time() - started) * 1000)
+    if status.get('matched'):
+        log(
+            'trace replay cross-check: {} cut {} ({}) {} matched in {}ms'.format(
+                status['cut']['kind'], fault_at, fault_type, replay_mode,
+                status['wall_time_ms'],
+            )
+        )
+    else:
+        log(status.get('error', 'trace replay cross-check failed'))
+    return status
+
+
+def _computed_erase_cross_check_state(fault_at, fault_type):
+    writes, erases = _replay_cross_check_expected_traces()
+    write_operations = [
+        {
+            'write_index': int(index),
+            'offset': int(offset),
+            'value': int(value),
+            'width': int(width),
+        }
+        for index, offset, value, width in writes
+    ]
+    erase_operations = [
+        {
+            'erase_index': int(index),
+            'offset': int(item[0]),
+            'writes_at_this_point': int(item[1]),
+            'erase_size': int(item[2]),
+        }
+        for index, item in enumerate(erases, start=1)
+    ]
+    operations = merge_operation_traces(write_operations, erase_operations)
+    reload_images_cached()
+    if _hash_bypass_active:
+        apply_hash_bypass()
+    _clear_mram_uncorrectable_words()
+    flash_base, flash_size, page_size, erase_fill = _replay_storage_geometry()
+    baseline = _replay_storage_read_bytes(0, flash_size)
+    state = PersistentState.from_bytes(
+        bytearray(to_py_bytes(baseline)),
+        name='nvm',
+        base_address=flash_base,
+    )
+    if torn_word_explicit and backend.get('kind') != 'mram':
+        expected_torn_word = torn_word
+        expected_torn_word_seed = torn_word_seed
+    else:
+        expected_torn_word = mram_torn_word
+        expected_torn_word_seed = mram_torn_word_seed
+    for operation in operations:
+        if (
+            operation.get('kind') == 'erase'
+            and int(operation.get('operation_index', -1)) == int(fault_at)
+        ):
+            return apply_interrupted_operation(
+                state,
+                operation,
+                fault_type=fault_type,
+                backend_kind=backend.get('kind'),
+                torn_word_mode=expected_torn_word,
+                erase_fill=erase_fill,
+                corruption_seed=expected_torn_word_seed,
+                page_size=page_size,
+                program_unit=int(
+                    getattr(backend.get('data'), 'ProgramUnitSize', 4) or 4
+                ),
+            )
+        state = apply_completed_operation(
+            state, operation, erase_fill=erase_fill
+        )
+    raise RuntimeError(
+        'calibration trace has no erase at zero-based index {}'.format(fault_at)
+    )
+
+
+def _run_execute_erase_with_replay_cross_check(fault_at, fault_type):
+    try:
+        expected_state = _computed_erase_cross_check_state(fault_at, fault_type)
+    except Exception as exc:
+        status = {
+            'checked': True,
+            'matched': False,
+            'cut': {
+                'kind': 'erase',
+                'index': int(fault_at),
+                'fault_type': str(fault_type),
+            },
+            'replay_mode': 'computed_erase',
+            'error_kind': 'replay_state_error',
+            'error': 'trace replay cross-check failed for erase cut {} ({}): {}'.format(
+                fault_at, fault_type, exc
+            ),
+        }
+        return _replay_cross_check_failure_result(fault_at, fault_type, status)
+    return run_execute_fault(
+        fault_at,
+        fault_type=fault_type,
+        replay_cross_check_expected=expected_state,
+        replay_cross_check_mode='computed_erase',
+        replay_cross_check_only=False,
+    )
+
+
+def _replay_cross_check_failure_result(fault_at, fault_type, status):
+    error_kind = (
+        'trace_replay_cross_check_mismatch'
+        if status.get('first_difference') is not None
+        else 'trace_replay_cross_check_error'
+    )
+    return {
+        'fault_at': int(fault_at),
+        'fault_requested': int(fault_at),
+        'fault_type': str(fault_type),
+        'fault_injected': bool(status.get('live_fault_injected')),
+        'fault_address': '0x00000000',
+        'boot_outcome': 'infra_error',
+        'boot_slot': None,
+        'fault_class': 'infrastructure_error',
+        'actual_writes': max(0, int(fault_at)),
+        'signals': {
+            'trace_replay_mode': status.get('replay_mode'),
+            'phase1_ms': int(status.get('wall_time_ms', 0)),
+            'phase2_ms': 0,
+            'followup_ms': 0,
+        },
+        'infrastructure_error': True,
+        'error_kind': error_kind,
+        'error': status.get('error', 'trace replay cross-check failed'),
+        'trace_replay_cross_check': status,
+    }
+
+
+def run_execute_fault(
+        fault_at, fault_type='w', replay_cross_check_expected=None,
+        replay_cross_check_mode=None, replay_cross_check_only=True):
     global _writeback_snapshot_reconstruction_status
     global trace_data_loaded, erase_trace_loaded
     _writeback_snapshot_reconstruction_status = None
@@ -12753,6 +13102,9 @@ def run_execute_fault(fault_at, fault_type='w'):
     fault_uncorrectable_addresses = []
     expected_backend_fault_index = None
     md_pre_snapshot = None
+    replay_check_trace_context = None
+    replay_check_live_trace = None
+    replay_cross_check_status = None
     fault_base = _base_fault_type_code(fault_type)
     is_erase_fault = fault_base in ('e', 'a')
     is_power_loss_fault = fault_base in ('w', 'e', 'a')
@@ -12772,6 +13124,8 @@ def run_execute_fault(fault_at, fault_type='w'):
     cpu_ref.IsHalted = False
 
     reset_nvmc_for_sweep()
+    if replay_cross_check_expected is not None:
+        replay_check_trace_context = _enable_replay_cross_check_live_trace()
 
     if is_erase_fault:
         # Erase faults: arm at the Nth erase operation.
@@ -12830,16 +13184,22 @@ def run_execute_fault(fault_at, fault_type='w'):
     arm_vtor_watchpoint()
     p1_wall_timeout = phase1_wall_timeout(default_s=4.0)
     p1_max_iters = phase1_max_iters(default_s=4.0)
-    phase1_status = run_until_done(
-        cpu_ref,
-        label='fp{}_p1'.format(fault_at),
-        stop_on_fault=True,
-        max_iters=p1_max_iters,
-        wall_timeout=p1_wall_timeout,
-        vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
-        effective_criteria=eff_criteria,
-        fault_injected=True,
-    )
+    try:
+        phase1_status = run_until_done(
+            cpu_ref,
+            label='fp{}_p1'.format(fault_at),
+            stop_on_fault=True,
+            max_iters=p1_max_iters,
+            wall_timeout=p1_wall_timeout,
+            vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
+            effective_criteria=eff_criteria,
+            fault_injected=True,
+        )
+    finally:
+        if replay_check_trace_context is not None:
+            replay_check_live_trace = _finish_replay_cross_check_live_trace(
+                replay_check_trace_context
+            )
     disarm_vtor_watchpoint()
     phase1_ms = int((_time.time() - fp_t0) * 1000)
     phase1_stopped_on_fault = phase1_status is not None and phase1_status.get('reason') == 'fault_fired'
@@ -12889,6 +13249,23 @@ def run_execute_fault(fault_at, fault_type='w'):
     disarm_fault()
     if is_otp_fault:
         disarm_otp_fault()
+
+    if replay_cross_check_expected is not None and not fault_injected:
+        check_status = _evaluate_replay_cross_check_live_cut(
+            fault_at,
+            fault_type,
+            replay_cross_check_expected,
+            False,
+            None,
+            (),
+            replay_check_live_trace or {},
+            replay_cross_check_mode,
+        )
+        if replay_cross_check_only:
+            return {'trace_replay_cross_check': check_status}
+        return _replay_cross_check_failure_result(
+            fault_at, fault_type, check_status
+        )
 
     if backend['kind'] != 'slow' and fault_injected:
         # Snapshot the faulted NVM state.
@@ -12990,6 +13367,27 @@ def run_execute_fault(fault_at, fault_type='w'):
                         'status': 'disabled', 'reason': 'missing_trace_data'
                     }
                 log('fp={} writeback: WARNING no trace data; reconstruction refused and result will be incomplete'.format(fault_at))
+
+        if replay_cross_check_expected is not None:
+            check_status = _evaluate_replay_cross_check_live_cut(
+                fault_at,
+                fault_type,
+                replay_cross_check_expected,
+                fault_injected,
+                fault_snapshot_bytes,
+                fault_uncorrectable_offsets,
+                replay_check_live_trace or {},
+                replay_cross_check_mode,
+            )
+            if backend['kind'] == 'fast':
+                backend['data'].FaultFlashSnapshot = None
+            if replay_cross_check_only:
+                return {'trace_replay_cross_check': check_status}
+            if not check_status.get('matched'):
+                return _replay_cross_check_failure_result(
+                    fault_at, fault_type, check_status
+                )
+            replay_cross_check_status = check_status
 
         if phase1_stopped_on_fault and is_power_loss_fault:
             # Power-loss class: simulate a cold reset and recovery boot.
@@ -13262,6 +13660,8 @@ def run_execute_fault(fault_at, fault_type='w'):
     if backend['kind'] == 'fast':
         backend['data'].FaultFlashSnapshot = None
 
+    if replay_cross_check_status is not None:
+        result['trace_replay_cross_check'] = replay_cross_check_status
     return result
 
 def run_cascading_fault(write_fault_at, erase_fault_at):
@@ -15244,6 +15644,18 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     replay_ms = int((_time.time() - t_replay) * 1000)
     phase1_ms = int((_time.time() - fp_t0) * 1000)
 
+    replay_cross_check = _run_replay_cross_check_live_cut(
+        fault_at,
+        fault_type,
+        fault_snapshot_bytes,
+        (),
+        'native',
+    )
+    if replay_cross_check is not None and not replay_cross_check.get('matched'):
+        return _replay_cross_check_failure_result(
+            fault_at, fault_type, replay_cross_check
+        )
+
     # Phase 2: reset machine and restore faulted flash for recovery boot.
     # machine Reset zeroes MappedMemory, so we must write back the faulted
     # snapshot captured above, then reload the bootloader ELF.
@@ -15323,7 +15735,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
             fault_at, writes_applied, reload_ms, replay_ms, reset_ms, setup_ms,
             emulation_ms, p2_status.get('iters'), total_ms, boot_outcome))
 
-    return _build_fault_result(
+    result = _build_fault_result(
         fault_at, fault_type, fault_injected, fault_address,
         actual_writes, signals, boot_outcome=boot_outcome,
         boot_slot=boot_slot, eff_criteria=eff_criteria, p2_status=p2_status,
@@ -15333,6 +15745,9 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         metadata_delta_pre_snapshot=md_pre_snapshot,
         fault_semantic_state=fault_semantic_state,
     )
+    if replay_cross_check is not None:
+        result['trace_replay_cross_check'] = replay_cross_check
+    return result
 
 def run_trace_replay_fault(fault_at, fault_type='w'):
     global trace_data_loaded, erase_trace_loaded
@@ -15585,6 +16000,18 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     replay_ms = int((_time.time() - t_replay) * 1000)
     phase1_ms = int((_time.time() - fp_t0) * 1000)
 
+    replay_cross_check = _run_replay_cross_check_live_cut(
+        fault_at,
+        fault_type,
+        fault_snapshot_bytes,
+        fault_uncorrectable_offsets,
+        'python',
+    )
+    if replay_cross_check is not None and not replay_cross_check.get('matched'):
+        return _replay_cross_check_failure_result(
+            fault_at, fault_type, replay_cross_check
+        )
+
     # Phase 2: reset machine and restore faulted flash for recovery boot.
     # machine Reset zeroes MappedMemory, so we must write back the faulted
     # snapshot captured above, then reload the bootloader ELF.
@@ -15686,7 +16113,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
             fault_at, writes_applied, reload_ms, replay_ms, reset_ms, setup_ms,
             emulation_ms, p2_status.get('iters'), total_ms, boot_outcome))
 
-    return _build_fault_result(
+    result = _build_fault_result(
         fault_at, fault_type, fault_injected, fault_address,
         actual_writes, signals, boot_outcome=boot_outcome,
         boot_slot=boot_slot, eff_criteria=eff_criteria, p2_status=p2_status,
@@ -15697,6 +16124,9 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         fault_semantic_state=fault_semantic_state,
         fault_uncorrectable_words=fault_uncorrectable_addresses,
     )
+    if replay_cross_check is not None:
+        result['trace_replay_cross_check'] = replay_cross_check
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -16184,6 +16614,13 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
 
     if default_run_fn == run_trace_replay_fault and base_ft in _TRACE_REPLAY_SUPPORTED_FAULT_TYPES:
         return default_run_fn(fp, fault_type=ft)
+
+    if (
+        default_run_fn == run_trace_replay_fault
+        and base_ft in ('e', 'a')
+        and replay_cross_check_selected(fp, trace_replay_cross_check_every)
+    ):
+        return _run_execute_erase_with_replay_cross_check(fp, ft)
 
     # --- Simple fault types that require full execute mode ---
     if base_ft in _EXECUTE_ONLY_FAULT_TYPES:

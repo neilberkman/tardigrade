@@ -19,7 +19,7 @@ from typing import (
 )
 
 
-POINT_COUNT_SCHEMA_VERSION = 1
+POINT_COUNT_SCHEMA_VERSION = 2
 
 POINT_KIND_LABELS: Dict[str, str] = {
     "single_cut_program": "single-cut program",
@@ -54,6 +54,7 @@ _COUNT_FIELDS = (
     "missing",
     "issues",
 )
+_TRACE_REPLAY_CROSS_CHECK_FIELDS = ("run", "passed", "failed")
 
 
 def _base_code(value: Any) -> str:
@@ -74,6 +75,9 @@ def _new_counts() -> Dict[str, Any]:
         "schema_version": POINT_COUNT_SCHEMA_VERSION,
         "kinds": {kind: _new_kind(kind) for kind in POINT_KIND_ORDER},
         "totals": {field: 0 for field in _COUNT_FIELDS},
+        "trace_replay_cross_checks": {
+            field: 0 for field in _TRACE_REPLAY_CROSS_CHECK_FIELDS
+        },
         "calibration": {
             "program": _new_calibration_row(),
             "erase": _new_calibration_row(),
@@ -421,6 +425,18 @@ def _refresh_totals(counts: Dict[str, Any]) -> None:
         )
 
 
+def _populate_trace_replay_cross_checks(
+    counts: Dict[str, Any], results: Sequence[Mapping[str, Any]]
+) -> None:
+    row = counts["trace_replay_cross_checks"]
+    for result in results:
+        check = result.get("trace_replay_cross_check")
+        if not isinstance(check, Mapping) or check.get("checked") is not True:
+            continue
+        row["run"] += 1
+        row["passed" if check.get("matched") is True else "failed"] += 1
+
+
 def build_point_counts(
     results: Iterable[Mapping[str, Any]],
     *,
@@ -543,6 +559,7 @@ def build_point_counts(
         state_row["missing"] = max(0, int(state_row["missing"]) - skipped)
 
     _populate_calibration(counts, result_list, calibration)
+    _populate_trace_replay_cross_checks(counts, result_list)
     _refresh_totals(counts)
     return counts
 
@@ -578,6 +595,12 @@ def merge_point_counts(*blocks: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
                     for operation in ("program", "erase")
                 }
                 calibration_set = True
+        cross_checks = block.get("trace_replay_cross_checks")
+        if isinstance(cross_checks, Mapping):
+            for field in _TRACE_REPLAY_CROSS_CHECK_FIELDS:
+                merged["trace_replay_cross_checks"][field] += int(
+                    cross_checks.get(field, 0) or 0
+                )
     _refresh_totals(merged)
     return merged
 
@@ -616,6 +639,16 @@ def render_point_counts_text(block: Mapping[str, Any]) -> str:
                 for reason, count in sorted(row["skip_reasons"].items())
             )
             lines.append("    skipped by reason: {}".format(reasons))
+    cross_checks = block.get("trace_replay_cross_checks") or {}
+    lines.append(
+        "Trace replay cross-checks (run / passed / failed): "
+        "{run} / {passed} / {failed}".format(
+            **{
+                field: int(cross_checks.get(field, 0) or 0)
+                for field in _TRACE_REPLAY_CROSS_CHECK_FIELDS
+            }
+        )
+    )
     calibration = block.get("calibration") or {}
     lines.append(
         "Calibration coverage "
@@ -682,6 +715,22 @@ def render_point_counts_markdown(block: Mapping[str, Any]) -> str:
                     reasons
                 )
             )
+    cross_checks = block.get("trace_replay_cross_checks") or {}
+    lines.extend(
+        [
+            "",
+            "### Trace replay cross-checks",
+            "",
+            "| Run | Passed | Failed |",
+            "| ---: | ---: | ---: |",
+            "| {run} | {passed} | {failed} |".format(
+                **{
+                    field: int(cross_checks.get(field, 0) or 0)
+                    for field in _TRACE_REPLAY_CROSS_CHECK_FIELDS
+                }
+            ),
+        ]
+    )
     lines.extend(
         [
             "",

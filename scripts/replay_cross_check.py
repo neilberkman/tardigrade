@@ -152,3 +152,37 @@ def first_pre_cut_trace_difference(
     return _first_sequence_difference(
         wanted_erase_prefix, actual_erase_prefix, "erase"
     )
+
+
+def format_replay_cross_check_error(cut_kind, cut_index, fault_type, difference):
+    cut = "{} cut {} ({})".format(cut_kind, int(cut_index), fault_type)
+    if difference.get("kind") == "pre_cut_execution_diverged":
+        return (
+            "trace replay cross-check failed for {}: live pre-cut execution "
+            "diverged from calibration at {} sequence position {}; "
+            "calibration={} live={}".format(
+                cut,
+                difference.get("operation", "operation"),
+                difference.get("sequence_position", "unknown"),
+                difference.get("expected"),
+                difference.get("observed"),
+            )
+        )
+    location = difference.get("address")
+    if location is None:
+        location = difference.get("name", difference.get("region", "unknown"))
+    expected = difference.get("expected")
+    observed = difference.get("observed")
+    if difference.get("kind") == "uncorrectable_words":
+        expected = "marked" if difference.get("expected_marked") else "unmarked"
+        observed = "marked" if difference.get("observed_marked") else "unmarked"
+    return (
+        "trace replay cross-check failed for {}: first persistent difference "
+        "at {} ({}); replay={} live={}".format(
+            cut,
+            location,
+            difference.get("kind", "unknown"),
+            expected,
+            observed,
+        )
+    )

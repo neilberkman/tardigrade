@@ -77,6 +77,10 @@ faults, controls, and other configured mechanisms. Every entry reports
 count. `point_counts.calibration` says how many calibrated writes and erases
 were cut directly, represented by heuristic or quick selection without a cut,
 outside the planned range, or neither cut nor represented.
+`point_counts.trace_replay_cross_checks` reports sampled replay checks as
+`run`, `passed`, and `failed` separately from fault-point totals. A failed
+check leaves its point in the matching kind's `run` count and records it as an
+`infrastructure_error`, not an evaluated point or product issue.
 
 These older fields remain for consumers of pre-existing reports. They cover
 only the main runtime sweep and deliberately exclude its control, the

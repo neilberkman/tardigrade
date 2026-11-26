@@ -1139,6 +1139,46 @@ The partial-bit selection mixes `torn_word_seed`, the program or erase index, th
 The string form applies one outcome to all cuts. The list form uses the same SplitMix64 per-point draw and positive integer weights as `mram_torn_word`. A listed outcome is recorded as `torn_word` on every non-control result and copied into `failures[]` and `fault_evidence[]`; phase-two compound results record `p1_torn_word` and `p2_torn_word`. `TORN_WORD_CHOICES`, `TORN_WORD`, and `TORN_WORD_SEED` are the corresponding Robot variables.
 
 `torn_word` and `mram_torn_word` are mutually exclusive. Use `mram_torn_word` for MRAM and its existing ECC-specific outcomes. The loader rejects `torn_word` on an MRAM platform and on a readable platform description without a supported flash peripheral. Runtime setup also refuses an explicitly selected outcome if the resolved peripheral does not expose `TornWordMode`; trace replay deliberately uses the Python path because the native replay engine implements only the historical `fixed` result. Omitting `torn_word` emits no new Robot variables and preserves existing plans and results.
+### Trace-replay live cross-checks
+
+```yaml
+fault_sweep:
+  trace_replay_cross_check_every: 100 # default; 0 disables
+```
+
+Execute-mode campaigns on fast-flash and MRAM backends can rebuild a power-cut
+state from the calibration trace instead of emulating Phase 1 for every point.
+For every cut whose zero-based fault index is divisible by
+`trace_replay_cross_check_every`, the sweep also runs the live fault-injection
+path to the cut and stops before recovery. The index-based selection is stable
+across batching, worker counts, and heuristic point ordering; index `0` is
+checked whenever the setting is nonzero. The check adds no fault points to the
+plan.
+
+The comparison covers every byte in the backend region restored for the
+recovery boot, all MRAM uncorrectable-word marks, and any named persistent
+values represented by the shared recovery-state model. It runs for native and
+Python write replay, all configured flash and MRAM torn-word outcomes, and the
+Python reconstruction used by `durability_model: writeback`. A flash outcome
+list uses the same per-cut draw and `torn_word_seed` for the replayed and live
+program or erase. Interrupted-erase points retain their live execute-mode
+verdict path; sampled erase points additionally compute the calibration-derived
+cut state with that selected outcome and compare it with the same live
+pre-recovery snapshot.
+
+The live check also records the actual write and erase prefix. If it differs
+from calibration before the cut, the error says that pre-cut execution
+diverged and names the first differing operation. Otherwise a state mismatch
+names the first differing address or uncorrectable word and gives the replayed
+and live values. A mismatch is an infrastructure error, never a finding: the
+point has no outcome verdict, the campaign is incomplete, and
+`summary.runtime_sweep.point_counts.trace_replay_cross_checks` reports `run`,
+`passed`, and `failed` separately from fault-point counts. The point remains in
+its kind's `run` count and increments that kind's `infrastructure_error` count.
+A backend selected for a sampled check must expose exact write and erase traces
+plus an immediate fault snapshot;
+missing capability is refused as an infrastructure error rather than silently
+disabling the check.
 
 ### MRAM torn-word mode
 
@@ -2305,6 +2345,9 @@ summary.runtime_sweep.point_counts
   .kinds.<kind>.reused                  -- state-search states reused without another boot
   .kinds.<kind>.missing                 -- requested with neither a result, recorded skip, nor reuse
   .kinds.<kind>.issues                  -- issue points with this kind's denominator
+  .trace_replay_cross_checks.run        -- sampled live comparisons performed
+  .trace_replay_cross_checks.passed     -- sampled comparisons that matched
+  .trace_replay_cross_checks.failed     -- sampled comparisons that failed as infrastructure errors
   .calibration.program                  -- calibrated writes and their direct/represented coverage
   .calibration.erase                    -- calibrated erases and their direct/represented coverage
 summary.runtime_sweep.timing            -- per-phase timing breakdown
