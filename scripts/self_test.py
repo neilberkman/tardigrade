@@ -417,6 +417,7 @@ def build_detailed_result(
         "audit_verdict": report.get("verdict"),
         "bricks": sweep.get("bricks"),
         "brick_rate": sweep.get("brick_rate"),
+        "point_counts": sweep.get("point_counts"),
     }
     # Self-test summaries wrap audit reports. Preserve explicit target source
     # provenance when present, without deriving it from the profile path.

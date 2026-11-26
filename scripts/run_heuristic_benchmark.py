@@ -140,6 +140,8 @@ def extract_run_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
         "profile": payload.get("profile"),
         "verdict": payload.get("verdict"),
         "fault_points_tested": payload.get("fault_points_tested"),
+        "fault_points_tested_scope": payload.get("fault_points_tested_scope"),
+        "point_counts": runtime.get("point_counts"),
         "issue_points": runtime.get("issue_points"),
         "bricks": runtime.get("bricks"),
         "semantic_issue_points": runtime.get("semantic_issue_points"),

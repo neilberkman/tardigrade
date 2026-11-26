@@ -148,10 +148,10 @@ class TestZeroDaySummary(unittest.TestCase):
             self.assertIn("36940db938a8f4a1e919496793ed439850a221c2", step_md)
             self.assertIn("mcuboot_head_scratch_stm32f4_writeback", step_md)
             self.assertIn("`security_aggregate.status` | `FINDINGS`", step_md)
-            self.assertIn("| Points | `3` |", step_md)
-            self.assertIn("| Issue points | `1` |", step_md)
-            self.assertIn("| Bricks | `0` |", step_md)
-            self.assertIn("| Timeouts | `3` |", step_md)
+            self.assertIn("| Main-runtime injected points | `3` |", step_md)
+            self.assertIn("| Main-runtime issue points | `1` |", step_md)
+            self.assertIn("| Main-runtime bricks | `0` |", step_md)
+            self.assertIn("| Main-runtime and control timeouts | `3` |", step_md)
             self.assertIn("| Wall time | `142.6s` |", step_md)
 
     def test_missing_report_produces_fallback_summary_and_jsonl(self) -> None:
@@ -216,8 +216,14 @@ class TestZeroDayResults(unittest.TestCase):
                 "[run-24019002]: https://github.com/xuku/tardigrade/actions/runs/24019002",
                 rendered,
             )
-            self.assertIn("`PASS`, `FINDINGS`, 1/3 issues", rendered)
-            self.assertIn("`FAIL`, `FINDINGS`, 1/3 issues", rendered)
+            self.assertIn(
+                "1 main-runtime issues/3 injected main-runtime points, `PASS`, `FINDINGS`",
+                rendered,
+            )
+            self.assertIn(
+                "1 main-runtime issues/3 injected main-runtime points, `FAIL`, `FINDINGS`",
+                rendered,
+            )
             self.assertNotIn("\u2014", rendered)
             self.assertNotIn("(", rendered)
             self.assertNotIn(")", rendered)

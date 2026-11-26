@@ -2000,9 +2000,19 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             output = stderr.getvalue()
             self.assertEqual(len(results), 5)
             self.assertIn("[audit ", output)
-            self.assertIn("worker 0 sub-batching 5 points into 3 chunks", output)
-            self.assertIn("worker 0 chunk 1/3 start: 2 points (faults 1..2)", output)
-            self.assertIn("worker 0 chunk 3/3 complete: 1 results", output)
+            self.assertIn(
+                "worker 0 sub-batching 5 requested runtime plan entries into 3 chunks",
+                output,
+            )
+            self.assertIn(
+                "worker 0 chunk 1/3 start: 2 requested runtime plan entries "
+                "(faults 1..2)",
+                output,
+            )
+            self.assertIn(
+                "worker 0 chunk 3/3 complete: 1 returned runtime result records",
+                output,
+            )
 
     def test_run_batch_with_fallback_splits_before_singles(self) -> None:
         with tempfile.TemporaryDirectory() as td:

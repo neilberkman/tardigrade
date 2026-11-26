@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from report_security_status import build_security_aggregate
+from point_counts import render_point_counts_markdown, render_point_counts_text
 
 
 DEFAULT_MCUBOOT_COMMIT_FILE = Path(
@@ -81,6 +82,8 @@ def extract_summary_record(
             "issue_points": 0,
             "mcuboot_commit": resolved_mcuboot,
             "points": 0,
+            "points_scope": "injected points in the main runtime sweep",
+            "point_counts": None,
             "profile": profile_name,
             "security_aggregate": {"status": "INCONCLUSIVE"},
             "security_status": "INCONCLUSIVE",
@@ -135,6 +138,8 @@ def extract_summary_record(
         "issue_points": issue_points,
         "mcuboot_commit": resolved_mcuboot,
         "points": points,
+        "points_scope": "injected points in the main runtime sweep",
+        "point_counts": runtime_map.get("point_counts"),
         "profile": profile_name,
         "security_aggregate": {"status": security_status},
         "security_status": security_status,
@@ -150,18 +155,22 @@ def format_console_summary(record: Mapping[str, Any]) -> str:
     sec_status = record.get("security_status") or record.get(
         "security_aggregate", {}
     ).get("status", "UNKNOWN")
-    lines = [
+    lines = []
+    point_counts = record.get("point_counts")
+    if isinstance(point_counts, Mapping):
+        lines.extend(render_point_counts_text(point_counts).splitlines())
+    lines.extend([
         f"MCUboot: {record['mcuboot_commit']}",
         f"Zephyr: {record['zephyr_commit']}",
         f"Profile: {record['profile']}",
         f"Verdict: {record['verdict']}",
         f"security_aggregate.status: {sec_status}",
-        f"Points: {record['points']}",
-        f"Issue points: {record['issue_points']}",
-        f"Bricks: {record['bricks']}",
-        f"Timeouts: {record['timeouts']}",
+        f"Main-runtime injected points: {record['points']}",
+        f"Main-runtime issue points: {record['issue_points']}",
+        f"Main-runtime bricks: {record['bricks']}",
+        f"Main-runtime and control timeouts: {record['timeouts']}",
         f"Wall time: {record['wall_time_s']}s",
-    ]
+    ])
     return "\n".join(lines) + "\n"
 
 
@@ -173,6 +182,12 @@ def format_step_summary(record: Mapping[str, Any]) -> str:
     lines = [
         f"## Zero-day canary summary: `{record['profile']}`",
         "",
+    ]
+    point_counts = record.get("point_counts")
+    if isinstance(point_counts, Mapping):
+        lines.extend(render_point_counts_markdown(point_counts).rstrip().splitlines())
+        lines.append("")
+    lines.extend([
         "| Field | Value |",
         "| --- | --- |",
         f"| MCUboot commit | `{record['mcuboot_commit']}` |",
@@ -180,13 +195,13 @@ def format_step_summary(record: Mapping[str, Any]) -> str:
         f"| Profile | `{record['profile']}` |",
         f"| Verdict | `{record['verdict']}` |",
         f"| `security_aggregate.status` | `{sec_status}` |",
-        f"| Points | `{record['points']}` |",
-        f"| Issue points | `{record['issue_points']}` |",
-        f"| Bricks | `{record['bricks']}` |",
-        f"| Timeouts | `{record['timeouts']}` |",
+        f"| Main-runtime injected points | `{record['points']}` |",
+        f"| Main-runtime issue points | `{record['issue_points']}` |",
+        f"| Main-runtime bricks | `{record['bricks']}` |",
+        f"| Main-runtime and control timeouts | `{record['timeouts']}` |",
         f"| Wall time | `{record['wall_time_s']}s` |",
         "",
-    ]
+    ])
     return "\n".join(lines)
 
 

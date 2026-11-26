@@ -24,6 +24,7 @@ from fault_classification import (
     writeback_reconstruction_is_valid,
 )
 from layout_validation import LayoutValidationError, validate_load_plan
+from point_counts import build_point_counts, render_point_counts_text
 
 
 PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -917,7 +918,9 @@ def run_profile(
     temp_ctx = tempfile.TemporaryDirectory(prefix="oss_val_{}_".format(name))
     work_dir = Path(temp_ctx.name)
     print(
-        "  one-process batch: control + {} fault point(s)".format(len(fault_points)),
+        "  one-process batch: 1 clean control + {} requested single-cut program point(s)".format(
+            len(fault_points)
+        ),
         file=sys.stderr,
     )
     campaign_error: str | None = None
@@ -1030,6 +1033,28 @@ def run_profile(
         "issue_rate": round(issue_rate, 4), "infra_errors": errors,
         "failures": failures, "results": results,
     }
+    result["point_counts"] = build_point_counts(
+        results,
+        planned_fault_types=["w"] * len(fault_points),
+        expected_control_points=1,
+        issue_predicate=lambda item: (
+            not item.get("is_control")
+            and _effective_outcome_str(item) != "success"
+            and _effective_outcome_str(item) not in incomplete_outcomes
+        ),
+        calibration={
+            "program": {
+                "calibrated": total_writes,
+                "planned_range": end - start + 1,
+                "representation": [],
+            },
+            "erase": {
+                "calibrated": 0,
+                "planned_range": 0,
+                "representation": [],
+            },
+        },
+    )
     # ``source_checkout`` is the manifest's explicit target-source
     # declaration. Report the complete commit resolved from its managed
     # worktree; do not infer provenance from an artifact path.
@@ -1091,10 +1116,19 @@ def main() -> int:
         entry = run_profile(repo_root, renode_test, profile, variables, args.workers, args.skip_setup)
         all_results.append(entry)
         status = "PASS" if entry["passed"] else "FAIL"
-        print("  {} bricks={}/{} issues={}/{} {}".format(
-            status, entry["bricks"], entry["faulted_runs"],
-            entry["issues"], entry["faulted_runs"],
-            " ".join(entry["failures"])), file=sys.stderr)
+        print(render_point_counts_text(entry["point_counts"]), file=sys.stderr)
+        print(
+            "  {} main-runtime bricks={}/{} evaluated program points; "
+            "main-runtime issues={}/{} evaluated program points {}".format(
+                status,
+                entry["bricks"],
+                entry["faulted_runs"],
+                entry["issues"],
+                entry["faulted_runs"],
+                " ".join(entry["failures"]),
+            ),
+            file=sys.stderr,
+        )
 
     all_passed = all(r["passed"] for r in all_results)
     summary = {

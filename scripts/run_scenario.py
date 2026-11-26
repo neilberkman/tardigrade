@@ -22,6 +22,7 @@ except ImportError as exc:  # pragma: no cover - runtime dependency check
     raise SystemExit("PyYAML is required for run_scenario.py (pip install pyyaml).") from exc
 
 from profile_loader import load_profile_raw
+from point_counts import render_point_counts_text
 from verdicts import is_pass_verdict
 
 
@@ -68,6 +69,7 @@ def _summarize_step_report(step_id: str, report: Optional[Dict[str, Any]]) -> No
             _progress("step {} verdict={}".format(step_id, verdict))
         return
     control = runtime.get("control") or {}
+    point_counts = runtime.get("point_counts")
     total_points = runtime.get("total_fault_points")
     issue_points = runtime.get("issue_points")
     bricks = runtime.get("bricks")
@@ -76,13 +78,16 @@ def _summarize_step_report(step_id: str, report: Optional[Dict[str, Any]]) -> No
     if verdict is not None:
         details.append("verdict={}".format(verdict))
     if total_points is not None:
-        details.append("points={}".format(total_points))
+        details.append("main_runtime_injected_points={}".format(total_points))
     if issue_points is not None:
-        details.append("issues={}".format(issue_points))
+        details.append("main_runtime_issue_points={}".format(issue_points))
     if bricks is not None:
-        details.append("bricks={}".format(bricks))
+        details.append("main_runtime_bricks={}".format(bricks))
     if control_outcome is not None:
         details.append("control={}".format(control_outcome))
+    if isinstance(point_counts, dict):
+        for line in render_point_counts_text(point_counts).splitlines():
+            _progress("step {} {}".format(step_id, line))
     if details:
         _progress("step {} {}".format(step_id, " ".join(details)))
 

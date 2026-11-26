@@ -191,7 +191,7 @@ Runs with `--quick --strict-profile` and `scripts/self_test.py --quick` (Renode 
 
 | Profile | Mode | Result |
 | --- | --- | --- |
-| `mcuboot_pr2214_offset_broken` | `--quick --strict-profile` & `self_test.py --quick` | `PASS`, control exhibits expected `wrong_image` (`actual_writes=1`, marker `0x00000001`, `security_aggregate.status=FINDINGS`, `issue_points=1`), sweep wall time 44.6 s |
+| `mcuboot_pr2214_offset_broken` | `--quick --strict-profile` & `self_test.py --quick` | `PASS`, control exhibits expected `wrong_image` (`actual_writes=1`, marker `0x00000001`, `security_aggregate.status=FINDINGS`, `security_aggregate.issue_points=1` across reliable report components), sweep wall time 44.6 s |
 | `mcuboot_pr2214_offset_fixed` | `--quick --strict-profile` & `self_test.py --quick` | `PASS`, control `success` (marker `0x00000201`), 124196 calibrated writes / 124 erases (409.9 s calibration), 3 power-loss points at writes `0` (`0x00080FD8`), `62098` (`0x000437A0`), and `124195` (`0x00080FE0`) all recover to v1.2.0 (52.8 s sweep wall time) |
 
 The fixed full sweep has not been run. Its quick run exceeds ten minutes

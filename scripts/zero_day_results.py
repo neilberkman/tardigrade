@@ -18,6 +18,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from point_counts import point_count_rows
 from zero_day_summary import extract_summary_record
 
 
@@ -280,6 +281,10 @@ def _normalize_loaded_record(
         "issue_points": issue_points,
         "mcuboot_commit": mcuboot_commit,
         "points": points,
+        "points_scope": str(
+            raw.get("points_scope") or "injected points in the main runtime sweep"
+        ),
+        "point_counts": raw.get("point_counts"),
         "profile": str(raw.get("profile", slug)),
         "run_id": int(run_id) if str(run_id or "").isdigit() else run_id,
         "run_url": str(run_url) if run_url else "",
@@ -428,11 +433,37 @@ def format_profile_cell(record: Mapping[str, Any] | None) -> str:
     bricks = int(record.get("bricks", 0) or 0)
     timeouts = int(record.get("timeouts", 0) or 0)
 
-    parts = [f"`{verdict_head}`", f"`{sec_status}`", f"{issues}/{points} issues"]
+    parts: list[str] = []
+    point_counts = record.get("point_counts")
+    if isinstance(point_counts, Mapping):
+        rows = point_count_rows(point_counts)
+        parts.extend(
+            "{}: requested {}, run {}, evaluated {}, skipped {}, infrastructure "
+            "error {}, timeout {}, reused {}, missing {}, issues {}".format(
+                row["label"],
+                row["requested"],
+                row["run"],
+                row["evaluated"],
+                row["skipped"],
+                row["infrastructure_error"],
+                row["timeout"],
+                row["reused"],
+                row["missing"],
+                row["issues"],
+            )
+            for row in rows
+        )
+        if not rows:
+            parts.append("no requested or returned points")
+    else:
+        parts.append(
+            f"{issues} main-runtime issues/{points} injected main-runtime points"
+        )
+    parts.extend([f"`{verdict_head}`", f"`{sec_status}`"])
     if bricks:
-        parts.append(f"{bricks} bricks")
+        parts.append(f"{bricks} main-runtime bricks")
     if timeouts:
-        parts.append(f"{timeouts} timeouts")
+        parts.append(f"{timeouts} main-runtime and control timeouts")
     return ", ".join(parts)
 
 
