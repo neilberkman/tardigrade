@@ -28,6 +28,7 @@ from profile_loader import (  # noqa: E402
     ProfileError,
     load_profile,
 )
+from renode_runner import profile_robot_timeout_minutes  # noqa: E402
 
 
 BASE_PROFILE = """
@@ -256,6 +257,169 @@ fault_sweep:
     fault_types: [command_drop]
 """
             )
+
+    def test_phase2_state_search_is_one_deterministic_runtime_plan(self) -> None:
+        profile = self._load(
+            """
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: 8
+  fault_types: [power_loss]
+  phase2_fault:
+    enabled: true
+    fault_types: [power_loss]
+    state_search:
+      enabled: true
+      first_cuts:
+        mode: ranges
+        ranges:
+          - { start: 0, end: 8 }
+      max_cuts: 3
+      max_new_states: 44
+      max_wall_time_s: 12.5
+      address_ranges:
+        - { start: 0x10000000, end: 0x100000FF }
+      cross_check_every: 7
+"""
+        )
+        state_search = profile.fault_sweep.phase2_fault.state_search
+        self.assertTrue(state_search.enabled)
+        self.assertEqual(state_search.first_cut_mode, "ranges")
+        self.assertEqual(state_search.first_cut_ranges, [(0, 8)])
+        self.assertEqual(state_search.max_cuts, 3)
+        self.assertEqual(state_search.max_new_states, 44)
+        self.assertEqual(state_search.max_wall_time_s, 12.5)
+        self.assertEqual(
+            state_search.address_ranges, [(0x10000000, 0x100000FF)]
+        )
+        self.assertEqual(state_search.cross_check_every, 7)
+
+        encoded = next(
+            value.split(":", 1)[1]
+            for value in profile.robot_vars(ROOT)
+            if value.startswith("PHASE2_STATE_SEARCH_B64:")
+        )
+        self.assertEqual(
+            json.loads(base64.b64decode(encoded))["first_cuts"],
+            {"mode": "ranges", "ranges": [{"start": 0, "end": 8}]},
+        )
+        self.assertIn("CALIBRATION_TRACE_REQUIRED:true", profile.robot_vars(ROOT))
+        robot_suite = (ROOT / "tests" / "ota_fault_point.robot").read_text()
+        self.assertIn("${PHASE2_STATE_SEARCH_B64}", robot_suite)
+        self.assertIn("$phase2_state_search_b64=", robot_suite)
+
+        plan = build_fault_plan(profile, CalibrationInputs(max_writes=200))
+        self.assertEqual(plan.fault_points, [0])
+        self.assertEqual(plan.fault_types_list, ["rs"])
+
+    def test_phase2_state_search_defaults_are_bounded(self) -> None:
+        profile = self._load(
+            """
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  phase2_fault:
+    enabled: true
+    state_search: { enabled: true }
+"""
+        )
+        config = profile.fault_sweep.phase2_fault.state_search
+        self.assertEqual(config.first_cut_mode, "quick")
+        self.assertEqual(config.max_cuts, 2)
+        self.assertEqual(config.max_new_states, 1000)
+        self.assertEqual(config.max_wall_time_s, 900.0)
+        self.assertEqual(config.cross_check_every, 100)
+
+    def test_phase2_state_search_sets_runner_timeout_from_search_bound(self) -> None:
+        profile = self._load(
+            """
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  run_duration: "4.0"
+  fault_types: [power_loss]
+  phase2_fault:
+    enabled: true
+    state_search:
+      enabled: true
+      max_wall_time_s: 901
+"""
+        )
+        self.assertEqual(profile_robot_timeout_minutes(profile), 18)
+
+    def test_phase2_state_search_rejects_incompatible_modes(self) -> None:
+        cases = {
+            "explicit pairs": """
+  evaluation_mode: execute
+  phase2_fault:
+    enabled: true
+    pairs: [[1, 2]]
+    state_search: { enabled: true }
+""",
+            "grid max": """
+  evaluation_mode: execute
+  phase2_fault:
+    enabled: true
+    max_points: 3
+    state_search: { enabled: true }
+""",
+            "state evaluation": """
+  evaluation_mode: state
+  phase2_fault:
+    enabled: true
+    state_search: { enabled: true }
+""",
+            "non-halting fault": """
+  evaluation_mode: execute
+  phase2_fault:
+    enabled: true
+    fault_types: [bit_corruption]
+    state_search: { enabled: true }
+""",
+            "writeback": """
+  evaluation_mode: execute
+  durability_model: writeback
+  phase2_fault:
+    enabled: true
+    state_search: { enabled: true }
+""",
+        }
+        for label, body in cases.items():
+            with self.subTest(label=label), self.assertRaisesRegex(
+                ProfileError, "state_search"
+            ):
+                self._load("fault_sweep:\n" + body)
+
+    def test_phase2_state_search_validates_ranges_and_limits(self) -> None:
+        invalid_fragments = (
+            "first_cuts: { mode: ranges, ranges: [] }",
+            "first_cuts: { mode: all, ranges: [{ start: 1, end: 2 }] }",
+            "first_cuts: { mode: ranges, ranges: [{ start: 3, end: 2 }] }",
+            "max_cuts: 1",
+            "max_new_states: 0",
+            "max_wall_time_s: 0",
+            "address_ranges: [{ start: 9, end: 8 }]",
+            "cross_check_every: -1",
+        )
+        for fragment in invalid_fragments:
+            with self.subTest(fragment=fragment), self.assertRaisesRegex(
+                ProfileError, "state_search"
+            ):
+                self._load(
+                    """
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  phase2_fault:
+    enabled: true
+    state_search:
+      enabled: true
+      {}
+""".format(fragment)
+                )
 
     def test_top_level_bootloader_region_is_canonical(self) -> None:
         profile = self._load(

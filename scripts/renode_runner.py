@@ -251,6 +251,13 @@ def profile_robot_timeout_minutes(profile: ProfileConfig) -> Optional[int]:
     if duration_s <= 0:
         return None
     robot_timeout_s = max(120.0, max(4.0, duration_s) * 30.0)
+    phase2 = getattr(fault_sweep, "phase2_fault", None)
+    state_search = getattr(phase2, "state_search", None)
+    if state_search is not None and bool(getattr(state_search, "enabled", False)):
+        # A single planner point expands to a dynamic number of recovery
+        # boots. Keep the harness guard beyond the search's own wall bound.
+        search_wall_s = float(getattr(state_search, "max_wall_time_s", 0.0) or 0.0)
+        robot_timeout_s = max(robot_timeout_s, search_wall_s + 120.0)
     return int(math.ceil(robot_timeout_s / 60.0))
 
 
@@ -724,17 +731,35 @@ def _validate_batch_results(
         raise RenodeProtocolError(
             "batch result must be a list, got {}".format(type(results).__name__)
         )
-    if len(results) != len(fault_points):
+    state_search_batch = (
+        len(fault_points) == 1
+        and fault_points == [0]
+        and fault_types_list == ["rs"]
+    )
+    if not state_search_batch and len(results) != len(fault_points):
         raise RenodeProtocolError(
             "batch result cardinality mismatch: requested {} point(s), received {}"
             .format(len(fault_points), len(results))
         )
 
     validated: List[Dict[str, Any]] = []
-    for idx, (result, expected_point) in enumerate(zip(results, fault_points)):
-        expected_type = (
-            str(fault_types_list[idx]) if fault_types_list is not None else "w"
+    if state_search_batch and not results:
+        raise RenodeProtocolError(
+            "recovery state search returned no evaluated persistent states"
         )
+    result_requests = (
+        [(result, 0, "rs") for result in results]
+        if state_search_batch
+        else [
+            (
+                result,
+                expected_point,
+                str(fault_types_list[idx]) if fault_types_list is not None else "w",
+            )
+            for idx, (result, expected_point) in enumerate(zip(results, fault_points))
+        ]
+    )
+    for idx, (result, expected_point, expected_type) in enumerate(result_requests):
         validated.append(
             _validate_result_identity(
                 result,

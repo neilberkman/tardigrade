@@ -39,6 +39,12 @@ from writeback_reconstruction import (
     is_known_writeback_fault_type,
     is_unsupported_writeback_fault_type,
 )
+from recovery_state import PersistentState, merge_operation_traces
+from recovery_search import (
+    RecoveryStateExplorer,
+    first_persistent_difference,
+    select_first_cuts,
+)
 
 
 def _try_disable_backend_fast_path(periph):
@@ -1145,6 +1151,19 @@ def _verify_recovery_marker_cleared():
 
 # Read monitor variables.
 result_file = str(monitor.GetVariable('result_file'))
+phase2_state_search_raw = get_optional_var('phase2_state_search_b64', '').strip()
+phase2_state_search = None
+if phase2_state_search_raw:
+    try:
+        phase2_state_search = json.loads(
+            base64.b64decode(phase2_state_search_raw).decode('utf-8')
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            'phase2 state search configuration is malformed: {}'.format(exc)
+        )
+    if not isinstance(phase2_state_search, dict):
+        raise RuntimeError('phase2 state search configuration must be a mapping')
 calibration_mode = str(monitor.GetVariable('calibration_mode')).lower() in ('1', 'true', 'yes')
 heuristic_trace_required = get_optional_var(
     'heuristic_trace_required', 'false'
@@ -12331,6 +12350,8 @@ def parse_write_trace_map(trace_text):
             meta['width'] = int(event[3])
             if meta['width'] not in (1, 2, 4, 8) or meta['width'] > int(flash_size) - flash_off:
                 raise ValueError('write trace map width spans outside flash')
+            if meta['width'] == 8:
+                meta['value'] = '0x{:016X}'.format(value & 0xFFFFFFFFFFFFFFFF)
         mapping[write_idx] = meta
     return mapping
 
@@ -13306,7 +13327,8 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
 # Phase 2: recovery boot with fault injection armed at p2_fault_at
 # Phase 3: boot from double-faulted state, validate recovery
 # ---------------------------------------------------------------------------
-def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type='w'):
+def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type='w',
+                     cross_check_expected=None):
     if backend['kind'] == 'slow':
         return {
             'fault_at': p1_fault_at,
@@ -13358,6 +13380,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     recovery_boot_signals = {}
     p1_fault_semantic_state = None
     p2_fault_semantic_state = None
+    cross_check_persistent_state = None
     log('p2fault p1={}/{} p2={}/{} phase1_setup'.format(
         p1_fault_at, p1_fault_type, p2_fault_at, p2_fault_type))
 
@@ -13604,6 +13627,29 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
                 flash_size = int(backend['data'].FlashSize)
                 saved_flash_p2 = flash_ref.ReadBytes(0, flash_size)
 
+        if cross_check_expected is not None:
+            cross_check_offsets = _snapshot_mram_uncorrectable_offsets()
+            mismatch = first_persistent_difference(
+                cross_check_expected,
+                {'nvm': bytearray(to_py_bytes(saved_flash_p2))},
+                tuple(('nvm', int(offset)) for offset in cross_check_offsets),
+            )
+            cross_check_persistent_state = {
+                'matched': mismatch is None,
+                'state_identity': cross_check_expected.identity_hex(),
+            }
+            if mismatch is not None:
+                cross_check_persistent_state['first_difference'] = mismatch
+                raise RuntimeError(
+                    'recovery state cross-check mismatch at {} '
+                    '({}; expected={} observed={})'.format(
+                        mismatch.get('address', 'unknown address'),
+                        mismatch.get('kind', 'unknown difference'),
+                        mismatch.get('expected', 'n/a'),
+                        mismatch.get('observed', 'n/a'),
+                    )
+                )
+
         # --- Phase 3: boot from double-faulted state ---
         phase3_t0 = _time.time()
         restore_flash_and_boot(saved_flash_p2)
@@ -13638,6 +13684,12 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         disarm_vtor_watchpoint()
         phase3_ms = int((_time.time() - phase3_t0) * 1000)
     else:
+        if cross_check_expected is not None:
+            raise RuntimeError(
+                'recovery state cross-check could not inject the second cut at {} ({})'.format(
+                    p2_fault_at, p2_fault_type
+                )
+            )
         if is_p2_erase:
             phase2_skip_reason = 'no_erase_at_index'
         else:
@@ -13741,6 +13793,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         result['phase2_fault']['p1_mram_torn_word'] = p1_torn_word
     if p2_torn_word is not None:
         result['phase2_fault']['p2_mram_torn_word'] = p2_torn_word
+    if cross_check_persistent_state is not None:
+        result['phase2_fault']['cross_check_persistent_state'] = cross_check_persistent_state
     if eff_criteria is not None:
         result['effective_success_criteria'] = eff_criteria
     if phase2_skip_reason is not None:
@@ -14200,6 +14254,10 @@ def ensure_trace_replay_engine():
 
 def load_trace_data(path):
     import csv as _csv
+    try:
+        trace_integer = long
+    except NameError:
+        trace_integer = int
     entries = []
     with open(path, 'r') as f:
         reader = _csv.DictReader(f)
@@ -14232,9 +14290,9 @@ def load_trace_data(path):
             if None in row and row[None]:
                 raise ValueError('write trace CSV row has extra fields')
             try:
-                write_index = int(str(row['write_index']).strip(), 0)
-                flash_offset = int(str(row['flash_offset']).strip(), 0)
-                value = int(str(row['value']).strip(), 0)
+                write_index = trace_integer(str(row['write_index']).strip(), 0)
+                flash_offset = trace_integer(str(row['flash_offset']).strip(), 0)
+                value = trace_integer(str(row['value']).strip(), 0)
             except (TypeError, ValueError) as exc:
                 raise ValueError('malformed write trace row: {}'.format(exc))
             if write_index < 0:
@@ -14252,7 +14310,7 @@ def load_trace_data(path):
             width = row.get(width_fields[0]) if width_fields else None
             if width not in (None, ''):
                 try:
-                    width_value = int(str(width).strip(), 0)
+                    width_value = trace_integer(str(width).strip(), 0)
                 except (TypeError, ValueError) as exc:
                     raise ValueError('malformed write width: {}'.format(exc))
                 if width_value not in (1, 2, 4, 8):
@@ -14531,7 +14589,10 @@ def to_clr_bytes(raw):
         return None
     arr = System.Array.CreateInstance(System.Byte, len(raw))
     for idx, value in enumerate(raw):
-        arr[idx] = int(value) & 0xFF
+        # IronPython exposes ``bytes`` as a string and iteration therefore
+        # yields one-character strings, unlike Python 3's integer elements.
+        byte_value = ord(value) if isinstance(value, string_types) else int(value)
+        arr[idx] = byte_value & 0xFF
     return arr
 
 
@@ -15357,6 +15418,367 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         fault_uncorrectable_words=fault_uncorrectable_addresses,
     )
 
+
+# ---------------------------------------------------------------------------
+# Recovery-state search: compute cuts from operation-accurate traces and boot
+# each distinct persistent state once.  The whole search stays in this Renode
+# batch so its verdict cache is shared by first and deeper cuts.
+# ---------------------------------------------------------------------------
+
+def _state_search_trace_target():
+    return backend.get('data')
+
+
+def _state_search_preflight():
+    if not isinstance(phase2_state_search, dict) or not phase2_state_search.get('enabled'):
+        raise RuntimeError('recovery state search was dispatched without enabled configuration')
+    if backend.get('kind') not in ('fast', 'mram'):
+        raise RuntimeError(
+            'recovery state search requires a fast flash or MRAM backend, got {}'.format(
+                backend.get('kind')
+            )
+        )
+    if durability_model != 'direct':
+        raise RuntimeError('recovery state search requires durability_model=direct')
+    if backend.get('controller') is not None:
+        raise RuntimeError(
+            'recovery state search cannot canonicalize a separate persistent NVM controller'
+        )
+    if backend.get('otp') is not None:
+        raise RuntimeError(
+            'recovery state search cannot canonicalize a separate OTP peripheral'
+        )
+    if not backend.get('write_trace_width_explicit'):
+        raise RuntimeError('recovery state search requires width-explicit write traces')
+    if not bool(backend.get('per_write_accurate')):
+        raise RuntimeError('recovery state search requires PerWriteAccurate=true')
+    target = _state_search_trace_target()
+    required = (
+        'WriteTraceClear', 'WriteTraceEnabled', 'WriteTraceCount',
+        'WriteTraceToString', 'EraseTraceClear', 'EraseTraceEnabled',
+        'EraseTraceCount', 'EraseTraceToString',
+    )
+    missing = [name for name in required if not hasattr(target, name)]
+    if missing:
+        raise RuntimeError(
+            'recovery state search backend lacks operation trace members: {}'.format(
+                ', '.join(missing)
+            )
+        )
+    if not trace_file_path or not os.path.exists(trace_file_path):
+        raise RuntimeError('recovery state search requires the calibration write trace CSV')
+
+
+def _state_search_operations_from_maps(write_map, erase_map):
+    writes = []
+    for expected_index, write_index in enumerate(sorted(write_map), start=1):
+        meta = write_map[write_index]
+        if int(write_index) != expected_index or 'width' not in meta:
+            raise RuntimeError(
+                'recovery state search requires contiguous width-explicit write records'
+            )
+        writes.append({
+            'write_index': int(write_index),
+            'offset': int(meta['flash_offset']),
+            'value': meta['value'],
+            'width': int(meta['width']),
+        })
+    erases = []
+    for expected_index, erase_index in enumerate(sorted(erase_map), start=1):
+        meta = erase_map[erase_index]
+        erase_size = int(meta.get('erase_size', 0))
+        if int(erase_index) != expected_index or erase_size <= 0:
+            raise RuntimeError(
+                'recovery state search requires contiguous erase indices and explicit sizes'
+            )
+        erases.append({
+            'erase_index': int(erase_index),
+            'offset': int(meta['flash_offset']),
+            'writes_at_this_point': int(meta.get('writes_at_this_point', 0)),
+            'erase_size': erase_size,
+        })
+    return merge_operation_traces(writes, erases)
+
+
+def _state_search_load_calibration_operations():
+    raw_writes = load_trace_data(trace_file_path)
+    if not raw_writes:
+        raise RuntimeError('recovery state search calibration write trace is empty')
+    if any(len(event) < 4 for event in raw_writes):
+        raise RuntimeError('recovery state search calibration trace has an ambiguous write width')
+    writes = _validated_writeback_trace(raw_writes)
+    write_map = {}
+    for write_index, flash_offset, value, width in writes:
+        if int(write_index) <= 0:
+            raise RuntimeError('recovery state search write indices must begin at one')
+        write_map[int(write_index)] = {
+            'flash_offset': int(flash_offset),
+            'value': int(value),
+            'width': int(width),
+        }
+    erase_map = {}
+    if erase_trace_file_path and os.path.exists(erase_trace_file_path):
+        erases = load_erase_trace_data(
+            erase_trace_file_path, require_replay_metadata=True
+        )
+        for position, (flash_offset, writes_at, erase_size) in enumerate(
+            erases, start=1
+        ):
+            erase_map[position] = {
+                'flash_offset': int(flash_offset),
+                'writes_at_this_point': int(writes_at),
+                'erase_size': int(erase_size),
+            }
+    return _state_search_operations_from_maps(write_map, erase_map), len(writes)
+
+
+def _state_search_capture_trace():
+    target = _state_search_trace_target()
+    write_text = str(target.WriteTraceToString())
+    erase_text = str(target.EraseTraceToString())
+    write_map = parse_write_trace_map(write_text)
+    erase_map = parse_erase_trace_map(erase_text)
+    return _state_search_operations_from_maps(write_map, erase_map)
+
+
+def _state_search_enable_operation_trace(target):
+    if backend.get('kind') == 'fast':
+        required = ('DiffLookahead', 'SkipShadowScan', 'PassthroughMode')
+        missing = [name for name in required if not hasattr(target, name)]
+        if missing:
+            raise RuntimeError(
+                'recovery state search cannot force operation-accurate tracing: {}'.format(
+                    ', '.join(missing)
+                )
+            )
+        target.DiffLookahead = 2147483647
+        target.SkipShadowScan = False
+        target.PassthroughMode = False
+    target.WriteTraceClear()
+    target.EraseTraceClear()
+    target.WriteTraceEnabled = True
+    target.EraseTraceEnabled = True
+
+
+def _state_search_should_capture_trace(generation):
+    return int(generation) < int(phase2_state_search.get('max_cuts', 2))
+
+
+def _state_search_mark_addresses(state):
+    base_address = int(state.region('nvm').base_address)
+    return [
+        fmt_u32(base_address + int(offset))
+        for region_name, offset in sorted(state.uncorrectable_words)
+        if region_name == 'nvm'
+    ]
+
+
+def _state_search_boot_state(state, chain, generation):
+    global _recovery_marker_precondition
+    _recovery_marker_precondition = None
+    started = _time.time()
+    state_bytes = state.materialize()['nvm']
+    state_marks = [
+        int(offset)
+        for region_name, offset in sorted(state.uncorrectable_words)
+        if region_name == 'nvm'
+    ]
+    restore_flash_and_boot(to_clr_bytes(state_bytes))
+    _clear_mram_uncorrectable_words()
+    _restore_mram_uncorrectable_offsets(state_marks)
+    fault_semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': 'power_loss_boundary',
+        'boot_slot': None,
+        'fault_injected': True,
+        'stage': 'fault_snapshot',
+        'recovery_state_generation': int(generation),
+    })
+    if _hash_bypass_active:
+        apply_hash_bypass()
+    reset_nvmc_for_recovery()
+    _clear_mram_uncorrectable_words()
+    _restore_mram_uncorrectable_offsets(state_marks)
+    _clear_mram_uncorrectable_read_log()
+
+    target = _state_search_trace_target()
+    capture_recovery_trace = _state_search_should_capture_trace(generation)
+    if capture_recovery_trace:
+        _state_search_enable_operation_trace(target)
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = False
+    eff_criteria = get_effective_criteria('p2')
+    arm_vtor_watchpoint()
+    boot_started = _time.time()
+    try:
+        p2_status = run_until_done(
+            cpu_ref,
+            label='recovery_state_{}_{}'.format(generation, len(chain)),
+            expect_writes=False,
+            zero_writes_is_brick=False,
+            wall_timeout=phase2_wall_timeout_s,
+            stop_on_fault=False,
+            time_slice=phase2_time_slice,
+            reset_already_observed=True,
+            effective_criteria=eff_criteria,
+            fault_injected=True,
+        )
+    finally:
+        disarm_vtor_watchpoint()
+        if capture_recovery_trace:
+            target.WriteTraceEnabled = False
+            target.EraseTraceEnabled = False
+    recovery_operations = (
+        _state_search_capture_trace() if capture_recovery_trace else ()
+    )
+    recovery_writes = get_total_writes()
+    boot_ms = int((_time.time() - boot_started) * 1000)
+
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value,
+        pc_value,
+        fault_injected=True,
+        effective_criteria=eff_criteria,
+        p2_status=p2_status,
+    )
+    marked_addresses = _state_search_mark_addresses(state)
+    _attach_uncorrectable_read_signals(
+        signals,
+        boot_outcome,
+        p2_status=p2_status,
+        marked_at_fault=marked_addresses,
+        torn_word_mode=mram_torn_word,
+    )
+    signals['phase1_ms'] = 0
+    signals['phase2_ms'] = boot_ms
+    signals['emulation_ms'] = boot_ms
+    signals['total_ms'] = int((_time.time() - started) * 1000)
+    signals['p2_iters'] = p2_status.get('iters')
+    signals['trace_replay_mode'] = 'computed_recovery_state'
+    signals['recovery_state_generation'] = int(generation)
+    merge_stop_status_signals(signals, 'phase2', p2_status)
+    fault_address = int(str(chain[-1]['address']), 0) if chain else 0
+    result = _build_fault_result(
+        int(chain[0]['operation_index']) if chain else 0,
+        'rs',
+        True,
+        fault_address,
+        recovery_writes,
+        signals,
+        boot_outcome=boot_outcome,
+        boot_slot=boot_slot,
+        eff_criteria=eff_criteria,
+        p2_status=p2_status,
+        followup_label='recovery_state_{}_followup'.format(generation),
+        saved_flash=to_clr_bytes(state_bytes),
+        fault_snapshot_bytes=bytearray(state_bytes),
+        extra_fields={'recovery_writes': recovery_writes},
+        fault_semantic_state=fault_semantic_state,
+        fault_uncorrectable_words=marked_addresses,
+    )
+    result = annotate_boot_span_result(
+        annotate_update_sequence_result(
+            _finalize_recovery_marker_precondition_result(result)
+        )
+    )
+    return result, recovery_operations
+
+
+def run_recovery_state_search():
+    _state_search_preflight()
+    calibration_operations, total_writes = _state_search_load_calibration_operations()
+    selected, excluded = select_first_cuts(
+        total_writes, phase2_state_search.get('first_cuts')
+    )
+    if not selected:
+        raise RuntimeError('recovery state search selected no in-range first cuts')
+
+    reload_images_cached()
+    if _hash_bypass_active:
+        apply_hash_bypass()
+    _clear_mram_uncorrectable_words()
+    flash_base, flash_size, page_size, erase_fill = _replay_storage_geometry()
+    baseline = _replay_storage_read_bytes(0, flash_size)
+    initial_state = PersistentState.from_bytes(
+        bytearray(to_py_bytes(baseline)),
+        name='nvm',
+        base_address=flash_base,
+    )
+
+    def torn_word_for_cut(operation, generation, chain):
+        if not mram_torn_word_choices:
+            return mram_torn_word
+        return _mram_torn_word_for_point(
+            int(operation['operation_index']),
+            mram_torn_word_choices,
+            mram_torn_word_seed,
+        )
+
+    def cross_check(state, chain, generation, operation):
+        if int(generation) != 2 or len(chain) != 2:
+            return False
+        p2_fault_type = 'e' if operation.get('kind') == 'erase' else 'w'
+        live_result = run_phase2_fault(
+            int(chain[0]['operation_index']),
+            int(chain[1]['operation_index']),
+            'w',
+            p2_fault_type,
+            cross_check_expected=state,
+        )
+        status = live_result.get('phase2_fault', {}).get(
+            'cross_check_persistent_state'
+        )
+        if not isinstance(status, dict) or status.get('matched') is not True:
+            raise RuntimeError('recovery state cross-check returned no positive proof')
+        log(
+            'recovery state cross-check: p1={} p2={}/{} matched'.format(
+                chain[0]['operation_index'],
+                chain[1]['operation_index'],
+                p2_fault_type,
+            )
+        )
+        return status
+
+    explorer = RecoveryStateExplorer(
+        initial_state,
+        calibration_operations,
+        first_cuts=selected,
+        max_cuts=int(phase2_state_search.get('max_cuts', 2)),
+        max_new_states=int(phase2_state_search.get('max_new_states', 1000)),
+        max_wall_time_s=float(phase2_state_search.get('max_wall_time_s', 900)),
+        clock=_time.time,
+        boot_state=_state_search_boot_state,
+        flash_base=flash_base,
+        address_ranges=phase2_state_search.get('address_ranges') or (),
+        backend_kind=backend.get('kind'),
+        torn_word_mode=mram_torn_word,
+        torn_word_for_cut=torn_word_for_cut,
+        erase_fill=erase_fill,
+        corruption_seed=mram_torn_word_seed,
+        page_size=page_size,
+        program_unit=int(getattr(backend.get('data'), 'ProgramUnitSize', 4) or 4),
+        cross_check_every=int(phase2_state_search.get('cross_check_every', 100)),
+        cross_check=cross_check,
+    )
+    results, summary = explorer.run()
+    summary['first_cuts_out_of_range'] = int(excluded)
+    summary['calibration_writes'] = int(total_writes)
+    summary['calibration_operations'] = len(calibration_operations)
+    if results:
+        results[0]['recovery_state_search_summary'] = dict(summary)
+    log(
+        'recovery state search: booted={} single={} deeper={} reused={} reason={}'.format(
+            summary.get('states_booted'),
+            summary.get('single_cut_states_booted'),
+            summary.get('deeper_cut_states_booted'),
+            summary.get('states_reused'),
+            summary.get('stopped_reason'),
+        )
+    )
+    return results
+
 # ---------------------------------------------------------------------------
 # Fault type dispatch: maps fault type codes to runner functions.
 #
@@ -15387,6 +15809,13 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
     # selected evaluator (including state-mode self-tests).
     if writeback_active() and _is_clean_control_fault_point(fp):
         return run_execute_fault(fp, fault_type='control')
+    if ft == 'rs':
+        try:
+            return run_recovery_state_search()
+        except Exception:
+            import traceback as _traceback
+            log('recovery state search failed:\n{}'.format(_traceback.format_exc()))
+            raise
     base_ft = _base_fault_type_code(ft)
     if writeback_active() and is_unsupported_writeback_fault_type(ft):
         return _writeback_unsupported_fault_result(fp, ft)
@@ -16147,11 +16576,13 @@ else:
         if ft == 'f':
             ensure_read_fault_preflight()
         point_torn_word = _select_point_mram_torn_word(fp)
+        dispatched = _dispatch_fault_point(fp, ft, run_fn)
+        if isinstance(dispatched, list):
+            results.extend(dispatched)
+            continue
         result = annotate_boot_span_result(
             annotate_update_sequence_result(
-                _finalize_recovery_marker_precondition_result(
-                    _dispatch_fault_point(fp, ft, run_fn)
-                )
+                _finalize_recovery_marker_precondition_result(dispatched)
             )
         )
         _record_point_mram_torn_word(result, point_torn_word)

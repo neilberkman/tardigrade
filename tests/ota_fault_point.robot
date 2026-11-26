@@ -115,6 +115,7 @@ ${RESET_MODE}                  warm
 ${ENABLE_MACHINE_SNAPSHOTS}    false
 ${PHASE2_FAULT_ENABLED}        false
 ${PHASE2_FAULT_MAX_POINTS}     0
+${PHASE2_STATE_SEARCH_B64}     ${EMPTY}
 ${SUCCESS_CRITERIA_OVERRIDES}    ${EMPTY}
 ${SUCCESS_CRITERIA_OVERRIDES_FILE}    ${EMPTY}
 ${OTP_PERIPHERAL}              ${EMPTY}
@@ -208,6 +209,7 @@ Run Runtime Fault Point
     Execute Command    $sram_end=${SRAM_END}
     Execute Command    $heuristic_trace_required=${HEURISTIC_TRACE_REQUIRED}
     Execute Command    $calibration_trace_required=${CALIBRATION_TRACE_REQUIRED}
+    Execute Command    $phase2_state_search_b64="${PHASE2_STATE_SEARCH_B64}"
     Execute Command    $volatile_regions_b64="${VOLATILE_REGIONS_B64}"
     Execute Command    $slot_exec_base=${SLOT_EXEC_BASE}
     Execute Command    $slot_exec_size=${SLOT_EXEC_SIZE}

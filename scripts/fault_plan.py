@@ -800,7 +800,12 @@ def build_fault_plan(
     if has_mixed_types:
         write_fps: List[Tuple[int, str]] = []
         p2_config = profile.fault_sweep.phase2_fault
-        if include_power_loss and not (p2_config.enabled and p2_config.pairs):
+        state_search_enabled = bool(
+            p2_config.enabled and p2_config.state_search.enabled
+        )
+        if include_power_loss and not (
+            p2_config.enabled and (p2_config.pairs or state_search_enabled)
+        ):
             write_fps = [(fp, 'w') for fp in fault_points] if max_writes > 0 else []
         combined = _BoundedFaultPointList(write_fps)
         swap_progress_count = 0
@@ -1332,7 +1337,10 @@ def build_fault_plan(
 
         # Phase 2 recovery fault injection.
         phase2_count = 0
-        if p2_config.enabled and (write_fps or include_reset_at_time or p2_config.pairs):
+        if state_search_enabled:
+            combined.append((0, "rs"))
+            phase2_count = 1
+        elif p2_config.enabled and (write_fps or include_reset_at_time or p2_config.pairs):
             p2_max = p2_config.max_points if p2_config.max_points > 0 else min(50, max(max_writes, 1))
             p2_type_codes = [
                 FAULT_TYPE_NAME_TO_CODE[ft] for ft in p2_config.fault_types

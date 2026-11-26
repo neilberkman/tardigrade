@@ -717,7 +717,7 @@ class MultiFaultConfig:
 class Phase2FaultConfig:
     """Configuration for injecting faults during Phase 2 recovery writes."""
 
-    __slots__ = ("enabled", "fault_types", "max_points", "pairs")
+    __slots__ = ("enabled", "fault_types", "max_points", "pairs", "state_search")
 
     def __init__(
         self,
@@ -725,17 +725,115 @@ class Phase2FaultConfig:
         fault_types: Optional[List[str]] = None,
         max_points: int = 0,
         pairs: Optional[List[Tuple[int, int]]] = None,
+        state_search: Optional["RecoveryStateSearchConfig"] = None,
     ) -> None:
         self.enabled = enabled
         self.fault_types = ["power_loss"] if fault_types is None else list(fault_types)
         self.max_points = max(0, int(max_points))
         self.pairs = list(pairs or [])
+        self.state_search = state_search or RecoveryStateSearchConfig()
         if self.max_points > MAX_PROFILE_FAULT_POINTS:
             raise ProfileError(
                 "fault_sweep.phase2_fault.max_points exceeds safety limit {}".format(
                     MAX_PROFILE_FAULT_POINTS
                 )
             )
+
+
+class RecoveryStateSearchConfig:
+    """Trace-derived recovery-state exploration limits and selection."""
+
+    __slots__ = (
+        "enabled",
+        "first_cut_mode",
+        "first_cut_ranges",
+        "max_cuts",
+        "max_new_states",
+        "max_wall_time_s",
+        "address_ranges",
+        "cross_check_every",
+    )
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        first_cut_mode: str = "quick",
+        first_cut_ranges: Optional[List[Tuple[int, int]]] = None,
+        max_cuts: int = 2,
+        max_new_states: int = 1000,
+        max_wall_time_s: float = 900.0,
+        address_ranges: Optional[List[Tuple[int, int]]] = None,
+        cross_check_every: int = 100,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.first_cut_mode = str(first_cut_mode).strip().lower()
+        if self.first_cut_mode not in ("quick", "all", "ranges"):
+            raise ProfileError(
+                "fault_sweep.phase2_fault.state_search.first_cuts.mode: "
+                "expected quick, all, or ranges"
+            )
+        self.first_cut_ranges = list(first_cut_ranges or [])
+        if self.first_cut_mode == "ranges" and not self.first_cut_ranges:
+            raise ProfileError(
+                "fault_sweep.phase2_fault.state_search.first_cuts.ranges: "
+                "at least one range is required when mode is ranges"
+            )
+        if self.first_cut_mode != "ranges" and self.first_cut_ranges:
+            raise ProfileError(
+                "fault_sweep.phase2_fault.state_search.first_cuts.ranges: "
+                "only valid when mode is ranges"
+            )
+        self.max_cuts = int(max_cuts)
+        if self.max_cuts < 2 or self.max_cuts > 8:
+            raise ProfileError(
+                "fault_sweep.phase2_fault.state_search.max_cuts: "
+                "expected an integer from 2 through 8"
+            )
+        self.max_new_states = int(max_new_states)
+        if self.max_new_states < 1 or self.max_new_states > MAX_PROFILE_FAULT_POINTS:
+            raise ProfileError(
+                "fault_sweep.phase2_fault.state_search.max_new_states: "
+                "expected an integer from 1 through {}".format(
+                    MAX_PROFILE_FAULT_POINTS
+                )
+            )
+        self.max_wall_time_s = float(max_wall_time_s)
+        if not math.isfinite(self.max_wall_time_s) or not (
+            0 < self.max_wall_time_s <= 86400
+        ):
+            raise ProfileError(
+                "fault_sweep.phase2_fault.state_search.max_wall_time_s: "
+                "expected a positive number no greater than 86400"
+            )
+        self.address_ranges = list(address_ranges or [])
+        self.cross_check_every = int(cross_check_every)
+        if self.cross_check_every < 0 or self.cross_check_every > MAX_PROFILE_FAULT_POINTS:
+            raise ProfileError(
+                "fault_sweep.phase2_fault.state_search.cross_check_every: "
+                "expected an integer from 0 through {}".format(
+                    MAX_PROFILE_FAULT_POINTS
+                )
+            )
+
+    def to_runtime_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "first_cuts": {
+                "mode": self.first_cut_mode,
+                "ranges": [
+                    {"start": start, "end": end}
+                    for start, end in self.first_cut_ranges
+                ],
+            },
+            "max_cuts": self.max_cuts,
+            "max_new_states": self.max_new_states,
+            "max_wall_time_s": self.max_wall_time_s,
+            "address_ranges": [
+                {"start": start, "end": end}
+                for start, end in self.address_ranges
+            ],
+            "cross_check_every": self.cross_check_every,
+        }
 
 
 class HookFaultConfig:
@@ -3277,6 +3375,7 @@ class ProfileConfig:
             "CALIBRATION_TRACE_REQUIRED:{}".format(
                 str(
                     bool(set(fs.fault_types) & TRACE_COVERAGE_FAULT_TYPES)
+                    or fs.phase2_fault.state_search.enabled
                 ).lower()
             ),
             "RUNTIME_MODE:true",
@@ -3347,6 +3446,17 @@ class ProfileConfig:
             if fs.phase2_fault.max_points > 0:
                 vars_list.append(
                     "PHASE2_FAULT_MAX_POINTS:{}".format(fs.phase2_fault.max_points)
+                )
+            if fs.phase2_fault.state_search.enabled:
+                state_search_payload = base64.b64encode(
+                    json.dumps(
+                        fs.phase2_fault.state_search.to_runtime_dict(),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).decode("ascii")
+                vars_list.append(
+                    "PHASE2_STATE_SEARCH_B64:{}".format(state_search_payload)
                 )
 
         if fs.confirm_cycle.enabled:
@@ -4891,6 +5001,21 @@ def _parse_fault_sweep(
     )
     fs_cfg._raw_boot_cycle_hook = raw_boot_cycle_hook
     fs_cfg._resolved_boot_cycle_hook = resolved_boot_cycle_hook
+    if fs_cfg.phase2_fault.state_search.enabled:
+        if str(fs_cfg.mode).strip().lower() != "runtime":
+            raise ProfileError(
+                "fault_sweep.phase2_fault.state_search requires fault_sweep.mode runtime"
+            )
+        if str(fs_cfg.evaluation_mode or "").strip().lower() != "execute":
+            raise ProfileError(
+                "fault_sweep.phase2_fault.state_search requires "
+                "fault_sweep.evaluation_mode execute"
+            )
+        if fs_cfg.durability_model != "direct":
+            raise ProfileError(
+                "fault_sweep.phase2_fault.state_search does not support the "
+                "writeback durability model"
+            )
     return fs_cfg
 
 
@@ -4946,11 +5071,103 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
         raise ProfileError(
             "fault_sweep.phase2_fault.pairs: requires phase2_fault.enabled"
         )
+    state_search = _parse_recovery_state_search(raw.get("state_search"))
+    if state_search.enabled and not enabled:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.state_search: requires phase2_fault.enabled"
+        )
+    if state_search.enabled and pairs:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.state_search: cannot be combined with "
+            "phase2_fault.pairs"
+        )
+    if state_search.enabled and max_points:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.state_search: cannot be combined with "
+            "phase2_fault.max_points"
+        )
+    if state_search.enabled and fault_types != ["power_loss"]:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.state_search: only power_loss is supported; "
+            "non-halting recovery faults can change the remainder of the trace"
+        )
     return Phase2FaultConfig(
         enabled=enabled,
         fault_types=fault_types,
         max_points=max_points,
         pairs=pairs,
+        state_search=state_search,
+    )
+
+
+def _parse_recovery_state_ranges(
+    raw: Any,
+    context: str,
+    maximum: int,
+) -> List[Tuple[int, int]]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("{}: expected list".format(context))
+    ranges: List[Tuple[int, int]] = []
+    for index, item in enumerate(raw):
+        item_context = "{}[{}]".format(context, index)
+        if not isinstance(item, dict):
+            raise ProfileError("{}: expected mapping".format(item_context))
+        _reject_unknown_keys(item, frozenset({"start", "end"}), item_context)
+        if "start" not in item or "end" not in item:
+            raise ProfileError("{}: start and end are required".format(item_context))
+        start = _parse_int(item["start"], "{}.start".format(item_context))
+        end = _parse_int(item["end"], "{}.end".format(item_context))
+        if start < 0 or end < start or end > maximum:
+            raise ProfileError(
+                "{}: expected 0 <= start <= end <= {}".format(
+                    item_context, maximum
+                )
+            )
+        ranges.append((start, end))
+    return ranges
+
+
+def _parse_recovery_state_search(raw: Optional[Dict[str, Any]]) -> RecoveryStateSearchConfig:
+    if raw is None:
+        return RecoveryStateSearchConfig()
+    if not isinstance(raw, dict):
+        raise ProfileError("fault_sweep.phase2_fault.state_search: expected mapping")
+    first_cuts = raw.get("first_cuts", {})
+    if not isinstance(first_cuts, dict):
+        raise ProfileError(
+            "fault_sweep.phase2_fault.state_search.first_cuts: expected mapping"
+        )
+    first_ranges = _parse_recovery_state_ranges(
+        first_cuts.get("ranges", []),
+        "fault_sweep.phase2_fault.state_search.first_cuts.ranges",
+        MAX_PROFILE_FAULT_POINTS - 1,
+    )
+    address_ranges = _parse_recovery_state_ranges(
+        raw.get("address_ranges", []),
+        "fault_sweep.phase2_fault.state_search.address_ranges",
+        0xFFFFFFFF,
+    )
+    try:
+        max_wall_time_s = float(raw.get("max_wall_time_s", 900.0))
+    except (TypeError, ValueError) as exc:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.state_search.max_wall_time_s: "
+            "expected positive number"
+        ) from exc
+    return RecoveryStateSearchConfig(
+        enabled=_parse_bool(
+            raw.get("enabled", False),
+            "fault_sweep.phase2_fault.state_search.enabled",
+        ),
+        first_cut_mode=str(first_cuts.get("mode", "quick")),
+        first_cut_ranges=first_ranges,
+        max_cuts=int(raw.get("max_cuts", 2)),
+        max_new_states=int(raw.get("max_new_states", 1000)),
+        max_wall_time_s=max_wall_time_s,
+        address_ranges=address_ranges,
+        cross_check_every=int(raw.get("cross_check_every", 100)),
     )
 
 
@@ -8083,7 +8300,9 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
                 "fault_sweep.sweep_strategy is 'heuristic'"
             )
         nested_fault_schemas = {
-            "phase2_fault": {"enabled", "fault_types", "max_points", "pairs"},
+            "phase2_fault": {
+                "enabled", "fault_types", "max_points", "pairs", "state_search",
+            },
             "hook_fault": {"enabled", "fault_types", "max_points"},
             "confirm_cycle": {
                 "enabled", "confirm_function", "post_confirm_assertions",
@@ -8144,6 +8363,27 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
                 frozenset(allowed),
                 "fault_sweep.{}".format(field_name),
             )
+
+        phase2 = fault_sweep.get("phase2_fault")
+        state_search = phase2.get("state_search") if isinstance(phase2, dict) else None
+        if isinstance(state_search, dict):
+            _reject_unknown_keys(
+                state_search,
+                frozenset(
+                    {
+                        "enabled", "first_cuts", "max_cuts", "max_new_states",
+                        "max_wall_time_s", "address_ranges", "cross_check_every",
+                    }
+                ),
+                "fault_sweep.phase2_fault.state_search",
+            )
+            first_cuts = state_search.get("first_cuts")
+            if isinstance(first_cuts, dict):
+                _reject_unknown_keys(
+                    first_cuts,
+                    frozenset({"mode", "ranges"}),
+                    "fault_sweep.phase2_fault.state_search.first_cuts",
+                )
 
         probes = fault_sweep.get("verification_probes") or []
         if not isinstance(probes, list):
@@ -9292,6 +9532,9 @@ def main() -> int:
         "phase2_fault_max_points": profile.fault_sweep.phase2_fault.max_points,
         "phase2_fault_types": profile.fault_sweep.phase2_fault.fault_types,
         "phase2_fault_pairs": profile.fault_sweep.phase2_fault.pairs,
+        "phase2_state_search": (
+            profile.fault_sweep.phase2_fault.state_search.to_runtime_dict()
+        ),
         "sweep_hash_bypass_symbols": profile.fault_sweep.sweep_hash_bypass_symbols,
         "hook_fault_enabled": profile.fault_sweep.hook_fault.enabled,
         "hook_fault_max_points": profile.fault_sweep.hook_fault.max_points,

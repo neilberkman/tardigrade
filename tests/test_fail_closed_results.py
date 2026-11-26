@@ -434,6 +434,57 @@ def test_implicit_power_loss_batch_rejects_wrong_runtime_fault_type() -> None:
         )
 
 
+def test_recovery_state_search_batch_accepts_dynamic_result_cardinality() -> None:
+    results = [
+        {
+            "fault_requested": 0,
+            "fault_at": index,
+            "fault_type": "rs",
+            "fault_injected": True,
+            "boot_outcome": "success",
+        }
+        for index in range(3)
+    ]
+    assert _validate_batch_results(results, [0], ["rs"]) == results
+
+
+def test_recovery_state_search_batch_rejects_empty_results() -> None:
+    with pytest.raises(RenodeProtocolError, match="no evaluated persistent states"):
+        _validate_batch_results([], [0], ["rs"])
+
+
+def test_recovery_state_search_summary_uses_evaluated_state_cardinality() -> None:
+    results = []
+    for index, generation in enumerate((1, 1, 2)):
+        result = {
+            "fault_at": index,
+            "fault_requested": 0,
+            "fault_type": "rs",
+            "fault_injected": True,
+            "boot_outcome": "success",
+            "signals": {},
+            "recovery_state_search": {"generation": generation},
+        }
+        if index == 0:
+            result["recovery_state_search_summary"] = {
+                "states_booted": 3,
+                "single_cut_states_booted": 2,
+                "deeper_cut_states_booted": 1,
+            }
+        results.append(result)
+
+    summary = summarize_runtime_sweep(
+        results, expected_fault_points=1, expected_control_points=0
+    )
+
+    assert summary["requested_fault_points"] == 3
+    assert summary["returned_fault_points"] == 3
+    assert summary["campaign_integrity"]["batch_requests"] == 1
+    assert summary["campaign_integrity"]["complete"] is True
+    assert summary["recovery_state_search"]["single_cut_states_booted"] == 2
+    assert summary["recovery_state_search"]["deeper_cut_states_booted"] == 1
+
+
 def test_result_protocol_rejects_non_boolean_fault_injected() -> None:
     with pytest.raises(RenodeProtocolError, match="fault_injected must be a boolean"):
         _validate_batch_results(

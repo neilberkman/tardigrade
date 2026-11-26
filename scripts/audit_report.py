@@ -430,6 +430,22 @@ def summarize_runtime_sweep(
                 result["error_kind"] = "rc_injection_not_applied"
                 result["boot_outcome"] = "infra_error"
     returned_fault_points = len(non_control)
+    recovery_state_search_summary = next(
+        (
+            result.get("recovery_state_search_summary")
+            for result in non_control
+            if isinstance(result.get("recovery_state_search_summary"), dict)
+        ),
+        None,
+    )
+    recovery_state_search_batch = bool(
+        recovery_state_search_summary is not None
+        and non_control
+        and all(str(result.get("fault_type") or "") == "rs" for result in non_control)
+    )
+    requested_batch_points = (
+        int(expected_fault_points) if expected_fault_points is not None else None
+    )
     if expected_fault_points is None:
         planned_fault_points = returned_fault_points
         planner_count_supplied = False
@@ -438,6 +454,10 @@ def summarize_runtime_sweep(
         if planned_fault_points < 0:
             raise ValueError("expected_fault_points must be non-negative")
         planner_count_supplied = True
+    if recovery_state_search_batch:
+        # One planner point requests a dynamic number of evaluated states.
+        # The runtime summary is the authoritative plan/result contract.
+        planned_fault_points = returned_fault_points
     missing_result_points = max(0, planned_fault_points - returned_fault_points)
     extra_result_points = max(0, returned_fault_points - planned_fault_points)
     result_cardinality_mismatch = missing_result_points + extra_result_points
@@ -905,6 +925,9 @@ def summarize_runtime_sweep(
             "complete": campaign_complete,
         },
     }
+    if recovery_state_search_batch:
+        summary["recovery_state_search"] = dict(recovery_state_search_summary)
+        summary["campaign_integrity"]["batch_requests"] = requested_batch_points
     fault_evidence = []
     for result in injected:
         evidence = result.get("mram_fault_evidence")

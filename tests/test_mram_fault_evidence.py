@@ -281,6 +281,15 @@ def test_mapped_mram_tracker_preserves_counters_across_firmware_reset_when_enabl
     assert "ResetCampaignObservability();" in tracker_cs
 
 
+def test_mapped_mram_tracker_suppresses_stores_after_power_loss() -> None:
+    tracker_cs = (ROOT / "peripherals" / "MappedMRAMTracker.cs").read_text(
+        encoding="utf-8"
+    )
+
+    assert "FaultEverFired && WriteFaultMode == 0" in tracker_cs
+    assert "EraseFaultFired || writePowerLossLatched" in tracker_cs
+
+
 
 
 def _extract_csharp_switch_blocks(source: str, header: str) -> list[str]:

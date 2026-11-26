@@ -820,10 +820,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
 
             EnsureShadow();
-            if(!PassthroughMode && EraseFaultFired)
+            var writePowerLossLatched = FaultEverFired && WriteFaultMode == 0;
+            if(!PassthroughMode && (EraseFaultFired || writePowerLossLatched))
             {
-                // Power has already been cut during an erase; revert the fast-path
-                // CPU write back to the pre-write shadow bytes and suppress counting.
+                // Power has already been cut. Revert any later fast-path CPU
+                // write to the pre-cut shadow bytes and suppress its accounting.
+                // This also catches the second store of a multi-store CPU
+                // instruction when its first store triggered the cut.
                 var revertFirst = AlignDown(offset, ProgramUnitSize);
                 var revertLast = AlignDown(offset + byteCount - 1, ProgramUnitSize);
                 for(var rUnit = revertFirst; rUnit <= revertLast; rUnit += ProgramUnitSize)

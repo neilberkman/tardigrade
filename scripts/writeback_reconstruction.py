@@ -54,10 +54,14 @@ def is_unsupported_writeback_fault_type(fault_type):
 
 def _parse_trace_int(text):
     try:
-        return int(text, 0)
+        integer_parser = long
+    except NameError:
+        integer_parser = int
+    try:
+        return integer_parser(text, 0)
     except ValueError:
         # Decimal records with a leading zero are valid exporter output too.
-        return int(text, 10)
+        return integer_parser(text, 10)
 
 
 def parse_write_trace_record(line):

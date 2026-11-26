@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import ast
 import struct
+import sys
 import tempfile
 from types import SimpleNamespace
 
@@ -23,6 +24,104 @@ IRONPYTHON_HELPERS = (
 
 
 class RuntimeFaultSweepLoaderTests(unittest.TestCase):
+    def test_state_search_skips_terminal_generation_trace(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_state_search_should_capture_trace"
+        )
+        namespace: dict[str, object] = {
+            "phase2_state_search": {"max_cuts": 3}
+        }
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]), str(PY_PATH), "exec"
+            ),
+            namespace,
+        )
+        should_capture = namespace["_state_search_should_capture_trace"]
+        self.assertTrue(should_capture(1))
+        self.assertTrue(should_capture(2))
+        self.assertFalse(should_capture(3))
+
+    def test_state_search_forces_operation_accurate_fast_trace(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_state_search_enable_operation_trace"
+        )
+        namespace: dict[str, object] = {"backend": {"kind": "fast"}}
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]), str(PY_PATH), "exec"
+            ),
+            namespace,
+        )
+
+        class Target:
+            DiffLookahead = 32
+            SkipShadowScan = True
+            PassthroughMode = True
+            WriteTraceEnabled = False
+            EraseTraceEnabled = False
+
+            def __init__(self) -> None:
+                self.cleared: list[str] = []
+
+            def WriteTraceClear(self) -> None:
+                self.cleared.append("write")
+
+            def EraseTraceClear(self) -> None:
+                self.cleared.append("erase")
+
+        target = Target()
+        namespace["_state_search_enable_operation_trace"](target)
+
+        self.assertEqual(target.DiffLookahead, 2147483647)
+        self.assertFalse(target.SkipShadowScan)
+        self.assertFalse(target.PassthroughMode)
+        self.assertTrue(target.WriteTraceEnabled)
+        self.assertTrue(target.EraseTraceEnabled)
+        self.assertEqual(target.cleared, ["write", "erase"])
+
+    def test_clr_byte_conversion_accepts_ironpython_byte_strings(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "to_clr_bytes"
+        )
+
+        class FakeArray:
+            @staticmethod
+            def CreateInstance(_kind: object, length: int) -> list[int | None]:
+                return [None] * length
+
+        fake_system = SimpleNamespace(Array=FakeArray, Byte=object())
+        previous_system = sys.modules.get("System")
+        sys.modules["System"] = fake_system
+        try:
+            namespace: dict[str, object] = {"string_types": (str,)}
+            exec(
+                compile(
+                    ast.Module(body=[function], type_ignores=[]),
+                    str(PY_PATH),
+                    "exec",
+                ),
+                namespace,
+            )
+            self.assertEqual(namespace["to_clr_bytes"]("\x00\xff"), [0, 255])
+            self.assertEqual(namespace["to_clr_bytes"](b"\x00\xff"), [0, 255])
+        finally:
+            if previous_system is None:
+                del sys.modules["System"]
+            else:
+                sys.modules["System"] = previous_system
+
     def test_runtime_helper_modules_avoid_unsupported_future_annotations(self) -> None:
         for path in IRONPYTHON_HELPERS:
             with self.subTest(path=path.name):
@@ -757,6 +856,32 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
             )
             self.assertEqual(load_trace_data(path), [(1, 2, 4660, 2)])
 
+    def test_load_trace_data_accepts_unsigned_32_bit_values(self) -> None:
+        source = PY_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "load_trace_data"
+        )
+        namespace: dict[str, object] = {}
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]), str(PY_PATH), "exec"
+            ),
+            namespace,
+        )
+        load_trace_data = namespace["load_trace_data"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trace.csv"
+            path.write_text(
+                "write_index,flash_offset,value,width\n"
+                "1,966632,4294967041,4\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(load_trace_data(path), [(1, 966632, 0xFFFFFF01, 4)])
+
     def test_native_replay_validates_erase_provenance_and_falls_back(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("_native_erase_trace_is_safe()", text)
@@ -854,6 +979,30 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             namespace["parse_write_trace_map"]("1:16:1")
+
+    def test_write_trace_map_preserves_quadword_value(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "parse_write_trace_map"
+        )
+        namespace = {
+            "flash_geometry": lambda: (0x10100000, 0x1000),
+            "parse_write_trace_record": lambda line: tuple(
+                int(part) for part in line.split(":")
+            ),
+            "fmt_u32": lambda value: "0x{:08X}".format(value & 0xFFFFFFFF),
+        }
+        exec(
+            compile(ast.Module(body=[function], type_ignores=[]), str(PY_PATH), "exec"),
+            namespace,
+        )
+
+        trace = namespace["parse_write_trace_map"](
+            "1:256:6075997274826165297:8"
+        )
+        self.assertEqual(trace[1]["value"], "0x5452475456414C31")
 
     def test_python_replay_rejects_out_of_bounds_erase_events(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")

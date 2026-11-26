@@ -118,6 +118,7 @@ def test_write_trace_parser_accepts_colon_comma_and_width_records():
     assert parse_write_trace_record('1,16,287454020,2') == (1, 16, 287454020, 2)
     assert parse_write_trace_record('1:16:287454020:4') == (1, 16, 287454020, 4)
     assert parse_write_trace_record('1:16') == (1, 16, 0)
+    assert parse_write_trace_record('1:16:4294967041:4') == (1, 16, 0xFFFFFF01, 4)
 
 
 def test_write_trace_parser_rejects_extra_fields():
