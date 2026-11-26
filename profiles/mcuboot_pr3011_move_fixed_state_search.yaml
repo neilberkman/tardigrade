@@ -1,0 +1,56 @@
+schema_version: 1
+name: mcuboot_pr3011_move_fixed_state_search
+description: >
+  MCUboot issue #3009 at PR #3011. Selects recovery cuts from each first-cut
+  boot's own operation trace and expects every computed state to recover.
+
+platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
+bootloader:
+  elf: results/oss_validation/assets/oss_mcuboot_pr3011_move_fixed.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x76000 }
+    staging: { base: 0x00082000, size: 0x76000 }
+images:
+  exec: results/oss_validation/assets/zephyr_head_move_nrf52_slot1.bin
+  staging: results/oss_validation/assets/zephyr_head_move_nrf52_slot0.bin
+pre_boot_state:
+  - { address: 0x00081FF0, u32: 0xF395C277 }
+  - { address: 0x00081FF4, u32: 0x7FEFD260 }
+  - { address: 0x00081FF8, u32: 0x0F505235 }
+  - { address: 0x00081FFC, u32: 0x8079B62C }
+  - { address: 0x00081FE0, u32: 0x00000001 }
+success_criteria:
+  vtor_in_slot: exec
+  marker_address: 0x0000C014
+  marker_value: 0x00000001
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "20.0"
+  max_step_limit: 200000000
+  sweep_hash_bypass_symbols: ["bootutil_img_validate"]
+  phase2_fault:
+    enabled: true
+    fault_types: [power_loss]
+    state_search:
+      enabled: true
+      first_cuts:
+        mode: ranges
+        ranges:
+          - { start: 0, end: 8 }
+      max_cuts: 2
+      max_new_states: 256
+      max_wall_time_s: 1800
+      address_ranges:
+        - { start: 0x00081FD0, end: 0x00081FFF }
+      cross_check_every: 1
+skip_self_test: true
+expect:
+  should_find_issues: false

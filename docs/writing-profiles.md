@@ -1658,6 +1658,80 @@ Explicit pairs replace the representative grid and are unchanged by
 `--quick`, `max_points`, and the main sweep's range options. The configured
 recovery fault types still apply to every listed pair.
 
+#### Recovery-state search
+
+`state_search` is the trace-derived alternative to the representative grid
+and hand-written `pairs`. It is off by default. When enabled, the runner keeps
+the complete search in one Renode batch, boots each selected first cut once,
+and obtains later cuts from that boot's write-and-erase trace:
+
+```yaml
+fault_sweep:
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  phase2_fault:
+    enabled: true
+    fault_types: [power_loss]
+    state_search:
+      enabled: true
+      first_cuts:
+        mode: ranges       # quick, all, or ranges
+        ranges:
+          - {start: 0, end: 8} # inclusive write indices
+      max_cuts: 2          # default 2; 3 and higher repeat the same process
+      max_new_states: 1000
+      max_wall_time_s: 900
+      address_ranges:      # optional inclusive bus-address ranges
+        - {start: 0x00081FE0, end: 0x00081FFF}
+      cross_check_every: 100 # 0 disables the periodic live two-cut check
+```
+
+The three first-cut modes select the normal first/middle/last quick set, all
+calibration writes, or the union of the configured inclusive index ranges.
+First cuts are writes; erase first cuts are not supported. Address ranges
+restrict recovery operations that may become later cuts. Operations outside
+the ranges still update the computed prefix, so later states remain exact.
+
+For each recovery operation, the runner applies the completed prefix and the
+configured interrupted-write or interrupted-erase rule to an immutable NVM
+state. It evaluates a canonical state only once. Identity includes every byte
+of the direct NVM backend and every MRAM uncorrectable-word mark. A separate
+NVM controller, a separate OTP peripheral, writeback durability, a slow
+backend, or a backend without width-explicit per-write-accurate write and
+erase traces is refused before the search. Those cases may retain persistent
+data that the canonical state cannot include completely.
+
+NVM is divided into fixed 4 KiB chunks. A write replaces only the affected
+chunks and updates their Merkle ancestors; the SHA-256 state identity then
+hashes region roots, region geometry, uncorrectable marks, and declared
+persistent values. On an Apple M-series development host, a synthetic 1 MiB
+flash walk of 24,000 four-byte cuts, including identity calculation, measured
+27,779 computed states/second. Recovery boots, rather than identity hashing,
+remain the dominant cost.
+
+New states are visited breadth-first: ascending first-cut index, then trace
+order for each boot. A newly booted state below the configured depth contributes
+its own recovery trace, so `max_cuts: 3` computes a third cut by the same rule.
+Terminal-generation boots skip unused trace capture. Larger values are accepted
+up to eight, but the number of reachable states and recovery boots is the
+practical limit. `max_new_states` bounds unique recovery boots and
+`max_wall_time_s` bounds the batch. The summary reports candidates omitted by
+the boot, time, depth, and address limits.
+
+Every `cross_check_every`th newly booted two-cut state is also reproduced through
+the existing live two-fault injector. All persistent bytes and MRAM
+uncorrectable marks must match. The first mismatch aborts as an infrastructure
+error and names the first differing address. Three-cut and deeper states are
+not live-cross-checked because the existing injector accepts two cuts.
+
+Each returned result is an ordinary recovery result, so follow-up boots,
+hooks, assertions, and invariants run unchanged. `recovery_state_search`
+records the cut chain, generation, state identity, equivalent chains, and a
+pasteable `phase2_fault_pair_yaml` for a two-cut path. The batch summary keeps
+single-cut and deeper-cut boot counts separate and reports operations
+considered, states computed, states booted and reused, cross-check totals, and
+bound exclusions.
+
 Second cuts support the `fast` and `mram` backend kinds. A point on a `slow`
 controller-backed `NVMemory` returns `phase2_unsupported_backend` before its
 first cut runs; OTP fault types are also not supported as recovery cuts.

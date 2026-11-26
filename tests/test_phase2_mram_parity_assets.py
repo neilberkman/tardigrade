@@ -28,6 +28,19 @@ def test_followup_profile_runs_hook_for_two_cycles() -> None:
     assert profile.state_probe.script.endswith("phase2_mram_parity/state_probe.py")
 
 
+def test_state_search_profile_deduplicates_uncorrectable_states() -> None:
+    profile = load_profile(EXAMPLE / "profile_state_search.yaml")
+    search = profile.fault_sweep.phase2_fault.state_search
+    assert profile.platform.endswith("cortex_m0_mram_tracked.repl")
+    assert profile.flash_backend == "mramTracker"
+    assert profile.fault_sweep.mram_torn_word == "uncorrectable"
+    assert search.enabled is True
+    assert search.first_cut_mode == "ranges"
+    assert search.first_cut_ranges == [(0, 0), (2, 2)]
+    assert search.max_cuts == 2
+    assert search.cross_check_every == 1
+
+
 def test_exec_slot_fixture_has_a_valid_cortex_m_vector() -> None:
     slot = (EXAMPLE / "slot.bin").read_bytes()
     stack_pointer, reset_vector = struct.unpack_from("<II", slot)

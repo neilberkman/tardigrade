@@ -172,6 +172,17 @@ jobs:
             --renode-test renode-test \
             --fault-end 10
 
+      - name: Run MCUboot PR3011 recovery-state differential
+        run: |
+          set -euxo pipefail
+          for variant in broken fixed; do
+            python3 scripts/audit_bootloader.py \
+              --profile "profiles/mcuboot_pr3011_move_${variant}_state_search.yaml" \
+              --output "results/oss_validation/mcuboot_pr3011_move_${variant}_state_search.json" \
+              --renode-test renode-test \
+              --quick --workers 1 --strict-profile
+          done
+
       - name: Upload OSS validation artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
