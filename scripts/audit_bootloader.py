@@ -205,6 +205,31 @@ def _calibration_point_coverage(
     heuristic_used: bool,
 ) -> Dict[str, Dict[str, Any]]:
     """Describe calibrated operations cut, represented, or outside the plan."""
+    def state_search_selected_count(
+        total: int, all_limit: Optional[int] = None
+    ) -> int:
+        state_search = profile.fault_sweep.phase2_fault.state_search
+        if state_search.first_cut_mode == "all":
+            return min(
+                int(total),
+                int(total if all_limit is None else all_limit),
+            )
+        if state_search.first_cut_mode == "ranges":
+            return len(
+                {
+                    index
+                    for start, end in state_search.first_cut_ranges
+                    for index in range(max(0, int(start)), int(end) + 1)
+                    if index < total
+                }
+            )
+        return min(3, int(total))
+
+    phase2_first_codes = []
+    for fault_type in planned_fault_types:
+        parts = str(fault_type).split(":")
+        if parts[0] == "p2":
+            phase2_first_codes.append(parts[3] if len(parts) > 3 else "w")
     planned_base_codes = {
         str(value or "w").split(":", 1)[0]
         for value in planned_fault_types
@@ -235,26 +260,23 @@ def _calibration_point_coverage(
                 int(point)
                 for point, fault_type in zip(fault_points, planned_fault_types)
                 if str(fault_type).split(":", 1)[0] == "p2"
+                and (
+                    len(str(fault_type).split(":")) <= 3
+                    or str(fault_type).split(":")[3] not in {"e", "a"}
+                )
                 and 0 <= int(point) < calibrated_program_operations
             }
         )
     elif "rs" in planned_base_codes:
-        state_search = profile.fault_sweep.phase2_fault.state_search
-        if state_search.first_cut_mode == "all":
-            planned_program_range = min(
-                int(planned_program_operations), calibrated_program_operations
+        planned_program_range = (
+            state_search_selected_count(
+                calibrated_program_operations,
+                all_limit=planned_program_operations,
             )
-        elif state_search.first_cut_mode == "ranges":
-            planned_program_range = len(
-                {
-                    index
-                    for start, end in state_search.first_cut_ranges
-                    for index in range(max(0, int(start)), int(end) + 1)
-                    if index < calibrated_program_operations
-                }
-            )
-        else:
-            planned_program_range = min(3, calibrated_program_operations)
+            if "power_loss"
+            in profile.fault_sweep.phase2_fault.first_fault_types
+            else 0
+        )
     elif planned_base_codes.intersection({"mf", "c"}):
         planned_program_range = len(
             {
@@ -282,7 +304,27 @@ def _calibration_point_coverage(
         and planned_base_codes.intersection({"e", "a"})
         else []
     )
-    if planned_base_codes.intersection({"e", "a"}):
+    if "p2" in planned_base_codes and any(
+        code in {"e", "a"} for code in phase2_first_codes
+    ):
+        planned_erase_range = len(
+            {
+                int(point)
+                for point, fault_type in zip(fault_points, planned_fault_types)
+                if str(fault_type).split(":", 1)[0] == "p2"
+                and len(str(fault_type).split(":")) > 3
+                and str(fault_type).split(":")[3] in {"e", "a"}
+                and 0 <= int(point) < calibrated_erases
+            }
+        )
+    elif "rs" in planned_base_codes:
+        planned_erase_range = (
+            state_search_selected_count(calibrated_erases)
+            if "interrupted_erase"
+            in profile.fault_sweep.phase2_fault.first_fault_types
+            else 0
+        )
+    elif planned_base_codes.intersection({"e", "a"}):
         planned_erase_start = max(0, int(fault_start or 0))
         planned_erase_end = min(
             int(calibrated_erases),

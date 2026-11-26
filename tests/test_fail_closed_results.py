@@ -485,6 +485,48 @@ def test_recovery_state_search_summary_uses_evaluated_state_cardinality() -> Non
     assert summary["recovery_state_search"]["deeper_cut_states_booted"] == 1
 
 
+def test_recovery_state_search_summary_preserves_coexisting_static_points() -> None:
+    state_results = []
+    for index in range(3):
+        result = {
+            "fault_at": index,
+            "fault_requested": 0,
+            "fault_type": "rs",
+            "fault_injected": True,
+            "boot_outcome": "success",
+            "signals": {},
+            "recovery_state_search": {"generation": 1},
+        }
+        if index == 0:
+            result["recovery_state_search_summary"] = {
+                "states_booted": 3,
+                "single_cut_states_booted": 3,
+                "deeper_cut_states_booted": 0,
+            }
+        state_results.append(result)
+    static_result = {
+        "fault_at": 0,
+        "fault_requested": 0,
+        "fault_type": "e",
+        "fault_injected": True,
+        "boot_outcome": "success",
+        "signals": {},
+    }
+
+    summary = summarize_runtime_sweep(
+        [static_result] + state_results,
+        expected_fault_points=2,
+        expected_control_points=0,
+        planned_fault_types=["e", "rs"],
+    )
+
+    assert summary["requested_fault_points"] == 4
+    assert summary["returned_fault_points"] == 4
+    assert summary["campaign_integrity"]["batch_requests"] == 1
+    assert summary["campaign_integrity"]["complete"] is True
+    assert summary["extra_result_points"] == 0
+
+
 def test_result_protocol_rejects_non_boolean_fault_injected() -> None:
     with pytest.raises(RenodeProtocolError, match="fault_injected must be a boolean"):
         _validate_batch_results(

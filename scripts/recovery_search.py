@@ -62,6 +62,39 @@ def select_first_cuts(total_writes, first_cuts):
     return selected, excluded
 
 
+def select_first_cut_operations(operations, first_cuts):
+    """Select typed first cuts from the write and erase trace domains."""
+    config = first_cuts or {}
+    fault_types = config.get("fault_types") or ("power_loss",)
+    kinds = []
+    for fault_type in fault_types:
+        normalized = str(fault_type).strip().lower()
+        if normalized == "power_loss":
+            kind = "write"
+        elif normalized == "interrupted_erase":
+            kind = "erase"
+        else:
+            raise RecoverySearchError(
+                "unsupported first-cut fault type {!r}".format(fault_type)
+            )
+        if kind not in kinds:
+            kinds.append(kind)
+
+    counts = dict((kind, 0) for kind in ("write", "erase"))
+    for operation in operations:
+        kind = str(operation.get("kind") or "")
+        if kind in counts:
+            counts[kind] += 1
+
+    selected = []
+    excluded = {"write": 0, "erase": 0}
+    for kind in kinds:
+        indices, excluded_count = select_first_cuts(counts[kind], config)
+        selected.extend((kind, index) for index in indices)
+        excluded[kind] = excluded_count
+    return tuple(selected), excluded
+
+
 def operation_in_address_ranges(operation, flash_base, address_ranges):
     if not address_ranges:
         return True
@@ -105,11 +138,20 @@ def format_chain(chain):
             for cut in cuts
         ),
     }
-    if len(cuts) == 2 and cuts[0]["operation"] == "write":
+    if len(cuts) == 2:
         pair = [cuts[0]["operation_index"], cuts[1]["operation_index"]]
         result["phase2_fault_pair"] = pair
         result["phase2_fault_pair_yaml"] = "- [{}, {}]".format(pair[0], pair[1])
+        result["phase2_fault_pair_first_fault_type"] = cuts[0]["fault_type"]
         result["phase2_fault_pair_fault_type"] = cuts[1]["fault_type"]
+        result["phase2_fault_yaml"] = (
+            "first_fault_types: [{}]\n"
+            "fault_types: [{}]\n"
+            "pairs:\n"
+            "  - [{}, {}]"
+        ).format(
+            cuts[0]["fault_type"], cuts[1]["fault_type"], pair[0], pair[1]
+        )
     return result
 
 
@@ -303,7 +345,12 @@ class RecoveryStateExplorer(object):
     ):
         self.initial_state = initial_state
         self.calibration_operations = tuple(calibration_operations)
-        self.first_cuts = tuple(int(item) for item in first_cuts)
+        self.first_cuts = tuple(
+            (str(item[0]), int(item[1]))
+            if isinstance(item, (tuple, list)) and len(item) == 2
+            else ("write", int(item))
+            for item in first_cuts
+        )
         self.max_cuts = int(max_cuts)
         self.boot_state = boot_state
         self.flash_base = int(flash_base)
@@ -323,12 +370,24 @@ class RecoveryStateExplorer(object):
         self.results = []
         self.summary = {
             "first_cuts_selected": len(self.first_cuts),
+            "first_cut_programs_selected": sum(
+                1 for kind, _index in self.first_cuts if kind == "write"
+            ),
+            "first_cut_erases_selected": sum(
+                1 for kind, _index in self.first_cuts if kind == "erase"
+            ),
             "first_cut_states_computed": 0,
+            "first_cut_program_states_computed": 0,
+            "first_cut_erase_states_computed": 0,
             "states_computed": 0,
             "states_booted": 0,
             "single_cut_states_booted": 0,
+            "single_cut_program_states_booted": 0,
+            "single_cut_erase_states_booted": 0,
             "deeper_cut_states_booted": 0,
             "states_reused": 0,
+            "program_first_states_reused": 0,
+            "erase_first_states_reused": 0,
             "recovery_operations_seen": 0,
             "recovery_operations_considered": 0,
             "recovery_operations_excluded_by_address": 0,
@@ -391,6 +450,10 @@ class RecoveryStateExplorer(object):
         prior = self._seen.get(identity)
         if prior is not None:
             self.summary["states_reused"] += 1
+            if chain and chain[0].get("operation") == "erase":
+                self.summary["erase_first_states_reused"] += 1
+            else:
+                self.summary["program_first_states_reused"] += 1
             if prior.get("result") is not None:
                 add_equivalent_chain(prior["result"], chain)
             return prior
@@ -444,6 +507,10 @@ class RecoveryStateExplorer(object):
         self.summary["states_booted"] += 1
         if generation == 1:
             self.summary["single_cut_states_booted"] += 1
+            if chain and chain[0].get("operation") == "erase":
+                self.summary["single_cut_erase_states_booted"] += 1
+            else:
+                self.summary["single_cut_program_states_booted"] += 1
         else:
             self.summary["deeper_cut_states_booted"] += 1
         return entry
@@ -454,11 +521,16 @@ class RecoveryStateExplorer(object):
         for operation, candidate in self._candidates(
             self.initial_state, self.calibration_operations, 1, ()
         ):
-            if operation["kind"] != "write":
-                continue
-            if operation["operation_index"] not in selected:
+            selected_key = (
+                str(operation["kind"]), int(operation["operation_index"])
+            )
+            if selected_key not in selected:
                 continue
             self.summary["first_cut_states_computed"] += 1
+            if operation["kind"] == "erase":
+                self.summary["first_cut_erase_states_computed"] += 1
+            else:
+                self.summary["first_cut_program_states_computed"] += 1
             self.summary["states_computed"] += 1
             chain = (format_cut(operation, self.flash_base),)
             if self._remember_or_reuse(candidate, chain) is not None:

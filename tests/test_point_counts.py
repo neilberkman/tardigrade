@@ -44,6 +44,17 @@ from zero_day_summary import format_console_summary, format_step_summary  # noqa
             "state_search_single_cut",
         ),
         (
+            "rs",
+            {
+                "fault_type": "rs",
+                "recovery_state_search": {
+                    "generation": 1,
+                    "chain": {"cuts": [{"operation": "erase"}]},
+                },
+            },
+            "state_search_single_cut_erase",
+        ),
+        (
             "p2:1:2:w:w",
             {"fault_type": "p2", "phase2_selection": "grid"},
             "two_cut_grid",
@@ -160,6 +171,52 @@ def test_state_search_budget_exclusions_are_skipped_not_missing() -> None:
     assert counts["kinds"]["two_cut_state_search"]["requested"] == 0
 
 
+def test_erase_first_state_search_accounting_is_separate_including_reuse() -> None:
+    counts = build_point_counts(
+        [
+            {
+                "fault_type": "rs",
+                "fault_injected": True,
+                "boot_outcome": "success",
+                "recovery_state_search": {
+                    "generation": 1,
+                    "chain": {
+                        "cut_count": 1,
+                        "cuts": [{"operation": "erase", "operation_index": 0}],
+                    },
+                    "equivalent_chains": [
+                        {
+                            "cut_count": 1,
+                            "cuts": [
+                                {"operation": "erase", "operation_index": 1}
+                            ],
+                        }
+                    ],
+                },
+                "recovery_state_search_summary": {
+                    "first_cut_states_computed": 3,
+                    "first_cut_program_states_computed": 0,
+                    "first_cut_erase_states_computed": 3,
+                    "states_computed": 3,
+                    "states_reused": 1,
+                    "stopped_reason": "max_new_states",
+                },
+            }
+        ],
+        planned_fault_types=["rs"],
+        expected_control_points=0,
+    )
+
+    row = counts["kinds"]["state_search_single_cut_erase"]
+    assert row["requested"] == 3
+    assert row["run"] == 1
+    assert row["evaluated"] == 1
+    assert row["reused"] == 1
+    assert row["skipped"] == 1
+    assert row["skip_reasons"] == {"max_new_states": 1}
+    assert counts["kinds"]["state_search_single_cut"]["requested"] == 0
+
+
 def test_calibration_plan_scope_distinguishes_pairs_state_search_and_heuristic() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     pairs_profile = load_profile(
@@ -205,6 +262,28 @@ def test_calibration_plan_scope_distinguishes_pairs_state_search_and_heuristic()
     )
     assert state_search["program"] == {
         "calibrated": 23815,
+        "planned_range": 9,
+        "representation": [],
+    }
+
+    state_profile.fault_sweep.phase2_fault.first_fault_types = [
+        "interrupted_erase"
+    ]
+    erase_state_search = _calibration_point_coverage(
+        profile=state_profile,
+        fault_points=[0],
+        planned_fault_types=["rs"],
+        calibrated_program_operations=23815,
+        planned_program_operations=23815,
+        calibrated_erases=42,
+        fault_start=None,
+        fault_end=None,
+        quick=False,
+        heuristic_used=True,
+    )
+    assert erase_state_search["program"]["planned_range"] == 0
+    assert erase_state_search["erase"] == {
+        "calibrated": 42,
         "planned_range": 9,
         "representation": [],
     }

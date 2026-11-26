@@ -48,7 +48,7 @@ from recovery_state import (
 from recovery_search import (
     RecoveryStateExplorer,
     first_persistent_difference,
-    select_first_cuts,
+    select_first_cut_operations,
 )
 from replay_cross_check import (
     first_pre_cut_trace_difference,
@@ -6232,6 +6232,37 @@ def arm_erase_fault(absolute_erase_index, erase_fault_mode=0):
         target.EraseFaultFired = False
         if hasattr(target, 'LastFaultInjected'):
             target.LastFaultInjected = False
+
+
+def _erase_fault_capability_error(require_trace=True):
+    """Return a precise erase-first capability failure, or ``None``."""
+    if backend.get('kind') == 'slow':
+        return 'controller-backed slow backends skip all phase-two points'
+    if backend.get('kind') == 'otp':
+        return 'OTP backends have no erase operations'
+    data = backend.get('data')
+    nvm = getattr(data, 'Nvm', None) if data is not None else None
+    candidates = [item for item in (data, nvm) if item is not None]
+    injection_members = (
+        'FaultAtPageErase', 'EraseFaultMode', 'EraseFaultFired',
+        'TotalPageErases',
+    )
+    if not any(
+        all(hasattr(candidate, member) for member in injection_members)
+        for candidate in candidates
+    ):
+        return 'backend lacks interrupted-erase fault injection members'
+    if require_trace:
+        trace_members = (
+            'EraseTraceClear', 'EraseTraceEnabled', 'EraseTraceCount',
+            'EraseTraceToString',
+        )
+        if not any(
+            all(hasattr(candidate, member) for member in trace_members)
+            for candidate in candidates
+        ):
+            return 'backend lacks erase tracing members'
+    return None
 
 def disarm_fault():
     b = backend
@@ -13868,6 +13899,19 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
                 'p2_max_fault_index': -1,
             },
         }
+    if p1_fault_type in ('e', 'a'):
+        capability_check = globals().get('_erase_fault_capability_error')
+        capability_error = (
+            capability_check(require_trace=True)
+            if callable(capability_check)
+            else None
+        )
+        if capability_error is not None:
+            raise RuntimeError(
+                'phase2 erase first cut is unsupported: {}'.format(
+                    capability_error
+                )
+            )
     eff_criteria = get_effective_criteria('p2')
     cpu_ref = monitor.Machine['sysbus.cpu']
     fp_t0 = _time.time()
@@ -16175,6 +16219,18 @@ def _state_search_preflight():
                 ', '.join(missing)
             )
         )
+    first_fault_types = (
+        phase2_state_search.get('first_cuts', {}).get('fault_types')
+        or ('power_loss',)
+    )
+    if 'interrupted_erase' in first_fault_types:
+        capability_error = _erase_fault_capability_error(require_trace=True)
+        if capability_error is not None:
+            raise RuntimeError(
+                'recovery state search erase first cuts are unsupported: {}'.format(
+                    capability_error
+                )
+            )
     if not trace_file_path or not os.path.exists(trace_file_path):
         raise RuntimeError('recovery state search requires the calibration write trace CSV')
 
@@ -16239,7 +16295,11 @@ def _state_search_load_calibration_operations():
                 'writes_at_this_point': int(writes_at),
                 'erase_size': int(erase_size),
             }
-    return _state_search_operations_from_maps(write_map, erase_map), len(writes)
+    return (
+        _state_search_operations_from_maps(write_map, erase_map),
+        len(writes),
+        len(erase_map),
+    )
 
 
 def _state_search_capture_trace():
@@ -16398,9 +16458,11 @@ def _state_search_boot_state(state, chain, generation):
 
 def run_recovery_state_search():
     _state_search_preflight()
-    calibration_operations, total_writes = _state_search_load_calibration_operations()
-    selected, excluded = select_first_cuts(
-        total_writes, phase2_state_search.get('first_cuts')
+    calibration_operations, total_writes, total_erases = (
+        _state_search_load_calibration_operations()
+    )
+    selected, excluded = select_first_cut_operations(
+        calibration_operations, phase2_state_search.get('first_cuts')
     )
     if not selected:
         raise RuntimeError('recovery state search selected no in-range first cuts')
@@ -16433,10 +16495,11 @@ def run_recovery_state_search():
         if int(generation) != 2 or len(chain) != 2:
             return False
         p2_fault_type = 'e' if operation.get('kind') == 'erase' else 'w'
+        p1_fault_type = 'e' if chain[0].get('operation') == 'erase' else 'w'
         live_result = run_phase2_fault(
             int(chain[0]['operation_index']),
             int(chain[1]['operation_index']),
-            'w',
+            p1_fault_type,
             p2_fault_type,
             cross_check_expected=state,
         )
@@ -16480,8 +16543,11 @@ def run_recovery_state_search():
         cross_check=cross_check,
     )
     results, summary = explorer.run()
-    summary['first_cuts_out_of_range'] = int(excluded)
+    summary['first_cut_programs_out_of_range'] = int(excluded.get('write', 0))
+    summary['first_cut_erases_out_of_range'] = int(excluded.get('erase', 0))
+    summary['first_cuts_out_of_range'] = sum(excluded.values())
     summary['calibration_writes'] = int(total_writes)
+    summary['calibration_erases'] = int(total_erases)
     summary['calibration_operations'] = len(calibration_operations)
     if results:
         results[0]['recovery_state_search_summary'] = dict(summary)

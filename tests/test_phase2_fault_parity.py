@@ -71,6 +71,7 @@ class _Phase2Runtime:
         self.followup_calls: list[dict] = []
         self.hook_calls: list[int] = []
         self.current_cut = 0
+        self.flash_choices: dict[int, str] = {}
         self.ns = {
             "_time": time,
             "get_effective_criteria": lambda _code: {"vtor_in_slot": "exec"},
@@ -127,6 +128,7 @@ class _Phase2Runtime:
             "mram_torn_word_choices": [],
             "mram_torn_word_seed": 0,
             "_select_point_mram_torn_word": self._select_mode,
+            "_select_point_torn_word": self._select_flash_mode,
         }
         _load_phase2_fault(self.ns)
 
@@ -246,8 +248,17 @@ class _Phase2Runtime:
         self.ns["mram_torn_word"] = mode
         return mode
 
-    def run(self, p1: int = 0, p2: int = 1) -> dict:
-        return self.ns["run_phase2_fault"](p1, p2)
+    def _select_flash_mode(self, fault_at: int):
+        return self.flash_choices.get(int(fault_at))
+
+    def run(
+        self,
+        p1: int = 0,
+        p2: int = 1,
+        p1_type: str = "w",
+        p2_type: str = "w",
+    ) -> dict:
+        return self.ns["run_phase2_fault"](p1, p2, p1_type, p2_type)
 
 
 def test_phase2_fault_skips_controller_backend_before_first_cut() -> None:
@@ -342,3 +353,54 @@ def test_phase2_fault_draws_and_records_each_cuts_torn_word_mode() -> None:
     assert result["phase2_fault"]["p1_mram_torn_word"] == "uncorrectable"
     assert result["phase2_fault"]["p2_mram_torn_word"] == "erased"
     assert result["mram_torn_word"] == "uncorrectable"
+
+
+def test_phase2_erase_first_cut_draws_records_and_carries_uncorrectable_words() -> None:
+    runtime = _Phase2Runtime()
+    runtime.ns["mram_torn_word_choices"] = [(3, "uncorrectable"), (9, "erased")]
+
+    result = runtime.run(3, 9, "e", "w")
+
+    assert runtime.modes_at_cut == ["uncorrectable", "erased"]
+    assert runtime.marks_seen_by_boot["p2fault_p2_3_9"] == {8}
+    assert result["phase2_fault"]["p1_fault_type"] == "e"
+    assert result["phase2_fault"]["p1_mram_torn_word"] == "uncorrectable"
+    assert result["phase2_fault"]["p2_mram_torn_word"] == "erased"
+
+
+def test_phase2_erase_first_cut_records_each_flash_outcome_draw() -> None:
+    runtime = _Phase2Runtime()
+    runtime.flash_choices = {3: "partial_bits", 9: "programmed"}
+
+    result = runtime.run(3, 9, "e", "w")
+
+    assert result["torn_word"] == "partial_bits"
+    assert result["phase2_fault"]["p1_torn_word"] == "partial_bits"
+    assert result["phase2_fault"]["p2_torn_word"] == "programmed"
+
+
+def test_erase_first_capability_check_names_missing_injection_and_trace() -> None:
+    tree = ast.parse(RUNNER.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_erase_fault_capability_error"
+    )
+    namespace = {"backend": {"kind": "fast", "data": SimpleNamespace()}}
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), str(RUNNER), "exec"),
+        namespace,
+    )
+    check = namespace["_erase_fault_capability_error"]
+
+    assert check() == "backend lacks interrupted-erase fault injection members"
+
+    injection_only = SimpleNamespace(
+        FaultAtPageErase=0,
+        EraseFaultMode=0,
+        EraseFaultFired=False,
+        TotalPageErases=0,
+    )
+    namespace["backend"] = {"kind": "fast", "data": injection_only}
+    assert check() == "backend lacks erase tracing members"

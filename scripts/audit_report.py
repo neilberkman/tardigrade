@@ -443,14 +443,22 @@ def summarize_runtime_sweep(
         ),
         None,
     )
+    returned_state_search_points = sum(
+        1 for result in non_control
+        if str(result.get("fault_type") or "").split(":", 1)[0] == "rs"
+    )
     recovery_state_search_batch = bool(
         recovery_state_search_summary is not None
-        and non_control
-        and all(str(result.get("fault_type") or "") == "rs" for result in non_control)
+        and returned_state_search_points > 0
     )
-    requested_batch_points = (
-        int(expected_fault_points) if expected_fault_points is not None else None
+    planned_state_search_requests = sum(
+        1 for fault_type in (planned_fault_types or ())
+        if str(fault_type or "").split(":", 1)[0] == "rs"
     )
+    if recovery_state_search_batch and planned_state_search_requests == 0:
+        # Older callers do not provide the wire plan. A state-search summary
+        # can only come from the one dynamic ``rs`` request in that batch.
+        planned_state_search_requests = 1
     if expected_fault_points is None:
         planned_fault_points = returned_fault_points
         planner_count_supplied = False
@@ -459,10 +467,13 @@ def summarize_runtime_sweep(
         if planned_fault_points < 0:
             raise ValueError("expected_fault_points must be non-negative")
         planner_count_supplied = True
-    if recovery_state_search_batch:
-        # One planner point requests a dynamic number of evaluated states.
-        # The runtime summary is the authoritative plan/result contract.
-        planned_fault_points = returned_fault_points
+    if recovery_state_search_batch and expected_fault_points is not None:
+        # Each ``rs`` planner point requests a dynamic number of evaluated
+        # states. Preserve ordinary points that shared the sweep while
+        # replacing only the state-search request cardinality.
+        planned_fault_points += (
+            returned_state_search_points - planned_state_search_requests
+        )
     missing_result_points = max(0, planned_fault_points - returned_fault_points)
     extra_result_points = max(0, returned_fault_points - planned_fault_points)
     result_cardinality_mismatch = missing_result_points + extra_result_points
@@ -956,7 +967,9 @@ def summarize_runtime_sweep(
     }
     if recovery_state_search_batch:
         summary["recovery_state_search"] = dict(recovery_state_search_summary)
-        summary["campaign_integrity"]["batch_requests"] = requested_batch_points
+        summary["campaign_integrity"]["batch_requests"] = (
+            planned_state_search_requests
+        )
     fault_evidence = []
     for result in injected:
         evidence = result.get("mram_fault_evidence")

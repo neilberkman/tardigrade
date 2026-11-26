@@ -20,6 +20,7 @@ from recovery_search import (  # noqa: E402
     first_persistent_difference,
     format_chain,
     operation_in_address_ranges,
+    select_first_cut_operations,
     select_first_cuts,
 )
 from recovery_state import PersistentState, merge_operation_traces  # noqa: E402
@@ -43,6 +44,43 @@ def test_first_cut_selection_is_ordered_and_reports_out_of_range_indices():
             ],
         },
     ) == ([1, 2, 3, 4], 3)
+
+
+def test_typed_first_cut_selection_uses_independent_program_and_erase_domains():
+    operations = merge_operation_traces(
+        [_write(1, 0, 1), _write(2, 1, 2), _write(3, 2, 3)],
+        [
+            {
+                "erase_index": 1,
+                "offset": 0,
+                "erase_size": 1,
+                "writes_at_this_point": 0,
+            },
+            {
+                "erase_index": 2,
+                "offset": 1,
+                "erase_size": 1,
+                "writes_at_this_point": 2,
+            },
+        ],
+    )
+
+    selected, excluded = select_first_cut_operations(
+        operations,
+        {
+            "mode": "all",
+            "fault_types": ["power_loss", "interrupted_erase"],
+        },
+    )
+
+    assert selected == (
+        ("write", 0),
+        ("write", 1),
+        ("write", 2),
+        ("erase", 0),
+        ("erase", 1),
+    )
+    assert excluded == {"write": 0, "erase": 0}
 
 
 def test_address_ranges_use_operation_overlap_and_absolute_addresses():
@@ -205,6 +243,104 @@ def test_explorer_is_breadth_first_deduplicates_and_keeps_generation_counts():
     assert results[0]["recovery_state_search_summary"]["states_booted"] == 3
 
 
+def test_explorer_reuses_erase_first_states_and_reports_them_separately():
+    baseline = PersistentState.from_bytes(b"\xff\xff")
+    erases = [
+        {
+            "erase_index": index,
+            "offset": index - 1,
+            "erase_size": 1,
+            "writes_at_this_point": 0,
+        }
+        for index in (1, 2)
+    ]
+    calibration = merge_operation_traces([], erases)
+
+    explorer = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(("erase", 0), ("erase", 1)),
+        max_cuts=2,
+        max_new_states=10,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=lambda _state, _chain, _generation: (
+            {"fault_injected": True, "signals": {}},
+            (),
+        ),
+        backend_kind="flash",
+        torn_word_mode="fixed",
+    )
+
+    results, summary = explorer.run()
+
+    assert len(results) == 1
+    assert results[0]["recovery_state_search"]["chain"]["cuts"][0][
+        "operation"
+    ] == "erase"
+    assert summary["first_cut_erases_selected"] == 2
+    assert summary["first_cut_erase_states_computed"] == 2
+    assert summary["single_cut_erase_states_booted"] == 1
+    assert summary["erase_first_states_reused"] == 1
+    assert summary["first_cut_program_states_computed"] == 0
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("fixed", b"\xee" * 4 + bytes(range(4, 8))),
+        ("untouched", bytes(range(8))),
+        ("programmed", b"\xee" * 8),
+        ("partial_bits", None),
+    ],
+)
+def test_explorer_computes_each_erase_first_outcome(mode, expected):
+    baseline_bytes = bytes(range(8))
+    baseline = PersistentState.from_bytes(baseline_bytes)
+    calibration = merge_operation_traces(
+        [],
+        [
+            {
+                "erase_index": 1,
+                "offset": 0,
+                "erase_size": 8,
+                "writes_at_this_point": 0,
+            }
+        ],
+    )
+    booted = []
+
+    def boot_state(state, _chain, _generation):
+        booted.append(state.materialize()["nvm"])
+        return ({"fault_injected": True, "signals": {}}, ())
+
+    explorer = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(("erase", 0),),
+        max_cuts=1,
+        max_new_states=1,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        backend_kind="flash",
+        torn_word_mode=mode,
+        erase_fill=0xEE,
+        corruption_seed=17,
+        program_unit=4,
+    )
+
+    _results, summary = explorer.run()
+
+    assert len(booted) == 1
+    if expected is None:
+        assert booted[0] not in (baseline_bytes, b"\xee" * 8)
+    else:
+        assert booted[0] == expected
+    assert summary["first_cut_erase_states_computed"] == 1
+    assert summary["single_cut_erase_states_booted"] == 1
+
+
 def test_explorer_applies_address_filter_without_skipping_prefix_mutations():
     baseline = PersistentState.from_bytes(b"\xff\xff", base_address=0x2000)
     calibration = merge_operation_traces([_write(1, 0, 0x10)], [])
@@ -312,6 +448,53 @@ def test_explorer_cross_checks_only_unique_states_that_will_be_booted():
     assert len(results) == 2
     assert len(checked) == 1
     assert summary["cross_checks_run"] == summary["cross_checks_passed"] == 1
+
+
+def test_explorer_cross_checks_erase_first_two_cut_state_with_typed_chain():
+    baseline = PersistentState.from_bytes(b"\x00")
+    calibration = merge_operation_traces(
+        [],
+        [
+            {
+                "erase_index": 1,
+                "offset": 0,
+                "erase_size": 1,
+                "writes_at_this_point": 0,
+            }
+        ],
+    )
+    checked = []
+
+    def boot_state(_state, _chain, generation):
+        operations = (
+            merge_operation_traces([_write(1, 0, 0x22)], [])
+            if generation == 1
+            else ()
+        )
+        return ({"fault_injected": True, "signals": {}}, operations)
+
+    explorer = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(("erase", 0),),
+        max_cuts=2,
+        max_new_states=10,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        torn_word_mode="programmed",
+        erase_fill=0xFF,
+        cross_check_every=2,
+        cross_check=lambda _state, chain, generation, operation: checked.append(
+            (chain[0]["operation"], generation, operation["kind"])
+        ),
+    )
+
+    _results, summary = explorer.run()
+
+    assert checked == [("erase", 2, "write")]
+    assert summary["cross_checks_run"] == 1
+    assert summary["cross_checks_passed"] == 1
 
 
 def test_explorer_cross_check_error_names_the_cut_chain():

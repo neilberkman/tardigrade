@@ -24,7 +24,8 @@ POINT_COUNT_SCHEMA_VERSION = 2
 POINT_KIND_LABELS: Dict[str, str] = {
     "single_cut_program": "single-cut program",
     "single_cut_erase": "single-cut erase",
-    "state_search_single_cut": "single-cut (state search)",
+    "state_search_single_cut": "single-cut program (state search)",
+    "state_search_single_cut_erase": "single-cut erase (state search)",
     "two_cut_grid": "two-cut (grid selection)",
     "two_cut_pairs": "two-cut (explicit pairs)",
     "two_cut_state_search": "two-cut (state search)",
@@ -131,6 +132,19 @@ def _state_search_generation(result: Mapping[str, Any]) -> int:
     return 1
 
 
+def _state_search_first_operation(result: Mapping[str, Any]) -> str:
+    metadata = result.get("recovery_state_search")
+    chain = metadata.get("chain") if isinstance(metadata, Mapping) else None
+    cuts = chain.get("cuts") if isinstance(chain, Mapping) else None
+    first = cuts[0] if cuts else None
+    return (
+        "erase"
+        if isinstance(first, Mapping)
+        and str(first.get("operation") or "write").strip().lower() == "erase"
+        else "write"
+    )
+
+
 def classify_point_kind(result: Mapping[str, Any], profile: Any = None) -> str:
     """Return the canonical accounting kind for one result record."""
     if bool(result.get("is_control")):
@@ -140,6 +154,8 @@ def classify_point_kind(result: Mapping[str, Any], profile: Any = None) -> str:
     if base == "rs" or isinstance(result.get("recovery_state_search"), Mapping):
         generation = _state_search_generation(result)
         if generation == 1:
+            if _state_search_first_operation(result) == "erase":
+                return "state_search_single_cut_erase"
             return "state_search_single_cut"
         if generation == 2:
             return "two_cut_state_search"
@@ -249,7 +265,14 @@ def _record_reused_state_chains(
             except (TypeError, ValueError):
                 cut_count = 2
             if cut_count <= 1:
-                kind = "state_search_single_cut"
+                cuts = chain.get("cuts") or []
+                first = cuts[0] if cuts else None
+                kind = (
+                    "state_search_single_cut_erase"
+                    if isinstance(first, Mapping)
+                    and str(first.get("operation") or "write") == "erase"
+                    else "state_search_single_cut"
+                )
             elif cut_count == 2:
                 kind = "two_cut_state_search"
             else:
@@ -293,19 +316,41 @@ def _record_state_search_remainder(
         first_cut_computed = max(
             0, int(summary.get("first_cut_states_computed", 0) or 0)
         )
+        first_program_computed = max(
+            0,
+            int(
+                summary.get(
+                    "first_cut_program_states_computed", first_cut_computed
+                )
+                or 0
+            ),
+        )
+        first_erase_computed = max(
+            0, int(summary.get("first_cut_erase_states_computed", 0) or 0)
+        )
     except (TypeError, ValueError):
         first_cut_computed = 0
-    first_cut_known = int(
+        first_program_computed = 0
+        first_erase_computed = 0
+    first_program_known = int(
         counts["kinds"]["state_search_single_cut"]["requested"]
     )
-    first_cut_remainder = min(
-        remainder, max(0, first_cut_computed - first_cut_known)
+    first_erase_known = int(
+        counts["kinds"]["state_search_single_cut_erase"]["requested"]
+    )
+    program_remainder = min(
+        remainder, max(0, first_program_computed - first_program_known)
+    )
+    erase_remainder = min(
+        remainder - program_remainder,
+        max(0, first_erase_computed - first_erase_known),
     )
     by_kind = {
-        "state_search_single_cut": first_cut_remainder,
+        "state_search_single_cut": program_remainder,
+        "state_search_single_cut_erase": erase_remainder,
         # Generation metadata is unavailable for computed states that were
         # never booted. Remaining states are conservatively two-cut.
-        "two_cut_state_search": remainder - first_cut_remainder,
+        "two_cut_state_search": remainder - program_remainder - erase_remainder,
     }
     for kind, count in by_kind.items():
         if not count:
@@ -532,6 +577,7 @@ def build_point_counts(
         if planned_fault_types is None or state_search_wire_request:
             for kind in (
                 "state_search_single_cut",
+                "state_search_single_cut_erase",
                 "two_cut_state_search",
                 "deeper_cut",
             ):

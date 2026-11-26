@@ -253,3 +253,35 @@ def test_recovery_state_computer_cuts_before_each_operation_and_advances_prefix(
     assert raw(candidates[0][1]) == b"\xFF" * 8
     assert raw(candidates[1][1]) == b"\xAA" * 4 + b"\xFF" * 4
     assert raw(RecoveryStateComputer(state, operations).final_state()) == b"\xAA" * 4 + b"\xBB" * 4
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("fixed", b"\xEE" * 4 + bytes(range(4, 8))),
+        ("untouched", bytes(range(8))),
+        ("programmed", b"\xEE" * 8),
+        ("partial_bits", None),
+    ],
+)
+def test_recovery_state_computer_computes_erase_first_cut_per_flash_outcome(
+    mode, expected
+):
+    baseline = bytes(range(8))
+    computer = RecoveryStateComputer(
+        PersistentState.from_bytes(baseline),
+        [erase(size=8)],
+        backend_kind="flash",
+        torn_word_mode=mode,
+        erase_fill=0xEE,
+        corruption_seed=17,
+        program_unit=4,
+    )
+
+    operation, candidate = next(iter(computer.iter_cut_states()))
+
+    assert operation["kind"] == "erase"
+    if expected is None:
+        assert raw(candidate) not in (baseline, b"\xEE" * 8)
+    else:
+        assert raw(candidate) == expected
