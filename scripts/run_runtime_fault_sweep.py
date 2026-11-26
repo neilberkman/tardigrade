@@ -4826,6 +4826,8 @@ def _snapshot_current_flash():
         return b['data'].ReadBytes(0, int(b['data'].Size))
     if b['kind'] == 'fast':
         return b['data'].Flash.ReadBytes(0, int(b['data'].FlashSize))
+    if b['kind'] == 'slow':
+        return b['data'].Nvm.ReadBytes(0, int(b['data'].Nvm.Size))
     return None
 
 
@@ -4984,13 +4986,6 @@ def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injec
     if cycle_wall_timeout is None:
         cycle_wall_timeout = phase2_wall_timeout_s
     b = backend
-    if b['kind'] == 'slow':
-        return cycle_records, {
-            'status': 'unsupported_fast_path_required',
-            'requested_cycles': int(boot_cycles),
-            'completed_cycles': len(cycle_records),
-        }, 0
-
     followup_t0 = _time.time()
     cpu_ref = monitor.Machine['sysbus.cpu']
     if b['kind'] == 'mram':
@@ -5000,7 +4995,10 @@ def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injec
 
     for cycle_index in range(int(start_cycle_index), int(boot_cycles)):
         run_boot_cycle_hook(cycle_index, cycle_records)
-        followup_uncorr = _snapshot_mram_uncorrectable_offsets() if b['kind'] == 'mram' else []
+        followup_uncorr = (
+            _snapshot_mram_uncorrectable_offsets()
+            if b['kind'] in ('mram', 'slow') else []
+        )
         if b['kind'] == 'mram':
             current_flash = b['data'].ReadBytes(0, flash_size)
         else:
@@ -7179,6 +7177,11 @@ def restore_initial_flash_cache():
     if _cached_initial_flash is not None and b['kind'] == 'fast':
         b['data'].Flash.WriteBytes(0, _cached_initial_flash)
         return True
+    if _cached_initial_flash is not None and b['kind'] == 'slow':
+        b['data'].Nvm.WriteBytes(
+            0, _cached_initial_flash, 0, len(_cached_initial_flash)
+        )
+        return True
     reload_images()
     apply_pre_boot_state()
     cache_initial_flash()
@@ -7281,6 +7284,8 @@ def prepare_cold_reset(apply_tracking_gate=True):
     # Restore the NVM contents that were saved before reset.
     if b['kind'] == 'mram':
         b['data'].WriteBytes(0, nvm_snapshot, 0, len(nvm_snapshot))
+    elif b['kind'] == 'slow':
+        b['data'].Nvm.WriteBytes(0, nvm_snapshot, 0, len(nvm_snapshot))
     else:
         flash_ref = b['data'].Flash
         flash_ref.WriteBytes(0, nvm_snapshot)
@@ -7307,6 +7312,8 @@ def restore_flash_and_boot(saved_flash):
         # MRAMMemory may or may not survive machine Reset depending on
         # vtable dispatch.  Always restore to be safe.
         b['data'].WriteBytes(0, saved_flash, 0, len(saved_flash))
+    elif b['kind'] == 'slow':
+        b['data'].Nvm.WriteBytes(0, saved_flash, 0, len(saved_flash))
     else:
         flash_ref = b['data'].Flash
         flash_ref.WriteBytes(0, saved_flash)
@@ -7646,6 +7653,10 @@ def cache_initial_flash():
     elif b['kind'] == 'fast':
         flash_ref = b['data'].Flash
         _cached_initial_flash = flash_ref.ReadBytes(0, int(b['data'].FlashSize))
+    elif b['kind'] == 'slow':
+        _cached_initial_flash = b['data'].Nvm.ReadBytes(
+            0, int(b['data'].Nvm.Size)
+        )
 
 def reload_images_cached():
     # Restore flash from cached snapshot if available; otherwise fall back
@@ -7673,6 +7684,10 @@ def reload_images_cached():
         b['data'].WriteBytes(0, _cached_initial_flash, 0, len(_cached_initial_flash))
     elif _cached_initial_flash is not None and b['kind'] == 'fast':
         b['data'].Flash.WriteBytes(0, _cached_initial_flash)
+    elif _cached_initial_flash is not None and b['kind'] == 'slow':
+        b['data'].Nvm.WriteBytes(
+            0, _cached_initial_flash, 0, len(_cached_initial_flash)
+        )
     else:
         reload_images()
         apply_pre_boot_state()
@@ -14039,33 +14054,6 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
 # ---------------------------------------------------------------------------
 def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type='w',
                      cross_check_expected=None):
-    if backend['kind'] == 'slow':
-        return {
-            'fault_at': p1_fault_at,
-            'fault_requested': p1_fault_at,
-            'fault_type': 'p2',
-            'fault_injected': False,
-            'skip_reason': 'phase2_unsupported_backend',
-            'fault_address': '0x00000000',
-            'boot_outcome': 'skipped',
-            'boot_slot': None,
-            'fault_class': 'skipped',
-            'actual_writes': 0,
-            'signals': {'phase1_ms': 0, 'phase2_ms': 0, 'phase3_ms': 0},
-            'phase2_fault': {
-                'p1_fault_at': p1_fault_at,
-                'p2_fault_at': p2_fault_at,
-                'p1_fault_type': p1_fault_type,
-                'p2_fault_type': p2_fault_type,
-                'p1_injected': False,
-                'p2_injected': False,
-                'p1_fault_address': '0x00000000',
-                'p2_fault_address': '0x00000000',
-                'skip_reason': 'unsupported_backend',
-                'p2_total_ops': 0,
-                'p2_max_fault_index': -1,
-            },
-        }
     if p1_fault_type in ('e', 'a'):
         capability_check = globals().get('_erase_fault_capability_error')
         capability_error = (
@@ -14130,7 +14118,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         log('p2fault p1={} type=t trigger_s={:.3f}'.format(p1_fault_at, trigger_s))
         monitor.Parse('emulation RunFor "{:.3f}"'.format(trigger_s))
         p1_injected = True  # Timed resets always "inject".
-        p1_ops = get_total_writes() if backend['kind'] != 'slow' else 0
+        p1_ops = get_total_writes()
     elif is_p1_erase:
         erase_mode = 1 if p1_fault_type == 'a' else 0
         base_erases = get_total_erases()
@@ -14275,7 +14263,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
             p1_fault_at, p2_fault_at, p2_trigger_s))
         monitor.Parse('emulation RunFor "{:.3f}"'.format(p2_trigger_s))
         p2_injected = True  # Timed resets always "inject".
-        p2_ops = get_total_writes() if backend['kind'] != 'slow' else 0
+        p2_ops = get_total_writes()
     elif is_p2_erase:
         erase_mode = 1 if p2_fault_type == 'a' else 0
         arm_erase_fault(p2_fault_at + 1, erase_fault_mode=erase_mode)
@@ -14958,12 +14946,17 @@ def _replay_storage_geometry():
 def _replay_storage_read_bytes(offset, count):
     if backend['kind'] == 'mram':
         return backend['data'].ReadBytes(int(offset), int(count))
+    if backend['kind'] == 'slow':
+        return backend['data'].Nvm.ReadBytes(int(offset), int(count))
     return backend['data'].Flash.ReadBytes(int(offset), int(count))
 
 
 def _replay_storage_write_bytes(offset, data):
     if backend['kind'] == 'mram':
         backend['data'].WriteBytes(int(offset), data, 0, len(data))
+        return
+    if backend['kind'] == 'slow':
+        backend['data'].Nvm.WriteBytes(int(offset), data, 0, len(data))
         return
     backend['data'].Flash.WriteBytes(int(offset), data)
 
@@ -16347,15 +16340,19 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 # ---------------------------------------------------------------------------
 
 def _state_search_trace_target():
-    return backend.get('data')
+    data = backend.get('data')
+    if backend.get('kind') == 'slow':
+        return getattr(data, 'Nvm', None)
+    return data
 
 
 def _state_search_preflight():
     if not isinstance(phase2_state_search, dict) or not phase2_state_search.get('enabled'):
         raise RuntimeError('recovery state search was dispatched without enabled configuration')
-    if backend.get('kind') not in ('fast', 'mram'):
+    if backend.get('kind') not in ('fast', 'mram', 'slow'):
         raise RuntimeError(
-            'recovery state search requires a fast flash or MRAM backend, got {}'.format(
+            'recovery state search requires a snapshot-capable flash, MRAM, '
+            'or controller-backed NVM backend, got {}'.format(
                 backend.get('kind')
             )
         )
@@ -16374,6 +16371,10 @@ def _state_search_preflight():
     if not bool(backend.get('per_write_accurate')):
         raise RuntimeError('recovery state search requires PerWriteAccurate=true')
     target = _state_search_trace_target()
+    if target is None:
+        raise RuntimeError(
+            'recovery state search controller backend has no backing Nvm member'
+        )
     required = (
         'WriteTraceClear', 'WriteTraceEnabled', 'WriteTraceCount',
         'WriteTraceToString', 'EraseTraceClear', 'EraseTraceEnabled',
@@ -16698,7 +16699,10 @@ def run_recovery_state_search():
         backend_kind=(
             'cfi'
             if 'CFIFlash' in str(type(backend.get('data')))
-            else backend.get('kind')
+            else (
+                'mram' if backend.get('kind') == 'slow'
+                else backend.get('kind')
+            )
         ),
         torn_word_mode=(torn_word if torn_word_explicit else mram_torn_word),
         torn_word_for_cut=torn_word_for_cut,
@@ -16950,6 +16954,13 @@ def _enable_fine_trace(data):
         data.EraseTraceEnabled = True
 
 
+def _calibration_trace_target():
+    data = backend['data']
+    if backend['kind'] == 'slow':
+        return getattr(data, 'Nvm', None)
+    return data
+
+
 if calibration_mode:
     if evaluation_mode == 'state':
         result = {
@@ -16964,6 +16975,7 @@ if calibration_mode:
             result['writeback_barriers'] = len(_writeback_barriers)
             result['writeback_erase_flushes'] = writeback_erase_flushes
     else:
+        calibration_trace_target = _calibration_trace_target()
         cpu_ref = monitor.Machine['sysbus.cpu']
         disarm_fault()
         if update_sequence_enabled:
@@ -16983,11 +16995,15 @@ if calibration_mode:
         bounded_calibration = bool(
             calibration_stop_address or calibration_stop_on_success
         )
-        if backend['kind'] == 'mram' and hasattr(backend['data'], 'WriteTraceToString'):
+        if (
+            backend['kind'] in ('mram', 'slow')
+            and calibration_trace_target is not None
+            and hasattr(calibration_trace_target, 'WriteTraceToString')
+        ):
             # Direct memory interceptors can record the coarse calibration
             # cheaply.  Keeping this active also covers successful boots that
             # do not require the optional fine rerun.
-            _enable_fine_trace(backend['data'])
+            _enable_fine_trace(calibration_trace_target)
         elif bounded_calibration and backend['kind'] == 'fast':
             _enable_fine_trace(backend['data'])
         elif (
@@ -17039,9 +17055,12 @@ if calibration_mode:
         # replay while keeping calibration fast. For targets where phase 1
         # already takes the full budget (slow swap), this is a no-op.
         trace_capable = (
-            backend['kind'] in ('fast', 'mram')
-            and bool(getattr(backend['data'], 'WriteTraceWidthExplicit', False))
-            and all(hasattr(backend['data'], member) for member in (
+            backend['kind'] in ('fast', 'mram', 'slow')
+            and calibration_trace_target is not None
+            and bool(getattr(
+                calibration_trace_target, 'WriteTraceWidthExplicit', False
+            ))
+            and all(hasattr(calibration_trace_target, member) for member in (
                 'WriteTraceClear', 'WriteTraceEnabled', 'WriteTraceCount',
                 'WriteTraceToString',
             ))
@@ -17070,7 +17089,7 @@ if calibration_mode:
             reset_nvmc_for_sweep()
             _prepare_calibration_stop()
             if trace_capable:
-                _enable_fine_trace(backend['data'])
+                _enable_fine_trace(calibration_trace_target)
             base_writes = get_total_writes()
             base_erases = get_total_erases()
             cal_status = run_until_done(cpu_ref, label='calibration_p2',
@@ -17124,12 +17143,12 @@ if calibration_mode:
         trace_file_bin = None
         program_trace_file = None
         calibration_last_program = None
-        if trace_capable and backend['data'].WriteTraceEnabled:
-            backend['data'].WriteTraceEnabled = False
-            trace_count = backend['data'].WriteTraceCount
+        if trace_capable and calibration_trace_target.WriteTraceEnabled:
+            calibration_trace_target.WriteTraceEnabled = False
+            trace_count = calibration_trace_target.WriteTraceCount
             if trace_count > 0:
                 trace_file = result_file.replace('.json', '_trace.csv')
-                trace_data = backend['data'].WriteTraceToString()
+                trace_data = calibration_trace_target.WriteTraceToString()
                 parsed_trace = []
                 trace_has_width = False
                 for line in trace_data.strip().split('\n'):
@@ -17249,14 +17268,18 @@ if calibration_mode:
         # Export erase trace — captured across fast, mram, and slow backends when supported.
         erase_trace_file = None
         erase_trace_file_bin = None
-        if hasattr(backend['data'], 'EraseTraceToString') and hasattr(backend['data'], 'EraseTraceCount'):
-            if hasattr(backend['data'], 'EraseTraceEnabled'):
-                backend['data'].EraseTraceEnabled = False
-            erase_count = int(backend['data'].EraseTraceCount)
+        if (
+            calibration_trace_target is not None
+            and hasattr(calibration_trace_target, 'EraseTraceToString')
+            and hasattr(calibration_trace_target, 'EraseTraceCount')
+        ):
+            if hasattr(calibration_trace_target, 'EraseTraceEnabled'):
+                calibration_trace_target.EraseTraceEnabled = False
+            erase_count = int(calibration_trace_target.EraseTraceCount)
             if erase_count > 0:
                 erase_trace_file = result_file.replace('.json', '_erase_trace.csv')
                 erase_trace_file_bin = result_file.replace('.json', '_erase_trace.bin')
-                erase_data = backend['data'].EraseTraceToString()
+                erase_data = calibration_trace_target.EraseTraceToString()
                 with open(erase_trace_file, 'w') as ef:
                     ef.write('erase_index,flash_offset,writes_at_this_point,erase_size\n')
                     with open(erase_trace_file_bin, 'wb') as efb:
@@ -17281,7 +17304,7 @@ if calibration_mode:
                                 erase_idx = int(parts[0]) & 0xFFFFFFFF
                                 flash_off = int(parts[1]) & 0xFFFFFFFF
                                 writes_at = int(parts[2]) & 0xFFFFFFFF
-                                fallback_sz = int(getattr(backend['data'], 'PageSize', 0) or effective_page_size()) & 0xFFFFFFFF
+                                fallback_sz = int(getattr(calibration_trace_target, 'PageSize', 0) or effective_page_size()) & 0xFFFFFFFF
                                 if not _calibration_event_within_stop(
                                     write_index=writes_at,
                                     erase_index=erase_idx,

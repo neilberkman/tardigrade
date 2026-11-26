@@ -127,12 +127,31 @@ class RuntimeFaultSweepCalibrationTests(unittest.TestCase):
         )
         self.assertIn("or calibration_trace_required", text)
 
-    def test_slow_controller_trace_stubs_are_not_trace_capable(self) -> None:
+    def test_slow_controller_calibration_uses_backing_nvm_trace(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_calibration_trace_target"
+        )
+        trace = object()
+        namespace = {
+            "backend": {
+                "kind": "slow",
+                "data": SimpleNamespace(Nvm=trace),
+            }
+        }
+        exec(
+            compile(ast.Module(body=[function], type_ignores=[]), str(PY_PATH), "exec"),
+            namespace,
+        )
+
+        self.assertIs(namespace["_calibration_trace_target"](), trace)
         text = PY_PATH.read_text(encoding="utf-8")
-        self.assertIn("backend['kind'] in ('fast', 'mram')", text)
+        self.assertIn("backend['kind'] in ('fast', 'mram', 'slow')", text)
         self.assertIn(
-            "getattr(backend['data'], 'WriteTraceWidthExplicit', False)",
-            text,
+            "calibration_trace_target, 'WriteTraceWidthExplicit'", text,
         )
 
     def test_fine_trace_enables_address_tracking_for_accurate_pg_backends(self) -> None:

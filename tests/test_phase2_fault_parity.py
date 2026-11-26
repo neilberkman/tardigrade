@@ -48,6 +48,21 @@ def _load_phase2_state_fault(namespace: dict) -> None:
     )
 
 
+def _load_state_search_preflight(namespace: dict) -> None:
+    tree = ast.parse(RUNNER.read_text(encoding="utf-8"))
+    names = {"_state_search_trace_target", "_state_search_preflight"}
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    exec(
+        compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER), "exec"),
+        namespace,
+        namespace,
+    )
+
+
 class _StatePhase2Runtime:
     def __init__(self) -> None:
         self.calls: list[int] = []
@@ -105,10 +120,16 @@ class _FakeMram:
 
 
 class _FakeController:
-    """Only the backing-NVM member needed from the real controller API."""
+    """Storage-forwarding members exposed by the real NVMemoryController."""
 
     def __init__(self, nvm: _FakeMram) -> None:
         self.Nvm = nvm
+        self.Flash = nvm
+        self.FlashSize = nvm.Size
+
+    @property
+    def FaultFlashSnapshot(self):
+        return self.Nvm.FaultFlashSnapshot
 
 
 class _Phase2Runtime:
@@ -315,20 +336,50 @@ class _Phase2Runtime:
         return self.ns["run_phase2_fault"](p1, p2, p1_type, p2_type)
 
 
-def test_phase2_fault_skips_controller_backend_before_first_cut() -> None:
+def test_execute_phase2_fault_uses_controller_storage_for_all_segments() -> None:
     runtime = _Phase2Runtime(backend_kind="slow")
 
     result = runtime.run()
 
-    assert not hasattr(runtime.data, "Flash")
-    assert not hasattr(runtime.data, "FlashSize")
     assert runtime.data.Nvm is runtime.nvm
-    assert runtime.current_cut == 0
-    assert runtime.modes_at_cut == []
-    assert result["fault_injected"] is False
-    assert result["skip_reason"] == "phase2_unsupported_backend"
-    assert result["phase2_fault"]["p1_injected"] is False
-    assert result["phase2_fault"]["p2_injected"] is False
+    assert runtime.data.Flash is runtime.nvm
+    assert runtime.current_cut == 2
+    assert result["fault_injected"] is True
+    assert result["phase2_fault"]["p1_injected"] is True
+    assert result["phase2_fault"]["p2_injected"] is True
+    assert result["boot_outcome"] == "success"
+
+
+def test_state_search_accepts_complete_controller_backed_nvm() -> None:
+    trace = SimpleNamespace(
+        WriteTraceClear=lambda: None,
+        WriteTraceEnabled=False,
+        WriteTraceCount=0,
+        WriteTraceToString=lambda: "",
+        EraseTraceClear=lambda: None,
+        EraseTraceEnabled=False,
+        EraseTraceCount=0,
+        EraseTraceToString=lambda: "",
+    )
+    namespace = {
+        "phase2_state_search": {"enabled": True},
+        "backend": {
+            "kind": "slow",
+            "data": SimpleNamespace(Nvm=trace),
+            "controller": None,
+            "otp": None,
+            "write_trace_width_explicit": True,
+            "per_write_accurate": True,
+        },
+        "durability_model": "direct",
+        "trace_file_path": "/calibration/trace.csv",
+        "os": SimpleNamespace(path=SimpleNamespace(exists=lambda _path: True)),
+    }
+    _load_state_search_preflight(namespace)
+
+    namespace["_state_search_preflight"]()
+
+    assert namespace["_state_search_trace_target"]() is trace
 
 
 def test_nxboot_controller_profile_plans_nine_state_mode_two_cut_points() -> None:
