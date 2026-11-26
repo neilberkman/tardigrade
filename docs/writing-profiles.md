@@ -1115,6 +1115,31 @@ fault_sweep:
 
 `warm` does `machine Reset` (CPU reset, NVM persists). `cold` saves NVM state, resets the entire machine, then restores NVM — models a full power cycle where volatile state (SRAM, peripheral registers) is lost.
 
+### Flash interrupted-operation outcomes
+
+```yaml
+fault_sweep:
+  torn_word: # one name, or a weighted per-cut list
+    - fixed
+    - untouched
+    - programmed
+    - partial_bits: 3
+  torn_word_seed: 7
+```
+
+`torn_word` is the backend-neutral setting for flash. It is supported by `NRF52NVMC`, `STM32F4FlashController`, `STM32F4FastFlash`, `STM32H7FlashController`, `STM32H7FastFlash`, `An521NvmInterceptor`, `CFIFlash`, the `NRF52NVMC` fast backend in `cortex_m4_flash_fast.repl`, flash trace replay, writeback reconstruction, and computed recovery-state reconstruction.
+
+- `fixed`: preserve the backend's behavior from profiles that predate this setting. A cut program retains the pre-program bytes on every flash backend. A cut erase erases the first half and retains the second half on every listed backend except `CFIFlash`, where it retains the complete sector.
+- `untouched`: retain all pre-operation bytes for either a cut program or a cut erase.
+- `programmed`: commit the complete program value for a program cut. For an erase cut, complete the erase and fill the complete span with `EraseFill`.
+- `partial_bits`: choose a deterministic non-empty, non-complete subset of the bits that differ between the old and target values when at least two bits differ. A one-bit operation necessarily reaches the target because there is no distinct intermediate value. Program cuts only move bits away from `EraseFill`; erase cuts only move bits toward `EraseFill`.
+
+The partial-bit selection mixes `torn_word_seed`, the program or erase index, the program-unit offset, and an operation-domain tag. Live peripherals, Python trace replay, writeback reconstruction, and computed recovery-state reconstruction use the same LCG and selection algorithm. Erase selection runs independently for each program unit (four bytes on the listed flash backends).
+
+The string form applies one outcome to all cuts. The list form uses the same SplitMix64 per-point draw and positive integer weights as `mram_torn_word`. A listed outcome is recorded as `torn_word` on every non-control result and copied into `failures[]` and `fault_evidence[]`; phase-two compound results record `p1_torn_word` and `p2_torn_word`. `TORN_WORD_CHOICES`, `TORN_WORD`, and `TORN_WORD_SEED` are the corresponding Robot variables.
+
+`torn_word` and `mram_torn_word` are mutually exclusive. Use `mram_torn_word` for MRAM and its existing ECC-specific outcomes. The loader rejects `torn_word` on an MRAM platform and on a readable platform description without a supported flash peripheral. Runtime setup also refuses an explicitly selected outcome if the resolved peripheral does not expose `TornWordMode`; trace replay deliberately uses the Python path because the native replay engine implements only the historical `fixed` result. Omitting `torn_word` emits no new Robot variables and preserves existing plans and results.
+
 ### MRAM torn-word mode
 
 ```yaml
@@ -1164,10 +1189,10 @@ fault_sweep:
 - A `phase2_fault` point draws independently for its first and second cut, using each cut's own fault index. The first draw remains the top-level `mram_torn_word` for compatibility, and `phase2_fault.p1_mram_torn_word` plus `phase2_fault.p2_mram_torn_word` record both draws. Other compound points (`multi_fault` and cascading write/erase) continue to use the point's one drawn mode for all their cuts.
 - The profile loader passes the list to the sweep as the Robot variable `MRAM_TORN_WORD_CHOICES` (`mode:weight,...`), alongside `MRAM_TORN_WORD` (set to the first listed mode) and `MRAM_TORN_WORD_SEED`. Leaving `MRAM_TORN_WORD_CHOICES` empty runs single-mode.
 
-Backends that take a per-cut mode are the ones that honor `mram_torn_word` today, since the sweep sets `MramTornWordMode` on the backend before each point:
+Backends that take a per-cut MRAM mode are the ones that honor `mram_torn_word`, since the sweep sets `MramTornWordMode` on the backend before each point:
 
 - Program (write) cuts: `MappedMRAMTracker`, `NVMemory` (directly or through `NVMemoryController` / `GenericNvmController`), and MRAM Python trace replay.
-- Erase cuts (`include_erase_fault_points: true` or `interrupted_erase`): the MRAM and NVMemory backends above, plus `An521NvmInterceptor`, `NRF52NVMC`, `STM32F4FlashController`, `STM32F4FastFlash`, `STM32H7FlashController`, and `STM32H7FastFlash`. `CFIFlash` has no torn-word modes.
+- Erase cuts (`include_erase_fault_points: true` or `interrupted_erase`): the MRAM and NVMemory backends above, plus `An521NvmInterceptor`, `NRF52NVMC`, `STM32F4FlashController`, `STM32F4FastFlash`, `STM32H7FlashController`, and `STM32H7FastFlash`. This legacy compatibility path is unchanged; new flash profiles should use `torn_word`.
 
 ### Erase fault points
 
@@ -1175,7 +1200,7 @@ Backends that take a per-cut mode are the ones that honor `mram_torn_word` today
 fault_sweep:
   fault_types: [power_loss]
   include_erase_fault_points: true # default: false
-  mram_torn_word: half # half, half_retain, untouched, erased, programmed, uncorrectable, or corrupted
+  torn_word: partial_bits # optional; omitted profiles retain their existing result
 ```
 
 By default (`include_erase_fault_points: false`), a `power_loss` sweep cuts power only during program/write operations, keeping existing profiles' fault indices and results unchanged.
@@ -1185,7 +1210,7 @@ When `include_erase_fault_points: true` is set:
 - Calibration counts erase operations (`total_erases`) and captures an erase trace across all built-in NVM and flash backends (`MappedMRAMTracker`, `NVMemoryController` / `NVMemory`, `GenericNvmController`, `An521NvmInterceptor`, `NRF52NVMC`, `STM32F4*`, `STM32H7*`, and `CFIFlash`).
 - The fault planner appends one interrupted-erase fault point (`fault_type: "e"`) for every calibrated erase operation (deduplicated if `interrupted_erase` is also listed in `fault_types`), in addition to program fault points.
 - Each fault point result, categorized failure, and runtime sweep summary reports its operation kind (`operation_kind`: `"program"` or `"erase"`, plus `operation_kind_points` / `operation_kind_issue_points` / `operation_kind_bricks` counts in the sweep summary).
-- What an interrupted erase leaves in the erased span `[offset .. offset + size)` is defined by the backend's torn-word mode (`mram_torn_word`, defaulting to `half`; `CFIFlash` does not implement torn-word modes and always retains pre-erase bytes when interrupted):
+- An explicit `torn_word` selects `fixed`, `untouched`, a complete erase (`programmed`), or `partial_bits` as described above. Without it, the legacy `mram_torn_word` compatibility behavior remains:
   - `half` / `half_retain` (default): the first half of the erased span is filled with `EraseFill` and the second half retains the pre-erase bytes (matching partial-page flash erases).
   - `untouched`: the entire span retains its pre-erase bytes unchanged (power cut just before the erase commits).
   - `erased` / `programmed`: the entire span is filled with `EraseFill` (erase completed immediately before power failed — tests power cuts between an erase and the subsequent program).
