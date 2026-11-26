@@ -305,6 +305,18 @@ def publish_report(
     issue_points = aggregate["issue_points"]
     security_bypass_points = aggregate["security_bypass_points"]
     brick_rate = aggregate["brick_rate"]
+    summary = payload.get("summary") or {}
+    runtime_sweep = summary.get("runtime_sweep") or {}
+    point_counts = runtime_sweep.get("point_counts")
+    if not isinstance(point_counts, dict):
+        # Compatibility for reports created before canonical point accounting.
+        # Current audit reports always provide the full block.
+        point_counts = {}
+    point_counts_json = json.dumps(
+        point_counts,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     security_clean = security_status == "CLEAN"
     security_reliable = not aggregate["inconclusive_reasons"]
     passed = assertion_passed and (
@@ -332,6 +344,7 @@ def publish_report(
             security_bypass_points,
         )
         _github_output_line(stream, "brick_rate", brick_rate)
+        _github_output_line(stream, "point_counts_json", point_counts_json)
         _github_output_line(stream, "report_path", report_path)
     return passed
 

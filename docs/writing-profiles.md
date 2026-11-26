@@ -2294,10 +2294,19 @@ Outcomes are grouped into classes:
 ### Report JSON structure
 
 ```
-summary.runtime_sweep.total_fault_points -- how many fault points tested
-summary.runtime_sweep.bricks            -- unrecoverable failures
-summary.runtime_sweep.issue_points      -- any non-success result
-summary.runtime_sweep.brick_rate        -- bricks / total
+summary.runtime_sweep.point_counts
+  .kinds.<kind>.requested               -- points selected or dynamically computed
+  .kinds.<kind>.run                     -- requests that returned a result record
+  .kinds.<kind>.evaluated               -- completed observations usable as evidence
+  .kinds.<kind>.skipped                 -- selected or computed but intentionally not evaluated
+  .kinds.<kind>.skip_reasons            -- skipped count grouped by reason
+  .kinds.<kind>.infrastructure_error    -- returned with infrastructure failure
+  .kinds.<kind>.timeout                 -- returned with a point-level timeout
+  .kinds.<kind>.reused                  -- state-search states reused without another boot
+  .kinds.<kind>.missing                 -- requested with neither a result, recorded skip, nor reuse
+  .kinds.<kind>.issues                  -- issue points with this kind's denominator
+  .calibration.program                  -- calibrated writes and their direct/represented coverage
+  .calibration.erase                    -- calibrated erases and their direct/represented coverage
 summary.runtime_sweep.timing            -- per-phase timing breakdown
 runtime_sweep_results[]                 -- per-point detail
   .fault_at                             -- which write was faulted
@@ -2311,6 +2320,21 @@ runtime_sweep_results[]                 -- per-point detail
   .postmortem_partition_dump            -- (no_boot only) slot header/trailer data
   .resume_trace                         -- (no_boot only) PC samples from second boot
 ```
+
+The ordered `<kind>` identifiers are `single_cut_program`,
+`single_cut_erase`, `state_search_single_cut`, `two_cut_grid`,
+`two_cut_pairs`, `two_cut_state_search`, `deeper_cut`, `multi_fault`,
+`cascading`, `glitch_instruction_skip`, `read_fault`, `control`, and `other`.
+State-search reuse is assigned by equivalent chain depth; reuse without chain
+metadata is conservatively assigned to `two_cut_state_search` and remains
+explicit in its `reused` count.
+
+The compatibility fields `total_fault_points`, `bricks`, `issue_points`, and
+`brick_rate` remain under `summary.runtime_sweep`. They count only the main
+runtime sweep's injected points across its configured fault mechanisms. They
+exclude controls, multi-fault follow-on results, and terminal-error campaign
+results. New consumers should use `point_counts`, whose `sources` array names
+the included campaigns.
 
 Use `scripts/render_results_html.py` to render the JSON as a browsable HTML report.
 

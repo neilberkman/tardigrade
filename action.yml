@@ -48,14 +48,17 @@ outputs:
     description: CLEAN, FINDINGS, or INCONCLUSIVE independent of regression expectations
     value: ${{ steps.run.outputs.security_status }}
   issue-points:
-    description: Total issue points across enabled fault campaigns
+    description: Security issue points across reliable evaluated report components; per-kind denominators are in point-counts-json
     value: ${{ steps.run.outputs.issue_points }}
   security-bypass-points:
     description: Instruction-skip points classified as security bypasses
     value: ${{ steps.run.outputs.security_bypass_points }}
   brick-rate:
-    description: Fraction of fault points that bricked the device
+    description: Fraction of reliable evaluated injected points that bricked the device across the security aggregate
     value: ${{ steps.run.outputs.brick_rate }}
+  point-counts-json:
+    description: JSON point accounting by kind, including requested, run, evaluated, skipped, infrastructure-error, timeout, reused, missing, and issue counts plus calibration coverage
+    value: ${{ steps.run.outputs.point_counts_json }}
   report-path:
     description: Path to JSON report for artifact upload
     value: ${{ steps.run.outputs.report_path }}
@@ -170,6 +173,7 @@ runs:
           echo "issue_points=0" >> "${GITHUB_OUTPUT}"
           echo "security_bypass_points=0" >> "${GITHUB_OUTPUT}"
           echo "brick_rate=-1" >> "${GITHUB_OUTPUT}"
+          echo "point_counts_json={}" >> "${GITHUB_OUTPUT}"
           echo "report_path=" >> "${GITHUB_OUTPUT}"
           echo "::error::Audit produced no report (exit ${audit_exit})"
           exit 1

@@ -101,10 +101,23 @@ def merge_runtime_sweep_payloads(
 
     calibrated_writes = max(int(payload.get("calibrated_writes") or 0) for payload in payloads)
     calibrated_erases = max(int(payload.get("calibrated_erases") or 0) for payload in payloads)
+    source_point_counts = (
+        (first.get("summary") or {}).get("runtime_sweep") or {}
+    ).get("point_counts") or {}
+    source_calibration = source_point_counts.get("calibration") or {}
     summary = summarize_runtime_sweep(
         ordered_results,
         total_writes=calibrated_writes,
         profile=profile,
+        expected_fault_points=len(merged_results),
+        planned_fault_types=[
+            str(result.get("fault_requested_type") or result.get("fault_type") or "w")
+            for result in merged_results
+        ],
+        calibration_point_coverage={
+            operation: dict(source_calibration.get(operation) or {})
+            for operation in ("program", "erase")
+        },
         expected_outcome_override=(
             first_expect.get("control_outcome")
             if isinstance(first_expect, dict)
@@ -126,6 +139,10 @@ def merge_runtime_sweep_payloads(
         "calibrated_erases": calibrated_erases,
         "setup_writes": max(int(payload.get("setup_writes") or 0) for payload in payloads),
         "fault_points_tested": len(merged_results),
+        "fault_points_tested_scope": (
+            "returned main-runtime fault records merged across slices; excludes "
+            "the clean control and follow-on campaigns"
+        ),
         "quick": any(bool(payload.get("quick")) for payload in payloads),
         "heuristic": first.get("heuristic"),
         "heuristic_config": first.get("heuristic_config"),

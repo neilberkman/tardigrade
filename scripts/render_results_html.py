@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from point_counts import point_count_rows
+
 from fault_classification import _effective_boot_result
 from audit_report import ownership_assessment
 
@@ -282,7 +284,7 @@ def render_fault_grid(results: List[Dict[str, Any]]) -> str:
 
     return (
         "<div class='telemetry-heading'><span>fault-point telemetry</span>"
-        f"<code>{len(points):04d} points</code></div>"
+        f"<code>{len(points):04d} returned non-control result records</code></div>"
         "<div class='grid' role='img' aria-label='Fault point outcome grid'>"
         + "".join(cells)
         + "</div>"
@@ -432,6 +434,72 @@ def render_terminal_error_panel(payload: Dict[str, Any]) -> str:
     )
 
 
+def render_point_counts_panel(payload: Dict[str, Any]) -> str:
+    """Render per-kind execution and calibration counts from the JSON block."""
+    block = payload.get("summary", {}).get("runtime_sweep", {}).get("point_counts")
+    if not isinstance(block, dict):
+        return ""
+    rows = []
+    for row in point_count_rows(block):
+        skip_reasons = ", ".join(
+            "{}={}".format(reason, count)
+            for reason, count in sorted((row.get("skip_reasons") or {}).items())
+        ) or "—"
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row['label']))}</td>"
+            f"<td>{_as_int(row.get('requested'))}</td>"
+            f"<td>{_as_int(row.get('run'))}</td>"
+            f"<td>{_as_int(row.get('evaluated'))}</td>"
+            f"<td>{_as_int(row.get('skipped'))}</td>"
+            f"<td>{_as_int(row.get('infrastructure_error'))}</td>"
+            f"<td>{_as_int(row.get('timeout'))}</td>"
+            f"<td>{_as_int(row.get('reused'))}</td>"
+            f"<td>{_as_int(row.get('missing'))}</td>"
+            f"<td>{_as_int(row.get('issues'))}</td>"
+            f"<td>{html.escape(skip_reasons)}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='11'>No requested or returned points.</td></tr>")
+
+    calibration_rows = []
+    calibration = block.get("calibration") or {}
+    for operation, label in (("program", "writes"), ("erase", "erases")):
+        row = calibration.get(operation) or {}
+        representation = ", ".join(row.get("representation") or []) or "none"
+        calibration_rows.append(
+            "<tr>"
+            f"<td>{label}</td>"
+            f"<td>{_as_int(row.get('calibrated'))}</td>"
+            f"<td>{_as_int(row.get('planned_range'))}</td>"
+            f"<td>{_as_int(row.get('cut_directly'))}</td>"
+            f"<td>{_as_int(row.get('represented_without_cut'))}</td>"
+            f"<td>{_as_int(row.get('outside_planned_range'))}</td>"
+            f"<td>{_as_int(row.get('not_cut_or_represented'))}</td>"
+            f"<td>{html.escape(representation)}</td>"
+            "</tr>"
+        )
+
+    return (
+        "<div class='telemetry-heading'><span>point counts by kind</span>"
+        "<code>requested / run / evaluated</code></div>"
+        "<div class='table-wrap'><table><thead><tr>"
+        "<th>Kind</th><th>Requested</th><th>Run</th><th>Evaluated</th>"
+        "<th>Skipped</th><th>Infrastructure error</th><th>Timeout</th>"
+        "<th>Reused</th><th>Missing</th><th>Issues</th><th>Skip reasons</th>"
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
+        "<div class='telemetry-heading'><span>calibration operation coverage</span>"
+        "<code>direct cuts and representation</code></div>"
+        "<div class='table-wrap'><table><thead><tr>"
+        "<th>Operation</th><th>Calibrated</th><th>Planned range</th>"
+        "<th>Cut directly</th>"
+        "<th>Represented without cutting</th><th>Outside planned range</th>"
+        "<th>Not cut or represented</th><th>Representation</th>"
+        "</tr></thead><tbody>" + "".join(calibration_rows) + "</tbody></table></div>"
+    )
+
+
 def render_audit_card(path: Path, payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     sweep = payload.get("summary", {}).get("runtime_sweep", {})
     profile = str(payload.get("profile", path.stem))
@@ -444,14 +512,18 @@ def render_audit_card(path: Path, payload: Dict[str, Any]) -> Tuple[str, Dict[st
     issues = int(sweep.get("issue_points", bricks) or 0)
     recoveries = int(sweep.get("recoveries", max(total - bricks, 0)) or 0)
     status_css = status_class(verdict)
+    point_counts = sweep.get("point_counts") or {}
+    count_totals = point_counts.get("totals") or {}
+    evaluated_points = int(count_totals.get("evaluated", total) or 0)
+    counted_issues = int(count_totals.get("issues", issues) or 0)
 
     metrics = (
         "<div class='metrics'>"
         f"<div class='metric metric-primary {status_css}'><b>verdict</b><span>{html.escape(verdict)}</span></div>"
-        f"<div class='metric'><b>fault points</b><span>{total}</span><small>in campaign</small></div>"
-        f"<div class='metric'><b>recoveries</b><span>{recoveries}</span><small>resilient paths</small></div>"
-        f"<div class='metric'><b>findings</b><span>{issues}</span><small>anomalous paths</small></div>"
-        f"<div class='metric'><b>brick rate</b><span>{brick_rate:.1f}%</span><small>{bricks}/{total} devices</small></div>"
+        f"<div class='metric'><b>evaluated points</b><span>{evaluated_points}</span><small>all listed kinds</small></div>"
+        f"<div class='metric'><b>main-runtime recoveries</b><span>{recoveries}</span><small>injected main-runtime paths</small></div>"
+        f"<div class='metric'><b>issue points</b><span>{counted_issues}</span><small>all listed kinds</small></div>"
+        f"<div class='metric'><b>main-runtime brick rate</b><span>{brick_rate:.1f}%</span><small>{bricks}/{total} injected main-runtime points</small></div>"
         f"<div class='metric'><b>control span</b><span class='outcome-span'>"
         f"{html.escape(control_initial_outcome)} <em>→</em> {html.escape(control_final_outcome)}"
         "</span><small>initial → final</small></div>"
@@ -503,6 +575,7 @@ def render_audit_card(path: Path, payload: Dict[str, Any]) -> Tuple[str, Dict[st
         "</div>"
         f"<div class='verdict-sigil' aria-label='Verdict {html.escape(verdict, quote=True)}'>"
         f"<span>{html.escape(verdict)}</span></div></header>"
+        f"{render_point_counts_panel(payload)}"
         f"{metrics}"
         f"{rc_panel}"
         f"{render_ownership_layout_panel(payload)}"
@@ -730,7 +803,9 @@ def render_comparison(summaries: List[Dict[str, Any]]) -> str:
         "<section class='card'>"
         "<p class='eyebrow'>diff // campaign comparison</p>"
         "<h2>Two-Report Comparison</h2>"
-        "<div class='table-wrap'><table><thead><tr><th>Report</th><th>Bricks</th><th>Rate</th><th>Verdict</th></tr></thead><tbody>"
+        "<div class='table-wrap'><table><thead><tr><th>Report</th>"
+        "<th>Main-runtime bricks / injected points</th>"
+        "<th>Main-runtime brick rate</th><th>Verdict</th></tr></thead><tbody>"
         f"<tr><td>{html.escape(a['profile'])}</td><td>{a['bricks']}/{a['total']}</td><td>{a['brick_rate']:.1f}%</td><td>{html.escape(a['verdict'])}</td></tr>"
         f"<tr><td>{html.escape(b['profile'])}</td><td>{b['bricks']}/{b['total']}</td><td>{b['brick_rate']:.1f}%</td><td>{html.escape(b['verdict'])}</td></tr>"
         "</tbody></table></div>"

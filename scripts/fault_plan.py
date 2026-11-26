@@ -1451,7 +1451,7 @@ def build_fault_plan(
         if confirm_count:
             parts.append("{} confirm-cycle".format(confirm_count))
         print(
-            "Running {} fault points ({}) for '{}'...".format(
+            "Running {} requested runtime fault points ({}) for '{}'...".format(
                 len(fault_points),
                 " + ".join(parts),
                 profile.name,
@@ -1460,7 +1460,9 @@ def build_fault_plan(
         )
     else:
         print(
-            "Running {} fault points for '{}'...".format(len(fault_points), profile.name),
+            "Running {} requested runtime fault points for '{}'...".format(
+                len(fault_points), profile.name
+            ),
             file=sys.stderr,
         )
 

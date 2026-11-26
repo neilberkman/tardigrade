@@ -53,6 +53,7 @@ from partial_staging import (
     classify_partial_staging_outcome,
     write_partial_image_to_temp,
 )
+from point_counts import merge_point_counts
 from profile_loader import ProfileConfig, load_profile
 from renode_runner import (
     RenodeTimeoutError,
@@ -649,7 +650,7 @@ def _auto_execute_batch_points(
     ):
         _progress(
             "Execute mode instruction-skip: forcing 1 pt/batch to avoid batch fallback churn "
-            "({} points).".format(len(fault_points))
+            "({} requested runtime plan entries).".format(len(fault_points))
         )
         return 1
 
@@ -670,7 +671,9 @@ def _auto_execute_batch_points(
     if eval_mode == "execute" and writeback_durability:
         _progress(
             "Writeback recovery replay: forcing 1 pt/batch until measured timing "
-            "can be used safely ({} points).".format(len(fault_points))
+            "can be used safely ({} requested runtime plan entries).".format(
+                len(fault_points)
+            )
         )
         return 1
 
@@ -700,7 +703,7 @@ def _auto_execute_batch_points(
         total_est_s = (len(fault_points) * point_cost_s) + (est_batches * update_sequence_overhead_s)
         _progress(
             "Execute mode with trace replay: ~{} batches, {} pts/batch "
-            "({}s budget, {:.0f}s total est, {} points).".format(
+            "({}s budget, {:.0f}s total est, {} requested runtime plan entries).".format(
                 est_batches,
                 chosen,
                 int(batch_budget_s),
@@ -758,7 +761,8 @@ def _auto_execute_batch_points(
         )
         print(
             "{}: ~{} batches, safe {} pts/batch "
-            "({}s budget, {:.0f}s total est, {} points, max fp={}).".format(
+            "({}s budget, {:.0f}s total est, {} requested runtime plan entries, "
+            "max fp={}).".format(
                 mode_label,
                 len(chunk_boundaries),
                 chosen,
@@ -954,7 +958,11 @@ def _run_batch_worker(
     # Share a single .NET bundle dir across all workers to avoid 160MB× N duplication.
     shared_bundle = work_dir / ".dotnet_bundle"
     shared_bundle.mkdir(parents=True, exist_ok=True)
-    _progress("worker {} starting: {} fault points.".format(worker_id, len(fault_points)))
+    _progress(
+        "worker {} starting: {} requested runtime plan entries.".format(
+            worker_id, len(fault_points)
+        )
+    )
 
     # Re-create the renode config for this worker's directory.
     renode_config = worker_dir / "renode.config"
@@ -2129,7 +2137,7 @@ def run_multi_component_sweep(
         fault_types_list = component_plan.fault_types_list
 
         _progress(
-            "Component '{}': sweeping {} fault points.".format(
+            "Component '{}': sweeping {} requested runtime plan entries.".format(
                 comp_name, len(fault_points)
             )
         )
@@ -2201,6 +2209,11 @@ def run_multi_component_sweep(
             total_writes=comp_max_writes,
             profile=comp_profile,
             expected_fault_points=len(fault_points),
+            planned_fault_types=(
+                list(fault_types_list)
+                if fault_types_list is not None
+                else ["w"] * len(fault_points)
+            ),
         )
         per_component_data[comp_name] = {
             "calibrated_writes": comp_max_writes,
@@ -2402,6 +2415,10 @@ def run_multi_component_sweep(
 
     combined_summary = {
         "total_fault_points": total_combined,
+        "total_fault_points_scope": (
+            "reliable and unreliable combined component observations, one per "
+            "injected component point; excludes the combined clean control"
+        ),
         **security_counts,
         "split_brain": split_brain_count,
         "all_failed": all_failed_count,
@@ -2413,9 +2430,20 @@ def run_multi_component_sweep(
             float(split_brain_count) / float(total_combined)
         ) if total_combined > 0 else 0.0,
     }
+    combined_summary["point_counts"] = merge_point_counts(
+        *(
+            data.get("summary", {}).get("point_counts")
+            for data in per_component_data.values()
+        )
+    )
+    combined_summary["point_counts"]["sources"] = [
+        "component:{}.runtime_sweep".format(name)
+        for name in sorted(per_component_data)
+    ]
 
     _progress(
-        "Multi-component sweep complete: {} total points, {} split-brain ({:.1%})".format(
+        "Multi-component sweep complete: {} combined injected component points, "
+        "{} split-brain combined outcomes ({:.1%})".format(
             total_combined,
             split_brain_count,
             combined_summary["split_brain_rate"],
@@ -2777,6 +2805,7 @@ def run_multi_fault_phase(
         profile=profile,
         expected_fault_points=len(multi_fault_points),
         expected_control_points=0,
+        planned_fault_types=multi_fault_types,
     )
     out.summary["wall_time_s"] = round(mf_wall_s, 1)
     print(

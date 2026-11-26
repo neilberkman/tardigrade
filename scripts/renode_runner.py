@@ -1364,7 +1364,8 @@ def run_batch(
             out = exc.stdout or ""
             err = exc.stderr or ""
             raise RenodeTimeoutError(
-                "renode-test batch timed out after {}s ({} points)\nSTDOUT:\n{}\nSTDERR:\n{}\n"
+                "renode-test batch timed out after {}s "
+                "({} requested runtime plan entries)\nSTDOUT:\n{}\nSTDERR:\n{}\n"
                 "Adjust with OTA_RENODE_POINT_TIMEOUT_S (seconds; <=0 disables timeout).".format(
                     process_timeout_s, len(fault_points), out, err
                 )
@@ -1685,7 +1686,8 @@ def _run_batches_chunked(
             else max_batch_points
         )
         _progress(
-            "{}sub-batching {} points into {} chunks (max {} points/chunk).".format(
+            "{}sub-batching {} requested runtime plan entries into {} chunks "
+            "(max {} requested entries/chunk).".format(
                 label_prefix, len(fault_points), len(plan), max_chunk_points
             )
         )
@@ -1697,7 +1699,8 @@ def _run_batches_chunked(
         chunk_start = time.monotonic()
         span = "{}..{}".format(chunk_points[0], chunk_points[-1]) if chunk_points else "empty"
         _progress(
-            "{}chunk {}/{} start: {} points (faults {}).".format(
+            "{}chunk {}/{} start: {} requested runtime plan entries "
+            "(faults {}).".format(
                 label_prefix, i + 1, len(plan), len(chunk_points), span
             )
         )
@@ -1720,7 +1723,7 @@ def _run_batches_chunked(
         )
         combined.extend(chunk_results)
         _progress(
-            "{}chunk {}/{} complete: {} results in {:.1f}s.".format(
+            "{}chunk {}/{} complete: {} returned runtime result records in {:.1f}s.".format(
                 label_prefix,
                 i + 1,
                 len(plan),

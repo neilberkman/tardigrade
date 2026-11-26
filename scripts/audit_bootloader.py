@@ -41,6 +41,11 @@ from partial_staging import (
     parse_partial_staging_config,
     summarize_partial_staging,
 )
+from point_counts import (
+    build_point_counts,
+    merge_point_counts,
+    render_point_counts_text,
+)
 from trace_utils import (
     annotate_clean_trace,
     flash_base_for_profile,
@@ -163,6 +168,143 @@ def _resolve_hash_bypass_addresses(
     return resolved
 EXIT_ASSERTION_FAILURE = 1
 EXIT_INFRA_FAILURE = 2
+
+
+def _calibrated_program_operation_count(
+    *,
+    calibration: Optional[CalibrationResult],
+    planned_program_operations: int,
+    heuristic_summary: Optional[Dict[str, Any]],
+) -> int:
+    """Return the complete calibrated program domain used for accounting."""
+    if isinstance(heuristic_summary, dict):
+        try:
+            heuristic_total = int(heuristic_summary.get("total_writes", 0) or 0)
+        except (TypeError, ValueError):
+            heuristic_total = 0
+        if heuristic_total > 0:
+            # A bounded execute sweep can cap CalibrationResult while active
+            # heuristic selection still reads and classifies the full trace.
+            return heuristic_total
+    if calibration is not None:
+        return int(calibration.total_writes)
+    return int(planned_program_operations)
+
+
+def _calibration_point_coverage(
+    *,
+    profile: ProfileConfig,
+    fault_points: List[int],
+    planned_fault_types: List[str],
+    calibrated_program_operations: int,
+    planned_program_operations: int,
+    calibrated_erases: int,
+    fault_start: Optional[int],
+    fault_end: Optional[int],
+    quick: bool,
+    heuristic_used: bool,
+) -> Dict[str, Dict[str, Any]]:
+    """Describe calibrated operations cut, represented, or outside the plan."""
+    planned_base_codes = {
+        str(value or "w").split(":", 1)[0]
+        for value in planned_fault_types
+    }
+    direct_program_codes = {"w", "b", "s", "g", "x", "d", "l", "r"}
+    has_direct_program_plan = bool(
+        planned_base_codes.intersection(direct_program_codes)
+    )
+    if has_direct_program_plan:
+        if heuristic_used:
+            # Active heuristic selection classifies the complete calibrated
+            # trace, even when max_writes bounds an exhaustive fallback.
+            planned_program_range = int(calibrated_program_operations)
+        else:
+            planned_program_start = max(0, int(fault_start or 0))
+            planned_program_end = min(
+                int(planned_program_operations),
+                int(fault_end)
+                if fault_end is not None
+                else int(planned_program_operations),
+            )
+            planned_program_range = max(
+                0, planned_program_end - planned_program_start
+            )
+    elif "p2" in planned_base_codes:
+        planned_program_range = len(
+            {
+                int(point)
+                for point, fault_type in zip(fault_points, planned_fault_types)
+                if str(fault_type).split(":", 1)[0] == "p2"
+                and 0 <= int(point) < calibrated_program_operations
+            }
+        )
+    elif "rs" in planned_base_codes:
+        state_search = profile.fault_sweep.phase2_fault.state_search
+        if state_search.first_cut_mode == "all":
+            planned_program_range = min(
+                int(planned_program_operations), calibrated_program_operations
+            )
+        elif state_search.first_cut_mode == "ranges":
+            planned_program_range = len(
+                {
+                    index
+                    for start, end in state_search.first_cut_ranges
+                    for index in range(max(0, int(start)), int(end) + 1)
+                    if index < calibrated_program_operations
+                }
+            )
+        else:
+            planned_program_range = min(3, calibrated_program_operations)
+    elif planned_base_codes.intersection({"mf", "c"}):
+        planned_program_range = len(
+            {
+                int(point)
+                for point in fault_points
+                if 0 <= int(point) < calibrated_program_operations
+            }
+        )
+    else:
+        planned_program_range = 0
+
+    program_representation: List[str] = []
+    if heuristic_used and has_direct_program_plan:
+        program_representation.append("heuristic")
+    if (
+        quick
+        and has_direct_program_plan
+        and not bool(profile.fault_sweep.quick_use_heuristic)
+    ):
+        program_representation.append("quick")
+    erase_representation = (
+        ["quick"]
+        if quick
+        and not bool(profile.fault_sweep.quick_use_heuristic)
+        and planned_base_codes.intersection({"e", "a"})
+        else []
+    )
+    if planned_base_codes.intersection({"e", "a"}):
+        planned_erase_start = max(0, int(fault_start or 0))
+        planned_erase_end = min(
+            int(calibrated_erases),
+            int(fault_end)
+            if fault_end is not None
+            else int(calibrated_erases),
+        )
+        planned_erase_range = max(0, planned_erase_end - planned_erase_start)
+    else:
+        planned_erase_range = 0
+    return {
+        "program": {
+            "calibrated": int(calibrated_program_operations),
+            "planned_range": planned_program_range,
+            "representation": program_representation,
+        },
+        "erase": {
+            "calibrated": int(calibrated_erases),
+            "planned_range": planned_erase_range,
+            "representation": erase_representation,
+        },
+    }
 
 
 def _calibration_stop_summary(
@@ -2252,7 +2394,8 @@ def _main_single() -> int:
 
         sweep_wall_s = _time_mod.time() - sweep_wall_t0
         print(
-            "Sweep completed: {} points in {:.1f}s ({:.0f}ms/point avg)".format(
+            "Main runtime sweep completed: {} requested points in {:.1f}s "
+            "({:.0f}ms/requested point avg)".format(
                 len(fault_points), sweep_wall_s,
                 (sweep_wall_s * 1000 / len(fault_points)) if fault_points else 0,
             ),
@@ -2368,12 +2511,37 @@ def _main_single() -> int:
             keep_run_artifacts=args.keep_run_artifacts,
             expected_outcome=getattr(profile.expect, "control_outcome", "success") or "success",
         )
+        planned_fault_types = (
+            list(fault_types_list)
+            if fault_types_list is not None
+            else ["w"] * len(fault_points)
+        )
+        calibrated_program_operations = _calibrated_program_operation_count(
+            calibration=cal,
+            planned_program_operations=int(max_writes),
+            heuristic_summary=heuristic_summary,
+        )
+        calibration_point_coverage = _calibration_point_coverage(
+            profile=profile,
+            fault_points=fault_points,
+            planned_fault_types=planned_fault_types,
+            calibrated_program_operations=calibrated_program_operations,
+            planned_program_operations=int(max_writes),
+            calibrated_erases=int(total_erases),
+            fault_start=fault_start,
+            fault_end=fault_end,
+            quick=bool(args.quick),
+            heuristic_used=heuristic_summary is not None,
+        )
         sweep_summary = summarize_runtime_sweep(
             sweep_results,
             total_writes=max_writes,
             profile=profile,
             calibration_coverage=calibration_coverage,
             expected_fault_points=len(fault_points),
+            expected_control_points=0 if args.no_control else 1,
+            planned_fault_types=planned_fault_types,
+            calibration_point_coverage=calibration_point_coverage,
         )
         sweep_summary["wall_time_s"] = round(sweep_wall_s, 1)
 
@@ -2554,6 +2722,46 @@ def _main_single() -> int:
         )
         verdict = qualify_ownership_verdict(verdict, ownership_plan)
 
+        point_count_blocks = [sweep_summary.get("point_counts")]
+        point_count_sources = ["runtime_sweep"]
+        if multi_fault_summary is not None:
+            point_count_blocks.append(multi_fault_summary.get("point_counts"))
+            point_count_sources.append("multi_fault_runtime_sweep")
+        if terminal_error_results is not None:
+            terminal_point_counts = build_point_counts(
+                terminal_error_results,
+                planned_fault_types=terminal_types,
+                expected_control_points=1,
+                profile=profile,
+                issue_predicate=lambda result: bool(
+                    isinstance(result.get("signals"), dict)
+                    and result["signals"].get("terminal_error_escaped")
+                ),
+            )
+            point_count_blocks.append(terminal_point_counts)
+            point_count_sources.append("terminal_error_campaign")
+        sweep_summary["point_counts"] = merge_point_counts(*point_count_blocks)
+        sweep_summary["point_counts"]["sources"] = point_count_sources
+        sweep_summary["compatibility_field_scopes"] = {
+            "total_fault_points": (
+                "injected points in the main runtime sweep across all configured "
+                "fault mechanisms; excludes controls and follow-on campaigns"
+            ),
+            "issue_points": (
+                "reportable issue points among injected main-runtime points; "
+                "excludes controls and follow-on campaigns"
+            ),
+            "brick_rate": (
+                "main-runtime bricks divided by injected main-runtime points"
+            ),
+            "fault_type_points": (
+                "injected main-runtime points grouped by fault type"
+            ),
+            "operation_kind_points": (
+                "injected main-runtime points grouped as program or erase"
+            ),
+        }
+
         # -------------------------------------------------------------------
         # Build output
         # -------------------------------------------------------------------
@@ -2572,6 +2780,10 @@ def _main_single() -> int:
             "calibrated_erases": total_erases,
             "setup_writes": setup_writes,
             "fault_points_tested": len(fault_points),
+            "fault_points_tested_scope": (
+                "requested main-runtime plan entries before result validation; "
+                "excludes the clean control and follow-on campaigns"
+            ),
             "quick": bool(args.quick),
             "heuristic": heuristic_summary,
             "heuristic_config": (
@@ -2745,9 +2957,14 @@ def _main_single() -> int:
         out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
         # Print summary.
+        print(
+            render_point_counts_text(sweep_summary["point_counts"]),
+            file=sys.stderr,
+        )
         print(json.dumps({
             "profile": profile.name,
             "verdict": verdict,
+            "point_counts": sweep_summary["point_counts"],
             "summary": payload["summary"],
         }, indent=2, sort_keys=True))
 

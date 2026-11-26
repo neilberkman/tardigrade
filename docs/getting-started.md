@@ -68,14 +68,26 @@ The output JSON report contains a top-level verdict and detailed per-fault-point
 
 ### Verdict
 
-The `summary.runtime_sweep` section has the key fields:
+Start with `summary.runtime_sweep.point_counts`. Its `kinds` entries separate
+single-cut programs and erases, state-search cuts, explicit and grid two-cut
+points, deeper cuts, multi-fault and cascading runs, instruction skips, read
+faults, controls, and other configured mechanisms. Every entry reports
+`requested`, `run`, `evaluated`, `skipped`, `infrastructure_error`, `timeout`,
+`reused`, `missing`, and `issues`, with `skip_reasons` beside the skipped
+count. `point_counts.calibration` says how many calibrated writes and erases
+were cut directly, represented by heuristic or quick selection without a cut,
+outside the planned range, or neither cut nor represented.
 
-| Field                | Meaning                                       |
-| -------------------- | --------------------------------------------- |
-| `total_fault_points` | How many fault points were tested             |
-| `bricks`             | Unrecoverable failures (device did not boot)  |
-| `issue_points`       | Any non-success result (bricks + wrong image) |
-| `brick_rate`         | Bricks / total points                         |
+These older fields remain for consumers of pre-existing reports. They cover
+only the main runtime sweep and deliberately exclude its control, the
+multi-fault follow-on, and the terminal-error instruction-skip campaign:
+
+| Field                | Compatibility meaning                                                |
+| -------------------- | -------------------------------------------------------------------- |
+| `total_fault_points` | Main-runtime records where a fault reported that it fired             |
+| `bricks`             | Main-runtime injected points with unrecoverable boot outcomes         |
+| `issue_points`       | Main-runtime injected points with reportable non-success observations |
+| `brick_rate`         | `bricks / total_fault_points` for the main runtime sweep               |
 
 The CLI's top-level `verdict` begins with `PASS`, `FAIL`, or `INCONCLUSIVE`.
 CI must treat only `PASS` as passing. The verdict evaluates the profile's
@@ -181,7 +193,9 @@ Tardigrade can run in CI via a reusable GitHub Action:
     workers: 2
 ```
 
-The action outputs `verdict`, `brick-rate`, and `report-path`. See [`action.yml`](../action.yml) and the [README](../README.md#quick-start) for all inputs and outputs.
+The action outputs `verdict`, `brick-rate`, `point-counts-json`, and
+`report-path`. See [`action.yml`](../action.yml) and the
+[README](../README.md#quick-start) for all inputs and outputs.
 
 Profile assets are resolved against the caller workspace by default. If the
 profile's relative paths start from a subdirectory, pass that directory as
