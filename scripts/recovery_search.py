@@ -30,6 +30,10 @@ def _byte_value(value):
     return int(value) & 0xFF
 
 
+def _hex_value(value):
+    return "".join("{:02x}".format(_byte_value(item)) for item in value)
+
+
 def select_first_cuts(total_writes, first_cuts):
     total_writes = max(0, int(total_writes))
     config = first_cuts or {}
@@ -153,7 +157,12 @@ class SearchBudget(object):
         self.booted += 1
 
 
-def first_persistent_difference(expected, observed_regions, observed_uncorrectable):
+def first_persistent_difference(
+    expected,
+    observed_regions,
+    observed_uncorrectable,
+    observed_persistent_values=None,
+):
     expected_regions = expected.materialize()
     for region in expected.regions:
         observed = observed_regions.get(region.name)
@@ -208,6 +217,30 @@ def first_persistent_difference(expected, observed_regions, observed_uncorrectab
             ),
             "expected_marked": bool(missing),
             "observed_marked": bool(extra),
+        }
+    expected_values = dict(expected.persistent_values)
+    observed_values = dict(
+        (str(name), bytes(bytearray(value)))
+        for name, value in (observed_persistent_values or {}).items()
+    )
+    if expected_values != observed_values:
+        differing_names = sorted(
+            name
+            for name in set(expected_values) | set(observed_values)
+            if expected_values.get(name) != observed_values.get(name)
+        )
+        name = differing_names[0]
+        expected_value = expected_values.get(name)
+        observed_value = observed_values.get(name)
+        return {
+            "kind": "persistent_value",
+            "name": name,
+            "expected": (
+                None if expected_value is None else _hex_value(expected_value)
+            ),
+            "observed": (
+                None if observed_value is None else _hex_value(observed_value)
+            ),
         }
     return None
 

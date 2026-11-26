@@ -68,6 +68,7 @@ ${TORN_WORD_SEED}              0
 ${TORN_WORD_CHOICES}           ${EMPTY}
 ${TORN_WORD_EXPLICIT}          false
 ${INCLUDE_ERASE_FAULT_POINTS}    false
+${TRACE_REPLAY_CROSS_CHECK_EVERY}    100
 ${HEURISTIC_TRACE_REQUIRED}    false
 ${CALIBRATION_TRACE_REQUIRED}  false
 ${CALIBRATION_STOP_ADDRESS}    ${EMPTY}
@@ -266,6 +267,7 @@ Run Runtime Fault Point
     Execute Command    $torn_word_choices="${TORN_WORD_CHOICES}"
     Execute Command    $torn_word_explicit="${TORN_WORD_EXPLICIT}"
     Execute Command    $include_erase_fault_points="${INCLUDE_ERASE_FAULT_POINTS}"
+    Execute Command    $trace_replay_cross_check_every="${TRACE_REPLAY_CROSS_CHECK_EVERY}"
     Execute Command    $calibration_stop_address="${CALIBRATION_STOP_ADDRESS}"
     Execute Command    $calibration_stop_on_success="${CALIBRATION_STOP_ON_SUCCESS}"
     Execute Command    $success_terminal_after_reset="${SUCCESS_TERMINAL_AFTER_RESET}"

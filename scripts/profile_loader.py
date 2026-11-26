@@ -1889,6 +1889,7 @@ class FaultSweepConfig:
         "torn_word_seed",
         "torn_word_choices",
         "include_erase_fault_points",
+        "trace_replay_cross_check_every",
     )
 
     def __init__(
@@ -1947,6 +1948,7 @@ class FaultSweepConfig:
         torn_word_explicit: bool = False,
         torn_word_seed: int = 0,
         include_erase_fault_points: bool = False,
+        trace_replay_cross_check_every: int = 100,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -2158,6 +2160,22 @@ class FaultSweepConfig:
             )
         self.torn_word_seed = parsed_torn_seed
         self.include_erase_fault_points = bool(include_erase_fault_points)
+        if isinstance(trace_replay_cross_check_every, bool):
+            raise ProfileError(
+                "fault_sweep.trace_replay_cross_check_every must be a non-negative integer"
+            )
+        try:
+            self.trace_replay_cross_check_every = int(
+                trace_replay_cross_check_every
+            )
+        except (TypeError, ValueError) as exc:
+            raise ProfileError(
+                "fault_sweep.trace_replay_cross_check_every must be a non-negative integer"
+            ) from exc
+        if self.trace_replay_cross_check_every < 0:
+            raise ProfileError(
+                "fault_sweep.trace_replay_cross_check_every must be a non-negative integer"
+            )
 
 
 class StateFuzzerConfig:
@@ -3509,6 +3527,9 @@ class ProfileConfig:
             "MRAM_TORN_WORD_SEED:{}".format(fs.mram_torn_word_seed),
             "INCLUDE_ERASE_FAULT_POINTS:{}".format(
                 "true" if fs.include_erase_fault_points else "false"
+            ),
+            "TRACE_REPLAY_CROSS_CHECK_EVERY:{}".format(
+                fs.trace_replay_cross_check_every
             ),
             "HEURISTIC_TRACE_REQUIRED:{}".format(
                 str(
@@ -5161,6 +5182,9 @@ def _parse_fault_sweep(
         include_erase_fault_points=_parse_bool(
             raw.get("include_erase_fault_points", False),
             "fault_sweep.include_erase_fault_points",
+        ),
+        trace_replay_cross_check_every=raw.get(
+            "trace_replay_cross_check_every", 100
         ),
     )
     fs_cfg._raw_boot_cycle_hook = raw_boot_cycle_hook
@@ -8194,6 +8218,7 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
         "torn_word",
         "torn_word_seed",
         "include_erase_fault_points",
+        "trace_replay_cross_check_every",
     }
 )
 

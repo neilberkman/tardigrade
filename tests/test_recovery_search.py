@@ -102,6 +102,24 @@ def test_cross_check_difference_names_first_byte_address_then_ecc():
     assert ecc_mismatch["address"] == "0x00002000"
 
 
+def test_cross_check_difference_includes_other_persistent_values():
+    expected = PersistentState.from_bytes(
+        b"abcd", persistent_values={"wear_epoch": b"\x02"}
+    )
+    mismatch = first_persistent_difference(
+        expected,
+        {"nvm": b"abcd"},
+        (),
+        {"wear_epoch": b"\x03"},
+    )
+    assert mismatch == {
+        "kind": "persistent_value",
+        "name": "wear_epoch",
+        "expected": "02",
+        "observed": "03",
+    }
+
+
 def test_two_cut_result_format_is_pasteable_and_preserves_equivalent_chain():
     state = PersistentState.from_bytes(b"abcd")
     chain = [
