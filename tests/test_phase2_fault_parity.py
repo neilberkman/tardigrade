@@ -33,6 +33,60 @@ def _load_phase2_fault(namespace: dict) -> None:
     )
 
 
+def _load_phase2_state_fault(namespace: dict) -> None:
+    tree = ast.parse(RUNNER.read_text(encoding="utf-8"))
+    names = {"_phase2_state_skip_result", "run_phase2_state_fault"}
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    exec(
+        compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER), "exec"),
+        namespace,
+        namespace,
+    )
+
+
+class _StatePhase2Runtime:
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+        self.ns = {
+            "_time": time,
+            "fmt_u32": lambda value: "0x{:08x}".format(int(value) & 0xFFFFFFFF),
+            "log": lambda _message: None,
+            "run_state_fault": self._run_state_fault,
+        }
+        _load_phase2_state_fault(self.ns)
+
+    def _run_state_fault(self, fault_at: int) -> dict:
+        self.calls.append(fault_at)
+        if fault_at < 0:
+            return {
+                "fault_injected": False,
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "fault_class": "recoverable",
+                "actual_writes": 16,
+                "signals": {"vector_valid": True, "copy_completed": True},
+                "semantic_state": {"stage": "state_mode", "segment": "final"},
+                "effective_success_criteria": {"vtor_slot": "exec"},
+            }
+        return {
+            "fault_injected": True,
+            "fault_address": "0x{:08x}".format(0x10002000 + fault_at * 4),
+            "boot_outcome": "hard_fault",
+            "boot_slot": None,
+            "fault_class": "unrecoverable",
+            "actual_writes": fault_at,
+            "signals": {"vector_valid": False, "copy_completed": False},
+            "semantic_state": {"stage": "state_mode", "cut": fault_at},
+        }
+
+    def run(self, p1: int, p2: int, p1_type: str = "w", p2_type: str = "w") -> dict:
+        return self.ns["run_phase2_state_fault"](p1, p2, p1_type, p2_type)
+
+
 class _FakeMram:
     Size = 64
     TotalPageErases = 0
@@ -277,7 +331,7 @@ def test_phase2_fault_skips_controller_backend_before_first_cut() -> None:
     assert result["phase2_fault"]["p2_injected"] is False
 
 
-def test_nxboot_controller_profile_plans_nine_early_skips() -> None:
+def test_nxboot_controller_profile_plans_nine_state_mode_two_cut_points() -> None:
     profile = load_profile(PROFILE)
     plan = build_fault_plan(
         profile,
@@ -291,13 +345,58 @@ def test_nxboot_controller_profile_plans_nine_early_skips() -> None:
     ]
 
     assert profile.flash_backend == "nvm_ctrl"
+    assert profile.fault_sweep.evaluation_mode is None
     assert len(phase2_types) == 9
     for fault_type in phase2_types:
-        _, p1_raw, p2_raw, _, _ = fault_type.split(":")
-        runtime = _Phase2Runtime(backend_kind="slow")
-        result = runtime.run(int(p1_raw), int(p2_raw))
-        assert result["skip_reason"] == "phase2_unsupported_backend"
-        assert runtime.current_cut == 0
+        _, p1_raw, p2_raw, p1_type, p2_type = fault_type.split(":")
+        runtime = _StatePhase2Runtime()
+        result = runtime.run(
+            int(p1_raw), int(p2_raw), p1_type=p1_type, p2_type=p2_type
+        )
+        assert result["fault_injected"] is True
+        assert result["boot_outcome"] == "success"
+        assert runtime.calls == [int(p1_raw), int(p2_raw), -1]
+
+
+def test_controller_state_mode_runs_both_cuts_and_final_copy_without_runfor() -> None:
+    runtime = _StatePhase2Runtime()
+
+    result = runtime.run(3, 9)
+
+    assert runtime.calls == [3, 9, -1]
+    assert result["fault_injected"] is True
+    assert result["boot_outcome"] == "success"
+    assert result["boot_slot"] == "exec"
+    assert result["fault_class"] == "recoverable"
+    assert result["phase2_fault"]["p1_injected"] is True
+    assert result["phase2_fault"]["p2_injected"] is True
+    assert result["phase2_fault"]["p1_fault_address"] == "0x1000200c"
+    assert result["phase2_fault"]["p2_fault_address"] == "0x10002024"
+    assert result["phase2_fault"]["p2_total_ops"] == 10
+    assert result["signals"]["trace_replay_mode"] == "state"
+    assert result["signals"]["copy_completed"] is True
+    assert result["phase2_fault"]["p1_fault_semantic_state"]["cut"] == 3
+    assert result["phase2_fault"]["p2_fault_semantic_state"]["cut"] == 9
+    assert result["semantic_state"]["segment"] == "final"
+
+
+def test_controller_state_mode_keeps_non_program_second_cuts_refused() -> None:
+    runtime = _StatePhase2Runtime()
+
+    result = runtime.run(3, 1, p2_type="e")
+
+    assert runtime.calls == []
+    assert result["skip_reason"] == "phase2_state_mode_fault_type_unsupported"
+    assert result["phase2_fault"]["skip_reason"] == (
+        "state_mode_fault_type_unsupported"
+    )
+
+
+def test_phase2_dispatch_routes_only_controller_state_mode_to_state_model() -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+
+    assert "evaluation_mode == 'state' and backend.get('kind') == 'slow'" in source
+    assert "return run_phase2_state_fault(p1_at, p2_at, p1_type, p2_type)" in source
 
 
 def test_phase2_fault_restores_uncorrectable_words_for_both_later_boots() -> None:

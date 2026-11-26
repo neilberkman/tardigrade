@@ -9502,6 +9502,173 @@ def run_state_fault(fault_at):
     return result
 
 
+def _phase2_state_skip_result(
+        p1_fault_at, p2_fault_at, p1_fault_type, p2_fault_type, reason):
+    return {
+        'fault_at': p1_fault_at,
+        'fault_requested': p1_fault_at,
+        'fault_type': 'p2',
+        'fault_injected': False,
+        'skip_reason': 'phase2_{}'.format(reason),
+        'fault_address': fmt_u32(0),
+        'boot_outcome': 'skipped',
+        'boot_slot': None,
+        'fault_class': 'skipped',
+        'actual_writes': 0,
+        'signals': {
+            'phase1_ms': 0,
+            'phase2_ms': 0,
+            'phase3_ms': 0,
+            'trace_replay_mode': 'state',
+        },
+        'phase2_fault': {
+            'p1_fault_at': p1_fault_at,
+            'p2_fault_at': p2_fault_at,
+            'p1_fault_type': p1_fault_type,
+            'p2_fault_type': p2_fault_type,
+            'p1_injected': False,
+            'p2_injected': False,
+            'p1_fault_address': fmt_u32(0),
+            'p2_fault_address': fmt_u32(0),
+            'skip_reason': reason,
+            'p2_total_ops': 0,
+            'p2_max_fault_index': -1,
+        },
+    }
+
+
+def run_phase2_state_fault(
+        p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type='w'):
+    """Apply two interrupted copies with the same model as ``run_state_fault``.
+
+    A state-mode point does not boot the CPU. Recovery is represented by
+    restarting the deterministic staging-to-exec copy against the persistent
+    bytes left by the preceding cut. The third segment completes that same
+    copy and evaluates the vector and content checks through ``run_state_fault``.
+    """
+    if p1_fault_type != 'w' or p2_fault_type != 'w':
+        return _phase2_state_skip_result(
+            p1_fault_at,
+            p2_fault_at,
+            p1_fault_type,
+            p2_fault_type,
+            'state_mode_fault_type_unsupported',
+        )
+
+    started = _time.time()
+    phase1 = run_state_fault(p1_fault_at)
+    phase1_ms = int((_time.time() - started) * 1000)
+    if not phase1.get('fault_injected'):
+        result = _phase2_state_skip_result(
+            p1_fault_at,
+            p2_fault_at,
+            p1_fault_type,
+            p2_fault_type,
+            'phase1_fault_not_injected',
+        )
+        result['signals']['phase1_ms'] = phase1_ms
+        result['actual_writes'] = int(phase1.get('actual_writes', 0))
+        result['phase2_fault']['p1_fault_address'] = phase1.get(
+            'fault_address', fmt_u32(0)
+        )
+        return result
+
+    phase2_started = _time.time()
+    phase2 = run_state_fault(p2_fault_at)
+    phase2_ms = int((_time.time() - phase2_started) * 1000)
+    if not phase2.get('fault_injected'):
+        result = _phase2_state_skip_result(
+            p1_fault_at,
+            p2_fault_at,
+            p1_fault_type,
+            p2_fault_type,
+            'no_write_at_index',
+        )
+        result['signals'].update({
+            'phase1_ms': phase1_ms,
+            'phase2_ms': phase2_ms,
+        })
+        result['actual_writes'] = int(phase1.get('actual_writes', 0))
+        result['phase2_fault'].update({
+            'p1_injected': True,
+            'p1_fault_address': phase1.get('fault_address', fmt_u32(0)),
+            'p2_total_ops': int(phase2.get('actual_writes', 0)),
+            'p2_max_fault_index': int(phase2.get('actual_writes', 0)) - 1,
+        })
+        return result
+
+    phase3_started = _time.time()
+    final_boot = run_state_fault(-1)
+    phase3_ms = int((_time.time() - phase3_started) * 1000)
+    signals = dict(final_boot.get('signals') or {})
+    signals.update({
+        'phase1_ms': phase1_ms,
+        'phase2_ms': phase2_ms,
+        'phase3_ms': phase3_ms,
+        'followup_ms': 0,
+        'trace_replay_mode': 'state',
+        'phase1_state_signals': dict(phase1.get('signals') or {}),
+        'recovery_state_signals': dict(phase2.get('signals') or {}),
+    })
+    elapsed = _time.time() - started
+    p2_total_ops = int(phase2.get('actual_writes', 0)) + 1
+    result = {
+        'fault_at': p1_fault_at,
+        'fault_requested': p1_fault_at,
+        'fault_type': 'p2',
+        'fault_injected': True,
+        'fault_address': phase2.get('fault_address', fmt_u32(0)),
+        'boot_outcome': final_boot.get('boot_outcome'),
+        'boot_slot': final_boot.get('boot_slot'),
+        'fault_class': final_boot.get('fault_class'),
+        'actual_writes': int(phase1.get('actual_writes', 0)),
+        'signals': signals,
+        'phase2_fault': {
+            'p1_fault_at': p1_fault_at,
+            'p2_fault_at': p2_fault_at,
+            'p1_fault_type': p1_fault_type,
+            'p2_fault_type': p2_fault_type,
+            'p1_injected': True,
+            'p2_injected': True,
+            'p1_fault_address': phase1.get('fault_address', fmt_u32(0)),
+            'p2_fault_address': phase2.get('fault_address', fmt_u32(0)),
+            'p2_ops': p2_total_ops,
+            'p2_total_ops': p2_total_ops,
+            'p2_max_fault_index': p2_total_ops - 1,
+            'skip_reason': None,
+            'elapsed_s': round(elapsed, 1),
+            'recovery_boot_signals': dict(phase2.get('signals') or {}),
+        },
+    }
+    if phase1.get('semantic_state') is not None:
+        result['phase2_fault']['p1_fault_semantic_state'] = phase1[
+            'semantic_state'
+        ]
+    if phase2.get('semantic_state') is not None:
+        result['phase2_fault']['p2_fault_semantic_state'] = phase2[
+            'semantic_state'
+        ]
+        result['fault_semantic_state'] = phase2['semantic_state']
+    if final_boot.get('semantic_state') is not None:
+        result['semantic_state'] = final_boot['semantic_state']
+        if phase2.get('semantic_state') is not None:
+            result['recovery_semantic_state'] = final_boot['semantic_state']
+    if final_boot.get('effective_success_criteria') is not None:
+        result['effective_success_criteria'] = final_boot[
+            'effective_success_criteria'
+        ]
+    log(
+        'p2fault state p1={} p2={} done outcome={} class={} elapsed={:.1f}s'.format(
+            p1_fault_at,
+            p2_fault_at,
+            result.get('boot_outcome'),
+            result.get('fault_class'),
+            elapsed,
+        )
+    )
+    return result
+
+
 def _calibration_success_stop_observation(cpu_ref, fault_timing=None):
     if not calibration_mode or not calibration_stop_on_success:
         return None
@@ -16629,6 +16796,8 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
         p2_at = int(parts[2])
         p1_type = parts[3] if len(parts) > 3 else 'w'
         p2_type = parts[4] if len(parts) > 4 else 'w'
+        if evaluation_mode == 'state' and backend.get('kind') == 'slow':
+            return run_phase2_state_fault(p1_at, p2_at, p1_type, p2_type)
         return run_phase2_fault(p1_at, p2_at, p1_type, p2_type)
 
     if ft.startswith('mf:'):
