@@ -8323,14 +8323,17 @@ def collect_uncorrectable_read_observation(
 
 
 def _attach_uncorrectable_read_signals(
-    signals, boot_outcome, p2_status=None, marked_at_fault=None
+    signals, boot_outcome, p2_status=None, marked_at_fault=None,
+    torn_word_mode=None,
 ):
     if not isinstance(signals, dict):
         return
     marked_list = list(marked_at_fault or [])
     remaining = _snapshot_mram_uncorrectable_addresses()
     if marked_list:
-        signals['mram_torn_word_mode'] = mram_torn_word
+        signals['mram_torn_word_mode'] = (
+            torn_word_mode if torn_word_mode is not None else mram_torn_word
+        )
         signals['uncorrectable_words_at_fault'] = marked_list
         signals['uncorrectable_words_remaining'] = remaining
     exec_ev = signals.get('recovery_execution')
@@ -13306,6 +13309,10 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     eff_criteria = get_effective_criteria('p2')
     cpu_ref = monitor.Machine['sysbus.cpu']
     fp_t0 = _time.time()
+    p1_torn_word = None
+    p1_applied_torn_word = mram_torn_word
+    p2_torn_word = None
+    p2_applied_torn_word = None
     is_p1_erase = p1_fault_type in ('e', 'a')
     is_p1_timed = p1_fault_type == 't'
     is_p2_erase = p2_fault_type in ('e', 'a')
@@ -13316,11 +13323,20 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     p2_fault_address = 0
     p2_write_trace = []
     p2_erase_trace = []
+    p1_uncorrectable_offsets = []
+    p1_uncorrectable_addresses = []
+    p2_uncorrectable_offsets = []
+    p2_uncorrectable_addresses = []
+    recovery_boot_signals = {}
+    p1_fault_semantic_state = None
+    p2_fault_semantic_state = None
     log('p2fault p1={}/{} p2={}/{} phase1_setup'.format(
         p1_fault_at, p1_fault_type, p2_fault_at, p2_fault_type))
 
     # --- Phase 1: create degraded state ---
     restore_phase1_baseline()
+    p1_torn_word = _select_point_mram_torn_word(p1_fault_at)
+    p1_applied_torn_word = mram_torn_word
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
     reset_nvmc_for_sweep()
@@ -13384,10 +13400,12 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     log('p2fault p1={}/{} phase1_done injected={} ops={}'.format(
         p1_fault_at, p1_fault_type, p1_injected, p1_ops))
 
+    if p1_injected:
+        p1_uncorrectable_offsets = _snapshot_mram_fault_uncorrectable_offsets()
+        p1_uncorrectable_addresses = _snapshot_mram_fault_uncorrectable_addresses()
+
     phase2_skip_reason = None
-    if backend['kind'] == 'slow':
-        phase2_skip_reason = 'unsupported_backend'
-    elif not p1_injected:
+    if not p1_injected:
         phase2_skip_reason = 'phase1_fault_not_injected'
 
     if phase2_skip_reason is not None:
@@ -13432,10 +13450,25 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     # --- Phase 2: recovery boot with fault armed ---
     phase2_t0 = _time.time()
     restore_flash_and_boot(saved_flash_p1)
+    if p1_uncorrectable_offsets:
+        _restore_mram_uncorrectable_offsets(p1_uncorrectable_offsets)
+    p1_fault_semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': 'power_loss_boundary',
+        'boot_slot': None,
+        'fault_injected': bool(p1_injected),
+        'stage': 'fault_snapshot',
+        'phase2_cut': 1,
+    })
     if _hash_bypass_active:
         apply_hash_bypass()
 
     reset_nvmc_for_sweep(enable_tracking_gate=False)
+    if p1_uncorrectable_offsets:
+        _restore_mram_uncorrectable_offsets(p1_uncorrectable_offsets)
+    _clear_mram_uncorrectable_read_log()
+    p2_torn_word = _select_point_mram_torn_word(p2_fault_at)
+    p2_applied_torn_word = mram_torn_word
     p2_trace_enabled = (
         backend['kind'] == 'fast'
         and all(hasattr(backend['data'], member) for member in (
@@ -13520,6 +13553,17 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     log('p2fault p1={} p2={}/{} phase2_done injected={} ops={}'.format(
         p1_fault_at, p2_fault_at, p2_fault_type, p2_injected, p2_ops))
 
+    _attach_uncorrectable_read_signals(
+        recovery_boot_signals,
+        'power_loss_boundary' if p2_injected else 'skipped',
+        p2_status=p2_status,
+        marked_at_fault=p1_uncorrectable_addresses,
+        torn_word_mode=p1_applied_torn_word,
+    )
+    if p2_injected:
+        p2_uncorrectable_offsets = _snapshot_mram_fault_uncorrectable_offsets()
+        p2_uncorrectable_addresses = _snapshot_mram_fault_uncorrectable_addresses()
+
     phase3_ms = 0
     p3_status = None
     if p2_injected:
@@ -13535,9 +13579,22 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         # --- Phase 3: boot from double-faulted state ---
         phase3_t0 = _time.time()
         restore_flash_and_boot(saved_flash_p2)
+        if p2_uncorrectable_offsets:
+            _restore_mram_uncorrectable_offsets(p2_uncorrectable_offsets)
+        p2_fault_semantic_state = collect_semantic_state({
+            'cycle': 0,
+            'boot_outcome': 'power_loss_boundary',
+            'boot_slot': None,
+            'fault_injected': True,
+            'stage': 'fault_snapshot',
+            'phase2_cut': 2,
+        })
         if _hash_bypass_active:
             apply_hash_bypass()
         reset_nvmc_for_recovery()
+        if p2_uncorrectable_offsets:
+            _restore_mram_uncorrectable_offsets(p2_uncorrectable_offsets)
+        _clear_mram_uncorrectable_read_log()
 
         log('p2fault p1={} p2={} phase3_step'.format(p1_fault_at, p2_fault_at))
         arm_vtor_watchpoint()
@@ -13568,6 +13625,18 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         effective_criteria=eff_criteria,
         p2_status=p3_status if p2_injected else p2_status,
     )
+    _attach_uncorrectable_read_signals(
+        signals,
+        boot_outcome,
+        p2_status=p3_status if p2_injected else p2_status,
+        marked_at_fault=(
+            p2_uncorrectable_addresses if p2_injected
+            else p1_uncorrectable_addresses
+        ),
+        torn_word_mode=(
+            p2_applied_torn_word if p2_injected else p1_applied_torn_word
+        ),
+    )
     signals['phase1_ms'] = phase1_ms
     signals['phase2_ms'] = phase2_ms
     signals['phase3_ms'] = phase3_ms
@@ -13578,6 +13647,22 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         merge_stop_status_signals(signals, 'phase2', p2_status)
     if p3_status is not None:
         merge_stop_status_signals(signals, 'phase3', p3_status)
+
+    boot_cycle_records = None
+    multi_boot_analysis = None
+    followup_ms = 0
+    if p2_injected:
+        boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
+            boot_outcome,
+            boot_slot,
+            signals,
+            initial_status=p3_status,
+            fault_injected=True,
+            label='p2fault_{}_{}_followup'.format(p1_fault_at, p2_fault_at),
+            effective_criteria=eff_criteria,
+        )
+    signals['followup_ms'] = int(followup_ms)
+    set_multiboot_cycles_run(signals, boot_cycle_records)
 
     semantic_state = collect_semantic_state({
         'cycle': 0,
@@ -13620,14 +13705,30 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
             'p2_max_fault_index': (p2_ops - 1) if p2_ops > 0 else -1,
             'skip_reason': phase2_skip_reason,
             'elapsed_s': round(elapsed, 1),
+            'recovery_boot_signals': recovery_boot_signals,
         },
     }
+    if p1_torn_word is not None:
+        result['mram_torn_word'] = p1_torn_word
+        result['phase2_fault']['p1_mram_torn_word'] = p1_torn_word
+    if p2_torn_word is not None:
+        result['phase2_fault']['p2_mram_torn_word'] = p2_torn_word
     if eff_criteria is not None:
         result['effective_success_criteria'] = eff_criteria
     if phase2_skip_reason is not None:
         result['skip_reason'] = 'phase2_{}'.format(phase2_skip_reason)
     if semantic_state is not None:
         result['semantic_state'] = semantic_state
+    if p1_fault_semantic_state is not None:
+        result['phase2_fault']['p1_fault_semantic_state'] = p1_fault_semantic_state
+    if p2_fault_semantic_state is not None:
+        result['phase2_fault']['p2_fault_semantic_state'] = p2_fault_semantic_state
+        result['fault_semantic_state'] = p2_fault_semantic_state
+        if semantic_state is not None:
+            result['recovery_semantic_state'] = semantic_state
+    if boot_cycle_records is not None:
+        result['boot_cycles'] = boot_cycle_records
+        result['multi_boot_analysis'] = multi_boot_analysis
     if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
         snapshot = saved_flash_p2 if p2_injected else saved_flash_p1
         result['postmortem_partition_dump'] = build_postmortem_partition_dump(
