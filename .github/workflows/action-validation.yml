@@ -82,13 +82,15 @@ jobs:
           # PR #2100: revert magic bug (swap-move).
           # Revert failure at fault points 3-5 out of ~15K.
           # Target first 10 points instead of full sweep.
-          - name: pr2100
-            broken: profiles/mcuboot_pr2100_broken_discovery.yaml
-            fixed: profiles/mcuboot_pr2100_fixed_discovery.yaml
+          - name: pr2100-broken
+            profile: profiles/mcuboot_pr2100_broken_discovery.yaml
             extra_args: "--fault-end 10"
+            check_broken: true
+          - name: pr2100-fixed
+            profile: profiles/mcuboot_pr2100_fixed_discovery.yaml
+            extra_args: "--fault-end 10"
+            check_broken: false
     env:
-      RENODE_URL: https://github.com/renode/renode/releases/download/v1.16.1/renode-1.16.1.linux-dotnet.tar.gz
-      RENODE_SHA256: 62629caa331ed4bd4eb7abe13ee2e4834fbcaa70de492db3965fafa4edc5694f
       PYTHONUNBUFFERED: "1"
 
     steps:
@@ -96,32 +98,30 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Renode portable
-        run: |
-          set -euxo pipefail
-          tarball="${RUNNER_TEMP}/renode-portable.tar.gz"
-          python3 scripts/action_helpers.py download-renode \
-            --url "${RENODE_URL}" --sha256 "${RENODE_SHA256}" --output "${tarball}"
-          mkdir -p "${RUNNER_TEMP}/renode"
-          tar -xzf "${tarball}" -C "${RUNNER_TEMP}/renode" --strip-components=1
-          python3 -m pip install --user \
-            -c requirements-renode-constraints.txt \
-            -r "${RUNNER_TEMP}/renode/tests/requirements.txt"
-          echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
+      - name: Set up validation dependencies
+        uses: ./.github/actions/setup-oss-validation
 
-      - name: Install Python dependencies
-        run: python3 -m pip install --user -r requirements.txt
-
-      - name: "Broken ELF: must detect revert failure"
+      - name: Run ${{ matrix.name }} profile
+        env:
+          EXTRA_ARGS: ${{ matrix.extra_args }}
+          PROFILE: ${{ matrix.profile }}
         run: |
+          set -euo pipefail
+          read -r -a extra_args <<< "${EXTRA_ARGS}"
           python3 scripts/audit_bootloader.py \
-            --profile "${{ matrix.broken }}" \
-            --output "${RUNNER_TEMP}/${{ matrix.name }}_broken.json" \
+            --profile "${PROFILE}" \
+            --output "${RUNNER_TEMP}/${{ matrix.name }}.json" \
             --renode-test "${RUNNER_TEMP}/renode/renode-test" \
-            ${{ matrix.extra_args }}
+            "${extra_args[@]}"
+
+      - name: Verify broken ELF detects revert failure
+        if: matrix.check_broken
+        env:
+          REPORT: ${{ runner.temp }}/${{ matrix.name }}.json
+        run: |
           python3 -c "
           import json, sys
-          r = json.load(open('${RUNNER_TEMP}/${{ matrix.name }}_broken.json'))
+          r = json.load(open('${REPORT}'))
           sweep = r.get('summary', {}).get('runtime_sweep', {})
           issues = int(sweep.get('issue_points', 0) or 0)
           wrong_image = int((sweep.get('failure_classes') or {}).get('wrong_image', 0) or 0)
@@ -142,17 +142,9 @@ jobs:
               sys.exit(1)
           "
 
-      - name: "Fixed ELF: must be clean"
-        run: |
-          python3 scripts/audit_bootloader.py \
-            --profile "${{ matrix.fixed }}" \
-            --output "${RUNNER_TEMP}/${{ matrix.name }}_fixed.json" \
-            --renode-test "${RUNNER_TEMP}/renode/renode-test" \
-            ${{ matrix.extra_args }}
-
       - name: Upload differential reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: differential-${{ matrix.name }}
-          path: ${{ runner.temp }}/${{ matrix.name }}_*.json
+          path: ${{ runner.temp }}/${{ matrix.name }}.json

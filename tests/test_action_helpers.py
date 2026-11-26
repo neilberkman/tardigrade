@@ -510,6 +510,24 @@ class TestActionSourceBoundaries(unittest.TestCase):
                 self.assertIn("action_helpers.py download-renode", source)
                 self.assertIn("requirements-renode-constraints.txt", source)
 
+        shared_setup = (
+            ROOT / ".github" / "actions" / "setup-oss-validation" / "action.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("renode-1.16.1.linux-dotnet.tar.gz", shared_setup)
+        self.assertIn(
+            "62629caa331ed4bd4eb7abe13ee2e4834fbcaa70de492db3965fafa4edc5694f",
+            shared_setup,
+        )
+        self.assertIn("action_helpers.py download-renode", shared_setup)
+        self.assertIn("requirements-renode-constraints.txt", shared_setup)
+
+        for name in ("action-validation.yml", "oss-validation.yml"):
+            source = (workflows / name).read_text(encoding="utf-8")
+            with self.subTest(workflow=name):
+                self.assertIn(
+                    "uses: ./.github/actions/setup-oss-validation", source
+                )
+
     def test_external_workflow_actions_use_full_commit_ids(self):
         uses_pattern = re.compile(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)", re.MULTILINE)
         commit_pattern = re.compile(r"^[^@]+@[0-9a-f]{40}$")
