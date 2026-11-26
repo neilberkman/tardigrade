@@ -165,6 +165,12 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Fixed
 
+- Phase-two fault points on supported `mram` and `fast` backends now run the
+  configured follow-up boot cycles and hook, expose per-cycle semantic state
+  and multi-boot analysis, and draw a weighted torn-word mode independently
+  for each cut. MRAM points also carry uncorrectable-word metadata across both
+  reset boundaries and attribute uncorrectable reads to the recovery or final
+  boot that made them.
 - `tests/nativeaot_runfor_bug.robot` now asserts the loop PC instead of any
   nonzero PC. Renode 1.17.1 raises a BusFault on the NVMemory fetch and locks
   up at `0xeffffffe`, which the old check counted as executing. The fetch path

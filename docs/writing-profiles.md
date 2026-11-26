@@ -1161,7 +1161,7 @@ fault_sweep:
 - The string form (`mram_torn_word: untouched`) keeps its existing meaning: one mode for every cut, no per-point draw, and no new result fields.
 - Every listed mode is validated as if it were set alone: `uncorrectable` anywhere in the list is rejected under `evaluation_mode: state`, `durability_model: writeback`, or a backend without uncorrectable read-fault support.
 - The drawn mode is recorded on every non-control fault point result as `mram_torn_word`, and carried into each categorized failure (`failures[]`) and `fault_evidence[]` entry of the sweep summary, so an issue point names the outcome that produced it. Points whose fault type does not use torn words (for example `bit_corruption`) still record the mode the backend held for that point.
-- The draw is per fault point. Compound points that cut power more than once (`phase2_fault`, `multi_fault`, cascading write/erase) use the point's one drawn mode for all their cuts.
+- A `phase2_fault` point draws independently for its first and second cut, using each cut's own fault index. The first draw remains the top-level `mram_torn_word` for compatibility, and `phase2_fault.p1_mram_torn_word` plus `phase2_fault.p2_mram_torn_word` record both draws. Other compound points (`multi_fault` and cascading write/erase) continue to use the point's one drawn mode for all their cuts.
 - The profile loader passes the list to the sweep as the Robot variable `MRAM_TORN_WORD_CHOICES` (`mode:weight,...`), alongside `MRAM_TORN_WORD` (set to the first listed mode) and `MRAM_TORN_WORD_SEED`. Leaving `MRAM_TORN_WORD_CHOICES` empty runs single-mode.
 
 Backends that take a per-cut mode are the ones that honor `mram_torn_word` today, since the sweep sets `MramTornWordMode` on the backend before each point:
@@ -1657,6 +1657,35 @@ while disabling phase-two fault injection is rejected at load time.
 Explicit pairs replace the representative grid and are unchanged by
 `--quick`, `max_points`, and the main sweep's range options. The configured
 recovery fault types still apply to every listed pair.
+
+Second cuts support the `fast` and `mram` backend kinds. A point on a `slow`
+controller-backed `NVMemory` returns `phase2_unsupported_backend` before its
+first cut runs; OTP fault types are also not supported as recovery cuts.
+
+The first cut's persistent bytes and MRAM uncorrectable-word marks are restored
+together before the recovery boot. This applies to `MappedMRAMTracker` and
+directly selected `NVMemory`. If the recovery boot repairs a marked word, the
+repair clears that mark normally. After the second cut, its complete set of
+remaining marks is restored with the second snapshot before the final boot.
+Uncorrectable reads made by the recovery boot are recorded under
+`phase2_fault.recovery_boot_signals`; reads made by the final boot remain in the
+result's top-level `signals`. Both locations use the same `uncorrectable_read`
+fields as a single-cut result, including count, word and access addresses, and
+PC.
+
+The final boot participates in `boot_cycles` and `boot_cycle_hook` exactly like
+a single-cut point. When `boot_cycles` is greater than one, the result contains
+`boot_cycles` and `multi_boot_analysis`, and host-side invariants inspect those
+cycles normally. A configured state probe runs for each cut's `fault_snapshot`
+boundary and for every final/follow-up boot. The two boundary states are also
+available as `phase2_fault.p1_fault_semantic_state` and
+`phase2_fault.p2_fault_semantic_state`; the second is the result's
+`fault_semantic_state` used by fault-boundary invariants.
+
+The recovery boot can terminate on an uncorrectable read before it reaches the
+configured second-cut index. Such a point keeps the existing
+`phase2_no_write_at_index` (or `phase2_no_erase_at_index`) skip reason, while
+its recovery-boot uncorrectable-read telemetry remains available.
 
 ### Multi-fault sweeps
 
