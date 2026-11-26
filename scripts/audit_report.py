@@ -49,6 +49,7 @@ from fault_types import (
     operation_kind_for_fault_type,
 )
 from profile_loader import ProfileConfig
+from point_counts import build_point_counts
 from read_fault_translation import (
     ReadFaultStats,
     cpu_path_capability_warning,
@@ -398,6 +399,8 @@ def summarize_runtime_sweep(
     expected_control_points: int = 1,
     expected_outcome_override: Optional[str] = None,
     rc_injection_config_override: Optional[Dict[str, Any]] = None,
+    planned_fault_types: Optional[List[str]] = None,
+    calibration_point_coverage: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Compute summary statistics from runtime sweep results."""
     non_control = [r for r in results if not r.get("is_control", False)]
@@ -926,6 +929,25 @@ def summarize_runtime_sweep(
             "intentional_control_only": intentional_control_only,
             "complete": campaign_complete,
         },
+        "compatibility_field_scopes": {
+            "total_fault_points": (
+                "injected non-control results in this summary component across "
+                "all supplied fault mechanisms"
+            ),
+            "issue_points": (
+                "reportable issue results among injected non-control results "
+                "in this summary component"
+            ),
+            "brick_rate": (
+                "bricks divided by injected non-control results in this summary component"
+            ),
+            "fault_type_points": (
+                "injected non-control results grouped by fault type in this summary component"
+            ),
+            "operation_kind_points": (
+                "injected non-control results grouped as program or erase in this summary component"
+            ),
+        },
     }
     if recovery_state_search_batch:
         summary["recovery_state_search"] = dict(recovery_state_search_summary)
@@ -1205,6 +1227,30 @@ def summarize_runtime_sweep(
     rf_aggregate = _aggregate_read_fault_summaries(results)
     if rf_aggregate is not None:
         summary["read_fault"] = rf_aggregate
+
+    failure_ids = {id(result) for result in failures}
+
+    def _point_has_issue(result: Dict[str, Any]) -> bool:
+        effective_outcome, _ = _effective_boot_result(result)
+        if (
+            bool(result.get("infrastructure_error"))
+            or result_is_timeout(result)
+            or effective_outcome in {"infra_error", "skipped"}
+        ):
+            return False
+        if result.get("is_control", False):
+            return bool(result_issue_reasons(result, expected_outcome))
+        return id(result) in failure_ids
+
+    summary["point_counts"] = build_point_counts(
+        results,
+        planned_fault_types=planned_fault_types,
+        expected_fault_points=planned_fault_points,
+        expected_control_points=expected_control_points,
+        profile=profile,
+        issue_predicate=_point_has_issue,
+        calibration=calibration_point_coverage,
+    )
 
     return summary
 
