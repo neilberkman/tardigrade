@@ -141,6 +141,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public uint MramTornWordSeed { get => tracker.MramTornWordSeed; set => tracker.MramTornWordSeed = value; }
 
+        public string TornWordMode { get => tracker.TornWordMode; set => tracker.TornWordMode = value; }
+
+        public uint TornWordSeed { get => tracker.TornWordSeed; set => tracker.TornWordSeed = value; }
+
         public bool PreserveCountersAcrossReset { get => tracker.PreserveCountersAcrossReset; set => tracker.PreserveCountersAcrossReset = value; }
 
         public bool WriteTraceEnabled { get => tracker.WriteTraceEnabled; set => tracker.WriteTraceEnabled = value; }
@@ -480,6 +484,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 else
                 {
                     var combinedOffset = bank.CombinedBaseOffset + sectorOffset;
+                    var neutralMode = (TornWordMode ?? "fixed").Trim().ToLowerInvariant();
+                    if(neutralMode != "fixed")
+                    {
+                        var previous = Flash.ReadBytes(combinedOffset, eraseSize, this);
+                        var torn = FaultTracker.BuildFlashTornEraseSpan(
+                            previous, combinedOffset, EraseFill, 4, neutralMode,
+                            TornWordSeed, TotalPageErases);
+                        Flash.WriteBytes(combinedOffset, torn, 0, torn.Length, this);
+                        WriteShadowBytes(combinedOffset, torn);
+                    }
+                    else
+                    {
                     var tornMode = (MramTornWordMode ?? "half").Trim().ToLowerInvariant();
                     if(tornMode == "untouched")
                     {
@@ -498,6 +514,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     else
                     {
                         EraseRange(combinedOffset, eraseSize / 2);
+                    }
                     }
                 }
                 FaultFlashSnapshot = ReadFlashSnapshot();
@@ -534,7 +551,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 SetProgrammingErrorForOffset(alignedOffset);
                 break;
             case 3:
+                WriteWordFault(alignedOffset, oldWord, oldWord);
+                break;
             case 0:
+            {
+                var torn = FaultTracker.BuildFlashTornProgramValue(
+                    oldWord, newWord, 4, EraseFill, TornWordMode,
+                    TornWordSeed, TotalWordWrites, alignedOffset);
+                WriteWordFault(alignedOffset, oldWord, (uint)torn);
+                break;
+            }
             default:
                 WriteWordFault(alignedOffset, oldWord, oldWord);
                 break;

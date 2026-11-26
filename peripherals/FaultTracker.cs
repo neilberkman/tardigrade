@@ -31,6 +31,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public uint CorruptionSeed;
         public string MramTornWordMode = "half";
         public uint MramTornWordSeed;
+        // Backend-neutral interrupted-operation outcome.  "fixed" preserves
+        // each flash controller's historical power-loss result.  Keep this
+        // separate from the MRAM compatibility properties: existing profiles
+        // may use MramTornWordMode to control erase cuts on flash while program
+        // cuts retain their historical result.
+        public string TornWordMode = "fixed";
+        public uint TornWordSeed;
         public bool PreserveCountersAcrossReset;
 
         public bool WriteTraceEnabled;
@@ -178,6 +185,140 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             seed ^= (uint)offset;
             seed ^= (uint)(TotalPageErases * 2654435761UL);
             return seed;
+        }
+
+        public static ulong BuildFlashTornProgramValue(ulong previousValue,
+            ulong requestedValue, int width, byte eraseFill, string mode,
+            uint seed, ulong operationIndex, long offset)
+        {
+            if(width < 1 || width > 8)
+            {
+                throw new ArgumentOutOfRangeException(nameof(width),
+                    "Flash torn-program width must be between 1 and 8 bytes");
+            }
+            var normalized = (mode ?? "fixed").Trim().ToLowerInvariant();
+            var valueMask = width == 8 ? ulong.MaxValue : ((1UL << (width * 8)) - 1UL);
+            previousValue &= valueMask;
+            requestedValue &= valueMask;
+            if(normalized == "fixed" || normalized == "untouched")
+            {
+                return previousValue;
+            }
+            var fill = 0UL;
+            for(var byteIndex = 0; byteIndex < width; byteIndex++)
+            {
+                fill |= (ulong)eraseFill << (byteIndex * 8);
+            }
+            // Programming may only move a bit away from its erased value.
+            var programmed = ((fill & previousValue & requestedValue)
+                | (~fill & (previousValue | requestedValue))) & valueMask;
+            if(normalized == "programmed")
+            {
+                return programmed;
+            }
+            if(normalized == "partial_bits")
+            {
+                return SelectPartialBits(previousValue, programmed, width,
+                    seed, operationIndex, offset, 0x50524F47U);
+            }
+            throw new ArgumentException(
+                "Flash torn-word mode must be fixed, untouched, programmed, or partial_bits",
+                nameof(mode));
+        }
+
+        public static byte[] BuildFlashTornEraseSpan(byte[] previousBytes,
+            long offset, byte eraseFill, int programUnit, string mode,
+            uint seed, ulong operationIndex)
+        {
+            if(previousBytes == null)
+            {
+                throw new ArgumentNullException(nameof(previousBytes));
+            }
+            var normalized = (mode ?? "fixed").Trim().ToLowerInvariant();
+            var result = (byte[])previousBytes.Clone();
+            if(normalized == "untouched")
+            {
+                return result;
+            }
+            if(normalized == "programmed" || normalized == "erased")
+            {
+                for(var index = 0; index < result.Length; index++)
+                {
+                    result[index] = eraseFill;
+                }
+                return result;
+            }
+            if(normalized != "partial_bits")
+            {
+                throw new ArgumentException(
+                    "Flash torn-word erase mode must be untouched, programmed, erased, or partial_bits",
+                    nameof(mode));
+            }
+
+            var unit = Math.Max(1, Math.Min(8, programUnit));
+            for(var relative = 0; relative < result.Length; relative += unit)
+            {
+                var width = Math.Min(unit, result.Length - relative);
+                ulong previous = 0;
+                ulong erased = 0;
+                for(var byteIndex = 0; byteIndex < width; byteIndex++)
+                {
+                    previous |= (ulong)previousBytes[relative + byteIndex] << (byteIndex * 8);
+                    erased |= (ulong)eraseFill << (byteIndex * 8);
+                }
+                var partial = SelectPartialBits(previous, erased, width, seed,
+                    operationIndex, offset + relative, 0x45524153U);
+                for(var byteIndex = 0; byteIndex < width; byteIndex++)
+                {
+                    result[relative + byteIndex] = (byte)(partial >> (byteIndex * 8));
+                }
+            }
+            return result;
+        }
+
+        private static ulong SelectPartialBits(ulong previousValue, ulong targetValue,
+            int width, uint seed, ulong operationIndex, long offset, uint domain)
+        {
+            var changed = new List<int>();
+            var totalBits = width * 8;
+            for(var bit = 0; bit < totalBits; bit++)
+            {
+                if(((previousValue ^ targetValue) & (1UL << bit)) != 0)
+                {
+                    changed.Add(bit);
+                }
+            }
+            if(changed.Count == 0)
+            {
+                return previousValue;
+            }
+
+            var state = seed != 0 ? seed : 0x5A3C96A5U;
+            state ^= (uint)(operationIndex * 2654435761UL);
+            state ^= (uint)((ulong)offset * 2246822519UL);
+            state ^= domain;
+            if(state == 0)
+            {
+                state = 0x9E3779B9U;
+            }
+            state = NextLcg(ref state);
+            // With two or more changing bits, keep both an old and a target
+            // bit.  A one-bit program has no physically distinct midpoint.
+            var selectedCount = changed.Count == 1
+                ? 1
+                : 1 + (int)(state % (uint)(changed.Count - 1));
+            var result = previousValue;
+            for(var index = 0; index < selectedCount; index++)
+            {
+                state = NextLcg(ref state);
+                var swapIndex = index + (int)(state % (uint)(changed.Count - index));
+                var selectedBit = changed[swapIndex];
+                changed[swapIndex] = changed[index];
+                changed[index] = selectedBit;
+                var mask = 1UL << selectedBit;
+                result = (result & ~mask) | (targetValue & mask);
+            }
+            return result;
         }
 
         public byte[] BuildCorruptedErasedSpan(long offset, int spanSize, byte eraseFill, int wordUnitBytes = 4)

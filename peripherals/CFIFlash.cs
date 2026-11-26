@@ -9,13 +9,16 @@ using System.Collections.Generic;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.Memory;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 
 namespace Antmicro.Renode.Peripherals.Tardigrade
 {
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
-    public class CFIFlash : IDoubleWordPeripheral, IBytePeripheral, IWordPeripheral, IKnownSize
+    public class CFIFlash : IDoubleWordPeripheral, IBytePeripheral, IWordPeripheral,
+                            IQuadWordPeripheral, IMemory, IKnownSize
     {
         public CFIFlash() : this(0x04000000)
         {
@@ -42,17 +45,52 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
 
         // --- Tardigrade write tracking ---
         public int TotalWrites => totalWrites;
-        public int TotalPageErases => totalErases;
+        public ulong TotalWordWrites
+        {
+            get { return (ulong)totalWrites; }
+            set { totalWrites = checked((int)value); }
+        }
+        public ulong TotalPageErases
+        {
+            get { return (ulong)totalErases; }
+            set { totalErases = checked((int)value); }
+        }
         public bool FaultFired { get; set; }
         public bool EraseFaultFired { get; set; }
         public int FaultAtWrite { get; set; } = -1;
-        public int FaultAtPageErase { get; set; } = -1;
+        public ulong FaultAtWordWrite
+        {
+            get { return FaultAtWrite < 0 ? ulong.MaxValue : (ulong)FaultAtWrite + 1UL; }
+            set { FaultAtWrite = value == ulong.MaxValue ? -1 : checked((int)value - 1); }
+        }
+        public ulong FaultAtPageErase { get; set; } = ulong.MaxValue;
         public int WriteFaultMode { get; set; } = 0;
+        public int EraseFaultMode { get; set; } = 0;
         public bool WriteTraceEnabled { get; set; }
         public bool DebugTrace { get; set; }
         public bool EraseTraceEnabled { get; set; }
         public int CorruptionSeed { get; set; }
+        public string TornWordMode { get; set; } = "fixed";
+        public uint TornWordSeed { get; set; }
         public bool FaultEverFired { get; set; }
+        public bool DriverErrorFired { get; set; }
+        public bool AnyFaultFired => FaultEverFired;
+        public bool FaultRequiresImmediateStop => EraseFaultFired || (FaultFired && WriteFaultMode == 0);
+        public uint LastFaultAddress { get; set; }
+        public byte[] FaultFlashSnapshot { get; set; }
+        public IMemory Flash => this;
+        public long FlashBaseAddress { get; set; }
+        public long FlashSize => size;
+        public int PageSize => checked((int)sectorSize);
+        public int ProgramUnitSize => 4;
+        public byte EraseFill => 0xFF;
+        public bool PerWriteAccurate => true;
+        public int WriteTraceCount => writeTrace.Count;
+        public int EraseTraceCount => eraseTrace.Count;
+        public int DiffLookahead { get; set; }
+        public bool SkipShadowScan { get; set; }
+        public bool PassthroughMode { get; set; }
+        public void InvalidateShadow() { }
 
         private readonly List<string> writeTrace = new List<string>();
         private readonly List<string> eraseTrace = new List<string>();
@@ -81,6 +119,47 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
         public void EraseTraceClear()
         {
             eraseTrace.Clear();
+        }
+
+        public ulong ReadQuadWord(long offset)
+        {
+            var low = ReadDoubleWord(offset);
+            var high = ReadDoubleWord(offset + 4);
+            return low | ((ulong)high << 32);
+        }
+
+        public void WriteQuadWord(long offset, ulong value)
+        {
+            WriteDoubleWord(offset, (uint)value);
+            WriteDoubleWord(offset + 4, (uint)(value >> 32));
+        }
+
+        public byte[] ReadBytes(long offset, int count, IPeripheral context = null)
+        {
+            if (offset < 0 || count < 0 || offset > size - count)
+                return new byte[0];
+            var result = new byte[count];
+            Array.Copy(flash, offset, result, 0, count);
+            return result;
+        }
+
+        public byte[] ReadBytes(long offset, int count)
+        {
+            return ReadBytes(offset, count, null);
+        }
+
+        public void WriteBytes(long offset, byte[] array)
+        {
+            WriteBytes(offset, array, 0, array == null ? 0 : array.Length, null);
+        }
+
+        public void WriteBytes(long offset, byte[] array, int startingIndex, int count,
+                               IPeripheral context = null)
+        {
+            if (array == null || offset < 0 || count < 0 || offset > size - count ||
+                startingIndex < 0 || startingIndex > array.Length - count)
+                return;
+            Array.Copy(array, startingIndex, flash, offset, count);
         }
 
         // --- IDoubleWordPeripheral ---
@@ -184,33 +263,13 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             totalErases = 0;
             FaultFired = false;
             EraseFaultFired = false;
+            DriverErrorFired = false;
             FaultEverFired = false;
+            LastFaultAddress = 0;
+            FaultFlashSnapshot = null;
             writeTrace.Clear();
             eraseTrace.Clear();
         }
-
-        // --- Flash read helpers ---
-        public byte[] ReadBytes(long offset, int count)
-        {
-            var result = new byte[count];
-            for (int i = 0; i < count && offset + i < size; i++)
-                result[i] = flash[offset + i];
-            return result;
-        }
-
-        public void WriteBytes(long offset, byte[] data)
-        {
-            for (int i = 0; i < data.Length && offset + i < size; i++)
-                flash[offset + i] = data[i];
-        }
-
-        public void WriteBytes(long offset, byte[] data, int startIndex, int count)
-        {
-            for (int i = 0; i < count && offset + i < size; i++)
-                flash[offset + i] = data[startIndex + i];
-        }
-
-        public long FlashSize => size;
 
         // --- Command handling ---
         private void HandleCommand(long offset, uint value)
@@ -274,11 +333,25 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             {
                 FaultFired = true;
                 FaultEverFired = true;
+                LastFaultAddress = (uint)(FlashBaseAddress + offset);
                 this.Log(LogLevel.Info, "CFIFlash: Fault injected at write #{0}, offset=0x{1:X}", totalWrites, offset);
 
                 if (WriteFaultMode == 0) // power_loss: don't write, halt
                 {
+                    if (offset >= 0 && offset + 3 < size)
+                    {
+                        ulong previous = (uint)(flash[offset]
+                            | (flash[offset + 1] << 8)
+                            | (flash[offset + 2] << 16)
+                            | (flash[offset + 3] << 24));
+                        var torn = FaultTracker.BuildFlashTornProgramValue(
+                            previous, value, 4, 0xFF, TornWordMode,
+                            TornWordSeed, (ulong)(totalWrites + 1), offset);
+                        for (var byteIndex = 0; byteIndex < 4; byteIndex++)
+                            flash[offset + byteIndex] = (byte)(torn >> (byteIndex * 8));
+                    }
                     totalWrites++;
+                    FaultFlashSnapshot = (byte[])flash.Clone();
                     return;
                 }
                 // Other fault modes: write with corruption (handled by caller)
@@ -306,12 +379,30 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             long sectorStart = (offset / sectorSize) * sectorSize;
 
             // Check erase fault injection
-            if (FaultAtPageErase >= 0 && totalErases == FaultAtPageErase && !FaultEverFired)
+            if ((ulong)(totalErases + 1) == FaultAtPageErase && !FaultEverFired)
             {
                 EraseFaultFired = true;
                 FaultEverFired = true;
+                LastFaultAddress = (uint)(FlashBaseAddress + sectorStart);
                 this.Log(LogLevel.Info, "CFIFlash: Erase fault at erase #{0}, sector=0x{1:X}", totalErases, sectorStart);
+                var mode = (TornWordMode ?? "fixed").Trim().ToLowerInvariant();
+                var spanSize = (int)Math.Min(sectorSize, size - sectorStart);
+                if (mode == "programmed" || mode == "erased")
+                {
+                    for (var index = 0; index < spanSize; index++)
+                        flash[sectorStart + index] = 0xFF;
+                }
+                else if (mode == "partial_bits")
+                {
+                    var previous = new byte[spanSize];
+                    Array.Copy(flash, sectorStart, previous, 0, spanSize);
+                    var torn = FaultTracker.BuildFlashTornEraseSpan(
+                        previous, sectorStart, 0xFF, 4, mode,
+                        TornWordSeed, (ulong)(totalErases + 1));
+                    Array.Copy(torn, 0, flash, sectorStart, torn.Length);
+                }
                 totalErases++;
+                FaultFlashSnapshot = (byte[])flash.Clone();
                 return;
             }
 

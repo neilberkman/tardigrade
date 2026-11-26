@@ -112,6 +112,15 @@ VALID_MRAM_TORN_WORD_MODES: FrozenSet[str] = frozenset(
     }
 )
 
+VALID_TORN_WORD_MODES: FrozenSet[str] = frozenset(
+    {
+        "fixed",
+        "untouched",
+        "programmed",
+        "partial_bits",
+    }
+)
+
 
 def _is_mram_backend(
     platform: Optional[str],
@@ -212,6 +221,101 @@ def _parse_mram_torn_word(value: Any) -> Tuple[str, Tuple[Tuple[str, int], ...]]
             )
         choices.append((mode, weight))
     return choices[0][0], tuple(choices)
+
+
+def _parse_torn_word(value: Any) -> Tuple[str, Tuple[Tuple[str, int], ...]]:
+    """Parse the backend-neutral flash interrupted-operation outcome."""
+    if isinstance(value, str):
+        if value not in VALID_TORN_WORD_MODES:
+            raise ProfileError(
+                "Invalid fault_sweep.torn_word '{}'. Valid: {}".format(
+                    value, sorted(VALID_TORN_WORD_MODES)
+                )
+            )
+        return value, ()
+    if not isinstance(value, list) or not value:
+        raise ProfileError(
+            "fault_sweep.torn_word must be a mode name or a non-empty list "
+            "of modes, got {!r}".format(value)
+        )
+    choices: List[Tuple[str, int]] = []
+    for entry in value:
+        if isinstance(entry, str):
+            mode, weight = entry, 1
+        elif isinstance(entry, dict) and len(entry) == 1:
+            mode, weight = next(iter(entry.items()))
+        else:
+            raise ProfileError(
+                "fault_sweep.torn_word list entries must be a mode name or "
+                "a one-key mapping {{mode: weight}}, got {!r}".format(entry)
+            )
+        if not isinstance(mode, str) or mode not in VALID_TORN_WORD_MODES:
+            raise ProfileError(
+                "Invalid fault_sweep.torn_word '{}'. Valid: {}".format(
+                    mode, sorted(VALID_TORN_WORD_MODES)
+                )
+            )
+        if any(mode == seen for seen, _ in choices):
+            raise ProfileError(
+                "fault_sweep.torn_word lists '{}' more than once".format(mode)
+            )
+        if isinstance(weight, bool) or not isinstance(weight, int) or weight <= 0:
+            raise ProfileError(
+                "fault_sweep.torn_word weight for '{}' must be a positive "
+                "integer, got {!r}".format(mode, weight)
+            )
+        choices.append((mode, weight))
+    return choices[0][0], tuple(choices)
+
+
+def _validate_torn_word_backend(
+    fs: Optional["FaultSweepConfig"],
+    platform: Optional[str],
+    flash_backend: Optional[str],
+    extra_peripherals: Optional[List[str]] = None,
+    profile_path: Optional[Path] = None,
+) -> None:
+    if fs is None or not getattr(fs, "torn_word_explicit", False):
+        return
+    if _is_mram_backend(
+        platform, flash_backend, extra_peripherals, profile_path=profile_path
+    ):
+        raise ProfileError(
+            "fault_sweep.torn_word selects flash outcomes; use "
+            "fault_sweep.mram_torn_word on MRAM backends"
+        )
+    if not platform:
+        return
+    default_root = Path(__file__).resolve().parents[1]
+    candidates = []
+    if profile_path is not None:
+        candidates.append(Path(profile_path).resolve().parent / platform)
+    candidates.append(default_root / platform)
+    candidates.append(Path(platform))
+    supported_types = (
+        "NRF52NVMC",
+        "STM32F4FlashController",
+        "STM32F4FastFlash",
+        "STM32H7FlashController",
+        "STM32H7FastFlash",
+        "An521NvmInterceptor",
+        "CFIFlash",
+    )
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            platform_text = candidate.read_text(encoding="utf-8", errors="ignore")
+            if not any(type_name in platform_text for type_name in supported_types):
+                raise ProfileError(
+                    "fault_sweep.torn_word is not supported by the flash "
+                    "peripheral declared in '{}'".format(platform)
+                )
+            return
+        except ProfileError:
+            raise
+        except OSError:
+            continue
 
 
 def _validate_mram_torn_word_backend(
@@ -1780,6 +1884,10 @@ class FaultSweepConfig:
         "mram_torn_word_explicit",
         "mram_torn_word_seed",
         "mram_torn_word_choices",
+        "torn_word",
+        "torn_word_explicit",
+        "torn_word_seed",
+        "torn_word_choices",
         "include_erase_fault_points",
     )
 
@@ -1835,6 +1943,9 @@ class FaultSweepConfig:
         mram_torn_word: Any = "half",
         mram_torn_word_explicit: bool = False,
         mram_torn_word_seed: int = 0,
+        torn_word: Any = "fixed",
+        torn_word_explicit: bool = False,
+        torn_word_seed: int = 0,
         include_erase_fault_points: bool = False,
     ) -> None:
         self.mode = mode
@@ -2020,6 +2131,32 @@ class FaultSweepConfig:
                 "fault_sweep.mram_torn_word_seed must be between 0 and 0xFFFFFFFF"
             )
         self.mram_torn_word_seed = parsed_seed
+        self.torn_word, self.torn_word_choices = _parse_torn_word(torn_word)
+        self.torn_word_explicit = bool(torn_word_explicit)
+        if self.torn_word_explicit and (
+            self.mram_torn_word_explicit or parsed_seed != 0
+        ):
+            raise ProfileError(
+                "fault_sweep.torn_word and fault_sweep.mram_torn_word cannot "
+                "be configured together"
+            )
+        if isinstance(torn_word_seed, bool):
+            raise ProfileError("fault_sweep.torn_word_seed must be an integer")
+        try:
+            parsed_torn_seed = int(torn_word_seed)
+        except (TypeError, ValueError) as exc:
+            raise ProfileError(
+                "fault_sweep.torn_word_seed must be an integer"
+            ) from exc
+        if parsed_torn_seed < 0 or parsed_torn_seed > 0xFFFFFFFF:
+            raise ProfileError(
+                "fault_sweep.torn_word_seed must be between 0 and 0xFFFFFFFF"
+            )
+        if parsed_torn_seed and not self.torn_word_explicit:
+            raise ProfileError(
+                "fault_sweep.torn_word_seed requires fault_sweep.torn_word"
+            )
+        self.torn_word_seed = parsed_torn_seed
         self.include_erase_fault_points = bool(include_erase_fault_points)
 
 
@@ -2769,6 +2906,13 @@ class ProfileConfig:
                 self.extra_peripherals,
                 profile_path=self.profile_path,
             )
+            _validate_torn_word_backend(
+                self.fault_sweep,
+                self.platform,
+                self.flash_backend,
+                self.extra_peripherals,
+                profile_path=self.profile_path,
+            )
         self.ownership_plan: Dict[str, Any] = _build_profile_ownership_plan(self)
         if isinstance(self.multi_component, MultiComponentConfig):
             self.ownership_plan["components"] = {
@@ -3389,6 +3533,23 @@ class ProfileConfig:
                     )
                 )
             )
+        if fs.torn_word_explicit:
+            vars_list.extend(
+                [
+                    "TORN_WORD:{}".format(fs.torn_word),
+                    "TORN_WORD_SEED:{}".format(fs.torn_word_seed),
+                    "TORN_WORD_EXPLICIT:true",
+                ]
+            )
+            if fs.torn_word_choices:
+                vars_list.append(
+                    "TORN_WORD_CHOICES:{}".format(
+                        ",".join(
+                            "{}:{}".format(mode, weight)
+                            for mode, weight in fs.torn_word_choices
+                        )
+                    )
+                )
         if mem.erase_fill is not None:
             vars_list.append("MEMORY_ERASE_FILL:0x{:02X}".format(mem.erase_fill))
         if mem.volatile_regions:
@@ -4994,6 +5155,9 @@ def _parse_fault_sweep(
         mram_torn_word=raw.get("mram_torn_word", "half"),
         mram_torn_word_explicit="mram_torn_word" in raw,
         mram_torn_word_seed=raw.get("mram_torn_word_seed", 0),
+        torn_word=raw.get("torn_word", "fixed"),
+        torn_word_explicit="torn_word" in raw,
+        torn_word_seed=raw.get("torn_word_seed", 0),
         include_erase_fault_points=_parse_bool(
             raw.get("include_erase_fault_points", False),
             "fault_sweep.include_erase_fault_points",
@@ -8027,6 +8191,8 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
         "rc_injection_config",
         "mram_torn_word",
         "mram_torn_word_seed",
+        "torn_word",
+        "torn_word_seed",
         "include_erase_fault_points",
     }
 )

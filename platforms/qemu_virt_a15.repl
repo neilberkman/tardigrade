@@ -26,6 +26,7 @@ flash0: Memory.MappedMemory @ sysbus 0x00000000
     size: 0x04000000
 
 flash1: Tardigrade.CFIFlash @ sysbus 0x04000000
+    FlashBaseAddress: 0x04000000
 
 ram: Memory.MappedMemory @ sysbus 0x40000000
     size: 0x80000000

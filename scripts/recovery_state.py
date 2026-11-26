@@ -55,6 +55,8 @@ _TORN_WORD_MODES = frozenset(
         "programmed",
         "uncorrectable",
         "corrupted",
+        "fixed",
+        "partial_bits",
     )
 )
 
@@ -538,6 +540,68 @@ def _corrupt_torn_bytes(intended, operation_index, offset, seed):
     return bytes(result)
 
 
+def _partial_bit_value(previous_value, target_value, width, seed,
+                       operation_index, offset, domain):
+    value_mask = (1 << (8 * int(width))) - 1
+    previous_value = int(previous_value) & value_mask
+    target_value = int(target_value) & value_mask
+    changed = [
+        bit for bit in range(int(width) * 8)
+        if ((previous_value ^ target_value) & (1 << bit)) != 0
+    ]
+    if not changed:
+        return previous_value
+    state = int(seed) & 0xFFFFFFFF
+    if state == 0:
+        state = 0x5A3C96A5
+    state ^= ((int(operation_index) & 0xFFFFFFFF) * 2654435761) & 0xFFFFFFFF
+    state ^= ((int(offset) & 0xFFFFFFFF) * 2246822519) & 0xFFFFFFFF
+    state ^= int(domain) & 0xFFFFFFFF
+    state &= 0xFFFFFFFF
+    if state == 0:
+        state = 0x9E3779B9
+    state = _next_lcg(state)
+    selected_count = 1 if len(changed) == 1 else 1 + state % (len(changed) - 1)
+    result = previous_value
+    for index in range(selected_count):
+        state = _next_lcg(state)
+        swap_index = index + state % (len(changed) - index)
+        selected_bit = changed[swap_index]
+        changed[swap_index], changed[index] = changed[index], selected_bit
+        mask = 1 << selected_bit
+        result = (result & ~mask) | (target_value & mask)
+    return result & value_mask
+
+
+def _flash_fault_bytes(previous, intended, mode, erase_fill,
+                       operation_index, offset, seed):
+    previous = _coerce_bytes(previous)
+    intended = _coerce_bytes(intended)
+    if len(previous) != len(intended):
+        raise RecoveryStateError("previous and intended flash words differ in width")
+    normalized = str(mode or "fixed").strip().lower()
+    if normalized in ("fixed", "untouched", "half", "half_retain"):
+        return previous
+    if normalized not in ("programmed", "partial_bits"):
+        raise RecoveryStateError("unknown flash torn-word mode {!r}".format(normalized))
+    width = len(previous)
+    previous_value = _little_endian_value(previous)
+    intended_value = _little_endian_value(intended)
+    value_mask = (1 << (8 * width)) - 1
+    fill = sum((int(erase_fill) & 0xFF) << (8 * index) for index in range(width))
+    programmed = (
+        (fill & previous_value & intended_value)
+        | ((~fill & value_mask) & (previous_value | intended_value))
+    ) & value_mask
+    if normalized == "programmed":
+        return _little_endian_bytes(programmed, width)
+    partial = _partial_bit_value(
+        previous_value, programmed, width, seed, operation_index,
+        offset, 0x50524F47
+    )
+    return _little_endian_bytes(partial, width)
+
+
 def _corrupt_erased_span(size, erase_fill, erase_index, offset, seed, writes_at, unit):
     result = bytearray((int(erase_fill) & 0xFF,) * int(size))
     state = int(seed) & 0xFFFFFFFF
@@ -614,17 +678,26 @@ def _apply_write_fault(
     intended = _little_endian_bytes(operation["value"], width)
 
     if fault_name == "power_loss":
-        if str(backend_kind).lower() != "mram":
-            return state
-        faulted = _mram_fault_bytes(
-            previous,
-            intended,
-            torn_word_mode,
-            erase_fill,
-            write_index,
-            offset,
-            corruption_seed,
-        )
+        if str(backend_kind).lower() == "mram":
+            faulted = _mram_fault_bytes(
+                previous,
+                intended,
+                torn_word_mode,
+                erase_fill,
+                write_index,
+                offset,
+                corruption_seed,
+            )
+        else:
+            faulted = _flash_fault_bytes(
+                previous,
+                intended,
+                torn_word_mode,
+                erase_fill,
+                write_index,
+                offset,
+                corruption_seed,
+            )
         result = state.write(region_name, offset, faulted, clear_uncorrectable=False)
         marks = set(result.uncorrectable_words)
         marks = set(_clear_marks_in_range(marks, region_name, offset, width))
@@ -800,6 +873,32 @@ def _apply_erase_fault(
         return state.write(
             region_name, offset, corrupted, clear_uncorrectable=True
         )
+    if mode == "partial_bits":
+        unit = max(1, min(8, int(program_unit)))
+        previous = bytearray(state.read(region_name, offset, size))
+        for relative in range(0, size, unit):
+            width = min(unit, size - relative)
+            old_value = _little_endian_value(previous[relative : relative + width])
+            erased_value = sum(fill_byte << (8 * index) for index in range(width))
+            partial = _partial_bit_value(
+                old_value,
+                erased_value,
+                width,
+                corruption_seed,
+                operation["erase_index"],
+                offset + relative,
+                0x45524153,
+            )
+            previous[relative : relative + width] = _little_endian_bytes(
+                partial, width
+            )
+        return state.write(
+            region_name, offset, bytes(previous), clear_uncorrectable=True
+        )
+    if mode == "fixed":
+        if str(backend_kind).lower() == "cfi":
+            return state
+        mode = "half"
     half = size // 2
     if half <= 0 and size > 0:
         half = size

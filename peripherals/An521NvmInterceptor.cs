@@ -85,6 +85,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public uint CorruptionSeed { get => tracker.CorruptionSeed; set => tracker.CorruptionSeed = value; }
         public string MramTornWordMode { get => tracker.MramTornWordMode; set => tracker.MramTornWordMode = value; }
         public uint MramTornWordSeed { get => tracker.MramTornWordSeed; set => tracker.MramTornWordSeed = value; }
+        public string TornWordMode { get => tracker.TornWordMode; set => tracker.TornWordMode = value; }
+        public uint TornWordSeed { get => tracker.TornWordSeed; set => tracker.TornWordSeed = value; }
         public bool PreserveCountersAcrossReset { get => tracker.PreserveCountersAcrossReset; set => tracker.PreserveCountersAcrossReset = value; }
         public int DiffLookahead { get; set; } = 32;
         public bool SkipShadowScan { get; set; } = true;
@@ -238,6 +240,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
 
             var mode = (MramTornWordMode ?? "half").Trim().ToLowerInvariant();
+            var neutralMode = (TornWordMode ?? "fixed").Trim().ToLowerInvariant();
+            if(neutralMode != "fixed")
+            {
+                var torn = FaultTracker.BuildFlashTornEraseSpan(
+                    preErase, offset, EraseFill, 4, neutralMode,
+                    TornWordSeed, TotalPageErases);
+                BackingMemory.WriteBytes(offset, torn, 0, torn.Length);
+                if(flashShadow != null)
+                {
+                    Array.Copy(torn, 0, flashShadow, checked((int)offset), torn.Length);
+                }
+                return;
+            }
             switch(mode)
             {
                 case "untouched":
@@ -408,7 +423,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 FaultFlashSnapshot = (byte[])flashShadow.Clone();
 
                 var faultWord = FaultWord(ReadShadowWord(aligned), result, aligned);
-                if(WriteFaultMode == 0 || WriteFaultMode == 3 ||
+                if((WriteFaultMode == 0 && TornProgramRetainsPrevious()) ||
+                   WriteFaultMode == 3 ||
                    (WriteFaultMode == 6 && DriverErrorFired))
                 {
                     // Power loss, write rejection, and driver error leave
@@ -418,6 +434,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
                 WriteBackingWord(aligned, faultWord);
                 WriteShadowWord(aligned, faultWord);
+                WriteFaultSnapshotWord(aligned, faultWord);
                 return;
             }
 
@@ -513,6 +530,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     // so those modes restore the pre-write value.
                     WriteBackingWord(aligned, faultWord);
                     WriteShadowWord(aligned, faultWord);
+                    WriteFaultSnapshotWord(aligned, faultWord);
                     return;
                 }
 
@@ -541,8 +559,26 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 DriverErrorFired = true;
                 return oldWord;
             default:
-                return oldWord;
+                return (uint)FaultTracker.BuildFlashTornProgramValue(
+                    oldWord, newWord, 4, EraseFill, TornWordMode,
+                    TornWordSeed, TotalWordWrites, aligned);
             }
+        }
+
+        private bool TornProgramRetainsPrevious()
+        {
+            var mode = (TornWordMode ?? "fixed").Trim().ToLowerInvariant();
+            return mode == "fixed" || mode == "untouched";
+        }
+
+        private void WriteFaultSnapshotWord(long aligned, uint value)
+        {
+            if(FaultFlashSnapshot == null || aligned < 0 || aligned > FaultFlashSnapshot.Length - 4)
+            {
+                return;
+            }
+            var bytes = FaultTracker.WordToBytes(value);
+            Array.Copy(bytes, 0, FaultFlashSnapshot, checked((int)aligned), bytes.Length);
         }
 
         private void ApplyWriteDisturb(long aligned)

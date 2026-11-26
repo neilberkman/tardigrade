@@ -24,6 +24,112 @@ KNOWN_SIMPLE_FAULT_CODES = (
 )
 
 
+def _next_lcg(seed):
+    return (int(seed) * 1103515245 + 12345) & 0xFFFFFFFF
+
+
+def _partial_bit_value(previous_value, target_value, width, seed,
+                       operation_index, offset, domain):
+    value_mask = (1 << (8 * int(width))) - 1
+    previous_value = int(previous_value) & value_mask
+    target_value = int(target_value) & value_mask
+    changed = [
+        bit for bit in range(int(width) * 8)
+        if ((previous_value ^ target_value) & (1 << bit)) != 0
+    ]
+    if not changed:
+        return previous_value
+    state = int(seed) & 0xFFFFFFFF
+    if state == 0:
+        state = 0x5A3C96A5
+    state ^= ((int(operation_index) & 0xFFFFFFFF) * 2654435761) & 0xFFFFFFFF
+    state ^= ((int(offset) & 0xFFFFFFFF) * 2246822519) & 0xFFFFFFFF
+    state ^= int(domain) & 0xFFFFFFFF
+    state &= 0xFFFFFFFF
+    if state == 0:
+        state = 0x9E3779B9
+    state = _next_lcg(state)
+    selected_count = 1 if len(changed) == 1 else 1 + state % (len(changed) - 1)
+    result = previous_value
+    for index in range(selected_count):
+        state = _next_lcg(state)
+        swap_index = index + state % (len(changed) - index)
+        selected_bit = changed[swap_index]
+        changed[swap_index], changed[index] = changed[index], selected_bit
+        mask = 1 << selected_bit
+        result = (result & ~mask) | (target_value & mask)
+    return result & value_mask
+
+
+def flash_torn_program_bytes(previous, requested, erase_fill, mode, seed,
+                             operation_index, offset):
+    """Return the selected flash program result for replay reconstruction."""
+    previous = bytearray(previous)
+    requested = bytearray(requested)
+    if len(previous) != len(requested) or len(previous) not in SUPPORTED_WRITE_WIDTHS:
+        raise ValueError("flash torn program values have an unsupported width")
+    normalized = str(mode or "fixed").strip().lower()
+    if normalized not in ("fixed", "untouched", "programmed", "partial_bits"):
+        raise ValueError("unknown flash torn-word mode {!r}".format(normalized))
+    if normalized in ("fixed", "untouched"):
+        return bytes(previous)
+    width = len(previous)
+    old_value = sum(int(value) << (8 * index) for index, value in enumerate(previous))
+    requested_value = sum(int(value) << (8 * index) for index, value in enumerate(requested))
+    value_mask = (1 << (8 * width)) - 1
+    fill = sum((int(erase_fill) & 0xFF) << (8 * index) for index in range(width))
+    programmed = (
+        (fill & old_value & requested_value)
+        | ((~fill & value_mask) & (old_value | requested_value))
+    ) & value_mask
+    if normalized == "partial_bits":
+        programmed = _partial_bit_value(
+            old_value, programmed, width, seed, operation_index,
+            offset, 0x50524F47
+        )
+    return bytes(bytearray(
+        (programmed >> (8 * index)) & 0xFF for index in range(width)
+    ))
+
+
+def flash_torn_erase_bytes(previous, erase_fill, program_unit, mode, seed,
+                           operation_index, offset, fixed_erase_behavior="half"):
+    """Return the selected flash erase result for replay reconstruction."""
+    normalized = str(mode or "fixed").strip().lower()
+    result = bytearray(previous)
+    if normalized == "untouched":
+        return bytes(result)
+    if normalized == "fixed":
+        if str(fixed_erase_behavior).strip().lower() == "untouched":
+            return bytes(result)
+        half = len(result) // 2
+        if half <= 0 and result:
+            half = len(result)
+        for index in range(half):
+            result[index] = int(erase_fill) & 0xFF
+        return bytes(result)
+    if normalized == "programmed":
+        return bytes(bytearray((int(erase_fill) & 0xFF,) * len(result)))
+    if normalized != "partial_bits":
+        raise ValueError("unknown flash torn erase mode {!r}".format(normalized))
+    unit = max(1, min(8, int(program_unit)))
+    for relative in range(0, len(result), unit):
+        width = min(unit, len(result) - relative)
+        old_value = sum(
+            int(result[relative + index]) << (8 * index) for index in range(width)
+        )
+        erased_value = sum(
+            (int(erase_fill) & 0xFF) << (8 * index) for index in range(width)
+        )
+        partial = _partial_bit_value(
+            old_value, erased_value, width, seed, operation_index,
+            int(offset) + relative, 0x45524153
+        )
+        for index in range(width):
+            result[relative + index] = (partial >> (8 * index)) & 0xFF
+    return bytes(result)
+
+
 def is_known_writeback_fault_type(fault_type):
     """Return whether a runtime wire encoding belongs to a known family."""
     token = str(fault_type or "").strip().lower()
@@ -263,6 +369,8 @@ def reconstruct_committed_snapshot(
     barriers=(),
     erase_fill=0xFF,
     erase_flushes_domain=False,
+    torn_word_mode=None,
+    torn_word_seed=0,
 ):
     """Replay only durable writes into a copy of the initial image.
 
@@ -363,6 +471,27 @@ def reconstruct_committed_snapshot(
             ]
         apply_erase(offset, size)
         erase_index[0] += 1
+
+    if torn_word_mode is not None:
+        target_write_index = int(fault_at) + 1
+        for write_index, offset, value, width in normalized_trace:
+            if write_index != target_write_index:
+                continue
+            previous = bytes(image[offset : offset + width])
+            requested = bytes(bytearray(
+                (int(value) >> (8 * index)) & 0xFF for index in range(width)
+            ))
+            torn = flash_torn_program_bytes(
+                previous,
+                requested,
+                erase_fill,
+                torn_word_mode,
+                torn_word_seed,
+                write_index,
+                offset,
+            )
+            image[offset : offset + width] = torn
+            break
 
     # bytearray is usable from both CPython and IronPython and preserves
     # integer indexing for the CLR conversion performed by the runner.

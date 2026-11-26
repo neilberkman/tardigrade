@@ -108,6 +108,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
         public string MramTornWordMode { get => tracker.MramTornWordMode; set => tracker.MramTornWordMode = value; }
         public uint MramTornWordSeed { get => tracker.MramTornWordSeed; set => tracker.MramTornWordSeed = value; }
+        public string TornWordMode { get => tracker.TornWordMode; set => tracker.TornWordMode = value; }
+        public uint TornWordSeed { get => tracker.TornWordSeed; set => tracker.TornWordSeed = value; }
         public bool PreserveCountersAcrossReset { get => tracker.PreserveCountersAcrossReset; set => tracker.PreserveCountersAcrossReset = value; }
 
         public bool AnyFaultFired => tracker.AnyFaultFired;
@@ -184,7 +186,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // Apply fault in snapshot and flash.
                 if(WriteFaultMode == 0)
                 {
-                    // Power-loss: suppress the write entirely.
+                    ulong previous = 0;
+                    for(int i = 0; i < width; i++)
+                    {
+                        previous |= (ulong)Flash.ReadBytes(offset + i, 1)[0] << (i * 8);
+                    }
+                    var torn = FaultTracker.BuildFlashTornProgramValue(
+                        previous, value, width, EraseFill, TornWordMode,
+                        TornWordSeed, TotalWordWrites, offset);
+                    for(int i = 0; i < width; i++)
+                    {
+                        var byteOff = checked((int)offset) + i;
+                        var tornByte = (byte)(torn >> (i * 8));
+                        Flash.WriteByte(byteOff, tornByte);
+                        FaultFlashSnapshot[byteOff] = tornByte;
+                    }
+                    // The interceptor must not apply the requested value after
+                    // this controller has persisted the selected cut result.
                     return false;
                 }
                 else if(WriteFaultMode == 1)
@@ -815,9 +833,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 case 0: // Power-loss: undo the write.
                 {
-                    Flash.WriteByte(offset, oldValue);
-                    flashShadow[offset] = oldValue;
-                    FaultFlashSnapshot[offset] = oldValue;
+                    var torn = (byte)FaultTracker.BuildFlashTornProgramValue(
+                        oldValue, newValue, 1, EraseFill, TornWordMode,
+                        TornWordSeed, TotalWordWrites, offset);
+                    Flash.WriteByte(offset, torn);
+                    flashShadow[offset] = torn;
+                    FaultFlashSnapshot[offset] = torn;
                     break;
                 }
                 case 1: // Bit corruption: partial write.
@@ -927,6 +948,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 else
                 {
+                    var neutralMode = (TornWordMode ?? "fixed").Trim().ToLowerInvariant();
+                    if(neutralMode != "fixed")
+                    {
+                        var previous = Flash.ReadBytes(sector.Offset, sector.Size);
+                        var torn = FaultTracker.BuildFlashTornEraseSpan(
+                            previous, sector.Offset, EraseFill, 4, neutralMode,
+                            TornWordSeed, TotalPageErases);
+                        Flash.WriteBytes(sector.Offset, torn, 0, torn.Length);
+                    }
+                    else
+                    {
                     var tornMode = (MramTornWordMode ?? "half").Trim().ToLowerInvariant();
                     if(tornMode == "untouched")
                     {
@@ -944,6 +976,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     else
                     {
                         EraseWithFill(Flash, sector.Offset, halfSize);
+                    }
                     }
                 }
 

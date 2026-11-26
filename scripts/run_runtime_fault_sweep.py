@@ -615,10 +615,110 @@ def _mram_torn_word_for_point(fault_at, choices, seed):
 mram_torn_word_choices = _parse_mram_torn_word_choices(
     get_optional_var('mram_torn_word_choices', '')
 )
+torn_word = get_optional_var('torn_word', 'fixed').strip().lower() or 'fixed'
+if torn_word not in ('fixed', 'untouched', 'programmed', 'partial_bits'):
+    raise Exception(
+        'torn_word must be fixed, untouched, programmed, or partial_bits, got {}'.format(
+            torn_word
+        )
+    )
+torn_word_seed = get_optional_int_var('torn_word_seed', 0) & 0xFFFFFFFF
+torn_word_explicit = (
+    get_optional_var('torn_word_explicit', '').strip().lower()
+    in ('1', 'true', 'yes', 'on')
+)
+
+
+def _parse_torn_word_choices(text):
+    valid = ('fixed', 'untouched', 'programmed', 'partial_bits')
+    choices = []
+    seen = set()
+    for item in str(text or '').split(','):
+        item = item.strip().lower()
+        if not item:
+            continue
+        mode, _, weight_text = item.partition(':')
+        mode = mode.strip()
+        weight_text = weight_text.strip() or '1'
+        if mode not in valid:
+            raise Exception(
+                'torn_word_choices: unknown mode {!r}; valid: {}'.format(
+                    mode, ', '.join(valid)
+                )
+            )
+        if mode in seen:
+            raise Exception('torn_word_choices: duplicate mode {!r}'.format(mode))
+        if not weight_text.isdigit() or int(weight_text) <= 0:
+            raise Exception(
+                'torn_word_choices: weight for {!r} must be a positive integer, '
+                'got {!r}'.format(mode, weight_text)
+            )
+        seen.add(mode)
+        choices.append((mode, int(weight_text)))
+    return choices
+
+
+torn_word_choices = _parse_torn_word_choices(
+    get_optional_var('torn_word_choices', '')
+)
 include_erase_fault_points = (
     get_optional_var('include_erase_fault_points', '').strip().lower()
     in ('1', 'true', 'yes', 'on')
 )
+
+
+def _apply_torn_word_mode():
+    """Apply the backend-neutral flash cut outcome when explicitly configured."""
+    if not torn_word_explicit:
+        return False
+    applied = False
+    data = backend.get('data')
+    if data is not None and hasattr(data, 'TornWordMode'):
+        data.TornWordMode = torn_word
+        applied = True
+    if data is not None and hasattr(data, 'TornWordSeed'):
+        data.TornWordSeed = int(torn_word_seed) & 0xFFFFFFFF
+    nvm = getattr(data, 'Nvm', None) if data is not None else None
+    if nvm is not None and hasattr(nvm, 'TornWordMode'):
+        nvm.TornWordMode = torn_word
+        applied = True
+    if nvm is not None and hasattr(nvm, 'TornWordSeed'):
+        nvm.TornWordSeed = int(torn_word_seed) & 0xFFFFFFFF
+    return applied
+
+
+def _select_point_torn_word(fault_at):
+    global torn_word
+    if not torn_word_choices:
+        return None
+    torn_word = _mram_torn_word_for_point(
+        fault_at, torn_word_choices, torn_word_seed
+    )
+    if '_apply_torn_word_mode' in globals():
+        _apply_torn_word_mode()
+    return torn_word
+
+
+def _record_point_torn_word(result, mode):
+    if mode is not None and isinstance(result, dict) and not result.get('is_control'):
+        result['torn_word'] = mode
+    return result
+
+
+def _require_torn_word_support():
+    if not torn_word_explicit:
+        return
+    if backend.get('kind') == 'mram':
+        raise Exception(
+            'fault_sweep.torn_word selects flash outcomes; use mram_torn_word on MRAM'
+        )
+    if not _apply_torn_word_mode():
+        raise Exception(
+            'fault_sweep.torn_word {!r} requires a flash peripheral with a '
+            'TornWordMode property; {} has none'.format(
+                torn_word, backend.get('backend_sysbus_name')
+            )
+        )
 
 def _apply_mram_torn_word_mode():
     """Set the torn-word mode (and optional seed) on every backend object that exposes it.
@@ -639,6 +739,8 @@ def _apply_mram_torn_word_mode():
         applied = True
     if nvm is not None and hasattr(nvm, 'MramTornWordSeed'):
         nvm.MramTornWordSeed = seed_val
+    if '_apply_torn_word_mode' in globals():
+        _apply_torn_word_mode()
     return applied
 
 def _select_point_mram_torn_word(fault_at):
@@ -4265,6 +4367,12 @@ def writeback_strip_uncommitted_from_snapshot(
             barriers=_writeback_barriers,
             erase_fill=_runtime_erase_fill_byte(),
             erase_flushes_domain=writeback_erase_flushes,
+            torn_word_mode=(
+                globals().get('torn_word')
+                if globals().get('torn_word_explicit', False)
+                else None
+            ),
+            torn_word_seed=globals().get('torn_word_seed', 0),
         )
     except Exception as exc:
         _writeback_snapshot_reconstruction_status = {
@@ -6048,6 +6156,9 @@ def get_total_erases():
 def arm_fault(absolute_write_index, write_fault_mode=0):
     if write_fault_mode == 0:
         _require_mram_torn_word_support()
+        require_flash_torn_word = globals().get('_require_torn_word_support')
+        if require_flash_torn_word is not None:
+            require_flash_torn_word()
     else:
         _apply_mram_torn_word_mode()
     b = backend
@@ -6085,6 +6196,7 @@ def arm_controller_fault(absolute_command_index, command_fault_mode=1):
 
 def arm_erase_fault(absolute_erase_index, erase_fault_mode=0):
     _apply_mram_torn_word_mode()
+    _require_torn_word_support()
     if mram_torn_word == 'uncorrectable':
         _require_mram_uncorrectable_support()
     b = backend
@@ -13363,6 +13475,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     p1_applied_torn_word = mram_torn_word
     p2_torn_word = None
     p2_applied_torn_word = None
+    p1_flash_torn_word = None
+    p2_flash_torn_word = None
     is_p1_erase = p1_fault_type in ('e', 'a')
     is_p1_timed = p1_fault_type == 't'
     is_p2_erase = p2_fault_type in ('e', 'a')
@@ -13387,6 +13501,9 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     # --- Phase 1: create degraded state ---
     restore_phase1_baseline()
     p1_torn_word = _select_point_mram_torn_word(p1_fault_at)
+    select_flash_torn_word = globals().get('_select_point_torn_word')
+    if select_flash_torn_word is not None:
+        p1_flash_torn_word = select_flash_torn_word(p1_fault_at)
     p1_applied_torn_word = mram_torn_word
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
@@ -13519,6 +13636,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         _restore_mram_uncorrectable_offsets(p1_uncorrectable_offsets)
     _clear_mram_uncorrectable_read_log()
     p2_torn_word = _select_point_mram_torn_word(p2_fault_at)
+    if select_flash_torn_word is not None:
+        p2_flash_torn_word = select_flash_torn_word(p2_fault_at)
     p2_applied_torn_word = mram_torn_word
     p2_trace_enabled = (
         backend['kind'] == 'fast'
@@ -13793,6 +13912,11 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         result['phase2_fault']['p1_mram_torn_word'] = p1_torn_word
     if p2_torn_word is not None:
         result['phase2_fault']['p2_mram_torn_word'] = p2_torn_word
+    if p1_flash_torn_word is not None:
+        result['torn_word'] = p1_flash_torn_word
+        result['phase2_fault']['p1_torn_word'] = p1_flash_torn_word
+    if p2_flash_torn_word is not None:
+        result['phase2_fault']['p2_torn_word'] = p2_flash_torn_word
     if cross_check_persistent_state is not None:
         result['phase2_fault']['cross_check_persistent_state'] = cross_check_persistent_state
     if eff_criteria is not None:
@@ -14755,6 +14879,105 @@ def _trace_replay_next_lcg(seed):
     return (int(seed) * 1103515245 + 12345) & 0xFFFFFFFF
 
 
+def _flash_torn_partial_value(previous_value, target_value, width, seed,
+                              operation_index, offset, domain):
+    width = int(width)
+    value_mask = (1 << (8 * width)) - 1
+    previous_value = int(previous_value) & value_mask
+    target_value = int(target_value) & value_mask
+    changed = [
+        bit for bit in range(width * 8)
+        if ((previous_value ^ target_value) & (1 << bit)) != 0
+    ]
+    if not changed:
+        return previous_value
+    state = int(seed) & 0xFFFFFFFF
+    if state == 0:
+        state = 0x5A3C96A5
+    state ^= ((int(operation_index) & 0xFFFFFFFF) * 2654435761) & 0xFFFFFFFF
+    state ^= ((int(offset) & 0xFFFFFFFF) * 2246822519) & 0xFFFFFFFF
+    state ^= int(domain) & 0xFFFFFFFF
+    state &= 0xFFFFFFFF
+    if state == 0:
+        state = 0x9E3779B9
+    state = _trace_replay_next_lcg(state)
+    selected_count = 1 if len(changed) == 1 else 1 + state % (len(changed) - 1)
+    result = previous_value
+    for index in range(selected_count):
+        state = _trace_replay_next_lcg(state)
+        swap_index = index + state % (len(changed) - index)
+        selected_bit = changed[swap_index]
+        changed[swap_index], changed[index] = changed[index], selected_bit
+        mask = 1 << selected_bit
+        result = (result & ~mask) | (target_value & mask)
+    return result & value_mask
+
+
+def _trace_replay_flash_torn_value(previous_value, requested_value, width,
+                                   erase_fill, mode, seed, operation_index,
+                                   offset):
+    width = int(width)
+    if width not in (1, 2, 4, 8):
+        raise ValueError('flash torn replay requires a supported write width')
+    normalized = str(mode or 'fixed').strip().lower()
+    if normalized not in ('fixed', 'untouched', 'programmed', 'partial_bits'):
+        raise ValueError('unknown flash torn-word mode {!r}'.format(normalized))
+    value_mask = (1 << (8 * width)) - 1
+    previous = int(previous_value) & value_mask
+    if normalized in ('fixed', 'untouched'):
+        return previous
+    fill = sum((int(erase_fill) & 0xFF) << (8 * index) for index in range(width))
+    requested = int(requested_value) & value_mask
+    programmed = (
+        (fill & previous & requested)
+        | ((~fill & value_mask) & (previous | requested))
+    ) & value_mask
+    if normalized == 'programmed':
+        return programmed
+    return _flash_torn_partial_value(
+        previous, programmed, width, seed, operation_index, offset, 0x50524F47
+    )
+
+
+def _trace_replay_flash_torn_erase(previous_bytes, offset, erase_fill,
+                                   program_unit, mode, seed, operation_index,
+                                   fixed_erase_behavior='half'):
+    normalized = str(mode or 'fixed').strip().lower()
+    result = bytearray(previous_bytes)
+    if normalized == 'untouched':
+        return result
+    if normalized == 'fixed':
+        if str(fixed_erase_behavior).strip().lower() == 'untouched':
+            return result
+        half = len(result) // 2
+        if half <= 0 and result:
+            half = len(result)
+        for index in range(half):
+            result[index] = int(erase_fill) & 0xFF
+        return result
+    if normalized in ('programmed', 'erased'):
+        for index in range(len(result)):
+            result[index] = int(erase_fill) & 0xFF
+        return result
+    if normalized != 'partial_bits':
+        raise ValueError('unknown flash torn erase mode {!r}'.format(normalized))
+    unit = max(1, min(8, int(program_unit)))
+    for relative in range(0, len(result), unit):
+        width = min(unit, len(result) - relative)
+        previous = 0
+        erased = 0
+        for byte_index in range(width):
+            previous |= (int(result[relative + byte_index]) & 0xFF) << (8 * byte_index)
+            erased |= (int(erase_fill) & 0xFF) << (8 * byte_index)
+        partial = _flash_torn_partial_value(
+            previous, erased, width, seed, operation_index,
+            int(offset) + relative, 0x45524153
+        )
+        for byte_index in range(width):
+            result[relative + byte_index] = (partial >> (8 * byte_index)) & 0xFF
+    return result
+
+
 def _trace_replay_build_seed(offset, write_index, total_page_erases, corruption_seed=0):
     seed = int(corruption_seed) & 0xFFFFFFFF
     if seed == 0:
@@ -14911,6 +15134,12 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     import os as _os_native
 
     if backend['kind'] != 'fast':
+        return None
+
+    # Native replay historically stops before the cut program and has no
+    # selected torn-operation API.  The Python path below applies every
+    # backend-neutral outcome with the same algorithm as the live peripheral.
+    if torn_word_explicit:
         return None
 
     fault_base = _base_fault_type_code(fault_type)
@@ -15219,6 +15448,29 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
                 flash_ref, trace_data_loaded, erase_trace_loaded,
                 fault_at, flash_base_addr, page_size,
             )
+        if torn_word_explicit and backend['kind'] != 'mram':
+            import System
+            target_write_index = int(fault_at) + 1
+            for write_idx, flash_off, value, width in _validated_writeback_trace(
+                    trace_data_loaded):
+                if int(write_idx) != target_write_index:
+                    continue
+                existing = to_py_bytes(
+                    _replay_storage_read_bytes(int(flash_off), int(width))
+                )
+                previous_value = 0
+                for byte_index, byte_value in enumerate(bytearray(existing)):
+                    previous_value |= (int(byte_value) & 0xFF) << (8 * byte_index)
+                torn_value = _trace_replay_flash_torn_value(
+                    previous_value, value, width, erase_fill, torn_word,
+                    torn_word_seed, write_idx, flash_off
+                )
+                torn_bytes = System.Array.CreateInstance(System.Byte, width)
+                for byte_index in range(width):
+                    torn_bytes[byte_index] = (torn_value >> (8 * byte_index)) & 0xFF
+                _replay_storage_write_bytes(int(flash_off), torn_bytes)
+                fault_snapshot_word = torn_value
+                break
         actual_writes = writes_applied
         if fault_at % 50 == 0:
             log('fp={} writeback_trace_replay: committed={} discarded={}'.format(
@@ -15289,6 +15541,30 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
                         fault_uncorrectable_addresses = [
                             fmt_u32(int(flash_off) + int(flash_base_addr))
                         ]
+                    writes_applied += 1
+                    mram_power_loss_torn = True
+                    mram_power_loss_width = int(width)
+                    fault_snapshot_word = torn_value
+                elif torn_word_explicit:
+                    previous_value = _trace_replay_read_value(
+                        bytearray(to_py_bytes(_replay_storage_read_bytes(0, flash_size))),
+                        flash_off,
+                        width,
+                    )
+                    torn_value = _trace_replay_flash_torn_value(
+                        previous_value,
+                        value,
+                        width,
+                        erase_fill,
+                        torn_word,
+                        torn_word_seed,
+                        write_idx,
+                        flash_off,
+                    )
+                    b = System.Array.CreateInstance(System.Byte, width)
+                    for byte_index in range(width):
+                        b[byte_index] = (torn_value >> (8 * byte_index)) & 0xFF
+                    _replay_storage_write_bytes(flash_off, b)
                     writes_applied += 1
                     mram_power_loss_torn = True
                     mram_power_loss_width = int(width)
@@ -15386,8 +15662,12 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     signals['total_ms'] = total_ms
     signals['trace_replay_mode'] = 'python'
     if mram_power_loss_torn:
-        signals['trace_replay_power_loss_semantics'] = 'mram_torn_word'
-        signals['mram_torn_word_mode'] = mram_torn_word
+        if backend['kind'] == 'mram':
+            signals['trace_replay_power_loss_semantics'] = 'mram_torn_word'
+            signals['mram_torn_word_mode'] = mram_torn_word
+        else:
+            signals['trace_replay_power_loss_semantics'] = 'flash_torn_word'
+            signals['torn_word_mode'] = torn_word
         if fault_snapshot_word is not None:
             signals['fault_snapshot_word'] = '0x{:0{}x}'.format(
                 int(fault_snapshot_word),
@@ -15708,12 +15988,15 @@ def run_recovery_state_search():
     )
 
     def torn_word_for_cut(operation, generation, chain):
-        if not mram_torn_word_choices:
-            return mram_torn_word
+        active_choices = torn_word_choices if torn_word_explicit else mram_torn_word_choices
+        active_mode = torn_word if torn_word_explicit else mram_torn_word
+        active_seed = torn_word_seed if torn_word_explicit else mram_torn_word_seed
+        if not active_choices:
+            return active_mode
         return _mram_torn_word_for_point(
             int(operation['operation_index']),
-            mram_torn_word_choices,
-            mram_torn_word_seed,
+            active_choices,
+            active_seed,
         )
 
     def cross_check(state, chain, generation, operation):
@@ -15752,11 +16035,15 @@ def run_recovery_state_search():
         boot_state=_state_search_boot_state,
         flash_base=flash_base,
         address_ranges=phase2_state_search.get('address_ranges') or (),
-        backend_kind=backend.get('kind'),
-        torn_word_mode=mram_torn_word,
+        backend_kind=(
+            'cfi'
+            if 'CFIFlash' in str(type(backend.get('data')))
+            else backend.get('kind')
+        ),
+        torn_word_mode=(torn_word if torn_word_explicit else mram_torn_word),
         torn_word_for_cut=torn_word_for_cut,
         erase_fill=erase_fill,
-        corruption_seed=mram_torn_word_seed,
+        corruption_seed=(torn_word_seed if torn_word_explicit else mram_torn_word_seed),
         page_size=page_size,
         program_unit=int(getattr(backend.get('data'), 'ProgramUnitSize', 4) or 4),
         cross_check_every=int(phase2_state_search.get('cross_check_every', 100)),
@@ -16576,6 +16863,7 @@ else:
         if ft == 'f':
             ensure_read_fault_preflight()
         point_torn_word = _select_point_mram_torn_word(fp)
+        point_flash_torn_word = _select_point_torn_word(fp)
         dispatched = _dispatch_fault_point(fp, ft, run_fn)
         if isinstance(dispatched, list):
             results.extend(dispatched)
@@ -16586,6 +16874,7 @@ else:
             )
         )
         _record_point_mram_torn_word(result, point_torn_word)
+        _record_point_torn_word(result, point_flash_torn_word)
         results.append(result)
 
         # Force .NET GC periodically to prevent memory exhaustion.

@@ -45,8 +45,10 @@ gpio2: Memory.MappedMemory @ sysbus 0x10015000
     size: 0x1000
 
 nor0: Tardigrade.CFIFlash @ sysbus 0x40000000
+    FlashBaseAddress: 0x40000000
 
 nor1: Tardigrade.CFIFlash @ sysbus 0x44000000
+    FlashBaseAddress: 0x44000000
 
 ram: Memory.MappedMemory @ sysbus 0x60000000
     size: 0x40000000

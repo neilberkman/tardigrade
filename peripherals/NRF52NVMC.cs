@@ -103,6 +103,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public int EraseFaultMode { get => tracker.EraseFaultMode; set => tracker.EraseFaultMode = value; }
         public string MramTornWordMode { get => tracker.MramTornWordMode; set => tracker.MramTornWordMode = value; }
         public uint MramTornWordSeed { get => tracker.MramTornWordSeed; set => tracker.MramTornWordSeed = value; }
+        public string TornWordMode { get => tracker.TornWordMode; set => tracker.TornWordMode = value; }
+        public uint TornWordSeed { get => tracker.TornWordSeed; set => tracker.TornWordSeed = value; }
         public bool PreserveCountersAcrossReset { get => tracker.PreserveCountersAcrossReset; set => tracker.PreserveCountersAcrossReset = value; }
 
         public bool AnyFaultFired => tracker.AnyFaultFired;
@@ -308,6 +310,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
+        private void ApplyTornProgramAtOffset(byte[] snap, byte[] pre, byte[] post,
+                                              int off, int len)
+        {
+            if(off < 0 || off > len - 4)
+            {
+                return;
+            }
+            var torn = FaultTracker.BuildFlashTornProgramValue(
+                FaultTracker.ReadU32(pre, off), FaultTracker.ReadU32(post, off),
+                4, EraseFill, TornWordMode, TornWordSeed, TotalWordWrites, off);
+            FaultTracker.WriteU32(snap, off, (uint)torn);
+        }
+
         private void EraseWithFill(IMemory flash, long offset, int size)
         {
             if(size <= 0)
@@ -439,6 +454,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
                                         if(WriteFaultMode == 0)
                                         {
+                                            ApplyTornProgramAtOffset(snap, wenSnapshot, current, off, len);
+                                            Flash.WriteBytes(0, snap, 0, len);
                                             FaultFlashSnapshot = snap;
                                         }
                                         else
@@ -507,6 +524,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                         // existing only in the diagnostic snapshot.
                                         if(WriteFaultMode == 0)
                                         {
+                                            ApplyTornProgramAtOffset(snap, wenSnapshot, current, off, len);
+                                            Flash.WriteBytes(0, snap, 0, len);
                                             FaultFlashSnapshot = snap;
                                         }
                                         else
@@ -585,6 +604,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                 }
                                 else
                                 {
+                                    var neutralMode = (TornWordMode ?? "fixed").Trim().ToLowerInvariant();
+                                    if(neutralMode != "fixed")
+                                    {
+                                        var previous = Nvm.ReadBytes(offset, PageSize);
+                                        var torn = FaultTracker.BuildFlashTornEraseSpan(
+                                            previous, offset, EraseFill, 4, neutralMode,
+                                            TornWordSeed, TotalPageErases);
+                                        Nvm.WriteSpanRaw(offset, torn);
+                                    }
+                                    else
+                                    {
                                     var tornMode = (MramTornWordMode ?? "half").Trim().ToLowerInvariant();
                                     if(tornMode == "untouched")
                                     {
@@ -602,6 +632,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                     else
                                     {
                                         Nvm.EraseSectorRaw(offset, halfPage);
+                                    }
                                     }
                                 }
                                 FaultFlashSnapshot = Nvm.ReadBytes(0, checked((int)Nvm.Size));
@@ -634,6 +665,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                 }
                                 else
                                 {
+                                    var neutralMode = (TornWordMode ?? "fixed").Trim().ToLowerInvariant();
+                                    if(neutralMode != "fixed")
+                                    {
+                                        var previous = Flash.ReadBytes(offset, PageSize);
+                                        var torn = FaultTracker.BuildFlashTornEraseSpan(
+                                            previous, offset, EraseFill, 4, neutralMode,
+                                            TornWordSeed, TotalPageErases);
+                                        Flash.WriteBytes(offset, torn, 0, torn.Length);
+                                    }
+                                    else
+                                    {
                                     var tornMode = (MramTornWordMode ?? "half").Trim().ToLowerInvariant();
                                     if(tornMode == "untouched")
                                     {
@@ -651,6 +693,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                     else
                                     {
                                         EraseWithFill(Flash, offset, halfPage);
+                                    }
                                     }
                                 }
 
