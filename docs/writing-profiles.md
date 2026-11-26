@@ -1688,6 +1688,7 @@ Inject faults during the recovery boot's own writes, or during between-boot hook
 fault_sweep:
   phase2_fault:
     enabled: true
+    first_fault_types: [power_loss] # power_loss or interrupted_erase
     fault_types: [power_loss]
     max_points: 100
   hook_fault:
@@ -1698,26 +1699,37 @@ fault_sweep:
 
 Gotcha: `phase2_fault` does not sweep the full Cartesian product of every
 single-fault point against every recovery write. It uses representative phase-1
-points (first/middle/last from the main write plan) and then sweeps recovery
-indices across `max_points`. This keeps the execute-mode search bounded while
-still exercising the second-stage recovery machinery.
+points (first/middle/last from each enabled first-cut operation domain) and then
+sweeps recovery indices across `max_points`. `first_fault_types` defaults to
+`[power_loss]`, so profiles that omit it retain the existing write-first plan.
+Add `interrupted_erase` and set `include_erase_fault_points: true` to include
+first/middle/last calibration erases as first cuts. This keeps the execute-mode
+search bounded while still exercising the second-stage recovery machinery.
 
 For a calibrated boundary that needs exact phase-1 and recovery operation
-indices, provide `pairs`. Each entry is `[first_write_index,
-recovery_operation_index]`. The recovery index counts writes for write fault
-types and erases for `interrupted_erase` or `multi_sector_atomicity`:
+indices, provide `pairs`. Each entry is `[first_operation_index,
+recovery_operation_index]`. The first index counts writes for the default
+`first_fault_types: [power_loss]` and erases for
+`first_fault_types: [interrupted_erase]`. If both first fault types are listed,
+each pair expands once for each first-cut kind. The recovery index counts writes
+for write fault types and erases for `interrupted_erase` or
+`multi_sector_atomicity`:
 
 ```yaml
 fault_sweep:
+  include_erase_fault_points: true
   phase2_fault:
     enabled: true
+    first_fault_types: [interrupted_erase]
     fault_types: [interrupted_erase]
     pairs:
       - [100, 3]
 ```
 
 `pairs` requires `phase2_fault.enabled: true`; a profile that supplies pairs
-while disabling phase-two fault injection is rejected at load time.
+while disabling phase-two fault injection is rejected at load time. An
+erase-first profile also requires `include_erase_fault_points: true`; omission
+is rejected by the profile loader.
 
 Explicit pairs replace the representative grid and are unchanged by
 `--quick`, `max_points`, and the main sweep's range options. The configured
@@ -1734,15 +1746,17 @@ and obtains later cuts from that boot's write-and-erase trace:
 fault_sweep:
   evaluation_mode: execute
   fault_types: [power_loss]
+  include_erase_fault_points: true
   phase2_fault:
     enabled: true
+    first_fault_types: [power_loss, interrupted_erase]
     fault_types: [power_loss]
     state_search:
       enabled: true
       first_cuts:
         mode: ranges       # quick, all, or ranges
         ranges:
-          - {start: 0, end: 8} # inclusive write indices
+          - {start: 0, end: 8} # inclusive indices in each selected domain
       max_cuts: 2          # default 2; 3 and higher repeat the same process
       max_new_states: 1000
       max_wall_time_s: 900
@@ -1752,10 +1766,12 @@ fault_sweep:
 ```
 
 The three first-cut modes select the normal first/middle/last quick set, all
-calibration writes, or the union of the configured inclusive index ranges.
-First cuts are writes; erase first cuts are not supported. Address ranges
-restrict recovery operations that may become later cuts. Operations outside
-the ranges still update the computed prefix, so later states remain exact.
+calibration operations, or the union of the configured inclusive index ranges.
+Selection is applied independently to the write and erase domains named by
+`first_fault_types`; for example, range `0..8` selects those erase indices in an
+erase-only search. Address ranges restrict recovery operations that may become
+later cuts. Operations outside the ranges still update the computed prefix, so
+later states remain exact.
 
 For each recovery operation, the runner applies the completed prefix and the
 configured interrupted-write or interrupted-erase rule to an immutable NVM
@@ -1784,24 +1800,39 @@ practical limit. `max_new_states` bounds unique recovery boots and
 the boot, time, depth, and address limits.
 
 Every `cross_check_every`th newly booted two-cut state is also reproduced through
-the existing live two-fault injector. All persistent bytes and MRAM
-uncorrectable marks must match. The first mismatch aborts as an infrastructure
-error and names the first differing address. Three-cut and deeper states are
-not live-cross-checked because the existing injector accepts two cuts.
+the existing live two-fault injector, including an erase first cut when that is
+the chain's first operation. All persistent bytes and MRAM uncorrectable marks
+must match. The first mismatch aborts as an infrastructure error and names the
+first differing address. Three-cut and deeper states are not live-cross-checked
+because the existing injector accepts two cuts.
 
 Each returned result is an ordinary recovery result, so follow-up boots,
 hooks, assertions, and invariants run unchanged. `recovery_state_search`
 records the cut chain, generation, state identity, equivalent chains, and a
-pasteable `phase2_fault_pair_yaml` for a two-cut path. The batch summary keeps
+pasteable `phase2_fault_pair_yaml` for a two-cut path. `phase2_fault_yaml`
+includes the first and second fault types and is directly pasteable for an
+erase-first chain. The batch summary keeps
 single-cut and deeper-cut boot counts separate and reports operations
 considered, states computed, states booted and reused, cross-check totals, and
-bound exclusions.
+bound exclusions. It additionally reports selected, computed, booted, and
+reused states separately for program-first and erase-first roots. Canonical
+point accounting uses `state_search_single_cut` for program-first states and
+`state_search_single_cut_erase` for erase-first states.
 
 Second cuts support the `fast` and `mram` backend kinds. A point on a `slow`
 controller-backed `NVMemory` returns `phase2_unsupported_backend` before its
-first cut runs; OTP fault types are also not supported as recovery cuts.
+first cut runs; this applies to erase-first points too. Before an erase first
+cut, the live runner requires both the erase-trace interface and the
+interrupted-erase injection interface and raises
+`phase2 erase first cut is unsupported` with the missing capability. State
+search performs the same check in `_state_search_preflight` and refuses before
+loading or booting states. OTP backends have no erase domain.
 
-The first cut's persistent bytes and MRAM uncorrectable-word marks are restored
+The first cut draws `torn_word` or `mram_torn_word` with its own first-cut index,
+applies that outcome to either the interrupted program or erase, and records it
+as `phase2_fault.p1_torn_word` or `phase2_fault.p1_mram_torn_word`. The second
+cut draws and records its outcome independently. The first cut's persistent
+bytes and MRAM uncorrectable-word marks are restored
 together before the recovery boot. This applies to `MappedMRAMTracker` and
 directly selected `NVMemory`. If the recovery boot repairs a marked word, the
 repair clears that mark normally. After the second cut, its complete set of
@@ -2365,9 +2396,10 @@ runtime_sweep_results[]                 -- per-point detail
 ```
 
 The ordered `<kind>` identifiers are `single_cut_program`,
-`single_cut_erase`, `state_search_single_cut`, `two_cut_grid`,
-`two_cut_pairs`, `two_cut_state_search`, `deeper_cut`, `multi_fault`,
-`cascading`, `glitch_instruction_skip`, `read_fault`, `control`, and `other`.
+`single_cut_erase`, `state_search_single_cut`,
+`state_search_single_cut_erase`, `two_cut_grid`, `two_cut_pairs`,
+`two_cut_state_search`, `deeper_cut`, `multi_fault`, `cascading`,
+`glitch_instruction_skip`, `read_fault`, `control`, and `other`.
 State-search reuse is assigned by equivalent chain depth; reuse without chain
 metadata is conservatively assigned to `two_cut_state_search` and remains
 explicit in its `reused` count.
