@@ -62,7 +62,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             tracker.Reset();
             configValue = 0;
             wenSnapshot = null;
+            operationTraceShadow = null;
             wenWriteOffsets.Clear();
+            OperationTraceFastMode = false;
             memoryAccessHookInstalled = false;
             UpdateMemoryAccessHook(false);
         }
@@ -136,6 +138,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // Recovery boots already avoid the expensive full diff path via
         // SkipShadowScan, so this stays as a defined no-op.
         public bool PassthroughMode { get; set; }
+        // State-search recovery boots arm no write fault and need only the
+        // chronological operation trace. In that narrow mode, the CPU memory
+        // hook can record each aligned word directly instead of copying and
+        // comparing the entire flash at every WEN window.
+        private bool operationTraceFastMode;
+        private byte[] operationTraceShadow;
+        public bool OperationTraceFastMode
+        {
+            get => operationTraceFastMode;
+            set
+            {
+                operationTraceFastMode = value;
+                operationTraceShadow = value && Flash != null && FlashSize > 0
+                    ? Flash.ReadBytes(0, checked((int)FlashSize))
+                    : null;
+            }
+        }
         public void InvalidateShadow() { wenSnapshot = null; }
 
         // Read-fault injection stubs.  NRF52NVMC uses MappedMemory for CPU
@@ -191,6 +210,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             if(rel < 0)
             {
+                return;
+            }
+            if(OperationTraceFastMode && WriteTraceEnabled)
+            {
+                if(width != 4 || (rel & 3L) != 0 || rel > FlashSize - 4)
+                {
+                    throw new InvalidOperationException(
+                        "operation trace fast mode requires aligned 4-byte flash writes");
+                }
+                int off = (int)rel;
+                if(wenWriteOffsets.Count == 0 || wenWriteOffsets[wenWriteOffsets.Count - 1] != off)
+                {
+                    wenWriteOffsets.Add(off);
+                }
                 return;
             }
             int startAligned = (int)(rel & ~3L);
@@ -382,8 +415,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     // word-level precision?
                     // DiffLookahead == int.MaxValue forces always-diff mode
                     // (used during calibration to get accurate word counts).
+                    bool directOperationTrace = OperationTraceFastMode
+                        && WriteTraceEnabled
+                        && FaultAtWordWrite == ulong.MaxValue
+                        && WriteFaultMode == 0;
                     bool needDiff = !PassthroughMode && !AnyFaultFired
-                        && (WriteTraceEnabled
+                        && ((WriteTraceEnabled && !directOperationTrace)
                             || DiffLookahead == int.MaxValue
                             || (FaultAtWordWrite != ulong.MaxValue
                                 && TotalWordWrites + (ulong)DiffLookahead >= FaultAtWordWrite));
@@ -404,7 +441,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         }
                         else
                         {
-                            if(memoryAccessHookInstalled)
+                            if(directOperationTrace && !memoryAccessHookInstalled)
+                            {
+                                UpdateMemoryAccessHook(true);
+                            }
+                            else if(!directOperationTrace && memoryAccessHookInstalled)
                             {
                                 UpdateMemoryAccessHook(false);
                             }
@@ -539,6 +580,36 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                         break; // Stop counting further words.
                                     }
                                 }
+                            }
+                        }
+                        else if(directOperationTrace)
+                        {
+                            if(operationTraceShadow == null || operationTraceShadow.Length != FlashSize)
+                            {
+                                throw new InvalidOperationException(
+                                    "operation trace fast mode has no flash shadow");
+                            }
+                            for(int idx = 0; idx < wenWriteOffsets.Count; idx++)
+                            {
+                                int off = wenWriteOffsets[idx];
+                                var currentWord = Flash.ReadBytes(off, 4);
+                                bool changed = currentWord[0] != operationTraceShadow[off]
+                                    || currentWord[1] != operationTraceShadow[off + 1]
+                                    || currentWord[2] != operationTraceShadow[off + 2]
+                                    || currentWord[3] != operationTraceShadow[off + 3];
+                                if(!changed)
+                                {
+                                    continue;
+                                }
+                                uint val32 = (uint)(currentWord[0]
+                                    | (currentWord[1] << 8)
+                                    | (currentWord[2] << 16)
+                                    | (currentWord[3] << 24));
+                                tracker.RecordWriteAndCheckFault(off, val32, 4);
+                                operationTraceShadow[off] = currentWord[0];
+                                operationTraceShadow[off + 1] = currentWord[1];
+                                operationTraceShadow[off + 2] = currentWord[2];
+                                operationTraceShadow[off + 3] = currentWord[3];
                             }
                         }
                         else if(!AnyFaultFired)
@@ -705,6 +776,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                             }
                         }
                     }
+                    if(operationTraceShadow != null && Flash != null)
+                    {
+                        var offset = pageAddr - FlashBaseAddress;
+                        if(offset >= 0 && offset + PageSize <= FlashSize)
+                        {
+                            var currentPage = Flash.ReadBytes(offset, PageSize);
+                            Array.Copy(currentPage, 0, operationTraceShadow, offset, PageSize);
+                        }
+                    }
                 }, name: "ERASEPAGE");
 
             // ERASEALL at 0x50C.
@@ -740,6 +820,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                     }
                                 }
                                 Flash.WriteBytes(offset, fillData, 0, fillData.Length);
+                            }
+                            if(operationTraceShadow != null)
+                            {
+                                operationTraceShadow = Flash.ReadBytes(0, checked((int)FlashSize));
                             }
                         }
                     }

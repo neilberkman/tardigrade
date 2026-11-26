@@ -203,6 +203,19 @@ class RuntimeFaultSweepCalibrationTests(unittest.TestCase):
         self.assertTrue(accurate.EraseTraceEnabled)
         self.assertEqual(accurate.clears, ["shadow", "write", "erase"])
 
+        class DirectTraceBackend(Backend):
+            OperationTraceFastMode = False
+            DiffLookahead = 2147483647
+
+        direct = DirectTraceBackend()
+        namespace["_enable_fine_trace"](direct)
+        self.assertTrue(direct.OperationTraceFastMode)
+        self.assertEqual(direct.DiffLookahead, 32)
+        self.assertTrue(direct.SkipShadowScan)
+        self.assertTrue(direct.WriteTraceEnabled)
+        self.assertTrue(direct.EraseTraceEnabled)
+        self.assertEqual(direct.clears, ["write", "erase"])
+
         class CountOnlyBackend(Backend):
             PerWriteAccurate = False
 

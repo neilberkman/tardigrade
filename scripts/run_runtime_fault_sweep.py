@@ -17128,6 +17128,7 @@ def _state_search_capture_trace():
 
 
 def _state_search_enable_operation_trace(target):
+    trace_mode = 'backend_native'
     if backend.get('kind') == 'fast':
         required = ('DiffLookahead', 'SkipShadowScan', 'PassthroughMode')
         missing = [name for name in required if not hasattr(target, name)]
@@ -17137,13 +17138,21 @@ def _state_search_enable_operation_trace(target):
                     ', '.join(missing)
                 )
             )
-        target.DiffLookahead = 2147483647
-        target.SkipShadowScan = False
+        if hasattr(target, 'OperationTraceFastMode'):
+            target.OperationTraceFastMode = True
+            target.DiffLookahead = 32
+            target.SkipShadowScan = True
+            trace_mode = 'direct_cpu_write_hook'
+        else:
+            target.DiffLookahead = 2147483647
+            target.SkipShadowScan = False
+            trace_mode = 'full_flash_snapshot_diff'
         target.PassthroughMode = False
     target.WriteTraceClear()
     target.EraseTraceClear()
     target.WriteTraceEnabled = True
     target.EraseTraceEnabled = True
+    return trace_mode
 
 
 def _state_search_should_capture_trace(generation):
@@ -17193,8 +17202,9 @@ def _state_search_boot_state(state, chain, generation):
 
     target = _state_search_trace_target()
     capture_recovery_trace = _state_search_should_capture_trace(generation)
+    operation_trace_mode = 'disabled_terminal_generation'
     if capture_recovery_trace:
-        _state_search_enable_operation_trace(target)
+        operation_trace_mode = _state_search_enable_operation_trace(target)
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
     eff_criteria = get_effective_criteria('p2')
@@ -17218,6 +17228,8 @@ def _state_search_boot_state(state, chain, generation):
         if capture_recovery_trace:
             target.WriteTraceEnabled = False
             target.EraseTraceEnabled = False
+            if hasattr(target, 'OperationTraceFastMode'):
+                target.OperationTraceFastMode = False
     _state_breakdown = p2_status.setdefault('wall_time_breakdown', {})
     _state_breakdown['snapshot_copy_s'] = round(snapshot_copy_s, 6)
     _state_breakdown['boot_setup_s'] = round(
@@ -17234,6 +17246,7 @@ def _state_search_boot_state(state, chain, generation):
     _state_breakdown['trace_export_s'] = round(
         max(0.0, _time.time() - trace_export_started), 6
     )
+    _state_breakdown['operation_trace_mode'] = operation_trace_mode
     recovery_writes = get_total_writes()
     boot_ms = int((_time.time() - boot_started) * 1000)
 
@@ -17607,10 +17620,17 @@ def _enable_fine_trace(data):
     # InvalidateShadow implementation is harmless, and their direct hook
     # remains the authoritative recorder.
     if getattr(data, 'PerWriteAccurate', False):
-        if hasattr(data, 'SkipShadowScan'):
-            data.SkipShadowScan = False
-        if hasattr(data, 'InvalidateShadow'):
-            data.InvalidateShadow()
+        if hasattr(data, 'OperationTraceFastMode'):
+            data.OperationTraceFastMode = True
+            if hasattr(data, 'DiffLookahead'):
+                data.DiffLookahead = 32
+            if hasattr(data, 'SkipShadowScan'):
+                data.SkipShadowScan = True
+        else:
+            if hasattr(data, 'SkipShadowScan'):
+                data.SkipShadowScan = False
+            if hasattr(data, 'InvalidateShadow'):
+                data.InvalidateShadow()
     data.WriteTraceClear()
     data.WriteTraceEnabled = True
     if hasattr(data, 'EraseTraceClear'):

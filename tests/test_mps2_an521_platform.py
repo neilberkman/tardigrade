@@ -257,7 +257,13 @@ class Mps2An521PlatformTest(unittest.TestCase):
         nrf = (ROOT / "peripherals/NRF52NVMC.cs").read_text(encoding="utf-8")
         self.assertIn("public bool WriteTraceWidthExplicit => true;", nrf)
         self.assertIn("tracker.RecordWriteAndCheckFault(off, val32, 4)", nrf)
-        self.assertIn("&& (WriteTraceEnabled", nrf)
+        self.assertIn("public bool OperationTraceFastMode", nrf)
+        self.assertIn(
+            "operationTraceShadow = value && Flash != null && FlashSize > 0",
+            nrf,
+        )
+        self.assertIn("tracker.RecordWriteAndCheckFault(off, val32, 4)", nrf)
+        self.assertIn("(WriteTraceEnabled && !directOperationTrace)", nrf)
 
 
 if __name__ == "__main__":

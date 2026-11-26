@@ -129,6 +129,13 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertTrue(target.EraseTraceEnabled)
         self.assertEqual(target.cleared, ["write", "erase"])
 
+        target.OperationTraceFastMode = False
+        mode = namespace["_state_search_enable_operation_trace"](target)
+        self.assertEqual(mode, "direct_cpu_write_hook")
+        self.assertTrue(target.OperationTraceFastMode)
+        self.assertEqual(target.DiffLookahead, 32)
+        self.assertTrue(target.SkipShadowScan)
+
     def test_clr_byte_conversion_accepts_ironpython_byte_strings(self) -> None:
         tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
         function = next(
