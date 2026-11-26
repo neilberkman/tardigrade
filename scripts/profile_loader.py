@@ -9546,10 +9546,10 @@ def _load_profile(
             "Invalid scenario '{}'. Valid: {}".format(scenario, sorted(VALID_SCENARIOS))
         )
 
-    # Guard: execute mode on pure NVMemory platforms is unfeasible — every CPU
-    # instruction fetch crosses the tlib↔C# boundary, making emulation
-    # ~300x slower than MappedMemory.  Hybrid platforms (MappedMemory for code,
-    # NVMemory only for metadata) are fine.
+    # Guard: Renode 1.16 cannot execute from the dynamically compiled
+    # NVMemory peripheral. Instruction fetch aborts before the first
+    # instruction and that release can leave RunFor blocked. Hybrid platforms
+    # (MappedMemory for code, NVMemory only for persistent data) are fine.
     if (
         fault_sweep.evaluation_mode == "execute"
         and "nvm" in platform
@@ -9558,7 +9558,7 @@ def _load_profile(
     ):
         raise ProfileError(
             "evaluation_mode 'execute' is incompatible with NVMemory platform '{}'. "
-            "NVMemory instruction fetch is too slow for CPU emulation. "
+            "NVMemory is not executable by the supported Renode runtime. "
             "Use evaluation_mode 'state' or switch to a MappedMemory/hybrid platform.".format(platform)
         )
 

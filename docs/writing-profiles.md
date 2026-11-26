@@ -1266,7 +1266,7 @@ fault_sweep:
   progress_stall_timeout_s: 10.0 # emulated-time threshold for zero-progress stall detection
 ```
 
-`phase2_time_slice` controls the emulation time per slice during Phase 2 recovery boot. Defaults to the calibration slice. Larger values mean fewer IPC round-trips but coarser progress detection. `phase2_wall_timeout_s` bounds the wall-clock time for each regular execute/replay recovery boot and defaults to 30 seconds. The outer Renode/Robot timeout remains the hard cap for the run. Specialized Phase 2 fault-injection paths may use their own larger budget. `progress_stall_timeout_s` is the amount of emulated time with no change in the tracked progress signals before the boot is considered stalled. A terminal `no_boot_stall(...)` or `no_progress_stall(...)` observation is treated as `no_boot` when no valid execution is observed. Exhausting the configured emulation, instruction, or wall-clock limit produces a `timeout` outcome and marks the observation incomplete. A captured PC or VTOR proves progress but does not, by itself, prove that the boot completed. Content mismatches observed at a limit remain supporting evidence and are not promoted to findings until a terminal boot result is captured.
+`phase2_time_slice` controls the emulation time per slice during Phase 2 recovery boot. Defaults to the calibration slice. Larger values mean fewer IPC round-trips but coarser progress detection. `phase2_wall_timeout_s` bounds the wall-clock time for each regular execute/replay recovery boot and defaults to 30 seconds. The outer Renode/Robot timeout remains the hard cap for the run. Specialized Phase 2 fault-injection paths may use their own larger budget. Before every `RunFor`, the runner rejects an instruction fetch from the dynamically compiled `NVMemory` storage peripheral because Renode 1.16.1 hangs on that path. Unmapped addresses, architectural lockup addresses, and other non-memory peripherals remain firmware observations for the existing outcome evaluator. Each call also has a wall-clock watchdog that halts and pauses the machine. An `NVMemory` instruction fetch, a `RunFor` exception, or a watchdog expiration produces a per-point `infra_error` with the PC and diagnostic instead of leaving the batch to its outer timeout. `progress_stall_timeout_s` is the amount of emulated time with no change in the tracked progress signals before the boot is considered stalled. A terminal `no_boot_stall(...)` or `no_progress_stall(...)` observation is treated as `no_boot` when no valid execution is observed. Exhausting the configured emulation, instruction, or wall-clock limit produces a `timeout` outcome and marks the observation incomplete. A captured PC or VTOR proves progress but does not, by itself, prove that the boot completed. Content mismatches observed at a limit remain supporting evidence and are not promoted to findings until a terminal boot result is captured.
 
 ### Write-back durability model
 
@@ -1776,11 +1776,15 @@ later states remain exact.
 For each recovery operation, the runner applies the completed prefix and the
 configured interrupted-write or interrupted-erase rule to an immutable NVM
 state. It evaluates a canonical state only once. Identity includes every byte
-of the direct NVM backend and every MRAM uncorrectable-word mark. A separate
-NVM controller, a separate OTP peripheral, writeback durability, a slow
-backend, or a backend without width-explicit per-write-accurate write and
-erase traces is refused before the search. Those cases may retain persistent
-data that the canonical state cannot include completely.
+of the direct NVM backend and every MRAM uncorrectable-word mark. A
+controller-backed `slow` backend can participate when its backing `Nvm` owns
+the complete persistent state and supplies the same snapshot and trace
+contract. A separate persistent NVM controller, a separate OTP peripheral,
+writeback durability, or a backend without width-explicit per-write-accurate
+write and erase traces is refused before the search. Because `state_search`
+uses execute mode, code must also run from directly executable memory; a pure
+`NVMemory` instruction-fetch platform is rejected at profile load time. These
+checks prevent the canonical state from omitting persistent data.
 
 NVM is divided into fixed 4 KiB chunks. A write replaces only the affected
 chunks and updates their Merkle ancestors; the SHA-256 state identity then
@@ -1819,14 +1823,19 @@ reused states separately for program-first and erase-first roots. Canonical
 point accounting uses `state_search_single_cut` for program-first states and
 `state_search_single_cut_erase` for erase-first states.
 
-Second cuts support the `fast` and `mram` backend kinds. A point on a `slow`
-controller-backed `NVMemory` returns `phase2_unsupported_backend` before its
-first cut runs; this applies to erase-first points too. Before an erase first
-cut, the live runner requires both the erase-trace interface and the
-interrupted-erase injection interface and raises
-`phase2 erase first cut is unsupported` with the missing capability. State
-search performs the same check in `_state_search_preflight` and refuses before
-loading or booting states. OTP backends have no erase domain.
+Second cuts support the `fast`, `mram`, and controller-backed `slow` backend
+kinds, with two controller-specific limits. In state evaluation, a program
+power-loss pair applies the first interrupted copy, the recovery copy with its
+second interruption, and the final uninterrupted recovery copy to the same
+persistent `Nvm` bytes. Other second-cut fault types return
+`phase2_state_mode_fault_type_unsupported`. In execute evaluation, all three
+boots use the controller's backing `Nvm` for snapshot and restore, but the CPU
+code must live in directly executable memory; therefore pure `NVMemory` boot
+platforms remain refused while hybrid code-plus-controller-storage platforms
+are supported. Erase-first live points require both the erase-trace interface
+and the interrupted-erase injection interface; controller-backed and OTP
+storage fail that capability check before loading or booting states. OTP fault
+types are not supported as recovery cuts.
 
 The first cut draws `torn_word` or `mram_torn_word` with its own first-cut index,
 applies that outcome to either the interrupted program or erase, and records it

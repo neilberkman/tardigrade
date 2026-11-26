@@ -8,6 +8,11 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Added
 
+- Controller-backed `NVMemory` support for two-cut state campaigns and for
+  execute-mode recovery on hybrid platforms, including all three persistent
+  segments and qualifying recovery-state searches. Every Renode `RunFor` now
+  rejects `NVMemory` instruction fetches known to hang Renode 1.16.1 and has a
+  wall watchdog that reports the PC as a per-point infrastructure error.
 - An MCUboot PR #3011 swap-offset differential for issue #3010, with tracked
   assertion-enabled v2.5.0 and fixed nRF52840 ELFs, two-sector 6 kB revert
   images, and the exact interrupted-fixup-erase regression pair.
