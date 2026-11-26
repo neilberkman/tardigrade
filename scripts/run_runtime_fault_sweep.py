@@ -8267,6 +8267,18 @@ def collect_recovery_execution_evidence(
         allow_fault_after_success = bool(allow_fault_after_success)
     reason = str(p2_status.get('reason', '') or '')
     evidence = {'stop_reason': reason}
+    if p2_status.get('infrastructure_error'):
+        evidence['infrastructure_error'] = True
+        evidence['error_kind'] = p2_status.get(
+            'error_kind', 'runfor_infrastructure_error'
+        )
+        evidence['error'] = p2_status.get(
+            'error', 'RunFor infrastructure error'
+        )
+        if p2_status.get('error_pc') is not None:
+            evidence['error_pc'] = p2_status['error_pc']
+        if p2_status.get('error_peripheral') is not None:
+            evidence['error_peripheral'] = p2_status['error_peripheral']
 
     active_exception = 0
     _cpu_obs = None
@@ -8546,6 +8558,8 @@ def recovery_failure_outcome(
     """Return a primary execution failure before evaluating image identity."""
     if not execution_evidence:
         return None
+    if execution_evidence.get('infrastructure_error'):
+        return 'infra_error'
     reason = str(execution_evidence.get('stop_reason', '') or '').lower()
     if execution_evidence.get('lockup_observed'):
         return 'hard_fault'
@@ -9818,6 +9832,118 @@ def _ensure_interrupt_begin_hook(cpu_ref):
         return False
 
 
+def _runfor_fetch_preflight(cpu_ref):
+    """Reject instruction fetches from NVMemory, which hang Renode 1.16.1."""
+    pc = as_int(cpu_ref.GetRegisterUnsafe(15)) & ~1
+    try:
+        peripheral = bus.WhatPeripheralIsAt(pc)
+    except Exception:
+        # Mapping inspection is advisory. RunFor and the existing outcome
+        # evaluator remain authoritative for ordinary firmware fetch faults.
+        return None
+    if peripheral is None:
+        return None
+
+    try:
+        peripheral_type = peripheral.GetType()
+        type_name = str(peripheral_type.FullName)
+    except Exception:
+        return None
+    if not type_name.endswith('.NVMemory'):
+        return None
+    return {
+        'error_kind': 'instruction_fetch_non_executable_peripheral',
+        'pc': fmt_u32(pc),
+        'peripheral': type_name,
+        'message': (
+            'Trying to execute code outside RAM or ROM at {} '
+            '(peripheral {} is not executable by this Renode build)'
+        ).format(fmt_u32(pc), type_name),
+    }
+
+
+def _run_for_with_watchdog(cpu_ref, duration, wall_timeout_s, label=''):
+    """Run one emulation slice with fetch validation and a wall watchdog."""
+    fetch_error = _runfor_fetch_preflight(cpu_ref)
+    if fetch_error is not None:
+        return fetch_error
+
+    try:
+        watchdog_s = max(0.05, float(wall_timeout_s))
+    except Exception:
+        watchdog_s = 30.0
+    state = {'fired': False, 'pc': None, 'pause_error': None}
+
+    def stop_stalled_runfor():
+        state['fired'] = True
+        try:
+            state['pc'] = fmt_u32(
+                as_int(cpu_ref.GetRegisterUnsafe(15)) & ~1
+            )
+        except Exception:
+            state['pc'] = None
+        try:
+            cpu_ref.IsHalted = True
+        except Exception:
+            pass
+        try:
+            monitor.Machine.Pause()
+        except Exception as exc:
+            state['pause_error'] = str(exc)
+
+    import threading as _runfor_threading
+    watchdog = _runfor_threading.Timer(watchdog_s, stop_stalled_runfor)
+    watchdog.daemon = True
+    watchdog.start()
+    started = _time.time()
+    runfor_exception = None
+    try:
+        monitor.Parse('emulation RunFor "{}"'.format(duration))
+    except Exception as exc:
+        runfor_exception = exc
+    finally:
+        watchdog.cancel()
+    if runfor_exception is not None and not state['fired']:
+        return {
+            'error_kind': 'runfor_exception',
+            'pc': fmt_u32(as_int(cpu_ref.GetRegisterUnsafe(15)) & ~1),
+            'message': 'RunFor failed: {}'.format(runfor_exception),
+        }
+    if not state['fired']:
+        return None
+    pc = state['pc'] or fmt_u32(as_int(cpu_ref.GetRegisterUnsafe(15)) & ~1)
+    message = 'RunFor watchdog expired after {:.3f}s at PC={}'.format(
+        _time.time() - started, pc
+    )
+    if state['pause_error']:
+        message += '; machine pause failed: {}'.format(state['pause_error'])
+    if runfor_exception is not None:
+        message += '; RunFor stopped with: {}'.format(runfor_exception)
+    return {
+        'error_kind': 'runfor_watchdog',
+        'pc': pc,
+        'message': message,
+    }
+
+
+def _runfor_error_status(error):
+    """Convert a bounded RunFor error into the standard stop-status fields."""
+    status = {
+        'reason': 'runfor_infrastructure_error',
+        'infrastructure_error': True,
+        'error_kind': error.get(
+            'error_kind', 'runfor_infrastructure_error'
+        ),
+        'error': error.get('message', 'RunFor infrastructure error'),
+    }
+    if error.get('pc') is not None:
+        status['error_pc'] = error['pc']
+        status['pc'] = error['pc']
+    if error.get('peripheral') is not None:
+        status['error_peripheral'] = error['peripheral']
+    return status
+
+
 def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, label='',
                    expect_writes=True, stop_on_fault=True, op_trace=None, op_trace_limit=0,
                    zero_writes_is_brick=True, vtor_settle_iters=0,
@@ -9845,6 +9971,15 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     terminal_after_reset = bool(
         globals().get('success_terminal_after_reset', False)
     )
+    runfor_guard = globals().get('_run_for_with_watchdog')
+    if runfor_guard is None:
+        # Unit tests execute this function in isolation from its module. The
+        # complete runtime always provides the guarded implementation above.
+        def runfor_guard(_cpu_ref, duration, _wall_timeout_s, label=''):
+            getattr(monitor, 'Parse')(
+                'emulation RunFor "{}"'.format(duration)
+            )
+            return None
     limit_resolution = globals().get('max_step_limit_resolution') or {
         'configured': max_step_limit,
         'source': 'profile',
@@ -9927,6 +10062,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         slice_s = 0.02
     emulated_s = 0.0
     reason = 'budget'
+    runfor_infrastructure_error = None
     console_fatal = None
     iters = 0
     trace_limit_hit = False
@@ -10705,7 +10841,16 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     try:
         for iters in range(max_iters):
             fault_timing_state['current_iter'] = iters + 1
-            monitor.Parse('emulation RunFor "{}"'.format(time_slice))
+            remaining_wall_s = max(0.05, float(wall_timeout) - (_time.time() - t0))
+            runfor_infrastructure_error = runfor_guard(
+                cpu_ref,
+                time_slice,
+                min(120.0, remaining_wall_s),
+                label=label,
+            )
+            if runfor_infrastructure_error is not None:
+                reason = 'runfor_infrastructure_error'
+                break
             emulated_s += slice_s
             timing_counters['emulated_s'] = emulated_s
             native_stop_sync = globals().get('_sync_native_calibration_stop')
@@ -10883,7 +11028,15 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                     # First capture.
                     if vtor_settle_iters == 0:
                         # Immediate stop (default/sweep behavior).
-                        monitor.Parse('emulation RunFor "0.005"')
+                        runfor_infrastructure_error = runfor_guard(
+                            cpu_ref,
+                            '0.005',
+                            30.0,
+                            label='{}_post_vtor'.format(label),
+                        )
+                        if runfor_infrastructure_error is not None:
+                            reason = 'runfor_infrastructure_error'
+                            break
                         if _post_vtor_fault_active():
                             # Fault active after VTOR capture. Only flag as hardfault if
                             # VTOR is NOT in the expected slot — post-handoff fault is the
@@ -10912,7 +11065,15 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                                 sticky_vtor['value'] = vtor_final
                                 sticky_vtor['slot'] = sn
                                 break
-                    monitor.Parse('emulation RunFor "0.005"')
+                    runfor_infrastructure_error = runfor_guard(
+                        cpu_ref,
+                        '0.005',
+                        30.0,
+                        label='{}_post_vtor_settle'.format(label),
+                    )
+                    if runfor_infrastructure_error is not None:
+                        reason = 'runfor_infrastructure_error'
+                        break
                     if _post_vtor_fault_active():
                         _vtor_expected = False
                         if success_vtor_slot == 'any':
@@ -11085,8 +11246,15 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                         sticky_vtor['value'] = vtor_final
                         sticky_vtor['slot'] = sn
                         break
-            monitor.Parse('emulation RunFor "0.005"')
-            if _post_vtor_fault_active():
+            runfor_infrastructure_error = runfor_guard(
+                cpu_ref,
+                '0.005',
+                30.0,
+                label='{}_post_budget_vtor'.format(label),
+            )
+            if runfor_infrastructure_error is not None:
+                reason = 'runfor_infrastructure_error'
+            elif _post_vtor_fault_active():
                 _vtor_expected = False
                 if success_vtor_slot == 'any':
                     _vtor_expected = sticky_vtor.get('slot') is not None
@@ -11178,6 +11346,20 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         'reset_observation': reset_observation,
         'fault_timing': _build_fault_timing_snapshot(),
     }
+    if runfor_infrastructure_error is not None:
+        status['infrastructure_error'] = True
+        status['error_kind'] = runfor_infrastructure_error.get(
+            'error_kind', 'runfor_infrastructure_error'
+        )
+        status['error'] = runfor_infrastructure_error.get(
+            'message', 'RunFor infrastructure error'
+        )
+        if runfor_infrastructure_error.get('pc') is not None:
+            status['error_pc'] = runfor_infrastructure_error['pc']
+        if runfor_infrastructure_error.get('peripheral') is not None:
+            status['error_peripheral'] = runfor_infrastructure_error[
+                'peripheral'
+            ]
     if success_terminal_observation is not None:
         status['reset_gated_terminal'] = success_terminal_observation
         if success_terminal_observation.get('boot_outcome') == 'success':
@@ -11985,7 +12167,35 @@ def run_timed_reset_fault(fault_at):
     frac = 0.0 if max_fp <= 0 else min(1.0, max(0.0, float(fault_at) / float(max_fp)))
     trigger_s = max(0.005, min(duration_s * 0.95, frac * duration_s))
     log('fp={} type=t trigger_s={:.3f} frac={:.3f}'.format(fault_at, trigger_s, frac))
-    monitor.Parse('emulation RunFor "{:.3f}"'.format(trigger_s))
+    trigger_error = _run_for_with_watchdog(
+        cpu_ref,
+        '{:.3f}'.format(trigger_s),
+        30.0,
+        label='fp{}_timed_trigger'.format(fault_at),
+    )
+    if trigger_error is not None:
+        trigger_status = _runfor_error_status(trigger_error)
+        boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+            as_int(bus.ReadDoubleWord(0xE000ED08)),
+            as_int(cpu_ref.GetRegisterUnsafe(15)),
+            fault_injected=False,
+            effective_criteria=eff_criteria,
+            p2_status=trigger_status,
+        )
+        merge_stop_status_signals(signals, 'phase1', trigger_status)
+        return _build_fault_result(
+            fault_at,
+            't',
+            False,
+            0,
+            get_total_writes(),
+            signals,
+            boot_outcome=boot_outcome,
+            boot_slot=boot_slot,
+            eff_criteria=eff_criteria,
+            p2_status=trigger_status,
+            skip_followup_if_failed=True,
+        )
 
     fault_injected = True
     fault_address = 0
@@ -12376,6 +12586,16 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
     fault_class = classify_fault_result(
         boot_outcome, boot_slot, signals, effective_criteria=eff_criteria
     )
+    runfor_error_status = (
+        p2_status
+        if isinstance(p2_status, dict)
+        and p2_status.get('infrastructure_error')
+        else None
+    )
+    if runfor_error_status is not None:
+        boot_outcome = 'infra_error'
+        fault_class = 'infrastructure_error'
+        skip_followup_if_failed = True
     # Shared entry/return probe telemetry is collected for every execute-mode
     # result, including control runs and non-instruction faults.
     merge_verification_probe_signals(signals)
@@ -12462,6 +12682,20 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         'actual_writes': actual_writes,
         'signals': signals,
     }
+    if runfor_error_status is not None:
+        result['infrastructure_error'] = True
+        result['error_kind'] = runfor_error_status.get(
+            'error_kind', 'runfor_infrastructure_error'
+        )
+        result['error'] = runfor_error_status.get(
+            'error', 'RunFor infrastructure error'
+        )
+        if runfor_error_status.get('error_pc') is not None:
+            result['error_pc'] = runfor_error_status['error_pc']
+        if runfor_error_status.get('error_peripheral') is not None:
+            result['error_peripheral'] = runfor_error_status[
+                'error_peripheral'
+            ]
     _op_kind_fn = globals().get('_operation_kind_for_fault_type')
     if callable(_op_kind_fn):
         _op_kind = _op_kind_fn(fault_type)
@@ -14116,8 +14350,18 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         frac = 0.0 if max_fp <= 0 else min(1.0, max(0.0, float(p1_fault_at) / float(max_fp)))
         trigger_s = max(0.005, min(duration_s * 0.95, frac * duration_s))
         log('p2fault p1={} type=t trigger_s={:.3f}'.format(p1_fault_at, trigger_s))
-        monitor.Parse('emulation RunFor "{:.3f}"'.format(trigger_s))
-        p1_injected = True  # Timed resets always "inject".
+        trigger_error = _run_for_with_watchdog(
+            cpu_ref,
+            '{:.3f}'.format(trigger_s),
+            30.0,
+            label='p2fault_p1_{}_timed'.format(p1_fault_at),
+        )
+        p1_status = (
+            _runfor_error_status(trigger_error)
+            if trigger_error is not None
+            else None
+        )
+        p1_injected = trigger_error is None
         p1_ops = get_total_writes()
     elif is_p1_erase:
         erase_mode = 1 if p1_fault_type == 'a' else 0
@@ -14166,6 +14410,50 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
 
     log('p2fault p1={}/{} phase1_done injected={} ops={}'.format(
         p1_fault_at, p1_fault_type, p1_injected, p1_ops))
+
+    if p1_status is not None and p1_status.get('infrastructure_error'):
+        signals = {
+            'phase1_ms': phase1_ms,
+            'phase2_ms': 0,
+            'phase3_ms': 0,
+            'trace_replay_mode': 'execute',
+        }
+        merge_stop_status_signals(signals, 'phase1', p1_status)
+        result = {
+            'fault_at': p1_fault_at,
+            'fault_requested': p1_fault_at,
+            'fault_type': 'p2',
+            'fault_injected': False,
+            'fault_address': fmt_u32(p1_fault_address),
+            'boot_outcome': 'infra_error',
+            'boot_slot': None,
+            'fault_class': 'infrastructure_error',
+            'actual_writes': p1_ops,
+            'signals': signals,
+            'infrastructure_error': True,
+            'error_kind': p1_status.get(
+                'error_kind', 'runfor_infrastructure_error'
+            ),
+            'error': p1_status.get('error', 'RunFor infrastructure error'),
+            'phase2_fault': {
+                'p1_fault_at': p1_fault_at,
+                'p2_fault_at': p2_fault_at,
+                'p1_fault_type': p1_fault_type,
+                'p2_fault_type': p2_fault_type,
+                'p1_injected': False,
+                'p2_injected': False,
+                'p1_fault_address': fmt_u32(p1_fault_address),
+                'p2_fault_address': fmt_u32(0),
+                'skip_reason': 'phase1_runfor_infrastructure_error',
+                'p2_total_ops': 0,
+                'p2_max_fault_index': -1,
+            },
+        }
+        if p1_status.get('error_pc') is not None:
+            result['error_pc'] = p1_status['error_pc']
+        if p1_status.get('error_peripheral') is not None:
+            result['error_peripheral'] = p1_status['error_peripheral']
+        return result
 
     if p1_injected:
         p1_uncorrectable_offsets = _snapshot_mram_fault_uncorrectable_offsets()
@@ -14261,8 +14549,20 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         p2_trigger_s = max(0.005, min(duration_s * 0.95, p2_frac * duration_s))
         log('p2fault p1={} p2={} type=t trigger_s={:.3f}'.format(
             p1_fault_at, p2_fault_at, p2_trigger_s))
-        monitor.Parse('emulation RunFor "{:.3f}"'.format(p2_trigger_s))
-        p2_injected = True  # Timed resets always "inject".
+        trigger_error = _run_for_with_watchdog(
+            cpu_ref,
+            '{:.3f}'.format(p2_trigger_s),
+            30.0,
+            label='p2fault_p2_{}_{}_timed'.format(
+                p1_fault_at, p2_fault_at
+            ),
+        )
+        p2_status = (
+            _runfor_error_status(trigger_error)
+            if trigger_error is not None
+            else None
+        )
+        p2_injected = trigger_error is None
         p2_ops = get_total_writes()
     elif is_p2_erase:
         erase_mode = 1 if p2_fault_type == 'a' else 0
@@ -14446,10 +14746,22 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     if p3_status is not None:
         merge_stop_status_signals(signals, 'phase3', p3_status)
 
+    runfor_error_status = next(
+        (
+            status for status in (p3_status, p2_status, p1_status)
+            if isinstance(status, dict)
+            and status.get('infrastructure_error')
+        ),
+        None,
+    )
+    if runfor_error_status is not None:
+        boot_outcome = 'infra_error'
+        boot_slot = None
+
     boot_cycle_records = None
     multi_boot_analysis = None
     followup_ms = 0
-    if p2_injected:
+    if p2_injected and runfor_error_status is None:
         boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
             boot_outcome,
             boot_slot,
@@ -14506,6 +14818,20 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
             'recovery_boot_signals': recovery_boot_signals,
         },
     }
+    if runfor_error_status is not None:
+        result['infrastructure_error'] = True
+        result['error_kind'] = runfor_error_status.get(
+            'error_kind', 'runfor_infrastructure_error'
+        )
+        result['error'] = runfor_error_status.get(
+            'error', 'RunFor infrastructure error'
+        )
+        if runfor_error_status.get('error_pc') is not None:
+            result['error_pc'] = runfor_error_status['error_pc']
+        if runfor_error_status.get('error_peripheral') is not None:
+            result['error_peripheral'] = runfor_error_status[
+                'error_peripheral'
+            ]
     if p1_torn_word is not None:
         result['mram_torn_word'] = p1_torn_word
         result['phase2_fault']['p1_mram_torn_word'] = p1_torn_word

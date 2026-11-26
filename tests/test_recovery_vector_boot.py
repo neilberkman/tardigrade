@@ -230,9 +230,19 @@ def test_runtime_erased_vector_and_real_lockup_classify_identically():
     import time as _time
 
     def _run_scenario(mode: str, allow_fault_after_success: bool = False):
+        initial_pc = {
+            "initial_erased_vector": 0xFFFFFFFE,
+            "initial_lockup": 0xEFFFFFFE,
+            "initial_unmapped": 0xDEADBEEE,
+            "initial_register_peripheral": 0x40001000,
+        }.get(mode, 0x10000040)
         state = {
-            "pc": 0x10000040,
-            "vtor": 0x10000000,
+            "pc": initial_pc,
+            "vtor": (
+                0
+                if mode in ("initial_unmapped", "initial_register_peripheral")
+                else 0x10000000
+            ),
             "ipsr": 0,
             "insns": 10,
             "pending": None,
@@ -285,6 +295,8 @@ def test_runtime_erased_vector_and_real_lockup_classify_identically():
                 state["irq_hooks"].append(cb)
 
         cpu = FakeCpu()
+        if mode == "initial_lockup":
+            cpu.IsLockedUp = True
         nvic = FakeNvic()
 
         class FakeBus:
@@ -294,6 +306,19 @@ def test_runtime_erased_vector_and_real_lockup_classify_identically():
                 if addr in (0xE000ED28, 0xE000ED2C):
                     return 0
                 return vectors.get(int(addr), 0)
+
+            def WhatPeripheralIsAt(self, addr):
+                if 0x10000000 <= int(addr) < 0x10001000:
+                    type_name = "Antmicro.Renode.Peripherals.Memory.MappedMemory"
+                elif mode == "initial_register_peripheral" and int(addr) == 0x40001000:
+                    type_name = "Antmicro.Renode.Peripherals.UART.NS16550"
+                else:
+                    return None
+                runtime_type = SimpleNamespace(
+                    FullName=type_name,
+                    GetInterfaces=lambda: [],
+                )
+                return SimpleNamespace(GetType=lambda: runtime_type)
 
         def parse_cmd(cmd: str):
             if not cmd.startswith("emulation RunFor"):
@@ -345,7 +370,7 @@ def test_runtime_erased_vector_and_real_lockup_classify_identically():
             "expect_control_outcome": "success",
             "phase1_time_slice": "0.02",
             "max_step_limit": 100000,
-            "progress_stall_timeout_s": 0.2,
+            "progress_stall_timeout_s": 0.04,
             "no_boot_zero_write_slices": 10,
             "no_boot_min_emulated_s": 0.1,
             "calibration_mode": False,
@@ -383,48 +408,73 @@ def test_runtime_erased_vector_and_real_lockup_classify_identically():
             "boot_outcome_after_stop": lambda outcome, stop_reason: outcome,
         }
         _load_runtime_functions(
+            "_runfor_fetch_preflight",
+            "_run_for_with_watchdog",
             "run_until_done",
             "collect_recovery_execution_evidence",
             "recovery_failure_outcome",
             "evaluate_boot_outcome",
+            "classify_fault_result",
             namespace=ns,
         )
         status = ns["run_until_done"](cpu, time_slice="0.02", max_iters=5)
         outcome, _slot, signals = ns["evaluate_boot_outcome"](
             state["vtor"], state["pc"], fault_injected=True, p2_status=status
         )
-        return status, outcome, signals, state, cpu
+        fault_class = ns["classify_fault_result"](outcome, _slot, signals)
+        return status, outcome, fault_class, signals, state, cpu
 
-    st_real, out_real, sig_real, _, cpu_real = _run_scenario("real_lockup")
+    st_real, out_real, class_real, sig_real, _, cpu_real = _run_scenario("real_lockup")
     assert st_real["reason"] == "cpu_lockup"
     assert out_real == "hard_fault"
+    assert class_real == "unrecoverable"
     assert sig_real["recovery_execution"]["lockup_observed"] is True
     assert sig_real["recovery_execution"].get("erased_vector_lockup") is None
     assert cpu_real.IsHalted is True
 
-    st_hf, out_hf, sig_hf, state_hf, cpu_hf = _run_scenario(
+    st_hf, out_hf, class_hf, sig_hf, state_hf, cpu_hf = _run_scenario(
         "erased_hf", allow_fault_after_success=True
     )
     assert st_hf["reason"] == "lockup_erased_vector"
     assert out_hf == out_real == "hard_fault"
+    assert class_hf == class_real == "unrecoverable"
     assert sig_hf["recovery_execution"]["lockup_observed"] is True
     assert sig_hf["recovery_execution"]["erased_vector_lockup"] is True
     assert state_hf["acked"] == 1
     assert cpu_hf.IsHalted is True
 
-    st_boot, out_boot, sig_boot, _, cpu_boot = _run_scenario("boot_erased_reset")
+    st_boot, out_boot, class_boot, sig_boot, _, cpu_boot = _run_scenario(
+        "boot_erased_reset"
+    )
     assert st_boot["reason"] == "lockup_erased_vector"
     assert st_boot["iters"] == 0
     assert out_boot == out_real == "hard_fault"
+    assert class_boot == class_real == "unrecoverable"
     assert sig_boot["recovery_execution"]["lockup_observed"] is True
     assert sig_boot["recovery_execution"]["erased_vector_lockup"] is True
     assert cpu_boot.IsHalted is True
 
-    st_loop, out_loop, sig_loop, _, _ = _run_scenario("exc_return_zero_progress")
+    st_loop, out_loop, class_loop, sig_loop, _, _ = _run_scenario(
+        "exc_return_zero_progress"
+    )
     assert st_loop["reason"] == "lockup_erased_vector"
     assert out_loop == out_real == "hard_fault"
+    assert class_loop == class_real == "unrecoverable"
     assert sig_loop["recovery_execution"]["lockup_observed"] is True
     assert sig_loop["recovery_execution"]["erased_vector_lockup"] is True
+
+    for mode in ("initial_erased_vector", "initial_lockup"):
+        status, outcome, fault_class, signals, _, _ = _run_scenario(mode)
+        assert status["reason"] in ("lockup_erased_vector", "cpu_lockup")
+        assert outcome == "hard_fault"
+        assert fault_class == "unrecoverable"
+        assert signals["recovery_execution"]["lockup_observed"] is True
+
+    for mode in ("initial_unmapped", "initial_register_peripheral"):
+        status, outcome, fault_class, _, _, _ = _run_scenario(mode)
+        assert status["reason"].startswith("no_boot_stall")
+        assert outcome == "no_boot"
+        assert fault_class == "unrecoverable"
 
 
 def test_erased_vector_fixture_loads_and_targets_erased_reset_and_hardfault():
