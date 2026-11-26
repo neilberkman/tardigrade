@@ -352,6 +352,58 @@ class Phase2FaultPairGenerationTest(unittest.TestCase):
                     self.assertEqual(plan.fault_points, expected_points)
                     self.assertEqual(plan.fault_types_list, expected_types)
 
+    def test_erase_first_pairs_and_representative_grid_use_erase_indices(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            explicit_path = _write_profile(td, textwrap.dedent("""\
+                fault_sweep:
+                  mode: runtime
+                  max_writes: auto
+                  fault_types: [power_loss]
+                  include_erase_fault_points: true
+                  phase2_fault:
+                    enabled: true
+                    first_fault_types: [interrupted_erase]
+                    fault_types: [power_loss]
+                    pairs: [[3, 7]]
+            """))
+            explicit = build_fault_plan(
+                profile=load_profile(explicit_path),
+                calibration=CalibrationInputs(max_writes=20, total_erases=9),
+            )
+            explicit_phase2 = [
+                (point, fault_type)
+                for point, fault_type in zip(
+                    explicit.fault_points, explicit.fault_types_list or []
+                )
+                if fault_type.startswith("p2:")
+            ]
+            self.assertEqual(explicit_phase2, [(3, "p2:3:7:e:w")])
+
+            grid_path = Path(td) / "grid.yaml"
+            grid_path.write_text(
+                explicit_path.read_text(encoding="utf-8").replace(
+                    "    pairs: [[3, 7]]\n", ""
+                ),
+                encoding="utf-8",
+            )
+            grid = build_fault_plan(
+                profile=load_profile(grid_path),
+                calibration=CalibrationInputs(max_writes=20, total_erases=9),
+                quick=True,
+            )
+            phase2 = [
+                item for item in grid.fault_types_list or []
+                if item.startswith("p2:")
+            ]
+            self.assertEqual(
+                phase2,
+                [
+                    "p2:{}:{}:e:w".format(first, second)
+                    for first in (0, 4, 8)
+                    for second in (0, 10, 19)
+                ],
+            )
+
     def test_swap_progress_fault_points_inferred_without_erase_trace(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = _write_profile(td, textwrap.dedent("""\

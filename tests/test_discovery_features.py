@@ -3113,6 +3113,73 @@ class Phase2FaultTest(unittest.TestCase):
             max_points_vars = [v for v in robot_vars if "PHASE2_FAULT_MAX_POINTS" in v]
             self.assertEqual(max_points_vars, [])
 
+    def test_phase2_erase_first_cut_parses_without_changing_default_pairs(self) -> None:
+        from profile_loader import ProfileError
+
+        base = """
+            schema_version: 1
+            name: phase2_erase_first
+            platform: platforms/cortex_m4_flash_fast.repl
+            flash_backend: faultFlash
+            bootloader:
+              elf: examples/vulnerable_ota/firmware.elf
+              entry: 0x10000000
+            memory:
+              sram: {{ start: 0x20000000, end: 0x20020000 }}
+              write_granularity: 4
+              slots:
+                exec: {{ base: 0x10000000, size: 0x1000 }}
+                staging: {{ base: 0x10001000, size: 0x1000 }}
+            images:
+              staging: examples/vulnerable_ota/firmware.bin
+            success_criteria:
+              vtor_in_slot: exec
+            fault_sweep:
+              mode: runtime
+              evaluation_mode: execute
+              {erase_opt_in}
+              phase2_fault:
+                enabled: true
+                {first_fault_types}
+                pairs: [[3, 0]]
+        """
+        with tempfile.TemporaryDirectory() as td:
+            default_path = self._write_profile(
+                Path(td),
+                base.format(erase_opt_in="", first_fault_types=""),
+            )
+            default = load_profile(default_path).fault_sweep.phase2_fault
+            self.assertEqual(default.first_fault_types, ["power_loss"])
+            self.assertEqual(default.pairs, [(3, 0)])
+
+            erase_path = Path(td) / "erase.yaml"
+            erase_path.write_text(
+                textwrap.dedent(
+                    base.format(
+                        erase_opt_in="include_erase_fault_points: true",
+                        first_fault_types="first_fault_types: [interrupted_erase]",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            erase = load_profile(erase_path).fault_sweep.phase2_fault
+            self.assertEqual(erase.first_fault_types, ["interrupted_erase"])
+
+            refused_path = Path(td) / "refused.yaml"
+            refused_path.write_text(
+                textwrap.dedent(
+                    base.format(
+                        erase_opt_in="",
+                        first_fault_types="first_fault_types: [interrupted_erase]",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ProfileError, "include_erase_fault_points"
+            ):
+                load_profile(refused_path)
+
     def test_phase2_fault_negative_max_points_rejected(self) -> None:
         """Negative max_points raises ProfileError."""
         from profile_loader import ProfileError

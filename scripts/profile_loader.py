@@ -821,17 +821,30 @@ class MultiFaultConfig:
 class Phase2FaultConfig:
     """Configuration for injecting faults during Phase 2 recovery writes."""
 
-    __slots__ = ("enabled", "fault_types", "max_points", "pairs", "state_search")
+    __slots__ = (
+        "enabled",
+        "first_fault_types",
+        "fault_types",
+        "max_points",
+        "pairs",
+        "state_search",
+    )
 
     def __init__(
         self,
         enabled: bool = False,
+        first_fault_types: Optional[List[str]] = None,
         fault_types: Optional[List[str]] = None,
         max_points: int = 0,
         pairs: Optional[List[Tuple[int, int]]] = None,
         state_search: Optional["RecoveryStateSearchConfig"] = None,
     ) -> None:
         self.enabled = enabled
+        self.first_fault_types = (
+            ["power_loss"]
+            if first_fault_types is None
+            else list(first_fault_types)
+        )
         self.fault_types = ["power_loss"] if fault_types is None else list(fault_types)
         self.max_points = max(0, int(max_points))
         self.pairs = list(pairs or [])
@@ -3630,9 +3643,15 @@ class ProfileConfig:
                     "PHASE2_FAULT_MAX_POINTS:{}".format(fs.phase2_fault.max_points)
                 )
             if fs.phase2_fault.state_search.enabled:
+                state_search_runtime = (
+                    fs.phase2_fault.state_search.to_runtime_dict()
+                )
+                state_search_runtime["first_cuts"]["fault_types"] = list(
+                    fs.phase2_fault.first_fault_types
+                )
                 state_search_payload = base64.b64encode(
                     json.dumps(
-                        fs.phase2_fault.state_search.to_runtime_dict(),
+                        state_search_runtime,
                         sort_keys=True,
                         separators=(",", ":"),
                     ).encode("utf-8")
@@ -4751,6 +4770,7 @@ def _warn_fault_backend_compat(
     # Collect every fault_type referenced across all sub-configs.
     all_types: set = set(fs.fault_types)
     if fs.phase2_fault:
+        all_types.update(fs.phase2_fault.first_fault_types)
         all_types.update(fs.phase2_fault.fault_types)
     if fs.hook_fault:
         all_types.update(fs.hook_fault.fault_types)
@@ -4815,6 +4835,7 @@ def _warn_fault_backend_compat(
     # peripheral on MRAM platforms).
     non_hook_types = set(fs.fault_types)
     if fs.phase2_fault:
+        non_hook_types.update(fs.phase2_fault.first_fault_types)
         non_hook_types.update(fs.phase2_fault.fault_types)
     if fs.metadata_fault:
         non_hook_types.update(fs.metadata_fault.fault_types)
@@ -5189,6 +5210,14 @@ def _parse_fault_sweep(
     )
     fs_cfg._raw_boot_cycle_hook = raw_boot_cycle_hook
     fs_cfg._resolved_boot_cycle_hook = resolved_boot_cycle_hook
+    if (
+        "interrupted_erase" in fs_cfg.phase2_fault.first_fault_types
+        and not fs_cfg.include_erase_fault_points
+    ):
+        raise ProfileError(
+            "fault_sweep.phase2_fault.first_fault_types: interrupted_erase "
+            "requires fault_sweep.include_erase_fault_points: true"
+        )
     if fs_cfg.phase2_fault.state_search.enabled:
         if str(fs_cfg.mode).strip().lower() != "runtime":
             raise ProfileError(
@@ -5213,6 +5242,21 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
     if not isinstance(raw, dict):
         raise ProfileError("fault_sweep.phase2_fault: expected mapping")
     enabled = _parse_bool(raw.get("enabled", False), "fault_sweep.phase2_fault.enabled")
+    first_fault_types = _normalize_fault_types(
+        raw.get("first_fault_types", ["power_loss"]),
+        "fault_sweep.phase2_fault.first_fault_types",
+    )
+    unsupported_first = sorted(
+        set(first_fault_types) - {"power_loss", "interrupted_erase"}
+    )
+    if unsupported_first:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.first_fault_types: unsupported first-cut "
+            "fault type(s) {}. Supported: {}".format(
+                unsupported_first,
+                ["interrupted_erase", "power_loss"],
+            )
+        )
     fault_types = _normalize_fault_types(
         raw.get("fault_types", ["power_loss"]),
         "fault_sweep.phase2_fault.fault_types",
@@ -5239,7 +5283,7 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
         field = "fault_sweep.phase2_fault.pairs[{}]".format(index)
         if not isinstance(pair_raw, list) or len(pair_raw) != 2:
             raise ProfileError(
-                "{}: expected [first_write_index, recovery_operation_index]".format(
+                "{}: expected [first_operation_index, recovery_operation_index]".format(
                     field
                 )
             )
@@ -5258,6 +5302,11 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
     if pairs and not enabled:
         raise ProfileError(
             "fault_sweep.phase2_fault.pairs: requires phase2_fault.enabled"
+        )
+    if first_fault_types != ["power_loss"] and not enabled:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.first_fault_types: requires "
+            "phase2_fault.enabled"
         )
     state_search = _parse_recovery_state_search(raw.get("state_search"))
     if state_search.enabled and not enabled:
@@ -5281,6 +5330,7 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
         )
     return Phase2FaultConfig(
         enabled=enabled,
+        first_fault_types=first_fault_types,
         fault_types=fault_types,
         max_points=max_points,
         pairs=pairs,
@@ -8492,7 +8542,8 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
             )
         nested_fault_schemas = {
             "phase2_fault": {
-                "enabled", "fault_types", "max_points", "pairs", "state_search",
+                "enabled", "first_fault_types", "fault_types", "max_points",
+                "pairs", "state_search",
             },
             "hook_fault": {"enabled", "fault_types", "max_points"},
             "confirm_cycle": {
@@ -9721,6 +9772,9 @@ def main() -> int:
         "expected_rollback_at_cycle": profile.fault_sweep.expected_rollback_at_cycle,
         "phase2_fault_enabled": profile.fault_sweep.phase2_fault.enabled,
         "phase2_fault_max_points": profile.fault_sweep.phase2_fault.max_points,
+        "phase2_first_fault_types": (
+            profile.fault_sweep.phase2_fault.first_fault_types
+        ),
         "phase2_fault_types": profile.fault_sweep.phase2_fault.fault_types,
         "phase2_fault_pairs": profile.fault_sweep.phase2_fault.pairs,
         "phase2_state_search": (

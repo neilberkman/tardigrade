@@ -800,6 +800,9 @@ def build_fault_plan(
     if has_mixed_types:
         write_fps: List[Tuple[int, str]] = []
         p2_config = profile.fault_sweep.phase2_fault
+        p2_first_codes = [
+            FAULT_TYPE_NAME_TO_CODE[ft] for ft in p2_config.first_fault_types
+        ]
         state_search_enabled = bool(
             p2_config.enabled and p2_config.state_search.enabled
         )
@@ -1340,7 +1343,16 @@ def build_fault_plan(
         if state_search_enabled:
             combined.append((0, "rs"))
             phase2_count = 1
-        elif p2_config.enabled and (write_fps or include_reset_at_time or p2_config.pairs):
+        elif p2_config.enabled and (
+            write_fps
+            or include_reset_at_time
+            or p2_config.pairs
+            or (
+                "e" in p2_first_codes
+                and include_erase_fault_points
+                and total_erases > 0
+            )
+        ):
             p2_max = p2_config.max_points if p2_config.max_points > 0 else min(50, max(max_writes, 1))
             p2_type_codes = [
                 FAULT_TYPE_NAME_TO_CODE[ft] for ft in p2_config.fault_types
@@ -1351,39 +1363,86 @@ def build_fault_plan(
 
             if p2_config.pairs:
                 for p1_fp, p2_fp in p2_config.pairs:
-                    for p2_code in p2_type_codes:
-                        enc = "p2:{}:{}:w:{}".format(
-                            p1_fp, p2_fp, p2_code
-                        )
-                        combined.append((p1_fp, enc))
-                        phase2_count += 1
-            elif p2_write_codes and write_fps:
-                if quick_use_heuristic:
-                    p1_representatives = [fp for fp, _ in write_fps]
-                else:
-                    p1_representatives = quick_subset([fp for fp, _ in write_fps])
+                    for p1_code in p2_first_codes:
+                        for p2_code in p2_type_codes:
+                            enc = "p2:{}:{}:{}:{}".format(
+                                p1_fp, p2_fp, p1_code, p2_code
+                            )
+                            combined.append((p1_fp, enc))
+                            phase2_count += 1
+            elif p2_write_codes:
                 p2_range = list(range(0, p2_max))
                 if quick and not quick_use_heuristic:
                     p2_range = quick_subset(p2_range)
-                for p1_fp in p1_representatives:
+                p1_representatives = []
+                if "w" in p2_first_codes:
+                    if quick_use_heuristic:
+                        p1_representatives.extend(
+                            (fp, "w") for fp, _ in write_fps
+                        )
+                    else:
+                        p1_representatives.extend(
+                            (fp, "w")
+                            for fp in quick_subset([fp for fp, _ in write_fps])
+                        )
+                if "e" in p2_first_codes and include_erase_fault_points:
+                    erase_first_points = _slice_explicit_points(
+                        list(range(total_erases)),
+                        fault_step=fault_step,
+                        fault_start=fault_start,
+                        fault_end=fault_end,
+                    )
+                    p1_representatives.extend(
+                        (fp, "e") for fp in quick_subset(erase_first_points)
+                    )
+                for p1_fp, p1_code in p1_representatives:
                     for p2_fp in p2_range:
                         for p2_code in p2_write_codes:
-                            enc = "p2:{}:{}:w:{}".format(p1_fp, p2_fp, p2_code)
+                            enc = "p2:{}:{}:{}:{}".format(
+                                p1_fp, p2_fp, p1_code, p2_code
+                            )
                             combined.append((p1_fp, enc))
                             phase2_count += 1
 
             if p2_timed_codes and not p2_config.pairs:
-                timed_p1_fps = list(fault_points) if fault_points else [0]
-                if quick_use_heuristic:
-                    timed_p1_reps = timed_p1_fps
+                if p2_first_codes == ["w"]:
+                    # Preserve the historical timed-reset grid exactly.
+                    timed_p1_fps = list(fault_points) if fault_points else [0]
+                    if quick_use_heuristic:
+                        timed_p1_reps = [(fp, "t") for fp in timed_p1_fps]
+                    else:
+                        timed_p1_reps = [
+                            (fp, "t") for fp in quick_subset(timed_p1_fps)
+                        ]
                 else:
-                    timed_p1_reps = quick_subset(timed_p1_fps)
+                    timed_p1_reps = []
+                    if "w" in p2_first_codes:
+                        timed_p1_reps.extend(
+                            (fp, "w")
+                            for fp in quick_subset(
+                                list(fault_points) if fault_points else [0]
+                            )
+                        )
+                    if "e" in p2_first_codes and include_erase_fault_points:
+                        timed_p1_reps.extend(
+                            (fp, "e")
+                            for fp in quick_subset(
+                                _slice_explicit_points(
+                                    list(range(total_erases)),
+                                    fault_step=fault_step,
+                                    fault_start=fault_start,
+                                    fault_end=fault_end,
+                                )
+                            )
+                        )
                 timed_p2_range = list(range(0, p2_max))
                 if quick and not quick_use_heuristic:
                     timed_p2_range = quick_subset(timed_p2_range)
-                for p1_fp in timed_p1_reps:
+                for p1_fp, p1_code in timed_p1_reps:
                     for p2_fp in timed_p2_range:
-                        enc = "p2:{}:{}:t:t".format(p1_fp, p2_fp)
+                        enc = "p2:{}:{}:{}:t".format(
+                            p1_fp, p2_fp, p1_code
+                        )
                         combined.append((p1_fp, enc))
                         phase2_count += 1
 

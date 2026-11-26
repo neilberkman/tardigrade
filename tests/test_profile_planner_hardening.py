@@ -302,7 +302,11 @@ fault_sweep:
         )
         self.assertEqual(
             json.loads(base64.b64decode(encoded))["first_cuts"],
-            {"mode": "ranges", "ranges": [{"start": 0, "end": 8}]},
+                {
+                    "mode": "ranges",
+                    "ranges": [{"start": 0, "end": 8}],
+                    "fault_types": ["power_loss"],
+                },
         )
         self.assertIn("CALIBRATION_TRACE_REQUIRED:true", profile.robot_vars(ROOT))
         robot_suite = (ROOT / "tests" / "ota_fault_point.robot").read_text()
