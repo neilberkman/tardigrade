@@ -24,6 +24,47 @@ IRONPYTHON_HELPERS = (
 
 
 class RuntimeFaultSweepLoaderTests(unittest.TestCase):
+    def test_terminal_self_branch_requires_fault_context_or_known_halt(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_provable_terminal_self_branch"
+        )
+
+        class Bus:
+            instruction = 0xE7FE
+
+            def ReadWord(self, _address: int) -> int:
+                return self.instruction
+
+        bus = Bus()
+        symbol = {"name": "ordinary_loop", "start": 0x100, "end": 0x110}
+        namespace: dict[str, object] = {
+            "as_int": int,
+            "bus": bus,
+            "fmt_u32": lambda value: f"0x{value:08X}",
+            "_elf_symbol_context": lambda _address: symbol,
+            "_TERMINAL_HALT_SYMBOLS": ("arch_system_halt", "HardFault_Handler"),
+        }
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]), str(PY_PATH), "exec"
+            ),
+            namespace,
+        )
+        detect = namespace["_provable_terminal_self_branch"]
+
+        self.assertIsNone(detect(SimpleNamespace(XProgramStatusRegister=0), 0x104))
+        fault = detect(SimpleNamespace(XProgramStatusRegister=3), 0x104)
+        self.assertEqual(fault["rule"], "fault_handler_self_branch")
+        symbol["name"] = "arch_system_halt"
+        halt = detect(SimpleNamespace(XProgramStatusRegister=0), 0x104)
+        self.assertEqual(halt["rule"], "known_halt_self_branch")
+        bus.instruction = 0xBF30
+        self.assertIsNone(detect(SimpleNamespace(XProgramStatusRegister=3), 0x104))
+
     def test_state_search_skips_terminal_generation_trace(self) -> None:
         tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
         function = next(
@@ -290,6 +331,29 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         self.assertIn("if time_slice_s is None:", text)
         self.assertIn("time_slice_s = float(phase1_time_slice)", text)
 
+    def test_run_until_done_reports_run_for_and_observation_wall_time(self) -> None:
+        text = PY_PATH.read_text(encoding="utf-8")
+        self.assertIn("'wall_time_breakdown': {", text)
+        self.assertIn("'run_for_s': round(run_for_wall_s, 6)", text)
+        self.assertIn("'run_for_calls': int(run_for_calls)", text)
+        self.assertIn("'settle_run_for_s': round(settle_run_for_wall_s, 6)", text)
+        self.assertIn(
+            "'setup_before_first_slice_s': round(setup_before_first_slice_s, 6)",
+            text,
+        )
+        self.assertIn("'per_slice_overhead_s': round(per_slice_overhead_s, 6)", text)
+        self.assertIn("outside_run_for_s = max(0.0, elapsed - run_for_wall_s)", text)
+        self.assertIn("signals[prefix + '_executed_instructions']", text)
+        self.assertIn("signals[prefix + '_wall_time_breakdown']", text)
+        self.assertIn("'machine_reset_s': round(_reset_s, 6)", text)
+        self.assertIn("'flash_restore_s': round(_flash_restore_s, 6)", text)
+        self.assertIn("'image_reload_s': round(_image_reload_s, 6)", text)
+        self.assertIn("_state_breakdown['trace_export_s']", text)
+        self.assertIn("_state_breakdown['snapshot_copy_s']", text)
+        self.assertIn("_native_breakdown['boot_setup_s']", text)
+        self.assertIn("_replay_breakdown['boot_setup_s']", text)
+        self.assertIn("'post_decision_s': round(post_decision_wall_s, 6)", text)
+
     def test_optional_time_slices_use_safe_monitor_helper(self) -> None:
         text = PY_PATH.read_text(encoding="utf-8")
         self.assertIn("resume_trace_time_slice = get_optional_var('resume_trace_time_slice', '0.02')", text)
@@ -443,10 +507,11 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
             text,
             re.compile(
                 r"def prepare_clean_phase1_state\(\):\n"
-                r"\s+_machine_reset\(\)\n"
-                r"\s+monitor.Parse\('machine Pause'\)\n"
+                r".*?\s+_machine_reset\(\)\n"
+                r".*?\s+monitor.Parse\('machine Pause'\)\n"
                 r"\s+restore_hw_init\(\)\n"
-                r"\s+needs_pre_boot = restore_initial_flash_cache\(\)\n"
+                r".*?\s+needs_pre_boot = restore_initial_flash_cache\(\)\n",
+                re.DOTALL,
             ),
         )
 

@@ -1046,6 +1046,8 @@ def _calibration_from_raw_data(profile: ProfileConfig, data: Dict[str, Any]) -> 
         emulated_s=data.get("calibration_emulated_s"),
         elapsed_s=data.get("calibration_elapsed_s"),
         pc=data.get("calibration_pc"),
+        executed_instructions=data.get("calibration_executed_instructions"),
+        wall_time_breakdown=data.get("calibration_wall_time_breakdown"),
         setup_writes=_strict_nonnegative_counter(data, "setup_writes"),
         total_i2c_transactions=_strict_nonnegative_counter(
             data, "total_i2c_transactions"

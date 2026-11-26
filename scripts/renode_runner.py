@@ -943,6 +943,8 @@ class CalibrationResult:
     emulated_s: Optional[float] = None
     elapsed_s: Optional[float] = None
     pc: Optional[str] = None
+    executed_instructions: Optional[int] = None
+    wall_time_breakdown: Optional[Dict[str, Any]] = None
     setup_writes: int = 0
     total_i2c_transactions: int = 0
     total_otp_blows: int = 0
@@ -1181,6 +1183,8 @@ def run_calibration(
         emulated_s=data.get("calibration_emulated_s"),
         elapsed_s=data.get("calibration_elapsed_s"),
         pc=data.get("calibration_pc"),
+        executed_instructions=data.get("calibration_executed_instructions"),
+        wall_time_breakdown=data.get("calibration_wall_time_breakdown"),
         setup_writes=int(data.get("setup_writes", 0)),
         total_i2c_transactions=int(data.get("total_i2c_transactions", 0)),
         total_otp_blows=int(data.get("total_otp_blows", 0)),

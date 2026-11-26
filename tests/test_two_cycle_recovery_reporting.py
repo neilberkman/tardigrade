@@ -1010,6 +1010,8 @@ class RecoveryWriteTrackingGateTests(unittest.TestCase):
                 "_time": SimpleNamespace(time=lambda: 0.0),
                 "tracking_start_address_config": gate_addr,
                 "_python_tracking_gate": gate_state,
+                "_last_phase1_setup_detail": None,
+                "_last_recovery_setup_detail": None,
                 "_apply_mram_torn_word_mode": lambda: None,
                 "_require_mram_torn_word_support": lambda: None,
                 "refresh_runtime_handles": lambda: None,

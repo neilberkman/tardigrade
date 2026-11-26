@@ -33,6 +33,11 @@ class RuntimeFaultSweepCalibrationTests(unittest.TestCase):
             "total_writes": 64,
             "total_erases": 0,
             "calibration_stop_reason": "calibration_stop_success_criteria",
+            "calibration_executed_instructions": 12345,
+            "calibration_wall_time_breakdown": {
+                "run_for_s": 1.25,
+                "per_slice_overhead_s": 0.05,
+            },
         }
         stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
@@ -49,6 +54,11 @@ class RuntimeFaultSweepCalibrationTests(unittest.TestCase):
             )
 
         self.assertEqual(calibration.total_writes, 64)
+        self.assertEqual(calibration.executed_instructions, 12345)
+        self.assertEqual(
+            calibration.wall_time_breakdown,
+            {"run_for_s": 1.25, "per_slice_overhead_s": 0.05},
+        )
         self.assertIn("before configured address 0x20000480", stderr.getvalue())
         self.assertIn("operation count may be incomplete", stderr.getvalue())
 

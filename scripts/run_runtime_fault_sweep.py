@@ -1121,6 +1121,8 @@ _cached_phase1_snapshot_path = None
 _cached_recovery_snapshot_path = None
 _machine_selector = '0'
 _recovery_marker_precondition = None
+_last_phase1_setup_detail = None
+_last_recovery_setup_detail = None
 
 
 def refresh_runtime_handles():
@@ -2682,6 +2684,7 @@ def disarm_vtor_watchpoint():
 # ---------------------------------------------------------------------------
 _bootloader_elf_path = str(monitor.GetVariable('bootloader_elf')).strip()
 _nm_lines = None
+_nm_symbol_ranges = None
 
 def _load_elf_nm_lines():
     global _nm_lines
@@ -2726,6 +2729,85 @@ def _load_elf_nm_lines():
     except Exception as _e:
         log('elf_symbols: nm not available ({}), falling back to single-match symbol lookup'.format(_e))
     return _nm_lines
+
+
+def _elf_symbol_context(address):
+    global _nm_symbol_ranges
+    if _nm_symbol_ranges is None:
+        entries = []
+        for line in _load_elf_nm_lines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                symbol_address = int(parts[0], 16) & ~1
+            except Exception:
+                continue
+            symbol_type = str(parts[1])
+            if symbol_type not in ('t', 'T', 'w', 'W'):
+                continue
+            entries.append((symbol_address, str(parts[2])))
+        entries.sort(key=lambda item: (item[0], item[1]))
+        _nm_symbol_ranges = []
+        for index, (start, name) in enumerate(entries):
+            end = entries[index + 1][0] if index + 1 < len(entries) else None
+            _nm_symbol_ranges.append((start, end, name))
+    target = int(address) & ~1
+    match = None
+    for start, end, name in _nm_symbol_ranges:
+        if start > target:
+            break
+        if end is None or target < end:
+            match = {'name': name, 'start': start, 'end': end}
+    return match
+
+
+_TERMINAL_HALT_SYMBOLS = (
+    'arch_system_halt',
+    'HardFault_Handler',
+    'MemManage_Handler',
+    'BusFault_Handler',
+    'UsageFault_Handler',
+    'Default_Handler',
+    'Error_Handler',
+)
+
+
+def _provable_terminal_self_branch(cpu_ref, pc_value):
+    pc_address = int(pc_value) & ~1
+    try:
+        instruction = as_int(bus.ReadWord(pc_address)) & 0xFFFF
+    except Exception:
+        try:
+            instruction = (
+                (as_int(bus.ReadByte(pc_address + 1)) & 0xFF) << 8
+            ) | (as_int(bus.ReadByte(pc_address)) & 0xFF)
+        except Exception:
+            return None
+    if instruction != 0xE7FE:
+        return None
+    try:
+        ipsr = as_int(getattr(cpu_ref, 'XProgramStatusRegister', 0)) & 0x1FF
+    except Exception:
+        ipsr = 0
+    symbol = _elf_symbol_context(pc_address)
+    symbol_name = symbol.get('name') if symbol is not None else None
+    if ipsr in (3, 4, 5, 6):
+        terminal_rule = 'fault_handler_self_branch'
+    elif symbol_name in _TERMINAL_HALT_SYMBOLS:
+        terminal_rule = 'known_halt_self_branch'
+    else:
+        return None
+    return {
+        'rule': terminal_rule,
+        'pc': fmt_u32(pc_address),
+        'instruction': '0x{:04X}'.format(instruction),
+        'ipsr': int(ipsr),
+        'symbol': symbol_name,
+        'symbol_start': (
+            fmt_u32(symbol.get('start')) if symbol is not None else None
+        ),
+    }
 
 def _is_glob_pattern(query):
     for ch in ('*', '?', '['):
@@ -4568,6 +4650,13 @@ def merge_stop_status_signals(signals, prefix, status):
         return
     signals[prefix + '_stop_reason'] = status.get('reason')
     signals[prefix + '_emulated_s'] = status.get('emulated_s')
+    signals[prefix + '_executed_instructions'] = status.get(
+        'executed_instructions'
+    )
+    if status.get('wall_time_breakdown') is not None:
+        signals[prefix + '_wall_time_breakdown'] = dict(
+            status.get('wall_time_breakdown')
+        )
     signals[prefix + '_instruction_limit'] = status.get('instruction_limit')
     signals[prefix + '_instruction_limit_configured'] = status.get(
         'instruction_limit_configured'
@@ -4583,6 +4672,10 @@ def merge_stop_status_signals(signals, prefix, status):
         signals[prefix + '_fault_timing'] = status.get('fault_timing')
     if status.get('lockup_observation') is not None:
         signals[prefix + '_lockup_observation'] = status.get('lockup_observation')
+    if status.get('terminal_self_branch_observation') is not None:
+        signals[prefix + '_terminal_self_branch_observation'] = status.get(
+            'terminal_self_branch_observation'
+        )
     if status.get('success_terminal') is not None:
         signals[prefix + '_success_terminal'] = status.get('success_terminal')
     if status.get('reset_gated_terminal') is not None:
@@ -7204,10 +7297,16 @@ def restore_initial_otp_cache():
 
 
 def prepare_clean_phase1_state():
+    global _last_phase1_setup_detail
+    _setup_started = _time.time()
+    _reset_started = _time.time()
     _machine_reset()
+    _reset_s = max(0.0, _time.time() - _reset_started)
     monitor.Parse('machine Pause')
     restore_hw_init()
+    _flash_restore_started = _time.time()
     needs_pre_boot = restore_initial_flash_cache()
+    _flash_restore_s = max(0.0, _time.time() - _flash_restore_started)
     _clear_mram_uncorrectable_words()
     if needs_pre_boot:
         b = backend
@@ -7230,10 +7329,21 @@ def prepare_clean_phase1_state():
     # registers; phase-1 baseline prep must do the same or control boots can
     # start at PC=0 and look like a target failure.
     prime_bootloader_entry()
+    _last_phase1_setup_detail = {
+        'mode': 'reset_and_flash_restore',
+        'machine_reset_s': round(_reset_s, 6),
+        'flash_restore_s': round(_flash_restore_s, 6),
+        'other_setup_s': round(max(
+            0.0,
+            (_time.time() - _setup_started) - _reset_s - _flash_restore_s,
+        ), 6),
+        'total_s': round(max(0.0, _time.time() - _setup_started), 6),
+    }
 
 
 def restore_phase1_baseline():
-    global _cached_phase1_snapshot_path
+    global _cached_phase1_snapshot_path, _last_phase1_setup_detail
+    _baseline_started = _time.time()
     if update_sequence_enabled:
         ensure_update_sequence_fault_baseline()
         _apply_phase_context(update_sequence_fault_phase)
@@ -7241,6 +7351,10 @@ def restore_phase1_baseline():
         _apply_update_phase_pre_boot(update_sequence_fault_phase)
         if _hash_bypass_active:
             apply_hash_bypass()
+        _last_phase1_setup_detail = {
+            'mode': 'update_sequence_flash_restore',
+            'total_s': round(max(0.0, _time.time() - _baseline_started), 6),
+        }
         return
     if not enable_machine_snapshots:
         prepare_clean_phase1_state()
@@ -7249,20 +7363,53 @@ def restore_phase1_baseline():
         _cached_phase1_snapshot_path = get_machine_snapshot_path('phase1_baseline')
         prepare_clean_phase1_state()
         save_machine_snapshot(_cached_phase1_snapshot_path)
+        if isinstance(_last_phase1_setup_detail, dict):
+            _last_phase1_setup_detail['mode'] = 'reset_flash_restore_snapshot_save'
+            _last_phase1_setup_detail['total_s'] = round(
+                max(0.0, _time.time() - _baseline_started), 6
+            )
         return
+    _snapshot_load_started = _time.time()
     load_machine_snapshot(_cached_phase1_snapshot_path)
+    _last_phase1_setup_detail = {
+        'mode': 'machine_snapshot_load',
+        'snapshot_load_s': round(
+            max(0.0, _time.time() - _snapshot_load_started), 6
+        ),
+        'total_s': round(max(0.0, _time.time() - _baseline_started), 6),
+    }
 
 
 def prepare_recovery_shell_state():
+    global _last_recovery_setup_detail
+    _shell_started = _time.time()
+    _reset_started = _time.time()
     if reset_mode == 'cold':
         prepare_cold_reset(apply_tracking_gate=False)
     else:
         _machine_reset(apply_tracking_gate=False)
+    _reset_s = max(0.0, _time.time() - _reset_started)
     monitor.Parse('machine Pause')
+    _volatile_clear_started = _time.time()
     _clear_volatile_memory()
     _verify_recovery_marker_cleared()
+    _volatile_clear_s = max(0.0, _time.time() - _volatile_clear_started)
+    _image_reload_started = _time.time()
     _bus_load_elf(bootloader_elf)
+    _image_reload_s = max(0.0, _time.time() - _image_reload_started)
     restore_hw_init()
+    _last_recovery_setup_detail = {
+        'shell_mode': 'machine_reset',
+        'machine_reset_s': round(_reset_s, 6),
+        'volatile_clear_s': round(_volatile_clear_s, 6),
+        'image_reload_s': round(_image_reload_s, 6),
+        'shell_other_s': round(max(
+            0.0,
+            (_time.time() - _shell_started)
+            - _reset_s - _volatile_clear_s - _image_reload_s,
+        ), 6),
+        'shell_total_s': round(max(0.0, _time.time() - _shell_started), 6),
+    }
 
 def prepare_cold_reset(apply_tracking_gate=True):
     # Cold reset: save NVM, destroy and recreate machine, restore NVM.
@@ -7295,7 +7442,8 @@ def restore_flash_and_boot(saved_flash):
     # Common pattern: restore a cached post-reset machine shell, then overlay
     # the faulted flash snapshot.  This preserves semantics while avoiding
     # repeated full reset/ELF reload work on every point.
-    global _cached_recovery_snapshot_path
+    global _cached_recovery_snapshot_path, _last_recovery_setup_detail
+    _restore_started = _time.time()
     _capture_recovery_marker_precondition()
     if not enable_machine_snapshots:
         prepare_recovery_shell_state()
@@ -7305,9 +7453,17 @@ def restore_flash_and_boot(saved_flash):
             prepare_recovery_shell_state()
             save_machine_snapshot(_cached_recovery_snapshot_path)
         else:
+            _snapshot_load_started = _time.time()
             load_machine_snapshot(_cached_recovery_snapshot_path)
             _verify_recovery_marker_cleared()
+            _last_recovery_setup_detail = {
+                'shell_mode': 'machine_snapshot_load',
+                'snapshot_load_s': round(
+                    max(0.0, _time.time() - _snapshot_load_started), 6
+                ),
+            }
     b = backend
+    _flash_overlay_started = _time.time()
     if b['kind'] == 'mram':
         # MRAMMemory may or may not survive machine Reset depending on
         # vtable dispatch.  Always restore to be safe.
@@ -7317,10 +7473,19 @@ def restore_flash_and_boot(saved_flash):
     else:
         flash_ref = b['data'].Flash
         flash_ref.WriteBytes(0, saved_flash)
+    _flash_overlay_s = max(0.0, _time.time() - _flash_overlay_started)
     # The shell was built from the clean ELF, but hardware reset state belongs
     # to the restored persistent image.  Fetch both vector words only after
     # installing that image, including zero/unprogrammed values.
     prime_bootloader_entry()
+    if not isinstance(_last_recovery_setup_detail, dict):
+        _last_recovery_setup_detail = {}
+    _last_recovery_setup_detail['flash_overlay_s'] = round(
+        _flash_overlay_s, 6
+    )
+    _last_recovery_setup_detail['total_s'] = round(
+        max(0.0, _time.time() - _restore_started), 6
+    )
     # Do NOT re-run setup_script here.  The faulted snapshot is the
     # ground-truth state for the recovery boot — re-running setup would
     # overwrite it with clean data and mask the fault.
@@ -10069,6 +10234,13 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     trace_prev_writes = 0
     trace_prev_erases = 0
     pc_samples = []
+    run_for_wall_s = 0.0
+    run_for_calls = 0
+    settle_run_for_wall_s = 0.0
+    settle_run_for_calls = 0
+    setup_before_first_slice_s = 0.0
+    terminal_self_branch_observation = None
+    previous_observed_pc = None
     instruction_previous = as_int(cpu_ref.ExecutedInstructions)
     instructions_executed = 0
     pc_handoff_slot = success_pc_slot if success_pc_slot in slot_ranges else None
@@ -10839,8 +11011,10 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         except Exception:
             pass
     try:
+        setup_before_first_slice_s = max(0.0, _time.time() - t0)
         for iters in range(max_iters):
             fault_timing_state['current_iter'] = iters + 1
+            _run_for_started = _time.time()
             remaining_wall_s = max(0.05, float(wall_timeout) - (_time.time() - t0))
             runfor_infrastructure_error = runfor_guard(
                 cpu_ref,
@@ -10848,6 +11022,8 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 min(120.0, remaining_wall_s),
                 label=label,
             )
+            run_for_wall_s += max(0.0, _time.time() - _run_for_started)
+            run_for_calls += 1
             if runfor_infrastructure_error is not None:
                 reason = 'runfor_infrastructure_error'
                 break
@@ -10942,6 +11118,27 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                     pass
                 reason = 'lockup_erased_vector'
                 break
+            _terminal_self_branch_fn = globals().get(
+                '_provable_terminal_self_branch'
+            )
+            if (
+                callable(_terminal_self_branch_fn)
+                and
+                terminal_self_branch_observation is None
+                and previous_observed_pc == (pc_now & ~1)
+            ):
+                terminal_self_branch_observation = (
+                    _terminal_self_branch_fn(cpu_ref, pc_now)
+                )
+                if terminal_self_branch_observation is not None:
+                    terminal_self_branch_observation.update({
+                        'observed_at_emulated_s': round(emulated_s, 6),
+                        'observed_at_elapsed_s': round(
+                            max(0.0, _time.time() - t0), 6
+                        ),
+                        'observed_at_instructions': int(instructions_executed),
+                    })
+            previous_observed_pc = pc_now & ~1
             capture_sticky_pc(pc_now)
             if pc_handoff_slot is not None and not sticky_pc['captured']:
                 observe_indirect_pc_handoff(cpu_ref, pc_now)
@@ -11028,12 +11225,20 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                     # First capture.
                     if vtor_settle_iters == 0:
                         # Immediate stop (default/sweep behavior).
+                        _settle_run_for_started = _time.time()
                         runfor_infrastructure_error = runfor_guard(
                             cpu_ref,
                             '0.005',
                             30.0,
                             label='{}_post_vtor'.format(label),
                         )
+                        _settle_run_for_elapsed = max(
+                            0.0, _time.time() - _settle_run_for_started
+                        )
+                        run_for_wall_s += _settle_run_for_elapsed
+                        run_for_calls += 1
+                        settle_run_for_wall_s += _settle_run_for_elapsed
+                        settle_run_for_calls += 1
                         if runfor_infrastructure_error is not None:
                             reason = 'runfor_infrastructure_error'
                             break
@@ -11065,12 +11270,20 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                                 sticky_vtor['value'] = vtor_final
                                 sticky_vtor['slot'] = sn
                                 break
+                    _settle_run_for_started = _time.time()
                     runfor_infrastructure_error = runfor_guard(
                         cpu_ref,
                         '0.005',
                         30.0,
                         label='{}_post_vtor_settle'.format(label),
                     )
+                    _settle_run_for_elapsed = max(
+                        0.0, _time.time() - _settle_run_for_started
+                    )
+                    run_for_wall_s += _settle_run_for_elapsed
+                    run_for_calls += 1
+                    settle_run_for_wall_s += _settle_run_for_elapsed
+                    settle_run_for_calls += 1
                     if runfor_infrastructure_error is not None:
                         reason = 'runfor_infrastructure_error'
                         break
@@ -11246,12 +11459,20 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                         sticky_vtor['value'] = vtor_final
                         sticky_vtor['slot'] = sn
                         break
+            _settle_run_for_started = _time.time()
             runfor_infrastructure_error = runfor_guard(
                 cpu_ref,
                 '0.005',
                 30.0,
                 label='{}_post_budget_vtor'.format(label),
             )
+            _settle_run_for_elapsed = max(
+                0.0, _time.time() - _settle_run_for_started
+            )
+            run_for_wall_s += _settle_run_for_elapsed
+            run_for_calls += 1
+            settle_run_for_wall_s += _settle_run_for_elapsed
+            settle_run_for_calls += 1
             if runfor_infrastructure_error is not None:
                 reason = 'runfor_infrastructure_error'
             elif _post_vtor_fault_active():
@@ -11300,6 +11521,37 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             except Exception:
                 pass
     elapsed = _time.time() - t0
+    outside_run_for_s = max(0.0, elapsed - run_for_wall_s)
+    per_slice_overhead_s = max(
+        0.0, outside_run_for_s - setup_before_first_slice_s
+    )
+    post_decision_wall_s = 0.0
+    post_decision_emulated_s = 0.0
+    post_decision_instructions = 0
+    if terminal_self_branch_observation is not None:
+        post_decision_wall_s = max(
+            0.0,
+            elapsed - float(
+                terminal_self_branch_observation.get(
+                    'observed_at_elapsed_s', elapsed
+                )
+            ),
+        )
+        post_decision_emulated_s = max(
+            0.0,
+            emulated_s - float(
+                terminal_self_branch_observation.get(
+                    'observed_at_emulated_s', emulated_s
+                )
+            ),
+        )
+        post_decision_instructions = max(
+            0,
+            int(instructions_executed)
+            - int(terminal_self_branch_observation.get(
+                'observed_at_instructions', instructions_executed
+            )),
+        )
     writes_now = get_total_writes()
     erases_now = get_total_erases()
     pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
@@ -11312,6 +11564,21 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         'reason': reason,
         'elapsed_s': round(elapsed, 6),
         'emulated_s': round(emulated_s, 6),
+        'wall_time_breakdown': {
+            'run_for_s': round(run_for_wall_s, 6),
+            'run_for_calls': int(run_for_calls),
+            'settle_run_for_s': round(settle_run_for_wall_s, 6),
+            'settle_run_for_calls': int(settle_run_for_calls),
+            'setup_before_first_slice_s': round(setup_before_first_slice_s, 6),
+            'per_slice_overhead_s': round(per_slice_overhead_s, 6),
+            'per_slice_overhead_avg_s': round(
+                per_slice_overhead_s / max(1, int(run_for_calls)), 6
+            ),
+            'outside_run_for_s': round(outside_run_for_s, 6),
+            'post_decision_s': round(post_decision_wall_s, 6),
+            'post_decision_emulated_s': round(post_decision_emulated_s, 6),
+            'post_decision_instructions': int(post_decision_instructions),
+        },
         'executed_instructions': instructions_executed,
         'instruction_limit': max_step_limit,
         'instruction_limit_configured': limit_resolution.get(
@@ -11345,6 +11612,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         'console_fatal_pattern': console_fatal,
         'reset_observation': reset_observation,
         'fault_timing': _build_fault_timing_snapshot(),
+        'terminal_self_branch_observation': terminal_self_branch_observation,
     }
     if runfor_infrastructure_error is not None:
         status['infrastructure_error'] = True
@@ -13477,11 +13745,23 @@ def run_execute_fault(
         disarm_fault()
 
         arm_vtor_watchpoint()
+        phase1_run_started = _time.time()
         phase1_status = run_control_phase1(
             cpu_ref,
             label='control_p1',
             vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
         )
+        if isinstance(phase1_status, dict):
+            _phase1_breakdown = phase1_status.setdefault(
+                'wall_time_breakdown', {}
+            )
+            _phase1_breakdown['boot_setup_s'] = round(
+                max(0.0, phase1_run_started - fp_t0), 6
+            )
+            if isinstance(_last_phase1_setup_detail, dict):
+                _phase1_breakdown['boot_setup_detail'] = dict(
+                    _last_phase1_setup_detail
+                )
         disarm_vtor_watchpoint()
         phase1_ms = int((_time.time() - fp_t0) * 1000)
 
@@ -13631,6 +13911,7 @@ def run_execute_fault(
     arm_vtor_watchpoint()
     p1_wall_timeout = phase1_wall_timeout(default_s=4.0)
     p1_max_iters = phase1_max_iters(default_s=4.0)
+    phase1_run_started = _time.time()
     try:
         phase1_status = run_until_done(
             cpu_ref,
@@ -13646,6 +13927,17 @@ def run_execute_fault(
         if replay_check_trace_context is not None:
             replay_check_live_trace = _finish_replay_cross_check_live_trace(
                 replay_check_trace_context
+            )
+    if isinstance(phase1_status, dict):
+        _phase1_breakdown = phase1_status.setdefault(
+            'wall_time_breakdown', {}
+        )
+        _phase1_breakdown['boot_setup_s'] = round(
+            max(0.0, phase1_run_started - fp_t0), 6
+        )
+        if isinstance(_last_phase1_setup_detail, dict):
+            _phase1_breakdown['boot_setup_detail'] = dict(
+                _last_phase1_setup_detail
             )
     disarm_vtor_watchpoint()
     phase1_ms = int((_time.time() - fp_t0) * 1000)
@@ -13883,6 +14175,7 @@ def run_execute_fault(
 
             log('fp={} phase2_step'.format(fault_at))
             arm_vtor_watchpoint()
+            phase2_run_started = _time.time()
             phase2_status = run_until_done(
                 cpu_ref,
                 label='fp{}_p2'.format(fault_at),
@@ -13895,6 +14188,17 @@ def run_execute_fault(
                 effective_criteria=eff_criteria,
                 fault_injected=fault_injected,
             )
+            if isinstance(phase2_status, dict):
+                _phase2_breakdown = phase2_status.setdefault(
+                    'wall_time_breakdown', {}
+                )
+                _phase2_breakdown['boot_setup_s'] = round(
+                    max(0.0, phase2_run_started - phase2_t0), 6
+                )
+                if isinstance(_last_recovery_setup_detail, dict):
+                    _phase2_breakdown['boot_setup_detail'] = dict(
+                        _last_recovery_setup_detail
+                    )
             disarm_vtor_watchpoint()
             recovery_writes = get_total_writes()
             phase2_ms = int((_time.time() - phase2_t0) * 1000)
@@ -16221,6 +16525,15 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         effective_criteria=eff_criteria,
         fault_injected=fault_injected,
     )
+    if isinstance(p2_status, dict):
+        _native_breakdown = p2_status.setdefault('wall_time_breakdown', {})
+        _native_breakdown['boot_setup_s'] = round(
+            max(0.0, t_emu - t_reset), 6
+        )
+        if isinstance(_last_recovery_setup_detail, dict):
+            _native_breakdown['boot_setup_detail'] = dict(
+                _last_recovery_setup_detail
+            )
     emulation_ms = int((_time.time() - t_emu) * 1000)
     disarm_vtor_watchpoint()
     recovery_writes = get_total_writes()
@@ -16580,6 +16893,15 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         effective_criteria=eff_criteria,
         fault_injected=fault_injected,
     )
+    if isinstance(p2_status, dict):
+        _replay_breakdown = p2_status.setdefault('wall_time_breakdown', {})
+        _replay_breakdown['boot_setup_s'] = round(
+            max(0.0, t_emu - t_reset), 6
+        )
+        if isinstance(_last_recovery_setup_detail, dict):
+            _replay_breakdown['boot_setup_detail'] = dict(
+                _last_recovery_setup_detail
+            )
     emulation_ms = int((_time.time() - t_emu) * 1000)
     disarm_vtor_watchpoint()
     recovery_writes = get_total_writes()
@@ -16841,13 +17163,17 @@ def _state_search_boot_state(state, chain, generation):
     global _recovery_marker_precondition
     _recovery_marker_precondition = None
     started = _time.time()
+    snapshot_copy_started = _time.time()
     state_bytes = state.materialize()['nvm']
     state_marks = [
         int(offset)
         for region_name, offset in sorted(state.uncorrectable_words)
         if region_name == 'nvm'
     ]
-    restore_flash_and_boot(to_clr_bytes(state_bytes))
+    state_restore_bytes = to_clr_bytes(state_bytes)
+    snapshot_copy_s = max(0.0, _time.time() - snapshot_copy_started)
+    setup_started = _time.time()
+    restore_flash_and_boot(state_restore_bytes)
     _clear_mram_uncorrectable_words()
     _restore_mram_uncorrectable_offsets(state_marks)
     fault_semantic_state = collect_semantic_state({
@@ -16892,8 +17218,21 @@ def _state_search_boot_state(state, chain, generation):
         if capture_recovery_trace:
             target.WriteTraceEnabled = False
             target.EraseTraceEnabled = False
+    _state_breakdown = p2_status.setdefault('wall_time_breakdown', {})
+    _state_breakdown['snapshot_copy_s'] = round(snapshot_copy_s, 6)
+    _state_breakdown['boot_setup_s'] = round(
+        max(0.0, boot_started - setup_started), 6
+    )
+    if isinstance(_last_recovery_setup_detail, dict):
+        _state_breakdown['boot_setup_detail'] = dict(
+            _last_recovery_setup_detail
+        )
+    trace_export_started = _time.time()
     recovery_operations = (
         _state_search_capture_trace() if capture_recovery_trace else ()
+    )
+    _state_breakdown['trace_export_s'] = round(
+        max(0.0, _time.time() - trace_export_started), 6
     )
     recovery_writes = get_total_writes()
     boot_ms = int((_time.time() - boot_started) * 1000)
@@ -16936,7 +17275,7 @@ def _state_search_boot_state(state, chain, generation):
         eff_criteria=eff_criteria,
         p2_status=p2_status,
         followup_label='recovery_state_{}_followup'.format(generation),
-        saved_flash=to_clr_bytes(state_bytes),
+        saved_flash=state_restore_bytes,
         fault_snapshot_bytes=bytearray(state_bytes),
         extra_fields={'recovery_writes': recovery_writes},
         fault_semantic_state=fault_semantic_state,
@@ -17667,6 +18006,12 @@ if calibration_mode:
             'cpu_performance_mips': cal_status.get('cpu_performance_mips'),
             'calibration_emulated_s': float(cal_status.get('emulated_s', 0)),
             'calibration_elapsed_s': float(cal_status.get('elapsed_s', 0)),
+            'calibration_executed_instructions': int(
+                cal_status.get('executed_instructions', 0) or 0
+            ),
+            'calibration_wall_time_breakdown': dict(
+                cal_status.get('wall_time_breakdown') or {}
+            ),
             'calibration_pc': cal_status.get('pc', '0x00000000'),
             'pc_handoff_observation': cal_status.get(
                 'pc_handoff_observation', {}

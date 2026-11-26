@@ -2931,6 +2931,12 @@ def _main_single() -> int:
             "emulated_s": cal.emulated_s if cal is not None else None,
             "elapsed_s": cal.elapsed_s if cal is not None else None,
             "pc": cal.pc if cal is not None else None,
+            "executed_instructions": (
+                cal.executed_instructions if cal is not None else None
+            ),
+            "wall_time_breakdown": (
+                cal.wall_time_breakdown if cal is not None else None
+            ),
             "program_trace_file": program_trace_file,
             "barrier_audit": cal.barrier_audit if cal is not None else None,
         }
