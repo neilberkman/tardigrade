@@ -524,6 +524,62 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             with self.assertRaisesRegex(ProfileError, "phase2_wall_timeout_s"):
                 load_profile(self._write_profile(tempdir, body))
 
+    def test_runfor_watchdog_timeout_defaults_and_serializes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            common = """
+                schema_version: 1
+                name: runfor_watchdog_profile
+                description: RunFor watchdog timeout
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: {{ start: 0x20000000, end: 0x20020000 }}
+                  write_granularity: 4
+                  slots:
+                    exec: {{ base: 0x10000000, size: 0x1000 }}
+                    staging: {{ base: 0x10001000, size: 0x1000 }}
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  {watchdog}
+                expect:
+                  should_find_issues: false
+                """
+            configured = load_profile(
+                self._write_profile(
+                    tempdir,
+                    common.format(
+                        watchdog="runfor_watchdog_timeout_s: 123.5"
+                    ),
+                )
+            )
+            self.assertEqual(
+                configured.fault_sweep.runfor_watchdog_timeout_s, 123.5
+            )
+            self.assertIn(
+                "RUNFOR_WATCHDOG_TIMEOUT_S:123.5",
+                configured.robot_vars(ROOT),
+            )
+
+            defaulted = load_profile(
+                self._write_profile(
+                    tempdir,
+                    common.format(watchdog=""),
+                )
+            )
+            self.assertEqual(
+                defaulted.fault_sweep.runfor_watchdog_timeout_s, 300.0
+            )
+            self.assertIn(
+                "RUNFOR_WATCHDOG_TIMEOUT_S:300.0",
+                defaulted.robot_vars(ROOT),
+            )
+
     def test_regular_phase2_runtime_calls_use_configured_wall_timeout(self) -> None:
         runtime = (ROOT / "scripts" / "run_runtime_fault_sweep.py").read_text(
             encoding="utf-8"

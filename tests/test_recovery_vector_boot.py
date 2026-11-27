@@ -323,7 +323,9 @@ def test_runtime_erased_vector_and_real_lockup_classify_identically():
         def parse_cmd(cmd: str):
             if not cmd.startswith("emulation RunFor"):
                 return
-            if mode == "erased_hf":
+            if mode == "slow_success":
+                _time.sleep(0.06)
+            elif mode == "erased_hf":
                 state["insns"] += 5
                 state["pending"] = 3
                 for cb in list(state["irq_hooks"]):
@@ -369,6 +371,7 @@ def test_runtime_erased_vector_and_real_lockup_classify_identically():
             "image_staging_sha256": "",
             "expect_control_outcome": "success",
             "phase1_time_slice": "0.02",
+            "runfor_watchdog_timeout_s": 0.5,
             "max_step_limit": 100000,
             "progress_stall_timeout_s": 0.04,
             "no_boot_zero_write_slices": 10,
@@ -407,17 +410,26 @@ def test_runtime_erased_vector_and_real_lockup_classify_identically():
             "capture_boot_registers": lambda: None,
             "boot_outcome_after_stop": lambda outcome, stop_reason: outcome,
         }
-        _load_runtime_functions(
-            "_runfor_fetch_preflight",
-            "_run_for_with_watchdog",
+        runtime_functions = [
             "run_until_done",
             "collect_recovery_execution_evidence",
             "recovery_failure_outcome",
             "evaluate_boot_outcome",
             "classify_fault_result",
-            namespace=ns,
+        ]
+        runtime_source = RUNTIME.read_text(encoding="utf-8")
+        if "def _run_for_with_watchdog(" in runtime_source:
+            runtime_functions[:0] = [
+                "_runfor_fetch_preflight",
+                "_run_for_with_watchdog",
+            ]
+        _load_runtime_functions(*runtime_functions, namespace=ns)
+        status = ns["run_until_done"](
+            cpu,
+            time_slice="0.02",
+            max_iters=5,
+            wall_timeout=0.02 if mode == "slow_success" else 120,
         )
-        status = ns["run_until_done"](cpu, time_slice="0.02", max_iters=5)
         outcome, _slot, signals = ns["evaluate_boot_outcome"](
             state["vtor"], state["pc"], fault_injected=True, p2_status=status
         )
@@ -431,6 +443,12 @@ def test_runtime_erased_vector_and_real_lockup_classify_identically():
     assert sig_real["recovery_execution"]["lockup_observed"] is True
     assert sig_real["recovery_execution"].get("erased_vector_lockup") is None
     assert cpu_real.IsHalted is True
+
+    st_slow, out_slow, class_slow, _, _, _ = _run_scenario("slow_success")
+    assert st_slow["elapsed_s"] > 0.02
+    assert st_slow["reason"] == "vtor_captured"
+    assert out_slow == "success"
+    assert class_slow == "recoverable"
 
     st_hf, out_hf, class_hf, sig_hf, state_hf, cpu_hf = _run_scenario(
         "erased_hf", allow_fault_after_success=True

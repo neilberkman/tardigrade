@@ -80,6 +80,7 @@ ${PHASE1_TIME_SLICE}           ${EMPTY}
 ${PHASE2_TIME_SLICE}           ${EMPTY}
 ${PHASE1_WALL_TIMEOUT_S}       ${EMPTY}
 ${PHASE2_WALL_TIMEOUT_S}       30
+${RUNFOR_WATCHDOG_TIMEOUT_S}   300
 ${VOLATILE_REGIONS_B64}        ${EMPTY}
 ${ZERO_POINT_EXECUTE_CONTROL}  false
 ${BOOT_CYCLE_HOOK}            ${EMPTY}
@@ -277,6 +278,7 @@ Run Runtime Fault Point
     Run Keyword If    '${PHASE2_TIME_SLICE}' != ''    Execute Command    $phase2_time_slice="${PHASE2_TIME_SLICE}"
     Run Keyword If    '${PHASE1_WALL_TIMEOUT_S}' != ''    Execute Command    $phase1_wall_timeout_s="${PHASE1_WALL_TIMEOUT_S}"
     Execute Command    $phase2_wall_timeout_s="${PHASE2_WALL_TIMEOUT_S}"
+    Execute Command    $runfor_watchdog_timeout_s="${RUNFOR_WATCHDOG_TIMEOUT_S}"
     Execute Command    $zero_point_execute_control="${ZERO_POINT_EXECUTE_CONTROL}"
     Run Keyword If    '${BOOT_CYCLE_HOOK}' != ''    Execute Command    $boot_cycle_hook="${BOOT_CYCLE_HOOK}"
     Run Keyword If    '${EXPECTED_ROLLBACK_AT_CYCLE}' != ''    Execute Command    $expected_rollback_at_cycle=${EXPECTED_ROLLBACK_AT_CYCLE}

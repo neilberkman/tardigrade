@@ -194,12 +194,68 @@ def test_runfor_watchdog_pauses_a_blocked_emulation_slice() -> None:
     )
     elapsed = time.monotonic() - started
 
+    assert elapsed >= 0.04
     assert elapsed < 1.0
     assert error["error_kind"] == "runfor_watchdog"
     assert error["pc"] == "0x08000100"
     assert "watchdog expired" in error["message"]
     assert cpu.IsHalted is True
     assert machine.pause_calls == 1
+    source = RUNTIME.read_text(encoding="utf-8")
+    run_until = source[
+        source.index("def run_until_done(") : source.index(
+            "def parse_duration_seconds(", source.index("def run_until_done(")
+        )
+    ]
+    assert "runfor_watchdog_s" in run_until
+    assert "remaining_wall_s" not in run_until
+
+
+def test_returning_slice_past_phase_limit_keeps_historical_classification() -> None:
+    namespace = _runtime_namespace()
+    phase_wall_limit_s = 0.02
+    watchdog_limit_s = 0.5
+
+    def parse(command: str) -> None:
+        assert command == 'emulation RunFor "0.02"'
+        time.sleep(0.06)
+
+    namespace["monitor"] = SimpleNamespace(
+        Parse=parse,
+        Machine=SimpleNamespace(Pause=lambda: None),
+    )
+    namespace["bus"] = SimpleNamespace(
+        WhatPeripheralIsAt=lambda address: _Peripheral(
+            "Antmicro.Renode.Peripherals.Memory.MappedMemory"
+        )
+    )
+
+    started = time.monotonic()
+    error = namespace["_run_for_with_watchdog"](
+        _CPU(0x08000101), "0.02", watchdog_limit_s, label="slow_return"
+    )
+    elapsed = time.monotonic() - started
+    evidence = {
+        "stop_reason": "wall_timeout({:.0f}s)".format(elapsed),
+    }
+    outcome = namespace["recovery_failure_outcome"](
+        evidence, execution_observed=False
+    )
+    fault_class = namespace["classify_fault_result"](outcome, None, {})
+
+    assert phase_wall_limit_s < elapsed < watchdog_limit_s
+    assert error is None
+    assert evidence["stop_reason"] == "wall_timeout(0s)"
+    assert outcome == "timeout"
+    assert fault_class == "incomplete"
+    source = RUNTIME.read_text(encoding="utf-8")
+    run_until = source[
+        source.index("def run_until_done(") : source.index(
+            "def parse_duration_seconds(", source.index("def run_until_done(")
+        )
+    ]
+    assert "runfor_watchdog_s" in run_until
+    assert "remaining_wall_s" not in run_until
 
 
 def test_all_runtime_runfor_calls_are_guarded_by_the_watchdog() -> None:
@@ -216,4 +272,5 @@ def test_all_runtime_runfor_calls_are_guarded_by_the_watchdog() -> None:
             "def parse_duration_seconds(", source.index("def run_until_done(")
         )
     ]
-    assert "min(120.0, remaining_wall_s)" in run_until
+    assert "remaining_wall_s" not in run_until
+    assert "runfor_watchdog_timeout_s" in run_until

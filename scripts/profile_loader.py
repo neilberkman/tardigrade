@@ -1855,6 +1855,7 @@ class FaultSweepConfig:
         "phase2_time_slice",
         "phase1_wall_timeout_s",
         "phase2_wall_timeout_s",
+        "runfor_watchdog_timeout_s",
         "fault_types",
         "evaluation_mode",
         "sweep_strategy",
@@ -1954,6 +1955,7 @@ class FaultSweepConfig:
         rc_injection_config: Optional["RcInjectionConfig"] = None,
         phase1_wall_timeout_s: Optional[float] = None,
         phase2_wall_timeout_s: Optional[float] = 30.0,
+        runfor_watchdog_timeout_s: Optional[float] = 300.0,
         mram_torn_word: Any = "half",
         mram_torn_word_explicit: bool = False,
         mram_torn_word_seed: int = 0,
@@ -2063,6 +2065,22 @@ class FaultSweepConfig:
                 "fault_sweep.phase2_wall_timeout_s: expected positive number"
             )
         self.phase2_wall_timeout_s = phase2_wall_timeout_s
+        if runfor_watchdog_timeout_s is None:
+            runfor_watchdog_timeout_s = 300.0
+        try:
+            runfor_watchdog_timeout_s = float(runfor_watchdog_timeout_s)
+        except (TypeError, ValueError) as exc:
+            raise ProfileError(
+                "fault_sweep.runfor_watchdog_timeout_s: expected positive number"
+            ) from exc
+        if (
+            not math.isfinite(runfor_watchdog_timeout_s)
+            or runfor_watchdog_timeout_s <= 0
+        ):
+            raise ProfileError(
+                "fault_sweep.runfor_watchdog_timeout_s: expected positive number"
+            )
+        self.runfor_watchdog_timeout_s = runfor_watchdog_timeout_s
         self.fault_types = ["power_loss"] if fault_types is None else list(fault_types)
         self.evaluation_mode = evaluation_mode
         self.sweep_strategy = sweep_strategy
@@ -3624,6 +3642,11 @@ class ProfileConfig:
         vars_list.append(
             "PHASE2_WALL_TIMEOUT_S:{}".format(fs.phase2_wall_timeout_s)
         )
+        vars_list.append(
+            "RUNFOR_WATCHDOG_TIMEOUT_S:{}".format(
+                fs.runfor_watchdog_timeout_s
+            )
+        )
         if fs.boot_cycle_hook:
             vars_list.append(
                 "BOOT_CYCLE_HOOK:{}".format(
@@ -5130,6 +5153,14 @@ def _parse_fault_sweep(
             else _parse_positive_float(
                 raw.get("phase2_wall_timeout_s"),
                 "fault_sweep.phase2_wall_timeout_s",
+            )
+        ),
+        runfor_watchdog_timeout_s=(
+            300.0
+            if raw.get("runfor_watchdog_timeout_s") is None
+            else _parse_positive_float(
+                raw.get("runfor_watchdog_timeout_s"),
+                "fault_sweep.runfor_watchdog_timeout_s",
             )
         ),
         fault_types=fault_types,
@@ -8249,6 +8280,7 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
         "max_step_limit", "run_duration", "calibration_time_slice",
         "phase1_time_slice", "phase2_time_slice", "phase1_wall_timeout_s",
         "phase2_wall_timeout_s",
+        "runfor_watchdog_timeout_s",
         "fault_types",
         "evaluation_mode", "sweep_strategy", "sweep_hash_bypass_symbols",
         "progress_stall_timeout_s", "boot_cycles", "boot_cycle_hook",
@@ -9768,6 +9800,9 @@ def main() -> int:
         "phase2_time_slice": profile.fault_sweep.phase2_time_slice,
         "phase1_wall_timeout_s": profile.fault_sweep.phase1_wall_timeout_s,
         "phase2_wall_timeout_s": profile.fault_sweep.phase2_wall_timeout_s,
+        "runfor_watchdog_timeout_s": (
+            profile.fault_sweep.runfor_watchdog_timeout_s
+        ),
         "boot_cycle_hook": profile.fault_sweep.boot_cycle_hook,
         "expected_rollback_at_cycle": profile.fault_sweep.expected_rollback_at_cycle,
         "phase2_fault_enabled": profile.fault_sweep.phase2_fault.enabled,

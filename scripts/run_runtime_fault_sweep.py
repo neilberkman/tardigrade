@@ -1413,6 +1413,15 @@ except Exception:
     phase2_wall_timeout_s = 30.0
 if not (phase2_wall_timeout_s > 0):
     phase2_wall_timeout_s = 30.0
+runfor_watchdog_timeout_raw = get_optional_var(
+    'runfor_watchdog_timeout_s', '300'
+)
+try:
+    runfor_watchdog_timeout_s = float(runfor_watchdog_timeout_raw)
+except Exception:
+    runfor_watchdog_timeout_s = 300.0
+if not (runfor_watchdog_timeout_s > 0):
+    runfor_watchdog_timeout_s = 300.0
 resume_trace_wall_timeout_raw = str(monitor.GetVariable('resume_trace_wall_timeout_s')).strip()
 try:
     resume_trace_wall_timeout_s = float(resume_trace_wall_timeout_raw)
@@ -10027,16 +10036,16 @@ def _runfor_fetch_preflight(cpu_ref):
     }
 
 
-def _run_for_with_watchdog(cpu_ref, duration, wall_timeout_s, label=''):
+def _run_for_with_watchdog(cpu_ref, duration, watchdog_timeout_s, label=''):
     """Run one emulation slice with fetch validation and a wall watchdog."""
     fetch_error = _runfor_fetch_preflight(cpu_ref)
     if fetch_error is not None:
         return fetch_error
 
     try:
-        watchdog_s = max(0.05, float(wall_timeout_s))
+        watchdog_s = max(0.05, float(watchdog_timeout_s))
     except Exception:
-        watchdog_s = 30.0
+        watchdog_s = 300.0
     state = {'fired': False, 'pc': None, 'pause_error': None}
 
     def stop_stalled_runfor():
@@ -10137,10 +10146,11 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         globals().get('success_terminal_after_reset', False)
     )
     runfor_guard = globals().get('_run_for_with_watchdog')
+    runfor_watchdog_s = globals().get('runfor_watchdog_timeout_s', 300.0)
     if runfor_guard is None:
         # Unit tests execute this function in isolation from its module. The
         # complete runtime always provides the guarded implementation above.
-        def runfor_guard(_cpu_ref, duration, _wall_timeout_s, label=''):
+        def runfor_guard(_cpu_ref, duration, _watchdog_timeout_s, label=''):
             getattr(monitor, 'Parse')(
                 'emulation RunFor "{}"'.format(duration)
             )
@@ -11015,11 +11025,10 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         for iters in range(max_iters):
             fault_timing_state['current_iter'] = iters + 1
             _run_for_started = _time.time()
-            remaining_wall_s = max(0.05, float(wall_timeout) - (_time.time() - t0))
             runfor_infrastructure_error = runfor_guard(
                 cpu_ref,
                 time_slice,
-                min(120.0, remaining_wall_s),
+                runfor_watchdog_s,
                 label=label,
             )
             run_for_wall_s += max(0.0, _time.time() - _run_for_started)
@@ -11229,7 +11238,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                         runfor_infrastructure_error = runfor_guard(
                             cpu_ref,
                             '0.005',
-                            30.0,
+                            runfor_watchdog_s,
                             label='{}_post_vtor'.format(label),
                         )
                         _settle_run_for_elapsed = max(
@@ -11274,7 +11283,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                     runfor_infrastructure_error = runfor_guard(
                         cpu_ref,
                         '0.005',
-                        30.0,
+                        runfor_watchdog_s,
                         label='{}_post_vtor_settle'.format(label),
                     )
                     _settle_run_for_elapsed = max(
@@ -11463,7 +11472,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             runfor_infrastructure_error = runfor_guard(
                 cpu_ref,
                 '0.005',
-                30.0,
+                runfor_watchdog_s,
                 label='{}_post_budget_vtor'.format(label),
             )
             _settle_run_for_elapsed = max(
@@ -12438,7 +12447,7 @@ def run_timed_reset_fault(fault_at):
     trigger_error = _run_for_with_watchdog(
         cpu_ref,
         '{:.3f}'.format(trigger_s),
-        30.0,
+        runfor_watchdog_timeout_s,
         label='fp{}_timed_trigger'.format(fault_at),
     )
     if trigger_error is not None:
@@ -14657,7 +14666,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         trigger_error = _run_for_with_watchdog(
             cpu_ref,
             '{:.3f}'.format(trigger_s),
-            30.0,
+            runfor_watchdog_timeout_s,
             label='p2fault_p1_{}_timed'.format(p1_fault_at),
         )
         p1_status = (
@@ -14856,7 +14865,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         trigger_error = _run_for_with_watchdog(
             cpu_ref,
             '{:.3f}'.format(p2_trigger_s),
-            30.0,
+            runfor_watchdog_timeout_s,
             label='p2fault_p2_{}_{}_timed'.format(
                 p1_fault_at, p2_fault_at
             ),
