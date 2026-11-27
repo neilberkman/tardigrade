@@ -278,6 +278,49 @@ def test_explorer_is_breadth_first_deduplicates_and_keeps_generation_counts():
     assert results[0]["recovery_state_search_summary"]["states_booted"] == 3
 
 
+def test_explorer_uses_deferred_recovery_trace_base_for_deeper_states():
+    initial = PersistentState.from_bytes(b"\xff\xff", base_address=0x1000)
+    calibration = merge_operation_traces([_write(1, 1, 0x10)], [])
+
+    def boot_state(state, _chain, generation):
+        operations = (
+            merge_operation_traces([_write(1, 1, 0x20)], [])
+            if generation == 1
+            else ()
+        )
+        trace_base = (
+            PersistentState.from_bytes(b"\xaa\x10", base_address=0x1000)
+            if generation == 1
+            else state
+        )
+        return (
+            {"fault_injected": True, "signals": {}},
+            operations,
+            trace_base,
+        )
+
+    explorer = RecoveryStateExplorer(
+        initial,
+        calibration,
+        first_cuts=(0,),
+        max_cuts=2,
+        max_new_states=10,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        flash_base=0x1000,
+        backend_kind="mram",
+        torn_word_mode="programmed",
+    )
+
+    results, _summary = explorer.run()
+
+    expected = PersistentState.from_bytes(b"\xaa\x20", base_address=0x1000)
+    assert results[1]["recovery_state_search"]["state_identity"] == (
+        expected.identity_hex()
+    )
+
+
 def test_explorer_reuses_erase_first_states_and_reports_them_separately():
     baseline = PersistentState.from_bytes(b"\xff\xff")
     erases = [

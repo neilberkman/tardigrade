@@ -3974,7 +3974,6 @@ def _validated_writeback_trace(trace_data):
     if (
         backend.get('kind') == 'mram'
         and globals().get('program_trace_file_path', '')
-        and not int(globals().get('tracking_start_address_config', 0) or 0)
     ):
         program_unit = int(
             getattr(backend.get('data'), 'ProgramUnitSize', 0)
@@ -13567,7 +13566,6 @@ def _replay_cross_check_expected_traces():
         if (
             backend.get('kind') == 'mram'
             and program_trace_file_path
-            and not int(tracking_start_address_config or 0)
         ):
             trace_data_loaded = _mram_program_trace_events_for_replay(
                 program_trace_file_path
@@ -13742,12 +13740,17 @@ def _computed_erase_cross_check_state(fault_at, fault_type):
         apply_hash_bypass()
     _clear_mram_uncorrectable_words()
     flash_base, flash_size, page_size, erase_fill = _replay_storage_geometry()
-    baseline = _replay_storage_read_bytes(0, flash_size)
-    state = PersistentState.from_bytes(
-        bytearray(to_py_bytes(baseline)),
-        name='nvm',
-        base_address=flash_base,
-    )
+    state = _load_tracking_base_state(required=True) if (
+        backend.get('kind') == 'mram'
+        and int(tracking_start_address_config or 0)
+    ) else None
+    if state is None:
+        baseline = _replay_storage_read_bytes(0, flash_size)
+        state = PersistentState.from_bytes(
+            bytearray(to_py_bytes(baseline)),
+            name='nvm',
+            base_address=flash_base,
+        )
     if torn_word_explicit and backend.get('kind') != 'mram':
         expected_torn_word = torn_word
         expected_torn_word_seed = torn_word_seed
@@ -15154,7 +15157,15 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None):
 
         cpu_ref = monitor.Machine['sysbus.cpu']
         cpu_ref.IsHalted = False
-        reset_nvmc_for_sweep(enable_tracking_gate=(cut_index == 0))
+        reset_nvmc_for_sweep(enable_tracking_gate=bool(
+            cut_index == 0
+            or (
+                cross_check_expected is not None
+                and int(
+                    globals().get('tracking_start_address_config', 0) or 0
+                )
+            )
+        ))
         if carried_offsets:
             _restore_mram_uncorrectable_offsets(carried_offsets)
         _clear_mram_uncorrectable_read_log()
@@ -15585,7 +15596,10 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     if _hash_bypass_active:
         apply_hash_bypass()
 
-    reset_nvmc_for_sweep(enable_tracking_gate=False)
+    reset_nvmc_for_sweep(enable_tracking_gate=bool(
+        cross_check_expected is not None
+        and int(globals().get('tracking_start_address_config', 0) or 0)
+    ))
     if p1_uncorrectable_offsets:
         _restore_mram_uncorrectable_offsets(p1_uncorrectable_offsets)
     _clear_mram_uncorrectable_read_log()
@@ -16348,6 +16362,7 @@ trace_data_loaded = None
 erase_trace_loaded = None
 trace_replay_engine = None
 trace_replay_engine_attempted = False
+tracking_base_state_loaded = None
 
 
 def _replay_storage_geometry():
@@ -16376,6 +16391,257 @@ def _replay_storage_write_bytes(offset, data):
         backend['data'].Nvm.WriteBytes(int(offset), data, 0, len(data))
         return
     backend['data'].Flash.WriteBytes(int(offset), data)
+
+
+def _tracking_base_artifact_path(program_path=None):
+    path = str(
+        program_trace_file_path if program_path is None else program_path
+    ).strip()
+    if not path:
+        return ''
+    return path + '.tracking_base.bin'
+
+
+def _tracking_base_identity(program_path=None):
+    target = backend.get('data')
+    trace_path = str(
+        program_trace_file_path if program_path is None else program_path
+    ).strip()
+    trace_digest = ''
+    if trace_path and os.path.isfile(trace_path):
+        digest = hashlib.sha256()
+        with open(trace_path, 'rb') as trace_stream:
+            while True:
+                chunk = trace_stream.read(1 << 16)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        trace_digest = digest.hexdigest()
+    return 'tracking-base-v1|{}|{}|{}|{}|{}|{}|{}'.format(
+        backend.get('backend_sysbus_name', ''),
+        backend.get('kind', ''),
+        int(backend.get('bus_base') or 0),
+        int(getattr(target, 'Size', 0) or 0),
+        int(
+            getattr(target, 'ProgramUnitSize', 0)
+            or getattr(target, 'WordSize', 0)
+            or 0
+        ),
+        int(tracking_start_address_config or 0),
+        trace_digest,
+    )
+
+
+def _tracking_base_geometry():
+    target = backend.get('data')
+    size = int(getattr(target, 'Size', 0) or 0)
+    unit = int(
+        getattr(target, 'ProgramUnitSize', 0)
+        or getattr(target, 'WordSize', 0)
+        or 0
+    )
+    if size <= 0 or unit <= 0 or size % unit != 0:
+        raise RuntimeError(
+            'deferred tracking base has invalid MRAM geometry '
+            '(size={}, program_unit={})'.format(size, unit)
+        )
+    return size, unit
+
+
+def _tracking_base_capability_error():
+    if backend.get('kind') != 'mram':
+        return 'deferred exact replay requires an MRAM backend'
+    if backend.get('controller') is not None:
+        return 'a separate persistent NVM controller is not captured'
+    if backend.get('otp') is not None:
+        return 'declared persistent OTP values are not captured at the tracking boundary'
+    target = backend.get('data')
+    required = (
+        'TrackingBaseSnapshotAvailable', 'TrackingBaseSnapshot',
+        'TrackingBaseSnapshotSize',
+        'TrackingBaseUncorrectableWordsToString',
+    )
+    missing = [name for name in required if not hasattr(target, name)]
+    if missing:
+        return 'backend lacks tracking-base snapshot members: {}'.format(
+            ', '.join(missing)
+        )
+    try:
+        _tracking_base_geometry()
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _tracking_base_marks_from_text(raw_text, size, unit):
+    marks = []
+    seen = set()
+    for entry in _parse_uncorrectable_words_table(
+        raw_text, bus_base=int(backend.get('bus_base') or 0)
+    ):
+        offset = int(entry['offset'])
+        if (
+            offset < 0
+            or offset >= int(size)
+            or offset % int(unit) != 0
+            or offset in seen
+        ):
+            raise RuntimeError(
+                'deferred tracking base has an invalid uncorrectable-word mark'
+            )
+        seen.add(offset)
+        marks.append(offset)
+    return tuple(sorted(marks))
+
+
+def _tracking_base_mark_bytes(marks, size, unit):
+    encoded = bytearray(int(size) // int(unit))
+    for offset in marks:
+        encoded[int(offset) // int(unit)] = 1
+    return bytes(encoded)
+
+
+def _tracking_base_marks_from_bytes(encoded, size, unit):
+    raw = bytearray(encoded)
+    expected = int(size) // int(unit)
+    if len(raw) != expected or any(value not in (0, 1) for value in raw):
+        raise RuntimeError(
+            'deferred tracking base has invalid uncorrectable-word data'
+        )
+    return tuple(
+        index * int(unit)
+        for index, value in enumerate(raw)
+        if value
+    )
+
+
+def _tracking_base_state_from_peripheral(require_available=True):
+    error = _tracking_base_capability_error()
+    if error is not None:
+        raise RuntimeError(
+            'deferred tracking base cannot cover complete persistent state: {}'.format(
+                error
+            )
+        )
+    target = backend.get('data')
+    size, unit = _tracking_base_geometry()
+    available = bool(target.TrackingBaseSnapshotAvailable)
+    snapshot_size = int(target.TrackingBaseSnapshotSize)
+    if not available or snapshot_size != size:
+        if not require_available:
+            return None
+        raise RuntimeError(
+            'deferred tracking base snapshot was not captured at the configured address'
+        )
+    snapshot = to_py_bytes(target.TrackingBaseSnapshot)
+    if snapshot is None or len(snapshot) != size:
+        raise RuntimeError(
+            'deferred tracking base snapshot does not cover the complete backend region'
+        )
+    marks = _tracking_base_marks_from_text(
+        target.TrackingBaseUncorrectableWordsToString(), size, unit
+    )
+    flash_base, _flash_size, _page_size, _erase_fill = (
+        _replay_storage_geometry()
+    )
+    return PersistentState.from_bytes(
+        bytearray(snapshot),
+        name='nvm',
+        base_address=flash_base,
+        uncorrectable_words=tuple(('nvm', offset) for offset in marks),
+        persistent_values={},
+    )
+
+
+def _write_tracking_base_artifact(program_path):
+    state = _tracking_base_state_from_peripheral(require_available=True)
+    size, unit = _tracking_base_geometry()
+    marks = tuple(
+        offset
+        for region_name, offset in state.uncorrectable_words
+        if region_name == 'nvm'
+    )
+    components = {
+        'nvm': state.materialize()['nvm'],
+        'uncorrectable_words': _tracking_base_mark_bytes(
+            marks, size, unit
+        ),
+    }
+    path = _tracking_base_artifact_path(program_path)
+    header = _write_boundary_snapshot_artifact(
+        path, components, _tracking_base_identity(program_path)
+    )
+    return path, state, header
+
+
+def _load_tracking_base_state(required=None):
+    global tracking_base_state_loaded
+    deferred = bool(int(tracking_start_address_config or 0))
+    if required is None:
+        required = deferred
+    if not deferred:
+        return None
+    if tracking_base_state_loaded is not None:
+        return tracking_base_state_loaded
+    error = _tracking_base_capability_error()
+    if error is not None:
+        raise RuntimeError(
+            'deferred tracking base cannot cover complete persistent state: {}'.format(
+                error
+            )
+        )
+    path = _tracking_base_artifact_path()
+    if not path or not os.path.isfile(path):
+        if not required:
+            return None
+        raise RuntimeError(
+            'deferred tracking base snapshot artifact is missing for the exact MRAM trace'
+        )
+    size, unit = _tracking_base_geometry()
+    expected_lengths = {
+        'nvm': size,
+        'uncorrectable_words': size // unit,
+    }
+    try:
+        components, _header = _read_boundary_snapshot_artifact(
+            path, _tracking_base_identity(), expected_lengths
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            'deferred tracking base snapshot artifact is incomplete or invalid: {}'.format(
+                exc
+            )
+        )
+    marks = _tracking_base_marks_from_bytes(
+        components['uncorrectable_words'], size, unit
+    )
+    flash_base, _flash_size, _page_size, _erase_fill = (
+        _replay_storage_geometry()
+    )
+    tracking_base_state_loaded = PersistentState.from_bytes(
+        bytearray(components['nvm']),
+        name='nvm',
+        base_address=flash_base,
+        uncorrectable_words=tuple(('nvm', offset) for offset in marks),
+        persistent_values={},
+    )
+    return tracking_base_state_loaded
+
+
+def _restore_tracking_base_for_replay():
+    state = _load_tracking_base_state(required=True)
+    if state is None:
+        return None
+    data = state.materialize()['nvm']
+    _replay_storage_write_bytes(0, to_clr_bytes(data))
+    _clear_mram_uncorrectable_words()
+    offsets = [
+        int(offset)
+        for region_name, offset in sorted(state.uncorrectable_words)
+        if region_name == 'nvm'
+    ]
+    _restore_mram_uncorrectable_offsets(offsets)
+    return state
 
 def ensure_trace_replay_engine():
     global trace_replay_engine, trace_replay_engine_attempted
@@ -16567,6 +16833,93 @@ def _mram_program_trace_events_for_replay(path):
         )
         for event in load_mram_program_trace_data(path)
     ]
+
+
+def _deferred_mram_replay_fault_evidence(
+    selected_write_index,
+    observed_pre_program_value,
+    post_fault_value,
+    marked_uncorrectable=False,
+):
+    """Build exact evidence from an authenticated deferred replay trace."""
+    if (
+        backend.get('kind') != 'mram'
+        or not int(tracking_start_address_config or 0)
+        or not program_trace_file_path
+    ):
+        return None
+    events = load_mram_program_trace_data(program_trace_file_path)
+    backend_index = int(selected_write_index) + 1
+    matching = [
+        event for event in events
+        if int(event['write_index']) == backend_index
+    ]
+    if len(matching) != 1:
+        raise RuntimeError(
+            'deferred exact MRAM replay has no unique program record for cut {}'.format(
+                selected_write_index
+            )
+        )
+    event = matching[0]
+    width = int(event['width'])
+    mask = (1 << (width * 8)) - 1
+    if int(observed_pre_program_value) & mask != int(
+        event['pre_program_value']
+    ) & mask:
+        raise RuntimeError(
+            'deferred exact MRAM replay pre-program bytes disagree at cut {}'.format(
+                selected_write_index
+            )
+        )
+
+    def value_hex(value):
+        return ''.join(
+            '{:02x}'.format((int(value) >> (8 * index)) & 0xFF)
+            for index in range(width)
+        )
+
+    bus_base = int(backend.get('bus_base') or 0)
+    trace = []
+    for trace_event in events:
+        trace_index = int(trace_event['write_index'])
+        if trace_index > backend_index:
+            break
+        is_fault = trace_index == backend_index
+        trace.append({
+            'write_index': trace_index,
+            'program_address': fmt_u32(
+                bus_base + int(trace_event['offset'])
+            ),
+            'offset': int(trace_event['offset']),
+            'program_width': int(trace_event['width']),
+            'intended_bytes': value_hex(trace_event['value']),
+            'pre_program_bytes': value_hex(
+                trace_event['pre_program_value']
+            ),
+            'post_program_bytes': value_hex(
+                post_fault_value
+                if is_fault
+                else trace_event['completed_value']
+            ),
+            'faulted': is_fault,
+        })
+    evidence = {
+        'contract_version': 1,
+        'selected_write_index': int(selected_write_index),
+        'backend_write_index': backend_index,
+        'program_address': fmt_u32(bus_base + int(event['offset'])),
+        'offset': int(event['offset']),
+        'program_width': width,
+        'intended_bytes': value_hex(event['value']),
+        'pre_program_bytes': value_hex(event['pre_program_value']),
+        'post_fault_bytes': value_hex(post_fault_value),
+        'write_trace': trace,
+        'exact': True,
+    }
+    if marked_uncorrectable:
+        evidence['word_marked_uncorrectable'] = True
+        evidence['uncorrectable_word_address'] = evidence['program_address']
+    return evidence
 
 def load_erase_trace_data(path, require_replay_metadata=False):
     import csv as _csv
@@ -17503,18 +17856,6 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     if writeback_active() and fault_base in _TRACE_REPLAY_WRITE_FAULT_TYPES:
         log('fp={} trace_replay_fallback writeback active for {}'.format(fault_at, fault_type))
         return run_execute_fault(fault_at, fault_type=fault_type)
-    if (
-        backend.get('kind') == 'mram'
-        and int(tracking_start_address_config or 0)
-    ):
-        log(
-            'fp={} trace_replay_fallback MRAM tracking starts at {}; '
-            'the trace omits the persistent prefix'.format(
-                fault_at, fmt_u32(tracking_start_address_config)
-            )
-        )
-        return run_execute_fault(fault_at, fault_type=fault_type)
-
     native_result = run_trace_replay_fault_native(fault_at, fault_type=fault_type)
     if native_result is not None:
         return native_result
@@ -17524,7 +17865,6 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
             if (
                 backend.get('kind') == 'mram'
                 and program_trace_file_path
-                and not int(tracking_start_address_config or 0)
             ):
                 trace_data_loaded = _mram_program_trace_events_for_replay(
                     program_trace_file_path
@@ -17583,6 +17923,11 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     # No machine Reset needed — reload_images_cached() overwrites full flash.
     t_reload = _time.time()
     reload_images_cached()
+    if (
+        backend.get('kind') == 'mram'
+        and int(tracking_start_address_config or 0)
+    ):
+        _restore_tracking_base_for_replay()
     if _hash_bypass_active:
         apply_hash_bypass()
     reload_ms = int((_time.time() - t_reload) * 1000)
@@ -17595,6 +17940,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     flash_ref = backend['data'] if backend['kind'] == 'mram' else backend['data'].Flash
 
     fault_snapshot_word = None
+    fault_pre_program_value = None
     mram_power_loss_torn = False
     mram_power_loss_width = 4
     fault_uncorrectable_offsets = []
@@ -17694,6 +18040,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
                         previous_value |= (int(byte_val) & 0xFF) << (
                             8 * byte_index
                         )
+                    fault_pre_program_value = previous_value
                     torn_value = _trace_replay_mram_torn_value(
                         value,
                         width,
@@ -17753,9 +18100,42 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
                 erase_buf[bi] = 0xFF
             _replay_storage_write_bytes(int(e_off), erase_buf)
             erase_idx += 1
-        actual_writes = writes_applied
+        actual_writes = (
+            max(0, int(fault_at))
+            if (
+                fault_injected
+                and backend.get('kind') == 'mram'
+                and int(tracking_start_address_config or 0)
+            )
+            else writes_applied
+        )
         faulted_flash = _replay_storage_read_bytes(0, flash_size)
         fault_snapshot_bytes = to_py_bytes(faulted_flash)
+
+    if backend.get('kind') == 'mram':
+        inherited_marks = set(_snapshot_mram_uncorrectable_offsets())
+        inherited_marks.update(
+            int(offset) for offset in fault_uncorrectable_offsets
+        )
+        fault_uncorrectable_offsets = sorted(inherited_marks)
+        fault_uncorrectable_addresses = [
+            fmt_u32(int(flash_base_addr) + int(offset))
+            for offset in fault_uncorrectable_offsets
+        ]
+
+    mram_fault_evidence = None
+    if (
+        fault_injected
+        and mram_power_loss_torn
+        and backend.get('kind') == 'mram'
+        and int(tracking_start_address_config or 0)
+    ):
+        mram_fault_evidence = _deferred_mram_replay_fault_evidence(
+            fault_at,
+            fault_pre_program_value,
+            fault_snapshot_word,
+            marked_uncorrectable=(mram_torn_word == 'uncorrectable'),
+        )
 
     replay_ms = int((_time.time() - t_replay) * 1000)
     phase1_ms = int((_time.time() - fp_t0) * 1000)
@@ -17882,13 +18262,16 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
             fault_at, writes_applied, reload_ms, replay_ms, reset_ms, setup_ms,
             emulation_ms, p2_status.get('iters'), total_ms, boot_outcome))
 
+    extra_fields = {'recovery_writes': recovery_writes}
+    if mram_fault_evidence is not None:
+        extra_fields['mram_fault_evidence'] = mram_fault_evidence
     result = _build_fault_result(
         fault_at, fault_type, fault_injected, fault_address,
         actual_writes, signals, boot_outcome=boot_outcome,
         boot_slot=boot_slot, eff_criteria=eff_criteria, p2_status=p2_status,
         followup_label='fp{}_python_followup'.format(fault_at),
         saved_flash=faulted_flash, fault_snapshot_bytes=fault_snapshot_bytes,
-        extra_fields={'recovery_writes': recovery_writes},
+        extra_fields=extra_fields,
         metadata_delta_pre_snapshot=md_pre_snapshot,
         fault_semantic_state=fault_semantic_state,
         fault_uncorrectable_words=fault_uncorrectable_addresses,
@@ -17935,10 +18318,13 @@ def _state_search_preflight():
     if uses_program_trace and int(
         globals().get('tracking_start_address_config', 0) or 0
     ):
-        raise RuntimeError(
-            'recovery state search cannot use an MRAM program trace captured '
-            'after a deferred tracking start'
-        )
+        capability_error = _tracking_base_capability_error()
+        if capability_error is not None:
+            raise RuntimeError(
+                'recovery state search deferred tracking base cannot cover '
+                'complete persistent state: {}'.format(capability_error)
+            )
+        _load_tracking_base_state(required=True)
     if not uses_program_trace and not backend.get('write_trace_width_explicit'):
         raise RuntimeError('recovery state search requires width-explicit write traces')
     if not bool(backend.get('per_write_accurate')):
@@ -18272,7 +18658,9 @@ def _state_search_boot_state(state, chain, generation):
     })
     if _hash_bypass_active:
         apply_hash_bypass()
-    reset_nvmc_for_recovery()
+    reset_nvmc_for_recovery(enable_tracking_gate=bool(
+        int(tracking_start_address_config or 0)
+    ))
     _clear_mram_uncorrectable_words()
     _restore_mram_uncorrectable_offsets(state_marks)
     _clear_mram_uncorrectable_read_log()
@@ -18321,8 +18709,19 @@ def _state_search_boot_state(state, chain, generation):
     recovery_operations = (
         _state_search_capture_trace() if capture_recovery_trace else ()
     )
+    recovery_trace_base = state
+    if (
+        capture_recovery_trace
+        and backend.get('kind') == 'mram'
+        and int(tracking_start_address_config or 0)
+    ):
+        recovery_trace_base = _tracking_base_state_from_peripheral(
+            require_available=True
+        )
     if capture_recovery_trace and backend.get('kind') == 'mram':
-        _state_search_validate_program_prefix(state, recovery_operations)
+        _state_search_validate_program_prefix(
+            recovery_trace_base, recovery_operations
+        )
     _state_breakdown['trace_export_s'] = round(
         max(0.0, _time.time() - trace_export_started), 6
     )
@@ -18379,7 +18778,7 @@ def _state_search_boot_state(state, chain, generation):
             _finalize_recovery_marker_precondition_result(result)
         )
     )
-    return result, recovery_operations
+    return result, recovery_operations, recovery_trace_base
 
 
 def _state_search_live_cross_check(state, chain, generation, operation):
@@ -18442,12 +18841,17 @@ def run_recovery_state_search():
         apply_hash_bypass()
     _clear_mram_uncorrectable_words()
     flash_base, flash_size, page_size, erase_fill = _replay_storage_geometry()
-    baseline = _replay_storage_read_bytes(0, flash_size)
-    initial_state = PersistentState.from_bytes(
-        bytearray(to_py_bytes(baseline)),
-        name='nvm',
-        base_address=flash_base,
-    )
+    initial_state = _load_tracking_base_state(required=True) if (
+        backend.get('kind') == 'mram'
+        and int(tracking_start_address_config or 0)
+    ) else None
+    if initial_state is None:
+        baseline = _replay_storage_read_bytes(0, flash_size)
+        initial_state = PersistentState.from_bytes(
+            bytearray(to_py_bytes(baseline)),
+            name='nvm',
+            base_address=flash_base,
+        )
     if backend.get('kind') == 'mram':
         _state_search_validate_program_prefix(
             initial_state, calibration_operations
@@ -18500,6 +18904,13 @@ def run_recovery_state_search():
     summary['calibration_writes'] = int(total_writes)
     summary['calibration_erases'] = int(total_erases)
     summary['calibration_operations'] = len(calibration_operations)
+    deferred_tracking_base = bool(
+        backend.get('kind') == 'mram'
+        and int(tracking_start_address_config or 0)
+    )
+    if deferred_tracking_base:
+        summary['calibration_base_state_identity'] = initial_state.identity_hex()
+        summary['deferred_tracking_base'] = True
     if results:
         results[0]['recovery_state_search_summary'] = dict(summary)
     log(
@@ -18940,6 +19351,9 @@ if calibration_mode:
         trace_file = None
         trace_file_bin = None
         program_trace_file = None
+        tracking_base_file = None
+        tracking_base_state = None
+        tracking_base_header = None
         calibration_last_program = None
         if trace_capable and calibration_trace_target.WriteTraceEnabled:
             calibration_trace_target.WriteTraceEnabled = False
@@ -19062,6 +19476,17 @@ if calibration_mode:
             log('calibration: wrote {} exact MRAM program entries to {}'.format(
                 len(program_trace), program_trace_file
             ))
+            if int(tracking_start_address_config or 0):
+                (
+                    tracking_base_file,
+                    tracking_base_state,
+                    tracking_base_header,
+                ) = _write_tracking_base_artifact(program_trace_file)
+                log(
+                    'calibration: wrote deferred tracking base state {} to {}'.format(
+                        tracking_base_state.identity_hex(), tracking_base_file
+                    )
+                )
 
         # Export erase trace — captured across fast, mram, and slow backends when supported.
         erase_trace_file = None
@@ -19303,6 +19728,21 @@ if calibration_mode:
             result['trace_file_bin'] = trace_file_bin
         if program_trace_file:
             result['program_trace_file'] = program_trace_file
+        if tracking_base_file:
+            result['tracking_base_file'] = tracking_base_file
+            result['tracking_base_state'] = {
+                'state_identity': tracking_base_state.identity_hex(),
+                'backend_bytes': len(
+                    tracking_base_state.materialize()['nvm']
+                ),
+                'uncorrectable_words': len(
+                    tracking_base_state.uncorrectable_words
+                ),
+                'persistent_values': len(
+                    tracking_base_state.persistent_values
+                ),
+                'components': list(tracking_base_header['components']),
+            }
         if erase_trace_file:
             result['erase_trace_file'] = erase_trace_file
         if erase_trace_file_bin:
@@ -19332,6 +19772,10 @@ else:
     trace_source_exists = (
         (trace_file_bin_path and _os.path.exists(trace_file_bin_path))
         or (trace_file_path and _os.path.exists(trace_file_path))
+        or (
+            program_trace_file_path
+            and _os.path.exists(program_trace_file_path)
+        )
     )
     use_trace_replay = (
         backend['kind'] in ('fast', 'mram')

@@ -43,6 +43,7 @@ MRAM Tracking Boundary Defers Counting Tracing And Faults
     Execute Command    nvm FaultAtWordWrite 1
     Execute Command    nvm WriteTraceEnabled true
     Execute Command    sysbus WriteDoubleWord 0x10000000 0xAABBCCDD
+    Execute Command    nvm MarkWordUncorrectable 0x10
     ${pre_value}=      Execute Command    sysbus ReadDoubleWord 0x10000000
     ${pre_count}=      Execute Command    nvm TotalWordWrites
     ${pre_trace}=      Execute Command    nvm WriteTraceCount
@@ -54,12 +55,21 @@ MRAM Tracking Boundary Defers Counting Tracing And Faults
     Should Be Equal As Strings    ${pre_fault}    false
     Should Be Equal As Strings    ${waiting}    false
     Execute Command    nvm TrackingStartAddress 0
+    ${base_available}=    Read Normalized Bool    nvm TrackingBaseSnapshotAvailable
+    ${base_size}=         Execute Command    nvm TrackingBaseSnapshotSize
+    ${base_prefix}=       Execute Command    python "m=monitor.Machine['sysbus.nvm']; print(''.join('%02x' % b for b in m.TrackingBaseSnapshot[:4]))"
+    ${base_prefix}=       Strip String    ${base_prefix}
+    ${base_marks}=        Execute Command    nvm TrackingBaseUncorrectableWordsToString
     Execute Command    sysbus WriteDoubleWord 0x10000008 0x55667788
     ${active}=         Read Normalized Bool    nvm TrackingStarted
     ${count}=          Execute Command    nvm TotalWordWrites
     ${trace}=          Execute Command    nvm WriteTraceCount
     ${fault}=          Read Normalized Bool    nvm FaultEverFired
     Should Be Equal As Strings    ${active}    true
+    Should Be Equal As Strings    ${base_available}    true
+    Should Be Equal As Numbers    ${base_size}    0x80000
+    Should Be Equal As Strings    ${base_prefix}    ddccbbaa
+    Should Contain    ${base_marks}    16:
     Should Be Equal As Numbers    ${count}    1
     Should Be Equal As Numbers    ${trace}    1
     Should Be Equal As Strings    ${fault}    true

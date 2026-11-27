@@ -141,7 +141,7 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "complete backend program unit"):
                     validate([event])
 
-    def test_exact_mram_replay_is_not_used_after_deferred_tracking_start(self) -> None:
+    def test_exact_mram_replay_is_validated_after_deferred_tracking_start(self) -> None:
         tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
         function = next(
             node
@@ -178,9 +178,191 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         event = (1, 0, int.from_bytes(bytes(range(16)), "little"), 16)
         self.assertEqual(
             namespace["_validated_writeback_trace"]([event]),
-            "generic trace validation",
+            [event],
         )
-        self.assertEqual(len(generic_validation_calls), 1)
+        self.assertEqual(generic_validation_calls, [])
+
+    def test_deferred_tracking_base_capture_includes_backend_bytes_and_marks(
+        self,
+    ) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_tracking_base_state_from_peripheral"
+        )
+        captured: dict[str, object] = {}
+
+        def from_bytes(data: object, **kwargs: object) -> dict[str, object]:
+            captured["data"] = bytes(data)
+            captured.update(kwargs)
+            return captured
+
+        target = SimpleNamespace(
+            TrackingBaseSnapshotAvailable=True,
+            TrackingBaseSnapshotSize=8,
+            TrackingBaseSnapshot=b"setup123",
+            TrackingBaseUncorrectableWordsToString=lambda: "4:0x00001004\n",
+        )
+        namespace: dict[str, object] = {
+            "backend": {"data": target},
+            "_tracking_base_capability_error": lambda: None,
+            "_tracking_base_geometry": lambda: (8, 4),
+            "to_py_bytes": bytes,
+            "_tracking_base_marks_from_text": (
+                lambda raw, size, unit: (4,)
+            ),
+            "_replay_storage_geometry": lambda: (0x1000, 8, 4, 0xFF),
+            "PersistentState": SimpleNamespace(from_bytes=from_bytes),
+        }
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                str(PY_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+
+        state = namespace["_tracking_base_state_from_peripheral"]()
+
+        self.assertIs(state, captured)
+        self.assertEqual(captured["data"], b"setup123")
+        self.assertEqual(captured["base_address"], 0x1000)
+        self.assertEqual(captured["uncorrectable_words"], (("nvm", 4),))
+        self.assertEqual(captured["persistent_values"], {})
+
+    def test_deferred_tracking_base_capture_refuses_missing_or_partial_state(
+        self,
+    ) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_tracking_base_state_from_peripheral"
+        )
+        target = SimpleNamespace(
+            TrackingBaseSnapshotAvailable=False,
+            TrackingBaseSnapshotSize=0,
+        )
+        namespace: dict[str, object] = {
+            "backend": {"data": target},
+            "_tracking_base_capability_error": lambda: None,
+            "_tracking_base_geometry": lambda: (8, 4),
+        }
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                str(PY_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "was not captured"):
+            namespace["_tracking_base_state_from_peripheral"]()
+
+        namespace["_tracking_base_capability_error"] = (
+            lambda: "declared persistent values are missing"
+        )
+        with self.assertRaisesRegex(RuntimeError, "complete persistent state"):
+            namespace["_tracking_base_state_from_peripheral"]()
+
+    def test_deferred_exact_replay_restores_base_bytes_and_marks(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_restore_tracking_base_for_replay"
+        )
+        writes: list[tuple[int, bytes]] = []
+        restored_marks: list[tuple[int, ...]] = []
+        cleared: list[bool] = []
+        state = SimpleNamespace(
+            materialize=lambda: {"nvm": b"setup-state"},
+            uncorrectable_words=frozenset({("nvm", 4), ("nvm", 8)}),
+        )
+        namespace: dict[str, object] = {
+            "_load_tracking_base_state": lambda required: state,
+            "_replay_storage_write_bytes": (
+                lambda offset, data: writes.append((offset, bytes(data)))
+            ),
+            "to_clr_bytes": bytes,
+            "_clear_mram_uncorrectable_words": lambda: cleared.append(True),
+            "_restore_mram_uncorrectable_offsets": (
+                lambda offsets: restored_marks.append(tuple(offsets))
+            ),
+        }
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                str(PY_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+
+        self.assertIs(namespace["_restore_tracking_base_for_replay"](), state)
+        self.assertEqual(writes, [(0, b"setup-state")])
+        self.assertEqual(cleared, [True])
+        self.assertEqual(restored_marks, [(4, 8)])
+
+    def test_deferred_exact_replay_reconstructs_exact_fault_evidence(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_deferred_mram_replay_fault_evidence"
+        )
+        namespace: dict[str, object] = {
+            "backend": {"kind": "mram", "bus_base": 0x10100000},
+            "tracking_start_address_config": 0x10000200,
+            "program_trace_file_path": "/calibration/program_trace.csv",
+            "load_mram_program_trace_data": lambda _path: [
+                {
+                    "write_index": 1,
+                    "offset": 0x100,
+                    "width": 4,
+                    "value": 0x11223344,
+                    "pre_program_value": 0xAABBCCDD,
+                    "completed_value": 0x10203040,
+                }
+            ],
+            "fmt_u32": lambda value: "0x{:08X}".format(value),
+        }
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                str(PY_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+
+        evidence = namespace["_deferred_mram_replay_fault_evidence"](
+            0,
+            0xAABBCCDD,
+            0xAABB3344,
+            marked_uncorrectable=True,
+        )
+
+        self.assertTrue(evidence["exact"])
+        self.assertEqual(evidence["program_width"], 4)
+        self.assertEqual(evidence["intended_bytes"], "44332211")
+        self.assertEqual(evidence["pre_program_bytes"], "ddccbbaa")
+        self.assertEqual(evidence["post_fault_bytes"], "4433bbaa")
+        self.assertTrue(evidence["word_marked_uncorrectable"])
+
+        with self.assertRaisesRegex(RuntimeError, "pre-program bytes disagree"):
+            namespace["_deferred_mram_replay_fault_evidence"](
+                0,
+                0,
+                0xAABB3344,
+            )
 
     def test_terminal_self_branch_requires_fault_context_or_known_halt(self) -> None:
         tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))

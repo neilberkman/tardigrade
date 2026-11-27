@@ -190,6 +190,7 @@ class _Phase2Runtime:
         self.miss_pair_second = False
         self.miss_reason = "hard_fault"
         self.flash_choices: dict[int, str] = {}
+        self.sweep_tracking_gates: list[object] = []
         self.ns = {
             "_time": time,
             "get_effective_criteria": lambda _code: {"vtor_in_slot": "exec"},
@@ -199,7 +200,9 @@ class _Phase2Runtime:
             "log": lambda _message: None,
             "restore_phase1_baseline": self._restore_phase1,
             "restore_flash_and_boot": self._restore_flash_and_boot,
-            "reset_nvmc_for_sweep": lambda **_kwargs: None,
+            "reset_nvmc_for_sweep": lambda **kwargs: self.sweep_tracking_gates.append(
+                kwargs.get("enable_tracking_gate")
+            ),
             "reset_nvmc_for_recovery": lambda **_kwargs: None,
             "arm_fault": self._arm_fault,
             "arm_erase_fault": self._arm_fault,
@@ -580,6 +583,31 @@ def test_pair_cross_check_reports_missed_computed_cut_as_infrastructure() -> Non
     assert "cut 2" in status["error"]
 
 
+def test_deferred_state_search_pair_cross_check_reuses_tracking_gate() -> None:
+    runtime = _Phase2Runtime()
+    runtime.miss_pair_second = True
+    runtime.ns["tracking_start_address_config"] = 0x20000400
+    expected = SimpleNamespace(identity_hex=lambda: "computed-state")
+
+    runtime.run(0, 99, cross_check_expected=expected)
+
+    assert runtime.sweep_tracking_gates == [None, True]
+
+
+def test_deferred_state_search_chain_cross_check_gates_every_segment() -> None:
+    runtime = _Phase2Runtime()
+    runtime.missed_chain_cut = 3
+    runtime.ns["tracking_start_address_config"] = 0x20000400
+    expected = SimpleNamespace(identity_hex=lambda: "computed-state")
+
+    runtime.run_chain(
+        [(0, "w"), (1, "w"), (99, "w")],
+        cross_check_expected=expected,
+    )
+
+    assert runtime.sweep_tracking_gates == [True, True, True]
+
+
 def test_state_search_live_cross_check_routes_deeper_chains_to_chain_injector() -> None:
     calls = []
     expected_state = object()
@@ -794,7 +822,7 @@ def test_state_search_accepts_mram_exact_program_trace_without_generic_width() -
     namespace["_state_search_preflight"]()
 
 
-def test_state_search_refuses_mram_trace_after_deferred_tracking_start() -> None:
+def test_state_search_accepts_mram_trace_with_complete_deferred_base() -> None:
     trace = SimpleNamespace(
         ProgramTraceClear=lambda: None,
         ProgramTraceCount=0,
@@ -818,11 +846,72 @@ def test_state_search_refuses_mram_trace_after_deferred_tracking_start() -> None
         "trace_file_path": "/calibration/ambiguous_trace.csv",
         "program_trace_file_path": "/calibration/program_trace.csv",
         "tracking_start_address_config": 0x20000400,
+        "_tracking_base_capability_error": lambda: None,
+        "_load_tracking_base_state": lambda required: (
+            "complete-base" if required else None
+        ),
         "os": SimpleNamespace(path=SimpleNamespace(exists=lambda _path: True)),
     }
     _load_state_search_preflight(namespace)
 
-    with pytest.raises(RuntimeError, match="deferred tracking start"):
+    namespace["_state_search_preflight"]()
+
+
+@pytest.mark.parametrize(
+    ("capability_error", "load_error", "message"),
+    [
+        (
+            "backend lacks tracking-base snapshot members",
+            None,
+            "cannot cover complete persistent state",
+        ),
+        (
+            None,
+            "deferred tracking base snapshot artifact is missing",
+            "snapshot artifact is missing",
+        ),
+    ],
+)
+def test_state_search_refuses_incomplete_deferred_tracking_base(
+    capability_error, load_error, message
+) -> None:
+    trace = SimpleNamespace(
+        ProgramTraceClear=lambda: None,
+        ProgramTraceCount=0,
+        ProgramTraceToString=lambda: "",
+        EraseTraceClear=lambda: None,
+        EraseTraceEnabled=False,
+        EraseTraceCount=0,
+        EraseTraceToString=lambda: "",
+    )
+
+    def load_base(required):
+        assert required is True
+        if load_error is not None:
+            raise RuntimeError(load_error)
+        return "base"
+
+    namespace = {
+        "phase2_state_search": {"enabled": True},
+        "backend": {
+            "kind": "mram",
+            "data": trace,
+            "controller": None,
+            "otp": None,
+            "write_trace_width_explicit": False,
+            "per_write_accurate": True,
+        },
+        "durability_model": "direct",
+        "trace_file_path": "/calibration/ambiguous_trace.csv",
+        "program_trace_file_path": "/calibration/program_trace.csv",
+        "tracking_start_address_config": 0x20000400,
+        "_tracking_base_capability_error": lambda: capability_error,
+        "_load_tracking_base_state": load_base,
+        "os": SimpleNamespace(path=SimpleNamespace(exists=lambda _path: True)),
+    }
+    _load_state_search_preflight(namespace)
+
+    with pytest.raises(RuntimeError, match=message):
         namespace["_state_search_preflight"]()
 
 

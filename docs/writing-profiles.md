@@ -1151,6 +1151,11 @@ state from the calibration trace instead of emulating Phase 1 for every point.
 MRAM uses its exact program trace rather than the legacy integer write trace;
 this retains the complete intended byte sequence when the program unit is
 wider than eight bytes and keeps that unit as one interruptible operation.
+When `tracking_start_address` is nonzero, calibration also records the complete
+MRAM bytes and uncorrectable-word marks at the tracking boundary. Replay starts
+from that authenticated base instead of the initial image, so programs made
+before the boundary remain present. A missing, truncated, or backend-incomplete
+base is refused rather than falling back to an inexact reconstruction.
 For every cut whose zero-based fault index is divisible by
 `trace_replay_cross_check_every`, the sweep also runs the live fault-injection
 path to the cut and stops before recovery. The index-based selection is stable
@@ -1840,7 +1845,13 @@ provide width-explicit, per-write-accurate write and erase traces. MRAM
 backends instead provide an exact program trace containing each whole unit's
 intended, pre-program, and completed bytes together with the erase trace. A
 missing, truncated, non-contiguous, or geometry-inconsistent MRAM program
-trace is refused. Because `state_search`
+trace is refused. For a deferred `tracking_start_address`, the calibration
+trace is based on the complete persistent snapshot captured at that boundary.
+Each nonterminal recovery boot captures its own boundary snapshot, and its
+later cuts are computed from that snapshot rather than from the state at boot.
+The search refuses a missing snapshot or a backend whose snapshot contract
+does not cover all bytes, MRAM uncorrectable marks, and declared persistent
+values. Because `state_search`
 uses execute mode, code must also run from directly executable memory; a pure
 `NVMemory` instruction-fetch platform is rejected at profile load time. These
 checks prevent the canonical state from omitting persistent data.

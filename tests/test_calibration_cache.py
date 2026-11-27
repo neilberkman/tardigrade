@@ -419,6 +419,8 @@ class TestSaveLoadCalibration(unittest.TestCase):
         )
         program_trace = os.path.join(self.td, "program_trace.csv")
         Path(program_trace).write_bytes(program_data)
+        tracking_base = Path(program_trace + ".tracking_base.bin")
+        tracking_base.write_bytes(b"authenticated deferred tracking base")
         cal = self._make_cal(total_writes=1)
         cal.program_trace_file = program_trace
 
@@ -433,6 +435,10 @@ class TestSaveLoadCalibration(unittest.TestCase):
         self.assertIsNotNone(loaded)
         self.assertIsNotNone(loaded.program_trace_file)
         self.assertEqual(Path(loaded.program_trace_file).read_bytes(), program_data)
+        self.assertEqual(
+            Path(loaded.program_trace_file + ".tracking_base.bin").read_bytes(),
+            tracking_base.read_bytes(),
+        )
 
         payload = json.loads(Path(self.cache_path).read_text(encoding="utf-8"))
         changed = program_data.replace(b"11223344", b"55667788", 1)
@@ -612,7 +618,7 @@ class TestSaveLoadCalibration(unittest.TestCase):
             payload = json.load(f)
 
         self.assertEqual(payload["cache_key"], "k")
-        self.assertEqual(payload["version"], 5)
+        self.assertEqual(payload["version"], 6)
         self.assertEqual(payload["total_writes"], 100)
 
     def test_rejects_malformed_barrier_audit(self):

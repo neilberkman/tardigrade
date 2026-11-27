@@ -430,6 +430,7 @@ namespace Antmicro.Renode.Peripherals.Memory
                     configuredTrackingStartAddress = value;
                     trackingStartAddress = value;
                     trackingStarted = false;
+                    TrackingBaseSnapshotClear();
                     ResetCampaignObservability();
                     return;
                 }
@@ -440,6 +441,7 @@ namespace Antmicro.Renode.Peripherals.Memory
                 if(!trackingStarted)
                 {
                     ResetCampaignObservability();
+                    CaptureTrackingBaseState();
                 }
                 trackingStartAddress = 0;
                 trackingStarted = true;
@@ -449,6 +451,54 @@ namespace Antmicro.Renode.Peripherals.Memory
         public bool TrackingStarted
         {
             get { return AliasTarget != null ? AliasTarget.TrackingStarted : trackingStarted; }
+        }
+
+        public bool TrackingBaseSnapshotAvailable
+        {
+            get
+            {
+                return AliasTarget != null
+                    ? AliasTarget.TrackingBaseSnapshotAvailable
+                    : trackingBaseSnapshot != null && trackingBaseSnapshot.Length == Size;
+            }
+        }
+
+        public byte[] TrackingBaseSnapshot
+        {
+            get
+            {
+                return AliasTarget != null
+                    ? AliasTarget.TrackingBaseSnapshot
+                    : CloneBytes(trackingBaseSnapshot);
+            }
+        }
+
+        public int TrackingBaseSnapshotSize
+        {
+            get
+            {
+                return AliasTarget != null
+                    ? AliasTarget.TrackingBaseSnapshotSize
+                    : (trackingBaseSnapshot != null ? trackingBaseSnapshot.Length : 0);
+            }
+        }
+
+        public string TrackingBaseUncorrectableWordsToString()
+        {
+            return AliasTarget != null
+                ? AliasTarget.TrackingBaseUncorrectableWordsToString()
+                : FormatWordOffsets(trackingBaseUncorrectableWords);
+        }
+
+        public void TrackingBaseSnapshotClear()
+        {
+            if(AliasTarget != null)
+            {
+                AliasTarget.TrackingBaseSnapshotClear();
+                return;
+            }
+            trackingBaseSnapshot = null;
+            trackingBaseUncorrectableWords.Clear();
         }
 
         public bool WriteTraceEnabled
@@ -1982,6 +2032,13 @@ namespace Antmicro.Renode.Peripherals.Memory
             DriverErrorFired = false;
         }
 
+        private void CaptureTrackingBaseState()
+        {
+            trackingBaseSnapshot = CloneBytes(storage);
+            trackingBaseUncorrectableWords.Clear();
+            trackingBaseUncorrectableWords.AddRange(uncorrectableWords);
+        }
+
         private long AlignDown(long value, long alignment)
         {
             return value & ~(alignment - 1);
@@ -2051,6 +2108,8 @@ namespace Antmicro.Renode.Peripherals.Memory
         private byte[] faultMemorySnapshot;
         private bool lastFaultMarkedUncorrectable;
         private readonly List<long> faultUncorrectableWords = new List<long>();
+        private byte[] trackingBaseSnapshot;
+        private readonly List<long> trackingBaseUncorrectableWords = new List<long>();
         private ulong uncorrectableReadCount;
         private ulong lastUncorrectableReadWordAddress;
         private ulong lastUncorrectableReadAddress;

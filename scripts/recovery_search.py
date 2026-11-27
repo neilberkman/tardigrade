@@ -333,10 +333,12 @@ def add_equivalent_chain(result, chain, cross_check=None):
 class RecoveryStateExplorer(object):
     """Breadth-first exploration with one boot per persistent state.
 
-    ``boot_state`` receives ``(state, chain, generation)`` and returns a pair
-    containing the ordinary runtime result and the recovery operation trace.
-    The trace is used only after the result has been retained in the verdict
-    cache, so equivalent paths never cause another recovery boot.
+    ``boot_state`` receives ``(state, chain, generation)`` and returns the
+    ordinary runtime result, the recovery operation trace, and optionally the
+    complete persistent state captured when that trace began. The optional
+    state equals ``state`` for boot-start tracing. The trace is used only after
+    the result has been retained in the verdict cache, so equivalent paths
+    never cause another recovery boot.
     """
 
     def __init__(
@@ -534,7 +536,16 @@ class RecoveryStateExplorer(object):
             selection_ordinal=cross_check_ordinal,
         )
         self.budget.record_boot()
-        result, operations = self.boot_state(state, chain, generation)
+        booted = self.boot_state(state, chain, generation)
+        if len(booted) == 2:
+            result, operations = booted
+            trace_base_state = state
+        elif len(booted) == 3:
+            result, operations, trace_base_state = booted
+        else:
+            raise RecoverySearchError(
+                "boot_state must return result, operations, and optional trace base"
+            )
         attach_search_metadata(result, chain, state, generation)
         if state.identity() in self._cross_checks:
             result["recovery_state_search"]["cross_check"] = self._cross_checks[
@@ -543,6 +554,7 @@ class RecoveryStateExplorer(object):
         entry = self._seen[state.identity()]
         entry["result"] = result
         entry["operations"] = tuple(operations)
+        entry["trace_base_state"] = trace_base_state
         self.results.append(result)
         self.summary["states_booted"] += 1
         if generation == 1:
@@ -577,7 +589,9 @@ class RecoveryStateExplorer(object):
                 continue
             entry = self._boot(candidate, chain, 1)
             if entry is not None:
-                queue.append((candidate, chain, 1, entry["operations"]))
+                queue.append((
+                    entry["trace_base_state"], chain, 1, entry["operations"]
+                ))
             if self.budget.wall_expired():
                 self.summary["stopped_reason"] = "max_wall_time_s"
                 break
@@ -641,7 +655,12 @@ class RecoveryStateExplorer(object):
                 )
                 if entry is not None:
                     queue.append(
-                        (candidate, next_chain, generation + 1, entry["operations"])
+                        (
+                            entry["trace_base_state"],
+                            next_chain,
+                            generation + 1,
+                            entry["operations"],
+                        )
                     )
                 if self.budget.wall_expired():
                     self.summary["stopped_reason"] = "max_wall_time_s"

@@ -364,6 +364,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             ClearFaultEvidence();
         }
 
+        public bool TrackingBaseSnapshotAvailable =>
+            trackingBaseSnapshot != null
+            && trackingBaseSnapshot.Length == Size;
+        public byte[] TrackingBaseSnapshot => CloneBytes(trackingBaseSnapshot);
+        public int TrackingBaseSnapshotSize =>
+            trackingBaseSnapshot != null ? trackingBaseSnapshot.Length : 0;
+        public string TrackingBaseUncorrectableWordsToString()
+        {
+            return FormatWordOffsets(trackingBaseUncorrectableWords);
+        }
+        public void TrackingBaseSnapshotClear()
+        {
+            trackingBaseSnapshot = null;
+            trackingBaseUncorrectableWords.Clear();
+        }
+
         public ulong LastFaultWriteIndex => lastFaultWriteIndex;
         public ulong LastFaultProgramAddress => lastFaultProgramAddress;
         public long LastFaultOffset => lastFaultOffset;
@@ -397,6 +413,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 trackingStarted = value == 0;
                 if(!trackingStarted)
                 {
+                    TrackingBaseSnapshotClear();
                     ResetCampaignObservability();
                 }
                 UpdateHooks();
@@ -974,6 +991,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             trackingStartAddress = 0;
             trackingStarted = true;
             ResetCampaignObservability();
+            CaptureTrackingBaseState();
             UpdateHooks();
             if(memoryAccessHookInstalled)
             {
@@ -1126,6 +1144,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             programTrace.Clear();
             ClearFaultEvidence();
             flashShadow = null;
+        }
+
+        private void CaptureTrackingBaseState()
+        {
+            if(BackingMemory == null || Size < 0 || Size > int.MaxValue)
+            {
+                TrackingBaseSnapshotClear();
+                return;
+            }
+            trackingBaseSnapshot = BackingMemory.ReadBytes(0, checked((int)Size));
+            trackingBaseUncorrectableWords.Clear();
+            trackingBaseUncorrectableWords.AddRange(uncorrectableWords);
         }
 
         private void ClearFaultEvidence()
@@ -1342,6 +1372,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private byte[] faultMemorySnapshot;
         private bool lastFaultMarkedUncorrectable;
         private readonly List<long> faultUncorrectableWords = new List<long>();
+        private byte[] trackingBaseSnapshot;
+        private readonly List<long> trackingBaseUncorrectableWords = new List<long>();
         private ulong uncorrectableReadCount;
         private ulong lastUncorrectableReadWordAddress;
         private ulong lastUncorrectableReadAddress;
