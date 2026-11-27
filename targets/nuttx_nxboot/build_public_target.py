@@ -206,6 +206,7 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args.nuttx_root / "nuttx", loader_elf)
     shutil.copyfile(args.nuttx_root / "nuttx.bin", loader_bin)
+    shutil.copyfile(args.nuttx_root / ".config", args.output_dir / ".config")
 
     _run(["make", "distclean"], cwd=args.nuttx_root)
     build_variant(args.nuttx_root, args.apps_root, "nxboot-app", args.jobs)
