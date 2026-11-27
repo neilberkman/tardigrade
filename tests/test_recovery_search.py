@@ -197,6 +197,41 @@ def test_two_cut_result_format_is_pasteable_and_preserves_equivalent_chain():
     assert len(result["recovery_state_search"]["equivalent_chains"]) == 1
 
 
+def test_deeper_result_format_is_a_pasteable_explicit_chain():
+    formatted = format_chain(
+        [
+            {
+                "operation": "write",
+                "operation_index": 2,
+                "address": "0x00001000",
+                "fault_type": "power_loss",
+            },
+            {
+                "operation": "erase",
+                "operation_index": 6,
+                "address": "0x00002000",
+                "fault_type": "interrupted_erase",
+            },
+            {
+                "operation": "write",
+                "operation_index": 1,
+                "address": "0x00003000",
+                "fault_type": "power_loss",
+            },
+        ]
+    )
+
+    assert formatted["phase2_fault_chain"] == [
+        [2, "power_loss"],
+        [6, "interrupted_erase"],
+        [1, "power_loss"],
+    ]
+    assert formatted["phase2_fault_yaml"] == (
+        "chains:\n"
+        "  - [[2, power_loss], [6, interrupted_erase], [1, power_loss]]"
+    )
+
+
 def _write(index, offset, value):
     return {
         "write_index": index,
@@ -448,6 +483,46 @@ def test_explorer_cross_checks_only_unique_states_that_will_be_booted():
     assert len(results) == 2
     assert len(checked) == 1
     assert summary["cross_checks_run"] == summary["cross_checks_passed"] == 1
+
+
+def test_explorer_cross_checks_third_cut_states_at_the_configured_rate():
+    baseline = PersistentState.from_bytes(b"\xff\xff\xff")
+    calibration = merge_operation_traces([_write(1, 0, 1)], [])
+    checked = []
+
+    def boot_state(_state, _chain, generation):
+        return (
+            {"fault_injected": True, "signals": {}},
+            merge_operation_traces(
+                [
+                    _write(1, generation, generation + 1),
+                    _write(2, generation, generation + 1),
+                ],
+                [],
+            )
+            if generation < 3
+            else (),
+        )
+
+    explorer = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0,),
+        max_cuts=3,
+        max_new_states=10,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        cross_check_every=1,
+        cross_check=lambda _state, chain, generation, _operation: checked.append(
+            (len(chain), generation)
+        ),
+    )
+
+    _results, summary = explorer.run()
+
+    assert checked == [(2, 2), (3, 3)]
+    assert summary["cross_checks_run"] == summary["cross_checks_passed"] == 2
 
 
 def test_explorer_cross_checks_erase_first_two_cut_state_with_typed_chain():

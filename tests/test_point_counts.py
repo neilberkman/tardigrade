@@ -75,6 +75,11 @@ from zero_day_summary import format_console_summary, format_step_summary  # noqa
             "deeper_cut",
         ),
         (
+            "pc:1:w:2:e:3:w",
+            {"fault_type": "pc", "phase2_fault_chain": {"cut_count": 3}},
+            "n_cut_explicit",
+        ),
+        (
             "mf:1:2",
             {"fault_type": "mf:1:2", "fault_sequence": [1, 2]},
             "multi_fault",
@@ -140,6 +145,39 @@ def test_control_kind_has_its_own_denominator() -> None:
     assert counts["kinds"]["control"]["run"] == 1
     assert counts["kinds"]["control"]["evaluated"] == 1
     assert counts["kinds"]["control"]["issues"] == 1
+
+
+def test_explicit_chain_accounts_first_cut_in_calibration_coverage() -> None:
+    counts = build_point_counts(
+        [
+            {
+                "fault_type": "pc",
+                "fault_injected": True,
+                "boot_outcome": "success",
+                "phase2_fault_chain": {
+                    "cuts": [
+                        {
+                            "fault_at": 3,
+                            "operation": "erase",
+                            "injected": True,
+                        },
+                        {"fault_at": 1, "operation": "write", "injected": True},
+                        {"fault_at": 2, "operation": "write", "injected": True},
+                    ]
+                },
+            }
+        ],
+        planned_fault_types=["pc:3:e:1:w:2:w"],
+        expected_control_points=0,
+        calibration={
+            "program": {"calibrated": 5, "planned_range": 5},
+            "erase": {"calibrated": 5, "planned_range": 5},
+        },
+    )
+
+    assert counts["kinds"]["n_cut_explicit"]["evaluated"] == 1
+    assert counts["calibration"]["erase"]["cut_directly"] == 1
+    assert counts["calibration"]["program"]["cut_directly"] == 0
 
 
 def test_state_search_budget_exclusions_are_skipped_not_missing() -> None:

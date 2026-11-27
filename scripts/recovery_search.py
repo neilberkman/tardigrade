@@ -152,6 +152,18 @@ def format_chain(chain):
         ).format(
             cuts[0]["fault_type"], cuts[1]["fault_type"], pair[0], pair[1]
         )
+    elif len(cuts) > 2:
+        explicit = [
+            [int(cut["operation_index"]), str(cut["fault_type"])]
+            for cut in cuts
+        ]
+        inline = ", ".join(
+            "[{}, {}]".format(operation_index, fault_type)
+            for operation_index, fault_type in explicit
+        )
+        result["phase2_fault_chain"] = explicit
+        result["phase2_fault_chain_yaml"] = "- [{}]".format(inline)
+        result["phase2_fault_yaml"] = "chains:\n  - [{}]".format(inline)
     return result
 
 
@@ -463,7 +475,7 @@ class RecoveryStateExplorer(object):
 
     def _maybe_cross_check(self, state, chain, generation, operation):
         if (
-            generation != 2
+            generation < 2
             or self.cross_check is None
             or self.cross_check_every <= 0
             or (self.summary["states_booted"] + 1) % self.cross_check_every != 0

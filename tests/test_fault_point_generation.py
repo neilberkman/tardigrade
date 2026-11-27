@@ -352,6 +352,34 @@ class Phase2FaultPairGenerationTest(unittest.TestCase):
                     self.assertEqual(plan.fault_points, expected_points)
                     self.assertEqual(plan.fault_types_list, expected_types)
 
+    def test_explicit_chains_plan_once_with_per_cut_types(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_profile(td, textwrap.dedent("""\
+                fault_sweep:
+                  mode: runtime
+                  max_writes: auto
+                  fault_types: [power_loss]
+                  phase2_fault:
+                    enabled: true
+                    chains:
+                      - [[3, power_loss], [7, interrupted_erase], [2, power_loss]]
+                      - [[4, interrupted_erase], [1, power_loss], [0, interrupted_erase]]
+            """))
+            profile = load_profile(path)
+
+            for quick in (False, True):
+                with self.subTest(quick=quick):
+                    plan = build_fault_plan(
+                        profile=profile,
+                        calibration=CalibrationInputs(max_writes=19),
+                        quick=quick,
+                    )
+                    self.assertEqual(plan.fault_points, [3, 4])
+                    self.assertEqual(
+                        plan.fault_types_list,
+                        ["pc:3:w:7:e:2:w", "pc:4:e:1:w:0:e"],
+                    )
+
     def test_erase_first_pairs_and_representative_grid_use_erase_indices(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             explicit_path = _write_profile(td, textwrap.dedent("""\

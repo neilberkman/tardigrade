@@ -807,7 +807,8 @@ def build_fault_plan(
             p2_config.enabled and p2_config.state_search.enabled
         )
         if include_power_loss and not (
-            p2_config.enabled and (p2_config.pairs or state_search_enabled)
+            p2_config.enabled
+            and (p2_config.pairs or p2_config.chains or state_search_enabled)
         ):
             write_fps = [(fp, 'w') for fp in fault_points] if max_writes > 0 else []
         combined = _BoundedFaultPointList(write_fps)
@@ -1347,6 +1348,7 @@ def build_fault_plan(
             write_fps
             or include_reset_at_time
             or p2_config.pairs
+            or p2_config.chains
             or (
                 "e" in p2_first_codes
                 and include_erase_fault_points
@@ -1361,7 +1363,16 @@ def build_fault_plan(
             p2_timed_codes = [c for c in p2_type_codes if c == "t"]
             p2_write_codes = [c for c in p2_type_codes if c != "t"]
 
-            if p2_config.pairs:
+            if p2_config.chains:
+                for chain in p2_config.chains:
+                    fields = ["pc"]
+                    for cut_at, cut_type in chain:
+                        fields.extend(
+                            (str(cut_at), FAULT_TYPE_NAME_TO_CODE[cut_type])
+                        )
+                    combined.append((chain[0][0], ":".join(fields)))
+                    phase2_count += 1
+            elif p2_config.pairs:
                 for p1_fp, p2_fp in p2_config.pairs:
                     for p1_code in p2_first_codes:
                         for p2_code in p2_type_codes:
@@ -1404,7 +1415,7 @@ def build_fault_plan(
                             combined.append((p1_fp, enc))
                             phase2_count += 1
 
-            if p2_timed_codes and not p2_config.pairs:
+            if p2_timed_codes and not p2_config.pairs and not p2_config.chains:
                 if p2_first_codes == ["w"]:
                     # Preserve the historical timed-reset grid exactly.
                     timed_p1_fps = list(fault_points) if fault_points else [0]

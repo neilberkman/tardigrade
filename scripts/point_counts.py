@@ -29,6 +29,7 @@ POINT_KIND_LABELS: Dict[str, str] = {
     "two_cut_grid": "two-cut (grid selection)",
     "two_cut_pairs": "two-cut (explicit pairs)",
     "two_cut_state_search": "two-cut (state search)",
+    "n_cut_explicit": "three-or-more-cut (explicit chains)",
     "deeper_cut": "deeper-cut state search",
     "multi_fault": "multi-fault sequence",
     "cascading": "cascading write/erase",
@@ -160,6 +161,8 @@ def classify_point_kind(result: Mapping[str, Any], profile: Any = None) -> str:
         if generation == 2:
             return "two_cut_state_search"
         return "deeper_cut"
+    if base == "pc" or isinstance(result.get("phase2_fault_chain"), Mapping):
+        return "n_cut_explicit"
     if base == "p2" or isinstance(result.get("phase2_fault"), Mapping):
         return "two_cut_{}".format(_phase2_selection(result, profile))
     if base == "mf" or result.get("fault_sequence") is not None:
@@ -190,6 +193,8 @@ def classify_planned_kind(
         # The one wire request expands dynamically. Its computed states are
         # accounted from the state-search results and summary instead.
         return "two_cut_state_search"
+    if base == "pc":
+        return "n_cut_explicit"
     if base == "p2":
         selection = phase2_selection or _profile_phase2_selection(profile)
         return "two_cut_{}".format(selection)
@@ -400,6 +405,21 @@ def _direct_calibration_cuts(
                 operation = "erase" if _base_code(phase2.get("p1_fault_type")) in _ERASE_CODES else "program"
                 try:
                     cuts[operation].add(int(phase2.get("p1_fault_at")))
+                except (TypeError, ValueError):
+                    pass
+            continue
+        phase2_chain = result.get("phase2_fault_chain")
+        if isinstance(phase2_chain, Mapping):
+            chain_cuts = phase2_chain.get("cuts") or []
+            first_cut = chain_cuts[0] if chain_cuts else None
+            if isinstance(first_cut, Mapping) and first_cut.get("injected") is True:
+                operation = (
+                    "erase"
+                    if str(first_cut.get("operation") or "write") == "erase"
+                    else "program"
+                )
+                try:
+                    cuts[operation].add(int(first_cut.get("fault_at")))
                 except (TypeError, ValueError):
                     pass
             continue

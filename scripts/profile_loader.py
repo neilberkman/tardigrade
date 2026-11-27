@@ -827,6 +827,7 @@ class Phase2FaultConfig:
         "fault_types",
         "max_points",
         "pairs",
+        "chains",
         "state_search",
     )
 
@@ -837,6 +838,7 @@ class Phase2FaultConfig:
         fault_types: Optional[List[str]] = None,
         max_points: int = 0,
         pairs: Optional[List[Tuple[int, int]]] = None,
+        chains: Optional[List[List[Tuple[int, str]]]] = None,
         state_search: Optional["RecoveryStateSearchConfig"] = None,
     ) -> None:
         self.enabled = enabled
@@ -848,6 +850,7 @@ class Phase2FaultConfig:
         self.fault_types = ["power_loss"] if fault_types is None else list(fault_types)
         self.max_points = max(0, int(max_points))
         self.pairs = list(pairs or [])
+        self.chains = [list(chain) for chain in (chains or [])]
         self.state_search = state_search or RecoveryStateSearchConfig()
         if self.max_points > MAX_PROFILE_FAULT_POINTS:
             raise ProfileError(
@@ -5264,6 +5267,14 @@ def _parse_fault_sweep(
                 "fault_sweep.phase2_fault.state_search does not support the "
                 "writeback durability model"
             )
+    if (
+        fs_cfg.phase2_fault.chains
+        and str(fs_cfg.evaluation_mode or "execute").strip().lower() != "execute"
+    ):
+        raise ProfileError(
+            "fault_sweep.phase2_fault.chains requires "
+            "fault_sweep.evaluation_mode execute"
+        )
     return fs_cfg
 
 
@@ -5330,9 +5341,59 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
                 MAX_PROFILE_FAULT_POINTS
             )
         )
+    chains_raw = raw.get("chains", [])
+    if not isinstance(chains_raw, list):
+        raise ProfileError("fault_sweep.phase2_fault.chains: expected list")
+    chains: List[List[Tuple[int, str]]] = []
+    for chain_index, chain_raw in enumerate(chains_raw):
+        chain_field = "fault_sweep.phase2_fault.chains[{}]".format(chain_index)
+        if not isinstance(chain_raw, list) or not 3 <= len(chain_raw) <= 8:
+            raise ProfileError(
+                "{}: expected 3 through 8 [operation_index, fault_type] cuts".format(
+                    chain_field
+                )
+            )
+        chain: List[Tuple[int, str]] = []
+        for cut_index, cut_raw in enumerate(chain_raw):
+            cut_field = "{}[{}]".format(chain_field, cut_index)
+            if not isinstance(cut_raw, list) or len(cut_raw) != 2:
+                raise ProfileError(
+                    "{}: expected [operation_index, fault_type]".format(cut_field)
+                )
+            operation_index, fault_type = cut_raw
+            if isinstance(operation_index, bool) or not isinstance(operation_index, int):
+                raise ProfileError("{}: operation index must be an integer".format(cut_field))
+            if operation_index < 0:
+                raise ProfileError("{}: operation index must be non-negative".format(cut_field))
+            normalized_types = _normalize_fault_types(
+                [fault_type], "{}.fault_type".format(cut_field)
+            )
+            normalized_type = normalized_types[0]
+            if normalized_type not in {"power_loss", "interrupted_erase"}:
+                raise ProfileError(
+                    "{}: fault type must be power_loss or interrupted_erase".format(
+                        cut_field
+                    )
+                )
+            chain.append((int(operation_index), normalized_type))
+        chains.append(chain)
+    if len(chains) > MAX_PROFILE_FAULT_POINTS:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.chains exceeds safety limit {}".format(
+                MAX_PROFILE_FAULT_POINTS
+            )
+        )
     if pairs and not enabled:
         raise ProfileError(
             "fault_sweep.phase2_fault.pairs: requires phase2_fault.enabled"
+        )
+    if chains and not enabled:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.chains: requires phase2_fault.enabled"
+        )
+    if pairs and chains:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.chains: cannot be combined with phase2_fault.pairs"
         )
     if first_fault_types != ["power_loss"] and not enabled:
         raise ProfileError(
@@ -5344,10 +5405,10 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
         raise ProfileError(
             "fault_sweep.phase2_fault.state_search: requires phase2_fault.enabled"
         )
-    if state_search.enabled and pairs:
+    if state_search.enabled and (pairs or chains):
         raise ProfileError(
             "fault_sweep.phase2_fault.state_search: cannot be combined with "
-            "phase2_fault.pairs"
+            "phase2_fault.pairs or phase2_fault.chains"
         )
     if state_search.enabled and max_points:
         raise ProfileError(
@@ -5365,6 +5426,7 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
         fault_types=fault_types,
         max_points=max_points,
         pairs=pairs,
+        chains=chains,
         state_search=state_search,
     )
 
@@ -8575,7 +8637,7 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
         nested_fault_schemas = {
             "phase2_fault": {
                 "enabled", "first_fault_types", "fault_types", "max_points",
-                "pairs", "state_search",
+                "pairs", "chains", "state_search",
             },
             "hook_fault": {"enabled", "fault_types", "max_points"},
             "confirm_cycle": {
@@ -9812,6 +9874,7 @@ def main() -> int:
         ),
         "phase2_fault_types": profile.fault_sweep.phase2_fault.fault_types,
         "phase2_fault_pairs": profile.fault_sweep.phase2_fault.pairs,
+        "phase2_fault_chains": profile.fault_sweep.phase2_fault.chains,
         "phase2_state_search": (
             profile.fault_sweep.phase2_fault.state_search.to_runtime_dict()
         ),

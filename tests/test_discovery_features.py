@@ -3091,6 +3091,63 @@ class Phase2FaultTest(unittest.TestCase):
                 with self.assertRaisesRegex(ProfileError, "phase2_fault.pairs"):
                     load_profile(path)
 
+    def test_phase2_fault_chains_parse_and_reject_ambiguous_forms(self) -> None:
+        from profile_loader import ProfileError
+
+        with tempfile.TemporaryDirectory() as td:
+            path = self._write_profile(
+                Path(td),
+                """
+                schema_version: 1
+                name: phase2_chains
+                platform: platforms/cortex_m4_flash_fast.repl
+                flash_backend: faultFlash
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                fault_sweep:
+                  mode: runtime
+                  phase2_fault:
+                    enabled: true
+                    chains:
+                      - [[3, power_loss], [7, interrupted_erase], [2, power_loss]]
+                """,
+            )
+            profile = load_profile(path)
+            self.assertEqual(
+                profile.fault_sweep.phase2_fault.chains,
+                [[(3, "power_loss"), (7, "interrupted_erase"), (2, "power_loss")]],
+            )
+
+            valid = path.read_text(encoding="utf-8")
+            invalid = valid.replace(
+                "- [[3, power_loss], [7, interrupted_erase], [2, power_loss]]",
+                "- [[3, power_loss], [7, bit_corruption], [2, power_loss]]",
+            )
+            path.write_text(invalid, encoding="utf-8")
+            with self.assertRaisesRegex(ProfileError, "phase2_fault.chains"):
+                load_profile(path)
+
+            state_mode = valid.replace(
+                "  mode: runtime\n",
+                "  mode: runtime\n  evaluation_mode: state\n",
+            )
+            path.write_text(state_mode, encoding="utf-8")
+            with self.assertRaisesRegex(
+                ProfileError, "phase2_fault.chains requires.*evaluation_mode execute"
+            ):
+                load_profile(path)
+
     def test_phase2_fault_pairs_require_enabled(self) -> None:
         from profile_loader import ProfileError
 
