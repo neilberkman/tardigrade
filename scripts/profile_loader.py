@@ -3952,35 +3952,42 @@ class ProfileConfig:
         pad_byte = self.image_pad_byte(repo_root)
         specs: List[Dict[str, Any]] = []
         digests: Dict[str, str] = {}
-        for name in approved.images:
-            resolved = self.resolve_path(repo_root, images[name])
-            raw = Path(resolved).read_bytes()
+        known_images: Dict[str, str] = {}
+
+        def _relocated_slot_bytes_and_digest(image_rel: str, image_key: str) -> Tuple[bytes, int, str, str]:
+            resolved_path = self.resolve_path(repo_root, image_rel)
+            raw_bytes = Path(resolved_path).read_bytes()
             if (
-                len(raw) >= 32
-                and struct.unpack_from("<I", raw, 0)[0] != MCUBOOT_IMAGE_MAGIC
-                and raw[0] == 0xFF
+                len(raw_bytes) >= 32
+                and struct.unpack_from("<I", raw_bytes, 0)[0] != MCUBOOT_IMAGE_MAGIC
+                and raw_bytes[0] == 0xFF
             ):
-                stripped = raw.lstrip(b"\xff")
+                stripped = raw_bytes.lstrip(b"\xff")
                 if (
                     len(stripped) >= 32
                     and struct.unpack_from("<I", stripped, 0)[0] == MCUBOOT_IMAGE_MAGIC
                     and mcuboot_validated_image_extent(stripped, slot_size=slot.size)
                     is not None
                 ):
-                    raw = stripped
-            digest_extent, digest_source = self._resolve_slot_hash_extent(
-                repo_root, raw, slot_name=approved.slot
+                    raw_bytes = stripped
+            d_extent, d_source = self._resolve_slot_hash_extent(
+                repo_root, raw_bytes, slot_name=approved.slot
             )
-            if digest_extent is None or digest_extent <= 0:
+            if d_extent is None or d_extent <= 0:
                 raise ProfileError(
                     "success_criteria.approved_image_running cannot resolve the "
-                    "digest extent for images.{}".format(name)
+                    "digest extent for images.{}".format(image_key)
                 )
-            if len(raw) >= digest_extent:
-                digest_bytes = raw[:digest_extent]
+            if len(raw_bytes) >= d_extent:
+                d_bytes = raw_bytes[:d_extent]
             else:
-                digest_bytes = raw + bytes([pad_byte]) * (digest_extent - len(raw))
-            digest = hashlib.sha256(digest_bytes).hexdigest()
+                d_bytes = raw_bytes + bytes([pad_byte]) * (d_extent - len(raw_bytes))
+            return raw_bytes, int(d_extent), str(d_source), hashlib.sha256(d_bytes).hexdigest()
+
+        for name in approved.images:
+            raw, digest_extent, digest_source, digest = _relocated_slot_bytes_and_digest(
+                images[name], name
+            )
             prior = digests.get(digest)
             if prior is not None:
                 raise ProfileError(
@@ -3988,6 +3995,7 @@ class ProfileConfig:
                     "have indistinguishable approved content".format(prior, name)
                 )
             digests[digest] = name
+            known_images[name] = digest
             code_offset, code_size, extent_source = image_executable_extent(
                 raw, slot_size=slot.size
             )
@@ -4006,12 +4014,23 @@ class ProfileConfig:
                     "artifact_size": len(raw),
                 }
             )
+        for img_name, img_rel in sorted(images.items()):
+            if img_name in known_images or not img_rel:
+                continue
+            try:
+                _raw_other, _ext_other, _src_other, other_digest = _relocated_slot_bytes_and_digest(
+                    img_rel, img_name
+                )
+                known_images[img_name] = other_digest
+            except Exception:
+                continue
         return {
             "slot": approved.slot,
             "slot_base": int(slot.base),
             "slot_size": int(slot.size),
             "dwell_s": float(approved.dwell_s),
             "images": specs,
+            "known_images": known_images,
         }
 
     def _success_checks_runtime_dict(

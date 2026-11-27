@@ -22,7 +22,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from audit_report import summarize_runtime_sweep  # noqa: E402
 from boundary_reserved import BOUNDARY_RESERVED_VARIABLES  # noqa: E402
-from fault_classification import _expected_boot_slot, result_issue_reasons  # noqa: E402
+from fault_classification import (  # noqa: E402
+    _expected_boot_slot,
+    classify_failure_class,
+    result_issue_reasons,
+)
 from profile_loader import (  # noqa: E402
     DEFAULT_APPROVED_IMAGE_DWELL_S,
     MCUBOOT_IMAGE_MAGIC,
@@ -1279,4 +1283,108 @@ def test_enabled_mcuboot_profiles_load_approved_image_running():
             assert img["code_offset"] > 0, (filename, img)
             assert img["code_size"] > 0, (filename, img)
             assert img["extent_source"] == "mcuboot_header", (filename, img)
+
+
+def test_approved_image_running_unapproved_known_image_and_early_handoff_stop(tmp_path: Path):
+    exec_blob = _build_mcuboot_image(body_fill=0x11)
+    staging_blob = _build_mcuboot_image(body_fill=0x22)
+    p_exec = _write_test_profile(
+        tmp_path,
+        exec_blob=exec_blob,
+        staging_blob=staging_blob,
+        evaluation_mode="execute",
+        success_criteria={
+            "vtor_in_slot": "exec",
+            "approved_image_running": {"slot": "exec", "images": ["staging"]},
+        },
+    )
+    cfg = load_profile(p_exec)
+    rv = cfg.robot_vars(tmp_path)
+    encoded = next(
+        item.split(":", 1)[1]
+        for item in rv
+        if item.startswith("APPROVED_IMAGE_RUNNING_B64:")
+    )
+    decoded = json.loads(base64.b64decode(encoded).decode("utf-8"))
+    assert "exec" in decoded["known_images"]
+    assert "staging" in decoded["known_images"]
+    exec_digest = decoded["known_images"]["exec"]
+    staging_digest = decoded["known_images"]["staging"]
+    assert exec_digest != staging_digest
+
+    # Boot into the unapproved-but-known exec image: run_until_done must stop on
+    # vtor_captured (1 slice + 1 post-VTOR settle = 2 RunFor calls) instead of
+    # spinning through all 20 max_iters slices to budget, and must classify the
+    # result as wrong_image (observed_image="exec", image_hash_match="exec_image")
+    # rather than silent_corruption.
+    ns, state, _, cpu, _, _ = _build_runtime_harness(
+        approved_image_running_config=decoded,
+        slot_hash_fn=lambda _slot: exec_digest,
+    )
+    p2_status = ns["run_until_done"](
+        cpu,
+        max_iters=20,
+        expect_writes=False,
+        zero_writes_is_brick=True,
+        label="p2_unapproved_known",
+        time_slice="0.05",
+    )
+    assert p2_status["reason"] == "vtor_captured"
+    assert state["run_calls"] == 2
+    outcome, slot, signals = ns["evaluate_boot_outcome"](
+        0x0000C200, cpu.PC, p2_status=p2_status
+    )
+    assert outcome == "wrong_image"
+    assert slot == "exec"
+    verdict = signals["approved_image_running"]
+    assert verdict["ok"] is False
+    assert verdict["failed_part"] == "digest"
+    assert verdict["matched_image"] is None
+    assert verdict["digest"]["observed_image"] == "exec"
+    assert signals["image_hash_match"] == "exec_image"
+    assert (
+        classify_failure_class(
+            {
+                "fault_injected": True,
+                "boot_outcome": outcome,
+                "boot_slot": slot,
+                "signals": signals,
+            }
+        )
+        == "wrong_image"
+    )
+
+    # By contrast, an unknown corrupted slot digest is classified as silent_corruption.
+    ns_corrupt, state_corrupt, _, cpu_corrupt, _, _ = _build_runtime_harness(
+        approved_image_running_config=decoded,
+        slot_hash_fn=lambda _slot: "ff" * 32,
+    )
+    p2_corrupt = ns_corrupt["run_until_done"](
+        cpu_corrupt,
+        max_iters=20,
+        expect_writes=False,
+        zero_writes_is_brick=True,
+        label="p2_corrupt",
+        time_slice="0.05",
+    )
+    assert p2_corrupt["reason"] == "vtor_captured"
+    assert state_corrupt["run_calls"] == 2
+    outcome_c, slot_c, signals_c = ns_corrupt["evaluate_boot_outcome"](
+        0x0000C200, cpu_corrupt.PC, p2_status=p2_corrupt
+    )
+    assert outcome_c == "wrong_image"
+    assert signals_c["approved_image_running"]["digest"]["observed_image"] is None
+    assert signals_c["image_hash_match"] == "unknown"
+    assert (
+        classify_failure_class(
+            {
+                "fault_injected": True,
+                "boot_outcome": outcome_c,
+                "boot_slot": slot_c,
+                "signals": signals_c,
+            }
+        )
+        == "silent_corruption"
+    )
+
 

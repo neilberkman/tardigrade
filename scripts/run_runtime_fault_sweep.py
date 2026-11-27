@@ -2137,12 +2137,27 @@ def _normalize_approved_image_running_config(raw_cfg):
             'digest_extent_source': str(entry.get('digest_extent_source', 'unknown')),
             'artifact_size': int(entry.get('artifact_size', code_offset + code_size)),
         })
+    known_images = {
+        entry['name']: entry['sha256'] for entry in normalized_images
+    }
+    raw_known = raw_cfg.get('known_images')
+    if isinstance(raw_known, dict):
+        for k_name, k_hash in sorted(raw_known.items()):
+            norm_k_name = str(k_name or '').strip()
+            norm_k_hash = str(k_hash or '').strip().lower()
+            if (
+                norm_k_name
+                and len(norm_k_hash) == 64
+                and all(ch in '0123456789abcdef' for ch in norm_k_hash)
+            ):
+                known_images.setdefault(norm_k_name, norm_k_hash)
     return {
         'slot': slot_name,
         'slot_base': int(slot_base),
         'slot_size': int(slot_size),
         'dwell_s': float(dwell_s),
         'images': normalized_images,
+        'known_images': known_images,
     }
 
 
@@ -9263,6 +9278,13 @@ def _evaluate_approved_image_digest(approved_cfg, digest_cache=None):
     matched_name = str(matched_spec.get('name')) if matched_spec is not None else None
     observed_known_image = matched_name
     if observed_known_image is None and actual_hash:
+        known_map = approved_cfg.get('known_images')
+        if isinstance(known_map, dict):
+            for k_name, k_hash in sorted(known_map.items()):
+                if actual_hash == str(k_hash or '').strip().lower():
+                    observed_known_image = str(k_name)
+                    break
+    if observed_known_image is None and actual_hash:
         if globals().get('image_exec_sha256') and actual_hash == str(globals().get('image_exec_sha256')).strip().lower():
             observed_known_image = 'exec'
         elif globals().get('image_staging_sha256') and actual_hash == str(globals().get('image_staging_sha256')).strip().lower():
@@ -12946,7 +12968,9 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                         terminal_outcome
                     )
                 break
-            if sticky_vtor['captured'] and not terminal_after_reset and approved_dwell_state is None:
+            if sticky_vtor['captured'] and not terminal_after_reset and (
+                approved_dwell_state is None or not approved_dwell_state.get('started')
+            ):
                 if vtor_settle_remaining < 0:
                     # First capture.
                     if vtor_settle_iters == 0:
@@ -13025,7 +13049,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                     break
             if (
                 not terminal_after_reset
-                and approved_dwell_state is None
+                and (approved_dwell_state is None or not approved_dwell_state.get('started'))
                 and
                 pc_handoff_slot is not None
                 and sticky_pc['captured']
