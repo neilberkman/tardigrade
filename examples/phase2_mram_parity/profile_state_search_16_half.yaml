@@ -4,7 +4,7 @@ description: Recovery-state search over whole 16-byte MRAM program units in half
 platform: platforms/cortex_m0_mram_tracked_16.repl
 flash_backend: mramTracker
 bootloader:
-  elf: examples/phase2_mram_parity/firmware.elf
+  elf: examples/phase2_mram_parity/firmware_two_unit.elf
   entry: 0x10000000
 memory:
   sram: { start: 0x20000000, end: 0x20002000 }
@@ -23,6 +23,8 @@ pre_boot_state:
   - { address: 0x20000400, u32: 0x55504432 }
   - { address: 0x10100100, u32: 0x56414C31 }
   - { address: 0x10100104, u32: 0x54524754 }
+  - { address: 0x10100118, u32: 0x31444C4F }
+  - { address: 0x1010011C, u32: 0x45544154 }
 success_criteria:
   vtor_in_slot: exec
   marker_address: 0x20000100

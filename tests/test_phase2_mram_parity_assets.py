@@ -55,6 +55,8 @@ def test_wide_state_search_profiles_cover_required_mram_outcomes() -> None:
         assert search.max_cuts == 2
         assert search.address_ranges == [(0x10100100, 0x1010011F)]
         assert search.cross_check_every == 1
+        if mode in ("half", "uncorrectable"):
+            assert profile.bootloader_elf.endswith("firmware_two_unit.elf")
 
 
 def test_wide_trace_replay_profile_cross_checks_every_cut() -> None:

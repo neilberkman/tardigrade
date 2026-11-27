@@ -1,10 +1,22 @@
 #include <stdint.h>
 
+#ifndef TARGET_ADDRESS_VALUE
+#define TARGET_ADDRESS_VALUE 0x10100100u
+#endif
+
+#ifndef PROGRESS_ADDRESS_VALUE
+#define PROGRESS_ADDRESS_VALUE 0x10100108u
+#endif
+
+#ifndef HOOK_ADDRESS_VALUE
+#define HOOK_ADDRESS_VALUE 0x10100110u
+#endif
+
 #define BOOT_BASE        ((uintptr_t)0x10000000u)
 #define EXEC_BASE        ((uintptr_t)0x10100000u)
-#define TARGET_ADDRESS   (*(volatile uint64_t *)0x10100100u)
-#define PROGRESS_ADDRESS (*(volatile uint64_t *)0x10100108u)
-#define HOOK_ADDRESS     (*(volatile uint64_t *)0x10100110u)
+#define TARGET_ADDRESS   (*(volatile uint64_t *)TARGET_ADDRESS_VALUE)
+#define PROGRESS_ADDRESS (*(volatile uint64_t *)PROGRESS_ADDRESS_VALUE)
+#define HOOK_ADDRESS     (*(volatile uint64_t *)HOOK_ADDRESS_VALUE)
 
 #define SUCCESS_MARKER   (*(volatile uint32_t *)0x20000100u)
 #define HOOK_SEEN_MARKER (*(volatile uint32_t *)0x20000104u)
