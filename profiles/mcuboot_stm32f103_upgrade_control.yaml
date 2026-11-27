@@ -1,0 +1,43 @@
+schema_version: 1
+name: mcuboot_stm32f103_upgrade_control
+description: >
+  Clean control run for MCUboot swap-using-move upgrade on STM32F103RB
+  (nucleo_f103rb) with half-word (16-bit) programming and 1 KiB page erases.
+
+platform: platforms/stm32f103.repl
+flash_backend: faultFlash
+target_source:
+  name: mcuboot
+  repository: https://github.com/zephyrproject-rtos/mcuboot
+  revision: b1b886eca7c9cffa8508bebd47721ba745f8c283
+bootloader:
+  elf: examples/stm32_mcuboot/mcuboot_stm32f103.elf
+  entry: 0x08000000
+memory:
+  sram: { start: 0x20000000, end: 0x20005000 }
+  write_granularity: 2
+  page_size: 0x400
+  slots:
+    exec: { base: 0x08008000, size: 0x8000 }
+    staging: { base: 0x08010000, size: 0x8000 }
+images:
+  exec: examples/stm32_mcuboot/zephyr_stm32f103_slot0.bin
+  staging: examples/stm32_mcuboot/zephyr_stm32f103_slot1.bin
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: staging
+success_criteria:
+  vtor_in_slot: exec
+  marker_address: 0x08008014
+  marker_value: 0x00000101
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  max_writes: 0
+  run_duration: "5.0"
+  max_step_limit: 50000000
+  sweep_hash_bypass_symbols: ["bootutil_img_validate"]
+skip_self_test: true
+expect:
+  should_find_issues: false

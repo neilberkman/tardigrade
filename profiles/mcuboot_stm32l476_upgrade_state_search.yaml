@@ -1,0 +1,61 @@
+schema_version: 1
+name: mcuboot_stm32l476_upgrade_state_search
+description: >
+  Power-loss sweep with recovery-state search (state_search) enabled for
+  MCUboot swap-using-move upgrade on STM32L476RG (nucleo_l476rg) across
+  dual-bank 2 KiB pages and 64-bit double-word programming.
+
+platform: platforms/stm32l476.repl
+flash_backend: faultFlash
+target_source:
+  name: mcuboot
+  repository: https://github.com/zephyrproject-rtos/mcuboot
+  revision: b1b886eca7c9cffa8508bebd47721ba745f8c283
+bootloader:
+  elf: examples/stm32_mcuboot/mcuboot_stm32l476.elf
+  entry: 0x08000000
+memory:
+  sram: { start: 0x20000000, end: 0x20018000 }
+  write_granularity: 8
+  page_size: 0x800
+  slots:
+    exec: { base: 0x08010000, size: 0x10000 }
+    staging: { base: 0x08080000, size: 0x10000 }
+images:
+  exec: examples/stm32_mcuboot/zephyr_stm32l476_slot0.bin
+  staging: examples/stm32_mcuboot/zephyr_stm32l476_slot1.bin
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: staging
+success_criteria:
+  vtor_in_slot: exec
+  marker_address: 0x08010014
+  marker_value: 0x00000101
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss, interrupted_erase]
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "5.0"
+  max_step_limit: 50000000
+  sweep_hash_bypass_symbols: ["bootutil_img_validate"]
+  phase2_fault:
+    enabled: true
+    fault_types: [power_loss, interrupted_erase]
+    state_search:
+      enabled: true
+      first_cuts:
+        mode: ranges
+        ranges:
+          - { start: 0, end: 8 }
+      max_cuts: 2
+      max_new_states: 32
+      max_wall_time_s: 600
+      address_ranges:
+        - { start: 0x0801F800, end: 0x0801FFFF }
+        - { start: 0x0808F800, end: 0x0808FFFF }
+      cross_check_every: 1
+skip_self_test: true
+expect:
+  should_find_issues: false
