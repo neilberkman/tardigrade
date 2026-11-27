@@ -9,6 +9,7 @@ bootloader:
 memory:
   sram: { start: 0x20000000, end: 0x20020000 }
   write_granularity: 8
+  erase_fill: 0x00
   slots:
     exec: { base: 0x10000000, size: 0x38000 }
     staging: { base: 0x10038000, size: 0x38000 }

@@ -1,0 +1,9 @@
+base_profile: mcuboot_offset_upgrade.yaml
+name: demo_mcuboot_offset_upgrade
+skip_self_test: true
+description: >
+  One-command demo baseline: MCUboot swap-using-offset preserves a bootable
+  image across the bounded power-loss cuts used by scripts/run_demo.py.
+
+fault_sweep:
+  fault_types: [power_loss]

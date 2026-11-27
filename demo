@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Neil Berkman
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+mode="auto"
+forwarded=()
+renode_was_given=false
+
+usage() {
+  cat <<'EOF'
+Usage: ./demo [--docker | --local] [--renode-test PATH] [demo options]
+
+Run the broken-versus-recovering power-loss demo. The default uses a local
+renode-test when one is available, then falls back to Docker.
+
+  --docker              Run in the pinned linux/amd64 demo image
+  --local               Run with a local renode-test
+  --renode-test PATH    Use this local Renode test runner
+  --output-dir PATH     Write reports under PATH (default: results/demo)
+  --workers N           Use N Renode workers (default: 1; maximum: 2)
+  --timeout SECONDS     Per-profile timeout (default: 600)
+  -h, --help            Show this help
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --docker)
+      if [[ "$renode_was_given" == true || "$mode" == "local" ]]; then
+        echo "ERROR: --docker cannot be combined with local-mode options" >&2
+        exit 2
+      fi
+      mode="docker"
+      shift
+      ;;
+    --local)
+      if [[ "$mode" == "docker" ]]; then
+        echo "ERROR: --local cannot be combined with --docker" >&2
+        exit 2
+      fi
+      mode="local"
+      shift
+      ;;
+    --renode-test)
+      if (($# < 2)); then
+        echo "ERROR: --renode-test requires a path" >&2
+        exit 2
+      fi
+      if [[ "$mode" == "docker" ]]; then
+        echo "ERROR: --renode-test cannot be combined with --docker" >&2
+        exit 2
+      fi
+      mode="local"
+      renode_was_given=true
+      forwarded+=("$1" "$2")
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      forwarded+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ "$mode" == "auto" ]]; then
+  if [[ -n "${RENODE_TEST:-}" ]] || command -v renode-test >/dev/null 2>&1; then
+    mode="local"
+  elif command -v docker >/dev/null 2>&1; then
+    mode="docker"
+  else
+    echo "ERROR: neither renode-test nor Docker was found" >&2
+    exit 2
+  fi
+fi
+
+if [[ "$mode" == "docker" ]]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: Docker was not found" >&2
+    exit 2
+  fi
+  image="${TARDIGRADE_DEMO_IMAGE:-tardigrade-demo:1.16.1}"
+  container_prefix="${TARDIGRADE_DEMO_CONTAINER_PREFIX:-tardigrade-demo}"
+  container="${container_prefix}-$$-${RANDOM}"
+  invoking_uid="$(id -u)"
+  invoking_gid="$(id -g)"
+  container_home="/tmp/tardigrade-demo-home-${invoking_uid}"
+  cleanup() {
+    docker rm -f "$container" >/dev/null 2>&1 || true
+  }
+  trap cleanup EXIT INT TERM
+  docker build \
+    --platform linux/amd64 \
+    --file "$repo_root/docker/demo.Dockerfile" \
+    --tag "$image" \
+    "$repo_root"
+  docker run --rm \
+    --platform linux/amd64 \
+    --name "$container" \
+    --user "${invoking_uid}:${invoking_gid}" \
+    --env "HOME=${container_home}" \
+    --volume "$repo_root:/workspace" \
+    --workdir /workspace \
+    "$image" "${forwarded[@]}"
+  trap - EXIT INT TERM
+  exit 0
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "ERROR: Python 3.10+ is required for local mode" >&2
+  exit 2
+fi
+
+python_bin="$(command -v python3)"
+if ! "$python_bin" -c \
+  'import capstone, elftools, psutil, robot, telnetlib3, yaml' \
+  >/dev/null 2>&1; then
+  venv="$repo_root/results/demo/.venv"
+  echo "Installing checksum-locked demo dependencies in $venv ..."
+  "$python_bin" -m venv "$venv"
+  "$venv/bin/python" -m pip install \
+    --disable-pip-version-check \
+    --no-build-isolation \
+    --require-hashes \
+    --requirement "$repo_root/requirements-demo.txt"
+  python_bin="$venv/bin/python"
+fi
+
+if [[ "$renode_was_given" == false && -z "${RENODE_TEST:-}" ]]; then
+  renode_path="$(command -v renode-test || true)"
+  if [[ -z "$renode_path" ]]; then
+    echo "ERROR: renode-test was not found; pass --renode-test PATH" >&2
+    exit 2
+  fi
+fi
+
+exec "$python_bin" "$repo_root/scripts/run_demo.py" "${forwarded[@]}"

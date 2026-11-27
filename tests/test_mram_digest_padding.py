@@ -192,6 +192,20 @@ def test_memory_erase_fill_sets_pad_byte_in_loader_sweep_and_discovery(
     assert f"MEMORY_ERASE_FILL:0x{erase_fill:02X}" in rv
 
 
+def test_naive_bare_copy_pad_byte_matches_nvm_backend_erase_fill() -> None:
+    """The generic NVMemory backend erases to zero, so digest padding must too."""
+    profile = load_profile(
+        ROOT / "profiles/naive_bare_copy.yaml",
+        strict=True,
+        repo_root=ROOT,
+    )
+
+    assert profile.flash_backend == "nvm_ctrl"
+    assert profile.memory.erase_fill == 0x00
+    assert profile.image_pad_byte(ROOT) == profile.memory.erase_fill
+    assert "MEMORY_ERASE_FILL:0x00" in profile.robot_vars(ROOT)
+
+
 @pytest.mark.parametrize(
     "platform_ref,backend_name",
     [
