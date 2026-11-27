@@ -16527,11 +16527,15 @@ def _tracking_base_state_from_peripheral(require_available=True):
     size, unit = _tracking_base_geometry()
     available = bool(target.TrackingBaseSnapshotAvailable)
     snapshot_size = int(target.TrackingBaseSnapshotSize)
-    if not available or snapshot_size != size:
+    if not available:
         if not require_available:
             return None
         raise RuntimeError(
             'deferred tracking base snapshot was not captured at the configured address'
+        )
+    if snapshot_size != size:
+        raise RuntimeError(
+            'deferred tracking base snapshot does not cover the complete backend region'
         )
     snapshot = to_py_bytes(target.TrackingBaseSnapshot)
     if snapshot is None or len(snapshot) != size:
@@ -18642,6 +18646,38 @@ def _state_search_validate_program_prefix(initial_state, operations):
         )
 
 
+def _state_search_resolve_recovery_trace(state, capture_recovery_trace):
+    """Return only operations from the recovery boot being evaluated.
+
+    A deferred MRAM gate captures the persistent base atomically when the
+    gate is executed.  Absence of that capture means this boot ended before
+    tracking began, so it has no tracked operations and cannot contribute a
+    later cut.  It is not an incomplete snapshot.  A capture that is present
+    remains subject to all complete-state and exact-program validation.
+    """
+    if not capture_recovery_trace:
+        return (), state, None
+
+    deferred = bool(
+        backend.get('kind') == 'mram'
+        and int(tracking_start_address_config or 0)
+    )
+    trace_base = state
+    gate_reached = None
+    if deferred:
+        trace_base = _tracking_base_state_from_peripheral(
+            require_available=False
+        )
+        if trace_base is None:
+            return (), state, False
+        gate_reached = True
+
+    operations = _state_search_capture_trace()
+    if backend.get('kind') == 'mram':
+        _state_search_validate_program_prefix(trace_base, operations)
+    return operations, trace_base, gate_reached
+
+
 def _state_search_boot_state(state, chain, generation):
     global _recovery_marker_precondition
     _recovery_marker_precondition = None
@@ -18717,26 +18753,21 @@ def _state_search_boot_state(state, chain, generation):
             _last_recovery_setup_detail
         )
     trace_export_started = _time.time()
-    recovery_operations = (
-        _state_search_capture_trace() if capture_recovery_trace else ()
+    (
+        recovery_operations,
+        recovery_trace_base,
+        deferred_tracking_gate_reached,
+    ) = _state_search_resolve_recovery_trace(
+        state, capture_recovery_trace
     )
-    recovery_trace_base = state
-    if (
-        capture_recovery_trace
-        and backend.get('kind') == 'mram'
-        and int(tracking_start_address_config or 0)
-    ):
-        recovery_trace_base = _tracking_base_state_from_peripheral(
-            require_available=True
-        )
-    if capture_recovery_trace and backend.get('kind') == 'mram':
-        _state_search_validate_program_prefix(
-            recovery_trace_base, recovery_operations
-        )
     _state_breakdown['trace_export_s'] = round(
         max(0.0, _time.time() - trace_export_started), 6
     )
     _state_breakdown['operation_trace_mode'] = operation_trace_mode
+    if deferred_tracking_gate_reached is not None:
+        _state_breakdown['deferred_tracking_gate_reached'] = bool(
+            deferred_tracking_gate_reached
+        )
     recovery_writes = get_total_writes()
     boot_ms = int((_time.time() - boot_started) * 1000)
 
@@ -18764,6 +18795,18 @@ def _state_search_boot_state(state, chain, generation):
     signals['p2_iters'] = p2_status.get('iters')
     signals['trace_replay_mode'] = 'computed_recovery_state'
     signals['recovery_state_generation'] = int(generation)
+    recovery_tracking_gate = None
+    state_search_extra_fields = {'recovery_writes': recovery_writes}
+    if deferred_tracking_gate_reached is not None:
+        recovery_tracking_gate = {
+            'address': fmt_u32(tracking_start_address_config),
+            'reached': bool(deferred_tracking_gate_reached),
+            'candidate_operations': len(recovery_operations),
+        }
+        signals['recovery_tracking_gate'] = dict(recovery_tracking_gate)
+        state_search_extra_fields['recovery_tracking_gate'] = (
+            recovery_tracking_gate
+        )
     merge_stop_status_signals(signals, 'phase2', p2_status)
     fault_address = int(str(chain[-1]['address']), 0) if chain else 0
     result = _build_fault_result(
@@ -18780,7 +18823,7 @@ def _state_search_boot_state(state, chain, generation):
         followup_label='recovery_state_{}_followup'.format(generation),
         saved_flash=state_restore_bytes,
         fault_snapshot_bytes=bytearray(state_bytes),
-        extra_fields={'recovery_writes': recovery_writes},
+        extra_fields=state_search_extra_fields,
         fault_semantic_state=fault_semantic_state,
         fault_uncorrectable_words=marked_addresses,
     )
@@ -18925,6 +18968,14 @@ def run_recovery_state_search():
     if deferred_tracking_base:
         summary['calibration_base_state_identity'] = initial_state.identity_hex()
         summary['deferred_tracking_base'] = True
+        summary['recovery_boots_reaching_deferred_gate'] = sum(
+            1 for result in results
+            if result.get('recovery_tracking_gate', {}).get('reached') is True
+        )
+        summary['recovery_boots_before_deferred_gate'] = sum(
+            1 for result in results
+            if result.get('recovery_tracking_gate', {}).get('reached') is False
+        )
     if results:
         results[0]['recovery_state_search_summary'] = dict(summary)
     log(

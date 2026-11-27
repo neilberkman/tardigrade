@@ -264,11 +264,150 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "was not captured"):
             namespace["_tracking_base_state_from_peripheral"]()
 
+        self.assertIsNone(
+            namespace["_tracking_base_state_from_peripheral"](
+                require_available=False
+            )
+        )
+
+        target.TrackingBaseSnapshotAvailable = True
+        with self.assertRaisesRegex(RuntimeError, "complete backend region"):
+            namespace["_tracking_base_state_from_peripheral"](
+                require_available=False
+            )
+
         namespace["_tracking_base_capability_error"] = (
             lambda: "declared persistent values are missing"
         )
         with self.assertRaisesRegex(RuntimeError, "complete persistent state"):
             namespace["_tracking_base_state_from_peripheral"]()
+
+    def test_state_search_boot_before_deferred_gate_has_no_candidates(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_state_search_resolve_recovery_trace"
+        )
+        calls: list[str] = []
+        state = object()
+        namespace: dict[str, object] = {
+            "backend": {"kind": "mram"},
+            "tracking_start_address_config": 0x10000200,
+            "_tracking_base_state_from_peripheral": (
+                lambda require_available: calls.append(
+                    f"base:{require_available}"
+                )
+            ),
+            "_state_search_capture_trace": lambda: self.fail(
+                "a boot before the gate must not export a trace"
+            ),
+            "_state_search_validate_program_prefix": lambda *_args: self.fail(
+                "a boot before the gate has no program prefix"
+            ),
+        }
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                str(PY_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+
+        operations, trace_base, gate_reached = namespace[
+            "_state_search_resolve_recovery_trace"
+        ](state, True)
+
+        self.assertEqual(operations, ())
+        self.assertIs(trace_base, state)
+        self.assertFalse(gate_reached)
+        self.assertEqual(calls, ["base:False"])
+
+    def test_state_search_uses_reached_deferred_gate_trace_and_base(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_state_search_resolve_recovery_trace"
+        )
+        calls: list[object] = []
+        state = object()
+        captured_base = object()
+        operations = ({"kind": "write", "operation_index": 0},)
+        namespace: dict[str, object] = {
+            "backend": {"kind": "mram"},
+            "tracking_start_address_config": 0x10000200,
+            "_tracking_base_state_from_peripheral": (
+                lambda require_available: (
+                    calls.append(("base", require_available)) or captured_base
+                )
+            ),
+            "_state_search_capture_trace": (
+                lambda: calls.append("trace") or operations
+            ),
+            "_state_search_validate_program_prefix": (
+                lambda base, trace: calls.append(("validate", base, trace))
+            ),
+        }
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                str(PY_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+
+        actual = namespace["_state_search_resolve_recovery_trace"](state, True)
+
+        self.assertEqual(actual, (operations, captured_base, True))
+        self.assertEqual(
+            calls,
+            [
+                ("base", False),
+                "trace",
+                ("validate", captured_base, operations),
+            ],
+        )
+
+    def test_state_search_boot_start_trace_is_unchanged(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_state_search_resolve_recovery_trace"
+        )
+        state = object()
+        operations = ({"kind": "write", "operation_index": 0},)
+        validated: list[tuple[object, object]] = []
+        namespace: dict[str, object] = {
+            "backend": {"kind": "mram"},
+            "tracking_start_address_config": 0,
+            "_tracking_base_state_from_peripheral": lambda **_kwargs: self.fail(
+                "boot-start tracing has no deferred base"
+            ),
+            "_state_search_capture_trace": lambda: operations,
+            "_state_search_validate_program_prefix": (
+                lambda base, trace: validated.append((base, trace))
+            ),
+        }
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                str(PY_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+
+        actual = namespace["_state_search_resolve_recovery_trace"](state, True)
+
+        self.assertEqual(actual, (operations, state, None))
+        self.assertEqual(validated, [(state, operations)])
 
     def test_deferred_exact_replay_restores_base_bytes_and_marks(self) -> None:
         tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
