@@ -55,6 +55,8 @@ Create NRF52 Fast Machine
     Execute Command    include "${root}/peripherals/NRF52NVMC.cs"
     Execute Command    include "${root}/peripherals/NRF52UARTE.cs"
     Execute Command    include "${root}/peripherals/TraceReplayEngine.cs"
+    Execute Command    include "${root}/peripherals/SPINORFlash.cs"
+    Execute Command    include "${root}/peripherals/I2CEEPROM.cs"
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${root}/platforms/cortex_m4_flash_fast.repl
 
@@ -270,3 +272,27 @@ STM32L4 Trace Carries Double-Word Width
     Should Contain    ${trace}    1:4096:9833440827789222417:8
     Should Be Equal As Numbers    ${lo}    0x44332211
     Should Be Equal As Numbers    ${hi}    0x88776655
+SPINORFlash And I2CEEPROM Emit Explicit Chunk Widths In Write Trace
+    ${root}=    Set Variable    ${CURDIR}/..
+    Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${root}/peripherals/FaultTracker.cs"
+    Execute Command    include "${root}/peripherals/NRF52NVMC.cs"
+    Execute Command    include "${root}/peripherals/NRF52UARTE.cs"
+    Execute Command    include "${root}/peripherals/TraceReplayEngine.cs"
+    Execute Command    include "${root}/peripherals/SPINORFlash.cs"
+    Execute Command    include "${root}/peripherals/I2CEEPROM.cs"
+    Execute Command    mach create "external_nvm_trace_widths"
+    Execute Command    machine LoadPlatformDescription @${root}/platforms/nrf52840_external_nvm.repl
+    Execute Command    spiNor WriteTraceEnabled true
+    Execute Command    i2cEeprom WriteTraceEnabled true
+    # SPI NOR: WREN (0x06), then Page Program (0x02) 6 bytes at 0x000010 -> 4-byte chunk + 2-byte chunk.
+    Execute Command    python "s=monitor.Machine['sysbus.spiNor']; s.Transmit(0x06); s.FinishTransmission()"
+    Execute Command    python "s=monitor.Machine['sysbus.spiNor']; [s.Transmit(b) for b in (0x02, 0x00, 0x00, 0x10, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66)]; s.FinishTransmission()"
+    ${spi_trace}=    Execute Command    spiNor WriteTraceToString
+    Should Contain    ${spi_trace}    1:16:1144201745:4
+    Should Contain    ${spi_trace}    2:20:26197:2
+    # I2C EEPROM: Page Write 6 bytes at 0x0020 -> 4-byte chunk + 2-byte chunk.
+    Execute Command    python "e=monitor.Machine['sysbus.i2cEeprom']; e.Write([0x00, 0x20, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x77]); e.FinishTransmission()"
+    ${i2c_trace}=    Execute Command    i2cEeprom WriteTraceToString
+    Should Contain    ${i2c_trace}    1:32:3721182122:4
+    Should Contain    ${i2c_trace}    2:36:30702:2

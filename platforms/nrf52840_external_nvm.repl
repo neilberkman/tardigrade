@@ -1,0 +1,122 @@
+// nRF52840 platform with external JEDEC SPI NOR flash (W25Q16JV)
+// on spi2 (0x40023000, CS# on gpio0 pin 22) and 24-series I2C EEPROM (24LC256)
+// on twi0 (0x40003000, slave address 0x50).
+//
+// Reuses Renode's built-in SPI.NRF52840_SPI, I2C.NRF52840_I2C,
+// GPIOPort.NRF52840_GPIO, and GPIOPort.NRF52840_GPIOTasksEvents controller models.
+// Both external NVM peripherals are also registered on sysbus windows
+// (spiNor at 0x60000000, i2cEeprom at 0x61000000) so the audit harness,
+// TraceReplayEngine, and memory_checks can inspect and restore persistent
+// storage directly while firmware accesses them strictly via SPI and I2C.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+
+// Bootloader / application code in internal flash (0x00000000-0x0000BFFF).
+boot_rom: Memory.MappedMemory @ sysbus 0x00000000
+    size: 0xC000
+
+// Internal flash (0x0000C000-0x000FFFFF).
+nvm: Memory.MappedMemory @ sysbus 0x0000C000
+    size: 0xF4000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x40000
+
+// FICR (Factory Information Configuration Registers).
+ficr: Memory.ArrayMemory @ sysbus 0x10000000
+    size: 0x1000
+
+// UICR (User Information Configuration Registers).
+uicr: Memory.ArrayMemory @ sysbus 0x10001000
+    size: 0x1000
+
+// CLOCK peripheral stub.
+clock: Memory.ArrayMemory @ sysbus 0x40000000
+    size: 0x1000
+
+// UARTE0 — nRF52840 UART at 0x40002000.
+uarte0: UART.NRF52UARTE @ sysbus 0x40002000
+
+// RTC1 — Zephyr system clock on nRF52840.
+rtc1: Timers.NRF52840_RTC @ sysbus 0x40011000
+    numberOfEvents: 3
+    -> nvic@17
+
+// WDT0 — watchdog register stub.
+wdt0: Memory.ArrayMemory @ sysbus 0x40010000
+    size: 0x1000
+
+// Internal NVMC.
+faultFlash: Miscellaneous.NRF52NVMC @ sysbus 0x4001E000
+    Flash: nvm
+    FlashBaseAddress: 0x0000C000
+    FlashSize: 0xF4000
+    EraseFill: 0xFF
+    PageSize: 4096
+
+// Renode nRF52840 GPIO & GPIOTE controllers (drives SPI CS# pin P0.22).
+gpio0: GPIOPort.NRF52840_GPIO @ sysbus 0x50000500
+    22 -> spiNor@0
+
+gpio1: GPIOPort.NRF52840_GPIO @ sysbus 0x50000800
+
+gpiote: GPIOPort.NRF52840_GPIOTasksEvents @ sysbus 0x40006000
+    port0: gpio0
+    port1: gpio1
+    -> nvic@6
+
+// Renode nRF52840 SPI2 controller at 0x40023000.
+spi2: SPI.NRF52840_SPI @ sysbus 0x40023000
+    -> nvic@0x23
+
+// External JEDEC SPI NOR Flash (Winbond W25Q16JV)
+// attached to spi2 and mapped on sysbus at 0x60000000 for harness inspection.
+spiNor: SPI.SPINORFlash @ { spi2; sysbus 0x60000000 }
+    size: 0x200000
+    flashBaseAddress: 0x60000000
+    jedecManufacturerId: 0xEF
+    jedecMemoryType: 0x40
+    jedecCapacityId: 0x15
+
+// Renode nRF52840 TWI0 (I2C0) controller at 0x40003000.
+twi0: I2C.NRF52840_I2C @ sysbus 0x40003000
+    -> nvic@0x3
+
+// External 24-series I2C EEPROM (Microchip 24LC256, 32 KiB, 64-byte pages)
+// attached to twi0 at 7-bit address 0x50 and mapped on sysbus at 0x61000000.
+i2cEeprom: I2C.I2CEEPROM @ { twi0 0x50; sysbus 0x61000000 }
+    size: 0x8000
+    pageSize: 64
+    addressBytes: 2
+    flashBaseAddress: 0x61000000
+    Controller: twi0
+    SlaveAddress: 0x50
+
+// Native trace replay engine (Target is bound dynamically to active flash_backend).
+trace_replay: Memory.TraceReplayEngine @ sysbus 0x4002F000
+    Target: spiNor
+    TargetBaseAddress: 0x60000000
+
+sysbus:
+    init:
+        Tag <0x00000000 0xC000> "BOOT_ROM"
+        Tag <0x0000C000 0xF4000> "NVM_FLASH"
+        Tag <0x20000000 0x40000> "SRAM"
+        Tag <0x40010000 0x1000> "WDT0"
+        Tag <0x4001E000 0x1000> "NVMC"
+        Tag <0x4002F000 0x100> "TRACE_REPLAY"
+        Tag <0x10000000 0x1000> "FICR"
+        Tag <0x10001000 0x1000> "UICR"
+        Tag <0x40000000 0x1000> "CLOCK"
+        WriteDoubleWord 0x10000010 0x1000
+        WriteDoubleWord 0x10000014 0x100
+        WriteDoubleWord 0x10001200 0x12
+        WriteDoubleWord 0x10001204 0x12
+        WriteDoubleWord 0x40000100 0x1
+        WriteDoubleWord 0x40000418 0x10001
+        Tag <0x40002000 0x1000> "UARTE0"

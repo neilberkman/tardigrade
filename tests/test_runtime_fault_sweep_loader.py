@@ -1571,6 +1571,8 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
             "NRF52NVMC.cs": True,
             "An521NvmInterceptor.cs": True,
             "CFIFlash.cs": True,
+            "SPINORFlash.cs": True,
+            "I2CEEPROM.cs": True,
         }
         for name, value in expected.items():
             text = (ROOT / "peripherals" / name).read_text(encoding="utf-8")

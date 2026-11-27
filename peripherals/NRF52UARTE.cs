@@ -23,6 +23,8 @@ namespace Antmicro.Renode.Peripherals.UART
         private uint eventsTxStarted = 0;
         private uint eventsRxDReady = 0;
         private uint eventsEndRx = 0;
+        private uint txdPtr = 0;
+        private uint txdMaxCnt = 0;
 
         private void DefineRegisters()
         {
@@ -105,12 +107,20 @@ namespace Antmicro.Renode.Peripherals.UART
             Registers.Enable.Define(this)
                 .WithValueField(0, 4, name: "ENABLE");
 
-            // RXD.AMOUNT (0x538)
+            // RXD.MAXCNT (0x538)
             Registers.RxdAmount.Define(this, 0);
 
-            // TXD.AMOUNT (0x548) — report amount = max
+            // TXD.PTR (0x544)
+            Registers.TxdPtr.Define(this)
+                .WithValueField(0, 32, writeCallback: (_, val) => txdPtr = (uint)val, valueProviderCallback: _ => txdPtr, name: "TXDPTR");
+
+            // TXD.MAXCNT (0x548)
+            Registers.TxdMaxCnt.Define(this)
+                .WithValueField(0, 32, writeCallback: (_, val) => txdMaxCnt = (uint)val, valueProviderCallback: _ => txdMaxCnt, name: "TXDMAXCNT");
+
+            // TXD.AMOUNT (0x54C) — report amount = max
             Registers.TxdAmount.Define(this)
-                .WithValueField(0, 32, name: "TXDAMOUNT");
+                .WithValueField(0, 32, valueProviderCallback: _ => txdMaxCnt, name: "TXDAMOUNT");
         }
 
         private enum Registers
@@ -127,7 +137,9 @@ namespace Antmicro.Renode.Peripherals.UART
             ErrorSrc = 0x480,
             Enable = 0x500,
             RxdAmount = 0x538,
-            TxdAmount = 0x548,
+            TxdPtr = 0x544,
+            TxdMaxCnt = 0x548,
+            TxdAmount = 0x54C,
         }
     }
 }

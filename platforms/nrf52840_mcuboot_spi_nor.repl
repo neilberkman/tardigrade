@@ -1,0 +1,123 @@
+// nRF52840 platform for MCUboot with primary slot in internal flash
+// (0x0000C000..0x000FFFFF) and secondary slot on external JEDEC SPI NOR flash
+// attached to spi2 (0x40023000, CS# on gpio0 pin 22).
+//
+// Firmware accesses the secondary slot strictly over SPI2 using Zephyr's
+// jedec,spi-nor driver (opcodes 0x9F, 0x5A, 0x05, 0x06, 0x03, 0x02, 0x20, 0x52, 0xD8).
+// The SPI NOR storage array is backed by the upper 2 MiB of `nvm` (bus offset
+// 0x00100000..0x002FFFFF, StorageBaseOffset 0x0F4000 from FlashBaseAddress
+// 0x0000C000) and shares its FaultTracker with `faultFlash` (CompanionNvmc)
+// so that snapshots, TraceReplayEngine, and recovery-state search (state_search)
+// capture the complete persistent state of both internal flash and external
+// SPI NOR flash across every cut and recovery boot.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+
+// Bootloader code (0x00000000-0x0000BFFF).
+boot_rom: Memory.MappedMemory @ sysbus 0x00000000
+    size: 0xC000
+
+// Unified persistent NVM backing:
+//   [0x0000C000..0x000FFFFF] (offset 0x000000..0x0F3FFF): internal nRF52840 flash (primary slot)
+//   [0x00100000..0x002FFFFF] (offset 0x0F4000..0x2F3FFF): external SPI NOR flash backing (secondary slot)
+nvm: Memory.MappedMemory @ sysbus 0x0000C000
+    size: 0x2F4000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x40000
+
+ficr: Memory.ArrayMemory @ sysbus 0x10000000
+    size: 0x1000
+
+uicr: Memory.ArrayMemory @ sysbus 0x10001000
+    size: 0x1000
+
+clock: Memory.ArrayMemory @ sysbus 0x40000000
+    size: 0x1000
+
+uarte0: UART.NRF52UARTE @ sysbus 0x40002000
+
+rtc1: Timers.NRF52840_RTC @ sysbus 0x40011000
+    numberOfEvents: 3
+    -> nvic@17
+
+wdt0: Memory.ArrayMemory @ sysbus 0x40010000
+    size: 0x1000
+
+// Internal flash NVMC (primary slot).
+faultFlash: Miscellaneous.NRF52NVMC @ sysbus 0x4001E000
+    Flash: nvm
+    FlashBaseAddress: 0x0000C000
+    FlashSize: 0x2F4000
+    EraseFill: 0xFF
+    PageSize: 4096
+
+// Renode nRF52840 GPIO & GPIOTE controllers (drives SPI CS# pin P0.22).
+gpio0: GPIOPort.NRF52840_GPIO @ sysbus 0x50000500
+    22 -> spiNor@0
+
+gpio1: GPIOPort.NRF52840_GPIO @ sysbus 0x50000800
+
+gpiote: GPIOPort.NRF52840_GPIOTasksEvents @ sysbus 0x40006000
+    port0: gpio0
+    port1: gpio1
+    -> nvic@6
+
+// Renode nRF52840 SPI2 controller at 0x40023000.
+spi2: SPI.NRF52840_SPI @ sysbus 0x40023000
+    -> nvic@0x23
+
+// External JEDEC SPI NOR Flash (Winbond W25Q16JV) on spi2, backed at
+// StorageBaseOffset 0x0F4000 (bus address 0x00100000) in `nvm`.
+spiNor: SPI.SPINORFlash @ { spi2; sysbus 0x60000000 }
+    size: 0x200000
+    flashBaseAddress: 0x0000C000
+    FlashSize: 0x2F4000
+    StorageBaseOffset: 0x0F4000
+    BackingMemory: nvm
+    CompanionNvmc: faultFlash
+    jedecManufacturerId: 0xEF
+    jedecMemoryType: 0x40
+    jedecCapacityId: 0x15
+
+// Renode nRF52840 TWI0 (I2C0) controller at 0x40003000.
+twi0: I2C.NRF52840_I2C @ sysbus 0x40003000
+    -> nvic@0x3
+
+// External 24-series I2C EEPROM (Microchip 24LC256) on twi0 at 0x50.
+i2cEeprom: I2C.I2CEEPROM @ { twi0 0x50; sysbus 0x61000000 }
+    size: 0x8000
+    pageSize: 64
+    addressBytes: 2
+    flashBaseAddress: 0x61000000
+    Controller: twi0
+    SlaveAddress: 0x50
+
+// Native trace replay engine.
+trace_replay: Memory.TraceReplayEngine @ sysbus 0x4002F000
+    Target: nvm
+    TargetBaseAddress: 0x0000C000
+
+sysbus:
+    init:
+        Tag <0x00000000 0xC000> "BOOT_ROM"
+        Tag <0x0000C000 0x2F4000> "NVM_FLASH"
+        Tag <0x20000000 0x40000> "SRAM"
+        Tag <0x40010000 0x1000> "WDT0"
+        Tag <0x4001E000 0x1000> "NVMC"
+        Tag <0x4002F000 0x100> "TRACE_REPLAY"
+        Tag <0x10000000 0x1000> "FICR"
+        Tag <0x10001000 0x1000> "UICR"
+        Tag <0x40000000 0x1000> "CLOCK"
+        WriteDoubleWord 0x10000010 0x1000
+        WriteDoubleWord 0x10000014 0x100
+        WriteDoubleWord 0x10001200 0x12
+        WriteDoubleWord 0x10001204 0x12
+        WriteDoubleWord 0x40000100 0x1
+        WriteDoubleWord 0x40000418 0x10001
+        Tag <0x40002000 0x1000> "UARTE0"

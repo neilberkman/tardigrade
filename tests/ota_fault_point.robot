@@ -186,6 +186,8 @@ Load Runtime Scenario
     Execute Command    include "${ROOT}/peripherals/STM32DummyUSART.cs"
     Execute Command    include "${ROOT}/peripherals/OTPMemory.cs"
     Execute Command    include "${ROOT}/peripherals/I2CFaultProxy.cs"
+    Execute Command    include "${ROOT}/peripherals/SPINORFlash.cs"
+    Execute Command    include "${ROOT}/peripherals/I2CEEPROM.cs"
     Run Keyword If    '${EXTRA_PERIPHERALS}' != ''    Load Extra Peripherals
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${PLATFORM_REPL}

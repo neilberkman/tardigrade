@@ -124,6 +124,7 @@ jobs:
             tests/cmsdk_apb_watchdog.robot
             tests/write_trace_widths.robot
             tests/stm32f1_l4_flash.robot
+            tests/external_nvm_peripherals.robot
           artifacts-path: results/ci_artifacts
 
       - name: Upload Renode artifacts

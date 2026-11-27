@@ -47,7 +47,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     public class NRF52NVMC : BasicDoubleWordPeripheral, IKnownSize, ITardigradeFaultInjectable
     {
-        private readonly FaultTracker tracker = new FaultTracker();
+        private FaultTracker tracker = new FaultTracker();
+
+        public FaultTracker SharedTracker
+        {
+            get => tracker;
+            set
+            {
+                if(value != null)
+                {
+                    tracker = value;
+                }
+            }
+        }
 
         public NRF52NVMC(IMachine machine) : base(machine)
         {

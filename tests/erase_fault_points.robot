@@ -16,6 +16,8 @@ Load All Builtin NVM Peripherals
     Execute Command    include "${ROOT}/peripherals/STM32F1FlashController.cs"
     Execute Command    include "${ROOT}/peripherals/STM32F4FastFlash.cs"
     Execute Command    include "${ROOT}/peripherals/STM32L4FlashController.cs"
+    Execute Command    include "${ROOT}/peripherals/SPINORFlash.cs"
+    Execute Command    include "${ROOT}/peripherals/I2CEEPROM.cs"
 
 Read Normalized Bool
     [Arguments]    ${command}
@@ -323,3 +325,49 @@ STM32F1 And STM32L4 Flash Controllers Track And Fault Page Erases
     Should Be Equal As Numbers    ${l4_lo}    0xFFFFFFFF
     Should Be Equal As Numbers    ${l4_hi}    0x55667788
     Should Contain    ${l4_trace}    1:528384:0:2048
+SPINORFlash Honors Torn Erase Modes Across 4K 32K And 64K Erases
+    Load All Builtin NVM Peripherals
+    Execute Command    include "${ROOT}/peripherals/NRF52UARTE.cs"
+    Execute Command    include "${ROOT}/peripherals/TraceReplayEngine.cs"
+    Execute Command    mach create "spinor_erases"
+    Execute Command    machine LoadPlatformDescription @${ROOT}/platforms/nrf52840_external_nvm.repl
+    Execute Command    spiNor EraseTraceEnabled true
+    Execute Command    spiNor BusyPollsPerErase 0
+
+    # Pre-seed 4 KiB sector at 0x001000 (mapped at 0x60001000).
+    Execute Command    sysbus WriteDoubleWord 0x60001000 0x11223344
+    Execute Command    sysbus WriteDoubleWord 0x60001800 0x55667788
+
+    # 1. Default half mode on 4 KiB sector erase (0x20): first 2 KiB erased, second 2 KiB retained.
+    Execute Command    spiNor MramTornWordMode "half"
+    Execute Command    spiNor FaultAtPageErase 1
+    Execute Command    python "s=monitor.Machine['sysbus.spiNor']; s.Transmit(0x06); s.FinishTransmission(); [s.Transmit(b) for b in (0x20, 0x00, 0x10, 0x00)]; s.FinishTransmission()"
+    ${fired}=          Read Normalized Bool    spiNor EraseFaultFired
+    ${lo}=             Execute Command    sysbus ReadDoubleWord 0x60001000
+    ${hi}=             Execute Command    sysbus ReadDoubleWord 0x60001800
+    Should Be Equal As Strings    ${fired}    true
+    Should Be Equal As Numbers    ${lo}       0xFFFFFFFF
+    Should Be Equal As Numbers    ${hi}       0x55667788
+
+    # 2. Untouched mode on 32 KiB block erase (0x52): pre-erase data retained.
+    Execute Command    spiNor EraseFaultFired false
+    Execute Command    sysbus WriteDoubleWord 0x60008000 0xAABBCCDD
+    Execute Command    sysbus WriteDoubleWord 0x6000C000 0xEEFF0011
+    Execute Command    spiNor MramTornWordMode "untouched"
+    Execute Command    spiNor FaultAtPageErase 2
+    Execute Command    python "s=monitor.Machine['sysbus.spiNor']; s.Transmit(0x06); s.FinishTransmission(); [s.Transmit(b) for b in (0x52, 0x00, 0x80, 0x00)]; s.FinishTransmission()"
+    ${u_lo}=           Execute Command    sysbus ReadDoubleWord 0x60008000
+    ${u_hi}=           Execute Command    sysbus ReadDoubleWord 0x6000C000
+    Should Be Equal As Numbers    ${u_lo}     0xAABBCCDD
+    Should Be Equal As Numbers    ${u_hi}     0xEEFF0011
+
+    # 3. Partial bits mode on 64 KiB block erase (0xD8).
+    Execute Command    spiNor EraseFaultFired false
+    Execute Command    sysbus WriteDoubleWord 0x60010000 0x00000000
+    Execute Command    spiNor TornWordMode "partial_bits"
+    Execute Command    spiNor TornWordSeed 42
+    Execute Command    spiNor FaultAtPageErase 3
+    Execute Command    python "s=monitor.Machine['sysbus.spiNor']; s.Transmit(0x06); s.FinishTransmission(); [s.Transmit(b) for b in (0xD8, 0x01, 0x00, 0x00)]; s.FinishTransmission()"
+    ${p_lo}=           Execute Command    sysbus ReadDoubleWord 0x60010000
+    Should Not Be Equal As Numbers    ${p_lo}    0x00000000
+    Should Not Be Equal As Numbers    ${p_lo}    0xFFFFFFFF

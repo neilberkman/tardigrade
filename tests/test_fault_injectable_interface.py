@@ -35,6 +35,8 @@ FAULT_BACKENDS = (
     "STM32L4FlashController.cs",
     "GenericNvmController.cs",
     "NVMemoryController.cs",
+    "SPINORFlash.cs",
+    "I2CEEPROM.cs",
 )
 
 
