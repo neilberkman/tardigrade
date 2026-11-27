@@ -1564,7 +1564,12 @@ def _run_batch_with_fallback(
             fault_types_list=fault_types_list,
         )
         if len(fault_points) == 1:
-            _progress("Fallback point {} complete.".format(fault_points[0]))
+            if _depth > 0:
+                _progress("Fallback point {} complete.".format(fault_points[0]))
+            else:
+                _progress(
+                    "Single-point batch {} complete.".format(fault_points[0])
+                )
         return results
     except Exception as exc:
         if len(fault_points) <= 1 or _depth >= _MAX_FALLBACK_DEPTH:

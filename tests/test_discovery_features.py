@@ -2347,6 +2347,68 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertEqual(calls, [[7, 8], [7], [8]])
             self.assertEqual(len(results), 2)
 
+    def test_initial_single_point_batch_is_not_retried_or_called_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tempdir = Path(td)
+            profile_path = self._write_profile(
+                tempdir,
+                """
+                schema_version: 1
+                name: initial_single_profile
+                description: one state-search plan entry
+                platform: platforms/cortex_m4_flash_fast.repl
+                bootloader:
+                  elf: examples/vulnerable_ota/firmware.elf
+                  entry: 0x10000000
+                memory:
+                  sram: { start: 0x20000000, end: 0x20020000 }
+                  write_granularity: 4
+                  slots:
+                    exec: { base: 0x10000000, size: 0x1000 }
+                    staging: { base: 0x10001000, size: 0x1000 }
+                images:
+                  staging: examples/vulnerable_ota/firmware.bin
+                success_criteria:
+                  vtor_in_slot: exec
+                expect:
+                  should_find_issues: false
+                """,
+            )
+            profile = load_profile(profile_path)
+            calls = []
+            stderr = StringIO()
+
+            def fake_run_batch(**kwargs):
+                calls.append(list(kwargs["fault_points"]))
+                return [{
+                    "fault_at": 0,
+                    "fault_requested": 0,
+                    "fault_type": "rs",
+                    "fault_injected": True,
+                    "boot_outcome": "success",
+                    "recovery_state_search": {"generation": 1},
+                }]
+
+            with mock.patch("renode_runner.run_batch", side_effect=fake_run_batch):
+                with redirect_stderr(stderr):
+                    results = _run_batch_with_fallback(
+                        repo_root=ROOT,
+                        renode_test="renode-test",
+                        robot_suite="tests/ota_fault_point.robot",
+                        profile=profile,
+                        fault_points=[0],
+                        fault_types_list=["rs"],
+                        robot_vars=[],
+                        work_dir=tempdir / "work",
+                        renode_remote_server_dir="",
+                        keep_run_artifacts=False,
+                    )
+
+            self.assertEqual(calls, [[0]])
+            self.assertEqual(len(results), 1)
+            self.assertIn("Single-point batch 0 complete", stderr.getvalue())
+            self.assertNotIn("Fallback point", stderr.getvalue())
+
     def test_run_batch_with_fallback_records_arbitrary_failure_as_infrastructure_error(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tempdir = Path(td)
