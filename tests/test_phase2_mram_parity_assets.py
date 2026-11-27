@@ -41,6 +41,29 @@ def test_state_search_profile_deduplicates_uncorrectable_states() -> None:
     assert search.cross_check_every == 1
 
 
+def test_wide_state_search_profiles_cover_required_mram_outcomes() -> None:
+    for mode in ("half", "uncorrectable", "corrupted"):
+        profile = load_profile(
+            EXAMPLE / "profile_state_search_16_{}.yaml".format(mode)
+        )
+        search = profile.fault_sweep.phase2_fault.state_search
+        assert profile.platform.endswith("cortex_m0_mram_tracked_16.repl")
+        assert profile.memory.write_granularity == 16
+        assert profile.fault_sweep.mram_torn_word == mode
+        assert profile.fault_sweep.trace_replay_cross_check_every == 1
+        assert search.first_cut_mode == "all"
+        assert search.max_cuts == 2
+        assert search.address_ranges == [(0x10100100, 0x1010011F)]
+        assert search.cross_check_every == 1
+
+
+def test_wide_trace_replay_profile_cross_checks_every_cut() -> None:
+    profile = load_profile(EXAMPLE / "profile_trace_replay_16_half.yaml")
+    assert profile.memory.write_granularity == 16
+    assert profile.fault_sweep.phase2_fault.state_search.enabled is False
+    assert profile.fault_sweep.trace_replay_cross_check_every == 1
+
+
 def test_exec_slot_fixture_has_a_valid_cortex_m_vector() -> None:
     slot = (EXAMPLE / "slot.bin").read_bytes()
     stack_pointer, reset_vector = struct.unpack_from("<II", slot)

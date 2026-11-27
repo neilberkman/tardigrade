@@ -8,6 +8,11 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Added
 
+- Recovery-state search and trace-replay live cross-checks for MRAM program
+  units wider than eight bytes. MRAM search and replay now consume the exact
+  program trace, preserve each whole program as one cut, and compare all bytes
+  plus uncorrectable-unit marks. The 16-byte parity profiles exercise `half`,
+  `uncorrectable`, and `corrupted` outcomes.
 - Controller-backed `NVMemory` support for two-cut state campaigns and for
   execute-mode recovery on hybrid platforms, including all three persistent
   segments and qualifying recovery-state searches. Every Renode `RunFor` now

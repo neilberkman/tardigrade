@@ -1148,6 +1148,9 @@ fault_sweep:
 
 Execute-mode campaigns on fast-flash and MRAM backends can rebuild a power-cut
 state from the calibration trace instead of emulating Phase 1 for every point.
+MRAM uses its exact program trace rather than the legacy integer write trace;
+this retains the complete intended byte sequence when the program unit is
+wider than eight bytes and keeps that unit as one interruptible operation.
 For every cut whose zero-based fault index is divisible by
 `trace_replay_cross_check_every`, the sweep also runs the live fault-injection
 path to the cut and stops before recovery. The index-based selection is stable
@@ -1831,9 +1834,13 @@ state. It evaluates a canonical state only once. Identity includes every byte
 of the direct NVM backend and every MRAM uncorrectable-word mark. A
 controller-backed `slow` backend can participate when its backing `Nvm` owns
 the complete persistent state and supplies the same snapshot and trace
-contract. A separate persistent NVM controller, a separate OTP peripheral,
-writeback durability, or a backend without width-explicit per-write-accurate
-write and erase traces is refused before the search. Because `state_search`
+contract. A separate persistent NVM controller, a separate OTP peripheral, or
+writeback durability is refused before the search. Non-MRAM backends must
+provide width-explicit, per-write-accurate write and erase traces. MRAM
+backends instead provide an exact program trace containing each whole unit's
+intended, pre-program, and completed bytes together with the erase trace. A
+missing, truncated, non-contiguous, or geometry-inconsistent MRAM program
+trace is refused. Because `state_search`
 uses execute mode, code must also run from directly executable memory; a pure
 `NVMemory` instruction-fetch platform is rejected at profile load time. These
 checks prevent the canonical state from omitting persistent data.

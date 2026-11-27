@@ -1,0 +1,44 @@
+schema_version: 1
+name: phase2_mram_trace_replay_16_half
+description: Trace replay and live cross-check of whole 16-byte MRAM programs.
+platform: platforms/cortex_m0_mram_tracked_16.repl
+flash_backend: mramTracker
+bootloader:
+  elf: examples/phase2_mram_parity/firmware.elf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x20000000, end: 0x20002000 }
+  volatile_regions:
+    - { name: runtime_sram, base: 0x20000000, size: 0x2000 }
+  write_granularity: 16
+  page_size: 0x1000
+  trace_address_map:
+    - { offset_start: 0x0, offset_end: 0x4000, address_addend: 0x10100000 }
+  slots:
+    exec: { base: 0x10100000, size: 0x2000 }
+    staging: { base: 0x10102000, size: 0x2000 }
+images:
+  exec: examples/phase2_mram_parity/slot.bin
+pre_boot_state:
+  - { address: 0x20000400, u32: 0x55504432 }
+  - { address: 0x10100100, u32: 0x56414C31 }
+  - { address: 0x10100104, u32: 0x54524754 }
+success_criteria:
+  vtor_in_slot: exec
+  marker_address: 0x20000100
+  marker_value: 0x50325041
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  mram_torn_word: half
+  max_writes: auto
+  max_writes_cap: 4
+  sweep_strategy: exhaustive
+  run_duration: "0.1"
+  progress_stall_timeout_s: 0.1
+  boot_cycles: 1
+  trace_replay_cross_check_every: 1
+expect:
+  should_find_issues: false
+skip_self_test: true
