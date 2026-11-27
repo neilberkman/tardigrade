@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from point_counts import point_count_rows
+from report_points import CAMPAIGNS, ReportRun, point_label, point_status
 
-from fault_classification import _effective_boot_result
-from audit_report import ownership_assessment
+from fault_classification import _effective_boot_result, result_has_issues
+from audit_report import ownership_assessment, summarize_runtime_sweep
 
 
 FAULT_LABELS = {
@@ -204,19 +205,19 @@ def load_json(path: Path) -> Any:
 
 
 def classify_payload(payload: Any) -> str:
-    if isinstance(payload, dict) and "engine" in payload and "summary" in payload:
+    if isinstance(payload, list) and all(isinstance(row, dict) and "boot_outcome" in row for row in payload):
+        return "runtime"
+    if isinstance(payload, dict) and "aborted" in payload and isinstance(payload.get("results"), list):
+        return "runtime"
+    if isinstance(payload, dict) and "boot_outcome" in payload:
+        return "runtime"
+    if isinstance(payload, dict) and ("runtime_sweep_results" in payload or ("engine" in payload and "summary" in payload)):
         return "audit"
     if isinstance(payload, dict) and "total_profiles" in payload and "results" in payload:
         return "self_test"
     if isinstance(payload, dict) and "clusters" in payload and "totals" in payload:
         return "matrix"
     return "unknown"
-
-
-def score_color(outcome: str, injected: bool) -> str:
-    if not injected:
-        return "#52606d"
-    return "#37f6a0" if outcome == "success" else "#ff4d6d"
 
 
 def status_class(value: Any) -> str:
@@ -247,7 +248,7 @@ def _boot_span_outcomes(result: Dict[str, Any]) -> Tuple[str, str]:
     return initial, str(final or initial or "unknown")
 
 
-def render_fault_grid(results: List[Dict[str, Any]]) -> str:
+def render_fault_grid(results: List[Dict[str, Any]], expected_outcome: str = "success") -> str:
     points = [r for r in results if not r.get("is_control", False)]
     if not points:
         return "<p class='empty-state'>No runtime sweep results found.</p>"
@@ -263,8 +264,10 @@ def render_fault_grid(results: List[Dict[str, Any]]) -> str:
         at = int(p.get("fault_requested", p.get("fault_at", 0)))
         initial_outcome, final_outcome = _boot_span_outcomes(p)
         injected = bool(p.get("fault_injected", False))
-        color = score_color(final_outcome, injected)
-        state = "idle" if not injected else ("safe" if final_outcome == "success" else "alert")
+        disposition, reason = point_status(p)
+        issue = not disposition and result_has_issues(p, expected_outcome)
+        state = "idle" if disposition else ("alert" if issue else "safe")
+        color = {"idle": "#52606d", "alert": "#ff4d6d", "safe": "#37f6a0"}[state]
         if initial_outcome == final_outcome:
             title = f"type={label} fp={at} outcome={final_outcome} injected={injected}"
         else:
@@ -272,6 +275,10 @@ def render_fault_grid(results: List[Dict[str, Any]]) -> str:
                 f"type={label} fp={at} initial={initial_outcome} "
                 f"final={final_outcome} injected={injected}"
             )
+        if reason:
+            title += " " + reason
+        if p.get("recovery_state_search") or p.get("phase2_fault_chain") or p.get("phase2_fault"):
+            title += " " + point_label(p)
         cells.append(
             "<div class='cell cell-{}' style='--cell-color:{}' title='{}' "
             "aria-label='{}'></div>".format(
@@ -544,7 +551,10 @@ def render_audit_card(path: Path, payload: Dict[str, Any]) -> Tuple[str, Dict[st
         "</div>"
     )
 
-    grid = render_fault_grid(payload.get("runtime_sweep_results", []))
+    grid = render_fault_grid(
+        [row for campaign in CAMPAIGNS for row in payload.get(campaign, [])],
+        (payload.get("expect") or {}).get("control_outcome") or "success",
+    )
 
     rc_cfg = payload.get("rc_injection_config") or {}
     rc_panel = ""
@@ -629,6 +639,9 @@ def render_self_test_card(path: Path, payload: Dict[str, Any]) -> str:
         rows.append(
             f"<tr class='{css}'><td>{profile}</td><td>{verdict}</td><td>{reason}</td></tr>"
         )
+        if item.get("point_counts"):
+            panel = render_point_counts_panel({"summary": {"runtime_sweep": {"point_counts": item["point_counts"]}}})
+            rows.append(f"<tr><td colspan='3'><details><summary>{profile} point counts</summary>{panel}</details></td></tr>")
 
     return (
         "<section class='card'>"
@@ -834,15 +847,42 @@ def main() -> int:
     parser.add_argument("--output", required=True, help="Output HTML path")
     args = parser.parse_args()
 
-    inputs = [Path(p) for p in args.input]
+    paths = [Path(p) for p in args.input]
+    out = Path(args.output)
+    write_html([(path, load_json(path)) for path in paths], out)
+    print(out)
+    return 0
+
+
+def runtime_payload(rows, name):
+    if isinstance(rows, dict) and "results" in rows:
+        rows = rows["results"]
+    rows = rows if isinstance(rows, list) else [rows]
+    rows = [{**row, "is_control": row.get("is_control", row.get("fault_type") == "control" or row.get("fault_at") == -1)}
+            for row in rows]
+    summary = summarize_runtime_sweep(rows, expected_control_points=sum(bool(r.get("is_control")) for r in rows))
+    return {"profile": name, "runtime_sweep_results": rows, "summary": {"runtime_sweep": summary}}
+
+
+def write_html(inputs, out):
     cards: List[str] = []
     audit_summaries: List[Dict[str, Any]] = []
     matrix_summaries: List[Dict[str, Any]] = []
 
-    for path in inputs:
-        payload = load_json(path)
+    for path, payload in inputs:
         kind = classify_payload(payload)
+        if kind == "runtime":
+            payload = runtime_payload(payload, path.stem)
+            kind = "audit"
         if kind == "audit":
+            summary = payload.get("summary") or {}
+            if "runtime_sweep_results" in payload:
+                sweep = summary.get("runtime_sweep")
+                if sweep is None:
+                    sweep = runtime_payload(payload["runtime_sweep_results"], path.stem)["summary"]["runtime_sweep"]
+                elif "point_counts" not in sweep:
+                    sweep = {**sweep, "point_counts": ReportRun(payload, path.stem).counts}
+                payload = {**payload, "summary": {**summary, "runtime_sweep": sweep}}
             card, summary = render_audit_card(path, payload)
             cards.append(card)
             audit_summaries.append(summary)
@@ -1051,11 +1091,8 @@ code { color: #99e8f7; font-family: ui-monospace, SFMono-Regular, Menlo, monospa
 </html>
 """
 
-    out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html_doc, encoding="utf-8")
-    print(out)
-    return 0
 
 
 if __name__ == "__main__":

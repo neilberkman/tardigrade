@@ -1,0 +1,112 @@
+{
+  "profile": "phase2_mram_deferred_state_search_16_uncorrectable",
+  "profile_path": "examples/phase2_mram_parity/profile_deferred_state_search_16_uncorrectable.yaml",
+  "expect": {
+    "control_outcome": "success",
+    "mode": "regression",
+    "should_find_issues": true
+  },
+  "git": {
+    "commit": "fb8174a8b190ba61953cb89cbeea89576fe89d37",
+    "dirty": "false",
+    "short_commit": "fb8174a"
+  },
+  "runtime_sweep_results": [
+    {
+      "fault_at": 2,
+      "fault_requested": 0,
+      "fault_type": "rs",
+      "fault_injected": true,
+      "is_control": false,
+      "boot_outcome": "no_boot",
+      "boot_slot": null,
+      "fault_class": "unrecoverable",
+      "signals": {
+        "total_ms": 304,
+        "marker_ok": false,
+        "vtor_ok": false,
+        "expectations_met": false
+      },
+      "recovery_state_search": {
+        "generation": 1,
+        "state_identity": "940ff1ef6542c953390ab3a04047ee18476fd48fe7238a94542bfa72f2df6543",
+        "chain": {
+          "cut_count": 1,
+          "cuts": [
+            {
+              "address": "0x10100110",
+              "fault_type": "power_loss",
+              "operation": "write",
+              "operation_index": 2,
+              "trace_sequence": 2
+            }
+          ],
+          "text": "write[2]@0x10100110"
+        }
+      }
+    },
+    {
+      "fault_at": 2,
+      "fault_requested": 0,
+      "fault_type": "rs",
+      "fault_injected": true,
+      "is_control": false,
+      "boot_outcome": "no_boot",
+      "boot_slot": null,
+      "fault_class": "unrecoverable",
+      "signals": {
+        "total_ms": 230,
+        "marker_ok": false,
+        "vtor_ok": false,
+        "expectations_met": false
+      },
+      "recovery_state_search": {
+        "generation": 2,
+        "state_identity": "601330377439036885f5929df921e7c6de4d7f4a9e990de02ec0b58ccbf7d0fd",
+        "chain": {
+          "cut_count": 2,
+          "cuts": [
+            {
+              "address": "0x10100110",
+              "fault_type": "power_loss",
+              "operation": "write",
+              "operation_index": 2,
+              "trace_sequence": 2
+            },
+            {
+              "address": "0x10100100",
+              "fault_type": "power_loss",
+              "operation": "write",
+              "operation_index": 0,
+              "trace_sequence": 0
+            }
+          ],
+          "phase2_fault_pair": [
+            2,
+            0
+          ],
+          "phase2_fault_pair_fault_type": "power_loss",
+          "phase2_fault_pair_first_fault_type": "power_loss",
+          "phase2_fault_pair_yaml": "- [2, 0]",
+          "phase2_fault_yaml": "first_fault_types: [power_loss]\nfault_types: [power_loss]\npairs:\n  - [2, 0]",
+          "text": "write[2]@0x10100110 -> write[0]@0x10100100"
+        }
+      }
+    },
+    {
+      "fault_at": -1,
+      "fault_requested": -1,
+      "fault_type": "control",
+      "fault_injected": false,
+      "is_control": true,
+      "boot_outcome": "success",
+      "boot_slot": "exec",
+      "fault_class": "recoverable",
+      "signals": {
+        "marker_ok": true,
+        "vtor_ok": true,
+        "expectations_met": true
+      }
+    }
+  ]
+}
