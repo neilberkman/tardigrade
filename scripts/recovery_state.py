@@ -61,6 +61,7 @@ _TORN_WORD_MODES = frozenset(
 )
 
 _STATE_CHUNK_SIZE = 4096
+_MAX_PROGRAM_WIDTH = 1 << 20
 
 try:
     _wide_integer = long
@@ -104,8 +105,14 @@ def _coerce_bytes(value):
 
 def _little_endian_bytes(value, width):
     width = int(width)
-    if width not in (1, 2, 4, 8):
-        raise RecoveryStateError("write width must be 1, 2, 4, or 8 bytes")
+    if (
+        width <= 0
+        or width > _MAX_PROGRAM_WIDTH
+        or (width & (width - 1)) != 0
+    ):
+        raise RecoveryStateError(
+            "write width must be a positive, bounded power of two"
+        )
     value = int(value)
     return bytes(bytearray((value >> (8 * index)) & 0xFF for index in range(width)))
 
@@ -421,16 +428,31 @@ def _normalize_operation(raw, kind=None, sequence=None):
         width = int(operation.get("width", operation.get("write_width", 0)))
         if write_index <= 0:
             raise RecoveryStateError("write trace indices must be positive")
-        if width not in (1, 2, 4, 8):
-            raise RecoveryStateError("write trace width must be 1, 2, 4, or 8")
+        if (
+            width <= 0
+            or width > _MAX_PROGRAM_WIDTH
+            or (width & (width - 1)) != 0
+        ):
+            raise RecoveryStateError(
+                "write trace width must be a positive, bounded power of two"
+            )
+        value = _coerce_integer(operation.get("value", 0))
+        completed_value = _coerce_integer(
+            operation.get("completed_value", value)
+        )
         normalized.update(
             {
                 "write_index": write_index,
                 "operation_index": write_index - 1,
                 "width": width,
-                "value": _coerce_integer(operation.get("value", 0)),
+                "value": value,
+                "completed_value": completed_value,
             }
         )
+        if "pre_program_value" in operation:
+            normalized["pre_program_value"] = _coerce_integer(
+                operation["pre_program_value"]
+            )
     else:
         erase_index = int(operation.get("erase_index", operation.get("index", 0)))
         erase_size = int(operation.get("erase_size", operation.get("size", 0)))
@@ -494,7 +516,9 @@ def apply_completed_operation(state, operation, erase_fill=0xFF):
     region_name = operation["region"]
     offset = operation["offset"]
     if operation["kind"] == "write":
-        data = _little_endian_bytes(operation["value"], operation["width"])
+        data = _little_endian_bytes(
+            operation["completed_value"], operation["width"]
+        )
         return state.write(region_name, offset, data, clear_uncorrectable=True)
     size = operation["erase_size"]
     fill = bytes(bytearray((int(erase_fill) & 0xFF,) * size))

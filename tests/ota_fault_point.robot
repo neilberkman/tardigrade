@@ -52,6 +52,7 @@ ${IMAGE_EXEC_PATH}             ${EMPTY}
 ${IMAGE_TERTIARY_PATH}         ${EMPTY}
 ${IMAGE_RECOVERY_PATH}         ${EMPTY}
 ${TRACE_FILE}                  ${EMPTY}
+${PROGRAM_TRACE_FILE}          ${EMPTY}
 ${ERASE_TRACE_FILE}            ${EMPTY}
 ${TRACE_FILE_BIN}              ${EMPTY}
 ${ERASE_TRACE_FILE_BIN}        ${EMPTY}
@@ -252,6 +253,7 @@ Run Runtime Fault Point
     Run Keyword If    '${IMAGE_TERTIARY_PATH}' != ''    Execute Command    $image_tertiary_path="${IMAGE_TERTIARY_PATH}"
     Run Keyword If    '${IMAGE_RECOVERY_PATH}' != ''    Execute Command    $image_recovery_path="${IMAGE_RECOVERY_PATH}"
     Execute Command    $trace_file="${TRACE_FILE}"
+    Execute Command    $program_trace_file="${PROGRAM_TRACE_FILE}"
     Execute Command    $erase_trace_file="${ERASE_TRACE_FILE}"
     Execute Command    $trace_file_bin="${TRACE_FILE_BIN}"
     Execute Command    $erase_trace_file_bin="${ERASE_TRACE_FILE_BIN}"

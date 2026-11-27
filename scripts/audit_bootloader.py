@@ -2476,6 +2476,9 @@ def _main_single() -> int:
             evaluation_mode=eval_mode,
             max_batch_points=args.max_batch_points,
             trace_file=trace_file if not args.no_trace_replay else None,
+            program_trace_file=(
+                program_trace_file if not args.no_trace_replay else None
+            ),
             erase_trace_file=erase_trace_file if not args.no_trace_replay else None,
             trace_file_bin=trace_file_bin if not args.no_trace_replay else None,
             erase_trace_file_bin=erase_trace_file_bin if not args.no_trace_replay else None,

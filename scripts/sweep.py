@@ -936,6 +936,7 @@ def _run_batch_worker(
     renode_remote_server_dir: str,
     worker_id: int,
     trace_file: Optional[str] = None,
+    program_trace_file: Optional[str] = None,
     erase_trace_file: Optional[str] = None,
     trace_file_bin: Optional[str] = None,
     erase_trace_file_bin: Optional[str] = None,
@@ -1030,6 +1031,7 @@ def _run_batch_worker(
         work_dir=worker_dir,
         renode_remote_server_dir=renode_remote_server_dir,
         trace_file=trace_file,
+        program_trace_file=program_trace_file,
         erase_trace_file=erase_trace_file,
         trace_file_bin=trace_file_bin,
         erase_trace_file_bin=erase_trace_file_bin,
@@ -1417,6 +1419,7 @@ def run_runtime_sweep(
     evaluation_mode: str = "state",
     max_batch_points: int = 0,
     trace_file: Optional[str] = None,
+    program_trace_file: Optional[str] = None,
     erase_trace_file: Optional[str] = None,
     trace_file_bin: Optional[str] = None,
     erase_trace_file_bin: Optional[str] = None,
@@ -1558,6 +1561,7 @@ def run_runtime_sweep(
                     renode_remote_server_dir=renode_remote_server_dir,
                     worker_id=wid,
                     trace_file=trace_file,
+                    program_trace_file=program_trace_file,
                     erase_trace_file=erase_trace_file,
                     trace_file_bin=trace_file_bin,
                     erase_trace_file_bin=erase_trace_file_bin,
@@ -1597,6 +1601,7 @@ def run_runtime_sweep(
             work_dir=work_dir,
             renode_remote_server_dir=renode_remote_server_dir,
             trace_file=trace_file,
+            program_trace_file=program_trace_file,
             erase_trace_file=erase_trace_file,
             trace_file_bin=trace_file_bin,
             erase_trace_file_bin=erase_trace_file_bin,
@@ -2050,6 +2055,7 @@ def run_multi_component_sweep(
         # Calibrate this component.
         comp_max_writes = comp_profile.fault_sweep.max_writes
         trace_file: Optional[str] = None
+        program_trace_file: Optional[str] = None
         erase_trace_file: Optional[str] = None
         trace_file_bin: Optional[str] = None
         erase_trace_file_bin: Optional[str] = None
@@ -2087,6 +2093,7 @@ def run_multi_component_sweep(
                 total_otp_blows = cal.total_otp_blows
                 setup_writes = cal.setup_writes
                 trace_file = cal.trace_file
+                program_trace_file = cal.program_trace_file
                 erase_trace_file = cal.erase_trace_file
                 trace_file_bin = cal.trace_file_bin
                 erase_trace_file_bin = cal.erase_trace_file_bin
@@ -2157,6 +2164,9 @@ def run_multi_component_sweep(
             evaluation_mode=comp_eval_mode,
             max_batch_points=max_batch_points,
             trace_file=trace_file if not no_trace_replay else None,
+            program_trace_file=(
+                program_trace_file if not no_trace_replay else None
+            ),
             erase_trace_file=erase_trace_file if not no_trace_replay else None,
             trace_file_bin=trace_file_bin if not no_trace_replay else None,
             erase_trace_file_bin=erase_trace_file_bin if not no_trace_replay else None,

@@ -764,6 +764,112 @@ def test_state_search_accepts_complete_controller_backed_nvm() -> None:
     assert namespace["_state_search_trace_target"]() is trace
 
 
+def test_state_search_accepts_mram_exact_program_trace_without_generic_width() -> None:
+    trace = SimpleNamespace(
+        ProgramTraceClear=lambda: None,
+        ProgramTraceCount=0,
+        ProgramTraceToString=lambda: "",
+        EraseTraceClear=lambda: None,
+        EraseTraceEnabled=False,
+        EraseTraceCount=0,
+        EraseTraceToString=lambda: "",
+    )
+    namespace = {
+        "phase2_state_search": {"enabled": True},
+        "backend": {
+            "kind": "mram",
+            "data": trace,
+            "controller": None,
+            "otp": None,
+            "write_trace_width_explicit": False,
+            "per_write_accurate": True,
+        },
+        "durability_model": "direct",
+        "trace_file_path": "/calibration/ambiguous_trace.csv",
+        "program_trace_file_path": "/calibration/program_trace.csv",
+        "os": SimpleNamespace(path=SimpleNamespace(exists=lambda _path: True)),
+    }
+    _load_state_search_preflight(namespace)
+
+    namespace["_state_search_preflight"]()
+
+
+def test_state_search_refuses_mram_trace_after_deferred_tracking_start() -> None:
+    trace = SimpleNamespace(
+        ProgramTraceClear=lambda: None,
+        ProgramTraceCount=0,
+        ProgramTraceToString=lambda: "",
+        EraseTraceClear=lambda: None,
+        EraseTraceEnabled=False,
+        EraseTraceCount=0,
+        EraseTraceToString=lambda: "",
+    )
+    namespace = {
+        "phase2_state_search": {"enabled": True},
+        "backend": {
+            "kind": "mram",
+            "data": trace,
+            "controller": None,
+            "otp": None,
+            "write_trace_width_explicit": False,
+            "per_write_accurate": True,
+        },
+        "durability_model": "direct",
+        "trace_file_path": "/calibration/ambiguous_trace.csv",
+        "program_trace_file_path": "/calibration/program_trace.csv",
+        "tracking_start_address_config": 0x20000400,
+        "os": SimpleNamespace(path=SimpleNamespace(exists=lambda _path: True)),
+    }
+    _load_state_search_preflight(namespace)
+
+    with pytest.raises(RuntimeError, match="deferred tracking start"):
+        namespace["_state_search_preflight"]()
+
+
+@pytest.mark.parametrize(
+    ("missing_member", "path_exists", "message"),
+    [
+        ("ProgramTraceToString", True, "ProgramTraceToString"),
+        (None, False, "calibration MRAM program trace CSV"),
+    ],
+)
+def test_state_search_refuses_incomplete_mram_program_provenance(
+    missing_member, path_exists, message
+) -> None:
+    members = {
+        "ProgramTraceClear": lambda: None,
+        "ProgramTraceCount": 0,
+        "ProgramTraceToString": lambda: "",
+        "EraseTraceClear": lambda: None,
+        "EraseTraceEnabled": False,
+        "EraseTraceCount": 0,
+        "EraseTraceToString": lambda: "",
+    }
+    if missing_member is not None:
+        members.pop(missing_member)
+    namespace = {
+        "phase2_state_search": {"enabled": True},
+        "backend": {
+            "kind": "mram",
+            "data": SimpleNamespace(**members),
+            "controller": None,
+            "otp": None,
+            "write_trace_width_explicit": False,
+            "per_write_accurate": True,
+        },
+        "durability_model": "direct",
+        "trace_file_path": "/calibration/ambiguous_trace.csv",
+        "program_trace_file_path": "/calibration/program_trace.csv",
+        "os": SimpleNamespace(
+            path=SimpleNamespace(exists=lambda _path: path_exists)
+        ),
+    }
+    _load_state_search_preflight(namespace)
+
+    with pytest.raises(RuntimeError, match=message):
+        namespace["_state_search_preflight"]()
+
+
 def test_nxboot_controller_profile_plans_nine_state_mode_two_cut_points() -> None:
     profile = load_profile(PROFILE)
     plan = build_fault_plan(

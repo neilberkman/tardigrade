@@ -3967,6 +3967,44 @@ def _writeback_flash_size():
 
 def _validated_writeback_trace(trace_data):
     """Normalize writeback events while enforcing legacy-width capability."""
+    if (
+        backend.get('kind') == 'mram'
+        and globals().get('program_trace_file_path', '')
+        and not int(globals().get('tracking_start_address_config', 0) or 0)
+    ):
+        program_unit = int(
+            getattr(backend.get('data'), 'ProgramUnitSize', 0)
+            or getattr(backend.get('data'), 'WordSize', 0)
+            or 0
+        )
+        capacity = _writeback_flash_size()
+        normalized = []
+        for expected_index, event in enumerate(trace_data or (), 1):
+            if len(event) != 4:
+                raise ValueError(
+                    'exact MRAM program event has an invalid field count'
+                )
+            write_index, offset, value, width = (
+                int(event[0]), int(event[1]), int(event[2]), int(event[3])
+            )
+            if (
+                write_index != expected_index
+                or program_unit <= 0
+                or width != program_unit
+                or offset < 0
+                or offset % program_unit != 0
+                or capacity is None
+                or offset > capacity
+                or width > capacity - offset
+                or value < 0
+                or value >= (1 << (8 * width))
+            ):
+                raise ValueError(
+                    'exact MRAM program event does not describe one complete '
+                    'backend program unit'
+                )
+            normalized.append((write_index, offset, value, width))
+        return normalized
     return validate_write_trace_width(
         trace_data,
         legacy_width=_writeback_legacy_trace_width(),
@@ -13347,8 +13385,15 @@ def run_resume_trace_from_snapshot(snapshot_flash, fault_at, fault_type):
 def _enable_replay_cross_check_live_trace():
     target = backend.get('data')
     required = (
-        'WriteTraceClear', 'WriteTraceEnabled', 'WriteTraceToString',
-        'EraseTraceClear', 'EraseTraceEnabled', 'EraseTraceToString',
+        (
+            'ProgramTraceClear', 'ProgramTraceCount', 'ProgramTraceToString',
+            'EraseTraceClear', 'EraseTraceEnabled', 'EraseTraceToString',
+        )
+        if backend.get('kind') == 'mram'
+        else (
+            'WriteTraceClear', 'WriteTraceEnabled', 'WriteTraceToString',
+            'EraseTraceClear', 'EraseTraceEnabled', 'EraseTraceToString',
+        )
     )
     missing = [name for name in required if not hasattr(target, name)]
     if missing:
@@ -13370,9 +13415,13 @@ def _enable_replay_cross_check_live_trace():
         target.SkipShadowScan = False
     if hasattr(target, 'PassthroughMode'):
         target.PassthroughMode = False
-    target.WriteTraceClear()
+    if backend.get('kind') == 'mram':
+        target.ProgramTraceClear()
+    else:
+        target.WriteTraceClear()
     target.EraseTraceClear()
-    target.WriteTraceEnabled = True
+    if hasattr(target, 'WriteTraceEnabled'):
+        target.WriteTraceEnabled = True
     target.EraseTraceEnabled = True
     return {'target': target, 'saved': saved}
 
@@ -13380,22 +13429,52 @@ def _enable_replay_cross_check_live_trace():
 def _finish_replay_cross_check_live_trace(context):
     target = context['target']
     try:
-        write_map = parse_write_trace_map(str(target.WriteTraceToString()))
+        if backend.get('kind') == 'mram':
+            program_events = parse_mram_program_trace(
+                target.ProgramTraceToString(),
+                int(target.Size),
+                int(backend.get('bus_base')),
+            )
+            if len(program_events) != int(target.ProgramTraceCount):
+                raise RuntimeError(
+                    'trace replay cross-check MRAM program trace count '
+                    'disagrees with exported trace'
+                )
+            write_map = None
+        else:
+            write_map = parse_write_trace_map(
+                str(target.WriteTraceToString())
+            )
         erase_map = parse_erase_trace_map(str(target.EraseTraceToString()))
     finally:
-        target.WriteTraceEnabled = False
+        if hasattr(target, 'WriteTraceEnabled'):
+            target.WriteTraceEnabled = False
         target.EraseTraceEnabled = False
         for name, value in context['saved'].items():
             setattr(target, name, value)
     writes = []
-    for index in sorted(write_map):
-        item = write_map[index]
-        writes.append((
-            int(index),
-            int(item['flash_offset']),
-            int(str(item['value']), 0),
-            int(item.get('width', 4)),
-        ))
+    if backend.get('kind') == 'mram':
+        for event in program_events:
+            width = int(event['program_width'])
+            writes.append((
+                int(event['write_index']),
+                int(event['offset']),
+                _little_endian_trace_value(
+                    _decode_exact_program_bytes(
+                        event['intended_bytes'], width, 'intended bytes'
+                    )
+                ),
+                width,
+            ))
+    else:
+        for index in sorted(write_map):
+            item = write_map[index]
+            writes.append((
+                int(index),
+                int(item['flash_offset']),
+                int(str(item['value']), 0),
+                int(item.get('width', 4)),
+            ))
     erases = []
     for index in sorted(erase_map):
         item = erase_map[index]
@@ -13411,7 +13490,16 @@ def _finish_replay_cross_check_live_trace(context):
 def _replay_cross_check_expected_traces():
     global trace_data_loaded, erase_trace_loaded
     if trace_data_loaded is None:
-        trace_data_loaded = load_trace_data(trace_file_path)
+        if (
+            backend.get('kind') == 'mram'
+            and program_trace_file_path
+            and not int(tracking_start_address_config or 0)
+        ):
+            trace_data_loaded = _mram_program_trace_events_for_replay(
+                program_trace_file_path
+            )
+        else:
+            trace_data_loaded = load_trace_data(trace_file_path)
     writes = _validated_writeback_trace(trace_data_loaded)
     if erase_trace_loaded is None:
         if erase_trace_file_path and os.path.exists(erase_trace_file_path):
@@ -16178,6 +16266,7 @@ def run_multi_fault_sequence(fault_sequence, stage_codes=None):
 # point costs only O(K) Python writes + ~1s Phase 2 recovery boot.
 # ---------------------------------------------------------------------------
 trace_file_path = str(monitor.GetVariable('trace_file')).strip()
+program_trace_file_path = str(monitor.GetVariable('program_trace_file')).strip()
 erase_trace_file_path = str(monitor.GetVariable('erase_trace_file')).strip()
 trace_file_bin_path = str(monitor.GetVariable('trace_file_bin')).strip()
 erase_trace_file_bin_path = str(monitor.GetVariable('erase_trace_file_bin')).strip()
@@ -16300,6 +16389,110 @@ def load_trace_data(path):
                 event = event + (width_value,)
             entries.append(event)
     return entries
+
+
+def load_mram_program_trace_data(path):
+    """Load exact, whole-unit MRAM programs from calibration CSV."""
+    import csv as _csv
+    expected_fields = (
+        'write_index', 'program_address', 'offset', 'width',
+        'intended_hex', 'pre_program_hex', 'post_program_hex', 'faulted',
+    )
+    events = []
+    address_base = None
+    previous_index = 0
+    with open(path, 'r') as program_file:
+        reader = _csv.DictReader(program_file)
+        if tuple(reader.fieldnames or ()) != expected_fields:
+            raise ValueError(
+                'MRAM program trace has an unexpected header'
+            )
+        for line_number, row in enumerate(reader, 2):
+            if None in row and row[None]:
+                raise ValueError(
+                    'MRAM program trace row {} has extra fields'.format(
+                        line_number
+                    )
+                )
+            try:
+                write_index = int(str(row['write_index']).strip(), 0)
+                program_address = int(str(row['program_address']).strip(), 0)
+                offset = int(str(row['offset']).strip(), 0)
+                width = int(str(row['width']).strip(), 0)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    'malformed MRAM program trace row {}: {}'.format(
+                        line_number, exc
+                    )
+                )
+            if write_index != previous_index + 1:
+                raise ValueError(
+                    'MRAM program trace indices must be contiguous from one'
+                )
+            if (
+                offset < 0
+                or width <= 0
+                or width > (1 << 20)
+                or (width & (width - 1)) != 0
+            ):
+                raise ValueError(
+                    'MRAM program trace row {} has invalid geometry'.format(
+                        line_number
+                    )
+                )
+            current_base = program_address - offset
+            if current_base < 0 or (
+                address_base is not None and current_base != address_base
+            ):
+                raise ValueError(
+                    'MRAM program trace has contradictory address provenance'
+                )
+            if address_base is None:
+                address_base = current_base
+            if str(row['faulted']).strip().lower() != 'false':
+                raise ValueError(
+                    'MRAM calibration program trace contains a faulted event'
+                )
+            decoded = {}
+            for field in (
+                'intended_hex', 'pre_program_hex', 'post_program_hex'
+            ):
+                decoded[field] = _decode_exact_program_bytes(
+                    row[field], width, field.replace('_', ' ')
+                )
+            events.append({
+                'write_index': write_index,
+                'offset': offset,
+                'width': width,
+                'value': _little_endian_trace_value(decoded['intended_hex']),
+                'pre_program_value': _little_endian_trace_value(
+                    decoded['pre_program_hex']
+                ),
+                'completed_value': _little_endian_trace_value(
+                    decoded['post_program_hex']
+                ),
+            })
+            previous_index = write_index
+    return events
+
+
+def _little_endian_trace_value(values):
+    value = 0
+    for byte_index, byte_value in enumerate(bytearray(values)):
+        value |= (int(byte_value) & 0xFF) << (8 * byte_index)
+    return value
+
+
+def _mram_program_trace_events_for_replay(path):
+    return [
+        (
+            int(event['write_index']),
+            int(event['offset']),
+            int(event['value']),
+            int(event['width']),
+        )
+        for event in load_mram_program_trace_data(path)
+    ]
 
 def load_erase_trace_data(path, require_replay_metadata=False):
     import csv as _csv
@@ -16661,8 +16854,14 @@ def _trace_replay_mram_torn_value(
 ):
     """Return the word persisted by NVMemory power loss mid-program."""
     width = int(width)
-    if width not in (1, 2, 4, 8):
-        raise ValueError('MRAM torn replay requires a supported write width')
+    if (
+        width <= 0
+        or width > (1 << 20)
+        or (width & (width - 1)) != 0
+    ):
+        raise ValueError(
+            'MRAM torn replay requires a positive, bounded program width'
+        )
     normalized_mode = str(mode or 'half').strip().lower()
     if normalized_mode not in (
         'half',
@@ -17230,6 +17429,17 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     if writeback_active() and fault_base in _TRACE_REPLAY_WRITE_FAULT_TYPES:
         log('fp={} trace_replay_fallback writeback active for {}'.format(fault_at, fault_type))
         return run_execute_fault(fault_at, fault_type=fault_type)
+    if (
+        backend.get('kind') == 'mram'
+        and int(tracking_start_address_config or 0)
+    ):
+        log(
+            'fp={} trace_replay_fallback MRAM tracking starts at {}; '
+            'the trace omits the persistent prefix'.format(
+                fault_at, fmt_u32(tracking_start_address_config)
+            )
+        )
+        return run_execute_fault(fault_at, fault_type=fault_type)
 
     native_result = run_trace_replay_fault_native(fault_at, fault_type=fault_type)
     if native_result is not None:
@@ -17237,7 +17447,16 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 
     if trace_data_loaded is None:
         try:
-            trace_data_loaded = load_trace_data(trace_file_path)
+            if (
+                backend.get('kind') == 'mram'
+                and program_trace_file_path
+                and not int(tracking_start_address_config or 0)
+            ):
+                trace_data_loaded = _mram_program_trace_events_for_replay(
+                    program_trace_file_path
+                )
+            else:
+                trace_data_loaded = load_trace_data(trace_file_path)
         except Exception as exc:
             if writeback_active():
                 _writeback_snapshot_reconstruction_status = {
@@ -17638,7 +17857,15 @@ def _state_search_preflight():
         raise RuntimeError(
             'recovery state search cannot canonicalize a separate OTP peripheral'
         )
-    if not backend.get('write_trace_width_explicit'):
+    uses_program_trace = backend.get('kind') == 'mram'
+    if uses_program_trace and int(
+        globals().get('tracking_start_address_config', 0) or 0
+    ):
+        raise RuntimeError(
+            'recovery state search cannot use an MRAM program trace captured '
+            'after a deferred tracking start'
+        )
+    if not uses_program_trace and not backend.get('write_trace_width_explicit'):
         raise RuntimeError('recovery state search requires width-explicit write traces')
     if not bool(backend.get('per_write_accurate')):
         raise RuntimeError('recovery state search requires PerWriteAccurate=true')
@@ -17648,9 +17875,17 @@ def _state_search_preflight():
             'recovery state search controller backend has no backing Nvm member'
         )
     required = (
-        'WriteTraceClear', 'WriteTraceEnabled', 'WriteTraceCount',
-        'WriteTraceToString', 'EraseTraceClear', 'EraseTraceEnabled',
-        'EraseTraceCount', 'EraseTraceToString',
+        (
+            'ProgramTraceClear', 'ProgramTraceCount', 'ProgramTraceToString',
+            'EraseTraceClear', 'EraseTraceEnabled', 'EraseTraceCount',
+            'EraseTraceToString',
+        )
+        if uses_program_trace
+        else (
+            'WriteTraceClear', 'WriteTraceEnabled', 'WriteTraceCount',
+            'WriteTraceToString', 'EraseTraceClear', 'EraseTraceEnabled',
+            'EraseTraceCount', 'EraseTraceToString',
+        )
     )
     missing = [name for name in required if not hasattr(target, name)]
     if missing:
@@ -17671,8 +17906,15 @@ def _state_search_preflight():
                     capability_error
                 )
             )
-    if not trace_file_path or not os.path.exists(trace_file_path):
-        raise RuntimeError('recovery state search requires the calibration write trace CSV')
+    operation_trace_path = (
+        program_trace_file_path if uses_program_trace else trace_file_path
+    )
+    if not operation_trace_path or not os.path.exists(operation_trace_path):
+        raise RuntimeError(
+            'recovery state search requires the calibration {} trace CSV'.format(
+                'MRAM program' if uses_program_trace else 'write'
+            )
+        )
 
 
 def _state_search_operations_from_maps(write_map, erase_map):
@@ -17707,6 +17949,52 @@ def _state_search_operations_from_maps(write_map, erase_map):
 
 
 def _state_search_load_calibration_operations():
+    if backend.get('kind') == 'mram':
+        program_events = load_mram_program_trace_data(program_trace_file_path)
+        if not program_events:
+            raise RuntimeError(
+                'recovery state search calibration MRAM program trace is empty'
+            )
+        program_unit = int(
+            getattr(backend.get('data'), 'ProgramUnitSize', 0) or 0
+        )
+        if program_unit <= 0:
+            program_unit = int(
+                getattr(backend.get('data'), 'WordSize', 0) or 0
+            )
+        if program_unit <= 0 or any(
+            int(event['width']) != program_unit for event in program_events
+        ):
+            raise RuntimeError(
+                'recovery state search MRAM program trace does not carry '
+                'complete backend program units'
+            )
+        erase_map = {}
+        if erase_trace_file_path and os.path.exists(erase_trace_file_path):
+            erases = load_erase_trace_data(
+                erase_trace_file_path, require_replay_metadata=True
+            )
+            for position, (flash_offset, writes_at, erase_size) in enumerate(
+                erases, start=1
+            ):
+                erase_map[position] = {
+                    'flash_offset': int(flash_offset),
+                    'writes_at_this_point': int(writes_at),
+                    'erase_size': int(erase_size),
+                }
+        operations = merge_operation_traces(program_events, [
+            {
+                'erase_index': int(index),
+                'offset': int(meta['flash_offset']),
+                'writes_at_this_point': int(
+                    meta.get('writes_at_this_point', 0)
+                ),
+                'erase_size': int(meta['erase_size']),
+            }
+            for index, meta in sorted(erase_map.items())
+        ])
+        return operations, len(program_events), len(erase_map)
+
     raw_writes = load_trace_data(trace_file_path)
     if not raw_writes:
         raise RuntimeError('recovery state search calibration write trace is empty')
@@ -17744,15 +18032,80 @@ def _state_search_load_calibration_operations():
 
 def _state_search_capture_trace():
     target = _state_search_trace_target()
-    write_text = str(target.WriteTraceToString())
     erase_text = str(target.EraseTraceToString())
-    write_map = parse_write_trace_map(write_text)
     erase_map = parse_erase_trace_map(erase_text)
+    if backend.get('kind') == 'mram':
+        program_events = parse_mram_program_trace(
+            target.ProgramTraceToString(),
+            int(target.Size),
+            int(backend.get('bus_base')),
+        )
+        if len(program_events) != int(target.ProgramTraceCount):
+            raise RuntimeError(
+                'recovery state search MRAM program trace count disagrees '
+                'with exported trace'
+            )
+        program_unit = int(
+            getattr(target, 'ProgramUnitSize', 0)
+            or getattr(target, 'WordSize', 0)
+            or 0
+        )
+        writes = []
+        for expected_index, event in enumerate(program_events, 1):
+            width = int(event['program_width'])
+            if (
+                int(event['write_index']) != expected_index
+                or width != program_unit
+                or event.get('faulted')
+            ):
+                raise RuntimeError(
+                    'recovery state search requires contiguous clean whole-unit '
+                    'MRAM program records'
+                )
+            writes.append({
+                'write_index': expected_index,
+                'offset': int(event['offset']),
+                'width': width,
+                'value': _little_endian_trace_value(
+                    _decode_exact_program_bytes(
+                        event['intended_bytes'], width, 'intended bytes'
+                    )
+                ),
+                'pre_program_value': _little_endian_trace_value(
+                    _decode_exact_program_bytes(
+                        event['pre_program_bytes'], width, 'pre-program bytes'
+                    )
+                ),
+                'completed_value': _little_endian_trace_value(
+                    _decode_exact_program_bytes(
+                        event['post_program_bytes'], width, 'post-program bytes'
+                    )
+                ),
+            })
+        erases = [
+            {
+                'erase_index': int(index),
+                'offset': int(meta['flash_offset']),
+                'writes_at_this_point': int(
+                    meta.get('writes_at_this_point', 0)
+                ),
+                'erase_size': int(meta['erase_size']),
+            }
+            for index, meta in sorted(erase_map.items())
+        ]
+        return merge_operation_traces(writes, erases)
+    write_text = str(target.WriteTraceToString())
+    write_map = parse_write_trace_map(write_text)
     return _state_search_operations_from_maps(write_map, erase_map)
 
 
 def _state_search_enable_operation_trace(target):
     trace_mode = 'backend_native'
+    if backend.get('kind') == 'mram':
+        target.ProgramTraceClear()
+        target.EraseTraceClear()
+        target.EraseTraceEnabled = True
+        return 'exact_mram_program_trace'
     if backend.get('kind') == 'fast':
         required = ('DiffLookahead', 'SkipShadowScan', 'PassthroughMode')
         missing = [name for name in required if not hasattr(target, name)]
@@ -17790,6 +18143,32 @@ def _state_search_mark_addresses(state):
         for region_name, offset in sorted(state.uncorrectable_words)
         if region_name == 'nvm'
     ]
+
+
+def _state_search_validate_program_prefix(initial_state, operations):
+    """Prove exact MRAM records describe the completed persistent stream."""
+    prefix = initial_state
+    for operation in operations:
+        if (
+            operation.get('kind') == 'write'
+            and 'pre_program_value' in operation
+        ):
+            width = int(operation['width'])
+            observed = _little_endian_trace_value(
+                prefix.read('nvm', int(operation['offset']), width)
+            )
+            if observed != int(operation['pre_program_value']):
+                raise RuntimeError(
+                    'recovery state search MRAM program trace pre-program '
+                    'bytes disagree at write {}'.format(
+                        operation['write_index']
+                    )
+                )
+        prefix = apply_completed_operation(
+            prefix, operation, erase_fill=int(
+                getattr(backend.get('data'), 'EraseFill', 0xFF)
+            )
+        )
 
 
 def _state_search_boot_state(state, chain, generation):
@@ -17850,7 +18229,8 @@ def _state_search_boot_state(state, chain, generation):
     finally:
         disarm_vtor_watchpoint()
         if capture_recovery_trace:
-            target.WriteTraceEnabled = False
+            if hasattr(target, 'WriteTraceEnabled'):
+                target.WriteTraceEnabled = False
             target.EraseTraceEnabled = False
             if hasattr(target, 'OperationTraceFastMode'):
                 target.OperationTraceFastMode = False
@@ -17867,6 +18247,8 @@ def _state_search_boot_state(state, chain, generation):
     recovery_operations = (
         _state_search_capture_trace() if capture_recovery_trace else ()
     )
+    if capture_recovery_trace and backend.get('kind') == 'mram':
+        _state_search_validate_program_prefix(state, recovery_operations)
     _state_breakdown['trace_export_s'] = round(
         max(0.0, _time.time() - trace_export_started), 6
     )
@@ -17992,6 +18374,10 @@ def run_recovery_state_search():
         name='nvm',
         base_address=flash_base,
     )
+    if backend.get('kind') == 'mram':
+        _state_search_validate_program_prefix(
+            initial_state, calibration_operations
+        )
 
     def torn_word_for_cut(operation, generation, chain):
         active_choices = torn_word_choices if torn_word_explicit else mram_torn_word_choices

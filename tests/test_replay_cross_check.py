@@ -460,6 +460,62 @@ def test_runtime_forced_mismatch_becomes_cross_check_failure():
     assert "live=0xFE" in status["error"]
 
 
+def test_runtime_wide_mram_cross_check_compares_upper_half_and_ecc_mark():
+    runtime_path = ROOT / "scripts" / "run_runtime_fault_sweep.py"
+    tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_evaluate_replay_cross_check_live_cut"
+    )
+    namespace = {
+        "_base_fault_type_code": lambda value: value,
+        "_replay_cross_check_expected_traces": lambda: (
+            [(1, 0, int.from_bytes(bytes(range(16)), "little"), 16)],
+            [],
+        ),
+        "first_pre_cut_trace_difference": first_pre_cut_trace_difference,
+        "first_persistent_difference": first_persistent_difference,
+        "format_replay_cross_check_error": format_replay_cross_check_error,
+    }
+    exec(
+        compile(
+            ast.Module(body=[function], type_ignores=[]),
+            str(runtime_path),
+            "exec",
+        ),
+        namespace,
+    )
+    expected_bytes = bytes(range(16))
+    expected = PersistentState.from_bytes(
+        expected_bytes,
+        base_address=0x10100100,
+        uncorrectable_words=(0,),
+    )
+    live_trace = {
+        "writes": [(1, 0, int.from_bytes(expected_bytes, "little"), 16)],
+        "erases": [],
+    }
+
+    matched = namespace["_evaluate_replay_cross_check_live_cut"](
+        0, "w", expected, True, expected_bytes, (0,), live_trace, "python"
+    )
+    assert matched["matched"] is True
+
+    changed = bytearray(expected_bytes)
+    changed[15] ^= 0x80
+    byte_mismatch = namespace["_evaluate_replay_cross_check_live_cut"](
+        0, "w", expected, True, changed, (0,), live_trace, "python"
+    )
+    assert byte_mismatch["first_difference"]["address"] == "0x1010010F"
+
+    mark_mismatch = namespace["_evaluate_replay_cross_check_live_cut"](
+        0, "w", expected, True, expected_bytes, (), live_trace, "python"
+    )
+    assert mark_mismatch["first_difference"]["kind"] == "uncorrectable_words"
+
+
 def test_runtime_wires_checks_into_native_python_erase_and_writeback_paths():
     runtime_path = ROOT / "scripts" / "run_runtime_fault_sweep.py"
     tree = ast.parse(runtime_path.read_text(encoding="utf-8"))

@@ -580,32 +580,36 @@ def test_mram_torn_word_modes_across_trace_replay_and_csharp_peripherals() -> No
     )
     replay_fn = replay_ns["_trace_replay_mram_torn_value"]
     corrupt_bytes_fn = replay_ns["_corrupt_mram_torn_bytes"]
-    prev_u64 = int.from_bytes(pre_program[:4] + pre_program[8:12], "little")
-    new_u64 = int.from_bytes(intended[:4] + intended[8:12], "little")
-    expected_half_retain_u64 = int.from_bytes(
-        intended[:4] + pre_program[8:12], "little"
+    prev_u128 = int.from_bytes(pre_program, "little")
+    new_u128 = int.from_bytes(intended, "little")
+    expected_half_retain_u128 = int.from_bytes(
+        intended[:8] + pre_program[8:], "little"
     )
-    assert replay_fn(new_u64, 8, 0xFF, "half", prev_u64) == (
-        0xFFFFFFFF00000000 | int.from_bytes(intended[:4], "little")
-    )
-    assert (
-        replay_fn(new_u64, 8, 0xFF, "half_retain", prev_u64)
-        == expected_half_retain_u64
+    assert replay_fn(new_u128, 16, 0xFF, "half", prev_u128) == int.from_bytes(
+        intended[:8] + b"\xFF" * 8, "little"
     )
     assert (
-        replay_fn(new_u64, 8, 0x00, "half_retain", prev_u64)
-        == expected_half_retain_u64
+        replay_fn(new_u128, 16, 0xFF, "half_retain", prev_u128)
+        == expected_half_retain_u128
     )
-    assert replay_fn(new_u64, 8, 0xFF, "untouched", prev_u64) == prev_u64
-    assert replay_fn(new_u64, 8, 0xFF, "uncorrectable", prev_u64) == prev_u64
-    assert replay_fn(new_u64, 8, 0xFF, "erased", prev_u64) == 0xFFFFFFFFFFFFFFFF
-    assert replay_fn(new_u64, 8, 0xFF, "programmed", prev_u64) == new_u64
-    corrupted_u64 = replay_fn(
-        new_u64, 8, 0xFF, "corrupted", prev_u64, seed=test_seed, write_index=1, offset=0
+    assert (
+        replay_fn(new_u128, 16, 0x00, "half_retain", prev_u128)
+        == expected_half_retain_u128
     )
-    assert 3 <= bin(corrupted_u64 ^ new_u64).count("1") <= 5
-    assert corrupted_u64 == int.from_bytes(
-        corrupt_bytes_fn(new_u64.to_bytes(8, "little"), 1, 0, test_seed), "little"
+    assert replay_fn(new_u128, 16, 0xFF, "untouched", prev_u128) == prev_u128
+    assert replay_fn(new_u128, 16, 0xFF, "uncorrectable", prev_u128) == prev_u128
+    assert replay_fn(new_u128, 16, 0xFF, "erased", prev_u128) == int.from_bytes(
+        b"\xFF" * 16, "little"
+    )
+    assert replay_fn(new_u128, 16, 0xFF, "programmed", prev_u128) == new_u128
+    corrupted_u128 = replay_fn(
+        new_u128, 16, 0xFF, "corrupted", prev_u128,
+        seed=test_seed, write_index=1, offset=0
+    )
+    assert 3 <= bin(corrupted_u128 ^ new_u128).count("1") <= 5
+    assert corrupted_u128 == int.from_bytes(
+        corrupt_bytes_fn(new_u128.to_bytes(16, "little"), 1, 0, test_seed),
+        "little",
     )
 
     # 2. Verify MappedMRAMTracker.cs and NVMemoryController.cs word images for all modes.

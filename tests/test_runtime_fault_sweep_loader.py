@@ -24,6 +24,164 @@ IRONPYTHON_HELPERS = (
 
 
 class RuntimeFaultSweepLoaderTests(unittest.TestCase):
+    def test_exact_mram_program_csv_preserves_all_16_bytes(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        names = {
+            "_decode_exact_program_bytes",
+            "_little_endian_trace_value",
+            "load_mram_program_trace_data",
+        }
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ]
+        namespace: dict[str, object] = {}
+        exec(
+            compile(
+                ast.Module(body=functions, type_ignores=[]),
+                str(PY_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+        intended = bytes.fromhex("00112233445566778899aabbccddeeff")
+        before = bytes.fromhex("ffeeddccbbaa99887766554433221100")
+        completed = bytes.fromhex("102132435465768798a9bacbdcedfe0f")
+        with tempfile.NamedTemporaryFile("w", suffix=".csv") as trace:
+            trace.write(
+                "write_index,program_address,offset,width,intended_hex,"
+                "pre_program_hex,post_program_hex,faulted\n"
+                "1,0x10100100,256,16,{},{},{},false\n".format(
+                    intended.hex(), before.hex(), completed.hex()
+                )
+            )
+            trace.flush()
+            events = namespace["load_mram_program_trace_data"](trace.name)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["width"], 16)
+        self.assertEqual(
+            events[0]["value"], int.from_bytes(intended, "little")
+        )
+        self.assertEqual(
+            events[0]["pre_program_value"], int.from_bytes(before, "little")
+        )
+        self.assertEqual(
+            events[0]["completed_value"], int.from_bytes(completed, "little")
+        )
+
+    def test_exact_mram_program_csv_refuses_truncated_program_bytes(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        names = {
+            "_decode_exact_program_bytes",
+            "_little_endian_trace_value",
+            "load_mram_program_trace_data",
+        }
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ]
+        namespace: dict[str, object] = {}
+        exec(
+            compile(
+                ast.Module(body=functions, type_ignores=[]),
+                str(PY_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".csv") as trace:
+            trace.write(
+                "write_index,program_address,offset,width,intended_hex,"
+                "pre_program_hex,post_program_hex,faulted\n"
+                "1,0x10100100,256,16,0011223344556677,"
+                "00000000000000000000000000000000,"
+                "00000000000000000000000000000000,false\n"
+            )
+            trace.flush()
+            with self.assertRaisesRegex(ValueError, "expected 32 for width 16"):
+                namespace["load_mram_program_trace_data"](trace.name)
+
+    def test_exact_mram_replay_validator_requires_aligned_complete_units(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_validated_writeback_trace"
+        )
+        data = SimpleNamespace(ProgramUnitSize=16)
+        namespace: dict[str, object] = {
+            "backend": {"kind": "mram", "data": data},
+            "program_trace_file_path": "/calibration/program_trace.csv",
+            "_writeback_flash_size": lambda: 64,
+            "validate_write_trace_width": lambda *_args, **_kwargs: None,
+            "_writeback_legacy_trace_width": lambda: None,
+        }
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                str(PY_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+        validate = namespace["_validated_writeback_trace"]
+        value = int.from_bytes(bytes(range(16)), "little")
+        self.assertEqual(validate([(1, 16, value, 16)]), [(1, 16, value, 16)])
+        for event in (
+            (1, 8, value, 16),
+            (1, 16, value, 8),
+            (2, 16, value, 16),
+            (1, 64, value, 16),
+        ):
+            with self.subTest(event=event):
+                with self.assertRaisesRegex(ValueError, "complete backend program unit"):
+                    validate([event])
+
+    def test_exact_mram_replay_is_not_used_after_deferred_tracking_start(self) -> None:
+        tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_validated_writeback_trace"
+        )
+        generic_validation_calls: list[tuple[object, object]] = []
+
+        def validate_generic(trace_data: object, **kwargs: object) -> str:
+            generic_validation_calls.append((trace_data, kwargs))
+            return "generic trace validation"
+
+        namespace: dict[str, object] = {
+            "backend": {
+                "kind": "mram",
+                "data": SimpleNamespace(ProgramUnitSize=16),
+            },
+            "program_trace_file_path": "/calibration/program_trace.csv",
+            "tracking_start_address_config": 0x20000400,
+            "_writeback_flash_size": lambda: 64,
+            "validate_write_trace_width": validate_generic,
+            "_writeback_legacy_trace_width": lambda: None,
+        }
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                str(PY_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+
+        event = (1, 0, int.from_bytes(bytes(range(16)), "little"), 16)
+        self.assertEqual(
+            namespace["_validated_writeback_trace"]([event]),
+            "generic trace validation",
+        )
+        self.assertEqual(len(generic_validation_calls), 1)
+
     def test_terminal_self_branch_requires_fault_context_or_known_halt(self) -> None:
         tree = ast.parse(PY_PATH.read_text(encoding="utf-8"))
         function = next(

@@ -67,6 +67,33 @@ def test_merge_operation_traces_accepts_full_width_hex_values():
     assert operations[0]["value"] == 0xFFFFFF01
 
 
+def test_merge_operation_traces_preserves_one_wide_program_operation():
+    intended = bytes.fromhex("00112233445566778899aabbccddeeff")
+    completed = bytes.fromhex("ffeeddccbbaa99887766554433221100")
+    operations = merge_operation_traces(
+        [
+            write(
+                value=int.from_bytes(intended, "little"),
+                width=16,
+            )
+            | {"completed_value": int.from_bytes(completed, "little")}
+        ],
+        [],
+    )
+
+    assert len(operations) == 1
+    assert operations[0]["width"] == 16
+    assert operations[0]["value"] == int.from_bytes(intended, "little")
+    state = PersistentState.from_bytes(b"\xAA" * 16)
+    assert raw(apply_completed_operation(state, operations[0])) == completed
+
+
+@pytest.mark.parametrize("width", [0, 3, (1 << 20) + 1])
+def test_merge_operation_traces_rejects_invalid_program_width(width):
+    with pytest.raises(RecoveryStateError, match="positive, bounded power of two"):
+        merge_operation_traces([write(width=width)], [])
+
+
 def test_merge_operation_traces_rejects_ambiguous_order():
     with pytest.raises(RecoveryStateError, match="strictly increasing"):
         merge_operation_traces([write(1), write(1, 4)], [])
@@ -127,6 +154,46 @@ def test_mram_corrupted_mode_matches_deterministically_and_changes_data():
 
     assert raw(one) == raw(two)
     assert raw(one) != b"\x11\x22\x33\x44"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected", "marked"),
+    [
+        ("half", bytes(range(8)) + b"\xEE" * 8, False),
+        ("half_retain", bytes(range(8)) + bytes(range(0xA8, 0xB0)), False),
+        ("untouched", bytes(range(0xA0, 0xB0)), False),
+        ("erased", b"\xEE" * 16, False),
+        ("programmed", bytes(range(16)), False),
+        ("uncorrectable", bytes(range(0xA0, 0xB0)), True),
+        ("corrupted", None, False),
+    ],
+)
+def test_mram_power_loss_modes_apply_to_one_16_byte_program(
+    mode, expected, marked
+):
+    before = bytes(range(0xA0, 0xB0))
+    intended = bytes(range(16))
+    state = PersistentState.from_bytes(
+        before, uncorrectable_words=(0,)
+    )
+    result = apply_interrupted_operation(
+        state,
+        write(value=int.from_bytes(intended, "little"), width=16),
+        backend_kind="mram",
+        torn_word_mode=mode,
+        erase_fill=0xEE,
+        corruption_seed=0x1234,
+    )
+
+    if mode == "corrupted":
+        assert raw(result) != intended
+        assert 3 <= sum(
+            (left ^ right).bit_count()
+            for left, right in zip(raw(result), intended)
+        ) <= 5
+    else:
+        assert raw(result) == expected
+    assert (("nvm", 0) in result.uncorrectable_words) is marked
 
 
 def test_flash_power_loss_leaves_target_write_untouched():
