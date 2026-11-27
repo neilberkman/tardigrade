@@ -1,6 +1,67 @@
 # Getting Started
 
-This guide walks you through running your first tardigrade fault sweep in about 10 minutes. By the end, you will have injected power-loss faults into a reference bootloader and seen whether it recovers.
+Get a first power-loss result from a fresh clone with one command. The demo
+cuts a deliberately broken direct-copy update and a recovering update at a
+small quick selection of operations. It succeeds only when the broken flow has
+a finding and the recovering flow has none.
+
+## Run the demo
+
+Clone the repository, enter it, and choose either Docker or a local Renode.
+
+### Docker only
+
+On Linux x86-64 or macOS arm64 with Docker Desktop:
+
+```bash
+./demo --docker
+```
+
+The command builds a checksum-pinned Linux x86-64 image. Docker Desktop runs
+that image under emulation on Apple silicon. The image contains Renode 1.16.1
+and hash-locked Python packages; it does not build firmware or download source
+trees.
+
+### Local Renode
+
+If `renode-test` is on `PATH`:
+
+```bash
+./demo --local
+```
+
+Or give its location explicitly:
+
+```bash
+./demo --renode-test /path/to/renode-test
+```
+
+When the required Python packages are not already available, the command
+installs their checksum-locked versions in `results/demo/.venv`. With no mode
+flag, `./demo` prefers local Renode and falls back to Docker.
+
+### Read the result
+
+The final output is a short text summary. For each profile it reports the
+number of points run and findings; for the first finding it also reports the
+cut operation, address, and next-boot behavior. Detailed JSON reports and run
+logs are written under `results/demo/`. The summary prints the command for
+rendering either JSON report with `scripts/render_results_html.py`.
+
+The demo uses these tracked inputs:
+
+- `profiles/naive_bare_copy.yaml`: a deliberately broken direct-copy update.
+- `profiles/demo_mcuboot_offset_upgrade.yaml`: a power-loss-only demo of an
+  MCUboot offset-swap update that recovers.
+
+The same command runs as an independent Linux CI job, so the demo is also a
+smoke test.
+
+## Run a profile directly
+
+The rest of this guide walks you through invoking the underlying audit command.
+By the end, you will have injected power-loss faults into a reference
+bootloader and inspected its detailed report.
 
 ## Prerequisites
 
