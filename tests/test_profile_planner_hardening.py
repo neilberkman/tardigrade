@@ -300,14 +300,16 @@ fault_sweep:
             for value in profile.robot_vars(ROOT)
             if value.startswith("PHASE2_STATE_SEARCH_B64:")
         )
+        decoded = json.loads(base64.b64decode(encoded))
         self.assertEqual(
-            json.loads(base64.b64decode(encoded))["first_cuts"],
+            decoded["first_cuts"],
                 {
                     "mode": "ranges",
                     "ranges": [{"start": 0, "end": 8}],
                     "fault_types": ["power_loss"],
                 },
         )
+        self.assertEqual(decoded["fault_types"], ["power_loss"])
         self.assertIn("CALIBRATION_TRACE_REQUIRED:true", profile.robot_vars(ROOT))
         robot_suite = (ROOT / "tests" / "ota_fault_point.robot").read_text()
         self.assertIn("${PHASE2_STATE_SEARCH_B64}", robot_suite)
@@ -316,6 +318,31 @@ fault_sweep:
         plan = build_fault_plan(profile, CalibrationInputs(max_writes=200))
         self.assertEqual(plan.fault_points, [0])
         self.assertEqual(plan.fault_types_list, ["rs"])
+
+    def test_phase2_state_search_accepts_recovery_erase_cuts(self) -> None:
+        profile = self._load(
+            """
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  phase2_fault:
+    enabled: true
+    fault_types: [power_loss, interrupted_erase]
+    state_search: { enabled: true }
+"""
+        )
+
+        encoded = next(
+            value.split(":", 1)[1]
+            for value in profile.robot_vars(ROOT)
+            if value.startswith("PHASE2_STATE_SEARCH_B64:")
+        )
+
+        self.assertEqual(
+            json.loads(base64.b64decode(encoded))["fault_types"],
+            ["power_loss", "interrupted_erase"],
+        )
 
     def test_phase2_state_search_defaults_are_bounded(self) -> None:
         profile = self._load(

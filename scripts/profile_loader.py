@@ -3675,6 +3675,9 @@ class ProfileConfig:
                 state_search_runtime["first_cuts"]["fault_types"] = list(
                     fs.phase2_fault.first_fault_types
                 )
+                state_search_runtime["fault_types"] = list(
+                    fs.phase2_fault.fault_types
+                )
                 state_search_payload = base64.b64encode(
                     json.dumps(
                         state_search_runtime,
@@ -5415,10 +5418,14 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
             "fault_sweep.phase2_fault.state_search: cannot be combined with "
             "phase2_fault.max_points"
         )
-    if state_search.enabled and fault_types != ["power_loss"]:
+    unsupported_state_search_types = sorted(
+        set(fault_types) - {"power_loss", "interrupted_erase"}
+    )
+    if state_search.enabled and unsupported_state_search_types:
         raise ProfileError(
-            "fault_sweep.phase2_fault.state_search: only power_loss is supported; "
-            "non-halting recovery faults can change the remainder of the trace"
+            "fault_sweep.phase2_fault.state_search: recovery cuts support only "
+            "power_loss and interrupted_erase; non-halting recovery faults can "
+            "change the remainder of the trace"
         )
     return Phase2FaultConfig(
         enabled=enabled,

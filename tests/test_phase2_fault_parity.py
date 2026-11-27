@@ -822,6 +822,50 @@ def test_state_search_accepts_mram_exact_program_trace_without_generic_width() -
     namespace["_state_search_preflight"]()
 
 
+def test_state_search_refuses_recovery_erase_cuts_without_injection_capability() -> None:
+    trace = SimpleNamespace(
+        ProgramTraceClear=lambda: None,
+        ProgramTraceCount=0,
+        ProgramTraceToString=lambda: "",
+        EraseTraceClear=lambda: None,
+        EraseTraceEnabled=False,
+        EraseTraceCount=0,
+        EraseTraceToString=lambda: "",
+    )
+    namespace = {
+        "phase2_state_search": {
+            "enabled": True,
+            "first_cuts": {"fault_types": ["power_loss"]},
+            "fault_types": ["power_loss", "interrupted_erase"],
+        },
+        "backend": {
+            "kind": "mram",
+            "data": trace,
+            "controller": None,
+            "otp": None,
+            "write_trace_width_explicit": False,
+            "per_write_accurate": True,
+        },
+        "durability_model": "direct",
+        "trace_file_path": "/calibration/ambiguous_trace.csv",
+        "program_trace_file_path": "/calibration/program_trace.csv",
+        "os": SimpleNamespace(path=SimpleNamespace(exists=lambda _path: True)),
+        "_erase_fault_capability_error": lambda require_trace=True: (
+            "backend lacks interrupted-erase fault injection members"
+        ),
+    }
+    _load_state_search_preflight(namespace)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "recovery state search recovery erase cuts are unsupported: "
+            "backend lacks interrupted-erase fault injection members"
+        ),
+    ):
+        namespace["_state_search_preflight"]()
+
+
 def test_state_search_accepts_mram_trace_with_complete_deferred_base() -> None:
     trace = SimpleNamespace(
         ProgramTraceClear=lambda: None,

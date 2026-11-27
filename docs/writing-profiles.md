@@ -1833,6 +1833,14 @@ erase-only search. Address ranges restrict recovery operations that may become
 later cuts. Operations outside the ranges still update the computed prefix, so
 later states remain exact.
 
+Recovery candidates use `phase2_fault.fault_types`: `power_loss` selects
+program operations and `interrupted_erase` selects erase operations. A traced
+operation that is not selected still updates the completed prefix. Thus a
+program-only search can consume an erase-before-program trace without emitting
+an erase cut, chain, or live cross-check. Selecting recovery erase cuts requires
+the backend's interrupted-erase injection interface and is refused during
+preflight when that interface is absent.
+
 For each recovery operation, the runner applies the completed prefix and the
 configured interrupted-write or interrupted-erase rule to an immutable NVM
 state. It evaluates a canonical state only once. Identity includes every byte

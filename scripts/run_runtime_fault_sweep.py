@@ -18366,6 +18366,17 @@ def _state_search_preflight():
                     capability_error
                 )
             )
+    recovery_fault_types = (
+        phase2_state_search.get('fault_types') or ('power_loss',)
+    )
+    if 'interrupted_erase' in recovery_fault_types:
+        capability_error = _erase_fault_capability_error(require_trace=True)
+        if capability_error is not None:
+            raise RuntimeError(
+                'recovery state search recovery erase cuts are unsupported: {}'.format(
+                    capability_error
+                )
+            )
     operation_trace_path = (
         program_trace_file_path if uses_program_trace else trace_file_path
     )
@@ -18894,6 +18905,9 @@ def run_recovery_state_search():
         corruption_seed=(torn_word_seed if torn_word_explicit else mram_torn_word_seed),
         page_size=page_size,
         program_unit=int(getattr(backend.get('data'), 'ProgramUnitSize', 4) or 4),
+        recovery_fault_types=(
+            phase2_state_search.get('fault_types') or ('power_loss',)
+        ),
         cross_check_every=int(phase2_state_search.get('cross_check_every', 100)),
         cross_check=_state_search_live_cross_check,
     )

@@ -241,6 +241,154 @@ def _write(index, offset, value):
     }
 
 
+def _erase(index, offset, size, writes_at=0):
+    return {
+        "erase_index": index,
+        "offset": offset,
+        "erase_size": size,
+        "writes_at_this_point": writes_at,
+    }
+
+
+def test_program_only_recovery_skips_erase_candidates_but_applies_their_prefix():
+    baseline = PersistentState.from_bytes(b"\x00\x00")
+    calibration = merge_operation_traces([_write(1, 1, 0x11)], [])
+    checked = []
+
+    def boot_state(state, _chain, generation):
+        operations = (
+            merge_operation_traces(
+                [_write(1, 1, 0x22)],
+                [_erase(1, 0, 1)],
+            )
+            if generation == 1
+            else ()
+        )
+        return ({"fault_injected": True, "signals": {}}, operations)
+
+    explorer = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0,),
+        max_cuts=2,
+        max_new_states=10,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        backend_kind="mram",
+        torn_word_mode="untouched",
+        recovery_fault_types=("power_loss",),
+        cross_check_every=1,
+        cross_check=lambda state, chain, _generation, _operation: checked.append(
+            (state.materialize()["nvm"], [cut["operation"] for cut in chain])
+        )
+        or {"matched": True},
+    )
+
+    results, summary = explorer.run()
+
+    assert len(results) == 2
+    assert results[1]["recovery_state_search"]["chain"]["cuts"][-1][
+        "operation"
+    ] == "write"
+    assert results[1]["recovery_state_search"]["state_identity"] == (
+        PersistentState.from_bytes(b"\xff\x00").identity_hex()
+    )
+    assert checked == [(b"\xff\x00", ["write", "write"])]
+    assert summary["recovery_operations_seen"] == 2
+    assert summary["recovery_operations_excluded_by_fault_type"] == 1
+    assert summary["recovery_operations_considered"] == 1
+
+
+def test_program_only_recovery_deduplicates_across_a_completed_erase_prefix():
+    baseline = PersistentState.from_bytes(b"\xff\x00")
+    calibration = merge_operation_traces(
+        [_write(1, 0, 0x00), _write(2, 1, 0x11)], []
+    )
+
+    def boot_state(state, _chain, generation):
+        if generation > 1:
+            operations = ()
+        elif state.materialize()["nvm"] == b"\xff\x00":
+            operations = merge_operation_traces([_write(1, 1, 0x22)], [])
+        else:
+            operations = merge_operation_traces(
+                [_write(1, 1, 0x33)],
+                [_erase(1, 0, 1)],
+            )
+        return ({"fault_injected": True, "signals": {}}, operations)
+
+    explorer = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0, 1),
+        max_cuts=2,
+        max_new_states=10,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        backend_kind="mram",
+        torn_word_mode="untouched",
+        recovery_fault_types=("power_loss",),
+    )
+
+    results, summary = explorer.run()
+
+    assert len(results) == 2
+    assert summary["states_reused"] == 2
+    equivalent = results[0]["recovery_state_search"]["equivalent_chains"]
+    assert len(equivalent) == 2
+    assert all(
+        cut["operation"] == "write"
+        for chain in equivalent
+        for cut in chain["cuts"]
+    )
+
+
+def test_erase_only_recovery_skips_program_candidates_but_applies_their_prefix():
+    baseline = PersistentState.from_bytes(b"\x00\x00")
+    calibration = merge_operation_traces([_write(1, 1, 0x11)], [])
+    checked = []
+
+    def boot_state(_state, _chain, generation):
+        operations = (
+            merge_operation_traces(
+                [_write(1, 0, 0x22)],
+                [_erase(1, 1, 1, writes_at=1)],
+            )
+            if generation == 1
+            else ()
+        )
+        return ({"fault_injected": True, "signals": {}}, operations)
+
+    explorer = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0,),
+        max_cuts=2,
+        max_new_states=10,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        backend_kind="mram",
+        torn_word_mode="untouched",
+        recovery_fault_types=("interrupted_erase",),
+        cross_check_every=1,
+        cross_check=lambda state, chain, _generation, _operation: checked.append(
+            (state.materialize()["nvm"], [cut["operation"] for cut in chain])
+        )
+        or {"matched": True},
+    )
+
+    results, summary = explorer.run()
+
+    assert len(results) == 2
+    assert checked == [(b"\x22\x00", ["write", "erase"])]
+    assert summary["recovery_operations_seen"] == 2
+    assert summary["recovery_operations_excluded_by_fault_type"] == 1
+    assert summary["recovery_operations_considered"] == 1
+
+
 def test_explorer_is_breadth_first_deduplicates_and_keeps_generation_counts():
     baseline = PersistentState.from_bytes(b"\xff\xff", base_address=0x1000)
     calibration = merge_operation_traces(

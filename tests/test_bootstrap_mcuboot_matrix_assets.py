@@ -536,6 +536,27 @@ class BootstrapMcubootMatrixAssetsScriptTests(unittest.TestCase):
             commit_path = ASSETS / f"oss_mcuboot_pr3011_move_{name}_commit.txt"
             self.assertEqual(commit_path.read_text(encoding="utf-8").strip(), commit)
 
+    def test_pr3011_move_state_search_profiles_preserve_recovery_erase_coverage(
+        self,
+    ) -> None:
+        for name in ("broken", "fixed"):
+            with self.subTest(profile=name):
+                profile = load_profile(
+                    ROOT
+                    / "profiles"
+                    / f"mcuboot_pr3011_move_{name}_state_search.yaml",
+                    strict=True,
+                )
+                self.assertEqual(
+                    profile.platform,
+                    "platforms/cortex_m4_flash_fast.repl",
+                )
+                self.assertEqual(profile.flash_backend, "faultFlash")
+                self.assertEqual(
+                    profile.fault_sweep.phase2_fault.fault_types,
+                    ["power_loss", "interrupted_erase"],
+                )
+
     def test_pr3011_offset_profiles_cover_issue_3010_pair(self) -> None:
         profiles = {
             name: yaml.safe_load(

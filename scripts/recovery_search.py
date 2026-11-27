@@ -360,6 +360,7 @@ class RecoveryStateExplorer(object):
         corruption_seed=0,
         page_size=4096,
         program_unit=4,
+        recovery_fault_types=("power_loss",),
         cross_check_every=0,
         cross_check=None,
     ):
@@ -382,6 +383,28 @@ class RecoveryStateExplorer(object):
         self.corruption_seed = int(corruption_seed) & 0xFFFFFFFF
         self.page_size = int(page_size)
         self.program_unit = int(program_unit)
+        normalized_recovery_fault_types = tuple(
+            str(fault_type).strip().lower()
+            for fault_type in recovery_fault_types
+        )
+        unsupported_recovery_fault_types = sorted(
+            set(normalized_recovery_fault_types)
+            - set(("power_loss", "interrupted_erase"))
+        )
+        if unsupported_recovery_fault_types:
+            raise RecoverySearchError(
+                "unsupported recovery cut type(s) {!r}".format(
+                    unsupported_recovery_fault_types
+                )
+            )
+        self.recovery_operation_kinds = frozenset(
+            kind
+            for fault_type, kind in (
+                ("power_loss", "write"),
+                ("interrupted_erase", "erase"),
+            )
+            if fault_type in normalized_recovery_fault_types
+        )
         self.cross_check_every = int(cross_check_every)
         self.cross_check = cross_check
         self.budget = SearchBudget(max_new_states, max_wall_time_s, clock)
@@ -411,6 +434,7 @@ class RecoveryStateExplorer(object):
             "erase_first_states_reused": 0,
             "recovery_operations_seen": 0,
             "recovery_operations_considered": 0,
+            "recovery_operations_excluded_by_fault_type": 0,
             "recovery_operations_excluded_by_address": 0,
             "recovery_operations_excluded_by_max_cuts": 0,
             "states_excluded_by_max_new_states": 0,
@@ -425,6 +449,9 @@ class RecoveryStateExplorer(object):
         if self.torn_word_for_cut is None:
             return self.torn_word_mode
         return str(self.torn_word_for_cut(operation, generation, chain))
+
+    def _is_recovery_cut(self, operation):
+        return str(operation.get("kind") or "") in self.recovery_operation_kinds
 
     def _computer(self, state, operations, generation, chain):
         # RecoveryStateComputer accepts one mode per walk.  Point-dependent
@@ -607,7 +634,8 @@ class RecoveryStateExplorer(object):
             eligible = sum(
                 1
                 for operation in operations
-                if operation_in_address_ranges(
+                if self._is_recovery_cut(operation)
+                and operation_in_address_ranges(
                     operation, self.flash_base, self.address_ranges
                 )
             )
@@ -619,6 +647,11 @@ class RecoveryStateExplorer(object):
                 state, operations, generation + 1, chain
             ):
                 self.summary["recovery_operations_seen"] += 1
+                if not self._is_recovery_cut(operation):
+                    self.summary[
+                        "recovery_operations_excluded_by_fault_type"
+                    ] += 1
+                    continue
                 if not operation_in_address_ranges(
                     operation, self.flash_base, self.address_ranges
                 ):

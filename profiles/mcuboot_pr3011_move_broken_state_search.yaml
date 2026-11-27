@@ -38,7 +38,7 @@ fault_sweep:
   sweep_hash_bypass_symbols: ["bootutil_img_validate"]
   phase2_fault:
     enabled: true
-    fault_types: [power_loss]
+    fault_types: [power_loss, interrupted_erase]
     state_search:
       enabled: true
       first_cuts:
