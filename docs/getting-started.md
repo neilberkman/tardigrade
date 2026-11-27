@@ -5,6 +5,9 @@ cuts a deliberately broken direct-copy update and a recovering update at a
 small quick selection of operations. It succeeds only when the broken flow has
 a finding and the recovering flow has none.
 
+For pip installation, environment checks and generation of a starter profile from
+firmware build artifacts, see [Install and check Tardigrade](installed-command.md).
+
 ## Run the demo
 
 Clone the repository, enter it, and choose either Docker or a local Renode.

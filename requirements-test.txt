@@ -1,5 +1,6 @@
 # Public, open-source test dependencies pinned for reproducible CI.
 -r requirements.txt
+devicetree==0.0.2
 pytest==9.0.3
 pytest-subtests==0.15.0
 attrs==26.1.0
@@ -11,3 +12,5 @@ pluggy==1.6.0
 Pygments==2.20.0
 tomli==2.4.1; python_version < "3.11"
 typing_extensions==4.15.0; python_version < "3.11"
+setuptools==82.0.1
+wheel==0.48.0
