@@ -1,0 +1,62 @@
+schema_version: 1
+name: mcuboot_zephyr_spi_nor_upgrade
+description: >
+  Pinned upstream MCUboot on Zephyr (nrf52840dk/nrf52840, overwrite-only) with
+  the primary slot (slot0_partition) in internal nRF52840 flash (0x0000C000,
+  64 KiB) and the 64 KiB
+  secondary slot (slot1_partition) on an external JEDEC SPI NOR
+  flash (Winbond W25Q16JV on spi2 @ 0x40023000, CS# on gpio0 pin 22, 64 KiB slot).
+
+platform: platforms/nrf52840_mcuboot_spi_nor.repl
+flash_backend: spiNor
+target_source:
+  name: mcuboot
+  repository: https://github.com/mcu-tools/mcuboot
+  commit: fb2cf0ec3da3687b93f28e556ab682bdd4b85223
+
+bootloader:
+  elf: targets/zephyr_external_nvm/build/mcuboot_spi_nor.elf
+  entry: 0x00000000
+  algorithm: overwrite-only
+
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  trace_address_map:
+    - { offset_start: 0x0, offset_end: 0x2F4000, address_addend: 0x0000C000 }
+  slots:
+    exec: { base: 0x0000C000, size: 0x00010000 }
+    staging: { base: 0x00100000, size: 0x00010000, compiled_offset: 0x0 }
+
+images:
+  exec: targets/zephyr_external_nvm/build/mcuboot_spi_nor_slot0_v1.bin
+  staging: targets/zephyr_external_nvm/build/mcuboot_spi_nor_slot1_v2.bin
+
+update_trigger:
+  type: mcuboot_trailer_magic
+  slot: staging
+  # This pinned MCUboot revision embeds the legacy 16-byte magic, selected by 8.
+  max_align: 8
+
+success_criteria:
+  vtor_in_slot: exec
+  vector_table_offset: 0x00000200
+  image_hash: true
+  expected_image: staging
+
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  sweep_strategy: full
+  max_writes: auto
+  max_writes_cap: 50000
+  run_duration: "2.0"
+  max_step_limit: 50000000
+  calibration_stop:
+    success_criteria: true
+  include_erase_fault_points: true
+  fault_types: [power_loss, interrupted_erase]
+
+expect:
+  control_outcome: success
+  should_find_issues: false

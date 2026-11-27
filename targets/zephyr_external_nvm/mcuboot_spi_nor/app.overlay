@@ -1,0 +1,13 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Application devicetree overlay paired with mcuboot.overlay (executes from slot0_partition).
+ */
+
+#include "mcuboot.overlay"
+
+/ {
+    chosen {
+        zephyr,code-partition = &slot0_partition;
+    };
+};

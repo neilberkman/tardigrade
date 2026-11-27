@@ -146,6 +146,10 @@ def _is_mram_backend(
         "stm32f4",
         "stm32h7",
         "stm32l4",
+        "spinor",
+        "spi_nor",
+        "i2ceeprom",
+        "i2c_eeprom",
     }
     if backend_lower:
         if "mram" in backend_lower:
@@ -305,6 +309,8 @@ def _validate_torn_word_backend(
         "STM32L4FlashController",
         "An521NvmInterceptor",
         "CFIFlash",
+        "SPINORFlash",
+        "I2CEEPROM",
     )
     torn_word_mode = getattr(fs, "torn_word", "fixed")
     torn_word_modes = {torn_word_mode} | {
@@ -566,11 +572,17 @@ class ProfileError(Exception):
 # ---------------------------------------------------------------------------
 
 class SlotConfig:
-    __slots__ = ("base", "size")
+    __slots__ = ("base", "size", "compiled_offset")
 
-    def __init__(self, base: int, size: int) -> None:
+    def __init__(
+        self,
+        base: int,
+        size: int,
+        compiled_offset: Optional[int] = None,
+    ) -> None:
         self.base = base
         self.size = size
+        self.compiled_offset = compiled_offset
 
 
 class MemoryRegionConfig:
@@ -4410,7 +4422,21 @@ def _parse_slots(raw: Dict[str, Any]) -> Dict[str, SlotConfig]:
     for name, slot_data in raw.items():
         base = _parse_int(_require(slot_data, "base", "slots.{}".format(name)), "slots.{}.base".format(name))
         size = _parse_int(_require(slot_data, "size", "slots.{}".format(name)), "slots.{}.size".format(name))
-        slots[name] = SlotConfig(base=base, size=size)
+        compiled_offset = None
+        if slot_data.get("compiled_offset") is not None:
+            compiled_offset = _parse_int(
+                slot_data["compiled_offset"],
+                "slots.{}.compiled_offset".format(name),
+            )
+            if compiled_offset < 0:
+                raise ProfileError(
+                    "slots.{}.compiled_offset must be >= 0".format(name)
+                )
+        slots[name] = SlotConfig(
+            base=base,
+            size=size,
+            compiled_offset=compiled_offset,
+        )
     return slots
 
 
@@ -8523,7 +8549,7 @@ def _validate_strict_memory(raw: Any, context: str) -> None:
     for slot_name, slot in slots.items():
         _reject_unknown_keys(
             slot,
-            frozenset({"base", "size"}),
+            frozenset({"base", "size", "compiled_offset"}),
             "{}.slots.{}".format(context, slot_name),
         )
     for field_name in ("erase_regions", "postmortem_partitions", "volatile_regions"):
@@ -9734,11 +9760,13 @@ def _load_profile(
     # NVMemory peripheral. Instruction fetch aborts before the first
     # instruction and that release can leave RunFor blocked. Hybrid platforms
     # (MappedMemory for code, NVMemory only for persistent data) are fine.
+    platform_name = Path(platform).name.lower()
     if (
         fault_sweep.evaluation_mode == "execute"
-        and "nvm" in platform
-        and "flash_fast" not in platform
-        and "hybrid" not in platform
+        and "nvm" in platform_name
+        and "flash_fast" not in platform_name
+        and "hybrid" not in platform_name
+        and "external_nvm" not in platform_name
     ):
         raise ProfileError(
             "evaluation_mode 'execute' is incompatible with NVMemory platform '{}'. "

@@ -7211,6 +7211,8 @@ def restore_hw_init():
     if backend['kind'] == 'mram':
         return
     platform_name = os.path.basename(platform_repl)
+    if platform_name in ('nrf52840_external_nvm.repl', 'nrf52840_mcuboot_spi_nor.repl'):
+        platform_name = 'cortex_m4_flash_fast.repl'
     if platform_name not in ('cortex_m4_flash.repl', 'cortex_m4_flash_fast.repl'):
         return
     bus.WriteDoubleWord(0x10000010, 0x1000)
@@ -16703,7 +16705,12 @@ def ensure_trace_replay_engine():
         return None
     try:
         trace_replay_engine = monitor.Machine['sysbus.trace_replay']
-        if trace_replay_engine.Target is None:
+        if backend.get('backend_sysbus_name') in (
+            'sysbus.spiNor', 'sysbus.i2cEeprom'
+        ):
+            trace_replay_engine.Target = backend['data'].Flash
+            trace_replay_engine.TargetBaseAddress = int(backend['data'].FlashBaseAddress)
+        elif trace_replay_engine.Target is None:
             trace_replay_engine.Target = backend['data'].Flash
             trace_replay_engine.TargetBaseAddress = int(backend['data'].FlashBaseAddress)
         log('trace_replay: native engine enabled')

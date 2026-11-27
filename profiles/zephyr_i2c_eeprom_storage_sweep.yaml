@@ -1,0 +1,59 @@
+schema_version: 1
+name: zephyr_i2c_eeprom_storage_sweep
+description: >
+  Pinned upstream Zephyr EEPROM storage subsystem on external 24-series I2C
+  EEPROM (Microchip 24LC256 via atmel,at24 driver on nRF52840 twi0 @ 0x40003000,
+  slave address 0x50, 32 KiB, 64-byte pages). Sweeps power-loss cuts across
+  64-byte page writes during the internal write cycle (t_WR), verifying on every
+  recovery boot that data written before the cut (anchor records A = 0xDEADBEEF
+  and B = 0x55667788) is read back intact via eeprom_read().
+
+platform: platforms/nrf52840_external_nvm.repl
+flash_backend: i2cEeprom
+target_source:
+  name: zephyr
+  repository: https://github.com/zephyrproject-rtos/zephyr
+  commit: 36940db938a8f4a1e919496793ed439850a221c2
+
+bootloader:
+  elf: targets/zephyr_external_nvm/build/zephyr_i2c_eeprom_storage.elf
+  entry: 0x00000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  trace_address_map:
+    - { offset_start: 0x0, offset_end: 0x8000, address_addend: 0x61000000 }
+  slots:
+    # Terminal irq-locked loop in the pinned zephyr_i2c_eeprom_storage.elf.
+    exec: { base: 0x0000019C, size: 0x00000012 }
+    staging: { base: 0x61000000, size: 0x00008000 }
+
+images:
+  staging: targets/zephyr_external_nvm/build/i2c_eeprom_seed.bin
+
+success_criteria:
+  pc_in_slot: exec
+  marker_address: 0x2003F000
+  marker_value: 0x45455052
+  memory_checks:
+    - { address: 0x2003F000, expected_value: 0x45455052, op: eq }
+    - { address: 0x2003F004, expected_value: 0xDEADBEEF, op: eq }
+    - { address: 0x2003F008, expected_value: 0x55667788, op: eq }
+    - { address: 0x2003F00C, expected_value: 0x00000001, op: eq }
+
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  sweep_strategy: full
+  max_writes: auto
+  max_writes_cap: 10000
+  run_duration: "0.2"
+  max_step_limit: 25000000
+  calibration_stop:
+    success_criteria: true
+  fault_types: [power_loss]
+
+expect:
+  control_outcome: success
+  should_find_issues: false

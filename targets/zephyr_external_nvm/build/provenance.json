@@ -1,0 +1,70 @@
+{
+  "board": "nrf52840dk/nrf52840",
+  "sources": {
+    "zephyr_base": {
+      "repository": "https://github.com/zephyrproject-rtos/zephyr",
+      "commit": "36940db938a8f4a1e919496793ed439850a221c2"
+    },
+    "zephyr_nvs_broken": {
+      "repository": "https://github.com/zephyrproject-rtos/zephyr",
+      "commit": "1c128d59b5e1561dafdc1c7b246b8eb1d9857a97"
+    },
+    "zephyr_nvs_fixed": {
+      "repository": "https://github.com/zephyrproject-rtos/zephyr",
+      "commit": "c200ff1eb4e30e06ae53e9cb9cb77515d1708509",
+      "fix_commit": "c200ff1eb4e30e06ae53e9cb9cb77515d1708509"
+    },
+    "mcuboot": {
+      "repository": "https://github.com/mcu-tools/mcuboot",
+      "commit": "fb2cf0ec3da3687b93f28e556ab682bdd4b85223"
+    }
+  },
+  "west_manifest": {
+    "file": "west-manifest.freeze.yml",
+    "sha256": "07ea9bab064384b0d39b7080e4320021e8beb6c90e4cfdaca5257e46f2f8bb6b"
+  },
+  "nvs_west_manifests": {
+    "west-manifest-nvs-broken.freeze.yml": {
+      "file": "west-manifest-nvs-broken.freeze.yml",
+      "sha256": "21aeb9389b1e42ba7ce909ecbf2dc46ae4b03b4bd32d39ff89930af313eae304"
+    },
+    "west-manifest-nvs-fixed.freeze.yml": {
+      "file": "west-manifest-nvs-fixed.freeze.yml",
+      "sha256": "21aeb9389b1e42ba7ce909ecbf2dc46ae4b03b4bd32d39ff89930af313eae304"
+    }
+  },
+  "artifacts": {
+    "mcuboot_spi_nor.elf": {
+      "size": 94372,
+      "sha256": "7fe2ea252c2488756e31dee0d79ce86b0a0560621b38c2eff561796901df2198"
+    },
+    "mcuboot_spi_nor_slot0_v1.bin": {
+      "size": 3444,
+      "sha256": "8c62eeae05801a5d78af9319fb686b411ecba2ff8e0a573e9dfc045631a0f63f"
+    },
+    "mcuboot_spi_nor_slot1_v2.bin": {
+      "size": 3508,
+      "sha256": "cd86e01ec61340e412127fe77f1341f975f5deaa4d503a15d3d60fd09a2b79f8"
+    },
+    "zephyr_spi_nor_nvs_broken.elf": {
+      "size": 98656,
+      "sha256": "2852485fbf13dcd1f5a9dc65464240086019151d7d96e269ea48f3d540031509"
+    },
+    "zephyr_spi_nor_nvs_fixed.elf": {
+      "size": 98656,
+      "sha256": "37bab47fbe131cc22089f8277590360bb0cef817c433c708ba3de8a0c2c58851"
+    },
+    "spi_nor_nvs_seed.bin": {
+      "size": 12288,
+      "sha256": "cab61bc32a1a9e99d02d8617212a3129e85f61fda2ae65dd944916673a7e63e4"
+    },
+    "zephyr_i2c_eeprom_storage.elf": {
+      "size": 71540,
+      "sha256": "6af8ee22b65a6fb08d7daa635a3c610a4daf5666f15f71885706888faec05841"
+    },
+    "i2c_eeprom_seed.bin": {
+      "size": 32768,
+      "sha256": "9bad02756fe17ec5f868d3aec39cd3e8047353f8179013138da8d35ff0ce0577"
+    }
+  }
+}

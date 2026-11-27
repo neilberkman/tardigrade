@@ -1,0 +1,57 @@
+schema_version: 1
+name: zephyr_spi_nor_nvs_broken
+description: >
+  Broken side of the Zephyr NVS power-loss differential. This source commit is
+  the parent of NVS fix c200ff1eb4e30e06ae53e9cb9cb77515d1708509. Program
+  cut 11 interrupts the second word of an ATE at the end of a full sector;
+  nvs_mount() then returns an error instead of recovering the prior records.
+
+platform: platforms/nrf52840_external_nvm.repl
+flash_backend: spiNor
+target_source:
+  name: zephyr-nvs-before-fix-c200ff1
+  repository: https://github.com/zephyrproject-rtos/zephyr
+  commit: 1c128d59b5e1561dafdc1c7b246b8eb1d9857a97
+
+bootloader:
+  elf: targets/zephyr_external_nvm/build/zephyr_spi_nor_nvs_broken.elf
+  entry: 0x00000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  trace_address_map:
+    - { offset_start: 0x0, offset_end: 0x200000, address_addend: 0x60000000 }
+  slots:
+    exec: { base: 0x00000160, size: 0x00000012 }
+    staging: { base: 0x60000000, size: 0x00003000 }
+
+images:
+  staging: targets/zephyr_external_nvm/build/spi_nor_nvs_seed.bin
+
+success_criteria:
+  pc_in_slot: exec
+  marker_address: 0x2003F000
+  marker_value: 0x5350494E
+  memory_checks:
+    - { address: 0x2003F000, expected_value: 0x5350494E, op: eq }
+    - { address: 0x2003F004, expected_value: 0xC0FFEE11, op: eq }
+    - { address: 0x2003F008, expected_value: 0x5AFE2233, op: eq }
+    - { address: 0x2003F00C, expected_value: 0x00000001, op: eq }
+
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  sweep_strategy: full
+  max_writes: auto
+  max_writes_cap: 10000
+  run_duration: "0.2"
+  max_step_limit: 25000000
+  calibration_stop:
+    success_criteria: true
+  include_erase_fault_points: true
+  fault_types: [power_loss, interrupted_erase]
+
+expect:
+  control_outcome: success
+  should_find_issues: true

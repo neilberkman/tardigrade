@@ -10,8 +10,10 @@ and recovery-state computation across all command and fault outcomes.
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -20,9 +22,15 @@ if str(SCRIPTS) not in sys.path:
 
 from profile_loader import (  # noqa: E402
     FaultSweepConfig,
+    MCUBOOT_GOOD_MAGIC,
     _is_mram_backend,
     _validate_torn_word_backend,
     load_profile,
+)
+from audit_report import compute_verdict  # noqa: E402
+from trace_utils import (  # noqa: E402
+    flash_base_for_profile,
+    summarize_calibration_coverage,
 )
 from trigger_discovery import validate_compiled_flash_map  # noqa: E402
 from recovery_search import (  # noqa: E402
@@ -132,6 +140,11 @@ class TestExternalNvmModelContracts(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("36940db938a8f4a1e919496793ed439850a221c2", build_script)
         self.assertIn("fb2cf0ec3da3687b93f28e556ab682bdd4b85223", build_script)
+        self.assertIn("1c128d59b5e1561dafdc1c7b246b8eb1d9857a97", build_script)
+        self.assertIn("c200ff1eb4e30e06ae53e9cb9cb77515d1708509", build_script)
+        self.assertIn("zephyr_spi_nor_nvs_broken.elf", build_script)
+        self.assertIn("zephyr_spi_nor_nvs_fixed.elf", build_script)
+        self.assertNotIn('"zephyr_spi_nor_nvs.elf"', build_script)
         self.assertIn('"${WEST}" init', build_script)
         self.assertIn('"${WEST}" manifest --freeze --active-only', build_script)
         self.assertIn(
@@ -201,10 +214,15 @@ class TestExternalNvmProfileLoaderAndStateSearch(unittest.TestCase):
                 "mcuboot",
                 "fb2cf0ec3da3687b93f28e556ab682bdd4b85223",
             ),
-            "zephyr_spi_nor_nvs_sweep.yaml": (
+            "zephyr_spi_nor_nvs_broken.yaml": (
                 "spiNor",
-                "zephyr",
-                "36940db938a8f4a1e919496793ed439850a221c2",
+                "zephyr-nvs-before-fix-c200ff1",
+                "1c128d59b5e1561dafdc1c7b246b8eb1d9857a97",
+            ),
+            "zephyr_spi_nor_nvs_fixed.yaml": (
+                "spiNor",
+                "zephyr-nvs-fix-c200ff1",
+                "c200ff1eb4e30e06ae53e9cb9cb77515d1708509",
             ),
             "zephyr_i2c_eeprom_storage_sweep.yaml": (
                 "i2cEeprom",
@@ -224,6 +242,92 @@ class TestExternalNvmProfileLoaderAndStateSearch(unittest.TestCase):
                     self.assertEqual(cfg.memory.slots["staging"].compiled_offset, 0)
                     geometry = validate_compiled_flash_map(cfg, ROOT)
                     self.assertEqual(geometry["status"], "match", geometry)
+
+    def test_external_mcuboot_profiles_seed_the_magic_embedded_by_the_target(self) -> None:
+        expected = list(MCUBOOT_GOOD_MAGIC)
+        for filename in (
+            "mcuboot_zephyr_spi_nor_upgrade.yaml",
+            "mcuboot_zephyr_spi_nor_state_search.yaml",
+        ):
+            with self.subTest(profile=filename):
+                cfg = load_profile(ROOT / "profiles" / filename, strict=True)
+                staging = cfg.memory.slots["staging"]
+                magic_base = staging.base + staging.size - 16
+                magic = {
+                    write.address: write.u32 for write in cfg.pre_boot_state
+                }
+                self.assertEqual(
+                    [magic[magic_base + offset] for offset in range(0, 16, 4)],
+                    expected,
+                )
+
+    def test_external_mcuboot_state_search_bounds_follow_on_cuts_to_trailers(self) -> None:
+        cfg = load_profile(
+            ROOT / "profiles" / "mcuboot_zephyr_spi_nor_state_search.yaml",
+            strict=True,
+        )
+        search = cfg.fault_sweep.phase2_fault.state_search
+        exec_slot = cfg.memory.slots["exec"]
+        staging_slot = cfg.memory.slots["staging"]
+        exec_end = exec_slot.base + exec_slot.size
+        staging_end = staging_slot.base + staging_slot.size
+        self.assertEqual(
+            search.address_ranges,
+            [
+                (exec_end - 32, exec_end),
+                (staging_end - 32, staging_end),
+            ],
+        )
+
+    def test_eeprom_storage_coverage_is_based_on_eeprom_writes(self) -> None:
+        cfg = load_profile(
+            ROOT / "profiles" / "zephyr_i2c_eeprom_storage_sweep.yaml",
+            strict=True,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trace = Path(temp_dir) / "eeprom-writes.csv"
+            trace.write_text(
+                "write_index,flash_offset,value,width\n"
+                "1,128,1162170450,4\n"
+                "2,132,3,4\n",
+                encoding="utf-8",
+            )
+            coverage = summarize_calibration_coverage(
+                trace_file=str(trace),
+                erase_trace_file=None,
+                flash_base=flash_base_for_profile(cfg),
+                slots=cfg.memory.slots,
+                page_size=cfg.memory.page_size,
+                trace_address_map=cfg.memory.trace_address_map,
+            )
+
+        self.assertEqual(coverage["status"], "slot_activity")
+        self.assertEqual(coverage["slot_data_writes"], 2)
+        summary = {
+            "bricks": 0,
+            "issue_points": 0,
+            "semantic_issue_points": 0,
+            "invariant_issue_points": 0,
+            "metadata_delta_issue_points": 0,
+            "timeout_points": 0,
+            "resilient_rollbacks": 0,
+            "calibration_coverage": coverage,
+            "control": {
+                "boot_outcome": "success",
+                "effective_outcome": "success",
+                "final_boot_outcome": "success",
+                "issue_count": 0,
+            },
+        }
+        verdict = compute_verdict(
+            summary,
+            SimpleNamespace(
+                should_find_issues=False,
+                control_outcome="success",
+                allow_control_only_issues=False,
+            ),
+        )
+        self.assertEqual(verdict, "PASS")
 
     def test_spi_nor_page_program_and_erase_fault_outcomes_in_recovery_state(self) -> None:
         # Simulate a 4 KiB SPI NOR sector erase (0x20) followed by a 16-byte

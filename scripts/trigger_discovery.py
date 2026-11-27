@@ -365,7 +365,11 @@ def _resolve_compiled_flash_slots(
     pending: List[Tuple[str, int, int]] = []
 
     for slot_name, slot in slots.items():
-        profile_off = int(slot.base) - flash_base
+        profile_off = (
+            int(slot.compiled_offset)
+            if getattr(slot, "compiled_offset", None) is not None
+            else int(slot.base) - flash_base
+        )
         profile_size = int(slot.size)
         candidates = _compiled_flash_map_candidates(
             entries,
@@ -554,7 +558,11 @@ def validate_compiled_flash_map(
         flash_base,
     )
     for slot_name, slot in declared_slots.items():
-        profile_off = int(slot.base) - flash_base
+        profile_off = (
+            int(slot.compiled_offset)
+            if getattr(slot, "compiled_offset", None) is not None
+            else int(slot.base) - flash_base
+        )
         slot_summary: Dict[str, Any] = {
             "slot": slot_name,
             "profile_base": "0x{:08X}".format(int(slot.base)),

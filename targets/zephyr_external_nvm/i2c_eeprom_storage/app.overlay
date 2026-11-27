@@ -1,0 +1,52 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Devicetree overlay for Zephyr EEPROM storage target on Microchip 24LC256
+ * (atmel,at24) attached to nRF52840 i2c0 (twi0 @ 0x40003000, slave address 0x50).
+ */
+
+&qspi {
+    status = "disabled";
+};
+
+&flash0 {
+    /delete-node/ partitions;
+
+    partitions {
+        compatible = "fixed-partitions";
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        boot_partition: partition@0 {
+            label = "mcuboot";
+            reg = <0x00000000 0x0000C000>;
+        };
+        slot0_partition: partition@c000 {
+            label = "image-0";
+            reg = <0x0000C000 0x00020000>;
+        };
+    };
+};
+
+&i2c0 {
+    compatible = "nordic,nrf-twi";
+    status = "okay";
+
+    eeprom0: eeprom@50 {
+        compatible = "atmel,at24";
+        reg = <0x50>;
+        size = <32768>;
+        pagesize = <64>;
+        address-width = <16>;
+        timeout = <5>;
+    };
+};
+
+/ {
+    aliases {
+        eeprom-0 = &eeprom0;
+    };
+    chosen {
+        zephyr,code-partition = &boot_partition;
+    };
+};
