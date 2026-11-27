@@ -1599,6 +1599,20 @@ slot_tertiary_base = get_optional_int_var('slot_tertiary_base', None)
 slot_tertiary_size = get_optional_int_var('slot_tertiary_size', None)
 slot_recovery_base = get_optional_int_var('slot_recovery_base', None)
 slot_recovery_size = get_optional_int_var('slot_recovery_size', None)
+slot_ranges = {
+    'exec': (slot_exec_base, slot_exec_base + slot_exec_size),
+    'staging': (slot_staging_base, slot_staging_base + slot_staging_size),
+}
+if slot_tertiary_base is not None and slot_tertiary_size is not None:
+    slot_ranges['tertiary'] = (
+        slot_tertiary_base,
+        slot_tertiary_base + slot_tertiary_size,
+    )
+if slot_recovery_base is not None and slot_recovery_size is not None:
+    slot_ranges['recovery'] = (
+        slot_recovery_base,
+        slot_recovery_base + slot_recovery_size,
+    )
 sram_start = int(str(monitor.GetVariable('sram_start')), 0)
 sram_end = int(str(monitor.GetVariable('sram_end')), 0)
 if sram_end <= sram_start:
