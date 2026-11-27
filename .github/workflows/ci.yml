@@ -12,6 +12,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  one-command-demo:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Run broken-versus-recovering demo
+        run: timeout 15m ./demo --docker --timeout 600
+
+      - name: Check Docker output ownership
+        run: |
+          test -d results/demo
+          unexpected_owner="$(find results/demo \
+            \( ! -uid "$(id -u)" -o ! -gid "$(id -g)" \) \
+            -print -quit)"
+          if [ -n "${unexpected_owner}" ]; then
+            echo "Docker output has the wrong owner: ${unexpected_owner}" >&2
+            exit 1
+          fi
+
   renode-tests:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
