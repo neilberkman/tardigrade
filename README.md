@@ -54,7 +54,7 @@ See [`docs/mcuboot-pr2214-swap-offset.md`](docs/mcuboot-pr2214-swap-offset.md) f
 
 ### MCUboot upstream
 
-Tardigrade's torn-write power-loss model is proposed for MCUboot's simulator in [mcu-tools/mcuboot#3011](https://github.com/mcu-tools/mcuboot/pull/3011). A two-power-loss revert sweep built on it found two revert bugs: [#3009](https://github.com/mcu-tools/mcuboot/issues/3009) (swap-move: the revert is lost and the unconfirmed image keeps booting) and [#3010](https://github.com/mcu-tools/mcuboot/issues/3010) (swap-using-offset: the device asserts on every boot).
+Tardigrade's torn-write power-loss model is part of MCUboot's simulator: it was proposed in [mcu-tools/mcuboot#2648](https://github.com/mcu-tools/mcuboot/pull/2648) in July 2026 and merged with [mcu-tools/mcuboot#3011](https://github.com/mcu-tools/mcuboot/pull/3011) in November 2026. #3011 fixes two revert bugs reported in [#3009](https://github.com/mcu-tools/mcuboot/issues/3009) (swap-move: the revert is lost and the unconfirmed image keeps booting) and [#3010](https://github.com/mcu-tools/mcuboot/issues/3010) (swap-using-offset: the device asserts on every boot), and its two-power-loss sweep reproduces both. Tardigrade reproduces both on an emulated nRF52840 with broken and fixed builds ([MCUboot differentials](docs/mcuboot-differentials.md)), and its recovery-state search finds #3009 without hand-picked cut pairs.
 
 ## Integrations
 
