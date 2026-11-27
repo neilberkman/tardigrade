@@ -19,6 +19,7 @@ from typing import (
 )
 
 from fault_classification import (
+    result_has_initial_timeout,
     result_is_infrastructure_error,
     result_is_skipped,
     result_is_timeout,
@@ -602,7 +603,11 @@ def build_point_counts(
             reason = _skip_reason(result)
             row["skip_reasons"][reason] = row["skip_reasons"].get(reason, 0) + 1
         evaluated = False
-        if not infra and not timeout and not skipped:
+        # Timeout is an orthogonal operational count: a later timed-out boot
+        # cycle does not discard the concrete cycle-0 observation.  A timeout
+        # on cycle 0 still leaves the point unevaluated.  Infrastructure
+        # errors remain point-wide because a required boot cycle did not run.
+        if not infra and not result_has_initial_timeout(result) and not skipped:
             if bool(result.get("is_control")) or result.get("fault_injected") is True:
                 row["evaluated"] += 1
                 evaluated = True

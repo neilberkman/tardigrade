@@ -1248,7 +1248,7 @@ def summarize_runtime_sweep(
 
     def _point_has_issue(result: Dict[str, Any]) -> bool:
         if (
-            result_is_timeout(result)
+            result_has_initial_timeout(result)
             or result_is_infrastructure_error(result)
             or result_is_skipped(result)
         ):

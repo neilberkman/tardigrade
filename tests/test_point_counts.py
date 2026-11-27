@@ -20,7 +20,9 @@ from audit_bootloader import (  # noqa: E402
     _calibration_point_coverage,
 )
 from audit_report import summarize_runtime_sweep  # noqa: E402
+from boot_cycle_analysis import analyze_boot_cycles  # noqa: E402
 from fault_classification import (  # noqa: E402
+    result_has_initial_timeout,
     result_has_issues,
     result_is_infrastructure_error,
     result_is_skipped,
@@ -40,18 +42,61 @@ from zero_day_results import format_profile_cell  # noqa: E402
 from zero_day_summary import format_console_summary, format_step_summary  # noqa: E402
 
 
-def test_later_boot_cycle_timeout_matches_runtime_classification() -> None:
+def _boot_span_result(
+    initial_outcome: str,
+    *,
+    followup_outcome: str | None = None,
+    followup_stop_reason: str = "completed",
+) -> dict:
+    cycles = [
+        {
+            "cycle": 0,
+            "boot_outcome": initial_outcome,
+            "stop_reason": (
+                "budget" if initial_outcome == "timeout" else "completed"
+            ),
+        }
+    ]
+    if initial_outcome == "timeout":
+        cycles[0]["boot_outcome"] = "no_boot"
+    if initial_outcome in {"infra_error", "infrastructure_error"}:
+        cycles[0].update(
+            {
+                "infrastructure_error": True,
+                "stop_reason": "runfor_infrastructure_error",
+                "error_kind": "runfor_exception",
+            }
+        )
+    if followup_outcome is not None:
+        followup = {
+            "cycle": 1,
+            "boot_outcome": followup_outcome,
+            "stop_reason": followup_stop_reason,
+        }
+        if followup_outcome in {"infra_error", "infrastructure_error"}:
+            followup.update(
+                {
+                    "infrastructure_error": True,
+                    "error_kind": "runfor_exception",
+                }
+            )
+        cycles.append(followup)
+
+    analysis = analyze_boot_cycles(cycles, requested_cycles=len(cycles))
     result = {
         "fault_type": "w",
         "fault_injected": True,
-        "boot_outcome": "success",
-        "boot_cycles": [
-            {"cycle": 0, "boot_outcome": "success", "stop_reason": "completed"},
-            {"cycle": 1, "boot_outcome": "no_boot", "stop_reason": "budget"},
-        ],
-        "multi_boot_analysis": {"status": "timeout"},
+        "boot_outcome": cycles[0]["boot_outcome"],
+        "initial_boot_outcome": cycles[0]["boot_outcome"],
+        "boot_cycles": cycles,
+        "multi_boot_analysis": analysis,
     }
+    if len(cycles) > 1:
+        result["final_boot_outcome"] = cycles[-1]["boot_outcome"]
+    return result
 
+
+def _summarize_one_point(result: dict) -> tuple[dict, dict]:
     summary = summarize_runtime_sweep(
         [result],
         expected_fault_points=1,
@@ -59,11 +104,103 @@ def test_later_boot_cycle_timeout_matches_runtime_classification() -> None:
         planned_fault_types=["w"],
     )
     row = summary["point_counts"]["kinds"]["single_cut_program"]
+    return summary, row
+
+
+def test_initial_hard_fault_remains_evaluated_issue_after_followup_timeout() -> None:
+    result = _boot_span_result(
+        "hard_fault",
+        followup_outcome="no_boot",
+        followup_stop_reason="budget",
+    )
+
+    summary, row = _summarize_one_point(result)
 
     assert result_is_timeout(result) is True
+    assert result_has_initial_timeout(result) is False
+    assert result_has_issues(result, "success") is True
     assert summary["timeout_points"] == 1
+    assert summary["issue_points"] == 1
+    assert summary["campaign_complete"] is False
+    assert row["timeout"] == 1
+    assert row["evaluated"] == 1
+    assert row["issues"] == 1
+    assert summary["point_counts"]["totals"]["timeout"] == 1
+    assert summary["point_counts"]["totals"]["evaluated"] == 1
+    assert summary["point_counts"]["totals"]["issues"] == 1
+
+
+def test_initial_timeout_remains_unevaluated() -> None:
+    result = _boot_span_result("timeout")
+
+    summary, row = _summarize_one_point(result)
+
+    assert result_is_timeout(result) is True
+    assert result_has_initial_timeout(result) is True
+    assert result_has_issues(result, "success") is False
+    assert summary["timeout_points"] == 1
+    assert summary["issue_points"] == 0
+    assert summary["campaign_complete"] is False
     assert row["timeout"] == 1
     assert row["evaluated"] == 0
+    assert row["issues"] == 0
+
+
+def test_initial_success_remains_evaluated_after_followup_timeout() -> None:
+    result = _boot_span_result(
+        "success",
+        followup_outcome="no_boot",
+        followup_stop_reason="budget",
+    )
+
+    summary, row = _summarize_one_point(result)
+
+    assert result_is_timeout(result) is True
+    assert result_has_initial_timeout(result) is False
+    assert result_has_issues(result, "success") is False
+    assert summary["timeout_points"] == 1
+    assert summary["issue_points"] == 0
+    assert summary["campaign_complete"] is False
+    assert row["timeout"] == 1
+    assert row["evaluated"] == 1
+    assert row["issues"] == 0
+
+
+@pytest.mark.parametrize("initial_outcome", ["hard_fault", "success"])
+def test_followup_infrastructure_error_remains_point_wide(
+    initial_outcome: str,
+) -> None:
+    result = _boot_span_result(
+        initial_outcome,
+        followup_outcome="infra_error",
+        followup_stop_reason="runfor_infrastructure_error",
+    )
+
+    summary, row = _summarize_one_point(result)
+
+    assert result_is_infrastructure_error(result) is True
+    assert summary["infrastructure_error_points"] == 1
+    assert summary["total_fault_points"] == 0
+    assert summary["issue_points"] == 0
+    assert summary["campaign_complete"] is False
+    assert row["infrastructure_error"] == 1
+    assert row["evaluated"] == 0
+    assert row["issues"] == 0
+
+
+def test_initial_infrastructure_error_remains_unevaluated() -> None:
+    result = _boot_span_result("infra_error")
+
+    summary, row = _summarize_one_point(result)
+
+    assert result_is_infrastructure_error(result) is True
+    assert summary["infrastructure_error_points"] == 1
+    assert summary["total_fault_points"] == 0
+    assert summary["issue_points"] == 0
+    assert summary["campaign_complete"] is False
+    assert row["infrastructure_error"] == 1
+    assert row["evaluated"] == 0
+    assert row["issues"] == 0
 
 
 def test_recorded_cycle_terminal_result_outranks_stale_timeout_flag() -> None:

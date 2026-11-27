@@ -2491,6 +2491,20 @@ State-search reuse is assigned by equivalent chain depth; reuse without chain
 metadata is conservatively assigned to `two_cut_state_search` and remains
 explicit in its `reused` count.
 
+`timeout` is an operational diagnostic, not a mutually exclusive disposition.
+When cycle 0 has a concrete result but a later required boot cycle times out,
+the point counts in both `timeout` and `evaluated`; it also counts in `issues`
+when the concrete initial result meets the verdict's issue predicate. An
+initial timeout has no concrete observation, so it counts in `timeout` but not
+in `evaluated` or `issues`. Thus the status columns do not sum to `run`; for
+each kind, `issues <= evaluated <= run`, while `missing` is computed from
+`requested`, `run`, and `reused`.
+
+Infrastructure errors remain point-wide. If any required boot cycle ends in an
+infrastructure error, including a follow-up after a concrete initial result,
+the point counts in `infrastructure_error`, not `evaluated` or `issues`, and
+the campaign remains incomplete.
+
 The compatibility fields `total_fault_points`, `bricks`, `issue_points`, and
 `brick_rate` remain under `summary.runtime_sweep`. They count only the main
 runtime sweep's injected points across its configured fault mechanisms. They
