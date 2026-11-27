@@ -12445,19 +12445,6 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             fault_timing_state['current_iter'] = iters + 1
             active_slice_s = slice_s
             active_slice_arg = time_slice
-            if (
-                approved_dwell_state is not None
-                and approved_dwell_state.get('started')
-                and not approved_dwell_state.get('completed')
-                and approved_dwell_state.get('dwell_failure_reason') is None
-            ):
-                _rem_dwell = max(
-                    0.001,
-                    float(approved_dwell_state['required_dwell_s'])
-                    - float(approved_dwell_state.get('observed_dwell_s', 0.0)),
-                )
-                active_slice_s = min(slice_s, 0.05, _rem_dwell)
-                active_slice_arg = '{:.6f}'.format(active_slice_s).rstrip('0').rstrip('.')
             _run_for_started = _time.time()
             if (
                 configured_test_runfor_error_label
