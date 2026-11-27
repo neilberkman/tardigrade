@@ -180,6 +180,47 @@ def test_explicit_chain_accounts_first_cut_in_calibration_coverage() -> None:
     assert counts["calibration"]["program"]["cut_directly"] == 0
 
 
+def test_explicit_chain_with_a_later_unreached_cut_is_evaluated() -> None:
+    counts = build_point_counts(
+        [
+            {
+                "fault_type": "pc:3:w:99:w:2:w",
+                "fault_injected": True,
+                "boot_outcome": "hard_fault",
+                "fault_class": "unrecoverable",
+                "phase2_fault_chain": {
+                    "cut_count": 1,
+                    "requested_cut_count": 3,
+                    "first_unreached_cut": 2,
+                    "cuts": [
+                        {
+                            "fault_at": 3,
+                            "operation": "write",
+                            "injected": True,
+                        }
+                    ],
+                    "requested_cuts": [
+                        {"fault_at": 3, "fault_type": "w"},
+                        {"fault_at": 99, "fault_type": "w"},
+                        {"fault_at": 2, "fault_type": "w"},
+                    ],
+                },
+            }
+        ],
+        planned_fault_types=["pc:3:w:99:w:2:w"],
+        expected_control_points=0,
+        issue_predicate=lambda result: result["boot_outcome"] == "hard_fault",
+    )
+
+    row = counts["kinds"]["n_cut_explicit"]
+    assert row["requested"] == 1
+    assert row["run"] == 1
+    assert row["evaluated"] == 1
+    assert row["skipped"] == 0
+    assert row["issues"] == 1
+    assert row["missing"] == 0
+
+
 def test_state_search_budget_exclusions_are_skipped_not_missing() -> None:
     counts = build_point_counts(
         [

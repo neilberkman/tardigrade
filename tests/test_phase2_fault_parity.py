@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "run_runtime_fault_sweep.py"
@@ -28,6 +30,28 @@ def _load_phase2_fault(namespace: dict) -> None:
     )
     exec(
         compile(ast.Module(body=[function], type_ignores=[]), str(RUNNER), "exec"),
+        namespace,
+        namespace,
+    )
+
+
+def _load_phase2_fault_chain(namespace: dict) -> None:
+    tree = ast.parse(RUNNER.read_text(encoding="utf-8"))
+    names = {
+        "_phase2_chain_snapshot",
+        "_phase2_chain_restore",
+        "_phase2_chain_cross_check",
+        "_phase2_chain_skip_result",
+        "_phase2_chain_evaluated_result",
+        "run_phase2_fault_chain",
+    }
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    exec(
+        compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER), "exec"),
         namespace,
         namespace,
     )
@@ -58,6 +82,21 @@ def _load_state_search_preflight(namespace: dict) -> None:
     ]
     exec(
         compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER), "exec"),
+        namespace,
+        namespace,
+    )
+
+
+def _load_state_search_live_cross_check(namespace: dict) -> None:
+    tree = ast.parse(RUNNER.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_state_search_live_cross_check"
+    )
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), str(RUNNER), "exec"),
         namespace,
         namespace,
     )
@@ -146,6 +185,10 @@ class _Phase2Runtime:
         self.followup_calls: list[dict] = []
         self.hook_calls: list[int] = []
         self.current_cut = 0
+        self.last_injected = True
+        self.missed_chain_cut: int | None = None
+        self.miss_pair_second = False
+        self.miss_reason = "hard_fault"
         self.flash_choices: dict[int, str] = {}
         self.ns = {
             "_time": time,
@@ -163,7 +206,7 @@ class _Phase2Runtime:
             "disarm_fault": lambda: None,
             "disarm_write_fault": lambda: None,
             "disarm_erase_fault": lambda: None,
-            "was_fault_injected": lambda: True,
+            "was_fault_injected": lambda: self.last_injected,
             "get_total_writes": lambda: self.nvm.TotalWordWrites,
             "get_total_erases": lambda: self.nvm.TotalPageErases,
             "get_last_write_address": lambda: 0x10000000 + self.current_cut * 8,
@@ -185,7 +228,7 @@ class _Phase2Runtime:
             "evaluate_boot_outcome": self._evaluate_boot_outcome,
             "merge_stop_status_signals": self._merge_stop_status_signals,
             "collect_semantic_state": self._collect_semantic_state,
-            "classify_fault_result": lambda *_args, **_kwargs: "success",
+            "classify_fault_result": self._classify_fault_result,
             "postmortem_dump_no_boot": False,
             "resume_trace_no_boot": False,
             "build_postmortem_partition_dump": lambda **_kwargs: {},
@@ -197,6 +240,7 @@ class _Phase2Runtime:
             "_snapshot_mram_fault_uncorrectable_addresses": self._fault_addresses,
             "_snapshot_mram_uncorrectable_addresses": self._addresses,
             "_restore_mram_uncorrectable_offsets": self._restore_offsets,
+            "_clear_mram_uncorrectable_words": self.nvm.marks.clear,
             "_clear_mram_uncorrectable_read_log": self.nvm.reads.clear,
             "_attach_uncorrectable_read_signals": self._attach_uncorrectable,
             "mram_torn_word": "half",
@@ -204,8 +248,11 @@ class _Phase2Runtime:
             "mram_torn_word_seed": 0,
             "_select_point_mram_torn_word": self._select_mode,
             "_select_point_torn_word": self._select_flash_mode,
+            "_erase_fault_capability_error": lambda require_trace=True: None,
+            "to_py_bytes": bytes,
         }
         _load_phase2_fault(self.ns)
+        _load_phase2_fault_chain(self.ns)
 
     def _restore_phase1(self) -> None:
         self.nvm.marks.clear()
@@ -225,7 +272,20 @@ class _Phase2Runtime:
 
     def _run_until_done(self, _cpu, *, label: str, **_kwargs) -> dict:
         self.marks_seen_by_boot[label] = set(self.nvm.marks)
+        if label.startswith("pchain_cut_"):
+            ordinal = int(label.split("_")[2])
+            if ordinal == self.missed_chain_cut:
+                self.last_injected = False
+                return {"reason": self.miss_reason, "emulated_s": 0.02}
+            self.last_injected = True
+            self.nvm.TotalWordWrites = 1
+            self.nvm.marks.clear()
+            self._apply_cut(self.current_cut * 8)
+            return {"reason": "fault_fired", "emulated_s": 0.01}
+        if label.startswith("pchain_final_"):
+            return {"reason": "vtor_captured", "emulated_s": 0.03}
         if "_p1_" in label:
+            self.last_injected = True
             self.nvm.TotalWordWrites = 1
             self._apply_cut(8)
             return {"reason": "fault_fired", "emulated_s": 0.01}
@@ -238,6 +298,10 @@ class _Phase2Runtime:
                 )
             self.nvm.marks.discard(8)
             self.nvm.TotalWordWrites = 1
+            if self.miss_pair_second:
+                self.last_injected = False
+                return {"reason": self.miss_reason, "emulated_s": 0.02}
+            self.last_injected = True
             self._apply_cut(16)
             return {"reason": "fault_fired", "emulated_s": 0.02}
         return {"reason": "vtor_captured", "emulated_s": 0.03}
@@ -247,8 +311,21 @@ class _Phase2Runtime:
             self.nvm.marks.add(offset)
         self.nvm.fault_marks = set(self.nvm.marks)
 
-    def _evaluate_boot_outcome(self, *_args, **_kwargs):
+    def _evaluate_boot_outcome(self, *_args, **kwargs):
+        reason = (kwargs.get("p2_status") or {}).get("reason")
+        if reason == "hard_fault":
+            return "hard_fault", None, {"expectations_met": False}
+        if reason == "no_boot":
+            return "no_boot", None, {"expectations_met": False}
         return "success", "exec", {"expectations_met": True}
+
+    @staticmethod
+    def _classify_fault_result(outcome, _slot, _signals, **_kwargs):
+        return (
+            "unrecoverable"
+            if outcome in {"hard_fault", "no_boot"}
+            else "recoverable"
+        )
 
     @staticmethod
     def _merge_stop_status_signals(signals: dict, prefix: str, status: dict) -> None:
@@ -332,8 +409,24 @@ class _Phase2Runtime:
         p2: int = 1,
         p1_type: str = "w",
         p2_type: str = "w",
+        cross_check_expected=None,
     ) -> dict:
-        return self.ns["run_phase2_fault"](p1, p2, p1_type, p2_type)
+        return self.ns["run_phase2_fault"](
+            p1,
+            p2,
+            p1_type,
+            p2_type,
+            cross_check_expected=cross_check_expected,
+        )
+
+    def run_chain(
+        self,
+        cuts: list[tuple[int, str]],
+        cross_check_expected=None,
+    ) -> dict:
+        return self.ns["run_phase2_fault_chain"](
+            cuts, cross_check_expected=cross_check_expected
+        )
 
 
 def test_execute_phase2_fault_uses_controller_storage_for_all_segments() -> None:
@@ -348,6 +441,295 @@ def test_execute_phase2_fault_uses_controller_storage_for_all_segments() -> None
     assert result["phase2_fault"]["p1_injected"] is True
     assert result["phase2_fault"]["p2_injected"] is True
     assert result["boot_outcome"] == "success"
+
+
+def test_execute_phase2_fault_chain_sequences_every_cut_before_final_boot() -> None:
+    runtime = _Phase2Runtime()
+    runtime.ns["mram_torn_word_choices"] = [
+        (3, "uncorrectable"),
+        (9, "erased"),
+        (4, "uncorrectable"),
+    ]
+
+    result = runtime.run_chain([(3, "w"), (9, "w"), (4, "w")])
+
+    assert runtime.modes_at_cut == ["uncorrectable", "erased", "uncorrectable"]
+    assert runtime.marks_seen_by_boot["pchain_cut_2_9_w"] == {8}
+    assert runtime.marks_seen_by_boot["pchain_cut_3_4_w"] == set()
+    assert runtime.marks_seen_by_boot["pchain_final_3"] == {24}
+    assert [cut["fault_at"] for cut in result["phase2_fault_chain"]["cuts"]] == [
+        3,
+        9,
+        4,
+    ]
+    assert [
+        cut.get("mram_torn_word")
+        for cut in result["phase2_fault_chain"]["cuts"]
+    ] == ["uncorrectable", "erased", "uncorrectable"]
+    assert result["phase2_fault_chain"]["cut_count"] == 3
+    assert result["fault_type"] == "pc"
+    assert result["fault_injected"] is True
+
+
+def test_chain_second_cut_hard_fault_matches_uninjected_pair_boot() -> None:
+    pair_runtime = _Phase2Runtime()
+    pair_runtime.miss_pair_second = True
+    pair = pair_runtime.run(0, 99)
+
+    chain_runtime = _Phase2Runtime()
+    chain_runtime.missed_chain_cut = 2
+    chain = chain_runtime.run_chain([(0, "w"), (99, "w"), (1, "w")])
+
+    assert (chain["boot_outcome"], chain["fault_class"]) == (
+        pair["boot_outcome"],
+        pair["fault_class"],
+    ) == ("hard_fault", "unrecoverable")
+    metadata = chain["phase2_fault_chain"]
+    assert metadata["cut_count"] == 1
+    assert metadata["requested_cut_count"] == 3
+    assert metadata["first_unreached_cut"] == 2
+    assert [cut["fault_at"] for cut in metadata["cuts"]] == [0]
+    assert metadata["first_unreached_cut_record"]["fault_at"] == 99
+    assert metadata["first_unreached_cut_record"]["unreached_reason"] == (
+        "no_write_at_index"
+    )
+    assert chain["fault_injected"] is True
+    assert "skip_reason" not in chain
+
+
+def test_chain_third_cut_miss_matches_two_cut_pair_final_boot() -> None:
+    pair_runtime = _Phase2Runtime(boot_cycles=2)
+    pair = pair_runtime.run(0, 1)
+
+    chain_runtime = _Phase2Runtime(boot_cycles=2)
+    chain_runtime.missed_chain_cut = 3
+    chain_runtime.miss_reason = "vtor_captured"
+    chain = chain_runtime.run_chain([(0, "w"), (1, "w"), (99, "w")])
+
+    assert (chain["boot_outcome"], chain["fault_class"]) == (
+        pair["boot_outcome"],
+        pair["fault_class"],
+    ) == ("success", "recoverable")
+    metadata = chain["phase2_fault_chain"]
+    assert metadata["first_unreached_cut"] == 3
+    assert [cut["fault_at"] for cut in metadata["cuts"]] == [0, 1]
+    assert [record["cycle"] for record in chain["boot_cycles"]] == [0, 1]
+    assert len(chain_runtime.followup_calls) == 1
+
+
+def test_chain_missed_first_cut_remains_a_skip() -> None:
+    runtime = _Phase2Runtime()
+    runtime.missed_chain_cut = 1
+
+    result = runtime.run_chain([(99, "w"), (1, "w"), (2, "w")])
+
+    assert result["boot_outcome"] == "skipped"
+    assert result["fault_class"] == "skipped"
+    assert result["fault_injected"] is False
+    assert result["skip_reason"] == "phase2_chain_cut1_no_write_at_index"
+
+
+def test_chain_missed_third_cut_keeps_postmortem_and_resume_trace() -> None:
+    runtime = _Phase2Runtime()
+    runtime.missed_chain_cut = 3
+    runtime.miss_reason = "no_boot"
+    runtime.ns["postmortem_dump_no_boot"] = True
+    runtime.ns["resume_trace_no_boot"] = True
+
+    result = runtime.run_chain([(0, "w"), (1, "w"), (99, "w")])
+
+    assert result["boot_outcome"] == "no_boot"
+    assert result["postmortem_partition_dump"] == {}
+    assert result["resume_trace"] == {}
+
+
+def test_chain_cross_check_reports_missed_computed_cut_as_infrastructure() -> None:
+    runtime = _Phase2Runtime()
+    runtime.missed_chain_cut = 3
+    expected = SimpleNamespace(identity_hex=lambda: "computed-state")
+
+    result = runtime.run_chain(
+        [(0, "w"), (1, "w"), (99, "w")],
+        cross_check_expected=expected,
+    )
+
+    status = result["phase2_fault_chain"]["cross_check_persistent_state"]
+    assert result["boot_outcome"] == "hard_fault"
+    assert result["infrastructure_error"] is True
+    assert result["error_kind"] == "recovery_state_cross_check_cut_not_reached"
+    assert status["matched"] is False
+    assert status["first_unreached_cut"] == 3
+    assert status["live_boot_outcome"] == "hard_fault"
+    assert "cut 3" in status["error"]
+
+
+def test_pair_cross_check_reports_missed_computed_cut_as_infrastructure() -> None:
+    runtime = _Phase2Runtime()
+    runtime.miss_pair_second = True
+    expected = SimpleNamespace(identity_hex=lambda: "computed-state")
+
+    result = runtime.run(0, 99, cross_check_expected=expected)
+
+    status = result["phase2_fault"]["cross_check_persistent_state"]
+    assert result["boot_outcome"] == "hard_fault"
+    assert result["infrastructure_error"] is True
+    assert result["error_kind"] == "recovery_state_cross_check_cut_not_reached"
+    assert status["matched"] is False
+    assert status["first_unreached_cut"] == 2
+    assert status["live_boot_outcome"] == "hard_fault"
+    assert "cut 2" in status["error"]
+
+
+def test_state_search_live_cross_check_routes_deeper_chains_to_chain_injector() -> None:
+    calls = []
+    expected_state = object()
+
+    def run_chain(cuts, cross_check_expected=None):
+        calls.append((cuts, cross_check_expected))
+        return {
+            "phase2_fault_chain": {
+                "cross_check_persistent_state": {"matched": True}
+            }
+        }
+
+    namespace = {
+        "run_phase2_fault": lambda *_args, **_kwargs: None,
+        "run_phase2_fault_chain": run_chain,
+        "log": lambda _message: None,
+    }
+    _load_state_search_live_cross_check(namespace)
+    chain = [
+        {"operation_index": 3, "operation": "write"},
+        {"operation_index": 7, "operation": "erase"},
+        {"operation_index": 2, "operation": "write"},
+    ]
+
+    status = namespace["_state_search_live_cross_check"](
+        expected_state, chain, 3, None
+    )
+
+    assert calls == [([(3, "w"), (7, "e"), (2, "w")], expected_state)]
+    assert status == {"matched": True}
+
+
+def test_state_search_live_cross_check_names_a_computed_cut_not_reached_live() -> None:
+    def run_chain(_cuts, cross_check_expected=None):
+        assert cross_check_expected is expected_state
+        return {
+            "phase2_fault_chain": {
+                "cross_check_persistent_state": {
+                    "matched": False,
+                    "infrastructure_error": True,
+                    "error": (
+                        "recovery state cross-check infrastructure error at cut 3"
+                    ),
+                    "first_unreached_cut": 3,
+                    "live_boot_outcome": "hard_fault",
+                }
+            }
+        }
+
+    expected_state = object()
+    namespace = {
+        "run_phase2_fault": lambda *_args, **_kwargs: None,
+        "run_phase2_fault_chain": run_chain,
+        "log": lambda _message: None,
+    }
+    _load_state_search_live_cross_check(namespace)
+
+    with pytest.raises(RuntimeError, match="infrastructure error at cut 3"):
+        namespace["_state_search_live_cross_check"](
+            expected_state,
+            [
+                {"operation_index": 0, "operation": "write"},
+                {"operation_index": 1, "operation": "write"},
+                {"operation_index": 99, "operation": "write"},
+            ],
+            3,
+            None,
+        )
+
+
+def test_state_search_live_pair_check_names_a_computed_cut_not_reached() -> None:
+    def run_pair(*_args, **kwargs):
+        assert kwargs["cross_check_expected"] is expected_state
+        return {
+            "phase2_fault": {
+                "cross_check_persistent_state": {
+                    "matched": False,
+                    "infrastructure_error": True,
+                    "error": (
+                        "recovery state cross-check infrastructure error at cut 2"
+                    ),
+                    "first_unreached_cut": 2,
+                    "live_boot_outcome": "hard_fault",
+                }
+            }
+        }
+
+    expected_state = object()
+    namespace = {
+        "run_phase2_fault": run_pair,
+        "run_phase2_fault_chain": lambda *_args, **_kwargs: None,
+        "log": lambda _message: None,
+    }
+    _load_state_search_live_cross_check(namespace)
+
+    with pytest.raises(RuntimeError, match="infrastructure error at cut 2"):
+        namespace["_state_search_live_cross_check"](
+            expected_state,
+            [
+                {"operation_index": 0, "operation": "write"},
+                {"operation_index": 99, "operation": "write"},
+            ],
+            2,
+            None,
+        )
+
+
+def test_phase2_fault_chain_carries_separate_otp_state_between_segments() -> None:
+    runtime = _Phase2Runtime()
+
+    class FakeOtp:
+        def __init__(self) -> None:
+            self.value = bytearray(b"\x00")
+            self.restored = []
+
+        def TestSnapshot(self):
+            return bytes(self.value)
+
+        def TestRestore(self, value) -> None:
+            self.value[:] = bytes(value)
+            self.restored.append(bytes(value))
+
+    otp = FakeOtp()
+    runtime.ns["backend"]["otp"] = otp
+    original_run = runtime._run_until_done
+
+    def run_and_update_otp(cpu, *, label, **kwargs):
+        status = original_run(cpu, label=label, **kwargs)
+        if label.startswith("pchain_cut_"):
+            otp.value[0] += 1
+        return status
+
+    runtime.ns["run_until_done"] = run_and_update_otp
+
+    runtime.run_chain([(0, "w"), (1, "w"), (2, "w")])
+
+    assert otp.restored == [b"\x01", b"\x02", b"\x03"]
+
+
+def test_phase2_fault_chain_refuses_an_unsupported_erase_segment() -> None:
+    runtime = _Phase2Runtime()
+    runtime.ns["_erase_fault_capability_error"] = (
+        lambda require_trace=True: "backend lacks interrupted-erase members"
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="phase2 chain erase cut is unsupported: backend lacks",
+    ):
+        runtime.run_chain([(0, "w"), (1, "e"), (2, "w")])
 
 
 def test_state_search_accepts_complete_controller_backed_nvm() -> None:

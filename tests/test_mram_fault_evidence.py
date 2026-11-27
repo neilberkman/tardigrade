@@ -1133,7 +1133,7 @@ def test_attach_uncorrectable_read_signals_call_sites_match_signature() -> None:
         and isinstance(node.func, ast.Name)
         and node.func.id == "_attach_uncorrectable_read_signals"
     ]
-    assert len(attach_calls) == 6
+    assert len(attach_calls) == 8
     for call in attach_calls:
         kw_names = [kw.arg for kw in call.keywords if kw.arg is not None]
         assert set(kw_names) <= allowed_kwargs

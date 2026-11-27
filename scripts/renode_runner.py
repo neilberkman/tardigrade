@@ -530,6 +530,31 @@ def _fault_type_semantically_matches(
             and str(metadata.get("p2_fault_type")) == expected_parts[4]
         )
 
+    if len(expected_parts) >= 7 and expected_parts[0] == "pc":
+        metadata = result.get("phase2_fault_chain")
+        expected_cuts = [
+            (_wire_int(expected_parts[index]), expected_parts[index + 1])
+            for index in range(1, len(expected_parts), 2)
+        ]
+        observed_cuts = (
+            metadata.get("requested_cuts") or metadata.get("cuts")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if not isinstance(observed_cuts, list) or len(observed_cuts) != len(expected_cuts):
+            return False
+        return bool(
+            observed == "pc"
+            and all(cut_at is not None for cut_at, _cut_type in expected_cuts)
+            and all(
+                _wire_int(observed_cut.get("fault_at")) == cut_at
+                and str(observed_cut.get("fault_type")) == cut_type
+                for observed_cut, (cut_at, cut_type) in zip(
+                    observed_cuts, expected_cuts
+                )
+            )
+        )
+
     if len(expected_parts) >= 3 and expected_parts[0] == "mf":
         sequence = result.get("fault_sequence")
         expected_stages = [token.partition("@") for token in expected_parts[1:]]

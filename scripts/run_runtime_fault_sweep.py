@@ -2139,6 +2139,7 @@ _FAULT_CODE_TO_NAME = {
     'cc': 'confirm_cycle',
     'm': 'metadata_fault',
     'p2': 'phase2_fault',
+    'pc': 'phase2_fault',
     'op': 'otp_partial_program',
     'os': 'otp_stuck_bit',
     'od': 'otp_read_disturb',
@@ -14599,6 +14600,562 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
 # Phase 2: recovery boot with fault injection armed at p2_fault_at
 # Phase 3: boot from double-faulted state, validate recovery
 # ---------------------------------------------------------------------------
+def _phase2_chain_snapshot():
+    """Capture persistent state after one explicit chain cut."""
+    b = backend
+    if b['kind'] in ('mram', 'otp'):
+        size = int(b['data'].Size)
+        flash = b['data'].ReadBytes(0, size)
+    else:
+        flash = b['data'].FaultFlashSnapshot
+        if flash is None:
+            flash_ref = (
+                b['data'].Nvm
+                if b['kind'] == 'slow'
+                else b['data'].Flash
+            )
+            size = int(
+                getattr(
+                    flash_ref,
+                    'Size',
+                    getattr(b['data'], 'FlashSize', 0),
+                )
+            )
+            if size <= 0:
+                raise RuntimeError(
+                    'phase2 fault chain cannot determine backend snapshot size'
+                )
+            flash = flash_ref.ReadBytes(0, size)
+    snapshot = {
+        'flash': flash,
+        'uncorrectable_offsets': _snapshot_mram_fault_uncorrectable_offsets(),
+        'uncorrectable_addresses': _snapshot_mram_fault_uncorrectable_addresses(),
+        'persistent_values': {},
+    }
+    otp = b.get('otp')
+    if otp is not None:
+        if not hasattr(otp, 'TestSnapshot') or not hasattr(otp, 'TestRestore'):
+            raise RuntimeError(
+                'phase2 fault chain cannot preserve the separate OTP peripheral'
+            )
+        snapshot['persistent_values']['otp'] = otp.TestSnapshot()
+    return snapshot
+
+
+def _phase2_chain_restore(snapshot):
+    restore_flash_and_boot(snapshot['flash'])
+    otp = backend.get('otp')
+    if otp is not None and 'otp' in snapshot.get('persistent_values', {}):
+        otp.TestRestore(snapshot['persistent_values']['otp'])
+    _clear_mram_uncorrectable_words()
+    _restore_mram_uncorrectable_offsets(snapshot['uncorrectable_offsets'])
+
+
+def _phase2_chain_cross_check(snapshot, expected):
+    if expected is None:
+        return None
+    observed_values = dict(
+        (name, bytearray(to_py_bytes(value)))
+        for name, value in snapshot.get('persistent_values', {}).items()
+    )
+    mismatch = first_persistent_difference(
+        expected,
+        {'nvm': bytearray(to_py_bytes(snapshot['flash']))},
+        tuple(
+            ('nvm', int(offset))
+            for offset in snapshot['uncorrectable_offsets']
+        ),
+        observed_values,
+    )
+    status = {
+        'matched': mismatch is None,
+        'state_identity': expected.identity_hex(),
+    }
+    if mismatch is not None:
+        status['first_difference'] = mismatch
+        raise RuntimeError(
+            'recovery state cross-check mismatch at {} '
+            '({}; expected={} observed={})'.format(
+                mismatch.get('address', mismatch.get('name', 'unknown state')),
+                mismatch.get('kind', 'unknown difference'),
+                mismatch.get('expected', 'n/a'),
+                mismatch.get('observed', 'n/a'),
+            )
+        )
+    return status
+
+
+def _phase2_chain_skip_result(cuts, records, reason, started, status=None):
+    first_at = int(cuts[0][0])
+    signals = {
+        'trace_replay_mode': 'execute',
+        'cut_ms': [int(record.get('elapsed_ms', 0)) for record in records],
+        'followup_ms': 0,
+    }
+    if status is not None:
+        merge_stop_status_signals(signals, 'cut{}'.format(len(records)), status)
+    infrastructure_error = bool(
+        isinstance(status, dict) and status.get('infrastructure_error')
+    )
+    result = {
+        'fault_at': first_at,
+        'fault_requested': first_at,
+        'fault_type': 'pc',
+        'fault_injected': False,
+        'skip_reason': 'phase2_chain_{}'.format(reason),
+        'fault_address': (
+            records[-1].get('fault_address', fmt_u32(0))
+            if records else fmt_u32(0)
+        ),
+        'boot_outcome': 'infra_error' if infrastructure_error else 'skipped',
+        'boot_slot': None,
+        'fault_class': (
+            'infrastructure_error' if infrastructure_error else 'skipped'
+        ),
+        'actual_writes': int(records[0].get('total_ops', 0)) if records else 0,
+        'signals': signals,
+        'phase2_fault_chain': {
+            'cut_count': len(cuts),
+            'cuts': records,
+            'skip_reason': reason,
+            'elapsed_s': round(_time.time() - started, 1),
+        },
+    }
+    if infrastructure_error:
+        result['infrastructure_error'] = True
+        result['error_kind'] = status.get(
+            'error_kind', 'runfor_infrastructure_error'
+        )
+        result['error'] = status.get('error', 'RunFor infrastructure error')
+        if status.get('error_pc') is not None:
+            result['error_pc'] = status['error_pc']
+        if status.get('error_peripheral') is not None:
+            result['error_peripheral'] = status['error_peripheral']
+    return result
+
+
+def _phase2_chain_evaluated_result(
+        cuts, records, snapshot, started, eff_criteria, cpu_ref, status,
+        boot_ms, first_unreached_record=None, cross_check_status=None):
+    """Evaluate the boot after an injected prefix of an explicit chain."""
+    first_unreached_cut = (
+        int(first_unreached_record['cut'])
+        if first_unreached_record is not None else None
+    )
+    evaluation_fault_injected = first_unreached_cut is None
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value,
+        pc_value,
+        fault_injected=evaluation_fault_injected,
+        effective_criteria=eff_criteria,
+        p2_status=status,
+    )
+    _attach_uncorrectable_read_signals(
+        signals,
+        boot_outcome,
+        p2_status=status,
+        marked_at_fault=snapshot['uncorrectable_addresses'],
+        torn_word_mode=records[-1]['_applied_mram_torn_word'],
+    )
+    signals['cut_ms'] = [record['elapsed_ms'] for record in records]
+    signals['final_boot_ms'] = int(boot_ms)
+    signals['trace_replay_mode'] = 'execute'
+    status_prefix = (
+        'cut{}'.format(first_unreached_cut)
+        if first_unreached_cut is not None else 'final'
+    )
+    merge_stop_status_signals(signals, status_prefix, status)
+
+    infrastructure_error = bool(
+        isinstance(status, dict) and status.get('infrastructure_error')
+    )
+    if infrastructure_error:
+        boot_outcome = 'infra_error'
+        boot_slot = None
+    boot_cycle_records = None
+    multi_boot_analysis = None
+    followup_ms = 0
+    # A missed second cut has the same lifecycle as run_phase2_fault's
+    # uninjected second cut. From the third cut onward, the completed prefix is
+    # itself a complete point and gets that prefix's ordinary follow-up boots.
+    run_followups = (
+        not infrastructure_error
+        and (first_unreached_cut is None or len(records) >= 2)
+    )
+    if run_followups:
+        boot_cycle_records, multi_boot_analysis, followup_ms = (
+            run_followup_boot_cycles(
+                boot_outcome,
+                boot_slot,
+                signals,
+                initial_status=status,
+                fault_injected=True,
+                label='pchain_{}_followup'.format(len(records)),
+                effective_criteria=eff_criteria,
+            )
+        )
+    signals['followup_ms'] = int(followup_ms)
+    set_multiboot_cycles_run(signals, boot_cycle_records)
+    semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'signals': signals,
+        'fault_injected': True,
+        'stage': 'post_boot',
+    })
+    fault_class = classify_fault_result(
+        boot_outcome, boot_slot, signals, effective_criteria=eff_criteria
+    )
+    for record in records:
+        record.pop('_applied_mram_torn_word', None)
+    if first_unreached_record is not None:
+        first_unreached_record.pop('_applied_mram_torn_word', None)
+    if backend['kind'] == 'fast':
+        backend['data'].FaultFlashSnapshot = None
+
+    requested_cuts = [
+        {
+            'cut': index + 1,
+            'fault_at': int(cut_at),
+            'fault_type': cut_type,
+            'operation': 'erase' if cut_type == 'e' else 'write',
+        }
+        for index, (cut_at, cut_type) in enumerate(cuts)
+    ]
+    chain_metadata = {
+        'cut_count': len(records),
+        'requested_cut_count': len(cuts),
+        'cuts': records,
+        'requested_cuts': requested_cuts,
+        'skip_reason': None,
+        'elapsed_s': round(_time.time() - started, 1),
+    }
+    if first_unreached_cut is not None:
+        chain_metadata['first_unreached_cut'] = first_unreached_cut
+        chain_metadata['first_unreached_cut_record'] = first_unreached_record
+
+    result = {
+        'fault_at': cuts[0][0],
+        'fault_requested': cuts[0][0],
+        'fault_type': 'pc',
+        # The returned evidence is for the injected prefix. The separate
+        # first_unreached_cut field records why the requested suffix did not run.
+        'fault_injected': bool(records),
+        'fault_address': records[-1]['fault_address'],
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'fault_class': fault_class,
+        'actual_writes': records[0]['total_ops'],
+        'signals': signals,
+        'phase2_fault_chain': chain_metadata,
+    }
+    if records[0].get('mram_torn_word') is not None:
+        result['mram_torn_word'] = records[0]['mram_torn_word']
+    if records[0].get('torn_word') is not None:
+        result['torn_word'] = records[0]['torn_word']
+    if cross_check_status is not None:
+        chain_metadata['cross_check_persistent_state'] = cross_check_status
+    if infrastructure_error:
+        result['infrastructure_error'] = True
+        result['error_kind'] = status.get(
+            'error_kind', 'runfor_infrastructure_error'
+        )
+        result['error'] = status.get(
+            'error', 'RunFor infrastructure error'
+        )
+        if status.get('error_pc') is not None:
+            result['error_pc'] = status['error_pc']
+        if status.get('error_peripheral') is not None:
+            result['error_peripheral'] = status['error_peripheral']
+    if eff_criteria is not None:
+        result['effective_success_criteria'] = eff_criteria
+    if semantic_state is not None:
+        result['semantic_state'] = semantic_state
+        result['recovery_semantic_state'] = semantic_state
+    result['fault_semantic_state'] = records[-1].get('fault_semantic_state')
+    if boot_cycle_records is not None:
+        result['boot_cycles'] = boot_cycle_records
+        result['multi_boot_analysis'] = multi_boot_analysis
+    if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
+        result['postmortem_partition_dump'] = build_postmortem_partition_dump(
+            snapshot_bytes=to_py_bytes(snapshot['flash']),
+            source='fault_snapshot',
+        )
+    if boot_outcome == 'no_boot' and resume_trace_no_boot and run_followups:
+        result['resume_trace'] = run_resume_trace_from_snapshot(
+            snapshot['flash'], cuts[0][0], 'pc'
+        )
+    log(
+        'pchain injected_cuts={} requested_cuts={} outcome={} class={} '
+        'first_unreached_cut={} elapsed={:.1f}s'.format(
+            len(records),
+            len(cuts),
+            boot_outcome,
+            fault_class,
+            first_unreached_cut,
+            _time.time() - started,
+        )
+    )
+    return result
+
+
+def run_phase2_fault_chain(cuts, cross_check_expected=None):
+    """Run three through eight live write/erase cuts, then the final boot."""
+    cuts = [(int(item[0]), str(item[1])) for item in cuts]
+    if not 3 <= len(cuts) <= 8:
+        raise RuntimeError('phase2 fault chain requires three through eight cuts')
+    for cut_index, (cut_at, cut_type) in enumerate(cuts):
+        if cut_at < 0:
+            raise RuntimeError('phase2 fault chain indices must be non-negative')
+        if cut_type not in ('w', 'e'):
+            raise RuntimeError(
+                'phase2 fault chain supports only power-loss write and erase cuts'
+            )
+        if cut_type == 'e':
+            capability_error = _erase_fault_capability_error(
+                require_trace=(cut_index == 0)
+            )
+            if capability_error is not None:
+                raise RuntimeError(
+                    'phase2 chain erase cut is unsupported: {}'.format(
+                        capability_error
+                    )
+                )
+
+    eff_criteria = get_effective_criteria('p2')
+    started = _time.time()
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    records = []
+    previous_snapshot = None
+    select_flash_torn_word = globals().get('_select_point_torn_word')
+
+    for cut_index, (cut_at, cut_type) in enumerate(cuts):
+        ordinal = cut_index + 1
+        segment_started = _time.time()
+        if cut_index == 0:
+            restore_phase1_baseline()
+            carried_offsets = []
+            carried_addresses = []
+        else:
+            _phase2_chain_restore(previous_snapshot)
+            carried_offsets = list(previous_snapshot['uncorrectable_offsets'])
+            carried_addresses = list(previous_snapshot['uncorrectable_addresses'])
+            previous_record = records[-1]
+            previous_record['fault_semantic_state'] = collect_semantic_state({
+                'cycle': 0,
+                'boot_outcome': 'power_loss_boundary',
+                'boot_slot': None,
+                'fault_injected': True,
+                'stage': 'fault_snapshot',
+                'phase2_cut': cut_index,
+            })
+            if _hash_bypass_active:
+                apply_hash_bypass()
+
+        cpu_ref = monitor.Machine['sysbus.cpu']
+        cpu_ref.IsHalted = False
+        reset_nvmc_for_sweep(enable_tracking_gate=(cut_index == 0))
+        if carried_offsets:
+            _restore_mram_uncorrectable_offsets(carried_offsets)
+        _clear_mram_uncorrectable_read_log()
+
+        drawn_mram = _select_point_mram_torn_word(cut_at)
+        applied_mram = mram_torn_word
+        drawn_flash = (
+            select_flash_torn_word(cut_at)
+            if select_flash_torn_word is not None
+            else None
+        )
+        base_ops = get_total_erases() if cut_type == 'e' else get_total_writes()
+        if cut_type == 'e':
+            arm_erase_fault(base_ops + cut_at + 1)
+            disarm_write_fault()
+        else:
+            arm_at = base_ops + cut_at + 1
+            if cut_index == 0 and arm_at > base_ops + max_writes_cap:
+                arm_at = base_ops + max_writes_cap + 1
+            arm_fault(arm_at, write_fault_mode=0)
+            disarm_erase_fault()
+
+        log(
+            'pchain cut={}/{} at={}/{} step'.format(
+                ordinal, len(cuts), cut_at, cut_type
+            )
+        )
+        status = run_until_done(
+            cpu_ref,
+            label='pchain_cut_{}_{}_{}'.format(ordinal, cut_at, cut_type),
+            stop_on_fault=True,
+            max_iters=(
+                phase1_max_iters(default_s=4.0) if cut_index == 0 else 200
+            ),
+            wall_timeout=(
+                phase1_wall_timeout(default_s=4.0) if cut_index == 0 else 60
+            ),
+            time_slice=(None if cut_index == 0 else phase2_time_slice),
+        )
+        disarm_fault()
+        injected = was_fault_injected()
+        total_ops = get_total_erases() if cut_type == 'e' else get_total_writes()
+        fault_address = get_last_write_address()
+        recovery_signals = {}
+        if cut_index > 0:
+            _attach_uncorrectable_read_signals(
+                recovery_signals,
+                'power_loss_boundary' if injected else 'skipped',
+                p2_status=status,
+                marked_at_fault=carried_addresses,
+                torn_word_mode=records[-1].get(
+                    '_applied_mram_torn_word', applied_mram
+                ),
+            )
+        record = {
+            'cut': ordinal,
+            'fault_at': cut_at,
+            'fault_type': cut_type,
+            'operation': 'erase' if cut_type == 'e' else 'write',
+            'injected': bool(injected),
+            'fault_address': fmt_u32(fault_address),
+            'total_ops': int(total_ops),
+            'max_fault_index': int(total_ops - 1) if total_ops > 0 else -1,
+            'elapsed_ms': int((_time.time() - segment_started) * 1000),
+            'recovery_boot_signals': recovery_signals,
+            '_applied_mram_torn_word': applied_mram,
+        }
+        if drawn_mram is not None:
+            record['mram_torn_word'] = drawn_mram
+        if drawn_flash is not None:
+            record['torn_word'] = drawn_flash
+        if cut_index == 0 and isinstance(status, dict) and status.get(
+                'infrastructure_error'):
+            records.append(record)
+            for item in records:
+                item.pop('_applied_mram_torn_word', None)
+            return _phase2_chain_skip_result(
+                cuts,
+                records,
+                'cut{}_runfor_infrastructure_error'.format(ordinal),
+                started,
+                status=status,
+            )
+        if not injected and cut_index == 0:
+            records.append(record)
+            reason = 'no_erase_at_index' if cut_type == 'e' else 'no_write_at_index'
+            for item in records:
+                item.pop('_applied_mram_torn_word', None)
+            if cross_check_expected is not None:
+                raise RuntimeError(
+                    'recovery state cross-check could not inject cut {} at {} ({})'.format(
+                        ordinal, cut_at, cut_type
+                    )
+                )
+            return _phase2_chain_skip_result(
+                cuts, records, 'cut{}_{}'.format(ordinal, reason), started
+            )
+        if not injected:
+            reason = 'no_erase_at_index' if cut_type == 'e' else 'no_write_at_index'
+            record['unreached_reason'] = reason
+            cross_check_status = None
+            if cross_check_expected is not None:
+                error = (
+                    'recovery state cross-check infrastructure error at cut {}: '
+                    'computed state exists but the live recovery boot did not '
+                    'reach {} index {}'.format(
+                        ordinal,
+                        'erase' if cut_type == 'e' else 'write',
+                        cut_at,
+                    )
+                )
+                cross_check_status = {
+                    'matched': False,
+                    'infrastructure_error': True,
+                    'error_kind': 'recovery_state_cross_check_cut_not_reached',
+                    'error': error,
+                    'state_identity': cross_check_expected.identity_hex(),
+                    'first_unreached_cut': ordinal,
+                }
+            result = _phase2_chain_evaluated_result(
+                cuts,
+                records,
+                previous_snapshot,
+                started,
+                eff_criteria,
+                cpu_ref,
+                status,
+                record['elapsed_ms'],
+                first_unreached_record=record,
+                cross_check_status=cross_check_status,
+            )
+            if cross_check_status is not None:
+                cross_check_status['live_boot_outcome'] = result['boot_outcome']
+                cross_check_status['live_fault_class'] = result['fault_class']
+                cross_check_status['error'] = (
+                    '{}; live boot outcome={} fault class={}'.format(
+                        cross_check_status['error'],
+                        result['boot_outcome'],
+                        result['fault_class'],
+                    )
+                )
+                result['infrastructure_error'] = True
+                result['error_kind'] = cross_check_status['error_kind']
+                result['error'] = cross_check_status['error']
+            return result
+        records.append(record)
+        previous_snapshot = _phase2_chain_snapshot()
+
+    cross_check_status = _phase2_chain_cross_check(
+        previous_snapshot, cross_check_expected
+    )
+
+    final_started = _time.time()
+    _phase2_chain_restore(previous_snapshot)
+    records[-1]['fault_semantic_state'] = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': 'power_loss_boundary',
+        'boot_slot': None,
+        'fault_injected': True,
+        'stage': 'fault_snapshot',
+        'phase2_cut': len(cuts),
+    })
+    if _hash_bypass_active:
+        apply_hash_bypass()
+    reset_nvmc_for_recovery()
+    if previous_snapshot['uncorrectable_offsets']:
+        _restore_mram_uncorrectable_offsets(
+            previous_snapshot['uncorrectable_offsets']
+        )
+    _clear_mram_uncorrectable_read_log()
+    arm_vtor_watchpoint()
+    try:
+        final_status = run_until_done(
+            cpu_ref,
+            label='pchain_final_{}'.format(len(cuts)),
+            expect_writes=False,
+            zero_writes_is_brick=False,
+            wall_timeout=phase2_wall_timeout_s,
+            stop_on_fault=False,
+            time_slice=phase2_time_slice,
+        )
+    finally:
+        disarm_vtor_watchpoint()
+    final_ms = int((_time.time() - final_started) * 1000)
+
+    return _phase2_chain_evaluated_result(
+        cuts,
+        records,
+        previous_snapshot,
+        started,
+        eff_criteria,
+        cpu_ref,
+        final_status,
+        final_ms,
+        cross_check_status=cross_check_status,
+    )
+
+
 def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type='w',
                      cross_check_expected=None):
     if p1_fault_type in ('e', 'a'):
@@ -15016,11 +15573,21 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         phase3_ms = int((_time.time() - phase3_t0) * 1000)
     else:
         if cross_check_expected is not None:
-            raise RuntimeError(
-                'recovery state cross-check could not inject the second cut at {} ({})'.format(
-                    p2_fault_at, p2_fault_type
+            error = (
+                'recovery state cross-check infrastructure error at cut 2: '
+                'computed state exists but the live recovery boot did not '
+                'reach {} index {}'.format(
+                    'erase' if is_p2_erase else 'write', p2_fault_at
                 )
             )
+            cross_check_persistent_state = {
+                'matched': False,
+                'infrastructure_error': True,
+                'error_kind': 'recovery_state_cross_check_cut_not_reached',
+                'error': error,
+                'state_identity': cross_check_expected.identity_hex(),
+                'first_unreached_cut': 2,
+            }
         if is_p2_erase:
             phase2_skip_reason = 'no_erase_at_index'
         else:
@@ -15157,6 +15724,19 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         result['phase2_fault']['p2_torn_word'] = p2_flash_torn_word
     if cross_check_persistent_state is not None:
         result['phase2_fault']['cross_check_persistent_state'] = cross_check_persistent_state
+        if cross_check_persistent_state.get('infrastructure_error'):
+            cross_check_persistent_state['live_boot_outcome'] = boot_outcome
+            cross_check_persistent_state['live_fault_class'] = fault_class
+            cross_check_persistent_state['error'] = (
+                '{}; live boot outcome={} fault class={}'.format(
+                    cross_check_persistent_state['error'],
+                    boot_outcome,
+                    fault_class,
+                )
+            )
+            result['infrastructure_error'] = True
+            result['error_kind'] = cross_check_persistent_state['error_kind']
+            result['error'] = cross_check_persistent_state['error']
     if eff_criteria is not None:
         result['effective_success_criteria'] = eff_criteria
     if phase2_skip_reason is not None:
@@ -17311,6 +17891,50 @@ def _state_search_boot_state(state, chain, generation):
     return result, recovery_operations
 
 
+def _state_search_live_cross_check(state, chain, generation, operation):
+    if int(generation) < 2 or len(chain) < 2:
+        return False
+    live_cuts = [
+        (
+            int(cut['operation_index']),
+            'e' if cut.get('operation') == 'erase' else 'w',
+        )
+        for cut in chain
+    ]
+    if len(live_cuts) == 2:
+        live_result = run_phase2_fault(
+            live_cuts[0][0],
+            live_cuts[1][0],
+            live_cuts[0][1],
+            live_cuts[1][1],
+            cross_check_expected=state,
+        )
+        status = live_result.get('phase2_fault', {}).get(
+            'cross_check_persistent_state'
+        )
+    else:
+        live_result = run_phase2_fault_chain(
+            live_cuts, cross_check_expected=state
+        )
+        status = live_result.get('phase2_fault_chain', {}).get(
+            'cross_check_persistent_state'
+        )
+    if isinstance(status, dict) and status.get('infrastructure_error'):
+        raise RuntimeError(status.get(
+            'error',
+            'recovery state cross-check infrastructure error',
+        ))
+    if not isinstance(status, dict) or status.get('matched') is not True:
+        raise RuntimeError('recovery state cross-check returned no positive proof')
+    log(
+        'recovery state cross-check: cuts={} generation={} matched'.format(
+            len(live_cuts),
+            generation,
+        )
+    )
+    return status
+
+
 def run_recovery_state_search():
     _state_search_preflight()
     calibration_operations, total_writes, total_erases = (
@@ -17346,32 +17970,6 @@ def run_recovery_state_search():
             active_seed,
         )
 
-    def cross_check(state, chain, generation, operation):
-        if int(generation) != 2 or len(chain) != 2:
-            return False
-        p2_fault_type = 'e' if operation.get('kind') == 'erase' else 'w'
-        p1_fault_type = 'e' if chain[0].get('operation') == 'erase' else 'w'
-        live_result = run_phase2_fault(
-            int(chain[0]['operation_index']),
-            int(chain[1]['operation_index']),
-            p1_fault_type,
-            p2_fault_type,
-            cross_check_expected=state,
-        )
-        status = live_result.get('phase2_fault', {}).get(
-            'cross_check_persistent_state'
-        )
-        if not isinstance(status, dict) or status.get('matched') is not True:
-            raise RuntimeError('recovery state cross-check returned no positive proof')
-        log(
-            'recovery state cross-check: p1={} p2={}/{} matched'.format(
-                chain[0]['operation_index'],
-                chain[1]['operation_index'],
-                p2_fault_type,
-            )
-        )
-        return status
-
     explorer = RecoveryStateExplorer(
         initial_state,
         calibration_operations,
@@ -17398,7 +17996,7 @@ def run_recovery_state_search():
         page_size=page_size,
         program_unit=int(getattr(backend.get('data'), 'ProgramUnitSize', 4) or 4),
         cross_check_every=int(phase2_state_search.get('cross_check_every', 100)),
-        cross_check=cross_check,
+        cross_check=_state_search_live_cross_check,
     )
     results, summary = explorer.run()
     summary['first_cut_programs_out_of_range'] = int(excluded.get('write', 0))
@@ -17423,7 +18021,8 @@ def run_recovery_state_search():
 # ---------------------------------------------------------------------------
 # Fault type dispatch: maps fault type codes to runner functions.
 #
-# Prefix-based codes (e.g. 'm:w', 'h:3:b', 'p2:100:5:w:e') encode
+# Prefix-based codes (e.g. 'm:w', 'h:3:b', 'p2:100:5:w:e',
+# 'pc:100:w:5:e:2:w') encode
 # parameters after the prefix.  Simple codes ('w', 'e', 'b', etc.)
 # route to run_execute_fault.  The default path uses the run_fn selected
 # at sweep start (trace replay or execute).
@@ -17490,6 +18089,16 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
         if evaluation_mode == 'state' and backend.get('kind') == 'slow':
             return run_phase2_state_fault(p1_at, p2_at, p1_type, p2_type)
         return run_phase2_fault(p1_at, p2_at, p1_type, p2_type)
+
+    if ft.startswith('pc:'):
+        parts = ft.split(':')[1:]
+        if len(parts) < 6 or len(parts) % 2:
+            raise RuntimeError('invalid phase2 fault chain wire encoding')
+        cuts = [
+            (int(parts[index]), parts[index + 1])
+            for index in range(0, len(parts), 2)
+        ]
+        return run_phase2_fault_chain(cuts)
 
     if ft.startswith('mf:'):
         mf_points, mf_codes = decode_multi_fault_stages_local(ft)

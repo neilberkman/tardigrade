@@ -316,12 +316,18 @@ def attach_search_metadata(result, chain, state, generation, reused=False):
     return target
 
 
-def add_equivalent_chain(result, chain):
+def add_equivalent_chain(result, chain, cross_check=None):
     metadata = result.setdefault("recovery_state_search", {})
     equivalent = metadata.setdefault("equivalent_chains", [])
     formatted = format_chain(chain)
-    if formatted not in equivalent:
-        equivalent.append(formatted)
+    for existing in equivalent:
+        if existing.get("cuts") == formatted.get("cuts"):
+            if cross_check is not None:
+                existing["cross_check"] = copy.deepcopy(cross_check)
+            return
+    if cross_check is not None:
+        formatted["cross_check"] = copy.deepcopy(cross_check)
+    equivalent.append(formatted)
 
 
 class RecoveryStateExplorer(object):
@@ -379,6 +385,7 @@ class RecoveryStateExplorer(object):
         self.budget = SearchBudget(max_new_states, max_wall_time_s, clock)
         self._seen = {}
         self._cross_checks = {}
+        self._deeper_cross_check_candidates = 0
         self.results = []
         self.summary = {
             "first_cuts_selected": len(self.first_cuts),
@@ -473,14 +480,21 @@ class RecoveryStateExplorer(object):
         self._seen[identity] = entry
         return None
 
-    def _maybe_cross_check(self, state, chain, generation, operation):
+    def _maybe_cross_check(
+        self, state, chain, generation, operation, selection_ordinal=None
+    ):
+        selected = (
+            int(selection_ordinal)
+            if selection_ordinal is not None
+            else self.summary["states_booted"] + 1
+        )
         if (
             generation < 2
             or self.cross_check is None
             or self.cross_check_every <= 0
-            or (self.summary["states_booted"] + 1) % self.cross_check_every != 0
+            or selected % self.cross_check_every != 0
         ):
-            return
+            return None
         self.summary["cross_checks_run"] += 1
         try:
             outcome = self.cross_check(state, chain, generation, operation)
@@ -493,8 +507,16 @@ class RecoveryStateExplorer(object):
         if outcome is not False:
             self._cross_checks[state.identity()] = outcome
         self.summary["cross_checks_passed"] += 1
+        return outcome
 
-    def _boot(self, state, chain, generation, operation=None):
+    def _boot(
+        self,
+        state,
+        chain,
+        generation,
+        operation=None,
+        cross_check_ordinal=None,
+    ):
         if self.budget.wall_expired():
             self.summary["states_excluded_by_wall_time"] += 1
             self.summary["stopped_reason"] = "max_wall_time_s"
@@ -504,7 +526,13 @@ class RecoveryStateExplorer(object):
             if self.summary["stopped_reason"] is None:
                 self.summary["stopped_reason"] = "max_new_states"
             return None
-        self._maybe_cross_check(state, chain, generation, operation)
+        self._maybe_cross_check(
+            state,
+            chain,
+            generation,
+            operation,
+            selection_ordinal=cross_check_ordinal,
+        )
         self.budget.record_boot()
         result, operations = self.boot_state(state, chain, generation)
         attach_search_metadata(result, chain, state, generation)
@@ -585,10 +613,31 @@ class RecoveryStateExplorer(object):
                 self.summary["recovery_operations_considered"] += 1
                 self.summary["states_computed"] += 1
                 next_chain = chain + (format_cut(operation, self.flash_base),)
-                if self._remember_or_reuse(candidate, next_chain) is not None:
+                cross_check_ordinal = None
+                if generation + 1 > 2:
+                    self._deeper_cross_check_candidates += 1
+                    cross_check_ordinal = self._deeper_cross_check_candidates
+                prior = self._remember_or_reuse(candidate, next_chain)
+                if prior is not None:
+                    if cross_check_ordinal is not None:
+                        cross_check = self._maybe_cross_check(
+                            candidate,
+                            next_chain,
+                            generation + 1,
+                            operation,
+                            selection_ordinal=cross_check_ordinal,
+                        )
+                        if cross_check is not None and prior.get("result") is not None:
+                            add_equivalent_chain(
+                                prior["result"], next_chain, cross_check=cross_check
+                            )
                     continue
                 entry = self._boot(
-                    candidate, next_chain, generation + 1, operation=operation
+                    candidate,
+                    next_chain,
+                    generation + 1,
+                    operation=operation,
+                    cross_check_ordinal=cross_check_ordinal,
                 )
                 if entry is not None:
                     queue.append(

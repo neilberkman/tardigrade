@@ -485,7 +485,7 @@ def test_explorer_cross_checks_only_unique_states_that_will_be_booted():
     assert summary["cross_checks_run"] == summary["cross_checks_passed"] == 1
 
 
-def test_explorer_cross_checks_third_cut_states_at_the_configured_rate():
+def test_explorer_cross_checks_third_cut_chains_including_reused_state():
     baseline = PersistentState.from_bytes(b"\xff\xff\xff")
     calibration = merge_operation_traces([_write(1, 0, 1)], [])
     checked = []
@@ -516,13 +516,17 @@ def test_explorer_cross_checks_third_cut_states_at_the_configured_rate():
         cross_check_every=1,
         cross_check=lambda _state, chain, generation, _operation: checked.append(
             (len(chain), generation)
-        ),
+        )
+        or {"matched": True},
     )
 
-    _results, summary = explorer.run()
+    results, summary = explorer.run()
 
-    assert checked == [(2, 2), (3, 3)]
-    assert summary["cross_checks_run"] == summary["cross_checks_passed"] == 2
+    assert checked == [(2, 2), (3, 3), (3, 3)]
+    assert summary["cross_checks_run"] == summary["cross_checks_passed"] == 3
+    reused_third_cut = results[1]["recovery_state_search"]["equivalent_chains"]
+    assert reused_third_cut[0]["cut_count"] == 3
+    assert reused_third_cut[0]["cross_check"] == {"matched": True}
 
 
 def test_explorer_cross_checks_erase_first_two_cut_state_with_typed_chain():

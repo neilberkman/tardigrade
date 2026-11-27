@@ -212,6 +212,7 @@ def test_writeback_prefixed_fault_codes_remain_fail_closed() -> None:
         "cc:2:w",
         "p2:4:5:w:e",
         "p2:4:5:b:b",
+        "pc:4:w:5:e:2:w",
         "mf:1:2",
         "c:4:7",
     ):
@@ -1059,6 +1060,44 @@ def test_compound_fault_results_validate_semantically_and_restore_wire_type() ->
                     "p2_fault_at": 4,
                     "p1_fault_type": "w",
                     "p2_fault_type": "b",
+                },
+            },
+        ),
+        (
+            3,
+            "pc:3:w:4:e:2:w",
+            {
+                "fault_at": 3,
+                "fault_requested": 3,
+                "fault_type": "pc",
+                "phase2_fault_chain": {
+                    "cuts": [
+                        {"fault_at": 3, "fault_type": "w"},
+                        {"fault_at": 4, "fault_type": "e"},
+                        {"fault_at": 2, "fault_type": "w"},
+                    ]
+                },
+            },
+        ),
+        (
+            3,
+            "pc:3:w:99:e:2:w",
+            {
+                "fault_at": 3,
+                "fault_requested": 3,
+                "fault_type": "pc",
+                "phase2_fault_chain": {
+                    "cut_count": 1,
+                    "requested_cut_count": 3,
+                    "first_unreached_cut": 2,
+                    "cuts": [
+                        {"fault_at": 3, "fault_type": "w", "injected": True}
+                    ],
+                    "requested_cuts": [
+                        {"fault_at": 3, "fault_type": "w"},
+                        {"fault_at": 99, "fault_type": "e"},
+                        {"fault_at": 2, "fault_type": "w"},
+                    ],
                 },
             },
         ),

@@ -10,7 +10,9 @@ class AmbiguousWriteEvent(ValueError):
 
 
 SUPPORTED_WRITE_WIDTHS = (1, 2, 4, 8)
-UNSUPPORTED_LIFECYCLE_PREFIXES = ("m:", "h:", "cc:", "p2:", "mf:", "c:")
+UNSUPPORTED_LIFECYCLE_PREFIXES = (
+    "m:", "h:", "cc:", "p2:", "pc:", "mf:", "c:"
+)
 UNSUPPORTED_ERASE_FAULT_CODES = (
     "e",
     "a",
