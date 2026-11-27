@@ -1740,6 +1740,53 @@ Explicit pairs replace the representative grid and are unchanged by
 `--quick`, `max_points`, and the main sweep's range options. The configured
 recovery fault types still apply to every listed pair.
 
+For an exact chain of three through eight cuts, use `chains`. Every cut is an
+`[operation_index, fault_type]` entry, so write and erase indices can be mixed
+without a Cartesian expansion:
+
+```yaml
+fault_sweep:
+  phase2_fault:
+    enabled: true
+    chains:
+      - [[2, power_loss], [6, interrupted_erase], [1, power_loss]]
+```
+
+`chains` accepts `power_loss` and `interrupted_erase`. Each index belongs to
+that cut's boot and operation domain: write indices restart at zero for a
+`power_loss` cut and erase indices restart at zero for an
+`interrupted_erase` cut. A chain is planned exactly once and is unchanged by
+`--quick`, `max_points`, and the main sweep's range options. `chains` requires
+phase-two injection, cannot be combined with `pairs`, and cannot be combined
+with `state_search`. It also requires execute evaluation because each segment
+is a live boot. The profile loader rejects chains shorter than three or longer
+than eight and rejects negative indices or other fault types.
+
+Each cut boot starts from the preceding cut's persistent bytes and MRAM
+uncorrectable-word marks. A configured separate OTP peripheral is snapshotted
+and restored too; a separate OTP peripheral without its snapshot contract is
+refused. An erase first cut requires erase injection and erase tracing, as it
+does for an explicit pair. Later erase cuts require the same injection members
+but do not require a trace because their indices are explicit. After the last
+cut, the ordinary final boot, follow-up cycles, hooks, assertions, and
+invariants run unchanged. If the first cut is not reached, the point remains
+skipped. If a later cut is not reached because that recovery boot finishes or
+fails first, that boot is evaluated as the final boot of the injected prefix.
+A two-or-more-cut prefix also runs its ordinary follow-up cycles, postmortem
+capture, and resume trace.
+
+The result uses `fault_type: pc` while the host restores the full `pc:` wire
+request after validating it. `phase2_fault_chain.cuts` has one ordered record
+per injected cut, including its index, write/erase code, address, operation
+count, independent torn-word draw, boundary semantic state, and recovery-boot
+signals. `cut_count` is the injected count. `requested_cuts` and
+`requested_cut_count` retain the complete pasteable request. On a partial
+chain, `first_unreached_cut` gives the first missed ordinal and
+`first_unreached_cut_record` records its requested index, operation domain,
+observed operation count, stop telemetry, and `unreached_reason`. The
+top-level `mram_torn_word` or `torn_word` remains the first cut's draw for
+compatibility with ordinary point consumers.
+
 #### Recovery-state search
 
 `state_search` is the trace-derived alternative to the representative grid
@@ -1767,7 +1814,7 @@ fault_sweep:
       max_wall_time_s: 900
       address_ranges:      # optional inclusive bus-address ranges
         - {start: 0x00081FE0, end: 0x00081FFF}
-      cross_check_every: 100 # 0 disables the periodic live two-cut check
+      cross_check_every: 100 # 0 disables periodic live chain checks
 ```
 
 The three first-cut modes select the normal first/middle/last quick set, all
@@ -1808,19 +1855,27 @@ practical limit. `max_new_states` bounds unique recovery boots and
 `max_wall_time_s` bounds the batch. The summary reports candidates omitted by
 the boot, time, depth, and address limits.
 
-Every `cross_check_every`th newly booted two-cut state is also reproduced through
-the existing live two-fault injector, including an erase first cut when that is
-the chain's first operation. All persistent bytes and MRAM uncorrectable marks
-must match. The first mismatch aborts as an infrastructure error and names the
-first differing address. Three-cut and deeper states are not live-cross-checked
-because the existing injector accepts two cuts.
+Every `cross_check_every`th newly booted generation-two state is also
+reproduced through the established two-cut live injector. At generation three
+and later, the rate applies to candidate chains, including a chain whose
+computed state was already seen and therefore needs no additional recovery
+boot. Those chains use the explicit chain injector, including erase cuts
+anywhere in the chain. All persistent bytes, MRAM uncorrectable marks, and
+declared persistent values must match. The first mismatch aborts as an
+infrastructure error and names the first differing address or value. If the
+computed state exists but the live chain does not reach one of its cuts, the
+injector first evaluates that live recovery boot, then reports a
+`recovery_state_cross_check_cut_not_reached` infrastructure error naming the
+cut and preserving the live outcome and fault class. It is never accepted as
+a successful comparison. A checked equivalent chain carries its own
+`cross_check` record.
 
 Each returned result is an ordinary recovery result, so follow-up boots,
 hooks, assertions, and invariants run unchanged. `recovery_state_search`
 records the cut chain, generation, state identity, equivalent chains, and a
-pasteable `phase2_fault_pair_yaml` for a two-cut path. `phase2_fault_yaml`
-includes the first and second fault types and is directly pasteable for an
-erase-first chain. The batch summary keeps
+pasteable `phase2_fault_pair_yaml` for a two-cut path. For a deeper path it
+records `phase2_fault_chain`, `phase2_fault_chain_yaml`, and a complete
+`phase2_fault_yaml` containing `chains`. The batch summary keeps
 single-cut and deeper-cut boot counts separate and reports operations
 considered, states computed, states booted and reused, cross-check totals, and
 bound exclusions. It additionally reports selected, computed, booted, and
@@ -2412,7 +2467,7 @@ runtime_sweep_results[]                 -- per-point detail
 The ordered `<kind>` identifiers are `single_cut_program`,
 `single_cut_erase`, `state_search_single_cut`,
 `state_search_single_cut_erase`, `two_cut_grid`, `two_cut_pairs`,
-`two_cut_state_search`, `deeper_cut`, `multi_fault`, `cascading`,
+`two_cut_state_search`, `n_cut_explicit`, `deeper_cut`, `multi_fault`, `cascading`,
 `glitch_instruction_skip`, `read_fault`, `control`, and `other`.
 State-search reuse is assigned by equivalent chain depth; reuse without chain
 metadata is conservatively assigned to `two_cut_state_search` and remains
