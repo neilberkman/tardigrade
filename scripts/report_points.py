@@ -91,19 +91,72 @@ def point_label(row):
     return f"{point['FAULT_TYPE_CSV']}[{point['FAULT_POINTS_CSV']}]"
 
 
+def _seconds(value, divisor=1):
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
+        return value / divisor
+    return None
+
+
 def point_time(row):
     signals = row.get("signals") or {}
-    for source, key, divisor in (
-        (signals, "total_ms", 1000), (row, "elapsed_s", 1),
-        (row.get("phase2_fault_chain") or {}, "elapsed_s", 1),
-        (row.get("phase2_fault") or {}, "elapsed_s", 1),
-        (row.get("cascade") or {}, "elapsed_s", 1), (row.get("hook_fault") or {}, "elapsed_s", 1),
-        (signals, "sequence_elapsed_s", 1), (signals, "timed_reset_elapsed_s", 1),
+    if (total := _seconds(signals.get("total_ms"), 1000)) is not None:
+        return total + (_seconds(signals.get("followup_ms"), 1000) or 0)
+    cycles = row.get("boot_cycles") or ()
+    cycle0 = (cycles[0].get("signals") or {}) if cycles and isinstance(cycles[0], dict) else {}
+    phase1 = signals.get("phase1_ms") if "phase1_ms" in signals else cycle0.get("phase1_ms")
+    parts = [
+        phase1,
+        *(signals.get(k) for k in ("phase2_ms", "phase3_ms", "hook_ms", "confirm_ms",
+                                   "final_boot_ms", "multi_fault_recovery_ms", "followup_ms")),
+        *(signals.get("cut_ms") or ()),
+        *((s.get("signals") or {}).get("stage_ms") for s in (row.get("per_fault_states") or ()) if isinstance(s, dict)),
+    ]
+    if ms := sum(v for p in parts if (v := _seconds(p)) is not None):
+        return ms / 1000
+    for source, key in (
+        (row, "elapsed_s"),
+        (row.get("phase2_fault_chain") or {}, "elapsed_s"),
+        (row.get("phase2_fault") or {}, "elapsed_s"),
+        (row.get("cascade") or {}, "elapsed_s"),
+        (row.get("hook_fault") or {}, "elapsed_s"),
+        (signals, "sequence_elapsed_s"),
+        (signals, "timed_reset_elapsed_s"),
     ):
-        value = source.get(key)
-        if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
-            return value / divisor
-    return 0
+        if (elapsed := _seconds(source.get(key))) is not None:
+            return elapsed
+    if cycle_s := sum(v for c in cycles if isinstance(c, dict) and (v := _seconds(c.get("elapsed_s"))) is not None):
+        return cycle_s
+    for record in (row.get("per_component") or {}).values():
+        if isinstance(record, dict) and (elapsed := point_time(record)) is not None:
+            return elapsed
+    return None
+
+
+def suite_time(run, case_times=()):
+    summary = run.data.get("summary") or {}
+    campaigns = [
+        _seconds(section.get("wall_time_s")) or _seconds(section.get("elapsed_s"))
+        for name in ("runtime_sweep", "multi_fault_runtime_sweep", "terminal_error_campaign", "combined")
+        if isinstance(section := summary.get(name), dict)
+    ]
+    if total := sum(v for v in campaigns if v is not None):
+        return total
+    for source, key, divisor in (
+        (summary.get("recovery_state_search") or {}, "elapsed_s", 1),
+        (((summary.get("runtime_sweep") or {}).get("timing") or {}).get("totals") or {}, "total_ms", 1000),
+        (summary, "wall_time_s", 1),
+        (summary, "elapsed_s", 1),
+        (run.data, "wall_time_s", 1),
+        (run.data, "elapsed_s", 1),
+    ):
+        if (elapsed := _seconds(source.get(key), divisor)) is not None:
+            return elapsed
+    if run.components:
+        if total := sum(v for c in run.components if (v := suite_time(c)) is not None):
+            return total
+    if total := sum(v for v in case_times if v is not None):
+        return total
+    return None
 
 
 def point_status(row):

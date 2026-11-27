@@ -30,7 +30,7 @@ Each profile run has a suite. Each returned runtime record has a case, including
 
 A later timeout preserves a concrete finding from the initial boot. With no finding, an incomplete follow-up is skipped. A profile can expect findings and pass its regression assertion while its affected cases still show failures. The suite's `verdict` property and the audit exit status preserve the profile-level assertion, including coverage gates.
 
-Case `time` is wall time in seconds from the point's timing fields, rounded to milliseconds. Missing timing contributes zero. Suite time sums the point timings. A setup failure before any records are available produces an error case.
+Case `time` is wall time in seconds from the point's timing fields, rounded to milliseconds. Suite `time` uses the report's recorded campaign wall time, or sums the timed cases when suite wall time is absent. If a suite or case has no timing data in the report, its `time` attribute is omitted. A setup failure before any records are available produces an error case.
 
 ## SARIF 2.1.0
 

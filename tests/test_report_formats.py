@@ -72,6 +72,27 @@ def test_junit_counts_cases_and_statuses():
     assert suite.find(".//error").get("message") == "broken <bus>�"
     assert "hard_fault" in suite.find(".//failure[@type='brick']").text
     assert suite.get("time") == "0.355"
+    assert suites[1].get("time") is None
+    assert [c.get("time") for c in suite.findall("testcase") if c.get("time") is not None] == ["0.105", "0.250"]
+
+
+def test_junit_suite_and_case_times_from_report_timing():
+    rows = [
+        result("e", signals={"phase1_ms": 632, "phase2_ms": 759, "followup_ms": 1313}),
+        result("control", is_control=True, fault_injected=False,
+               signals={"phase1_ms": 780, "phase2_ms": 0, "followup_ms": 1465}),
+        result("pc", phase2_fault_chain={"cuts": [{"fault_at": 0, "fault_type": "w"}]},
+               signals={"cut_ms": [410, 320], "final_boot_ms": 270, "followup_ms": 0}),
+        result("mf:1:2", fault_sequence=[1, 2],
+               per_fault_states=[{"signals": {"stage_ms": 150}}, {"signals": {"stage_ms": 250}}],
+               signals={"multi_fault_recovery_ms": 100, "followup_ms": 0}),
+        result("w", "skipped", fault_injected=False,
+               signals={"phase1_ms": 0, "phase2_ms": 0, "followup_ms": 0}),
+    ]
+    report = run(rows, summary={"runtime_sweep": {"wall_time_s": 52.5}})
+    suite = ET.fromstring(junit_report([report]))[0]
+    assert suite.get("time") == "52.500"
+    assert [c.get("time") for c in suite.findall("testcase")] == ["2.704", "2.245", "1.000", "0.500", None]
 
 
 def test_junit_initial_timeout_and_followup_timeout():
@@ -173,6 +194,21 @@ def test_sarif_dwarf_locations_from_addresses_and_symbols(tmp_path):
     source = next(loc for loc in physical if loc["artifactLocation"]["uri"].endswith("firmware.c"))
     assert source["region"]["startLine"] > 1
     assert sorted(len(r["properties"]["points"]) for r in findings) == [1, 2]
+
+    ota_elf = ROOT / "examples/vulnerable_ota/firmware.elf"
+    state_rows = [
+        result(outcome="hard_fault", fault_address="0x10000000",
+               signals={"vector_base": "0x10000000", "vector_reset": "0x00000000"}),
+        result(outcome="hard_fault", fault_address="0x1001c000",
+               signals={"vector_base": "0x10000000", "vector_reset": "0x10000045"}),
+    ]
+    ota_report = run(state_rows)
+    ota_report.elf = ota_elf
+    ota_locs = [r["locations"][0]["physicalLocation"] for r in sarif_report([ota_report], ROOT)["runs"][0]["results"]]
+    assert [(loc["artifactLocation"]["uri"], loc["region"]["startLine"]) for loc in ota_locs] == [
+        ("examples/vulnerable_ota/firmware.c", 24),
+        ("examples/vulnerable_ota/firmware.c", 57),
+    ]
 
 
 def test_html_raw_and_wrapped_batches(tmp_path):

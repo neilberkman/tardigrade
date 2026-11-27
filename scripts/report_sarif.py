@@ -34,17 +34,22 @@ class SourceLocations:
             try:
                 with self.elf.open("rb") as stream:
                     elf = ELFFile(stream)
-                    if elf.has_dwarf_info(strict=True):
+                    if elf.has_dwarf_info() and elf.get_section_by_name(".debug_line"):
+                        objects = {}
                         table = elf.get_section_by_name(".symtab")
                         if table:
-                            symbols = {s.name: s["st_value"] for s in table.iter_symbols()
-                                       if s["st_info"]["type"] == "STT_FUNC"}
-                        ranges = sorted(self._line_ranges(elf.get_dwarf_info()))
+                            for s in table.iter_symbols():
+                                kind = s["st_info"]["type"]
+                                if kind == "STT_FUNC":
+                                    symbols[s.name] = s["st_value"]
+                                elif kind == "STT_OBJECT" and s["st_value"] and s["st_size"]:
+                                    objects[s.name] = (s["st_value"], s["st_size"])
+                        ranges = sorted(self._line_ranges(elf.get_dwarf_info(), objects))
             except (ELFError, OSError):
                 pass
         return [r[0] for r in ranges], ranges, symbols
 
-    def _line_ranges(self, dwarf):
+    def _line_ranges(self, dwarf, objects=()):
         for unit in dwarf.iter_CUs():
             program = dwarf.line_program_for_CU(unit)
             if program is None:
@@ -54,25 +59,35 @@ class SourceLocations:
             previous = None
             files = {}
             base = 0 if program["version"] >= 5 else 1
+
+            def source_file(file_id):
+                if file_id not in files:
+                    file = program["file_entry"][file_id - base]
+                    folder = directory
+                    if file.dir_index >= base:
+                        folder /= os.fsdecode(program["include_directory"][file.dir_index - base])
+                    name = Path(os.fsdecode(file.name))
+                    path = folder / name
+                    # A relocatable ELF may sit beside its original source.
+                    if not path.is_file() and not name.is_absolute() and (self.elf.parent / name).is_file():
+                        path = self.elf.parent / name
+                    files[file_id] = path
+                return files[file_id]
+
             for entry in program.get_entries():
                 state = entry.state
                 if state is None:
                     continue
                 if previous and previous.line and previous.address < state.address:
-                    file_id = previous.file
-                    if file_id not in files:
-                        file = program["file_entry"][file_id - base]
-                        folder = directory
-                        if file.dir_index >= base:
-                            folder /= os.fsdecode(program["include_directory"][file.dir_index - base])
-                        name = Path(os.fsdecode(file.name))
-                        path = folder / name
-                        # A relocatable ELF may sit beside its original source.
-                        if not path.is_file() and not name.is_absolute() and (self.elf.parent / name).is_file():
-                            path = self.elf.parent / name
-                        files[file_id] = path
-                    yield previous.address, state.address, files[file_id], previous.line
+                    yield previous.address, state.address, source_file(previous.file), previous.line
                 previous = None if state.end_sequence else state
+            for die in (unit.iter_DIEs() if objects else ()):
+                attrs = die.attributes
+                name = os.fsdecode(attrs["DW_AT_name"].value) if "DW_AT_name" in attrs else None
+                if (die.tag == "DW_TAG_variable" and name in objects
+                        and "DW_AT_decl_file" in attrs and "DW_AT_decl_line" in attrs):
+                    start, size = objects[name]
+                    yield start, start + size, source_file(attrs["DW_AT_decl_file"].value), attrs["DW_AT_decl_line"].value
 
     def lookup(self, row):
         signals = row.get("signals") or {}
@@ -81,7 +96,8 @@ class SourceLocations:
         candidates = (signals.get("skip_address"), row.get("fault_pc"), row.get("firmware_address"),
                       symbols.get(rc.get("applied_symbol") or row.get("firmware_symbol") or row.get("symbol")
                                   or signals.get("rc_injection_symbol")), rc.get("applied_return_address"),
-                      row.get("fault_address"), signals.get("pc"), row.get("pc"))
+                      row.get("fault_address"), signals.get("pc"), row.get("pc"),
+                      signals.get("vector_reset"), signals.get("vector_base"))
         for value in candidates:
             if value is None:
                 continue
@@ -89,11 +105,12 @@ class SourceLocations:
                 address = int(str(value), 0)
             except ValueError:
                 continue
-            index = bisect_right(starts, address) - 1
-            if index >= 0:
-                _, end, path, line = ranges[index]
-                if address < end:
-                    return self.uri(path), line
+            for probe in (address, address & ~1):
+                index = bisect_right(starts, probe) - 1
+                if index >= 0:
+                    _, end, path, line = ranges[index]
+                    if probe < end:
+                        return self.uri(path), line
         return None
 
     def uri(self, path):
