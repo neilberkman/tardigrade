@@ -8,6 +8,11 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Added
 
+- Recovery-state search now treats a recovery boot that completes before its
+  deferred tracking address as an evaluated result with no candidate
+  operations. Results and search summaries distinguish deferred gates reached
+  from those not reached, while reached-gate traces retain the same exact
+  boundary validation and live cross-checking.
 - Recovery-state search and trace-replay live cross-checks for MRAM program
   units wider than eight bytes. MRAM search and replay now consume the exact
   program trace, preserve each whole program as one cut, and compare all bytes

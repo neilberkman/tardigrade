@@ -85,6 +85,24 @@ def test_deferred_uncorrectable_profile_expects_its_recovery_finding() -> None:
     assert profile.expect.should_find_issues is True
 
 
+def test_deferred_gate_not_reached_profile_checks_every_deeper_state() -> None:
+    profile = load_profile(
+        EXAMPLE / "profile_deferred_gate_not_reached.yaml"
+    )
+    search = profile.fault_sweep.phase2_fault.state_search
+    assert profile.bootloader_elf.endswith(
+        "firmware_deferred_early_success.elf"
+    )
+    assert profile.fault_sweep.tracking_start_address == 0x10000200
+    assert profile.fault_sweep.mram_torn_word_choices == (
+        ("half", 1),
+        ("programmed", 1),
+    )
+    assert profile.fault_sweep.mram_torn_word_seed == 1
+    assert search.max_cuts == 3
+    assert search.cross_check_every == 1
+
+
 def test_exec_slot_fixture_has_a_valid_cortex_m_vector() -> None:
     slot = (EXAMPLE / "slot.bin").read_bytes()
     stack_pointer, reset_vector = struct.unpack_from("<II", slot)

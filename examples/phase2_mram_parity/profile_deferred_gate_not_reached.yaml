@@ -1,0 +1,15 @@
+base_profile: profile_deferred_state_search_16_half.yaml
+name: phase2_mram_deferred_gate_not_reached
+description: Recovery-state search accepts a successful recovery boot that finishes before its deferred tracking gate.
+bootloader:
+  elf: examples/phase2_mram_parity/firmware_deferred_early_success.elf
+fault_sweep:
+  mram_torn_word_seed: 1
+  mram_torn_word:
+    - half
+    - programmed
+  phase2_fault:
+    state_search:
+      max_cuts: 3
+      max_new_states: 32
+      cross_check_every: 1

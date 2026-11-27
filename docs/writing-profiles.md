@@ -1857,9 +1857,17 @@ trace is refused. For a deferred `tracking_start_address`, the calibration
 trace is based on the complete persistent snapshot captured at that boundary.
 Each nonterminal recovery boot captures its own boundary snapshot, and its
 later cuts are computed from that snapshot rather than from the state at boot.
-The search refuses a missing snapshot or a backend whose snapshot contract
-does not cover all bytes, MRAM uncorrectable marks, and declared persistent
-values. Because `state_search`
+If a recovery boot reaches its success or failure condition before the
+deferred address, its result remains an ordinary evaluated state. The result's
+`recovery_tracking_gate.reached` is `false`, its candidate-operation count is
+zero, and it contributes no later cuts. No boundary snapshot is required for
+that boot because no operation was tracked. A boot that reaches the address
+records `reached: true`; its exact trace and base are captured before any
+configured follow-up boot, so follow-up execution cannot replace the trace
+associated with the evaluated result. The search still refuses a partial or
+invalid captured snapshot, or a backend whose snapshot contract does not
+cover all bytes, MRAM uncorrectable marks, and declared persistent values.
+Because `state_search`
 uses execute mode, code must also run from directly executable memory; a pure
 `NVMemory` instruction-fetch platform is rejected at profile load time. These
 checks prevent the canonical state from omitting persistent data.
@@ -1879,7 +1887,9 @@ Terminal-generation boots skip unused trace capture. Larger values are accepted
 up to eight, but the number of reachable states and recovery boots is the
 practical limit. `max_new_states` bounds unique recovery boots and
 `max_wall_time_s` bounds the batch. The summary reports candidates omitted by
-the boot, time, depth, and address limits.
+the boot, time, depth, and address limits. Deferred searches also report
+`recovery_boots_reaching_deferred_gate` and
+`recovery_boots_before_deferred_gate`.
 
 Every `cross_check_every`th newly booted generation-two state is also
 reproduced through the established two-cut live injector. At generation three

@@ -97,6 +97,18 @@ void Reset_Handler(void)
     }
 
 #ifdef DEFERRED_TRACKING_FIXTURE
+#ifdef DEFERRED_EARLY_SUCCESS_FIXTURE
+    if(!update_requested && TARGET_ADDRESS == TARGET_VALUE &&
+       PROGRESS_ADDRESS == PROGRESS_DONE)
+    {
+        SUCCESS_MARKER = SUCCESS_VALUE;
+        VTOR = EXEC_BASE;
+        for(;;)
+        {
+            __asm volatile("wfi");
+        }
+    }
+#endif
     tracking_gate();
     if(update_requested)
     {
