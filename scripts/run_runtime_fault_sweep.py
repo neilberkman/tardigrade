@@ -1422,6 +1422,10 @@ except Exception:
     runfor_watchdog_timeout_s = 300.0
 if not (runfor_watchdog_timeout_s > 0):
     runfor_watchdog_timeout_s = 300.0
+test_runfor_error_label = get_optional_var(
+    'test_runfor_error_label', ''
+).strip()
+_test_runfor_error_consumed_labels = set()
 resume_trace_wall_timeout_raw = str(monitor.GetVariable('resume_trace_wall_timeout_s')).strip()
 try:
     resume_trace_wall_timeout_s = float(resume_trace_wall_timeout_raw)
@@ -7812,6 +7816,22 @@ def _run_clean_update_phase(phase, phase_index):
         final_outcome = last_cycle.get('boot_outcome', final_outcome)
         final_slot = last_cycle.get('boot_slot', final_slot)
 
+    infrastructure_status = None
+    if isinstance(status, dict) and status.get('infrastructure_error'):
+        infrastructure_status = status
+    if isinstance(multi_boot_analysis, dict) and multi_boot_analysis.get('status') == 'infra_error':
+        infrastructure_status = multi_boot_analysis
+    if infrastructure_status is None:
+        for cycle_record in cycle_records:
+            if (
+                cycle_record.get('infrastructure_error')
+                or cycle_record.get('boot_outcome') == 'infra_error'
+            ):
+                infrastructure_status = cycle_record
+                break
+    if infrastructure_status is not None:
+        final_outcome = 'infra_error'
+
     # Defensive final content check after follow-up cycles so an unexpected
     # rollback inside a clean update_sequence phase cannot slip past.
     if final_outcome == 'success' and success_image_hash and expected_exec_sha256:
@@ -7839,7 +7859,7 @@ def _run_clean_update_phase(phase, phase_index):
             'phase_name': phase_name,
         })
 
-    return {
+    result = {
         'phase_name': phase_name,
         'boot_outcome': boot_outcome,
         'boot_slot': boot_slot,
@@ -7849,6 +7869,18 @@ def _run_clean_update_phase(phase, phase_index):
         'multi_boot_analysis': multi_boot_analysis,
         'semantic_state': phase_semantic_state,
     }
+    if infrastructure_status is not None:
+        result['infrastructure_error'] = True
+        result['error_kind'] = infrastructure_status.get(
+            'error_kind', 'runfor_infrastructure_error'
+        )
+        result['error'] = infrastructure_status.get(
+            'error', 'RunFor infrastructure error'
+        )
+        for field in ('error_pc', 'error_peripheral'):
+            if infrastructure_status.get(field) is not None:
+                result[field] = infrastructure_status[field]
+    return result
 
 
 def ensure_update_sequence_fault_baseline():
@@ -7867,6 +7899,23 @@ def ensure_update_sequence_fault_baseline():
             log('update_sequence: cached fault baseline for phase {}'.format(phase_name))
             return True
         clean_result = _run_clean_update_phase(phase, idx)
+        multi_boot_analysis = clean_result.get('multi_boot_analysis')
+        infrastructure_error = bool(clean_result.get('infrastructure_error'))
+        infrastructure_error = infrastructure_error or (
+            isinstance(multi_boot_analysis, dict)
+            and multi_boot_analysis.get('status') == 'infra_error'
+        )
+        if infrastructure_error:
+            raise RuntimeError(
+                "update_sequence clean phase '{}' had an infrastructure error "
+                "(boot_outcome={}, final_outcome={}, stop_reason={}, error_kind={})".format(
+                    phase_name,
+                    clean_result.get('boot_outcome'),
+                    clean_result.get('final_outcome'),
+                    clean_result.get('stop_reason'),
+                    clean_result.get('error_kind', 'runfor_infrastructure_error'),
+                )
+            )
         phase_record = {
             'phase_name': phase_name,
             'fault_injection': False,
@@ -10221,6 +10270,17 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     )
     runfor_guard = globals().get('_run_for_with_watchdog')
     runfor_watchdog_s = globals().get('runfor_watchdog_timeout_s', 300.0)
+    configured_test_runfor_error_label = str(
+        globals().get('test_runfor_error_label', '') or ''
+    ).strip()
+    consumed_test_runfor_error_labels = globals().get(
+        '_test_runfor_error_consumed_labels'
+    )
+    if consumed_test_runfor_error_labels is None:
+        consumed_test_runfor_error_labels = set()
+        globals()['_test_runfor_error_consumed_labels'] = (
+            consumed_test_runfor_error_labels
+        )
     if runfor_guard is None:
         # Unit tests execute this function in isolation from its module. The
         # complete runtime always provides the guarded implementation above.
@@ -11099,12 +11159,26 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         for iters in range(max_iters):
             fault_timing_state['current_iter'] = iters + 1
             _run_for_started = _time.time()
-            runfor_infrastructure_error = runfor_guard(
-                cpu_ref,
-                time_slice,
-                runfor_watchdog_s,
-                label=label,
-            )
+            if (
+                configured_test_runfor_error_label
+                and label == configured_test_runfor_error_label
+                and label not in consumed_test_runfor_error_labels
+            ):
+                consumed_test_runfor_error_labels.add(label)
+                runfor_infrastructure_error = {
+                    'error_kind': 'test_runfor_error',
+                    'pc': fmt_u32(as_int(cpu_ref.GetRegisterUnsafe(15)) & ~1),
+                    'message': 'test hook injected RunFor infrastructure error at {}'.format(
+                        label
+                    ),
+                }
+            else:
+                runfor_infrastructure_error = runfor_guard(
+                    cpu_ref,
+                    time_slice,
+                    runfor_watchdog_s,
+                    label=label,
+                )
             run_for_wall_s += max(0.0, _time.time() - _run_for_started)
             run_for_calls += 1
             if runfor_infrastructure_error is not None:

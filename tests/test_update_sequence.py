@@ -569,6 +569,156 @@ class UpdateSequenceSchemaTest(unittest.TestCase):
         self.assertEqual(observed_contexts[-1]["stage"], "update_sequence_phase")
         self.assertEqual(observed_contexts[-1]["cycle"], 0)
 
+    def test_clean_update_phase_retains_first_cycle_infrastructure_error(self) -> None:
+        source = (ROOT / "scripts" / "run_runtime_fault_sweep.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_run_clean_update_phase"
+        )
+        initial_status = {
+            "reason": "runfor_infrastructure_error",
+            "infrastructure_error": True,
+            "error_kind": "runfor_exception",
+            "error": "RunFor failed",
+        }
+        cycle_records = [
+            {
+                "cycle": 0,
+                "boot_outcome": "infra_error",
+                "boot_slot": None,
+                "infrastructure_error": True,
+                "error_kind": "runfor_exception",
+                "error": "RunFor failed",
+            },
+            {
+                "cycle": 1,
+                "boot_outcome": "success",
+                "boot_slot": "exec",
+                "semantic_state": {"confirmed": True},
+            },
+        ]
+        analysis = {
+            "status": "infra_error",
+            "final_outcome": "success",
+            "final_slot": "exec",
+            "error_kind": "runfor_exception",
+            "error": "RunFor failed",
+        }
+        namespace = {
+            "_apply_phase_context": lambda _phase: None,
+            "_prepare_update_phase_start_state": lambda _phase, _idx: None,
+            "_snapshot_current_flash": lambda: b"\xff" * 64,
+            "restore_flash_and_boot": lambda _flash: None,
+            "_apply_update_phase_pre_boot": lambda _phase: None,
+            "_hash_bypass_active": False,
+            "apply_hash_bypass": lambda: None,
+            "monitor": SimpleNamespace(
+                Machine={
+                    "sysbus.cpu": SimpleNamespace(
+                        IsHalted=False,
+                        GetRegisterUnsafe=lambda _reg: 0x000103E8,
+                    )
+                }
+            ),
+            "reset_nvmc_for_recovery": lambda: None,
+            "disarm_fault": lambda: None,
+            "arm_vtor_watchpoint": lambda: None,
+            "phase1_wall_timeout": lambda default_s=4.0: default_s,
+            "phase1_max_iters": lambda default_s=4.0: 10,
+            "run_until_done": lambda *_args, **_kwargs: dict(initial_status),
+            "_copy_on_boot_vtor_settle_iters": lambda: 0,
+            "disarm_vtor_watchpoint": lambda: None,
+            "as_int": int,
+            "bus": SimpleNamespace(ReadDoubleWord=lambda _addr: 0x0000C000),
+            "evaluate_boot_outcome": lambda *_args, **_kwargs: (
+                "infra_error",
+                None,
+                {"expectations_met": False},
+            ),
+            "run_followup_boot_cycles": lambda *_args, **_kwargs: (
+                list(cycle_records),
+                dict(analysis),
+                0,
+            ),
+            "success_image_hash": False,
+            "expected_exec_sha256": "",
+            "success_image_hash_slot": "exec",
+            "compute_slot_hash": lambda _slot: "",
+            "log": lambda _msg: None,
+            "collect_semantic_state": lambda _context: None,
+        }
+        exec(
+            compile(ast.Module(body=[function], type_ignores=[]), str(ROOT), "exec"),
+            namespace,
+        )
+
+        result = namespace["_run_clean_update_phase"]({"name": "prepare"}, 0)
+
+        self.assertEqual(result["boot_outcome"], "infra_error")
+        self.assertEqual(result["final_outcome"], "infra_error")
+        self.assertTrue(result["infrastructure_error"])
+        self.assertEqual(result["error_kind"], "runfor_exception")
+        self.assertEqual(result["multi_boot_analysis"]["status"], "infra_error")
+
+    def test_infrastructure_error_refuses_update_sequence_fault_baseline(self) -> None:
+        source = (ROOT / "scripts" / "run_runtime_fault_sweep.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ensure_update_sequence_fault_baseline"
+        )
+        fault_phase_prepared = []
+        namespace = {
+            "update_sequence_enabled": True,
+            "_cached_update_sequence_fault_flash": None,
+            "_update_sequence_phase_results": [],
+            "update_sequence_phases": [
+                {"name": "prepare", "fault_injection": False},
+                {"name": "campaign", "fault_injection": True},
+            ],
+            "_run_clean_update_phase": lambda _phase, _idx: {
+                "phase_name": "prepare",
+                "boot_outcome": "infra_error",
+                "final_outcome": "success",
+                "stop_reason": "runfor_infrastructure_error",
+                "multi_boot_analysis": {
+                    "status": "infra_error",
+                    "final_outcome": "success",
+                },
+            },
+            "_apply_phase_context": lambda _phase: fault_phase_prepared.append(
+                "context"
+            ),
+            "_prepare_update_phase_start_state": (
+                lambda _phase, _idx: fault_phase_prepared.append("state")
+            ),
+            "_snapshot_current_flash": lambda: b"tainted baseline",
+            "log": lambda _msg: None,
+        }
+        exec(
+            compile(ast.Module(body=[function], type_ignores=[]), str(ROOT), "exec"),
+            namespace,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"clean phase 'prepare' had an infrastructure error",
+        ):
+            namespace["ensure_update_sequence_fault_baseline"]()
+
+        self.assertIsNone(namespace["_cached_update_sequence_fault_flash"])
+        self.assertEqual(namespace["_update_sequence_phase_results"], [])
+        self.assertEqual(fault_phase_prepared, [])
+
 
 if __name__ == "__main__":
     unittest.main()
