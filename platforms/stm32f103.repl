@@ -1,0 +1,98 @@
+// STM32F103 platform (Cortex-M3) with STM32F1FlashController fault injection
+// and operation-accurate half-word (16-bit) write and page/mass erase tracing.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m3"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+    systickFrequency: 72000000
+
+flash: Memory.MappedMemory @ { sysbus 0x00000000; sysbus 0x08000000 }
+    size: 0x20000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x5000
+
+faultFlash: Miscellaneous.STM32F1FlashController @ sysbus 0x40022000
+    -> nvic@4
+    flash: flash
+    flashBaseAddress: 0x08000000
+    flashSize: 0x20000
+    pageSize: 0x400
+
+rcc: Miscellaneous.STM32F1RCCStub @ sysbus 0x40021000
+
+crc: CRC.STM32_CRC @ sysbus 0x40023000
+    series: STM32Series.F4
+    configurablePoly: false
+
+afio: Memory.ArrayMemory @ sysbus 0x40010000
+    size: 0x400
+
+exti: IRQControllers.STM32F4_EXTI @ sysbus 0x40010400
+    numberOfOutputLines: 16
+    [0-4] -> nvic@[6-10]
+
+gpioPortA: GPIOPort.STM32F1GPIOPort @ sysbus <0x40010800, +0x400>
+    [0-15] -> exti@[0-15]
+
+gpioPortB: GPIOPort.STM32F1GPIOPort @ sysbus <0x40010C00, +0x400>
+    [0-15] -> exti@[0-15]
+
+gpioPortC: GPIOPort.STM32F1GPIOPort @ sysbus <0x40011000, +0x400>
+    [0-15] -> exti@[0-15]
+
+gpioPortD: GPIOPort.STM32F1GPIOPort @ sysbus <0x40011400, +0x400>
+    [0-15] -> exti@[0-15]
+
+gpioPortE: GPIOPort.STM32F1GPIOPort @ sysbus <0x40011800, +0x400>
+    [0-15] -> exti@[0-15]
+
+usart1: UART.STM32_UART @ sysbus <0x40013800, +0x100>
+    frequency: 72000000
+    -> nvic@37
+
+usart2: UART.STM32_UART @ sysbus <0x40004400, +0x100>
+    frequency: 36000000
+    -> nvic@38
+
+usart3: UART.STM32_UART @ sysbus <0x40004800, +0x100>
+    frequency: 36000000
+    -> nvic@39
+
+timer1: Timers.STM32_Timer @ sysbus <0x40012C00, +0x400>
+    frequency: 72000000
+    initialLimit: 0xFFFF
+    -> nvic@25
+
+timer2: Timers.STM32_Timer @ sysbus <0x40000000, +0x400>
+    frequency: 72000000
+    initialLimit: 0xFFFF
+    -> nvic@28
+
+timer3: Timers.STM32_Timer @ sysbus <0x40000400, +0x400>
+    frequency: 72000000
+    initialLimit: 0xFFFF
+    -> nvic@29
+
+timer4: Timers.STM32_Timer @ sysbus <0x40000800, +0x400>
+    frequency: 72000000
+    initialLimit: 0xFFFF
+    -> nvic@30
+
+iwdg: Timers.STM32_IndependentWatchdog @ sysbus 0x40003000
+    frequency: 40000
+
+bkp: Memory.ArrayMemory @ sysbus 0x40006C00
+    size: 0x400
+
+pwr: Memory.ArrayMemory @ sysbus 0x40007000
+    size: 0x400
+
+dbg: Memory.ArrayMemory @ sysbus 0xE0042000
+    size: 0x100
+
+deviceInfo: Miscellaneous.STM32F1DeviceInfoStub @ sysbus 0x1FFFF700
+    flashSizeKiB: 128

@@ -1,0 +1,118 @@
+// STM32L476 platform (Cortex-M4) with STM32L4FlashController fault injection,
+// dual-bank 1 MiB flash (2 KiB pages), double-word (64-bit) programming,
+// fast row programming (FSTPG), and ECC double-error read fault modeling.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+    systickFrequency: 80000000
+
+flash: Memory.MappedMemory @ { sysbus 0x00000000; sysbus 0x08000000 }
+    size: 0x100000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x18000
+
+sram2: Memory.MappedMemory @ { sysbus 0x10000000; sysbus 0x20018000 }
+    size: 0x8000
+
+faultFlash: Miscellaneous.STM32L4FlashController @ sysbus 0x40022000
+    -> nvic@4
+    flash: flash
+    flashBaseAddress: 0x08000000
+    flashSize: 0x100000
+    pageSize: 0x800
+    dualBank: true
+
+rcc: Miscellaneous.STM32L4RCCStub @ sysbus 0x40021000
+
+crc: CRC.STM32_CRC @ sysbus 0x40023000
+    series: STM32Series.F4
+    configurablePoly: true
+
+syscfg: Memory.ArrayMemory @ sysbus 0x40010000
+    size: 0x400
+
+exti: IRQControllers.STM32F4_EXTI @ sysbus 0x40010400
+    numberOfOutputLines: 40
+    [0-4] -> nvic@[6-10]
+
+gpioPortA: GPIOPort.STM32_GPIOPort @ sysbus <0x48000000, +0x400>
+    numberOfAFs: 16
+    [0-15] -> exti@[0-15]
+
+gpioPortB: GPIOPort.STM32_GPIOPort @ sysbus <0x48000400, +0x400>
+    numberOfAFs: 16
+    [0-15] -> exti@[0-15]
+
+gpioPortC: GPIOPort.STM32_GPIOPort @ sysbus <0x48000800, +0x400>
+    numberOfAFs: 16
+    [0-15] -> exti@[0-15]
+
+gpioPortD: GPIOPort.STM32_GPIOPort @ sysbus <0x48000C00, +0x400>
+    numberOfAFs: 16
+    [0-15] -> exti@[0-15]
+
+gpioPortE: GPIOPort.STM32_GPIOPort @ sysbus <0x48001000, +0x400>
+    numberOfAFs: 16
+    [0-15] -> exti@[0-15]
+
+gpioPortF: GPIOPort.STM32_GPIOPort @ sysbus <0x48001400, +0x400>
+    numberOfAFs: 16
+    [0-15] -> exti@[0-15]
+
+gpioPortG: GPIOPort.STM32_GPIOPort @ sysbus <0x48001800, +0x400>
+    numberOfAFs: 16
+    [0-15] -> exti@[0-15]
+
+gpioPortH: GPIOPort.STM32_GPIOPort @ sysbus <0x48001C00, +0x400>
+    numberOfAFs: 16
+    [0-15] -> exti@[0-15]
+
+usart1: UART.STM32F7_USART @ sysbus 0x40013800
+    frequency: 80000000
+    IRQ -> nvic@37
+
+usart2: UART.STM32F7_USART @ sysbus 0x40004400
+    frequency: 80000000
+    IRQ -> nvic@38
+
+usart3: UART.STM32F7_USART @ sysbus 0x40004800
+    frequency: 80000000
+    IRQ -> nvic@39
+
+lpuart1: UART.STM32F7_USART @ sysbus 0x40008000
+    frequency: 80000000
+    IRQ -> nvic@70
+
+lptim1: Timers.STM32L0_LpTimer @ sysbus 0x40007C00
+    frequency: 32768
+    -> nvic@65
+
+timer2: Timers.STM32_Timer @ sysbus <0x40000000, +0x400>
+    frequency: 80000000
+    initialLimit: 0xFFFFFFFF
+    -> nvic@28
+
+timer3: Timers.STM32_Timer @ sysbus <0x40000400, +0x400>
+    frequency: 80000000
+    initialLimit: 0xFFFF
+    -> nvic@29
+
+iwdg: Timers.STM32_IndependentWatchdog @ sysbus 0x40003000
+    frequency: 32000
+
+pwr: Memory.ArrayMemory @ sysbus 0x40007000
+    size: 0x400
+
+rng: Memory.ArrayMemory @ sysbus 0x50060800
+    size: 0x400
+
+dbg: Memory.ArrayMemory @ sysbus 0xE0042000
+    size: 0x100
+
+deviceInfo: Miscellaneous.STM32L4DeviceInfoStub @ sysbus 0x1FFF7500
+    flashSizeKiB: 1024
