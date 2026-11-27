@@ -538,6 +538,7 @@ def test_calibration_plan_scope_distinguishes_pairs_state_search_and_heuristic()
         "calibrated": 20,
         "planned_range": 20,
         "representation": ["heuristic"],
+        "representative_groups": {"0": 3, "5": 5, "9": 12},
     }
     assert heuristic["erase"] == {
         "calibrated": 2,
@@ -577,6 +578,77 @@ def test_active_heuristic_uses_complete_trace_as_calibrated_program_domain() -> 
         planned_program_operations=256,
         heuristic_summary=None,
     ) == 512
+
+
+def test_sampled_coverage_requires_each_representative_to_be_evaluated() -> None:
+    counts = build_point_counts(
+        [
+            {
+                "fault_at": 0,
+                "fault_type": "w",
+                "operation_kind": "program",
+                "fault_injected": True,
+                "boot_outcome": "success",
+            },
+            {
+                "fault_at": 4,
+                "fault_type": "w",
+                "operation_kind": "program",
+                "fault_injected": True,
+                "boot_outcome": "infra_error",
+                "infrastructure_error": True,
+            },
+            {
+                "fault_at": 9,
+                "fault_type": "w",
+                "operation_kind": "program",
+                "fault_injected": False,
+                "boot_outcome": "skipped",
+            },
+        ],
+        planned_fault_types=["w", "w", "w"],
+        expected_control_points=0,
+        calibration={
+            "program": {
+                "calibrated": 12,
+                "planned_range": 10,
+                "representation": ["quick"],
+                "representative_groups": {"0": 3, "4": 4, "9": 3},
+            }
+        },
+    )
+
+    program = counts["calibration"]["program"]
+    assert program["cut_directly"] == 2
+    assert program["represented_without_cut"] == 2
+    assert program["outside_planned_range"] == 2
+    assert program["not_cut_or_represented"] == 6
+
+
+def test_calibration_coverage_emits_representative_groups_for_quick_plan() -> None:
+    profile = load_profile(
+        Path(__file__).resolve().parents[1]
+        / "profiles"
+        / "mcuboot_pr3011_move_broken.yaml"
+    )
+    coverage = _calibration_point_coverage(
+        profile=profile,
+        fault_points=[0, 5, 9],
+        planned_fault_types=["w", "w", "w"],
+        calibrated_program_operations=12,
+        planned_program_operations=10,
+        calibrated_erases=0,
+        fault_start=None,
+        fault_end=None,
+        quick=True,
+        heuristic_used=False,
+    )
+
+    assert coverage["program"]["representative_groups"] == {
+        "0": 3,
+        "5": 5,
+        "9": 2,
+    }
 
 
 def test_mixed_campaign_accounts_every_kind_and_status() -> None:
@@ -785,18 +857,18 @@ def test_mixed_campaign_accounts_every_kind_and_status() -> None:
             "calibrated": 10,
             "planned_range": 8,
             "cut_directly": 4,
-            "represented_without_cut": 4,
+            "represented_without_cut": 0,
             "outside_planned_range": 2,
-            "not_cut_or_represented": 0,
+            "not_cut_or_represented": 4,
             "representation": ["quick"],
         },
         "erase": {
             "calibrated": 4,
             "planned_range": 4,
             "cut_directly": 1,
-            "represented_without_cut": 3,
+            "represented_without_cut": 0,
             "outside_planned_range": 0,
-            "not_cut_or_represented": 0,
+            "not_cut_or_represented": 3,
             "representation": ["heuristic"],
         },
     }
@@ -936,7 +1008,8 @@ def test_json_summary_and_html_render_from_the_same_count_block() -> None:
         "unsupported_backend": 1
     }
     assert counts["calibration"]["program"]["outside_planned_range"] == 7
-    assert counts["calibration"]["erase"]["represented_without_cut"] == 3
+    assert counts["calibration"]["erase"]["represented_without_cut"] == 0
+    assert counts["calibration"]["erase"]["not_cut_or_represented"] == 3
 
     html = render_point_counts_panel(
         {"summary": {"runtime_sweep": {"point_counts": counts}}}

@@ -6,6 +6,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -26,6 +27,7 @@ from fault_classification import (
     result_issue_reasons,
 )
 from audit_report import summarize_runtime_sweep
+from result_checks import annotate_result_checks
 
 
 class EffectiveBootResultTests(unittest.TestCase):
@@ -340,6 +342,111 @@ class EffectiveBootResultTests(unittest.TestCase):
         outcome, slot = _effective_boot_result(result)
         self.assertEqual(outcome, "timeout")
         self.assertIsNone(slot)
+
+    def test_later_infrastructure_error_overrides_initial_success(self):
+        result = {
+            "boot_outcome": "success",
+            "boot_slot": "exec",
+            "initial_boot_outcome": "success",
+            "initial_boot_slot": "exec",
+            "final_boot_outcome": "infra_error",
+            "final_boot_slot": "exec",
+            "boot_cycles": [
+                {
+                    "cycle": 0,
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "signals": {"memory_checks_ok": True},
+                },
+                {
+                    "cycle": 1,
+                    "boot_outcome": "infra_error",
+                    "boot_slot": "exec",
+                    "stop_reason": "runfor_infrastructure_error",
+                    "infrastructure_error": True,
+                    "error_kind": "runfor_exception",
+                    "error": "injected",
+                    "signals": {},
+                },
+            ],
+            "multi_boot_analysis": {
+                "status": "infra_error",
+                "initial_outcome": "success",
+                "final_outcome": "infra_error",
+                "final_slot": "exec",
+                "error_kind": "runfor_exception",
+                "error": "injected",
+            },
+        }
+
+        self.assertEqual(_effective_boot_result(result), ("infra_error", "exec"))
+        self.assertEqual(_effective_boot_signals(result), {})
+
+
+class InfrastructureCheckAnnotationTests(unittest.TestCase):
+    def test_incomplete_final_boot_is_not_judged_by_assertions_or_invariants(self):
+        profile = SimpleNamespace(
+            semantic_assertions={"always": {"signals.required": True}},
+            invariant_config={},
+            invariants=["slot_integrity"],
+            invariant_providers=[],
+            state_probe=None,
+            memory=SimpleNamespace(
+                slots={
+                    "exec": SimpleNamespace(base=0x1000, size=0x1000),
+                },
+                write_granularity=4,
+            ),
+            success_criteria=SimpleNamespace(boot_register_values=[]),
+            expect=SimpleNamespace(control_outcome="success"),
+            fault_sweep=SimpleNamespace(metadata_delta=SimpleNamespace(enabled=False)),
+            resolve_path=lambda _root, path: path,
+        )
+        result = {
+            "fault_at": 0,
+            "fault_injected": True,
+            "boot_outcome": "success",
+            "boot_slot": "exec",
+            "nvm_state": {
+                "initial_sp": 0,
+                "reset_vector": 0,
+                "slot_start": 0x1000,
+                "slot_end": 0x2000,
+            },
+            "signals": {},
+            "boot_cycles": [
+                {
+                    "cycle": 0,
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "signals": {},
+                },
+                {
+                    "cycle": 1,
+                    "boot_outcome": "infra_error",
+                    "boot_slot": "exec",
+                    "infrastructure_error": True,
+                    "error_kind": "runfor_exception",
+                    "error": "injected",
+                    "signals": {},
+                },
+            ],
+            "multi_boot_analysis": {
+                "status": "infra_error",
+                "final_outcome": "infra_error",
+                "final_slot": "exec",
+                "error_kind": "runfor_exception",
+                "error": "injected",
+            },
+        }
+
+        annotate_result_checks([result], profile)
+
+        self.assertTrue(result["infrastructure_error"])
+        self.assertEqual(result["error_kind"], "runfor_exception")
+        self.assertNotIn("semantic_assertion_failures", result)
+        self.assertNotIn("semantic_observation_failures", result)
+        self.assertNotIn("invariant_violations", result)
 
 
 class RawFieldsPreservedTests(unittest.TestCase):

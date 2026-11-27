@@ -437,6 +437,11 @@ def _effective_boot_result(result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
         return ("timeout", raw_slot)
     mba = result.get("multi_boot_analysis")
     if isinstance(mba, dict):
+        if str(mba.get("status") or "").strip().lower() == "infra_error":
+            infrastructure_slot = mba.get("infrastructure_error_slot")
+            if infrastructure_slot is None:
+                infrastructure_slot = mba.get("final_slot")
+            return ("infra_error", infrastructure_slot)
         final_outcome = result.get("final_boot_outcome")
         final_slot = result.get("final_boot_slot")
         if final_outcome is None:
@@ -500,6 +505,27 @@ def _effective_boot_signals(result: Dict[str, Any]) -> Dict[str, Any]:
     top_signals = result.get("signals")
     top_dict = top_signals if isinstance(top_signals, dict) else {}
     boot_cycles = result.get("boot_cycles")
+    mba = result.get("multi_boot_analysis")
+    if (
+        isinstance(mba, dict)
+        and str(mba.get("status") or "").strip().lower() == "infra_error"
+        and isinstance(boot_cycles, list)
+    ):
+        error_cycle = mba.get("infrastructure_error_cycle")
+        for index, cycle in enumerate(boot_cycles):
+            if not isinstance(cycle, dict):
+                continue
+            cycle_index = cycle.get("cycle", index)
+            if error_cycle is not None and cycle_index != error_cycle:
+                continue
+            outcome = str(cycle.get("boot_outcome") or "").strip().lower()
+            if not cycle.get("infrastructure_error") and outcome not in {
+                "infra_error", "infrastructure_error"
+            }:
+                continue
+            signals = cycle.get("signals")
+            return signals if isinstance(signals, dict) else {}
+        return {}
     if _effective_boot_cycle_is_final(result):
         if isinstance(boot_cycles, list) and len(boot_cycles) >= 2:
             final_cycle = boot_cycles[-1]

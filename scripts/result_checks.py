@@ -562,6 +562,40 @@ def annotate_result_checks(
         signals = result.get("signals")
         if isinstance(signals, dict) and signals.get("matched_image") is not None:
             result["matched_image"] = signals.get("matched_image")
+        effective_outcome, _ = _effective_boot_result(result)
+        if str(effective_outcome or "").strip().lower() == "infra_error":
+            result["infrastructure_error"] = True
+            mba = result.get("multi_boot_analysis")
+            details = mba if isinstance(mba, dict) else {}
+            if not details:
+                cycles = result.get("boot_cycles")
+                if isinstance(cycles, list):
+                    details = next(
+                        (
+                            cycle for cycle in cycles
+                            if isinstance(cycle, dict)
+                            and (
+                                cycle.get("infrastructure_error")
+                                or str(cycle.get("boot_outcome") or "")
+                                .strip()
+                                .lower()
+                                == "infra_error"
+                            )
+                        ),
+                        {},
+                    )
+            result.setdefault(
+                "error_kind",
+                details.get("error_kind", "runfor_infrastructure_error"),
+            )
+            result.setdefault(
+                "error",
+                details.get("error", "RunFor infrastructure error"),
+            )
+            for field in ("error_pc", "error_peripheral"):
+                if details.get(field) is not None:
+                    result.setdefault(field, details[field])
+            continue
         contract_observation_failures = _evaluate_state_probe_contract(result, profile)
         semantic_failures, observation_failures = _evaluate_semantic_assertions(
             result, profile

@@ -205,6 +205,32 @@ def _calibration_point_coverage(
     heuristic_used: bool,
 ) -> Dict[str, Dict[str, Any]]:
     """Describe calibrated operations cut, represented, or outside the plan."""
+    def representative_groups(
+        representatives: List[int], start: int, end: int
+    ) -> Dict[str, int]:
+        selected = sorted(
+            {
+                int(value)
+                for value in representatives
+                if start <= int(value) < end
+            }
+        )
+        if not selected or end <= start:
+            return {}
+        groups: Dict[str, int] = {}
+        for index, representative in enumerate(selected):
+            group_start = start
+            if index > 0:
+                group_start = (selected[index - 1] + representative) // 2 + 1
+            group_end = end
+            if index + 1 < len(selected):
+                group_end = (representative + selected[index + 1]) // 2 + 1
+            groups[str(representative)] = max(0, group_end - group_start)
+        return groups
+
+    def base_fault_type_code(value: Any) -> str:
+        return str(value or "w").strip().lower().split(":", 1)[0]
+
     def state_search_selected_count(
         total: int, all_limit: Optional[int] = None
     ) -> int:
@@ -335,18 +361,45 @@ def _calibration_point_coverage(
         planned_erase_range = max(0, planned_erase_end - planned_erase_start)
     else:
         planned_erase_range = 0
-    return {
-        "program": {
-            "calibrated": int(calibrated_program_operations),
-            "planned_range": planned_program_range,
-            "representation": program_representation,
-        },
-        "erase": {
-            "calibrated": int(calibrated_erases),
-            "planned_range": planned_erase_range,
-            "representation": erase_representation,
-        },
+    program_row = {
+        "calibrated": int(calibrated_program_operations),
+        "planned_range": planned_program_range,
+        "representation": program_representation,
     }
+    erase_row = {
+        "calibrated": int(calibrated_erases),
+        "planned_range": planned_erase_range,
+        "representation": erase_representation,
+    }
+    if program_representation:
+        program_start = 0 if heuristic_used else max(0, int(fault_start or 0))
+        program_end = min(
+            int(calibrated_program_operations),
+            program_start + int(planned_program_range),
+        )
+        program_representatives = [
+            int(point)
+            for point, fault_type in zip(fault_points, planned_fault_types)
+            if base_fault_type_code(fault_type) in direct_program_codes
+        ]
+        program_row["representative_groups"] = representative_groups(
+            program_representatives, program_start, program_end
+        )
+    if erase_representation:
+        erase_start = max(0, int(fault_start or 0))
+        erase_end = min(
+            int(calibrated_erases),
+            erase_start + int(planned_erase_range),
+        )
+        erase_representatives = [
+            int(point)
+            for point, fault_type in zip(fault_points, planned_fault_types)
+            if base_fault_type_code(fault_type) in {"e", "a"}
+        ]
+        erase_row["representative_groups"] = representative_groups(
+            erase_representatives, erase_start, erase_end
+        )
+    return {"program": program_row, "erase": erase_row}
 
 
 def _calibration_stop_summary(
@@ -441,6 +494,8 @@ def _can_fallback_to_control_only_calibration(
     if expected_outcome == "success":
         return False
     message = str(exc)
+    if "reason='runfor_infrastructure_error'" in message:
+        return False
     return (
         "Calibration did not complete cleanly" in message
         and "writes=0, erases=0" in message

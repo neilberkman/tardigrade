@@ -455,11 +455,44 @@ def _populate_calibration(
         representation = sorted(
             {str(value) for value in representation if str(value).strip()}
         )
-        represented = (
-            max(0, planned_range - direct_count)
-            if {"heuristic", "quick"}.intersection(representation)
-            else 0
-        )
+        represented = 0
+        if {"heuristic", "quick"}.intersection(representation):
+            successful_representatives: Set[int] = set()
+            for result in results:
+                if (
+                    bool(result.get("is_control"))
+                    or result.get("fault_injected") is not True
+                    or result_is_infrastructure_error(result)
+                    or result_is_timeout(result)
+                    or _is_skipped(result)
+                ):
+                    continue
+                result_operation = str(
+                    result.get("operation_kind") or ""
+                ).strip().lower()
+                result_base = _base_code(result.get("fault_type"))
+                if result_operation not in {"program", "erase"}:
+                    if result_base in _PROGRAM_CODES:
+                        result_operation = "program"
+                    elif result_base in _ERASE_CODES:
+                        result_operation = "erase"
+                if result_operation != operation:
+                    continue
+                try:
+                    successful_representatives.add(int(result.get("fault_at")))
+                except (TypeError, ValueError):
+                    pass
+            groups = supplied.get("representative_groups") or {}
+            if isinstance(groups, Mapping):
+                for representative, group_size in groups.items():
+                    try:
+                        representative_index = int(representative)
+                        size = max(0, int(group_size))
+                    except (TypeError, ValueError):
+                        continue
+                    if representative_index in successful_representatives:
+                        represented += max(0, size - 1)
+            represented = min(represented, max(0, planned_range - direct_count))
         outside = max(0, calibrated - planned_range)
         not_cut = max(0, calibrated - direct_count - represented - outside)
         row.update(

@@ -21,6 +21,63 @@ import renode_runner  # noqa: E402
 
 
 class RuntimeFaultSweepCalibrationTests(unittest.TestCase):
+    def test_runfor_infrastructure_error_refuses_partial_calibration(self) -> None:
+        profile = SimpleNamespace(
+            expect=SimpleNamespace(control_outcome="success"),
+            fault_sweep=SimpleNamespace(max_writes_cap=1000),
+        )
+        result = {
+            "total_writes": 17,
+            "total_erases": 1,
+            "calibration_stop_reason": "runfor_infrastructure_error",
+        }
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            renode_runner, "run_single_point", return_value=result
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"reason='runfor_infrastructure_error'.*writes=17, erases=1",
+            ):
+                renode_runner.run_calibration(
+                    repo_root=ROOT,
+                    renode_test="renode-test",
+                    robot_suite="tests/ota_fault_point.robot",
+                    profile=profile,
+                    robot_vars=[],
+                    work_dir=Path(td),
+                    renode_remote_server_dir="",
+                )
+
+    def test_measured_writes_survive_plan_cap(self) -> None:
+        profile = SimpleNamespace(
+            expect=SimpleNamespace(control_outcome="success"),
+            fault_sweep=SimpleNamespace(
+                max_writes_cap=3,
+                calibration_stop=SimpleNamespace(address=None),
+            ),
+        )
+        result = {
+            "total_writes": 7,
+            "total_erases": 0,
+            "calibration_stop_reason": "vtor_captured",
+        }
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            renode_runner, "run_single_point", return_value=result
+        ), mock.patch("sys.stderr", stderr):
+            calibration = renode_runner.run_calibration(
+                repo_root=ROOT,
+                renode_test="renode-test",
+                robot_suite="tests/ota_fault_point.robot",
+                profile=profile,
+                robot_vars=[],
+                work_dir=Path(td),
+                renode_remote_server_dir="",
+            )
+
+        self.assertEqual(calibration.total_writes, 7)
+        self.assertIn("plan will be capped to 3", stderr.getvalue())
+
     def test_success_before_configured_address_is_reported(self) -> None:
         profile = SimpleNamespace(
             expect=SimpleNamespace(control_outcome="success"),

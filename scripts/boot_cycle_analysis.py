@@ -66,6 +66,17 @@ def cycle_has_unresolved_timeout(record):
     return outcome not in _CONCRETE_TERMINAL_BOOT_OUTCOMES
 
 
+def cycle_has_infrastructure_error(record):
+    """Return whether a required boot cycle ended in infrastructure failure."""
+    outcome = str(record.get("boot_outcome") or "").strip().lower()
+    reason = str(record.get("stop_reason") or "").strip().lower()
+    return bool(
+        record.get("infrastructure_error")
+        or outcome in ("infra_error", "infrastructure_error")
+        or reason == "runfor_infrastructure_error"
+    )
+
+
 def _pair_sequence(cycle_records):
     return [
         (record.get("boot_slot"), record.get("boot_outcome"))
@@ -102,6 +113,27 @@ def analyze_boot_cycles(
         analysis["expected_rollback_at_cycle"] = int(expected_rollback_at_cycle)
         if target_slot is not None:
             analysis["rollback_target_slot"] = target_slot
+
+    infrastructure_error_records = [
+        record for record in cycle_records
+        if cycle_has_infrastructure_error(record)
+    ]
+    if infrastructure_error_records:
+        first_error = infrastructure_error_records[0]
+        analysis["infrastructure_error_cycles"] = [
+            int(record.get("cycle", index))
+            for index, record in enumerate(cycle_records)
+            if cycle_has_infrastructure_error(record)
+        ]
+        analysis["infrastructure_error_cycle"] = int(
+            first_error.get("cycle", analysis["infrastructure_error_cycles"][0])
+        )
+        analysis["infrastructure_error_slot"] = first_error.get("boot_slot")
+        analysis["status"] = "infra_error"
+        for field in ("error_kind", "error", "error_pc", "error_peripheral"):
+            if first_error.get(field) is not None:
+                analysis[field] = first_error[field]
+        return analysis
 
     timeout_cycles = [
         int(record.get("cycle", index))

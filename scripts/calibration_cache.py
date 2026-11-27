@@ -44,6 +44,8 @@ CACHE_FIELDS = {
     "emulated_s",
     "elapsed_s",
     "pc",
+    "executed_instructions",
+    "wall_time_breakdown",
     "setup_writes",
     "total_i2c_transactions",
     "total_otp_blows",
@@ -58,6 +60,10 @@ CACHE_FIELDS = {
     "program_trace_file_sha256",
     "erase_trace_file_bin_b64",
     "erase_trace_file_bin_sha256",
+}
+OPTIONAL_CACHE_FIELDS = {
+    "executed_instructions",
+    "wall_time_breakdown",
 }
 
 
@@ -139,6 +145,40 @@ def _counter(payload: Dict[str, Any], name: str) -> int:
     ):
         raise ValueError("{} must be a bounded non-negative integer".format(name))
     return value
+
+
+def _validate_runtime_telemetry(value: Any, name: str, depth: int = 0) -> None:
+    if depth > 8:
+        raise ValueError("{} exceeds nesting limit".format(name))
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, str):
+        if len(value) > 4096:
+            raise ValueError("{} string is too long".format(name))
+        return
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("{} must contain finite numbers".format(name))
+        if value < 0:
+            raise ValueError("{} must contain non-negative numbers".format(name))
+        return
+    if isinstance(value, dict):
+        if len(value) > 256:
+            raise ValueError("{} contains too many fields".format(name))
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or len(key) > 256:
+                raise ValueError("{} contains an invalid field name".format(name))
+            _validate_runtime_telemetry(item, "{}.{}".format(name, key), depth + 1)
+        return
+    if isinstance(value, list):
+        if len(value) > 256:
+            raise ValueError("{} contains too many entries".format(name))
+        for index, item in enumerate(value):
+            _validate_runtime_telemetry(
+                item, "{}[{}]".format(name, index), depth + 1
+            )
+        return
+    raise ValueError("{} contains an unsupported value".format(name))
 
 
 def _parse_trace_csv(
@@ -252,8 +292,11 @@ def _validate_trace_pair(
 def _validate_cache_payload(payload: Any) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("calibration cache must contain a JSON object")
-    if set(payload) != CACHE_FIELDS:
-        missing = sorted(CACHE_FIELDS - set(payload))
+    required_fields = CACHE_FIELDS - OPTIONAL_CACHE_FIELDS
+    if not required_fields.issubset(payload) or not set(payload).issubset(
+        CACHE_FIELDS
+    ):
+        missing = sorted(required_fields - set(payload))
         unknown = sorted(set(payload) - CACHE_FIELDS)
         raise ValueError(
             "calibration cache fields are invalid (missing={}, unknown={})".format(
@@ -261,6 +304,8 @@ def _validate_cache_payload(payload: Any) -> Dict[str, Any]:
                 unknown,
             )
         )
+    for field in OPTIONAL_CACHE_FIELDS:
+        payload.setdefault(field, None)
     if type(payload["version"]) is not int or payload["version"] != CACHE_VERSION:
         raise ValueError(
             "unsupported calibration cache version {}; regenerate the cache".format(
@@ -305,6 +350,22 @@ def _validate_cache_payload(payload: Any) -> Dict[str, Any]:
             or value < 0
         ):
             raise ValueError("{} must be a finite non-negative number or null".format(name))
+    executed_instructions = payload["executed_instructions"]
+    if executed_instructions is not None and (
+        not isinstance(executed_instructions, int)
+        or isinstance(executed_instructions, bool)
+        or executed_instructions < 0
+        or executed_instructions > 1_000_000_000_000_000
+    ):
+        raise ValueError(
+            "executed_instructions must be a bounded non-negative integer or null"
+        )
+    wall_time_breakdown = payload["wall_time_breakdown"]
+    if wall_time_breakdown is not None and not isinstance(
+        wall_time_breakdown, dict
+    ):
+        raise ValueError("wall_time_breakdown must be an object or null")
+    _validate_runtime_telemetry(wall_time_breakdown, "wall_time_breakdown")
     validate_barrier_audit(payload["barrier_audit"])
 
     trace_csv = _decode_artifact(payload, "trace_file_b64")
@@ -471,6 +532,10 @@ def save_calibration(
     cache_key: str,
 ) -> None:
     """Save calibration result and trace files to a JSON cache file."""
+    if str(cal.stop_reason or "").startswith("runfor_infrastructure_error"):
+        raise ValueError(
+            "refusing to save incomplete calibration with RunFor infrastructure error"
+        )
     trace_b64, trace_sha256 = _artifact_payload(cal.trace_file)
     erase_trace_b64, erase_trace_sha256 = _artifact_payload(cal.erase_trace_file)
     trace_bin_b64, trace_bin_sha256 = _artifact_payload(cal.trace_file_bin)
@@ -492,6 +557,8 @@ def save_calibration(
         "emulated_s": cal.emulated_s,
         "elapsed_s": cal.elapsed_s,
         "pc": cal.pc,
+        "executed_instructions": cal.executed_instructions,
+        "wall_time_breakdown": cal.wall_time_breakdown,
         "setup_writes": cal.setup_writes,
         "total_i2c_transactions": cal.total_i2c_transactions,
         "total_otp_blows": cal.total_otp_blows,
@@ -580,6 +647,13 @@ def load_calibration(
         raise ValueError("calibration cache is not valid UTF-8 JSON") from exc
     payload = _validate_cache_payload(payload)
 
+    if str(payload.get("stop_reason") or "").startswith(
+        "runfor_infrastructure_error"
+    ):
+        raise ValueError(
+            "refusing to restore incomplete calibration with RunFor infrastructure error"
+        )
+
     if payload["cache_key"] != cache_key:
         if expected_sha256 is not None:
             raise ValueError("pinned calibration cache key does not match this run")
@@ -620,6 +694,8 @@ def load_calibration(
         emulated_s=payload.get("emulated_s"),
         elapsed_s=payload.get("elapsed_s"),
         pc=payload.get("pc"),
+        executed_instructions=payload.get("executed_instructions"),
+        wall_time_breakdown=payload.get("wall_time_breakdown"),
         setup_writes=payload.get("setup_writes", 0),
         total_i2c_transactions=payload.get("total_i2c_transactions", 0),
         total_otp_blows=payload.get("total_otp_blows", 0),

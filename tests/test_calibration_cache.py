@@ -263,6 +263,15 @@ class TestSaveLoadCalibration(unittest.TestCase):
             emulated_s=1.5,
             elapsed_s=55.0,
             pc="0x10000100",
+            executed_instructions=123456,
+            wall_time_breakdown={
+                "run_for_s": 1.25,
+                "run_for_calls": 8,
+                "boot_setup_detail": {
+                    "mode": "machine_snapshot_load",
+                    "total_s": 0.2,
+                },
+            },
             setup_writes=10,
             total_i2c_transactions=2,
             total_otp_blows=0,
@@ -309,6 +318,47 @@ class TestSaveLoadCalibration(unittest.TestCase):
         self.assertEqual(loaded.total_i2c_transactions, 2)
         self.assertEqual(loaded.total_otp_blows, 0)
         self.assertEqual(loaded.barrier_audit, cal.barrier_audit)
+        self.assertEqual(loaded.executed_instructions, 123456)
+        self.assertEqual(loaded.wall_time_breakdown, cal.wall_time_breakdown)
+
+    def test_cache_written_before_runtime_telemetry_fields_still_loads(self):
+        cal = self._make_cal(total_writes=42)
+        save_calibration(self.cache_path, cal, "legacy-telemetry-key")
+        payload = json.loads(Path(self.cache_path).read_text(encoding="utf-8"))
+        payload.pop("executed_instructions", None)
+        payload.pop("wall_time_breakdown", None)
+        Path(self.cache_path).write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = load_calibration(
+            self.cache_path,
+            "legacy-telemetry-key",
+            self.work_dir,
+            allow_unsigned=True,
+        )
+
+        self.assertIsNotNone(loaded)
+        self.assertIsNone(loaded.executed_instructions)
+        self.assertIsNone(loaded.wall_time_breakdown)
+
+    def test_runfor_infrastructure_error_is_never_saved_or_restored(self):
+        cal = self._make_cal(total_writes=42)
+        cal.stop_reason = "runfor_infrastructure_error"
+        with self.assertRaisesRegex(ValueError, "incomplete calibration"):
+            save_calibration(self.cache_path, cal, "runfor-key")
+        self.assertFalse(Path(self.cache_path).exists())
+
+        cal.stop_reason = "vtor_captured"
+        save_calibration(self.cache_path, cal, "runfor-key")
+        payload = json.loads(Path(self.cache_path).read_text(encoding="utf-8"))
+        payload["stop_reason"] = "runfor_infrastructure_error"
+        Path(self.cache_path).write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "incomplete calibration"):
+            load_calibration(
+                self.cache_path,
+                "runfor-key",
+                self.work_dir,
+                allow_unsigned=True,
+            )
 
     def test_cache_miss_wrong_key(self):
         cal = self._make_cal()

@@ -15,6 +15,31 @@ from scripts.boot_cycle_analysis import analyze_boot_cycles
 
 
 class BootCycleAnalysisTests(unittest.TestCase):
+    def test_later_infrastructure_error_makes_boot_span_incomplete(self) -> None:
+        analysis = analyze_boot_cycles(
+            [
+                {"cycle": 0, "boot_slot": "exec", "boot_outcome": "success"},
+                {
+                    "cycle": 1,
+                    "boot_slot": "exec",
+                    "boot_outcome": "infra_error",
+                    "stop_reason": "runfor_infrastructure_error",
+                    "infrastructure_error": True,
+                    "error_kind": "runfor_exception",
+                    "error": "RunFor failed: injected test exception",
+                },
+            ],
+            requested_cycles=2,
+        )
+
+        self.assertEqual(analysis["status"], "infra_error")
+        self.assertEqual(analysis["infrastructure_error_cycles"], [1])
+        self.assertEqual(analysis["final_outcome"], "infra_error")
+        self.assertEqual(analysis["error_kind"], "runfor_exception")
+        self.assertEqual(
+            analysis["error"], "RunFor failed: injected test exception"
+        )
+
     def test_converged_without_rollback_expectation(self) -> None:
         analysis = analyze_boot_cycles(
             [

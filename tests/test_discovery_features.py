@@ -1476,6 +1476,7 @@ class DiscoveryFeaturesTest(unittest.TestCase):
 
     def test_calibration_completed_rejects_incomplete_reasons(self) -> None:
         self.assertTrue(calibration_completed("vtor_captured"))
+        self.assertFalse(calibration_completed("runfor_infrastructure_error"))
         self.assertFalse(calibration_completed("wall_timeout(600s)"))
         self.assertFalse(calibration_completed("budget"))
         self.assertFalse(calibration_completed("budget", total_writes=13416))

@@ -262,6 +262,49 @@ def test_summary_retains_concise_evidence_and_snapshot_identity() -> None:
     ]
 
 
+def test_recovery_infrastructure_error_keeps_cut_evidence_outside_judged_counts() -> None:
+    result = {
+        "is_control": False,
+        "fault_at": 4,
+        "fault_requested": 4,
+        "fault_address": "0x10000040",
+        "fault_injected": True,
+        "boot_outcome": "infra_error",
+        "boot_slot": None,
+        "fault_class": "infrastructure_error",
+        "infrastructure_error": True,
+        "error_kind": "runfor_exception",
+        "error": "RunFor failed during recovery",
+        "mram_fault_evidence": {"exact": True, "program_width": 16},
+        "fault_snapshot": {"sha256": "cd" * 32},
+        "signals": {},
+    }
+
+    summary = summarize_runtime_sweep(
+        [result],
+        expected_fault_points=1,
+        expected_control_points=0,
+        planned_fault_types=["w"],
+    )
+
+    assert summary["infrastructure_error_points"] == 1
+    assert summary["total_fault_points"] == 0
+    assert summary["issue_points"] == 0
+    assert summary["point_counts"]["kinds"]["single_cut_program"][
+        "infrastructure_error"
+    ] == 1
+    assert summary["fault_evidence"] == [
+        {
+            "fault_at": 4,
+            "fault_address": "0x10000040",
+            "boot_outcome": "infra_error",
+            "exact": True,
+            "program_width": 16,
+            "snapshot_sha256": "cd" * 32,
+        }
+    ]
+
+
 def test_mapped_mram_tracker_preserves_counters_across_firmware_reset_when_enabled() -> None:
     interface_cs = (ROOT / "peripherals" / "ITardigradeFaultInjectable.cs").read_text(
         encoding="utf-8"

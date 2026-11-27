@@ -471,6 +471,17 @@ def test_calibration_fallback_rejects_success_profiles():
     assert _can_fallback_to_control_only_calibration(profile, exc) is False
 
 
+def test_calibration_fallback_rejects_runfor_infrastructure_error():
+    profile = load_profile(ROOT / "tests" / "fixtures" / "profiles" / "control_only_issue_profile.yaml")
+    profile.expect.control_outcome = "no_boot"
+    exc = RuntimeError(
+        "Calibration did not complete cleanly "
+        "(reason='runfor_infrastructure_error', writes=0, erases=0). "
+        "Refusing to run a partial sweep."
+    )
+    assert _can_fallback_to_control_only_calibration(profile, exc) is False
+
+
 def test_allow_expected_control_only_issues_requires_non_success_control():
     profile = load_profile(ROOT / "tests" / "fixtures" / "profiles" / "control_only_issue_profile.yaml")
     profile.expect.control_outcome = "wrong_image"

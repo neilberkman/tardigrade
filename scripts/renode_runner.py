@@ -28,6 +28,7 @@ from profile_loader import HeuristicConfig, ProfileConfig, load_profile
 
 DOCKER_RENODE_PREFIX = "docker://"
 CALIBRATION_INCOMPLETE_PREFIXES = (
+    "runfor_infrastructure_error",
     "wall_timeout(",
     "instruction_limit(",
     "no_progress_stall(",
@@ -1171,12 +1172,11 @@ def run_calibration(
     cap = profile.fault_sweep.max_writes_cap
     if total_writes > cap:
         print(
-            "WARNING: Calibration found {} writes, capping to {}".format(
+            "WARNING: Calibration found {} writes; the fault plan will be capped to {}".format(
                 total_writes, cap
             ),
             file=sys.stderr,
         )
-        total_writes = cap
     configured_stop_address = getattr(
         getattr(profile.fault_sweep, "calibration_stop", None),
         "address",

@@ -969,7 +969,7 @@ def summarize_runtime_sweep(
             planned_state_search_requests
         )
     fault_evidence = []
-    for result in injected:
+    for result in injected_with_infrastructure:
         evidence = result.get("mram_fault_evidence")
         snapshot = result.get("fault_snapshot")
         if not isinstance(evidence, dict) and not isinstance(snapshot, dict):

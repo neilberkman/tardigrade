@@ -2535,6 +2535,18 @@ def annotate_boot_span_result(result):
     result['initial_boot_slot'] = initial_slot
     result['final_boot_outcome'] = final_outcome
     result['final_boot_slot'] = final_slot
+    mba = result.get('multi_boot_analysis')
+    if isinstance(mba, dict) and mba.get('status') == 'infra_error':
+        result['infrastructure_error'] = True
+        result['error_kind'] = mba.get(
+            'error_kind', result.get('error_kind', 'runfor_infrastructure_error')
+        )
+        result['error'] = mba.get(
+            'error', result.get('error', 'RunFor infrastructure error')
+        )
+        for field in ('error_pc', 'error_peripheral'):
+            if mba.get(field) is not None:
+                result[field] = mba[field]
     signals = result.get('signals')
     if isinstance(signals, dict):
         observations = signals.get('success_checks')
@@ -4636,6 +4648,17 @@ def build_cycle_record(cycle_index, boot_outcome, boot_slot, signals, stop_statu
         record['emulated_s'] = stop_status.get('emulated_s')
         record['elapsed_s'] = stop_status.get('elapsed_s')
         record['iters'] = stop_status.get('iters')
+        if stop_status.get('infrastructure_error'):
+            record['infrastructure_error'] = True
+            record['error_kind'] = stop_status.get(
+                'error_kind', 'runfor_infrastructure_error'
+            )
+            record['error'] = stop_status.get(
+                'error', 'RunFor infrastructure error'
+            )
+            for field in ('error_pc', 'error_peripheral'):
+                if stop_status.get(field) is not None:
+                    record[field] = stop_status[field]
     semantic_state = collect_semantic_state({
         'cycle': int(cycle_index),
         'boot_outcome': boot_outcome,
@@ -5111,7 +5134,19 @@ def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injec
             _restore_mram_uncorrectable_offsets(followup_uncorr)
         if _hash_bypass_active:
             apply_hash_bypass()
-        cycle_records.append(_boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=effective_criteria, wall_timeout=cycle_wall_timeout))
+        cycle_record = _boot_followup_cycle(
+            cycle_index,
+            fault_injected,
+            label,
+            effective_criteria=effective_criteria,
+            wall_timeout=cycle_wall_timeout,
+        )
+        cycle_records.append(cycle_record)
+        if (
+            cycle_record.get('infrastructure_error')
+            or cycle_record.get('boot_outcome') == 'infra_error'
+        ):
+            break
 
     followup_ms = int((_time.time() - followup_t0) * 1000)
     return cycle_records, analyze_boot_cycles(cycle_records), followup_ms
