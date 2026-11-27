@@ -27,10 +27,12 @@ INTERFACE_FILE = PERIPHERALS / "ITardigradeFaultInjectable.cs"
 # can abort mid-campaign on a missing member.
 FAULT_BACKENDS = (
     "NRF52NVMC.cs",
+    "STM32F1FlashController.cs",
     "STM32F4FastFlash.cs",
     "STM32H7FastFlash.cs",
     "STM32F4FlashController.cs",
     "STM32H7FlashController.cs",
+    "STM32L4FlashController.cs",
     "GenericNvmController.cs",
     "NVMemoryController.cs",
 )

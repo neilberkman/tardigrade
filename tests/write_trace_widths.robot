@@ -29,6 +29,24 @@ Create STM32H7 Fast Machine
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${root}/platforms/stm32h743_fast.repl
 
+Create STM32F1 Machine
+    ${root}=    Set Variable    ${CURDIR}/..
+    Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${root}/peripherals/FaultTracker.cs"
+    Execute Command    include "${root}/peripherals/TraceReplayEngine.cs"
+    Execute Command    include "${root}/peripherals/STM32F1FlashController.cs"
+    Execute Command    mach create
+    Execute Command    machine LoadPlatformDescription @${root}/platforms/stm32f103.repl
+
+Create STM32L4 Machine
+    ${root}=    Set Variable    ${CURDIR}/..
+    Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${root}/peripherals/FaultTracker.cs"
+    Execute Command    include "${root}/peripherals/TraceReplayEngine.cs"
+    Execute Command    include "${root}/peripherals/STM32L4FlashController.cs"
+    Execute Command    mach create
+    Execute Command    machine LoadPlatformDescription @${root}/platforms/stm32l476.repl
+
 Create NRF52 Fast Machine
     ${root}=    Set Variable    ${CURDIR}/..
     Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
@@ -192,3 +210,63 @@ AN521 Mapped Write Canonicalizes Cross Word Three Byte Chunk
     Should Contain    ${trace}    2:36:4286076468:4
     Should Be Equal As Numbers    ${first}    0x12FFFFFF
     Should Be Equal As Numbers    ${second}    0xFF785634
+
+STM32F1 Trace Carries Half-Word Width
+    Create STM32F1 Machine
+    # Erase page at 0x08001000 so it is 0xFFFF.
+    Execute Command    sysbus WriteDoubleWord 0x40022004 0x45670123
+    Execute Command    sysbus WriteDoubleWord 0x40022004 0xCDEF89AB
+    Execute Command    sysbus WriteDoubleWord 0x40022010 0x00000002
+    Execute Command    sysbus WriteDoubleWord 0x40022014 0x08001000
+    Execute Command    sysbus WriteDoubleWord 0x40022010 0x00000042
+    Execute Command    sysbus WriteDoubleWord 0x40022010 0x00000001
+    # Thumb snippet in SRAM at 0x20000000:
+    #   ldr r0, =0x08001000 (0x4802)
+    #   ldr r1, =0xABCD     (0x4903)
+    #   strh r1, [r0, #0]   (0x8001)
+    #   b .                 (0xE7FE)
+    Execute Command    sysbus WriteDoubleWord 0x20000000 0x49034802
+    Execute Command    sysbus WriteDoubleWord 0x20000004 0xE7FE8001
+    Execute Command    sysbus WriteDoubleWord 0x2000000C 0x08001000
+    Execute Command    sysbus WriteDoubleWord 0x20000010 0x0000ABCD
+    Execute Command    faultFlash WriteTraceClear
+    Execute Command    faultFlash TotalWordWrites 0
+    Execute Command    faultFlash WriteTraceEnabled true
+    Execute Command    cpu PC 0x20000001
+    Execute Command    emulation RunFor "1us"
+    ${trace}=    Execute Command    faultFlash WriteTraceToString
+    ${val}=      Execute Command    sysbus ReadWord 0x08001000
+    Should Contain    ${trace}    1:4096:43981:2
+    Should Be Equal As Numbers    ${val}    0xABCD
+
+STM32L4 Trace Carries Double-Word Width
+    Create STM32L4 Machine
+    # Unlock and erase page 2 (offset 0x1000).
+    Execute Command    sysbus WriteDoubleWord 0x40022008 0x45670123
+    Execute Command    sysbus WriteDoubleWord 0x40022008 0xCDEF89AB
+    Execute Command    sysbus WriteDoubleWord 0x40022014 0x00010012
+    Execute Command    sysbus WriteDoubleWord 0x40022014 0x00000001
+    # Thumb snippet in SRAM at 0x20000000:
+    #   ldr r0, =0x08001000 (0x4802)
+    #   ldr r1, =0x44332211 (0x4903)
+    #   ldr r2, =0x88776655 (0x4A03)
+    #   str r1, [r0, #0]    (0x6001)
+    #   str r2, [r0, #4]    (0x6042)
+    #   b .                 (0xE7FE)
+    Execute Command    sysbus WriteDoubleWord 0x20000000 0x49034802
+    Execute Command    sysbus WriteDoubleWord 0x20000004 0x60014A03
+    Execute Command    sysbus WriteDoubleWord 0x20000008 0xE7FE6042
+    Execute Command    sysbus WriteDoubleWord 0x2000000C 0x08001000
+    Execute Command    sysbus WriteDoubleWord 0x20000010 0x44332211
+    Execute Command    sysbus WriteDoubleWord 0x20000014 0x88776655
+    Execute Command    faultFlash WriteTraceClear
+    Execute Command    faultFlash TotalWordWrites 0
+    Execute Command    faultFlash WriteTraceEnabled true
+    Execute Command    cpu PC 0x20000001
+    Execute Command    emulation RunFor "1us"
+    ${trace}=    Execute Command    faultFlash WriteTraceToString
+    ${lo}=       Execute Command    sysbus ReadDoubleWord 0x08001000
+    ${hi}=       Execute Command    sysbus ReadDoubleWord 0x08001004
+    Should Contain    ${trace}    1:4096:9833440827789222417:8
+    Should Be Equal As Numbers    ${lo}    0x44332211
+    Should Be Equal As Numbers    ${hi}    0x88776655

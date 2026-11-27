@@ -1562,10 +1562,12 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
 
     def test_trace_capable_backends_emit_explicit_widths(self) -> None:
         expected = {
+            "STM32F1FlashController.cs": True,
             "STM32F4FastFlash.cs": True,
             "STM32F4FlashController.cs": True,
             "STM32H7FastFlash.cs": True,
             "STM32H7FlashController.cs": True,
+            "STM32L4FlashController.cs": True,
             "NRF52NVMC.cs": True,
             "An521NvmInterceptor.cs": True,
             "CFIFlash.cs": True,

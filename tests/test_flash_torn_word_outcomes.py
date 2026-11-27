@@ -32,10 +32,12 @@ from writeback_reconstruction import (  # noqa: E402
 BACKENDS = (
     ("NRF52NVMC", "NRF52NVMC.cs", "half"),
     ("cortex_m4_flash_fast", "NRF52NVMC.cs", "half"),
+    ("STM32F1FlashController", "STM32F1FlashController.cs", "half"),
     ("STM32F4FlashController", "STM32F4FlashController.cs", "half"),
     ("STM32F4FastFlash", "STM32F4FastFlash.cs", "half"),
     ("STM32H7FlashController", "STM32H7FlashController.cs", "half"),
     ("STM32H7FastFlash", "STM32H7FastFlash.cs", "half"),
+    ("STM32L4FlashController", "STM32L4FlashController.cs", "half"),
     ("An521NvmInterceptor", "An521NvmInterceptor.cs", "half"),
     ("CFIFlash", "CFIFlash.cs", "untouched"),
 )

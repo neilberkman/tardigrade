@@ -13,7 +13,9 @@ Load All Builtin NVM Peripherals
     Execute Command    include "${ROOT}/peripherals/MappedMRAMTracker.cs"
     Execute Command    include "${ROOT}/peripherals/An521NvmInterceptor.cs"
     Execute Command    include "${ROOT}/peripherals/NRF52NVMC.cs"
+    Execute Command    include "${ROOT}/peripherals/STM32F1FlashController.cs"
     Execute Command    include "${ROOT}/peripherals/STM32F4FastFlash.cs"
+    Execute Command    include "${ROOT}/peripherals/STM32L4FlashController.cs"
 
 Read Normalized Bool
     [Arguments]    ${command}
@@ -281,3 +283,43 @@ NRF52NVMC And STM32F4FastFlash Honor Torn Erase Modes
     Execute Command    sysbus WriteDoubleWord 0x40023C10 0x0001000A
     ${s_c_lo}=         Execute Command    sysbus ReadDoubleWord 0x08004000
     Should Not Be Equal As Numbers    ${s_c_lo}    0xFFFFFFFF
+
+STM32F1 And STM32L4 Flash Controllers Track And Fault Page Erases
+    Load All Builtin NVM Peripherals
+    Execute Command    include "${ROOT}/peripherals/TraceReplayEngine.cs"
+    Execute Command    mach create "stm32f1_erases"
+    Execute Command    machine LoadPlatformDescription @${ROOT}/platforms/stm32f103.repl
+    Execute Command    faultFlash EraseTraceEnabled true
+    Execute Command    sysbus WriteDoubleWord 0x40022004 0x45670123
+    Execute Command    sysbus WriteDoubleWord 0x40022004 0xCDEF89AB
+    Execute Command    sysbus WriteDoubleWord 0x08001000 0x11223344
+    Execute Command    sysbus WriteDoubleWord 0x08001200 0x55667788
+    Execute Command    faultFlash TornWordMode "fixed"
+    Execute Command    faultFlash FaultAtPageErase 1
+    Execute Command    sysbus WriteDoubleWord 0x40022010 0x00000002
+    Execute Command    sysbus WriteDoubleWord 0x40022014 0x08001000
+    Execute Command    sysbus WriteDoubleWord 0x40022010 0x00000042
+    ${f1_lo}=          Execute Command    sysbus ReadDoubleWord 0x08001000
+    ${f1_hi}=          Execute Command    sysbus ReadDoubleWord 0x08001200
+    ${f1_trace}=       Execute Command    faultFlash EraseTraceToString
+    Should Be Equal As Numbers    ${f1_lo}    0xFFFFFFFF
+    Should Be Equal As Numbers    ${f1_hi}    0x55667788
+    Should Contain    ${f1_trace}    1:4096:0:1024
+
+    Execute Command    mach create "stm32l4_erases"
+    Execute Command    machine LoadPlatformDescription @${ROOT}/platforms/stm32l476.repl
+    Execute Command    faultFlash EraseTraceEnabled true
+    Execute Command    sysbus WriteDoubleWord 0x40022008 0x45670123
+    Execute Command    sysbus WriteDoubleWord 0x40022008 0xCDEF89AB
+    Execute Command    sysbus WriteDoubleWord 0x08081000 0x11223344
+    Execute Command    sysbus WriteDoubleWord 0x08081400 0x55667788
+    Execute Command    faultFlash TornWordMode "fixed"
+    Execute Command    faultFlash FaultAtPageErase 1
+    # Bank 2 (BKER=1<<11=0x800), page 2 (PNB=2<<3=0x10), PER(0x2), STRT(0x10000) -> 0x00010812
+    Execute Command    sysbus WriteDoubleWord 0x40022014 0x00010812
+    ${l4_lo}=          Execute Command    sysbus ReadDoubleWord 0x08081000
+    ${l4_hi}=          Execute Command    sysbus ReadDoubleWord 0x08081400
+    ${l4_trace}=       Execute Command    faultFlash EraseTraceToString
+    Should Be Equal As Numbers    ${l4_lo}    0xFFFFFFFF
+    Should Be Equal As Numbers    ${l4_hi}    0x55667788
+    Should Contain    ${l4_trace}    1:528384:0:2048

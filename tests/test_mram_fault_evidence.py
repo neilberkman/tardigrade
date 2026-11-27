@@ -694,10 +694,12 @@ def test_mram_torn_word_modes_across_trace_replay_and_csharp_peripherals() -> No
         "NVMemoryController.cs": "Nvm.MramTornWordMode = value;",
         "An521NvmInterceptor.cs": "tracker.MramTornWordMode = value;",
         "NRF52NVMC.cs": "tracker.MramTornWordMode = value;",
+        "STM32F1FlashController.cs": "tracker.MramTornWordMode = value;",
         "STM32F4FastFlash.cs": "tracker.MramTornWordMode = value;",
         "STM32F4FlashController.cs": "tracker.MramTornWordMode = value;",
         "STM32H7FastFlash.cs": "tracker.MramTornWordMode = value;",
         "STM32H7FlashController.cs": "tracker.MramTornWordMode = value;",
+        "STM32L4FlashController.cs": "tracker.MramTornWordMode = value;",
     }
     for filename, expected_forwarding in forwarding_peripherals.items():
         cs_source = (ROOT / "peripherals" / filename).read_text(encoding="utf-8")
