@@ -187,6 +187,8 @@ python3 scripts/render_results_html.py \
   --output /tmp/report.html
 ```
 
+For JUnit XML, SARIF, and GitHub Actions upload examples, see [Audit reports for CI](report-formats.md).
+
 ## Testing your own bootloader
 
 To test your own bootloader, you need to write a YAML profile that describes your memory layout, slot addresses, firmware images, and success criteria. See [**Writing Profiles**](writing-profiles.md) for the complete guide.

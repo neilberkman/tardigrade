@@ -112,6 +112,9 @@ from terminal_error_escape import (
     evaluate_terminal_error_differential,
 )
 from boundary_campaigns import aggregate_boundary_results, boundary_campaign_dict
+from report_formats import (
+    FORMATS, add_report_options, profile_run, requested, validate_report_paths, write_audit_report,
+)
 from report_security_status import attach_security_aggregate
 from verdicts import (
     EXPECTATION_MODES,
@@ -945,9 +948,7 @@ def _write_trigger_discovery_failure(
         **_report_provenance(profile, repo_root),
     }
     attach_security_aggregate(payload)
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    write_audit_report(args, payload, profile, repo_root)
     print(
         json.dumps(
             {
@@ -1018,9 +1019,7 @@ def _write_geometry_preflight_failure(
         **_report_provenance(profile, repo_root),
     }
     attach_security_aggregate(payload)
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    write_audit_report(args, payload, profile, repo_root)
     print(
         json.dumps(
             {
@@ -1043,6 +1042,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to a YAML bootloader profile.",
     )
     parser.add_argument("--output", required=True, help="Output JSON report path.")
+    add_report_options(parser)
     parser.add_argument(
         "--evaluation-mode",
         choices=("state", "execute"),
@@ -1199,6 +1199,7 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
+    validate_report_paths(parser, args, [args.profile])
     if args.workers < 1 or args.workers > 64:
         parser.error("--workers must be between 1 and 64")
     if args.fault_step < 1:
@@ -1992,11 +1993,19 @@ def _main_single() -> int:
             }
 
             attach_security_aggregate(payload)
-            out_path = Path(args.output)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(
-                json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
-            )
+            runs = None
+            if requested(args):
+                parent = profile_run(args, payload, profile, repo_root)
+                components = []
+                for component in profile.multi_component.components:
+                    child = component.to_profile_config(profile)
+                    evidence = mc_result["per_component"][component.name]
+                    data = {"runtime_sweep_results": evidence["results"], "summary": {"runtime_sweep": evidence["summary"]},
+                            "expect": {"control_outcome": child.expect.control_outcome}}
+                    components.append(profile_run(args, data, child, repo_root, component.name))
+                parent.components = tuple(components)
+                runs = [parent]
+            write_audit_report(args, payload, profile, repo_root, runs)
 
             print(json.dumps({
                 "profile": profile.name,
@@ -3061,9 +3070,7 @@ def _main_single() -> int:
             payload["summary"]["fuzz_crash"] = fuzz_crash_summary
 
         attach_security_aggregate(payload)
-        out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        write_audit_report(args, payload, profile, repo_root)
 
         # Print summary.
         print(
@@ -3141,12 +3148,13 @@ def _initial_state_child_command(
     filtered: List[str] = []
     argv = list(sys.argv[1:])
     index = 0
+    replaced = {"--output", "--initial-state", *("--" + name for name in FORMATS)}
     while index < len(argv):
         token = argv[index]
-        if token in {"--output", "--initial-state"}:
+        if token in replaced:
             index += 2
             continue
-        if token.startswith("--output=") or token.startswith("--initial-state="):
+        if token.partition("=")[0] in replaced:
             index += 1
             continue
         filtered.append(token)
@@ -3284,6 +3292,7 @@ def _run_initial_state_matrix(
     """Run and aggregate every declared initial state through the real CLI."""
     repo_root = Path(args.repo_root).resolve() if args.repo_root else REPO_ROOT
     entries: List[Dict[str, Any]] = []
+    runs = []
     with tempfile.TemporaryDirectory(prefix="tardigrade_initial_states_") as td:
         temp_root = Path(td)
         for index, state in enumerate(profile.initial_states):
@@ -3319,6 +3328,11 @@ def _run_initial_state_matrix(
             else:
                 parse_error = "child report was not created"
 
+            if requested(args):
+                state_profile = profile.resolve_initial_state(state)
+                name = f"{profile.name}/{state.name}"
+                evidence = child_payload or {"verdict": "INCONCLUSIVE", "error": parse_error}
+                runs.append(profile_run(args, evidence, state_profile, repo_root, name))
             # Boundary campaigns are intentionally runner-owned two-phase
             # relations.  The first child performs the ordinary update
             # sequence for N; its semantic post-state is handed to the
@@ -3361,6 +3375,9 @@ def _run_initial_state_matrix(
                                         follow_payload = loaded_follow
                                 except (OSError, ValueError):
                                     pass
+                            if requested(args):
+                                evidence = follow_payload or {"verdict": "INCONCLUSIVE", "error": "missing follow-up report"}
+                                runs.append(profile_run(args, evidence, state_profile, repo_root, name + "/follow_up"))
                             follow_observation = _boundary_observation(
                                 follow_payload,
                                 campaign,
@@ -3508,9 +3525,7 @@ def _run_initial_state_matrix(
         **_report_provenance(profile, repo_root),
     }
     attach_security_aggregate(payload)
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    write_audit_report(args, payload, profile, repo_root, runs)
     print(
         json.dumps(
             {

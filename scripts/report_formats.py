@@ -57,7 +57,7 @@ def profile_run(args, data, profile, root, name=None):
     elf = None
     if args.sarif and profile.bootloader_elf:
         elf = Path(profile.resolve_path(root, profile.bootloader_elf))
-    return ReportRun(data, name or profile.name, Path(args.profile), elf)
+    return ReportRun(data, name or profile.name, Path(args.profile).resolve(), elf)
 
 
 def write_audit_report(args, data, profile, root, runs=None):
@@ -133,21 +133,25 @@ def collect_child_reports(args, children, root=None):
 
 def saved_run(data, path, root, profile_path=None, elf=None, name=None):
     from render_results_html import classify_payload, runtime_payload
-    if classify_payload(data) == "runtime":
-        data = runtime_payload(data, name or path.stem)
-    if classify_payload(data) != "audit":
+    kind = classify_payload(data)
+    if kind not in {"audit", "runtime"}:
         raise ValueError(f"{path} has no runtime audit records")
-    if data.get("initial_states"):
-        raise ValueError(f"{path} is a summary of an initial-state matrix. Export its child audits or use the audit CLI.")
-    profile_path = profile_path or data.get("profile_path")
+    if kind == "audit":
+        if data.get("initial_states"):
+            raise ValueError(f"{path} is a summary of an initial-state matrix. Export its child audits or use the audit CLI.")
+        profile_path = profile_path or data.get("profile_path")
     profile_path = Path(profile_path) if profile_path else None
     if profile_path and not profile_path.is_absolute() and (root / profile_path).is_file():
         profile_path = (root / profile_path).resolve()
-    if not elf and profile_path and profile_path.is_file():
+    raw_profile = {}
+    if profile_path and profile_path.is_file():
         from profile_loader import _resolve_profile_input_path, load_profile_raw
-        raw_elf = (load_profile_raw(profile_path).get("bootloader") or {}).get("elf")
-        if raw_elf:
+        raw_profile = load_profile_raw(profile_path)
+        raw_elf = (raw_profile.get("bootloader") or {}).get("elf")
+        if not elf and raw_elf:
             elf = _resolve_profile_input_path(raw_elf, repo_root=root, profile_path=profile_path)
+    if kind == "runtime":
+        data = runtime_payload(data, name or raw_profile.get("name") or path.stem, raw_profile)
     return ReportRun(data, name or data.get("profile") or path.stem, profile_path, elf)
 
 
@@ -159,7 +163,7 @@ def main():
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     add_report_options(parser)
     args = parser.parse_args()
-    validate_report_paths(parser, args, args.input)
+    validate_report_paths(parser, args, [*args.input, args.profile, args.elf])
     if not requested(args):
         parser.error("choose --junit, --sarif or --html")
     runs = []

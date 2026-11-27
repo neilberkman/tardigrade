@@ -21,6 +21,7 @@ try:
 except ImportError as exc:  # pragma: no cover - runtime dependency check
     raise SystemExit("PyYAML is required for run_scenario.py (pip install pyyaml).") from exc
 
+from report_formats import add_report_options, child_report_args, collect_child_reports, validate_report_paths
 from profile_loader import load_profile_raw
 from point_counts import render_point_counts_text
 from verdicts import is_pass_verdict
@@ -194,7 +195,10 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Override worker count for all audit steps (0 = use per-step YAML value).",
     )
-    return parser.parse_args()
+    add_report_options(parser)
+    args = parser.parse_args()
+    validate_report_paths(parser, args, [args.scenario])
+    return args
 
 
 def _load_data(path: Path) -> Dict[str, Any]:
@@ -478,6 +482,7 @@ def run_audit_step(
     step_profile.write_text(yaml.safe_dump(profile_raw, sort_keys=False), encoding="utf-8")
 
     cmd = build_audit_command(repo_root, step_profile, step_output, step_audit, args)
+    cmd.extend(child_report_args(args, step_output))
     _progress("starting step {} ({})".format(step_id, step_kind))
     _progress("profile {}".format(step_profile))
     proc_returncode, proc_stdout, proc_stderr = _run_command_streamed(cmd, repo_root)
@@ -615,6 +620,17 @@ def main() -> int:
             if failures:
                 results["status"] = "FAIL"
             results["steps"][step_id] = step_result
+
+        audit_steps = [step for step in results["steps"].values() if step.get("kind") in {"audit", "replay"}]
+        if args.junit or args.sarif:
+            collect_child_reports(args, [
+                (step["id"], tempdir / (step["id"] + "_report.json"), Path(step["base_profile"]),
+                 f"Scenario step {step['id']} produced no report") for step in audit_steps
+            ], root=repo_root)
+        if args.html:
+            from render_results_html import write_html
+            write_html([(Path(step["base_profile"]), {**(step["report"] or {}), "profile": step["id"]})
+                        for step in audit_steps], args.html)
 
     target_source = _consistent_target_source(results)
     if target_source is not None:

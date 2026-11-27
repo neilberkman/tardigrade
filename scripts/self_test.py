@@ -23,6 +23,7 @@ from pathlib import Path
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
 
+from report_formats import add_report_options, child_report_args, collect_child_reports, validate_report_paths
 from profile_loader import load_profile_raw
 from fault_types import TRACE_COVERAGE_FAULT_TYPES, _fault_type_label
 from verdicts import expectation_requires_findings, is_exploratory_expectation
@@ -717,7 +718,9 @@ def main() -> int:
         default=DEFAULT_SELF_TEST_RUNTIME_MANIFEST,
         help="Path to the self-test runtime cost manifest used for weighted sharding.",
     )
+    add_report_options(parser)
     args = parser.parse_args()
+    validate_report_paths(parser, args, args.profile)
 
     repo_root = Path(__file__).resolve().parent.parent
     default_cost_s, profile_costs = load_runtime_manifest(repo_root, args.runtime_manifest)
@@ -778,7 +781,7 @@ def main() -> int:
                 write_summary(args.output, len(profiles), detailed_results)
                 continue
 
-            extra_args: List[str] = []
+            extra_args = child_report_args(args, output_path)
             if args.renode_remote_server_dir:
                 extra_args.extend(["--renode-remote-server-dir", args.renode_remote_server_dir])
             if args.fault_step is not None:
@@ -834,6 +837,17 @@ def main() -> int:
                 report=report,
             ))
             write_summary(args.output, len(profiles), detailed_results)
+
+        if args.junit or args.sarif:
+            collect_child_reports(args, [
+                (path.stem, tmp_path / (path.stem + "_result.json"), path, result["reason"])
+                for path, result in zip(profiles, detailed_results)
+            ])
+        if args.html:
+            from render_results_html import load_json, write_html
+            summary_path = tmp_path / "summary.json"
+            write_summary(str(summary_path), len(profiles), detailed_results)
+            write_html([(Path(args.output or "self-test.json"), load_json(summary_path))], args.html)
 
         try:
             current_profile_path.unlink()

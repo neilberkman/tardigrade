@@ -32,6 +32,18 @@ inputs:
     description: Number of parallel Renode workers for sweep
     required: false
     default: "2"
+  junit:
+    description: Write a JUnit XML report
+    required: false
+    default: "false"
+  sarif:
+    description: Write a SARIF 2.1.0 report
+    required: false
+    default: "false"
+  html:
+    description: Write a HTML report
+    required: false
+    default: "false"
   regression-mode:
     description: Allow expected-finding profiles to pass their regression assertion
     required: false
@@ -59,6 +71,15 @@ outputs:
   point-counts-json:
     description: JSON point accounting by kind, including requested, run, evaluated, skipped, infrastructure-error, timeout, reused, missing, and issue counts plus calibration coverage
     value: ${{ steps.run.outputs.point_counts_json }}
+  junit-path:
+    description: Path to the optional JUnit XML report
+    value: ${{ steps.run.outputs.junit_path }}
+  sarif-path:
+    description: Path to the optional SARIF 2.1.0 report
+    value: ${{ steps.run.outputs.sarif_path }}
+  html-path:
+    description: Path to the optional HTML report
+    value: ${{ steps.run.outputs.html_path }}
   report-path:
     description: Path to JSON report for artifact upload
     value: ${{ steps.run.outputs.report_path }}
@@ -110,6 +131,9 @@ runs:
       shell: bash
       env:
         TARDIGRADE_ACTION_PATH: ${{ github.action_path }}
+        JUNIT_INPUT: ${{ inputs.junit }}
+        SARIF_INPUT: ${{ inputs.sarif }}
+        HTML_INPUT: ${{ inputs.html }}
         PROFILE_INPUT: ${{ inputs.profile }}
         ASSET_ROOT_INPUT: ${{ inputs.asset-root }}
         QUICK_INPUT: ${{ inputs.quick }}
@@ -154,6 +178,16 @@ runs:
           --robot-suite "${TARDIGRADE}/tests/ota_fault_point.robot"
           --strict-profile
         )
+        formats_dir="$(mktemp -d "${RUNNER_TEMP}/tardigrade-formats.XXXXXX")"
+        for format in junit sarif html; do
+          input_name="${format^^}_INPUT"
+          enabled="$("${TARDIGRADE_VENV_PYTHON}" "${helper}" normalize-bool --name "${format}" --value "${!input_name}")"
+          if [ "${enabled}" = true ]; then
+            extension="${format}"
+            if [ "${format}" = junit ]; then extension=xml; fi
+            args+=("--${format}" "${formats_dir}/report.${extension}")
+          fi
+        done
         if [ "${QUICK}" = "true" ]; then
           args+=(--quick)
         fi
@@ -165,6 +199,13 @@ runs:
         "${TARDIGRADE_VENV_PYTHON}" "${TARDIGRADE}/scripts/audit_bootloader.py" "${args[@]}"
         audit_exit=$?
         set -e
+
+        for entry in junit:xml sarif:sarif html:html; do
+          path="${formats_dir}/report.${entry#*:}"
+          if [ -f "${path}" ]; then
+            echo "${entry%:*}_path=${path}" >> "${GITHUB_OUTPUT}"
+          fi
+        done
 
         if [ ! -f "${REPORT}" ]; then
           echo "verdict=FAIL" >> "${GITHUB_OUTPUT}"

@@ -854,14 +854,24 @@ def main() -> int:
     return 0
 
 
-def runtime_payload(rows, name):
+def runtime_payload(rows, name, profile=None):
     if isinstance(rows, dict) and "results" in rows:
         rows = rows["results"]
     rows = rows if isinstance(rows, list) else [rows]
     rows = [{**row, "is_control": row.get("is_control", row.get("fault_type") == "control" or row.get("fault_at") == -1)}
             for row in rows]
-    summary = summarize_runtime_sweep(rows, expected_control_points=sum(bool(r.get("is_control")) for r in rows))
-    return {"profile": name, "runtime_sweep_results": rows, "summary": {"runtime_sweep": summary}}
+    profile = profile or {}
+    phase2 = (profile.get("fault_sweep") or {}).get("phase2_fault") or {}
+    if phase2.get("pairs"):
+        for row in rows:
+            if row.get("phase2_fault") or str(row.get("fault_type")).split(":")[0] == "p2":
+                row.setdefault("phase2_selection", "pairs")
+    expect = profile.get("expect") or {}
+    summary = summarize_runtime_sweep(
+        rows, expected_control_points=sum(bool(r.get("is_control")) for r in rows),
+        expected_outcome_override=expect.get("control_outcome"),
+    )
+    return {"profile": name, "expect": expect, "runtime_sweep_results": rows, "summary": {"runtime_sweep": summary}}
 
 
 def write_html(inputs, out):
@@ -879,7 +889,7 @@ def write_html(inputs, out):
             if "runtime_sweep_results" in payload:
                 sweep = summary.get("runtime_sweep")
                 if sweep is None:
-                    sweep = runtime_payload(payload["runtime_sweep_results"], path.stem)["summary"]["runtime_sweep"]
+                    sweep = runtime_payload(payload["runtime_sweep_results"], path.stem, payload)["summary"]["runtime_sweep"]
                 elif "point_counts" not in sweep:
                     sweep = {**sweep, "point_counts": ReportRun(payload, path.stem).counts}
                 payload = {**payload, "summary": {**summary, "runtime_sweep": sweep}}

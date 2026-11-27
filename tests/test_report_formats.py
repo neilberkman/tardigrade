@@ -264,6 +264,16 @@ def test_merge_orchestrated_reports_retains_suites_and_missing_child(tmp_path):
     assert len(runs[0]["results"]) == 3 and not runs[1]["invocations"][0]["executionSuccessful"]
 
 
+def test_no_sidecar_overwrites_json(tmp_path):
+    output = tmp_path / "report.json"
+    output.write_text("sentinel")
+    proc = subprocess.run([sys.executable, str(ROOT / "scripts/audit_bootloader.py"),
+                           "--profile", "profiles/mcuboot_head_move_small_upgrade.yaml",
+                           "--output", str(output), "--junit", str(output)], capture_output=True, text=True)
+    assert proc.returncode == 2 and "distinct output path" in proc.stderr
+    assert output.read_text() == "sentinel"
+
+
 def test_phase2_requested_chain_and_reused_states():
     state = search("wew")
     metadata = state["recovery_state_search"]
@@ -295,3 +305,55 @@ def test_recovered_and_dismissed_findings_follow_audit_classification():
     assert [r["ruleId"] for r in results] == ["recovered_after_failure"]
     assert ET.fromstring(junit_report([report]))[0].get("failures") == "1"
 
+
+def test_matrix_sidecars_include_every_child_preserving_wrapper(tmp_path, monkeypatch):
+    import audit_bootloader as audit
+    from types import SimpleNamespace
+
+    data = json.loads(EXAMPLE.read_text())
+    profile_path = ROOT / data["profile_path"]
+    profile = SimpleNamespace(name="matrix", schema_version=1, initial_states=[
+        SimpleNamespace(name=name, description=name) for name in ("first", "second")], profile_path=profile_path)
+    profile.resolve_initial_state = lambda state: SimpleNamespace(bootloader_elf=None)
+    args = argparse.Namespace(output=tmp_path / "report.json", profile=profile_path, no_assert_verdict=True,
+                              repo_root=str(ROOT), junit=tmp_path / "report.xml", sarif=tmp_path / "report.sarif",
+                              html=tmp_path / "index.html")
+
+    def child(command, **kwargs):
+        if command[0] == "git":
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        path = Path(command[command.index("--output") + 1])
+        assert "--junit" not in command and not any(arg.startswith("--sarif=") for arg in command)
+        path.write_text(json.dumps({**data, "verdict": "PASS", "summary": {}}))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sys, "argv", ["audit", "--profile", str(profile_path), "--output", str(args.output),
+                                     "--junit", str(args.junit), "--sarif=" + str(args.sarif)])
+    monkeypatch.setattr(audit.subprocess, "run", child)
+    assert audit._run_initial_state_matrix(args, profile) == 0
+    assert [(s.get("name"), s.get("tests")) for s in ET.parse(args.junit).findall("testsuite")] == [
+        ("matrix/first", "3"), ("matrix/second", "3")]
+    assert len(json.loads(args.sarif.read_text())["runs"]) == 2
+    assert all("_child_payload" not in r for r in json.loads(args.output.read_text())["initial_state_results"])
+
+
+def test_action_optional_artifacts_available_before_gate():
+    import yaml
+    action = yaml.safe_load((ROOT / "action.yml").read_text())
+    step = next(step for step in action["runs"]["steps"] if step.get("id") == "run")
+    for fmt in ("junit", "html", "sarif"):
+        assert action["inputs"][fmt]["default"] == "false"
+        assert action["outputs"][fmt + "-path"]["value"] == "${{ steps.run.outputs." + fmt + "_path }}"
+        assert step["env"][fmt.upper() + "_INPUT"] == "${{ inputs." + fmt + " }}"
+    assert step["run"].index("_path=${path}") < step["run"].index("publish-report")
+
+
+def test_raw_batch_respects_supplied_profile_outcome_and_pair_selection(tmp_path):
+    profile = tmp_path / "negative.yaml"
+    profile.write_text("name: negative\nexpect: {control_outcome: no_boot}\nfault_sweep: {phase2_fault: {pairs: [[3, 1]]}}\n")
+    rows = [result("p2", "no_boot", phase2_fault={"p1_fault_at": 3, "p2_fault_at": 1})]
+    report = saved_run(rows, tmp_path / "raw.json", tmp_path, profile_path=profile)
+    assert report.counts["kinds"]["two_cut_pairs"]["run"] == 1
+    assert report.counts["totals"]["issues"] == 0
+    assert ET.fromstring(junit_report([report]))[0].get("failures") == "0"
+    assert sarif_report([report], tmp_path)["runs"][0]["results"] == []

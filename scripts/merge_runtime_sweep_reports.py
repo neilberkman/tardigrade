@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from audit_report import summarize_runtime_sweep
+from report_formats import add_report_options, requested, saved_run, validate_report_paths, write_formats
 from profile_loader import ProfileConfig, load_profile
 
 
@@ -193,9 +194,16 @@ def main() -> None:
         type=Path,
         help="Write merged payload to this path instead of stdout",
     )
+    add_report_options(parser)
     args = parser.parse_args()
+    validate_report_paths(parser, args, args.inputs)
 
     payload = merge_runtime_sweep_files(args.inputs)
+    if requested(args):
+        run = saved_run(payload, args.output or args.inputs[0], Path.cwd())
+        if args.sarif and run.profile_path is None:
+            parser.error("--sarif requires source reports with profile_path")
+        write_formats(args, [run], Path.cwd())
     rendered = json.dumps(payload, indent=2, sort_keys=True)
     if args.output is None:
         print(rendered)
