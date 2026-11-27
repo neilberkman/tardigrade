@@ -10870,6 +10870,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             'iter': now_iter,
             'exception': pending,
             'source': 'interrupt_begin',
+            'pc': fmt_u32(_read_cpu_pc_fast(cpu_ref)),
             'seq': _next_timing_seq(),
             'checks_held_at_entry': checks_held_at_entry,
             'uncorrectable_read_triggered': uncorr_triggered,
@@ -19071,6 +19072,7 @@ def run_recovery_state_search():
                     os.unlink(temporary)
         if checkpoint is not None:
             summary['checkpoint'] = os.path.basename(checkpoint_path)
+    explorer.compare_boot_snapshots()
     if not results and summary['stopped_reason'] == 'max_wall_time_s':
         # Preserve a zero-boot stop through the dynamic batch protocol.
         results.append({'fault_at': 0, 'fault_requested': 0, 'fault_type': 'rs',

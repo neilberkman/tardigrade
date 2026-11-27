@@ -256,6 +256,7 @@ def render_fault_grid(results: List[Dict[str, Any]], expected_outcome: str = "su
     points.sort(key=lambda r: (str(r.get("fault_type", "w")), int(r.get("fault_requested", r.get("fault_at", 0)))))
 
     cells = []
+    explanations = []
     for p in points:
         ftype = str(p.get("fault_type", "w"))
         label = FAULT_LABELS.get(ftype, ftype)
@@ -279,6 +280,15 @@ def render_fault_grid(results: List[Dict[str, Any]], expected_outcome: str = "su
             title += " " + reason
         if p.get("recovery_state_search") or p.get("phase2_fault_chain") or p.get("phase2_fault"):
             title += " " + point_label(p)
+        explanation = p.get("failure_explanation")
+        if explanation:
+            text = explanation["message"]
+            title += " " + text
+            explanations.append(
+                "<details><summary>" + html.escape(point_label(p) + " — " + text)
+                + "</summary><pre>" + html.escape(json.dumps(explanation, indent=2))
+                + "</pre></details>"
+            )
         cells.append(
             "<div class='cell cell-{}' style='--cell-color:{}' title='{}' "
             "aria-label='{}'></div>".format(
@@ -299,7 +309,7 @@ def render_fault_grid(results: List[Dict[str, Any]], expected_outcome: str = "su
         "<span><i class='key-safe'></i> recovered</span>"
         "<span><i class='key-alert'></i> finding</span>"
         "<span><i class='key-idle'></i> not injected</span>"
-        "</div>"
+        "</div>" + "".join(explanations)
     )
 
 

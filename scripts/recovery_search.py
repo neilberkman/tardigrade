@@ -5,8 +5,10 @@
 
 from __future__ import division
 
+import binascii
 import copy
-from collections import deque
+from bisect import bisect_left
+from collections import defaultdict, deque
 
 from recovery_checkpoint import SnapshotWriter, restore_snapshots, validate_checkpoint
 from recovery_state import (
@@ -36,6 +38,100 @@ def _byte_value(value):
 
 def _hex_value(value):
     return "".join("{:02x}".format(_byte_value(item)) for item in value)
+
+
+def search_cut_paths(row):
+    search = row["recovery_state_search"]
+    chains = [search["chain"]] + search.get("equivalent_chains", [])
+    return [tuple((cut["operation_index"], cut["fault_type"]) for cut in chain["cuts"])
+            for chain in chains]
+
+
+def passing_siblings(records):
+    """Match canonical failures to passing paths in the same parent and index domain."""
+    if not any(status == "failure" for _, _, status in records):
+        return
+    parents = {}
+    for row, paths, _ in records:
+        state = (row.get("recovery_state_search") or {}).get("state_identity")
+        if state:
+            for path in paths:
+                parents[path] = state
+
+    def group(row, path):
+        search = bool(row.get("recovery_state_search"))
+        prefix = path[:-1]
+        parent = parents.get(prefix, prefix) if search else prefix
+        return search, parent, path[-1][1]
+
+    passed = defaultdict(dict)
+    for row, paths, status in records:
+        if status == "pass":
+            for path in paths:
+                passed[group(row, path)][path[-1][0]] = row
+    indices = dict((key, sorted(rows)) for key, rows in passed.items())
+    for row, paths, status in records:
+        if status != "failure":
+            continue
+        path = paths[0]
+        key = group(row, path)
+        index = path[-1][0]
+        ordered = indices.get(key, [])
+        pos = bisect_left(ordered, index)
+        nearby = [i for i in ordered[max(0, pos - 1):pos + 2] if i != index]
+        chosen = min(nearby, key=lambda i: (abs(i - index), i)) if nearby else None
+        yield row, passed[key].get(chosen), chosen
+
+
+def compare_persistent_states(failing, passing):
+    """Compare the actual pre-recovery states retained by the explorer."""
+    ranges = []
+    for left in failing.regions:
+        right = passing.region(left.name)
+        if (left.base_address, left.length) != (right.base_address, right.length):
+            raise RecoverySearchError("sibling states have incompatible region geometry")
+        start = None
+        for index, (bad, good) in enumerate(zip(left.chunks, right.chunks)):
+            offset = index * left.chunk_size
+            if bad == good:
+                if start is not None:
+                    ranges.append((left, right, start, offset))
+                    start = None
+                continue
+            for i in range(len(bad)):
+                if bad[i] != good[i]:
+                    if start is None:
+                        start = offset + i
+                elif start is not None:
+                    end = offset + i
+                    ranges.append((left, right, start, end))
+                    start = None
+        if start is not None:
+            ranges.append((left, right, start, left.length))
+
+    def addresses(state, marks):
+        return ["0x{:08X}".format(state.region(name).base_address + offset)
+                for name, offset in sorted(marks)]
+
+    bad_values, good_values = dict(failing.persistent_values), dict(passing.persistent_values)
+    return {
+        "status": "compared_persistent_state",
+        "ranges": [
+            {"region": left.name, "address": "0x{:08X}".format(left.base_address + start),
+             "failing_hex": binascii.hexlify(left.read(start, end - start)).decode("ascii"),
+             "passing_hex": binascii.hexlify(right.read(start, end - start)).decode("ascii")}
+            for left, right, start, end in ranges
+        ],
+        "uncorrectable_only_in_failing": addresses(failing, failing.uncorrectable_words - passing.uncorrectable_words),
+        "uncorrectable_only_in_passing": addresses(passing, passing.uncorrectable_words - failing.uncorrectable_words),
+        "persistent_values": [
+            {"name": name,
+             "failing_hex": _hex_value(bad_values[name]) if name in bad_values else None,
+             "passing_hex": _hex_value(good_values[name]) if name in good_values else None}
+            for name in sorted(set(bad_values) | set(good_values))
+            if bad_values.get(name) != good_values.get(name)
+        ],
+    }
 
 
 def select_first_cuts(total_writes, first_cuts):
@@ -449,6 +545,7 @@ class RecoveryStateExplorer(object):
         self.plan_only = plan_only
         self.budget = SearchBudget(max_new_states, max_wall_time_s, clock)
         self._seen = {}
+        self._booted_states = {}
         self._traces = []
         # A frame retains the completed prefix immediately before its next cut.
         # Parent None denotes the calibration trace; other parents index results.
@@ -594,6 +691,11 @@ class RecoveryStateExplorer(object):
             ordinal = self._deeper_cross_check_candidates
         prior = self._seen.get(state.identity_hex())
         if prior is None:
+            self._booted_states[state.identity_hex()] = {
+                "state": state,
+                "parent": parent,
+                "chain": chain,
+            }
             self._boot(state, chain, generation, operation, ordinal)
             return
         self._count_reuse(self.summary, chain)
@@ -775,6 +877,42 @@ class RecoveryStateExplorer(object):
         if self.max_cuts > 2:
             plan["deeper_counts"] = "not_estimated"
         return plan
+
+    def compare_boot_snapshots(self):
+        # Final host-side invariant checks may disqualify a successful boot.
+        # Bind each comparison to its sibling identity for the host to verify.
+        records = []
+        states = {}
+        chains = {}
+        parent_ops = {}
+        for identity, row in self._seen.items():
+            if row is None:
+                continue
+            booted_entry = self._booted_states.get(identity)
+            if booted_entry is None:
+                continue
+            outcome = row.get("boot_outcome")
+            status = "other"
+            if outcome == "success":
+                status = "pass"
+            elif outcome in (
+                "no_boot", "hard_fault", "bus_fault", "wrong_pc",
+                "misaligned_vtor", "wrong_image", "memory_checks_unmet",
+            ):
+                status = "failure"
+            records.append((row, search_cut_paths(row), status))
+            states[id(row)] = booted_entry["state"]
+            chains[id(row)] = booted_entry.get("chain") or ()
+            parent = booted_entry.get("parent")
+            parent_ops[id(row)] = (
+                self.calibration_operations if parent is None else self._traces[parent]
+            )
+        for row, sibling, _ in passing_siblings(records):
+            if sibling is not None:
+                row["_sibling_snapshot_comparison"] = {
+                    "sibling": sibling["recovery_state_search"]["state_identity"],
+                    "comparison": compare_persistent_states(states[id(row)], states[id(sibling)]),
+                }
 
     def run(self):
         self.budget.started_at = self.budget.clock() - self._prior_elapsed

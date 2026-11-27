@@ -31,7 +31,12 @@ def junit_report(runs):
             counters["tests"] += 1
             if point.status:
                 category = point.findings[0].rule if point.findings else point.status
-                ET.SubElement(case, point.status, type=category, message=point.message).text = point.message
+                explanation = point.row.get("failure_explanation") if point.status == "failure" else None
+                message = explanation["message"] if explanation else point.message
+                failure = ET.SubElement(case, point.status, type=category, message=message)
+                failure.text = point.message
+                if explanation:
+                    failure.text += "\n" + json.dumps(explanation, sort_keys=True)
                 counter = {"error": "errors", "failure": "failures", "skipped": "skipped"}[point.status]
                 counters[counter] += 1
         suite.attrib.update({key: str(value) for key, value in counters.items()})

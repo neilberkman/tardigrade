@@ -152,6 +152,9 @@ def saved_run(data, path, root, profile_path=None, elf=None, name=None):
             elf = _resolve_profile_input_path(raw_elf, repo_root=root, profile_path=profile_path)
     if kind == "runtime":
         data = runtime_payload(data, name or raw_profile.get("name") or path.stem, raw_profile)
+    from recovery_explanation import explain_recovery_failures
+    expected = (data.get("expect") or {}).get("control_outcome") or "success"
+    explain_recovery_failures(data.get("runtime_sweep_results", []), expected, elf, root)
     return ReportRun(data, name or data.get("profile") or path.stem, profile_path, elf)
 
 

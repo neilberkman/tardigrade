@@ -2780,6 +2780,12 @@ def _main_single() -> int:
             keep_run_artifacts=args.keep_run_artifacts,
             expected_outcome=getattr(profile.expect, "control_outcome", "success") or "success",
         )
+        from recovery_explanation import explain_recovery_failures
+        explain_recovery_failures(
+            sweep_results, getattr(profile.expect, "control_outcome", "success") or "success",
+            Path(profile.resolve_path(repo_root, profile.bootloader_elf)) if profile.bootloader_elf else None,
+            repo_root,
+        )
         planned_fault_types = (
             list(fault_types_list)
             if fault_types_list is not None

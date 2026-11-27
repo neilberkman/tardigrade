@@ -40,6 +40,14 @@ def sarif_run(run, root):
         message = entries[0][1].message
         points = [{"name": point.name, "kind": point.kind, "reproduction": point.selector or reproduction(point.row)}
                   for point, _ in entries]
+        explanations = {}
+        for record, (point, _) in zip(points, entries):
+            explanation = point.row.get("failure_explanation")
+            if explanation:
+                record["failure_explanation"] = explanation
+                explanations[explanation["message"]] = None
+        if explanations:
+            message += "\n" + "\n".join(explanations)
         properties = {"profile": run.name, "points": points}
         if component:
             properties["component"] = component
