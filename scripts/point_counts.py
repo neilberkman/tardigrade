@@ -18,6 +18,12 @@ from typing import (
     Tuple,
 )
 
+from fault_classification import (
+    result_is_infrastructure_error,
+    result_is_skipped,
+    result_is_timeout,
+)
+
 
 POINT_COUNT_SCHEMA_VERSION = 2
 
@@ -213,26 +219,12 @@ def classify_planned_kind(
     return "other"
 
 
-def _is_infrastructure_error(result: Mapping[str, Any]) -> bool:
-    outcome = str(result.get("boot_outcome") or "").strip().lower()
-    return bool(result.get("infrastructure_error")) or outcome in {
-        "infra_error",
-        "infrastructure_error",
-    }
-
-
-def _is_timeout(result: Mapping[str, Any]) -> bool:
-    outcome = str(result.get("boot_outcome") or "").strip().lower()
-    return bool(result.get("timeout")) or outcome == "timeout"
-
-
 def _is_skipped(result: Mapping[str, Any]) -> bool:
-    outcome = str(result.get("boot_outcome") or "").strip().lower()
-    return outcome == "skipped" or (
+    return result_is_skipped(result) or (
         not bool(result.get("is_control"))
         and result.get("fault_injected") is False
-        and not _is_infrastructure_error(result)
-        and not _is_timeout(result)
+        and not result_is_infrastructure_error(result)
+        and not result_is_timeout(result)
     )
 
 
@@ -565,8 +557,8 @@ def build_point_counts(
         kind = classify_point_kind(result, profile)
         row = counts["kinds"][kind]
         row["run"] += 1
-        infra = _is_infrastructure_error(result)
-        timeout = _is_timeout(result)
+        infra = result_is_infrastructure_error(result)
+        timeout = result_is_timeout(result)
         skipped = _is_skipped(result)
         if infra:
             row["infrastructure_error"] += 1

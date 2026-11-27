@@ -25,7 +25,9 @@ from fault_classification import (
     result_has_initial_timeout,
     result_has_issues,
     result_is_brick,
+    result_is_infrastructure_error,
     result_is_recovery,
+    result_is_skipped,
     result_is_timeout,
     result_issue_reasons,
     result_recovered_after_failure,
@@ -508,21 +510,17 @@ def summarize_runtime_sweep(
     ]
     timeout_results = [r for r in non_control if result_is_timeout(r)]
     infrastructure_errors = [
-        r for r in non_control
-        if bool(r.get("infrastructure_error"))
-        or _effective_boot_result(r)[0] == "infra_error"
+        r for r in non_control if result_is_infrastructure_error(r)
     ]
     skipped_results = [
-        r for r in non_control if _effective_boot_result(r)[0] == "skipped"
+        r for r in non_control if result_is_skipped(r)
     ]
     control_timeouts = [r for r in control if result_is_timeout(r)]
     control_infrastructure_errors = [
-        r for r in control
-        if bool(r.get("infrastructure_error"))
-        or _effective_boot_result(r)[0] == "infra_error"
+        r for r in control if result_is_infrastructure_error(r)
     ]
     control_skipped_results = [
-        r for r in control if _effective_boot_result(r)[0] == "skipped"
+        r for r in control if result_is_skipped(r)
     ]
     malformed_control_results = [
         r for r in control if type(r.get("fault_injected")) is not bool
@@ -1249,11 +1247,10 @@ def summarize_runtime_sweep(
     failure_ids = {id(result) for result in failures}
 
     def _point_has_issue(result: Dict[str, Any]) -> bool:
-        effective_outcome, _ = _effective_boot_result(result)
         if (
-            bool(result.get("infrastructure_error"))
-            or result_is_timeout(result)
-            or effective_outcome in {"infra_error", "skipped"}
+            result_is_timeout(result)
+            or result_is_infrastructure_error(result)
+            or result_is_skipped(result)
         ):
             return False
         if result.get("is_control", False):

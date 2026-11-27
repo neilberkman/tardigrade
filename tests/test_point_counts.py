@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -19,6 +20,12 @@ from audit_bootloader import (  # noqa: E402
     _calibration_point_coverage,
 )
 from audit_report import summarize_runtime_sweep  # noqa: E402
+from fault_classification import (  # noqa: E402
+    result_has_issues,
+    result_is_infrastructure_error,
+    result_is_skipped,
+    result_is_timeout,
+)
 from point_counts import (  # noqa: E402
     POINT_KIND_LABELS,
     build_point_counts,
@@ -31,6 +38,154 @@ from render_results_html import render_point_counts_panel  # noqa: E402
 from profile_loader import load_profile  # noqa: E402
 from zero_day_results import format_profile_cell  # noqa: E402
 from zero_day_summary import format_console_summary, format_step_summary  # noqa: E402
+
+
+def test_later_boot_cycle_timeout_matches_runtime_classification() -> None:
+    result = {
+        "fault_type": "w",
+        "fault_injected": True,
+        "boot_outcome": "success",
+        "boot_cycles": [
+            {"cycle": 0, "boot_outcome": "success", "stop_reason": "completed"},
+            {"cycle": 1, "boot_outcome": "no_boot", "stop_reason": "budget"},
+        ],
+        "multi_boot_analysis": {"status": "timeout"},
+    }
+
+    summary = summarize_runtime_sweep(
+        [result],
+        expected_fault_points=1,
+        expected_control_points=0,
+        planned_fault_types=["w"],
+    )
+    row = summary["point_counts"]["kinds"]["single_cut_program"]
+
+    assert result_is_timeout(result) is True
+    assert summary["timeout_points"] == 1
+    assert row["timeout"] == 1
+    assert row["evaluated"] == 0
+
+
+def test_recorded_cycle_terminal_result_outranks_stale_timeout_flag() -> None:
+    result = {
+        "fault_type": "w",
+        "fault_injected": True,
+        "boot_outcome": "hard_fault",
+        "timeout": True,
+        "boot_cycles": [
+            {
+                "cycle": 0,
+                "boot_outcome": "hard_fault",
+                "stop_reason": "wall_timeout_after_terminal_result",
+            }
+        ],
+        "multi_boot_analysis": {"status": "timeout"},
+    }
+
+    summary = summarize_runtime_sweep(
+        [result],
+        expected_fault_points=1,
+        expected_control_points=0,
+        planned_fault_types=["w"],
+    )
+    row = summary["point_counts"]["kinds"]["single_cut_program"]
+
+    assert result_is_timeout(result) is False
+    assert summary["timeout_points"] == 0
+    assert row["timeout"] == 0
+    assert row["evaluated"] == 1
+
+
+@pytest.mark.parametrize(
+    ("boot_outcome", "timeout", "evaluated"),
+    [
+        ("success", 0, 1),
+        ("wrong_image", 0, 1),
+        ("timeout", 1, 0),
+    ],
+)
+def test_single_boot_point_counts_remain_unchanged(
+    boot_outcome: str,
+    timeout: int,
+    evaluated: int,
+) -> None:
+    result = {
+        "fault_type": "w",
+        "fault_injected": True,
+        "boot_outcome": boot_outcome,
+    }
+
+    counts = build_point_counts(
+        [result],
+        planned_fault_types=["w"],
+        expected_control_points=0,
+    )
+    row = counts["kinds"]["single_cut_program"]
+
+    assert row["timeout"] == timeout
+    assert row["evaluated"] == evaluated
+
+
+@pytest.mark.parametrize(
+    ("final_outcome", "field", "classifier"),
+    [
+        ("infra_error", "infrastructure_error", result_is_infrastructure_error),
+        ("skipped", "skipped", result_is_skipped),
+    ],
+)
+def test_effective_non_evaluated_outcomes_match_runtime_classification(
+    final_outcome: str,
+    field: str,
+    classifier: Callable[[dict], bool],
+) -> None:
+    result = {
+        "fault_type": "w",
+        "fault_injected": True,
+        "boot_outcome": "success",
+        "final_boot_outcome": final_outcome,
+    }
+
+    summary = summarize_runtime_sweep(
+        [result],
+        expected_fault_points=1,
+        expected_control_points=0,
+        planned_fault_types=["w"],
+    )
+    row = summary["point_counts"]["kinds"]["single_cut_program"]
+
+    assert classifier(result) is True
+    assert row[field] == 1
+    assert row["evaluated"] == 0
+
+
+def test_issue_count_matches_effective_cycle_classification() -> None:
+    result = {
+        "fault_type": "w",
+        "fault_injected": True,
+        "boot_outcome": "success",
+        "final_boot_outcome": "hard_fault",
+        "boot_cycles": [
+            {"cycle": 0, "boot_outcome": "success"},
+            {"cycle": 1, "boot_outcome": "hard_fault"},
+        ],
+        "multi_boot_analysis": {
+            "status": "failed_after_success",
+            "final_outcome": "hard_fault",
+        },
+    }
+
+    summary = summarize_runtime_sweep(
+        [result],
+        expected_fault_points=1,
+        expected_control_points=0,
+        planned_fault_types=["w"],
+    )
+    row = summary["point_counts"]["kinds"]["single_cut_program"]
+
+    assert result_has_issues(result, "success") is True
+    assert summary["issue_points"] == 1
+    assert row["issues"] == 1
+    assert row["evaluated"] == 1
 
 
 @pytest.mark.parametrize(

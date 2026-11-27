@@ -824,6 +824,23 @@ def result_has_issues(result: Dict[str, Any], expected_outcome: str) -> bool:
     return bool(result_issue_reasons(result, expected_outcome))
 
 
+def result_is_infrastructure_error(result: Dict[str, Any]) -> bool:
+    """Return whether the effective result is an infrastructure failure."""
+    if bool(result.get("infrastructure_error")):
+        return True
+    effective_outcome, _ = _effective_boot_result(result)
+    return str(effective_outcome or "").strip().lower() in {
+        "infra_error",
+        "infrastructure_error",
+    }
+
+
+def result_is_skipped(result: Dict[str, Any]) -> bool:
+    """Return whether the effective result is explicitly skipped."""
+    effective_outcome, _ = _effective_boot_result(result)
+    return str(effective_outcome or "").strip().lower() == "skipped"
+
+
 def result_is_timeout(result: Dict[str, Any]) -> bool:
     if result_has_initial_timeout(result):
         return True
