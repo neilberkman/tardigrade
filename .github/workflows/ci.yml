@@ -261,6 +261,9 @@ jobs:
           python3 -m pip install --user -r requirements.txt
           echo "${RUNNER_TEMP}/renode" >> "${GITHUB_PATH}"
 
+      - name: Load STM32H7 platforms and check RNG and DMA on Renode 1.17.0
+        run: renode-test tests/stm32h7_platforms.robot
+
       - name: Build runtime self-update fixture
         run: make -C examples/runtime_self_update clean all
 
