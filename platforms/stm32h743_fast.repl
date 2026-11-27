@@ -176,9 +176,7 @@ dma1: DMA.STM32DMA @ sysbus 0x40020000
 dma2: DMA.STM32DMA @ sysbus 0x40020400
     [0-7] -> nvic@[56-60, 68-70]
 
-dmamux1: Miscellaneous.STM32_DMAMUX @ sysbus 0x40020800
-    numberOfOutputRequestChannels: 16
-    numberOfRequestGeneratorChannels: 8
+dmamux1: Miscellaneous.TardigradeH7DMAMUX @ sysbus 0x40020800
     [0-7] -> dma1@[0-7]
     [8-15] -> dma2@[0-7]
 
@@ -199,12 +197,16 @@ rtc: Timers.STM32F4_RTC @ sysbus 0x58004000
     AlarmIRQ -> exti@17
     WakeupIRQ -> exti@19
 
-rng: Miscellaneous.STM32F4_RNG @ sysbus 0x48021800
+rng: Miscellaneous.TardigradeH7RNG @ sysbus 0x48021800
     -> nvic@80
 
 hsem: Miscellaneous.STM32H7_HardwareSemaphore @ sysbus 0x58026400
 
+// Renode 1.17 renamed the RNG and added an input count to the DMAMUX.
+// Select the native constructors before Renode resolves the peripheral types.
 sysbus:
+    preinit add:
+        include `python "from Antmicro.Renode.Peripherals import Miscellaneous; print '@../peripherals/STM32H7LegacyConstructors.cs' if hasattr(Miscellaneous, 'STM32F4_RNG') else '@../peripherals/STM32H7Constructors.cs'"`
     init:
         Tag <0x58027000, 0x580273FF> "RAMECC3"
         Tag <0x58025800, 0x58025BFF> "DMAMUX2"
