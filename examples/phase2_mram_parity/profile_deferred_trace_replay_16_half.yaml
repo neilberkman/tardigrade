@@ -1,0 +1,7 @@
+base_profile: profile_trace_replay_16_half.yaml
+name: phase2_mram_deferred_trace_replay_16_half
+description: Deferred-boundary exact replay and live cross-check of whole 16-byte MRAM programs.
+bootloader:
+  elf: examples/phase2_mram_parity/firmware_deferred.elf
+fault_sweep:
+  tracking_start_address: 0x10000200

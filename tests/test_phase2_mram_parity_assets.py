@@ -66,6 +66,25 @@ def test_wide_trace_replay_profile_cross_checks_every_cut() -> None:
     assert profile.fault_sweep.trace_replay_cross_check_every == 1
 
 
+def test_deferred_profiles_reach_a_fixed_tracking_boundary() -> None:
+    profile_names = [
+        "profile_deferred_state_search_16_{}.yaml".format(mode)
+        for mode in ("half", "uncorrectable", "corrupted")
+    ] + ["profile_deferred_trace_replay_16_half.yaml"]
+    for profile_name in profile_names:
+        profile = load_profile(EXAMPLE / profile_name)
+        assert profile.bootloader_elf.endswith("firmware_deferred.elf")
+        assert profile.fault_sweep.tracking_start_address == 0x10000200
+        assert profile.fault_sweep.trace_replay_cross_check_every == 1
+
+
+def test_deferred_uncorrectable_profile_expects_its_recovery_finding() -> None:
+    profile = load_profile(
+        EXAMPLE / "profile_deferred_state_search_16_uncorrectable.yaml"
+    )
+    assert profile.expect.should_find_issues is True
+
+
 def test_exec_slot_fixture_has_a_valid_cortex_m_vector() -> None:
     slot = (EXAMPLE / "slot.bin").read_bytes()
     stack_pointer, reset_vector = struct.unpack_from("<II", slot)

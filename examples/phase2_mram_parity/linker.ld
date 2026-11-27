@@ -10,6 +10,7 @@ SECTIONS
 {
     .isr_vector : { KEEP(*(.isr_vector)) } > BOOT
     .text : { *(.text*) *(.rodata*) } > BOOT
+    .tracking_gate ORIGIN(BOOT) + 0x200 : { KEEP(*(.tracking_gate)) } > BOOT
     .bss (NOLOAD) : { *(.bss*) *(COMMON) } > SRAM
     __stack_top = ORIGIN(SRAM) + LENGTH(SRAM);
 }

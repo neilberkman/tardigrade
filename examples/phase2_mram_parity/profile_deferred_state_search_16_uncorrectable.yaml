@@ -1,0 +1,10 @@
+base_profile: profile_state_search_16_uncorrectable.yaml
+name: phase2_mram_deferred_state_search_16_uncorrectable
+description: Deferred-boundary recovery-state search over whole 16-byte MRAM program units with ECC marks.
+bootloader:
+  elf: examples/phase2_mram_parity/firmware_deferred.elf
+fault_sweep:
+  tracking_start_address: 0x10000200
+expect:
+  # The deferred build's ECC handler can rewrite the target from a stale register.
+  should_find_issues: true

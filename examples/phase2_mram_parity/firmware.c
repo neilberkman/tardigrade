@@ -18,6 +18,11 @@
 #define PROGRESS_ADDRESS (*(volatile uint64_t *)PROGRESS_ADDRESS_VALUE)
 #define HOOK_ADDRESS     (*(volatile uint64_t *)HOOK_ADDRESS_VALUE)
 
+#ifdef DEFERRED_TRACKING_FIXTURE
+#define PRE_GATE_ADDRESS (*(volatile uint64_t *)0x10100138u)
+#define PRE_GATE_VALUE   UINT64_C(0x5052454741544531)
+#endif
+
 #define SUCCESS_MARKER   (*(volatile uint32_t *)0x20000100u)
 #define HOOK_SEEN_MARKER (*(volatile uint32_t *)0x20000104u)
 #define UPDATE_REQUEST   (*(volatile uint32_t *)0x20000400u)
@@ -65,16 +70,40 @@ __attribute__((naked)) void HardFault_Handler(void)
     );
 }
 
+#ifdef DEFERRED_TRACKING_FIXTURE
+__attribute__((naked, noinline, used, section(".tracking_gate")))
+static void tracking_gate(void)
+{
+    __asm volatile("bx lr");
+}
+#endif
+
 void Reset_Handler(void)
 {
-    VTOR = BOOT_BASE;
+    uint32_t update_requested;
 
-    if(UPDATE_REQUEST == UPDATE_MAGIC)
+    VTOR = BOOT_BASE;
+    update_requested = UPDATE_REQUEST == UPDATE_MAGIC;
+
+    if(update_requested)
     {
         UPDATE_REQUEST = 0u;
+#ifdef DEFERRED_TRACKING_FIXTURE
+        PRE_GATE_ADDRESS = PRE_GATE_VALUE;
+#else
+        TARGET_ADDRESS = TARGET_VALUE;
+        PROGRESS_ADDRESS = PROGRESS_DONE;
+#endif
+    }
+
+#ifdef DEFERRED_TRACKING_FIXTURE
+    tracking_gate();
+    if(update_requested)
+    {
         TARGET_ADDRESS = TARGET_VALUE;
         PROGRESS_ADDRESS = PROGRESS_DONE;
     }
+#endif
 
     /* The first recovery instruction touching MRAM reads cut one's word. */
     uint64_t target = TARGET_ADDRESS;

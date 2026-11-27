@@ -12,7 +12,7 @@ LDFLAGS := -nostdlib -Wl,--gc-sections -T linker.ld
 
 .PHONY: all clean
 
-all: firmware.elf firmware_two_unit.elf slot.bin
+all: firmware.elf firmware_two_unit.elf firmware_deferred.elf slot.bin
 
 firmware.elf: firmware.c linker.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ firmware.c
@@ -24,6 +24,14 @@ firmware_two_unit.elf: firmware.c linker.ld
 		-DHOOK_ADDRESS_VALUE=0x10100128u \
 		-o $@ firmware.c
 
+firmware_deferred.elf: firmware.c linker.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) \
+		-DTARGET_ADDRESS_VALUE=0x10100108u \
+		-DPROGRESS_ADDRESS_VALUE=0x10100118u \
+		-DHOOK_ADDRESS_VALUE=0x10100128u \
+		-DDEFERRED_TRACKING_FIXTURE=1 \
+		-o $@ firmware.c
+
 slot.elf: slot.c slot.ld
 	$(CC) $(CFLAGS) -nostdlib -Wl,--gc-sections -T slot.ld -o $@ slot.c
 
@@ -31,4 +39,4 @@ slot.bin: slot.elf
 	$(OBJCOPY) -O binary $< $@
 
 clean:
-	rm -f firmware.elf firmware_two_unit.elf slot.elf slot.bin
+	rm -f firmware.elf firmware_two_unit.elf firmware_deferred.elf slot.elf slot.bin

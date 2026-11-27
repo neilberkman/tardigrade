@@ -1,0 +1,7 @@
+base_profile: profile_state_search_16_corrupted.yaml
+name: phase2_mram_deferred_state_search_16_corrupted
+description: Deferred-boundary recovery-state search over whole 16-byte MRAM program units with deterministic corruption.
+bootloader:
+  elf: examples/phase2_mram_parity/firmware_deferred.elf
+fault_sweep:
+  tracking_start_address: 0x10000200
