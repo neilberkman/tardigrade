@@ -5,122 +5,13 @@
 
 from __future__ import annotations
 
-import os
-from bisect import bisect_right
 from collections import defaultdict
-from functools import cached_property
 from itertools import chain
-from pathlib import Path
-from urllib.parse import quote
-
-from elftools.common.exceptions import ELFError
-from elftools.elf.elffile import ELFFile
 
 from report_points import reproduction
+from source_locations import SourceLocations
 
 SARIF_SCHEMA = "https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/schemas/sarif-schema-2.1.0.json"
-
-
-class SourceLocations:
-    def __init__(self, elf, root):
-        self.elf = elf
-        self.root = root.resolve()
-
-    @cached_property
-    def index(self):
-        ranges = []
-        symbols = {}
-        if self.elf and self.elf.is_file():
-            try:
-                with self.elf.open("rb") as stream:
-                    elf = ELFFile(stream)
-                    if elf.has_dwarf_info() and elf.get_section_by_name(".debug_line"):
-                        objects = {}
-                        table = elf.get_section_by_name(".symtab")
-                        if table:
-                            for s in table.iter_symbols():
-                                kind = s["st_info"]["type"]
-                                if kind == "STT_FUNC":
-                                    symbols[s.name] = s["st_value"]
-                                elif kind == "STT_OBJECT" and s["st_value"] and s["st_size"]:
-                                    objects[s.name] = (s["st_value"], s["st_size"])
-                        ranges = sorted(self._line_ranges(elf.get_dwarf_info(), objects))
-            except (ELFError, OSError):
-                pass
-        return [r[0] for r in ranges], ranges, symbols
-
-    def _line_ranges(self, dwarf, objects=()):
-        for unit in dwarf.iter_CUs():
-            program = dwarf.line_program_for_CU(unit)
-            if program is None:
-                continue
-            attribute = unit.get_top_DIE().attributes.get("DW_AT_comp_dir")
-            directory = Path(os.fsdecode(attribute.value)) if attribute else Path(".")
-            previous = None
-            files = {}
-            base = 0 if program["version"] >= 5 else 1
-
-            def source_file(file_id):
-                if file_id not in files:
-                    file = program["file_entry"][file_id - base]
-                    folder = directory
-                    if file.dir_index >= base:
-                        folder /= os.fsdecode(program["include_directory"][file.dir_index - base])
-                    name = Path(os.fsdecode(file.name))
-                    path = folder / name
-                    # A relocatable ELF may sit beside its original source.
-                    if not path.is_file() and not name.is_absolute() and (self.elf.parent / name).is_file():
-                        path = self.elf.parent / name
-                    files[file_id] = path
-                return files[file_id]
-
-            for entry in program.get_entries():
-                state = entry.state
-                if state is None:
-                    continue
-                if previous and previous.line and previous.address < state.address:
-                    yield previous.address, state.address, source_file(previous.file), previous.line
-                previous = None if state.end_sequence else state
-            for die in (unit.iter_DIEs() if objects else ()):
-                attrs = die.attributes
-                name = os.fsdecode(attrs["DW_AT_name"].value) if "DW_AT_name" in attrs else None
-                if (die.tag == "DW_TAG_variable" and name in objects
-                        and "DW_AT_decl_file" in attrs and "DW_AT_decl_line" in attrs):
-                    start, size = objects[name]
-                    yield start, start + size, source_file(attrs["DW_AT_decl_file"].value), attrs["DW_AT_decl_line"].value
-
-    def lookup(self, row):
-        signals = row.get("signals") or {}
-        rc = row.get("rc_injection") or signals.get("rc_injection") or {}
-        starts, ranges, symbols = self.index
-        candidates = (signals.get("skip_address"), row.get("fault_pc"), row.get("firmware_address"),
-                      symbols.get(rc.get("applied_symbol") or row.get("firmware_symbol") or row.get("symbol")
-                                  or signals.get("rc_injection_symbol")), rc.get("applied_return_address"),
-                      row.get("fault_address"), signals.get("pc"), row.get("pc"),
-                      signals.get("vector_reset"), signals.get("vector_base"))
-        for value in candidates:
-            if value is None:
-                continue
-            try:
-                address = int(str(value), 0)
-            except ValueError:
-                continue
-            for probe in (address, address & ~1):
-                index = bisect_right(starts, probe) - 1
-                if index >= 0:
-                    _, end, path, line = ranges[index]
-                    if probe < end:
-                        return self.uri(path), line
-        return None
-
-    def uri(self, path):
-        path = Path(path)
-        if path.is_absolute():
-            try:
-                path = path.relative_to(self.root)
-            except ValueError:
-                return path.as_uri()
-        return quote(path.as_posix(), safe="/")
 
 
 def sarif_run(run, root):
