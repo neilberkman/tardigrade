@@ -10,7 +10,7 @@ import tempfile
 import textwrap
 import unittest
 import json
-from contextlib import redirect_stderr
+from contextlib import ExitStack, redirect_stderr
 from io import StringIO
 from types import SimpleNamespace
 from unittest import mock
@@ -253,6 +253,160 @@ class DiscoveryFeaturesTest(unittest.TestCase):
             self.assertEqual(payload["calibration"]["performed"], False)
             self.assertEqual(payload["calibration"]["source"], "skipped_control_only")
             self.assertEqual(payload["summary"]["runtime_sweep"]["control"]["boot_outcome"], "success")
+
+    def test_report_exports_measured_writes_while_plan_uses_cap(self) -> None:
+        for measured_writes, planned_writes in ((7, 3), (2, 2)):
+            with self.subTest(
+                measured_writes=measured_writes,
+                planned_writes=planned_writes,
+            ), tempfile.TemporaryDirectory() as td:
+                tempdir = Path(td)
+                profile_path = self._write_profile(
+                    tempdir,
+                    """
+                    schema_version: 1
+                    name: measured_write_report
+                    description: measured write export regression
+                    platform: platforms/cortex_m4_flash_fast.repl
+                    bootloader:
+                      elf: examples/vulnerable_ota/firmware.elf
+                      entry: 0x10000000
+                    memory:
+                      sram: { start: 0x20000000, end: 0x20020000 }
+                      write_granularity: 4
+                      slots:
+                        exec: { base: 0x10000000, size: 0x1000 }
+                        staging: { base: 0x10001000, size: 0x1000 }
+                    images:
+                      staging: examples/vulnerable_ota/firmware.bin
+                    success_criteria:
+                      vtor_in_slot: exec
+                    fault_sweep:
+                      mode: runtime
+                      evaluation_mode: execute
+                      max_writes: auto
+                      max_writes_cap: 3
+                      run_duration: "0.01"
+                      fault_types: [power_loss]
+                    expect:
+                      should_find_issues: false
+                    """,
+                )
+                output_path = tempdir / "audit.json"
+                control_result = {
+                    "fault_at": 1000000,
+                    "fault_requested": -1,
+                    "fault_injected": False,
+                    "fault_address": "0x00000000",
+                    "boot_outcome": "success",
+                    "boot_slot": "exec",
+                    "actual_writes": measured_writes,
+                    "signals": {"trace_replay_mode": "execute"},
+                    "is_control": True,
+                }
+                calibration_result = CalibrationResult(
+                    total_writes=measured_writes,
+                    total_erases=0,
+                    trace_file=None,
+                    erase_trace_file=None,
+                    trace_file_bin=None,
+                    erase_trace_file_bin=None,
+                    stop_reason="vtor_captured",
+                )
+                sweep_summary = {
+                    "bricks": 0,
+                    "issue_points": 0,
+                    "semantic_issue_points": 0,
+                    "invariant_issue_points": 0,
+                    "metadata_delta_issue_points": 0,
+                    "timeout_points": 0,
+                    "resilient_rollbacks": 0,
+                    "control": {
+                        "boot_outcome": "success",
+                        "effective_outcome": "success",
+                        "final_boot_outcome": "success",
+                        "issue_count": 0,
+                    },
+                }
+
+                def fake_build_fault_plan(**kwargs):
+                    self.assertEqual(
+                        kwargs["calibration"].max_writes,
+                        planned_writes,
+                    )
+                    return SimpleNamespace(
+                        fault_points=[],
+                        fault_types_list=None,
+                        heuristic_summary=None,
+                        clustered_bit_count=0,
+                    )
+
+                argv = [
+                    "audit_bootloader.py",
+                    "--profile",
+                    str(profile_path),
+                    "--output",
+                    str(output_path),
+                    "--evaluation-mode",
+                    "execute",
+                ]
+                patches = (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch(
+                        "audit_bootloader.ensure_tool", return_value="renode-test"
+                    ),
+                    mock.patch(
+                        "audit_bootloader.should_auto_discover_trigger",
+                        return_value=False,
+                    ),
+                    mock.patch(
+                        "audit_bootloader.validate_compiled_flash_map",
+                        return_value={"status": "not_applicable"},
+                    ),
+                    mock.patch(
+                        "audit_bootloader.run_calibration",
+                        return_value=calibration_result,
+                    ),
+                    mock.patch(
+                        "audit_bootloader.build_fault_plan",
+                        side_effect=fake_build_fault_plan,
+                    ),
+                    mock.patch(
+                        "audit_bootloader.run_runtime_sweep",
+                        return_value=[dict(control_result)],
+                    ),
+                    mock.patch(
+                        "audit_bootloader.annotate_clean_trace", return_value=None
+                    ),
+                    mock.patch("audit_bootloader.annotate_result_checks"),
+                    mock.patch("audit_bootloader.validate_runtime_findings"),
+                    mock.patch(
+                        "audit_bootloader.summarize_runtime_sweep",
+                        return_value=dict(sweep_summary),
+                    ),
+                    mock.patch("audit_bootloader.report_skip_reasons"),
+                    mock.patch(
+                        "audit_bootloader.run_multi_fault_phase",
+                        return_value=SimpleNamespace(
+                            plan=None,
+                            plan_data=None,
+                            results=None,
+                            summary=None,
+                        ),
+                    ),
+                    mock.patch("audit_bootloader.compute_verdict", return_value="PASS"),
+                    mock.patch("audit_bootloader.git_metadata", return_value={}),
+                )
+                with ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    rc = audit_bootloader.main()
+
+                self.assertEqual(rc, 0)
+                payload = json.loads(output_path.read_text(encoding="utf-8"))
+                self.assertEqual(payload["calibrated_writes"], measured_writes)
+                self.assertEqual(payload["calibration"]["writes"], measured_writes)
+                self.assertEqual(payload["runtime_sweep_results"], [control_result])
 
     def test_profile_max_writes_zero_skips_calibration_and_uses_control_only_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:

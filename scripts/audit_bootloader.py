@@ -2413,6 +2413,9 @@ def _main_single() -> int:
                     )
 
         # Apply safety cap.
+        reported_writes = (
+            int(cal.total_writes) if cal is not None else int(max_writes)
+        )
         cap = profile.fault_sweep.max_writes_cap
         if max_writes > cap:
             print(
@@ -2876,7 +2879,7 @@ def _main_single() -> int:
             "profile_path": str(profile.profile_path) if profile.profile_path else None,
             "schema_version": profile.schema_version,
             "rc_injection_config": profile.fault_sweep.rc_injection_config.to_dict(),
-            "calibrated_writes": max_writes,
+            "calibrated_writes": reported_writes,
             "calibrated_erases": total_erases,
             "setup_writes": setup_writes,
             "fault_points_tested": len(fault_points),
@@ -2979,7 +2982,7 @@ def _main_single() -> int:
         payload["calibration"] = {
             "performed": cal is not None,
             "source": calibration_source,
-            "writes": max_writes,
+            "writes": reported_writes,
             "erases": total_erases,
             "coverage": calibration_coverage,
             "stop_reason": cal.stop_reason if cal is not None else None,
