@@ -19011,6 +19011,7 @@ def run_recovery_state_search():
         ),
         cross_check_every=int(phase2_state_search.get('cross_check_every', 100)),
         cross_check=_state_search_live_cross_check,
+        plan_only=phase2_state_search.get('plan_only', False),
     )
     checkpoint_path = get_optional_var('state_search_checkpoint', '').strip()
     resume_path = get_optional_var('state_search_resume', '').strip()
@@ -19035,7 +19036,7 @@ def run_recovery_state_search():
                              'fault_injected': False, 'boot_outcome': 'infra_error',
                              'infrastructure_error': True, 'error': str(exc), 'signals': {}}]
     results, summary = explorer.run()
-    if checkpoint_path:
+    if checkpoint_path and not explorer.plan_only:
         checkpoint = explorer.checkpoint(inputs)
         if checkpoint is not None or os.path.isfile(checkpoint_path):
             # Reusing the report path replaces an old continuation atomically.

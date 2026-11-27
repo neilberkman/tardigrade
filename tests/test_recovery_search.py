@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from recovery_search import (  # noqa: E402
+    RecoverySearchError,
     RecoveryStateExplorer,
     SearchBudget,
     StateVerdictCache,
@@ -424,6 +425,175 @@ def test_explorer_is_breadth_first_deduplicates_and_keeps_generation_counts():
     assert summary["states_reused"] == 3
     assert summary["states_booted"] == len(results) == 3
     assert results[0]["recovery_state_search_summary"]["states_booted"] == 3
+
+
+@pytest.mark.parametrize("plan_only", [False, True])
+@pytest.mark.parametrize(
+    ("fault_types", "ranges", "expected"),
+    [
+        (("power_loss",), (), 2),
+        (("power_loss", "interrupted_erase"), (), 3),
+        (("interrupted_erase",), (), 1),
+        (("power_loss",), ((0x1001, 0x1001),), 1),
+        (("power_loss", "interrupted_erase"), ((0x1001, 0x1001),), 2),
+        (("power_loss", "interrupted_erase"), ((0x2000, 0x2002),), 0),
+    ],
+)
+def test_first_cut_trace_counts_use_full_filtered_trace(plan_only, fault_types, ranges, expected):
+    trace = merge_operation_traces([_write(1, 0, 1), _write(2, 1, 2)], [_erase(1, 0, 2)])
+    mode = {"plan_only": True} if plan_only else {}
+    explorer = RecoveryStateExplorer(
+        PersistentState.from_bytes(b"\xff\xff"),
+        merge_operation_traces([_write(1, 0, 1)], []),
+        first_cuts=(0,), max_cuts=2, max_new_states=1, max_wall_time_s=30,
+        clock=lambda: 1.0, boot_state=lambda *_: ({}, trace),
+        flash_base=0x1000,
+        address_ranges=[{"start": start, "end": end} for start, end in ranges],
+        recovery_fault_types=fault_types, **mode,
+    )
+    results, summary = explorer.run()
+    (row,) = summary["first_cut_traces"]
+    assert row["first_cut"]["operation_index"] == 0
+    assert row["trace_operations"] == 3
+    assert row["generation_two_candidates"] == expected
+    assert len(results) == 1
+    if plan_only:
+        assert summary["generation_two_plan"]["generation_two_candidates"] == expected
+
+
+def test_plan_counts_identities_and_boots_in_full_search_order():
+    # The first two calibration cuts alias. Each recovery's first cut
+    # revisits its parent, then both traces converge on the same new state.
+    calibration = merge_operation_traces(
+        [_write(1, 0, 0xff), _write(2, 0, 0x11), _write(3, 1, 0x22)], []
+    )
+    trace = merge_operation_traces([_write(1, 0, 0x33), _write(2, 0, 0x33)], [])
+
+    def search(plan_only, max_cuts):
+        clock = [0.0]
+        boots = []
+
+        def boot(state, chain, generation):
+            boots.append((chain[0]["operation_index"], generation, state.identity()))
+            clock[0] += 2.0
+            return {}, trace if generation == 1 else ()
+
+        explorer = RecoveryStateExplorer(
+            PersistentState.from_bytes(b"\xff\xff"), calibration,
+            first_cuts=(0, 1, 2), max_cuts=max_cuts, max_new_states=10,
+            max_wall_time_s=60, clock=lambda: clock[0], boot_state=boot,
+            cross_check_every=1, cross_check=lambda *_: True,
+            plan_only=plan_only,
+        )
+        return explorer.run()[1], boots
+
+    full, full_boots = search(False, 2)
+    planned, plan_boots = search(True, 3)
+    assert plan_boots == full_boots[:2]
+    assert len(plan_boots) == 2
+    assert all(generation == 1 for _, generation, _ in plan_boots)
+    assert full["states_booted"] == len(full_boots) == 3
+    assert planned["states_reused"] == full["states_reused"] == 4
+    assert planned["cross_checks_run"] == 0
+    plan = planned["generation_two_plan"]
+    assert plan["generation_two_candidates"] == full["recovery_operations_considered"] == 4
+    assert plan["distinct_candidate_states"] == 3
+    assert plan["reused_candidates"] == 3
+    assert plan["new_states"] == full["deeper_cut_states_booted"] == 1
+    assert plan["recovery_boots_through_generation_two"] == full["states_booted"]
+    assert plan["measured_first_cut_boot_s"] == 4.0
+    assert plan["estimated_recovery_boot_time_s"] == 6.0
+    assert plan["deeper_counts"] == "not_estimated"
+    rows = planned["first_cut_traces"]
+    assert [r["first_cut"]["operation_index"] for r in rows] == [0, 2]
+    assert [c["operation_index"] for c in rows[0]["equivalent_first_cuts"]] == [1]
+    assert [r["generation_two_candidates"] for r in rows] == [2, 2]
+    assert [r["distinct_candidate_states"] for r in rows] == [2, 2]
+    assert [r["reused_candidates"] for r in rows] == [1, 2]
+    assert [r["recovery_boots_through_generation_two"] for r in rows] == [2, 1]
+
+
+@pytest.mark.parametrize("bound", ["max_new_states", "max_wall_time_s"])
+def test_plan_refuses_incomplete_first_cut_pass(bound):
+    clock = [0.0]
+
+    def boot(*_):
+        clock[0] += 1.0
+        return {}, ()
+
+    explorer = RecoveryStateExplorer(
+        PersistentState.from_bytes(b"\xff\xff"),
+        merge_operation_traces([_write(1, 0, 1), _write(2, 1, 2)], []),
+        first_cuts=(0, 1), max_cuts=2,
+        max_new_states=1 if bound == "max_new_states" else 10,
+        max_wall_time_s=1 if bound == "max_wall_time_s" else 30,
+        clock=lambda: clock[0], boot_state=boot, plan_only=True,
+    )
+    with pytest.raises(RecoverySearchError, match="incomplete state_search plan: " + bound):
+        explorer.run()
+
+
+@pytest.mark.parametrize("bound", ["max_new_states", "max_wall_time_s"])
+def test_plan_stops_calibration_walk_as_soon_as_a_bound_prevents_sizing(bound, monkeypatch):
+    clock = [0.0]
+    visited = []
+
+    import recovery_search
+    complete = recovery_search.apply_completed_operation
+
+    def walk(prefix, operation, fill):
+        visited.append(operation["operation_index"])
+        clock[0] += 1.0
+        return complete(prefix, operation, fill)
+
+    monkeypatch.setattr(recovery_search, "apply_completed_operation", walk)
+
+    writes = [_write(i + 1, 0, i) for i in range(6)]
+    # For the time limit the second operation is outside the selected range.
+    explorer = RecoveryStateExplorer(
+        PersistentState.from_bytes(b"\xff"), merge_operation_traces(writes, []),
+        first_cuts=(0, 1, 5) if bound == "max_new_states" else (0, 5),
+        max_cuts=2, max_new_states=1,
+        max_wall_time_s=2 if bound == "max_wall_time_s" else 60,
+        clock=lambda: clock[0], boot_state=lambda *_: ({}, ()),
+        torn_word_mode="untouched", plan_only=True,
+    )
+    with pytest.raises(RecoverySearchError, match="incomplete state_search plan: " + bound):
+        explorer.run()
+    assert visited == [0, 1]
+
+
+def test_plan_counts_deferred_trace_base_with_distinct_ecc_marks():
+    trace = merge_operation_traces([_write(1, 1, 0x11)], [])
+    baseline = PersistentState.from_bytes(b"\xff\xff")
+    marked = PersistentState.from_bytes(b"\xff\xff", uncorrectable_words=(0,))
+    explorer = RecoveryStateExplorer(
+        baseline, trace, first_cuts=(0,), max_cuts=2,
+        max_new_states=1, max_wall_time_s=30, clock=lambda: 0.0,
+        boot_state=lambda *_: ({}, trace, marked),
+        backend_kind="mram", torn_word_mode="untouched", plan_only=True,
+    )
+    _, summary = explorer.run()
+    assert summary["states_booted"] == 1
+    assert summary["generation_two_plan"]["recovery_boots_through_generation_two"] == 2
+
+
+def test_normal_summary_counts_trace_tail_after_wall_time_stop():
+    trace = merge_operation_traces([_write(i, 0, i) for i in range(1, 9)], [])
+    clock = [0.0]
+
+    def boot(_state, _chain, generation):
+        clock[0] += 1
+        return {}, trace if generation == 1 else ()
+
+    explorer = RecoveryStateExplorer(
+        PersistentState.from_bytes(b"\xff"), trace, first_cuts=(0,), max_cuts=2,
+        max_new_states=20, max_wall_time_s=2, clock=lambda: clock[0], boot_state=boot,
+    )
+    _, summary = explorer.run()
+    assert summary["stopped_reason"] == "max_wall_time_s"
+    assert summary["recovery_operations_considered"] == 2
+    assert summary["first_cut_traces"][0]["generation_two_candidates"] == 8
 
 
 def test_explorer_uses_deferred_recovery_trace_base_for_deeper_states():

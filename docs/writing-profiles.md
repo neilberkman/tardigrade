@@ -1957,6 +1957,42 @@ report, each canonical result has `recovery_state_search.resume_origin` set to
 `before_resume` or `after_resume`. A finished search sets `complete` to `true`.
 When reusing a report path, it marks any older checkpoint at that path final.
 
+A plan-only audit never writes a checkpoint. Resuming requires a normal search.
+
+To size a search, set `plan_only: true` alongside `state_search.enabled: true`
+and run the profile normally. The planner boots each distinct first-cut state
+once. It walks the resulting traces and computes candidate identities in
+memory, ending before generation-two recovery boots and live cross-checks.
+Planning and full search use the same first-cut pass within their respective
+Renode batches.
+
+Both modes report `summary.runtime_sweep.recovery_state_search.first_cut_traces`. Each row
+identifies a first cut and any equivalent first cuts that share its boot.
+`trace_operations` counts the entire recovery trace. `generation_two_candidates`
+counts operations matching both the recovery fault types and address ranges.
+A full run reports these counts for every first-cut state it actually booted,
+even when a limit stops the search partway through that trace.
+
+A completed plan has `stopped_reason: plan_complete`. Its `generation_two_plan`
+totals and its trace rows include the following counts.
+
+- `distinct_candidate_states` counts distinct identities among the filtered
+  candidates. The total counts an identity shared by several rows only once.
+- `new_states` counts candidates needing their first recovery boot. An identity
+  already reached at generation one or earlier in trace order contributes to
+  `reused_candidates`. These two counts sum to `generation_two_candidates`.
+- `recovery_boots_through_generation_two` includes one boot per distinct
+  first-cut state plus the boots for new generation-two states. It sizes a
+  complete search through two cuts, before applying full-search limits.
+
+The total `estimated_recovery_boot_time_s` multiplies that boot count by the
+mean measured first-cut boot time. The estimate covers recovery boot execution
+only. Calibration, hashing, live cross-checks and harness overhead add wall
+time. For `max_cuts` above two, `deeper_counts: not_estimated` marks the
+limit of the projection. The plan respects the configured budget for actual
+first-cut boots and the search wall time. If either prevents a complete plan,
+the runner reports the exhausted bound as an error.
+
 Every `cross_check_every`th newly booted generation-two state is also
 reproduced through the established two-cut live injector. At generation three
 and later, the rate applies to candidate chains, including a chain whose

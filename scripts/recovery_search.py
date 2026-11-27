@@ -140,15 +140,29 @@ def recovery_operation_kinds(recovery_fault_types):
     )
 
 
+def _recovery_exclusion(operation, kinds, flash_base, ranges):
+    if operation["kind"] not in kinds:
+        return "recovery_operations_excluded_by_fault_type"
+    if not operation_in_address_ranges(operation, flash_base, ranges):
+        return "recovery_operations_excluded_by_address"
+    return None
+
+
+def _count_recovery_candidates(operations, kinds, flash_base, ranges):
+    return sum(
+        1 for operation in operations
+        if _recovery_exclusion(operation, kinds, flash_base, ranges) is None
+    )
+
+
 def recovery_trace_size(operations, tracking_start, flash_base, config):
     kinds = recovery_operation_kinds(config.get("fault_types") or ("power_loss",))
     ranges = config.get("address_ranges") or ()
     return {
         "address": "0x{:08X}".format(tracking_start),
         "traced_operations": len(operations),
-        "candidate_operations": sum(
-            1 for operation in operations
-            if operation["kind"] in kinds and operation_in_address_ranges(operation, flash_base, ranges)
+        "candidate_operations": _count_recovery_candidates(
+            operations, kinds, flash_base, ranges
         ),
     }
 
@@ -405,6 +419,7 @@ class RecoveryStateExplorer(object):
         recovery_fault_types=("power_loss",),
         cross_check_every=0,
         cross_check=None,
+        plan_only=False,
     ):
         self.initial_state = initial_state
         self.calibration_operations = normalize_trace(calibration_operations)
@@ -428,6 +443,8 @@ class RecoveryStateExplorer(object):
         self.recovery_operation_kinds = recovery_operation_kinds(recovery_fault_types)
         self.cross_check_every = int(cross_check_every)
         self.cross_check = cross_check
+        self._boot_times = []
+        self.plan_only = plan_only
         self.budget = SearchBudget(max_new_states, max_wall_time_s, clock)
         self._seen = {}
         self._traces = []
@@ -478,8 +495,10 @@ class RecoveryStateExplorer(object):
             return self.torn_word_mode
         return str(self.torn_word_for_cut(operation, generation, chain))
 
-    def _is_recovery_cut(self, operation):
-        return str(operation.get("kind") or "") in self.recovery_operation_kinds
+    def _eligible_count(self, operations):
+        return _count_recovery_candidates(
+            operations, self.recovery_operation_kinds, self.flash_base, self.address_ranges
+        )
 
     def _maybe_cross_check(
         self, state, chain, generation, operation, selection_ordinal=None
@@ -522,7 +541,10 @@ class RecoveryStateExplorer(object):
         checked = self._maybe_cross_check(
             state, chain, generation, operation, selection_ordinal=cross_check_ordinal,
         )
+        started = self.budget.clock() if self.plan_only else None
         booted = self.boot_state(state, chain, generation)
+        if self.plan_only:
+            self._boot_times.append(max(0.0, self.budget.clock() - started))
         if len(booted) == 2:
             result, operations = booted
             trace_base_state = state
@@ -595,11 +617,11 @@ class RecoveryStateExplorer(object):
             counts[field] += 1
         else:
             counts["recovery_operations_seen"] += 1
-            if not self._is_recovery_cut(operation):
-                counts["recovery_operations_excluded_by_fault_type"] += 1
-                return False
-            if not operation_in_address_ranges(operation, self.flash_base, self.address_ranges):
-                counts["recovery_operations_excluded_by_address"] += 1
+            exclusion = _recovery_exclusion(
+                operation, self.recovery_operation_kinds, self.flash_base, self.address_ranges
+            )
+            if exclusion:
+                counts[exclusion] += 1
                 return False
             counts["recovery_operations_considered"] += 1
         counts["states_computed"] += 1
@@ -609,10 +631,7 @@ class RecoveryStateExplorer(object):
         parent, index, prefix, erases = frames.popleft()
         operations, chain = self._source(parent)
         if len(chain) >= self.max_cuts:
-            counts["recovery_operations_excluded_by_max_cuts"] += sum(
-                1 for op in operations if self._is_recovery_cut(op)
-                and operation_in_address_ranges(op, self.flash_base, self.address_ranges)
-            )
+            counts["recovery_operations_excluded_by_max_cuts"] += self._eligible_count(operations)
             return
         op = operations[index]
         if index + 1 < len(operations):
@@ -636,7 +655,7 @@ class RecoveryStateExplorer(object):
         return parent, index, candidate
 
     def checkpoint(self, inputs):
-        if not self._pending and not self._frames:
+        if self.plan_only or (not self._pending and not self._frames):
             return None
         snapshots = SnapshotWriter()
         visits = [[parent, index, snapshots.reference(state)]
@@ -656,6 +675,8 @@ class RecoveryStateExplorer(object):
         }
 
     def restore(self, checkpoint, inputs):
+        if self.plan_only:
+            raise RecoverySearchError("plan_only cannot resume a state search checkpoint")
         validate_checkpoint(checkpoint, inputs)
         snapshots = restore_snapshots(checkpoint)
         self.results = checkpoint["results"]
@@ -678,6 +699,68 @@ class RecoveryStateExplorer(object):
         self._prior_elapsed = checkpoint["elapsed_s"]
         self._resumed = True
 
+    def _first_cut_traces(self, results):
+        rows = []
+        for index, result in enumerate(results):
+            meta = result["recovery_state_search"]
+            if meta["generation"] != 1:
+                break
+            operations = self._traces[index]
+            rows.append({
+                "first_cut": meta["chain"]["cuts"][0],
+                "equivalent_first_cuts": [c["cuts"][0] for c in meta.get("equivalent_chains", [])
+                                          if c["cut_count"] == 1],
+                "trace_operations": len(operations),
+                "generation_two_candidates": self._eligible_count(operations),
+            })
+        return rows
+
+    def _check_plan_time(self):
+        if self.budget.wall_expired():
+            raise RecoverySearchError("incomplete state_search plan: max_wall_time_s reached")
+
+    def _plan_generation_two(self, rows, selected):
+        identities = set()
+        new_states = 0
+        for parent, row in enumerate(rows):
+            children = set()
+            while self._frames and self._frames[0][0] == parent:
+                self._check_plan_time()
+                visit = self._expand(self._frames, selected, self.summary)
+                if visit:
+                    children.add(visit[2].identity_hex())
+            new = sum(1 for key in children if key not in self._seen and key not in identities)
+            identities.update(children)
+            reused = row["generation_two_candidates"] - new
+            new_states += new
+            row.update({
+                "distinct_candidate_states": len(children),
+                "new_states": new,
+                "reused_candidates": reused,
+                "recovery_boots_through_generation_two": 1 + new,
+                "measured_boot_s": self._boot_times[parent],
+            })
+            self.summary["states_reused"] += reused
+            kind = "erase" if row["first_cut"]["operation"] == "erase" else "program"
+            self.summary[kind + "_first_states_reused"] += reused
+        self._check_plan_time()
+        boots = len(rows) + new_states
+        candidates = self.summary["recovery_operations_considered"]
+        measured = sum(self._boot_times)
+        plan = {
+            "trace_operations": self.summary["recovery_operations_seen"],
+            "generation_two_candidates": candidates,
+            "distinct_candidate_states": len(identities),
+            "new_states": new_states,
+            "reused_candidates": candidates - new_states,
+            "recovery_boots_through_generation_two": boots,
+            "measured_first_cut_boot_s": measured,
+            "estimated_recovery_boot_time_s": round(measured / len(rows) * boots, 3) if rows else None,
+        }
+        if self.max_cuts > 2:
+            plan["deeper_counts"] = "not_estimated"
+        return plan
+
     def run(self):
         self.budget.started_at = self.budget.clock() - self._prior_elapsed
         selected = set(self.first_cuts)
@@ -685,6 +768,8 @@ class RecoveryStateExplorer(object):
         while self._pending or self._frames:
             if self.budget.wall_expired():
                 reason = "max_wall_time_s"
+                break
+            if self.plan_only and not self._pending and self._frames[0][0] is not None:
                 break
             if self._pending:
                 parent, index, state = self._pending[0]
@@ -698,6 +783,12 @@ class RecoveryStateExplorer(object):
                 if visit:
                     self._pending.append(visit)
 
+        if self.plan_only:
+            if reason != "complete":
+                raise RecoverySearchError("incomplete state_search plan: " + reason + " reached")
+            rows = self._first_cut_traces(self.results)
+            plan = self._plan_generation_two(rows, selected)
+            reason = "plan_complete"
         self._elapsed = self.budget.wall_time_s()
         summary = dict(self.summary)
         omitted = list(self._pending)
@@ -729,7 +820,8 @@ class RecoveryStateExplorer(object):
                     if identity in by_id:
                         add_equivalent_chain(by_id[identity], chain)
                 known.add(identity)
-        summary["complete"] = reason == "complete"
+        summary["first_cut_traces"] = rows if self.plan_only else self._first_cut_traces(results)
+        summary["complete"] = reason in ("complete", "plan_complete")
         if reason == "max_wall_time_s":
             summary["states_excluded_by_wall_time"] = len(known) - len(self._seen)
             summary["unexpanded_states_at_wall_time"] = len(self._frames)
@@ -737,6 +829,9 @@ class RecoveryStateExplorer(object):
             summary["states_excluded_by_max_new_states"] = len(known) - len(self._seen)
         summary["stopped_reason"] = reason
         summary["unique_states_seen"] = len(known)
+        if self.plan_only:
+            summary["generation_two_plan"] = plan
+            summary["unique_states_seen"] = plan["recovery_boots_through_generation_two"]
         summary["elapsed_s"] = round(self._elapsed, 3)
         if results:
             results = list(results)

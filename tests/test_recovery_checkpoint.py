@@ -261,3 +261,29 @@ def test_cli_names_host_input_mismatch_before_calibration(tmp_path, monkeypatch,
     monkeypatch.setattr(audit, "ensure_tool", lambda *_args: pytest.fail("started runner selection"))
     assert audit.main() == audit.EXIT_INFRA_FAILURE
     assert "state search checkpoint mismatch: " + key in capsys.readouterr().err
+
+
+def test_plan_only_omits_checkpoint_destination_and_refuses_resume(tmp_path):
+    from audit_bootloader import _state_search_checkpoint_vars
+    from profile_loader import load_profile
+
+    path = tmp_path / "plan.yaml"
+    base = ROOT / "examples/phase2_mram_parity/profile_state_search.yaml"
+    path.write_text(f"base_profile: {base}\nfault_sweep:\n  phase2_fault:\n"
+                    "    state_search: {plan_only: true}\n")
+    profile = load_profile(path, repo_root=ROOT)
+    variables = profile.robot_vars(ROOT)
+    args = SimpleNamespace(output=tmp_path / "report.json", resume_state_search=None)
+    assert _state_search_checkpoint_vars(profile, ROOT, args, variables) == variables
+    with pytest.raises(ValueError, match="plan_only cannot resume"):
+        _state_search_checkpoint_vars(profile, ROOT, args, variables, previous={"version": 1})
+
+
+def test_first_cut_counts_match_after_resuming_mid_calibration():
+    first = model(limit=1)
+    first.run()
+    second = model()
+    second.restore(saved(first), INPUTS)
+    rows = second.run()[1]["first_cut_traces"]
+    assert rows == model().run()[1]["first_cut_traces"]
+    assert [r["generation_two_candidates"] for r in rows] == [4, 4, 4]

@@ -271,6 +271,7 @@ fault_sweep:
     fault_types: [power_loss]
     state_search:
       enabled: true
+      plan_only: true
       first_cuts:
         mode: ranges
         ranges:
@@ -285,6 +286,7 @@ fault_sweep:
         )
         state_search = profile.fault_sweep.phase2_fault.state_search
         self.assertTrue(state_search.enabled)
+        self.assertTrue(state_search.plan_only)
         self.assertEqual(state_search.first_cut_mode, "ranges")
         self.assertEqual(state_search.first_cut_ranges, [(0, 8)])
         self.assertEqual(state_search.max_cuts, 3)
@@ -309,6 +311,7 @@ fault_sweep:
                     "fault_types": ["power_loss"],
                 },
         )
+        self.assertTrue(decoded["plan_only"])
         self.assertEqual(decoded["fault_types"], ["power_loss"])
         self.assertIn("CALIBRATION_TRACE_REQUIRED:true", profile.robot_vars(ROOT))
         robot_suite = (ROOT / "tests" / "ota_fault_point.robot").read_text()
@@ -357,6 +360,8 @@ fault_sweep:
 """
         )
         config = profile.fault_sweep.phase2_fault.state_search
+        self.assertFalse(config.plan_only)
+        self.assertNotIn("plan_only", config.to_runtime_dict())
         self.assertEqual(config.first_cut_mode, "quick")
         self.assertEqual(config.max_cuts, 2)
         self.assertEqual(config.max_new_states, 1000)
@@ -433,6 +438,7 @@ fault_sweep:
             "max_wall_time_s: 0",
             "address_ranges: [{ start: 9, end: 8 }]",
             "cross_check_every: -1",
+            "plan_only: sometimes",
         )
         for fragment in invalid_fragments:
             with self.subTest(fragment=fragment), self.assertRaisesRegex(

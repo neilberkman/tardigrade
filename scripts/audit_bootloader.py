@@ -1456,6 +1456,10 @@ def _state_search_checkpoint_vars(
     prefix = "PHASE2_STATE_SEARCH_B64:"
     payload = next(v[len(prefix):] for v in robot_vars if v.startswith(prefix))
     config = json.loads(base64.b64decode(payload))
+    if config.get("plan_only"):
+        if previous is not None:
+            raise ValueError("plan_only cannot resume a state search checkpoint")
+        return robot_vars
     settings = _cache_robot_var_material([v for v in robot_vars if not v.startswith(prefix)])
     for item in settings:
         if "file_sha256" in item:

@@ -895,6 +895,7 @@ class RecoveryStateSearchConfig:
 
     __slots__ = (
         "enabled",
+        "plan_only",
         "first_cut_mode",
         "first_cut_ranges",
         "max_cuts",
@@ -914,8 +915,14 @@ class RecoveryStateSearchConfig:
         max_wall_time_s: float = 900.0,
         address_ranges: Optional[List[Tuple[int, int]]] = None,
         cross_check_every: int = 100,
+        plan_only: bool = False,
     ) -> None:
         self.enabled = bool(enabled)
+        self.plan_only = bool(plan_only)
+        if self.plan_only and not self.enabled:
+            raise ProfileError(
+                "fault_sweep.phase2_fault.state_search.plan_only requires state_search.enabled"
+            )
         self.first_cut_mode = str(first_cut_mode).strip().lower()
         if self.first_cut_mode not in ("quick", "all", "ranges"):
             raise ProfileError(
@@ -968,6 +975,7 @@ class RecoveryStateSearchConfig:
     def to_runtime_dict(self) -> Dict[str, Any]:
         return {
             "enabled": self.enabled,
+            **({"plan_only": True} if self.plan_only else {}),
             "first_cuts": {
                 "mode": self.first_cut_mode,
                 "ranges": [
@@ -5555,6 +5563,10 @@ def _parse_recovery_state_search(raw: Optional[Dict[str, Any]]) -> RecoveryState
             raw.get("enabled", False),
             "fault_sweep.phase2_fault.state_search.enabled",
         ),
+        plan_only=_parse_bool(
+            raw.get("plan_only", False),
+            "fault_sweep.phase2_fault.state_search.plan_only",
+        ),
         first_cut_mode=str(first_cuts.get("mode", "quick")),
         first_cut_ranges=first_ranges,
         max_cuts=int(raw.get("max_cuts", 2)),
@@ -8770,7 +8782,7 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
                 state_search,
                 frozenset(
                     {
-                        "enabled", "first_cuts", "max_cuts", "max_new_states",
+                        "enabled", "plan_only", "first_cuts", "max_cuts", "max_new_states",
                         "max_wall_time_s", "address_ranges", "cross_check_every",
                     }
                 ),
