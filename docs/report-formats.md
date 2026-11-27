@@ -34,6 +34,8 @@ Case `time` is wall time in seconds from the point's timing fields, rounded to m
 
 ## SARIF 2.1.0
 
+When first-cut state accounting is available, each SARIF run carries it in `properties.first_cut_states`. The `summary` field gives the tested and total distinct states, and `duplicate_cuts` counts the cuts grouped under an earlier representative.
+
 The driver registers each observed finding class once. A result groups affected points by class, check or outcome, component and source location. Named invariants and metadata fields retain their identity when they share a profile location. The writer uses the runtime's effective boot outcome and issue classification, including the exclusions for timed-out initial boots and dismissed findings. Inconclusive campaign diagnostics also appear in the invocation record.
 
 Each result lists its points and reproductions under `properties.points`. Use the original profile, firmware, calibration and seed. For a single point, the reproduction gives the existing Renode Robot point variables. For a pair or chain, replace the profile's `fault_sweep.phase2_fault` with the supplied block, and apply the indicated first-erase setting if present. For state search these selectors identify the operations in the evaluated path. The auxiliary staging, fuzz and authorization-review campaigns retain their own selectors.

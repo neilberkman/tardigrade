@@ -250,7 +250,7 @@ class ReportRun:
             return bool(result_issue_reasons(row, expected))
 
         return build_point_counts(rows, expected_control_points=sum(bool(r.get("is_control")) for r in rows),
-                                  issue_predicate=has_issue)
+                                  issue_predicate=has_issue, first_cut_states=self.data.get("first_cut_states"))
 
     def points(self):
         for component in self.components:

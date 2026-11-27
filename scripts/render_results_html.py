@@ -722,6 +722,39 @@ def render_point_counts_panel(payload: Dict[str, Any]) -> str:
             "</tr>"
         )
 
+    fcs = block.get("first_cut_states") or {}
+    fcs_rows = []
+    for operation, label in (("program", "writes"), ("erase", "erases")):
+        d_row = fcs.get(operation) if isinstance(fcs.get(operation), dict) else {}
+        d_tested = _as_int(d_row.get("tested_states"))
+        d_distinct = _as_int(d_row.get("distinct_states"))
+        fcs_rows.append(
+            "<tr>"
+            f"<td>{label}</td>"
+            f"<td>{_as_int(d_row.get('candidate_cuts'))}</td>"
+            f"<td>{d_distinct}</td>"
+            f"<td>{_as_int(d_row.get('planned_states'))}</td>"
+            f"<td>{d_tested}</td>"
+            f"<td>{_as_int(d_row.get('duplicate_cuts'))}</td>"
+            f"<td>{_as_int(d_row.get('capped_states'))}</td>"
+            f"<td>{d_tested} of {d_distinct} distinct first-cut states tested</td>"
+            "</tr>"
+        )
+    tot_tested = _as_int(fcs.get("tested_states"))
+    tot_distinct = _as_int(fcs.get("distinct_states"))
+    fcs_rows.append(
+        "<tr>"
+        "<td>total</td>"
+        f"<td>{_as_int(fcs.get('candidate_cuts'))}</td>"
+        f"<td>{tot_distinct}</td>"
+        f"<td>{_as_int(fcs.get('planned_states'))}</td>"
+        f"<td>{tot_tested}</td>"
+        f"<td>{_as_int(fcs.get('duplicate_cuts'))}</td>"
+        f"<td>{_as_int(fcs.get('capped_states'))}</td>"
+        f"<td>{tot_tested} of {tot_distinct} distinct first-cut states tested</td>"
+        "</tr>"
+    )
+
     return (
         "<div class='telemetry-heading'><span>point counts by kind</span>"
         "<code>requested / run / evaluated</code></div>"
@@ -743,6 +776,13 @@ def render_point_counts_panel(payload: Dict[str, Any]) -> str:
         "<th>Represented without cutting</th><th>Outside planned range</th>"
         "<th>Not cut or represented</th><th>Representation</th>"
         "</tr></thead><tbody>" + "".join(calibration_rows) + "</tbody></table></div>"
+        "<div class='telemetry-heading'><span>first-cut persistent states</span>"
+        f"<code>{tot_tested} of {tot_distinct} distinct first-cut states tested</code></div>"
+        "<div class='table-wrap'><table><thead><tr>"
+        "<th>Domain</th><th>Candidate cuts</th><th>Distinct states</th>"
+        "<th>Planned states</th><th>Tested states</th><th>Duplicate cuts</th>"
+        "<th>Capped states</th><th>Coverage</th>"
+        "</tr></thead><tbody>" + "".join(fcs_rows) + "</tbody></table></div>"
     )
 
 
@@ -1096,6 +1136,8 @@ def runtime_payload(rows, name, profile=None):
     summary = summarize_runtime_sweep(
         rows, expected_control_points=sum(bool(r.get("is_control")) for r in rows),
         expected_outcome_override=expect.get("control_outcome"),
+        calibration_point_coverage={"first_cut_states": profile["first_cut_states"]}
+        if profile.get("first_cut_states") else None,
     )
     return {"profile": name, "expect": expect, "runtime_sweep_results": rows, "summary": {"runtime_sweep": summary}}
 

@@ -64,8 +64,12 @@ def sarif_run(run, root):
     invocation = {"executionSuccessful": not incomplete}
     if incomplete:
         invocation["toolExecutionNotifications"] = [{"message": {"text": reason}} for reason in incomplete]
-    return {"tool": {"driver": {"name": "Tardigrade", "rules": rules}},
-            "automationDetails": {"id": f"{run.name}/"}, "invocations": [invocation], "results": results}
+    report = {"tool": {"driver": {"name": "Tardigrade", "rules": rules}},
+              "automationDetails": {"id": f"{run.name}/"}, "invocations": [invocation], "results": results}
+    first_cuts = run.counts.get("first_cut_states") or {}
+    if first_cuts.get("available"):
+        report["properties"] = {"first_cut_states": first_cuts}
+    return report
 
 
 def sarif_report(runs, root):

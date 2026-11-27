@@ -106,6 +106,16 @@ def merge_runtime_sweep_payloads(
         (first.get("summary") or {}).get("runtime_sweep") or {}
     ).get("point_counts") or {}
     source_calibration = source_point_counts.get("calibration") or {}
+    source_first_cut_states = (
+        first.get("first_cut_states")
+        or source_point_counts.get("first_cut_states")
+    )
+    calibration_cov: Dict[str, Any] = {
+        operation: dict(source_calibration.get(operation) or {})
+        for operation in ("program", "erase")
+    }
+    if isinstance(source_first_cut_states, dict):
+        calibration_cov["first_cut_states"] = dict(source_first_cut_states)
     summary = summarize_runtime_sweep(
         ordered_results,
         total_writes=calibrated_writes,
@@ -115,10 +125,7 @@ def merge_runtime_sweep_payloads(
             str(result.get("fault_requested_type") or result.get("fault_type") or "w")
             for result in merged_results
         ],
-        calibration_point_coverage={
-            operation: dict(source_calibration.get(operation) or {})
-            for operation in ("program", "erase")
-        },
+        calibration_point_coverage=calibration_cov,
         expected_outcome_override=(
             first_expect.get("control_outcome")
             if isinstance(first_expect, dict)
@@ -166,6 +173,8 @@ def merge_runtime_sweep_payloads(
     }
     if first_target_source is not None:
         merged_payload["target_source"] = first_target_source
+    if isinstance(source_first_cut_states, dict):
+        merged_payload["first_cut_states"] = dict(source_first_cut_states)
     for key in ("contracts", "calibration", "clean_trace"):
         if key in first:
             merged_payload[key] = first.get(key)

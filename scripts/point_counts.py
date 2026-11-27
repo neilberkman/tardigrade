@@ -91,6 +91,7 @@ def _new_counts() -> Dict[str, Any]:
             "program": _new_calibration_row(),
             "erase": _new_calibration_row(),
         },
+        "first_cut_states": _new_first_cut_states_block(),
     }
 
 
@@ -103,6 +104,35 @@ def _new_calibration_row() -> Dict[str, Any]:
         "outside_planned_range": 0,
         "not_cut_or_represented": 0,
         "representation": [],
+    }
+
+
+def _new_first_cut_state_domain_row() -> Dict[str, Any]:
+    return {
+        "candidate_cuts": 0,
+        "distinct_states": 0,
+        "planned_states": 0,
+        "tested_states": 0,
+        "duplicate_cuts": 0,
+        "capped_states": 0,
+        "summary": "0 of 0 distinct first-cut states tested",
+    }
+
+
+def _new_first_cut_states_block() -> Dict[str, Any]:
+    return {
+        "available": False,
+        "strategy": None,
+        "cap": None,
+        "candidate_cuts": 0,
+        "distinct_states": 0,
+        "planned_states": 0,
+        "tested_states": 0,
+        "duplicate_cuts": 0,
+        "capped_states": 0,
+        "summary": "0 of 0 distinct first-cut states tested",
+        "program": _new_first_cut_state_domain_row(),
+        "erase": _new_first_cut_state_domain_row(),
     }
 
 
@@ -457,7 +487,7 @@ def _populate_calibration(
             {str(value) for value in representation if str(value).strip()}
         )
         represented = 0
-        if {"heuristic", "quick"}.intersection(representation):
+        if {"heuristic", "quick", "distinct_states"}.intersection(representation):
             successful_representatives: Set[int] = set()
             for result in results:
                 if (
@@ -516,6 +546,362 @@ def _refresh_totals(counts: Dict[str, Any]) -> None:
         )
 
 
+def _evaluated_calibration_cuts(
+    results: Sequence[Mapping[str, Any]],
+) -> Dict[str, Set[int]]:
+    evaluated: List[Mapping[str, Any]] = [
+        result
+        for result in results
+        if not bool(result.get("is_control"))
+        and not result_is_infrastructure_error(result)
+        and not result_has_initial_timeout(result)
+        and not _is_skipped(result)
+    ]
+    return _direct_calibration_cuts(evaluated)
+
+
+def _populate_first_cut_states(
+    counts: Dict[str, Any],
+    results: Sequence[Mapping[str, Any]],
+    calibration: Optional[Mapping[str, Any]] = None,
+    first_cut_states: Optional[Mapping[str, Any]] = None,
+    profile: Any = None,
+    state_results: Sequence[Mapping[str, Any]] = (),
+) -> None:
+    block = counts["first_cut_states"]
+    supplied = first_cut_states
+    if not isinstance(supplied, Mapping) and isinstance(calibration, Mapping):
+        candidate = calibration.get("first_cut_states")
+        if isinstance(candidate, Mapping):
+            supplied = candidate
+
+    evaluated_cuts = _evaluated_calibration_cuts(results)
+    strategy = None
+    if profile is not None:
+        strategy = getattr(getattr(profile, "fault_sweep", None), "sweep_strategy", None)
+    cap_default = None
+    if profile is not None:
+        cap_default = getattr(
+            getattr(profile, "fault_sweep", None), "max_distinct_states", None
+        )
+
+    if isinstance(supplied, Mapping) and (
+        bool(supplied.get("available"))
+        or "distinct_states" in supplied
+        or "representatives" in supplied
+    ):
+        block["available"] = True
+        block["strategy"] = supplied.get("strategy") or strategy
+        block["cap"] = supplied.get("cap", cap_default)
+
+        reps = supplied.get("representatives")
+        if isinstance(reps, Sequence) and not isinstance(reps, (str, bytes)):
+            domain_candidates = {
+                "program": max(
+                    0,
+                    int(
+                        ((supplied.get("program") or {}).get("candidate_cuts", 0))
+                        or 0
+                    ),
+                ),
+                "erase": max(
+                    0,
+                    int(
+                        ((supplied.get("erase") or {}).get("candidate_cuts", 0))
+                        or 0
+                    ),
+                ),
+            }
+            domain_duplicates = {
+                "program": max(
+                    0,
+                    int(
+                        ((supplied.get("program") or {}).get("duplicate_cuts", 0))
+                        or 0
+                    ),
+                ),
+                "erase": max(
+                    0,
+                    int(
+                        ((supplied.get("erase") or {}).get("duplicate_cuts", 0))
+                        or 0
+                    ),
+                ),
+            }
+            domain_distinct = {"program": 0, "erase": 0}
+            domain_planned = {"program": 0, "erase": 0}
+            domain_tested = {"program": 0, "erase": 0}
+            for rep in reps:
+                if not isinstance(rep, Mapping):
+                    continue
+                rep_op = (
+                    "erase"
+                    if str(rep.get("operation") or "write").strip().lower()
+                    == "erase"
+                    else "program"
+                )
+                domain_distinct[rep_op] += 1
+                if rep.get("selected", True) is not False:
+                    domain_planned[rep_op] += 1
+                rep_cuts = rep.get("represented_cuts")
+                if not isinstance(rep_cuts, Sequence) or isinstance(
+                    rep_cuts, (str, bytes)
+                ):
+                    rep_cuts = [rep]
+                is_tested = False
+                for cut in rep_cuts:
+                    if not isinstance(cut, Mapping):
+                        continue
+                    cut_op = (
+                        "erase"
+                        if str(cut.get("operation") or rep_op).strip().lower()
+                        == "erase"
+                        else "program"
+                    )
+                    try:
+                        cut_idx = int(cut.get("operation_index"))
+                    except (TypeError, ValueError):
+                        continue
+                    if cut_idx in evaluated_cuts[cut_op]:
+                        is_tested = True
+                        break
+                if is_tested:
+                    domain_tested[rep_op] += 1
+
+            for domain in ("program", "erase"):
+                d_row = block[domain]
+                d_distinct = domain_distinct[domain]
+                d_planned = domain_planned[domain]
+                d_tested = domain_tested[domain]
+                d_dups = domain_duplicates[domain]
+                d_cands = max(d_distinct + d_dups, domain_candidates[domain])
+                d_capped = max(0, d_distinct - d_planned)
+                d_row.update(
+                    {
+                        "candidate_cuts": d_cands,
+                        "distinct_states": d_distinct,
+                        "planned_states": d_planned,
+                        "tested_states": d_tested,
+                        "duplicate_cuts": d_dups,
+                        "capped_states": d_capped,
+                        "summary": "{} of {} distinct first-cut states tested".format(
+                            d_tested, d_distinct
+                        ),
+                    }
+                )
+        else:
+            for domain in ("program", "erase"):
+                src = supplied.get(domain) if isinstance(supplied.get(domain), Mapping) else {}
+                d_distinct = max(0, int(src.get("distinct_states", 0) or 0))
+                d_dups = max(0, int(src.get("duplicate_cuts", 0) or 0))
+                d_cands = max(
+                    d_distinct + d_dups,
+                    int(src.get("candidate_cuts", d_distinct + d_dups) or 0),
+                )
+                d_planned = max(
+                    0,
+                    int(
+                        src.get(
+                            "planned_states",
+                            src.get("selected_states", d_distinct),
+                        )
+                        or 0
+                    ),
+                )
+                if "tested_states" in src:
+                    d_tested = max(0, int(src.get("tested_states", 0) or 0))
+                else:
+                    d_tested = min(d_distinct, len(evaluated_cuts[domain]))
+                d_capped = max(
+                    0,
+                    int(src.get("capped_states", max(0, d_distinct - d_planned)) or 0),
+                )
+                block[domain].update(
+                    {
+                        "candidate_cuts": d_cands,
+                        "distinct_states": d_distinct,
+                        "planned_states": d_planned,
+                        "tested_states": d_tested,
+                        "duplicate_cuts": d_dups,
+                        "capped_states": d_capped,
+                        "summary": "{} of {} distinct first-cut states tested".format(
+                            d_tested, d_distinct
+                        ),
+                    }
+                )
+            if not any(
+                block[d]["distinct_states"] or block[d]["candidate_cuts"]
+                for d in ("program", "erase")
+            ):
+                tot_distinct = max(0, int(supplied.get("distinct_states", 0) or 0))
+                tot_dups = max(0, int(supplied.get("duplicate_cuts", 0) or 0))
+                tot_cands = max(
+                    tot_distinct + tot_dups,
+                    int(supplied.get("candidate_cuts", tot_distinct + tot_dups) or 0),
+                )
+                tot_planned = max(
+                    0,
+                    int(
+                        supplied.get(
+                            "planned_states",
+                            supplied.get("selected_states", tot_distinct),
+                        )
+                        or 0
+                    ),
+                )
+                if "tested_states" in supplied:
+                    tot_tested = max(0, int(supplied.get("tested_states", 0) or 0))
+                else:
+                    tot_tested = min(
+                        tot_distinct,
+                        len(evaluated_cuts["program"]) + len(evaluated_cuts["erase"]),
+                    )
+                tot_capped = max(
+                    0,
+                    int(
+                        supplied.get(
+                            "capped_states", max(0, tot_distinct - tot_planned)
+                        )
+                        or 0
+                    ),
+                )
+                block["program"].update(
+                    {
+                        "candidate_cuts": tot_cands,
+                        "distinct_states": tot_distinct,
+                        "planned_states": tot_planned,
+                        "tested_states": tot_tested,
+                        "duplicate_cuts": tot_dups,
+                        "capped_states": tot_capped,
+                        "summary": "{} of {} distinct first-cut states tested".format(
+                            tot_tested, tot_distinct
+                        ),
+                    }
+                )
+    elif state_results:
+        summary = _state_search_summary(state_results)
+        if summary:
+            block["available"] = True
+            block["strategy"] = (
+                summary.get("first_cut_strategy") or strategy or "state_search"
+            )
+            block["cap"] = summary.get("first_cut_cap", cap_default)
+            p_comp = max(
+                0,
+                int(
+                    summary.get(
+                        "first_cut_program_states_computed",
+                        summary.get("first_cut_states_computed", 0),
+                    )
+                    or 0
+                ),
+            )
+            e_comp = max(
+                0,
+                int(summary.get("first_cut_erase_states_computed", 0) or 0),
+            )
+            p_dups = max(
+                0,
+                int(
+                    summary.get(
+                        "first_cut_program_states_reused",
+                        summary.get("first_cut_states_reused", 0)
+                        if e_comp == 0
+                        else 0,
+                    )
+                    or 0
+                ),
+            )
+            e_dups = max(
+                0,
+                int(summary.get("first_cut_erase_states_reused", 0) or 0),
+            )
+            for domain, computed, reused, kind in (
+                ("program", p_comp, p_dups, "state_search_single_cut"),
+                ("erase", e_comp, e_dups, "state_search_single_cut_erase"),
+            ):
+                candidate_cuts = max(
+                    0,
+                    int(
+                        summary.get(
+                            "first_cut_{}_candidate_cuts".format(domain),
+                            computed,
+                        )
+                        or 0
+                    ),
+                )
+                distinct_states = max(
+                    0,
+                    int(
+                        summary.get(
+                            "first_cut_{}_distinct_states".format(domain),
+                            max(0, computed - reused),
+                        )
+                        or 0
+                    ),
+                )
+                duplicate_cuts = max(
+                    0,
+                    int(
+                        summary.get(
+                            "first_cut_{}_duplicate_cuts".format(domain),
+                            reused,
+                        )
+                        or 0
+                    ),
+                )
+                planned_states = max(
+                    0,
+                    int(
+                        summary.get(
+                            "first_cut_{}_planned_states".format(domain),
+                            distinct_states,
+                        )
+                        or 0
+                    ),
+                )
+                capped_states = max(
+                    0,
+                    int(
+                        summary.get(
+                            "first_cut_{}_capped_states".format(domain),
+                            max(0, distinct_states - planned_states),
+                        )
+                        or 0
+                    ),
+                )
+                tested_states = min(
+                    distinct_states,
+                    int(counts["kinds"][kind]["evaluated"]),
+                )
+                block[domain].update(
+                    {
+                        "candidate_cuts": candidate_cuts,
+                        "distinct_states": distinct_states,
+                        "planned_states": planned_states,
+                        "tested_states": tested_states,
+                        "duplicate_cuts": duplicate_cuts,
+                        "capped_states": capped_states,
+                        "summary": "{} of {} distinct first-cut states tested".format(
+                            tested_states, distinct_states
+                        ),
+                    }
+                )
+
+    for key in (
+        "candidate_cuts",
+        "distinct_states",
+        "planned_states",
+        "tested_states",
+        "duplicate_cuts",
+        "capped_states",
+    ):
+        block[key] = int(block["program"][key]) + int(block["erase"][key])
+    block["summary"] = "{} of {} distinct first-cut states tested".format(
+        block["tested_states"], block["distinct_states"]
+    )
+
+
 def _populate_trace_replay_cross_checks(
     counts: Dict[str, Any], results: Sequence[Mapping[str, Any]]
 ) -> None:
@@ -536,7 +922,8 @@ def build_point_counts(
     expected_control_points: int = 1,
     profile: Any = None,
     issue_predicate: Optional[Callable[[Mapping[str, Any]], bool]] = None,
-    calibration: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    calibration: Optional[Mapping[str, Any]] = None,
+    first_cut_states: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the shared point-accounting block used by every report renderer."""
     result_list: List[Mapping[str, Any]] = list(results)
@@ -655,6 +1042,14 @@ def build_point_counts(
         state_row["missing"] = max(0, int(state_row["missing"]) - skipped)
 
     _populate_calibration(counts, result_list, calibration)
+    _populate_first_cut_states(
+        counts,
+        result_list,
+        calibration=calibration,
+        first_cut_states=first_cut_states,
+        profile=profile,
+        state_results=state_results,
+    )
     _populate_trace_replay_cross_checks(counts, result_list)
     _refresh_totals(counts)
     return counts
@@ -664,6 +1059,7 @@ def merge_point_counts(*blocks: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     """Merge campaign blocks while retaining the first calibration baseline."""
     merged = _new_counts()
     calibration_set = False
+    first_cut_states_set = False
     for block in blocks:
         if not isinstance(block, Mapping):
             continue
@@ -691,6 +1087,53 @@ def merge_point_counts(*blocks: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
                     for operation in ("program", "erase")
                 }
                 calibration_set = True
+        fcs = block.get("first_cut_states")
+        if not first_cut_states_set and isinstance(fcs, Mapping):
+            if bool(fcs.get("available")) or int(fcs.get("distinct_states", 0) or 0) > 0:
+                merged_fcs = _new_first_cut_states_block()
+                merged_fcs["available"] = bool(fcs.get("available", True))
+                merged_fcs["strategy"] = fcs.get("strategy")
+                merged_fcs["cap"] = fcs.get("cap")
+                for domain in ("program", "erase"):
+                    src_dom = fcs.get(domain) if isinstance(fcs.get(domain), Mapping) else {}
+                    for k in (
+                        "candidate_cuts",
+                        "distinct_states",
+                        "planned_states",
+                        "tested_states",
+                        "duplicate_cuts",
+                        "capped_states",
+                    ):
+                        merged_fcs[domain][k] = int(src_dom.get(k, 0) or 0)
+                    merged_fcs[domain]["summary"] = (
+                        "{} of {} distinct first-cut states tested".format(
+                            merged_fcs[domain]["tested_states"],
+                            merged_fcs[domain]["distinct_states"],
+                        )
+                    )
+                for k in (
+                    "candidate_cuts",
+                    "distinct_states",
+                    "planned_states",
+                    "tested_states",
+                    "duplicate_cuts",
+                    "capped_states",
+                ):
+                    merged_fcs[k] = int(
+                        fcs.get(
+                            k,
+                            merged_fcs["program"][k] + merged_fcs["erase"][k],
+                        )
+                        or 0
+                    )
+                merged_fcs["summary"] = (
+                    "{} of {} distinct first-cut states tested".format(
+                        merged_fcs["tested_states"],
+                        merged_fcs["distinct_states"],
+                    )
+                )
+                merged["first_cut_states"] = merged_fcs
+                first_cut_states_set = True
         cross_checks = block.get("trace_replay_cross_checks")
         if isinstance(cross_checks, Mapping):
             for field in _TRACE_REPLAY_CROSS_CHECK_FIELDS:
@@ -773,6 +1216,46 @@ def render_point_counts_text(block: Mapping[str, Any]) -> str:
                     row.get("not_cut_or_represented", 0) or 0
                 ),
                 representation=representation,
+            )
+        )
+    fcs = block.get("first_cut_states") or {}
+    fcs_tested = int(fcs.get("tested_states", 0) or 0)
+    fcs_distinct = int(fcs.get("distinct_states", 0) or 0)
+    fcs_planned = int(fcs.get("planned_states", 0) or 0)
+    fcs_candidates = int(fcs.get("candidate_cuts", 0) or 0)
+    fcs_duplicates = int(fcs.get("duplicate_cuts", 0) or 0)
+    fcs_capped = int(fcs.get("capped_states", 0) or 0)
+    lines.append(
+        "First-cut states "
+        "(tested / distinct / planned / candidate cuts / duplicate cuts / capped): "
+        "{tested} / {distinct} / {planned} / {candidates} / {duplicates} / {capped} "
+        "({tested} of {distinct} distinct first-cut states tested)".format(
+            tested=fcs_tested,
+            distinct=fcs_distinct,
+            planned=fcs_planned,
+            candidates=fcs_candidates,
+            duplicates=fcs_duplicates,
+            capped=fcs_capped,
+        )
+    )
+    for operation, label in (("program", "writes"), ("erase", "erases")):
+        d_row = fcs.get(operation) if isinstance(fcs.get(operation), Mapping) else {}
+        d_tested = int(d_row.get("tested_states", 0) or 0)
+        d_distinct = int(d_row.get("distinct_states", 0) or 0)
+        d_planned = int(d_row.get("planned_states", 0) or 0)
+        d_candidates = int(d_row.get("candidate_cuts", 0) or 0)
+        d_duplicates = int(d_row.get("duplicate_cuts", 0) or 0)
+        d_capped = int(d_row.get("capped_states", 0) or 0)
+        lines.append(
+            "  {label}: {tested} / {distinct} / {planned} / {candidates} / "
+            "{duplicates} / {capped} ({tested} of {distinct} distinct first-cut states tested)".format(
+                label=label,
+                tested=d_tested,
+                distinct=d_distinct,
+                planned=d_planned,
+                candidates=d_candidates,
+                duplicates=d_duplicates,
+                capped=d_capped,
             )
         )
     return "\n".join(lines)
@@ -860,4 +1343,51 @@ def render_point_counts_markdown(block: Mapping[str, Any]) -> str:
                 representation=representation,
             )
         )
+    fcs = block.get("first_cut_states") or {}
+    fcs_tested = int(fcs.get("tested_states", 0) or 0)
+    fcs_distinct = int(fcs.get("distinct_states", 0) or 0)
+    fcs_planned = int(fcs.get("planned_states", 0) or 0)
+    fcs_candidates = int(fcs.get("candidate_cuts", 0) or 0)
+    fcs_duplicates = int(fcs.get("duplicate_cuts", 0) or 0)
+    fcs_capped = int(fcs.get("capped_states", 0) or 0)
+    lines.extend(
+        [
+            "",
+            "### First-cut persistent states",
+            "",
+            "| Domain | Candidate cuts | Distinct states | Planned states | Tested states | Duplicate cuts | Capped states | Coverage |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
+    for operation, label in (("program", "writes"), ("erase", "erases")):
+        d_row = fcs.get(operation) if isinstance(fcs.get(operation), Mapping) else {}
+        d_tested = int(d_row.get("tested_states", 0) or 0)
+        d_distinct = int(d_row.get("distinct_states", 0) or 0)
+        d_planned = int(d_row.get("planned_states", 0) or 0)
+        d_candidates = int(d_row.get("candidate_cuts", 0) or 0)
+        d_duplicates = int(d_row.get("duplicate_cuts", 0) or 0)
+        d_capped = int(d_row.get("capped_states", 0) or 0)
+        lines.append(
+            "| {label} | {candidates} | {distinct} | {planned} | {tested} | "
+            "{duplicates} | {capped} | {tested} of {distinct} distinct first-cut states tested |".format(
+                label=label,
+                candidates=d_candidates,
+                distinct=d_distinct,
+                planned=d_planned,
+                tested=d_tested,
+                duplicates=d_duplicates,
+                capped=d_capped,
+            )
+        )
+    lines.append(
+        "| total | {candidates} | {distinct} | {planned} | {tested} | "
+        "{duplicates} | {capped} | {tested} of {distinct} distinct first-cut states tested |".format(
+            candidates=fcs_candidates,
+            distinct=fcs_distinct,
+            planned=fcs_planned,
+            tested=fcs_tested,
+            duplicates=fcs_duplicates,
+            capped=fcs_capped,
+        )
+    )
     return "\n".join(lines) + "\n"

@@ -463,6 +463,22 @@ def format_profile_cell(record: Mapping[str, Any] | None) -> str:
                 int(cross_checks.get("failed", 0) or 0),
             )
         )
+        fcs = point_counts.get("first_cut_states") or {}
+        fcs_tested = int(fcs.get("tested_states", 0) or 0)
+        fcs_distinct = int(fcs.get("distinct_states", 0) or 0)
+        fcs_candidates = int(fcs.get("candidate_cuts", 0) or 0)
+        fcs_duplicates = int(fcs.get("duplicate_cuts", 0) or 0)
+        fcs_capped = int(fcs.get("capped_states", 0) or 0)
+        parts.append(
+            "first-cut states: {} of {} distinct first-cut states tested "
+            "(candidate cuts {}, duplicate cuts {}, capped {})".format(
+                fcs_tested,
+                fcs_distinct,
+                fcs_candidates,
+                fcs_duplicates,
+                fcs_capped,
+            )
+        )
     else:
         parts.append(
             f"{issues} main-runtime issues/{points} injected main-runtime points"
