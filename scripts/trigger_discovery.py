@@ -26,7 +26,12 @@ from renode_runner import (
     run_single_point,
     validate_barrier_audit,
 )
-from profile_loader import ELFFile, ProfileConfig, UpdateTrigger
+from profile_loader import (
+    ELFFile,
+    ProfileConfig,
+    UpdateTrigger,
+    mcuboot_validated_image_extent,
+)
 
 
 STM32F4_ERASE_GEOMETRY = [
@@ -874,7 +879,16 @@ def _prefers_triggered_upgrade(profile: ProfileConfig, repo_root: Path) -> bool:
         str(name).strip().lower()
         for name in (getattr(criteria, "allowed_images", []) or [])
     }
-    if expected_image == "staging" or "staging" in allowed_images:
+    approved_running = getattr(criteria, "approved_image_running", None)
+    approved_images = {
+        str(name).strip().lower()
+        for name in (getattr(approved_running, "images", []) or [])
+    }
+    if (
+        expected_image == "staging"
+        or "staging" in allowed_images
+        or "staging" in approved_images
+    ):
         return True
     marker_address = getattr(criteria, "marker_address", None)
     marker_value = getattr(criteria, "marker_value", None)
@@ -1264,18 +1278,24 @@ def _image_digest_for_evidence(
         if exec_slot is None:
             return None
         page_size = 4096
-        data_size = int(exec_slot.size) - page_size
-        if data_size > 0:
-            pad_byte_fn = getattr(profile, "image_pad_byte", None)
-            if callable(pad_byte_fn):
-                pad_byte = pad_byte_fn(repo_root)
-            else:
-                pad_byte = (
-                    0x00
-                    if str(getattr(profile, "flash_backend", "")).lower() == "mram"
-                    else 0xFF
-                )
-            raw = raw[:data_size].ljust(data_size, bytes([pad_byte]))
+        mcu_extent = mcuboot_validated_image_extent(
+            raw, slot_size=int(exec_slot.size)
+        )
+        if mcu_extent is not None:
+            raw = raw[:mcu_extent]
+        else:
+            data_size = int(exec_slot.size) - page_size
+            if data_size > 0:
+                pad_byte_fn = getattr(profile, "image_pad_byte", None)
+                if callable(pad_byte_fn):
+                    pad_byte = pad_byte_fn(repo_root)
+                else:
+                    pad_byte = (
+                        0x00
+                        if str(getattr(profile, "flash_backend", "")).lower() == "mram"
+                        else 0xFF
+                    )
+                raw = raw[:data_size].ljust(data_size, bytes([pad_byte]))
         return hashlib.sha256(raw).hexdigest()
     except (OSError, TypeError, ValueError):
         return None
@@ -1350,7 +1370,13 @@ def _trace_less_boot_state_is_valid(
             reported_slots.append(str(value).strip().lower())
     if any(slot != actual_slot for slot in reported_slots):
         return None
-    expected_vtor_slot = str(getattr(criteria, "vtor_in_slot", None) or "").strip().lower()
+    approved_running = getattr(criteria, "approved_image_running", None)
+    approved_slot = str(
+        getattr(approved_running, "slot", None) or ""
+    ).strip().lower()
+    expected_vtor_slot = str(
+        getattr(criteria, "vtor_in_slot", None) or approved_slot or ""
+    ).strip().lower()
     if not expected_vtor_slot:
         return None
     if expected_vtor_slot and expected_vtor_slot != "any" and actual_slot != expected_vtor_slot:
@@ -1415,14 +1441,30 @@ def _trace_less_content_evidence(
     if boot_state is None:
         return None
     boot_slot = boot_state["slot"]
-    expected_vtor_slot = str(getattr(criteria, "vtor_in_slot", None) or "").strip().lower()
+    approved_running = getattr(criteria, "approved_image_running", None)
+    approved_slot = str(
+        getattr(approved_running, "slot", None) or ""
+    ).strip().lower()
+    expected_vtor_slot = str(
+        getattr(criteria, "vtor_in_slot", None) or approved_slot or ""
+    ).strip().lower()
     if expected_vtor_slot == "any" and not boot_slot:
         return None
     if expected_vtor_slot and expected_vtor_slot != "any" and boot_slot != expected_vtor_slot:
         return None
-    expected_hash_slot = str(getattr(criteria, "image_hash_slot", None) or "").strip().lower()
+    expected_hash_slot = str(
+        getattr(criteria, "image_hash_slot", None) or approved_slot or ""
+    ).strip().lower()
     if expected_hash_slot and expected_hash_slot != "any" and boot_slot != expected_hash_slot:
         return None
+    if approved_running is not None:
+        approved_sig = (
+            signals.get("approved_image_running")
+            if isinstance(signals, dict)
+            else None
+        )
+        if isinstance(approved_sig, dict) and approved_sig.get("ok") is False:
+            return None
 
     marker_value = _parse_evidence_int(getattr(criteria, "marker_value", None))
     marker_address = _parse_evidence_int(getattr(criteria, "marker_address", None))
@@ -1440,7 +1482,8 @@ def _trace_less_content_evidence(
     )
 
     allowed_names = list(getattr(criteria, "allowed_images", []) or [])
-    candidate_names = allowed_names or [
+    approved_names = list(getattr(approved_running, "images", []) or [])
+    candidate_names = allowed_names or approved_names or [
         str(getattr(criteria, "expected_image", None) or "staging").strip()
     ]
     exec_hash = _image_digest_for_evidence(profile, repo_root, "exec")
@@ -1480,7 +1523,10 @@ def _trace_less_content_evidence(
         or runtime_names[0] not in matching_names
     ):
         return None
-    if bool(getattr(criteria, "image_hash", False)) and len(matching_names) != 1:
+    hash_configured = bool(
+        getattr(criteria, "image_hash", False) or approved_running is not None
+    )
+    if hash_configured and len(matching_names) != 1:
         return None
     expected_name = (
         matching_names[0]
@@ -1495,7 +1541,6 @@ def _trace_less_content_evidence(
         and all(value == observed_hash for value in observed_hashes)
         and observed_hash == target_hash
     )
-    hash_configured = bool(getattr(criteria, "image_hash", False))
 
     marker_details = None
     if marker_evidence:

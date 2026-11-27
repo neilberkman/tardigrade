@@ -2057,6 +2057,100 @@ if allowed_image_hashes_raw:
         raise RuntimeError('allowed_image_hashes_b64: {}'.format(exc))
 
 
+DEFAULT_APPROVED_IMAGE_DWELL_S = 0.25
+
+
+def _normalize_approved_image_running_config(raw_cfg):
+    if not raw_cfg:
+        return None
+    if not isinstance(raw_cfg, dict):
+        raise ValueError('decoded value is not a mapping')
+    slot_name = str(raw_cfg.get('slot', '')).strip()
+    if not slot_name or slot_name not in slot_ranges:
+        raise ValueError(
+            'slot {!r} is not present in slot_ranges ({})'.format(
+                slot_name, sorted(slot_ranges.keys())
+            )
+        )
+    slot_base, slot_end = slot_ranges[slot_name]
+    slot_size = int(slot_end) - int(slot_base)
+    raw_dwell = raw_cfg.get('dwell_s', globals().get('DEFAULT_APPROVED_IMAGE_DWELL_S', 0.25))
+    dwell_s = float(raw_dwell)
+    if dwell_s <= 0:
+        raise ValueError('dwell_s must be > 0, got {!r}'.format(raw_dwell))
+    raw_images = raw_cfg.get('images')
+    if not isinstance(raw_images, list) or not raw_images:
+        raise ValueError('images must be a non-empty list')
+    seen_names = set()
+    seen_hashes = set()
+    normalized_images = []
+    for index, entry in enumerate(raw_images):
+        if not isinstance(entry, dict):
+            raise ValueError('images[{}] is not a mapping'.format(index))
+        name = str(entry.get('name', '')).strip()
+        digest = str(entry.get('sha256', '')).strip().lower()
+        if not name or len(digest) != 64 or any(ch not in '0123456789abcdef' for ch in digest):
+            raise ValueError('images[{}] has invalid name or SHA-256'.format(index))
+        if name in seen_names or digest in seen_hashes:
+            raise ValueError('images[{}] duplicates an approved image name or digest'.format(index))
+        code_offset = int(entry.get('code_offset', 0))
+        code_size = int(entry.get('code_size', 0))
+        code_start = int(entry.get('code_start', int(slot_base) + code_offset))
+        code_end = int(entry.get('code_end', code_start + code_size))
+        if code_offset < 0 or code_size <= 0 or code_offset + code_size > slot_size:
+            raise ValueError(
+                'images[{}] ({}) executable extent [0x{:X}, 0x{:X}) lies outside slot {} size 0x{:X}'.format(
+                    index, name, code_offset, code_offset + code_size, slot_name, slot_size
+                )
+            )
+        if code_start != int(slot_base) + code_offset or code_end != code_start + code_size:
+            raise ValueError(
+                'images[{}] ({}) code_start/code_end disagree with slot {} base 0x{:08X}'.format(
+                    index, name, slot_name, int(slot_base)
+                )
+            )
+        seen_names.add(name)
+        seen_hashes.add(digest)
+        normalized_images.append({
+            'name': name,
+            'sha256': digest,
+            'code_offset': code_offset,
+            'code_size': code_size,
+            'code_start': code_start,
+            'code_end': code_end,
+            'extent_source': str(entry.get('extent_source', 'unknown')),
+            'digest_extent': int(entry.get('digest_extent', code_offset + code_size)),
+            'digest_extent_source': str(entry.get('digest_extent_source', 'unknown')),
+            'artifact_size': int(entry.get('artifact_size', code_offset + code_size)),
+        })
+    return {
+        'slot': slot_name,
+        'slot_base': int(slot_base),
+        'slot_size': int(slot_size),
+        'dwell_s': float(dwell_s),
+        'images': normalized_images,
+    }
+
+
+approved_image_running_config = None
+approved_image_running_raw = get_optional_var('approved_image_running_b64', '')
+if approved_image_running_raw:
+    try:
+        decoded_approved = json.loads(
+            base64.b64decode(approved_image_running_raw).decode('utf-8')
+        )
+        approved_image_running_config = _normalize_approved_image_running_config(
+            decoded_approved
+        )
+    except Exception as exc:
+        raise RuntimeError('approved_image_running_b64: {}'.format(exc))
+if approved_image_running_config is not None and evaluation_mode == 'state':
+    raise RuntimeError(
+        'success_criteria.approved_image_running requires fault_sweep.evaluation_mode: execute; '
+        'state mode does not execute the CPU and produces no slot-digest, executable-extent, or dwell evidence'
+    )
+
+
 calibration_stop_address = get_optional_int_var('calibration_stop_address', 0) or 0
 if calibration_stop_address < 0 or calibration_stop_address > 0xFFFFFFFF:
     raise RuntimeError('calibration_stop_address must be a 32-bit address')
@@ -2289,6 +2383,7 @@ _base_phase_context = {
         'expected_exec_sha256': expected_exec_sha256,
         'expected_image': expected_image_name,
         'allowed_image_hashes': list(allowed_image_hashes),
+        'approved_image_running': approved_image_running_config,
         'otadata_expect': {},
         'otadata_expect_scope': success_otadata_expect_scope,
         'allow_fault_after_success': bool(success_allow_fault_after_success),
@@ -2303,7 +2398,7 @@ def _apply_phase_context(phase=None):
     global success_marker_addr, success_marker_value
     global success_image_hash, success_image_hash_slot
     global image_exec_sha256, image_staging_sha256, expected_exec_sha256
-    global expected_image_name, allowed_image_hashes
+    global expected_image_name, allowed_image_hashes, approved_image_running_config
     global success_otadata_expect, success_otadata_expect_scope
     global success_allow_fault_after_success
     global success_checks_config, success_checks_parse_error
@@ -2357,6 +2452,15 @@ def _apply_phase_context(phase=None):
             _base_phase_context['success_criteria']['allowed_image_hashes'],
         )
         or []
+    )
+    raw_phase_approved = criteria.get(
+        'approved_image_running',
+        _base_phase_context['success_criteria']['approved_image_running'],
+    )
+    approved_image_running_config = (
+        _normalize_approved_image_running_config(raw_phase_approved)
+        if raw_phase_approved
+        else None
     )
     success_otadata_expect = criteria.get(
         'otadata_expect',
@@ -2462,6 +2566,7 @@ def get_effective_criteria(fault_type_code):
         'allowed_images': [
             str(entry.get('name', '')) for entry in allowed_image_hashes
         ],
+        'approved_image_running': approved_image_running_config,
         'allow_fault_after_success': bool(success_allow_fault_after_success),
     }
     if not _success_criteria_overrides or not fault_type_code:
@@ -5098,6 +5203,10 @@ def merge_stop_status_signals(signals, prefix, status):
     if status.get('reset_gated_terminal') is not None:
         signals[prefix + '_reset_gated_terminal'] = status.get(
             'reset_gated_terminal'
+        )
+    if status.get('approved_image_running') is not None:
+        signals[prefix + '_approved_image_running'] = status.get(
+            'approved_image_running'
         )
     if status.get('pc_samples'):
         signals[prefix + '_pc_samples'] = status.get('pc_samples')
@@ -8670,11 +8779,18 @@ def _validate_image_pad_byte():
         return
     if actual_erase_fill == pad:
         return
-    any_image_hash = bool(success_image_hash) or any(
-        isinstance(phase, dict)
-        and isinstance(phase.get('success_criteria'), dict)
-        and bool(phase['success_criteria'].get('image_hash'))
-        for phase in update_sequence_phases
+    any_image_hash = (
+        bool(success_image_hash)
+        or bool(globals().get('approved_image_running_config'))
+        or any(
+            isinstance(phase, dict)
+            and isinstance(phase.get('success_criteria'), dict)
+            and (
+                bool(phase['success_criteria'].get('image_hash'))
+                or bool(phase['success_criteria'].get('approved_image_running'))
+            )
+            for phase in update_sequence_phases
+        )
     )
     if (
         memory_erase_fill is None
@@ -9044,6 +9160,11 @@ def evaluate_structured_success_checks():
 def _match_configured_image_hash(actual_hash):
     """Return the exact declared image name for a computed slot digest."""
     normalized = str(actual_hash or '').strip().lower()
+    _app_cfg = globals().get('approved_image_running_config')
+    if isinstance(_app_cfg, dict):
+        for entry in _app_cfg.get('images', ()):
+            if normalized == str(entry.get('sha256', '')).strip().lower():
+                return str(entry.get('name', '')).strip() or None
     for entry in allowed_image_hashes:
         if normalized == str(entry.get('sha256', '')).strip().lower():
             return str(entry.get('name', '')).strip() or None
@@ -9054,6 +9175,407 @@ def _match_configured_image_hash(actual_hash):
     if image_staging_sha256 and normalized == image_staging_sha256.lower():
         return 'staging'
     return None
+
+
+def _resolve_effective_approved_image_running(effective_criteria=None):
+    raw_cfg = (
+        effective_criteria.get('approved_image_running', globals().get('approved_image_running_config'))
+        if isinstance(effective_criteria, dict)
+        else globals().get('approved_image_running_config')
+    )
+    if not raw_cfg:
+        return None
+    if (
+        isinstance(raw_cfg, dict)
+        and 'slot_base' in raw_cfg
+        and 'slot_size' in raw_cfg
+        and isinstance(raw_cfg.get('images'), list)
+    ):
+        return raw_cfg
+    norm_fn = globals().get('_normalize_approved_image_running_config')
+    if callable(norm_fn):
+        return norm_fn(raw_cfg)
+    return None
+
+
+def _classify_pc_in_approved_slot(pc_norm, slot_base, slot_size, code_start, code_end, digest_extent=None):
+    slot_end = int(slot_base) + int(slot_size)
+    if int(code_start) <= int(pc_norm) < int(code_end):
+        return 'executable_extent'
+    if int(slot_base) <= int(pc_norm) < int(code_start):
+        return 'header'
+    if int(code_end) <= int(pc_norm) < int(slot_end):
+        if digest_extent is not None:
+            tlv_end = min(int(slot_end), int(slot_base) + int(digest_extent))
+            if int(code_end) <= int(pc_norm) < tlv_end:
+                return 'tlv'
+        return 'slot_tail'
+    return 'outside_slot'
+
+
+def _evaluate_approved_image_digest(approved_cfg, digest_cache=None):
+    slot_name = str(approved_cfg.get('slot', '')).strip()
+    slot_base = int(approved_cfg.get('slot_base', 0))
+    slot_size = int(approved_cfg.get('slot_size', 0))
+    slot_end = slot_base + slot_size
+    if isinstance(digest_cache, dict) and digest_cache.get('slot') == slot_name and digest_cache.get('observed_sha256'):
+        actual_hash = str(digest_cache['observed_sha256']).strip().lower()
+        extent_size = digest_cache.get('digest_extent')
+        extent_source = digest_cache.get('digest_extent_source')
+    else:
+        actual_hash = str(compute_slot_hash(slot_name) or '').strip().lower()
+        extent_size = None
+        extent_source = None
+        if 'resolve_slot_hash_extent' in globals():
+            try:
+                extent_size, extent_source = resolve_slot_hash_extent(slot_base, slot_size)
+            except Exception:
+                extent_size = None
+                extent_source = None
+        if isinstance(digest_cache, dict):
+            digest_cache['slot'] = slot_name
+            digest_cache['observed_sha256'] = actual_hash
+            digest_cache['digest_extent'] = extent_size
+            digest_cache['digest_extent_source'] = extent_source
+    uncorrectable_words = []
+    _range_uncorr_fn = globals().get('_mram_uncorrectable_words_in_range')
+    if callable(_range_uncorr_fn) and slot_name in slot_ranges:
+        uncorrectable_words = list(_range_uncorr_fn(slot_base, slot_end) or [])
+    matched_spec = None
+    for spec in approved_cfg.get('images', ()):
+        if actual_hash and actual_hash == str(spec.get('sha256', '')).strip().lower():
+            matched_spec = spec
+            break
+    matched_name = str(matched_spec.get('name')) if matched_spec is not None else None
+    observed_known_image = matched_name
+    if observed_known_image is None and actual_hash:
+        if globals().get('image_exec_sha256') and actual_hash == str(globals().get('image_exec_sha256')).strip().lower():
+            observed_known_image = 'exec'
+        elif globals().get('image_staging_sha256') and actual_hash == str(globals().get('image_staging_sha256')).strip().lower():
+            observed_known_image = 'staging'
+    digest_ok = bool(matched_spec is not None and not uncorrectable_words)
+    return {
+        'ok': digest_ok,
+        'slot': slot_name,
+        'approved_images': [str(item.get('name', '')) for item in approved_cfg.get('images', ())],
+        'expected_sha256': {
+            str(item.get('name', '')): str(item.get('sha256', ''))
+            for item in approved_cfg.get('images', ())
+        },
+        'observed_sha256': actual_hash or None,
+        'matched_image': matched_name if digest_ok else None,
+        'observed_image': observed_known_image,
+        'digest_extent': int(extent_size) if extent_size is not None else None,
+        'digest_extent_source': extent_source,
+        'uncorrectable_words': uncorrectable_words,
+        '_matched_spec': matched_spec if digest_ok else None,
+    }
+
+
+def _evaluate_approved_image_extent(approved_cfg, digest_obs, pc_value, vtor_value=0):
+    slot_name = str(approved_cfg.get('slot', '')).strip()
+    slot_base = int(approved_cfg.get('slot_base', 0))
+    slot_size = int(approved_cfg.get('slot_size', 0))
+    matched_spec = digest_obs.get('_matched_spec') if isinstance(digest_obs, dict) else None
+    reference_spec = matched_spec
+    if reference_spec is None:
+        images = approved_cfg.get('images') or []
+        reference_spec = images[0] if images else None
+    if isinstance(reference_spec, dict):
+        code_offset = int(reference_spec.get('code_offset', 0))
+        code_size = int(reference_spec.get('code_size', slot_size))
+        code_start = int(reference_spec.get('code_start', slot_base + code_offset))
+        code_end = int(reference_spec.get('code_end', code_start + code_size))
+        extent_source = str(reference_spec.get('extent_source', 'unknown'))
+        digest_extent = reference_spec.get('digest_extent')
+        ref_image_name = str(reference_spec.get('name', '')) or None
+    else:
+        code_offset = 0
+        code_size = slot_size
+        code_start = slot_base
+        code_end = slot_base + slot_size
+        extent_source = 'slot_size'
+        digest_extent = slot_size
+        ref_image_name = None
+    pc_norm = as_int(pc_value) & ~1
+    location = _classify_pc_in_approved_slot(
+        pc_norm,
+        slot_base,
+        slot_size,
+        code_start,
+        code_end,
+        digest_extent=digest_extent,
+    )
+    in_extent = (code_start <= pc_norm < code_end)
+    extent_ok = bool(
+        isinstance(digest_obs, dict)
+        and digest_obs.get('ok')
+        and in_extent
+    )
+    return {
+        'ok': extent_ok,
+        'in_executable_extent': bool(in_extent),
+        'slot': slot_name,
+        'slot_base': fmt_u32(slot_base),
+        'slot_end': fmt_u32(slot_base + slot_size),
+        'image': matched_spec.get('name') if isinstance(matched_spec, dict) else ref_image_name,
+        'code_offset': int(code_offset),
+        'code_size': int(code_size),
+        'expected_extent': [fmt_u32(code_start), fmt_u32(code_end)],
+        'extent_source': extent_source,
+        'observed_pc': fmt_u32(pc_norm),
+        'observed_vtor': fmt_u32(as_int(vtor_value)),
+        'pc_location': location,
+        '_code_start': int(code_start),
+        '_code_end': int(code_end),
+        '_digest_extent': digest_extent,
+    }
+
+
+def _evaluate_approved_image_running(
+    approved_cfg,
+    actual_vtor,
+    pc_value,
+    p2_status=None,
+    execution_evidence=None,
+):
+    slot_name = str(approved_cfg.get('slot', '')).strip()
+    required_dwell_s = float(
+        approved_cfg.get('dwell_s', globals().get('DEFAULT_APPROVED_IMAGE_DWELL_S', 0.25))
+    )
+    runtime_obs = (
+        p2_status.get('approved_image_running')
+        if isinstance(p2_status, dict)
+        and isinstance(p2_status.get('approved_image_running'), dict)
+        else None
+    )
+    digest_obs = _evaluate_approved_image_digest(approved_cfg)
+    extent_obs = _evaluate_approved_image_extent(
+        approved_cfg, digest_obs, pc_value, vtor_value=actual_vtor
+    )
+    digest_public = {
+        k: v for k, v in digest_obs.items() if not str(k).startswith('_')
+    }
+    extent_public = {
+        k: v for k, v in extent_obs.items() if not str(k).startswith('_')
+    }
+    if runtime_obs is not None:
+        dwell_started = bool(runtime_obs.get('started'))
+        dwell_completed = bool(runtime_obs.get('completed'))
+        observed_dwell_s = float(runtime_obs.get('observed_dwell_s', 0.0) or 0.0)
+        dwell_samples = int(runtime_obs.get('samples', 0) or 0)
+        start_emulated_s = runtime_obs.get('start_emulated_s')
+        end_emulated_s = runtime_obs.get('end_emulated_s')
+        dwell_failure_reason = runtime_obs.get('dwell_failure_reason')
+        dwell_failure_detail = runtime_obs.get('dwell_failure_detail')
+        runtime_matched_image = runtime_obs.get('matched_image')
+        if dwell_started and runtime_matched_image and not digest_public.get('matched_image'):
+            # Digest held when the dwell started and later changed during execution.
+            if dwell_failure_reason is None:
+                dwell_failure_reason = 'digest_changed'
+        if dwell_started and isinstance(runtime_obs.get('entry_extent'), dict):
+            entry_ext = runtime_obs['entry_extent']
+            if not extent_public.get('ok') and dwell_completed and not dwell_failure_reason:
+                extent_public = dict(entry_ext)
+    else:
+        # Standalone evaluation (e.g. direct evaluate_boot_outcome call in unit tests).
+        p2_emulated_s = (
+            float(p2_status.get('emulated_s', 0.0) or 0.0)
+            if isinstance(p2_status, dict) and p2_status.get('emulated_s') is not None
+            else 0.0
+        )
+        p2_reason = str((p2_status or {}).get('reason', '') or '')
+        reset_obs = (
+            p2_status.get('reset_observation')
+            if isinstance(p2_status, dict)
+            and isinstance(p2_status.get('reset_observation'), dict)
+            else None
+        )
+        reset_during = bool(
+            reset_obs is not None
+            and reset_obs.get('observed')
+            and not bool(globals().get('success_terminal_after_reset', False))
+        )
+        exec_ev = execution_evidence if isinstance(execution_evidence, dict) else {}
+        lockup_during = bool(
+            exec_ev.get('lockup_observed')
+            or 'lockup' in p2_reason.lower()
+        )
+        fault_during = bool(
+            exec_ev.get('fault_exception_active')
+            or exec_ev.get('hardfault_observed')
+            or 'hardfault' in p2_reason.lower()
+            or 'hard_fault' in p2_reason.lower()
+        )
+        dwell_started = bool(digest_public.get('ok') and extent_public.get('ok'))
+        observed_dwell_s = round(p2_emulated_s, 6) if dwell_started else 0.0
+        dwell_samples = 1 if dwell_started else 0
+        start_emulated_s = 0.0 if dwell_started else None
+        end_emulated_s = round(p2_emulated_s, 6) if dwell_started else None
+        dwell_failure_reason = None
+        dwell_failure_detail = None
+        if dwell_started:
+            if fault_during:
+                dwell_failure_reason = 'fault_exception'
+                dwell_failure_detail = 'Cortex-M fault observed before {:.3f}s dwell completed'.format(
+                    required_dwell_s
+                )
+            elif lockup_during:
+                dwell_failure_reason = 'lockup'
+                dwell_failure_detail = 'CPU lock-up observed before {:.3f}s dwell completed'.format(
+                    required_dwell_s
+                )
+            elif reset_during:
+                dwell_failure_reason = 'reset'
+                dwell_failure_detail = 'in-run reset observed before {:.3f}s dwell completed'.format(
+                    required_dwell_s
+                )
+            elif observed_dwell_s + 1e-9 < required_dwell_s:
+                dwell_failure_reason = 'insufficient_dwell'
+                dwell_failure_detail = (
+                    'observed dwell {:.6f}s is shorter than required dwell {:.6f}s (stop_reason={})'.format(
+                        observed_dwell_s, required_dwell_s, p2_reason or 'none'
+                    )
+                )
+        dwell_completed = bool(
+            dwell_started
+            and dwell_failure_reason is None
+            and (observed_dwell_s + 1e-9 >= required_dwell_s)
+        )
+
+    # Also check live execution_evidence for any late fault/lockup not yet
+    # reflected in runtime_obs.
+    exec_ev = execution_evidence if isinstance(execution_evidence, dict) else {}
+    if dwell_started and dwell_failure_reason is None:
+        if exec_ev.get('lockup_observed'):
+            dwell_failure_reason = 'lockup'
+            dwell_failure_detail = 'CPU lock-up observed during approved-image dwell'
+            dwell_completed = False
+        elif exec_ev.get('fault_exception_active') or exec_ev.get('hardfault_observed'):
+            dwell_failure_reason = 'fault_exception'
+            dwell_failure_detail = 'Cortex-M fault observed during approved-image dwell'
+            dwell_completed = False
+        elif not extent_public.get('in_executable_extent'):
+            dwell_failure_reason = 'pc_exited_extent'
+            dwell_failure_detail = (
+                'PC {} exited executable extent [{}..{}) into {}'.format(
+                    extent_public.get('observed_pc'),
+                    extent_public['expected_extent'][0],
+                    extent_public['expected_extent'][1],
+                    extent_public.get('pc_location'),
+                )
+            )
+            dwell_completed = False
+        elif not digest_public.get('ok'):
+            dwell_failure_reason = 'digest_changed'
+            dwell_failure_detail = 'slot {} digest no longer matched approved images at dwell end'.format(
+                slot_name
+            )
+            dwell_completed = False
+        elif observed_dwell_s + 1e-9 < required_dwell_s:
+            dwell_failure_reason = 'insufficient_dwell'
+            dwell_failure_detail = (
+                'observed dwell {:.6f}s is shorter than required dwell {:.6f}s'.format(
+                    observed_dwell_s, required_dwell_s
+                )
+            )
+            dwell_completed = False
+
+    dwell_ok = bool(
+        dwell_started
+        and dwell_completed
+        and dwell_failure_reason is None
+        and observed_dwell_s + 1e-9 >= required_dwell_s
+    )
+    dwell_public = {
+        'ok': dwell_ok,
+        'started': bool(dwell_started),
+        'completed': bool(dwell_completed),
+        'required_dwell_s': round(required_dwell_s, 6),
+        'observed_dwell_s': round(observed_dwell_s, 6),
+        'samples': int(dwell_samples),
+        'start_emulated_s': start_emulated_s,
+        'end_emulated_s': end_emulated_s,
+        'failure_reason': dwell_failure_reason,
+        'failure_detail': dwell_failure_detail,
+    }
+    if runtime_obs is not None:
+        for extra_key in (
+            'fault_ipsr',
+            'fault_cfsr',
+            'fault_hfsr',
+            'exit_pc',
+            'exit_pc_location',
+            'reset_sources',
+        ):
+            if runtime_obs.get(extra_key) is not None:
+                dwell_public[extra_key] = runtime_obs.get(extra_key)
+
+    failed_part = None
+    failure_reason = None
+    if not digest_public.get('ok') and not dwell_started:
+        failed_part = 'digest'
+        if digest_public.get('uncorrectable_words'):
+            failure_reason = (
+                'approved_image_running(digest): slot {} contains uncorrectable words {}'.format(
+                    slot_name, ', '.join(digest_public['uncorrectable_words'])
+                )
+            )
+        else:
+            failure_reason = (
+                'approved_image_running(digest): slot {} sha256 {} (observed_image={}) did not match approved images {}'.format(
+                    slot_name,
+                    digest_public.get('observed_sha256') or 'none',
+                    digest_public.get('observed_image') or 'unknown',
+                    digest_public.get('approved_images'),
+                )
+            )
+    elif not extent_public.get('ok') and not dwell_started:
+        failed_part = 'extent'
+        failure_reason = (
+            'approved_image_running(extent): PC {} is in {} outside {} executable extent [{}..{}) of slot {}'.format(
+                extent_public.get('observed_pc'),
+                extent_public.get('pc_location'),
+                extent_public.get('image') or 'approved_image',
+                extent_public['expected_extent'][0],
+                extent_public['expected_extent'][1],
+                slot_name,
+            )
+        )
+    elif not dwell_ok:
+        failed_part = 'dwell'
+        failure_reason = 'approved_image_running(dwell): {}'.format(
+            dwell_failure_detail
+            or dwell_failure_reason
+            or 'dwell requirement not satisfied'
+        )
+        if dwell_failure_reason == 'pc_exited_extent':
+            extent_public['ok'] = False
+
+    overall_ok = bool(failed_part is None and digest_public.get('ok') and extent_public.get('ok') and dwell_ok)
+    matched_image = (
+        digest_public.get('matched_image')
+        if overall_ok
+        else (
+            runtime_obs.get('matched_image')
+            if isinstance(runtime_obs, dict) and runtime_obs.get('matched_image')
+            else digest_public.get('matched_image')
+        )
+    )
+    return {
+        'ok': overall_ok,
+        'failed_part': failed_part,
+        'slot': slot_name,
+        'approved_images': list(digest_public.get('approved_images') or []),
+        'matched_image': matched_image if digest_public.get('ok') else None,
+        'entry_matched_image': matched_image,
+        'required_dwell_s': round(required_dwell_s, 6),
+        'observed_dwell_s': round(observed_dwell_s, 6),
+        'digest': digest_public,
+        'extent': extent_public,
+        'dwell': dwell_public,
+        'failure_reason': failure_reason,
+    }
 
 
 def collect_recovery_execution_evidence(
@@ -9407,6 +9929,16 @@ def evaluate_boot_outcome(
     eff_allow_fault_after_success = bool(
         globals().get('success_allow_fault_after_success', False)
     )
+    _resolve_approved_fn = globals().get('_resolve_effective_approved_image_running')
+    eff_approved_image_running = (
+        _resolve_approved_fn(effective_criteria)
+        if callable(_resolve_approved_fn)
+        else (
+            effective_criteria.get('approved_image_running', globals().get('approved_image_running_config'))
+            if isinstance(effective_criteria, dict)
+            else globals().get('approved_image_running_config')
+        )
+    )
     if effective_criteria is not None:
         eff_vtor_slot = effective_criteria.get('vtor_slot', success_vtor_slot)
         eff_pc_slot = effective_criteria.get('pc_slot', success_pc_slot)
@@ -9464,6 +9996,17 @@ def evaluate_boot_outcome(
         _s_lo, _s_hi = slot_ranges[eff_pc_slot]
         if _s_lo <= _pc_norm < _s_hi:
             boot_slot = eff_pc_slot
+    if (
+        boot_slot is None
+        and not no_boot_phase_without_vtor
+        and isinstance(eff_approved_image_running, dict)
+    ):
+        _app_slot = str(eff_approved_image_running.get('slot', '')).strip()
+        if _app_slot in slot_ranges:
+            _pc_norm = as_int(pc_value) & ~1
+            _s_lo, _s_hi = slot_ranges[_app_slot]
+            if _s_lo <= _pc_norm < _s_hi or sticky_pc_slot == _app_slot:
+                boot_slot = _app_slot
     execution_observed = boot_slot is not None
 
     vtor_ok = not bool(eff_vtor_slot)
@@ -9956,6 +10499,107 @@ def evaluate_boot_outcome(
         execution_evidence = collect_recovery_execution_evidence(
             actual_vtor, pc_value, boot_slot, p2_status
         )
+    approved_verdict = None
+    approved_failed_part = None
+    approved_dwell_failure_reason = None
+    if eff_approved_image_running is not None and enforce_content_criteria:
+        approved_verdict = _evaluate_approved_image_running(
+            eff_approved_image_running,
+            actual_vtor,
+            pc_value,
+            p2_status=p2_status,
+            execution_evidence=execution_evidence,
+        )
+        signals['approved_image_running'] = approved_verdict
+        approved_failed_part = approved_verdict.get('failed_part')
+        approved_dwell_failure_reason = (
+            (approved_verdict.get('dwell') or {}).get('failure_reason')
+            if isinstance(approved_verdict.get('dwell'), dict)
+            else None
+        )
+        approved_digest = (
+            approved_verdict.get('digest')
+            if isinstance(approved_verdict.get('digest'), dict)
+            else {}
+        )
+        if approved_digest.get('observed_sha256') and actual_hash is None:
+            actual_hash = approved_digest.get('observed_sha256')
+            signals['image_hash_actual'] = actual_hash
+        if approved_verdict.get('matched_image') is not None:
+            matched_image = approved_verdict.get('matched_image')
+            signals['matched_image'] = matched_image
+        if hash_result is None:
+            if matched_image == 'exec':
+                hash_result = 'exec_image'
+            elif matched_image == 'staging':
+                hash_result = 'staging_image'
+            elif matched_image is not None:
+                hash_result = 'expected_image'
+            elif approved_digest.get('observed_image') == 'exec':
+                hash_result = 'exec_image'
+            elif approved_digest.get('observed_image') == 'staging':
+                hash_result = 'staging_image'
+            else:
+                hash_result = 'unknown'
+            signals['image_hash_match'] = hash_result
+        if not eff_image_hash_slot and approved_verdict.get('slot'):
+            signals['image_hash_slot'] = approved_verdict.get('slot')
+        if approved_digest.get('uncorrectable_words') and not image_hash_uncorrectable_words:
+            image_hash_uncorrectable_words = list(approved_digest.get('uncorrectable_words'))
+            signals['image_hash_contains_uncorrectable'] = True
+            signals['image_hash_uncorrectable_words'] = list(image_hash_uncorrectable_words)
+        if (
+            approved_verdict.get('dwell')
+            and isinstance(approved_verdict.get('dwell'), dict)
+            and approved_verdict['dwell'].get('started')
+            and not execution_observed
+        ):
+            boot_slot = approved_verdict.get('slot')
+            execution_observed = boot_slot is not None
+            signals['execution_observed'] = execution_observed
+        if approved_failed_part == 'digest':
+            marker_ok = False
+            signals['marker_ok'] = False
+        elif approved_failed_part == 'extent':
+            pc_ok = False
+            signals['pc_ok'] = False
+        elif approved_failed_part == 'dwell':
+            if approved_dwell_failure_reason == 'pc_exited_extent':
+                pc_ok = False
+                signals['pc_ok'] = False
+            elif approved_dwell_failure_reason == 'digest_changed':
+                marker_ok = False
+                signals['marker_ok'] = False
+        if approved_verdict.get('failure_reason'):
+            signals['approved_image_running_failure_reason'] = approved_verdict['failure_reason']
+            if signals.get('failure_reason'):
+                signals['failure_reason'] = (
+                    signals['failure_reason'] + '; ' + approved_verdict['failure_reason']
+                )
+            else:
+                signals['failure_reason'] = approved_verdict['failure_reason']
+        content_criteria_ok = (
+            marker_ok
+            and otadata_expect_ok
+            and rollback_ok
+            and reset_vector_offset_ok
+            and non_memory_structured_ok
+        )
+        criteria_ok = (
+            content_criteria_ok
+            and memory_checks_ok
+            and bool(approved_verdict.get('ok'))
+        )
+        liveness_established = bool(
+            execution_observed
+            and pc_ok
+            and bool((approved_verdict.get('dwell') or {}).get('ok'))
+        )
+        expectations_met = vtor_ok and vtor_aligned and pc_ok and criteria_ok
+        signals['content_criteria_ok'] = content_criteria_ok
+        signals['liveness_established'] = liveness_established
+        signals['expectations_met'] = expectations_met
+
     if (
         execution_evidence
         and execution_evidence.get('fault_exception_active')
@@ -9981,6 +10625,8 @@ def evaluate_boot_outcome(
             or not otadata_expect_ok
             or not reset_vector_offset_ok
             or not non_memory_structured_ok
+            or approved_failed_part == 'digest'
+            or approved_dwell_failure_reason == 'digest_changed'
         )
     )
     signals['content_mismatch'] = content_mismatch
@@ -10020,7 +10666,58 @@ def evaluate_boot_outcome(
 
     # Keep execution failures separate from expectation mismatches:
     # a boot into a real slot with the "wrong" image/slot is not "no_boot".
-    if primary_execution_failure is not None and not budget_exhausted_with_unmet_checks:
+    if approved_failed_part == 'digest':
+        if (
+            primary_execution_failure is not None
+            and primary_execution_failure != 'timeout'
+            and not budget_exhausted_with_unmet_checks
+        ):
+            boot_outcome = primary_execution_failure
+            signals['supporting_outcomes'] = ['wrong_image']
+        else:
+            boot_outcome = 'wrong_image'
+    elif approved_failed_part == 'extent':
+        if (
+            primary_execution_failure is not None
+            and primary_execution_failure != 'timeout'
+            and not budget_exhausted_with_unmet_checks
+        ):
+            boot_outcome = primary_execution_failure
+        elif not execution_observed:
+            boot_outcome = boot_outcome_after_stop('no_boot', p2_reason)
+        elif not vtor_aligned:
+            boot_outcome = 'misaligned_vtor'
+        else:
+            boot_outcome = 'wrong_pc'
+    elif approved_failed_part == 'dwell':
+        if approved_dwell_failure_reason in ('fault_exception', 'lockup'):
+            boot_outcome = (
+                primary_execution_failure
+                if primary_execution_failure in ('hard_fault', 'bus_fault')
+                else 'hard_fault'
+            )
+        elif approved_dwell_failure_reason == 'digest_changed':
+            boot_outcome = 'wrong_image'
+        elif approved_dwell_failure_reason == 'pc_exited_extent':
+            boot_outcome = 'wrong_pc'
+        elif approved_dwell_failure_reason == 'reset':
+            boot_outcome = (
+                primary_execution_failure
+                if primary_execution_failure in ('hard_fault', 'bus_fault', 'infra_error')
+                else boot_outcome_after_stop('no_boot', 'approved_image_dwell_reset')
+            )
+        else:
+            boot_outcome = (
+                primary_execution_failure
+                if primary_execution_failure in ('hard_fault', 'bus_fault', 'infra_error')
+                else boot_outcome_after_stop(
+                    'no_boot',
+                    p2_reason
+                    if str(p2_reason).lower().startswith(('wall_timeout', 'instruction_limit'))
+                    else 'approved_image_dwell_incomplete',
+                )
+            )
+    elif primary_execution_failure is not None and not budget_exhausted_with_unmet_checks:
         boot_outcome = primary_execution_failure
         if content_mismatch:
             signals['supporting_outcomes'] = ['wrong_image']
@@ -10200,9 +10897,21 @@ def annotate_result_metadata_delta(result, pre_snapshot, marker_written=False):
 
 def run_state_fault(fault_at):
     # State mode: simulate staging->exec copy, fault at given index.
-    # NOTE: metadata_delta is intentionally not supported in state mode.
-    # State mode does not run the bootloader (no emulated boot cycles),
-    # so there are no NVM metadata writes to track deltas on.
+    # NOTE: metadata_delta and approved_image_running are intentionally not
+    # supported in state mode. State mode does not run the bootloader or
+    # application CPU, so it cannot verify live execution inside an image's
+    # executable extent or a post-handoff dwell.
+    _resolve_approved_fn = globals().get('_resolve_effective_approved_image_running')
+    _active_approved_cfg = (
+        _resolve_approved_fn()
+        if callable(_resolve_approved_fn)
+        else globals().get('approved_image_running_config')
+    )
+    if _active_approved_cfg is not None:
+        raise RuntimeError(
+            'success_criteria.approved_image_running cannot run in evaluation_mode: state; '
+            'state mode does not execute the CPU and produces no slot-digest, executable-extent, or dwell evidence'
+        )
     fault_injected = False
     fault_address = 0
     actual_writes = 0
@@ -10330,6 +11039,8 @@ def run_state_fault(fault_at):
     }
     if signals.get('matched_image') is not None:
         result['matched_image'] = signals.get('matched_image')
+    if isinstance(signals.get('approved_image_running'), dict):
+        result['approved_image_running'] = dict(signals['approved_image_running'])
     if isinstance(signals.get('function_return_probes'), dict):
         result['function_return_probes'] = signals['function_return_probes']
     if eff_criteria is not None:
@@ -10587,6 +11298,15 @@ def _reset_gated_success_stop_observation(
     if outcome == 'success':
         reset_observation['post_reset_checks_pending'] = False
         reset_observation.pop('last_unmet_memory_checks', None)
+    elif (
+        isinstance(signals.get('approved_image_running'), dict)
+        and signals['approved_image_running'].get('failed_part') == 'dwell'
+        and isinstance(signals['approved_image_running'].get('dwell'), dict)
+        and signals['approved_image_running']['dwell'].get('started')
+        and signals['approved_image_running']['dwell'].get('failure_reason') == 'insufficient_dwell'
+    ):
+        reset_observation['post_reset_checks_pending'] = True
+        return None
     elif outcome == 'wrong_image' and signals.get('liveness_established'):
         reset_observation['post_reset_checks_pending'] = False
         reset_observation.pop('last_unmet_memory_checks', None)
@@ -10898,7 +11618,46 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     previous_observed_pc = None
     instruction_previous = as_int(cpu_ref.ExecutedInstructions)
     instructions_executed = 0
+    resolve_approved_fn = globals().get('_resolve_effective_approved_image_running')
+    approved_cfg = (
+        resolve_approved_fn(effective_criteria)
+        if callable(resolve_approved_fn) and bool(enforce_content_criteria)
+        else None
+    )
+    approved_dwell_state = None
+    approved_digest_cache = {'writes': None, 'erases': None, 'obs': None}
+    if isinstance(approved_cfg, dict):
+        approved_dwell_state = {
+            'slot': str(approved_cfg.get('slot', '')).strip(),
+            'required_dwell_s': float(
+                approved_cfg.get('dwell_s', globals().get('DEFAULT_APPROVED_IMAGE_DWELL_S', 0.25))
+            ),
+            'observed_dwell_s': 0.0,
+            'started': False,
+            'completed': False,
+            'ok': False,
+            'samples': 0,
+            'start_emulated_s': None,
+            'end_emulated_s': None,
+            'start_iter': None,
+            'end_iter': None,
+            'matched_image': None,
+            'observed_sha256': None,
+            'entry_pc': None,
+            'last_pc': None,
+            'entry_extent': None,
+            'code_start': None,
+            'code_end': None,
+            'digest_extent': None,
+            'dwell_failure_reason': None,
+            'dwell_failure_detail': None,
+            'reset_count_at_start': 0,
+        }
     pc_handoff_slot = success_pc_slot if success_pc_slot in slot_ranges else None
+    if pc_handoff_slot is None and isinstance(approved_cfg, dict):
+        _app_slot = str(approved_cfg.get('slot', '')).strip()
+        if _app_slot in slot_ranges:
+            pc_handoff_slot = _app_slot
     pc_handoff_vector_offset = (
         success_vector_offset if pc_handoff_slot is not None else 0
     )
@@ -11557,7 +12316,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 pc_handoff_indirect_branches.append(observation)
             return False
 
-    if terminal_after_reset:
+    if terminal_after_reset or approved_dwell_state is not None:
         if machine_ref is not None and hasattr(machine_ref, 'MachineReset'):
             try:
                 try:
@@ -11670,6 +12429,21 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         setup_before_first_slice_s = max(0.0, _time.time() - t0)
         for iters in range(max_iters):
             fault_timing_state['current_iter'] = iters + 1
+            active_slice_s = slice_s
+            active_slice_arg = time_slice
+            if (
+                approved_dwell_state is not None
+                and approved_dwell_state.get('started')
+                and not approved_dwell_state.get('completed')
+                and approved_dwell_state.get('dwell_failure_reason') is None
+            ):
+                _rem_dwell = max(
+                    0.001,
+                    float(approved_dwell_state['required_dwell_s'])
+                    - float(approved_dwell_state.get('observed_dwell_s', 0.0)),
+                )
+                active_slice_s = min(slice_s, 0.05, _rem_dwell)
+                active_slice_arg = '{:.6f}'.format(active_slice_s).rstrip('0').rstrip('.')
             _run_for_started = _time.time()
             if (
                 configured_test_runfor_error_label
@@ -11687,7 +12461,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             else:
                 runfor_infrastructure_error = runfor_guard(
                     cpu_ref,
-                    time_slice,
+                    active_slice_arg,
                     runfor_watchdog_s,
                     label=label,
                 )
@@ -11696,7 +12470,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             if runfor_infrastructure_error is not None:
                 reason = 'runfor_infrastructure_error'
                 break
-            emulated_s += slice_s
+            emulated_s += active_slice_s
             timing_counters['emulated_s'] = emulated_s
             native_stop_sync = globals().get('_sync_native_calibration_stop')
             if native_stop_sync is not None:
@@ -11739,6 +12513,20 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 reason = 'fault_fired'
                 break
             if lockup_state.get('detected'):
+                if approved_dwell_state is not None and approved_dwell_state.get('started'):
+                    approved_dwell_state['end_emulated_s'] = round(emulated_s, 6)
+                    approved_dwell_state['end_iter'] = iters + 1
+                    approved_dwell_state['observed_dwell_s'] = round(
+                        max(0.0, emulated_s - float(approved_dwell_state['start_emulated_s'] or 0.0)),
+                        6,
+                    )
+                    approved_dwell_state['dwell_failure_reason'] = 'lockup'
+                    approved_dwell_state['dwell_failure_detail'] = (
+                        'CPU lock-up observed {:.6f}s after approved image entry (required {:.6f}s)'.format(
+                            approved_dwell_state['observed_dwell_s'],
+                            approved_dwell_state['required_dwell_s'],
+                        )
+                    )
                 try:
                     cpu_ref.IsHalted = True
                 except Exception:
@@ -11766,6 +12554,20 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 lockup_state['vtor'] = fmt_u32(as_int(bus.ReadDoubleWord(0xE000ED08)))
                 lockup_state['instructions'] = int(instructions_executed)
                 lockup_state['source'] = 'cpu_lockup'
+                if approved_dwell_state is not None and approved_dwell_state.get('started'):
+                    approved_dwell_state['end_emulated_s'] = round(emulated_s, 6)
+                    approved_dwell_state['end_iter'] = iters + 1
+                    approved_dwell_state['observed_dwell_s'] = round(
+                        max(0.0, emulated_s - float(approved_dwell_state['start_emulated_s'] or 0.0)),
+                        6,
+                    )
+                    approved_dwell_state['dwell_failure_reason'] = 'lockup'
+                    approved_dwell_state['dwell_failure_detail'] = (
+                        'CPU lock-up observed {:.6f}s after approved image entry (required {:.6f}s)'.format(
+                            approved_dwell_state['observed_dwell_s'],
+                            approved_dwell_state['required_dwell_s'],
+                        )
+                    )
                 try:
                     cpu_ref.IsHalted = True
                 except Exception:
@@ -11781,6 +12583,20 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 lockup_state['vtor'] = fmt_u32(as_int(bus.ReadDoubleWord(0xE000ED08)))
                 lockup_state['instructions'] = int(instructions_executed)
                 lockup_state['source'] = 'exc_return_zero_progress_loop'
+                if approved_dwell_state is not None and approved_dwell_state.get('started'):
+                    approved_dwell_state['end_emulated_s'] = round(emulated_s, 6)
+                    approved_dwell_state['end_iter'] = iters + 1
+                    approved_dwell_state['observed_dwell_s'] = round(
+                        max(0.0, emulated_s - float(approved_dwell_state['start_emulated_s'] or 0.0)),
+                        6,
+                    )
+                    approved_dwell_state['dwell_failure_reason'] = 'lockup'
+                    approved_dwell_state['dwell_failure_detail'] = (
+                        'CPU lock-up observed {:.6f}s after approved image entry (required {:.6f}s)'.format(
+                            approved_dwell_state['observed_dwell_s'],
+                            approved_dwell_state['required_dwell_s'],
+                        )
+                    )
                 try:
                     cpu_ref.IsHalted = True
                 except Exception:
@@ -11824,6 +12640,246 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                         break
             _record_slice_fault_timing(iters, emulated_s, vtor_now, pc_now)
             _slice_fault_timing = _build_fault_timing_snapshot()
+            if approved_dwell_state is not None:
+                _cur_w_for_app = get_total_writes()
+                _cur_e_for_app = get_total_erases()
+                _cur_reset_events = (
+                    int(reset_observation.get('machine_resets', 0))
+                    + int(reset_observation.get('cpu_resets', 0))
+                    + int(reset_observation.get('instruction_counter_resets', 0))
+                    + max(0, int(reset_observation.get('boot_entry_hits', 0)) - 1)
+                )
+                _app_reset_gate_ok = bool(
+                    not terminal_after_reset or reset_observation.get('observed')
+                )
+                if not approved_dwell_state['started']:
+                    if _app_reset_gate_ok:
+                        _pc_norm_app = pc_now & ~1
+                        _slot_lo_app = int(approved_cfg['slot_base'])
+                        _slot_hi_app = _slot_lo_app + int(approved_cfg['slot_size'])
+                        # Evaluate digest when PC or VTOR reaches the configured slot.
+                        if (
+                            (_slot_lo_app <= _pc_norm_app < _slot_hi_app)
+                            or (_slot_lo_app <= (sticky_vtor['value'] if sticky_vtor['captured'] else vtor_now) < _slot_hi_app)
+                        ):
+                            if (
+                                approved_digest_cache['obs'] is None
+                                or approved_digest_cache['writes'] != _cur_w_for_app
+                                or approved_digest_cache['erases'] != _cur_e_for_app
+                            ):
+                                approved_digest_cache['obs'] = _evaluate_approved_image_digest(
+                                    approved_cfg
+                                )
+                                approved_digest_cache['writes'] = _cur_w_for_app
+                                approved_digest_cache['erases'] = _cur_e_for_app
+                            _dig_obs = approved_digest_cache['obs']
+                            _ext_obs = _evaluate_approved_image_extent(
+                                approved_cfg,
+                                _dig_obs,
+                                pc_now,
+                                vtor_value=(sticky_vtor['value'] if sticky_vtor['captured'] else vtor_now),
+                            )
+                            if _dig_obs.get('ok') and _ext_obs.get('ok'):
+                                _ipsr_start = _read_cpu_ipsr(cpu_ref)
+                                _cfsr_start = (
+                                    as_int(bus.ReadDoubleWord(0xE000ED28)) & 0xFFFFFFFF
+                                    if _has_fault_status_regs else 0
+                                )
+                                _hfsr_start = (
+                                    as_int(bus.ReadDoubleWord(0xE000ED2C)) & 0xFFFFFFFF
+                                    if _has_fault_status_regs else 0
+                                )
+                                _vec_base_start = (
+                                    sticky_vtor['value']
+                                    if sticky_vtor['captured']
+                                    else int(_ext_obs.get('_code_start', _slot_lo_app))
+                                )
+                                _hf_vec_start = 0
+                                _bf_vec_start = 0
+                                try:
+                                    _hf_vec_start = as_int(bus.ReadDoubleWord(_vec_base_start + 12)) & 0xFFFFFFFF
+                                    _bf_vec_start = as_int(bus.ReadDoubleWord(_vec_base_start + 20)) & 0xFFFFFFFF
+                                except Exception:
+                                    pass
+                                _at_fault_vec_start = bool(
+                                    (_hf_vec_start and (_hf_vec_start & 1) == 1 and _pc_norm_app == (_hf_vec_start & ~1))
+                                    or (_bf_vec_start and (_bf_vec_start & 1) == 1 and _pc_norm_app == (_bf_vec_start & ~1))
+                                )
+                                _fault_start = bool(
+                                    _ipsr_start in (3, 4, 5, 6)
+                                    or _cfsr_start != 0
+                                    or _hfsr_start != 0
+                                    or _at_fault_vec_start
+                                )
+                                approved_dwell_state['started'] = True
+                                approved_dwell_state['start_emulated_s'] = round(emulated_s, 6)
+                                approved_dwell_state['end_emulated_s'] = round(emulated_s, 6)
+                                approved_dwell_state['start_iter'] = iters + 1
+                                approved_dwell_state['end_iter'] = iters + 1
+                                approved_dwell_state['observed_dwell_s'] = 0.0
+                                approved_dwell_state['samples'] = 1
+                                approved_dwell_state['matched_image'] = _dig_obs.get('matched_image')
+                                approved_dwell_state['observed_sha256'] = _dig_obs.get('observed_sha256')
+                                approved_dwell_state['entry_pc'] = fmt_u32(_pc_norm_app)
+                                approved_dwell_state['last_pc'] = fmt_u32(_pc_norm_app)
+                                approved_dwell_state['code_start'] = int(_ext_obs['_code_start'])
+                                approved_dwell_state['code_end'] = int(_ext_obs['_code_end'])
+                                approved_dwell_state['digest_extent'] = _ext_obs.get('_digest_extent')
+                                approved_dwell_state['entry_extent'] = {
+                                    k: v for k, v in _ext_obs.items() if not str(k).startswith('_')
+                                }
+                                approved_dwell_state['reset_count_at_start'] = _cur_reset_events
+                                if _fault_start:
+                                    approved_dwell_state['dwell_failure_reason'] = 'fault_exception'
+                                    approved_dwell_state['fault_ipsr'] = int(_ipsr_start)
+                                    approved_dwell_state['fault_cfsr'] = fmt_u32(_cfsr_start)
+                                    approved_dwell_state['fault_hfsr'] = fmt_u32(_hfsr_start)
+                                    approved_dwell_state['dwell_failure_detail'] = (
+                                        'Cortex-M fault active on entry to approved image {} at PC {} (IPSR={}, CFSR={}, HFSR={})'.format(
+                                            approved_dwell_state['matched_image'],
+                                            fmt_u32(_pc_norm_app),
+                                            int(_ipsr_start),
+                                            fmt_u32(_cfsr_start),
+                                            fmt_u32(_hfsr_start),
+                                        )
+                                    )
+                                    reason = 'approved_image_dwell_fault'
+                                    break
+                else:
+                    # Dwell already started on an earlier slice: verify that no
+                    # reset, lock-up, or fault occurred and PC remained inside
+                    # the matched image's executable extent.
+                    approved_dwell_state['samples'] = int(approved_dwell_state.get('samples', 0)) + 1
+                    approved_dwell_state['end_emulated_s'] = round(emulated_s, 6)
+                    approved_dwell_state['end_iter'] = iters + 1
+                    _pc_norm_app = pc_now & ~1
+                    approved_dwell_state['last_pc'] = fmt_u32(_pc_norm_app)
+                    _elapsed_dwell_s = round(
+                        max(0.0, emulated_s - float(approved_dwell_state['start_emulated_s'] or 0.0)),
+                        6,
+                    )
+                    approved_dwell_state['observed_dwell_s'] = _elapsed_dwell_s
+                    _ipsr_now_app = _read_cpu_ipsr(cpu_ref)
+                    _cfsr_now_app = (
+                        as_int(bus.ReadDoubleWord(0xE000ED28)) & 0xFFFFFFFF
+                        if _has_fault_status_regs else 0
+                    )
+                    _hfsr_now_app = (
+                        as_int(bus.ReadDoubleWord(0xE000ED2C)) & 0xFFFFFFFF
+                        if _has_fault_status_regs else 0
+                    )
+                    _vec_base_now = (
+                        sticky_vtor['value']
+                        if sticky_vtor['captured']
+                        else int(approved_dwell_state.get('code_start') or approved_cfg['slot_base'])
+                    )
+                    _hf_vec_now = 0
+                    _bf_vec_now = 0
+                    try:
+                        _hf_vec_now = as_int(bus.ReadDoubleWord(_vec_base_now + 12)) & 0xFFFFFFFF
+                        _bf_vec_now = as_int(bus.ReadDoubleWord(_vec_base_now + 20)) & 0xFFFFFFFF
+                    except Exception:
+                        pass
+                    _at_fault_vec_now = bool(
+                        (_hf_vec_now and (_hf_vec_now & 1) == 1 and _pc_norm_app == (_hf_vec_now & ~1))
+                        or (_bf_vec_now and (_bf_vec_now & 1) == 1 and _pc_norm_app == (_bf_vec_now & ~1))
+                    )
+                    _fault_rec_now = fault_timing_state.get('fault_first_active')
+                    _fault_during_slice = bool(
+                        _ipsr_now_app in (3, 4, 5, 6)
+                        or _cfsr_now_app != 0
+                        or _hfsr_now_app != 0
+                        or _at_fault_vec_now
+                        or (
+                            isinstance(_fault_rec_now, dict)
+                            and int(_fault_rec_now.get('iter', 0) or 0)
+                            >= int(approved_dwell_state.get('start_iter') or 0)
+                        )
+                    )
+                    if _cur_reset_events > int(approved_dwell_state.get('reset_count_at_start', 0)):
+                        approved_dwell_state['dwell_failure_reason'] = 'reset'
+                        approved_dwell_state['reset_sources'] = list(reset_observation.get('sources') or [])
+                        approved_dwell_state['dwell_failure_detail'] = (
+                            'in-run reset ({}) observed {:.6f}s after approved image entry (required {:.6f}s)'.format(
+                                ', '.join(approved_dwell_state['reset_sources']) or 'reset',
+                                _elapsed_dwell_s,
+                                approved_dwell_state['required_dwell_s'],
+                            )
+                        )
+                        reason = 'approved_image_dwell_reset'
+                        break
+                    if _fault_during_slice:
+                        approved_dwell_state['dwell_failure_reason'] = 'fault_exception'
+                        approved_dwell_state['fault_ipsr'] = int(
+                            _ipsr_now_app
+                            or (
+                                _fault_rec_now.get('exception', 0)
+                                if isinstance(_fault_rec_now, dict)
+                                else 0
+                            )
+                        )
+                        approved_dwell_state['fault_cfsr'] = fmt_u32(_cfsr_now_app)
+                        approved_dwell_state['fault_hfsr'] = fmt_u32(_hfsr_now_app)
+                        approved_dwell_state['dwell_failure_detail'] = (
+                            'Cortex-M fault observed {:.6f}s after approved image entry at PC {} (IPSR={}, CFSR={}, HFSR={}, required {:.6f}s)'.format(
+                                _elapsed_dwell_s,
+                                fmt_u32(_pc_norm_app),
+                                approved_dwell_state['fault_ipsr'],
+                                fmt_u32(_cfsr_now_app),
+                                fmt_u32(_hfsr_now_app),
+                                approved_dwell_state['required_dwell_s'],
+                            )
+                        )
+                        reason = 'approved_image_dwell_fault'
+                        break
+                    _c_start = int(approved_dwell_state['code_start'])
+                    _c_end = int(approved_dwell_state['code_end'])
+                    if not (_c_start <= _pc_norm_app < _c_end):
+                        _exit_loc = _classify_pc_in_approved_slot(
+                            _pc_norm_app,
+                            approved_cfg['slot_base'],
+                            approved_cfg['slot_size'],
+                            _c_start,
+                            _c_end,
+                            digest_extent=approved_dwell_state.get('digest_extent'),
+                        )
+                        approved_dwell_state['dwell_failure_reason'] = 'pc_exited_extent'
+                        approved_dwell_state['exit_pc'] = fmt_u32(_pc_norm_app)
+                        approved_dwell_state['exit_pc_location'] = _exit_loc
+                        approved_dwell_state['dwell_failure_detail'] = (
+                            'PC {} exited {} executable extent [{}..{}) into {} after {:.6f}s (required {:.6f}s)'.format(
+                                fmt_u32(_pc_norm_app),
+                                approved_dwell_state.get('matched_image') or 'approved_image',
+                                fmt_u32(_c_start),
+                                fmt_u32(_c_end),
+                                _exit_loc,
+                                _elapsed_dwell_s,
+                                approved_dwell_state['required_dwell_s'],
+                            )
+                        )
+                        reason = 'approved_image_dwell_pc_exited_extent'
+                        break
+                    if _elapsed_dwell_s + 1e-9 >= float(approved_dwell_state['required_dwell_s']):
+                        _final_dig = _evaluate_approved_image_digest(approved_cfg)
+                        if not _final_dig.get('ok'):
+                            approved_dwell_state['dwell_failure_reason'] = 'digest_changed'
+                            approved_dwell_state['dwell_failure_detail'] = (
+                                'slot {} digest changed during dwell (final sha256={})'.format(
+                                    approved_dwell_state['slot'],
+                                    _final_dig.get('observed_sha256') or 'none',
+                                )
+                            )
+                            reason = 'approved_image_dwell_digest_changed'
+                            break
+                        approved_dwell_state['completed'] = True
+                        approved_dwell_state['ok'] = True
+                        if not terminal_after_reset:
+                            reason = (
+                                'vtor_captured'
+                                if sticky_vtor['captured']
+                                else 'pc_captured'
+                            )
+                            break
             calibration_success_gate_satisfied = bool(
                 not terminal_after_reset or reset_observation.get('observed')
             )
@@ -11889,7 +12945,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                         terminal_outcome
                     )
                 break
-            if sticky_vtor['captured'] and not terminal_after_reset:
+            if sticky_vtor['captured'] and not terminal_after_reset and approved_dwell_state is None:
                 if vtor_settle_remaining < 0:
                     # First capture.
                     if vtor_settle_iters == 0:
@@ -11968,6 +13024,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                     break
             if (
                 not terminal_after_reset
+                and approved_dwell_state is None
                 and
                 pc_handoff_slot is not None
                 and sticky_pc['captured']
@@ -12039,6 +13096,11 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 or progress_key != prev_progress_key
                 or reset_observation.get('post_reset_checks_pending')
                 or (
+                    approved_dwell_state is not None
+                    and approved_dwell_state.get('started')
+                    and not approved_dwell_state.get('completed')
+                )
+                or (
                     reset_observation.get('observed')
                     and reset_observation.get('post_reset_samples') == 1
                 )
@@ -12103,7 +13165,15 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             # Bricked device detection: no writes at all after several slices.
             # Some clean follow-up boots are legitimately read-only and should not
             # be cut off by this heuristic.
-            if zero_writes_is_brick and cur_writes == 0 and not expect_writes:
+            if (
+                zero_writes_is_brick
+                and cur_writes == 0
+                and not expect_writes
+                and not (
+                    approved_dwell_state is not None
+                    and approved_dwell_state.get('started')
+                )
+            ):
                 zero_writes_count += 1
                 if zero_writes_count >= 5:
                     reason = 'no_writes_brick'
@@ -12120,7 +13190,26 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 reason = 'wall_timeout({:.0f}s)'.format(elapsed)
                 break
         # If we hit max_iters while mid-settle, finalize the VTOR capture.
-        if reason == 'budget' and vtor_settle_remaining >= 0 and sticky_vtor['captured']:
+        if (
+            approved_dwell_state is not None
+            and approved_dwell_state.get('started')
+            and not approved_dwell_state.get('completed')
+            and approved_dwell_state.get('dwell_failure_reason') is None
+        ):
+            approved_dwell_state['end_emulated_s'] = round(emulated_s, 6)
+            approved_dwell_state['observed_dwell_s'] = round(
+                max(0.0, emulated_s - float(approved_dwell_state['start_emulated_s'] or 0.0)),
+                6,
+            )
+            approved_dwell_state['dwell_failure_reason'] = 'insufficient_dwell'
+            approved_dwell_state['dwell_failure_detail'] = (
+                'observed dwell {:.6f}s is shorter than required dwell {:.6f}s before run stopped ({})'.format(
+                    approved_dwell_state['observed_dwell_s'],
+                    approved_dwell_state['required_dwell_s'],
+                    reason,
+                )
+            )
+        if reason == 'budget' and vtor_settle_remaining >= 0 and sticky_vtor['captured'] and approved_dwell_state is None:
             vtor_final = as_int(bus.ReadDoubleWord(0xE000ED08))
             if vtor_final != 0:
                 for sn, (s_lo, s_hi) in slot_ranges.items():
@@ -12308,6 +13397,8 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         }
     if calibration_mode and _calibration_stop_state.get('triggered'):
         status['calibration_stop'] = dict(_calibration_stop_state)
+    if approved_dwell_state is not None:
+        status['approved_image_running'] = dict(approved_dwell_state)
     return status
 
 
@@ -14009,6 +15100,8 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         signals['operation_kind'] = _op_kind
     if signals.get('matched_image') is not None:
         result['matched_image'] = signals.get('matched_image')
+    if isinstance(signals.get('approved_image_running'), dict):
+        result['approved_image_running'] = dict(signals['approved_image_running'])
     if isinstance(signals.get('function_return_probes'), dict):
         result['function_return_probes'] = signals['function_return_probes']
     if fault_snapshot_bytes is not None:
@@ -23137,7 +24230,7 @@ if calibration_mode:
         # calibration run.  This is the ground-truth hash of what a successful
         # operation produces (bootloaders modify headers/trailers during swap,
         # so the result won't match the original binary file).
-        if success_image_hash:
+        if success_image_hash or approved_image_running_config is not None:
             cal_exec_hash = compute_exec_slot_hash()
             result['calibration_exec_hash'] = cal_exec_hash
             log('calibration: exec slot hash = {}'.format(cal_exec_hash[:16]))

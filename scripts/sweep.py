@@ -318,6 +318,74 @@ def _validate_runtime_control_result(
                     )
                 )
 
+    approved_running = getattr(criteria, "approved_image_running", None)
+    if approved_running is not None:
+        if not hash_evidence_expected:
+            raise RuntimeError(
+                "Clean control failed: success_criteria.approved_image_running "
+                "requires evaluation_mode 'execute'. Fault dispatch was aborted."
+            )
+        expected_approved_slot = str(
+            getattr(approved_running, "slot", "") or ""
+        ).strip().lower()
+        if (
+            expected_approved_slot
+            and expected_approved_slot != "any"
+            and observed_slot_name != expected_approved_slot
+        ):
+            raise RuntimeError(
+                "Clean control failed: success_criteria.approved_image_running.slot "
+                "requires slot {!r}, observed {!r}. Fault dispatch was aborted.".format(
+                    expected_approved_slot,
+                    observed_slot_name or None,
+                )
+            )
+        signals = result.get("signals")
+        approved_sig = (
+            signals.get("approved_image_running")
+            if isinstance(signals, dict)
+            else None
+        )
+        if (
+            not isinstance(approved_sig, dict)
+            or approved_sig.get("ok") is not True
+            or approved_sig.get("failed_part") is not None
+        ):
+            failed_part = (
+                approved_sig.get("failed_part")
+                if isinstance(approved_sig, dict)
+                else None
+            )
+            detail = (
+                " (failed_part={!r})".format(failed_part)
+                if failed_part is not None
+                else ""
+            )
+            raise RuntimeError(
+                "Clean control failed: configured approved_image_running was not "
+                "confirmed{}. Fault dispatch was aborted.".format(detail)
+            )
+        approved_images = [
+            str(name).strip()
+            for name in (getattr(approved_running, "images", None) or ())
+            if str(name).strip()
+        ]
+        matched_image = str(
+            approved_sig.get("matched_image")
+            or (signals.get("matched_image") if isinstance(signals, dict) else "")
+            or ""
+        ).strip()
+        if not matched_image or (
+            approved_images and matched_image not in approved_images
+        ):
+            raise RuntimeError(
+                "Clean control failed: expected approved image in {!r}, observed {!r}. "
+                "Fault dispatch was aborted.".format(
+                    approved_images,
+                    matched_image or None,
+                )
+            )
+
     marker_address = getattr(criteria, "marker_address", None)
     if marker_address in (None, 0):
         return
@@ -832,6 +900,15 @@ def _select_mcuboot_state_evaluator_points(
     if not trace_file or not os.path.exists(trace_file):
         return None
     if getattr(profile, "has_update_sequence", False):
+        return None
+    if (
+        getattr(
+            getattr(profile, "success_criteria", None),
+            "approved_image_running",
+            None,
+        )
+        is not None
+    ):
         return None
     if "exec" not in profile.memory.slots or "staging" not in profile.memory.slots:
         return None
@@ -1713,6 +1790,27 @@ def validate_runtime_fault_mode_compat(profile: "ProfileConfig", eval_mode: str)
     ):
         raise RuntimeError(
             "durability_model=writeback requires evaluation_mode 'execute'."
+        )
+    has_approved_running = (
+        getattr(
+            getattr(profile, "success_criteria", None),
+            "approved_image_running",
+            None,
+        )
+        is not None
+        or any(
+            getattr(
+                getattr(phase, "success_criteria", None),
+                "approved_image_running",
+                None,
+            )
+            is not None
+            for phase in (getattr(profile, "update_sequence", None) or ())
+        )
+    )
+    if has_approved_running and str(eval_mode or "").strip().lower() != "execute":
+        raise RuntimeError(
+            "success_criteria.approved_image_running requires evaluation_mode 'execute'."
         )
     if str(getattr(profile.fault_sweep, "mode", "runtime")) != "runtime":
         return

@@ -105,6 +105,7 @@ MAX_STATE_FUZZ_ITERATIONS = 100_000
 MAX_MULTI_FAULT_PAIRS = 100_000
 MAX_MULTI_FAULTS_PER_RUN = 64
 MAX_BOOT_CYCLES = 1_000
+DEFAULT_APPROVED_IMAGE_DWELL_S = 0.25
 
 VALID_MRAM_TORN_WORD_MODES: FrozenSet[str] = frozenset(
     {
@@ -769,7 +770,10 @@ def _resolve_base_profile(
     merged = _deep_merge_profile_data(base_data, data)
     if (
         isinstance(child_criteria, dict)
-        and child_criteria.get("image_hash") is True
+        and (
+            child_criteria.get("image_hash") is True
+            or child_criteria.get("approved_image_running") is not None
+        )
         and "marker_address" not in child_criteria
         and "marker_value" not in child_criteria
         and isinstance(merged.get("success_criteria"), dict)
@@ -963,6 +967,22 @@ class MemoryCheck:
         self.op = op
 
 
+class ApprovedImageRunning:
+    """Atomic digest, executable-extent, and dwell success criterion."""
+
+    __slots__ = ("slot", "images", "dwell_s")
+
+    def __init__(
+        self,
+        slot: str,
+        images: List[str],
+        dwell_s: float = DEFAULT_APPROVED_IMAGE_DWELL_S,
+    ) -> None:
+        self.slot = str(slot).strip()
+        self.images = list(images)
+        self.dwell_s = float(dwell_s)
+
+
 class SuccessCriteria:
     __slots__ = (
         "vtor_in_slot",
@@ -984,6 +1004,7 @@ class SuccessCriteria:
         "memory_checks",
         "terminal_after_reset",
         "allow_fault_after_success",
+        "approved_image_running",
     )
 
     def __init__(
@@ -1007,6 +1028,7 @@ class SuccessCriteria:
         terminal_after_reset: bool = False,
         allow_fault_after_success: bool = False,
         vector_table_offset_source: Optional[str] = None,
+        approved_image_running: Optional[ApprovedImageRunning] = None,
     ) -> None:
         self.vtor_in_slot = vtor_in_slot
         self.vector_table_offset = max(0, int(vector_table_offset))
@@ -1037,6 +1059,7 @@ class SuccessCriteria:
         self.memory_checks = memory_checks or []
         self.terminal_after_reset = bool(terminal_after_reset)
         self.allow_fault_after_success = bool(allow_fault_after_success)
+        self.approved_image_running = approved_image_running
 
 
 
@@ -3027,7 +3050,12 @@ def resolve_image_header_vector_offset(
     """
     if criteria.vector_table_offset_source != VECTOR_TABLE_OFFSET_IMAGE_HEADER:
         return
-    name = criteria.expected_image or "staging"
+    name = criteria.expected_image or (
+        criteria.approved_image_running.images[0]
+        if criteria.approved_image_running is not None
+        and criteria.approved_image_running.images
+        else "staging"
+    )
     field = ctx + ".vector_table_offset"
     if name not in images:
         raise ProfileError(
@@ -3083,6 +3111,44 @@ def mcuboot_validated_image_extent(blob: bytes, slot_size: int = 0) -> Optional[
     if int(slot_size) > 0 and extent > int(slot_size):
         return None
     return extent
+
+
+def image_executable_extent(
+    blob: bytes,
+    slot_size: int = 0,
+) -> Tuple[int, int, str]:
+    """Return ``(offset, size, source)`` for an image's executable payload.
+
+    MCUboot's header and TLV areas are not executable payload.  A raw image
+    has no self-describing header, so its artifact length is the only bounded
+    executable extent available.
+    """
+    blob_size = len(blob)
+    slot_limit = int(slot_size)
+    if slot_limit > 0 and blob_size > slot_limit:
+        raise ProfileError(
+            "image artifact is 0x{:X} bytes, larger than its 0x{:X}-byte slot".format(
+                blob_size, slot_limit
+            )
+        )
+    if blob_size >= 32 and struct.unpack_from("<I", blob, 0)[0] == MCUBOOT_IMAGE_MAGIC:
+        header_size, _protected_tlv_size, image_size = struct.unpack_from(
+            "<HHI", blob, 8
+        )
+        code_end = int(header_size) + int(image_size)
+        validated_end = mcuboot_validated_image_extent(blob, slot_size=slot_limit)
+        if (
+            header_size < 32
+            or image_size <= 0
+            or code_end > blob_size
+            or validated_end is None
+            or code_end > validated_end
+        ):
+            raise ProfileError("MCUboot image has an invalid executable payload extent")
+        return int(header_size), int(image_size), "mcuboot_header"
+    if blob_size <= 0:
+        raise ProfileError("image artifact is empty")
+    return 0, blob_size, "artifact_size"
 
 
 def last_erase_sector_reserve(
@@ -3848,6 +3914,10 @@ class ProfileConfig:
                 )
             )
 
+        approved_running = self._approved_image_running_runtime_dict(
+            repo_root, criteria, images
+        )
+
         return {
             "vtor_in_slot": criteria.vtor_in_slot or "",
             "vector_table_offset": int(criteria.vector_table_offset),
@@ -3865,7 +3935,83 @@ class ProfileConfig:
             "otadata_expect": criteria.otadata_expect,
             "otadata_expect_scope": criteria.otadata_expect_scope or "always",
             "allow_fault_after_success": bool(criteria.allow_fault_after_success),
+            "approved_image_running": approved_running,
             "success_checks": self._success_checks_runtime_dict(criteria),
+        }
+
+    def _approved_image_running_runtime_dict(
+        self,
+        repo_root: Path,
+        criteria: "SuccessCriteria",
+        images: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        approved = criteria.approved_image_running
+        if approved is None:
+            return None
+        slot = self.memory.slots[approved.slot]
+        pad_byte = self.image_pad_byte(repo_root)
+        specs: List[Dict[str, Any]] = []
+        digests: Dict[str, str] = {}
+        for name in approved.images:
+            resolved = self.resolve_path(repo_root, images[name])
+            raw = Path(resolved).read_bytes()
+            if (
+                len(raw) >= 32
+                and struct.unpack_from("<I", raw, 0)[0] != MCUBOOT_IMAGE_MAGIC
+                and raw[0] == 0xFF
+            ):
+                stripped = raw.lstrip(b"\xff")
+                if (
+                    len(stripped) >= 32
+                    and struct.unpack_from("<I", stripped, 0)[0] == MCUBOOT_IMAGE_MAGIC
+                    and mcuboot_validated_image_extent(stripped, slot_size=slot.size)
+                    is not None
+                ):
+                    raw = stripped
+            digest_extent, digest_source = self._resolve_slot_hash_extent(
+                repo_root, raw, slot_name=approved.slot
+            )
+            if digest_extent is None or digest_extent <= 0:
+                raise ProfileError(
+                    "success_criteria.approved_image_running cannot resolve the "
+                    "digest extent for images.{}".format(name)
+                )
+            if len(raw) >= digest_extent:
+                digest_bytes = raw[:digest_extent]
+            else:
+                digest_bytes = raw + bytes([pad_byte]) * (digest_extent - len(raw))
+            digest = hashlib.sha256(digest_bytes).hexdigest()
+            prior = digests.get(digest)
+            if prior is not None:
+                raise ProfileError(
+                    "success_criteria.approved_image_running images {!r} and {!r} "
+                    "have indistinguishable approved content".format(prior, name)
+                )
+            digests[digest] = name
+            code_offset, code_size, extent_source = image_executable_extent(
+                raw, slot_size=slot.size
+            )
+            specs.append(
+                {
+                    "name": name,
+                    "sha256": digest,
+                    "digest_extent": int(digest_extent),
+                    "digest_extent_source": digest_source,
+                    "code_offset": int(code_offset),
+                    "code_size": int(code_size),
+                    "code_start": int(slot.base) + int(code_offset),
+                    "code_end": int(slot.base) + int(code_offset) + int(code_size),
+                    "code_extent_source": extent_source,
+                    "extent_source": extent_source,
+                    "artifact_size": len(raw),
+                }
+            )
+        return {
+            "slot": approved.slot,
+            "slot_base": int(slot.base),
+            "slot_size": int(slot.size),
+            "dwell_s": float(approved.dwell_s),
+            "images": specs,
         }
 
     def _success_checks_runtime_dict(
@@ -4339,6 +4485,18 @@ class ProfileConfig:
             vars_list.append("SUCCESS_TERMINAL_AFTER_RESET:true")
         if sc.allow_fault_after_success:
             vars_list.append("SUCCESS_ALLOW_FAULT_AFTER_SUCCESS:true")
+        approved_running = self._approved_image_running_runtime_dict(
+            repo_root, sc, self.images
+        )
+        if approved_running is not None:
+            encoded_approved = base64.b64encode(
+                json.dumps(
+                    approved_running, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).decode("ascii")
+            vars_list.append(
+                "APPROVED_IMAGE_RUNNING_B64:{}".format(encoded_approved)
+            )
         if sc.marker_address is not None:
             vars_list.append("SUCCESS_MARKER_ADDR:0x{:08X}".format(sc.marker_address))
         if sc.marker_value is not None:
@@ -5137,6 +5295,39 @@ def _parse_allowed_images(raw: Any) -> List[str]:
     return names
 
 
+def _parse_approved_image_running(raw: Any) -> Optional[ApprovedImageRunning]:
+    if raw is None:
+        return None
+    field = "success_criteria.approved_image_running"
+    if not isinstance(raw, dict):
+        raise ProfileError("{}: expected mapping".format(field))
+    slot = str(raw.get("slot", "")).strip()
+    if not slot:
+        raise ProfileError("{}.slot: expected a non-empty slot name".format(field))
+    raw_images = raw.get("images")
+    if not isinstance(raw_images, list) or not raw_images:
+        raise ProfileError("{}.images: expected a non-empty list of image names".format(field))
+    images: List[str] = []
+    seen = set()
+    for index, value in enumerate(raw_images):
+        name = str(value).strip() if isinstance(value, str) else ""
+        if not name:
+            raise ProfileError(
+                "{}.images[{}]: expected a non-empty image name".format(field, index)
+            )
+        if name in seen:
+            raise ProfileError(
+                "{}.images[{}]: duplicate image name {!r}".format(field, index, name)
+            )
+        seen.add(name)
+        images.append(name)
+    dwell_s = _parse_positive_float(
+        raw.get("dwell_s", DEFAULT_APPROVED_IMAGE_DWELL_S),
+        field + ".dwell_s",
+    )
+    return ApprovedImageRunning(slot=slot, images=images, dwell_s=dwell_s)
+
+
 def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
     if raw is None:
         return SuccessCriteria()
@@ -5199,6 +5390,9 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
             raw.get("allow_fault_after_success", False),
             "success_criteria.allow_fault_after_success",
         ),
+        approved_image_running=_parse_approved_image_running(
+            raw.get("approved_image_running")
+        ),
     )
 
 
@@ -5219,6 +5413,29 @@ def _validate_success_image_names(
                     name,
                 )
             )
+    if criteria.approved_image_running is not None:
+        for name in criteria.approved_image_running.images:
+            if name not in images:
+                raise ProfileError(
+                    "{}.approved_image_running.images={!r} is not present in the effective images mapping".format(
+                        context,
+                        name,
+                    )
+                )
+
+
+def _validate_approved_image_running_slot(
+    criteria: SuccessCriteria,
+    slots: Dict[str, SlotConfig],
+    context: str,
+) -> None:
+    approved = criteria.approved_image_running
+    if approved is not None and approved.slot not in slots:
+        raise ProfileError(
+            "{}.approved_image_running.slot={!r} is not present in memory.slots".format(
+                context, approved.slot
+            )
+        )
 
 
 def _parse_terminal_error_paths(raw: Optional[Any]) -> List[TerminalErrorPathConfig]:
@@ -8166,6 +8383,7 @@ def _parse_update_sequence(
     raw: Optional[Any],
     *,
     images: Dict[str, str],
+    slots: Dict[str, SlotConfig],
     success_criteria: SuccessCriteria,
     fault_sweep: FaultSweepConfig,
     profile_path: Optional[Path] = None,
@@ -8286,9 +8504,15 @@ def _parse_update_sequence(
             start_images,
             "update_sequence[{}].success_criteria".format(idx),
         )
+        _validate_approved_image_running_slot(
+            phase.success_criteria,
+            slots,
+            "update_sequence[{}].success_criteria".format(idx),
+        )
         current_images = dict(start_images)
         expected_name = phase.success_criteria.expected_image
         allowed_names = phase.success_criteria.allowed_images
+        approved_running = phase.success_criteria.approved_image_running
         is_last = idx == len(phases) - 1
         if expected_name:
             if expected_name not in start_images:
@@ -8297,6 +8521,27 @@ def _parse_update_sequence(
                     "is not present in the phase images".format(idx, expected_name)
                 )
             current_images["exec"] = start_images[expected_name]
+        elif (
+            approved_running is not None
+            and len(approved_running.images) == 1
+            and not is_last
+            and not phase.fault_injection
+        ):
+            current_images[approved_running.slot] = start_images[
+                approved_running.images[0]
+            ]
+        elif (
+            approved_running is not None
+            and len(approved_running.images) > 1
+            and not is_last
+            and not phase.fault_injection
+        ):
+            raise ProfileError(
+                "update_sequence[{}] ('{}'): clean phases that precede another phase "
+                "must use a single approved image or scalar success_criteria.expected_image; "
+                "multi-image approved_image_running cannot determine the next phase's "
+                "slot image".format(idx, phase.name)
+            )
         elif allowed_names and not is_last and not phase.fault_injection:
             raise ProfileError(
                 "update_sequence[{}] ('{}'): clean phases that precede another phase "
@@ -8547,6 +8792,9 @@ def _parse_component(
 
     success_criteria = _parse_success_criteria(raw.get("success_criteria"))
     _validate_success_image_names(success_criteria, images, ctx + ".success_criteria")
+    _validate_approved_image_running_slot(
+        success_criteria, memory.slots, ctx + ".success_criteria"
+    )
     resolve_image_header_vector_offset(
         success_criteria,
         images,
@@ -8562,6 +8810,15 @@ def _parse_component(
         if "fault_sweep" in raw
         else None
     )
+    if (
+        success_criteria.approved_image_running is not None
+        and fault_sweep is not None
+        and str(fault_sweep.evaluation_mode or "state").strip().lower() != "execute"
+    ):
+        raise ProfileError(
+            "{}.success_criteria.approved_image_running requires bounded CPU "
+            "execution; use fault_sweep.evaluation_mode 'execute'".format(ctx)
+        )
 
     flash_backend_raw = raw.get("flash_backend")
     flash_backend: Optional[str] = str(flash_backend_raw) if flash_backend_raw is not None else None
@@ -9153,6 +9410,7 @@ _STRICT_SUCCESS_CRITERIA_KEYS = frozenset(
         "otadata_expect", "otadata_expect_scope", "bootloader_integrity",
         "config_checks", "boot_register_values", "max_reset_vector_offset",
         "memory_checks", "terminal_after_reset", "allow_fault_after_success",
+        "approved_image_running",
     }
 )
 
@@ -9324,6 +9582,12 @@ def _validate_strict_success_criteria(
     require_meaningful: bool = True,
 ) -> None:
     _reject_unknown_keys(raw, _STRICT_SUCCESS_CRITERIA_KEYS, context)
+    if raw.get("approved_image_running") is not None:
+        _reject_unknown_keys(
+            raw.get("approved_image_running"),
+            frozenset({"slot", "images", "dwell_s"}),
+            context + ".approved_image_running",
+        )
     if require_meaningful and not _strict_success_criteria_is_meaningful(raw):
         raise ProfileError(
             "{}: strict validation requires at least one observable success "
@@ -9422,6 +9686,7 @@ def _strict_success_criteria_is_meaningful(raw: Dict[str, Any]) -> bool:
         or raw.get("boot_register_values")
         or raw.get("memory_checks")
         or raw.get("max_reset_vector_offset") is not None
+        or raw.get("approved_image_running")
     )
 
 
@@ -10267,13 +10532,20 @@ def _load_profile(
     success_criteria = _parse_success_criteria(data.get("success_criteria"))
     # Preserve scalar expected_image compatibility for update sequences that
     # introduce the named image in a later phase. The new allowed_images list
-    # is unambiguous only when every member exists in the current declaration.
-    if success_criteria.allowed_images:
+    # and approved_image_running list are unambiguous only when every member
+    # exists in the current declaration.
+    if (
+        success_criteria.allowed_images
+        or success_criteria.approved_image_running is not None
+    ):
         _validate_success_image_names(
             success_criteria,
             images,
             "success_criteria",
         )
+    _validate_approved_image_running_slot(
+        success_criteria, memory.slots, "success_criteria"
+    )
     resolve_image_header_vector_offset(
         success_criteria, images, profile_path=path, ctx="success_criteria"
     )
@@ -10291,6 +10563,14 @@ def _load_profile(
     ):
         raise ProfileError(
             "fault_sweep.calibration_stop requires execute evaluation mode"
+        )
+    if (
+        success_criteria.approved_image_running is not None
+        and str(fault_sweep.evaluation_mode or "state").strip().lower() != "execute"
+    ):
+        raise ProfileError(
+            "success_criteria.approved_image_running requires bounded CPU "
+            "execution; use fault_sweep.evaluation_mode 'execute'"
         )
     if (
         success_criteria.terminal_after_reset
@@ -10311,6 +10591,7 @@ def _load_profile(
             success_criteria.boot_register_values,
             success_criteria.memory_checks,
             success_criteria.max_reset_vector_offset is not None,
+            success_criteria.approved_image_running is not None,
         )
     ):
         raise ProfileError(
@@ -10336,6 +10617,7 @@ def _load_profile(
             success_criteria.boot_register_values,
             success_criteria.memory_checks,
             success_criteria.max_reset_vector_offset is not None,
+            success_criteria.approved_image_running is not None,
         )
     ):
         raise ProfileError(
@@ -10345,10 +10627,22 @@ def _load_profile(
     update_sequence = _parse_update_sequence(
         data.get("update_sequence"),
         images=images,
+        slots=memory.slots,
         success_criteria=success_criteria,
         fault_sweep=fault_sweep,
         profile_path=path,
     )
+    if (
+        any(
+            phase.success_criteria.approved_image_running is not None
+            for phase in update_sequence
+        )
+        and str(fault_sweep.evaluation_mode or "state").strip().lower() != "execute"
+    ):
+        raise ProfileError(
+            "success_criteria.approved_image_running requires bounded CPU "
+            "execution; use fault_sweep.evaluation_mode 'execute'"
+        )
     if fault_sweep.calibration_stop.success_criteria:
         stop_criteria = (
             update_sequence[-1].success_criteria
@@ -10367,6 +10661,7 @@ def _load_profile(
                 stop_criteria.boot_register_values,
                 stop_criteria.memory_checks,
                 stop_criteria.max_reset_vector_offset is not None,
+                stop_criteria.approved_image_running is not None,
             )
         ):
             raise ProfileError(
@@ -10777,6 +11072,15 @@ def main() -> int:
         "image_hash_slot": profile.success_criteria.image_hash_slot,
         "terminal_after_reset": profile.success_criteria.terminal_after_reset,
         "allow_fault_after_success": profile.success_criteria.allow_fault_after_success,
+        "approved_image_running": (
+            {
+                "slot": profile.success_criteria.approved_image_running.slot,
+                "images": list(profile.success_criteria.approved_image_running.images),
+                "dwell_s": profile.success_criteria.approved_image_running.dwell_s,
+            }
+            if profile.success_criteria.approved_image_running is not None
+            else None
+        ),
         "calibration_stop": {
             "address": profile.fault_sweep.calibration_stop.address,
             "success_criteria": profile.fault_sweep.calibration_stop.success_criteria,

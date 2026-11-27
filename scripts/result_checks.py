@@ -562,6 +562,12 @@ def annotate_result_checks(
         signals = result.get("signals")
         if isinstance(signals, dict) and signals.get("matched_image") is not None:
             result["matched_image"] = signals.get("matched_image")
+        if isinstance(signals, dict) and isinstance(
+            signals.get("approved_image_running"), dict
+        ):
+            result["approved_image_running"] = signals.get(
+                "approved_image_running"
+            )
         effective_outcome, _ = _effective_boot_result(result)
         if str(effective_outcome or "").strip().lower() == "infra_error":
             result["infrastructure_error"] = True

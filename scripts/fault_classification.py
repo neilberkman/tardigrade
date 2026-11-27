@@ -127,6 +127,11 @@ def _normalize_slot_name(raw: Any) -> Optional[str]:
 def _expected_boot_slot(result: Dict[str, Any]) -> Optional[str]:
     criteria = result.get("effective_success_criteria")
     if isinstance(criteria, dict):
+        approved_cfg = criteria.get("approved_image_running")
+        if isinstance(approved_cfg, dict):
+            approved_slot = _normalize_slot_name(approved_cfg.get("slot"))
+            if approved_slot not in {None, "any"}:
+                return approved_slot
         hash_slot = _normalize_slot_name(criteria.get("image_hash_slot"))
         if hash_slot not in {None, "any"}:
             return hash_slot
@@ -138,6 +143,11 @@ def _expected_boot_slot(result: Dict[str, Any]) -> Optional[str]:
 
     signals = result.get("signals")
     if isinstance(signals, dict):
+        approved_sig = signals.get("approved_image_running")
+        if isinstance(approved_sig, dict):
+            approved_slot = _normalize_slot_name(approved_sig.get("slot"))
+            if approved_slot not in {None, "any"}:
+                return approved_slot
         hash_slot = _normalize_slot_name(signals.get("image_hash_slot"))
         if hash_slot not in {None, "any"}:
             return hash_slot
@@ -784,6 +794,13 @@ def result_issue_reasons(result: Dict[str, Any], expected_outcome: str) -> List[
             if signals.get("vtor_aligned") is False:
                 reasons.append("vtor_alignment")
             if signals.get("pc_ok") is False:
+                reasons.append("pc_expectation")
+        approved_sig = signals.get("approved_image_running")
+        if isinstance(approved_sig, dict) and approved_sig.get("ok") is False:
+            failed_part = str(approved_sig.get("failed_part") or "").strip().lower()
+            if failed_part == "digest" and not safe_instruction_skip_divergence:
+                reasons.append("content_criteria")
+            elif failed_part in {"extent", "dwell"}:
                 reasons.append("pc_expectation")
     if result_recovered_after_failure(result, expected_outcome):
         reasons.append("recovered_after_failure")

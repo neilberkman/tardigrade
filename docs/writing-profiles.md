@@ -559,6 +559,33 @@ When an image binary is shorter than the slot's hash extent, image digests (in t
 
 `image_hash` is evaluated only in `fault_sweep.evaluation_mode: execute`. State mode, the default, performs the staging-to-exec copy itself and judges the result by its vector table alone, so a digest declared there produces no evidence. The loader warns about that combination, and the clean-control gate requires hash evidence only from execute-mode controls.
 
+### Approved image running
+
+`vtor_in_slot`, `pc_in_slot`, and `image_hash` check parts of boot handoff separately. `approved_image_running` combines slot content identity, executable-code bounds, and post-handoff execution stability into a single execute-mode criterion:
+
+```yaml
+success_criteria:
+  vtor_in_slot: exec
+  approved_image_running:
+    slot: exec
+    images: [staging] # or [exec, staging] when rollback to the old image is also safe
+    dwell_s: 0.25     # optional; defaults to 0.25s of emulated execution
+```
+
+A point passes `approved_image_running` only when all three parts hold:
+
+1. **Digest (`digest`)**: The SHA-256 digest of `slot` matches one of the declared `images` (`images.<name>`), with no uncorrectable MRAM words in the slot. The matched image name is recorded in `matched_image`.
+2. **Executable extent (`extent`)**: The CPU's program counter lies inside the matched image's executable code range `[slot_base + code_offset, slot_base + code_offset + code_size)`, computed from the image binary:
+   - For MCUboot images (`IMAGE_MAGIC = 0x96F3B83D` with a valid TLV block), `code_offset` is `ih_hdr_size` and `code_size` is `ih_img_size`, excluding both the leading MCUboot header `[0, ih_hdr_size)` and the trailing protected/unprotected TLV region and erased or stale slot tail.
+   - For raw non-MCUboot binaries, `code_offset` is `0` and `code_size` is the artifact file size, excluding any unprogrammed tail of a larger slot.
+3. **Post-handoff dwell (`dwell`)**: After first meeting both `digest` and `extent`, the CPU continues executing inside `[slot_base + code_offset, slot_base + code_offset + code_size)` for `dwell_s` of emulated time (default `0.25` seconds) with no in-run reset, CPU lock-up, Cortex-M fault exception (`IPSR` 3–6, `CFSR`, `HFSR`, or `HardFault`/`BusFault` vector entry), PC excursion outside the executable extent, or slot digest change.
+
+The default `dwell_s: 0.25` (250 ms = five default 50 ms Phase 2 slices) is derived from in-tree firmware and runner timings: it is 50× the legacy 5 ms `vtor_in_slot` post-capture settle window, 2.5× the 100 ms `no_boot_min_emulated_s` threshold, and longer than both the 37 ms post-reset startup delay (`1,850,000` loops at 100 MIPS) and the 165 ms delayed-fault/reset window (`8,250,000` loops) in `examples/runtime_self_update_delayed/app.c` and `examples/deliberate_crash_report/app.c`.
+
+`approved_image_running` requires `fault_sweep.evaluation_mode: execute`. Loading a profile (or running a sweep) with `approved_image_running` in `evaluation_mode: state` is rejected with an error because state mode does not execute the CPU and cannot produce digest, extent, or dwell evidence.
+
+Every evaluated point records `signals.approved_image_running` (mirrored at top-level `result.approved_image_running`) with `ok`, `failed_part` (`"digest"`, `"extent"`, `"dwell"`, or `null` when `ok` is `true`), `matched_image`, `required_dwell_s`, `observed_dwell_s`, and detailed `digest`, `extent`, and `dwell` sub-records.
+
 ### Boot register values
 
 Capture and verify hardware register state at boot time. Useful for checking MPU configuration, peripheral lock bits, or clock settings:

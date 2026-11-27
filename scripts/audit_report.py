@@ -1189,6 +1189,7 @@ def summarize_runtime_sweep(
                 "reset_vector_offset_ok",
                 "matched_image",
                 "image_hash_actual",
+                "approved_image_running",
             )
             if ctrl_signals.get(key) is not None
         }
