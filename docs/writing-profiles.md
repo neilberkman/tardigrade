@@ -1928,6 +1928,35 @@ the boot, time, depth, and address limits. Deferred searches also report
 `recovery_boots_reaching_deferred_gate` and
 `recovery_boots_before_deferred_gate`.
 
+When either budget stops a search, the audit writes a JSON checkpoint beside
+its report. For example, `results/first.json` produces
+`results/first.checkpoint.json`. The search summary names the checkpoint and
+sets `complete` to `false`. To continue, change either or both budgets in
+the profile and pass the checkpoint on the next audit:
+
+```sh
+python3 scripts/audit_bootloader.py \
+  --profile examples/phase2_mram_parity/profile_state_search.yaml \
+  --resume-state-search results/first.checkpoint.json \
+  --output results/continued.json
+```
+
+Each invocation adds its configured `max_new_states` and `max_wall_time_s`
+to the saved limits. Unspent budget carries forward. For example, a search
+given three boots followed by a resume given two boots can evaluate five
+unique states. A live check and its recovery boot finish together before the
+next time check. Elapsed search time excludes the interval between runs.
+
+The checkpoint contains canonical boot results, their recovery traces, the
+sampling position, and the ordered visits and trace prefixes still pending.
+A resume validates the firmware images, resolved profile (including inherited
+settings), Tardigrade revision, Renode version, runtime options, and the
+calibration trace and starting state. Only the two budgets may change in the
+profile. Normal calibration and control settings still apply. In a resumed
+report, each canonical result has `recovery_state_search.resume_origin` set to
+`before_resume` or `after_resume`. A finished search sets `complete` to `true`.
+When reusing a report path, it marks any older checkpoint at that path final.
+
 Every `cross_check_every`th newly booted generation-two state is also
 reproduced through the established two-cut live injector. At generation three
 and later, the rate applies to candidate chains, including a chain whose

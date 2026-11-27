@@ -125,6 +125,8 @@ ${ENABLE_MACHINE_SNAPSHOTS}    false
 ${PHASE2_FAULT_ENABLED}        false
 ${PHASE2_FAULT_MAX_POINTS}     0
 ${PHASE2_STATE_SEARCH_B64}     ${EMPTY}
+${STATE_SEARCH_CHECKPOINT}     ${EMPTY}
+${STATE_SEARCH_RESUME}         ${EMPTY}
 ${SUCCESS_CRITERIA_OVERRIDES}    ${EMPTY}
 ${SUCCESS_CRITERIA_OVERRIDES_FILE}    ${EMPTY}
 ${OTP_PERIPHERAL}              ${EMPTY}
@@ -221,6 +223,8 @@ Run Runtime Fault Point
     Execute Command    $sram_end=${SRAM_END}
     Execute Command    $heuristic_trace_required=${HEURISTIC_TRACE_REQUIRED}
     Execute Command    $calibration_trace_required=${CALIBRATION_TRACE_REQUIRED}
+    Execute Command    $state_search_checkpoint="${STATE_SEARCH_CHECKPOINT}"
+    Execute Command    $state_search_resume="${STATE_SEARCH_RESUME}"
     Execute Command    $phase2_state_search_b64="${PHASE2_STATE_SEARCH_B64}"
     Execute Command    $volatile_regions_b64="${VOLATILE_REGIONS_B64}"
     Execute Command    $slot_exec_base=${SLOT_EXEC_BASE}

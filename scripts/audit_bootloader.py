@@ -20,6 +20,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import datetime as dt
 import hashlib
@@ -66,6 +67,7 @@ from audit_report import (
     report_skip_reasons,
     summarize_runtime_sweep,
 )
+from recovery_checkpoint import json_digest, remaining_wall_time, validate_checkpoint
 from result_checks import annotate_result_checks
 from state_fuzz import (
     derive_default_metadata_base,
@@ -1042,6 +1044,10 @@ def parse_args() -> argparse.Namespace:
         help="Path to a YAML bootloader profile.",
     )
     parser.add_argument("--output", required=True, help="Output JSON report path.")
+    parser.add_argument(
+        "--resume-state-search", metavar="CHECKPOINT", type=Path,
+        help="Continue a limited recovery search with this invocation's state and time budgets.",
+    )
     add_report_options(parser)
     parser.add_argument(
         "--evaluation-mode",
@@ -1199,7 +1205,9 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
-    validate_report_paths(parser, args, [args.profile])
+    validate_report_paths(parser, args, [args.profile, args.resume_state_search])
+    if args.resume_state_search and args.resume_state_search.resolve() == Path(args.output).resolve():
+        parser.error("--output must be distinct from --resume-state-search")
     if args.workers < 1 or args.workers > 64:
         parser.error("--workers must be between 1 and 64")
     if args.fault_step < 1:
@@ -1224,15 +1232,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def _compute_calibration_cache_key(
-    profile: ProfileConfig,
-    repo_root: Path,
-    renode_test: str = "",
-    robot_suite: str = "",
-    robot_vars: Optional[List[str]] = None,
-    renode_remote_server_dir: str = "",
-) -> str:
-    """Compute a cache key for calibration based on profile inputs."""
+def _resolved_image_files(profile: ProfileConfig, repo_root: Path) -> Dict[str, str]:
     resolved_images = {
         name: profile.resolve_path(repo_root, path)
         for name, path in profile.images.items()
@@ -1252,6 +1252,28 @@ def _compute_calibration_cache_key(
         resolved_images["residual_image_prior"] = profile.resolve_path(
             repo_root, profile.residual_image.prior_image
         )
+    for index, phase in enumerate(profile.update_sequence):
+        for name, path in sorted(phase.images.items()):
+            resolved_images["phase{}:{}".format(index, name)] = profile.resolve_path(
+                repo_root, path
+            )
+        for name, path in sorted(phase.start_images.items()):
+            resolved_images["phase{}:start:{}".format(index, name)] = profile.resolve_path(
+                repo_root, path
+            )
+    return resolved_images
+
+
+def _compute_calibration_cache_key(
+    profile: ProfileConfig,
+    repo_root: Path,
+    renode_test: str = "",
+    robot_suite: str = "",
+    robot_vars: Optional[List[str]] = None,
+    renode_remote_server_dir: str = "",
+) -> str:
+    """Compute a cache key for calibration based on profile inputs."""
+    resolved_images = _resolved_image_files(profile, repo_root)
     setup_files: Dict[str, str] = {}
     hook_files: Dict[str, str] = {}
     if profile.setup_script:
@@ -1270,14 +1292,6 @@ def _compute_calibration_cache_key(
         if os.path.isfile(candidate):
             hook_files["invariant_provider{}".format(index)] = candidate
     for index, phase in enumerate(profile.update_sequence):
-        for name, path in sorted(phase.images.items()):
-            resolved_images["phase{}:{}".format(index, name)] = profile.resolve_path(
-                repo_root, path
-            )
-        for name, path in sorted(phase.start_images.items()):
-            resolved_images["phase{}:start:{}".format(index, name)] = profile.resolve_path(
-                repo_root, path
-            )
         if phase.setup_script:
             setup_files["phase{}".format(index)] = profile.resolve_path(
                 repo_root, phase.setup_script
@@ -1390,6 +1404,86 @@ def _sha256_path(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _checkpoint_header(path: Optional[Path]) -> Optional[Dict[str, Any]]:
+    if path is None:
+        return None
+    with path.open() as stream:
+        saved = json.load(stream)
+    if saved.get("final"):
+        raise ValueError("state search checkpoint is final")
+    return {key: saved[key] for key in ("version", "inputs", "limits", "elapsed_s")}
+
+
+def _state_search_inputs(profile: ProfileConfig, repo_root: Path) -> Dict[str, Any]:
+    raw = load_profile_raw(profile.profile_path)
+    for scope in [raw] + raw.get("multi_component", {}).get("components", []):
+        search = (scope.get("fault_sweep") or {}).get("phase2_fault", {}).get("state_search", {})
+        for key in ("max_new_states", "max_wall_time_s"):
+            search.pop(key, None)
+    images = _resolved_image_files(profile, repo_root)
+    firmware = {
+        "images": {name: _sha256_path(Path(path)) for name, path in images.items()},
+        "bootloader": _sha256_path(Path(profile.resolve_path(repo_root, profile.bootloader_elf))),
+    }
+    if (REPO_ROOT / ".git").exists():
+        revision = git_metadata(REPO_ROOT)["commit"]
+        if revision == "unavailable":
+            raise ValueError("cannot identify Tardigrade revision for state search")
+    else:
+        # Installed wheels have no .git directory. Identify the shipped runtime.
+        revision = "source-sha256:" + json_digest({
+            str(path.relative_to(REPO_ROOT)): _sha256_path(path)
+            for directory in ("scripts", "peripherals", "platforms", "tests")
+            for path in (REPO_ROOT / directory).glob("*")
+            if path.is_file() and path.suffix in (".py", ".resc", ".cs", ".repl", ".robot")
+        })
+    return {
+        "firmware_sha256": json_digest(firmware),
+        "profile_sha256": json_digest(raw),
+        "tardigrade_revision": revision,
+        "initial_state": profile.resolved_initial_state_name,
+        "search_profile": profile.name,
+    }
+
+
+def _state_search_checkpoint_vars(
+    profile: ProfileConfig, repo_root: Path, args: argparse.Namespace,
+    robot_vars: List[str], previous: Optional[Dict[str, Any]] = None,
+    component: Optional[int] = None,
+) -> List[str]:
+    prefix = "PHASE2_STATE_SEARCH_B64:"
+    payload = next(v[len(prefix):] for v in robot_vars if v.startswith(prefix))
+    config = json.loads(base64.b64decode(payload))
+    settings = _cache_robot_var_material([v for v in robot_vars if not v.startswith(prefix)])
+    for item in settings:
+        if "file_sha256" in item:
+            item.pop("value", None)
+    inputs = _state_search_inputs(profile, repo_root)
+    inputs["runtime_options_sha256"] = json_digest({
+        "vars": settings,
+        "search": {key: value for key, value in config.items()
+                   if key not in ("max_new_states", "max_wall_time_s")},
+        "hash_bypass": not args.no_hash_bypass,
+        "suite": _sha256_path(repo_root / args.robot_suite),
+    })
+    config["checkpoint_inputs"] = inputs
+    report = Path(args.output).resolve()
+    stem = report.stem if component is None else "{}.component-{}".format(report.stem, component)
+    output = report.with_name(stem + ".checkpoint.json")
+    reserved_paths = [args.profile] + [getattr(args, fmt, None) for fmt in FORMATS]
+    if any(output == Path(path).resolve() for path in reserved_paths if path):
+        raise ValueError("state search checkpoint must be distinct from the profile and report outputs")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    additions = ["STATE_SEARCH_CHECKPOINT:" + str(output)]
+    if previous is not None:
+        source = args.resume_state_search.resolve(strict=True)
+        validate_checkpoint(previous, config["checkpoint_inputs"], host_only=True)
+        config["resume_wall_time_s"] = config["max_wall_time_s"] + remaining_wall_time(previous)
+        additions.append("STATE_SEARCH_RESUME:" + str(source))
+    additions.append(prefix + base64.b64encode(json.dumps(config).encode()).decode())
+    return merge_robot_vars(robot_vars, additions)
 
 
 def _cache_robot_var_material(robot_vars: List[str]) -> List[Dict[str, str]]:
@@ -1790,6 +1884,11 @@ def _main_single() -> int:
             strict_root=strict_root,
             repo_root=repo_root,
         )
+        previous = _checkpoint_header(args.resume_state_search)
+        if previous and profile.initial_states and not args.initial_state:
+            args.initial_state = previous["inputs"].get("initial_state")
+            if not args.initial_state:
+                raise ValueError("state search checkpoint mismatch: initial_state")
         if args.initial_state:
             matches = [
                 state
@@ -1805,6 +1904,16 @@ def _main_single() -> int:
             profile = profile.resolve_initial_state(matches[0])
         if args.strict_profile:
             _validate_profile_asset_containment(profile, repo_root)
+        if previous:
+            target = profile
+            if profile.is_multi_component:
+                target = next((p for p in profile.component_profiles()
+                               if p.name == previous["inputs"].get("search_profile")), None)
+                if target is None:
+                    raise ValueError("state search checkpoint mismatch: search_profile")
+            validate_checkpoint(previous, _state_search_inputs(target, repo_root), host_only=True)
+            if not target.fault_sweep.phase2_fault.state_search.enabled:
+                raise ValueError("--resume-state-search requires an enabled phase2_fault.state_search")
         authorization_review_analysis = None
         if getattr(profile, "authorization_review", None) is not None:
             authorization_traces = [load_trace(path) for path in args.authorization_review_traces]
@@ -1911,7 +2020,14 @@ def _main_single() -> int:
                 temp_ctx = tempfile.TemporaryDirectory(prefix="ota_audit_")
                 work_dir = Path(temp_ctx.name)
 
+            def component_checkpoint(index, component, variables):
+                resume = previous
+                if resume and resume["inputs"]["search_profile"] != component.name:
+                    resume = None
+                return _state_search_checkpoint_vars(component, repo_root, args, variables, resume, index)
+
             mc_result = run_multi_component_sweep(
+                checkpoint_vars=component_checkpoint,
                 repo_root=repo_root,
                 renode_test=renode_test,
                 robot_suite=robot_suite,
@@ -2474,6 +2590,8 @@ def _main_single() -> int:
         import time as _time_mod
         sweep_wall_t0 = _time_mod.time()
 
+        if profile.fault_sweep.phase2_fault.state_search.enabled:
+            robot_vars = _state_search_checkpoint_vars(profile, repo_root, args, robot_vars, previous)
         sweep_results = run_runtime_sweep(
             repo_root=repo_root,
             renode_test=renode_test,
@@ -3288,6 +3406,7 @@ def _is_pass_verdict(value: Any) -> bool:
 def _run_initial_state_matrix(
     args: argparse.Namespace,
     profile: ProfileConfig,
+    per_state_reports: bool = False,
 ) -> int:
     """Run and aggregate every declared initial state through the real CLI."""
     repo_root = Path(args.repo_root).resolve() if args.repo_root else REPO_ROOT
@@ -3297,6 +3416,9 @@ def _run_initial_state_matrix(
         temp_root = Path(td)
         for index, state in enumerate(profile.initial_states):
             child_output = temp_root / "state_{:04d}.json".format(index)
+            if per_state_reports:
+                # Each independently resumable search needs a durable report sibling.
+                child_output = Path(args.output).resolve().with_suffix(".state-{:04d}.json".format(index))
             campaign = getattr(state, "boundary_campaign", None)
             candidate_vars: List[str] = []
             candidate_state_file = temp_root / "state_{:04d}_durable.bin".format(index)
@@ -3349,7 +3471,7 @@ def _run_initial_state_matrix(
                         state_file = candidate_state_file
                         previous = state.boundary_previous_value
                         if previous is not None:
-                            follow_output = temp_root / "state_{:04d}_followup.json".format(index)
+                            follow_output = child_output.with_name(child_output.stem + "_followup.json")
                             follow_vars = [
                                 "BOUNDARY_VALUE:{}".format(int(previous)),
                                 "BOUNDARY_PHASE:follow_up",
@@ -3551,7 +3673,7 @@ def _run_initial_state_matrix(
 
 def main() -> int:
     args = parse_args()
-    if args.initial_state:
+    if args.initial_state or args.resume_state_search:
         return _main_single()
     repo_root = Path(args.repo_root) if args.repo_root else REPO_ROOT
     strict_root = Path(args.repo_root) if args.repo_root else None
@@ -3566,7 +3688,9 @@ def main() -> int:
         return _main_single()
     if not getattr(profile, "initial_states", None):
         return _main_single()
-    return _run_initial_state_matrix(args, profile)
+    search_profiles = profile.component_profiles() or [profile]
+    per_state_reports = any(p.fault_sweep.phase2_fault.state_search.enabled for p in search_profiles)
+    return _run_initial_state_matrix(args, profile, per_state_reports)
 
 
 if __name__ == "__main__":

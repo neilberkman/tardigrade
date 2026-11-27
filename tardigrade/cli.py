@@ -120,6 +120,8 @@ def main(argv=None):
     audit.add_argument("--profile", required=True, type=Path)
     audit.add_argument("--output", required=True, type=Path)
     audit.add_argument("--renode-test", default=runner)
+    audit.add_argument("--resume-state-search", type=Path, metavar="CHECKPOINT",
+                       help="continue a recovery search from its checkpoint")
     audit.add_argument("--timeout", type=int, default=None, help="optional wall-clock budget in seconds")
     demo = commands.add_parser("demo", help="run the two-profile power-loss demo")
     demo.add_argument("--renode-test", default=runner)
@@ -167,6 +169,8 @@ def main(argv=None):
                 args.renode_test,
                 args.timeout,
             )
+        if args.resume_state_search:
+            unknown.extend(["--resume-state-search", str(args.resume_state_search.expanduser().resolve())])
         return run_audit(
             args.profile,
             args.output,

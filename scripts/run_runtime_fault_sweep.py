@@ -45,6 +45,7 @@ from recovery_state import (
     apply_interrupted_operation,
     merge_operation_traces,
 )
+from recovery_checkpoint import json_digest
 from recovery_search import (
     RecoveryStateExplorer,
     first_persistent_difference,
@@ -19011,7 +19012,53 @@ def run_recovery_state_search():
         cross_check_every=int(phase2_state_search.get('cross_check_every', 100)),
         cross_check=_state_search_live_cross_check,
     )
+    checkpoint_path = get_optional_var('state_search_checkpoint', '').strip()
+    resume_path = get_optional_var('state_search_resume', '').strip()
+    if checkpoint_path:
+        from System.Reflection import Assembly, AssemblyInformationalVersionAttribute
+        inputs = dict(phase2_state_search['checkpoint_inputs'])
+        assembly = Assembly.GetEntryAssembly()
+        versions = assembly.GetCustomAttributes(AssemblyInformationalVersionAttribute, False)
+        inputs['renode_version'] = str(
+            versions[0].InformationalVersion if versions.Length else assembly.GetName().Version
+        )
+        inputs['initial_state_identity'] = initial_state.identity_hex()
+        inputs['calibration_trace_sha256'] = json_digest(calibration_operations)
+        if resume_path:
+            with open(resume_path) as stream:
+                try:
+                    explorer.restore(json.load(stream), inputs)
+                except ValueError as exc:
+                    # Carry the named mismatch through the batch protocol even
+                    # when renode-test suppresses the monitor's output.
+                    return [{'fault_at': 0, 'fault_requested': 0, 'fault_type': 'rs',
+                             'fault_injected': False, 'boot_outcome': 'infra_error',
+                             'infrastructure_error': True, 'error': str(exc), 'signals': {}}]
     results, summary = explorer.run()
+    if checkpoint_path:
+        checkpoint = explorer.checkpoint(inputs)
+        if checkpoint is not None or os.path.isfile(checkpoint_path):
+            # Reusing the report path replaces an old continuation atomically.
+            from System.IO import File
+            temporary = checkpoint_path + '.tmp.' + str(os.getpid())
+            try:
+                with open(temporary, 'w') as stream:
+                    json.dump(checkpoint or {'version': 1, 'final': True}, stream,
+                              default=_json_safe, separators=(',', ':'))
+                if os.path.isfile(checkpoint_path):
+                    File.Replace(temporary, checkpoint_path, None)
+                else:
+                    File.Move(temporary, checkpoint_path)
+            finally:
+                if os.path.isfile(temporary):
+                    os.unlink(temporary)
+        if checkpoint is not None:
+            summary['checkpoint'] = os.path.basename(checkpoint_path)
+    if not results and summary['stopped_reason'] == 'max_wall_time_s':
+        # Preserve a zero-boot stop through the dynamic batch protocol.
+        results.append({'fault_at': 0, 'fault_requested': 0, 'fault_type': 'rs',
+                        'fault_injected': False, 'boot_outcome': 'skipped',
+                        'skip_reason': 'max_wall_time_s', 'signals': {}})
     summary['first_cut_programs_out_of_range'] = int(excluded.get('write', 0))
     summary['first_cut_erases_out_of_range'] = int(excluded.get('erase', 0))
     summary['first_cuts_out_of_range'] = sum(excluded.values())

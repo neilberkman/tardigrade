@@ -1664,6 +1664,11 @@ def run_runtime_sweep(
             for target in work_dir.glob(pattern):
                 shutil.rmtree(target, ignore_errors=True)
 
+    if "rs" in (fault_types_list or ()) and any(
+        v.startswith("STATE_SEARCH_RESUME:") for v in robot_vars
+    ) and not any("recovery_state_search_summary" in r for r in results):
+        error = next((r.get("error") for r in results if r.get("fault_type") == "rs"), None)
+        raise ValueError(error or "resume produced no recovery state search")
     return results
 
 
@@ -1990,6 +1995,7 @@ def run_multi_component_sweep(
     keep_run_artifacts: bool = False,
     no_control: bool = False,
     allow_state_evaluator: bool = False,
+    checkpoint_vars=None,
 ) -> Dict[str, Any]:
     """Orchestrate fault injection across multiple components.
 
@@ -2149,6 +2155,8 @@ def run_multi_component_sweep(
             )
         )
 
+        if checkpoint_vars and comp_profile.fault_sweep.phase2_fault.state_search.enabled:
+            comp_robot_vars = checkpoint_vars(comp_idx, comp_profile, comp_robot_vars)
         # Sweep this component.
         comp_results = run_runtime_sweep(
             repo_root=repo_root,

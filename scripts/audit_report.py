@@ -724,8 +724,8 @@ def summarize_runtime_sweep(
         if planned_fault_points == 0 and not non_control
         else (
             bool(injected)
-            and
-            not incomplete_result_ids
+            and (recovery_state_search_summary or {}).get("complete", True)
+            and not incomplete_result_ids
             and result_cardinality_mismatch == 0
             and control_cardinality_ok
             and not control_timeouts

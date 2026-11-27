@@ -6,6 +6,7 @@ invoking renode-test, running fault-point batches, and calibration logic.
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import datetime as dt
 import json
@@ -1298,6 +1299,13 @@ def run_batch(
     # point.  Keep the outer suite timeout at least as long as the profile's
     # configured execute budget (the same floor used by run_single_point()).
     profile_timeout_m = profile_robot_timeout_minutes(profile)
+    if fault_types_list == ["rs"]:
+        for variable in robot_vars:
+            if variable.startswith("PHASE2_STATE_SEARCH_B64:"):
+                config = json.loads(base64.b64decode(variable.split(":", 1)[1]))
+                if "resume_wall_time_s" in config:
+                    profile_timeout_m = max(profile_timeout_m or 0,
+                                            math.ceil((config["resume_wall_time_s"] + 120) / 60))
     if profile_timeout_m is not None:
         robot_test_timeout_s = max(
             robot_test_timeout_s,
