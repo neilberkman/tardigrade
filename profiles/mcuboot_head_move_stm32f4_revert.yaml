@@ -29,6 +29,9 @@ success_criteria:
   vtor_in_slot: exec
   marker_address: 0x00020014
   marker_value: 0x00000001
+  approved_image_running:
+    slot: exec
+    images: [staging]
 fault_sweep:
   mode: runtime
   evaluation_mode: execute

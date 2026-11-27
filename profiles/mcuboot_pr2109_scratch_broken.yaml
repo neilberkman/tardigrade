@@ -39,6 +39,9 @@ success_criteria:
   vtor_in_slot: exec
   image_hash: true
   expected_image: staging
+  approved_image_running:
+    slot: exec
+    images: [staging]
 
 fault_sweep:
   mode: runtime

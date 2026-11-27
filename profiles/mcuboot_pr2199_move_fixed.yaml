@@ -32,6 +32,9 @@ pre_boot_state:
   # Primary image_ok stays 0xFF (erased/UNSET) — triggers REVERT row
 success_criteria:
   vtor_in_slot: exec
+  approved_image_running:
+    slot: exec
+    images: [exec]
 state_probe:
   script: targets/mcuboot/probe.py
   required_paths:
