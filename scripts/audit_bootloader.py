@@ -209,6 +209,7 @@ def _calibration_point_coverage(
     fault_end: Optional[int],
     quick: bool,
     heuristic_used: bool,
+    first_cut_states_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Describe calibrated operations cut, represented, or outside the plan."""
     def representative_groups(
@@ -241,7 +242,7 @@ def _calibration_point_coverage(
         total: int, all_limit: Optional[int] = None
     ) -> int:
         state_search = profile.fault_sweep.phase2_fault.state_search
-        if state_search.first_cut_mode == "all":
+        if state_search.first_cut_mode in ("all", "distinct_states"):
             return min(
                 int(total),
                 int(total if all_limit is None else all_limit),
@@ -320,22 +321,30 @@ def _calibration_point_coverage(
     else:
         planned_program_range = 0
 
+    distinct_strategy = (
+        getattr(profile.fault_sweep, "sweep_strategy", "heuristic")
+        == "distinct_states"
+    )
     program_representation: List[str] = []
     if heuristic_used and has_direct_program_plan:
         program_representation.append("heuristic")
+    if distinct_strategy and has_direct_program_plan:
+        program_representation.append("distinct_states")
     if (
         quick
         and has_direct_program_plan
         and not bool(profile.fault_sweep.quick_use_heuristic)
     ):
         program_representation.append("quick")
-    erase_representation = (
-        ["quick"]
-        if quick
+    erase_representation: List[str] = []
+    if distinct_strategy and planned_base_codes.intersection({"e", "a"}):
+        erase_representation.append("distinct_states")
+    if (
+        quick
         and not bool(profile.fault_sweep.quick_use_heuristic)
         and planned_base_codes.intersection({"e", "a"})
-        else []
-    )
+    ):
+        erase_representation.append("quick")
     if "p2" in planned_base_codes and any(
         code in {"e", "a"} for code in phase2_first_codes
     ):
@@ -378,34 +387,64 @@ def _calibration_point_coverage(
         "representation": erase_representation,
     }
     if program_representation:
-        program_start = 0 if heuristic_used else max(0, int(fault_start or 0))
-        program_end = min(
-            int(calibrated_program_operations),
-            program_start + int(planned_program_range),
+        fcs_prog_groups = (
+            ((first_cut_states_summary or {}).get("program") or {}).get(
+                "representative_groups"
+            )
+            if distinct_strategy and not quick
+            else None
         )
-        program_representatives = [
-            int(point)
-            for point, fault_type in zip(fault_points, planned_fault_types)
-            if base_fault_type_code(fault_type) in direct_program_codes
-        ]
-        program_row["representative_groups"] = representative_groups(
-            program_representatives, program_start, program_end
-        )
+        if isinstance(fcs_prog_groups, dict):
+            program_row["representative_groups"] = dict(fcs_prog_groups)
+        else:
+            program_start = 0 if heuristic_used else max(0, int(fault_start or 0))
+            program_end = min(
+                int(calibrated_program_operations),
+                program_start + int(planned_program_range),
+            )
+            program_representatives = [
+                int(point)
+                for point, fault_type in zip(fault_points, planned_fault_types)
+                if base_fault_type_code(fault_type) in direct_program_codes
+            ]
+            program_row["representative_groups"] = representative_groups(
+                program_representatives, program_start, program_end
+            )
     if erase_representation:
-        erase_start = max(0, int(fault_start or 0))
-        erase_end = min(
-            int(calibrated_erases),
-            erase_start + int(planned_erase_range),
+        fcs_erase_groups = (
+            ((first_cut_states_summary or {}).get("erase") or {}).get(
+                "representative_groups"
+            )
+            if distinct_strategy and not quick
+            else None
         )
-        erase_representatives = [
-            int(point)
-            for point, fault_type in zip(fault_points, planned_fault_types)
-            if base_fault_type_code(fault_type) in {"e", "a"}
-        ]
-        erase_row["representative_groups"] = representative_groups(
-            erase_representatives, erase_start, erase_end
+        if isinstance(fcs_erase_groups, dict):
+            erase_row["representative_groups"] = dict(fcs_erase_groups)
+        else:
+            erase_start = max(0, int(fault_start or 0))
+            erase_end = min(
+                int(calibrated_erases),
+                erase_start + int(planned_erase_range),
+            )
+            erase_representatives = [
+                int(point)
+                for point, fault_type in zip(fault_points, planned_fault_types)
+                if base_fault_type_code(fault_type) in {"e", "a"}
+            ]
+            erase_row["representative_groups"] = representative_groups(
+                erase_representatives, erase_start, erase_end
+            )
+    coverage_out: Dict[str, Dict[str, Any]] = {
+        "program": program_row,
+        "erase": erase_row,
+    }
+    if isinstance(first_cut_states_summary, dict):
+        fcs_copy = dict(first_cut_states_summary)
+        fcs_copy.setdefault(
+            "strategy", getattr(profile.fault_sweep, "sweep_strategy", None)
         )
-    return {"program": program_row, "erase": erase_row}
+        coverage_out["first_cut_states"] = fcs_copy
+    return coverage_out
 
 
 def _calibration_stop_summary(
@@ -444,6 +483,41 @@ def _trace_replay_eligible_fault_types(fault_types: List[str]) -> bool:
         for ft in fault_types or ["power_loss"]
     }
     return bool(normalized.intersection(TRACE_REPLAY_FAULT_TYPES))
+
+
+def _first_cut_accounting_needs_erase_trace(
+    profile: ProfileConfig,
+    eval_mode: str,
+    fault_types: List[str],
+) -> bool:
+    """Return whether host first-cut state accounting needs erase provenance."""
+    if str(eval_mode or "").strip().lower() != "execute":
+        return False
+    durability = str(
+        getattr(profile.fault_sweep, "durability_model", "direct") or "direct"
+    ).strip().lower()
+    if durability != "direct":
+        return False
+
+    phase2 = profile.fault_sweep.phase2_fault
+    if phase2.enabled and phase2.state_search.enabled:
+        # Recovery-state search reports generation-1 accounting itself.
+        return False
+    if phase2.enabled and phase2.chains:
+        first_types = [chain[0][1] for chain in phase2.chains if chain]
+    elif phase2.enabled and phase2.pairs:
+        first_types = phase2.first_fault_types
+    else:
+        first_types = fault_types or ["power_loss"]
+    normalized = {
+        str(fault_type or "power_loss").split(":", 1)[0]
+        for fault_type in first_types
+    }
+    return bool(
+        normalized.intersection(
+            {"power_loss", "swap_progress", "interrupted_erase"}
+        )
+    )
 
 
 def _can_skip_auto_calibration(profile: ProfileConfig, eval_mode: str) -> bool:
@@ -2270,17 +2344,40 @@ def _main_single() -> int:
             or "multi_sector_atomicity" in fault_types
             or include_erase_fault_points
         )
-        include_erase_trace = include_erases or "swap_progress" in fault_types
-        include_erase_trace = include_erase_trace or "security_state_erase" in fault_types
+        distinct_states_active = (
+            getattr(profile.fault_sweep, "sweep_strategy", "heuristic")
+            == "distinct_states"
+            or getattr(
+                profile.fault_sweep.phase2_fault.state_search,
+                "first_cut_mode",
+                "quick",
+            )
+            == "distinct_states"
+        )
+        first_cut_accounting_active = _first_cut_accounting_needs_erase_trace(
+            profile,
+            eval_mode,
+            fault_types,
+        )
+        include_erase_trace = (
+            include_erases
+            or "swap_progress" in fault_types
+            or "security_state_erase" in fault_types
+            or distinct_states_active
+            or first_cut_accounting_active
+        )
 
         # Pass fault_types to calibration so erase trace is captured.
         if include_erase_trace:
             robot_vars.append("FAULT_TYPES:both")
 
-        should_calibrate_for_trace = (
-            eval_mode == "execute"
-            and not args.no_trace_replay
-            and _trace_replay_eligible_fault_types(fault_types)
+        should_calibrate_for_trace = eval_mode == "execute" and (
+            (
+                not args.no_trace_replay
+                and _trace_replay_eligible_fault_types(fault_types)
+            )
+            or distinct_states_active
+            or first_cut_accounting_active
         )
         # Prepare hash bypass for faulted sweep runs only.  Calibration and
         # clean controls always execute without bypass so they remain a
@@ -2601,6 +2698,7 @@ def _main_single() -> int:
                 setup_writes=setup_writes,
                 trace_file=trace_file,
                 erase_trace_file=erase_trace_file,
+                program_trace_file=program_trace_file,
                 backend_name=profile.flash_backend,
             ),
             quick=args.quick,
@@ -2612,6 +2710,7 @@ def _main_single() -> int:
         fault_points = plan.fault_points
         fault_types_list = plan.fault_types_list
         heuristic_summary = plan.heuristic_summary
+        first_cut_states_summary = getattr(plan, "first_cut_states_summary", None)
         swap_progress_summary = getattr(plan, "swap_progress_summary", None)
         security_state_erase_summary = getattr(plan, "security_state_erase_summary", None)
         clustered_bit_count = plan.clustered_bit_count
@@ -2813,6 +2912,46 @@ def _main_single() -> int:
             planned_program_operations=int(max_writes),
             heuristic_summary=heuristic_summary,
         )
+        if isinstance(first_cut_states_summary, dict):
+            rep_by_key: Dict[Tuple[str, int], Dict[str, Any]] = {}
+            for rep in first_cut_states_summary.get("representatives") or ():
+                if isinstance(rep, dict):
+                    rep_op = (
+                        "erase"
+                        if str(rep.get("operation")) == "erase"
+                        else "program"
+                    )
+                    rep_by_key[(rep_op, int(rep.get("operation_index", -1)))] = rep
+            for row in sweep_results:
+                if not isinstance(row, dict) or row.get("is_control"):
+                    continue
+                ft_base = str(row.get("fault_type") or "w").split(":", 1)[0]
+                if ft_base in ("rs", "p2", "pc"):
+                    continue
+                op_domain = (
+                    "erase"
+                    if (
+                        str(row.get("operation_kind") or "") == "erase"
+                        or ft_base in ("e", "a")
+                    )
+                    else "program"
+                )
+                try:
+                    f_at = int(row.get("fault_at"))
+                except (TypeError, ValueError):
+                    continue
+                matched_rep = rep_by_key.get((op_domain, f_at))
+                if matched_rep is not None:
+                    row["first_cut_state"] = {
+                        "state_identity": matched_rep.get("state_identity"),
+                        "torn_word": matched_rep.get("torn_word"),
+                        "phase_index": matched_rep.get("phase_index"),
+                        "region": matched_rep.get("region"),
+                        "duplicate_count": matched_rep.get("duplicate_count", 0),
+                        "duplicate_cuts": list(
+                            matched_rep.get("duplicate_cuts") or ()
+                        ),
+                    }
         calibration_point_coverage = _calibration_point_coverage(
             profile=profile,
             fault_points=fault_points,
@@ -2824,6 +2963,7 @@ def _main_single() -> int:
             fault_end=fault_end,
             quick=bool(args.quick),
             heuristic_used=heuristic_summary is not None,
+            first_cut_states_summary=first_cut_states_summary,
         )
         sweep_summary = summarize_runtime_sweep(
             sweep_results,
@@ -3079,6 +3219,7 @@ def _main_single() -> int:
             ),
             "quick": bool(args.quick),
             "heuristic": heuristic_summary,
+            "first_cut_states": first_cut_states_summary,
             "heuristic_config": (
                 profile.fault_sweep.heuristic_config.to_dict()
                 if profile.fault_sweep.heuristic_config is not None

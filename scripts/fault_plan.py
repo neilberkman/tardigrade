@@ -73,6 +73,7 @@ class FaultPlan:
     swap_progress_summary: Optional[Dict[str, Any]] = None
     security_state_erase_summary: Optional[Dict[str, Any]] = None
     clustered_bit_count: int = 0
+    first_cut_states_summary: Optional[Dict[str, Any]] = None
 
 
 @dataclasses.dataclass
@@ -86,6 +87,8 @@ class CalibrationInputs:
     setup_writes: int = 0
     trace_file: Optional[str] = None
     erase_trace_file: Optional[str] = None
+    program_trace_file: Optional[str] = None
+    tracking_base_file: Optional[str] = None
     backend_name: Optional[str] = None
 
 
@@ -571,6 +574,8 @@ def build_fault_plan(
         )
     trace_file = calibration.trace_file
     erase_trace_file = calibration.erase_trace_file
+    program_trace_file = getattr(calibration, "program_trace_file", None)
+    tracking_base_file = getattr(calibration, "tracking_base_file", None)
 
     fault_types = list(getattr(profile.fault_sweep, "fault_types", []) or [])
     include_power_loss = "power_loss" in fault_types
@@ -605,16 +610,19 @@ def build_fault_plan(
     include_metadata_fault = getattr(profile.fault_sweep, "metadata_fault", None) is not None and profile.fault_sweep.metadata_fault.enabled
 
     # -------------------------------------------------------------------
-    # Heuristic vs exhaustive point selection
+    # Heuristic vs distinct_states vs exhaustive point selection
     # -------------------------------------------------------------------
     heuristic_summary: Optional[Dict[str, Any]] = None
+    first_cut_states_summary: Optional[Dict[str, Any]] = None
+    distinct_selected_erase_fps: Optional[List[int]] = None
+    distinct_selected_state_ids: set = set()
     quick_use_heuristic = bool(
         getattr(profile.fault_sweep, "quick_use_heuristic", False)
     )
     trace_available = bool(trace_file and os.path.exists(trace_file))
-    heuristic_requested = (
-        getattr(profile.fault_sweep, "sweep_strategy", "heuristic") == "heuristic"
-    )
+    sweep_strategy = getattr(profile.fault_sweep, "sweep_strategy", "heuristic")
+    heuristic_requested = sweep_strategy == "heuristic"
+    distinct_states_requested = sweep_strategy == "distinct_states"
     heuristic_explicitly_requested = bool(
         getattr(profile.fault_sweep, "sweep_strategy_explicit", False)
     )
@@ -651,7 +659,140 @@ def build_fault_plan(
         and heuristic_requested
     )
 
-    if use_heuristic:
+    if distinct_states_requested:
+        from first_cut_states import analyze_profile_first_cut_states
+        from profile_loader import _validate_distinct_states_strategy
+
+        _validate_distinct_states_strategy(
+            profile.fault_sweep,
+            profile.platform,
+            calibration.backend_name or profile.flash_backend,
+            profile.extra_peripherals,
+            nvm_controller=profile.nvm_controller,
+            otp_peripheral=profile.otp_peripheral,
+            profile_path=profile.profile_path,
+        )
+        is_mram_for_erases = bool(
+            profile.flash_backend and "mram" in profile.flash_backend.lower()
+        )
+        allow_erase_candidates = include_erase_fault_points or not is_mram_for_erases
+        p2_cfg = profile.fault_sweep.phase2_fault
+        p2_ss_enabled = bool(p2_cfg.enabled and p2_cfg.state_search.enabled)
+        if p2_cfg.enabled and (p2_cfg.pairs or p2_cfg.chains or p2_ss_enabled):
+            if p2_cfg.chains:
+                cand_writes = any(
+                    chain[0][1] == "power_loss" for chain in p2_cfg.chains if chain
+                )
+                cand_erases = any(
+                    chain[0][1] == "interrupted_erase"
+                    for chain in p2_cfg.chains
+                    if chain
+                )
+            else:
+                cand_writes = "power_loss" in p2_cfg.first_fault_types
+                cand_erases = (
+                    "interrupted_erase" in p2_cfg.first_fault_types
+                    and include_erase_fault_points
+                )
+        else:
+            cand_writes = bool(include_power_loss or include_swap_progress)
+            cand_erases = bool(
+                include_erases and total_erases > 0 and allow_erase_candidates
+            )
+
+        allowed_writes = None
+        allowed_erases = None
+        if fault_start is not None or fault_end is not None or fault_step != 1:
+            allowed_writes = set(
+                _slice_explicit_points(
+                    list(range(max(0, max_writes))),
+                    fault_step=fault_step,
+                    fault_start=fault_start,
+                    fault_end=fault_end,
+                )
+            )
+            allowed_erases = set(
+                _slice_explicit_points(
+                    list(range(max(0, total_erases))),
+                    fault_step=fault_step,
+                    fault_start=fault_start,
+                    fault_end=fault_end,
+                )
+            )
+        elif p2_ss_enabled and p2_cfg.state_search.first_cut_mode == "ranges":
+            range_indices = {
+                idx
+                for r_start, r_end in p2_cfg.state_search.first_cut_ranges
+                for idx in range(int(r_start), int(r_end) + 1)
+            }
+            allowed_writes = set(range_indices)
+            allowed_erases = set(range_indices)
+        elif p2_cfg.enabled and p2_cfg.chains:
+            allowed_writes = {
+                int(chain[0][0])
+                for chain in p2_cfg.chains
+                if chain and chain[0][1] == "power_loss"
+            }
+            allowed_erases = {
+                int(chain[0][0])
+                for chain in p2_cfg.chains
+                if chain and chain[0][1] == "interrupted_erase"
+            }
+        elif p2_cfg.enabled and p2_cfg.pairs:
+            configured_first_cuts = {
+                int(first_cut) for first_cut, _second_cut in p2_cfg.pairs
+            }
+            allowed_writes = (
+                configured_first_cuts
+                if "power_loss" in p2_cfg.first_fault_types
+                else set()
+            )
+            allowed_erases = (
+                configured_first_cuts
+                if "interrupted_erase" in p2_cfg.first_fault_types
+                else set()
+            )
+
+        first_cut_states_summary = analyze_profile_first_cut_states(
+            profile,
+            trace_file=trace_file,
+            erase_trace_file=erase_trace_file,
+            program_trace_file=program_trace_file,
+            tracking_base_file=tracking_base_file,
+            total_writes=max_writes,
+            total_erases=total_erases,
+            include_writes=cand_writes,
+            include_erases=cand_erases,
+            backend_name=calibration.backend_name or profile.flash_backend,
+            allowed_write_indices=allowed_writes,
+            allowed_erase_indices=allowed_erases,
+            repo_root=repo_root,
+        )
+        fault_points = [
+            int(rep["operation_index"])
+            for rep in first_cut_states_summary["selected_representatives"]
+            if rep["operation"] == "write"
+        ]
+        distinct_selected_erase_fps = [
+            int(rep["operation_index"])
+            for rep in first_cut_states_summary["selected_representatives"]
+            if rep["operation"] == "erase"
+        ]
+        distinct_selected_state_ids = {
+            str(rep["state_identity"])
+            for rep in first_cut_states_summary["selected_representatives"]
+        }
+        print(
+            "Distinct states: {} planned from {} distinct states across {} candidate first cuts ({} duplicate cuts, {} capped).".format(
+                first_cut_states_summary["selected_states"],
+                first_cut_states_summary["distinct_states"],
+                first_cut_states_summary["candidate_cuts"],
+                first_cut_states_summary["duplicate_cuts"],
+                first_cut_states_summary["capped_states"],
+            ),
+            file=sys.stderr,
+        )
+    elif use_heuristic:
         from write_trace_heuristic import (
             classify_trace,
             load_trace,
@@ -877,11 +1018,19 @@ def build_fault_plan(
                 )
                 if quick and not quick_use_heuristic:
                     swap_fps = quick_subset(swap_fps)
-                combined.extend(
-                    (fp, FAULT_TYPE_NAME_TO_CODE["swap_progress"])
-                    for fp in swap_fps
-                )
-                swap_progress_count = len(swap_fps)
+                if distinct_states_requested:
+                    if not include_power_loss:
+                        combined.extend(
+                            (fp, FAULT_TYPE_NAME_TO_CODE["swap_progress"])
+                            for fp in fault_points
+                        )
+                        swap_progress_count = len(fault_points)
+                else:
+                    combined.extend(
+                        (fp, FAULT_TYPE_NAME_TO_CODE["swap_progress"])
+                        for fp in swap_fps
+                    )
+                    swap_progress_count = len(swap_fps)
             elif erase_entries:
                 flash_base = flash_base_for_profile(profile)
                 slot_ranges = sorted(
@@ -913,11 +1062,18 @@ def build_fault_plan(
                 )
                 if quick and not quick_use_heuristic:
                     swap_fps = quick_subset(swap_fps)
-                combined.extend(
-                    (fp, FAULT_TYPE_NAME_TO_CODE["swap_progress"])
-                    for fp in swap_fps
-                )
-                swap_progress_count = len(swap_fps)
+                if distinct_states_requested and not include_power_loss:
+                    combined.extend(
+                        (fp, FAULT_TYPE_NAME_TO_CODE["swap_progress"])
+                        for fp in fault_points
+                    )
+                    swap_progress_count = len(fault_points)
+                elif not distinct_states_requested:
+                    combined.extend(
+                        (fp, FAULT_TYPE_NAME_TO_CODE["swap_progress"])
+                        for fp in swap_fps
+                    )
+                    swap_progress_count = len(swap_fps)
             else:
                 swap_progress_summary = {
                     "status": "unavailable",
@@ -937,13 +1093,16 @@ def build_fault_plan(
         atomicity_count = 0
         allow_erase_points = include_erase_fault_points or not is_mram_backend
         if include_erases and total_erases > 0 and allow_erase_points:
-            erase_fps = list(range(0, total_erases))
-            erase_fps = _slice_explicit_points(
-                erase_fps,
-                fault_step=fault_step,
-                fault_start=fault_start,
-                fault_end=fault_end,
-            )
+            if distinct_states_requested and distinct_selected_erase_fps is not None:
+                erase_fps = list(distinct_selected_erase_fps)
+            else:
+                erase_fps = list(range(0, total_erases))
+                erase_fps = _slice_explicit_points(
+                    erase_fps,
+                    fault_step=fault_step,
+                    fault_start=fault_start,
+                    fault_end=fault_end,
+                )
             if quick and not quick_use_heuristic:
                 erase_fps = quick_subset(erase_fps)
             if "interrupted_erase" in fault_types or include_erase_fault_points:
@@ -1346,6 +1505,11 @@ def build_fault_plan(
             phase2_count = 1
         elif p2_config.enabled and (
             write_fps
+            or (
+                distinct_states_requested
+                and fault_points
+                and "w" in p2_first_codes
+            )
             or include_reset_at_time
             or p2_config.pairs
             or p2_config.chains
@@ -1364,22 +1528,90 @@ def build_fault_plan(
             p2_write_codes = [c for c in p2_type_codes if c != "t"]
 
             if p2_config.chains:
+                seen_chains: set = set()
+                cut_to_state = (
+                    (first_cut_states_summary or {}).get("cut_to_state") or {}
+                )
+                cut_to_rep = (
+                    (first_cut_states_summary or {}).get("cut_to_representative")
+                    or {}
+                )
                 for chain in p2_config.chains:
+                    effective_chain = list(chain)
+                    if distinct_states_requested and effective_chain:
+                        c0_at, c0_type = effective_chain[0]
+                        c0_code = FAULT_TYPE_NAME_TO_CODE[c0_type]
+                        c0_key = "{}:{}".format(c0_code, c0_at)
+                        if c0_key not in cut_to_state:
+                            raise ProfileError(
+                                "phase2_fault.chains first cut {} is outside the "
+                                "calibrated distinct-state candidate set".format(
+                                    c0_key
+                                )
+                            )
+                        st_id = cut_to_state[c0_key]
+                        if st_id not in distinct_selected_state_ids:
+                            continue
+                        rep_label = cut_to_rep.get(c0_key)
+                        if rep_label and ":" in rep_label:
+                            rep_code, rep_idx_text = rep_label.split(":", 1)
+                            rep_type = (
+                                "interrupted_erase"
+                                if rep_code == "e"
+                                else "power_loss"
+                            )
+                            effective_chain[0] = (int(rep_idx_text), rep_type)
+                        dedup_key = (st_id, tuple(effective_chain[1:]))
+                        if dedup_key in seen_chains:
+                            continue
+                        seen_chains.add(dedup_key)
                     fields = ["pc"]
-                    for cut_at, cut_type in chain:
+                    for cut_at, cut_type in effective_chain:
                         fields.extend(
                             (str(cut_at), FAULT_TYPE_NAME_TO_CODE[cut_type])
                         )
-                    combined.append((chain[0][0], ":".join(fields)))
+                    combined.append((effective_chain[0][0], ":".join(fields)))
                     phase2_count += 1
             elif p2_config.pairs:
+                seen_pairs: set = set()
+                cut_to_state = (
+                    (first_cut_states_summary or {}).get("cut_to_state") or {}
+                )
+                cut_to_rep = (
+                    (first_cut_states_summary or {}).get("cut_to_representative")
+                    or {}
+                )
                 for p1_fp, p2_fp in p2_config.pairs:
                     for p1_code in p2_first_codes:
+                        eff_p1_fp = p1_fp
+                        eff_p1_code = p1_code
+                        st_id = "{}:{}".format(p1_code, p1_fp)
+                        if distinct_states_requested:
+                            c_key = "{}:{}".format(p1_code, p1_fp)
+                            if c_key not in cut_to_state:
+                                raise ProfileError(
+                                    "phase2_fault.pairs first cut {} is outside "
+                                    "the calibrated distinct-state candidate "
+                                    "set".format(c_key)
+                                )
+                            st_id = cut_to_state[c_key]
+                            if st_id not in distinct_selected_state_ids:
+                                continue
+                            rep_label = cut_to_rep.get(c_key)
+                            if rep_label and ":" in rep_label:
+                                rep_c, rep_i = rep_label.split(":", 1)
+                                eff_p1_code = rep_c
+                                eff_p1_fp = int(rep_i)
                         for p2_code in p2_type_codes:
+                            if distinct_states_requested:
+                                dedup_key = (st_id, p2_fp, p2_code)
+                                if dedup_key in seen_pairs:
+                                    continue
+                                seen_pairs.add(dedup_key)
                             enc = "p2:{}:{}:{}:{}".format(
-                                p1_fp, p2_fp, p1_code, p2_code
+                                eff_p1_fp, p2_fp, eff_p1_code, p2_code
                             )
-                            combined.append((p1_fp, enc))
+                            combined.append((eff_p1_fp, enc))
                             phase2_count += 1
             elif p2_write_codes:
                 p2_range = list(range(0, p2_max))
@@ -1387,7 +1619,11 @@ def build_fault_plan(
                     p2_range = quick_subset(p2_range)
                 p1_representatives = []
                 if "w" in p2_first_codes:
-                    if quick_use_heuristic:
+                    if distinct_states_requested:
+                        p1_representatives.extend(
+                            (fp, "w") for fp in fault_points
+                        )
+                    elif quick_use_heuristic:
                         p1_representatives.extend(
                             (fp, "w") for fp, _ in write_fps
                         )
@@ -1397,15 +1633,28 @@ def build_fault_plan(
                             for fp in quick_subset([fp for fp, _ in write_fps])
                         )
                 if "e" in p2_first_codes and include_erase_fault_points:
-                    erase_first_points = _slice_explicit_points(
-                        list(range(total_erases)),
-                        fault_step=fault_step,
-                        fault_start=fault_start,
-                        fault_end=fault_end,
-                    )
-                    p1_representatives.extend(
-                        (fp, "e") for fp in quick_subset(erase_first_points)
-                    )
+                    if (
+                        distinct_states_requested
+                        and distinct_selected_erase_fps is not None
+                    ):
+                        erase_first_points = list(distinct_selected_erase_fps)
+                    else:
+                        erase_first_points = _slice_explicit_points(
+                            list(range(total_erases)),
+                            fault_step=fault_step,
+                            fault_start=fault_start,
+                            fault_end=fault_end,
+                        )
+                    if distinct_states_requested and (
+                        not quick or quick_use_heuristic
+                    ):
+                        p1_representatives.extend(
+                            (fp, "e") for fp in erase_first_points
+                        )
+                    else:
+                        p1_representatives.extend(
+                            (fp, "e") for fp in quick_subset(erase_first_points)
+                        )
                 for p1_fp, p1_code in p1_representatives:
                     for p2_fp in p2_range:
                         for p2_code in p2_write_codes:
@@ -1536,6 +1785,109 @@ def build_fault_plan(
             file=sys.stderr,
         )
 
+    if first_cut_states_summary is None and (
+        (trace_file and os.path.isfile(str(trace_file)))
+        or (program_trace_file and os.path.isfile(str(program_trace_file)))
+    ):
+        try:
+            from first_cut_states import analyze_profile_first_cut_states
+
+            is_mram_for_erases = bool(
+                profile.flash_backend and "mram" in profile.flash_backend.lower()
+            )
+            allow_erase_candidates = include_erase_fault_points or not is_mram_for_erases
+            summary_p2_config = profile.fault_sweep.phase2_fault
+            if summary_p2_config.enabled and summary_p2_config.state_search.enabled:
+                # Recovery-state search reports its generation-1 state counts
+                # directly. A host-side all-write summary would mask them in
+                # canonical point accounting.
+                cand_writes = False
+                cand_erases = False
+            elif summary_p2_config.enabled and summary_p2_config.chains:
+                cand_writes = any(
+                    chain and chain[0][1] == "power_loss"
+                    for chain in summary_p2_config.chains
+                )
+                cand_erases = any(
+                    chain and chain[0][1] == "interrupted_erase"
+                    for chain in summary_p2_config.chains
+                )
+            elif summary_p2_config.enabled and summary_p2_config.pairs:
+                cand_writes = "power_loss" in summary_p2_config.first_fault_types
+                cand_erases = (
+                    "interrupted_erase" in summary_p2_config.first_fault_types
+                    and include_erase_fault_points
+                )
+            else:
+                cand_writes = bool(include_power_loss or include_swap_progress)
+                cand_erases = bool(
+                    include_erases and total_erases > 0 and allow_erase_candidates
+                )
+            if cand_writes or cand_erases:
+                summary_allowed_writes = None
+                summary_allowed_erases = None
+                if fault_start is not None or fault_end is not None or fault_step != 1:
+                    summary_allowed_writes = set(
+                        _slice_explicit_points(
+                            list(range(max(0, max_writes))),
+                            fault_step=fault_step,
+                            fault_start=fault_start,
+                            fault_end=fault_end,
+                        )
+                    )
+                    summary_allowed_erases = set(
+                        _slice_explicit_points(
+                            list(range(max(0, total_erases))),
+                            fault_step=fault_step,
+                            fault_start=fault_start,
+                            fault_end=fault_end,
+                        )
+                    )
+                elif summary_p2_config.enabled and summary_p2_config.chains:
+                    summary_allowed_writes = {
+                        int(chain[0][0])
+                        for chain in summary_p2_config.chains
+                        if chain and chain[0][1] == "power_loss"
+                    }
+                    summary_allowed_erases = {
+                        int(chain[0][0])
+                        for chain in summary_p2_config.chains
+                        if chain and chain[0][1] == "interrupted_erase"
+                    }
+                elif summary_p2_config.enabled and summary_p2_config.pairs:
+                    configured_first_cuts = {
+                        int(first_cut)
+                        for first_cut, _second_cut in summary_p2_config.pairs
+                    }
+                    summary_allowed_writes = (
+                        configured_first_cuts
+                        if "power_loss" in summary_p2_config.first_fault_types
+                        else set()
+                    )
+                    summary_allowed_erases = (
+                        configured_first_cuts
+                        if "interrupted_erase"
+                        in summary_p2_config.first_fault_types
+                        else set()
+                    )
+                first_cut_states_summary = analyze_profile_first_cut_states(
+                    profile,
+                    trace_file=trace_file,
+                    erase_trace_file=erase_trace_file,
+                    program_trace_file=program_trace_file,
+                    tracking_base_file=tracking_base_file,
+                    total_writes=max_writes,
+                    total_erases=total_erases,
+                    include_writes=cand_writes,
+                    include_erases=cand_erases,
+                    backend_name=calibration.backend_name or profile.flash_backend,
+                    allowed_write_indices=summary_allowed_writes,
+                    allowed_erase_indices=summary_allowed_erases,
+                    repo_root=repo_root,
+                )
+        except Exception:
+            first_cut_states_summary = None
+
     return FaultPlan(
         fault_points=fault_points,
         fault_types_list=fault_types_list,
@@ -1543,4 +1895,5 @@ def build_fault_plan(
         swap_progress_summary=swap_progress_summary,
         security_state_erase_summary=security_state_erase_summary,
         clustered_bit_count=clustered_bit_count,
+        first_cut_states_summary=first_cut_states_summary,
     )

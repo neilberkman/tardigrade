@@ -53,6 +53,7 @@ from recovery_search import (
     select_first_cut_operations,
 )
 from recovery_coverage import resolve_executed_probe_pcs
+from first_cut_states import compute_first_cut_states
 from replay_cross_check import (
     first_pre_cut_trace_difference,
     format_replay_cross_check_error,
@@ -19815,6 +19816,15 @@ def _state_search_live_cross_check(state, chain, generation, operation):
     return status
 
 
+def _state_search_apply_distinct_first_cuts(selected, first_cut_analysis):
+    if first_cut_analysis is None:
+        return tuple(selected)
+    return tuple(
+        (representative['operation'], int(representative['operation_index']))
+        for representative in first_cut_analysis.get('selected_representatives', ())
+    )
+
+
 def run_recovery_state_search():
     _state_search_preflight()
     calibration_operations, total_writes, total_erases = (
@@ -19859,6 +19869,51 @@ def run_recovery_state_search():
             active_seed,
         )
 
+    effective_backend_kind = (
+        'cfi'
+        if 'CFIFlash' in str(type(backend.get('data')))
+        else ('mram' if backend.get('kind') == 'slow' else backend.get('kind'))
+    )
+    effective_program_unit = int(
+        getattr(backend.get('data'), 'ProgramUnitSize', 0)
+        or getattr(backend.get('data'), 'WordSize', 0)
+        or 4
+    )
+    first_cuts_config = phase2_state_search.get('first_cuts') or {}
+    use_distinct_first_cuts = bool(first_cuts_config.get('distinct_states')) or (
+        str(first_cuts_config.get('mode') or '').strip().lower() == 'distinct_states'
+    )
+    first_cut_analysis = None
+    if use_distinct_first_cuts:
+        first_cut_analysis = compute_first_cut_states(
+            initial_state,
+            calibration_operations,
+            include_writes=any(kind == 'write' for kind, _ in selected),
+            include_erases=any(kind == 'erase' for kind, _ in selected),
+            backend_kind=effective_backend_kind,
+            torn_word_mode=(torn_word if torn_word_explicit else mram_torn_word),
+            torn_word_choices=(
+                torn_word_choices if torn_word_explicit else mram_torn_word_choices
+            ),
+            torn_word_seed=(
+                torn_word_seed if torn_word_explicit else mram_torn_word_seed
+            ),
+            erase_fill=erase_fill,
+            corruption_seed=(
+                torn_word_seed if torn_word_explicit else mram_torn_word_seed
+            ),
+            page_size=page_size,
+            program_unit=effective_program_unit,
+            flash_base=flash_base,
+            cap=first_cuts_config.get('max_distinct_states'),
+            slots=dict(slots),
+            allowed_write_indices=[index for kind, index in selected if kind == 'write'],
+            allowed_erase_indices=[index for kind, index in selected if kind == 'erase'],
+        )
+        selected = _state_search_apply_distinct_first_cuts(
+            selected, first_cut_analysis
+        )
+
     explorer_class = RecoveryStateExplorer
     shard_options = {}
     if phase2_state_search.get('shard_count', 1) > 1:
@@ -19878,20 +19933,13 @@ def run_recovery_state_search():
         boot_state=_state_search_boot_state,
         flash_base=flash_base,
         address_ranges=phase2_state_search.get('address_ranges') or (),
-        backend_kind=(
-            'cfi'
-            if 'CFIFlash' in str(type(backend.get('data')))
-            else (
-                'mram' if backend.get('kind') == 'slow'
-                else backend.get('kind')
-            )
-        ),
+        backend_kind=effective_backend_kind,
         torn_word_mode=(torn_word if torn_word_explicit else mram_torn_word),
         torn_word_for_cut=torn_word_for_cut,
         erase_fill=erase_fill,
         corruption_seed=(torn_word_seed if torn_word_explicit else mram_torn_word_seed),
         page_size=page_size,
-        program_unit=int(getattr(backend.get('data'), 'ProgramUnitSize', 4) or 4),
+        program_unit=effective_program_unit,
         recovery_fault_types=(
             phase2_state_search.get('fault_types') or ('power_loss',)
         ),
@@ -19956,6 +20004,31 @@ def run_recovery_state_search():
         results.append({'fault_at': 0, 'fault_requested': 0, 'fault_type': 'rs',
                         'fault_injected': False, 'boot_outcome': 'skipped',
                         'skip_reason': 'max_wall_time_s', 'signals': {}})
+    if first_cut_analysis is not None:
+        summary['first_cut_strategy'] = 'distinct_states'
+        summary['first_cut_cap'] = first_cut_analysis.get('cap')
+        for domain in ('program', 'erase'):
+            domain_summary = first_cut_analysis.get(domain) or {}
+            for field in (
+                'candidate_cuts',
+                'distinct_states',
+                'planned_states',
+                'duplicate_cuts',
+                'capped_states',
+            ):
+                summary['first_cut_{}_{}'.format(domain, field)] = int(
+                    domain_summary.get(field, 0)
+                )
+        for field in (
+            'candidate_cuts',
+            'distinct_states',
+            'planned_states',
+            'duplicate_cuts',
+            'capped_states',
+        ):
+            summary['first_cut_{}'.format(field)] = int(
+                first_cut_analysis.get(field, 0)
+            )
     summary['first_cut_programs_out_of_range'] = int(excluded.get('write', 0))
     summary['first_cut_erases_out_of_range'] = int(excluded.get('erase', 0))
     summary['first_cuts_out_of_range'] = sum(excluded.values())

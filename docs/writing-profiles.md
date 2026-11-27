@@ -1085,7 +1085,27 @@ return does not violate the contract.
 
 ### Sweep strategy
 
-Default is `heuristic` — classifies writes by address and samples densely near trailer/metadata regions, sparsely over bulk data. Override with `sweep_strategy: exhaustive` for full coverage (slower).
+Default is `heuristic` — classifies writes by address and samples densely near trailer/metadata regions, sparsely over bulk data. Override with `sweep_strategy: exhaustive` for full coverage (slower), or `sweep_strategy: distinct_states` to compute the canonical persistent state left by each candidate first cut from the calibration trace and plan one point per distinct state.
+
+```yaml
+fault_sweep:
+  evaluation_mode: execute
+  sweep_strategy: distinct_states
+  max_distinct_states: 250   # optional phase-spread cap
+```
+
+`distinct_states` reuses the chunked Merkle-tree persistent-state model and SHA-256 identity from `scripts/recovery_state.py`. From the initial NVM baseline (or the deferred `tracking_start_address` boundary snapshot on MRAM), it steps the merged calibration write and erase stream in device execution order:
+
+1. **Candidate first cuts**: evaluates cutting before every write (when `power_loss` or `swap_progress` is configured) and before every erase when erase fault points are enabled (`include_erase_fault_points: true` or `interrupted_erase`). Even when erase fault points are disabled, completed erases in the calibration trace update the running persistent prefix so post-erase writes see the exact erased sector contents.
+2. **Torn outcomes and ECC marks**: applies the configured interrupted-operation outcome (`torn_word` on flash/CFI backends; `mram_torn_word` on MRAM/NVMemory backends, including `half`, `untouched`, `programmed`, `corrupted`, `uncorrectable` word marks, and deterministic per-point weighted choice draws via `torn_word_seed` / `mram_torn_word_seed`).
+3. **Representative selection and duplicate grouping**: keeps the earliest cut in trace sequence order that leaves a given persistent state identity as the planned representative and records every later write or erase cut that leaves the identical state under `duplicate_cuts` (both in the top-level `first_cut_states` report block and on each representative's `first_cut_state` result annotation).
+4. **Optional phase-spread cap (`max_distinct_states`)**: when the number of distinct first-cut states exceeds `max_distinct_states`, the trace is segmented into contiguous region phases (`<slot>_data`, `<slot>_trailer`, `scratch`/declared partitions, `metadata:<name>`, `bootloader`, `nvs`, or `outside`). Progressive water-filling allocates the cap across active phases so short phases (such as trailer updates or scratch erases) are tested in full while long bulk-copy phases share the remaining quota and sample evenly spaced distinct states across each long phase. The per-phase quotas, selected representatives, and omitted representatives are recorded deterministically in `first_cut_states.phases`.
+5. **Load-time and planning refusals**: `distinct_states` requires `mode: runtime`, `evaluation_mode: execute`, `durability_model: direct`, halting first-cut fault types (`power_loss`, `interrupted_erase`, `swap_progress`), no separate `nvm_controller` or `otp_peripheral`, and a direct width-explicit trace-capable flash or MRAM backend (and `TrackingBaseSnapshot` on MRAM when `tracking_start_address` is nonzero). Profiles that violate any requirement are refused at load time naming the missing capability; missing or width-ambiguous calibration traces fail closed during planning without falling back to `exhaustive`.
+6. **Combination with `state_search` and `phase2_fault`**:
+   - When `sweep_strategy: distinct_states` is combined with `phase2_fault.state_search.enabled: true` (or when `state_search.first_cuts.mode: distinct_states` is set explicitly), generation-1 first cuts come from the same distinct first-cut representative set (including `max_distinct_states` phase-spread capping when configured, and restricted to `first_cuts.ranges` when `mode: ranges` is explicitly set).
+   - With `phase2_fault` in representative grid mode (no `pairs`, `chains`, or `state_search`), the Phase-1 representative pool is drawn from the selected distinct-state write and erase representatives.
+   - With `phase2_fault.pairs` or `phase2_fault.chains`, the configured first cuts are the candidate universe. Each pair or chain's first cut is mapped to its canonical first-cut persistent state and earliest representative cut, deduplicating pairs or chains that share the same first-cut state identity and remaining recovery cut(s). A cap applies only to those configured first-cut states.
+7. **Canonical point accounting**: `point_counts.first_cut_states` (and all text, Markdown, HTML, and zero-day summary renderers) reports `candidate_cuts`, `distinct_states`, `planned_states`, `tested_states`, `duplicate_cuts`, `capped_states`, and `"N of M distinct first-cut states tested"` for both `program` and `erase` domains and in total.
 
 An explicitly configured heuristic strategy requires an address-bearing write
 trace. Trace-capable fast backends perform a fine calibration rerun when the
@@ -1844,7 +1864,7 @@ fault_sweep:
     state_search:
       enabled: true
       first_cuts:
-        mode: ranges       # quick, all, or ranges
+        mode: ranges       # quick, all, ranges, or distinct_states
         ranges:
           - {start: 0, end: 8} # inclusive indices in each selected domain
       max_cuts: 2          # default 2; 3 and higher repeat the same process
@@ -1855,8 +1875,11 @@ fault_sweep:
       cross_check_every: 100 # 0 disables periodic live chain checks
 ```
 
-The three first-cut modes select the normal first/middle/last quick set, all
-calibration operations, or the union of the configured inclusive index ranges.
+The four first-cut modes select the normal first/middle/last quick set, all
+calibration operations, the union of the configured inclusive index ranges, or
+the distinct first-cut representative set (`distinct_states`, which is also the
+default when `fault_sweep.sweep_strategy: distinct_states` is configured and
+`first_cuts.mode` is omitted).
 Selection is applied independently to the write and erase domains named by
 `first_fault_types`; for example, range `0..8` selects those erase indices in an
 erase-only search. Address ranges restrict recovery operations that may become

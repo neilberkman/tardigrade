@@ -228,7 +228,7 @@ def select_first_cuts(total_writes, first_cuts):
             selected = list(range(total_writes))
         else:
             selected = sorted(set((0, total_writes // 2, total_writes - 1)))
-    elif mode == "all":
+    elif mode in ("all", "distinct_states"):
         selected = list(range(total_writes))
     elif mode == "ranges":
         selected_set = set()

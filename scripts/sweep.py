@@ -2139,6 +2139,8 @@ def run_multi_component_sweep(
                 setup_writes=setup_writes,
                 trace_file=trace_file,
                 erase_trace_file=erase_trace_file,
+                program_trace_file=program_trace_file,
+                backend_name=comp_profile.flash_backend,
             ),
             quick=quick,
             fault_step=max(1, fault_step),

@@ -128,6 +128,23 @@ VALID_TORN_WORD_MODES: FrozenSet[str] = frozenset(
     }
 )
 
+VALID_SWEEP_STRATEGIES: FrozenSet[str] = frozenset(
+    {
+        "heuristic",
+        "exhaustive",
+        "full",
+        "distinct_states",
+    }
+)
+
+SUPPORTED_DISTINCT_STATES_FAULT_TYPES: FrozenSet[str] = frozenset(
+    {
+        "power_loss",
+        "interrupted_erase",
+        "swap_progress",
+    }
+)
+
 
 def _is_mram_backend(
     platform: Optional[str],
@@ -416,14 +433,206 @@ def _validate_mram_torn_word_backend(
                 "evaluation_mode 'execute' (state mode does not execute the "
                 "CPU and cannot model a bus error on read)"
             )
-        durability = (
-            str(getattr(fs, "durability_model", None) or "direct").strip().lower()
-        )
-        if durability == "writeback":
-            raise ProfileError(
-                "fault_sweep.mram_torn_word 'uncorrectable' is not supported "
-                "with durability_model 'writeback'"
+        if "uncorrectable" in torn_word_modes:
+            durability = (
+                str(getattr(fs, "durability_model", None) or "direct").strip().lower()
             )
+            if durability == "writeback":
+                raise ProfileError(
+                    "fault_sweep.mram_torn_word 'uncorrectable' is not supported "
+                    "with durability_model 'writeback'"
+                )
+
+
+def _read_repl_with_includes(repl_path: Path, _seen: Optional[set] = None) -> str:
+    seen = set(_seen or ())
+    try:
+        resolved = repl_path.resolve()
+    except OSError:
+        return ""
+    if resolved in seen or not repl_path.is_file():
+        return ""
+    seen.add(resolved)
+    try:
+        text = repl_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    parts = [text]
+    for match in re.finditer(r'using\s+"([^"]+)"', text):
+        inc_path = repl_path.parent / match.group(1)
+        if inc_path.is_file():
+            parts.append(_read_repl_with_includes(inc_path, seen))
+    return "\n".join(parts)
+
+
+def _validate_distinct_states_strategy(
+    fs: Optional["FaultSweepConfig"],
+    platform: Optional[str],
+    flash_backend: Optional[str],
+    extra_peripherals: Optional[List[str]] = None,
+    nvm_controller: Optional[str] = None,
+    otp_peripheral: Optional[str] = None,
+    profile_path: Optional[Path] = None,
+) -> None:
+    if fs is None:
+        return
+    p2 = getattr(fs, "phase2_fault", None)
+    ss = getattr(p2, "state_search", None) if p2 is not None else None
+    strategy_is_distinct = getattr(fs, "sweep_strategy", "heuristic") == "distinct_states"
+    ss_uses_distinct = bool(
+        p2 is not None
+        and getattr(p2, "enabled", False)
+        and ss is not None
+        and getattr(ss, "enabled", False)
+        and getattr(ss, "first_cut_mode", "") == "distinct_states"
+    )
+    if not strategy_is_distinct and not ss_uses_distinct:
+        return
+
+    mode = str(getattr(fs, "mode", "runtime") or "").strip().lower()
+    if mode != "runtime":
+        raise ProfileError(
+            "fault_sweep.sweep_strategy 'distinct_states' requires "
+            "fault_sweep.mode 'runtime' (got {!r})".format(getattr(fs, "mode", None))
+        )
+    eval_mode = str(getattr(fs, "evaluation_mode", None) or "").strip().lower()
+    if eval_mode != "execute":
+        raise ProfileError(
+            "fault_sweep.sweep_strategy 'distinct_states' requires "
+            "fault_sweep.evaluation_mode 'execute' (got {!r})".format(
+                getattr(fs, "evaluation_mode", None)
+            )
+        )
+    durability = str(getattr(fs, "durability_model", "direct") or "direct").strip().lower()
+    if durability != "direct":
+        raise ProfileError(
+            "fault_sweep.sweep_strategy 'distinct_states' does not support "
+            "fault_sweep.durability_model {!r}; direct durability is required".format(
+                durability
+            )
+        )
+    max_writes = getattr(fs, "max_writes", "auto")
+    if not (isinstance(max_writes, str) and max_writes.strip().lower() == "auto"):
+        if int(max_writes) <= 0:
+            raise ProfileError(
+                "fault_sweep.sweep_strategy 'distinct_states' requires "
+                "fault_sweep.max_writes 'auto' or a positive integer (got {!r})".format(
+                    max_writes
+                )
+            )
+    if nvm_controller is not None:
+        raise ProfileError(
+            "fault_sweep.sweep_strategy 'distinct_states' cannot canonicalize a "
+            "separate nvm_controller ({!r})".format(nvm_controller)
+        )
+    if otp_peripheral is not None:
+        raise ProfileError(
+            "fault_sweep.sweep_strategy 'distinct_states' cannot canonicalize a "
+            "separate otp_peripheral ({!r})".format(otp_peripheral)
+        )
+    backend_lower = str(flash_backend or "").strip().lower()
+    if backend_lower.startswith("sysbus."):
+        backend_lower = backend_lower[len("sysbus."):]
+    if "otp" in backend_lower:
+        raise ProfileError(
+            "fault_sweep.sweep_strategy 'distinct_states' does not support OTP "
+            "flash_backend {!r}".format(flash_backend)
+        )
+    if backend_lower in ("nvm_ctrl", "gfc", "generic_nvm"):
+        raise ProfileError(
+            "fault_sweep.sweep_strategy 'distinct_states' requires a direct "
+            "trace-capable flash or MRAM backend; controller-only flash_backend "
+            "{!r} cannot supply the calibration operation trace".format(flash_backend)
+        )
+
+    is_mram = _is_mram_backend(
+        platform, flash_backend, extra_peripherals, profile_path=profile_path
+    )
+    tracking_start = int(getattr(fs, "tracking_start_address", 0) or 0)
+    if tracking_start != 0 and not is_mram:
+        raise ProfileError(
+            "fault_sweep.sweep_strategy 'distinct_states' with nonzero "
+            "fault_sweep.tracking_start_address requires an MRAM backend with "
+            "TrackingBaseSnapshot support (got platform={!r}, flash_backend={!r})".format(
+                platform, flash_backend
+            )
+        )
+
+    if platform:
+        if "cortex_m0_traceless.repl" in str(platform).lower():
+            raise ProfileError(
+                "fault_sweep.sweep_strategy 'distinct_states' requires a "
+                "width-explicit trace-capable backend in platform {!r}".format(platform)
+            )
+        default_root = Path(__file__).resolve().parents[1]
+        candidates = []
+        if profile_path is not None:
+            candidates.append(Path(profile_path).resolve().parent / platform)
+        candidates.append(default_root / platform)
+        candidates.append(Path(platform))
+        trace_capable_types = (
+            "NRF52NVMC",
+            "STM32F4FlashController",
+            "STM32F4FastFlash",
+            "STM32H7FlashController",
+            "STM32H7FastFlash",
+            "An521NvmInterceptor",
+            "CFIFlash",
+            "MappedMRAMTracker",
+            "Memory.NVMemory",
+        )
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            platform_text = _read_repl_with_includes(candidate)
+            if not any(type_name in platform_text for type_name in trace_capable_types):
+                raise ProfileError(
+                    "fault_sweep.sweep_strategy 'distinct_states' requires a "
+                    "width-explicit trace-capable backend in platform {!r}; "
+                    "declared peripherals cannot supply a width-explicit "
+                    "calibration operation trace".format(platform)
+                )
+            break
+
+    if strategy_is_distinct:
+        p2_replaces_single_cuts = bool(
+            p2 is not None
+            and getattr(p2, "enabled", False)
+            and (
+                bool(getattr(p2, "pairs", None))
+                or bool(getattr(p2, "chains", None))
+                or bool(ss is not None and getattr(ss, "enabled", False))
+            )
+        )
+        if not p2_replaces_single_cuts:
+            configured_types = list(getattr(fs, "fault_types", None) or [])
+            unsupported_types = sorted(
+                set(configured_types) - SUPPORTED_DISTINCT_STATES_FAULT_TYPES
+            )
+            if unsupported_types:
+                raise ProfileError(
+                    "fault_sweep.sweep_strategy 'distinct_states' requires halting "
+                    "first-cut fault types (power_loss, interrupted_erase, "
+                    "swap_progress); fault_sweep.fault_types {!r} cannot be "
+                    "canonicalized from the calibration trace".format(unsupported_types)
+                )
+            include_erase_points = bool(getattr(fs, "include_erase_fault_points", False))
+            if not configured_types and not include_erase_points:
+                raise ProfileError(
+                    "fault_sweep.sweep_strategy 'distinct_states' requires at "
+                    "least one write or erase first-cut fault type in "
+                    "fault_sweep.fault_types"
+                )
+            if (
+                "interrupted_erase" in configured_types
+                and is_mram
+                and not include_erase_points
+            ):
+                raise ProfileError(
+                    "fault_sweep.sweep_strategy 'distinct_states' with "
+                    "interrupted_erase on an MRAM backend requires "
+                    "fault_sweep.include_erase_fault_points: true"
+                )
 
 
 _MAX_INHERITANCE_DEPTH = 10
@@ -915,6 +1124,9 @@ class RecoveryStateSearchConfig:
         "enabled",
         "plan_only",
         "first_cut_mode",
+        "first_cut_mode_explicit",
+        "use_distinct_first_cuts",
+        "max_distinct_states",
         "first_cut_ranges",
         "max_cuts",
         "max_new_states",
@@ -931,6 +1143,9 @@ class RecoveryStateSearchConfig:
         self,
         enabled: bool = False,
         first_cut_mode: str = "quick",
+        first_cut_mode_explicit: bool = False,
+        use_distinct_first_cuts: bool = False,
+        max_distinct_states: Optional[int] = None,
         first_cut_ranges: Optional[List[Tuple[int, int]]] = None,
         max_cuts: int = 2,
         max_new_states: int = 1000,
@@ -950,10 +1165,17 @@ class RecoveryStateSearchConfig:
                 "fault_sweep.phase2_fault.state_search.plan_only requires state_search.enabled"
             )
         self.first_cut_mode = str(first_cut_mode).strip().lower()
-        if self.first_cut_mode not in ("quick", "all", "ranges"):
+        self.first_cut_mode_explicit = bool(first_cut_mode_explicit)
+        self.use_distinct_first_cuts = bool(
+            use_distinct_first_cuts or self.first_cut_mode == "distinct_states"
+        )
+        self.max_distinct_states = (
+            None if max_distinct_states is None else int(max_distinct_states)
+        )
+        if self.first_cut_mode not in ("quick", "all", "ranges", "distinct_states"):
             raise ProfileError(
                 "fault_sweep.phase2_fault.state_search.first_cuts.mode: "
-                "expected quick, all, or ranges"
+                "expected quick, all, ranges, or distinct_states"
             )
         self.first_cut_ranges = list(first_cut_ranges or [])
         if self.first_cut_mode == "ranges" and not self.first_cut_ranges:
@@ -1030,16 +1252,23 @@ class RecoveryStateSearchConfig:
             self.max_boots_without_new_coverage = None
 
     def to_runtime_dict(self) -> Dict[str, Any]:
+        first_cuts_payload: Dict[str, Any] = {
+            "mode": self.first_cut_mode,
+            "ranges": [
+                {"start": start, "end": end}
+                for start, end in self.first_cut_ranges
+            ],
+        }
+        if self.use_distinct_first_cuts or self.first_cut_mode == "distinct_states":
+            first_cuts_payload["distinct_states"] = True
+            if self.max_distinct_states is not None:
+                first_cuts_payload["max_distinct_states"] = int(
+                    self.max_distinct_states
+                )
         payload: Dict[str, Any] = {
             "enabled": self.enabled,
             **({"plan_only": True} if self.plan_only else {}),
-            "first_cuts": {
-                "mode": self.first_cut_mode,
-                "ranges": [
-                    {"start": start, "end": end}
-                    for start, end in self.first_cut_ranges
-                ],
-            },
+            "first_cuts": first_cuts_payload,
             "max_cuts": self.max_cuts,
             "max_new_states": self.max_new_states,
             "max_wall_time_s": self.max_wall_time_s,
@@ -2074,6 +2303,7 @@ class FaultSweepConfig:
         "fault_distribution",
         "heuristic_config",
         "max_heuristic_points",
+        "max_distinct_states",
         "quick_use_heuristic",
         "boot_registers",
         "reset_mode",
@@ -2135,6 +2365,7 @@ class FaultSweepConfig:
         fault_distribution: Optional["FaultDistributionConfig"] = None,
         heuristic_config: Optional["HeuristicConfig"] = None,
         max_heuristic_points: Optional[int] = 2000,
+        max_distinct_states: Optional[int] = None,
         quick_use_heuristic: bool = False,
         boot_registers: Optional[List[Dict[str, Any]]] = None,
         reset_mode: str = "warm",
@@ -2285,7 +2516,13 @@ class FaultSweepConfig:
         self.runfor_watchdog_timeout_s = runfor_watchdog_timeout_s
         self.fault_types = ["power_loss"] if fault_types is None else list(fault_types)
         self.evaluation_mode = evaluation_mode
-        self.sweep_strategy = sweep_strategy
+        self.sweep_strategy = str(sweep_strategy).strip()
+        if self.sweep_strategy not in VALID_SWEEP_STRATEGIES:
+            raise ProfileError(
+                "fault_sweep.sweep_strategy: expected one of {}, got {!r}".format(
+                    sorted(VALID_SWEEP_STRATEGIES), sweep_strategy
+                )
+            )
         self.sweep_strategy_explicit = bool(sweep_strategy_explicit)
         self.sweep_hash_bypass_symbols = sweep_hash_bypass_symbols or []
         self.progress_stall_timeout_s = progress_stall_timeout_s
@@ -2322,6 +2559,48 @@ class FaultSweepConfig:
         self.max_heuristic_points = (
             None if max_heuristic_points is None else int(max_heuristic_points)
         )
+        if isinstance(max_distinct_states, bool):
+            raise ProfileError(
+                "fault_sweep.max_distinct_states must be an integer or None"
+            )
+        try:
+            self.max_distinct_states = (
+                None if max_distinct_states is None else int(max_distinct_states)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ProfileError(
+                "fault_sweep.max_distinct_states must be an integer or None"
+            ) from exc
+        if self.max_distinct_states is not None and self.max_distinct_states < 1:
+            raise ProfileError(
+                "fault_sweep.max_distinct_states must be >= 1 or None, got {}".format(
+                    self.max_distinct_states
+                )
+            )
+        if (
+            self.max_distinct_states is not None
+            and self.max_distinct_states > MAX_PROFILE_FAULT_POINTS
+        ):
+            raise ProfileError(
+                "fault_sweep.max_distinct_states exceeds safety limit {}".format(
+                    MAX_PROFILE_FAULT_POINTS
+                )
+            )
+        if (
+            self.max_distinct_states is not None
+            and self.sweep_strategy != "distinct_states"
+        ):
+            raise ProfileError(
+                "fault_sweep.max_distinct_states is only valid when "
+                "fault_sweep.sweep_strategy is 'distinct_states'"
+            )
+        if self.sweep_strategy == "distinct_states" and self.phase2_fault.state_search.enabled:
+            self.phase2_fault.state_search.use_distinct_first_cuts = True
+            self.phase2_fault.state_search.max_distinct_states = (
+                self.max_distinct_states
+            )
+            if not self.phase2_fault.state_search.first_cut_mode_explicit:
+                self.phase2_fault.state_search.first_cut_mode = "distinct_states"
         self.quick_use_heuristic = bool(quick_use_heuristic)
         if self.max_heuristic_points is not None and self.max_heuristic_points < 1:
             raise ValueError(
@@ -3187,6 +3466,15 @@ class ProfileConfig:
                 self.extra_peripherals,
                 profile_path=self.profile_path,
             )
+            _validate_distinct_states_strategy(
+                self.fault_sweep,
+                self.platform,
+                self.flash_backend,
+                self.extra_peripherals,
+                nvm_controller=self.nvm_controller,
+                otp_peripheral=self.otp_peripheral,
+                profile_path=self.profile_path,
+            )
         self.ownership_plan: Dict[str, Any] = _build_profile_ownership_plan(self)
         if isinstance(self.multi_component, MultiComponentConfig):
             self.ownership_plan["components"] = {
@@ -3798,6 +4086,7 @@ class ProfileConfig:
                 str(
                     bool(set(fs.fault_types) & TRACE_COVERAGE_FAULT_TYPES)
                     or fs.phase2_fault.state_search.enabled
+                    or fs.sweep_strategy == "distinct_states"
                 ).lower()
             ),
             "RUNTIME_MODE:true",
@@ -5484,6 +5773,7 @@ def _parse_fault_sweep(
                 else int(raw.get("max_heuristic_points"))
             )
         ),
+        max_distinct_states=raw.get("max_distinct_states"),
         quick_use_heuristic=_parse_bool(
             raw.get("quick_use_heuristic", False),
             "fault_sweep.quick_use_heuristic",
@@ -5822,6 +6112,7 @@ def _parse_recovery_state_search(raw: Optional[Dict[str, Any]]) -> RecoveryState
             "fault_sweep.phase2_fault.state_search.plan_only",
         ),
         first_cut_mode=str(first_cuts.get("mode", "quick")),
+        first_cut_mode_explicit="mode" in first_cuts,
         first_cut_ranges=first_ranges,
         max_cuts=int(raw.get("max_cuts", 2)),
         max_new_states=int(raw.get("max_new_states", 1000)),
@@ -8837,6 +9128,7 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
         "verification_probes", "function_return_probes", "verification_bypass_probe", "metadata_fault",
         "metadata_delta", "partial_staging", "nvs_corruption",
         "fault_distribution", "heuristic", "max_heuristic_points",
+        "max_distinct_states",
         "quick_use_heuristic", "reset_mode", "i2c_fault_config",
         "durability_model", "writeback",
         "rc_injection_config",
@@ -9120,6 +9412,14 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
             raise ProfileError(
                 "fault_sweep.max_heuristic_points is only valid when "
                 "fault_sweep.sweep_strategy is 'heuristic'"
+            )
+        if (
+            "max_distinct_states" in fault_sweep
+            and str(fault_sweep.get("sweep_strategy", "heuristic")) != "distinct_states"
+        ):
+            raise ProfileError(
+                "fault_sweep.max_distinct_states is only valid when "
+                "fault_sweep.sweep_strategy is 'distinct_states'"
             )
         nested_fault_schemas = {
             "phase2_fault": {
