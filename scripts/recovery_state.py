@@ -476,6 +476,10 @@ def _normalize_operation(raw, kind=None, sequence=None):
     return normalized
 
 
+def normalize_trace(operations):
+    return tuple(_normalize_operation(op, sequence=i) for i, op in enumerate(operations))
+
+
 def merge_operation_traces(write_trace, erase_trace):
     """Return the deterministic device order represented by both traces.
 
@@ -987,10 +991,7 @@ class RecoveryStateComputer(object):
         program_unit=4,
     ):
         self.initial_state = initial_state
-        self.operations = tuple(
-            _normalize_operation(operation, sequence=index)
-            for index, operation in enumerate(operations)
-        )
+        self.operations = normalize_trace(operations)
         self.fault_type = fault_type
         self.backend_kind = backend_kind
         self.torn_word_mode = torn_word_mode

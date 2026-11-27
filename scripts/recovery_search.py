@@ -6,9 +6,13 @@
 from __future__ import division
 
 import copy
+from collections import deque
 
+from recovery_checkpoint import SnapshotWriter, restore_snapshots, validate_checkpoint
 from recovery_state import (
-    RecoveryStateComputer,
+    normalize_trace,
+    apply_completed_operation,
+    apply_interrupted_operation,
 )
 
 
@@ -403,7 +407,7 @@ class RecoveryStateExplorer(object):
         cross_check=None,
     ):
         self.initial_state = initial_state
-        self.calibration_operations = tuple(calibration_operations)
+        self.calibration_operations = normalize_trace(calibration_operations)
         self.first_cuts = tuple(
             (str(item[0]), int(item[1]))
             if isinstance(item, (tuple, list)) and len(item) == 2
@@ -426,7 +430,14 @@ class RecoveryStateExplorer(object):
         self.cross_check = cross_check
         self.budget = SearchBudget(max_new_states, max_wall_time_s, clock)
         self._seen = {}
-        self._cross_checks = {}
+        self._traces = []
+        # A frame retains the completed prefix immediately before its next cut.
+        # Parent None denotes the calibration trace; other parents index results.
+        self._frames = deque([(None, 0, initial_state, 0)] if self.calibration_operations else [])
+        self._pending = deque()
+        self._computed_frontier = {}
+        self._prior_elapsed = 0.0
+        self._resumed = False
         self._deeper_cross_check_candidates = 0
         self.results = []
         self.summary = {
@@ -470,62 +481,6 @@ class RecoveryStateExplorer(object):
     def _is_recovery_cut(self, operation):
         return str(operation.get("kind") or "") in self.recovery_operation_kinds
 
-    def _computer(self, state, operations, generation, chain):
-        # RecoveryStateComputer accepts one mode per walk.  Point-dependent
-        # modes are handled by walking one operation at a time in _candidates.
-        return RecoveryStateComputer(
-            state,
-            operations,
-            backend_kind=self.backend_kind,
-            torn_word_mode=self.torn_word_mode,
-            erase_fill=self.erase_fill,
-            corruption_seed=self.corruption_seed,
-            page_size=self.page_size,
-            program_unit=self.program_unit,
-        )
-
-    def _candidates(self, state, operations, generation, chain):
-        if self.torn_word_for_cut is None:
-            for operation, candidate in self._computer(
-                state, operations, generation, chain
-            ).iter_cut_states():
-                yield operation, candidate
-            return
-
-        # Preserve the completed prefix while allowing the configured MRAM
-        # torn-word choice to vary deterministically with each operation.
-        prefix = state
-        for operation in operations:
-            one = RecoveryStateComputer(
-                prefix,
-                (operation,),
-                backend_kind=self.backend_kind,
-                torn_word_mode=self._mode_for_cut(operation, generation, chain),
-                erase_fill=self.erase_fill,
-                corruption_seed=self.corruption_seed,
-                page_size=self.page_size,
-                program_unit=self.program_unit,
-            )
-            candidate = next(iter(one.iter_cut_states()))[1]
-            yield operation, candidate
-            prefix = one.final_state()
-
-    def _remember_or_reuse(self, state, chain):
-        identity = state.identity()
-        prior = self._seen.get(identity)
-        if prior is not None:
-            self.summary["states_reused"] += 1
-            if chain and chain[0].get("operation") == "erase":
-                self.summary["erase_first_states_reused"] += 1
-            else:
-                self.summary["program_first_states_reused"] += 1
-            if prior.get("result") is not None:
-                add_equivalent_chain(prior["result"], chain)
-            return prior
-        entry = {"state": state, "result": None}
-        self._seen[identity] = entry
-        return None
-
     def _maybe_cross_check(
         self, state, chain, generation, operation, selection_ordinal=None
     ):
@@ -550,8 +505,6 @@ class RecoveryStateExplorer(object):
                     format_chain(chain)["text"], exc
                 )
             )
-        if outcome is not False:
-            self._cross_checks[state.identity()] = outcome
         self.summary["cross_checks_passed"] += 1
         return outcome
 
@@ -563,23 +516,12 @@ class RecoveryStateExplorer(object):
         operation=None,
         cross_check_ordinal=None,
     ):
-        if self.budget.wall_expired():
-            self.summary["states_excluded_by_wall_time"] += 1
-            self.summary["stopped_reason"] = "max_wall_time_s"
-            return None
-        if self.budget.boot_limit_reached():
-            self.summary["states_excluded_by_max_new_states"] += 1
-            if self.summary["stopped_reason"] is None:
-                self.summary["stopped_reason"] = "max_new_states"
-            return None
-        self._maybe_cross_check(
-            state,
-            chain,
-            generation,
-            operation,
-            selection_ordinal=cross_check_ordinal,
+        # Admission covers the check and its recovery boot as one visit.
+        # A live check may itself carry the clock past the deadline.
+        self.budget.booted += 1
+        checked = self._maybe_cross_check(
+            state, chain, generation, operation, selection_ordinal=cross_check_ordinal,
         )
-        self.budget.record_boot()
         booted = self.boot_state(state, chain, generation)
         if len(booted) == 2:
             result, operations = booted
@@ -591,15 +533,16 @@ class RecoveryStateExplorer(object):
                 "boot_state must return result, operations, and optional trace base"
             )
         attach_search_metadata(result, chain, state, generation)
-        if state.identity() in self._cross_checks:
-            result["recovery_state_search"]["cross_check"] = self._cross_checks[
-                state.identity()
-            ]
-        entry = self._seen[state.identity()]
-        entry["result"] = result
-        entry["operations"] = tuple(operations)
-        entry["trace_base_state"] = trace_base_state
+        if self._resumed:
+            result["recovery_state_search"]["resume_origin"] = "after_resume"
+        if checked is not None and checked is not False:
+            result["recovery_state_search"]["cross_check"] = checked
+        parent = len(self.results)
+        self._seen[state.identity_hex()] = result
         self.results.append(result)
+        self._traces.append(normalize_trace(operations))
+        if self._traces[-1]:
+            self._frames.append((parent, 0, trace_base_state, 0))
         self.summary["states_booted"] += 1
         if generation == 1:
             self.summary["single_cut_states_booted"] += 1
@@ -609,122 +552,193 @@ class RecoveryStateExplorer(object):
                 self.summary["single_cut_program_states_booted"] += 1
         else:
             self.summary["deeper_cut_states_booted"] += 1
-        return entry
+
+    def _source(self, parent):
+        if parent is None:
+            return self.calibration_operations, ()
+        chain = self.results[parent]["recovery_state_search"]["chain"]["cuts"]
+        return self._traces[parent], tuple(chain)
+
+    def _visit(self, parent, index, state):
+        operations, prefix = self._source(parent)
+        operation = operations[index]
+        chain = prefix + (format_cut(operation, self.flash_base),)
+        generation = len(chain)
+        ordinal = None
+        if generation > 2:
+            self._deeper_cross_check_candidates += 1
+            ordinal = self._deeper_cross_check_candidates
+        prior = self._seen.get(state.identity_hex())
+        if prior is None:
+            self._boot(state, chain, generation, operation, ordinal)
+            return
+        self._count_reuse(self.summary, chain)
+        checked = None
+        if ordinal is not None:
+            checked = self._maybe_cross_check(state, chain, generation, operation, ordinal)
+        add_equivalent_chain(prior, chain, checked)
+
+    @staticmethod
+    def _count_reuse(summary, chain):
+        summary["states_reused"] += 1
+        field = ("erase_first_states_reused" if chain[0]["operation"] == "erase"
+                 else "program_first_states_reused")
+        summary[field] += 1
+
+    def _selected(self, operation, first, selected, counts):
+        if first:
+            if (operation["kind"], operation["operation_index"]) not in selected:
+                return False
+            counts["first_cut_states_computed"] += 1
+            field = ("first_cut_erase_states_computed" if operation["kind"] == "erase"
+                     else "first_cut_program_states_computed")
+            counts[field] += 1
+        else:
+            counts["recovery_operations_seen"] += 1
+            if not self._is_recovery_cut(operation):
+                counts["recovery_operations_excluded_by_fault_type"] += 1
+                return False
+            if not operation_in_address_ranges(operation, self.flash_base, self.address_ranges):
+                counts["recovery_operations_excluded_by_address"] += 1
+                return False
+            counts["recovery_operations_considered"] += 1
+        counts["states_computed"] += 1
+        return True
+
+    def _expand(self, frames, selected, counts, preview=False):
+        parent, index, prefix, erases = frames.popleft()
+        operations, chain = self._source(parent)
+        if len(chain) >= self.max_cuts:
+            counts["recovery_operations_excluded_by_max_cuts"] += sum(
+                1 for op in operations if self._is_recovery_cut(op)
+                and operation_in_address_ranges(op, self.flash_base, self.address_ranges)
+            )
+            return
+        op = operations[index]
+        if index + 1 < len(operations):
+            completed = apply_completed_operation(prefix, op, self.erase_fill)
+            frames.appendleft((parent, index + 1, completed, erases + (op["kind"] == "erase")))
+        if not self._selected(op, parent is None, selected, counts):
+            return None
+        key = (parent, index)
+        candidate = self._computed_frontier.get(key)
+        if candidate is None:
+            candidate = apply_interrupted_operation(
+                prefix, op, backend_kind=self.backend_kind,
+                torn_word_mode=self._mode_for_cut(op, len(chain) + 1, chain),
+                erase_fill=self.erase_fill, corruption_seed=self.corruption_seed,
+                total_erases=erases, page_size=self.page_size, program_unit=self.program_unit,
+            )
+        if preview:
+            self._computed_frontier[key] = candidate
+        else:
+            self._computed_frontier.pop(key, None)
+        return parent, index, candidate
+
+    def checkpoint(self, inputs):
+        if not self._pending and not self._frames:
+            return None
+        snapshots = SnapshotWriter()
+        visits = [[parent, index, snapshots.reference(state)]
+                  for parent, index, state in self._pending]
+        frames = [[parent, index, snapshots.reference(prefix), erases]
+                  for parent, index, prefix, erases in self._frames]
+        return {
+            "version": 1, "inputs": inputs, "results": self.results,
+            "recovery_traces": self._traces, "pending_visits": visits,
+            "computed_frontier": [[parent, index, snapshots.reference(state)]
+                                  for (parent, index), state in self._computed_frontier.items()],
+            "trace_queue": frames, "snapshots": snapshots.states, "chunks": snapshots.chunks,
+            "cross_check_position": self._deeper_cross_check_candidates,
+            "counters": self.summary, "elapsed_s": self._elapsed,
+            "limits": {"max_new_states": self.budget.max_new_states,
+                       "max_wall_time_s": self.budget.max_wall_time_s},
+        }
+
+    def restore(self, checkpoint, inputs):
+        validate_checkpoint(checkpoint, inputs)
+        snapshots = restore_snapshots(checkpoint)
+        self.results = checkpoint["results"]
+        self._traces = checkpoint["recovery_traces"]
+        self.summary = checkpoint["counters"]
+        for result in self.results:
+            metadata = result["recovery_state_search"]
+            metadata["resume_origin"] = "before_resume"
+            self._seen[metadata["state_identity"]] = result
+        self._pending = deque((parent, index, snapshots[key])
+                              for parent, index, key in checkpoint["pending_visits"])
+        self._frames = deque((parent, index, snapshots[key], erases)
+                             for parent, index, key, erases in checkpoint["trace_queue"])
+        self._computed_frontier = dict(((parent, index), snapshots[key])
+                                       for parent, index, key in checkpoint["computed_frontier"])
+        self._deeper_cross_check_candidates = checkpoint["cross_check_position"]
+        self.budget.max_new_states += checkpoint["limits"]["max_new_states"]
+        self.budget.max_wall_time_s += checkpoint["limits"]["max_wall_time_s"]
+        self.budget.booted = len(self.results)
+        self._prior_elapsed = checkpoint["elapsed_s"]
+        self._resumed = True
 
     def run(self):
-        queue = []
+        self.budget.started_at = self.budget.clock() - self._prior_elapsed
         selected = set(self.first_cuts)
-        for operation, candidate in self._candidates(
-            self.initial_state, self.calibration_operations, 1, ()
-        ):
-            selected_key = (
-                str(operation["kind"]), int(operation["operation_index"])
-            )
-            if selected_key not in selected:
-                continue
-            self.summary["first_cut_states_computed"] += 1
-            if operation["kind"] == "erase":
-                self.summary["first_cut_erase_states_computed"] += 1
-            else:
-                self.summary["first_cut_program_states_computed"] += 1
-            self.summary["states_computed"] += 1
-            chain = (format_cut(operation, self.flash_base),)
-            if self._remember_or_reuse(candidate, chain) is not None:
-                continue
-            entry = self._boot(candidate, chain, 1)
-            if entry is not None:
-                queue.append((
-                    entry["trace_base_state"], chain, 1, entry["operations"]
-                ))
+        reason = "complete"
+        while self._pending or self._frames:
             if self.budget.wall_expired():
-                self.summary["stopped_reason"] = "max_wall_time_s"
+                reason = "max_wall_time_s"
                 break
-
-        cursor = 0
-        while cursor < len(queue):
-            if self.budget.wall_expired():
-                self.summary["stopped_reason"] = "max_wall_time_s"
-                self.summary["unexpanded_states_at_wall_time"] += len(queue) - cursor
-                break
-            state, chain, generation, operations = queue[cursor]
-            cursor += 1
-            eligible = sum(
-                1
-                for operation in operations
-                if self._is_recovery_cut(operation)
-                and operation_in_address_ranges(
-                    operation, self.flash_base, self.address_ranges
-                )
-            )
-            if generation >= self.max_cuts:
-                self.summary["recovery_operations_excluded_by_max_cuts"] += eligible
-                continue
-
-            for operation, candidate in self._candidates(
-                state, operations, generation + 1, chain
-            ):
-                self.summary["recovery_operations_seen"] += 1
-                if not self._is_recovery_cut(operation):
-                    self.summary[
-                        "recovery_operations_excluded_by_fault_type"
-                    ] += 1
-                    continue
-                if not operation_in_address_ranges(
-                    operation, self.flash_base, self.address_ranges
-                ):
-                    self.summary["recovery_operations_excluded_by_address"] += 1
-                    continue
-                self.summary["recovery_operations_considered"] += 1
-                self.summary["states_computed"] += 1
-                next_chain = chain + (format_cut(operation, self.flash_base),)
-                cross_check_ordinal = None
-                if generation + 1 > 2:
-                    self._deeper_cross_check_candidates += 1
-                    cross_check_ordinal = self._deeper_cross_check_candidates
-                prior = self._remember_or_reuse(candidate, next_chain)
-                if prior is not None:
-                    if cross_check_ordinal is not None:
-                        cross_check = self._maybe_cross_check(
-                            candidate,
-                            next_chain,
-                            generation + 1,
-                            operation,
-                            selection_ordinal=cross_check_ordinal,
-                        )
-                        if cross_check is not None and prior.get("result") is not None:
-                            add_equivalent_chain(
-                                prior["result"], next_chain, cross_check=cross_check
-                            )
-                    continue
-                entry = self._boot(
-                    candidate,
-                    next_chain,
-                    generation + 1,
-                    operation=operation,
-                    cross_check_ordinal=cross_check_ordinal,
-                )
-                if entry is not None:
-                    queue.append(
-                        (
-                            entry["trace_base_state"],
-                            next_chain,
-                            generation + 1,
-                            entry["operations"],
-                        )
-                    )
-                if self.budget.wall_expired():
-                    self.summary["stopped_reason"] = "max_wall_time_s"
-                    self.summary["unexpanded_states_at_wall_time"] += len(queue) - cursor
+            if self._pending:
+                parent, index, state = self._pending[0]
+                if self.budget.boot_limit_reached() and state.identity_hex() not in self._seen:
+                    reason = "max_new_states"
                     break
-            if self.summary["stopped_reason"] == "max_wall_time_s":
-                break
+                self._pending.popleft()
+                self._visit(parent, index, state)
+            else:
+                visit = self._expand(self._frames, selected, self.summary)
+                if visit:
+                    self._pending.append(visit)
 
-        self.summary["unique_states_seen"] = len(self._seen)
-        self.summary["elapsed_s"] = round(self.budget.wall_time_s(), 3)
-        if self.summary["stopped_reason"] is None:
-            self.summary["stopped_reason"] = "complete"
-        if self.results:
-            self.results[0]["recovery_state_search_summary"] = copy.deepcopy(
-                self.summary
-            )
-        return self.results, self.summary
+        self._elapsed = self.budget.wall_time_s()
+        summary = dict(self.summary)
+        omitted = list(self._pending)
+        if reason == "max_new_states":
+            # Count the known frontier for this report without advancing the
+            # durable visit cursor. A later wall stop must see exactly the same
+            # counters and unexpanded parents as an uninterrupted search.
+            frames = deque(self._frames)
+            while frames and not self.budget.wall_expired():
+                visit = self._expand(frames, selected, summary, preview=True)
+                if visit:
+                    omitted.append(visit)
+        known = set(self._seen)
+        results = self.results
+        if omitted:
+            # Project the omitted frontier onto this report only. A subsequent
+            # run accounts for each deferred visit when it reaches that visit.
+            results = [
+                dict(r, recovery_state_search=copy.deepcopy(r["recovery_state_search"]))
+                for r in results
+            ]
+            by_id = dict((r["recovery_state_search"]["state_identity"], r) for r in results)
+            for parent, index, state in omitted:
+                identity = state.identity_hex()
+                if identity in known:
+                    operations, prefix = self._source(parent)
+                    chain = prefix + (format_cut(operations[index], self.flash_base),)
+                    self._count_reuse(summary, chain)
+                    if identity in by_id:
+                        add_equivalent_chain(by_id[identity], chain)
+                known.add(identity)
+        summary["complete"] = reason == "complete"
+        if reason == "max_wall_time_s":
+            summary["states_excluded_by_wall_time"] = len(known) - len(self._seen)
+            summary["unexpanded_states_at_wall_time"] = len(self._frames)
+        elif reason == "max_new_states":
+            summary["states_excluded_by_max_new_states"] = len(known) - len(self._seen)
+        summary["stopped_reason"] = reason
+        summary["unique_states_seen"] = len(known)
+        summary["elapsed_s"] = round(self._elapsed, 3)
+        if results:
+            results = list(results)
+            results[0] = dict(results[0], recovery_state_search_summary=dict(summary))
+        return results, summary
