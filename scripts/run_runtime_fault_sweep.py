@@ -639,9 +639,9 @@ mram_torn_word_choices = _parse_mram_torn_word_choices(
     get_optional_var('mram_torn_word_choices', '')
 )
 torn_word = get_optional_var('torn_word', 'fixed').strip().lower() or 'fixed'
-if torn_word not in ('fixed', 'untouched', 'programmed', 'partial_bits'):
+if torn_word not in ('fixed', 'untouched', 'programmed', 'partial_bits', 'uncorrectable'):
     raise Exception(
-        'torn_word must be fixed, untouched, programmed, or partial_bits, got {}'.format(
+        'torn_word must be fixed, untouched, programmed, partial_bits, or uncorrectable, got {}'.format(
             torn_word
         )
     )
@@ -653,7 +653,7 @@ torn_word_explicit = (
 
 
 def _parse_torn_word_choices(text):
-    valid = ('fixed', 'untouched', 'programmed', 'partial_bits')
+    valid = ('fixed', 'untouched', 'programmed', 'partial_bits', 'uncorrectable')
     choices = []
     seen = set()
     for item in str(text or '').split(','):
@@ -747,6 +747,25 @@ def _require_torn_word_support():
                 torn_word, backend.get('backend_sysbus_name')
             )
         )
+    if torn_word == 'uncorrectable' or any(
+        mode == 'uncorrectable' for mode, _ in (torn_word_choices or ())
+    ):
+        target = _mram_uncorrectable_target()
+        required = (
+            'MarkWordUncorrectable',
+            'ClearUncorrectableWords',
+            'ClearUncorrectableReadLog',
+            'UncorrectableWordsToString',
+            'UncorrectableReadsToString',
+            'UncorrectableReadCount',
+        )
+        if target is None or any(not hasattr(target, attr) for attr in required):
+            raise Exception(
+                "fault_sweep.torn_word 'uncorrectable' requires an ECC flash peripheral "
+                'with uncorrectable word tracking and read-fault support; {} lacks it'.format(
+                    backend.get('backend_sysbus_name')
+                )
+            )
 
 def _apply_mram_torn_word_mode():
     """Set the torn-word mode (and optional seed) on every backend object that exposes it.
@@ -2835,7 +2854,7 @@ def _provable_terminal_self_branch(cpu_ref, pc_value):
         ipsr = 0
     symbol = _elf_symbol_context(pc_address)
     symbol_name = symbol.get('name') if symbol is not None else None
-    if ipsr in (3, 4, 5, 6):
+    if ipsr in (2, 3, 4, 5, 6):
         terminal_rule = 'fault_handler_self_branch'
     elif symbol_name in _TERMINAL_HALT_SYMBOLS:
         terminal_rule = 'known_halt_self_branch'
@@ -5116,7 +5135,14 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
     if wall_timeout is None:
         wall_timeout = phase2_wall_timeout_s
     cpu_ref = monitor.Machine['sysbus.cpu']
-    marked_addresses = _snapshot_mram_uncorrectable_addresses() if backend.get('kind') == 'mram' else []
+    marked_addresses = (
+        _snapshot_mram_uncorrectable_addresses()
+        if (
+            backend.get('kind') == 'mram'
+            or (globals().get('_mram_uncorrectable_target') and _mram_uncorrectable_target() is not None)
+        )
+        else []
+    )
     reset_nvmc_for_recovery()
     arm_vtor_watchpoint()
     status = run_until_done(
@@ -5181,7 +5207,8 @@ def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injec
         run_boot_cycle_hook(cycle_index, cycle_records)
         followup_uncorr = (
             _snapshot_mram_uncorrectable_offsets()
-            if b['kind'] in ('mram', 'slow') else []
+            if (b['kind'] in ('mram', 'slow') or _mram_uncorrectable_target() is not None)
+            else []
         )
         if b['kind'] == 'mram':
             current_flash = b['data'].ReadBytes(0, flash_size)
@@ -7627,6 +7654,7 @@ def reload_images_from_map(images_map):
     elif b['kind'] == 'fast':
         # Fast path: fill MappedMemory with 0xFF (erased state).
         # Use page-size chunks via NVMC ERASEPAGE for efficient fill.
+        _clear_mram_uncorrectable_words()
         flash_size = int(b['data'].FlashSize)
         flash_base = int(b['data'].FlashBaseAddress)
         page_size = int(b['data'].PageSize)
@@ -7981,6 +8009,7 @@ def reload_images_cached():
         except:
             pass
         b = backend
+        _clear_mram_uncorrectable_words()
         if b['kind'] == 'mram':
             b['data'].WriteBytes(0, _cached_update_sequence_fault_flash, 0, len(_cached_update_sequence_fault_flash))
         elif b['kind'] == 'fast':
@@ -7993,6 +8022,7 @@ def reload_images_cached():
     except:
         pass
     b = backend
+    _clear_mram_uncorrectable_words()
     if _cached_initial_flash is not None and b['kind'] == 'mram':
         b['data'].WriteBytes(0, _cached_initial_flash, 0, len(_cached_initial_flash))
     elif _cached_initial_flash is not None and b['kind'] == 'fast':
@@ -8602,7 +8632,7 @@ def collect_recovery_execution_evidence(
         evidence['ipsr'] = active_exception
     except Exception:
         active_exception = 0
-    fault_exception_active = active_exception in (3, 4, 5, 6)
+    fault_exception_active = active_exception in (2, 3, 4, 5, 6)
     evidence['fault_exception_active'] = fault_exception_active
 
     _resolve_model_fn = globals().get('_resolve_cpu_model')
@@ -17422,11 +17452,11 @@ def _trace_replay_flash_torn_value(previous_value, requested_value, width,
     if width not in (1, 2, 4, 8):
         raise ValueError('flash torn replay requires a supported write width')
     normalized = str(mode or 'fixed').strip().lower()
-    if normalized not in ('fixed', 'untouched', 'programmed', 'partial_bits'):
+    if normalized not in ('fixed', 'untouched', 'programmed', 'partial_bits', 'uncorrectable'):
         raise ValueError('unknown flash torn-word mode {!r}'.format(normalized))
     value_mask = (1 << (8 * width)) - 1
     previous = int(previous_value) & value_mask
-    if normalized in ('fixed', 'untouched'):
+    if normalized in ('fixed', 'untouched', 'uncorrectable'):
         return previous
     fill = sum((int(erase_fill) & 0xFF) << (8 * index) for index in range(width))
     requested = int(requested_value) & value_mask
@@ -17446,7 +17476,7 @@ def _trace_replay_flash_torn_erase(previous_bytes, offset, erase_fill,
                                    fixed_erase_behavior='half'):
     normalized = str(mode or 'fixed').strip().lower()
     result = bytearray(previous_bytes)
-    if normalized == 'untouched':
+    if normalized in ('untouched', 'uncorrectable'):
         return result
     if normalized == 'fixed':
         if str(fixed_erase_behavior).strip().lower() == 'untouched':
@@ -18105,6 +18135,12 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
                     for byte_index in range(width):
                         b[byte_index] = (torn_value >> (8 * byte_index)) & 0xFF
                     _replay_storage_write_bytes(flash_off, b)
+                    if torn_word == 'uncorrectable':
+                        _require_torn_word_support()
+                        fault_uncorrectable_offsets = [int(flash_off)]
+                        fault_uncorrectable_addresses = [
+                            fmt_u32(int(flash_off) + int(flash_base_addr))
+                        ]
                     writes_applied += 1
                     mram_power_loss_torn = True
                     mram_power_loss_width = int(width)
@@ -18130,7 +18166,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         faulted_flash = _replay_storage_read_bytes(0, flash_size)
         fault_snapshot_bytes = to_py_bytes(faulted_flash)
 
-    if backend.get('kind') == 'mram':
+    if backend.get('kind') == 'mram' or _mram_uncorrectable_target() is not None:
         inherited_marks = set(_snapshot_mram_uncorrectable_offsets())
         inherited_marks.update(
             int(offset) for offset in fault_uncorrectable_offsets
@@ -18799,7 +18835,7 @@ def _state_search_boot_state(state, chain, generation):
         boot_outcome,
         p2_status=p2_status,
         marked_at_fault=marked_addresses,
-        torn_word_mode=mram_torn_word,
+        torn_word_mode=(torn_word if torn_word_explicit else mram_torn_word),
     )
     signals['phase1_ms'] = 0
     signals['phase2_ms'] = boot_ms

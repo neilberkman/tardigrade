@@ -604,7 +604,7 @@ def _flash_fault_bytes(previous, intended, mode, erase_fill,
     if len(previous) != len(intended):
         raise RecoveryStateError("previous and intended flash words differ in width")
     normalized = str(mode or "fixed").strip().lower()
-    if normalized in ("fixed", "untouched", "half", "half_retain"):
+    if normalized in ("fixed", "untouched", "uncorrectable", "half", "half_retain"):
         return previous
     if normalized not in ("programmed", "partial_bits"):
         raise RecoveryStateError("unknown flash torn-word mode {!r}".format(normalized))
@@ -862,7 +862,7 @@ def _apply_erase_fault(
             bytes(bytearray((fill_byte,) * size)),
             clear_uncorrectable=True,
         )
-    if mode == "uncorrectable" and str(backend_kind).lower() == "mram":
+    if mode == "uncorrectable":
         marks = set(state.uncorrectable_words)
         unit = max(1, int(program_unit))
         first = (offset // unit) * unit

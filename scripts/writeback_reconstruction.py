@@ -71,9 +71,9 @@ def flash_torn_program_bytes(previous, requested, erase_fill, mode, seed,
     if len(previous) != len(requested) or len(previous) not in SUPPORTED_WRITE_WIDTHS:
         raise ValueError("flash torn program values have an unsupported width")
     normalized = str(mode or "fixed").strip().lower()
-    if normalized not in ("fixed", "untouched", "programmed", "partial_bits"):
+    if normalized not in ("fixed", "untouched", "programmed", "partial_bits", "uncorrectable"):
         raise ValueError("unknown flash torn-word mode {!r}".format(normalized))
-    if normalized in ("fixed", "untouched"):
+    if normalized in ("fixed", "untouched", "uncorrectable"):
         return bytes(previous)
     width = len(previous)
     old_value = sum(int(value) << (8 * index) for index, value in enumerate(previous))
@@ -99,7 +99,7 @@ def flash_torn_erase_bytes(previous, erase_fill, program_unit, mode, seed,
     """Return the selected flash erase result for replay reconstruction."""
     normalized = str(mode or "fixed").strip().lower()
     result = bytearray(previous)
-    if normalized == "untouched":
+    if normalized in ("untouched", "uncorrectable"):
         return bytes(result)
     if normalized == "fixed":
         if str(fixed_erase_behavior).strip().lower() == "untouched":

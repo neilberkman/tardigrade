@@ -118,6 +118,7 @@ VALID_TORN_WORD_MODES: FrozenSet[str] = frozenset(
         "untouched",
         "programmed",
         "partial_bits",
+        "uncorrectable",
     }
 )
 
@@ -141,8 +142,10 @@ def _is_mram_backend(
         "nvmc",
         "nvm_ctrl",
         "flash",
+        "stm32f1",
         "stm32f4",
         "stm32h7",
+        "stm32l4",
     }
     if backend_lower:
         if "mram" in backend_lower:
@@ -294,13 +297,19 @@ def _validate_torn_word_backend(
     candidates.append(Path(platform))
     supported_types = (
         "NRF52NVMC",
+        "STM32F1FlashController",
         "STM32F4FlashController",
         "STM32F4FastFlash",
         "STM32H7FlashController",
         "STM32H7FastFlash",
+        "STM32L4FlashController",
         "An521NvmInterceptor",
         "CFIFlash",
     )
+    torn_word_mode = getattr(fs, "torn_word", "fixed")
+    torn_word_modes = {torn_word_mode} | {
+        mode for mode, _ in getattr(fs, "torn_word_choices", ())
+    }
     for candidate in candidates:
         try:
             if not candidate.is_file():
@@ -311,6 +320,27 @@ def _validate_torn_word_backend(
                     "fault_sweep.torn_word is not supported by the flash "
                     "peripheral declared in '{}'".format(platform)
                 )
+            if "uncorrectable" in torn_word_modes:
+                if "STM32L4FlashController" not in platform_text:
+                    raise ProfileError(
+                        "fault_sweep.torn_word 'uncorrectable' requires an ECC "
+                        "flash peripheral with uncorrectable read-fault support "
+                        "in '{}'".format(platform)
+                    )
+                eval_mode = str(getattr(fs, "evaluation_mode", None) or "").strip().lower()
+                if eval_mode == "state":
+                    raise ProfileError(
+                        "fault_sweep.torn_word 'uncorrectable' requires "
+                        "evaluation_mode 'execute'"
+                    )
+                durability = (
+                    str(getattr(fs, "durability_model", None) or "direct").strip().lower()
+                )
+                if durability == "writeback":
+                    raise ProfileError(
+                        "fault_sweep.torn_word 'uncorrectable' is not supported "
+                        "with durability_model 'writeback'"
+                    )
             return
         except ProfileError:
             raise
