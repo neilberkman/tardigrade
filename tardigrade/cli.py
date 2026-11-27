@@ -128,6 +128,9 @@ def main(argv=None):
     demo.add_argument("--timeout", type=int, default=600)
     demo.add_argument("--workers", type=int, default=1)
     demo.add_argument("--output-dir", type=Path, default=Path("results/demo"))
+    bisect_parser = commands.add_parser("bisect", help="find a change in a repeated point verdict")
+    from .verdict_bisect import add_arguments, run as run_bisect
+    add_arguments(bisect_parser)
     report = commands.add_parser("report", help="render audit JSON as HTML")
     report.add_argument("--input", required=True, action="append")
     report.add_argument("--output", required=True)
@@ -158,6 +161,8 @@ def main(argv=None):
             str(args.output_dir.expanduser().resolve()),
         ])
     try:
+        if args.command == "bisect":
+            return run_bisect(args)
         if args.command == "merge-state-search":
             sys.path.insert(0, str(RUNTIME / "scripts"))
             from merge_state_search import merge_files

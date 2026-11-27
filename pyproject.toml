@@ -34,6 +34,7 @@ include-package-data = false
     "profiles/naive_bare_copy.yaml",
     "profiles/demo_mcuboot_offset_upgrade.yaml",
     "profiles/mcuboot_offset_upgrade.yaml",
+    "examples/mram_ecc_record_recovery/profile_handled.yaml",
     "examples/vulnerable_ota/firmware.elf",
     "examples/vulnerable_ota/firmware.bin",
     "results/oss_validation/assets/oss_mcuboot_head_offset.elf",
