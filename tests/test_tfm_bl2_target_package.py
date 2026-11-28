@@ -768,6 +768,62 @@ class TfmBl2GenerateRuntimeProfileTest(unittest.TestCase):
             )
             self.assertFalse(loaded_ow.expect.should_find_issues)
 
+            # Verify --state-search profile rendering and CLI
+            rendered_ss = render_runtime_profile(
+                build_dir,
+                state_search=True,
+                state_search_max_cuts=3,
+                state_search_max_new_states=384,
+                state_search_cross_check_every=8,
+            )
+            written_ss = write_runtime_profile(out_yaml, rendered_ss)
+            loaded_ss = load_profile(written_ss, strict=True)
+            self.assertEqual(loaded_ss.fault_sweep.tracking_start_address, 0)
+            self.assertTrue(loaded_ss.fault_sweep.include_erase_fault_points)
+            self.assertTrue(loaded_ss.fault_sweep.torn_word_explicit)
+            self.assertEqual(loaded_ss.fault_sweep.torn_word_seed, 20261127)
+            self.assertTrue(loaded_ss.fault_sweep.phase2_fault.enabled)
+            self.assertEqual(
+                loaded_ss.fault_sweep.phase2_fault.first_fault_types,
+                ["power_loss", "interrupted_erase"],
+            )
+            self.assertEqual(
+                loaded_ss.fault_sweep.phase2_fault.fault_types,
+                ["power_loss", "interrupted_erase"],
+            )
+            self.assertTrue(loaded_ss.fault_sweep.phase2_fault.state_search.enabled)
+            self.assertEqual(
+                loaded_ss.fault_sweep.phase2_fault.state_search.max_cuts, 3
+            )
+            self.assertEqual(
+                loaded_ss.fault_sweep.phase2_fault.state_search.max_new_states, 384
+            )
+            self.assertEqual(
+                loaded_ss.fault_sweep.phase2_fault.state_search.cross_check_every, 8
+            )
+            self.assertEqual(
+                len(loaded_ss.fault_sweep.phase2_fault.state_search.address_ranges),
+                12,
+            )
+
+            rc_ss = gen_main(
+                [
+                    "--build-dir",
+                    str(build_dir),
+                    "--state-search",
+                    "--state-search-max-cuts",
+                    "2",
+                ]
+            )
+            self.assertEqual(rc_ss, 0)
+            loaded_cli_ss = load_profile(out_yaml, strict=True)
+            self.assertTrue(
+                loaded_cli_ss.fault_sweep.phase2_fault.state_search.enabled
+            )
+            self.assertEqual(
+                loaded_cli_ss.fault_sweep.phase2_fault.state_search.max_cuts, 2
+            )
+
             (build_dir / "tfm_s_signed.bin").write_bytes(b"\xAA" * (0x80000 + 4))
             with self.assertRaisesRegex(ValueError, "exceeds slot size"):
                 render_runtime_profile(build_dir)

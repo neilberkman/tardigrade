@@ -20,6 +20,8 @@ UPGRADE_STRATEGY="SWAP_USING_MOVE"
 JOBS=4
 PREPARE_ONLY=0
 PACKAGE_ONLY=0
+NO_DOCKER=0
+ALLOW_UNPINNED=0
 
 # Pinned upstream revisions
 TFM_REPO_URL="https://github.com/TrustedFirmware-M/trusted-firmware-m.git"
@@ -67,6 +69,10 @@ Options:
   --upgrade-strategy STR  MCUboot upgrade strategy (default: SWAP_USING_MOVE)
   --strategy STR          Alias for --upgrade-strategy
   --jobs N                Parallel build jobs (default: 4)
+  --no-docker             Run the build directly on the host without Docker
+  --allow-unpinned        Allow third-party checkouts at non-pinned commits
+  --tfm-ref REF           Override Trusted Firmware-M git ref/branch
+  --mcuboot-ref REF       Override MCUboot git ref/branch
   --prepare-only          Clone/verify and patch third_party repositories only
   --package-only          Sign and package existing build outputs without rebuilding
   -h, --help              Show this help text
@@ -101,6 +107,24 @@ while [[ $# -gt 0 ]]; do
       ;;
     --jobs)
       JOBS="$2"
+      shift 2
+      ;;
+    --no-docker|--local)
+      NO_DOCKER=1
+      shift
+      ;;
+    --allow-unpinned)
+      ALLOW_UNPINNED=1
+      shift
+      ;;
+    --tfm-ref)
+      TFM_TAG="$2"
+      ALLOW_UNPINNED=1
+      shift 2
+      ;;
+    --mcuboot-ref)
+      MCUBOOT_TAG="$2"
+      ALLOW_UNPINNED=1
       shift 2
       ;;
     --prepare-only)
@@ -167,7 +191,7 @@ ensure_pinned_repo() {
 
   local head_commit
   head_commit="$(git -C "$repo_dir" rev-parse HEAD)"
-  if [[ "$head_commit" != "$expected_commit" ]]; then
+  if [[ "$ALLOW_UNPINNED" -eq 0 && "$head_commit" != "$expected_commit" ]]; then
     echo "Error: $name HEAD is $head_commit, expected $expected_commit" >&2
     exit 1
   fi
@@ -235,19 +259,36 @@ if [[ "$PREPARE_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
-docker run --rm --platform linux/amd64 \
-  -v "$REPO_ROOT:/workspace" \
-  -w /workspace \
-  -e REL_OUTPUT_DIR="$REL_OUTPUT_DIR" \
-  -e REL_THIRD_PARTY_DIR="$REL_THIRD_PARTY_DIR" \
-  -e PRIMARY_VERSION="$PRIMARY_VERSION" \
-  -e STAGING_VERSION="$STAGING_VERSION" \
-  -e UPGRADE_STRATEGY="$UPGRADE_STRATEGY" \
-  -e JOBS="$JOBS" \
-  -e PACKAGE_ONLY="$PACKAGE_ONLY" \
-  "$DOCKER_IMAGE" bash -lc '
+run_build_payload() {
+  if [[ "$NO_DOCKER" -eq 1 ]]; then
+    WORKSPACE="$REPO_ROOT" \
+    REL_OUTPUT_DIR="$REL_OUTPUT_DIR" \
+    REL_THIRD_PARTY_DIR="$REL_THIRD_PARTY_DIR" \
+    PRIMARY_VERSION="$PRIMARY_VERSION" \
+    STAGING_VERSION="$STAGING_VERSION" \
+    UPGRADE_STRATEGY="$UPGRADE_STRATEGY" \
+    JOBS="$JOBS" \
+    PACKAGE_ONLY="$PACKAGE_ONLY" \
+    bash -c "$1"
+  else
+    docker run --rm --platform linux/amd64 \
+      -v "$REPO_ROOT:/workspace" \
+      -w /workspace \
+      -e WORKSPACE="/workspace" \
+      -e REL_OUTPUT_DIR="$REL_OUTPUT_DIR" \
+      -e REL_THIRD_PARTY_DIR="$REL_THIRD_PARTY_DIR" \
+      -e PRIMARY_VERSION="$PRIMARY_VERSION" \
+      -e STAGING_VERSION="$STAGING_VERSION" \
+      -e UPGRADE_STRATEGY="$UPGRADE_STRATEGY" \
+      -e JOBS="$JOBS" \
+      -e PACKAGE_ONLY="$PACKAGE_ONLY" \
+      "$DOCKER_IMAGE" bash -lc "$1"
+  fi
+}
+
+run_build_payload '
 set -euo pipefail
-WORKSPACE="/workspace"
+WORKSPACE="${WORKSPACE:-/workspace}"
 OUT_DIR="$WORKSPACE/$REL_OUTPUT_DIR"
 TP_DIR="$WORKSPACE/$REL_THIRD_PARTY_DIR"
 BUILD_ROOT="$OUT_DIR/build_test"
@@ -402,6 +443,44 @@ mcuboot_imagesign_wrapper \
   --psa-key-ids 2147451244 \
   "$BUILD_ROOT/nspe/bin/tfm_ns.bin" \
   "$OUT_DIR/tfm_ns_staging_signed.bin"
+
+mcuboot_imagesign_wrapper \
+  --version "$STAGING_VERSION" \
+  --layout "$BUILD_ROOT/spe/api_ns/image_signing/layout_files/signing_layout_s.o" \
+  --key "$BUILD_ROOT/spe/api_ns/image_signing/keys/image_s_signing_private_key.pem" \
+  --public-key-format hash \
+  --align 1 \
+  --pad \
+  --pad-header \
+  --confirm \
+  -H 0x400 \
+  -s 1 \
+  -L 128 \
+  -d "(1, 0.0.0+0)" \
+  "${STRATEGY_SIGN_ARGS[@]}" \
+  --measured-boot-record \
+  --psa-key-ids 2147451243 \
+  "$BUILD_ROOT/spe/api_ns/bin/tfm_s.bin" \
+  "$OUT_DIR/tfm_s_staging_confirmed.bin"
+
+mcuboot_imagesign_wrapper \
+  --version "$STAGING_VERSION" \
+  --layout "$BUILD_ROOT/spe/api_ns/image_signing/layout_files/signing_layout_ns.o" \
+  --key "$BUILD_ROOT/spe/api_ns/image_signing/keys/image_ns_signing_private_key.pem" \
+  --public-key-format hash \
+  --align 1 \
+  --pad \
+  --pad-header \
+  --confirm \
+  -H 0x400 \
+  -s 1 \
+  -L 128 \
+  -d "(0, 0.0.0+0)" \
+  "${STRATEGY_SIGN_ARGS[@]}" \
+  --measured-boot-record \
+  --psa-key-ids 2147451244 \
+  "$BUILD_ROOT/nspe/bin/tfm_ns.bin" \
+  "$OUT_DIR/tfm_ns_staging_confirmed.bin"
 '
 
 python3 "$REPO_ROOT/targets/tf_m_bl2/generate_runtime_profile.py" --build-dir "$OUTPUT_DIR"

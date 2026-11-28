@@ -255,6 +255,12 @@ def render_runtime_profile(
     should_find_issues: bool | None = None,
     confirmed_staging: bool = False,
     boot_cycles: int = 1,
+    state_search: bool = False,
+    state_search_max_cuts: int = 2,
+    state_search_max_new_states: int = 256,
+    state_search_max_wall_time_s: float = 3600.0,
+    state_search_cross_check_every: int = 16,
+    torn_word_seed: int = 20261127,
 ) -> str:
     """Substitute all ${TFM_*} tokens in the AN521 native template."""
     build_dir = build_dir.resolve()
@@ -304,16 +310,24 @@ def render_runtime_profile(
         bl2_entry = layout["bl2_entry"]
 
     if tracking_start_address is None:
-        sym_addr = symbols.get(tracking_start_symbol)
-        tracking_start = (sym_addr & ~1) if sym_addr is not None else 0
+        if state_search:
+            tracking_start = 0
+        else:
+            sym_addr = symbols.get(tracking_start_symbol)
+            tracking_start = (sym_addr & ~1) if sym_addr is not None else 0
     else:
         tracking_start = int(tracking_start_address)
 
     def _rel_or_abs(path: Path) -> str:
+        resolved = path.resolve()
         try:
-            return path.resolve().relative_to(REPO_ROOT).as_posix()
+            return resolved.relative_to(REPO_ROOT).as_posix()
         except ValueError:
-            return path.resolve().as_posix()
+            pass
+        try:
+            return resolved.relative_to(build_dir).as_posix()
+        except ValueError:
+            return resolved.as_posix()
 
     substitutions = {
         "${TFM_BL2_ELF}": _rel_or_abs(bl2_elf),
@@ -381,6 +395,41 @@ def render_runtime_profile(
                     f"      - {{ start: 0x{secondary_end - 16:08X}, end: 0x{secondary_end:08X} }}"
                 )
     boot_cycles_line = f"  boot_cycles: {int(boot_cycles)}\n"
+    if state_search:
+        extra_lines.extend(
+            [
+                "  include_erase_fault_points: true",
+                "  torn_word: [fixed, untouched, programmed, { partial_bits: 3 }]",
+                f"  torn_word_seed: {int(torn_word_seed)}",
+                "  phase2_fault:",
+                "    enabled: true",
+                "    first_fault_types: [power_loss, interrupted_erase]",
+                "    fault_types: [power_loss, interrupted_erase]",
+                "    state_search:",
+                "      enabled: true",
+                f"      max_cuts: {int(state_search_max_cuts)}",
+                f"      max_new_states: {int(state_search_max_new_states)}",
+                f"      max_wall_time_s: {float(state_search_max_wall_time_s)}",
+                "      address_ranges:",
+            ]
+        )
+        for slot_base in (
+            layout["secure_primary_base"],
+            layout["secure_secondary_base"],
+            layout["ns_primary_base"],
+            layout["ns_secondary_base"],
+        ):
+            for base_view in sorted({slot_base, slot_base & 0x0FFFFFFF}):
+                slot_end = base_view + slot_size
+                extra_lines.append(
+                    f"        - {{ start: 0x{base_view:08X}, end: 0x{base_view + 0x400:08X} }}"
+                )
+                extra_lines.append(
+                    f"        - {{ start: 0x{slot_end - 0x1000:08X}, end: 0x{slot_end:08X} }}"
+                )
+        extra_lines.append(
+            f"      cross_check_every: {int(state_search_cross_check_every)}"
+        )
     if "  boot_cycles: 1\n" in rendered:
         replacement = boot_cycles_line
         if extra_lines:
@@ -493,6 +542,41 @@ def main(argv: list[str] | None = None) -> int:
         default=1,
         help="Number of recovery boot cycles per fault point (default: 1)",
     )
+    parser.add_argument(
+        "--state-search",
+        action="store_true",
+        help="Enable recovery-state search across write and erase cuts",
+    )
+    parser.add_argument(
+        "--state-search-max-cuts",
+        type=int,
+        default=2,
+        help="Maximum cut depth for state_search (default: 2)",
+    )
+    parser.add_argument(
+        "--state-search-max-new-states",
+        type=int,
+        default=256,
+        help="Maximum distinct persistent states to boot in state_search (default: 256)",
+    )
+    parser.add_argument(
+        "--state-search-max-wall-time-s",
+        type=float,
+        default=3600.0,
+        help="Wall-clock budget in seconds for state_search (default: 3600.0)",
+    )
+    parser.add_argument(
+        "--state-search-cross-check-every",
+        type=int,
+        default=16,
+        help="Live cross-check interval for state_search (default: 16)",
+    )
+    parser.add_argument(
+        "--torn-word-seed",
+        type=int,
+        default=20261127,
+        help="Deterministic seed for torn_word outcome draws (default: 20261127)",
+    )
     args = parser.parse_args(argv)
 
     output_path = args.output or (args.build_dir / "tf_m_bl2_an521_native.yaml")
@@ -508,6 +592,12 @@ def main(argv: list[str] | None = None) -> int:
         preserve_critical_tiers=args.preserve_critical_tiers,
         confirmed_staging=args.confirmed_staging,
         boot_cycles=args.boot_cycles,
+        state_search=args.state_search,
+        state_search_max_cuts=args.state_search_max_cuts,
+        state_search_max_new_states=args.state_search_max_new_states,
+        state_search_max_wall_time_s=args.state_search_max_wall_time_s,
+        state_search_cross_check_every=args.state_search_cross_check_every,
+        torn_word_seed=args.torn_word_seed,
     )
     written = write_runtime_profile(output_path, rendered)
     print(written)
