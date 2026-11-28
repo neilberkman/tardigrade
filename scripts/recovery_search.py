@@ -47,6 +47,13 @@ def search_cut_paths(row):
             for chain in chains]
 
 
+def _final_cut_address(row):
+    try:
+        return int(str(row.get("fault_address") or "0"), 0)
+    except Exception:
+        return 0
+
+
 def passing_siblings(records):
     """Match canonical failures to passing paths in the same parent and index domain."""
     if not any(status == "failure" for _, _, status in records):
@@ -65,10 +72,13 @@ def passing_siblings(records):
         return search, parent, path[-1][1]
 
     passed = defaultdict(dict)
+    multi_cut_passed = []
     for row, paths, status in records:
         if status == "pass":
             for path in paths:
                 passed[group(row, path)][path[-1][0]] = row
+                if len(path) >= 2:
+                    multi_cut_passed.append((bool(row.get("recovery_state_search")), path, row))
     indices = dict((key, sorted(rows)) for key, rows in passed.items())
     for row, paths, status in records:
         if status != "failure":
@@ -80,7 +90,36 @@ def passing_siblings(records):
         pos = bisect_left(ordered, index)
         nearby = [i for i in ordered[max(0, pos - 1):pos + 2] if i != index]
         chosen = min(nearby, key=lambda i: (abs(i - index), i)) if nearby else None
-        yield row, passed[key].get(chosen), chosen
+        if chosen is not None:
+            yield row, passed[key].get(chosen), chosen
+            continue
+        if len(path) >= 2:
+            search = bool(row.get("recovery_state_search"))
+            row_addr = _final_cut_address(row)
+            candidates = [
+                (cand_path, cand_row)
+                for cand_search, cand_path, cand_row in multi_cut_passed
+                if cand_search == search
+                and len(cand_path) == len(path)
+                and cand_path[:-2] == path[:-2]
+                and cand_path[-2][1] == path[-2][1]
+                and cand_path[-1][1] == path[-1][1]
+                and cand_path != path
+            ]
+            if candidates:
+                best_path, best_row = min(
+                    candidates,
+                    key=lambda item: (
+                        abs(item[0][-2][0] - path[-2][0]),
+                        item[0][-2][0],
+                        0 if (row_addr and _final_cut_address(item[1]) == row_addr) else 1,
+                        abs(item[0][-1][0] - index),
+                        item[0][-1][0],
+                    ),
+                )
+                yield row, best_row, best_path[-1][0]
+                continue
+        yield row, None, None
 
 
 def compare_persistent_states(failing, passing):
@@ -267,7 +306,7 @@ def format_cut(operation, flash_base, fault_type="power_loss"):
     operation_kind = str(operation["kind"])
     operation_index = int(operation["operation_index"])
     address = int(flash_base) + int(operation["offset"])
-    return {
+    cut = {
         "operation": operation_kind,
         "operation_index": operation_index,
         "trace_sequence": int(operation.get("sequence", operation_index)),
@@ -276,6 +315,152 @@ def format_cut(operation, flash_base, fault_type="power_loss"):
             "interrupted_erase" if operation_kind == "erase" else str(fault_type)
         ),
     }
+    if operation.get("pc"):
+        cut["pc"] = str(operation["pc"])
+    return cut
+
+
+def attribute_ranges_to_operations(
+    ranges,
+    operations,
+    flash_base=0,
+    fail_cut=None,
+    pass_cut=None,
+):
+    """Map each differing byte range to the trace operation that produced it."""
+    if not ranges or not operations:
+        return
+    normalized_ops = []
+    for seq_idx, op in enumerate(operations):
+        kind = str(op.get("kind") or op.get("operation") or "").lower()
+        if not kind:
+            if "write_index" in op:
+                kind = "write"
+            elif "erase_index" in op:
+                kind = "erase"
+        if kind not in ("write", "erase"):
+            continue
+        if "operation_index" in op:
+            op_index = int(op["operation_index"])
+        elif kind == "write" and "write_index" in op:
+            op_index = int(op["write_index"]) - 1
+        elif kind == "erase" and "erase_index" in op:
+            op_index = int(op["erase_index"]) - 1
+        else:
+            continue
+        if "address" in op and op["address"] is not None:
+            addr = int(str(op["address"]), 0)
+        elif "program_address" in op and op["program_address"] is not None:
+            addr = int(str(op["program_address"]), 0)
+        else:
+            off = int(op.get("offset", op.get("flash_offset", 0)))
+            addr = int(flash_base) + off
+        if kind == "write":
+            size = int(op.get("width", op.get("program_width", 4)) or 4)
+        else:
+            size = int(op.get("erase_size", op.get("size", 4096)) or 4096)
+        if size <= 0:
+            size = 4
+        entry = {
+            "operation": kind,
+            "operation_index": op_index,
+            "address": "0x{:08X}".format(addr & 0xFFFFFFFF),
+            "size": size,
+            "_start": addr,
+            "_end": addr + size,
+            "_seq": int(op.get("sequence", seq_idx)),
+        }
+        if op.get("pc"):
+            entry["pc"] = str(op["pc"])
+        normalized_ops.append(entry)
+    if not normalized_ops:
+        return
+
+    fail_seq = None
+    pass_seq = None
+    if fail_cut is not None:
+        for item in normalized_ops:
+            if (
+                item["operation"] == fail_cut[0]
+                and item["operation_index"] == fail_cut[1]
+            ):
+                fail_seq = item["_seq"]
+                break
+    if pass_cut is not None:
+        for item in normalized_ops:
+            if (
+                item["operation"] == pass_cut[0]
+                and item["operation_index"] == pass_cut[1]
+            ):
+                pass_seq = item["_seq"]
+                break
+    lo_seq = (
+        min(fail_seq, pass_seq)
+        if fail_seq is not None and pass_seq is not None
+        else None
+    )
+    hi_seq = (
+        max(fail_seq, pass_seq)
+        if fail_seq is not None and pass_seq is not None
+        else (fail_seq if fail_seq is not None else pass_seq)
+    )
+
+    for span in ranges:
+        if "operation" in span:
+            continue
+        try:
+            start = int(str(span["address"]), 0)
+        except Exception:
+            continue
+        span_len = max(1, len(str(span.get("failing_hex") or "")) // 2)
+        end = start + span_len
+        overlapping = [
+            item
+            for item in normalized_ops
+            if item["_start"] < end and start < item["_end"]
+        ]
+        if not overlapping:
+            continue
+        covering_start = [
+            item
+            for item in overlapping
+            if item["_start"] <= start < item["_end"]
+        ]
+        if covering_start:
+            overlapping = covering_start
+        chosen = None
+        if lo_seq is not None and hi_seq is not None:
+            window = [
+                item
+                for item in overlapping
+                if lo_seq <= item["_seq"] <= hi_seq
+            ]
+            if window:
+                if fail_seq is not None:
+                    exact_fail = [
+                        item for item in window if item["_seq"] == fail_seq
+                    ]
+                    if exact_fail:
+                        chosen = exact_fail[-1]
+                if chosen is None:
+                    chosen = window[-1]
+        if chosen is None and hi_seq is not None:
+            before_hi = [
+                item for item in overlapping if item["_seq"] <= hi_seq
+            ]
+            if before_hi:
+                chosen = before_hi[-1]
+        if chosen is None:
+            chosen = overlapping[-1]
+        public_op = {
+            "operation": chosen["operation"],
+            "operation_index": chosen["operation_index"],
+            "address": chosen["address"],
+            "size": chosen["size"],
+        }
+        if chosen.get("pc"):
+            public_op["pc"] = chosen["pc"]
+        span["operation"] = public_op
 
 
 def format_chain(chain):
@@ -907,11 +1092,39 @@ class RecoveryStateExplorer(object):
             parent_ops[id(row)] = (
                 self.calibration_operations if parent is None else self._traces[parent]
             )
-        for row, sibling, _ in passing_siblings(records):
+        for row, sibling, chosen_index in passing_siblings(records):
             if sibling is not None:
+                comparison = compare_persistent_states(states[id(row)], states[id(sibling)])
+                row_chain = chains.get(id(row)) or ()
+                fail_cut = (
+                    (row_chain[-1]["operation"], int(row_chain[-1]["operation_index"]))
+                    if row_chain else None
+                )
+                pass_cut = (
+                    (row_chain[-1]["operation"], int(chosen_index))
+                    if row_chain and chosen_index is not None else None
+                )
+                attribute_ranges_to_operations(
+                    comparison.get("ranges"),
+                    parent_ops.get(id(row)) or self.calibration_operations,
+                    flash_base=self.flash_base,
+                    fail_cut=fail_cut,
+                    pass_cut=pass_cut,
+                )
+                if any("operation" not in r for r in comparison.get("ranges") or ()):
+                    attribute_ranges_to_operations(
+                        comparison.get("ranges"),
+                        parent_ops.get(id(sibling)) or self.calibration_operations,
+                        flash_base=self.flash_base,
+                    )
+                    attribute_ranges_to_operations(
+                        comparison.get("ranges"),
+                        self.calibration_operations,
+                        flash_base=self.flash_base,
+                    )
                 row["_sibling_snapshot_comparison"] = {
                     "sibling": sibling["recovery_state_search"]["state_identity"],
-                    "comparison": compare_persistent_states(states[id(row)], states[id(sibling)]),
+                    "comparison": comparison,
                 }
 
     def run(self):

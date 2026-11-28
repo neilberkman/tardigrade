@@ -2785,6 +2785,13 @@ def _main_single() -> int:
             sweep_results, getattr(profile.expect, "control_outcome", "success") or "success",
             Path(profile.resolve_path(repo_root, profile.bootloader_elf)) if profile.bootloader_elf else None,
             repo_root,
+            trace_file=trace_file,
+            erase_trace_file=erase_trace_file,
+            program_trace_file=program_trace_file,
+            flash_base=flash_base,
+            page_size=getattr(profile.memory, "page_size", 4096),
+            write_granularity=getattr(profile.memory, "write_granularity", 4),
+            trace_address_map=getattr(profile.memory, "trace_address_map", None),
         )
         planned_fault_types = (
             list(fault_types_list)
