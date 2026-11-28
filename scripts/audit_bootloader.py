@@ -3319,6 +3319,36 @@ def _main_single() -> int:
                             and isinstance(profile.fault_sweep.recovery_coverage.scope, dict)
                             else {}
                         ),
+                        **(
+                            {
+                                **(
+                                    {
+                                        "critical_regions": [
+                                            {"start": r.start, "end": r.end}
+                                            for r in profile.fault_sweep.critical_regions
+                                        ]
+                                    }
+                                    if getattr(profile.fault_sweep, "critical_regions", None)
+                                    else {}
+                                ),
+                                **(
+                                    {
+                                        "metadata_regions": [
+                                            {"start": r.start, "end": r.end}
+                                            for r in profile.memory.metadata_regions
+                                        ]
+                                    }
+                                    if getattr(profile.memory, "metadata_regions", None)
+                                    else {}
+                                ),
+                            }
+                            if (
+                                profile.fault_sweep.phase2_fault is not None
+                                and profile.fault_sweep.phase2_fault.state_search is not None
+                                and profile.fault_sweep.phase2_fault.state_search.order == "best_first"
+                            )
+                            else {}
+                        ),
                     }
                     break
         dist = profile.fault_sweep.fault_distribution

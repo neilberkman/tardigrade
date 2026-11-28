@@ -24,7 +24,8 @@ class RecoverySearchError(ValueError):
     pass
 
 
-SUPPORTED_SEARCH_ORDERS = ("breadth_first", "coverage_guided")
+SUPPORTED_SEARCH_ORDERS = ("breadth_first", "coverage_guided", "best_first")
+REGION_TIERS = ("metadata", "boundary", "bulk")
 
 try:
     _string_types = (basestring,)
@@ -60,6 +61,25 @@ def _coverage_signature(units):
         digest.update(item.encode("utf-8"))
         digest.update(b"\0")
     return binascii.hexlify(digest.digest()).decode("ascii")
+
+
+def _deserialize_signature(raw_sig):
+    if not raw_sig:
+        return ()
+    if isinstance(raw_sig, _string_types):
+        return str(raw_sig)
+    if (
+        isinstance(raw_sig, (list, tuple))
+        and len(raw_sig) == 64
+        and all(
+            isinstance(ch, _string_types)
+            and len(ch) == 1
+            and ch in "0123456789abcdefABCDEF"
+            for ch in raw_sig
+        )
+    ):
+        return "".join(str(ch) for ch in raw_sig)
+    return tuple(_normalize_coverage_unit(u) for u in raw_sig)
 
 
 def _extract_result_coverage_units(result):
@@ -729,6 +749,390 @@ def add_equivalent_chain(result, chain, cross_check=None):
     equivalent.append(formatted)
 
 
+def _normalize_region_pair(item):
+    if item is None:
+        return None
+    if isinstance(item, dict):
+        if "start" in item and "end" in item:
+            start = int(item["start"])
+            end = int(item["end"])
+        elif "base" in item and "size" in item:
+            start = int(item["base"])
+            end = start + int(item["size"])
+        elif "address" in item and "size" in item:
+            start = int(item["address"])
+            end = start + int(item["size"])
+        else:
+            return None
+        return (start, end) if end > start else None
+    if isinstance(item, (tuple, list)) and len(item) == 2:
+        start = int(item[0])
+        end = int(item[1])
+        return (start, end) if end > start else None
+    if hasattr(item, "start") and hasattr(item, "end"):
+        start = int(item.start)
+        end = int(item.end)
+        return (start, end) if end > start else None
+    if hasattr(item, "base") and hasattr(item, "size"):
+        start = int(item.base)
+        end = start + int(item.size)
+        return (start, end) if end > start else None
+    if hasattr(item, "address") and hasattr(item, "size"):
+        start = int(item.address)
+        end = start + int(item.size)
+        return (start, end) if end > start else None
+    return None
+
+
+def _normalize_region_list(items):
+    if not items:
+        return ()
+    if isinstance(items, dict):
+        values = [items[k] for k in sorted(items.keys())]
+    else:
+        values = list(items)
+    result = []
+    for item in values:
+        pair = _normalize_region_pair(item)
+        if pair is not None:
+            result.append(pair)
+    return tuple(result)
+
+
+def _range_overlaps(start, end, ranges):
+    for r_start, r_end in ranges:
+        if r_start < end and start < r_end:
+            return True
+    return False
+
+
+def classify_trace_operation_tiers(
+    operations,
+    flash_base=0,
+    page_size=4096,
+    slot_ranges=(),
+    critical_regions=(),
+    metadata_regions=(),
+    bootloader_region=None,
+    trailer_regions=(),
+    boundary_regions=(),
+    discontinuity_window=3,
+    tier2_step=3,
+    tier3_step=100,
+):
+    """Classify every operation in a trace into a heuristic region tier.
+
+    Returns a tuple of ``(tier_rank, sub_tier, region_tier)`` with one entry
+    per operation:
+    - Tier 0 (``"metadata"``):
+      - ``sub_tier = 0``: ``bootloader_region``, ``critical_regions``, and
+        declared ``metadata_regions``
+      - ``sub_tier = 1``: slot trailer regions
+      - ``sub_tier = 2``: heuristic discontinuity / same-address overwrite cuts
+    - Tier 1 (``"boundary"``):
+      - ``sub_tier = 0``: slot boundary region stride anchors / endpoints
+      - ``sub_tier = 1``: remaining slot boundary region cuts
+    - Tier 2 (``"bulk"``):
+      - ``sub_tier = 0``: bulk page entry/exit anchors and stride samples
+      - ``sub_tier = 1``: interior bulk data cuts
+    """
+    ops = tuple(operations or ())
+    n = len(ops)
+    if n == 0:
+        return ()
+
+    if all(
+        isinstance(op, dict) and "tier_key" in op and "region_tier" in op
+        for op in ops
+    ):
+        return tuple(
+            (int(op["tier_key"][0]), int(op["tier_key"][1]), str(op["region_tier"]))
+            for op in ops
+        )
+
+    page_size = max(1, int(page_size))
+    flash_base = int(flash_base)
+    discontinuity_window = max(0, int(discontinuity_window))
+    tier2_step = max(1, int(tier2_step))
+    tier3_step = max(1, int(tier3_step))
+
+    norm_slots = _normalize_region_list(slot_ranges)
+    norm_critical = _normalize_region_list(critical_regions)
+    norm_metadata = _normalize_region_list(metadata_regions)
+    norm_boot = _normalize_region_pair(bootloader_region)
+    norm_trailers = list(_normalize_region_list(trailer_regions))
+    norm_trailer_tails = list(norm_trailers)
+    norm_boundaries = list(_normalize_region_list(boundary_regions))
+
+    critical_and_metadata = list(norm_critical) + list(norm_metadata)
+    if norm_boot is not None:
+        critical_and_metadata.append(norm_boot)
+
+    tail_bytes = min(64, max(16, page_size // 16))
+    for slot_start, slot_end in norm_slots:
+        slot_size = slot_end - slot_start
+        if slot_size <= 0:
+            continue
+        if slot_size > 2 * page_size:
+            t_size = page_size
+            b_size = min(2 * page_size, max(1, (slot_size - t_size) // 2))
+            norm_trailers.append((slot_end - t_size, slot_end))
+            p_start = max(slot_start, slot_end - tail_bytes)
+            if p_start < slot_end:
+                norm_trailer_tails.append((p_start, slot_end))
+        elif slot_size >= 4:
+            t_size = max(1, slot_size // 4)
+            b_size = max(1, slot_size // 4)
+            norm_trailers.append((slot_end - t_size, slot_end))
+            norm_trailer_tails.append((slot_end - t_size, slot_end))
+        else:
+            t_size = 0
+            b_size = 0
+        if b_size > 0:
+            norm_boundaries.append((slot_start, slot_start + b_size))
+
+    critical_and_metadata = tuple(critical_and_metadata)
+    norm_trailers = tuple(norm_trailers)
+    norm_trailer_tails = tuple(norm_trailer_tails)
+    norm_boundaries = tuple(norm_boundaries)
+    has_explicit_regions = bool(
+        norm_slots
+        or critical_and_metadata
+        or norm_trailers
+        or norm_boundaries
+    )
+
+    spans = []
+    addr_positions = defaultdict(list)
+    pages = []
+    in_trailer_indices = []
+    for idx, op in enumerate(ops):
+        op_start = flash_base + int(op["offset"])
+        if op.get("kind") == "erase":
+            op_len = max(1, int(op.get("erase_size", page_size)))
+        else:
+            op_len = max(1, int(op.get("width", 1)))
+        op_end = op_start + op_len
+        spans.append((op_start, op_end))
+        if op.get("kind") != "erase":
+            addr_positions[op_start].append(idx)
+        pages.append(op_start // page_size)
+        if _range_overlaps(op_start, op_end, norm_trailers):
+            in_trailer_indices.append(idx)
+
+    trailer_anchor_indices = set(
+        in_trailer_indices[:2] + in_trailer_indices[-2:]
+    )
+
+    overwrite_indices = set()
+    if not has_explicit_regions:
+        for positions in addr_positions.values():
+            if len(positions) > 1:
+                overwrite_indices.update(positions)
+
+    # Compute sequential same-page run lengths to identify bulk-to-metadata
+    # discontinuity transitions when no explicit slot or metadata layout is given.
+    run_lengths = [1] * n
+    run_start = 0
+    for idx in range(1, n + 1):
+        if idx < n and pages[idx] == pages[run_start]:
+            continue
+        length = idx - run_start
+        for k in range(run_start, idx):
+            run_lengths[k] = length
+        run_start = idx
+
+    discontinuity_window_indices = set()
+    if not has_explicit_regions:
+        for idx in range(1, n):
+            prev_start = spans[idx - 1][0]
+            cur_start = spans[idx][0]
+            if abs(cur_start - prev_start) > page_size and (
+                run_lengths[idx - 1] >= 4 or run_lengths[idx] >= 4
+            ):
+                lo = max(0, idx - discontinuity_window)
+                hi = min(n - 1, idx + discontinuity_window)
+                for k in range(lo, hi + 1):
+                    if run_lengths[k] <= 4:
+                        discontinuity_window_indices.add(k)
+
+    # First/last operation in each page for page entry/exit anchors.
+    page_first_last = set()
+    cur_page = None
+    for idx in range(n):
+        p = pages[idx]
+        if p != cur_page:
+            page_first_last.add(idx)
+            if idx > 0:
+                page_first_last.add(idx - 1)
+            cur_page = p
+    if n > 0:
+        page_first_last.add(n - 1)
+
+    classified = []
+    for idx, op in enumerate(ops):
+        if "tier_key" in op and "region_tier" in op:
+            classified.append(
+                (
+                    int(op["tier_key"][0]),
+                    int(op["tier_key"][1]),
+                    str(op["region_tier"]),
+                )
+            )
+            continue
+        op_start, op_end = spans[idx]
+        if _range_overlaps(op_start, op_end, critical_and_metadata):
+            classified.append((0, 0, "metadata"))
+        elif _range_overlaps(op_start, op_end, norm_trailer_tails):
+            classified.append((0, 0, "metadata"))
+        elif _range_overlaps(op_start, op_end, norm_trailers):
+            sub_tier = (
+                0
+                if (
+                    op.get("kind") == "erase"
+                    or idx in trailer_anchor_indices
+                )
+                else 1
+            )
+            classified.append((0, sub_tier, "metadata"))
+        elif idx in overwrite_indices or idx in discontinuity_window_indices:
+            classified.append((0, 2, "metadata"))
+        elif _range_overlaps(op_start, op_end, norm_boundaries):
+            if (
+                op.get("kind") == "erase"
+                or idx == 0
+                or idx == n - 1
+                or idx in page_first_last
+            ):
+                sub_tier = 0
+            elif idx % tier2_step == 0:
+                sub_tier = 1
+            else:
+                sub_tier = 2
+            classified.append((1, sub_tier, "boundary"))
+        else:
+            sub_tier = (
+                0
+                if (
+                    op.get("kind") == "erase"
+                    or idx == 0
+                    or idx == n - 1
+                    or idx in page_first_last
+                    or (idx % tier3_step == 0)
+                )
+                else 1
+            )
+            classified.append((2, sub_tier, "bulk"))
+    return tuple(classified)
+
+
+def _completed_op_bytes(operation, erase_fill):
+    if operation["kind"] == "write":
+        width = int(operation["width"])
+        val = int(operation["completed_value"])
+        return bytes(
+            bytearray((val >> (8 * index)) & 0xFF for index in range(width))
+        )
+    size = int(operation["erase_size"])
+    fill_byte = int(erase_fill) & 0xFF
+    return bytes(bytearray((fill_byte,) * size))
+
+
+class _PrefixWalker(object):
+    """Fast random-access completed-prefix evaluator over an operation trace."""
+
+    def __init__(self, base_state, operations, erase_fill, stride=256):
+        self.base_state = base_state
+        self.operations = operations
+        self.erase_fill = int(erase_fill) & 0xFF
+        self.stride = max(16, int(stride))
+        self._checkpoints = [(0, base_state, 0)]
+        self._last = (0, base_state, 0)
+
+    def _advance_batch(self, state, erases, start_idx, end_idx):
+        if start_idx >= end_idx or state is None:
+            return state, erases
+        ops = self.operations
+        if end_idx - start_idx == 1:
+            op = ops[start_idx]
+            return (
+                apply_completed_operation(state, op, self.erase_fill),
+                erases + (1 if op["kind"] == "erase" else 0),
+            )
+        cur_region = None
+        writes = []
+        clear_ranges = []
+        has_marks = bool(state.uncorrectable_words)
+        for idx in range(start_idx, end_idx):
+            op = ops[idx]
+            if op["kind"] == "erase":
+                erases += 1
+            region_name = str(op.get("region", "nvm"))
+            offset = int(op["offset"])
+            data = _completed_op_bytes(op, self.erase_fill)
+            if cur_region is not None and region_name != cur_region:
+                state = state.write_many(
+                    cur_region,
+                    writes,
+                    clear_ranges=clear_ranges if has_marks else (),
+                )
+                has_marks = bool(state.uncorrectable_words)
+                writes = []
+                clear_ranges = []
+            cur_region = region_name
+            writes.append((offset, data))
+            if has_marks and data:
+                clear_ranges.append((offset, len(data)))
+        if writes and cur_region is not None:
+            state = state.write_many(
+                cur_region,
+                writes,
+                clear_ranges=clear_ranges if has_marks else (),
+            )
+        return state, erases
+
+    def prefix_at(self, target_index):
+        target_index = int(target_index)
+        if self.base_state is None or target_index <= 0:
+            return self.base_state, 0
+        last_idx, last_state, last_erases = self._last
+        if target_index == last_idx:
+            return last_state, last_erases
+        if last_idx < target_index <= last_idx + 16:
+            state, erases = self._advance_batch(
+                last_state, last_erases, last_idx, target_index
+            )
+            self._last = (target_index, state, erases)
+            return state, erases
+
+        # Ensure stride checkpoints exist up to target_index // stride.
+        target_cp = target_index // self.stride
+        while len(self._checkpoints) - 1 < target_cp:
+            cp_idx, cp_state, cp_erases = self._checkpoints[-1]
+            next_idx = min(len(self.operations), cp_idx + self.stride)
+            next_state, next_erases = self._advance_batch(
+                cp_state, cp_erases, cp_idx, next_idx
+            )
+            self._checkpoints.append((next_idx, next_state, next_erases))
+            if next_idx >= len(self.operations):
+                break
+
+        cp_pos = min(target_cp, len(self._checkpoints) - 1)
+        base_idx, base_state, base_erases = self._checkpoints[cp_pos]
+        if (
+            last_idx <= target_index
+            and last_idx > base_idx
+        ):
+            base_idx, base_state, base_erases = last_idx, last_state, last_erases
+        state, erases = self._advance_batch(
+            base_state, base_erases, base_idx, target_index
+        )
+        self._last = (target_index, state, erases)
+        return state, erases
+
+    state_at = prefix_at
+
+
 class RecoveryStateExplorer(object):
     """Breadth-first exploration with one boot per persistent state.
 
@@ -769,6 +1173,14 @@ class RecoveryStateExplorer(object):
         max_boots_without_new_coverage=None,
         coverage_for_result=None,
         initial_coverage=(),
+        slot_ranges=None,
+        slots=None,
+        critical_regions=(),
+        metadata_regions=(),
+        bootloader_region=None,
+        trailer_regions=(),
+        boundary_regions=(),
+        starvation_guard_interval=4,
     ):
         self.initial_state = initial_state
         self.calibration_operations = self._normalize_trace(calibration_operations)
@@ -789,6 +1201,15 @@ class RecoveryStateExplorer(object):
         self.corruption_seed = int(corruption_seed) & 0xFFFFFFFF
         self.page_size = int(page_size)
         self.program_unit = int(program_unit)
+        self.slot_ranges = _normalize_region_list(
+            slot_ranges if slot_ranges is not None else slots
+        )
+        self.critical_regions = _normalize_region_list(critical_regions)
+        self.metadata_regions = _normalize_region_list(metadata_regions)
+        self.bootloader_region = _normalize_region_pair(bootloader_region)
+        self.trailer_regions = _normalize_region_list(trailer_regions)
+        self.boundary_regions = _normalize_region_list(boundary_regions)
+        self.starvation_guard_interval = max(0, int(starvation_guard_interval))
         normalized_order = str(order or "breadth_first").strip().lower()
         if normalized_order not in SUPPORTED_SEARCH_ORDERS:
             raise RecoverySearchError(
@@ -821,6 +1242,9 @@ class RecoveryStateExplorer(object):
         self.budget = SearchBudget(max_new_states, max_wall_time_s, clock)
         self._seen = {}
         self._booted_states = {}
+        self._state_result_index = {}
+        self._trace_bases = {}
+        self._state_tier = {}
         self._traces = []
         # A frame retains the completed prefix immediately before its next cut.
         # Parent None denotes the calibration trace; other parents index results.
@@ -852,6 +1276,16 @@ class RecoveryStateExplorer(object):
             or self.coverage_for_result is not None
             or self.initial_coverage
         )
+        self._bf_tiers_cache = {}
+        self._bf_schedule_cache = {}
+        self._bf_walkers = {}
+        self._bf_gen1_expanded = set()
+        self._bf_gen1_trace_cursor = 0
+        self._bf_starvation_active = False
+        self._bf_last_starvation_boot = -1
+        self._bf_gen1_state_to_index = None
+        self._last_expanded_parent = None
+        self._last_expanded_index = None
         self.results = []
         self.summary = {
             "order": self.order,
@@ -977,7 +1411,9 @@ class RecoveryStateExplorer(object):
                 "generation": int(generation),
                 "children_booted": 0,
                 "productive_children": 0,
+                "failure_children": 0,
                 "child_stall": 0,
+                "bf_stall": 0,
             }
             return entry
 
@@ -1075,7 +1511,9 @@ class RecoveryStateExplorer(object):
             "generation": int(generation),
             "children_booted": 0,
             "productive_children": 0,
+            "failure_children": 0,
             "child_stall": 0,
+            "bf_stall": 0,
         }
         return entry
 
@@ -1112,7 +1550,10 @@ class RecoveryStateExplorer(object):
         if checked is not None and checked is not False:
             result["recovery_state_search"]["cross_check"] = checked
         parent = len(self.results)
-        self._seen[state.identity_hex()] = result
+        identity = state.identity_hex()
+        self._seen[identity] = result
+        self._state_result_index[identity] = parent
+        self._trace_bases[parent] = trace_base_state
         self.results.append(result)
         self._traces.append(self._normalize_trace(operations))
         if self._traces[-1]:
@@ -1174,6 +1615,105 @@ class RecoveryStateExplorer(object):
             total_erases=erases, page_size=self.page_size, program_unit=self.program_unit,
         )
 
+    def _promote_to_shallower_chain(
+        self, prior, parent, index, state, chain, generation, operation, ordinal
+    ):
+        identity = state.identity_hex()
+        prior_meta = prior["recovery_state_search"]
+        prior_gen = int(prior_meta["generation"])
+        old_chain_dict = prior_meta["chain"]
+        old_cuts = tuple(old_chain_dict["cuts"])
+        old_cross_check = prior_meta.pop("cross_check", None)
+
+        self._count_reuse(self.summary, old_cuts)
+        add_equivalent_chain(prior, old_cuts, old_cross_check)
+
+        prior_meta["generation"] = int(generation)
+        prior_meta["chain"] = format_chain(chain)
+        if chain:
+            prior["fault_at"] = int(chain[0]["operation_index"])
+            prior["fault_address"] = chain[-1]["address"]
+        if prior_gen > 1 and generation == 1:
+            self.summary["deeper_cut_states_booted"] = max(
+                0, int(self.summary["deeper_cut_states_booted"]) - 1
+            )
+            self.summary["single_cut_states_booted"] += 1
+            if chain and chain[0].get("operation") == "erase":
+                self.summary["single_cut_erase_states_booted"] += 1
+            else:
+                self.summary["single_cut_program_states_booted"] += 1
+
+        checked = None
+        if ordinal is not None:
+            checked = self._maybe_cross_check(
+                state, chain, generation, operation, ordinal
+            )
+        elif generation == 2 and old_cross_check is not None:
+            checked = old_cross_check
+        if checked is not None and checked is not False:
+            prior_meta["cross_check"] = checked
+
+        if identity in self._booted_states:
+            self._booted_states[identity]["parent"] = parent
+            self._booted_states[identity]["chain"] = chain
+        if self.order == "best_first":
+            self._state_tier[identity] = self._cut_region_tier(parent, index)
+
+        parent_id = self._state_result_index.get(identity)
+        if parent_id is None:
+            for idx, r in enumerate(self.results):
+                if r.get("recovery_state_search", {}).get("state_identity") == identity:
+                    parent_id = idx
+                    self._state_result_index[identity] = idx
+                    break
+        if parent_id is not None:
+            if parent_id in self._parent_cov:
+                self._parent_cov[parent_id]["generation"] = int(generation)
+            if prior_gen >= self.max_cuts and generation < self.max_cuts:
+                in_frames = any(f[0] == parent_id for f in self._frames)
+                if not in_frames:
+                    if (
+                        hasattr(self, "edges")
+                        and identity in getattr(self, "edges", {})
+                        and not self._traces[parent_id]
+                    ):
+                        terminal_count = int(
+                            getattr(self, "terminal", {}).get(identity, 0)
+                        )
+                        self.summary["recovery_operations_excluded_by_max_cuts"] = max(
+                            0,
+                            int(self.summary["recovery_operations_excluded_by_max_cuts"])
+                            - terminal_count,
+                        )
+                        excluded_type, excluded_addr = getattr(
+                            self, "filters", {}
+                        ).get(identity, (0, 0))
+                        self.summary["recovery_operations_excluded_by_fault_type"] += (
+                            excluded_type
+                        )
+                        self.summary["recovery_operations_excluded_by_address"] += (
+                            excluded_addr
+                        )
+                        self.summary["recovery_operations_seen"] += (
+                            excluded_type + excluded_addr
+                        )
+                        edge_map = self.edges[identity]
+                        self._traces[parent_id] = tuple(
+                            edge_map[k] for k in sorted(edge_map)
+                        )
+                    else:
+                        eligible = self._eligible_count(self._traces[parent_id])
+                        self.summary["recovery_operations_excluded_by_max_cuts"] = max(
+                            0,
+                            int(self.summary["recovery_operations_excluded_by_max_cuts"])
+                            - eligible,
+                        )
+                    if self._traces[parent_id]:
+                        trace_base = self._trace_bases.get(parent_id, state)
+                        self._frames.append((parent_id, 0, trace_base, 0))
+                        self._bf_schedule_cache.pop(parent_id, None)
+                        self._bf_tiers_cache.pop(parent_id, None)
+
     def _visit(self, parent, index, state):
         operations, prefix = self._source(parent)
         operation = operations[index]
@@ -1183,13 +1723,16 @@ class RecoveryStateExplorer(object):
         if generation > 2:
             self._deeper_cross_check_candidates += 1
             ordinal = self._deeper_cross_check_candidates
-        prior = self._seen.get(state.identity_hex())
+        identity = state.identity_hex()
+        prior = self._seen.get(identity)
         if prior is None:
-            self._booted_states[state.identity_hex()] = {
+            self._booted_states[identity] = {
                 "state": state,
                 "parent": parent,
                 "chain": chain,
             }
+            if self.order == "best_first":
+                self._state_tier[identity] = self._cut_region_tier(parent, index)
             child_entry = self._boot(state, chain, generation, operation, ordinal)
             if parent is not None and parent in self._parent_cov:
                 pnode = self._parent_cov[parent]
@@ -1197,13 +1740,35 @@ class RecoveryStateExplorer(object):
                 psig = pnode["entry"].get("coverage_signature", ())
                 if psig:
                     self._expanded_signatures.add(psig)
-                if child_entry is not None and int(child_entry.get("new_coverage_count", 0)) > 0:
+                child_result = self.results[-1]
+                child_outcome = child_result.get("boot_outcome")
+                child_failed = child_outcome not in (None, "success")
+                if child_failed:
+                    pnode["failure_children"] = (
+                        int(pnode.get("failure_children", 0)) + 1
+                    )
+                has_new_cov = bool(
+                    child_entry is not None
+                    and int(child_entry.get("new_coverage_count", 0)) > 0
+                )
+                if has_new_cov:
                     pnode["productive_children"] += 1
                     pnode["child_stall"] = 0
                     if psig:
                         self._productive_signatures.add(psig)
                 else:
                     pnode["child_stall"] += 1
+                if has_new_cov or child_failed:
+                    pnode["bf_stall"] = 0
+                else:
+                    pnode["bf_stall"] = int(pnode.get("bf_stall", 0)) + 1
+            return
+        if self.order == "best_first" and generation < int(
+            prior["recovery_state_search"]["generation"]
+        ):
+            self._promote_to_shallower_chain(
+                prior, parent, index, state, chain, generation, operation, ordinal
+            )
             return
         self._count_reuse(self.summary, chain)
         checked = None
@@ -1238,31 +1803,691 @@ class RecoveryStateExplorer(object):
         counts["states_computed"] += 1
         return True
 
+    def _bf_trace_tiers(self, parent):
+        cached = self._bf_tiers_cache.get(parent)
+        if cached is not None:
+            return cached
+        operations, _ = self._source(parent)
+        classified = classify_trace_operation_tiers(
+            operations,
+            flash_base=self.flash_base,
+            page_size=self.page_size,
+            slot_ranges=self.slot_ranges,
+            critical_regions=self.critical_regions,
+            metadata_regions=self.metadata_regions,
+            bootloader_region=self.bootloader_region,
+            trailer_regions=self.trailer_regions,
+            boundary_regions=self.boundary_regions,
+        )
+        self._bf_tiers_cache[parent] = classified
+        return classified
+
+    def _cut_region_tier(self, parent, index):
+        tiers = self._bf_trace_tiers(parent)
+        if 0 <= index < len(tiers):
+            return tiers[index][2]
+        return "bulk"
+
+    def _cut_tier_key(self, parent, index):
+        tiers = self._bf_trace_tiers(parent)
+        if 0 <= index < len(tiers):
+            return (tiers[index][0], tiers[index][1])
+        return (2, 1)
+
+    def _bf_schedule(self, parent, selected):
+        cached = self._bf_schedule_cache.get(parent)
+        if cached is not None:
+            return cached
+        operations, _ = self._source(parent)
+        tiers = self._bf_trace_tiers(parent)
+        if parent is None:
+            eligible = [
+                idx
+                for idx, op in enumerate(operations)
+                if (op["kind"], op["operation_index"]) in selected
+            ]
+            ordered = tuple(
+                sorted(
+                    eligible,
+                    key=lambda idx: (tiers[idx][0], tiers[idx][1], idx),
+                )
+            )
+        else:
+            excluded = []
+            eligible = []
+            for idx, op in enumerate(operations):
+                if (
+                    _recovery_exclusion(
+                        op,
+                        self.recovery_operation_kinds,
+                        self.flash_base,
+                        self.address_ranges,
+                    )
+                    is not None
+                ):
+                    excluded.append(idx)
+                else:
+                    eligible.append(idx)
+            ordered = tuple(excluded) + tuple(
+                sorted(
+                    eligible,
+                    key=lambda idx: (
+                        tiers[idx][0],
+                        tiers[idx][1],
+                        0 if operations[idx].get("kind") == "erase" else 1,
+                        idx,
+                    ),
+                )
+            )
+        self._bf_schedule_cache[parent] = ordered
+        return ordered
+
+    def _get_prefix_walker(self, parent, base_state):
+        walker = self._bf_walkers.get(parent)
+        if walker is None:
+            operations, _ = self._source(parent)
+            walker = _PrefixWalker(base_state, operations, self.erase_fill)
+            self._bf_walkers[parent] = walker
+        return walker
+
+    def _ensure_bf_gen1_state_map(self, selected):
+        if self._bf_gen1_state_to_index is not None:
+            return
+        mapping = {}
+        operations = self.calibration_operations
+        if self.initial_state is None:
+            for idx, op in enumerate(operations):
+                if (op["kind"], op["operation_index"]) not in selected:
+                    continue
+                target = op.get("target")
+                if target is not None and hasattr(target, "identity_hex"):
+                    ident = target.identity_hex()
+                    if ident not in mapping:
+                        mapping[ident] = idx
+            self._bf_gen1_state_to_index = mapping
+            return
+        if len(self.first_cuts) > 64:
+            self._bf_gen1_state_to_index = mapping
+            return
+        walker = self._get_prefix_walker(None, self.initial_state)
+        for idx, op in enumerate(operations):
+            if (op["kind"], op["operation_index"]) not in selected:
+                continue
+            prefix, erases = walker.state_at(idx)
+            cand = apply_interrupted_operation(
+                prefix,
+                op,
+                backend_kind=self.backend_kind,
+                torn_word_mode=self._mode_for_cut(op, 1, ()),
+                erase_fill=self.erase_fill,
+                corruption_seed=self.corruption_seed,
+                total_erases=erases,
+                page_size=self.page_size,
+                program_unit=self.program_unit,
+            )
+            ident = cand.identity_hex()
+            if ident not in mapping:
+                mapping[ident] = idx
+        self._bf_gen1_state_to_index = mapping
+
+    def _expand_gen1_index(self, frames, gen1_idx, selected, counts):
+        g_frame_pos = None
+        for pos, f in enumerate(frames):
+            if f[0] is None:
+                g_frame_pos = pos
+                break
+        if g_frame_pos is None:
+            return None
+        _, g_cursor, g_base, _ = frames[g_frame_pos]
+        self._bf_gen1_expanded.add(gen1_idx)
+        g_schedule = self._bf_schedule(None, selected)
+        while (
+            g_cursor < len(g_schedule)
+            and g_schedule[g_cursor] in self._bf_gen1_expanded
+        ):
+            g_cursor += 1
+        if g_cursor < len(g_schedule):
+            frames[g_frame_pos] = (None, g_cursor, g_base, 0)
+        else:
+            del frames[g_frame_pos]
+        op = self.calibration_operations[gen1_idx]
+        self._last_expanded_parent = None
+        self._last_expanded_index = gen1_idx
+        if not self._selected(op, True, selected, counts):
+            return None
+        key = (None, gen1_idx)
+        candidate = self._computed_frontier.pop(key, None)
+        if candidate is None:
+            if "target" in op:
+                candidate = op["target"]
+            else:
+                walker = self._get_prefix_walker(None, g_base)
+                prefix, erases = walker.state_at(gen1_idx)
+                candidate = apply_interrupted_operation(
+                    prefix,
+                    op,
+                    backend_kind=self.backend_kind,
+                    torn_word_mode=self._mode_for_cut(op, 1, ()),
+                    erase_fill=self.erase_fill,
+                    corruption_seed=self.corruption_seed,
+                    total_erases=erases,
+                    page_size=self.page_size,
+                    program_unit=self.program_unit,
+                )
+        return None, gen1_idx, candidate
+
     def _expand(self, frames, selected, counts, preview=False):
-        parent, index, prefix, erases = frames.popleft()
+        self._last_expanded_parent = None
+        self._last_expanded_index = None
+        if self.order != "best_first" or self.plan_only:
+            parent, index, prefix, erases = frames.popleft()
+            self._last_expanded_parent = parent
+            operations, chain = self._source(parent)
+            if len(chain) >= self.max_cuts:
+                counts["recovery_operations_excluded_by_max_cuts"] += self._eligible_count(operations)
+                return
+            self._last_expanded_index = index
+            op = operations[index]
+            if index + 1 < len(operations):
+                completed = apply_completed_operation(prefix, op, self.erase_fill)
+                frames.appendleft((parent, index + 1, completed, erases + (op["kind"] == "erase")))
+            elif not preview and parent is not None and parent in self._parent_cov:
+                psig = self._parent_cov[parent]["entry"].get("coverage_signature", ())
+                if psig:
+                    self._expanded_signatures.add(psig)
+            if not self._selected(op, parent is None, selected, counts):
+                return None
+            key = (parent, index)
+            candidate = self._computed_frontier.get(key)
+            if candidate is None:
+                candidate = apply_interrupted_operation(
+                    prefix, op, backend_kind=self.backend_kind,
+                    torn_word_mode=self._mode_for_cut(op, len(chain) + 1, chain),
+                    erase_fill=self.erase_fill, corruption_seed=self.corruption_seed,
+                    total_erases=erases, page_size=self.page_size, program_unit=self.program_unit,
+                )
+            if preview:
+                self._computed_frontier[key] = candidate
+            else:
+                self._computed_frontier.pop(key, None)
+            return parent, index, candidate
+
+        parent, cursor, base_state, _ = frames.popleft()
+        self._last_expanded_parent = parent
         operations, chain = self._source(parent)
         if len(chain) >= self.max_cuts:
             counts["recovery_operations_excluded_by_max_cuts"] += self._eligible_count(operations)
-            return
-        op = operations[index]
-        if index + 1 < len(operations):
-            completed = apply_completed_operation(prefix, op, self.erase_fill)
-            frames.appendleft((parent, index + 1, completed, erases + (op["kind"] == "erase")))
-        elif not preview and parent is not None and parent in self._parent_cov:
-            psig = self._parent_cov[parent]["entry"].get("coverage_signature", ())
-            if psig:
-                self._expanded_signatures.add(psig)
-        if not self._selected(op, parent is None, selected, counts):
             return None
+        schedule = self._bf_schedule(parent, selected)
+        if parent is None:
+            index = None
+            if not preview and self._bf_starvation_active:
+                while self._bf_gen1_trace_cursor < len(operations):
+                    cand_idx = self._bf_gen1_trace_cursor
+                    self._bf_gen1_trace_cursor += 1
+                    cand_op = operations[cand_idx]
+                    if (
+                        cand_op["kind"],
+                        cand_op["operation_index"],
+                    ) in selected and cand_idx not in self._bf_gen1_expanded:
+                        index = cand_idx
+                        break
+            if index is None:
+                while (
+                    cursor < len(schedule)
+                    and schedule[cursor] in self._bf_gen1_expanded
+                ):
+                    cursor += 1
+                if cursor >= len(schedule):
+                    return None
+                index = schedule[cursor]
+                next_cursor = cursor + 1
+            else:
+                next_cursor = cursor
+            if not preview:
+                self._bf_gen1_expanded.add(index)
+            while (
+                next_cursor < len(schedule)
+                and schedule[next_cursor] in self._bf_gen1_expanded
+            ):
+                next_cursor += 1
+            if next_cursor < len(schedule):
+                frames.appendleft((parent, next_cursor, base_state, 0))
+            op = operations[index]
+            self._last_expanded_index = index
+            if not self._selected(op, True, selected, counts):
+                return None
+            key = (parent, index)
+            candidate = self._computed_frontier.get(key)
+            if candidate is None:
+                if "target" in op:
+                    candidate = op["target"]
+                else:
+                    walker = self._get_prefix_walker(parent, base_state)
+                    prefix, erases = walker.state_at(index)
+                    candidate = apply_interrupted_operation(
+                        prefix,
+                        op,
+                        backend_kind=self.backend_kind,
+                        torn_word_mode=self._mode_for_cut(
+                            op, len(chain) + 1, chain
+                        ),
+                        erase_fill=self.erase_fill,
+                        corruption_seed=self.corruption_seed,
+                        total_erases=erases,
+                        page_size=self.page_size,
+                        program_unit=self.program_unit,
+                    )
+            if preview:
+                self._computed_frontier[key] = candidate
+            else:
+                self._computed_frontier.pop(key, None)
+            return parent, index, candidate
+
+        if cursor >= len(schedule):
+            if not preview and parent in self._parent_cov:
+                psig = self._parent_cov[parent]["entry"].get(
+                    "coverage_signature", ()
+                )
+                if psig:
+                    self._expanded_signatures.add(psig)
+            return None
+        index = schedule[cursor]
+        op = operations[index]
+        is_excluded = (
+            _recovery_exclusion(
+                op,
+                self.recovery_operation_kinds,
+                self.flash_base,
+                self.address_ranges,
+            )
+            is not None
+        )
+        if is_excluded:
+            next_cursor = cursor + 1
+            if next_cursor < len(schedule):
+                frames.appendleft((parent, next_cursor, base_state, 0))
+            elif not preview and parent in self._parent_cov:
+                psig = self._parent_cov[parent]["entry"].get(
+                    "coverage_signature", ()
+                )
+                if psig:
+                    self._expanded_signatures.add(psig)
+            self._last_expanded_index = index
+            self._selected(op, False, selected, counts)
+            return None
+
         key = (parent, index)
         candidate = self._computed_frontier.get(key)
         if candidate is None:
-            candidate = self._interrupted_state(prefix, op, chain, erases)
+            if "target" in op:
+                candidate = op["target"]
+            else:
+                walker = self._get_prefix_walker(parent, base_state)
+                prefix, erases = walker.state_at(index)
+                candidate = self._interrupted_state(prefix, op, chain, erases)
+        if not preview:
+            self._ensure_bf_gen1_state_map(selected)
+            cand_id = candidate.identity_hex()
+            gen1_idx = self._bf_gen1_state_to_index.get(cand_id)
+            if (
+                gen1_idx is not None
+                and cand_id not in self._seen
+                and gen1_idx not in self._bf_gen1_expanded
+                and any(f[0] is None for f in frames)
+            ):
+                self._computed_frontier[key] = candidate
+                frames.appendleft((parent, cursor, base_state, 0))
+                return self._expand_gen1_index(
+                    frames, gen1_idx, selected, counts
+                )
+
+        next_cursor = cursor + 1
+        if next_cursor < len(schedule):
+            frames.appendleft((parent, next_cursor, base_state, 0))
+        elif not preview and parent in self._parent_cov:
+            psig = self._parent_cov[parent]["entry"].get(
+                "coverage_signature", ()
+            )
+            if psig:
+                self._expanded_signatures.add(psig)
+        self._last_expanded_index = index
+        if not self._selected(op, False, selected, counts):
+            return None
         if preview:
             self._computed_frontier[key] = candidate
         else:
             self._computed_frontier.pop(key, None)
         return parent, index, candidate
+
+    def _best_first_frame_priority_key(self, frame, selected):
+        parent, cursor = frame[0], int(frame[1])
+        operations, chain = self._source(parent)
+        if len(chain) >= self.max_cuts:
+            return (-2, 0 if parent is None else int(parent))
+        schedule = self._bf_schedule(parent, selected)
+        if parent is None:
+            while (
+                cursor < len(schedule)
+                and schedule[cursor] in self._bf_gen1_expanded
+            ):
+                cursor += 1
+            if cursor >= len(schedule):
+                return (-2, -1)
+            trace_index = schedule[cursor]
+        else:
+            if cursor >= len(schedule):
+                return (-2, int(parent))
+            trace_index = schedule[cursor]
+            op = operations[trace_index]
+            if (
+                _recovery_exclusion(
+                    op,
+                    self.recovery_operation_kinds,
+                    self.flash_base,
+                    self.address_ranges,
+                )
+                is not None
+            ):
+                return (-1, int(parent), int(trace_index))
+
+        cut_tier_rank, cut_sub_tier = self._cut_tier_key(parent, trace_index)
+        if parent is None:
+            stall_bucket = 0
+            novelty_rank = 1
+            if cut_tier_rank == 0:
+                tier_group = 0
+            elif cut_tier_rank == 1 and cut_sub_tier == 0:
+                tier_group = 1
+            elif cut_tier_rank == 1:
+                tier_group = 2
+            else:
+                tier_group = 3
+            sub_tier_order = (cut_sub_tier, 1)
+            secondary_key = (
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                10**9,
+                10**9,
+                0,
+                0,
+                0,
+                -1,
+                int(trace_index),
+            )
+            return (
+                0,
+                tier_group,
+                cut_tier_rank,
+                stall_bucket,
+                novelty_rank,
+                sub_tier_order,
+                secondary_key,
+            )
+
+        pnode = self._parent_cov.get(parent)
+        if pnode is None:
+            return (
+                0,
+                3,
+                cut_tier_rank,
+                2,
+                2,
+                (cut_sub_tier, 0),
+                (int(parent), int(trace_index)),
+            )
+        entry = pnode["entry"]
+        new_count = int(entry.get("new_coverage_count", 0))
+        reached_new = 1 if new_count > 0 else 0
+        reached_new_sig = 1 if entry.get("reached_new_signature") else 0
+        diverged = 1 if entry.get("diverged_from_prior_recovery") else 0
+        productive_children = int(pnode.get("productive_children", 0))
+        failure_children = int(pnode.get("failure_children", 0))
+        children_booted = int(pnode.get("children_booted", 0))
+        bf_stall = int(pnode.get("bf_stall", 0))
+        generation = int(pnode.get("generation", 1))
+        discovery_ordinal = int(entry.get("discovery_ordinal", 0))
+        signature = entry.get("coverage_signature", ())
+        signature_productive = (
+            1 if signature and signature in self._productive_signatures else 0
+        )
+        sig_unexpanded = (
+            1
+            if (signature and signature not in self._expanded_signatures)
+            else 0
+        )
+        sig_frequency = (
+            int(self._signature_boot_count.get(signature, 10**9))
+            if signature
+            else 10**9
+        )
+        units = entry.get("coverage_units") or ()
+        if units:
+            min_unit_frequency = min(
+                int(self._unit_boot_count.get(u, 1)) for u in units
+            )
+        else:
+            min_unit_frequency = 10**9
+
+        if self._coverage_tracking_active:
+            has_novel_coverage = bool(
+                reached_new
+                or reached_new_sig
+                or diverged
+                or productive_children > 0
+            )
+            if bf_stall == 0 and (
+                has_novel_coverage or failure_children > 0
+            ):
+                stall_bucket = 0
+                novelty_rank = 0
+            else:
+                stall_bucket = 1
+                novelty_rank = 2
+        else:
+            if bf_stall < 2:
+                stall_bucket = 0
+                novelty_rank = 0 if failure_children > 0 else 1
+            else:
+                stall_bucket = 1
+                novelty_rank = 2
+
+        if cut_tier_rank == 0 and stall_bucket == 0:
+            tier_group = 0
+        elif cut_tier_rank == 1 and cut_sub_tier == 0 and stall_bucket == 0:
+            tier_group = 1
+        elif cut_tier_rank <= 1:
+            tier_group = 2
+        else:
+            tier_group = 3
+
+        sub_tier_order = (cut_sub_tier, 0)
+        secondary_key = (
+            -failure_children,
+            -productive_children,
+            -diverged,
+            -reached_new,
+            -reached_new_sig,
+            bf_stall,
+            sig_frequency,
+            min_unit_frequency,
+            generation,
+            -new_count,
+            children_booted,
+            discovery_ordinal,
+            int(trace_index),
+        )
+        return (
+            0,
+            tier_group,
+            cut_tier_rank,
+            stall_bucket,
+            novelty_rank,
+            sub_tier_order,
+            secondary_key,
+        )
+
+    def _select_best_first_frame(self, frames, selected):
+        if not frames:
+            return
+        # First check if any frame has priority < 0 (max_cuts or excluded op
+        # or exhausted schedule) so those are drained in 0 boots before
+        # starvation guard or normal selection.
+        best_idx = 0
+        best_key = None
+        gen1_frame_idx = None
+        for idx, frame in enumerate(frames):
+            if frame[0] is None:
+                gen1_frame_idx = idx
+            key = self._best_first_frame_priority_key(frame, selected)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_idx = idx
+        if best_key is not None and best_key[0] < 0:
+            if best_idx > 0:
+                chosen = frames[best_idx]
+                del frames[best_idx]
+                frames.appendleft(chosen)
+            return
+
+        if (
+            self.starvation_guard_interval > 0
+            and gen1_frame_idx is not None
+            and (
+                (
+                    self.summary["states_booted"] > 0
+                    and (self.summary["states_booted"] + 1)
+                    % self.starvation_guard_interval
+                    == 0
+                    and self._bf_last_starvation_boot
+                    != self.summary["states_booted"]
+                )
+                or self._bf_starvation_active
+            )
+        ):
+            self._bf_starvation_active = True
+            if gen1_frame_idx > 0:
+                chosen = frames[gen1_frame_idx]
+                del frames[gen1_frame_idx]
+                frames.appendleft(chosen)
+            return
+
+        if best_idx > 0:
+            chosen = frames[best_idx]
+            del frames[best_idx]
+            frames.appendleft(chosen)
+
+    def _compute_tier_and_generation_counts(self, results, selected):
+        eval_by_gen = {}
+        eval_by_tier = {"metadata": 0, "boundary": 0, "bulk": 0}
+        cal_tiers = self._bf_trace_tiers(None)
+        cal_seq_to_idx = dict(
+            (int(op.get("sequence", idx)), idx)
+            for idx, op in enumerate(self.calibration_operations)
+        )
+        for row in results:
+            meta = row.get("recovery_state_search") or {}
+            gen = int(meta.get("generation", 1))
+            gen_key = str(gen)
+            eval_by_gen[gen_key] = int(eval_by_gen.get(gen_key, 0)) + 1
+            identity = meta.get("state_identity")
+            tier = self._state_tier.get(identity)
+            if tier not in eval_by_tier:
+                cuts = (meta.get("chain") or {}).get("cuts") or ()
+                if cuts:
+                    seq = int(cuts[-1].get("trace_sequence", -1))
+                    if gen == 1 and seq in cal_seq_to_idx:
+                        idx = cal_seq_to_idx[seq]
+                        if 0 <= idx < len(cal_tiers):
+                            tier = cal_tiers[idx][2]
+            if tier not in eval_by_tier:
+                tier = "metadata"
+            eval_by_tier[tier] = int(eval_by_tier.get(tier, 0)) + 1
+
+        unexp_by_gen = {}
+        unexp_by_tier = {"metadata": 0, "boundary": 0, "bulk": 0}
+        unexp_parents_by_gen = {}
+        unexp_parents_by_tier = {"metadata": 0, "boundary": 0, "bulk": 0}
+
+        for parent, index, _state in self._pending:
+            if parent is None:
+                t_gen = 1
+            else:
+                p_meta = self.results[parent].get("recovery_state_search") or {}
+                t_gen = int(p_meta.get("generation", 1)) + 1
+            g_key = str(t_gen)
+            unexp_by_gen[g_key] = int(unexp_by_gen.get(g_key, 0)) + 1
+            t_tier = self._cut_region_tier(parent, index)
+            if t_tier not in unexp_by_tier:
+                t_tier = "metadata"
+            unexp_by_tier[t_tier] = int(unexp_by_tier.get(t_tier, 0)) + 1
+
+        for frame in self._frames:
+            parent, cursor = frame[0], int(frame[1])
+            operations, chain = self._source(parent)
+            if len(chain) >= self.max_cuts:
+                continue
+            schedule = self._bf_schedule(parent, selected)
+            if parent is None:
+                rem = [
+                    idx
+                    for idx in schedule[cursor:]
+                    if idx not in self._bf_gen1_expanded
+                ]
+                t_gen = 1
+                p_gen_key = "0"
+                p_tier = "metadata"
+            else:
+                rem = [
+                    idx
+                    for idx in schedule[cursor:]
+                    if _recovery_exclusion(
+                        operations[idx],
+                        self.recovery_operation_kinds,
+                        self.flash_base,
+                        self.address_ranges,
+                    )
+                    is None
+                ]
+                p_meta = self.results[parent].get("recovery_state_search") or {}
+                p_gen = int(p_meta.get("generation", 1))
+                t_gen = p_gen + 1
+                p_gen_key = str(p_gen)
+                p_id = p_meta.get("state_identity")
+                p_tier = self._state_tier.get(p_id, "metadata")
+                if p_tier not in unexp_parents_by_tier:
+                    p_tier = "metadata"
+            if rem:
+                unexp_parents_by_gen[p_gen_key] = (
+                    int(unexp_parents_by_gen.get(p_gen_key, 0)) + 1
+                )
+                unexp_parents_by_tier[p_tier] = (
+                    int(unexp_parents_by_tier.get(p_tier, 0)) + 1
+                )
+                g_key = str(t_gen)
+                unexp_by_gen[g_key] = (
+                    int(unexp_by_gen.get(g_key, 0)) + len(rem)
+                )
+                for idx in rem:
+                    c_tier = self._cut_region_tier(parent, idx)
+                    if c_tier not in unexp_by_tier:
+                        c_tier = "metadata"
+                    unexp_by_tier[c_tier] = (
+                        int(unexp_by_tier.get(c_tier, 0)) + 1
+                    )
+
+        return {
+            "evaluated_states_by_generation": eval_by_gen,
+            "evaluated_states_by_tier": eval_by_tier,
+            "unexpanded_states_by_generation": unexp_by_gen,
+            "unexpanded_states_by_tier": unexp_by_tier,
+            "unexpanded_parent_states_by_generation": unexp_parents_by_gen,
+            "unexpanded_parent_states_by_tier": unexp_parents_by_tier,
+        }
 
     def _parent_priority_key(self, node):
         entry = node["entry"]
@@ -1366,7 +2591,9 @@ class RecoveryStateExplorer(object):
                 "generation": int(node["generation"]),
                 "children_booted": int(node["children_booted"]),
                 "productive_children": int(node["productive_children"]),
+                "failure_children": int(node.get("failure_children", 0)),
                 "child_stall": int(node["child_stall"]),
+                "bf_stall": int(node.get("bf_stall", 0)),
                 "entry": {
                     "coverage_units": sorted(
                         entry.get("coverage_units") or (),
@@ -1394,6 +2621,7 @@ class RecoveryStateExplorer(object):
                 },
             }
         return {
+            "coverage_tracking_active": bool(self._coverage_tracking_active),
             "seen_coverage": sorted(
                 self._seen_coverage, key=lambda item: (str(type(item)), item)
             ),
@@ -1462,7 +2690,9 @@ class RecoveryStateExplorer(object):
     def _deserialize_coverage_state(self, cov_state):
         if not isinstance(cov_state, dict):
             return
-        self._coverage_tracking_active = True
+        self._coverage_tracking_active = bool(
+            cov_state.get("coverage_tracking_active", True)
+        )
         self._seen_coverage = set(
             _normalize_coverage_unit(u)
             for u in (cov_state.get("seen_coverage") or ())
@@ -1487,22 +2717,22 @@ class RecoveryStateExplorer(object):
             self._unit_boot_count[_normalize_coverage_unit(u)] = int(c)
         if "seen_signatures" in cov_state:
             self._seen_signatures = set(
-                tuple(_normalize_coverage_unit(u) for u in sig)
+                _deserialize_signature(sig)
                 for sig in (cov_state.get("seen_signatures") or ())
             )
         if "signature_boot_count" in cov_state:
             self._signature_boot_count = dict(
-                (tuple(_normalize_coverage_unit(u) for u in sig), int(count))
+                (_deserialize_signature(sig), int(count))
                 for sig, count in (cov_state.get("signature_boot_count") or ())
             )
         if "expanded_signatures" in cov_state:
             self._expanded_signatures = set(
-                tuple(_normalize_coverage_unit(u) for u in sig)
+                _deserialize_signature(sig)
                 for sig in (cov_state.get("expanded_signatures") or ())
             )
         if "productive_signatures" in cov_state:
             self._productive_signatures = set(
-                tuple(_normalize_coverage_unit(u) for u in sig)
+                _deserialize_signature(sig)
                 for sig in (cov_state.get("productive_signatures") or ())
             )
         if "parent_cov" in cov_state and isinstance(
@@ -1518,17 +2748,16 @@ class RecoveryStateExplorer(object):
                     "productive_children": int(
                         node.get("productive_children", 0)
                     ),
+                    "failure_children": int(node.get("failure_children", 0)),
                     "child_stall": int(node.get("child_stall", 0)),
+                    "bf_stall": int(node.get("bf_stall", 0)),
                     "entry": {
                         "coverage_units": frozenset(
                             _normalize_coverage_unit(u)
                             for u in (raw_entry.get("coverage_units") or ())
                         ),
-                        "coverage_signature": tuple(
-                            _normalize_coverage_unit(u)
-                            for u in (
-                                raw_entry.get("coverage_signature") or ()
-                            )
+                        "coverage_signature": _deserialize_signature(
+                            raw_entry.get("coverage_signature")
                         ),
                         "reached_new_signature": bool(
                             raw_entry.get("reached_new_signature")
@@ -1624,8 +2853,18 @@ class RecoveryStateExplorer(object):
             "limits": {"max_new_states": self.budget.max_new_states,
                        "max_wall_time_s": self.budget.max_wall_time_s},
         }
-        if self._coverage_tracking_active:
+        if self._coverage_tracking_active or self.order == "best_first":
             data["coverage_state"] = self._serialize_coverage_state()
+        if self.order == "best_first":
+            data["best_first_state"] = {
+                "gen1_expanded": sorted(int(i) for i in self._bf_gen1_expanded),
+                "gen1_trace_cursor": int(self._bf_gen1_trace_cursor),
+                "starvation_active": bool(self._bf_starvation_active),
+                "last_starvation_boot": int(self._bf_last_starvation_boot),
+                "state_tier": dict(
+                    (str(k), str(v)) for k, v in sorted(self._state_tier.items())
+                ),
+            }
         return data
 
     def restore(self, checkpoint, inputs):
@@ -1640,14 +2879,20 @@ class RecoveryStateExplorer(object):
         self.results = checkpoint["results"]
         self._traces = checkpoint["recovery_traces"]
         self.summary = checkpoint["counters"]
-        for result in self.results:
+        self._state_result_index = {}
+        for idx, result in enumerate(self.results):
             metadata = result["recovery_state_search"]
             metadata["resume_origin"] = "before_resume"
             self._seen[metadata["state_identity"]] = result
+            self._state_result_index[metadata["state_identity"]] = idx
         self._pending = deque((parent, index, snapshots[key])
                               for parent, index, key in checkpoint["pending_visits"])
         self._frames = deque((parent, index, snapshots[key], erases)
                              for parent, index, key, erases in checkpoint["trace_queue"])
+        self._trace_bases = {}
+        for parent, _index, base_state, _erases in self._frames:
+            if parent is not None:
+                self._trace_bases[parent] = base_state
         self._computed_frontier = dict(((parent, index), snapshots[key])
                                        for parent, index, key in checkpoint["computed_frontier"])
         self._deeper_cross_check_candidates = checkpoint["cross_check_position"]
@@ -1656,8 +2901,33 @@ class RecoveryStateExplorer(object):
         self.budget.booted = len(self.results)
         self._prior_elapsed = checkpoint["elapsed_s"]
         self._resumed = True
+        self._bf_tiers_cache = {}
+        self._bf_schedule_cache = {}
+        self._bf_walkers = {}
+        self._bf_gen1_state_to_index = None
         if "coverage_state" in checkpoint:
             self._deserialize_coverage_state(checkpoint["coverage_state"])
+        if "best_first_state" in checkpoint and isinstance(
+            checkpoint["best_first_state"], dict
+        ):
+            bf_state = checkpoint["best_first_state"]
+            self._bf_gen1_expanded = set(
+                int(i) for i in (bf_state.get("gen1_expanded") or ())
+            )
+            self._bf_gen1_trace_cursor = int(
+                bf_state.get("gen1_trace_cursor", 0)
+            )
+            self._bf_starvation_active = bool(
+                bf_state.get("starvation_active", False)
+            )
+            self._bf_last_starvation_boot = int(
+                bf_state.get("last_starvation_boot", -1)
+            )
+            raw_tiers = bf_state.get("state_tier") or {}
+            if isinstance(raw_tiers, dict):
+                self._state_tier = dict(
+                    (str(k), str(v)) for k, v in raw_tiers.items()
+                )
 
     def _trace_counts(self, index):
         operations = self._traces[index]
@@ -1668,6 +2938,8 @@ class RecoveryStateExplorer(object):
         for index, result in enumerate(results):
             meta = result["recovery_state_search"]
             if meta["generation"] != 1:
+                if self.order == "best_first":
+                    continue
                 break
             total, candidates = self._trace_counts(index)
             rows.append({
@@ -1811,6 +3083,15 @@ class RecoveryStateExplorer(object):
                     break
                 self._pending.popleft()
                 will_boot = self._needs_boot(parent, state)
+                if (
+                    self.order == "best_first"
+                    and self._bf_starvation_active
+                    and will_boot
+                ):
+                    self._bf_last_starvation_boot = int(
+                        self.summary["states_booted"]
+                    )
+                    self._bf_starvation_active = False
                 self._visit(parent, index, state)
                 if will_boot:
                     self._current_cov_parent = None
@@ -1826,6 +3107,12 @@ class RecoveryStateExplorer(object):
                 ):
                     self._select_best_coverage_frame(self._frames)
                     self._current_cov_parent = self._frames[0][0]
+                elif (
+                    self.order == "best_first"
+                    and not self.plan_only
+                    and self._frames
+                ):
+                    self._select_best_first_frame(self._frames, selected)
                 visit = self._expand(self._frames, selected, self.summary)
                 if visit:
                     self._pending.append(visit)
@@ -1877,6 +3164,10 @@ class RecoveryStateExplorer(object):
         elif reason == "coverage_plateau":
             summary["states_excluded_by_coverage_plateau"] = len(known) - len(self._seen)
             summary["unexpanded_states_at_coverage_plateau"] = len(self._frames)
+        if self.order == "best_first":
+            summary.update(
+                self._compute_tier_and_generation_counts(results, selected)
+            )
         summary["stopped_reason"] = reason
         summary["unique_states_seen"] = len(known)
         if self.plan_only:

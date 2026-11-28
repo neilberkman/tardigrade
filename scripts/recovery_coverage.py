@@ -30,6 +30,7 @@ SUPPORTED_COVERAGE_MECHANISMS = (
 SUPPORTED_STATE_SEARCH_ORDERS = (
     "breadth_first",
     "coverage_guided",
+    "best_first",
 )
 
 _CLONE_SUFFIX_RE = re.compile(

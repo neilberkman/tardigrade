@@ -81,6 +81,10 @@ def collect_edges(target, edges):
         op = {"kind": cut["operation"], "operation_index": cut["operation_index"],
               "sequence": cut["trace_sequence"], "offset": int(cut["address"], 16),
               "target": StateID(identity)}
+        if "tier_key" in cut:
+            op["tier_key"] = list(cut["tier_key"])
+        if "region_tier" in cut:
+            op["region_tier"] = str(cut["region_tier"])
         if target.setdefault(op["sequence"], op) != op:
             raise ValueError(f"conflicting trace operation at {cut['address']}")
 
@@ -104,6 +108,7 @@ class RecordedSearch(RecoveryStateExplorer):
         self.filters = {}
         self.terminal = {}
         self.checks = {}
+        self.checks_by_state_cut = {}
         self.stops = {}
         roots = {}
         for report in reports:
@@ -125,7 +130,10 @@ class RecordedSearch(RecoveryStateExplorer):
                             r["recovery_state_search"]["state_identity"] for r in rows
                             if r["recovery_state_search"]["generation"] == 1}
             for sizes in summary.get("first_cut_traces", ()):
-                identity = roots_by_cut[chain_key([sizes["first_cut"]])]
+                cut_key = chain_key([sizes["first_cut"]])
+                if cut_key not in roots_by_cut and reason != "complete":
+                    continue
+                identity = roots_by_cut[cut_key]
                 counts = (sizes["trace_operations"], sizes["generation_two_candidates"])
                 if self.trace_counts.setdefault(identity, counts) != counts:
                     raise ValueError(f"shards disagree on first-cut trace counts for {identity}")
@@ -149,16 +157,21 @@ class RecordedSearch(RecoveryStateExplorer):
                 if isinstance(cov, dict) and isinstance(cov.get("executed_pcs"), list):
                     control_coverage = tuple(cov["executed_pcs"])
                 break
+        report_ctx = part.get("report_context") if isinstance(part.get("report_context"), dict) else {}
         super().__init__(
             initial_state=None, calibration_operations=operations,
             first_cuts=[(op["kind"], op["operation_index"]) for op in operations],
             max_cuts=part["max_cuts"], max_new_states=part["max_new_states"],
             max_wall_time_s=1, clock=lambda: 0, boot_state=self.read_boot,
+            page_size=report_ctx.get("page_size", 4096),
             recovery_fault_types=("power_loss", "interrupted_erase"),
             cross_check_every=part.get("cross_check_every", 1),
             order=order,
             max_boots_without_new_coverage=max_boots_without_new_coverage,
             initial_coverage=control_coverage,
+            slots=report_ctx.get("slots"),
+            critical_regions=report_ctx.get("critical_regions") or (),
+            metadata_regions=report_ctx.get("metadata_regions") or (),
         )
 
     def record_check(self, index, key, check):
@@ -186,6 +199,8 @@ class RecordedSearch(RecoveryStateExplorer):
             if "cross_check" in chain:
                 cuts = chain.get("chain", chain)["cuts"]
                 self.record_check(part["shard_index"], chain_key(cuts), chain["cross_check"])
+                if cuts:
+                    self.checks_by_state_cut[(identity, cuts[-1]["trace_sequence"])] = chain["cross_check"]
         if "shard_depth_excluded" in row:
             self.terminal[identity] = row["shard_depth_excluded"]
         expansion = row.get("shard_expansion")
@@ -197,6 +212,7 @@ class RecordedSearch(RecoveryStateExplorer):
                 raise ValueError(f"foreign generation-two candidate in shard {part['shard_index']}")
             collect_edges(self.edges[identity], expansion["edges"])
             collect_edges(self.edges[identity], expansion.get("peer_edges", []))
+            self.terminal.setdefault(identity, len(self.edges[identity]))
             # Overlapping boots see the same trace. A wall limit can leave
             # one runner with a shorter prefix of that trace.
             old_type, old_addr = self.filters.get(identity, (0, 0))
@@ -210,7 +226,11 @@ class RecordedSearch(RecoveryStateExplorer):
         if generation == self.max_cuts:
             self.summary["recovery_operations_excluded_by_max_cuts"] += self.terminal.get(state, 0)
             return row, ()
-        if state not in self.filters and "max_wall_time_s" not in self.stops.values():
+        if (
+            state not in self.filters
+            and "max_wall_time_s" not in self.stops.values()
+            and not (self.order == "best_first" and self.stops)
+        ):
             raise ValueError(f"missing expansion for state {state}")
         excluded_type, excluded_addr = self.filters.get(state, (0, 0))
         self.summary["recovery_operations_excluded_by_fault_type"] += excluded_type
@@ -225,9 +245,11 @@ class RecordedSearch(RecoveryStateExplorer):
 
     def _trace_counts(self, index):
         identity = self.results[index]["recovery_state_search"]["state_identity"]
-        return self.trace_counts[identity]
+        return self.trace_counts.get(identity, (0, 0))
 
     def _expand(self, frames, selected, counts, preview=False):
+        if self.order == "best_first":
+            return super()._expand(frames, selected, counts, preview)
         parent, index, _, _ = frames.popleft()
         operations, _ = self._source(parent)
         op = operations[index]
@@ -244,7 +266,9 @@ class RecordedSearch(RecoveryStateExplorer):
         if state not in self.rows:
             owner = state_owner(state, self.count)
             reason = self.stops.get(owner) if generation == 2 else None
-            if not self.stops or (generation == 2 and reason is None):
+            if not self.stops or (
+                generation == 2 and reason is None and self.order != "best_first"
+            ):
                 raise ValueError(f"missing boot result for state {state}")
             if state not in self.missing:
                 reason = reason or ("max_wall_time_s" if "max_wall_time_s" in self.stops.values()
@@ -272,6 +296,8 @@ class RecordedSearch(RecoveryStateExplorer):
         ):
             return None
         check = self.checks.get(chain_key(chain))
+        if check is None and self.order == "best_first" and chain:
+            check = self.checks_by_state_cut.get((state, chain[-1]["trace_sequence"]))
         if check is None:
             if "max_wall_time_s" not in self.stops.values():
                 raise ValueError(f"missing cross-check evidence for {chain_key(chain)}")

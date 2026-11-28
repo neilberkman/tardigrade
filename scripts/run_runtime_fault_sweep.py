@@ -21967,6 +21967,19 @@ def run_recovery_state_search():
         shard_options = dict((key, phase2_state_search[key])
                             for key in ('shard_count', 'shard_index'))
 
+    _ss_metadata_regions = list(phase2_state_search.get('metadata_regions') or ())
+    if not _ss_metadata_regions and isinstance(globals().get('metadata_regions'), (list, tuple)):
+        _ss_metadata_regions = [
+            (int(item[1]), int(item[2]))
+            for item in globals().get('metadata_regions')
+            if isinstance(item, (list, tuple)) and len(item) >= 3
+        ]
+    _ss_bootloader_region = (
+        success_checks_config.get('bootloader_region')
+        if isinstance(globals().get('success_checks_config'), dict)
+        else None
+    )
+
     explorer = explorer_class(
         initial_state,
         calibration_operations,
@@ -22000,6 +22013,10 @@ def run_recovery_state_search():
             'max_boots_without_new_coverage'
         ),
         initial_coverage=globals().get('_control_recovery_coverage_pcs') or (),
+        slot_ranges=dict(slot_ranges),
+        critical_regions=phase2_state_search.get('critical_regions') or (),
+        metadata_regions=_ss_metadata_regions,
+        bootloader_region=_ss_bootloader_region,
         **shard_options
     )
     checkpoint_path = get_optional_var('state_search_checkpoint', '').strip()

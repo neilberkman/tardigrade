@@ -1273,7 +1273,7 @@ class RecoveryStateSearchConfig:
         if normalized_order not in SUPPORTED_STATE_SEARCH_ORDERS:
             raise ProfileError(
                 "fault_sweep.phase2_fault.state_search.order: "
-                "expected breadth_first or coverage_guided"
+                "expected breadth_first, coverage_guided, or best_first"
             )
         self.order = normalized_order
         if max_boots_without_new_coverage is not None:
@@ -4464,6 +4464,23 @@ class ProfileConfig:
                 state_search_runtime["fault_types"] = list(
                     fs.phase2_fault.fault_types
                 )
+                if (
+                    fs.phase2_fault.state_search.order == "best_first"
+                    and fs.heuristic_config is not None
+                    and fs.heuristic_config.critical_regions
+                ):
+                    state_search_runtime["critical_regions"] = [
+                        {"start": int(start), "end": int(end)}
+                        for start, end in fs.heuristic_config.critical_regions
+                    ]
+                if (
+                    fs.phase2_fault.state_search.order == "best_first"
+                    and self.metadata_fault_regions
+                ):
+                    state_search_runtime["metadata_regions"] = [
+                        {"start": int(region.start), "end": int(region.end)}
+                        for region in self.metadata_fault_regions
+                    ]
                 state_search_payload = base64.b64encode(
                     json.dumps(
                         state_search_runtime,
