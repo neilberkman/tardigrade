@@ -126,42 +126,6 @@ def compare_snapshots(failing, passing):
     return dict(result, status="compared_identity_slot", base=f"0x{base:08X}", size=extent, ranges=ranges)
 
 
-_FAULT_HANDLER_NAMES = frozenset((
-    "HardFault_Handler", "BusFault_Handler", "MemManage_Handler",
-    "UsageFault_Handler", "Default_Handler",
-))
-
-
-def _resolve_last_function(row, signals, endpoint, source):
-    last_obs = endpoint.get("last_observed")
-    exc_entry = endpoint.get("exception_entry")
-    if (
-        exc_entry
-        and exc_entry.get("function")
-        and (not last_obs or not last_obs.get("function") or last_obs.get("function") in _FAULT_HANDLER_NAMES)
-    ):
-        return exc_entry
-    if last_obs and last_obs.get("function"):
-        return last_obs
-    if exc_entry and exc_entry.get("function"):
-        return exc_entry
-    handoff = signals.get("phase2_pc_handoff_observation") or signals.get("pc_handoff_observation") or {}
-    for branch in reversed(handoff.get("indirect_branches") or ()):
-        resolved = source.resolve_pc(branch.get("pc"))
-        if resolved and resolved.get("function"):
-            return resolved
-    for sample_pc in reversed(signals.get("phase2_pc_samples") or signals.get("pc_samples") or ()):
-        resolved = source.resolve_pc(sample_pc)
-        if resolved and resolved.get("function"):
-            return resolved
-    p2 = row.get("phase2_fault") or {}
-    for entry in reversed(p2.get("p2_write_trace") or ()):
-        resolved = source.resolve_pc(entry.get("pc"))
-        if resolved and resolved.get("function"):
-            return resolved
-    return last_obs
-
-
 def _endpoint(row, expected, source):
     outcome, slot = _effective_boot_result(row)
     signals = _effective_boot_signals(row)
@@ -194,9 +158,8 @@ def _endpoint(row, expected, source):
     location = source.resolve_pc(loop.get("pc"))
     if location and endpoint["last_observed"] and location["pc"] == endpoint["last_observed"]["pc"]:
         endpoint["hang_loop"] = location
-    last_fn = _resolve_last_function(row, signals, endpoint, source)
-    if last_fn is not None:
-        endpoint["last_function"] = last_fn
+    if endpoint["last_observed"] is not None:
+        endpoint["last_function"] = endpoint["last_observed"]
     return endpoint
 
 
@@ -580,13 +543,13 @@ def _message(endpoint, comparison, cuts=()):
                 else:
                     recovery_clause = f"recovery triggered {exc}{image_note} at {entry_loc}"
             else:
-                loc = _format_recovery_source(endpoint.get("last_observed") or endpoint.get("last_function"))
+                loc = _format_recovery_source(endpoint.get("last_observed"))
                 recovery_clause = f"recovery triggered {exc}{image_note} at {loc}"
         elif endpoint.get("hang_loop"):
             loc = _format_recovery_source(endpoint["hang_loop"])
             recovery_clause = f"recovery hung in self-branch ({outcome_label}{image_note}) at {loc}"
         else:
-            loc = _format_recovery_source(endpoint.get("last_observed") or endpoint.get("last_function"))
+            loc = _format_recovery_source(endpoint.get("last_observed"))
             recovery_clause = f"recovery ended with {outcome_label}{image_note} at {loc}"
     elif endpoint.get("copy_completed") is False:
         count = endpoint.get("completed_writes")
@@ -618,6 +581,15 @@ def explain_recovery_failures(
     comparisons = {}
     pre_states = {}
     for row in rows:
+        # Saved reports can have an earlier symbol in last_function even
+        # when the terminal PC was outside the supplied ELF.
+        explanation = row.get("failure_explanation")
+        recovery = explanation.get("recovery") if isinstance(explanation, dict) else None
+        if isinstance(recovery, dict):
+            if recovery.get("last_observed"):
+                recovery["last_function"] = recovery["last_observed"]
+            else:
+                recovery.pop("last_function", None)
         candidate = row.pop("_sibling_snapshot_comparison", None)
         if candidate:
             comparisons[id(row)] = candidate

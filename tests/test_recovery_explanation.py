@@ -373,3 +373,38 @@ def test_two_cut_neighbouring_parent_sibling_and_p2_trace_attribution(tmp_path):
     assert span["operation"]["pc"] == p2_pc
     assert span["operation"]["source"]["resolution"] == "dwarf"
 
+
+def test_recovery_endpoint_stays_at_unsymbolized_application_pc(tmp_path):
+    # Only the boot firmware has a matching ELF. All earlier PCs resolve.
+    previous = "0x1000004A"
+    failed = row(0, "no_boot", signals={
+        "pc": "0x103e8",
+        "phase2_executed_instructions": 100,
+        "phase2_pc_samples": [previous],
+        "phase2_pc_handoff_observation": {"indirect_branches": [{"pc": previous}]},
+    }, phase2_fault={"p2_write_trace": [{"write_index": 1, "pc": previous}]})
+    audit([failed], tmp_path)
+    endpoint = failed["failure_explanation"]["recovery"]
+    assert endpoint["last_function"] == endpoint["last_observed"] == {
+        "resolution": "address_only", "pc": "0x000103E8",
+    }
+
+
+def test_saved_report_uses_original_endpoint_evidence(tmp_path):
+    observed = {"pc": "0x000103E8", "resolution": "address_only"}
+    earlier = {"pc": "0x1000004A", "function": "old_write", "resolution": "symbol_table"}
+    recovery = {"last_observed": observed, "last_function": earlier}
+    explanation = {"message": "recorded message", "recovery": recovery}
+    failed = row(0, "no_boot", failure_explanation=explanation)
+    audit([failed], tmp_path)
+    assert recovery["last_function"] == observed
+    assert failed["failure_explanation"]["message"] == "recorded message"
+
+
+def test_missing_endpoint_pc_has_no_last_function(tmp_path):
+    failed = row(0, "no_boot", signals={
+        "phase2_executed_instructions": 42,
+        "phase2_pc_handoff_observation": {"indirect_branches": [{"pc": "0x1000004A"}]},
+    })
+    audit([failed], tmp_path)
+    assert "last_function" not in failed["failure_explanation"]["recovery"]
