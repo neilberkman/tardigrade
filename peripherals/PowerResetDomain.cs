@@ -5,6 +5,7 @@ using System.Linq;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Memory;
 using Antmicro.Renode.Peripherals.Timers;
 
@@ -206,6 +207,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public void PowerRestored()
         {
             pending = Source.Unspecified;
+            EnableReleasedCpuTimeHandles();
         }
 
         public void Reset()
@@ -249,6 +251,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 history.Add("warm");
             }
             pending = Source.Unspecified;
+            EnableReleasedCpuTimeHandles();
         }
 
         private void WarmReset(Source source)
@@ -257,6 +260,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 pending = source;
                 machine.Reset();
+                EnableReleasedCpuTimeHandles();
+            }
+        }
+
+        private void EnableReleasedCpuTimeHandles()
+        {
+            foreach(var cpu in machine.SystemBus.GetCPUs().OfType<BaseCPU>())
+            {
+                if(cpu.TimeHandle != null)
+                {
+                    cpu.TimeHandle.Enabled = true;
+                }
             }
         }
 

@@ -231,3 +231,50 @@ Retained Fill Stops At Both Unaligned Boundaries
     Word Should Equal    0x20000000    0x5b5b5b44
     Word Should Equal    0x20010000    0x555b5b5b
     Word Should Equal    0x20010004    0x99000000
+
+Released CPU Runs From Reset Instant After Mid-Quantum Halt
+    nRF Board
+    # Program at 0x0:
+    #   +0x00: SP = 0x20004000
+    #   +0x04: Reset_Handler = 0x00000009
+    #   +0x08: ldr r0, [pc, #16]   (0x4804 -> [0x1c] = 1)
+    #   +0x0a: ldr r1, [pc, #20]   (0x4905 -> [0x20] = 0x4000051c)
+    #   +0x0c: str r0, [r1]        (0x6008)
+    #   +0x0e: b .                 (0xe7fe)
+    Execute Command    sysbus WriteDoubleWord 0x00000000 0x20004000
+    Execute Command    sysbus WriteDoubleWord 0x00000004 0x00000009
+    Execute Command    sysbus WriteDoubleWord 0x00000008 0x49054804
+    Execute Command    sysbus WriteDoubleWord 0x0000000c 0xe7fe6008
+    Execute Command    sysbus WriteDoubleWord 0x0000001c 0x00000001
+    Execute Command    sysbus WriteDoubleWord 0x00000020 0x4000051c
+    Execute Command    python "bus = monitor.Machine.SystemBus; cpu = monitor.Machine['sysbus.cpu']; reset_us = [0]; samples = []"
+    Execute Command    python "from System import Action, UInt64, UInt32; cpu.SetHookAtBlockBegin(Action[UInt64, UInt32](lambda pc, sz: (samples.append(int(monitor.Machine.LocalTimeSource.ElapsedVirtualTime.TotalMicroseconds) - reset_us[0]), setattr(cpu, 'IsHalted', True)) if int(pc) == 8 else None))"
+    # Clean boot 1: halts mid-quantum inside the MMIO write watchpoint.
+    Execute Command    powerDomain StartTrial
+    Execute Command    powerDomain PreparePowerOn
+    Execute Command    machine Reset
+    Execute Command    python "reset_us[0] = int(monitor.Machine.LocalTimeSource.ElapsedVirtualTime.TotalMicroseconds)"
+    Execute Command    cpu VectorTableOffset 0x0
+    Execute Command    cpu SP 0x20004000
+    Execute Command    cpu PC 0x00000009
+    Execute Command    cpu IsHalted false
+    Execute Command    emulation RunFor "0.001"
+    ${halted}=    Execute Command    python "print(cpu.IsHalted)"
+    Should Be Equal    ${halted.strip()}    True
+    # Bracketed power-loss reset after mid-quantum halt must re-enable TimeHandle.
+    Execute Command    powerDomain BeginPowerLoss
+    Execute Command    machine Reset
+    Execute Command    powerDomain EndPowerLoss
+    Execute Command    python "reset_us[0] = int(monitor.Machine.LocalTimeSource.ElapsedVirtualTime.TotalMicroseconds)"
+    ${th_enabled}=    Execute Command    python "print(cpu.TimeHandle.Enabled)"
+    Should Be Equal    ${th_enabled.strip()}    True
+    Execute Command    cpu VectorTableOffset 0x0
+    Execute Command    cpu SP 0x20004000
+    Execute Command    cpu PC 0x00000009
+    Execute Command    cpu IsHalted false
+    Execute Command    emulation RunFor "0.001"
+    ${sample0}=    Execute Command    python "print(samples[0])"
+    ${sample1}=    Execute Command    python "print(samples[1])"
+    Should Be Equal As Integers    ${sample0}    0
+    Should Be Equal As Integers    ${sample1}    ${sample0}
+
