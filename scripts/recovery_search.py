@@ -111,6 +111,44 @@ def operation_in_address_ranges(operation, flash_base, address_ranges):
     )
 
 
+def recovery_operation_kinds(recovery_fault_types):
+    normalized_recovery_fault_types = tuple(
+        str(fault_type).strip().lower()
+        for fault_type in recovery_fault_types
+    )
+    unsupported_recovery_fault_types = sorted(
+        set(normalized_recovery_fault_types)
+        - set(("power_loss", "interrupted_erase"))
+    )
+    if unsupported_recovery_fault_types:
+        raise RecoverySearchError(
+            "unsupported recovery cut type(s) {!r}".format(
+                unsupported_recovery_fault_types
+            )
+        )
+    return frozenset(
+        kind
+        for fault_type, kind in (
+            ("power_loss", "write"),
+            ("interrupted_erase", "erase"),
+        )
+        if fault_type in normalized_recovery_fault_types
+    )
+
+
+def recovery_trace_size(operations, tracking_start, flash_base, config):
+    kinds = recovery_operation_kinds(config.get("fault_types") or ("power_loss",))
+    ranges = config.get("address_ranges") or ()
+    return {
+        "address": "0x{:08X}".format(tracking_start),
+        "traced_operations": len(operations),
+        "candidate_operations": sum(
+            1 for operation in operations
+            if operation["kind"] in kinds and operation_in_address_ranges(operation, flash_base, ranges)
+        ),
+    }
+
+
 def format_cut(operation, flash_base, fault_type="power_loss"):
     operation_kind = str(operation["kind"])
     operation_index = int(operation["operation_index"])
@@ -383,28 +421,7 @@ class RecoveryStateExplorer(object):
         self.corruption_seed = int(corruption_seed) & 0xFFFFFFFF
         self.page_size = int(page_size)
         self.program_unit = int(program_unit)
-        normalized_recovery_fault_types = tuple(
-            str(fault_type).strip().lower()
-            for fault_type in recovery_fault_types
-        )
-        unsupported_recovery_fault_types = sorted(
-            set(normalized_recovery_fault_types)
-            - set(("power_loss", "interrupted_erase"))
-        )
-        if unsupported_recovery_fault_types:
-            raise RecoverySearchError(
-                "unsupported recovery cut type(s) {!r}".format(
-                    unsupported_recovery_fault_types
-                )
-            )
-        self.recovery_operation_kinds = frozenset(
-            kind
-            for fault_type, kind in (
-                ("power_loss", "write"),
-                ("interrupted_erase", "erase"),
-            )
-            if fault_type in normalized_recovery_fault_types
-        )
+        self.recovery_operation_kinds = recovery_operation_kinds(recovery_fault_types)
         self.cross_check_every = int(cross_check_every)
         self.cross_check = cross_check
         self.budget = SearchBudget(max_new_states, max_wall_time_s, clock)

@@ -782,10 +782,10 @@ class RecoveryWriteTrackingGateTests(unittest.TestCase):
         self.assertEqual(data.TotalWordWrites, 0)
         self.assertTrue(gate_state["started"])
 
-        # Passing enable_tracking_gate=True (used by clean control Phase 1) keeps
+        # Passing tracking_start=None (used by clean control Phase 1) keeps
         # both backend and Python CPU tracking gates armed while zeroing counters.
         data.TotalWordWrites = 6
-        ns["reset_nvmc_for_recovery"](enable_tracking_gate=True)
+        ns["reset_nvmc_for_recovery"](tracking_start=None)
         self.assertEqual(data.TrackingStartAddress, 0x20000400)
         self.assertEqual(cpu.hooks, [0x20000400])
         self.assertEqual(data.TotalWordWrites, 0)

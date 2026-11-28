@@ -44,6 +44,7 @@ def _load_phase2_fault_chain(namespace: dict) -> None:
         "_phase2_chain_skip_result",
         "_phase2_chain_evaluated_result",
         "run_phase2_fault_chain",
+        "_recovery_tracking_start",
     }
     functions = [
         node
@@ -74,6 +75,8 @@ def _load_phase2_state_fault(namespace: dict) -> None:
 
 def _load_state_search_preflight(namespace: dict) -> None:
     tree = ast.parse(RUNNER.read_text(encoding="utf-8"))
+    namespace.setdefault("tracking_start_address_config", 0)
+    namespace.setdefault("recovery_tracking_start_address", None)
     names = {"_state_search_trace_target", "_state_search_preflight"}
     functions = [
         node
@@ -200,8 +203,10 @@ class _Phase2Runtime:
             "log": lambda _message: None,
             "restore_phase1_baseline": self._restore_phase1,
             "restore_flash_and_boot": self._restore_flash_and_boot,
+            "tracking_start_address_config": 0,
+            "recovery_tracking_start_address": None,
             "reset_nvmc_for_sweep": lambda **kwargs: self.sweep_tracking_gates.append(
-                kwargs.get("enable_tracking_gate")
+                kwargs.get("tracking_start")
             ),
             "reset_nvmc_for_recovery": lambda **_kwargs: None,
             "arm_fault": self._arm_fault,
@@ -591,7 +596,7 @@ def test_deferred_state_search_pair_cross_check_reuses_tracking_gate() -> None:
 
     runtime.run(0, 99, cross_check_expected=expected)
 
-    assert runtime.sweep_tracking_gates == [None, True]
+    assert runtime.sweep_tracking_gates == [None, 0x20000400]
 
 
 def test_deferred_state_search_chain_cross_check_gates_every_segment() -> None:
@@ -605,7 +610,7 @@ def test_deferred_state_search_chain_cross_check_gates_every_segment() -> None:
         cross_check_expected=expected,
     )
 
-    assert runtime.sweep_tracking_gates == [True, True, True]
+    assert runtime.sweep_tracking_gates == [0x20000400] * 3
 
 
 def test_state_search_live_cross_check_routes_deeper_chains_to_chain_injector() -> None:

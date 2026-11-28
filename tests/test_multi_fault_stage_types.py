@@ -167,7 +167,7 @@ class _FakeRuntime:
         self.torn_word_applied.append(self.ns["mram_torn_word"])
         return True
 
-    def _reset(self, enable_tracking_gate=True) -> None:
+    def _reset(self, tracking_start=None) -> None:
         self.fired = {"write": False, "erase": False}
 
     def _arm_fault(self, arm_at, write_fault_mode=0) -> None:

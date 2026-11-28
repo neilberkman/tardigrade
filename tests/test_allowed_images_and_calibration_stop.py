@@ -1112,16 +1112,16 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
             },
             "monitor": Monitor(),
             "refresh_runtime_handles": lambda: None,
-            "_configure_tracking_start_address": lambda enable_tracking_gate=True: (
-                tracking_gate_calls.append(enable_tracking_gate),
+            "_configure_tracking_start_address": lambda address=None: (
+                tracking_gate_calls.append(address),
                 setattr(
                     data,
                     "TrackingStartAddress",
-                    0x200003C0 if enable_tracking_gate else 0,
+                    0x200003C0 if address is None else address,
                 ),
             ),
-            "_configure_python_tracking_gate": lambda force=False, enable_tracking_gate=True: python_gate_calls.append(
-                (force, enable_tracking_gate)
+            "_configure_python_tracking_gate": lambda force=False, address=None: python_gate_calls.append(
+                (force, address)
             ),
             "_prepare_calibration_stop": lambda: None,
             "reset_sticky_handoff_state": lambda: None,
@@ -1136,15 +1136,15 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
         self.assertEqual(ctrl.CommandExecutions, 0)
         self.assertFalse(data.shadow_preserved)
         self.assertEqual(data.TrackingStartAddress, 0x200003C0)
-        self.assertEqual(tracking_gate_calls, [True])
-        self.assertEqual(python_gate_calls, [(True, True)])
+        self.assertEqual(tracking_gate_calls, [None])
+        self.assertEqual(python_gate_calls, [(True, None)])
         self.assertTrue(data.PreserveCountersAcrossReset)
         self.assertTrue(ctrl.PreserveCountersAcrossReset)
 
         namespace["_machine_reset"](apply_tracking_gate=False)
         self.assertEqual(data.TrackingStartAddress, 0)
-        self.assertEqual(tracking_gate_calls, [True, False])
-        self.assertEqual(python_gate_calls, [(True, True), (True, False)])
+        self.assertEqual(tracking_gate_calls, [None, 0])
+        self.assertEqual(python_gate_calls, [(True, None), (True, 0)])
 
     def test_reset_nvmc_for_sweep_and_recovery_clear_counters_and_enable_in_run_preservation(
         self,
@@ -1181,11 +1181,11 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
                 "backend_sysbus_name": "sysbus.mram_tracker",
             },
             "_DISARM_SENTINEL": 0x7FFFFFFF,
-            "_configure_tracking_start_address": lambda enable_tracking_gate=True: tracking_gate_calls.append(
-                enable_tracking_gate
+            "_configure_tracking_start_address": lambda address=None: tracking_gate_calls.append(
+                address
             ),
-            "_configure_python_tracking_gate": lambda force=False, enable_tracking_gate=True: python_gate_calls.append(
-                (force, enable_tracking_gate)
+            "_configure_python_tracking_gate": lambda force=False, address=None: python_gate_calls.append(
+                (force, address)
             ),
             "disarm_controller_fault": lambda: None,
             "disarm_i2c_fault": lambda: None,
@@ -1202,8 +1202,8 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
         self.assertEqual(data.shadow_invalidations, 1)
         self.assertTrue(data.PreserveCountersAcrossReset)
         self.assertFalse(data.FaultEverFired)
-        self.assertEqual(tracking_gate_calls, [True])
-        self.assertEqual(python_gate_calls, [(True, True)])
+        self.assertEqual(tracking_gate_calls, [None])
+        self.assertEqual(python_gate_calls, [(True, None)])
 
         data.TotalWordWrites = 512
         data.PreserveCountersAcrossReset = False
@@ -1216,15 +1216,15 @@ class CalibrationRuntimeBoundaryTests(unittest.TestCase):
         self.assertTrue(data.PreserveCountersAcrossReset)
         self.assertFalse(data.FaultEverFired)
         self.assertEqual(data.FaultAtWordWrite, 0x7FFFFFFF)
-        self.assertEqual(tracking_gate_calls, [True, False])
-        self.assertEqual(python_gate_calls, [(True, True), (True, False)])
+        self.assertEqual(tracking_gate_calls, [None, 0])
+        self.assertEqual(python_gate_calls, [(True, None), (True, 0)])
 
         data.TotalWordWrites = 17
-        namespace["reset_nvmc_for_recovery"](enable_tracking_gate=True)
+        namespace["reset_nvmc_for_recovery"](tracking_start=None)
         self.assertEqual(data.TotalWordWrites, 0)
         self.assertEqual(data.FaultAtWordWrite, 0x7FFFFFFF)
-        self.assertEqual(tracking_gate_calls, [True, False, True])
-        self.assertEqual(python_gate_calls, [(True, True), (True, False), (True, True)])
+        self.assertEqual(tracking_gate_calls, [None, 0, None])
+        self.assertEqual(python_gate_calls, [(True, None), (True, 0), (True, None)])
 
     def test_in_run_firmware_reset_preserves_monotonic_writes_and_reaches_post_reset_fault_index(
         self,

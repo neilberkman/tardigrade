@@ -318,7 +318,7 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
 
         operations, trace_base, gate_reached = namespace[
             "_state_search_resolve_recovery_trace"
-        ](state, True)
+        ](state, True, namespace["tracking_start_address_config"])
 
         self.assertEqual(operations, ())
         self.assertIs(trace_base, state)
@@ -361,7 +361,7 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
             namespace,
         )
 
-        actual = namespace["_state_search_resolve_recovery_trace"](state, True)
+        actual = namespace["_state_search_resolve_recovery_trace"](state, True, namespace["tracking_start_address_config"])
 
         self.assertEqual(actual, (operations, captured_base, True))
         self.assertEqual(
@@ -404,7 +404,7 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
             namespace,
         )
 
-        actual = namespace["_state_search_resolve_recovery_trace"](state, True)
+        actual = namespace["_state_search_resolve_recovery_trace"](state, True, namespace["tracking_start_address_config"])
 
         self.assertEqual(actual, (operations, state, None))
         self.assertEqual(validated, [(state, operations)])

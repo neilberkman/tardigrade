@@ -507,23 +507,23 @@ class TfmBl2ProbeSlotCompatibilityTest(unittest.TestCase):
         self.assertIn("_apply_tracking_start_address", runtime)
         self.assertIn("requires backend", runtime)
         self.assertIn(
-            "def _configure_python_tracking_gate(force=False, enable_tracking_gate=True)",
+            "def _configure_python_tracking_gate(force=False, address=None)",
             runtime,
         )
         self.assertIn(
-            "_configure_python_tracking_gate(force=True, enable_tracking_gate=apply_tracking_gate)",
+            "_configure_python_tracking_gate(force=True, address=address)",
             runtime,
         )
         self.assertIn(
-            "def reset_nvmc_for_recovery(enable_tracking_gate=False):",
+            "def reset_nvmc_for_recovery(tracking_start=0):",
             runtime,
         )
         self.assertIn(
-            "_configure_python_tracking_gate(force=True, enable_tracking_gate=enable_tracking_gate)",
+            "_configure_python_tracking_gate(force=True, address=tracking_start)",
             runtime,
         )
         self.assertIn(
-            "reset_nvmc_for_recovery(enable_tracking_gate=True)",
+            "reset_nvmc_for_recovery(tracking_start=None)",
             runtime,
         )
         self.assertIn("cpu_ref.AddHook(address, _python_tracking_gate_hook)", runtime)

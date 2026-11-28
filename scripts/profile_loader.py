@@ -5279,6 +5279,8 @@ def _parse_fault_sweep(
             "fault_sweep.phase2_fault.first_fault_types: interrupted_erase "
             "requires fault_sweep.include_erase_fault_points: true"
         )
+    if fs_cfg.recovery_tracking_start_address is not None and fs_cfg.evaluation_mode == "state":
+        raise ProfileError("fault_sweep.recovery_tracking_start_address requires execute evaluation mode")
     if fs_cfg.phase2_fault.state_search.enabled:
         if str(fs_cfg.mode).strip().lower() != "runtime":
             raise ProfileError(

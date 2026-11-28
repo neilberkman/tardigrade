@@ -48,6 +48,7 @@ from recovery_state import (
 from recovery_search import (
     RecoveryStateExplorer,
     first_persistent_difference,
+    recovery_trace_size,
     select_first_cut_operations,
 )
 from replay_cross_check import (
@@ -537,6 +538,18 @@ if tracking_start_address_config < 0 or tracking_start_address_config > 0xFFFFFF
             tracking_start_address_config
         )
     )
+
+recovery_start_raw = get_optional_var('recovery_tracking_start_address', '')
+recovery_tracking_start_address = int(recovery_start_raw, 0) if recovery_start_raw else None
+if recovery_tracking_start_address is not None and not 0 <= recovery_tracking_start_address <= 0xFFFFFFFF:
+    raise ValueError('recovery_tracking_start_address must be a 32-bit address')
+
+
+def _recovery_tracking_start(inherit_first_gate=True):
+    if recovery_tracking_start_address is not None:
+        return recovery_tracking_start_address
+    return tracking_start_address_config if inherit_first_gate else 0
+
 
 mram_torn_word = get_optional_var('mram_torn_word', 'half').strip().lower()
 if not mram_torn_word:
@@ -1029,10 +1042,10 @@ def _apply_tracking_start_address(data, backend_name, address):
         return
     data.TrackingStartAddress = address
 
-def _configure_tracking_start_address(enable_tracking_gate=True):
+def _configure_tracking_start_address(address=None):
     """Apply or bypass the optional precise tracking boundary on the active backend."""
     _apply_mram_torn_word_mode()
-    effective_address = tracking_start_address_config if enable_tracking_gate else 0
+    effective_address = tracking_start_address_config if address is None else address
     _apply_tracking_start_address(
         backend['data'], backend['backend_sysbus_name'], effective_address
     )
@@ -1082,8 +1095,9 @@ def _python_tracking_gate_hook(cpu, addr):
         pass
     log('tracking_gate: python activation at 0x{:08X}'.format(current))
 
-def _configure_python_tracking_gate(force=False, enable_tracking_gate=True):
-    address = (tracking_start_address_config & 0xFFFFFFFF) if enable_tracking_gate else 0
+def _configure_python_tracking_gate(force=False, address=None):
+    if address is None:
+        address = tracking_start_address_config
     gate = _python_tracking_gate
     if (not force and gate['installed'] and gate['address'] == address and
             gate['cpu'] is monitor.Machine['sysbus.cpu']):
@@ -1156,9 +1170,10 @@ def _machine_reset(apply_tracking_gate=True):
     _set_preserve_counters_across_reset(False)
     monitor.Parse('machine Reset')
     refresh_runtime_handles()
-    _configure_tracking_start_address(enable_tracking_gate=apply_tracking_gate)
+    address = None if apply_tracking_gate else 0
+    _configure_tracking_start_address(address)
     _set_preserve_counters_across_reset(True)
-    _configure_python_tracking_gate(force=True, enable_tracking_gate=apply_tracking_gate)
+    _configure_python_tracking_gate(force=True, address=address)
     if '_prepare_calibration_stop' in globals():
         _prepare_calibration_stop()
     globals()['_recovery_zero_vector_guard'] = False
@@ -1293,6 +1308,8 @@ calibration_trace_required = get_optional_var(
 evaluation_mode = str(monitor.GetVariable('evaluation_mode')).strip().lower()
 if evaluation_mode not in ('execute', 'state'):
     evaluation_mode = 'state'
+if recovery_tracking_start_address is not None and evaluation_mode != 'execute':
+    raise ValueError('recovery_tracking_start_address requires execute evaluation mode')
 run_duration = str(monitor.GetVariable('run_duration'))
 max_step_limit_configured = int(monitor.GetVariable('max_step_limit'))
 max_step_limit_resolution = resolve_runtime_step_limit(
@@ -7175,10 +7192,10 @@ def restore_hw_init():
     bus.WriteDoubleWord(0x40000100, 0x1)
     bus.WriteDoubleWord(0x40000418, 0x10001)
 
-def reset_nvmc_for_sweep(enable_tracking_gate=True):
+def reset_nvmc_for_sweep(tracking_start=None):
     # Reset NVM counters and prepare for fault-injected run.
-    _configure_tracking_start_address(enable_tracking_gate=enable_tracking_gate)
-    _configure_python_tracking_gate(force=True, enable_tracking_gate=enable_tracking_gate)
+    _configure_tracking_start_address(tracking_start)
+    _configure_python_tracking_gate(force=True, address=tracking_start)
     _clear_uncorr_fn = globals().get('_clear_mram_uncorrectable_words')
     if _clear_uncorr_fn is not None:
         _clear_uncorr_fn()
@@ -7252,14 +7269,14 @@ def reset_nvmc_for_sweep(enable_tracking_gate=True):
     # Reset I2C fault state.
     disarm_i2c_fault()
 
-def reset_nvmc_for_recovery(enable_tracking_gate=False):
+def reset_nvmc_for_recovery(tracking_start=0):
     # Reset NVM for recovery boot: count recovery writes regardless of any
     # Phase 1 tracking_start_address gate by default so recovery_writes and
     # Phase 2 write-progress observation remain active.  The clean control run
-    # passes enable_tracking_gate=True so its Phase 1 stays behind the same
+    # passes the Phase 1 address so its Phase 1 stays behind the same
     # tracking gate as calibration.
-    _configure_tracking_start_address(enable_tracking_gate=enable_tracking_gate)
-    _configure_python_tracking_gate(force=True, enable_tracking_gate=enable_tracking_gate)
+    _configure_tracking_start_address(tracking_start)
+    _configure_python_tracking_gate(force=True, address=tracking_start)
     _clear_read_log_fn = globals().get('_clear_mram_uncorrectable_read_log')
     if _clear_read_log_fn is not None:
         _clear_read_log_fn()
@@ -13951,7 +13968,7 @@ def run_execute_fault(
         cpu_ref = monitor.Machine['sysbus.cpu']
         cpu_ref.IsHalted = False
 
-        reset_nvmc_for_recovery(enable_tracking_gate=True)
+        reset_nvmc_for_recovery(tracking_start=None)
         disarm_fault()
 
         arm_vtor_watchpoint()
@@ -14697,7 +14714,7 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
     restore_flash_and_boot(saved_flash)
 
     # Reset counters and arm erase fault for recovery boot.
-    reset_nvmc_for_sweep(enable_tracking_gate=False)
+    reset_nvmc_for_sweep(tracking_start=0)
     disarm_write_fault()
     arm_erase_fault(erase_fault_at + 1)  # 0-indexed → 1-indexed
 
@@ -15157,15 +15174,10 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None):
 
         cpu_ref = monitor.Machine['sysbus.cpu']
         cpu_ref.IsHalted = False
-        reset_nvmc_for_sweep(enable_tracking_gate=bool(
-            cut_index == 0
-            or (
-                cross_check_expected is not None
-                and int(
-                    globals().get('tracking_start_address_config', 0) or 0
-                )
-            )
-        ))
+        tracking_start = tracking_start_address_config if cut_index == 0 else (
+            _recovery_tracking_start(inherit_first_gate=cross_check_expected is not None)
+        )
+        reset_nvmc_for_sweep(tracking_start=tracking_start)
         if carried_offsets:
             _restore_mram_uncorrectable_offsets(carried_offsets)
         _clear_mram_uncorrectable_read_log()
@@ -15233,6 +15245,8 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None):
             'recovery_boot_signals': recovery_signals,
             '_applied_mram_torn_word': applied_mram,
         }
+        if recovery_tracking_start_address is not None:
+            record['tracking_start_address'] = fmt_u32(tracking_start)
         if drawn_mram is not None:
             record['mram_torn_word'] = drawn_mram
         if drawn_flash is not None:
@@ -15330,7 +15344,7 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None):
     })
     if _hash_bypass_active:
         apply_hash_bypass()
-    reset_nvmc_for_recovery()
+    reset_nvmc_for_recovery(tracking_start=_recovery_tracking_start(inherit_first_gate=False))
     if previous_snapshot['uncorrectable_offsets']:
         _restore_mram_uncorrectable_offsets(
             previous_snapshot['uncorrectable_offsets']
@@ -15596,10 +15610,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     if _hash_bypass_active:
         apply_hash_bypass()
 
-    reset_nvmc_for_sweep(enable_tracking_gate=bool(
-        cross_check_expected is not None
-        and int(globals().get('tracking_start_address_config', 0) or 0)
-    ))
+    recovery_start = _recovery_tracking_start(inherit_first_gate=cross_check_expected is not None)
+    reset_nvmc_for_sweep(tracking_start=recovery_start)
     if p1_uncorrectable_offsets:
         _restore_mram_uncorrectable_offsets(p1_uncorrectable_offsets)
     _clear_mram_uncorrectable_read_log()
@@ -15764,7 +15776,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         })
         if _hash_bypass_active:
             apply_hash_bypass()
-        reset_nvmc_for_recovery()
+        reset_nvmc_for_recovery(tracking_start=_recovery_tracking_start(inherit_first_gate=False))
         if p2_uncorrectable_offsets:
             _restore_mram_uncorrectable_offsets(p2_uncorrectable_offsets)
         _clear_mram_uncorrectable_read_log()
@@ -15909,6 +15921,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
             'recovery_boot_signals': recovery_boot_signals,
         },
     }
+    if recovery_tracking_start_address is not None:
+        result['phase2_fault']['recovery_tracking_start_address'] = fmt_u32(recovery_start)
     if runfor_error_status is not None:
         result['infrastructure_error'] = True
         result['error_kind'] = runfor_error_status.get(
@@ -16125,7 +16139,7 @@ def run_multi_fault_sequence(fault_sequence, stage_codes=None):
             restore_flash_and_boot(stage_input_flash)
             if _hash_bypass_active:
                 apply_hash_bypass()
-        reset_nvmc_for_sweep(enable_tracking_gate=(idx == 0))
+        reset_nvmc_for_sweep(tracking_start=None if idx == 0 else 0)
 
         log('mf seq={} stage={} type={} arm fault_at={}'.format(
             seq, idx + 1, _FAULT_CODE_TO_NAME.get(code, code), fault_at))
@@ -16169,7 +16183,7 @@ def run_multi_fault_sequence(fault_sequence, stage_codes=None):
             restore_flash_and_boot(stage_input_flash)
             if _hash_bypass_active:
                 apply_hash_bypass()
-            reset_nvmc_for_sweep(enable_tracking_gate=False)
+            reset_nvmc_for_sweep(tracking_start=0)
             _arm_multi_fault_stage(code, fault_at)
             arm_vtor_watchpoint()
             status = run_until_done(
@@ -18319,16 +18333,19 @@ def _state_search_preflight():
             'recovery state search cannot canonicalize a separate OTP peripheral'
         )
     uses_program_trace = backend.get('kind') == 'mram'
-    if uses_program_trace and int(
-        globals().get('tracking_start_address_config', 0) or 0
-    ):
+    if recovery_tracking_start_address and not uses_program_trace:
+        raise RuntimeError(
+            'deferred recovery state search requires an MRAM tracking-base snapshot'
+        )
+    if uses_program_trace and (tracking_start_address_config or recovery_tracking_start_address):
         capability_error = _tracking_base_capability_error()
         if capability_error is not None:
             raise RuntimeError(
                 'recovery state search deferred tracking base cannot cover '
                 'complete persistent state: {}'.format(capability_error)
             )
-        _load_tracking_base_state(required=True)
+        if tracking_start_address_config:
+            _load_tracking_base_state(required=True)
     if not uses_program_trace and not backend.get('write_trace_width_explicit'):
         raise RuntimeError('recovery state search requires width-explicit write traces')
     if not bool(backend.get('per_write_accurate')):
@@ -18646,7 +18663,7 @@ def _state_search_validate_program_prefix(initial_state, operations):
         )
 
 
-def _state_search_resolve_recovery_trace(state, capture_recovery_trace):
+def _state_search_resolve_recovery_trace(state, capture_recovery_trace, tracking_start):
     """Return only operations from the recovery boot being evaluated.
 
     A deferred MRAM gate captures the persistent base atomically when the
@@ -18658,10 +18675,7 @@ def _state_search_resolve_recovery_trace(state, capture_recovery_trace):
     if not capture_recovery_trace:
         return (), state, None
 
-    deferred = bool(
-        backend.get('kind') == 'mram'
-        and int(tracking_start_address_config or 0)
-    )
+    deferred = backend.get('kind') == 'mram' and tracking_start
     trace_base = state
     gate_reached = None
     if deferred:
@@ -18705,9 +18719,8 @@ def _state_search_boot_state(state, chain, generation):
     })
     if _hash_bypass_active:
         apply_hash_bypass()
-    reset_nvmc_for_recovery(enable_tracking_gate=bool(
-        int(tracking_start_address_config or 0)
-    ))
+    recovery_start = _recovery_tracking_start()
+    reset_nvmc_for_recovery(tracking_start=recovery_start)
     _clear_mram_uncorrectable_words()
     _restore_mram_uncorrectable_offsets(state_marks)
     _clear_mram_uncorrectable_read_log()
@@ -18758,7 +18771,7 @@ def _state_search_boot_state(state, chain, generation):
         recovery_trace_base,
         deferred_tracking_gate_reached,
     ) = _state_search_resolve_recovery_trace(
-        state, capture_recovery_trace
+        state, capture_recovery_trace, recovery_start
     )
     _state_breakdown['trace_export_s'] = round(
         max(0.0, _time.time() - trace_export_started), 6
@@ -18797,12 +18810,20 @@ def _state_search_boot_state(state, chain, generation):
     signals['recovery_state_generation'] = int(generation)
     recovery_tracking_gate = None
     state_search_extra_fields = {'recovery_writes': recovery_writes}
-    if deferred_tracking_gate_reached is not None:
+    if recovery_tracking_start_address is not None:
+        state_search_extra_fields['recovery_tracking_start_address'] = fmt_u32(recovery_start)
+    if recovery_tracking_start_address is not None and capture_recovery_trace:
+        recovery_tracking_gate = recovery_trace_size(
+            recovery_operations, recovery_start, state.region('nvm').base_address, phase2_state_search
+        )
+        recovery_tracking_gate['reached'] = recovery_start == 0 or bool(deferred_tracking_gate_reached)
+    elif deferred_tracking_gate_reached is not None:
         recovery_tracking_gate = {
-            'address': fmt_u32(tracking_start_address_config),
+            'address': fmt_u32(recovery_start),
             'reached': bool(deferred_tracking_gate_reached),
             'candidate_operations': len(recovery_operations),
         }
+    if recovery_tracking_gate is not None:
         signals['recovery_tracking_gate'] = dict(recovery_tracking_gate)
         state_search_extra_fields['recovery_tracking_gate'] = (
             recovery_tracking_gate
@@ -18968,6 +18989,9 @@ def run_recovery_state_search():
     if deferred_tracking_base:
         summary['calibration_base_state_identity'] = initial_state.identity_hex()
         summary['deferred_tracking_base'] = True
+    if recovery_tracking_start_address is not None:
+        summary['recovery_tracking_start_address'] = fmt_u32(recovery_tracking_start_address)
+    if backend.get('kind') == 'mram' and _recovery_tracking_start():
         summary['recovery_boots_reaching_deferred_gate'] = sum(
             1 for result in results
             if result.get('recovery_tracking_gate', {}).get('reached') is True
