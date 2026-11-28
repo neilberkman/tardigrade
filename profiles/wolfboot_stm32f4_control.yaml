@@ -1,0 +1,17 @@
+schema_version: 1
+name: wolfboot_stm32f4_control
+description: >
+  Verify that an uninterrupted scratch swap installs signed v2 in the boot
+  partition and starts it with the expected vector table and version marker.
+
+base_profile: wolfboot_stm32f4_power_loss_erase.yaml
+
+success_criteria:
+  allowed_images: null
+  expected_image: staging
+  marker_address: 0x0802000C
+  marker_value: 0x00000002
+
+fault_sweep:
+  max_writes: 0
+  heuristic: null

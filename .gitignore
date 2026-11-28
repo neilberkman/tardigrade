@@ -48,6 +48,10 @@ results/oss_validation/build/
 results/oss_validation/worktrees/
 results/tfm_an521/
 results/tfm_an521_repro/
+results/wolfboot/
+build/wolfboot/
+targets/wolfboot/upstream/
+targets/wolfboot/build/
 
 # Third-party source checkouts
 third_party/

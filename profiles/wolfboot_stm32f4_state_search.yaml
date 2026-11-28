@@ -1,0 +1,26 @@
+schema_version: 1
+name: wolfboot_stm32f4_state_search
+description: >
+  Explore two-cut recovery after erases of the dedicated boot and update
+  trailer sectors. Cross-check each generated recovery state by live execution.
+
+base_profile: wolfboot_stm32f4_power_loss_erase.yaml
+skip_self_test: true
+
+fault_sweep:
+  phase2_fault:
+    enabled: true
+    first_fault_types: [interrupted_erase]
+    fault_types: [power_loss, interrupted_erase]
+    state_search:
+      enabled: true
+      first_cuts:
+        mode: ranges
+        ranges:
+          - { start: 7, end: 8 }
+      max_cuts: 2
+      max_new_states: 64
+      max_wall_time_s: 1800
+      address_ranges:
+        - { start: 0x08004000, end: 0x0800BFFF }
+      cross_check_every: 1

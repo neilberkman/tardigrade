@@ -1,0 +1,79 @@
+schema_version: 1
+name: wolfboot_stm32f4_power_loss_erase
+description: >
+  Sample flash programming cuts and exercise every sector erase during the
+  scratch swap and trailer finalization. Verify the running image after recovery.
+
+platform: platforms/stm32f4.repl
+flash_backend: faultFlash
+
+target_source:
+  name: wolfboot
+  repository: https://github.com/wolfSSL/wolfBoot.git
+  commit: ad8dc62131fc0067a3ab25edc1b7e731397712d4
+
+bootloader:
+  elf: build/wolfboot/assets/wolfboot_stm32f4/wolfboot_stm32f4.elf
+  entry: 0x08000000
+  algorithm: swap_scratch
+
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 1
+  erase_regions:
+    - { base: 0x08000000, size: 0x10000, sector_size: 0x4000 }
+    - { base: 0x08010000, size: 0x10000, sector_size: 0x10000 }
+    - { base: 0x08020000, size: 0xE0000, sector_size: 0x20000 }
+  postmortem_partitions:
+    - { name: boot_trailer, base: 0x08004000, size: 0x4000 }
+    - { name: update_trailer, base: 0x08008000, size: 0x4000 }
+    - { name: swap, base: 0x080E0000, size: 0x20000 }
+  slots:
+    exec: { base: 0x08020000, size: 0x60000 }
+    staging: { base: 0x08080000, size: 0x60000 }
+
+images:
+  exec: build/wolfboot/assets/wolfboot_stm32f4/wolfboot_stm32f4_v1_signed.bin
+  staging: build/wolfboot/assets/wolfboot_stm32f4/wolfboot_stm32f4_v2_signed.bin
+
+pre_boot_state:
+  # PART_BOOT custom trailer at end of Sector 1 (0x08004000..0x08007FFF):
+  # state byte 0x08007FFB = 0x00 (IMG_STATE_SUCCESS), magic 0x08007FFC = "BOOT"
+  - { address: 0x08007FF8, u32: 0x00FFFFFF }
+  - { address: 0x08007FFC, u32: 0x544F4F42 }
+  # PART_UPDATE custom trailer at end of Sector 2 (0x08008000..0x0800BFFF):
+  # state byte 0x0800BFFB = 0x70 (IMG_STATE_UPDATING), magic 0x0800BFFC = "BOOT"
+  - { address: 0x0800BFF8, u32: 0x70FFFFFF }
+  - { address: 0x0800BFFC, u32: 0x544F4F42 }
+
+update_trigger: auto
+
+success_criteria:
+  vtor_in_slot: exec
+  vector_table_offset: 0x100
+  image_hash: true
+  image_hash_slot: exec
+  # An unconfirmed update can roll back before its first application boot.
+  allowed_images: [exec, staging]
+
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  include_erase_fault_points: true
+  max_writes: auto
+  max_writes_cap: 200000
+  vtor_settle_iters: 1
+  run_duration: "20.0"
+  max_step_limit: 200000000
+  calibration_stop:
+    success_criteria: true
+  heuristic:
+    target_points: 32
+    preserve_critical_tiers: false
+    critical_regions:
+      - { start: 0x08004000, end: 0x0800C000 }
+
+expect:
+  control_outcome: success
+  should_find_issues: false
