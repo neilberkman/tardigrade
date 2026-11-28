@@ -68,15 +68,193 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public NRF52NVMC(IMachine machine) : base(machine)
         {
             tracker.Bind(machine, this);
+            operation = new FlashOperationTimer(this);
             DefineRegisters();
         }
 
         public long Size => 0x1000;
 
+        public FlashTiming OperationTiming
+        {
+            get => timing;
+            set
+            {
+                if(value == timing)
+                {
+                    return;
+                }
+                if(operation.Busy || configValue != 0)
+                {
+                    throw new InvalidOperationException("Select NVMC timing in read mode while ready");
+                }
+                timing = value;
+                programBuffer.Invalidate();
+                UpdateMemoryAccessHook(false);
+            }
+        }
+
+        private FlashTiming timing;
+        private readonly FlashOperationTimer operation;
+        private readonly FlashProgramBuffer programBuffer = new FlashProgramBuffer();
+        private Action bufferedProgram;
+        private bool eraseBusy;
+
+        private void SubmitProgram(long offset, int width, Action write)
+        {
+            if(width != 4 || (offset & 3) != 0)
+            {
+                throw new ArgumentException("NVMC programming requires an aligned 32-bit word");
+            }
+            if(operation.Busy)
+            {
+                if(bufferedProgram == null)
+                {
+                    bufferedProgram = () => StartProgram(write);
+                }
+                return;
+            }
+            StartProgram(write);
+        }
+
+        private void StartProgram(Action write)
+        {
+            operation.Start(41, () =>
+            {
+                write();
+                RunNextBufferedProgram();
+            });
+        }
+
+        private void RunNextBufferedProgram()
+        {
+            var next = bufferedProgram;
+            bufferedProgram = null;
+            if(next != null)
+            {
+                next();
+            }
+        }
+
+        private void SubmitTimedFlashProgram(long rel, int width, ulong value)
+        {
+            if(width != 4 || (rel & 3L) != 0)
+            {
+                throw new ArgumentException("NVMC programming requires an aligned 32-bit word");
+            }
+            if(operation.Busy)
+            {
+                if(bufferedProgram == null)
+                {
+                    bufferedProgram = () => StartTimedFlashProgram(rel, width, value);
+                }
+                return;
+            }
+            StartTimedFlashProgram(rel, width, value);
+        }
+
+        private void StartTimedFlashProgram(long rel, int width, ulong value)
+        {
+            if(AnyFaultFired && FaultRequiresImmediateStop)
+            {
+                return;
+            }
+            programBuffer.Prepare(Flash, FlashSize);
+            int off = checked((int)rel);
+            uint oldWord = programBuffer.ReadU32(off);
+            uint newWord = (uint)value;
+            bool directOperationTrace = OperationTraceFastMode
+                && WriteTraceEnabled
+                && FaultAtWordWrite == ulong.MaxValue
+                && WriteFaultMode == 0;
+            bool needDiff = !PassthroughMode && !AnyFaultFired
+                && ((WriteTraceEnabled && !directOperationTrace)
+                    || DiffLookahead == int.MaxValue
+                    || (FaultAtWordWrite != ulong.MaxValue
+                        && TotalWordWrites + (ulong)DiffLookahead >= FaultAtWordWrite));
+            bool wantSnap = needDiff || (!PassthroughMode && WriteFaultMode != 0 && !AnyFaultFired);
+
+            if(PassthroughMode)
+            {
+                if(!AnyFaultFired && newWord != oldWord)
+                {
+                    tracker.IncrementWriteCount();
+                }
+            }
+            else if(directOperationTrace)
+            {
+                if(newWord != oldWord)
+                {
+                    tracker.RecordWriteAndCheckFault(off, newWord, 4);
+                }
+            }
+            else if(wantSnap)
+            {
+                if(newWord != oldWord && tracker.RecordWriteAndCheckFault(off, newWord, 4))
+                {
+                    FaultFired = true;
+                    LastFaultAddress = (uint)(FlashBaseAddress + off);
+                    int len = checked((int)FlashSize);
+                    var preBytes = Flash.ReadBytes(0, len);
+                    var postBytes = (byte[])preBytes.Clone();
+                    FaultTracker.WriteU32(postBytes, off, newWord);
+                    if(WriteFaultMode == 0)
+                    {
+                        var snap = (byte[])preBytes.Clone();
+                        ApplyTornProgramAtOffset(snap, preBytes, postBytes, off, len);
+                        Flash.WriteBytes(0, snap, 0, len);
+                        programBuffer.RefreshIfPrepared(Flash);
+                        FaultFlashSnapshot = snap;
+                        bufferedProgram = null;
+                        return;
+                    }
+                    var faultedCurrent = (byte[])postBytes.Clone();
+                    ApplyWriteFaultAtOffset(faultedCurrent, preBytes, postBytes, off, len);
+                    FaultFlashSnapshot = faultedCurrent;
+                    operation.Start(41, () =>
+                    {
+                        Flash.WriteBytes(0, faultedCurrent, 0, len);
+                        programBuffer.RefreshIfPrepared(Flash);
+                        RunNextBufferedProgram();
+                    });
+                    return;
+                }
+            }
+            else if(!AnyFaultFired)
+            {
+                if(newWord != oldWord && tracker.IncrementWriteCount())
+                {
+                    FaultFired = true;
+                    LastFaultAddress = (uint)(FlashBaseAddress + off);
+                    FaultFlashSnapshot = Flash.ReadBytes(0, checked((int)FlashSize));
+                    bufferedProgram = null;
+                    return;
+                }
+            }
+
+            var data = FlashProgramBuffer.StoreBytes(value, width);
+            operation.Start(41, () =>
+            {
+                programBuffer.Program(Flash, off, data);
+                if(operationTraceShadow != null && off >= 0 && off <= operationTraceShadow.Length - 4)
+                {
+                    Array.Copy(data, 0, operationTraceShadow, off, 4);
+                }
+                RunNextBufferedProgram();
+            });
+        }
+
         public override void Reset()
         {
             base.Reset();
             tracker.Reset();
+            operation.Reset();
+            eraseBusy = false;
+            programBuffer.Invalidate();
+            bufferedProgram = null;
+            if(Nvm != null)
+            {
+                Nvm.ProgramScheduler = null;
+            }
             configValue = 0;
             wenSnapshot = null;
             operationTraceShadow = null;
@@ -179,7 +357,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     : null;
             }
         }
-        public void InvalidateShadow() { wenSnapshot = null; }
+        public void InvalidateShadow()
+        {
+            wenSnapshot = null;
+            programBuffer.RefreshIfPrepared(Flash);
+        }
 
         // Read-fault injection stubs.  NRF52NVMC uses MappedMemory for CPU
         // reads (fast path), so read-time interception is not possible.
@@ -239,6 +421,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void UpdateMemoryAccessHook(bool enabled)
         {
+            if(timing != FlashTiming.Off && Flash != null && FlashSize > 0)
+            {
+                if(memoryAccessHookInstalled) return;
+                enabled = true;
+            }
             if(!machine.IsRegistered(this))
             {
                 memoryAccessHookInstalled = false;
@@ -271,6 +458,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             if(rel < 0)
             {
+                return;
+            }
+            if(timing != FlashTiming.Off && rel <= FlashSize - width)
+            {
+                programBuffer.Prepare(Flash, FlashSize);
+                programBuffer.UndoStore(Flash, rel, (int)width);
+                if(AnyFaultFired && FaultRequiresImmediateStop)
+                {
+                    return;
+                }
+                SubmitTimedFlashProgram(rel, (int)width, value);
                 return;
             }
             if(OperationTraceFastMode && WriteTraceEnabled)
@@ -445,11 +643,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void DefineRegisters()
         {
-            // READY at 0x400 — always ready (instant operations).
-            Registers.Ready.Define(this, 1);
-
-            // READYNEXT at 0x408 — always ready.
-            Registers.ReadyNext.Define(this, 1);
+            Registers.Ready.Define(this, 1)
+                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => !operation.Busy);
+            Registers.ReadyNext.Define(this, 1)
+                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ =>
+                    !operation.Busy || (configValue == 1 && bufferedProgram == null));
 
             // ERRORSTATUS at 0x410 — sticky driver error flag.
             Registers.ErrorStatus.Define(this)
@@ -468,6 +666,38 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             Registers.Config.Define(this)
                 .WithValueField(0, 2, writeCallback: (_, val) =>
                 {
+                    if(eraseBusy)
+                    {
+                        return;
+                    }
+                    if(timing != FlashTiming.Off)
+                    {
+                        if(Nvm != null)
+                        {
+                            if(operation.Busy)
+                            {
+                                return;
+                            }
+                            Nvm.ProgramScheduler = val == 1 ? (Action<long, int, Action>)SubmitProgram : null;
+                        }
+                        else if(Flash != null && FlashSize > 0)
+                        {
+                            configValue = (uint)val;
+                            if(val == 1)
+                            {
+                                programBuffer.Prepare(Flash, FlashSize);
+                                if(!memoryAccessHookInstalled)
+                                {
+                                    UpdateMemoryAccessHook(true);
+                                }
+                            }
+                            return;
+                        }
+                    }
+                    if(operation.Busy)
+                    {
+                        return;
+                    }
                     var oldConfig = configValue;
                     configValue = (uint)val;
 
@@ -505,6 +735,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         wenWriteOffsets.Clear();
                         wenWritePcs.Clear();
                         wenWriteContexts.Clear();
+                        if(timing != FlashTiming.Off)
+                        {
+                            programBuffer.Prepare(Flash, FlashSize);
+                        }
                         bool wantSnap = needDiff || (!PassthroughMode && WriteFaultMode != 0 && !AnyFaultFired);
                         if(wantSnap)
                         {
@@ -516,11 +750,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         }
                         else
                         {
-                            if(directOperationTrace && !memoryAccessHookInstalled)
+                            if((directOperationTrace || timing != FlashTiming.Off) && !memoryAccessHookInstalled)
                             {
                                 UpdateMemoryAccessHook(true);
                             }
-                            else if(!directOperationTrace && memoryAccessHookInstalled)
+                            else if(!directOperationTrace && timing == FlashTiming.Off && memoryAccessHookInstalled)
                             {
                                 UpdateMemoryAccessHook(false);
                             }
@@ -737,138 +971,31 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         return;
                     }
 
-                    var erasePc = CurrentCpuPc();
-                    if(Nvm != null)
+                    if(operation.Busy)
                     {
-                        var offset = pageAddr - NvmBaseAddress;
-                        if(offset >= 0 && offset + PageSize <= Nvm.Size)
-                        {
-                            if(tracker.RecordEraseAndCheckFault(offset, PageSize, erasePc))
-                            {
-                                EraseFaultFired = true;
-                                LastFaultAddress = (uint)pageAddr;
-                                int halfPage = PageSize / 2;
-                                if(EraseFaultMode == 1)
-                                {
-                                    int quarterPage = Math.Max(1, PageSize / 4);
-                                    Nvm.EraseSectorRaw(offset, halfPage);
-                                    long neighbor = offset + PageSize;
-                                    if(neighbor + quarterPage <= Nvm.Size)
-                                    {
-                                        Nvm.EraseSectorRaw(neighbor, quarterPage);
-                                    }
-                                }
-                                else
-                                {
-                                    var neutralMode = (TornWordMode ?? "fixed").Trim().ToLowerInvariant();
-                                    if(neutralMode != "fixed")
-                                    {
-                                        var previous = Nvm.ReadBytes(offset, PageSize);
-                                        var torn = FaultTracker.BuildFlashTornEraseSpan(
-                                            previous, offset, EraseFill, 4, neutralMode,
-                                            TornWordSeed, TotalPageErases);
-                                        Nvm.WriteSpanRaw(offset, torn);
-                                    }
-                                    else
-                                    {
-                                    var tornMode = (MramTornWordMode ?? "half").Trim().ToLowerInvariant();
-                                    if(tornMode == "untouched")
-                                    {
-                                        // Power cut before erase took effect.
-                                    }
-                                    else if(tornMode == "erased" || tornMode == "programmed")
-                                    {
-                                        Nvm.EraseSectorRaw(offset, PageSize);
-                                    }
-                                    else if(tornMode == "corrupted")
-                                    {
-                                        var corrupted = tracker.BuildCorruptedErasedSpan(offset, PageSize, EraseFill, 4);
-                                        Nvm.WriteSpanRaw(offset, corrupted);
-                                    }
-                                    else
-                                    {
-                                        Nvm.EraseSectorRaw(offset, halfPage);
-                                    }
-                                    }
-                                }
-                                FaultFlashSnapshot = Nvm.ReadBytes(0, checked((int)Nvm.Size));
-                            }
-                            else
-                            {
-                                Nvm.EraseSectorRaw(offset, PageSize);
-                            }
-                        }
+                        return;
                     }
-                    else if(Flash != null)
+                    if(timing == FlashTiming.Off)
                     {
-                        var offset = pageAddr - FlashBaseAddress;
-                        if(offset >= 0 && offset + PageSize <= FlashSize)
-                        {
-                            if(tracker.RecordEraseAndCheckFault(offset, PageSize, erasePc))
-                            {
-                                EraseFaultFired = true;
-                                LastFaultAddress = (uint)pageAddr;
-                                int halfPage = PageSize / 2;
-                                if(EraseFaultMode == 1)
-                                {
-                                    int quarterPage = Math.Max(1, PageSize / 4);
-                                    EraseWithFill(Flash, offset, halfPage);
-                                    long neighbor = offset + PageSize;
-                                    if(neighbor + quarterPage <= FlashSize)
-                                    {
-                                        EraseWithFill(Flash, neighbor, quarterPage);
-                                    }
-                                }
-                                else
-                                {
-                                    var neutralMode = (TornWordMode ?? "fixed").Trim().ToLowerInvariant();
-                                    if(neutralMode != "fixed")
-                                    {
-                                        var previous = Flash.ReadBytes(offset, PageSize);
-                                        var torn = FaultTracker.BuildFlashTornEraseSpan(
-                                            previous, offset, EraseFill, 4, neutralMode,
-                                            TornWordSeed, TotalPageErases);
-                                        Flash.WriteBytes(offset, torn, 0, torn.Length);
-                                    }
-                                    else
-                                    {
-                                    var tornMode = (MramTornWordMode ?? "half").Trim().ToLowerInvariant();
-                                    if(tornMode == "untouched")
-                                    {
-                                        // Power cut before erase took effect.
-                                    }
-                                    else if(tornMode == "erased" || tornMode == "programmed")
-                                    {
-                                        EraseWithFill(Flash, offset, PageSize);
-                                    }
-                                    else if(tornMode == "corrupted")
-                                    {
-                                        var corrupted = tracker.BuildCorruptedErasedSpan(offset, PageSize, EraseFill, 4);
-                                        Flash.WriteBytes(offset, corrupted, 0, corrupted.Length);
-                                    }
-                                    else
-                                    {
-                                        EraseWithFill(Flash, offset, halfPage);
-                                    }
-                                    }
-                                }
-
-                                FaultFlashSnapshot = Flash.ReadBytes(0, checked((int)FlashSize));
-                            }
-                            else
-                            {
-                                EraseWithFill(Flash, offset, PageSize);
-                            }
-                        }
+                        CompletePageErase(pageAddr);
+                        return;
                     }
-                    if(operationTraceShadow != null && Flash != null)
+                    long offset = pageAddr - (Nvm != null ? NvmBaseAddress : FlashBaseAddress);
+                    if(offset >= 0 && offset + PageSize <= (Nvm != null ? Nvm.Size : FlashSize))
                     {
-                        var offset = pageAddr - FlashBaseAddress;
-                        if(offset >= 0 && offset + PageSize <= FlashSize)
+                        if(!PassthroughMode && !AnyFaultFired && TotalPageErases + 1 == FaultAtPageErase)
                         {
-                            var currentPage = Flash.ReadBytes(offset, PageSize);
-                            Array.Copy(currentPage, 0, operationTraceShadow, offset, PageSize);
+                            CompletePageErase(pageAddr);
+                            programBuffer.RefreshIfPrepared(Flash);
+                            return;
                         }
+                        eraseBusy = true;
+                        operation.Start(85000, () =>
+                        {
+                            eraseBusy = false;
+                            CompletePageErase(pageAddr);
+                            programBuffer.RefreshIfPrepared(Flash);
+                        });
                     }
                 }, name: "ERASEPAGE");
 
@@ -878,41 +1005,198 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     if(val == 1 && configValue == 2)
                     {
-                        if(Nvm != null)
+                        if(operation.Busy)
                         {
-                            for(long offset = 0; offset < Nvm.Size; offset += PageSize)
-                            {
-                                var remaining = (int)Math.Min(PageSize, Nvm.Size - offset);
-                                Nvm.EraseSectorRaw(offset, remaining);
-                            }
+                            return;
                         }
-                        else if(Flash != null)
+                        if(timing == FlashTiming.Off)
                         {
-                            var fillData = new byte[PageSize];
-                            for(int i = 0; i < PageSize; i++)
-                            {
-                                fillData[i] = EraseFill;
-                            }
-                            for(long offset = 0; offset < FlashSize; offset += PageSize)
-                            {
-                                var remaining = (int)Math.Min(PageSize, FlashSize - offset);
-                                if(remaining < PageSize)
-                                {
-                                    fillData = new byte[remaining];
-                                    for(int i = 0; i < remaining; i++)
-                                    {
-                                        fillData[i] = EraseFill;
-                                    }
-                                }
-                                Flash.WriteBytes(offset, fillData, 0, fillData.Length);
-                            }
-                            if(operationTraceShadow != null)
-                            {
-                                operationTraceShadow = Flash.ReadBytes(0, checked((int)FlashSize));
-                            }
+                            CompleteEraseAll();
+                            return;
                         }
+                        eraseBusy = true;
+                        operation.Start(169000, () =>
+                        {
+                            eraseBusy = false;
+                            CompleteEraseAll();
+                            programBuffer.RefreshIfPrepared(Flash);
+                        });
                     }
                 }, name: "ERASEALL");
+        }
+
+        private void CompletePageErase(long pageAddr)
+        {
+            var erasePc = CurrentCpuPc();
+            if(Nvm != null)
+            {
+                var offset = pageAddr - NvmBaseAddress;
+                if(offset >= 0 && offset + PageSize <= Nvm.Size)
+                {
+                    if(tracker.RecordEraseAndCheckFault(offset, PageSize, erasePc))
+                    {
+                        EraseFaultFired = true;
+                        LastFaultAddress = (uint)pageAddr;
+                        int halfPage = PageSize / 2;
+                        if(EraseFaultMode == 1)
+                        {
+                            int quarterPage = Math.Max(1, PageSize / 4);
+                            Nvm.EraseSectorRaw(offset, halfPage);
+                            long neighbor = offset + PageSize;
+                            if(neighbor + quarterPage <= Nvm.Size)
+                            {
+                                Nvm.EraseSectorRaw(neighbor, quarterPage);
+                            }
+                        }
+                        else
+                        {
+                            var neutralMode = (TornWordMode ?? "fixed").Trim().ToLowerInvariant();
+                            if(neutralMode != "fixed")
+                            {
+                                var previous = Nvm.ReadBytes(offset, PageSize);
+                                var torn = FaultTracker.BuildFlashTornEraseSpan(
+                                    previous, offset, EraseFill, 4, neutralMode,
+                                    TornWordSeed, TotalPageErases);
+                                Nvm.WriteSpanRaw(offset, torn);
+                            }
+                            else
+                            {
+                            var tornMode = (MramTornWordMode ?? "half").Trim().ToLowerInvariant();
+                            if(tornMode == "untouched")
+                            {
+                                // Power cut before erase took effect.
+                            }
+                            else if(tornMode == "erased" || tornMode == "programmed")
+                            {
+                                Nvm.EraseSectorRaw(offset, PageSize);
+                            }
+                            else if(tornMode == "corrupted")
+                            {
+                                var corrupted = tracker.BuildCorruptedErasedSpan(offset, PageSize, EraseFill, 4);
+                                Nvm.WriteSpanRaw(offset, corrupted);
+                            }
+                            else
+                            {
+                                Nvm.EraseSectorRaw(offset, halfPage);
+                            }
+                            }
+                        }
+                        FaultFlashSnapshot = Nvm.ReadBytes(0, checked((int)Nvm.Size));
+                    }
+                    else
+                    {
+                        Nvm.EraseSectorRaw(offset, PageSize);
+                    }
+                }
+            }
+            else if(Flash != null)
+            {
+                var offset = pageAddr - FlashBaseAddress;
+                if(offset >= 0 && offset + PageSize <= FlashSize)
+                {
+                    if(tracker.RecordEraseAndCheckFault(offset, PageSize, erasePc))
+                    {
+                        EraseFaultFired = true;
+                        LastFaultAddress = (uint)pageAddr;
+                        int halfPage = PageSize / 2;
+                        if(EraseFaultMode == 1)
+                        {
+                            int quarterPage = Math.Max(1, PageSize / 4);
+                            EraseWithFill(Flash, offset, halfPage);
+                            long neighbor = offset + PageSize;
+                            if(neighbor + quarterPage <= FlashSize)
+                            {
+                                EraseWithFill(Flash, neighbor, quarterPage);
+                            }
+                        }
+                        else
+                        {
+                            var neutralMode = (TornWordMode ?? "fixed").Trim().ToLowerInvariant();
+                            if(neutralMode != "fixed")
+                            {
+                                var previous = Flash.ReadBytes(offset, PageSize);
+                                var torn = FaultTracker.BuildFlashTornEraseSpan(
+                                    previous, offset, EraseFill, 4, neutralMode,
+                                    TornWordSeed, TotalPageErases);
+                                Flash.WriteBytes(offset, torn, 0, torn.Length);
+                            }
+                            else
+                            {
+                            var tornMode = (MramTornWordMode ?? "half").Trim().ToLowerInvariant();
+                            if(tornMode == "untouched")
+                            {
+                                // Power cut before erase took effect.
+                            }
+                            else if(tornMode == "erased" || tornMode == "programmed")
+                            {
+                                EraseWithFill(Flash, offset, PageSize);
+                            }
+                            else if(tornMode == "corrupted")
+                            {
+                                var corrupted = tracker.BuildCorruptedErasedSpan(offset, PageSize, EraseFill, 4);
+                                Flash.WriteBytes(offset, corrupted, 0, corrupted.Length);
+                            }
+                            else
+                            {
+                                EraseWithFill(Flash, offset, halfPage);
+                            }
+                            }
+                        }
+
+                        FaultFlashSnapshot = Flash.ReadBytes(0, checked((int)FlashSize));
+                    }
+                    else
+                    {
+                        EraseWithFill(Flash, offset, PageSize);
+                    }
+                }
+            }
+            if(operationTraceShadow != null && Flash != null)
+            {
+                var offset = pageAddr - FlashBaseAddress;
+                if(offset >= 0 && offset + PageSize <= FlashSize)
+                {
+                    var currentPage = Flash.ReadBytes(offset, PageSize);
+                    Array.Copy(currentPage, 0, operationTraceShadow, offset, PageSize);
+                }
+            }
+        }
+
+        private void CompleteEraseAll()
+        {
+            if(Nvm != null)
+            {
+                for(long offset = 0; offset < Nvm.Size; offset += PageSize)
+                {
+                    var remaining = (int)Math.Min(PageSize, Nvm.Size - offset);
+                    Nvm.EraseSectorRaw(offset, remaining);
+                }
+            }
+            else if(Flash != null)
+            {
+                var fillData = new byte[PageSize];
+                for(int i = 0; i < PageSize; i++)
+                {
+                    fillData[i] = EraseFill;
+                }
+                for(long offset = 0; offset < FlashSize; offset += PageSize)
+                {
+                    var remaining = (int)Math.Min(PageSize, FlashSize - offset);
+                    if(remaining < PageSize)
+                    {
+                        fillData = new byte[remaining];
+                        for(int i = 0; i < remaining; i++)
+                        {
+                            fillData[i] = EraseFill;
+                        }
+                    }
+                    Flash.WriteBytes(offset, fillData, 0, fillData.Length);
+                }
+                if(operationTraceShadow != null)
+                {
+                    operationTraceShadow = Flash.ReadBytes(0, checked((int)FlashSize));
+                }
+            }
         }
 
         private enum Registers

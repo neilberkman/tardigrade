@@ -36,6 +36,31 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
     public class STM32H7FlashController : STM32_FlashController, IKnownSize, ITardigradeFaultInjectable
     {
+        private FlashTiming timing;
+        public FlashTiming OperationTiming
+        {
+            get => timing;
+            set
+            {
+                if(timing == value)
+                {
+                    return;
+                }
+                if(banks.Any(bank => bank.WriteEnabled || bank.Timing.Busy))
+                {
+                    throw new InvalidOperationException("Change flash timing while both banks are idle and PG is clear");
+                }
+                foreach(var bank in banks)
+                {
+                    bank.Timing.Reset();
+                }
+                timing = value;
+                // Install before firmware enters its first programming window. Renode
+                // may already have translated the store following the MMIO write.
+                UpdateMemoryProgramHooks(banks.Any(bank => bank.WriteEnabled));
+            }
+        }
+
         private readonly FaultTracker tracker = new FaultTracker();
 
         public STM32H7FlashController(IMachine machine, MappedMemory flash1, MappedMemory flash2) : base(machine)
@@ -78,12 +103,38 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             ProgramCurrentValues();
         }
 
+        private Bank ControlBank(long offset)
+        {
+            switch((Registers)offset)
+            {
+                case Registers.ControlBank1: return banks[0];
+                case Registers.ControlBank2: return banks[1];
+                default: return null;
+            }
+        }
+
+        public override uint ReadDoubleWord(long offset)
+        {
+            uint value = base.ReadDoubleWord(offset);
+            var bank = OperationTiming == FlashTiming.Off ? null : ControlBank(offset);
+            return bank == null ? value : (value & ~0x30U) | (bank.Parallelism << 4);
+        }
+
         public override void WriteDoubleWord(long offset, uint value)
         {
             if(optionControlLock.IsLocked && IsOffsetToProgramRegister(offset))
             {
                 this.Log(LogLevel.Warning, "Attempted to write to a program register ({0}) while OPTLOCK bit is set. Ignoring", Enum.GetName(typeof(Registers), (Registers)offset));
                 return;
+            }
+            var bank = OperationTiming == FlashTiming.Off ? null : ControlBank(offset);
+            if(bank != null)
+            {
+                if(bank.Timing.Busy)
+                {
+                    return;
+                }
+                bank.Parallelism = (value >> 4) & 3;
             }
             base.WriteDoubleWord(offset, value);
         }
@@ -176,6 +227,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public void InvalidateShadow()
         {
+            foreach(var bank in banks)
+            {
+                bank.Timing.RefreshCommittedBytes();
+            }
             flashShadow = null;
         }
 
@@ -330,11 +385,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 return;
             }
-            bank.HandleMemoryProgramWrite(localOffset, width, value, pc);
+            if(timing == FlashTiming.Off || bank.WriteEnabled)
+            {
+                bank.HandleMemoryProgramWrite(localOffset, width, value, pc);
+            }
         }
 
         private void UpdateMemoryProgramHooks(bool enabled)
         {
+            enabled |= timing != FlashTiming.Off;
             if(memoryProgramHooksInstalled == enabled)
             {
                 return;
@@ -809,6 +868,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             public Bank(STM32H7FlashController parent, int id, MappedMemory memory, long combinedBaseOffset)
             {
+                Timing = new H7BankTiming(parent);
                 this.parent = parent;
                 this.Id = id;
                 this.memory = memory;
@@ -819,6 +879,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             public void Reset()
             {
+                Timing.Reset();
+                Parallelism = 3;
                 controlBankLock.Reset();
                 bankWriteBufferCounter = 0;
                 bankWriteBufferAddress = 0;
@@ -863,6 +925,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             public ulong HandleMemoryProgramWrite(long localOffset, uint width, ulong value, ulong pc = 0)
             {
+                if(parent.OperationTiming != FlashTiming.Off && bankWriteEnabled.Value
+                    && !Timing.Stage(localOffset, width, value))
+                {
+                    bankProgrammingErrorStatus.Value = true;
+                    parent.UpdateInterrupts();
+                    return parent.ReadCurrentValue(this, localOffset, width);
+                }
                 if(!bankWriteEnabled.Value || bankInconsistencyErrorStatus.Value)
                 {
                     bankProgrammingErrorStatus.Value = true;
@@ -882,6 +951,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
 
                 var filteredValue = parent.HandleTrackedWrite(this, localOffset, width, value, pc);
+                if(parent.OperationTiming != FlashTiming.Off && bankWriteEnabled.Value)
+                {
+                    Timing.UpdateStaged(localOffset, width, filteredValue);
+                    if(parent.AnyFaultFired && parent.FaultRequiresImmediateStop)
+                    {
+                        Timing.AbortInFlight();
+                        bankWriteBufferCounter = 0;
+                        return filteredValue;
+                    }
+                }
 
                 bankWriteBufferCounter += (int)width;
                 if(bankWriteBufferCounter >= WriteBufferSize)
@@ -943,10 +1022,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     .WithReservedBits(29, 3);
 
                 (Registers.StatusBank1 + bankOffset).Define(parent)
-                    .WithTaggedFlag($"BSY{Id}", 0)
+                    .WithFlag(0, FieldMode.Read, name: $"BSY{Id}", valueProviderCallback: _ => Timing.Busy)
                     .WithFlag(1, FieldMode.Read, name: $"WBNE{Id}",
                         valueProviderCallback: _ => bankWriteEnabled.Value && bankWriteBufferCounter > 0)
-                    .WithTaggedFlag($"QW{Id}", 2)
+                    .WithFlag(2, FieldMode.Read, name: $"QW{Id}", valueProviderCallback: _ => Timing.Busy)
                     .WithTaggedFlag($"CRC_BUSY{Id}", 3)
                     .WithReservedBits(4, 12)
                     .WithFlag(16, out bankEndOfProgramIrqStatus, name: $"EOP{Id}")
@@ -1020,17 +1099,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 if(bankEraseRequest.Value)
                 {
-                    parent.HandleTrackedErase(this, 0, (int)memory.Size);
-                    bankEndOfProgramIrqStatus.Value = true;
-                    parent.UpdateInterrupts();
+                    StartErase(0, (int)memory.Size, true);
                 }
                 else if(bankSectorEraseRequest.Value)
                 {
                     var sectorIdx = bankSectorEraseNumber.Value;
                     var sectorStartAddr = (long)(sectorIdx * SectorSize);
-                    parent.HandleTrackedErase(this, sectorStartAddr, SectorSize);
-                    bankEndOfProgramIrqStatus.Value = true;
-                    parent.UpdateInterrupts();
+                    StartErase(sectorStartAddr, SectorSize, false);
                 }
                 else
                 {
@@ -1038,8 +1113,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             }
 
+            private void StartErase(long start, int size, bool mass)
+            {
+                if(parent.OperationTiming == FlashTiming.Off)
+                {
+                    parent.HandleTrackedErase(this, start, size);
+                    EndOperation();
+                    return;
+                }
+                Timing.Erase(parent.OperationTiming, Parallelism, mass, () =>
+                {
+                    parent.HandleTrackedErase(this, start, size);
+                    EndOperation();
+                });
+            }
+
             private void HandleProgramWriteEnableChange(bool value)
             {
+                if(value && parent.OperationTiming != FlashTiming.Off)
+                {
+                    Timing.Prepare(memory, memory.Size);
+                }
                 var hooksShouldBeInstalled = value || parent.banks.Any(bank => bank.Id != Id && bank.WriteEnabled);
                 parent.UpdateMemoryProgramHooks(hooksShouldBeInstalled);
 
@@ -1049,6 +1143,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             private void FinishProgramWrite()
             {
                 bankWriteBufferCounter = 0;
+                if(parent.OperationTiming != FlashTiming.Off)
+                {
+                    Timing.Program(parent.OperationTiming, Parallelism, EndOperation);
+                    return;
+                }
+                EndOperation();
+            }
+
+            private void EndOperation()
+            {
                 bankEndOfProgramIrqStatus.Value = true;
                 parent.UpdateInterrupts();
             }
@@ -1075,6 +1179,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             private int bankWriteBufferCounter;
             private ulong bankWriteBufferAddress;
 
+            public H7BankTiming Timing { get; }
+            public uint Parallelism { get; set; }
             private readonly STM32H7FlashController parent;
             private readonly MappedMemory memory;
             private readonly LockRegister controlBankLock;

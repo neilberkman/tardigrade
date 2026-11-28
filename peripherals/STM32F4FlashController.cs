@@ -48,11 +48,82 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     public class STM32F4FlashController : BasicDoubleWordPeripheral, IKnownSize, ITardigradeFaultInjectable
     {
+        private FlashTiming timing;
+        public FlashTiming OperationTiming
+        {
+            get => timing;
+            set
+            {
+                if(timing == value)
+                {
+                    return;
+                }
+                if(operation.Busy || PgActive)
+                {
+                    throw new InvalidOperationException("Change flash timing while the controller is idle and PG is clear");
+                }
+                programBuffer.Invalidate();
+                timing = value;
+                // Install before firmware enters its first programming window. Renode
+                // may already have translated the store following the MMIO write.
+                UpdateMemoryAccessHook(!locked && NeedsCpuWriteHook);
+            }
+        }
+        private readonly FlashProgramBuffer programBuffer = new FlashProgramBuffer();
+        private readonly FlashOperationTimer operation;
+
+        private void ProgramStore(long offset, int width, ulong value, bool nativeStore)
+        {
+            if(nativeStore)
+            {
+                programBuffer.UndoStore(Flash, offset, width);
+            }
+            if(AnyFaultFired && FaultRequiresImmediateStop)
+            {
+                return;
+            }
+            if(operation.Busy)
+            {
+                return;
+            }
+            var data = FlashProgramBuffer.StoreBytes(value, width);
+            if(!nativeStore && !PassthroughMode && !AnyFaultFired
+                && TotalWordWrites + 1 == FaultAtWordWrite
+                && WriteFaultMode == 0
+                && Flash != null && FlashSize > 0)
+            {
+                int off = checked((int)offset);
+                byte oldByte = programBuffer.ReadByte(off);
+                programBuffer.Program(Flash, offset, data);
+                if(flashShadow == null)
+                {
+                    flashShadow = Flash.ReadBytes(0, checked((int)FlashSize));
+                    flashShadow[off] = oldByte;
+                }
+                tracker.RecordWriteAndCheckFault(off, (uint)value, width);
+                FaultFired = true;
+                LastFaultAddress = (uint)(FlashBaseAddress + off);
+                FaultFlashSnapshot = Flash.ReadBytes(0, checked((int)FlashSize));
+                ApplyWriteFault(off, oldByte, (byte)(value & 0xFF));
+                programBuffer.RefreshIfPrepared(Flash);
+                return;
+            }
+            operation.Start(OperationTiming == FlashTiming.Maximum ? 100UL : 16UL, () =>
+            {
+                programBuffer.Program(Flash, offset, data);
+                if(!nativeStore)
+                {
+                    tracker.RecordWriteAndCheckFault(checked((int)offset), (uint)value, width);
+                }
+            });
+        }
+
         private readonly FaultTracker tracker = new FaultTracker();
 
         public STM32F4FlashController(IMachine machine) : base(machine)
         {
             tracker.Bind(machine, this);
+            operation = new FlashOperationTimer(this);
             DefineRegisters();
         }
 
@@ -132,6 +203,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public void InvalidateShadow()
         {
+            programBuffer.RefreshIfPrepared(Flash);
             flashShadow = null;
             Array.Clear(localityCache, 0, LocalityCacheSize);
             localityCacheIdx = 0;
@@ -171,6 +243,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private bool HandleDirectWrite(long offset, int width, uint value)
         {
             hadDirectWrite = true;
+            if(OperationTiming != FlashTiming.Off)
+            {
+                ProgramStore(offset, width, value, false);
+                return false;
+            }
 
             if(AnyFaultFired || Flash == null || FlashSize == 0)
             {
@@ -423,7 +500,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     genericStorage.TryGetValue(offset, out acrVal);
                     return acrVal;
                 case 0x404: return 0;         // KEYR: write-only
-                case 0x40C: return DriverErrorFired ? PROGRAM_ERROR_BIT : 0; // SR
+                case 0x40C: return (DriverErrorFired ? PROGRAM_ERROR_BIT : 0) | (operation.Busy ? (1U << 16) : 0);
                 case 0x410: return crValue;   // CR
 
                 default:
@@ -474,6 +551,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public override void Reset()
         {
             base.Reset();
+            operation.Reset();
+            programBuffer.Invalidate();
             tracker.Reset();
             crValue = LOCK_BIT;
             locked = true;
@@ -497,6 +576,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void UpdateMemoryAccessHook(bool enabled)
         {
+            if(timing != FlashTiming.Off && Flash != null && FlashSize > 0)
+            {
+                if(memoryAccessHookInstalled) return;
+                enabled = true;
+            }
             if(!machine.IsRegistered(this))
             {
                 memoryAccessHookInstalled = false;
@@ -531,6 +615,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 pgLastWritePc = pc;
                 pgLastWriteContext = tracker.CaptureCallContext(pc);
+                if(OperationTiming != FlashTiming.Off && off <= FlashSize - width)
+                {
+                    ProgramStore(off, (int)width, value, true);
+                }
                 if(off < pgWriteMinOffset)
                 {
                     pgWriteMinOffset = off;
@@ -583,6 +671,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void HandleCr(uint newCr)
         {
+            if(operation.Busy)
+            {
+                return;
+            }
             // Setting LOCK always works.
             if((newCr & LOCK_BIT) != 0)
             {
@@ -618,7 +710,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 bool faultTargetWrite = SkipShadowScan && !AnyFaultFired
                     && Flash != null && FlashSize > 0
                     && TotalWordWrites + 1 == FaultAtWordWrite;
-                if(NeedsCpuWriteHook || faultTargetWrite)
+                if(OperationTiming != FlashTiming.Off)
+                {
+                    programBuffer.Prepare(Flash, FlashSize);
+                }
+                if(OperationTiming != FlashTiming.Off || NeedsCpuWriteHook || faultTargetWrite)
                 {
                     if(!memoryAccessHookInstalled)
                     {
@@ -657,10 +753,36 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
 
             // Detect SER + STRT for erase.
+            if(FlashDurations.StartF4MassErase(OperationTiming, newCr, this, operation, HandleErase, programBuffer))
+            {
+                crValue &= ~STRT_BIT;
+                return;
+            }
             if((newCr & SER_BIT) != 0 && (newCr & STRT_BIT) != 0)
             {
                 int sectorNum = DecodeSectorNumber(newCr);
-                HandleErase(sectorNum);
+                if(OperationTiming == FlashTiming.Off)
+                {
+                    HandleErase(sectorNum);
+                }
+                else if(sectorNum >= 0 && sectorNum < Sectors.Length && Flash != null
+                    && Sectors[sectorNum].Offset + Sectors[sectorNum].Size <= FlashSize)
+                {
+                    if(!PassthroughMode && !AnyFaultFired && TotalPageErases + 1 == FaultAtPageErase)
+                    {
+                        HandleErase(sectorNum);
+                        programBuffer.RefreshIfPrepared(Flash);
+                    }
+                    else
+                    {
+                        var delay = FlashDurations.F4Sector(OperationTiming, newCr, Sectors[sectorNum].Size);
+                        operation.Start(delay, () =>
+                        {
+                            HandleErase(sectorNum);
+                            programBuffer.RefreshIfPrepared(Flash);
+                        });
+                    }
+                }
                 crValue &= ~STRT_BIT;
             }
         }
@@ -940,6 +1062,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     break;
                 }
             }
+            programBuffer.RefreshIfPrepared(Flash);
         }
 
         // ---------------------------------------------------------------

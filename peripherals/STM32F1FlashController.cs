@@ -49,6 +49,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             this.flashSize = flashSize;
             this.pageSize = pageSize > 0 ? pageSize : DefaultPageSize;
             this.eraseFill = eraseFill;
+            this.operation = new FlashOperationTimer(this);
             IRQ = new GPIO();
 
             var regMap = new Dictionary<long, DoubleWordRegister>
@@ -71,7 +72,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 },
                 {(long)Registers.Sr, new DoubleWordRegister(this)
                     .WithValueField(0, 32,
-                        valueProviderCallback: _ => sr & ~SrBsyBit,
+                        valueProviderCallback: _ => (sr & ~SrBsyBit) | (operation.Busy ? SrBsyBit : 0u),
                         writeCallback: (_, val) => WriteSr((uint)val),
                         name: "SR")
                 },
@@ -116,6 +117,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public void Reset()
         {
             registers.Reset();
+            operation.Reset();
             acr = ResetAcr;
             sr = 0;
             cr = ResetCr;
@@ -188,6 +190,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public GPIO IRQ { get; }
         public long Size => 0x400;
+
+        public FlashTiming OperationTiming
+        {
+            get => timing;
+            set
+            {
+                if(timing == value)
+                {
+                    return;
+                }
+                if(operation.Busy)
+                {
+                    throw new InvalidOperationException("Change flash timing while the controller is idle");
+                }
+                timing = value;
+                UpdateMemoryHooks();
+            }
+        }
 
         public IMemory Flash
         {
@@ -578,6 +598,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void WriteCr(uint value)
         {
+            if(operation.Busy)
+            {
+                return;
+            }
             if((cr & CrLockBit) != 0 || keyLockedUntilReset)
             {
                 this.Log(LogLevel.Warning, "STM32F1 FLASH_CR write ignored while LOCK=1 (value=0x{0:X8})", value);
@@ -614,7 +638,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void WriteAr(uint value)
         {
-            if((cr & CrLockBit) != 0)
+            if(operation.Busy || (cr & CrLockBit) != 0)
             {
                 return;
             }
@@ -657,6 +681,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             EnsureShadow();
             if(!trackingStarted)
             {
+                if(OperationTiming != FlashTiming.Off)
+                {
+                    var untimedDelay = OperationTiming == FlashTiming.Maximum ? F1EraseMaxMicros : F1EraseTypMicros;
+                    operation.Start(untimedDelay, () =>
+                    {
+                        FillFlashAndShadow(pageBase, eraseLen, eraseFill);
+                        sr |= SrEopBit;
+                        UpdateInterrupts();
+                    });
+                    return;
+                }
                 FillFlashAndShadow(pageBase, eraseLen, eraseFill);
                 sr |= SrEopBit;
                 return;
@@ -668,6 +703,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(!passthroughMode && shouldFault)
             {
                 ApplyEraseFault(pageBase, eraseLen, eraseIndex);
+                return;
+            }
+
+            if(OperationTiming != FlashTiming.Off)
+            {
+                var delay = OperationTiming == FlashTiming.Maximum ? F1EraseMaxMicros : F1EraseTypMicros;
+                operation.Start(delay, () =>
+                {
+                    FillFlashAndShadow(pageBase, eraseLen, eraseFill);
+                    sr |= SrEopBit;
+                    UpdateInterrupts();
+                });
                 return;
             }
 
@@ -690,6 +737,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var totalLen = (int)flashSize;
             if(!trackingStarted)
             {
+                if(OperationTiming != FlashTiming.Off)
+                {
+                    var untimedDelay = OperationTiming == FlashTiming.Maximum ? F1EraseMaxMicros : F1EraseTypMicros;
+                    operation.Start(untimedDelay, () =>
+                    {
+                        FillFlashAndShadow(0, totalLen, eraseFill);
+                        sr |= SrEopBit;
+                        UpdateInterrupts();
+                    });
+                    return;
+                }
                 FillFlashAndShadow(0, totalLen, eraseFill);
                 sr |= SrEopBit;
                 return;
@@ -701,6 +759,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(!passthroughMode && shouldFault)
             {
                 ApplyEraseFault(0, totalLen, eraseIndex);
+                return;
+            }
+
+            if(OperationTiming != FlashTiming.Off)
+            {
+                var delay = OperationTiming == FlashTiming.Maximum ? F1EraseMaxMicros : F1EraseTypMicros;
+                operation.Start(delay, () =>
+                {
+                    FillFlashAndShadow(0, totalLen, eraseFill);
+                    sr |= SrEopBit;
+                    UpdateInterrupts();
+                });
                 return;
             }
 
@@ -797,6 +867,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
+            if(this.operation.Busy)
+            {
+                RevertFromShadow(offset, (int)Math.Min(width, 8u));
+                return;
+            }
+
             if((cr & CrLockBit) != 0 || (cr & CrPgBit) == 0)
             {
                 RevertFromShadow(offset, (int)Math.Min(width, 8u));
@@ -847,6 +923,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             if(!trackingStarted)
             {
+                if(OperationTiming != FlashTiming.Off)
+                {
+                    WriteFlashHalfWord(offset, oldHalfWord);
+                    var untimedDelay = OperationTiming == FlashTiming.Maximum ? F1ProgMaxMicros : F1ProgTypMicros;
+                    operation.Start(untimedDelay, () =>
+                    {
+                        WriteFlashAndShadowHalfWord(offset, newHalfWord);
+                        sr |= SrEopBit;
+                        UpdateInterrupts();
+                    });
+                    return;
+                }
                 WriteFlashAndShadowHalfWord(offset, newHalfWord);
                 sr |= SrEopBit;
                 UpdateInterrupts();
@@ -858,7 +946,33 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             if(!passthroughMode && shouldFault)
             {
+                if(OperationTiming != FlashTiming.Off
+                    && tracker.WriteFaultMode != 0
+                    && tracker.WriteFaultMode != 3
+                    && tracker.WriteFaultMode != 6)
+                {
+                    WriteFlashHalfWord(offset, oldHalfWord);
+                    var faultDelay = OperationTiming == FlashTiming.Maximum ? F1ProgMaxMicros : F1ProgTypMicros;
+                    operation.Start(faultDelay, () =>
+                    {
+                        ApplyWriteFault(offset, oldHalfWord, newHalfWord, writeIndex);
+                    });
+                    return;
+                }
                 ApplyWriteFault(offset, oldHalfWord, newHalfWord, writeIndex);
+                return;
+            }
+
+            if(OperationTiming != FlashTiming.Off)
+            {
+                WriteFlashHalfWord(offset, oldHalfWord);
+                var delay = OperationTiming == FlashTiming.Maximum ? F1ProgMaxMicros : F1ProgTypMicros;
+                operation.Start(delay, () =>
+                {
+                    WriteFlashAndShadowHalfWord(offset, newHalfWord);
+                    sr |= SrEopBit;
+                    UpdateInterrupts();
+                });
                 return;
             }
 
@@ -1211,6 +1325,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly IMachine machine;
         private readonly DoubleWordRegisterCollection registers;
         private readonly FaultTracker tracker = new FaultTracker();
+        private readonly FlashOperationTimer operation;
+        private FlashTiming timing;
+
+        // DS5319 Rev 19 §5.3.9 Table 28 (Flash memory characteristics):
+        //   tprog (16-bit programming time): Typ 52.5 us (rounded to 53 us), Max 70 us
+        //   tERASE (page 1 KB erase time): Min 20 ms (used for Typical), Max 40 ms
+        //   tME (mass erase time): Min 20 ms (used for Typical), Max 40 ms
+        private const ulong F1ProgTypMicros = 53UL;
+        private const ulong F1ProgMaxMicros = 70UL;
+        private const ulong F1EraseTypMicros = 20000UL;
+        private const ulong F1EraseMaxMicros = 40000UL;
 
         private MappedMemory flash;
         private long flashBaseAddress;

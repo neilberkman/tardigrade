@@ -21,6 +21,7 @@ using System.Collections.Generic;
 using System.Text;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Logging.Profiling;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
@@ -31,11 +32,54 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     public class STM32F4FastFlash : BasicDoubleWordPeripheral, IKnownSize, ITardigradeFaultInjectable
     {
+        private FlashTiming timing;
+        public FlashTiming OperationTiming
+        {
+            get => timing;
+            set
+            {
+                if(timing == value)
+                {
+                    return;
+                }
+                if(operation.Busy || pgActive)
+                {
+                    throw new InvalidOperationException("Change flash timing while the controller is idle and PG is clear");
+                }
+                programBuffer.Invalidate();
+                timing = value;
+                // Install before firmware enters its first programming window. Renode
+                // may already have translated the store following the MMIO write.
+                UpdateTimedHook();
+            }
+        }
+        private readonly FlashProgramBuffer programBuffer = new FlashProgramBuffer();
+        private readonly FlashOperationTimer operation;
+
+        private void ProgramStore(long offset, int width, ulong value)
+        {
+            programBuffer.UndoStore(Flash, offset, width);
+            if(AnyFaultFired && FaultRequiresImmediateStop)
+            {
+                return;
+            }
+            if(operation.Busy)
+            {
+                return;
+            }
+            var data = FlashProgramBuffer.StoreBytes(value, width);
+            operation.Start(OperationTiming == FlashTiming.Maximum ? 100UL : 16UL, () =>
+            {
+                programBuffer.Program(Flash, offset, data);
+            });
+        }
+
         private readonly FaultTracker tracker = new FaultTracker();
 
         public STM32F4FastFlash(IMachine machine) : base(machine)
         {
             tracker.Bind(machine, this);
+            operation = new FlashOperationTimer(this);
         }
 
         public long Size => 0x20;
@@ -75,7 +119,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // Stored but ignored — always skip scan.
         public int DiffLookahead { get; set; } = 32;
 
-        public void InvalidateShadow() { }
+        public void InvalidateShadow() { programBuffer.RefreshIfPrepared(Flash); }
 
         // --- Erase tracking ---
 
@@ -200,7 +244,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 case 0x00: return acrValue;      // ACR
                 case 0x04: return 0;             // KEYR: write-only
                 case 0x08: return 0;             // OPTKEYR: ignored
-                case 0x0C: return 0;             // SR: BSY=0, no errors
+                case 0x0C: return operation.Busy ? (1U << 16) : 0;
                 case 0x10: return crValue;       // CR
                 case 0x14: return 0;             // OPTCR: ignored
                 default:   return 0;
@@ -232,6 +276,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public override void Reset()
         {
             base.Reset();
+            operation.Reset();
+            UpdateTimedHook();
+            programBuffer.Invalidate();
             tracker.Reset();
             acrValue = 0;
             crValue = LOCK_BIT;
@@ -269,6 +316,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void HandleCr(uint newCr)
         {
+            if(operation.Busy)
+            {
+                return;
+            }
             // Setting LOCK always works.
             if((newCr & LOCK_BIT) != 0)
             {
@@ -304,10 +355,36 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
 
             // SER + STRT: sector erase.
+            if(FlashDurations.StartF4MassErase(OperationTiming, newCr, this, operation, HandleErase, programBuffer))
+            {
+                crValue &= ~STRT_BIT;
+                return;
+            }
             if((newCr & SER_BIT) != 0 && (newCr & STRT_BIT) != 0)
             {
                 int sectorNum = DecodeSectorNumber(newCr);
-                HandleErase(sectorNum);
+                if(OperationTiming == FlashTiming.Off)
+                {
+                    HandleErase(sectorNum);
+                }
+                else if(sectorNum >= 0 && sectorNum < Sectors.Length && Flash != null
+                    && Sectors[sectorNum].Offset + Sectors[sectorNum].Size <= FlashSize)
+                {
+                    if(!PassthroughMode && !AnyFaultFired && TotalPageErases + 1 == FaultAtPageErase)
+                    {
+                        HandleErase(sectorNum);
+                        programBuffer.RefreshIfPrepared(Flash);
+                    }
+                    else
+                    {
+                        var delay = FlashDurations.F4Sector(OperationTiming, newCr, Sectors[sectorNum].Size);
+                        operation.Start(delay, () =>
+                        {
+                            HandleErase(sectorNum);
+                            programBuffer.RefreshIfPrepared(Flash);
+                        });
+                    }
+                }
                 crValue &= ~STRT_BIT;
             }
         }
@@ -330,8 +407,41 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // PG activation: snapshot if needed for trace or fault.
         // ---------------------------------------------------------------
 
+        private void OnCpuStore(ulong pc, MemoryOperation op, ulong virtualAddress,
+                                ulong address, uint width, ulong value)
+        {
+            if(!pgActive || op != MemoryOperation.MemoryWrite || OperationTiming == FlashTiming.Off)
+            {
+                return;
+            }
+            var offset = (long)address;
+            if(offset >= FlashBaseAddress)
+            {
+                offset -= FlashBaseAddress;
+            }
+            if(offset >= 0 && offset <= FlashSize - width)
+            {
+                ProgramStore(offset, (int)width, value);
+            }
+        }
+
+        private bool timedHookInstalled;
+
+        private void UpdateTimedHook()
+        {
+            bool enabled = timing != FlashTiming.Off && machine.IsRegistered(this);
+            if(enabled == timedHookInstalled) return;
+            FlashDurations.SetCpuWriteHook(machine, this, enabled ? (Antmicro.Renode.Peripherals.CPU.MemoryAccessHook)OnCpuStore : null);
+            timedHookInstalled = enabled;
+        }
+
         private void HandlePgActivation()
         {
+            if(OperationTiming != FlashTiming.Off)
+            {
+                programBuffer.Prepare(Flash, FlashSize);
+                UpdateTimedHook();
+            }
             preFaultSnapshot = null;
 
             if(AnyFaultFired || Flash == null || FlashSize <= 0)
@@ -401,6 +511,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                             ApplyTornProgramAtOffset(snap, preFaultSnapshot, current,
                                 changedOffset, flashLen);
                             Flash.WriteBytes(0, snap, 0, flashLen);
+                            programBuffer.RefreshIfPrepared(Flash);
                             FaultFlashSnapshot = snap;
                         }
                         else
@@ -413,6 +524,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                             Array.Copy(current, faultedCurrent, flashLen);
                             ApplyWriteFaultAtOffset(faultedCurrent, preFaultSnapshot, current, changedOffset, flashLen);
                             Flash.WriteBytes(0, faultedCurrent, 0, flashLen);
+                            programBuffer.RefreshIfPrepared(Flash);
                             FaultFlashSnapshot = faultedCurrent;
                         }
                     }

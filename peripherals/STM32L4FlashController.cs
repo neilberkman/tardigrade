@@ -41,6 +41,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             this.pageSize = pageSize > 0 ? pageSize : DefaultPageSize;
             this.eraseFill = eraseFill;
             this.dualBankEnabled = dualBank;
+            this.operation = new FlashOperationTimer(this);
             IRQ = new GPIO();
 
             var regMap = new Dictionary<long, DoubleWordRegister>
@@ -68,7 +69,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 },
                 {(long)Registers.Sr, new DoubleWordRegister(this)
                     .WithValueField(0, 32,
-                        valueProviderCallback: _ => sr & ~SrBsyBit,
+                        valueProviderCallback: _ => (sr & ~SrBsyBit) | (operation.Busy ? SrBsyBit : 0u),
                         writeCallback: (_, val) => WriteSr((uint)val),
                         name: "SR")
                 },
@@ -133,6 +134,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public void Reset()
         {
             registers.Reset();
+            operation.Reset();
             acr = ResetAcr;
             sr = 0;
             cr = ResetCr;
@@ -360,6 +362,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public GPIO IRQ { get; }
         public long Size => 0x400;
+
+        public FlashTiming OperationTiming
+        {
+            get => timing;
+            set
+            {
+                if(timing == value)
+                {
+                    return;
+                }
+                if(operation.Busy)
+                {
+                    throw new InvalidOperationException("Change flash timing while the controller is idle");
+                }
+                timing = value;
+                UpdateMemoryHooks();
+            }
+        }
 
         public IMemory Flash
         {
@@ -804,6 +824,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void WriteCr(uint value)
         {
+            if(operation.Busy)
+            {
+                return;
+            }
             if((cr & CrLockBit) != 0 || keyLockedUntilReset)
             {
                 this.Log(LogLevel.Warning, "STM32L4 FLASH_CR write ignored while LOCK=1 (value=0x{0:X8})", value);
@@ -959,6 +983,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             EnsureShadow();
             if(!trackingStarted)
             {
+                if(OperationTiming != FlashTiming.Off)
+                {
+                    var untimedDelay = GetL4EraseDelayMicros(regionLength);
+                    operation.Start(untimedDelay, () =>
+                    {
+                        FillFlashAndShadow(regionBase, regionLength, eraseFill);
+                        ClearUncorrectableRange(regionBase, regionLength);
+                        SetEopIfEnabled();
+                        UpdateInterrupts();
+                    });
+                    return;
+                }
                 FillFlashAndShadow(regionBase, regionLength, eraseFill);
                 ClearUncorrectableRange(regionBase, regionLength);
                 SetEopIfEnabled();
@@ -974,9 +1010,32 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
+            if(OperationTiming != FlashTiming.Off)
+            {
+                var delay = GetL4EraseDelayMicros(regionLength);
+                operation.Start(delay, () =>
+                {
+                    FillFlashAndShadow(regionBase, regionLength, eraseFill);
+                    ClearUncorrectableRange(regionBase, regionLength);
+                    SetEopIfEnabled();
+                    UpdateInterrupts();
+                });
+                return;
+            }
+
             FillFlashAndShadow(regionBase, regionLength, eraseFill);
             ClearUncorrectableRange(regionBase, regionLength);
             SetEopIfEnabled();
+        }
+
+        private ulong GetL4EraseDelayMicros(int regionLength)
+        {
+            var isMassOrBank = regionLength > pageSize;
+            if(isMassOrBank)
+            {
+                return OperationTiming == FlashTiming.Maximum ? L4MassEraseMaxMicros : L4MassEraseTypMicros;
+            }
+            return OperationTiming == FlashTiming.Maximum ? L4PageEraseMaxMicros : L4PageEraseTypMicros;
         }
 
         private void ApplyEraseFault(long regionBase, int regionLength, ulong eraseIndex)
@@ -1127,6 +1186,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
+            if(this.operation.Busy)
+            {
+                RevertFromShadow(offset, (int)Math.Min(width, 8u));
+                return;
+            }
+
             var pgEnabled = (cr & CrPgBit) != 0;
             var fstpgEnabled = (cr & CrFstpgBit) != 0;
             if((cr & CrLockBit) != 0 || (!pgEnabled && !fstpgEnabled))
@@ -1263,9 +1328,42 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 fstpgWordsInRow = 0;
                 fstpgRowBase = -1;
+                if(OperationTiming != FlashTiming.Off)
+                {
+                    var staged = fstpgStagedDoubleWords.ToArray();
+                    fstpgStagedDoubleWords.Clear();
+                    var delay = OperationTiming == FlashTiming.Maximum ? L4FastRowProgMaxMicros : L4FastRowProgTypMicros;
+                    operation.Start(delay, () =>
+                    {
+                        foreach(var entry in staged)
+                        {
+                            WriteFlashAndShadowDoubleWord(entry.Key, entry.Value);
+                            ClearUncorrectableWord(entry.Key);
+                            ClearCorrectableWord(entry.Key);
+                        }
+                        SetEopIfEnabled();
+                        UpdateInterrupts();
+                    });
+                    return;
+                }
                 SetEopIfEnabled();
                 UpdateInterrupts();
             }
+        }
+
+        private void FlushStagedFastRowDoubleWords()
+        {
+            if(fstpgStagedDoubleWords.Count == 0)
+            {
+                return;
+            }
+            foreach(var entry in fstpgStagedDoubleWords)
+            {
+                WriteFlashAndShadowDoubleWord(entry.Key, entry.Value);
+                ClearUncorrectableWord(entry.Key);
+                ClearCorrectableWord(entry.Key);
+            }
+            fstpgStagedDoubleWords.Clear();
         }
 
         private bool HandleStandardWordWrite(long offset, uint wordValue, bool isFastRow)
@@ -1340,6 +1438,25 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             if(!trackingStarted)
             {
+                if(OperationTiming != FlashTiming.Off)
+                {
+                    WriteFlashDoubleWord(dwOffset, oldDoubleWord);
+                    if(isFastRow)
+                    {
+                        fstpgStagedDoubleWords.Add(new KeyValuePair<long, ulong>(dwOffset, intendedValue));
+                        return true;
+                    }
+                    var untimedDelay = OperationTiming == FlashTiming.Maximum ? L4ProgMaxMicros : L4ProgTypMicros;
+                    operation.Start(untimedDelay, () =>
+                    {
+                        WriteFlashAndShadowDoubleWord(dwOffset, intendedValue);
+                        ClearUncorrectableWord(dwOffset);
+                        ClearCorrectableWord(dwOffset);
+                        SetEopIfEnabled();
+                        UpdateInterrupts();
+                    });
+                    return true;
+                }
                 WriteFlashAndShadowDoubleWord(dwOffset, intendedValue);
                 ClearUncorrectableWord(dwOffset);
                 ClearCorrectableWord(dwOffset);
@@ -1356,7 +1473,46 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             if(!passthroughMode && shouldFault)
             {
+                if(OperationTiming != FlashTiming.Off)
+                {
+                    WriteFlashDoubleWord(dwOffset, oldDoubleWord);
+                    if(isFastRow)
+                    {
+                        FlushStagedFastRowDoubleWords();
+                    }
+                    else if(tracker.WriteFaultMode != 0
+                        && tracker.WriteFaultMode != 3
+                        && tracker.WriteFaultMode != 6)
+                    {
+                        var faultDelay = OperationTiming == FlashTiming.Maximum ? L4ProgMaxMicros : L4ProgTypMicros;
+                        operation.Start(faultDelay, () =>
+                        {
+                            ApplyWriteFault(dwOffset, oldDoubleWord, intendedValue, writeIndex, isFastRow: false);
+                        });
+                        return true;
+                    }
+                }
                 return ApplyWriteFault(dwOffset, oldDoubleWord, intendedValue, writeIndex, isFastRow);
+            }
+
+            if(OperationTiming != FlashTiming.Off)
+            {
+                WriteFlashDoubleWord(dwOffset, oldDoubleWord);
+                if(isFastRow)
+                {
+                    fstpgStagedDoubleWords.Add(new KeyValuePair<long, ulong>(dwOffset, intendedValue));
+                    return true;
+                }
+                var delay = OperationTiming == FlashTiming.Maximum ? L4ProgMaxMicros : L4ProgTypMicros;
+                operation.Start(delay, () =>
+                {
+                    WriteFlashAndShadowDoubleWord(dwOffset, intendedValue);
+                    ClearUncorrectableWord(dwOffset);
+                    ClearCorrectableWord(dwOffset);
+                    SetEopIfEnabled();
+                    UpdateInterrupts();
+                });
+                return true;
             }
 
             WriteFlashAndShadowDoubleWord(dwOffset, intendedValue);
@@ -1703,6 +1859,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             pendingWordValue = 0;
             fstpgRowBase = -1;
             fstpgWordsInRow = 0;
+            fstpgStagedDoubleWords.Clear();
         }
 
         private void SetEopIfEnabled()
@@ -1958,6 +2115,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly IMachine machine;
         private readonly DoubleWordRegisterCollection registers;
         private readonly FaultTracker tracker = new FaultTracker();
+        private readonly FlashOperationTimer operation;
+        private FlashTiming timing;
+        private readonly List<KeyValuePair<long, ulong>> fstpgStagedDoubleWords = new List<KeyValuePair<long, ulong>>();
+
+        // DS10198 Rev 8 §6.3.10 Table 63 (Flash memory characteristics):
+        //   tprog (64-bit double-word programming time): Typ 81.69 us (82 us), Max 90.76 us (91 us)
+        //   tprog_row (32 double-word fast row programming time, FSTPG): Typ 1.91 ms (1910 us), Max 2.12 ms (2120 us)
+        //   tERASE (2 KB page erase time): Typ 22.02 ms (22020 us), Max 24.47 ms (24470 us)
+        //   tME (mass or single-bank erase time): Typ 22.13 ms (22130 us), Max 24.59 ms (24590 us)
+        private const ulong L4ProgTypMicros = 82UL;
+        private const ulong L4ProgMaxMicros = 91UL;
+        private const ulong L4FastRowProgTypMicros = 1910UL;
+        private const ulong L4FastRowProgMaxMicros = 2120UL;
+        private const ulong L4PageEraseTypMicros = 22020UL;
+        private const ulong L4PageEraseMaxMicros = 24470UL;
+        private const ulong L4MassEraseTypMicros = 22130UL;
+        private const ulong L4MassEraseMaxMicros = 24590UL;
         private readonly HashSet<long> uncorrectableWords = new HashSet<long>();
         private readonly HashSet<long> correctableWords = new HashSet<long>();
         private readonly List<long> faultUncorrectableWords = new List<long>();
