@@ -137,11 +137,60 @@ def main(argv=None):
     merge = commands.add_parser("merge-state-search", help="merge recovery state search shard reports")
     merge.add_argument("shards", nargs="+", type=Path, metavar="SHARD.json")
     merge.add_argument("--output", required=True, type=Path)
+    debug = commands.add_parser("debug", help="open a failing point or state in a Renode GDB session")
+    debug.add_argument("--report", "--input", "--sarif", dest="report", type=Path)
+    debug.add_argument("--point")
+    debug.add_argument("--state")
+    debug.add_argument("--reproduction")
+    debug.add_argument("--profile", type=Path)
+    debug.add_argument("--elf", type=Path)
+    debug.add_argument("--stop-at", "--at", "--stop", dest="stop_at", default="recovery-reset")
+    debug.add_argument("--port", type=int, default=3333)
+    debug.add_argument("--gdb")
+    debug.add_argument("--renode-test", default=runner)
+    debug.add_argument("--timeout", type=int, default=300)
+    debug.add_argument("--output", type=Path)
+    debug.add_argument("--ex", dest="gdb_ex", action="append")
     args, unknown = parser.parse_known_args(argv)
     if unknown and args.command != "audit":
         parser.error(f"unrecognized arguments: {' '.join(unknown)}")
     if args.command == "doctor":
         return doctor(args)
+    if args.command == "debug":
+        sys.path.insert(0, str(RUNTIME / "scripts"))
+        import debug_point
+
+        debug_argv = [
+            "--stop-at",
+            str(args.stop_at),
+            "--port",
+            str(args.port),
+            "--renode-test",
+            _resolve_runner_arg(args.renode_test),
+            "--timeout",
+            str(args.timeout),
+            "--repo-root",
+            str(RUNTIME),
+        ]
+        if args.report is not None:
+            debug_argv.extend(["--report", str(args.report.expanduser().resolve())])
+        if args.point is not None:
+            debug_argv.extend(["--point", str(args.point)])
+        if args.state is not None:
+            debug_argv.extend(["--state", str(args.state)])
+        if args.reproduction is not None:
+            debug_argv.extend(["--reproduction", str(args.reproduction)])
+        if args.profile is not None:
+            debug_argv.extend(["--profile", str(args.profile.expanduser().resolve())])
+        if args.elf is not None:
+            debug_argv.extend(["--elf", str(args.elf.expanduser().resolve())])
+        if args.gdb is not None:
+            debug_argv.extend(["--gdb", str(args.gdb)])
+        if args.output is not None:
+            debug_argv.extend(["--output", str(args.output.expanduser().resolve())])
+        for ex_cmd in args.gdb_ex or ():
+            debug_argv.extend(["--ex", str(ex_cmd)])
+        return debug_point.main(debug_argv, prog="tardigrade debug")
     if args.command == "report":
         command = [sys.executable, str(RUNTIME / "scripts/render_results_html.py")]
         for item in args.input:
