@@ -408,3 +408,174 @@ def test_missing_endpoint_pc_has_no_last_function(tmp_path):
     })
     audit([failed], tmp_path)
     assert "last_function" not in failed["failure_explanation"]["recovery"]
+
+
+def test_call_chain_driver_skip_and_probe_field_names_in_explanation(tmp_path):
+    import base64
+    import struct
+    import zlib
+    from recovery_explanation import explain_recovery_failures
+
+    mcu_elf = ROOT / "results/oss_validation/assets/oss_mcuboot_pr3011_move_broken.elf"
+    profile_path = ROOT / "profiles/mcuboot_pr3011_move_broken.yaml"
+
+    # Build realistic stack snapshots at nvmc_word_write (0x00003D72):
+    # p1: nvmc_word_write -> nrfx_nvmc_word_write -> flash_nrf_write -> boot_write_magic -> swap_status_init
+    p1_stack = bytearray(96)
+    struct.pack_into("<I", p1_stack, 4, 0x000024D7)
+    struct.pack_into("<I", p1_stack, 36, 0x00003E1B)
+    struct.pack_into("<I", p1_stack, 68, 0x00004D99)
+    p1_ctx = f"0x00003D72@0x00003DCF@0x2003FE00@0x00000000@0x00000000@{p1_stack.hex()}"
+
+    # p2: nvmc_word_write -> nrfx_nvmc_word_write -> flash_nrf_write -> boot_write_magic -> fixup_revert
+    p2_stack = bytearray(96)
+    struct.pack_into("<I", p2_stack, 4, 0x000024D7)
+    struct.pack_into("<I", p2_stack, 36, 0x00003E1B)
+    struct.pack_into("<I", p2_stack, 68, 0x00001379)
+    p2_ctx = f"0x00003D72@0x00003DCF@0x2003FE00@0x00000000@0x00000000@{p2_stack.hex()}"
+
+    def encode_trailer_state(magic_tail_bytes):
+        buf = bytearray(b"\xff" * 64)
+        # Base 0x000F7FC0 -> offset 0x34..0x40 is 0x000F7FF4..0x000F7FFF (12 bytes of staging trailer magic)
+        buf[0x34:0x40] = magic_tail_bytes
+        return {
+            "base_address": "0x000F7FC0",
+            "size": len(buf),
+            "zlib_b64": base64.b64encode(zlib.compress(bytes(buf), 1)).decode("ascii"),
+        }
+
+    failed = {
+        "fault_at": 2,
+        "fault_requested": 2,
+        "fault_type": "p2",
+        "fault_injected": True,
+        "fault_address": "0x000F7FF0",
+        "fault_pc": "0x00003D72",
+        "fault_call_context": p2_ctx,
+        "boot_outcome": "no_boot",
+        "boot_slot": None,
+        "fault_class": "brick",
+        "_pre_recovery_state": encode_trailer_state(bytes(12)),
+        "phase2_fault": {
+            "p1_fault_at": 2,
+            "p2_fault_at": 6,
+            "p1_fault_type": "w",
+            "p2_fault_type": "w",
+            "p1_injected": True,
+            "p2_injected": True,
+            "p1_fault_address": "0x000F7FF8",
+            "p2_fault_address": "0x000F7FF0",
+            "p1_fault_pc": "0x00003D72",
+            "p2_fault_pc": "0x00003D72",
+            "p1_fault_call_context": p1_ctx,
+            "p2_fault_call_context": p2_ctx,
+            "p2_write_trace": [
+                {
+                    "write_index": 7,
+                    "flash_offset": 0xF7FF0,
+                    "address": "0x000F7FF0",
+                    "value": "0x00000000",
+                    "width": 4,
+                    "pc": "0x00003D72",
+                    "call_context": p2_ctx,
+                }
+            ],
+            "p2_erase_trace": [],
+        },
+        "signals": {
+            "pc": "0x000046C4",
+            "phase2_executed_instructions": 500,
+            "phase2_terminal_self_branch_observation": {"pc": "0x000046C4"},
+        },
+    }
+    passed = {
+        "fault_at": 2,
+        "fault_requested": 2,
+        "fault_type": "p2",
+        "fault_injected": True,
+        "fault_address": "0x00081FE8",
+        "boot_outcome": "success",
+        "boot_slot": "exec",
+        "fault_class": "recoverable",
+        "_pre_recovery_state": encode_trailer_state(bytes.fromhex("7fefd2600f5052358079b62c")),
+        "phase2_fault": {
+            "p1_fault_at": 2,
+            "p2_fault_at": 5,
+            "p1_fault_type": "w",
+            "p2_fault_type": "w",
+            "p1_injected": True,
+            "p2_injected": True,
+            "p1_fault_address": "0x000F7FF8",
+            "p2_fault_address": "0x00081FE8",
+            "p2_write_trace": [],
+            "p2_erase_trace": [],
+        },
+        "signals": {"pc": "0x0000C200", "phase2_executed_instructions": 500},
+    }
+
+    report = saved_run(
+        {"runtime_sweep_results": [passed, failed]},
+        tmp_path / "pr3011_audit.json",
+        ROOT,
+        profile_path,
+        elf=mcu_elf,
+    )
+    exp = failed["failure_explanation"]
+
+    # Both cuts must keep the full call chain and report the first non-driver frame.
+    assert [f["function"] for f in exp["cuts"][0]["call_chain"][:5]] == [
+        "nvmc_word_write",
+        "nrfx_nvmc_word_write",
+        "flash_nrf_write",
+        "boot_write_magic",
+        "swap_status_init",
+    ]
+    assert exp["cuts"][0]["source"]["function"] == "boot_write_magic"
+    assert [f["function"] for f in exp["cuts"][1]["call_chain"][:5]] == [
+        "nvmc_word_write",
+        "nrfx_nvmc_word_write",
+        "flash_nrf_write",
+        "boot_write_magic",
+        "fixup_revert",
+    ]
+    assert exp["cuts"][1]["source"]["function"] == "boot_write_magic"
+
+    # Traced writes in p2_write_trace also record call_chain and non-driver source.
+    traced_write = failed["phase2_fault"]["p2_write_trace"][0]
+    assert [f["function"] for f in traced_write["call_chain"][:5]] == [
+        "nvmc_word_write",
+        "nrfx_nvmc_word_write",
+        "flash_nrf_write",
+        "boot_write_magic",
+        "fixup_revert",
+    ]
+    assert traced_write["source"]["function"] == "boot_write_magic"
+
+    # Probe-provided field name on differing range and in message.
+    span = exp["state_comparison"]["ranges"][0]
+    assert span["field"] == "MCUboot trailer magic"
+    assert span["slot"] == "staging"
+    assert "cut during boot_write_magic at 0x00003E16 (symbol table only)" in exp["message"]
+    assert (
+        "leaves MCUboot trailer magic 0x000F7FF4..0x000F7FFF (12 bytes) "
+        "holding 000000000000000000000000 instead of 7fefd2600f5052358079b62c"
+    ) in exp["message"]
+    assert "recovery hung in self-branch (no boot) at onoff_request (0x000046C4, symbol table only)" in exp["message"]
+
+    # Extending driver_functions via profile list skips boot_write_magic to fixup_revert.
+    failed.pop("failure_explanation")
+    failed["_pre_recovery_state"] = encode_trailer_state(bytes(12))
+    passed["_pre_recovery_state"] = encode_trailer_state(bytes.fromhex("7fefd2600f5052358079b62c"))
+    explain_recovery_failures(
+        [passed, failed],
+        "success",
+        mcu_elf,
+        ROOT,
+        driver_functions=("boot_write_magic",),
+        slots={
+            "exec": {"base": 0x0000C000, "size": 0x76000},
+            "staging": {"base": 0x00082000, "size": 0x76000},
+        },
+    )
+    assert failed["failure_explanation"]["cuts"][1]["source"]["function"] == "fixup_revert"
+    assert "cut during fixup_revert at 0x00001376 (symbol table only)" in failed["failure_explanation"]["message"]
