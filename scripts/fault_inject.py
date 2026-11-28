@@ -10,7 +10,9 @@ import random
 import struct as _struct
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from fault_types import _fault_type_label
+from fault_types import FAULT_TYPE_NAME_TO_CODE, _fault_type_label
+
+_CODE_TO_FAULT_TYPE_NAME = {v: k for k, v in FAULT_TYPE_NAME_TO_CODE.items()}
 
 
 @dataclasses.dataclass
@@ -570,7 +572,8 @@ def generate_multi_fault_sequences(
     max_faults_per_run: int = 2,
     max_pairs: int = 5000,
     seed: Optional[int] = None,
-    explicit_sequences: Optional[List[List[int]]] = None,
+    explicit_sequences: Optional[List[List[Any]]] = None,
+    explicit_stage_types: Optional[List[Optional[List[str]]]] = None,
     fallback_strategy: Optional[str] = None,
     fallback_points: Optional[List[int]] = None,
     point_provenance: Optional[Dict[int, Dict[str, Any]]] = None,
@@ -603,6 +606,7 @@ def generate_multi_fault_sequences(
             explicit_sequences,
             max_faults_per_run,
             max_sequences=max_pairs,
+            stage_types=explicit_stage_types,
         )
     elif strategy == "pairwise_interesting":
         plan = generate_pairwise_interesting(
@@ -624,10 +628,48 @@ def generate_multi_fault_sequences(
         )
 
 
+def _parse_explicit_stage_item(item: Any) -> Tuple[int, Optional[str]]:
+    if isinstance(item, bool):
+        raise ValueError(f"invalid multi-fault stage point {item!r}")
+    if isinstance(item, int):
+        return int(item), None
+    if isinstance(item, (list, tuple)) and len(item) == 2:
+        if isinstance(item[0], bool) or not isinstance(item[0], int):
+            raise ValueError(f"invalid multi-fault stage index {item[0]!r}")
+        raw_ft = str(item[1] or "").strip().lower()
+        code = FAULT_TYPE_NAME_TO_CODE.get(
+            raw_ft,
+            {"write": "w", "program": "w", "erase": "e"}.get(raw_ft, raw_ft),
+        )
+        name = _CODE_TO_FAULT_TYPE_NAME.get(code, raw_ft)
+        return int(item[0]), name
+    if isinstance(item, str):
+        text = item.strip()
+        if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+            return int(text), None
+        import re as _re
+        m = _re.match(
+            r"^(?:(?P<ft1>[A-Za-z_]+)\s*(?:\[\s*(?P<idx1>-?\d+)\s*\]|:\s*(?P<idx2>-?\d+)|@\s*(?P<idx3>-?\d+))"
+            r"|(?P<idx4>-?\d+)\s*(?:@|:)\s*(?P<ft2>[A-Za-z_]+))$",
+            text,
+        )
+        if m:
+            idx_str = m.group("idx1") or m.group("idx2") or m.group("idx3") or m.group("idx4")
+            ft_str = (m.group("ft1") or m.group("ft2") or "").strip().lower()
+            code = FAULT_TYPE_NAME_TO_CODE.get(
+                ft_str,
+                {"write": "w", "program": "w", "erase": "e"}.get(ft_str, ft_str),
+            )
+            name = _CODE_TO_FAULT_TYPE_NAME.get(code, ft_str)
+            return int(idx_str), name
+    return int(item), None
+
+
 def generate_explicit(
-    sequences: Optional[List[List[int]]],
+    sequences: Optional[List[List[Any]]],
     max_faults_per_run: int,
     max_sequences: Optional[int] = None,
+    stage_types: Optional[List[Optional[List[str]]]] = None,
 ) -> MultiFaultPlan:
     """Validate and return user-provided explicit sequences."""
     if not sequences:
@@ -639,7 +681,7 @@ def generate_explicit(
             )
         )
     validated: List[AnnotatedSequence] = []
-    for seq in sequences:
+    for seq_idx, seq in enumerate(sequences):
         if len(seq) < 2:
             raise ValueError(
                 "each multi-fault sequence must have >= 2 points, got {}".format(seq)
@@ -648,16 +690,40 @@ def generate_explicit(
             raise ValueError(
                 "sequence {} exceeds max_faults_per_run={}".format(seq, max_faults_per_run)
             )
-        if any(int(point) < 0 for point in seq):
+        parsed_stages = [_parse_explicit_stage_item(x) for x in seq]
+        if any(pt < 0 for pt, _ in parsed_stages):
             raise ValueError(
                 "multi-fault sequence contains a negative fault point: {}".format(
                     seq
                 )
             )
-        validated.append(AnnotatedSequence(
-            fault_points=sorted(seq),
-            rationale="explicit: user-specified sequence",
-        ))
+        explicit_types: Optional[List[str]] = None
+        if stage_types and seq_idx < len(stage_types) and stage_types[seq_idx]:
+            explicit_types = list(stage_types[seq_idx])
+        elif any(st is not None for _, st in parsed_stages):
+            explicit_types = [st or "power_loss" for _, st in parsed_stages]
+        if explicit_types is not None:
+            pts = [pt for pt, _ in parsed_stages]
+            stage_codes = [
+                FAULT_TYPE_NAME_TO_CODE.get(
+                    str(st).strip().lower(),
+                    {"write": "w", "program": "w", "erase": "e"}.get(
+                        str(st).strip().lower(), str(st).strip()
+                    ),
+                )
+                for st in explicit_types
+            ]
+            validated.append(AnnotatedSequence(
+                fault_points=pts,
+                rationale="explicit: user-specified sequence",
+                fault_types=stage_codes,
+            ))
+        else:
+            pts = sorted(pt for pt, _ in parsed_stages)
+            validated.append(AnnotatedSequence(
+                fault_points=pts,
+                rationale="explicit: user-specified sequence",
+            ))
     return MultiFaultPlan(
         sequences=validated,
         strategy="explicit",

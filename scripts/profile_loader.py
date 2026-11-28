@@ -1074,6 +1074,7 @@ class MultiFaultConfig:
         "max_pairs",
         "seed",
         "sequences",
+        "sequence_stage_types",
     )
 
     def __init__(
@@ -1085,6 +1086,7 @@ class MultiFaultConfig:
         max_pairs: int = 5000,
         seed=None,
         sequences=None,
+        sequence_stage_types=None,
     ) -> None:
         self.enabled = enabled
         self.max_faults_per_run = max(2, int(max_faults_per_run))
@@ -1104,6 +1106,7 @@ class MultiFaultConfig:
             )
         self.seed = seed
         self.sequences = sequences or []
+        self.sequence_stage_types = sequence_stage_types or []
 
 
 class Phase2FaultConfig:
@@ -1115,6 +1118,7 @@ class Phase2FaultConfig:
         "fault_types",
         "max_points",
         "pairs",
+        "typed_pairs",
         "chains",
         "state_search",
     )
@@ -1128,6 +1132,7 @@ class Phase2FaultConfig:
         pairs: Optional[List[Tuple[int, int]]] = None,
         chains: Optional[List[List[Tuple[int, str]]]] = None,
         state_search: Optional["RecoveryStateSearchConfig"] = None,
+        typed_pairs: Optional[List[Tuple[int, Optional[str], int, Optional[str]]]] = None,
     ) -> None:
         self.enabled = enabled
         self.first_fault_types = (
@@ -1138,6 +1143,7 @@ class Phase2FaultConfig:
         self.fault_types = ["power_loss"] if fault_types is None else list(fault_types)
         self.max_points = max(0, int(max_points))
         self.pairs = list(pairs or [])
+        self.typed_pairs = list(typed_pairs or [])
         self.chains = [list(chain) for chain in (chains or [])]
         self.state_search = state_search or RecoveryStateSearchConfig()
         if self.max_points > MAX_PROFILE_FAULT_POINTS:
@@ -2360,6 +2366,8 @@ class FaultSweepConfig:
         "torn_word_seed",
         "torn_word_choices",
         "include_erase_fault_points",
+        "require_planned_points_per_kind",
+        "points",
         "trace_replay_cross_check_every",
         "_driver_functions",
         "recovery_coverage",
@@ -2423,6 +2431,12 @@ class FaultSweepConfig:
         torn_word_explicit: bool = False,
         torn_word_seed: int = 0,
         include_erase_fault_points: bool = False,
+        require_planned_points_per_kind: bool = False,
+        fail_on_zero_point_fault_kind: bool = False,
+        fail_on_empty_fault_kind: bool = False,
+        require_points_per_fault_kind: bool = False,
+        require_nonempty_fault_kinds: bool = False,
+        points: Optional[List[Tuple[int, str]]] = None,
         trace_replay_cross_check_every: int = 100,
         recovery_tracking_start_address: Optional[int] = None,
         driver_functions: Optional[List[str]] = None,
@@ -2711,6 +2725,16 @@ class FaultSweepConfig:
             )
         self.torn_word_seed = parsed_torn_seed
         self.include_erase_fault_points = bool(include_erase_fault_points)
+        self.require_planned_points_per_kind = bool(
+            require_planned_points_per_kind
+            or fail_on_zero_point_fault_kind
+            or fail_on_empty_fault_kind
+            or require_points_per_fault_kind
+            or require_nonempty_fault_kinds
+        )
+        self.points = list(points) if points is not None else None
+        if self.points and any(ft in ("interrupted_erase", "multi_sector_atomicity", "e", "a") for _, ft in self.points):
+            self.include_erase_fault_points = True
         if isinstance(trace_replay_cross_check_every, bool):
             raise ProfileError(
                 "fault_sweep.trace_replay_cross_check_every must be a non-negative integer"
@@ -2728,6 +2752,38 @@ class FaultSweepConfig:
                 "fault_sweep.trace_replay_cross_check_every must be a non-negative integer"
             )
         self.recovery_coverage = recovery_coverage or RecoveryCoverageConfig()
+
+    @property
+    def fail_on_zero_point_fault_kind(self) -> bool:
+        return self.require_planned_points_per_kind
+
+    @fail_on_zero_point_fault_kind.setter
+    def fail_on_zero_point_fault_kind(self, value: bool) -> None:
+        self.require_planned_points_per_kind = bool(value)
+
+    @property
+    def fail_on_empty_fault_kind(self) -> bool:
+        return self.require_planned_points_per_kind
+
+    @fail_on_empty_fault_kind.setter
+    def fail_on_empty_fault_kind(self, value: bool) -> None:
+        self.require_planned_points_per_kind = bool(value)
+
+    @property
+    def require_points_per_fault_kind(self) -> bool:
+        return self.require_planned_points_per_kind
+
+    @require_points_per_fault_kind.setter
+    def require_points_per_fault_kind(self, value: bool) -> None:
+        self.require_planned_points_per_kind = bool(value)
+
+    @property
+    def require_nonempty_fault_kinds(self) -> bool:
+        return self.require_planned_points_per_kind
+
+    @require_nonempty_fault_kinds.setter
+    def require_nonempty_fault_kinds(self, value: bool) -> None:
+        self.require_planned_points_per_kind = bool(value)
 
 
 class StateFuzzerConfig:
@@ -6085,6 +6141,32 @@ def _parse_fault_sweep(
             raw.get("include_erase_fault_points", False),
             "fault_sweep.include_erase_fault_points",
         ),
+        require_planned_points_per_kind=(
+            _parse_bool(
+                raw.get("require_planned_points_per_kind", False),
+                "fault_sweep.require_planned_points_per_kind",
+            )
+            or _parse_bool(
+                raw.get("fail_on_zero_point_fault_kind", False),
+                "fault_sweep.fail_on_zero_point_fault_kind",
+            )
+            or _parse_bool(
+                raw.get("fail_on_empty_fault_kind", False),
+                "fault_sweep.fail_on_empty_fault_kind",
+            )
+            or _parse_bool(
+                raw.get("require_points_per_fault_kind", False),
+                "fault_sweep.require_points_per_fault_kind",
+            )
+            or _parse_bool(
+                raw.get("require_nonempty_fault_kinds", False),
+                "fault_sweep.require_nonempty_fault_kinds",
+            )
+        ),
+        points=_parse_fault_sweep_points(
+            raw.get("points"),
+            default_fault_types=fault_types,
+        ),
         trace_replay_cross_check_every=raw.get(
             "trace_replay_cross_check_every", 100
         ),
@@ -6160,7 +6242,141 @@ def _parse_fault_sweep(
             "fault_sweep.phase2_fault.chains requires "
             "fault_sweep.evaluation_mode execute"
         )
+    if any(
+        chain and chain[0][1] == "interrupted_erase"
+        for chain in (fs_cfg.phase2_fault.chains or [])
+    ) or any(
+        tp[1] == "interrupted_erase"
+        for tp in (getattr(fs_cfg.phase2_fault, "typed_pairs", None) or [])
+    ):
+        fs_cfg.include_erase_fault_points = True
     return fs_cfg
+
+
+_EXPLICIT_CUT_TOKEN_RE = re.compile(
+    r"^(?:"
+    r"(?P<ft1>[A-Za-z_]+)\s*(?:\[\s*(?P<idx1>-?\d+)\s*\]|:\s*(?P<idx2>-?\d+)|@\s*(?P<idx3>-?\d+))"
+    r"|(?P<idx4>-?\d+)\s*(?:@|:)\s*(?P<ft2>(?!0[xX][0-9A-Fa-f]+\b)[A-Za-z_]+)"
+    r"|(?P<idx5>-?\d+)"
+    r")(?:\s*@\s*0x[0-9A-Fa-f]+)?$"
+)
+
+
+def _normalize_explicit_cut_fault_type(raw_type: Any, context: str) -> str:
+    text = str(raw_type or "").strip().lower()
+    alias_map = {
+        "write": "power_loss",
+        "program": "power_loss",
+        "w": "power_loss",
+        "erase": "interrupted_erase",
+        "e": "interrupted_erase",
+    }
+    mapped = alias_map.get(text, text)
+    normalized = _normalize_fault_types([mapped], context)
+    return normalized[0]
+
+
+def _parse_explicit_cut_spec(
+    raw_item: Any,
+    context: str,
+    *,
+    default_fault_type: Optional[str] = None,
+) -> Tuple[int, Optional[str]]:
+    if isinstance(raw_item, bool):
+        raise ProfileError("{}: index must be an integer".format(context))
+    if isinstance(raw_item, int):
+        if raw_item < 0:
+            raise ProfileError("{}: index must be non-negative".format(context))
+        return int(raw_item), default_fault_type
+    if isinstance(raw_item, list):
+        if len(raw_item) != 2:
+            raise ProfileError("{}: expected [operation_index, fault_type]".format(context))
+        idx_val, ft_val = raw_item
+        if isinstance(idx_val, bool) or not isinstance(idx_val, int):
+            raise ProfileError("{}: operation index must be an integer".format(context))
+        if idx_val < 0:
+            raise ProfileError("{}: operation index must be non-negative".format(context))
+        ft_norm = _normalize_explicit_cut_fault_type(ft_val, "{}.fault_type".format(context))
+        return int(idx_val), ft_norm
+    if isinstance(raw_item, dict):
+        raw_idx = (
+            raw_item.get("fault_at")
+            if "fault_at" in raw_item
+            else raw_item.get(
+                "operation_index",
+                raw_item.get("FAULT_POINTS_CSV", raw_item.get("fault_points_csv")),
+            )
+        )
+        if raw_idx is None or isinstance(raw_idx, bool):
+            raise ProfileError("{}: mapping requires fault_at or operation_index".format(context))
+        try:
+            idx_int = int(str(raw_idx).strip(), 0)
+        except (TypeError, ValueError) as exc:
+            raise ProfileError("{}: operation index must be an integer".format(context)) from exc
+        if idx_int < 0:
+            raise ProfileError("{}: operation index must be non-negative".format(context))
+        raw_ft = (
+            raw_item.get("fault_type")
+            or raw_item.get("operation_kind")
+            or raw_item.get("operation")
+            or raw_item.get("FAULT_TYPE_CSV")
+            or raw_item.get("fault_type_csv")
+        )
+        ft_norm = (
+            _normalize_explicit_cut_fault_type(raw_ft, "{}.fault_type".format(context))
+            if raw_ft is not None
+            else default_fault_type
+        )
+        return idx_int, ft_norm
+    if isinstance(raw_item, str):
+        m = _EXPLICIT_CUT_TOKEN_RE.match(raw_item.strip())
+        if not m:
+            raise ProfileError("{}: invalid point selector {!r}".format(context, raw_item))
+        idx_str = (
+            m.group("idx1")
+            or m.group("idx2")
+            or m.group("idx3")
+            or m.group("idx4")
+            or m.group("idx5")
+        )
+        ft_str = m.group("ft1") or m.group("ft2")
+        idx_int = int(idx_str)
+        if idx_int < 0:
+            raise ProfileError("{}: operation index must be non-negative".format(context))
+        ft_norm = (
+            _normalize_explicit_cut_fault_type(ft_str, "{}.fault_type".format(context))
+            if ft_str is not None
+            else default_fault_type
+        )
+        return idx_int, ft_norm
+    raise ProfileError("{}: expected integer or typed point selector".format(context))
+
+
+def _parse_fault_sweep_points(
+    raw: Any,
+    *,
+    default_fault_types: Optional[Sequence[str]] = None,
+) -> Optional[List[Tuple[int, str]]]:
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise ProfileError("fault_sweep.points: expected non-empty list")
+    if len(raw) > MAX_PROFILE_FAULT_POINTS:
+        raise ProfileError(
+            "fault_sweep.points exceeds safety limit {}".format(MAX_PROFILE_FAULT_POINTS)
+        )
+    default_ft = "power_loss"
+    if default_fault_types and len(default_fault_types) == 1:
+        default_ft = str(default_fault_types[0])
+    parsed: List[Tuple[int, str]] = []
+    for idx, item in enumerate(raw):
+        pt_idx, pt_ft = _parse_explicit_cut_spec(
+            item,
+            "fault_sweep.points[{}]".format(idx),
+            default_fault_type=default_ft,
+        )
+        parsed.append((pt_idx, pt_ft or default_ft))
+    return parsed
 
 
 def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
@@ -6206,6 +6422,7 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
     if not isinstance(pairs_raw, list):
         raise ProfileError("fault_sweep.phase2_fault.pairs: expected list")
     pairs: List[Tuple[int, int]] = []
+    typed_pairs: List[Tuple[int, Optional[str], int, Optional[str]]] = []
     for index, pair_raw in enumerate(pairs_raw):
         field = "fault_sweep.phase2_fault.pairs[{}]".format(index)
         if not isinstance(pair_raw, list) or len(pair_raw) != 2:
@@ -6214,12 +6431,22 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
                     field
                 )
             )
-        if any(isinstance(value, bool) or not isinstance(value, int) for value in pair_raw):
-            raise ProfileError("{}: indices must be integers".format(field))
-        first_index, second_index = (int(value) for value in pair_raw)
-        if first_index < 0 or second_index < 0:
-            raise ProfileError("{}: indices must be non-negative".format(field))
+        first_index, first_ft = _parse_explicit_cut_spec(
+            pair_raw[0], "{}[0]".format(field), default_fault_type=None
+        )
+        second_index, second_ft = _parse_explicit_cut_spec(
+            pair_raw[1], "{}[1]".format(field), default_fault_type=None
+        )
+        if first_ft is not None and first_ft not in {"power_loss", "interrupted_erase"}:
+            raise ProfileError(
+                "{}[0]: fault type must be power_loss or interrupted_erase".format(field)
+            )
+        if second_ft is not None and second_ft not in PHASE2_FAULT_TYPES:
+            raise ProfileError(
+                "{}[1]: unsupported recovery-phase fault type {!r}".format(field, second_ft)
+            )
         pairs.append((first_index, second_index))
+        typed_pairs.append((first_index, first_ft, second_index, second_ft))
     if len(pairs) > MAX_PROFILE_FAULT_POINTS:
         raise ProfileError(
             "fault_sweep.phase2_fault.pairs exceeds safety limit {}".format(
@@ -6232,28 +6459,22 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
     chains: List[List[Tuple[int, str]]] = []
     for chain_index, chain_raw in enumerate(chains_raw):
         chain_field = "fault_sweep.phase2_fault.chains[{}]".format(chain_index)
-        if not isinstance(chain_raw, list) or not 3 <= len(chain_raw) <= 8:
+        if not isinstance(chain_raw, list) or not 2 <= len(chain_raw) <= 8:
             raise ProfileError(
-                "{}: expected 3 through 8 [operation_index, fault_type] cuts".format(
+                "{}: expected 2 through 8 [operation_index, fault_type] cuts".format(
                     chain_field
                 )
             )
         chain: List[Tuple[int, str]] = []
         for cut_index, cut_raw in enumerate(chain_raw):
             cut_field = "{}[{}]".format(chain_field, cut_index)
-            if not isinstance(cut_raw, list) or len(cut_raw) != 2:
+            operation_index, normalized_type = _parse_explicit_cut_spec(
+                cut_raw, cut_field, default_fault_type=None
+            )
+            if normalized_type is None:
                 raise ProfileError(
                     "{}: expected [operation_index, fault_type]".format(cut_field)
                 )
-            operation_index, fault_type = cut_raw
-            if isinstance(operation_index, bool) or not isinstance(operation_index, int):
-                raise ProfileError("{}: operation index must be an integer".format(cut_field))
-            if operation_index < 0:
-                raise ProfileError("{}: operation index must be non-negative".format(cut_field))
-            normalized_types = _normalize_fault_types(
-                [fault_type], "{}.fault_type".format(cut_field)
-            )
-            normalized_type = normalized_types[0]
             if normalized_type not in {"power_loss", "interrupted_erase"}:
                 raise ProfileError(
                     "{}: fault type must be power_loss or interrupted_erase".format(
@@ -6315,6 +6536,7 @@ def _parse_phase2_fault(raw: Optional[Dict[str, Any]]) -> Phase2FaultConfig:
         fault_types=fault_types,
         max_points=max_points,
         pairs=pairs,
+        typed_pairs=typed_pairs,
         chains=chains,
         state_search=state_search,
     )
@@ -6726,6 +6948,7 @@ def _parse_multi_fault(raw):
                 "max_pairs={}".format(len(sequences_raw), max_pairs)
             )
         sequences = []
+        sequence_stage_types: List[Optional[List[str]]] = []
         for i, seq in enumerate(sequences_raw):
             if not isinstance(seq, list) or len(seq) < 2:
                 raise ProfileError(
@@ -6736,13 +6959,23 @@ def _parse_multi_fault(raw):
                     "fault_sweep.multi_fault.sequences[{}] exceeds "
                     "max_faults_per_run={}".format(i, max_faults_per_run)
                 )
-            parsed_sequence = [int(x) for x in seq]
-            if any(point < 0 for point in parsed_sequence):
-                raise ProfileError(
-                    "fault_sweep.multi_fault.sequences[{}] contains a negative "
-                    "fault point".format(i)
+            parsed_sequence: List[int] = []
+            parsed_types: List[Optional[str]] = []
+            for j, x in enumerate(seq):
+                pt_idx, pt_ft = _parse_explicit_cut_spec(
+                    x,
+                    "fault_sweep.multi_fault.sequences[{}][{}]".format(i, j),
+                    default_fault_type=None,
                 )
+                parsed_sequence.append(pt_idx)
+                parsed_types.append(pt_ft)
             sequences.append(parsed_sequence)
+            if any(t is not None for t in parsed_types):
+                sequence_stage_types.append([t or "power_loss" for t in parsed_types])
+            else:
+                sequence_stage_types.append(None)
+    else:
+        sequence_stage_types = []
     return MultiFaultConfig(
         enabled=enabled,
         max_faults_per_run=max_faults_per_run,
@@ -6751,6 +6984,7 @@ def _parse_multi_fault(raw):
         max_pairs=max_pairs,
         seed=seed,
         sequences=sequences,
+        sequence_stage_types=sequence_stage_types,
     )
 
 
@@ -9469,6 +9703,12 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
         "torn_word",
         "torn_word_seed",
         "include_erase_fault_points",
+        "require_planned_points_per_kind",
+        "fail_on_zero_point_fault_kind",
+        "fail_on_empty_fault_kind",
+        "require_points_per_fault_kind",
+        "require_nonempty_fault_kinds",
+        "points",
         "trace_replay_cross_check_every",
         "driver_functions",
         "recovery_coverage",

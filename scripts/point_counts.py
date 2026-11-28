@@ -914,6 +914,133 @@ def _populate_trace_replay_cross_checks(
         row["passed" if check.get("matched") is True else "failed"] += 1
 
 
+def requested_point_kinds_for_profile(
+    profile: Any = None,
+    configured_fault_types: Optional[Sequence[Any]] = None,
+) -> Dict[str, Any]:
+    """Identify the point-count kinds, operation kinds, and fault types requested by a profile."""
+    from fault_types import FAULT_TYPE_NAME_TO_CODE, operation_kind_for_fault_type
+
+    code_to_name = {code: name for name, code in FAULT_TYPE_NAME_TO_CODE.items()}
+    kinds: List[str] = []
+    operation_kinds: List[str] = []
+    fault_types_out: List[str] = []
+    kind_fault_types: Dict[str, List[str]] = {}
+
+    def _add(kind: str, ft_name: Optional[str] = None, op_kind: Optional[str] = None) -> None:
+        if kind in POINT_KIND_ORDER and kind not in kinds:
+            kinds.append(kind)
+        if ft_name:
+            if ft_name not in fault_types_out:
+                fault_types_out.append(ft_name)
+            bucket = kind_fault_types.setdefault(kind, [])
+            if ft_name not in bucket:
+                bucket.append(ft_name)
+        if op_kind in ("program", "erase") and op_kind not in operation_kinds:
+            operation_kinds.append(op_kind)
+
+    fs = None
+    if profile is not None:
+        fs = (
+            profile.get("fault_sweep")
+            if isinstance(profile, Mapping)
+            else getattr(profile, "fault_sweep", None)
+        )
+    if fs is None and configured_fault_types is None:
+        return {
+            "kinds": kinds,
+            "operation_kinds": operation_kinds,
+            "fault_types": fault_types_out,
+            "kind_fault_types": kind_fault_types,
+        }
+
+    def _get(obj: Any, attr: str, default: Any = None) -> Any:
+        if obj is None:
+            return default
+        if isinstance(obj, Mapping):
+            return obj.get(attr, default)
+        return getattr(obj, attr, default)
+
+    raw_fts = (
+        list(configured_fault_types)
+        if configured_fault_types is not None
+        else list(_get(fs, "fault_types", None) or [])
+    )
+    include_erase = bool(_get(fs, "include_erase_fault_points", False))
+    p2 = _get(fs, "phase2_fault", None)
+    p2_enabled = bool(_get(p2, "enabled", False))
+    p2_ss = _get(p2, "state_search", None)
+    p2_ss_enabled = bool(p2_enabled and _get(p2_ss, "enabled", False))
+    p2_pairs = bool(p2_enabled and _get(p2, "pairs", None))
+    p2_chains = bool(p2_enabled and _get(p2, "chains", None))
+    p2_only = bool(p2_enabled and (p2_pairs or p2_chains or p2_ss_enabled))
+
+    explicit_points = _get(fs, "points", None)
+    has_explicit_points = bool(
+        isinstance(explicit_points, Sequence)
+        and not isinstance(explicit_points, (str, bytes))
+        and explicit_points
+    )
+    if has_explicit_points:
+        for item in explicit_points:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                raw_token = str(item[1] or "power_loss").strip().lower()
+            else:
+                raw_token = "power_loss"
+            ft_name = code_to_name.get(raw_token, raw_token)
+            code = FAULT_TYPE_NAME_TO_CODE.get(ft_name, raw_token)
+            kind = classify_planned_kind(code, profile=profile)
+            _add(kind, ft_name, operation_kind_for_fault_type(ft_name))
+
+    norm_fts: List[str] = []
+    for raw_ft in raw_fts:
+        token = str(raw_ft or "").strip().lower()
+        if not token:
+            continue
+        ft_name = code_to_name.get(token, token)
+        if ft_name not in norm_fts:
+            norm_fts.append(ft_name)
+
+    for ft_name in norm_fts:
+        if ft_name == "power_loss" and (p2_only or has_explicit_points):
+            continue
+        code = FAULT_TYPE_NAME_TO_CODE.get(ft_name, ft_name)
+        kind = classify_planned_kind(code, profile=profile)
+        _add(kind, ft_name, operation_kind_for_fault_type(ft_name))
+
+    if (
+        include_erase
+        and "interrupted_erase" not in norm_fts
+        and "multi_sector_atomicity" not in norm_fts
+        and not p2_only
+    ):
+        _add("single_cut_erase", "interrupted_erase", "erase")
+
+    if p2_enabled:
+        if p2_ss_enabled:
+            first_fts = [
+                code_to_name.get(str(x).strip().lower(), str(x).strip().lower())
+                for x in (_get(p2, "first_fault_types", None) or ["power_loss"])
+            ]
+            if "power_loss" in first_fts:
+                _add("state_search_single_cut", "power_loss", "program")
+            if "interrupted_erase" in first_fts or include_erase:
+                _add("state_search_single_cut_erase", "interrupted_erase", "erase")
+        elif p2_pairs:
+            _add("two_cut_pairs")
+        elif p2_chains:
+            _add("n_cut_explicit")
+        else:
+            _add("two_cut_grid")
+
+    return {
+        "kinds": kinds,
+        "operation_kinds": operation_kinds,
+        "fault_types": fault_types_out,
+        "kind_fault_types": kind_fault_types,
+    }
+
+
 def build_point_counts(
     results: Iterable[Mapping[str, Any]],
     *,
@@ -1052,6 +1179,21 @@ def build_point_counts(
     )
     _populate_trace_replay_cross_checks(counts, result_list)
     _refresh_totals(counts)
+    if profile is not None:
+        req_info = requested_point_kinds_for_profile(profile)
+        zero_kinds: List[str] = []
+        for req_kind in req_info["kinds"]:
+            k_row = counts["kinds"].get(req_kind)
+            if not isinstance(k_row, dict):
+                continue
+            if int(k_row.get("requested", 0) or 0) == 0 and int(k_row.get("run", 0) or 0) == 0:
+                k_row["configured"] = True
+                k_row["zero_planned_points"] = True
+                k_row["status"] = "zero_planned_points"
+                k_row["note"] = "requested fault kind yielded zero planned points"
+                zero_kinds.append(req_kind)
+        if zero_kinds:
+            counts["zero_point_kinds"] = zero_kinds
     return counts
 
 
@@ -1060,6 +1202,7 @@ def merge_point_counts(*blocks: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     merged = _new_counts()
     calibration_set = False
     first_cut_states_set = False
+    configured_zero_candidates: Set[str] = set()
     for block in blocks:
         if not isinstance(block, Mapping):
             continue
@@ -1072,6 +1215,8 @@ def merge_point_counts(*blocks: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
                 target = merged["kinds"][kind]
                 for field in _COUNT_FIELDS:
                     target[field] += int(source.get(field, 0) or 0)
+                if source.get("zero_planned_points") or source.get("configured"):
+                    configured_zero_candidates.add(kind)
                 for reason, value in (source.get("skip_reasons") or {}).items():
                     target["skip_reasons"][str(reason)] = (
                         target["skip_reasons"].get(str(reason), 0) + int(value or 0)
@@ -1141,6 +1286,19 @@ def merge_point_counts(*blocks: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
                     cross_checks.get(field, 0) or 0
                 )
     _refresh_totals(merged)
+    merged_zero_kinds: List[str] = []
+    for kind in POINT_KIND_ORDER:
+        if kind not in configured_zero_candidates:
+            continue
+        target = merged["kinds"][kind]
+        if int(target.get("requested", 0) or 0) == 0 and int(target.get("run", 0) or 0) == 0:
+            target["configured"] = True
+            target["zero_planned_points"] = True
+            target["status"] = "zero_planned_points"
+            target["note"] = "requested fault kind yielded zero planned points"
+            merged_zero_kinds.append(kind)
+    if merged_zero_kinds:
+        merged["zero_point_kinds"] = merged_zero_kinds
     return merged
 
 
@@ -1150,7 +1308,11 @@ def point_count_rows(block: Mapping[str, Any], *, include_zero: bool = False) ->
     rows: List[Dict[str, Any]] = []
     for kind in POINT_KIND_ORDER:
         source = kinds.get(kind) or {}
-        if not include_zero and not any(int(source.get(field, 0) or 0) for field in _COUNT_FIELDS):
+        if (
+            not include_zero
+            and not bool(source.get("zero_planned_points"))
+            and not any(int(source.get(field, 0) or 0) for field in _COUNT_FIELDS)
+        ):
             continue
         rows.append({"kind": kind, **_new_kind(kind), **dict(source)})
     return rows
@@ -1167,11 +1329,14 @@ def render_point_counts_text(block: Mapping[str, Any]) -> str:
     if not rows:
         lines.append("  no requested or returned points")
     for row in rows:
-        lines.append(
+        line = (
             "  {label}: {requested} / {run} / {evaluated} / {skipped} / "
             "{infrastructure_error} / {timeout} / {reused} / {missing} / "
             "{issues}".format(**row)
         )
+        if row.get("zero_planned_points"):
+            line += " (zero planned points)"
+        lines.append(line)
         if row.get("skip_reasons"):
             reasons = ", ".join(
                 "{}={}".format(reason, count)
@@ -1293,6 +1458,10 @@ def render_point_counts_markdown(block: Mapping[str, Any]) -> str:
                 "| ↳ skipped by reason: {} |  |  |  |  |  |  |  |  |  |".format(
                     reasons
                 )
+            )
+        elif row.get("zero_planned_points"):
+            lines.append(
+                "| ↳ zero planned points for requested kind |  |  |  |  |  |  |  |  |  |"
             )
     cross_checks = block.get("trace_replay_cross_checks") or {}
     lines.extend(

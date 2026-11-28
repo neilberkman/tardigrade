@@ -74,6 +74,7 @@ class FaultPlan:
     security_state_erase_summary: Optional[Dict[str, Any]] = None
     clustered_bit_count: int = 0
     first_cut_states_summary: Optional[Dict[str, Any]] = None
+    zero_point_fault_kinds: Tuple[str, ...] = ()
 
 
 @dataclasses.dataclass
@@ -909,9 +910,11 @@ def build_fault_plan(
     # -------------------------------------------------------------------
     # Build combined fault point list
     # -------------------------------------------------------------------
+    explicit_points = list(getattr(profile.fault_sweep, "points", []) or [])
     fault_types_list: Optional[List[str]] = None
     has_mixed_types = (
-        (include_erases and total_erases > 0)
+        bool(explicit_points)
+        or (include_erases and total_erases > 0)
         or include_bit_corruption
         or include_silent_write_failure
         or include_driver_error
@@ -938,27 +941,39 @@ def build_fault_plan(
     clustered_bit_count = 0
     swap_progress_summary: Optional[Dict[str, Any]] = None
     security_state_erase_summary: Optional[Dict[str, Any]] = None
+    is_mram_backend = bool(
+        profile.flash_backend and "mram" in profile.flash_backend.lower()
+    )
+    allow_erase_points = include_erase_fault_points or not is_mram_backend
+    p2_config = profile.fault_sweep.phase2_fault
     if has_mixed_types:
         write_fps: List[Tuple[int, str]] = []
-        p2_config = profile.fault_sweep.phase2_fault
         p2_first_codes = [
             FAULT_TYPE_NAME_TO_CODE[ft] for ft in p2_config.first_fault_types
         ]
         state_search_enabled = bool(
             p2_config.enabled and p2_config.state_search.enabled
         )
-        if include_power_loss and not (
-            p2_config.enabled
-            and (p2_config.pairs or p2_config.chains or state_search_enabled)
-        ):
-            write_fps = [(fp, 'w') for fp in fault_points] if max_writes > 0 else []
-        combined = _BoundedFaultPointList(write_fps)
+        if explicit_points:
+            explicit_combined = [
+                (int(pt_idx), FAULT_TYPE_NAME_TO_CODE[pt_type])
+                for pt_idx, pt_type in explicit_points
+            ]
+            write_fps = [(fp, ft) for fp, ft in explicit_combined if ft == "w"]
+            combined = _BoundedFaultPointList(explicit_combined)
+        else:
+            if include_power_loss and not (
+                p2_config.enabled
+                and (p2_config.pairs or p2_config.chains or state_search_enabled)
+            ):
+                write_fps = [(fp, 'w') for fp in fault_points] if max_writes > 0 else []
+            combined = _BoundedFaultPointList(write_fps)
         swap_progress_count = 0
 
         # Security-state erase-domain selector.  It emits ordinary power-loss
         # points and only annotates their wire label with the semantic phase;
         # the runtime therefore uses the existing reboot path.
-        if include_security_state_erase:
+        if include_security_state_erase and not explicit_points:
             security_write_entries = load_clean_write_trace(trace_file)
             security_erase_entries = load_clean_erase_trace(erase_trace_file)
             try:
@@ -986,7 +1001,7 @@ def build_fault_plan(
                     file=sys.stderr,
                 )
 
-        if include_swap_progress:
+        if include_swap_progress and not explicit_points:
             swap_entries = load_clean_write_trace(trace_file)
             erase_entries = load_clean_erase_trace(erase_trace_file)
             if swap_entries:
@@ -1089,10 +1104,10 @@ def build_fault_plan(
             profile.flash_backend
             and "mram" in profile.flash_backend.lower()
         )
-        erase_count = 0
-        atomicity_count = 0
+        erase_count = sum(1 for _, ft in combined if ft == "e") if explicit_points else 0
+        atomicity_count = sum(1 for _, ft in combined if ft == "a") if explicit_points else 0
         allow_erase_points = include_erase_fault_points or not is_mram_backend
-        if include_erases and total_erases > 0 and allow_erase_points:
+        if not explicit_points and include_erases and total_erases > 0 and allow_erase_points:
             if distinct_states_requested and distinct_selected_erase_fps is not None:
                 erase_fps = list(distinct_selected_erase_fps)
             else:
@@ -1581,8 +1596,28 @@ def build_fault_plan(
                     (first_cut_states_summary or {}).get("cut_to_representative")
                     or {}
                 )
-                for p1_fp, p2_fp in p2_config.pairs:
-                    for p1_code in p2_first_codes:
+                typed_pairs = getattr(p2_config, "typed_pairs", None)
+                pair_specs = (
+                    typed_pairs
+                    if isinstance(typed_pairs, (list, tuple))
+                    and len(typed_pairs) == len(p2_config.pairs)
+                    else [
+                        (p1_fp, None, p2_fp, None)
+                        for p1_fp, p2_fp in p2_config.pairs
+                    ]
+                )
+                for p1_fp, p1_explicit_type, p2_fp, p2_explicit_type in pair_specs:
+                    entry_p1_codes = (
+                        [FAULT_TYPE_NAME_TO_CODE[p1_explicit_type]]
+                        if p1_explicit_type
+                        else p2_first_codes
+                    )
+                    entry_p2_codes = (
+                        [FAULT_TYPE_NAME_TO_CODE[p2_explicit_type]]
+                        if p2_explicit_type
+                        else p2_type_codes
+                    )
+                    for p1_code in entry_p1_codes:
                         eff_p1_fp = p1_fp
                         eff_p1_code = p1_code
                         st_id = "{}:{}".format(p1_code, p1_fp)
@@ -1602,7 +1637,7 @@ def build_fault_plan(
                                 rep_c, rep_i = rep_label.split(":", 1)
                                 eff_p1_code = rep_c
                                 eff_p1_fp = int(rep_i)
-                        for p2_code in p2_type_codes:
+                        for p2_code in entry_p2_codes:
                             if distinct_states_requested:
                                 dedup_key = (st_id, p2_fp, p2_code)
                                 if dedup_key in seen_pairs:
@@ -1888,6 +1923,51 @@ def build_fault_plan(
         except Exception:
             first_cut_states_summary = None
 
+    from fault_types import _fault_type_label
+    from point_counts import build_point_counts, requested_point_kinds_for_profile
+
+    effective_ft_list = (
+        list(fault_types_list)
+        if fault_types_list is not None
+        else ["w"] * len(fault_points)
+    )
+    req_info = requested_point_kinds_for_profile(profile)
+    zero_kinds: List[str] = []
+    if p2_config.enabled and p2_config.state_search.enabled:
+        if "state_search_single_cut" in req_info["kinds"] and max_writes <= 0:
+            zero_kinds.append("state_search_single_cut")
+        if "state_search_single_cut_erase" in req_info["kinds"] and (
+            total_erases <= 0 or not allow_erase_points
+        ):
+            zero_kinds.append("state_search_single_cut_erase")
+    else:
+        pc_block = build_point_counts(
+            [],
+            planned_fault_types=effective_ft_list,
+            profile=profile,
+        )
+        for z_kind in pc_block.get("zero_point_kinds") or []:
+            if z_kind not in zero_kinds:
+                zero_kinds.append(z_kind)
+        planned_ft_names: set[str] = set()
+        for wc in effective_ft_list:
+            lbl = _fault_type_label(wc)
+            planned_ft_names.add(lbl)
+            if lbl == "bit_corruption_clustered":
+                planned_ft_names.add("bit_corruption")
+        for req_ft in req_info["fault_types"]:
+            if req_ft not in planned_ft_names and req_ft not in zero_kinds:
+                zero_kinds.append(req_ft)
+
+    if zero_kinds and bool(
+        getattr(profile.fault_sweep, "require_planned_points_per_kind", False)
+    ):
+        raise ProfileError(
+            "requested fault kind(s) yielded zero planned points: {}".format(
+                ", ".join(zero_kinds)
+            )
+        )
+
     return FaultPlan(
         fault_points=fault_points,
         fault_types_list=fault_types_list,
@@ -1896,4 +1976,5 @@ def build_fault_plan(
         security_state_erase_summary=security_state_erase_summary,
         clustered_bit_count=clustered_bit_count,
         first_cut_states_summary=first_cut_states_summary,
+        zero_point_fault_kinds=tuple(zero_kinds),
     )

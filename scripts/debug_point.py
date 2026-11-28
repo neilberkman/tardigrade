@@ -85,6 +85,7 @@ STOP_AT_ALIASES = {
 CODE_TO_FAULT_NAME = {code: name for name, code in FAULT_TYPE_NAME_TO_CODE.items()}
 OPERATION_NAME_TO_CODE = {
     "write": "w",
+    "program": "w",
     "erase": "e",
 }
 SINGLE_BOOT_NON_RESET_CODES = frozenset({
@@ -238,8 +239,8 @@ def _cuts_from_wire_code(fault_at: int, code: str) -> tuple[tuple[int, str], ...
                     f"phase2 fault chain supports only power_loss (w) and interrupted_erase (e), got {tail[idx + 1]!r}"
                 )
             cuts.append((cut_at, cut_code))
-        if not 3 <= len(cuts) <= 8:
-            raise DebugError("phase2 fault chain requires 3 through 8 cuts")
+        if not 2 <= len(cuts) <= 8:
+            raise DebugError("phase2 fault chain requires 2 through 8 cuts")
         return tuple(cuts)
     if prefix == "c":
         if len(parts) != 3:
@@ -293,6 +294,21 @@ def _parse_reproduction_dict(
             "cuts": (),
             "is_control": True,
             "include_erase_fault_points": False,
+        }
+
+    if "fault_points_csv" in repro or "fault_type_csv" in repro:
+        repro = {
+            **repro,
+            **(
+                {"FAULT_POINTS_CSV": repro["fault_points_csv"]}
+                if "fault_points_csv" in repro and "FAULT_POINTS_CSV" not in repro
+                else {}
+            ),
+            **(
+                {"FAULT_TYPE_CSV": repro["fault_type_csv"]}
+                if "fault_type_csv" in repro and "FAULT_TYPE_CSV" not in repro
+                else {}
+            ),
         }
 
     if "FAULT_POINTS_CSV" in repro or "FAULT_TYPE_CSV" in repro:
@@ -407,6 +423,53 @@ def _parse_reproduction_dict(
                 "is_control": False,
                 "include_erase_fault_points": include_erase or parsed_cuts[0][1] in ("e", "a"),
             }
+
+    if isinstance(fault_sweep, dict) and "points" in fault_sweep:
+        pts_raw = fault_sweep.get("points")
+        if not isinstance(pts_raw, list) or len(pts_raw) != 1:
+            raise DebugError("fault_sweep.points reproduction must contain exactly one point")
+        pt_item = pts_raw[0]
+        if isinstance(pt_item, dict):
+            return _parse_reproduction_dict(pt_item, point_name=point_name, point_kind=point_kind)
+        parsed_sel = _parse_selector_cuts(json.dumps(pt_item) if isinstance(pt_item, list) else str(pt_item))
+        if parsed_sel and len(parsed_sel) == 1:
+            p_at, p_code = parsed_sel[0]
+            eff_code = p_code or "w"
+            cuts = _cuts_from_wire_code(p_at, eff_code)
+            return {
+                "point_name": point_name if point_name != "reproduction" else f"{eff_code}[{p_at}]",
+                "point_kind": point_kind,
+                "fault_at": p_at,
+                "fault_type_code": eff_code,
+                "cuts": cuts,
+                "is_control": False,
+                "include_erase_fault_points": bool(
+                    fault_sweep.get("include_erase_fault_points", False)
+                    or (cuts and cuts[0][1] in ("e", "a"))
+                ),
+            }
+
+    if "fault_at" in repro and (
+        "fault_type" in repro or "operation_kind" in repro or "fault_requested_type" in repro
+    ):
+        fault_at = _parse_non_negative_int(repro["fault_at"], "fault_at")
+        raw_ft = (
+            repro.get("fault_requested_type")
+            or repro.get("fault_type")
+            or repro.get("operation_kind")
+        )
+        code = _fault_type_to_code(raw_ft)
+        cuts = _cuts_from_wire_code(fault_at, code)
+        include_erase = bool(cuts and cuts[0][1] in ("e", "a"))
+        return {
+            "point_name": point_name if point_name != "reproduction" else f"{code}[{fault_at}]",
+            "point_kind": point_kind,
+            "fault_at": fault_at,
+            "fault_type_code": code,
+            "cuts": cuts,
+            "is_control": False,
+            "include_erase_fault_points": include_erase,
+        }
 
     raise DebugError(f"unrecognized reproduction block structure: {sorted(repro.keys())}")
 
@@ -526,13 +589,24 @@ def _parse_selector_cuts(selector: str) -> list[tuple[int, str | None]] | None:
     if not text:
         return None
 
-    # JSON list form: [3, 0] or [[0, "power_loss"], [1, "interrupted_erase"]]
+    # JSON list form: [3, 0], [0, "interrupted_erase"], or [[0, "power_loss"], [1, "interrupted_erase"]]
     if text.startswith("[") and text.endswith("]"):
         try:
             parsed = yaml.safe_load(text)
         except Exception:
             parsed = None
         if isinstance(parsed, list) and parsed:
+            if (
+                len(parsed) == 2
+                and isinstance(parsed[0], int)
+                and not isinstance(parsed[0], bool)
+                and parsed[0] >= 0
+                and isinstance(parsed[1], str)
+            ):
+                try:
+                    return [(int(parsed[0]), _fault_type_to_code(parsed[1]))]
+                except DebugError:
+                    return None
             if all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in parsed):
                 return [(int(x), None) for x in parsed]
             if all(
@@ -547,6 +621,9 @@ def _parse_selector_cuts(selector: str) -> list[tuple[int, str | None]] | None:
                     return [(int(x[0]), _fault_type_to_code(x[1])) for x in parsed]
                 except DebugError:
                     return None
+            if all(isinstance(x, str) for x in parsed):
+                joined = " -> ".join(str(x) for x in parsed)
+                return _parse_selector_cuts(joined)
 
     # Wire code form: p2:3:0:w:w or pc:0:w:1:e:2:w
     if text.startswith("p2:") or text.startswith("pc:"):
@@ -558,7 +635,7 @@ def _parse_selector_cuts(selector: str) -> list[tuple[int, str | None]] | None:
                 c1 = _fault_type_to_code(parts[3]) if len(parts) == 5 else None
                 c2 = _fault_type_to_code(parts[4]) if len(parts) == 5 else None
                 return [(p1, c1), (p2, c2)]
-            if parts[0] == "pc" and len(parts) >= 7 and len(parts) % 2 == 1:
+            if parts[0] == "pc" and len(parts) >= 5 and len(parts) % 2 == 1:
                 cuts = []
                 for idx in range(1, len(parts), 2):
                     cuts.append((
@@ -576,21 +653,35 @@ def _parse_selector_cuts(selector: str) -> list[tuple[int, str | None]] | None:
         tokens = [t.strip() for t in norm.split(" -> ")]
     elif "," in norm:
         tokens = [t.strip() for t in norm.split(",")]
-    elif ":" in norm and not norm.startswith(("i:", "tb:", "mf:", "c:", "b:", "m:", "h:", "cc:", "nv:")):
+    elif (
+        ":" in norm
+        and not norm.startswith(("i:", "tb:", "mf:", "c:", "b:", "m:", "h:", "cc:", "nv:"))
+        and not re.match(r"^(?:[A-Za-z_]+\s*:\s*\d+|\d+\s*:\s*[A-Za-z_]+)(?:\s*@\s*0x[0-9A-Fa-f]+)?$", norm)
+    ):
         tokens = [t.strip() for t in norm.split(":")]
     else:
         tokens = [norm]
 
     token_re = re.compile(
-        r"^(?:(?P<ft>[A-Za-z_]+)\s*(?:\[\s*(?P<idx1>\d+)\s*\]|:\s*(?P<idx2>\d+))|(?P<idx3>\d+))(?:\s*@\s*0x[0-9A-Fa-f]+)?$"
+        r"^(?:"
+        r"(?P<ft1>[A-Za-z_]+)\s*(?:\[\s*(?P<idx1>\d+)\s*\]|:\s*(?P<idx2>\d+)|@\s*(?P<idx3>\d+))"
+        r"|(?P<idx4>\d+)\s*(?:@|:)\s*(?P<ft2>(?!0[xX][0-9A-Fa-f]+\b)[A-Za-z_]+)"
+        r"|(?P<idx5>\d+)"
+        r")(?:\s*@\s*0x[0-9A-Fa-f]+)?$"
     )
     cuts_out: list[tuple[int, str | None]] = []
     for tok in tokens:
         m = token_re.match(tok)
         if not m:
             return None
-        idx_str = m.group("idx1") or m.group("idx2") or m.group("idx3")
-        ft_str = m.group("ft")
+        idx_str = (
+            m.group("idx1")
+            or m.group("idx2")
+            or m.group("idx3")
+            or m.group("idx4")
+            or m.group("idx5")
+        )
+        ft_str = m.group("ft1") or m.group("ft2")
         if idx_str is None:
             return None
         code = None
@@ -615,7 +706,13 @@ def _candidate_cuts(point: Point) -> list[tuple[int, str]]:
                     return []
             return out
         if not point.row.get("is_control") and "fault_at" in point.row:
-            ft = str(point.row.get("fault_requested_type") or point.row.get("fault_type") or "w")
+            raw_op = str(point.row.get("operation_kind") or "").strip().lower()
+            default_ft = "e" if raw_op == "erase" else "w"
+            ft = str(
+                point.row.get("fault_requested_type")
+                or point.row.get("fault_type")
+                or default_ft
+            )
             try:
                 return list(_cuts_from_wire_code(int(point.row["fault_at"]), _fault_type_to_code(ft)))
             except Exception:
@@ -1150,7 +1247,7 @@ def _preserve_pre_recovery_states(report_data: Any) -> dict[tuple[Any, ...], dic
                 sid = str((row.get("recovery_state_search") or {}).get("state_identity") or "").strip().lower()
                 if sid:
                     preserved[("state", sid)] = dict(pre)
-                preserved[("row", idx, row.get("fault_at"), row.get("fault_type"))] = dict(pre)
+                preserved[("row", idx, row.get("fault_at"), row.get("fault_type"), row.get("operation_kind"))] = dict(pre)
 
     if isinstance(report_data, list):
         _visit_rows(report_data)
@@ -1178,7 +1275,13 @@ def _lookup_preserved_pre_state(
     if sid and ("state", sid) in preserved:
         return preserved[("state", sid)]
     for key, val in preserved.items():
-        if len(key) == 4 and key[0] == "row" and key[2] == row.get("fault_at") and key[3] == row.get("fault_type"):
+        if (
+            len(key) == 5
+            and key[0] == "row"
+            and key[2] == row.get("fault_at")
+            and key[3] == row.get("fault_type")
+            and (key[4] is None or row.get("operation_kind") is None or key[4] == row.get("operation_kind"))
+        ):
             return val
     return None
 

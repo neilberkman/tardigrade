@@ -45,6 +45,7 @@ from fault_types import (
     TRACE_REPLAY_WIRE_CODES,
     _fault_type_label,
     multi_fault_stage_code,
+    operation_kind_for_fault_type,
 )
 from partial_staging import (
     PartialStagingConfig,
@@ -978,19 +979,29 @@ def _run_mcuboot_state_evaluator_points(
     evaluator = selection["module"]
     results: List[Dict[str, Any]] = []
     evaluate_types = selection.get("evaluate_types", [])
-    type_by_fault_at = {
-        int(point): str(fault_type)
-        for point, fault_type in zip(selection["evaluate_points"], evaluate_types)
-    }
-    for fault_at in sorted(selection["evaluate_points"]):
+    evaluate_pairs = sorted(
+        (
+            int(point),
+            str(
+                evaluate_types[idx]
+                if idx < len(evaluate_types) and evaluate_types[idx]
+                else "w"
+            ),
+        )
+        for idx, point in enumerate(selection["evaluate_points"])
+    )
+    for fault_at, fault_type in evaluate_pairs:
         committed_writes = cursor.advance_to_fault_point(fault_at)
         prediction = evaluator.predict_boot_outcome(cursor.flash, selection["slot_config"])
         signals = dict(prediction.get("signals", {}) or {})
         signals["state_evaluator_used"] = True
+        op_kind = operation_kind_for_fault_type(fault_type) or "program"
+        signals["operation_kind"] = op_kind
         result: Dict[str, Any] = {
             "fault_at": int(fault_at),
             "fault_requested": int(fault_at),
-            "fault_type": type_by_fault_at.get(int(fault_at), "w"),
+            "fault_type": fault_type,
+            "operation_kind": op_kind,
             "fault_injected": True,
             "fault_address": _fmt_u32(cursor.target_fault_address(fault_at) or 0),
             "boot_outcome": prediction.get("boot_outcome", "unknown"),
@@ -2651,6 +2662,7 @@ def run_multi_fault_phase(
         max_faults_per_run=mf_config.max_faults_per_run,
         max_pairs=mf_config.max_pairs,
         explicit_sequences=mf_config.sequences or None,
+        explicit_stage_types=getattr(mf_config, "sequence_stage_types", None),
         seed=mf_config.seed,
         fallback_strategy=mf_config.fallback_strategy,
         fallback_points=[
