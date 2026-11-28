@@ -3846,6 +3846,30 @@ paths writable by another user or job. A digest fetched alongside an untrusted
 cache is not a trust anchor; pin it in reviewed configuration or carry it over
 a separately authenticated channel.
 
+#### Cached calibration trace CSV columns
+
+Calibration trace CSV headers are defined in one shared schema (`scripts/writeback_reconstruction.py`) used by the runtime exporter (`scripts/run_runtime_fault_sweep.py`), the cache validator (`scripts/calibration_cache.py`), and trace parsers (`scripts/trace_utils.py`):
+
+- **Clean write trace (`write_trace.csv`)**:
+  - Accepted headers:
+    - `write_index,flash_offset,value`
+    - `write_index,flash_offset,value,width`
+    - `write_index,flash_offset,value,pc`
+    - `write_index,flash_offset,value,width,pc`
+  - Column rules: `write_index` (`1..0xFFFFFFFF`, strictly increasing), `flash_offset` (`0..0xFFFFFFFF`), `width` (optional column; when present, every row must be in `{1, 2, 4, 8, 16}`), `value` (`0..(1 << (width * 8)) - 1` when `width` is present, otherwise `0..0xFFFFFFFF`), and `pc` (optional column; when present, each cell is either empty when no PC was recorded for that event or a non-zero 32-bit unsigned address in `1..0xFFFFFFFF`). When the native binary companion (`write_trace.bin`) is present, its `<III` records `(write_index, flash_offset, value)` must match the CSV row-for-row and every `width` (when present) must be `4`.
+- **Clean erase trace (`erase_trace.csv`)**:
+  - Accepted headers:
+    - `erase_index,flash_offset,writes_at_this_point,erase_size`
+    - `erase_index,flash_offset,writes_at_this_point,erase_size,pc`
+  - Column rules: `erase_index` (`1..0xFFFFFFFF`, strictly increasing), `flash_offset` (`0..0xFFFFFFFF`), `writes_at_this_point` (`0..0xFFFFFFFF`), `erase_size` (`0..0xFFFFFFFF`), and `pc` (optional column; empty or `1..0xFFFFFFFF`). When the native binary companion (`erase_trace.bin`) is present, its `<III` records `(writes_at_this_point, flash_offset, erase_size)` must match the CSV row-for-row.
+- **Exact MRAM program trace (`program_trace.csv`)**:
+  - Accepted headers:
+    - `write_index,program_address,offset,width,intended_hex,pre_program_hex,post_program_hex,faulted`
+    - `write_index,program_address,offset,width,intended_hex,pre_program_hex,post_program_hex,faulted,pc`
+  - Column rules: `write_index` (`1..0xFFFFFFFF`, strictly increasing), `program_address` and `offset` (`0..0xFFFFFFFF`, consistent constant `program_address - offset` base across rows, and span within `2^32`), `width` (`1..1048576`), `intended_hex` / `pre_program_hex` / `post_program_hex` (lowercase/uppercase hex strings of exact length `2 * width`), `faulted` (`false` in clean calibration traces), and `pc` (optional column; empty or `1..0xFFFFFFFF`). When both `write_trace.csv` and `program_trace.csv` are cached together, their counts, indices, offsets, widths, and PCs must agree.
+
+Any other header or out-of-range value is rejected when saving or loading a calibration cache.
+
 ### Quick mode with heuristic points
 
 The experimental MCUboot state evaluator is disabled by default for CLI runs.
