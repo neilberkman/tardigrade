@@ -1006,3 +1006,538 @@ def test_explorer_repeats_the_same_trace_step_for_a_third_cut():
     assert summary["single_cut_states_booted"] == 1
     assert summary["deeper_cut_states_booted"] == 2
     assert summary["recovery_operations_excluded_by_max_cuts"] == 2
+
+
+def _make_coverage_guided_fixture():
+    """Synthetic two-cut tree modeling a divergent recovery branch at first-cut 2.
+
+    First cuts 0 and 1 follow the baseline recovery path {0x1000, 0x1004} and
+    their second-cut children all recover cleanly with no new coverage.
+    First cut 2 takes a rare recovery branch {0x1000, 0x1008}; its second-cut
+    children fail recovery and execute {0x1000, 0x1008, 0x2000}.
+    First cut 3 shares first cut 2's coverage signature {0x1000, 0x1008} and its
+    second-cut children also fail recovery.
+    """
+    baseline = PersistentState.from_bytes(b"\xff\xff\xff\xff", base_address=0x1000)
+    calibration = merge_operation_traces(
+        [
+            _write(1, 0, 0x10),
+            _write(2, 1, 0x20),
+            _write(3, 2, 0x30),
+            _write(4, 3, 0x40),
+        ],
+        [],
+    )
+
+    def boot_state(state, chain, generation):
+        nvm = state.materialize()["nvm"]
+        first_idx = int(chain[0]["operation_index"])
+        if generation == 1:
+            ops = merge_operation_traces(
+                [
+                    _write(1, 0, (nvm[0] ^ 0x01) & 0xFF),
+                    _write(2, 1, (nvm[1] ^ 0x02) & 0xFF),
+                    _write(3, 2, (nvm[2] ^ 0x04) & 0xFF),
+                ],
+                [],
+            )
+            if first_idx in (2, 3):
+                pcs = [0x1000, 0x1008]
+            else:
+                pcs = [0x1000, 0x1004]
+            outcome = "recovered"
+        else:
+            ops = ()
+            if first_idx in (2, 3):
+                pcs = [0x1000, 0x1008, 0x2000]
+                outcome = "boot_failure"
+            else:
+                pcs = [0x1000, 0x1004]
+                outcome = "recovered"
+        return (
+            {
+                "fault_injected": True,
+                "boot_outcome": outcome,
+                "signals": {},
+                "recovery_coverage": {"executed_pcs": pcs},
+            },
+            ops,
+        )
+
+    return baseline, calibration, boot_state
+
+
+def test_coverage_guided_visits_identical_set_when_unlimited_and_is_deterministic():
+    baseline, calibration, boot_state = _make_coverage_guided_fixture()
+
+    bfs_explorer = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0, 1, 2, 3),
+        max_cuts=2,
+        max_new_states=100,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        order="breadth_first",
+    )
+    bfs_results, bfs_summary = bfs_explorer.run()
+
+    cg_explorer_1 = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0, 1, 2, 3),
+        max_cuts=2,
+        max_new_states=100,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        order="coverage_guided",
+    )
+    cg_results_1, cg_summary_1 = cg_explorer_1.run()
+
+    cg_explorer_2 = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0, 1, 2, 3),
+        max_cuts=2,
+        max_new_states=100,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        order="coverage_guided",
+    )
+    cg_results_2, _cg_summary_2 = cg_explorer_2.run()
+
+    bfs_identities = {
+        r["recovery_state_search"]["state_identity"] for r in bfs_results
+    }
+    cg_seq_1 = [
+        r["recovery_state_search"]["state_identity"] for r in cg_results_1
+    ]
+    cg_seq_2 = [
+        r["recovery_state_search"]["state_identity"] for r in cg_results_2
+    ]
+
+    # Deterministic for identical inputs.
+    assert cg_seq_1 == cg_seq_2
+    # Identical visited sets when unlimited.
+    assert set(cg_seq_1) == bfs_identities
+    assert cg_summary_1["states_booted"] == bfs_summary["states_booted"]
+    assert cg_summary_1["unique_states_seen"] == bfs_summary["unique_states_seen"]
+
+    # Coverage-guided expands first cut 2 first in Generation 2 (boot index 5,
+    # 0-based index 4) and finds the first failing chain before breadth-first.
+    bfs_first_failure_boot = next(
+        idx + 1
+        for idx, r in enumerate(bfs_results)
+        if r["boot_outcome"] == "boot_failure"
+    )
+    cg_first_failure_boot = next(
+        idx + 1
+        for idx, r in enumerate(cg_results_1)
+        if r["boot_outcome"] == "boot_failure"
+    )
+    assert cg_first_failure_boot == 5
+    assert cg_first_failure_boot < bfs_first_failure_boot
+
+
+def test_coverage_guided_reaches_more_code_under_boot_and_wall_time_limits():
+    baseline, calibration, boot_state = _make_coverage_guided_fixture()
+
+    bfs_limited = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0, 1, 2, 3),
+        max_cuts=2,
+        max_new_states=6,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        order="breadth_first",
+    )
+    bfs_results, bfs_summary = bfs_limited.run()
+
+    cg_limited = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0, 1, 2, 3),
+        max_cuts=2,
+        max_new_states=6,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        order="coverage_guided",
+    )
+    cg_results, cg_summary = cg_limited.run()
+
+    assert bfs_summary["stopped_reason"] == "max_new_states"
+    assert cg_summary["stopped_reason"] == "max_new_states"
+    assert (
+        cg_summary["coverage_units_reached"]
+        > bfs_summary["coverage_units_reached"]
+    )
+    assert any(r["boot_outcome"] == "boot_failure" for r in cg_results)
+    assert not any(r["boot_outcome"] == "boot_failure" for r in bfs_results)
+
+    # Also verify under max_wall_time_s where each boot advances the clock by 1s.
+    bfs_clock = [0.0]
+
+    def bfs_timed_boot(state, chain, generation):
+        bfs_clock[0] += 1.0
+        return boot_state(state, chain, generation)
+
+    cg_clock = [0.0]
+
+    def cg_timed_boot(state, chain, generation):
+        cg_clock[0] += 1.0
+        return boot_state(state, chain, generation)
+
+    _, bfs_time_summary = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0, 1, 2, 3),
+        max_cuts=2,
+        max_new_states=100,
+        max_wall_time_s=5.5,
+        clock=lambda: bfs_clock[0],
+        boot_state=bfs_timed_boot,
+        order="breadth_first",
+    ).run()
+
+    _, cg_time_summary = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0, 1, 2, 3),
+        max_cuts=2,
+        max_new_states=100,
+        max_wall_time_s=5.5,
+        clock=lambda: cg_clock[0],
+        boot_state=cg_timed_boot,
+        order="coverage_guided",
+    ).run()
+
+    assert bfs_time_summary["stopped_reason"] == "max_wall_time_s"
+    assert cg_time_summary["stopped_reason"] == "max_wall_time_s"
+    assert (
+        cg_time_summary["coverage_units_reached"]
+        > bfs_time_summary["coverage_units_reached"]
+    )
+
+
+def test_explorer_stops_on_coverage_plateau_and_checkpoints_state():
+    baseline, calibration, boot_state = _make_coverage_guided_fixture()
+
+    explorer = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0, 1, 2, 3),
+        max_cuts=2,
+        max_new_states=100,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        order="coverage_guided",
+        max_boots_without_new_coverage=3,
+    )
+    results, summary = explorer.run()
+
+    assert summary["stopped_reason"] == "coverage_plateau"
+    assert summary["consecutive_boots_without_new_coverage"] == 3
+    assert summary["states_excluded_by_coverage_plateau"] > 0
+    assert summary["coverage_units_reached"] == 4
+    assert len(summary["coverage_by_boot"]) == len(results)
+
+    checkpoint = explorer.export_coverage_checkpoint()
+    assert checkpoint["schema_version"] == 1
+    assert checkpoint["seen_coverage"] == [0x1000, 0x1004, 0x1008, 0x2000]
+
+    restored = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0,),
+        max_cuts=1,
+        max_new_states=10,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        order="coverage_guided",
+    )
+    restored.restore_coverage_checkpoint(checkpoint)
+    assert restored.summary["coverage_units_reached"] == 4
+
+
+def test_explorer_rejects_invalid_order_or_missing_coverage_when_required():
+    baseline = PersistentState.from_bytes(b"\xff")
+    calibration = merge_operation_traces([_write(1, 0, 1)], [])
+
+    with pytest.raises(
+        ValueError,
+        match=r"unsupported state_search order",
+    ):
+        RecoveryStateExplorer(
+            baseline,
+            calibration,
+            first_cuts=(0,),
+            max_cuts=1,
+            max_new_states=5,
+            max_wall_time_s=30,
+            clock=lambda: 1.0,
+            boot_state=lambda *_a: ({"fault_injected": True}, ()),
+            order="random_walk",
+        )
+
+    with pytest.raises(
+        ValueError,
+        match=r"requires recovery coverage data on each booted state",
+    ):
+        RecoveryStateExplorer(
+            baseline,
+            calibration,
+            first_cuts=(0,),
+            max_cuts=1,
+            max_new_states=5,
+            max_wall_time_s=30,
+            clock=lambda: 1.0,
+            boot_state=lambda *_a: ({"fault_injected": True}, ()),
+            order="coverage_guided",
+        ).run()
+
+
+def test_coverage_guided_checkpoint_resume_matches_single_run():
+    import json
+
+    baseline, calibration, boot_state = _make_coverage_guided_fixture()
+    inputs = {
+        "firmware_sha256": "f" * 64,
+        "profile_sha256": "a" * 64,
+        "tardigrade_revision": "b" * 40,
+        "renode_version": "1.17.0",
+    }
+
+    first = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0, 1, 2, 3),
+        max_cuts=2,
+        max_new_states=5,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        order="coverage_guided",
+    )
+    prior, first_summary = first.run()
+    assert first_summary["stopped_reason"] == "max_new_states"
+    saved = json.loads(json.dumps(first.checkpoint(inputs)))
+    assert "coverage_state" in saved
+
+    second = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0, 1, 2, 3),
+        max_cuts=2,
+        max_new_states=100,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        order="coverage_guided",
+    )
+    second.restore(saved, inputs)
+    actual, summary = second.run()
+
+    expected, expected_summary = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0, 1, 2, 3),
+        max_cuts=2,
+        max_new_states=105,
+        max_wall_time_s=60,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        order="coverage_guided",
+    ).run()
+
+    for idx, row in enumerate(actual):
+        assert row["recovery_state_search"].pop("resume_origin") == (
+            "before_resume" if idx < len(prior) else "after_resume"
+        )
+    assert actual == expected
+    assert summary == expected_summary
+
+
+def test_coverage_guided_sharded_merge_matches_single_run_and_attributes_coverage():
+    from audit_report import summarize_runtime_sweep
+    from merge_state_search import merge_reports
+    from recovery_search_shard import ShardedRecoveryStateExplorer
+
+    baseline, calibration, boot_state = _make_coverage_guided_fixture()
+    scope = {
+        "enabled": True,
+        "mechanism": "oneshot_address_hooks",
+        "granularity": "function_only",
+        "line_info_available": False,
+        "line_info_notice": "No DWARF line info in synthetic fixture.",
+        "functions": [
+            {
+                "id": "common_recovery@0x00001000",
+                "name": "common_recovery",
+                "start_address": "0x00001000",
+                "end_address": "0x0000100C",
+                "size_bytes": 12,
+                "probe_pcs": [0x1000, 0x1004, 0x1008],
+            },
+            {
+                "id": "rare_recovery_branch@0x00002000",
+                "name": "rare_recovery_branch",
+                "start_address": "0x00002000",
+                "end_address": "0x00002008",
+                "size_bytes": 8,
+                "probe_pcs": [0x2000, 0x2004],
+            },
+            {
+                "id": "deep_bug_handler@0x00003000",
+                "name": "deep_bug_handler",
+                "start_address": "0x00003000",
+                "end_address": "0x00003008",
+                "size_bytes": 8,
+                "probe_pcs": [0x3000, 0x3004],
+            },
+        ],
+        "source_lines": [],
+        "basic_blocks": [
+            {"start": 0x1000, "end": 0x1004},
+            {"start": 0x1004, "end": 0x1008},
+            {"start": 0x1008, "end": 0x100C},
+            {"start": 0x2000, "end": 0x2004},
+            {"start": 0x2004, "end": 0x2008},
+            {"start": 0x3000, "end": 0x3004},
+            {"start": 0x3004, "end": 0x3008},
+        ],
+        "probe_pcs": [0x1000, 0x1004, 0x1008, 0x2000, 0x2004, 0x3000, 0x3004],
+        "active_intervals": [[0x1000, 0x100C], [0x2000, 0x2008], [0x3000, 0x3008]],
+    }
+    expect = {
+        "control_outcome": "success",
+        "should_find_issues": True,
+        "mode": "regression",
+    }
+    shard_reports = []
+    for shard_idx in range(2):
+        explorer = ShardedRecoveryStateExplorer(
+            baseline,
+            calibration,
+            first_cuts=(0, 1, 2, 3),
+            max_cuts=2,
+            max_new_states=100,
+            max_wall_time_s=30,
+            clock=lambda: 0.0,
+            boot_state=boot_state,
+            order="coverage_guided",
+            shard_count=2,
+            shard_index=shard_idx,
+        )
+        rows, _summary = explorer.run()
+        runtime = summarize_runtime_sweep(
+            rows, expected_fault_points=1, expected_control_points=0
+        )
+        shard_reports.append(
+            {
+                "state_search_shard": {
+                    **explorer.partition,
+                    "firmware_sha256": "1" * 64,
+                    "profile_sha256": "2" * 64,
+                    "tardigrade_revision": "3" * 40,
+                    "renode_version": "1.17.0",
+                    "report_context": {
+                        "expect": expect,
+                        "page_size": 4096,
+                        "slots": {},
+                        "planned_fault_types": ["rs"],
+                        "total_writes": 4,
+                        "calibration_point_coverage": {},
+                        "recovery_coverage_scope": scope,
+                    },
+                },
+                "summary": {"runtime_sweep": runtime},
+                "runtime_sweep_results": rows,
+                "expect": expect,
+                "profile": "cg_sharded",
+                "calibrated_writes": 4,
+                "fault_points_tested": 1,
+            }
+        )
+
+    merged = merge_reports(shard_reports)
+    single_rows, single_summary = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0, 1, 2, 3),
+        max_cuts=2,
+        max_new_states=100,
+        max_wall_time_s=30,
+        clock=lambda: 0.0,
+        boot_state=boot_state,
+        order="coverage_guided",
+    ).run()
+    summarize_runtime_sweep(
+        single_rows, expected_fault_points=1, expected_control_points=0
+    )
+    assert merged["runtime_sweep_results"] == single_rows
+    assert (
+        merged["summary"]["runtime_sweep"]["recovery_state_search"]
+        == single_summary
+    )
+    assert "recovery_coverage" in merged
+    cov_report = merged["recovery_coverage"]
+    assert cov_report["function_summary"]["executed_only_under_cut_count"] == 2
+    assert cov_report["function_summary"]["never_executed_by_cut_count"] == 1
+
+
+def test_coverage_guided_plan_only_sizing():
+    baseline, calibration, boot_state = _make_coverage_guided_fixture()
+    explorer = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=(0, 1, 2, 3),
+        max_cuts=2,
+        max_new_states=100,
+        max_wall_time_s=30,
+        clock=lambda: 1.0,
+        boot_state=boot_state,
+        order="coverage_guided",
+        plan_only=True,
+    )
+    rows, summary = explorer.run()
+    assert summary["stopped_reason"] == "plan_complete"
+    assert len(rows) == 4
+    assert "generation_two_plan" in summary
+    assert explorer.checkpoint({}) is None
+
+
+def test_guided_boot_preserves_trace_context_and_sibling_comparison():
+    writes = [_write(1, 0, 0x10), _write(2, 1, 0x20)]
+    contexts = ["0x1010@0x1021", "0x1030@0x1041"]
+    for write, context in zip(writes, contexts):
+        write["call_context"] = context
+
+    def boot(state, chain, generation):
+        index = chain[-1]["operation_index"]
+        return {
+            "boot_outcome": ("success", "no_boot")[index],
+            "recovery_coverage": {"executed_pcs": [0x1000 + 2 * index]},
+        }, []
+
+    explorer = RecoveryStateExplorer(
+        PersistentState.from_bytes(b"abcd"), merge_operation_traces(writes, []),
+        first_cuts=(0, 1), max_cuts=1, max_new_states=2, max_wall_time_s=10,
+        clock=lambda: 1, boot_state=boot, order="coverage_guided",
+    )
+    rows, _ = explorer.run()
+    explorer.compare_boot_snapshots()
+    good, bad = rows
+    assert [row["recovery_state_search"]["chain"]["cuts"][0]["call_context"]
+            for row in rows] == contexts
+    assert bad["recovery_coverage"]["executed_pcs"] == [0x1002]
+    comparison = bad["_sibling_snapshot_comparison"]
+    assert comparison["sibling"] == good["recovery_state_search"]["state_identity"]
+    assert comparison["comparison"]["ranges"]

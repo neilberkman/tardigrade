@@ -7,6 +7,7 @@ from __future__ import division
 
 import binascii
 import copy
+import hashlib
 from bisect import bisect_left
 from collections import defaultdict, deque
 
@@ -22,10 +23,54 @@ class RecoverySearchError(ValueError):
     pass
 
 
+SUPPORTED_SEARCH_ORDERS = ("breadth_first", "coverage_guided")
+
 try:
     _string_types = (basestring,)
 except NameError:
     _string_types = (str,)
+
+try:
+    _integer_types = (int, long)
+except NameError:
+    _integer_types = (int,)
+
+
+def _is_int(value):
+    return isinstance(value, _integer_types) and not isinstance(value, bool)
+
+
+def _normalize_coverage_unit(unit):
+    if _is_int(unit):
+        return int(unit) & ~1
+    text = str(unit).strip()
+    if not text:
+        raise RecoverySearchError("coverage unit must not be empty")
+    try:
+        return int(text, 0) & ~1
+    except ValueError:
+        return text
+
+
+def _coverage_signature(units):
+    digest = hashlib.sha256()
+    digest.update(b"tardigrade-recovery-search-cov-v1\0")
+    for item in sorted((str(u) for u in (units or ()))):
+        digest.update(item.encode("utf-8"))
+        digest.update(b"\0")
+    return binascii.hexlify(digest.digest()).decode("ascii")
+
+
+def _extract_result_coverage_units(result):
+    if not isinstance(result, dict):
+        return None
+    cov = result.get("recovery_coverage")
+    if isinstance(cov, dict) and "executed_pcs" in cov:
+        return cov.get("executed_pcs")
+    signals = result.get("signals")
+    if isinstance(signals, dict) and "recovery_coverage_pcs" in signals:
+        return signals.get("recovery_coverage_pcs")
+    return None
 
 
 def _byte_value(value):
@@ -709,6 +754,10 @@ class RecoveryStateExplorer(object):
         cross_check_every=0,
         cross_check=None,
         plan_only=False,
+        order="breadth_first",
+        max_boots_without_new_coverage=None,
+        coverage_for_result=None,
+        initial_coverage=(),
     ):
         self.initial_state = initial_state
         self.calibration_operations = self._normalize_trace(calibration_operations)
@@ -729,6 +778,30 @@ class RecoveryStateExplorer(object):
         self.corruption_seed = int(corruption_seed) & 0xFFFFFFFF
         self.page_size = int(page_size)
         self.program_unit = int(program_unit)
+        normalized_order = str(order or "breadth_first").strip().lower()
+        if normalized_order not in SUPPORTED_SEARCH_ORDERS:
+            raise RecoverySearchError(
+                "unsupported state_search order {!r}; expected one of {}".format(
+                    order, list(SUPPORTED_SEARCH_ORDERS)
+                )
+            )
+        self.order = normalized_order
+        if max_boots_without_new_coverage is not None:
+            if not _is_int(max_boots_without_new_coverage) or int(
+                max_boots_without_new_coverage
+            ) < 1:
+                raise RecoverySearchError(
+                    "max_boots_without_new_coverage must be a positive integer"
+                )
+            self.max_boots_without_new_coverage = int(
+                max_boots_without_new_coverage
+            )
+        else:
+            self.max_boots_without_new_coverage = None
+        self.coverage_for_result = coverage_for_result
+        self.initial_coverage = frozenset(
+            _normalize_coverage_unit(u) for u in (initial_coverage or ())
+        )
         self.recovery_operation_kinds = recovery_operation_kinds(recovery_fault_types)
         self.cross_check_every = int(cross_check_every)
         self.cross_check = cross_check
@@ -746,8 +819,32 @@ class RecoveryStateExplorer(object):
         self._prior_elapsed = 0.0
         self._resumed = False
         self._deeper_cross_check_candidates = 0
+        self._seen_coverage = set(self.initial_coverage)
+        self._recovery_coverage_seen = set()
+        self._unit_first_boot = {}
+        self._unit_boot_count = {}
+        self._seen_signatures = (
+            set([_coverage_signature(self.initial_coverage)])
+            if self.initial_coverage
+            else set()
+        )
+        self._signature_boot_count = {}
+        self._expanded_signatures = set()
+        self._productive_signatures = set()
+        self._parent_cov = {}
+        self._consecutive_boots_without_new_coverage = 0
+        self._discovery_counter = 0
+        self._current_cov_parent = None
+        self._coverage_tracking_active = bool(
+            self.order == "coverage_guided"
+            or self.max_boots_without_new_coverage is not None
+            or self.coverage_for_result is not None
+            or self.initial_coverage
+        )
         self.results = []
         self.summary = {
+            "order": self.order,
+            "max_boots_without_new_coverage": self.max_boots_without_new_coverage,
             "first_cuts_selected": len(self.first_cuts),
             "first_cut_programs_selected": sum(
                 1 for kind, _index in self.first_cuts if kind == "write"
@@ -774,9 +871,16 @@ class RecoveryStateExplorer(object):
             "recovery_operations_excluded_by_max_cuts": 0,
             "states_excluded_by_max_new_states": 0,
             "states_excluded_by_wall_time": 0,
+            "states_excluded_by_coverage_plateau": 0,
             "unexpanded_states_at_wall_time": 0,
+            "unexpanded_states_at_coverage_plateau": 0,
             "cross_checks_run": 0,
             "cross_checks_passed": 0,
+            "coverage_units_reached": 0,
+            "boots_reaching_new_coverage": 0,
+            "consecutive_boots_without_new_coverage": 0,
+            "max_consecutive_boots_without_new_coverage": 0,
+            "coverage_by_boot": [],
             "stopped_reason": None,
         }
 
@@ -816,6 +920,151 @@ class RecoveryStateExplorer(object):
             )
         self.summary["cross_checks_passed"] += 1
         return outcome
+
+    def _coverage_plateau_reached(self):
+        return (
+            self.max_boots_without_new_coverage is not None
+            and self._consecutive_boots_without_new_coverage
+            >= self.max_boots_without_new_coverage
+        )
+
+    def _record_boot_coverage(self, parent_id, result, state, chain, generation):
+        if self.coverage_for_result is not None:
+            raw_units = self.coverage_for_result(result, state, chain, generation)
+            units = (
+                None
+                if raw_units is None
+                else tuple(_normalize_coverage_unit(u) for u in raw_units)
+            )
+        else:
+            units = _extract_result_coverage_units(result)
+
+        boot_ordinal = int(self.summary["states_booted"])
+        entry = {}
+        if units is None:
+            if self.order == "coverage_guided":
+                raise RecoverySearchError(
+                    "state_search order 'coverage_guided' requires recovery coverage data on each booted state"
+                )
+            if self.max_boots_without_new_coverage is not None:
+                raise RecoverySearchError(
+                    "max_boots_without_new_coverage requires recovery coverage data on each booted state"
+                )
+            entry["coverage_units"] = frozenset()
+            entry["coverage_signature"] = ()
+            entry["reached_new_signature"] = False
+            entry["new_coverage_units"] = ()
+            entry["new_coverage_count"] = 0
+            entry["diverged_from_prior_recovery"] = False
+            entry["boot_ordinal"] = boot_ordinal
+            entry["discovery_ordinal"] = int(self._discovery_counter)
+            self._discovery_counter += 1
+            self._parent_cov[parent_id] = {
+                "entry": entry,
+                "generation": int(generation),
+                "children_booted": 0,
+                "productive_children": 0,
+                "child_stall": 0,
+            }
+            return entry
+
+        self._coverage_tracking_active = True
+        had_prior_recovery_coverage = bool(self._recovery_coverage_seen)
+        unit_set = frozenset(units)
+        signature = _coverage_signature(unit_set)
+        reached_new_signature = bool(
+            signature and signature not in self._seen_signatures
+        )
+        if signature:
+            self._seen_signatures.add(signature)
+            self._signature_boot_count[signature] = (
+                int(self._signature_boot_count.get(signature, 0)) + 1
+            )
+        new_units = tuple(
+            sorted(
+                (u for u in unit_set if u not in self._seen_coverage),
+                key=lambda item: (str(type(item)), item),
+            )
+        )
+        new_recovery_units = tuple(
+            sorted(
+                (u for u in unit_set if u not in self._recovery_coverage_seen),
+                key=lambda item: (str(type(item)), item),
+            )
+        )
+        for u in unit_set:
+            self._seen_coverage.add(u)
+            self._recovery_coverage_seen.add(u)
+            self._unit_boot_count[u] = int(self._unit_boot_count.get(u, 0)) + 1
+            if u not in self._unit_first_boot:
+                self._unit_first_boot[u] = boot_ordinal
+
+        if new_units:
+            self._consecutive_boots_without_new_coverage = 0
+            self.summary["boots_reaching_new_coverage"] += 1
+        else:
+            self._consecutive_boots_without_new_coverage += 1
+        if (
+            self._consecutive_boots_without_new_coverage
+            > self.summary["max_consecutive_boots_without_new_coverage"]
+        ):
+            self.summary["max_consecutive_boots_without_new_coverage"] = (
+                self._consecutive_boots_without_new_coverage
+            )
+        self.summary["consecutive_boots_without_new_coverage"] = (
+            self._consecutive_boots_without_new_coverage
+        )
+        self.summary["coverage_units_reached"] = len(self._seen_coverage)
+
+        formatted_chain = format_chain(chain)
+        self.summary["coverage_by_boot"].append(
+            {
+                "boot_index": boot_ordinal,
+                "generation": int(generation),
+                "chain": formatted_chain["text"],
+                "state_identity": state.identity_hex(),
+                "boot_coverage_units": len(unit_set),
+                "new_coverage_units": len(new_units),
+                "cumulative_coverage_units": len(self._seen_coverage),
+                "cumulative_recovery_coverage_units": len(
+                    self._recovery_coverage_seen
+                ),
+                "consecutive_boots_without_new_coverage": (
+                    self._consecutive_boots_without_new_coverage
+                ),
+            }
+        )
+        if isinstance(result.get("recovery_state_search"), dict):
+            result["recovery_state_search"]["coverage"] = {
+                "boot_index": boot_ordinal,
+                "boot_coverage_units": len(unit_set),
+                "new_coverage_units": len(new_units),
+                "cumulative_coverage_units": len(self._seen_coverage),
+                "cumulative_recovery_coverage_units": len(
+                    self._recovery_coverage_seen
+                ),
+                "reached_new_coverage": bool(new_units),
+            }
+
+        entry["coverage_units"] = unit_set
+        entry["coverage_signature"] = signature
+        entry["reached_new_signature"] = reached_new_signature
+        entry["new_coverage_units"] = new_units
+        entry["new_coverage_count"] = len(new_units)
+        entry["diverged_from_prior_recovery"] = bool(
+            had_prior_recovery_coverage and new_recovery_units
+        )
+        entry["boot_ordinal"] = boot_ordinal
+        entry["discovery_ordinal"] = int(self._discovery_counter)
+        self._discovery_counter += 1
+        self._parent_cov[parent_id] = {
+            "entry": entry,
+            "generation": int(generation),
+            "children_booted": 0,
+            "productive_children": 0,
+            "child_stall": 0,
+        }
+        return entry
 
     def _boot(
         self,
@@ -864,6 +1113,7 @@ class RecoveryStateExplorer(object):
                 self.summary["single_cut_program_states_booted"] += 1
         else:
             self.summary["deeper_cut_states_booted"] += 1
+        return self._record_boot_coverage(parent, result, state, chain, generation)
 
     def _source(self, parent):
         if parent is None:
@@ -887,7 +1137,20 @@ class RecoveryStateExplorer(object):
                 "parent": parent,
                 "chain": chain,
             }
-            self._boot(state, chain, generation, operation, ordinal)
+            child_entry = self._boot(state, chain, generation, operation, ordinal)
+            if parent is not None and parent in self._parent_cov:
+                pnode = self._parent_cov[parent]
+                pnode["children_booted"] += 1
+                psig = pnode["entry"].get("coverage_signature", ())
+                if psig:
+                    self._expanded_signatures.add(psig)
+                if child_entry is not None and int(child_entry.get("new_coverage_count", 0)) > 0:
+                    pnode["productive_children"] += 1
+                    pnode["child_stall"] = 0
+                    if psig:
+                        self._productive_signatures.add(psig)
+                else:
+                    pnode["child_stall"] += 1
             return
         self._count_reuse(self.summary, chain)
         checked = None
@@ -932,6 +1195,10 @@ class RecoveryStateExplorer(object):
         if index + 1 < len(operations):
             completed = apply_completed_operation(prefix, op, self.erase_fill)
             frames.appendleft((parent, index + 1, completed, erases + (op["kind"] == "erase")))
+        elif not preview and parent is not None and parent in self._parent_cov:
+            psig = self._parent_cov[parent]["entry"].get("coverage_signature", ())
+            if psig:
+                self._expanded_signatures.add(psig)
         if not self._selected(op, parent is None, selected, counts):
             return None
         key = (parent, index)
@@ -949,8 +1216,346 @@ class RecoveryStateExplorer(object):
             self._computed_frontier.pop(key, None)
         return parent, index, candidate
 
+    def _parent_priority_key(self, node):
+        entry = node["entry"]
+        new_count = int(entry.get("new_coverage_count", 0))
+        reached_new = 1 if new_count > 0 else 0
+        reached_new_sig = 1 if entry.get("reached_new_signature") else 0
+        diverged = 1 if entry.get("diverged_from_prior_recovery") else 0
+        productive_children = int(node.get("productive_children", 0))
+        child_stall = int(node.get("child_stall", 0))
+        children_booted = int(node.get("children_booted", 0))
+        signature = entry.get("coverage_signature", ())
+        signature_productive = (
+            1 if signature and signature in self._productive_signatures else 0
+        )
+        sig_unexpanded = (
+            1
+            if (signature and signature not in self._expanded_signatures)
+            else 0
+        )
+        sig_frequency = (
+            int(self._signature_boot_count.get(signature, 10**9))
+            if signature
+            else 10**9
+        )
+        units = entry.get("coverage_units") or ()
+        if units:
+            min_unit_frequency = min(
+                int(self._unit_boot_count.get(u, 1)) for u in units
+            )
+        else:
+            min_unit_frequency = 10**9
+
+        has_new_path = 1 if (reached_new or reached_new_sig) else 0
+        if has_new_path and child_stall == 0:
+            tier = 0
+        elif signature_productive and child_stall == 0:
+            tier = 1
+        elif signature_productive or productive_children > 0:
+            tier = 2
+        elif has_new_path:
+            tier = 3
+        elif child_stall == 0:
+            tier = 4
+        else:
+            tier = 5
+
+        return (
+            tier,
+            -diverged,
+            -reached_new,
+            -reached_new_sig,
+            -sig_unexpanded,
+            -productive_children,
+            child_stall,
+            sig_frequency,
+            min_unit_frequency,
+            -new_count,
+            children_booted,
+            int(node["generation"]),
+            int(entry.get("discovery_ordinal", 0)),
+        )
+
+    def _select_best_coverage_frame(self, frames):
+        if not frames or frames[0][0] is None:
+            return
+        best_idx = 0
+        best_key = None
+        for idx, frame in enumerate(frames):
+            parent = frame[0]
+            if parent is None:
+                return
+            _ops, chain = self._source(parent)
+            if len(chain) >= self.max_cuts:
+                key = (-1,)
+            else:
+                pnode = self._parent_cov.get(parent)
+                if pnode is None:
+                    key = (99, int(parent))
+                else:
+                    key = self._parent_priority_key(pnode)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_idx = idx
+        if best_idx > 0:
+            chosen = frames[best_idx]
+            del frames[best_idx]
+            frames.appendleft(chosen)
+
     def _needs_boot(self, parent, state):
         return state.identity_hex() not in self._seen
+
+    def _serialize_coverage_state(self):
+        parent_cov = {}
+        for parent_id, node in sorted(
+            self._parent_cov.items(),
+            key=lambda kv: (-1 if kv[0] is None else int(kv[0])),
+        ):
+            entry = node["entry"]
+            key = "null" if parent_id is None else str(int(parent_id))
+            parent_cov[key] = {
+                "generation": int(node["generation"]),
+                "children_booted": int(node["children_booted"]),
+                "productive_children": int(node["productive_children"]),
+                "child_stall": int(node["child_stall"]),
+                "entry": {
+                    "coverage_units": sorted(
+                        entry.get("coverage_units") or (),
+                        key=lambda item: (str(type(item)), item),
+                    ),
+                    "coverage_signature": list(
+                        entry.get("coverage_signature") or ()
+                    ),
+                    "reached_new_signature": bool(
+                        entry.get("reached_new_signature")
+                    ),
+                    "new_coverage_units": list(
+                        entry.get("new_coverage_units") or ()
+                    ),
+                    "new_coverage_count": int(
+                        entry.get("new_coverage_count", 0)
+                    ),
+                    "diverged_from_prior_recovery": bool(
+                        entry.get("diverged_from_prior_recovery")
+                    ),
+                    "boot_ordinal": int(entry.get("boot_ordinal", 0)),
+                    "discovery_ordinal": int(
+                        entry.get("discovery_ordinal", 0)
+                    ),
+                },
+            }
+        return {
+            "seen_coverage": sorted(
+                self._seen_coverage, key=lambda item: (str(type(item)), item)
+            ),
+            "recovery_coverage_seen": sorted(
+                self._recovery_coverage_seen,
+                key=lambda item: (str(type(item)), item),
+            ),
+            "unit_first_boot": [
+                [u, int(b)]
+                for u, b in sorted(
+                    self._unit_first_boot.items(),
+                    key=lambda kv: (str(type(kv[0])), kv[0]),
+                )
+            ],
+            "unit_boot_count": [
+                [u, int(c)]
+                for u, c in sorted(
+                    self._unit_boot_count.items(),
+                    key=lambda kv: (str(type(kv[0])), kv[0]),
+                )
+            ],
+            "seen_signatures": [
+                list(sig)
+                for sig in sorted(
+                    self._seen_signatures,
+                    key=lambda s: [
+                        (str(type(item)), item) for item in s
+                    ],
+                )
+            ],
+            "signature_boot_count": [
+                [list(sig), int(count)]
+                for sig, count in sorted(
+                    self._signature_boot_count.items(),
+                    key=lambda kv: [
+                        (str(type(item)), item) for item in kv[0]
+                    ],
+                )
+            ],
+            "expanded_signatures": [
+                list(sig)
+                for sig in sorted(
+                    self._expanded_signatures,
+                    key=lambda s: [
+                        (str(type(item)), item) for item in s
+                    ],
+                )
+            ],
+            "productive_signatures": [
+                list(sig)
+                for sig in sorted(
+                    self._productive_signatures,
+                    key=lambda s: [
+                        (str(type(item)), item) for item in s
+                    ],
+                )
+            ],
+            "parent_cov": parent_cov,
+            "consecutive_boots_without_new_coverage": int(
+                self._consecutive_boots_without_new_coverage
+            ),
+            "discovery_counter": int(self._discovery_counter),
+            "current_cov_parent": self._current_cov_parent,
+        }
+
+    def _deserialize_coverage_state(self, cov_state):
+        if not isinstance(cov_state, dict):
+            return
+        self._coverage_tracking_active = True
+        self._seen_coverage = set(
+            _normalize_coverage_unit(u)
+            for u in (cov_state.get("seen_coverage") or ())
+        )
+        self._recovery_coverage_seen = set(
+            _normalize_coverage_unit(u)
+            for u in (cov_state.get("recovery_coverage_seen") or ())
+        )
+        self._unit_first_boot = {}
+        for item in cov_state.get("unit_first_boot") or ():
+            if isinstance(item, dict):
+                u, b = item["unit"], item["first_boot"]
+            else:
+                u, b = item
+            self._unit_first_boot[_normalize_coverage_unit(u)] = int(b)
+        self._unit_boot_count = {}
+        for item in cov_state.get("unit_boot_count") or ():
+            if isinstance(item, dict):
+                u, c = item["unit"], item["boot_count"]
+            else:
+                u, c = item
+            self._unit_boot_count[_normalize_coverage_unit(u)] = int(c)
+        if "seen_signatures" in cov_state:
+            self._seen_signatures = set(
+                tuple(_normalize_coverage_unit(u) for u in sig)
+                for sig in (cov_state.get("seen_signatures") or ())
+            )
+        if "signature_boot_count" in cov_state:
+            self._signature_boot_count = dict(
+                (tuple(_normalize_coverage_unit(u) for u in sig), int(count))
+                for sig, count in (cov_state.get("signature_boot_count") or ())
+            )
+        if "expanded_signatures" in cov_state:
+            self._expanded_signatures = set(
+                tuple(_normalize_coverage_unit(u) for u in sig)
+                for sig in (cov_state.get("expanded_signatures") or ())
+            )
+        if "productive_signatures" in cov_state:
+            self._productive_signatures = set(
+                tuple(_normalize_coverage_unit(u) for u in sig)
+                for sig in (cov_state.get("productive_signatures") or ())
+            )
+        if "parent_cov" in cov_state and isinstance(
+            cov_state["parent_cov"], dict
+        ):
+            self._parent_cov = {}
+            for key, node in cov_state["parent_cov"].items():
+                parent_id = None if key == "null" else int(key)
+                raw_entry = node.get("entry") or {}
+                self._parent_cov[parent_id] = {
+                    "generation": int(node.get("generation", 1)),
+                    "children_booted": int(node.get("children_booted", 0)),
+                    "productive_children": int(
+                        node.get("productive_children", 0)
+                    ),
+                    "child_stall": int(node.get("child_stall", 0)),
+                    "entry": {
+                        "coverage_units": frozenset(
+                            _normalize_coverage_unit(u)
+                            for u in (raw_entry.get("coverage_units") or ())
+                        ),
+                        "coverage_signature": tuple(
+                            _normalize_coverage_unit(u)
+                            for u in (
+                                raw_entry.get("coverage_signature") or ()
+                            )
+                        ),
+                        "reached_new_signature": bool(
+                            raw_entry.get("reached_new_signature")
+                        ),
+                        "new_coverage_units": tuple(
+                            _normalize_coverage_unit(u)
+                            for u in (
+                                raw_entry.get("new_coverage_units") or ()
+                            )
+                        ),
+                        "new_coverage_count": int(
+                            raw_entry.get("new_coverage_count", 0)
+                        ),
+                        "diverged_from_prior_recovery": bool(
+                            raw_entry.get("diverged_from_prior_recovery")
+                        ),
+                        "boot_ordinal": int(raw_entry.get("boot_ordinal", 0)),
+                        "discovery_ordinal": int(
+                            raw_entry.get("discovery_ordinal", 0)
+                        ),
+                    },
+                }
+        self._consecutive_boots_without_new_coverage = int(
+            cov_state.get("consecutive_boots_without_new_coverage", 0)
+        )
+        if "discovery_counter" in cov_state:
+            self._discovery_counter = int(cov_state["discovery_counter"])
+        self._current_cov_parent = cov_state.get("current_cov_parent")
+        self.summary["consecutive_boots_without_new_coverage"] = (
+            self._consecutive_boots_without_new_coverage
+        )
+        self.summary["coverage_units_reached"] = len(self._seen_coverage)
+
+    def export_coverage_checkpoint(self):
+        """Export deterministic coverage and search state for checkpoint/merge."""
+        serialized = self._serialize_coverage_state()
+        return {
+            "schema_version": 1,
+            "order": self.order,
+            "max_boots_without_new_coverage": self.max_boots_without_new_coverage,
+            "initial_coverage": sorted(
+                self.initial_coverage, key=lambda item: (str(type(item)), item)
+            ),
+            "seen_coverage": serialized["seen_coverage"],
+            "recovery_coverage_seen": serialized["recovery_coverage_seen"],
+            "unit_first_boot": [
+                {"unit": u, "first_boot": int(b)}
+                for u, b in serialized["unit_first_boot"]
+            ],
+            "unit_boot_count": [
+                {"unit": u, "boot_count": int(c)}
+                for u, c in serialized["unit_boot_count"]
+            ],
+            "seen_signatures": serialized["seen_signatures"],
+            "signature_boot_count": serialized["signature_boot_count"],
+            "expanded_signatures": serialized["expanded_signatures"],
+            "productive_signatures": serialized["productive_signatures"],
+            "parent_cov": serialized["parent_cov"],
+            "consecutive_boots_without_new_coverage": serialized[
+                "consecutive_boots_without_new_coverage"
+            ],
+            "discovery_counter": serialized["discovery_counter"],
+            "current_cov_parent": serialized["current_cov_parent"],
+            "visited_state_identities": sorted(
+                self._seen.keys()
+            ),
+            "coverage_by_boot": copy.deepcopy(self.summary["coverage_by_boot"]),
+            "summary": copy.deepcopy(self.summary),
+        }
+
+    def restore_coverage_checkpoint(self, checkpoint):
+        """Restore prior coverage state into this explorer before running."""
+        if not isinstance(checkpoint, dict):
+            raise RecoverySearchError("checkpoint must be a dict")
+        self._deserialize_coverage_state(checkpoint)
 
     def checkpoint(self, inputs):
         if self.plan_only or (not self._pending and not self._frames):
@@ -960,7 +1565,7 @@ class RecoveryStateExplorer(object):
                   for parent, index, state in self._pending]
         frames = [[parent, index, snapshots.reference(prefix), erases]
                   for parent, index, prefix, erases in self._frames]
-        return {
+        data = {
             "version": 1, "inputs": inputs, "results": self.results,
             "recovery_traces": self._traces, "pending_visits": visits,
             "computed_frontier": [[parent, index, snapshots.reference(state)]
@@ -971,6 +1576,9 @@ class RecoveryStateExplorer(object):
             "limits": {"max_new_states": self.budget.max_new_states,
                        "max_wall_time_s": self.budget.max_wall_time_s},
         }
+        if self._coverage_tracking_active:
+            data["coverage_state"] = self._serialize_coverage_state()
+        return data
 
     def restore(self, checkpoint, inputs):
         if self.plan_only:
@@ -1000,6 +1608,8 @@ class RecoveryStateExplorer(object):
         self.budget.booted = len(self.results)
         self._prior_elapsed = checkpoint["elapsed_s"]
         self._resumed = True
+        if "coverage_state" in checkpoint:
+            self._deserialize_coverage_state(checkpoint["coverage_state"])
 
     def _trace_counts(self, index):
         operations = self._traces[index]
@@ -1148,9 +1758,26 @@ class RecoveryStateExplorer(object):
                 if self.budget.boot_limit_reached() and self._needs_boot(parent, state):
                     reason = "max_new_states"
                     break
+                if self._coverage_plateau_reached() and self._needs_boot(parent, state):
+                    reason = "coverage_plateau"
+                    break
                 self._pending.popleft()
+                will_boot = self._needs_boot(parent, state)
                 self._visit(parent, index, state)
+                if will_boot:
+                    self._current_cov_parent = None
             else:
+                if (
+                    self.order == "coverage_guided"
+                    and self._frames
+                    and self._frames[0][0] is not None
+                    and (
+                        self._current_cov_parent is None
+                        or self._frames[0][0] != self._current_cov_parent
+                    )
+                ):
+                    self._select_best_coverage_frame(self._frames)
+                    self._current_cov_parent = self._frames[0][0]
                 visit = self._expand(self._frames, selected, self.summary)
                 if visit:
                     self._pending.append(visit)
@@ -1164,7 +1791,7 @@ class RecoveryStateExplorer(object):
         self._elapsed = self.budget.wall_time_s()
         summary = dict(self.summary)
         omitted = list(self._pending)
-        if reason == "max_new_states":
+        if reason in ("max_new_states", "coverage_plateau"):
             # Count the known frontier for this report without advancing the
             # durable visit cursor. A later wall stop must see exactly the same
             # counters and unexpanded parents as an uninterrupted search.
@@ -1199,6 +1826,9 @@ class RecoveryStateExplorer(object):
             summary["unexpanded_states_at_wall_time"] = len(self._frames)
         elif reason == "max_new_states":
             summary["states_excluded_by_max_new_states"] = len(known) - len(self._seen)
+        elif reason == "coverage_plateau":
+            summary["states_excluded_by_coverage_plateau"] = len(known) - len(self._seen)
+            summary["unexpanded_states_at_coverage_plateau"] = len(self._frames)
         summary["stopped_reason"] = reason
         summary["unique_states_seen"] = len(known)
         if self.plan_only:
