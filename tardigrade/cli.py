@@ -119,6 +119,7 @@ def main(argv=None):
     audit = commands.add_parser("audit", help="run the profile-driven bootloader audit")
     audit.add_argument("--profile", required=True, type=Path)
     audit.add_argument("--output", required=True, type=Path)
+    audit.add_argument("--clause-map", type=Path, help="replace the software update clause mapping")
     audit.add_argument("--renode-test", default=runner)
     audit.add_argument("--resume-state-search", type=Path, metavar="CHECKPOINT",
                        help="continue a recovery search from its checkpoint")
@@ -134,6 +135,7 @@ def main(argv=None):
     report = commands.add_parser("report", help="render audit JSON as HTML")
     report.add_argument("--input", required=True, action="append")
     report.add_argument("--output", required=True)
+    report.add_argument("--clause-map", type=Path, help="replace the saved clause mapping")
     merge = commands.add_parser("merge-state-search", help="merge recovery state search shard reports")
     merge.add_argument("shards", nargs="+", type=Path, metavar="SHARD.json")
     merge.add_argument("--output", required=True, type=Path)
@@ -250,6 +252,8 @@ def main(argv=None):
         return debug_point.main(debug_argv, prog="tardigrade debug")
     if args.command == "report":
         command = [sys.executable, str(RUNTIME / "scripts/render_results_html.py")]
+        if args.clause_map:
+            command.extend(["--clause-map", str(args.clause_map.expanduser().resolve())])
         for item in args.input:
             command.extend(["--input", item])
         return subprocess.call([*command, "--output", args.output])
@@ -288,6 +292,8 @@ def main(argv=None):
                 args.renode_test,
                 args.timeout,
             )
+        if args.clause_map:
+            unknown.extend(["--clause-map", str(args.clause_map.expanduser().resolve())])
         if args.resume_state_search:
             unknown.extend(["--resume-state-search", str(args.resume_state_search.expanduser().resolve())])
         return run_audit(

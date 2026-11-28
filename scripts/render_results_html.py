@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from clause_evidence import clause_evidence, clause_html
 from point_counts import point_count_rows
 from report_points import CAMPAIGNS, ReportRun, point_label, point_status
 
@@ -786,7 +787,7 @@ def render_point_counts_panel(payload: Dict[str, Any]) -> str:
     )
 
 
-def render_audit_card(path: Path, payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+def render_audit_card(path: Path, payload: Dict[str, Any], mapping=None) -> Tuple[str, Dict[str, Any]]:
     sweep = payload.get("summary", {}).get("runtime_sweep", {})
     profile = str(payload.get("profile", path.stem))
     bricks = int(sweep.get("bricks", 0))
@@ -865,6 +866,7 @@ def render_audit_card(path: Path, payload: Dict[str, Any]) -> Tuple[str, Dict[st
         f"<div class='verdict-sigil' aria-label='Verdict {html.escape(verdict, quote=True)}'>"
         f"<span>{html.escape(verdict)}</span></div></header>"
         f"{render_point_counts_panel(payload)}"
+        f"{clause_html(clause_evidence(payload, mapping))}"
         f"{metrics}"
         f"{rc_panel}"
         f"{render_ownership_layout_panel(payload)}"
@@ -1111,11 +1113,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Render HTML summary for audit/self-test JSON reports")
     parser.add_argument("--input", action="append", required=True, help="Input JSON file (repeatable)")
     parser.add_argument("--output", required=True, help="Output HTML path")
+    from clause_mapping import load_mapping
+    parser.add_argument("--clause-map", type=Path, help="Replace the clause mapping in each audit.")
     args = parser.parse_args()
+    mapping = None
+    if args.clause_map:
+        if args.clause_map.resolve() == Path(args.output).resolve():
+            parser.error("--output must be distinct from --clause-map")
+        try:
+            mapping = load_mapping(args.clause_map)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     paths = [Path(p) for p in args.input]
     out = Path(args.output)
-    write_html([(path, load_json(path)) for path in paths], out)
+    write_html([(path, load_json(path)) for path in paths], out, mapping)
     print(out)
     return 0
 
@@ -1142,7 +1154,7 @@ def runtime_payload(rows, name, profile=None):
     return {"profile": name, "expect": expect, "runtime_sweep_results": rows, "summary": {"runtime_sweep": summary}}
 
 
-def write_html(inputs, out):
+def write_html(inputs, out, mapping=None):
     cards: List[str] = []
     audit_summaries: List[Dict[str, Any]] = []
     matrix_summaries: List[Dict[str, Any]] = []
@@ -1161,7 +1173,7 @@ def write_html(inputs, out):
                 elif "point_counts" not in sweep:
                     sweep = {**sweep, "point_counts": ReportRun(payload, path.stem).counts}
                 payload = {**payload, "summary": {**summary, "runtime_sweep": sweep}}
-            card, summary = render_audit_card(path, payload)
+            card, summary = render_audit_card(path, payload, mapping)
             cards.append(card)
             audit_summaries.append(summary)
         elif kind == "self_test":

@@ -50,7 +50,8 @@ def write_formats(args, runs, root):
         args.sarif.write_text(json.dumps(sarif_report(runs, location_root), indent=2) + "\n", encoding="utf-8")
     if getattr(args, "html", None):
         from render_results_html import write_html
-        write_html([(r.profile_path or Path(r.name), {**r.data, "profile": r.name}) for r in runs], args.html)
+        write_html([(r.profile_path or Path(r.name), {**r.data, "profile": r.name}) for r in runs],
+                   args.html, vars(args).get("clause_mapping"))
 
 
 def profile_run(args, data, profile, root, name=None):
@@ -61,6 +62,8 @@ def profile_run(args, data, profile, root, name=None):
 
 
 def write_audit_report(args, data, profile, root, runs=None):
+    from clause_evidence import clause_evidence
+    data = {**data, "clause_evidence": clause_evidence(data, vars(args).get("clause_mapping"))}
     path = Path(args.output)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")

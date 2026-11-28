@@ -1123,6 +1123,8 @@ def parse_args() -> argparse.Namespace:
         "--resume-state-search", metavar="CHECKPOINT", type=Path,
         help="Continue a limited recovery search with this invocation's state and time budgets.",
     )
+    from clause_mapping import load_mapping
+    parser.add_argument("--clause-map", type=Path, help="Replacement YAML mapping for report evidence.")
     add_report_options(parser)
     parser.add_argument(
         "--evaluation-mode",
@@ -1280,7 +1282,14 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
-    validate_report_paths(parser, args, [args.profile, args.resume_state_search])
+    validate_report_paths(parser, args, [args.profile, args.resume_state_search, args.clause_map])
+    if args.clause_map:
+        if args.clause_map.resolve() == Path(args.output).resolve():
+            parser.error("--output must be distinct from --clause-map")
+        try:
+            args.clause_mapping = load_mapping(args.clause_map)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.resume_state_search and args.resume_state_search.resolve() == Path(args.output).resolve():
         parser.error("--output must be distinct from --resume-state-search")
     if args.workers < 1 or args.workers > 64:

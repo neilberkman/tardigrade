@@ -267,8 +267,9 @@ def test_auxiliary_findings_and_infrastructure():
 
 
 def test_live_audit_preserves_json_bytes_and_writes_requested_formats(tmp_path):
+    from clause_evidence import clause_evidence
     data = json.loads(EXAMPLE.read_text())
-    expected = json.dumps(data, sort_keys=True, indent=2).encode()
+    expected = json.dumps({**data, "clause_evidence": clause_evidence(data)}, sort_keys=True, indent=2).encode()
     from profile_loader import load_profile
     path = ROOT / data["profile_path"]
     profile = load_profile(path)

@@ -178,6 +178,8 @@ def merge_runtime_sweep_payloads(
     for key in ("contracts", "calibration", "clean_trace"):
         if key in first:
             merged_payload[key] = first.get(key)
+    from clause_evidence import clause_evidence
+    merged_payload["clause_evidence"] = clause_evidence(merged_payload)
     return merged_payload
 
 
