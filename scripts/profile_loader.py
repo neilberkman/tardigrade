@@ -1871,6 +1871,7 @@ class FaultSweepConfig:
         "_resolved_boot_cycle_hook",
         "vtor_settle_iters",
         "tracking_start_address",
+        "recovery_tracking_start_address",
         "calibration_stop",
         "expected_rollback_at_cycle",
         "phase2_fault",
@@ -1967,6 +1968,7 @@ class FaultSweepConfig:
         torn_word_seed: int = 0,
         include_erase_fault_points: bool = False,
         trace_replay_cross_check_every: int = 100,
+        recovery_tracking_start_address: Optional[int] = None,
     ) -> None:
         self.mode = mode
         self.max_writes = max_writes
@@ -2031,6 +2033,14 @@ class FaultSweepConfig:
             raise ProfileError(
                 "fault_sweep.tracking_start_address must be a 32-bit address"
             )
+        if recovery_tracking_start_address is not None and (
+            isinstance(recovery_tracking_start_address, bool)
+            or not 0 <= recovery_tracking_start_address <= 0xFFFFFFFF
+        ):
+            raise ProfileError(
+                "fault_sweep.recovery_tracking_start_address must be reset or a 32-bit address"
+            )
+        self.recovery_tracking_start_address = recovery_tracking_start_address
         self.calibration_stop = calibration_stop or CalibrationStopConfig()
         self.calibration_time_slice = (
             str(calibration_time_slice).strip()
@@ -3579,6 +3589,12 @@ class ProfileConfig:
             ),
             "RUNTIME_MODE:true",
         ]
+        if fs.recovery_tracking_start_address is not None:
+            vars_list.append(
+                "RECOVERY_TRACKING_START_ADDRESS:0x{:08X}".format(
+                    fs.recovery_tracking_start_address
+                )
+            )
         if fs.mram_torn_word_choices:
             vars_list.append(
                 "MRAM_TORN_WORD_CHOICES:{}".format(
@@ -5181,6 +5197,14 @@ def _parse_fault_sweep(
         tracking_start_address=_parse_int(
             raw.get("tracking_start_address", 0),
             "fault_sweep.tracking_start_address",
+        ),
+        recovery_tracking_start_address=(
+            None if "recovery_tracking_start_address" not in raw
+            else 0 if raw["recovery_tracking_start_address"] == "reset"
+            else _parse_int(
+                raw["recovery_tracking_start_address"],
+                "fault_sweep.recovery_tracking_start_address",
+            )
         ),
         calibration_stop=_parse_calibration_stop(raw.get("calibration_stop")),
         expected_rollback_at_cycle=expected_rollback_at_cycle,
@@ -8354,7 +8378,7 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
         "evaluation_mode", "sweep_strategy", "sweep_hash_bypass_symbols",
         "progress_stall_timeout_s", "boot_cycles", "boot_cycle_hook",
         "vtor_settle_iters",
-        "tracking_start_address", "calibration_stop",
+        "tracking_start_address", "recovery_tracking_start_address", "calibration_stop",
         "expected_rollback_at_cycle", "phase2_fault", "hook_fault",
         "confirm_cycle", "multi_fault", "read_fault_config",
         "instruction_skip_config", "timed_bit_corruption_config",

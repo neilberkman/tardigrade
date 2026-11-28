@@ -61,6 +61,7 @@ ${FAULT_TYPE_CSV}              ${EMPTY}
 ${BOOT_CYCLES}                 1
 ${VTOR_SETTLE_ITERS}           0
 ${TRACKING_START_ADDRESS}      0
+${RECOVERY_TRACKING_START_ADDRESS}    ${EMPTY}
 ${MRAM_TORN_WORD}              half
 ${MRAM_TORN_WORD_SEED}         0
 ${MRAM_TORN_WORD_CHOICES}      ${EMPTY}
@@ -263,6 +264,7 @@ Run Runtime Fault Point
     Execute Command    $boot_cycles="${BOOT_CYCLES}"
     Execute Command    $vtor_settle_iters="${VTOR_SETTLE_ITERS}"
     Execute Command    $tracking_start_address="${TRACKING_START_ADDRESS}"
+    Execute Command    $recovery_tracking_start_address="${RECOVERY_TRACKING_START_ADDRESS}"
     Execute Command    $mram_torn_word="${MRAM_TORN_WORD}"
     Execute Command    $mram_torn_word_seed="${MRAM_TORN_WORD_SEED}"
     Execute Command    $mram_torn_word_choices="${MRAM_TORN_WORD_CHOICES}"
