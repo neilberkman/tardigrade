@@ -336,6 +336,20 @@ def _estimate_batch_runtime_seconds(
                 len(fault_points) * writeback_point_cost_s
             )
         trace_replay_point_cost_s = 1.25 if "stm32f4" in platform else 0.9
+        approved_cfg = getattr(
+            getattr(profile, "success_criteria", None),
+            "approved_image_running",
+            None,
+        )
+        if approved_cfg is not None:
+            # approved_image_running disables the fast Python state evaluator
+            # and runs every trace-replay point on the CPU through dwell_s
+            # (or up to the Phase 2 slice budget on pre-handoff boot faults).
+            dwell_s = float(getattr(approved_cfg, "dwell_s", 0.25) or 0.25)
+            trace_replay_point_cost_s = max(
+                trace_replay_point_cost_s,
+                12.0 + max(1.0, dwell_s * 4.0),
+            )
         return update_sequence_overhead_s + (len(fault_points) * trace_replay_point_cost_s)
 
     sequential_faults = {"w", "b", "e", "a", "s", "g", "x", "d", "l", "r", "k"}

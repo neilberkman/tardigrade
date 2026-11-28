@@ -1388,3 +1388,25 @@ def test_approved_image_running_unapproved_known_image_and_early_handoff_stop(tm
     )
 
 
+def test_trace_replay_batch_runtime_estimator_accounts_for_approved_image_running() -> None:
+    from renode_runner import _estimate_batch_runtime_seconds
+
+    profile = load_profile(
+        str(ROOT / "profiles" / "mcuboot_pr2109_scratch_broken.yaml")
+    )
+    points = list(range(128))
+    fault_types = ["w"] * 128
+    estimated_s = _estimate_batch_runtime_seconds(
+        profile=profile,
+        fault_points=points,
+        fault_types_list=fault_types,
+        trace_replay=True,
+    )
+    # 128 CPU-executed trace-replay points with approved_image_running (including
+    # pre-handoff hard_fault points that run to the Phase 2 slice budget) need
+    # well above the legacy 115.2s (0.9s/pt) estimate so Robot's suite timeout
+    # does not prematurely abort and split 128-point chunks.
+    assert estimated_s >= 1500.0
+
+
+
