@@ -851,6 +851,7 @@ class MemoryConfig:
         "write_granularity",
         "page_size",
         "page_size_explicit",
+        "flash_timing",
         "erase_fill",
         "slots",
         "bootloader_region",
@@ -878,7 +879,9 @@ class MemoryConfig:
         erase_fill: Optional[int] = None,
         retained_regions: Optional[List[MemoryRegionConfig]] = None,
         vbat_present: Optional[bool] = None,
+        flash_timing: Optional[str | Dict[str, int]] = None,
     ) -> None:
+        self.flash_timing = flash_timing
         self.sram_start = sram_start
         self.sram_end = sram_end
         self.write_granularity = write_granularity
@@ -3704,6 +3707,11 @@ class ProfileConfig:
         self.extra_peripherals = extra_peripherals or []
         self.success_criteria = success_criteria
         self.fault_sweep = fault_sweep
+        if memory.flash_timing and (
+            fault_sweep.mode != "runtime"
+            or fault_sweep.evaluation_mode != "execute"
+        ):
+            raise ProfileError("memory.flash_timing requires a runtime execute profile")
         self.state_fuzzer = state_fuzzer
         self.expect = expect
         self.profile_path = profile_path
@@ -4955,6 +4963,13 @@ class ProfileConfig:
         if self.flash_backend:
             vars_list.append("FLASH_BACKEND:{}".format(self.flash_backend))
 
+        timing = self.memory.flash_timing
+        if timing:
+            if isinstance(timing, dict):
+                vars_list.append("FLASH_TIMING:{program_us},{erase_us}".format(**timing))
+            else:
+                vars_list.append("FLASH_TIMING:{}".format(timing))
+
         # NVM controller: optional separate command-based controller peripheral
         # (e.g. for MRAM platforms where flash_backend is the memory, not the
         # controller).  Enables command_drop fault injection on MRAM paths.
@@ -5484,6 +5499,21 @@ def _parse_memory_regions(
     return regions
 
 
+def _parse_flash_timing(raw: Any) -> Optional[str | Dict[str, int]]:
+    # PyYAML also decodes unquoted 'off' as False.
+    if raw is None or raw is False or raw == "off":
+        return None
+    if raw in ("typical", "maximum"):
+        return raw
+    if isinstance(raw, dict) and set(raw) == {"program_us", "erase_us"}:
+        if all(type(v) is int and 0 < v <= 0xFFFFFFFF for v in raw.values()):
+            return dict(raw)
+    raise ProfileError(
+        "memory.flash_timing expects off, typical, maximum, or positive uint32 "
+        "program_us and erase_us"
+    )
+
+
 def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
     sram = _require(raw, "sram", "memory")
     sram_start = _parse_int(_require(sram, "start", "memory.sram"), "memory.sram.start")
@@ -5579,6 +5609,7 @@ def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
         retained_regions=_parse_memory_regions(raw.get("retained_regions"), "memory.retained_regions"),
         vbat_present=_parse_bool(raw["vbat_present"], "memory.vbat_present") if "vbat_present" in raw else None,
         page_size_explicit=("page_size" in raw),
+        flash_timing=_parse_flash_timing(raw.get("flash_timing")),
         erase_fill=erase_fill,
     )
 
@@ -10088,7 +10119,7 @@ def _validate_strict_memory(raw: Any, context: str) -> None:
         raw,
         frozenset(
             {
-                "sram", "write_granularity", "page_size", "erase_fill", "slots",
+                "sram", "write_granularity", "page_size", "erase_fill", "slots", "flash_timing",
                 "bootloader_region", "trace_address_map", "erase_regions",
                 "postmortem_partitions", "volatile_regions", "retained_regions", "vbat_present",
             }

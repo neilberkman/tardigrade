@@ -274,6 +274,25 @@ memory:
 
 `erase_fill` is an optional single-byte value (`0x00`–`0xFF`) that overrides the default erased-memory byte used to pad short images for digest checks and writeback reconstruction. Set it when a backend erases to a non-default byte (for example, `memory.erase_fill: 0xFF` for an MRAM peripheral with `EraseFill: 0xFF`). At runtime, before images load, the sweep compares the padding byte in use against the live backend's `EraseFill` and stops with an error if they differ.
 
+### Flash program and erase timing
+
+Use `memory.flash_timing` on a runtime execute profile (either a zero-point control or a full fault sweep) to run with datasheet program and erase latencies on the Renode virtual clock. Omitting the setting or selecting `off` uses the default instantaneous operations.
+
+```yaml
+memory:
+  flash_timing: typical
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+```
+
+Use `typical` or `maximum` with the nRF52840 (`NRF52NVMC`), STM32F103 (`STM32F1FlashController`), STM32F429 (`STM32F4FlashController`, `STM32F4FastFlash`), STM32L476 (`STM32L4FlashController`), STM32H743/H753 (`STM32H7FlashController`, `STM32H7FastFlash`), or 28F128J3 CFI (`CFIFlash`) models. The nRF52840 datasheet gives a single value for each operation (`41 µs` word write, `85 ms` page erase, `169 ms` mass erase), which are used for both `typical` and `maximum`. On STM32F103, half-word programming (`53 / 70 µs`) and 1 KiB page or mass erases (`20 / 40 ms`) hold `FLASH_SR.BSY`. On STM32L476, double-word programming (`82 / 91 µs`), 32-double-word fast row programming (`1.91 / 2.12 ms`), 2 KiB page erases (`22.02 / 24.47 ms`), and bank/mass erases (`22.13 / 24.59 ms`) hold `FLASH_SR.BSY`. On STM32F429, external-VPP sector, bank, and mass erases support `typical` timing only. The STM32H7 models have separate bank timers and start one program timer for a full 32-byte flash word or an explicit force-write. [Part numbers, datasheet revisions and timing tables](flash-timing.md)
+
+For an `NVMemory` backend, including its generic command controllers, supply measured microseconds for the platform. For example, `flash_timing: {program_us: 20, erase_us: 5000}` charges 20 µs per program unit and 5 ms per erase command. These example values describe a synthetic device. The mapped MRAM tracker, AN521 code SRAM and OTP peripheral have no part timing profile.
+
+Firmware issues a command, polls the part's status register, and sees the updated storage at expiry. Resetting an unarmed device during that interval discards its pending program, buffered data or erase while preserving previously completed units. When a power-loss, write, or erase fault is armed at operation $N$, operations $1 \dots N-1$ complete at their configured deadlines and the cut interrupts operation $N$ mid-flight, applying the configured torn-program or interrupted-erase outcome without letting the completion timer overwrite the faulted state.
+
 ### Postmortem flash evidence
 
 For no-boot diagnostics, declare non-uniform erase geometry and optional

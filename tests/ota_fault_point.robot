@@ -120,6 +120,7 @@ ${RESUME_TRACE_WALL_TIMEOUT_S}    30
 ${EXTRA_PERIPHERALS}           ${EMPTY}
 ${WATCHDOG_FREQUENCY}          ${EMPTY}
 ${FLASH_BACKEND}               ${EMPTY}
+${FLASH_TIMING}                ${EMPTY}
 ${NVM_CONTROLLER}              ${EMPTY}
 ${BOOT_REGISTER_PRE_WRITES}    ${EMPTY}
 ${BOOT_REGISTERS}              ${EMPTY}
@@ -174,6 +175,7 @@ Load Runtime Scenario
     [Documentation]    Profile-driven runtime scenario: load peripheral, platform, ELF, and seed images.
     Should Not Be Empty    ${BOOTLOADER_ELF}    BOOTLOADER_ELF is required
     Execute Command    include "${ROOT}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${ROOT}/peripherals/FlashTiming.cs"
     Execute Command    include "${ROOT}/peripherals/NVMemoryController.cs"
     Execute Command    include "${ROOT}/peripherals/GenericNvmController.cs"
     Execute Command    include "${ROOT}/peripherals/FaultTracker.cs"
@@ -269,6 +271,7 @@ Run Runtime Fault Point
     Execute Command    $boundary_phase="${BOUNDARY_PHASE}"
     Execute Command    $boundary_acceptance="${BOUNDARY_ACCEPTANCE}"
     Execute Command    $flash_backend="${FLASH_BACKEND}"
+    Execute Command    $flash_timing="${FLASH_TIMING}"
     Run Keyword If    '${NVM_CONTROLLER}' != ''    Execute Command    $nvm_controller="${NVM_CONTROLLER}"
     Execute Command    $enable_machine_snapshots="${ENABLE_MACHINE_SNAPSHOTS}"
     Execute Command    $success_vtor_slot="${SUCCESS_VTOR_SLOT}"

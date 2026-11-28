@@ -372,7 +372,8 @@ def resolve_runtime_step_limit(configured_value, duration_value, cpu_ref):
         performance_mips = 100.0
         performance_source = 'fallback_100_mips'
 
-    if configured > 0:
+    active_timing = globals().get('get_optional_var', lambda *_a: '')('flash_timing', '').strip().lower()
+    if configured > 0 and active_timing in ('', 'off'):
         return {
             'value': configured,
             'configured': configured,
@@ -394,6 +395,18 @@ def resolve_runtime_step_limit(configured_value, duration_value, cpu_ref):
         (budget_s * performance_mips * 1000000.0 * 2.0) + 0.999999
     )
     derived = max(1, min(2000000000, derived))
+    if configured > 0:
+        effective = max(configured, derived)
+        return {
+            'value': effective,
+            'configured': configured,
+            'source': 'flash_timing_scaled_profile' if effective > configured else 'profile',
+            'duration_s': duration_s,
+            'budget_s': budget_s,
+            'headroom': 2.0,
+            'performance_mips': performance_mips,
+            'performance_source': performance_source,
+        }
     return {
         'value': derived,
         'configured': None,
@@ -8694,6 +8707,9 @@ def reset_nvmc_for_sweep(tracking_start=None):
     disarm_controller_fault()
     # Reset I2C fault state.
     disarm_i2c_fault()
+    _active_flash_timing = globals().get('get_optional_var', lambda *_a: '')('flash_timing', '')
+    if _active_flash_timing and 'configure_control_flash_timing' in globals():
+        configure_control_flash_timing(_active_flash_timing)
 
 def reset_nvmc_for_recovery(tracking_start=0):
     # Reset NVM for recovery boot: count recovery writes regardless of any
@@ -8756,6 +8772,8 @@ def reset_nvmc_for_recovery(tracking_start=0):
         # for progress tracking. Avoids O(flash_size) ReadBytes per write.
         b['data'].SkipShadowScan = True
         b['data'].PassthroughMode = True
+        if hasattr(b['data'], 'InvalidateShadow'):
+            b['data'].InvalidateShadow()
         disarm_fault()
     else:
         b['data'].Nvm.TotalWordWrites = 0
@@ -8788,6 +8806,9 @@ def reset_nvmc_for_recovery(tracking_start=0):
     _set_preserve_counters_across_reset(True)
     # Reset I2C fault state for recovery boot.
     disarm_i2c_fault()
+    _active_flash_timing = globals().get('get_optional_var', lambda *_a: '')('flash_timing', '')
+    if _active_flash_timing and 'configure_control_flash_timing' in globals():
+        configure_control_flash_timing(_active_flash_timing)
 
 
 def get_machine_snapshot_path(kind):
@@ -12433,6 +12454,11 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         slice_s = max(0.001, float(time_slice))
     except Exception:
         slice_s = 0.02
+    _active_timing_var = globals().get('get_optional_var', lambda *_a: '')('flash_timing', '').strip().lower()
+    if _active_timing_var not in ('', 'off') and max_iters == 200 and 'phase1_max_iters' in globals():
+        max_iters = max(int(max_iters), int(phase1_max_iters(default_s=4.0, time_slice_s=slice_s)))
+        if 'phase1_wall_timeout' in globals():
+            wall_timeout = max(float(wall_timeout), float(phase1_wall_timeout(default_s=4.0)))
     emulated_s = 0.0
     reason = 'budget'
     runfor_infrastructure_error = None
@@ -14593,13 +14619,49 @@ def phase1_wall_timeout(default_s=4.0, min_wall_s=120.0, wall_per_emulated_s=30.
         duration_s = phase1_budget_duration(default_s=default_s)
     else:
         duration_s = max(0.02, float(budget_s))
+    _active_timing_var = globals().get('get_optional_var', lambda *_a: '')('flash_timing', '').strip().lower()
+    if _active_timing_var not in ('', 'off'):
+        min_wall_s = max(float(min_wall_s), float(globals().get('phase2_wall_timeout_s', 120.0)))
     stall_floor_s = max(float(min_wall_s), float(progress_stall_timeout_s) * 3.0)
     duration_budget_s = max(float(min_wall_s), duration_s * float(wall_per_emulated_s))
     return max(int(stall_floor_s + 0.999), int(duration_budget_s + 0.999))
 
 
+def configure_control_flash_timing(timing):
+    # Image loading, baseline restore and setup writes finish before the
+    # firmware starts issuing timed controller commands.
+    timing = str(timing or '').strip().lower()
+    if not timing:
+        return
+    device = backend['data']
+    if timing == 'off':
+        if hasattr(device, 'OperationTiming'):
+            from System import Enum
+            device.OperationTiming = Enum.Parse(device.OperationTiming.GetType(), 'off', True)
+        storage = getattr(device, 'Nvm', None) or device
+        if hasattr(storage, 'EraseLatencyMicros'):
+            storage.WriteLatencyMicros = 0
+            storage.EraseLatencyMicros = 0
+        return
+    if timing in ('typical', 'maximum'):
+        if not hasattr(device, 'OperationTiming'):
+            raise ValueError('flash backend has no part-specific timing table')
+        from System import Enum
+        device.OperationTiming = Enum.Parse(device.OperationTiming.GetType(), timing, True)
+    else:
+        storage = getattr(device, 'Nvm', None) or device
+        if not hasattr(storage, 'EraseLatencyMicros'):
+            raise ValueError('flash backend has no configurable operation clock')
+        program_us, erase_us = timing.split(',')
+        storage.WriteLatencyMicros = int(program_us)
+        storage.EraseLatencyMicros = int(erase_us)
+
+
 def run_control_phase1(cpu_ref, label='control_p1', vtor_settle_iters=0):
     global progress_stall_timeout_s
+    timing = get_optional_var('flash_timing', '')
+    if timing:
+        configure_control_flash_timing(timing)
     control_budget_s = phase1_budget_duration(
         default_s=4.0,
         prefer_run_duration=zero_point_execute_control,
