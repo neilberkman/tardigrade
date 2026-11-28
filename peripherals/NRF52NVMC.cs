@@ -81,8 +81,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             wenSnapshot = null;
             operationTraceShadow = null;
             wenWriteOffsets.Clear();
+<<<<<<< HEAD
             wenWritePcs.Clear();
             wenWriteContexts.Clear();
+=======
+            wenFlushedAnyInWindow = false;
+>>>>>>> ba94e842 (Flush NRF52NVMC WEN writes on READY reads and non-WEN transitions)
             OperationTraceFastMode = false;
             memoryAccessHookInstalled = false;
             UpdateMemoryAccessHook(false);
@@ -197,8 +201,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private byte[] wenSnapshot;
         private readonly List<int> wenWriteOffsets = new List<int>();
+<<<<<<< HEAD
         private readonly Dictionary<int, ulong> wenWritePcs = new Dictionary<int, ulong>();
         private readonly Dictionary<int, string> wenWriteContexts = new Dictionary<int, string>();
+=======
+        private bool wenFlushedAnyInWindow;
+>>>>>>> ba94e842 (Flush NRF52NVMC WEN writes on READY reads and non-WEN transitions)
         private bool memoryAccessHookInstalled;
 
         private ulong CurrentCpuPc()
@@ -442,10 +450,231 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             flash.WriteBytes(offset, fillData, 0, fillData.Length);
         }
 
+        private void FlushWenWrites(bool keepWenOpen)
+        {
+            if(Flash == null || FlashSize <= 0)
+            {
+                return;
+            }
+            var configWritePc = CurrentCpuPc();
+            bool directOperationTrace = OperationTraceFastMode
+                && WriteTraceEnabled
+                && FaultAtWordWrite == ulong.MaxValue
+                && WriteFaultMode == 0;
+            if(wenSnapshot != null && !AnyFaultFired)
+            {
+                int len = checked((int)FlashSize);
+                if(wenWriteOffsets.Count > 0)
+                {
+                    wenFlushedAnyInWindow = true;
+                    for(int idx = 0; idx < wenWriteOffsets.Count; idx++)
+                    {
+                        int off = wenWriteOffsets[idx];
+                        if(off < 0 || off > len - 4)
+                        {
+                            continue;
+                        }
+                        var currentWord = Flash.ReadBytes(off, 4);
+                        bool changed = currentWord[0] != wenSnapshot[off]
+                                    || currentWord[1] != wenSnapshot[off + 1]
+                                    || currentWord[2] != wenSnapshot[off + 2]
+                                    || currentWord[3] != wenSnapshot[off + 3];
+                        if(!changed)
+                        {
+                            continue;
+                        }
+
+                        uint val32 = (uint)(currentWord[0]
+                            | (currentWord[1] << 8)
+                            | (currentWord[2] << 16)
+                            | (currentWord[3] << 24));
+
+                        tracker.PendingPC = ResolveWritePc(off, configWritePc);
+                        tracker.PendingCallContext = ResolveWriteContext(off);
+                        if(tracker.RecordWriteAndCheckFault(off, val32, 4))
+                        {
+                            FaultFired = true;
+                            LastFaultAddress = (uint)(FlashBaseAddress + off);
+
+                            var current = Flash.ReadBytes(0, len);
+                            var snap = new byte[len];
+                            Array.Copy(wenSnapshot, snap, len);
+
+                            if(WriteFaultMode == 0)
+                            {
+                                ApplyTornProgramAtOffset(snap, wenSnapshot, current, off, len);
+                                Flash.WriteBytes(0, snap, 0, len);
+                                FaultFlashSnapshot = snap;
+                            }
+                            else
+                            {
+                                var faultedCurrent = new byte[len];
+                                Array.Copy(current, faultedCurrent, len);
+                                ApplyWriteFaultAtOffset(faultedCurrent, wenSnapshot, current, off, len);
+                                Flash.WriteBytes(0, faultedCurrent, 0, len);
+                                FaultFlashSnapshot = faultedCurrent;
+                            }
+                            break;
+                        }
+
+                        wenSnapshot[off]     = currentWord[0];
+                        wenSnapshot[off + 1] = currentWord[1];
+                        wenSnapshot[off + 2] = currentWord[2];
+                        wenSnapshot[off + 3] = currentWord[3];
+                    }
+                    wenWriteOffsets.Clear();
+                    wenWritePcs.Clear();
+                    wenWriteContexts.Clear();
+                }
+                else if(!keepWenOpen && !wenFlushedAnyInWindow)
+                {
+                    var current = Flash.ReadBytes(0, len);
+                    for(int off = 0; off <= len - 4; off += 4)
+                    {
+                        bool changed = current[off]     != wenSnapshot[off]
+                                    || current[off + 1] != wenSnapshot[off + 1]
+                                    || current[off + 2] != wenSnapshot[off + 2]
+                                    || current[off + 3] != wenSnapshot[off + 3];
+                        if(!changed)
+                        {
+                            continue;
+                        }
+
+                        uint val32 = (uint)(current[off]
+                            | (current[off + 1] << 8)
+                            | (current[off + 2] << 16)
+                            | (current[off + 3] << 24));
+
+                        tracker.PendingPC = ResolveWritePc(off, configWritePc);
+                        tracker.PendingCallContext = ResolveWriteContext(off);
+                        if(tracker.RecordWriteAndCheckFault(off, val32, 4))
+                        {
+                            FaultFired = true;
+                            LastFaultAddress = (uint)(FlashBaseAddress + off);
+
+                            // Build partial snapshot: pre-WEN state
+                            // with words before the fault fully applied.
+                            var snap = new byte[len];
+                            Array.Copy(wenSnapshot, snap, len);
+                            for(int j = 0; j < off; j += 4)
+                            {
+                                if(j > len - 4) break;
+                                if(current[j]     != wenSnapshot[j]
+                                || current[j + 1] != wenSnapshot[j + 1]
+                                || current[j + 2] != wenSnapshot[j + 2]
+                                || current[j + 3] != wenSnapshot[j + 3])
+                                {
+                                    snap[j]     = current[j];
+                                    snap[j + 1] = current[j + 1];
+                                    snap[j + 2] = current[j + 2];
+                                    snap[j + 3] = current[j + 3];
+                                }
+                            }
+
+                            // Power-loss mode resumes from the partial
+                            // pre-WEN snapshot above.  Other write faults
+                            // continue executing, so their corruption must
+                            // be applied to the live mapped flash rather than
+                            // existing only in the diagnostic snapshot.
+                            if(WriteFaultMode == 0)
+                            {
+                                ApplyTornProgramAtOffset(snap, wenSnapshot, current, off, len);
+                                Flash.WriteBytes(0, snap, 0, len);
+                                FaultFlashSnapshot = snap;
+                            }
+                            else
+                            {
+                                var faultedCurrent = new byte[len];
+                                Array.Copy(current, faultedCurrent, len);
+                                ApplyWriteFaultAtOffset(faultedCurrent, wenSnapshot, current, off, len);
+                                Flash.WriteBytes(0, faultedCurrent, 0, len);
+                                FaultFlashSnapshot = faultedCurrent;
+                            }
+                            break; // Stop counting further words.
+                        }
+                    }
+                }
+            }
+            else if(directOperationTrace)
+            {
+                if(operationTraceShadow == null || operationTraceShadow.Length != FlashSize)
+                {
+                    throw new InvalidOperationException(
+                        "operation trace fast mode has no flash shadow");
+                }
+                if(wenWriteOffsets.Count > 0)
+                {
+                    wenFlushedAnyInWindow = true;
+                    for(int idx = 0; idx < wenWriteOffsets.Count; idx++)
+                    {
+                        int off = wenWriteOffsets[idx];
+                        var currentWord = Flash.ReadBytes(off, 4);
+                        bool changed = currentWord[0] != operationTraceShadow[off]
+                            || currentWord[1] != operationTraceShadow[off + 1]
+                            || currentWord[2] != operationTraceShadow[off + 2]
+                            || currentWord[3] != operationTraceShadow[off + 3];
+                        if(!changed)
+                        {
+                            continue;
+                        }
+                        uint val32 = (uint)(currentWord[0]
+                            | (currentWord[1] << 8)
+                            | (currentWord[2] << 16)
+                            | (currentWord[3] << 24));
+                        tracker.PendingPC = ResolveWritePc(off, configWritePc);
+                        tracker.PendingCallContext = ResolveWriteContext(off);
+                        tracker.RecordWriteAndCheckFault(off, val32, 4);
+                        operationTraceShadow[off] = currentWord[0];
+                        operationTraceShadow[off + 1] = currentWord[1];
+                        operationTraceShadow[off + 2] = currentWord[2];
+                        operationTraceShadow[off + 3] = currentWord[3];
+                    }
+                    wenWriteOffsets.Clear();
+                    wenWritePcs.Clear();
+                    wenWriteContexts.Clear();
+                }
+            }
+            else if(!AnyFaultFired && !keepWenOpen && !wenFlushedAnyInWindow)
+            {
+                // Fast path: assume 1 word write per WEN->REN.
+                // Only reachable for power-loss mode (WriteFaultMode==0)
+                // because the WEN entry guard captures wenSnapshot for
+                // all non-power-loss modes, routing them through the
+                // slow diff path above which calls ApplyWriteFaultAtOffset.
+                if(tracker.IncrementWriteCount(configWritePc))
+                {
+                    FaultFired = true;
+                    LastFaultAddress = 0;
+                    FaultFlashSnapshot = Flash.ReadBytes(0, checked((int)FlashSize));
+                }
+            }
+
+            if(!keepWenOpen)
+            {
+                wenWriteOffsets.Clear();
+                wenWritePcs.Clear();
+                wenWriteContexts.Clear();
+                wenSnapshot = null;
+                wenFlushedAnyInWindow = false;
+            }
+        }
+
         private void DefineRegisters()
         {
             // READY at 0x400 — always ready (instant operations).
-            Registers.Ready.Define(this, 1);
+            // Also flushes any pending WEN CPU writes so drivers that poll
+            // READY after each word without toggling CONFIG back to REN (e.g.
+            // rustBoot's nRF52840 HAL) still record exact per-word writes.
+            Registers.Ready.Define(this, 1)
+                .WithFlag(0, FieldMode.Read, name: "READY",
+                    valueProviderCallback: _ =>
+                    {
+                        if(configValue == 1 && wenWriteOffsets.Count > 0)
+                        {
+                            FlushWenWrites(keepWenOpen: true);
+                        }
+                        return true;
+                    });
 
             // READYNEXT at 0x408 — always ready.
             Registers.ReadyNext.Define(this, 1);
@@ -473,7 +702,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     if(Flash == null || FlashSize <= 0)
                     {
                         // No MappedMemory — fall back to simple counting.
-                        if(oldConfig == 1 && val == 0 && !AnyFaultFired)
+                        if(oldConfig == 1 && val != 1 && !AnyFaultFired)
                         {
                             if(tracker.IncrementWriteCount(CurrentCpuPc()))
                             {
@@ -481,6 +710,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                             }
                         }
                         return;
+                    }
+
+                    if(oldConfig == 1)
+                    {
+                        if(val != 1)
+                        {
+                            FlushWenWrites(keepWenOpen: false);
+                        }
+                        else if(wenWriteOffsets.Count > 0)
+                        {
+                            FlushWenWrites(keepWenOpen: true);
+                        }
                     }
 
                     // Are we close enough to the fault target to need
@@ -497,13 +738,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                             || (FaultAtWordWrite != ulong.MaxValue
                                 && TotalWordWrites + (ulong)DiffLookahead >= FaultAtWordWrite));
 
-                    // Entering WEN: snapshot flash if we need word-level diff,
-                    // or if WriteFaultMode requires pre/post comparison.
-                    if(val == 1 && oldConfig != 1)
+                    // Entering (or continuing) WEN: snapshot flash if we need
+                    // word-level diff, or if WriteFaultMode requires pre/post comparison.
+                    if(val == 1)
                     {
-                        wenWriteOffsets.Clear();
-                        wenWritePcs.Clear();
-                        wenWriteContexts.Clear();
+                        if(oldConfig != 1)
+                        {
+                            wenWriteOffsets.Clear();
+                            wenWritePcs.Clear();
+                            wenWriteContexts.Clear();
+                            wenFlushedAnyInWindow = false;
+                        }
                         bool wantSnap = needDiff || (!PassthroughMode && WriteFaultMode != 0 && !AnyFaultFired);
                         if(wantSnap)
                         {
@@ -511,7 +756,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                             {
                                 UpdateMemoryAccessHook(true);
                             }
-                            wenSnapshot = Flash.ReadBytes(0, checked((int)FlashSize));
+                            if(wenSnapshot == null)
+                            {
+                                wenSnapshot = Flash.ReadBytes(0, checked((int)FlashSize));
+                            }
                         }
                         else
                         {
@@ -525,193 +773,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                             }
                             wenSnapshot = null;
                         }
-                    }
-
-                    // Exiting WEN → REN.
-                    if(oldConfig == 1 && val == 0)
-                    {
-                        var configWritePc = CurrentCpuPc();
-                        if(wenSnapshot != null && !AnyFaultFired)
-                        {
-                            // Word-level diff mode: count each changed 4-byte word.
-                            var current = Flash.ReadBytes(0, checked((int)FlashSize));
-                            int len = checked((int)FlashSize);
-
-                            if(wenWriteOffsets.Count > 0)
-                            {
-                                for(int idx = 0; idx < wenWriteOffsets.Count; idx++)
-                                {
-                                    int off = wenWriteOffsets[idx];
-                                    if(off < 0 || off > len - 4)
-                                    {
-                                        continue;
-                                    }
-                                    bool changed = current[off]     != wenSnapshot[off]
-                                                || current[off + 1] != wenSnapshot[off + 1]
-                                                || current[off + 2] != wenSnapshot[off + 2]
-                                                || current[off + 3] != wenSnapshot[off + 3];
-                                    if(!changed)
-                                    {
-                                        continue;
-                                    }
-
-                                    uint val32 = (uint)(current[off]
-                                        | (current[off + 1] << 8)
-                                        | (current[off + 2] << 16)
-                                        | (current[off + 3] << 24));
-
-                                    tracker.PendingPC = ResolveWritePc(off, configWritePc);
-                                    tracker.PendingCallContext = ResolveWriteContext(off);
-                                    if(tracker.RecordWriteAndCheckFault(off, val32, 4))
-                                    {
-                                        FaultFired = true;
-                                        LastFaultAddress = (uint)(FlashBaseAddress + off);
-
-                                        var snap = new byte[len];
-                                        Array.Copy(wenSnapshot, snap, len);
-
-                                        if(WriteFaultMode == 0)
-                                        {
-                                            ApplyTornProgramAtOffset(snap, wenSnapshot, current, off, len);
-                                            Flash.WriteBytes(0, snap, 0, len);
-                                            FaultFlashSnapshot = snap;
-                                        }
-                                        else
-                                        {
-                                            var faultedCurrent = new byte[len];
-                                            Array.Copy(current, faultedCurrent, len);
-                                            ApplyWriteFaultAtOffset(faultedCurrent, wenSnapshot, current, off, len);
-                                            Flash.WriteBytes(0, faultedCurrent, 0, len);
-                                            FaultFlashSnapshot = faultedCurrent;
-                                        }
-                                        break;
-                                    }
-
-                                    wenSnapshot[off]     = current[off];
-                                    wenSnapshot[off + 1] = current[off + 1];
-                                    wenSnapshot[off + 2] = current[off + 2];
-                                    wenSnapshot[off + 3] = current[off + 3];
-                                }
-                            }
-                            else
-                            {
-                                for(int off = 0; off <= len - 4; off += 4)
-                                {
-                                    bool changed = current[off]     != wenSnapshot[off]
-                                                || current[off + 1] != wenSnapshot[off + 1]
-                                                || current[off + 2] != wenSnapshot[off + 2]
-                                                || current[off + 3] != wenSnapshot[off + 3];
-                                    if(!changed)
-                                    {
-                                        continue;
-                                    }
-
-                                    uint val32 = (uint)(current[off]
-                                        | (current[off + 1] << 8)
-                                        | (current[off + 2] << 16)
-                                        | (current[off + 3] << 24));
-
-                                    tracker.PendingPC = ResolveWritePc(off, configWritePc);
-                                    tracker.PendingCallContext = ResolveWriteContext(off);
-                                    if(tracker.RecordWriteAndCheckFault(off, val32, 4))
-                                    {
-                                        FaultFired = true;
-                                        LastFaultAddress = (uint)(FlashBaseAddress + off);
-
-                                        // Build partial snapshot: pre-WEN state
-                                        // with words before the fault fully applied.
-                                        var snap = new byte[len];
-                                        Array.Copy(wenSnapshot, snap, len);
-                                        for(int j = 0; j < off; j += 4)
-                                        {
-                                            if(j > len - 4) break;
-                                            if(current[j]     != wenSnapshot[j]
-                                            || current[j + 1] != wenSnapshot[j + 1]
-                                            || current[j + 2] != wenSnapshot[j + 2]
-                                            || current[j + 3] != wenSnapshot[j + 3])
-                                            {
-                                                snap[j]     = current[j];
-                                                snap[j + 1] = current[j + 1];
-                                                snap[j + 2] = current[j + 2];
-                                                snap[j + 3] = current[j + 3];
-                                            }
-                                        }
-
-                                        // Power-loss mode resumes from the partial
-                                        // pre-WEN snapshot above.  Other write faults
-                                        // continue executing, so their corruption must
-                                        // be applied to the live mapped flash rather than
-                                        // existing only in the diagnostic snapshot.
-                                        if(WriteFaultMode == 0)
-                                        {
-                                            ApplyTornProgramAtOffset(snap, wenSnapshot, current, off, len);
-                                            Flash.WriteBytes(0, snap, 0, len);
-                                            FaultFlashSnapshot = snap;
-                                        }
-                                        else
-                                        {
-                                            var faultedCurrent = new byte[len];
-                                            Array.Copy(current, faultedCurrent, len);
-                                            ApplyWriteFaultAtOffset(faultedCurrent, wenSnapshot, current, off, len);
-                                            Flash.WriteBytes(0, faultedCurrent, 0, len);
-                                            FaultFlashSnapshot = faultedCurrent;
-                                        }
-                                        break; // Stop counting further words.
-                                    }
-                                }
-                            }
-                        }
-                        else if(directOperationTrace)
-                        {
-                            if(operationTraceShadow == null || operationTraceShadow.Length != FlashSize)
-                            {
-                                throw new InvalidOperationException(
-                                    "operation trace fast mode has no flash shadow");
-                            }
-                            for(int idx = 0; idx < wenWriteOffsets.Count; idx++)
-                            {
-                                int off = wenWriteOffsets[idx];
-                                var currentWord = Flash.ReadBytes(off, 4);
-                                bool changed = currentWord[0] != operationTraceShadow[off]
-                                    || currentWord[1] != operationTraceShadow[off + 1]
-                                    || currentWord[2] != operationTraceShadow[off + 2]
-                                    || currentWord[3] != operationTraceShadow[off + 3];
-                                if(!changed)
-                                {
-                                    continue;
-                                }
-                                uint val32 = (uint)(currentWord[0]
-                                    | (currentWord[1] << 8)
-                                    | (currentWord[2] << 16)
-                                    | (currentWord[3] << 24));
-                                tracker.PendingPC = ResolveWritePc(off, configWritePc);
-                                tracker.PendingCallContext = ResolveWriteContext(off);
-                                tracker.RecordWriteAndCheckFault(off, val32, 4);
-                                operationTraceShadow[off] = currentWord[0];
-                                operationTraceShadow[off + 1] = currentWord[1];
-                                operationTraceShadow[off + 2] = currentWord[2];
-                                operationTraceShadow[off + 3] = currentWord[3];
-                            }
-                        }
-                        else if(!AnyFaultFired)
-                        {
-                            // Fast path: assume 1 word write per WEN->REN.
-                            // Only reachable for power-loss mode (WriteFaultMode==0)
-                            // because the WEN entry guard captures wenSnapshot for
-                            // all non-power-loss modes, routing them through the
-                            // slow diff path above which calls ApplyWriteFaultAtOffset.
-                            if(tracker.IncrementWriteCount(configWritePc))
-                            {
-                                FaultFired = true;
-                                LastFaultAddress = 0;
-                                FaultFlashSnapshot = Flash.ReadBytes(0, checked((int)FlashSize));
-                            }
-                        }
-
-                        wenWriteOffsets.Clear();
-                        wenWritePcs.Clear();
-                        wenWriteContexts.Clear();
-                        wenSnapshot = null;
                     }
                 }, valueProviderCallback: _ => configValue, name: "WEN");
 

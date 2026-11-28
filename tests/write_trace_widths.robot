@@ -169,6 +169,29 @@ NRF52 Trace Carries Reconstructed Word Width
     Should Contain    ${trace}    1:0:1144201745:4
     Should Be Equal As Numbers    ${value}    0x44332211
 
+NRF52 Ready Poll Flushes Consecutive WEN Writes Without REN Toggle
+    Create NRF52 Fast Machine
+    Execute Command    sysbus WriteDoubleWord 0x20000000 0x49054804
+    Execute Command    sysbus WriteDoubleWord 0x20000004 0x4B064A05
+    Execute Command    sysbus WriteDoubleWord 0x20000008 0x680C6002
+    Execute Command    sysbus WriteDoubleWord 0x2000000C 0x680C6043
+    Execute Command    sysbus WriteDoubleWord 0x20000010 0xBF00E7FE
+    Execute Command    sysbus WriteDoubleWord 0x20000014 0x0000C000
+    Execute Command    sysbus WriteDoubleWord 0x20000018 0x4001E400
+    Execute Command    sysbus WriteDoubleWord 0x2000001C 0x44332211
+    Execute Command    sysbus WriteDoubleWord 0x20000020 0x88776655
+    Execute Command    faultFlash WriteTraceClear
+    Execute Command    faultFlash TotalWordWrites 0
+    Execute Command    faultFlash WriteTraceEnabled true
+    Execute Command    sysbus WriteDoubleWord 0x4001E504 1
+    Execute Command    cpu PC 0x20000001
+    Execute Command    emulation RunFor "1us"
+    ${count}=    Execute Command    faultFlash WriteTraceCount
+    ${trace}=    Execute Command    faultFlash WriteTraceToString
+    Should Be Equal As Integers    ${count}    2
+    Should Contain    ${trace}    1:0:1144201745:4
+    Should Contain    ${trace}    2:4:2289526357:4
+
 AN521 Trace Uses Canonical Aligned Post-State Words
     Create AN521 Machine
     Execute Command    sysbus WriteDoubleWord 0x10000000 0xFFFFFFFF

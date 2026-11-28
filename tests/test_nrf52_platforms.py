@@ -26,6 +26,39 @@ class NRF52PlatformTests(unittest.TestCase):
                 self.assertIn("WriteDoubleWord 0x10001204 0x12", text)
                 self.assertIn("SystemInit programs them to 0x12", text)
 
+    def test_nrf52_nvmc_flushes_wen_writes_on_ready_reads_and_config_transitions(
+        self,
+    ) -> None:
+        source = (ROOT / "peripherals" / "NRF52NVMC.cs").read_text(encoding="utf-8")
+        self.assertIn("private void FlushWenWrites(bool keepWenOpen)", source)
+        self.assertIn("private bool wenFlushedAnyInWindow;", source)
+        self.assertIn(
+            'Registers.Ready.Define(this, 1)\n'
+            '                .WithFlag(0, FieldMode.Read, name: "READY",',
+            source,
+        )
+        self.assertIn(
+            "if(configValue == 1 && wenWriteOffsets.Count > 0)\n"
+            "                        {\n"
+            "                            FlushWenWrites(keepWenOpen: true);\n"
+            "                        }",
+            source,
+        )
+        self.assertIn(
+            "if(oldConfig == 1)\n"
+            "                    {\n"
+            "                        if(val != 1)\n"
+            "                        {\n"
+            "                            FlushWenWrites(keepWenOpen: false);\n"
+            "                        }\n"
+            "                        else if(wenWriteOffsets.Count > 0)\n"
+            "                        {\n"
+            "                            FlushWenWrites(keepWenOpen: true);\n"
+            "                        }\n"
+            "                    }",
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
