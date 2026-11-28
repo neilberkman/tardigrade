@@ -626,3 +626,212 @@ def test_runtime_recovery_coverage_hook_recording_and_merging() -> None:
     )
     assert result["recovery_coverage"]["boots_recorded"] == 2
     assert signals["recovery_coverage_blocks"] == 3
+
+
+def test_json_and_html_recovery_coverage_reports_with_and_without_dwarf(
+    tmp_path: Path,
+) -> None:
+    from audit_report import summarize_runtime_sweep
+    from render_results_html import write_html
+
+    # 1. With DWARF line info (MRAM deferred ELF).
+    dwarf_scope = build_recovery_coverage_scope(
+        MRAM_DEFERRED_ELF,
+        source_files=["firmware.c"],
+        mechanism="oneshot_address_hooks",
+    )
+    fn_by_name = {fn["name"]: fn for fn in dwarf_scope["functions"]}
+    reset_pcs = fn_by_name["Reset_Handler"]["probe_pcs"]
+    gate_pcs = fn_by_name["tracking_gate"]["probe_pcs"]
+    hardfault_pcs = fn_by_name["HardFault_Handler"]["probe_pcs"]
+
+    dwarf_results = [
+        {
+            "fault_at": -1,
+            "fault_requested": -1,
+            "fault_type": "control",
+            "fault_injected": False,
+            "is_control": True,
+            "boot_outcome": "success",
+            "boot_slot": "exec",
+            "recovery_coverage": {
+                "enabled": True,
+                "mechanism": "oneshot_address_hooks",
+                "executed_pcs": list(reset_pcs[:4]) + list(gate_pcs),
+                "recording_overhead_s": 0.0012,
+                "boot_wall_time_s": 0.020,
+            },
+        },
+        {
+            "fault_at": 0,
+            "fault_requested": 0,
+            "fault_type": "rs",
+            "fault_injected": True,
+            "boot_outcome": "no_boot",
+            "boot_slot": None,
+            "recovery_state_search": {
+                "generation": 1,
+                "state_identity": "aa" * 32,
+                "chain": {
+                    "text": "w=0 (0x10100100)",
+                    "cuts": [
+                        {
+                            "cut": 1,
+                            "operation": "write",
+                            "operation_index": 0,
+                            "fault_type": "power_loss",
+                            "address": "0x10100100",
+                        }
+                    ],
+                },
+            },
+            "recovery_coverage": {
+                "enabled": True,
+                "mechanism": "oneshot_address_hooks",
+                "executed_pcs": [reset_pcs[0]] + list(hardfault_pcs),
+                "recording_overhead_s": 0.0009,
+                "boot_wall_time_s": 0.018,
+            },
+        },
+    ]
+    dwarf_summary = summarize_runtime_sweep(
+        dwarf_results,
+        expected_fault_points=1,
+        expected_control_points=1,
+        planned_fault_types=["rs"],
+        recovery_coverage_scope=dwarf_scope,
+    )
+    assert "recovery_coverage" in dwarf_summary
+    cov_report = dwarf_summary["recovery_coverage"]
+    assert cov_report["line_info_available"] is True
+    assert cov_report["granularity"] == "function_and_line"
+    assert cov_report["line_summary"] is not None
+    assert cov_report["function_summary"]["executed_by_control_count"] == 2
+    assert cov_report["function_summary"]["executed_only_under_cut_count"] == 1
+    assert cov_report["function_summary"]["never_executed_by_cut_count"] >= 1
+
+    dwarf_payload = {
+        "profile": "phase2_mram_deferred_state_search_16_uncorrectable",
+        "verdict": "FAIL — found 1 issue points",
+        "summary": {"runtime_sweep": dwarf_summary},
+        "recovery_coverage": cov_report,
+        "runtime_sweep_results": dwarf_results,
+    }
+    dwarf_html_path = tmp_path / "dwarf_report.html"
+    write_html([(Path("dwarf.json"), dwarf_payload)], dwarf_html_path)
+    dwarf_html = dwarf_html_path.read_text(encoding="utf-8")
+    assert "recovery code coverage" in dwarf_html
+    assert "function_and_line // oneshot_address_hooks" in dwarf_html
+    assert "recovery coverage by source line" in dwarf_html
+    assert "recovery coverage vs. boots" in dwarf_html
+    assert "HardFault_Handler" in dwarf_html
+    assert "executed_only_under_cut" in dwarf_html
+    assert "w=0 (0x10100100)" in dwarf_html
+
+    # 2. Without DWARF line info (MCUboot PR 3011 ELF).
+    nodwarf_scope = build_recovery_coverage_scope(
+        MCUBOOT_PR3011_ELF,
+        functions=["fixup_revert", "context_boot_go"],
+        mechanism="oneshot_address_hooks",
+    )
+    nd_fns = {fn["name"]: fn for fn in nodwarf_scope["functions"]}
+    boot_go_pcs = nd_fns["context_boot_go"]["probe_pcs"]
+    fixup_pcs = nd_fns["fixup_revert"]["probe_pcs"]
+
+    nodwarf_results = [
+        {
+            "fault_at": -1,
+            "fault_requested": -1,
+            "fault_type": "control",
+            "fault_injected": False,
+            "is_control": True,
+            "boot_outcome": "success",
+            "boot_slot": "exec",
+            "recovery_coverage": {
+                "enabled": True,
+                "mechanism": "oneshot_address_hooks",
+                "executed_pcs": list(boot_go_pcs[:3]),
+                "recording_overhead_s": 0.0015,
+                "boot_wall_time_s": 0.030,
+            },
+        },
+        {
+            "fault_at": 0,
+            "fault_requested": 0,
+            "fault_type": "rs",
+            "fault_injected": True,
+            "boot_outcome": "success",
+            "boot_slot": "exec",
+            "recovery_state_search": {
+                "generation": 1,
+                "state_identity": "bb" * 32,
+                "chain": {
+                    "text": "w=3 (0x000F7FF4)",
+                    "cuts": [
+                        {
+                            "cut": 1,
+                            "operation": "write",
+                            "operation_index": 3,
+                            "fault_type": "power_loss",
+                            "address": "0x000F7FF4",
+                        }
+                    ],
+                },
+            },
+            "recovery_coverage": {
+                "enabled": True,
+                "mechanism": "oneshot_address_hooks",
+                "executed_pcs": [boot_go_pcs[0], fixup_pcs[0]],
+                "recording_overhead_s": 0.0014,
+                "boot_wall_time_s": 0.028,
+            },
+        },
+    ]
+    nodwarf_summary = summarize_runtime_sweep(
+        nodwarf_results,
+        expected_fault_points=1,
+        expected_control_points=1,
+        planned_fault_types=["rs"],
+        recovery_coverage_scope=nodwarf_scope,
+    )
+    nd_cov = nodwarf_summary["recovery_coverage"]
+    assert nd_cov["line_info_available"] is False
+    assert nd_cov["granularity"] == "function_only"
+    assert nd_cov["line_summary"] is None
+    assert "DWARF" in (nd_cov["line_info_notice"] or "")
+
+    nodwarf_payload = {
+        "profile": "mcuboot_pr3011_move_broken_state_search",
+        "verdict": "PASS",
+        "summary": {"runtime_sweep": nodwarf_summary},
+        "recovery_coverage": nd_cov,
+        "runtime_sweep_results": nodwarf_results,
+    }
+    nodwarf_html_path = tmp_path / "nodwarf_report.html"
+    write_html([(Path("nodwarf.json"), nodwarf_payload)], nodwarf_html_path)
+    nodwarf_html = nodwarf_html_path.read_text(encoding="utf-8")
+    assert "function_only // oneshot_address_hooks" in nodwarf_html
+    assert str(nd_cov["line_info_notice"]) in nodwarf_html
+    assert "recovery coverage by source line" not in nodwarf_html
+    assert "fixup_revert" in nodwarf_html
+    assert "w=3 (0x000F7FF4)" in nodwarf_html
+
+
+def test_search_report_attributes_first_hit_in_visit_order():
+    scope = build_recovery_coverage_scope(MRAM_DEFERRED_ELF, functions=["tracking_gate"])
+    pcs = list(scope["probe_pcs"])
+    rows = [
+        {"fault_injected": True, "fault_at": i,
+         "recovery_state_search": {"state_identity": state},
+         "recovery_coverage": {"executed_pcs": pcs}}
+        for i, state in enumerate(("later", "earlier"))
+    ]
+    summary = {"coverage_by_boot": [
+        {"boot_index": 1, "state_identity": "earlier"},
+        {"boot_index": 2, "state_identity": "later"},
+    ]}
+    report = summarize_recovery_coverage(rows, scope, state_search_summary=summary)
+    assert [r["state_identity"] for r in report["coverage_by_boot"]] == ["earlier", "later"]
+    first = report["functions"][0]["first_reached_by"]
+    assert (first["boot_index"], first["state_identity"]) == (1, "earlier")
+    assert rows[0]["recovery_state_search"]["state_identity"] == "later"

@@ -112,7 +112,7 @@ class RecordedSearch(RecoveryStateExplorer):
             summary = report["summary"]["runtime_sweep"]["recovery_state_search"]
             reason = summary["stopped_reason"]
             if reason != "complete":
-                if reason not in ("max_new_states", "max_wall_time_s"):
+                if reason not in ("max_new_states", "max_wall_time_s", "coverage_plateau"):
                     raise ValueError(f"shard {index} has unknown stopped_reason {reason}")
                 self.stops[index] = reason
             collect_edges(roots, part["roots"])
@@ -133,6 +133,22 @@ class RecordedSearch(RecoveryStateExplorer):
                 self.record(row, part, report["expect"]["control_outcome"])
         self.count = len(reports)
         operations = trace(roots)
+        first_search_summary = reports[0]["summary"]["runtime_sweep"]["recovery_state_search"]
+        order = first_search_summary.get("order", "breadth_first")
+        max_boots_without_new_coverage = first_search_summary.get("max_boots_without_new_coverage")
+        for report in reports[1:]:
+            other_summary = report["summary"]["runtime_sweep"]["recovery_state_search"]
+            if other_summary.get("order", "breadth_first") != order:
+                raise ValueError("shards disagree on order")
+            if other_summary.get("max_boots_without_new_coverage") != max_boots_without_new_coverage:
+                raise ValueError("shards disagree on max_boots_without_new_coverage")
+        control_coverage = ()
+        for row in reports[0].get("runtime_sweep_results") or ():
+            if isinstance(row, dict) and row.get("is_control"):
+                cov = row.get("recovery_coverage")
+                if isinstance(cov, dict) and isinstance(cov.get("executed_pcs"), list):
+                    control_coverage = tuple(cov["executed_pcs"])
+                break
         super().__init__(
             initial_state=None, calibration_operations=operations,
             first_cuts=[(op["kind"], op["operation_index"]) for op in operations],
@@ -140,6 +156,9 @@ class RecordedSearch(RecoveryStateExplorer):
             max_wall_time_s=1, clock=lambda: 0, boot_state=self.read_boot,
             recovery_fault_types=("power_loss", "interrupted_erase"),
             cross_check_every=part.get("cross_check_every", 1),
+            order=order,
+            max_boots_without_new_coverage=max_boots_without_new_coverage,
+            initial_coverage=control_coverage,
         )
 
     def record_check(self, index, key, check):
@@ -214,6 +233,10 @@ class RecordedSearch(RecoveryStateExplorer):
         op = operations[index]
         if index + 1 < len(operations):
             frames.appendleft((parent, index + 1, None, 0))
+        elif not preview and parent is not None and parent in self._parent_cov:
+            psig = self._parent_cov[parent]["entry"].get("coverage_signature", ())
+            if psig:
+                self._expanded_signatures.add(psig)
         self._selected(op, parent is None, selected, counts)
         return parent, index, op["target"]
 
@@ -225,13 +248,16 @@ class RecordedSearch(RecoveryStateExplorer):
                 raise ValueError(f"missing boot result for state {state}")
             if state not in self.missing:
                 reason = reason or ("max_wall_time_s" if "max_wall_time_s" in self.stops.values()
+                                    else "coverage_plateau" if "coverage_plateau" in self.stops.values()
+                                    and "max_new_states" not in self.stops.values()
                                     else "max_new_states")
                 field = ("states_excluded_by_wall_time" if reason == "max_wall_time_s"
+                         else "states_excluded_by_coverage_plateau" if reason == "coverage_plateau"
                          else "states_excluded_by_max_new_states")
                 self.summary[field] += 1
                 self.missing[state] = reason
-            return
-        super()._boot(state, chain, generation, operation, cross_check_ordinal)
+            return None
+        return super()._boot(state, chain, generation, operation, cross_check_ordinal)
 
     def _maybe_cross_check(self, state, chain, generation, operation, selection_ordinal=None):
         selected = (
@@ -277,6 +303,8 @@ def merge_reports(reports):
         summary["complete"] = False
         summary["unique_states_seen"] += len(search.missing)
         summary["stopped_reason"] = ("max_wall_time_s" if "max_wall_time_s" in search.stops.values()
+                                     else "coverage_plateau" if "coverage_plateau" in search.stops.values()
+                                     and "max_new_states" not in search.stops.values()
                                      else "max_new_states")
     summary["elapsed_s"] = max(s["elapsed_s"] for s in local)
     if states:
@@ -291,8 +319,16 @@ def merge_reports(reports):
     expect = ExpectConfig(**context["expect"])
     memory = SimpleNamespace(page_size=context["page_size"],
                              slots={k: SimpleNamespace(**v) for k, v in context["slots"].items()})
+    profile_ns = SimpleNamespace(memory=memory, expect=expect)
+    if isinstance(context.get("recovery_coverage_scope"), dict):
+        profile_ns.fault_sweep = SimpleNamespace(
+            recovery_coverage=SimpleNamespace(
+                enabled=True,
+                scope=context["recovery_coverage_scope"],
+            )
+        )
     sweep = summarize_runtime_sweep(
-        rows, total_writes=context["total_writes"], profile=SimpleNamespace(memory=memory, expect=expect),
+        rows, total_writes=context["total_writes"], profile=profile_ns,
         planned_fault_types=context["planned_fault_types"],
         expected_fault_points=first["fault_points_tested"],
         expected_control_points=first_sweep["campaign_integrity"]["expected_control_points"],
@@ -323,6 +359,8 @@ def merge_reports(reports):
         "verdict": qualify_ownership_verdict(verdict, ownership),
         "state_search_merge": {**inputs, "stopped_shards": search.stops},
     })
+    if isinstance(sweep.get("recovery_coverage"), dict):
+        report["recovery_coverage"] = sweep["recovery_coverage"]
     attach_security_aggregate(report)
     return report
 

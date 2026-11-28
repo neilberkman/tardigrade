@@ -57,6 +57,7 @@ from read_fault_translation import (
     cpu_path_capability_warning,
     read_fault_warning,
 )
+from recovery_coverage import summarize_recovery_coverage
 from verdicts import expectation_requires_findings, is_exploratory_expectation
 
 
@@ -403,6 +404,8 @@ def summarize_runtime_sweep(
     rc_injection_config_override: Optional[Dict[str, Any]] = None,
     planned_fault_types: Optional[List[str]] = None,
     calibration_point_coverage: Optional[Dict[str, Dict[str, Any]]] = None,
+    recovery_coverage_scope: Optional[Dict[str, Any]] = None,
+    repo_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Compute summary statistics from runtime sweep results."""
     non_control = [r for r in results if not r.get("is_control", False)]
@@ -1266,6 +1269,31 @@ def summarize_runtime_sweep(
         issue_predicate=_point_has_issue,
         calibration=calibration_point_coverage,
     )
+
+    resolved_cov_scope = recovery_coverage_scope
+    if resolved_cov_scope is None and profile is not None:
+        cov_cfg = getattr(
+            getattr(profile, "fault_sweep", None), "recovery_coverage", None
+        )
+        if cov_cfg is not None and bool(getattr(cov_cfg, "enabled", False)):
+            if isinstance(getattr(cov_cfg, "scope", None), dict):
+                resolved_cov_scope = cov_cfg.scope
+            else:
+                scope_builder = getattr(
+                    profile, "_recovery_coverage_runtime_dict", None
+                )
+                if callable(scope_builder):
+                    resolved_cov_scope = scope_builder(
+                        repo_root or Path(__file__).resolve().parents[1]
+                    )
+    if isinstance(resolved_cov_scope, dict) and resolved_cov_scope.get("enabled"):
+        cov_report = summarize_recovery_coverage(
+            results,
+            resolved_cov_scope,
+            state_search_summary=recovery_state_search_summary,
+        )
+        if cov_report is not None:
+            summary["recovery_coverage"] = cov_report
 
     return summary
 

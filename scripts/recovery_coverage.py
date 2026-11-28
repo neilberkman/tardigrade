@@ -1220,6 +1220,22 @@ def summarize_recovery_coverage(results, scope, state_search_summary=None):
         and r.get("fault_injected") is True
     ]
 
+    # Audit rows can be sorted by fault point after the search. Recover the
+    # visit order for known states while retaining other points in their slots.
+    if isinstance(state_search_summary, dict):
+        visit_order = {
+            visit["state_identity"]: visit["boot_index"]
+            for visit in state_search_summary.get("coverage_by_boot") or ()
+        }
+        ranked = []
+        for slot, row in enumerate(cut_results):
+            state = (row.get("recovery_state_search") or {}).get("state_identity")
+            if state in visit_order:
+                ranked.append((visit_order[state], slot))
+        ordered = [cut_results[slot] for _, slot in sorted(ranked)]
+        for (_, slot), row in zip(ranked, ordered):
+            cut_results[slot] = row
+
     control_pcs = set()
     control_recorded = False
     for ctrl in control_results:

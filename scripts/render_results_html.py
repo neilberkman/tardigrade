@@ -451,6 +451,221 @@ def render_terminal_error_panel(payload: Dict[str, Any]) -> str:
     )
 
 
+def _format_first_reached_cell(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return "—"
+    label = str(
+        entry.get("label")
+        or entry.get("chain")
+        or entry.get("state_identity")
+        or ""
+    ).strip()
+    boot_index = entry.get("boot_index")
+    if not label and boot_index is not None:
+        label = f"boot {boot_index}"
+    elif label and boot_index is not None:
+        label = f"{label} (boot {boot_index})"
+    return html.escape(label or "—")
+
+
+def render_recovery_coverage_panel(payload: Dict[str, Any]) -> str:
+    """Render per-function, per-line, and coverage-vs-boots recovery coverage report."""
+    cov = payload.get("recovery_coverage")
+    if not isinstance(cov, dict):
+        cov = (
+            (payload.get("summary") or {})
+            .get("runtime_sweep", {})
+            .get("recovery_coverage")
+        )
+    if not isinstance(cov, dict) or not cov.get("enabled"):
+        return ""
+
+    granularity = str(cov.get("granularity") or "function_only")
+    mechanism = str(cov.get("mechanism") or "oneshot_address_hooks")
+    line_info_available = bool(cov.get("line_info_available"))
+    line_info_notice = cov.get("line_info_notice")
+
+    fn_sum = cov.get("function_summary") or {}
+    bb_sum = cov.get("basic_block_summary") or {}
+    ln_sum = cov.get("line_summary") or {}
+    overhead = cov.get("recording_overhead") or {}
+    state_search = cov.get("state_search") or {}
+
+    mean_overhead_ms = _as_float(overhead.get("mean_recording_overhead_s")) * 1000.0
+    overhead_ratio_pct = _as_float(overhead.get("overhead_ratio")) * 100.0
+
+    notice_html = ""
+    if not line_info_available:
+        notice_text = str(
+            line_info_notice
+            or "ELF lacks DWARF line information (.debug_line); reporting coverage per function only."
+        )
+        notice_html = (
+            "<p class='path'><span>line info</span> "
+            f"{html.escape(notice_text)}</p>"
+        )
+
+    search_meta_html = ""
+    if isinstance(state_search, dict) and state_search.get("order"):
+        plateau_cfg = state_search.get("max_boots_without_new_coverage")
+        plateau_str = "disabled" if plateau_cfg is None else f"{_as_int(plateau_cfg)} boots"
+        stopped_str = str(state_search.get("stopped_reason") or "completed")
+        search_meta_html = (
+            "<p class='path'>"
+            f"<span>search order</span> {html.escape(str(state_search.get('order')))} &nbsp; "
+            f"<span>plateau limit</span> {html.escape(plateau_str)} &nbsp; "
+            f"<span>stopped reason</span> {html.escape(stopped_str)}"
+            "</p>"
+        )
+
+    line_metric_html = ""
+    if line_info_available and isinstance(ln_sum, dict):
+        line_metric_html = (
+            f"<div class='metric'><b>lines (control / cut-only / never)</b>"
+            f"<span>{_as_int(ln_sum.get('executed_by_control_count'))} / "
+            f"{_as_int(ln_sum.get('executed_only_under_cut_count'))} / "
+            f"{_as_int(ln_sum.get('never_executed_by_cut_count'))}</span>"
+            f"<small>{_as_int(ln_sum.get('total'))} total source lines in scope</small></div>"
+        )
+
+    metrics_html = (
+        "<div class='metrics'>"
+        f"<div class='metric'><b>functions (control / cut-only / never)</b>"
+        f"<span>{_as_int(fn_sum.get('executed_by_control_count'))} / "
+        f"{_as_int(fn_sum.get('executed_only_under_cut_count'))} / "
+        f"{_as_int(fn_sum.get('never_executed_by_cut_count'))}</span>"
+        f"<small>{_as_int(fn_sum.get('total'))} functions in scope</small></div>"
+        f"{line_metric_html}"
+        f"<div class='metric'><b>basic blocks (cut / total)</b>"
+        f"<span>{_as_int(bb_sum.get('executed_by_cut_count'))} / "
+        f"{_as_int(bb_sum.get('total'))}</span>"
+        f"<small>{_as_int(bb_sum.get('executed_only_under_cut_count'))} cut-only, "
+        f"{_as_int(bb_sum.get('never_executed_by_cut_count'))} never by cut</small></div>"
+        f"<div class='metric'><b>recording overhead</b>"
+        f"<span>{mean_overhead_ms:.2f} ms/boot</span>"
+        f"<small>{html.escape(mechanism)} ({overhead_ratio_pct:.1f}% of boot time)</small></div>"
+        "</div>"
+    )
+
+    fn_rows: List[str] = []
+    for fn in cov.get("functions") or []:
+        if not isinstance(fn, dict):
+            continue
+        status = str(fn.get("classification") or fn.get("status") or "unknown")
+        addr_span = "{}..{}".format(
+            fn.get("start_address") or "—",
+            fn.get("end_address") or "—",
+        )
+        blocks_summary = "{} / {} / {} / {}".format(
+            _as_int(fn.get("control_basic_blocks")),
+            _as_int(fn.get("cut_basic_blocks")),
+            _as_int(fn.get("cut_only_basic_blocks")),
+            _as_int(fn.get("total_basic_blocks")),
+        )
+        fn_rows.append(
+            "<tr>"
+            f"<td><code>{html.escape(str(fn.get('name') or fn.get('id') or '—'))}</code></td>"
+            f"<td><code>{html.escape(addr_span)}</code></td>"
+            f"<td><code>{html.escape(status)}</code></td>"
+            f"<td>{html.escape(blocks_summary)}</td>"
+            f"<td>{_format_first_reached_cell(fn.get('first_reached_by'))}</td>"
+            f"<td>{_format_first_reached_cell(fn.get('first_cut_only_block_reached_by'))}</td>"
+            "</tr>"
+        )
+    if not fn_rows:
+        fn_rows.append("<tr><td colspan='6'>No functions in configured scope.</td></tr>")
+
+    fn_table_html = (
+        "<div class='table-wrap'><table><thead><tr>"
+        "<th>Function</th><th>Address Range</th><th>Classification</th>"
+        "<th>Blocks (ctrl / cut / cut-only / total)</th>"
+        "<th>First Reached By</th><th>First Cut-Only Block Reached By</th>"
+        "</tr></thead><tbody>" + "".join(fn_rows) + "</tbody></table></div>"
+    )
+
+    lines_table_html = ""
+    if line_info_available:
+        ln_rows: List[str] = []
+        for ln in cov.get("lines") or []:
+            if not isinstance(ln, dict):
+                continue
+            status = str(ln.get("classification") or ln.get("status") or "unknown")
+            loc = "{}:{}".format(
+                ln.get("file") or "unknown", _as_int(ln.get("line"))
+            )
+            addr_span = "{}..{}".format(
+                ln.get("start_address") or "—",
+                ln.get("end_address") or "—",
+            )
+            ln_rows.append(
+                "<tr>"
+                f"<td><code>{html.escape(loc)}</code></td>"
+                f"<td><code>{html.escape(str(ln.get('function') or '—'))}</code></td>"
+                f"<td><code>{html.escape(addr_span)}</code></td>"
+                f"<td><code>{html.escape(status)}</code></td>"
+                f"<td>{_format_first_reached_cell(ln.get('first_reached_by'))}</td>"
+                "</tr>"
+            )
+        if not ln_rows:
+            ln_rows.append("<tr><td colspan='5'>No source lines in configured scope.</td></tr>")
+        lines_table_html = (
+            "<div class='telemetry-heading'><span>recovery coverage by source line</span>"
+            "<code>DWARF .debug_line attribution</code></div>"
+            "<div class='table-wrap'><table><thead><tr>"
+            "<th>Source Line</th><th>Function</th><th>Address Range</th>"
+            "<th>Classification</th><th>First Reached By</th>"
+            "</tr></thead><tbody>" + "".join(ln_rows) + "</tbody></table></div>"
+        )
+
+    boot_rows: List[str] = []
+    for boot in cov.get("coverage_by_boot") or []:
+        if not isinstance(boot, dict):
+            continue
+        point_label = str(
+            boot.get("label") or boot.get("chain") or f"point {boot.get('fault_at', '?')}"
+        )
+        cum_lines_cell = (
+            f"<td>{_as_int(boot.get('cumulative_lines'))}</td>"
+            if line_info_available
+            else ""
+        )
+        boot_rows.append(
+            "<tr>"
+            f"<td>{_as_int(boot.get('boot_index'))}</td>"
+            f"<td><code>{html.escape(point_label)}</code></td>"
+            f"<td>{_as_int(boot.get('boot_basic_blocks'))}</td>"
+            f"<td>{_as_int(boot.get('new_basic_blocks'))}</td>"
+            f"<td>{_as_int(boot.get('cumulative_basic_blocks'))}</td>"
+            f"<td>{_as_int(boot.get('cumulative_functions'))}</td>"
+            f"{cum_lines_cell}"
+            f"<td>{html.escape(str(boot.get('boot_outcome') or '—'))}</td>"
+            "</tr>"
+        )
+    boots_table_html = ""
+    if boot_rows:
+        cum_lines_header = "<th>Cumulative Lines</th>" if line_info_available else ""
+        boots_table_html = (
+            "<div class='telemetry-heading'><span>recovery coverage vs. boots</span>"
+            "<code>cumulative code reached per recovery boot</code></div>"
+            "<div class='table-wrap'><table><thead><tr>"
+            "<th>Boot</th><th>Point / State</th><th>Boot Blocks</th>"
+            "<th>New Blocks</th><th>Cumulative Blocks</th>"
+            f"<th>Cumulative Functions</th>{cum_lines_header}<th>Outcome</th>"
+            "</tr></thead><tbody>" + "".join(boot_rows) + "</tbody></table></div>"
+        )
+
+    return (
+        "<div class='telemetry-heading'><span>recovery code coverage</span>"
+        f"<code>{html.escape(granularity)} // {html.escape(mechanism)}</code></div>"
+        f"{notice_html}"
+        f"{search_meta_html}"
+        f"{metrics_html}"
+        f"{fn_table_html}"
+        f"{lines_table_html}"
+        f"{boots_table_html}"
+    )
+
+
 def render_point_counts_panel(payload: Dict[str, Any]) -> str:
     """Render per-kind execution and calibration counts from the JSON block."""
     block = payload.get("summary", {}).get("runtime_sweep", {}).get("point_counts")
@@ -619,6 +834,7 @@ def render_audit_card(path: Path, payload: Dict[str, Any]) -> Tuple[str, Dict[st
         f"{render_success_effect_panel(payload.get('runtime_sweep_results', []))}"
         f"{render_multi_component_panel(payload)}"
         f"{render_terminal_error_panel(payload)}"
+        f"{render_recovery_coverage_panel(payload)}"
         f"{grid}"
         "</section>"
     )

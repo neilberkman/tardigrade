@@ -2834,6 +2834,7 @@ def _main_single() -> int:
             expected_control_points=0 if args.no_control else 1,
             planned_fault_types=planned_fault_types,
             calibration_point_coverage=calibration_point_coverage,
+            repo_root=repo_root,
         )
         sweep_summary["wall_time_s"] = round(sweep_wall_s, 1)
 
@@ -3142,6 +3143,15 @@ def _main_single() -> int:
                         "planned_fault_types": planned_fault_types,
                         "calibration_point_coverage": calibration_point_coverage,
                         "total_writes": max_writes,
+                        **(
+                            {
+                                "recovery_coverage_scope": profile.fault_sweep.recovery_coverage.scope,
+                            }
+                            if getattr(profile.fault_sweep, "recovery_coverage", None) is not None
+                            and profile.fault_sweep.recovery_coverage.enabled
+                            and isinstance(profile.fault_sweep.recovery_coverage.scope, dict)
+                            else {}
+                        ),
                     }
                     break
         dist = profile.fault_sweep.fault_distribution
@@ -3166,6 +3176,8 @@ def _main_single() -> int:
             )
         if security_state_erase_summary is not None:
             payload["summary"]["security_state_erase"] = security_state_erase_summary
+        if isinstance(sweep_summary.get("recovery_coverage"), dict):
+            payload["recovery_coverage"] = sweep_summary["recovery_coverage"]
         payload["contracts"] = {
             "state_probe": (
                 {
