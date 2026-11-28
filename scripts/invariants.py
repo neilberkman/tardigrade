@@ -2161,6 +2161,16 @@ _ALL_INVARIANTS: List[InvariantFn] = [
     check_persistent_state_fail_closed,
 ]
 
+
+def check_zephyr_fcb_durability(result: FaultResult, **kwargs: Any) -> None:
+    """Delegate to the Zephyr FCB / settings-on-FCB durability oracle."""
+    from zephyr_fcb_oracle import (
+        check_zephyr_fcb_durability as _check_zephyr_fcb_durability,
+    )
+
+    _check_zephyr_fcb_durability(result, **kwargs)
+
+
 _INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
     "at_least_one_bootable": check_at_least_one_bootable,
     "boot_matches_metadata": check_boot_matches_metadata,
@@ -2182,6 +2192,7 @@ _INVARIANT_REGISTRY: Dict[str, InvariantFn] = {
     "transaction_state_isolation": check_transaction_state_isolation,
     "success_implies_effect": check_success_implies_effect,
     "persistent_state_fail_closed": check_persistent_state_fail_closed,
+    "zephyr_fcb_durability": check_zephyr_fcb_durability,
 }
 _PROVIDER_CACHE: Dict[str, Dict[str, InvariantFn]] = {}
 
