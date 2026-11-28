@@ -131,6 +131,9 @@ def main(argv=None):
     report = commands.add_parser("report", help="render audit JSON as HTML")
     report.add_argument("--input", required=True, action="append")
     report.add_argument("--output", required=True)
+    merge = commands.add_parser("merge-state-search", help="merge recovery state search shard reports")
+    merge.add_argument("shards", nargs="+", type=Path, metavar="SHARD.json")
+    merge.add_argument("--output", required=True, type=Path)
     args, unknown = parser.parse_known_args(argv)
     if unknown and args.command != "audit":
         parser.error(f"unrecognized arguments: {' '.join(unknown)}")
@@ -155,6 +158,11 @@ def main(argv=None):
             str(args.output_dir.expanduser().resolve()),
         ])
     try:
+        if args.command == "merge-state-search":
+            sys.path.insert(0, str(RUNTIME / "scripts"))
+            from merge_state_search import merge_files
+            merge_files(args.shards, args.output)
+            return 0
         if args.command == "init":
             if args.timeout is not None and args.timeout <= 0:
                 raise ValueError("--timeout must be positive")

@@ -1993,6 +1993,63 @@ limit of the projection. The plan respects the configured budget for actual
 first-cut boots and the search wall time. If either prevents a complete plan,
 the runner reports the exhausted bound as an error.
 
+To distribute one search, create a small overlay beside the original profile
+for each runner. Give all runners the same base profile and shard count. Use
+each index from zero through `shard_count - 1` once.
+
+```yaml
+base_profile: profile_state_search_16_corrupted.yaml
+fault_sweep:
+  phase2_fault:
+    state_search:
+      shard_count: 4
+      shard_index: 0
+```
+
+Each runner boots the distinct first-cut states and scans their traces. The
+first 32 bits of the persistent state's SHA-256 identity, interpreted as an
+unsigned big-endian integer modulo `shard_count`, assign each generation-two
+candidate to one runner. Equivalent second cuts have the same owner. Below
+generation two, each runner follows its own subtrees. Different subtrees can
+converge on the same deeper state, which each runner boots at most once.
+A runner that encounters another runner's generation-two root again at a
+greater depth leaves that root's expansion to its owner. Calibration and any
+ordinary audit points, including the clean control, run on each runner.
+
+Run each overlay through the usual audit command and merge the JSON reports:
+
+```sh
+tardigrade merge-state-search --output merged.json shard-[0-3].json
+```
+
+The merger works offline. It checks the firmware and inherited profile
+digests, Tardigrade commit, running Renode build and shard count. It requires
+one report per index and rejects conflicting outcomes for a persistent state.
+It follows the recorded candidate edges in breadth-first order, restores
+equivalent chains and applies the original state budget to the union.
+`summary.runtime_sweep.recovery_state_search` contains the search counts.
+The merged main runtime sweep includes one copy of the ordinary points.
+The output records which shards hit a bound in
+`state_search_merge.stopped_shards`. Any such stop makes the merged search
+incomplete, even if another runner observed the same state. Wall limits apply
+to each runner. The merged elapsed time is the longest shard search time.
+
+Generation-two periodic live checks use the shared discovery order. When
+periodic cross-checks are enabled, each runner also records live-check
+evidence for the deeper candidate chains in its subtrees so the merged report
+retains the exact checks selected by an unsharded search.
+
+Resume a shard with the same `shard_index` and `shard_count`. Changing either
+is refused before continuing. The checkpoint retains the runner's ownership
+and merge evidence along with the ordered frontier. Merge completed resumes
+using the same cumulative budgets across runners. With `plan_only: true`, each
+runner predicts its own generation-two candidates and boots, including its
+repeated first-cut boots. In each first-cut trace, `generation_two_candidates`
+counts all cuts passing the type and address filters. The shard also reports
+`owned_generation_two_candidates` once it has classified every candidate in
+that trace. The shard plan totals count owned candidates. A plan contains no
+deeper verdicts for a merge.
+
 Every `cross_check_every`th newly booted generation-two state is also
 reproduced through the established two-cut live injector. At generation three
 and later, the rate applies to candidate chains, including a chain whose

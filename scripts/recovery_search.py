@@ -397,6 +397,8 @@ class RecoveryStateExplorer(object):
     never cause another recovery boot.
     """
 
+    _normalize_trace = staticmethod(normalize_trace)
+
     def __init__(
         self,
         initial_state,
@@ -422,7 +424,7 @@ class RecoveryStateExplorer(object):
         plan_only=False,
     ):
         self.initial_state = initial_state
-        self.calibration_operations = normalize_trace(calibration_operations)
+        self.calibration_operations = self._normalize_trace(calibration_operations)
         self.first_cuts = tuple(
             (str(item[0]), int(item[1]))
             if isinstance(item, (tuple, list)) and len(item) == 2
@@ -562,7 +564,7 @@ class RecoveryStateExplorer(object):
         parent = len(self.results)
         self._seen[state.identity_hex()] = result
         self.results.append(result)
-        self._traces.append(normalize_trace(operations))
+        self._traces.append(self._normalize_trace(operations))
         if self._traces[-1]:
             self._frames.append((parent, 0, trace_base_state, 0))
         self.summary["states_booted"] += 1
@@ -706,19 +708,23 @@ class RecoveryStateExplorer(object):
         self._prior_elapsed = checkpoint["elapsed_s"]
         self._resumed = True
 
+    def _trace_counts(self, index):
+        operations = self._traces[index]
+        return len(operations), self._eligible_count(operations)
+
     def _first_cut_traces(self, results):
         rows = []
         for index, result in enumerate(results):
             meta = result["recovery_state_search"]
             if meta["generation"] != 1:
                 break
-            operations = self._traces[index]
+            total, candidates = self._trace_counts(index)
             rows.append({
                 "first_cut": meta["chain"]["cuts"][0],
                 "equivalent_first_cuts": [c["cuts"][0] for c in meta.get("equivalent_chains", [])
                                           if c["cut_count"] == 1],
-                "trace_operations": len(operations),
-                "generation_two_candidates": self._eligible_count(operations),
+                "trace_operations": total,
+                "generation_two_candidates": candidates,
             })
         return rows
 
