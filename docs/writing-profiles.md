@@ -1392,6 +1392,8 @@ Backends that take a per-cut MRAM mode are the ones that honor `mram_torn_word`,
 fault_sweep:
   fault_types: [power_loss]
   include_erase_fault_points: true # default: false
+  require_planned_points_per_kind: false # default: false; set true to fail when a requested kind plans 0 points
+  points: ["w[0]", "e[0]"] # optional explicit single-cut list (index and kind)
   torn_word: partial_bits # optional; omitted profiles retain their existing result
 ```
 
@@ -1401,7 +1403,9 @@ When `include_erase_fault_points: true` is set:
 
 - Calibration counts erase operations (`total_erases`) and captures an erase trace across all built-in NVM and flash backends (`MappedMRAMTracker`, `NVMemoryController` / `NVMemory`, `GenericNvmController`, `An521NvmInterceptor`, `NRF52NVMC`, `STM32F4*`, `STM32H7*`, and `CFIFlash`).
 - The fault planner appends one interrupted-erase fault point (`fault_type: "e"`) for every calibrated erase operation (deduplicated if `interrupted_erase` is also listed in `fault_types`), in addition to program fault points.
-- Each fault point result, categorized failure, and runtime sweep summary reports its operation kind (`operation_kind`: `"program"` or `"erase"`, plus `operation_kind_points` / `operation_kind_issue_points` / `operation_kind_bricks` counts in the sweep summary).
+- Each fault point result, categorized failure, `fault_evidence` entry, `mram_uncorrectable_reads.observations` entry, recovery-coverage point descriptor (`first_reached_by`, `first_cut_only_block_reached_by`, `coverage_by_boot`), invariant violation, and runtime sweep summary reports its operation kind (`operation_kind`: `"program"` or `"erase"`, plus `operation_kind_points` / `operation_kind_issue_points` / `operation_kind_bricks` counts in the sweep summary). Profiles without erase cuts emit the exact same reports apart from the added `operation_kind` field (`"program"` on write-cut points).
+- Explicit point lists in `fault_sweep.points`, `phase2_fault.pairs`, `phase2_fault.chains` (2 to 8 cuts), `multi_fault.sequences`, and `tardigrade debug --point` accept kind-qualified syntax copied directly from report labels (`w[0]`, `e[0]`, `w[0] -> e[1]`, `w@0`, `e:0`, or `[0, "interrupted_erase"]`), keeping program point `0` and erase point `0` distinct.
+- When any requested fault kind yields zero planned points (for example, `interrupted_erase` or `include_erase_fault_points: true` on a target that performs 0 erases), `point_counts.kinds.<kind>` marks `zero_planned_points: true` (`status: "zero_planned_points"`, `note: "requested fault kind yielded zero planned points"`), `point_counts.zero_point_kinds` and `summary.runtime_sweep.zero_point_fault_kinds` list the zero-point kinds, and text/Markdown/HTML point-count tables annotate the row with `zero planned points`. Setting `fault_sweep.require_planned_points_per_kind: true` makes a zero-point requested kind an immediate planner and verdict error.
 - An explicit `torn_word` selects `fixed`, `untouched`, a complete erase (`programmed`), or `partial_bits` as described above. Without it, the legacy `mram_torn_word` compatibility behavior remains:
   - `half` / `half_retain` (default): the first half of the erased span is filled with `EraseFill` and the second half retains the pre-erase bytes (matching partial-page flash erases).
   - `untouched`: the entire span retains its pre-erase bytes unchanged (power cut just before the erase commits).
@@ -2754,10 +2758,17 @@ checks in `signals.unmet_memory_checks`, `signals.failed_memory_checks`, and
 Captured execution is progress evidence, not terminal `no_boot` or
 successful-boot evidence.
 
-For injected MRAM programs, the backend contract is fail-closed. The per-point
-record includes `mram_fault_evidence` with the selected and backend write
-indices, absolute address, offset, exact program width, intended/pre/post byte
-strings, and ordered width-aware program trace. `fault_snapshot` describes the
+For injected MRAM programs and interrupted erases, the backend contract is
+fail-closed. The per-point record includes `mram_fault_evidence` with
+`operation_kind` (`"program"` or `"erase"`), the selected and backend
+write/erase indices (`selected_write_index` / `backend_write_index` or
+`selected_erase_index` / `backend_erase_index`), absolute address
+(`program_address` / `erase_address`), offset, exact unit size (`program_width` /
+`erase_size`), intended/pre/post byte strings (`intended_bytes`,
+`pre_program_bytes` / `pre_erase_bytes`, `post_fault_bytes` /
+`post_erase_bytes`), uncorrectable marks (`word_marked_uncorrectable`,
+`uncorrectable_word_address`, `uncorrectable_words`), and the ordered
+operation trace (`write_trace` or `erase_trace`). `fault_snapshot` describes the
 immediate post-fault persistent-memory image with its SHA-256, closest declared
 image, differing-byte count, and compact differing ranges. The raw snapshot is
 stored in `fault_snapshot_file`. Missing or contradictory address/width data is
@@ -2796,12 +2807,13 @@ summary.runtime_sweep.point_counts
   .calibration.erase                    -- calibrated erases and their direct/represented coverage
 summary.runtime_sweep.timing            -- per-phase timing breakdown
 runtime_sweep_results[]                 -- per-point detail
-  .fault_at                             -- which write was faulted
-  .fault_type                           -- power_loss, bit_corruption, etc.
+  .fault_at                             -- which write or erase was faulted
+  .fault_type                           -- wire code ("w", "e", "b", "p2:...", etc.)
+  .operation_kind                       -- "program" or "erase" (carried on every per-point structure with fault_at)
   .boot_outcome                         -- success/wrong_image/no_boot/...
   .fault_class                          -- recoverable/wrong_image/unrecoverable
   .signals                              -- raw harness signals (VTOR, markers, etc.)
-  .mram_fault_evidence                  -- exact program bytes, address, width, trace
+  .mram_fault_evidence                  -- exact program/erase bytes, address, width/size, uncorrectable marks, trace
   .fault_snapshot                       -- immediate digest, closest image, byte ranges
   .fault_snapshot_file                  -- raw immediate persistent-memory snapshot
   .postmortem_partition_dump            -- (no_boot only) slot header/trailer data

@@ -250,6 +250,7 @@ def test_summary_retains_concise_evidence_and_snapshot_identity() -> None:
     assert summary["fault_evidence"] == [
         {
             "fault_at": 3,
+            "operation_kind": "program",
             "fault_address": "0x10000030",
             "boot_outcome": "hard_fault",
             "exact": True,
@@ -296,6 +297,7 @@ def test_recovery_infrastructure_error_keeps_cut_evidence_outside_judged_counts(
     assert summary["fault_evidence"] == [
         {
             "fault_at": 4,
+            "operation_kind": "program",
             "fault_address": "0x10000040",
             "boot_outcome": "infra_error",
             "exact": True,
