@@ -1,0 +1,58 @@
+schema_version: 1
+name: recovery_boot_path_parity
+description: >-
+  Two-cut recovery-state search where firmware persists a value derived from a
+  free-running counter sampled at boot and a host recovery message delivered by
+  setup_script, cross-checking every explored state against live injection.
+platform: examples/recovery_boot_path_parity/platform.repl
+flash_backend: mramTracker
+bootloader:
+  elf: examples/recovery_boot_path_parity/firmware.elf
+  entry: 0x10000000
+memory:
+  sram: { start: 0x20000000, end: 0x20002000 }
+  volatile_regions:
+    - { name: runtime_sram, base: 0x20000000, size: 0x2000 }
+  write_granularity: 8
+  page_size: 0x1000
+  trace_address_map:
+    - { offset_start: 0x0, offset_end: 0x4000, address_addend: 0x10100000 }
+  slots:
+    exec: { base: 0x10100000, size: 0x2000 }
+    staging: { base: 0x10102000, size: 0x2000 }
+images:
+  exec: examples/recovery_boot_path_parity/slot.bin
+setup_script: examples/recovery_boot_path_parity/setup.resc
+pre_boot_state:
+  - { address: 0x20000400, u32: 0x55504432 }
+success_criteria:
+  vtor_in_slot: exec
+  marker_address: 0x20000100
+  marker_value: 0x50325041
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [power_loss]
+  mram_torn_word: half
+  max_writes: auto
+  max_writes_cap: 8
+  sweep_strategy: exhaustive
+  run_duration: "0.1"
+  progress_stall_timeout_s: 0.1
+  boot_cycles: 1
+  phase2_fault:
+    enabled: true
+    fault_types: [power_loss]
+    state_search:
+      enabled: true
+      first_cuts:
+        mode: ranges
+        ranges:
+          - { start: 0, end: 1 }
+      max_cuts: 2
+      max_new_states: 16
+      max_wall_time_s: 120
+      cross_check_every: 1
+expect:
+  should_find_issues: false
+skip_self_test: true

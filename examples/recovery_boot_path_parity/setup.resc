@@ -1,0 +1,30 @@
+python """
+_cpu = monitor.Machine['sysbus.cpu']
+_tracker = monitor.Machine['sysbus.mramTracker']
+_bus = monitor.Machine.SystemBus
+
+if not globals().get('_parity_hooks_installed'):
+    from System import Action, UInt64, UInt32
+
+    def _parity_on_block_begin(pc, size):
+        if bool(_tracker.FaultRequiresImmediateStop):
+            _cpu.IsHalted = True
+
+    _parity_block_delegate = Action[UInt64, UInt32](_parity_on_block_begin)
+    _parity_hooks_installed = True
+
+_cpu.SetHookAtBlockBegin(_parity_block_delegate)
+
+_role = globals().get('boot_role')
+_phase = _role.get('phase') if isinstance(_role, dict) else globals().get('boot_phase')
+if not _phase:
+    try:
+        _phase = str(monitor.GetVariable('boot_phase') or '').strip('\"')
+    except Exception:
+        _phase = None
+
+if _phase == 'recovery':
+    _bus.WriteDoubleWord(0x20000410, 0x52454356)
+else:
+    _bus.WriteDoubleWord(0x20000410, 0x00000000)
+"""
