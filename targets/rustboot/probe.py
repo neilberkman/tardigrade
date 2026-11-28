@@ -213,6 +213,57 @@ def _flags_monotonic(sector_flags):
     return True
 
 
+def describe_ranges(context=None):
+    """Return named persistent address ranges for rustBoot partition trailers."""
+    context = context or {}
+    geometry = context.get("slot_geometry") or context.get("slots") or {}
+    sector_size = _as_int(context.get("page_size", _DEFAULT_SECTOR_SIZE), _DEFAULT_SECTOR_SIZE)
+    if sector_size <= 0:
+        sector_size = _DEFAULT_SECTOR_SIZE
+    partitions = []
+    if geometry:
+        for slot_name, slot_info in sorted(geometry.items()):
+            if isinstance(slot_info, dict):
+                base = _as_int(slot_info.get("base"), -1)
+                size = _as_int(slot_info.get("size"), 0)
+                if base >= 0 and size > 0:
+                    partitions.append((slot_name, base, size))
+    else:
+        partitions = [
+            ("boot", _DEFAULT_BOOT_BASE, _DEFAULT_BOOT_SIZE),
+            ("update", _DEFAULT_UPDATE_BASE, _DEFAULT_UPDATE_SIZE),
+        ]
+    ranges = []
+    for part_name, part_base, part_size in partitions:
+        part_end = part_base + part_size
+        num_sectors = max(1, part_size // sector_size)
+        flag_bytes_count = (num_sectors + 1) // 2
+        ranges.extend([
+            {
+                "start": part_end - 4,
+                "end": part_end,
+                "name": "rustBoot trailer magic",
+                "slot": part_name,
+                "field": "magic",
+            },
+            {
+                "start": part_end - 5,
+                "end": part_end - 4,
+                "name": "rustBoot trailer state",
+                "slot": part_name,
+                "field": "state",
+            },
+            {
+                "start": part_end - 5 - flag_bytes_count,
+                "end": part_end - 5,
+                "name": "rustBoot sector flags",
+                "slot": part_name,
+                "field": "sector_flags",
+            },
+        ])
+    return ranges
+
+
 def collect_state(bus=None, monitor=None, context=None):
     """Collect rustBoot semantic state from emulated memory.
 

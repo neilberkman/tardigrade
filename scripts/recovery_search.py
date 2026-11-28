@@ -317,6 +317,8 @@ def format_cut(operation, flash_base, fault_type="power_loss"):
     }
     if operation.get("pc"):
         cut["pc"] = str(operation["pc"])
+    if operation.get("call_context"):
+        cut["call_context"] = str(operation["call_context"])
     return cut
 
 
@@ -372,6 +374,8 @@ def attribute_ranges_to_operations(
         }
         if op.get("pc"):
             entry["pc"] = str(op["pc"])
+        if op.get("call_context"):
+            entry["call_context"] = str(op["call_context"])
         normalized_ops.append(entry)
     if not normalized_ops:
         return
@@ -460,6 +464,8 @@ def attribute_ranges_to_operations(
         }
         if chosen.get("pc"):
             public_op["pc"] = chosen["pc"]
+        if chosen.get("call_context"):
+            public_op["call_context"] = chosen["call_context"]
         span["operation"] = public_op
 
 

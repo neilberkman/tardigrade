@@ -67,6 +67,35 @@ def _parse_optional_int(value: Any) -> Optional[int]:
         return None
 
 
+def _companion_call_context_path(trace_path: Optional[str]) -> Optional[str]:
+    if not trace_path:
+        return None
+    text = str(trace_path)
+    if text.endswith(".csv"):
+        return text[:-4] + "_call_context.txt"
+    return text + "_call_context.txt"
+
+
+def load_call_context_map(trace_path: Optional[str]) -> Dict[int, str]:
+    companion = _companion_call_context_path(trace_path)
+    if not companion or not os.path.isfile(companion):
+        return {}
+    mapping: Dict[int, str] = {}
+    try:
+        with open(companion, "r", encoding="utf-8") as f:
+            for line in f:
+                text = line.strip()
+                if not text or ":" not in text:
+                    continue
+                idx_str, ctx = text.split(":", 1)
+                idx = _parse_optional_int(idx_str)
+                if idx is not None and idx >= 0 and ctx.strip():
+                    mapping[idx] = ctx.strip()
+    except OSError:
+        return {}
+    return mapping
+
+
 def _fmt_u32(value: int) -> str:
     return "0x{0:08X}".format(int(value) & 0xFFFFFFFF)
 
@@ -139,7 +168,7 @@ def load_clean_write_trace(
             raise ValueError(
                 "write trace CSV is missing columns: {}".format(",".join(sorted(missing)))
             )
-        allowed = required | {"width", "write_width", "length", "pc"}
+        allowed = required | {"width", "write_width", "length", "pc", "call_context"}
         unexpected = set(fields) - allowed
         if unexpected:
             raise ValueError(
@@ -213,7 +242,17 @@ def load_clean_write_trace(
                         raise ValueError("malformed write trace pc")
                     if pc_value != 0:
                         entry["pc"] = _fmt_u32(pc_value)
+            if "call_context" in fields:
+                raw_ctx = str(row.get("call_context", "") or "").strip()
+                if raw_ctx:
+                    entry["call_context"] = raw_ctx
             entries.append(entry)
+    ctx_map = load_call_context_map(trace_file)
+    if ctx_map:
+        for entry in entries:
+            idx = int(entry["write_index"])
+            if idx in ctx_map and "call_context" not in entry:
+                entry["call_context"] = ctx_map[idx]
     return entries
 
 
@@ -253,6 +292,8 @@ def parse_exact_program_trace_csv(
     if fields not in (
         EXACT_PROGRAM_TRACE_FIELDS,
         EXACT_PROGRAM_TRACE_FIELDS + ("pc",),
+        EXACT_PROGRAM_TRACE_FIELDS + ("pc", "call_context"),
+        EXACT_PROGRAM_TRACE_FIELDS + ("call_context",),
     ):
         raise ValueError("{} has an unexpected header".format(source))
 
@@ -372,6 +413,10 @@ def parse_exact_program_trace_csv(
                     )
                 if pc_value != 0:
                     entry_record["pc"] = _fmt_u32(pc_value)
+        if "call_context" in fields:
+            raw_ctx = str(row.get("call_context", "") or "").strip()
+            if raw_ctx:
+                entry_record["call_context"] = raw_ctx
         entries.append(entry_record)
         previous_index = write_index
     return entries
@@ -391,11 +436,18 @@ def load_exact_program_trace(
         )
     try:
         with open(program_trace_file, "r", encoding="utf-8", newline="") as stream:
-            return parse_exact_program_trace_csv(
+            entries = parse_exact_program_trace_csv(
                 stream.read(), source="exact MRAM program trace"
             )
     except (OSError, UnicodeError, csv.Error) as exc:
         raise ValueError("exact MRAM program trace could not be read: {}".format(exc))
+    ctx_map = load_call_context_map(program_trace_file)
+    if ctx_map:
+        for entry in entries:
+            idx = int(entry["write_index"])
+            if idx in ctx_map and "call_context" not in entry:
+                entry["call_context"] = ctx_map[idx]
+    return entries
 
 
 def _validate_coexisting_write_traces(
@@ -562,6 +614,7 @@ def load_clean_erase_trace(
             "write_count_at_erase",
             "erase_size",
             "pc",
+            "call_context",
         }
         unexpected = set(fields) - allowed
         if unexpected:
@@ -667,7 +720,17 @@ def load_clean_erase_trace(
                         raise ValueError("erase trace pc is malformed")
                     if pc_value != 0:
                         erase_entry["pc"] = _fmt_u32(pc_value)
+            if "call_context" in fields:
+                raw_ctx = str(row.get("call_context", "") or "").strip()
+                if raw_ctx:
+                    erase_entry["call_context"] = raw_ctx
             entries.append(erase_entry)
+    ctx_map = load_call_context_map(erase_trace_file)
+    if ctx_map:
+        for erase_entry in entries:
+            idx = int(erase_entry["erase_index"])
+            if idx in ctx_map and "call_context" not in erase_entry:
+                erase_entry["call_context"] = ctx_map[idx]
     entries.sort(
         key=lambda e: (
             e["writes_at_this_point"] is None,
@@ -876,6 +939,8 @@ def build_clean_operation_trace(
             op["width"] = int(w["width"])
         if w.get("pc"):
             op["pc"] = str(w["pc"])
+        if w.get("call_context"):
+            op["call_context"] = str(w["call_context"])
         ops.append(op)
     for e in erase_entries:
         erase_idx = int(e["erase_index"])
@@ -906,6 +971,8 @@ def build_clean_operation_trace(
             erase_op["erase_size"] = int(e["erase_size"])
         if e.get("pc"):
             erase_op["pc"] = str(e["pc"])
+        if e.get("call_context"):
+            erase_op["call_context"] = str(e["call_context"])
         ops.append(erase_op)
     ops.sort(key=lambda o: o["_sort_key"])
     for i, op in enumerate(ops, start=1):
@@ -938,6 +1005,8 @@ def _compact_operation(op: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
             base["erase_size"] = int(op["erase_size"])
     if op.get("pc"):
         base["pc"] = str(op["pc"])
+    if op.get("call_context"):
+        base["call_context"] = str(op["call_context"])
     return base
 
 

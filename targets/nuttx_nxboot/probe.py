@@ -25,6 +25,7 @@ try:
         _slot_probe,
     )
     from targets.nxboot.probe import collect_state as _base_collect_state
+    from targets.nxboot.probe import describe_ranges  # noqa: F401
 except ImportError:
     # Renode embedded exec() mode: load shared probe by file path.
     _shared = _os.path.normpath(
@@ -43,6 +44,7 @@ except ImportError:
     _hex_u64 = _ns["_hex_u64"]
     _slot_probe = _ns["_slot_probe"]
     _base_collect_state = _ns["collect_state"]
+    describe_ranges = _ns.get("describe_ranges")
 
 
 def collect_state(bus=None, monitor=None, context=None):

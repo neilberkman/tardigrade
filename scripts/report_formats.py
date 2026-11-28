@@ -154,7 +154,47 @@ def saved_run(data, path, root, profile_path=None, elf=None, name=None):
         data = runtime_payload(data, name or raw_profile.get("name") or path.stem, raw_profile)
     from recovery_explanation import explain_recovery_failures
     expected = (data.get("expect") or {}).get("control_outcome") or "success"
-    explain_recovery_failures(data.get("runtime_sweep_results", []), expected, elf, root)
+    raw_bootloader = raw_profile.get("bootloader") if isinstance(raw_profile.get("bootloader"), dict) else {}
+    raw_fs = raw_profile.get("fault_sweep") if isinstance(raw_profile.get("fault_sweep"), dict) else {}
+    raw_mem = raw_profile.get("memory") if isinstance(raw_profile.get("memory"), dict) else {}
+    driver_functions = []
+    for src in (
+        raw_bootloader.get("driver_functions"),
+        raw_profile.get("driver_functions"),
+        raw_fs.get("driver_functions"),
+    ):
+        if isinstance(src, list):
+            for item in src:
+                if isinstance(item, str) and item.strip() and item.strip() not in driver_functions:
+                    driver_functions.append(item.strip())
+    raw_probe = raw_profile.get("state_probe")
+    if isinstance(raw_probe, dict):
+        raw_probe = raw_probe.get("script")
+    if not raw_probe:
+        contracts = data.get("contracts") if isinstance(data.get("contracts"), dict) else {}
+        contract_probe = contracts.get("state_probe")
+        if isinstance(contract_probe, dict):
+            raw_probe = contract_probe.get("script")
+    probe_path = None
+    if isinstance(raw_probe, str) and raw_probe.strip():
+        from profile_loader import _resolve_profile_input_path
+        probe_path = str(_resolve_profile_input_path(raw_probe.strip(), repo_root=root, profile_path=profile_path))
+    raw_slots = raw_mem.get("slots") if isinstance(raw_mem.get("slots"), dict) else None
+    raw_page_size = raw_mem.get("page_size", 4096)
+    try:
+        page_size = int(str(raw_page_size), 0)
+    except Exception:
+        page_size = 4096
+    explain_recovery_failures(
+        data.get("runtime_sweep_results", []),
+        expected,
+        elf,
+        root,
+        page_size=page_size,
+        driver_functions=driver_functions,
+        state_probe=probe_path,
+        slots=raw_slots,
+    )
     return ReportRun(data, name or data.get("profile") or path.stem, profile_path, elf)
 
 

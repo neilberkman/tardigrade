@@ -2792,6 +2792,16 @@ def _main_single() -> int:
             page_size=getattr(profile.memory, "page_size", 4096),
             write_granularity=getattr(profile.memory, "write_granularity", 4),
             trace_address_map=getattr(profile.memory, "trace_address_map", None),
+            driver_functions=getattr(profile, "driver_functions", ()),
+            state_probe=(
+                profile.resolve_path(repo_root, profile.state_probe.script)
+                if getattr(profile, "state_probe", None) and getattr(profile.state_probe, "script", None)
+                else None
+            ),
+            slots={
+                name: {"base": int(slot.base), "size": int(slot.size)}
+                for name, slot in (getattr(profile.memory, "slots", None) or {}).items()
+            },
         )
         planned_fault_types = (
             list(fault_types_list)

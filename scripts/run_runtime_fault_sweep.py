@@ -6699,6 +6699,45 @@ def get_last_fault_pc():
         return 0
 
 
+def get_last_fault_call_context():
+    b = backend
+    if b['kind'] in ('mram', 'fast'):
+        try:
+            ctx = getattr(b['data'], 'LastFaultCallContext', None)
+            return str(ctx).strip() if ctx else None
+        except Exception:
+            return None
+    try:
+        ctx = getattr(b['data'], 'LastFaultCallContext', None)
+        if ctx:
+            return str(ctx).strip()
+    except Exception:
+        pass
+    try:
+        ctx = getattr(b['data'].Nvm, 'LastFaultCallContext', None)
+        return str(ctx).strip() if ctx else None
+    except Exception:
+        return None
+
+
+def parse_call_context_map(text):
+    mapping = {}
+    if not text:
+        return mapping
+    for line in str(text).strip().split('\n'):
+        line = line.strip()
+        if not line or ':' not in line:
+            continue
+        idx_text, ctx = line.split(':', 1)
+        try:
+            idx = int(idx_text.strip(), 0)
+            if idx >= 0 and ctx.strip():
+                mapping[idx] = ctx.strip()
+        except Exception:
+            continue
+    return mapping
+
+
 def _decode_exact_program_bytes(value, width, field_name):
     text = str(value or '').strip()
     if len(text) != int(width) * 2:
@@ -6719,8 +6758,9 @@ def _program_bytes_hex(values):
     return ''.join('{:02x}'.format(int(value) & 0xFF) for value in values)
 
 
-def parse_mram_program_trace(trace_text, memory_size, bus_base):
+def parse_mram_program_trace(trace_text, memory_size, bus_base, call_context_text=None):
     """Parse the exact width-aware program stream exposed by NVMemory."""
+    ctx_map = parse_call_context_map(call_context_text) if call_context_text else {}
     events = []
     previous_index = 0
     for line_number, raw_line in enumerate(str(trace_text or '').splitlines(), 1):
@@ -6766,6 +6806,8 @@ def parse_mram_program_trace(trace_text, memory_size, bus_base):
             pc_val = int(fields[7].strip(), 0)
             if pc_val > 0:
                 event['pc'] = fmt_u32(pc_val)
+        if index in ctx_map:
+            event['call_context'] = ctx_map[index]
         events.append(event)
         previous_index = index
     return events
@@ -6843,6 +6885,15 @@ def collect_mram_fault_evidence(selected_write_index, expected_backend_index):
         trace = parse_mram_program_trace(
             data.ProgramTraceToString(), memory_size, bus_base
         )
+        if hasattr(data, 'WriteCallContextToString'):
+            try:
+                mram_ctx_map = parse_call_context_map(data.WriteCallContextToString())
+                for item in trace:
+                    item_ctx = mram_ctx_map.get(int(item['write_index']))
+                    if item_ctx:
+                        item['call_context'] = item_ctx
+            except Exception:
+                pass
         if len(trace) != int(data.ProgramTraceCount):
             raise ValueError('program trace count does not match exported trace')
         if not trace:
@@ -6877,6 +6928,8 @@ def collect_mram_fault_evidence(selected_write_index, expected_backend_index):
         })
         if fault_event.get('pc'):
             evidence['fault_pc'] = fault_event['pc']
+        if fault_event.get('call_context'):
+            evidence['fault_call_context'] = fault_event['call_context']
         if bool(getattr(data, 'LastFaultMarkedUncorrectable', False)):
             evidence['word_marked_uncorrectable'] = True
             evidence['uncorrectable_word_address'] = fmt_u32(program_address)
@@ -7280,6 +7333,8 @@ def reset_nvmc_for_sweep(tracking_start=None):
             b['data'].LastFaultAddress = 0
         if hasattr(b['data'], 'LastFaultPC'):
             b['data'].LastFaultPC = 0
+        if hasattr(b['data'], 'LastFaultCallContext'):
+            b['data'].LastFaultCallContext = ''
         if hasattr(b['data'], 'PassthroughMode'):
             b['data'].PassthroughMode = False
     elif b['kind'] == 'fast':
@@ -7296,6 +7351,8 @@ def reset_nvmc_for_sweep(tracking_start=None):
         b['data'].LastFaultAddress = 0
         if hasattr(b['data'], 'LastFaultPC'):
             b['data'].LastFaultPC = 0
+        if hasattr(b['data'], 'LastFaultCallContext'):
+            b['data'].LastFaultCallContext = ''
         b['data'].FaultFlashSnapshot = None
         # Shadow scanning: enable for NRF52-style controllers (WEN batches
         # multiple writes, needs diff to count them).  Skip for STM32F4-style
@@ -7323,8 +7380,12 @@ def reset_nvmc_for_sweep(tracking_start=None):
             b['data'].Nvm.LastFaultAddress = 0
         if hasattr(b['data'].Nvm, 'LastFaultPC'):
             b['data'].Nvm.LastFaultPC = 0
+        if hasattr(b['data'].Nvm, 'LastFaultCallContext'):
+            b['data'].Nvm.LastFaultCallContext = ''
         if hasattr(b['data'], 'LastFaultPC'):
             b['data'].LastFaultPC = 0
+        if hasattr(b['data'], 'LastFaultCallContext'):
+            b['data'].LastFaultCallContext = ''
         b['data'].Nvm.DriverErrorFired = False
     _set_preserve_counters_across_reset(True)
     # Reset controller fault state on all backends — command_drop can be
@@ -7369,6 +7430,8 @@ def reset_nvmc_for_recovery(tracking_start=0):
             b['data'].LastFaultAddress = 0
         if hasattr(b['data'], 'LastFaultPC'):
             b['data'].LastFaultPC = 0
+        if hasattr(b['data'], 'LastFaultCallContext'):
+            b['data'].LastFaultCallContext = ''
         if hasattr(b['data'], 'PassthroughMode'):
             b['data'].PassthroughMode = False
         _set_preserve_counters_across_reset(True)
@@ -7386,6 +7449,8 @@ def reset_nvmc_for_recovery(tracking_start=0):
         b['data'].LastFaultAddress = 0
         if hasattr(b['data'], 'LastFaultPC'):
             b['data'].LastFaultPC = 0
+        if hasattr(b['data'], 'LastFaultCallContext'):
+            b['data'].LastFaultCallContext = ''
         # Skip shadow scanning during recovery boot — just count PG transitions
         # for progress tracking. Avoids O(flash_size) ReadBytes per write.
         b['data'].SkipShadowScan = True
@@ -7407,8 +7472,12 @@ def reset_nvmc_for_recovery(tracking_start=0):
             b['data'].Nvm.LastFaultAddress = 0
         if hasattr(b['data'].Nvm, 'LastFaultPC'):
             b['data'].Nvm.LastFaultPC = 0
+        if hasattr(b['data'].Nvm, 'LastFaultCallContext'):
+            b['data'].Nvm.LastFaultCallContext = ''
         if hasattr(b['data'], 'LastFaultPC'):
             b['data'].LastFaultPC = 0
+        if hasattr(b['data'], 'LastFaultCallContext'):
+            b['data'].LastFaultCallContext = ''
         b['data'].Nvm.DriverErrorFired = False
         disarm_fault()
     _set_preserve_counters_across_reset(True)
@@ -13434,8 +13503,9 @@ def _encode_pre_recovery_state(snapshot_bytes, uncorrectable_words=None):
         return None
 
 
-def parse_write_trace_map(trace_text):
+def parse_write_trace_map(trace_text, call_context_text=None):
     flash_base, flash_size = flash_geometry()
+    ctx_map = parse_call_context_map(call_context_text) if call_context_text else {}
     mapping = {}
     previous_index = None
     for line in trace_text.strip().split('\n'):
@@ -13472,11 +13542,14 @@ def parse_write_trace_map(trace_text):
                 meta['value'] = '0x{:016X}'.format(value & 0xFFFFFFFFFFFFFFFF)
         if len(event) >= 5 and int(event[4]) > 0:
             meta['pc'] = fmt_u32(int(event[4]))
+        if write_idx in ctx_map:
+            meta['call_context'] = ctx_map[write_idx]
         mapping[write_idx] = meta
     return mapping
 
-def parse_erase_trace_map(trace_text):
+def parse_erase_trace_map(trace_text, call_context_text=None):
     flash_base, _ = flash_geometry()
+    ctx_map = parse_call_context_map(call_context_text) if call_context_text else {}
     mapping = {}
     for line in trace_text.strip().split('\n'):
         line = line.strip()
@@ -13499,6 +13572,8 @@ def parse_erase_trace_map(trace_text):
             pc_val = int(parts[4].strip(), 0)
             if pc_val > 0:
                 entry['pc'] = fmt_u32(pc_val)
+        if erase_idx in ctx_map:
+            entry['call_context'] = ctx_map[erase_idx]
         mapping[erase_idx] = entry
     return mapping
 
@@ -14289,6 +14364,8 @@ def run_execute_fault(
     fault_address = get_last_command_address() if is_command_fault else get_last_write_address()
     _fault_pc_fn = globals().get('get_last_fault_pc')
     fault_pc = 0 if (is_command_fault or not callable(_fault_pc_fn)) else _fault_pc_fn()
+    _fault_ctx_fn = globals().get('get_last_fault_call_context')
+    fault_call_context = None if (is_command_fault or not callable(_fault_ctx_fn)) else _fault_ctx_fn()
     if (
         backend['kind'] == 'mram'
         and fault_injected
@@ -14304,6 +14381,8 @@ def run_execute_fault(
             fault_address = int(mram_fault_evidence['program_address'], 0)
         if mram_fault_evidence.get('fault_pc') and not fault_pc:
             fault_pc = int(str(mram_fault_evidence['fault_pc']), 0)
+        if mram_fault_evidence.get('fault_call_context') and not fault_call_context:
+            fault_call_context = str(mram_fault_evidence['fault_call_context'])
     if fault_injected and is_power_loss_fault:
         fault_uncorrectable_offsets = _snapshot_mram_fault_uncorrectable_offsets()
         fault_uncorrectable_addresses = _snapshot_mram_fault_uncorrectable_addresses()
@@ -14717,6 +14796,13 @@ def run_execute_fault(
             cal_pc = _cal_pc_fn(fault_type, fault_at) if callable(_cal_pc_fn) else None
             if cal_pc:
                 extras['fault_pc'] = cal_pc
+        if fault_call_context:
+            extras['fault_call_context'] = fault_call_context
+        else:
+            _cal_ctx_fn = globals().get('_get_calibration_op_call_context')
+            cal_ctx = _cal_ctx_fn(fault_type, fault_at) if callable(_cal_ctx_fn) else None
+            if cal_ctx:
+                extras['fault_call_context'] = cal_ctx
     if backend['kind'] != 'slow' and fault_injected and is_power_loss_fault:
         if debug_trailer is not None:
             extras['debug_trailer'] = debug_trailer
@@ -15192,6 +15278,8 @@ def _phase2_chain_evaluated_result(
     }
     if records[-1].get('fault_pc'):
         result['fault_pc'] = records[-1]['fault_pc']
+    if records[-1].get('fault_call_context'):
+        result['fault_call_context'] = records[-1]['fault_call_context']
     _encode_pre_fn = globals().get('_encode_pre_recovery_state')
     if callable(_encode_pre_fn) and snapshot and snapshot.get('flash') is not None:
         _chain_pre_state = _encode_pre_fn(
@@ -15354,6 +15442,8 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None):
         fault_address = get_last_write_address()
         _fault_pc_fn = globals().get('get_last_fault_pc')
         fault_pc = _fault_pc_fn() if callable(_fault_pc_fn) else 0
+        _fault_ctx_fn = globals().get('get_last_fault_call_context')
+        fault_call_context = _fault_ctx_fn() if callable(_fault_ctx_fn) else None
         recovery_signals = {}
         if cut_index > 0:
             _attach_uncorrectable_read_signals(
@@ -15382,6 +15472,8 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None):
             record['tracking_start_address'] = fmt_u32(tracking_start)
         if fault_pc > 0:
             record['fault_pc'] = fmt_u32(fault_pc)
+        if fault_call_context:
+            record['fault_call_context'] = fault_call_context
         if drawn_mram is not None:
             record['mram_torn_word'] = drawn_mram
         if drawn_flash is not None:
@@ -15547,6 +15639,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     p2_fault_address = 0
     p1_fault_pc = 0
     p2_fault_pc = 0
+    p1_fault_call_context = None
+    p2_fault_call_context = None
     p2_write_trace = []
     p2_erase_trace = []
     p1_uncorrectable_offsets = []
@@ -15614,6 +15708,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         p1_fault_address = get_last_write_address()
         _fault_pc_fn = globals().get('get_last_fault_pc')
         p1_fault_pc = _fault_pc_fn() if callable(_fault_pc_fn) else 0
+        _fault_ctx_fn = globals().get('get_last_fault_call_context')
+        p1_fault_call_context = _fault_ctx_fn() if callable(_fault_ctx_fn) else None
     else:
         write_mode = _WRITE_FAULT_MODE.get(p1_fault_type, 0)
         base_writes = get_total_writes()
@@ -15638,6 +15734,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         p1_fault_address = get_last_write_address()
         _fault_pc_fn = globals().get('get_last_fault_pc')
         p1_fault_pc = _fault_pc_fn() if callable(_fault_pc_fn) else 0
+        _fault_ctx_fn = globals().get('get_last_fault_call_context')
+        p1_fault_call_context = _fault_ctx_fn() if callable(_fault_ctx_fn) else None
 
     phase1_ms = int((_time.time() - fp_t0) * 1000)
 
@@ -15818,6 +15916,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         p2_fault_address = get_last_write_address()
         _fault_pc_fn = globals().get('get_last_fault_pc')
         p2_fault_pc = _fault_pc_fn() if callable(_fault_pc_fn) else 0
+        _fault_ctx_fn = globals().get('get_last_fault_call_context')
+        p2_fault_call_context = _fault_ctx_fn() if callable(_fault_ctx_fn) else None
     else:
         write_mode = _WRITE_FAULT_MODE.get(p2_fault_type, 0)
         base_writes = get_total_writes()
@@ -15840,12 +15940,30 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         p2_fault_address = get_last_write_address()
         _fault_pc_fn = globals().get('get_last_fault_pc')
         p2_fault_pc = _fault_pc_fn() if callable(_fault_pc_fn) else 0
+        _fault_ctx_fn = globals().get('get_last_fault_call_context')
+        p2_fault_call_context = _fault_ctx_fn() if callable(_fault_ctx_fn) else None
 
     if p2_trace_enabled:
         backend['data'].WriteTraceEnabled = False
         backend['data'].EraseTraceEnabled = False
-        p2_write_map = parse_write_trace_map(backend['data'].WriteTraceToString())
-        p2_erase_map = parse_erase_trace_map(backend['data'].EraseTraceToString())
+        p2_write_ctx = (
+            backend['data'].WriteCallContextToString()
+            if hasattr(backend['data'], 'WriteCallContextToString')
+            else None
+        )
+        p2_erase_ctx = (
+            backend['data'].EraseCallContextToString()
+            if hasattr(backend['data'], 'EraseCallContextToString')
+            else None
+        )
+        p2_write_map = parse_write_trace_map(
+            backend['data'].WriteTraceToString(),
+            call_context_text=p2_write_ctx,
+        )
+        p2_erase_map = parse_erase_trace_map(
+            backend['data'].EraseTraceToString(),
+            call_context_text=p2_erase_ctx,
+        )
         p2_write_trace = [
             dict({'write_index': index}, **p2_write_map[index])
             for index in sorted(p2_write_map)
@@ -16075,9 +16193,19 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         cal_p1_pc = _cal_pc_fn(p1_fault_type, p1_fault_at) if callable(_cal_pc_fn) else None
         if cal_p1_pc:
             result['phase2_fault']['p1_fault_pc'] = cal_p1_pc
+    if p1_fault_call_context:
+        result['phase2_fault']['p1_fault_call_context'] = p1_fault_call_context
+    else:
+        _cal_ctx_fn = globals().get('_get_calibration_op_call_context')
+        cal_p1_ctx = _cal_ctx_fn(p1_fault_type, p1_fault_at) if callable(_cal_ctx_fn) else None
+        if cal_p1_ctx:
+            result['phase2_fault']['p1_fault_call_context'] = cal_p1_ctx
     if p2_fault_pc > 0:
         result['phase2_fault']['p2_fault_pc'] = fmt_u32(p2_fault_pc)
         result['fault_pc'] = fmt_u32(p2_fault_pc)
+    if p2_fault_call_context:
+        result['phase2_fault']['p2_fault_call_context'] = p2_fault_call_context
+        result['fault_call_context'] = p2_fault_call_context
     _p2_pre_snap = saved_flash_p2 if p2_injected else saved_flash_p1
     _encode_pre_fn = globals().get('_encode_pre_recovery_state')
     if callable(_encode_pre_fn) and _p2_pre_snap is not None:
@@ -16920,6 +17048,41 @@ def load_trace_data(path):
 
 _calibration_write_pc_cache = None
 _calibration_erase_pc_cache = None
+_calibration_write_ctx_cache = None
+_calibration_erase_ctx_cache = None
+
+
+def load_trace_call_context_map(path):
+    if not path:
+        return {}
+    companion = path[:-4] + '_call_context.txt' if str(path).endswith('.csv') else str(path) + '_call_context.txt'
+    if not os.path.exists(companion):
+        return {}
+    try:
+        with open(companion, 'r') as f:
+            return parse_call_context_map(f.read())
+    except Exception:
+        return {}
+
+
+def _get_calibration_op_call_context(fault_type, fault_at):
+    global _calibration_write_ctx_cache, _calibration_erase_ctx_cache
+    try:
+        idx = int(fault_at) + 1
+    except Exception:
+        return None
+    if idx <= 0:
+        return None
+    fault_base = _base_fault_type_code(fault_type)
+    if fault_base in ('e', 'a'):
+        if _calibration_erase_ctx_cache is None:
+            _calibration_erase_ctx_cache = load_trace_call_context_map(erase_trace_file_path)
+        return _calibration_erase_ctx_cache.get(idx)
+    if _calibration_write_ctx_cache is None:
+        _calibration_write_ctx_cache = load_trace_call_context_map(trace_file_path)
+        if not _calibration_write_ctx_cache and program_trace_file_path:
+            _calibration_write_ctx_cache = load_trace_call_context_map(program_trace_file_path)
+    return _calibration_write_ctx_cache.get(idx)
 
 
 def load_trace_pc_map(path):
@@ -17083,6 +17246,12 @@ def load_mram_program_trace_data(path):
                     entry['pc'] = fmt_u32(pc_val)
             events.append(entry)
             previous_index = write_index
+    ctx_map = load_trace_call_context_map(path) if 'load_trace_call_context_map' in globals() else {}
+    if ctx_map:
+        for ev in events:
+            idx = int(ev['write_index'])
+            if idx in ctx_map:
+                ev['call_context'] = ctx_map[idx]
     return events
 
 
@@ -17175,6 +17344,8 @@ def _deferred_mram_replay_fault_evidence(
         }
         if trace_event.get('pc'):
             trace_item['pc'] = trace_event['pc']
+        if trace_event.get('call_context'):
+            trace_item['call_context'] = trace_event['call_context']
         trace.append(trace_item)
     evidence = {
         'contract_version': 1,
@@ -17191,6 +17362,8 @@ def _deferred_mram_replay_fault_evidence(
     }
     if event.get('pc'):
         evidence['fault_pc'] = event['pc']
+    if event.get('call_context'):
+        evidence['fault_call_context'] = event['call_context']
     if marked_uncorrectable:
         evidence['word_marked_uncorrectable'] = True
         evidence['uncorrectable_word_address'] = evidence['program_address']
@@ -18109,6 +18282,10 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
         cal_pc = _cal_pc_fn(fault_type, fault_at) if callable(_cal_pc_fn) else None
         if cal_pc:
             native_extra_fields['fault_pc'] = cal_pc
+        _cal_ctx_fn = globals().get('_get_calibration_op_call_context')
+        cal_ctx = _cal_ctx_fn(fault_type, fault_at) if callable(_cal_ctx_fn) else None
+        if cal_ctx:
+            native_extra_fields['fault_call_context'] = cal_ctx
     result = _build_fault_result(
         fault_at, fault_type, fault_injected, fault_address,
         actual_writes, signals, boot_outcome=boot_outcome,
@@ -18554,11 +18731,18 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
         extra_fields['mram_fault_evidence'] = mram_fault_evidence
         if mram_fault_evidence.get('fault_pc'):
             extra_fields['fault_pc'] = mram_fault_evidence['fault_pc']
+        if mram_fault_evidence.get('fault_call_context'):
+            extra_fields['fault_call_context'] = mram_fault_evidence['fault_call_context']
     if fault_injected and 'fault_pc' not in extra_fields:
         _cal_pc_fn = globals().get('_get_calibration_op_pc')
         cal_pc = _cal_pc_fn(fault_type, fault_at) if callable(_cal_pc_fn) else None
         if cal_pc:
             extra_fields['fault_pc'] = cal_pc
+    if fault_injected and 'fault_call_context' not in extra_fields:
+        _cal_ctx_fn = globals().get('_get_calibration_op_call_context')
+        cal_ctx = _cal_ctx_fn(fault_type, fault_at) if callable(_cal_ctx_fn) else None
+        if cal_ctx:
+            extra_fields['fault_call_context'] = cal_ctx
     result = _build_fault_result(
         fault_at, fault_type, fault_injected, fault_address,
         actual_writes, signals, boot_outcome=boot_outcome,
@@ -18701,6 +18885,8 @@ def _state_search_operations_from_maps(write_map, erase_map):
         }
         if meta.get('pc'):
             write_item['pc'] = meta['pc']
+        if meta.get('call_context'):
+            write_item['call_context'] = meta['call_context']
         writes.append(write_item)
     erases = []
     for expected_index, erase_index in enumerate(sorted(erase_map), start=1):
@@ -18718,6 +18904,8 @@ def _state_search_operations_from_maps(write_map, erase_map):
         }
         if meta.get('pc'):
             erase_item['pc'] = meta['pc']
+        if meta.get('call_context'):
+            erase_item['call_context'] = meta['call_context']
         erases.append(erase_item)
     return merge_operation_traces(writes, erases)
 
@@ -18749,6 +18937,7 @@ def _state_search_load_calibration_operations():
                 erase_trace_file_path, require_replay_metadata=True
             )
             erase_pcs = load_erase_trace_pc_map(erase_trace_file_path)
+            erase_ctxs = load_trace_call_context_map(erase_trace_file_path)
             for position, (flash_offset, writes_at, erase_size) in enumerate(
                 erases, start=1
             ):
@@ -18757,6 +18946,7 @@ def _state_search_load_calibration_operations():
                     'writes_at_this_point': int(writes_at),
                     'erase_size': int(erase_size),
                     'pc': erase_pcs.get(position),
+                    'call_context': erase_ctxs.get(position),
                 }
         operations = merge_operation_traces(program_events, [
             {
@@ -18767,6 +18957,7 @@ def _state_search_load_calibration_operations():
                 ),
                 'erase_size': int(meta['erase_size']),
                 'pc': meta.get('pc'),
+                'call_context': meta.get('call_context'),
             }
             for index, meta in sorted(erase_map.items())
         ])
@@ -18779,6 +18970,7 @@ def _state_search_load_calibration_operations():
         raise RuntimeError('recovery state search calibration trace has an ambiguous write width')
     writes = _validated_writeback_trace(raw_writes)
     write_pcs = load_trace_pc_map(trace_file_path)
+    write_ctxs = load_trace_call_context_map(trace_file_path)
     write_map = {}
     for write_index, flash_offset, value, width in writes:
         if int(write_index) <= 0:
@@ -18788,6 +18980,7 @@ def _state_search_load_calibration_operations():
             'value': int(value),
             'width': int(width),
             'pc': write_pcs.get(int(write_index)),
+            'call_context': write_ctxs.get(int(write_index)),
         }
     erase_map = {}
     if erase_trace_file_path and os.path.exists(erase_trace_file_path):
@@ -18795,6 +18988,7 @@ def _state_search_load_calibration_operations():
             erase_trace_file_path, require_replay_metadata=True
         )
         erase_pcs = load_erase_trace_pc_map(erase_trace_file_path)
+        erase_ctxs = load_trace_call_context_map(erase_trace_file_path)
         for position, (flash_offset, writes_at, erase_size) in enumerate(
             erases, start=1
         ):
@@ -18803,6 +18997,7 @@ def _state_search_load_calibration_operations():
                 'writes_at_this_point': int(writes_at),
                 'erase_size': int(erase_size),
                 'pc': erase_pcs.get(position),
+                'call_context': erase_ctxs.get(position),
             }
     return (
         _state_search_operations_from_maps(write_map, erase_map),
@@ -18814,12 +19009,23 @@ def _state_search_load_calibration_operations():
 def _state_search_capture_trace():
     target = _state_search_trace_target()
     erase_text = str(target.EraseTraceToString())
-    erase_map = parse_erase_trace_map(erase_text)
+    erase_ctx_text = (
+        str(target.EraseCallContextToString())
+        if hasattr(target, 'EraseCallContextToString')
+        else None
+    )
+    erase_map = parse_erase_trace_map(erase_text, call_context_text=erase_ctx_text)
     if backend.get('kind') == 'mram':
+        write_ctx_text = (
+            str(target.WriteCallContextToString())
+            if hasattr(target, 'WriteCallContextToString')
+            else None
+        )
         program_events = parse_mram_program_trace(
             target.ProgramTraceToString(),
             int(target.Size),
             int(backend.get('bus_base')),
+            call_context_text=write_ctx_text,
         )
         if len(program_events) != int(target.ProgramTraceCount):
             raise RuntimeError(
@@ -18865,6 +19071,8 @@ def _state_search_capture_trace():
             }
             if event.get('pc'):
                 write_item['pc'] = event['pc']
+            if event.get('call_context'):
+                write_item['call_context'] = event['call_context']
             writes.append(write_item)
         erases = [
             {
@@ -18875,12 +19083,18 @@ def _state_search_capture_trace():
                 ),
                 'erase_size': int(meta['erase_size']),
                 'pc': meta.get('pc'),
+                'call_context': meta.get('call_context'),
             }
             for index, meta in sorted(erase_map.items())
         ]
         return merge_operation_traces(writes, erases)
     write_text = str(target.WriteTraceToString())
-    write_map = parse_write_trace_map(write_text)
+    write_ctx_text = (
+        str(target.WriteCallContextToString())
+        if hasattr(target, 'WriteCallContextToString')
+        else None
+    )
+    write_map = parse_write_trace_map(write_text, call_context_text=write_ctx_text)
     return _state_search_operations_from_maps(write_map, erase_map)
 
 
@@ -19107,6 +19321,8 @@ def _state_search_boot_state(state, chain, generation):
         state_search_extra_fields['recovery_tracking_start_address'] = fmt_u32(recovery_start)
     if chain and chain[-1].get('pc'):
         state_search_extra_fields['fault_pc'] = chain[-1]['pc']
+    if chain and chain[-1].get('call_context'):
+        state_search_extra_fields['fault_call_context'] = chain[-1]['call_context']
     if recovery_tracking_start_address is not None and capture_recovery_trace:
         recovery_tracking_gate = recovery_trace_size(
             recovery_operations, recovery_start, state.region('nvm').base_address, phase2_state_search
@@ -19887,6 +20103,15 @@ if calibration_mode:
                 log('calibration: wrote {} trace entries to {}'.format(
                     len(parsed_trace), trace_file
                 ))
+                if hasattr(calibration_trace_target, 'WriteCallContextToString'):
+                    try:
+                        raw_w_ctx = str(calibration_trace_target.WriteCallContextToString() or '').strip()
+                        if raw_w_ctx:
+                            w_ctx_file = trace_file[:-4] + '_call_context.txt' if trace_file.endswith('.csv') else trace_file + '_call_context.txt'
+                            with open(w_ctx_file, 'w') as wcf:
+                                wcf.write(raw_w_ctx + '\n')
+                    except Exception:
+                        pass
                 if trace_file_bin:
                     with open(trace_file_bin, 'wb') as tfb:
                         for write_idx, flash_off, value, _width, _pc in parsed_trace:
@@ -19967,6 +20192,15 @@ if calibration_mode:
             log('calibration: wrote {} exact MRAM program entries to {}'.format(
                 len(program_trace), program_trace_file
             ))
+            if hasattr(backend['data'], 'WriteCallContextToString'):
+                try:
+                    raw_p_ctx = str(backend['data'].WriteCallContextToString() or '').strip()
+                    if raw_p_ctx:
+                        p_ctx_file = program_trace_file[:-4] + '_call_context.txt' if program_trace_file.endswith('.csv') else program_trace_file + '_call_context.txt'
+                        with open(p_ctx_file, 'w') as pcf:
+                            pcf.write(raw_p_ctx + '\n')
+                except Exception:
+                    pass
             if int(tracking_start_address_config or 0):
                 (
                     tracking_base_file,
@@ -20042,6 +20276,15 @@ if calibration_mode:
                 log('calibration: wrote {} erase trace entries to {}'.format(erase_count, erase_trace_file))
                 log('calibration: wrote {} binary erase entries to {}'.format(erase_bin_count, erase_trace_file_bin))
                 log('calibration: {} total erases'.format(total_erases))
+                if hasattr(calibration_trace_target, 'EraseCallContextToString'):
+                    try:
+                        raw_e_ctx = str(calibration_trace_target.EraseCallContextToString() or '').strip()
+                        if raw_e_ctx:
+                            e_ctx_file = erase_trace_file[:-4] + '_call_context.txt' if erase_trace_file.endswith('.csv') else erase_trace_file + '_call_context.txt'
+                            with open(e_ctx_file, 'w') as ecf:
+                                ecf.write(raw_e_ctx + '\n')
+                    except Exception:
+                        pass
 
         total_i2c_transactions = get_total_i2c_transactions()
         total_otp_blows = get_total_otp_blows()

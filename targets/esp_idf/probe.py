@@ -158,6 +158,33 @@ def _seq_to_slot(ota_seq, num_slots=2):
     return (ota_seq - 1) % num_slots
 
 
+def describe_ranges(context=None):
+    """Return named persistent address ranges for ESP-IDF otadata sectors."""
+    context = context or {}
+    otadata_base = _as_int(context.get("otadata_base", _DEFAULT_OTADATA_BASE), _DEFAULT_OTADATA_BASE)
+    sector_size = _as_int(
+        context.get("otadata_sector_size", _DEFAULT_OTADATA_SECTOR_SIZE),
+        _DEFAULT_OTADATA_SECTOR_SIZE,
+    )
+    ranges = []
+    for idx, sector_name in enumerate(("sector0", "sector1")):
+        base = otadata_base + idx * sector_size
+        for start_off, end_off, label, field in (
+            (0, 4, "ESP-IDF otadata ota_seq", "ota_seq"),
+            (4, 24, "ESP-IDF otadata seq_label", "seq_label"),
+            (24, 28, "ESP-IDF otadata ota_state", "ota_state"),
+            (28, 32, "ESP-IDF otadata crc", "crc"),
+        ):
+            ranges.append({
+                "start": base + start_off,
+                "end": base + end_off,
+                "name": label,
+                "slot": sector_name,
+                "field": field,
+            })
+    return ranges
+
+
 def collect_state(bus=None, monitor=None, context=None):
     """Collect ESP-IDF otadata semantic state from emulated memory.
 

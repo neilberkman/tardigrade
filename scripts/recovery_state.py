@@ -479,6 +479,8 @@ def _normalize_operation(raw, kind=None, sequence=None):
         pc_value = _coerce_integer(operation["pc"]) & 0xFFFFFFFF
         if pc_value != 0:
             normalized["pc"] = "0x{:08X}".format(pc_value)
+    if operation.get("call_context") not in (None, ""):
+        normalized["call_context"] = str(operation["call_context"])
     return normalized
 
 

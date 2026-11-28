@@ -64,6 +64,83 @@ def _slot_probe(bus, base, size, align):
     }
 
 
+def describe_ranges(context=None):
+    """Return named persistent address ranges for MCUboot slot trailers and headers."""
+    context = context or {}
+    geometry = context.get("slot_geometry") or context.get("slots") or {}
+    align = _as_int(context.get("trailer_align", 8), 8)
+    if align <= 0:
+        align = 8
+    page_size = _as_int(context.get("page_size", 4096), 4096)
+    if page_size <= 0:
+        page_size = 4096
+    magic_align_size = ((16 + align - 1) // align) * align if align > 16 else 16
+    ranges = []
+    for slot_name, slot_info in sorted(geometry.items()):
+        if not isinstance(slot_info, dict):
+            continue
+        base = _as_int(slot_info.get("base"), -1)
+        size = _as_int(slot_info.get("size"), 0)
+        if base < 0 or size <= 0:
+            continue
+        slot_end = base + size
+        magic_start = slot_end - 16
+        image_ok_start = slot_end - magic_align_size - align
+        copy_done_start = slot_end - magic_align_size - (2 * align)
+        swap_info_start = slot_end - magic_align_size - (3 * align)
+        swap_size_start = slot_end - magic_align_size - (4 * align)
+        status_start = max(base, slot_end - page_size)
+        if magic_start >= base:
+            ranges.append({
+                "start": magic_start,
+                "end": slot_end,
+                "name": "MCUboot trailer magic",
+                "slot": slot_name,
+                "field": "magic",
+            })
+        if image_ok_start >= base:
+            ranges.append({
+                "start": image_ok_start,
+                "end": slot_end - magic_align_size,
+                "name": "MCUboot image_ok",
+                "slot": slot_name,
+                "field": "image_ok",
+            })
+        if copy_done_start >= base:
+            ranges.append({
+                "start": copy_done_start,
+                "end": image_ok_start,
+                "name": "MCUboot copy_done",
+                "slot": slot_name,
+                "field": "copy_done",
+            })
+        if swap_info_start >= base:
+            ranges.append({
+                "start": swap_info_start,
+                "end": copy_done_start,
+                "name": "MCUboot swap_info",
+                "slot": slot_name,
+                "field": "swap_info",
+            })
+        if swap_size_start >= base:
+            ranges.append({
+                "start": swap_size_start,
+                "end": swap_info_start,
+                "name": "MCUboot swap_size",
+                "slot": slot_name,
+                "field": "swap_size",
+            })
+        if swap_size_start > status_start:
+            ranges.append({
+                "start": status_start,
+                "end": swap_size_start,
+                "name": "MCUboot swap status",
+                "slot": slot_name,
+                "field": "swap_status",
+            })
+    return ranges
+
+
 def collect_state(bus=None, monitor=None, context=None):
     if bus is None or monitor is None:
         return {}

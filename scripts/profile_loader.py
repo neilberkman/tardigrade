@@ -1380,6 +1380,7 @@ class ComponentConfig:
         "bootloader_elf",
         "bootloader_entry",
         "bootloader_algorithm",
+        "driver_functions",
         "memory",
         "images",
         "pre_boot_state",
@@ -1405,6 +1406,7 @@ class ComponentConfig:
         fault_sweep: Optional["FaultSweepConfig"] = None,
         flash_backend: Optional[str] = None,
         bootloader_algorithm: Optional[str] = None,
+        driver_functions: Optional[List[str]] = None,
     ) -> None:
         self.name = name
         self.platform = platform
@@ -1414,6 +1416,7 @@ class ComponentConfig:
             bootloader_algorithm,
             "bootloader.algorithm",
         )
+        self.driver_functions: Tuple[str, ...] = tuple(driver_functions or ())
         self.memory = memory
         self.images = images
         self.pre_boot_state = pre_boot_state
@@ -1516,6 +1519,11 @@ class ComponentConfig:
             boundary_previous_value=getattr(parent, "boundary_previous_value", None),
             target_source=getattr(parent, "target_source", None),
             ownership_manifest_complete=parent.ownership_manifest_complete,
+            driver_functions=list(
+                self.driver_functions
+                if getattr(self, "driver_functions", None)
+                else getattr(parent, "driver_functions", ())
+            ),
         )
         resolved.auto_update_trigger = bool(
             getattr(parent, "auto_update_trigger", False)
@@ -1970,6 +1978,7 @@ class FaultSweepConfig:
         "torn_word_choices",
         "include_erase_fault_points",
         "trace_replay_cross_check_every",
+        "_driver_functions",
     )
 
     def __init__(
@@ -2031,7 +2040,9 @@ class FaultSweepConfig:
         include_erase_fault_points: bool = False,
         trace_replay_cross_check_every: int = 100,
         recovery_tracking_start_address: Optional[int] = None,
+        driver_functions: Optional[List[str]] = None,
     ) -> None:
+        self._driver_functions: Tuple[str, ...] = tuple(driver_functions or ())
         self.mode = mode
         self.max_writes = max_writes
         if not (
@@ -2765,6 +2776,21 @@ VALID_BOOTLOADER_ALGORITHMS = frozenset(
 )
 
 
+def _parse_driver_functions(raw: Any, context: str) -> List[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("{}: expected list of function names or patterns".format(context))
+    out: List[str] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, str) or not item.strip():
+            raise ProfileError("{}[{}]: expected non-empty string".format(context, index))
+        val = item.strip()
+        if val not in out:
+            out.append(val)
+    return out
+
+
 def _parse_bootloader_algorithm(
     raw: Any,
     context: str = "bootloader.algorithm",
@@ -2936,6 +2962,7 @@ class ProfileConfig:
         target_source: Optional[TargetSourceConfig] = None,
         ownership_manifest_complete: bool = False,
         bootloader_algorithm: Optional[str] = None,
+        driver_functions: Optional[List[str]] = None,
 
     ) -> None:
         self.schema_version = schema_version
@@ -2948,6 +2975,12 @@ class ProfileConfig:
             bootloader_algorithm,
             "bootloader.algorithm",
         )
+        merged_drivers: List[str] = []
+        for item in list(driver_functions or []) + list(getattr(fault_sweep, "_driver_functions", ()) or ()):
+            text = str(item).strip()
+            if text and text not in merged_drivers:
+                merged_drivers.append(text)
+        self.driver_functions: Tuple[str, ...] = tuple(merged_drivers)
         self.memory = memory
         self.images = images
         self.pre_boot_state = pre_boot_state
@@ -3148,6 +3181,7 @@ class ProfileConfig:
             ),
             target_source=getattr(self, "target_source", None),
             ownership_manifest_complete=self.ownership_manifest_complete,
+            driver_functions=list(getattr(self, "driver_functions", ()) or ()),
 
         )
         if state.update_trigger is not None and state.pre_boot_state is None:
@@ -5343,6 +5377,10 @@ def _parse_fault_sweep(
         ),
         trace_replay_cross_check_every=raw.get(
             "trace_replay_cross_check_every", 100
+        ),
+        driver_functions=_parse_driver_functions(
+            raw.get("driver_functions"),
+            "fault_sweep.driver_functions",
         ),
     )
     fs_cfg._raw_boot_cycle_hook = raw_boot_cycle_hook
@@ -7821,6 +7859,10 @@ def _parse_component(
         bootloader.get("algorithm") if isinstance(bootloader, dict) else None,
         "{}.bootloader.algorithm".format(ctx),
     )
+    component_drivers = _parse_driver_functions(
+        bootloader.get("driver_functions") if isinstance(bootloader, dict) else None,
+        "{}.bootloader.driver_functions".format(ctx),
+    )
 
     memory = _parse_memory(_require(raw, "memory", ctx))
 
@@ -7877,6 +7919,7 @@ def _parse_component(
         fault_sweep=fault_sweep,
         flash_backend=flash_backend,
         bootloader_algorithm=bootloader_algorithm,
+        driver_functions=component_drivers,
     )
 
 
@@ -8437,6 +8480,7 @@ _STRICT_TOP_LEVEL_KEYS = frozenset(
         "terminal_error_paths",
         "boundary_campaigns",
         "target_source",
+        "driver_functions",
     }
 )
 
@@ -8478,6 +8522,7 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
         "torn_word_seed",
         "include_erase_fault_points",
         "trace_replay_cross_check_every",
+        "driver_functions",
     }
 )
 
@@ -8521,9 +8566,11 @@ def _reject_unknown_keys(
 
 
 def _validate_strict_bootloader(raw: Any, context: str) -> None:
-    _reject_unknown_keys(raw, frozenset({"elf", "entry", "algorithm"}), context)
+    _reject_unknown_keys(raw, frozenset({"elf", "entry", "algorithm", "driver_functions"}), context)
     if "algorithm" in raw:
         _parse_bootloader_algorithm(raw.get("algorithm"), "{}.algorithm".format(context))
+    if "driver_functions" in raw:
+        _parse_driver_functions(raw.get("driver_functions"), "{}.driver_functions".format(context))
 
 
 def _validate_strict_memory(raw: Any, context: str) -> None:
@@ -9408,6 +9455,19 @@ def _load_profile(
         bootloader.get("algorithm") if isinstance(bootloader, dict) else None,
         "bootloader.algorithm",
     )
+    driver_functions = []
+    for item in (
+        _parse_driver_functions(
+            bootloader.get("driver_functions") if isinstance(bootloader, dict) else None,
+            "bootloader.driver_functions",
+        )
+        + _parse_driver_functions(
+            data.get("driver_functions"),
+            "driver_functions",
+        )
+    ):
+        if item not in driver_functions:
+            driver_functions.append(item)
 
     ownership_manifest_complete = data.get("ownership_manifest_complete", False)
     if not isinstance(ownership_manifest_complete, bool):
@@ -9852,6 +9912,7 @@ def _load_profile(
         boundary_campaigns=boundary_campaigns,
         target_source=target_source,
         ownership_manifest_complete=ownership_manifest_complete,
+        driver_functions=driver_functions,
 
     )
     profile.auto_update_trigger = auto_update_trigger

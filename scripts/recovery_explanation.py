@@ -4,7 +4,9 @@
 """Explain recovery observations after classification, using recorded evidence."""
 
 import base64
+import importlib.util
 import os
+from pathlib import Path
 import zlib
 
 from fault_classification import (
@@ -178,6 +180,10 @@ def _p2_merged_operations(p2_info):
             entry["address"] = item["address"]
         if item.get("pc"):
             entry["pc"] = item["pc"]
+        if item.get("call_context"):
+            entry["call_context"] = item["call_context"]
+        elif item.get("call_chain"):
+            entry["call_context"] = item["call_chain"]
         writes.append(entry)
     erases = []
     for item in p2_info.get("p2_erase_trace") or ():
@@ -191,6 +197,10 @@ def _p2_merged_operations(p2_info):
             entry["address"] = item["address"]
         if item.get("pc"):
             entry["pc"] = item["pc"]
+        if item.get("call_context"):
+            entry["call_context"] = item["call_context"]
+        elif item.get("call_chain"):
+            entry["call_context"] = item["call_chain"]
         erases.append(entry)
     if writes and erases:
         try:
@@ -230,7 +240,24 @@ def _lookup_op_in_list(operations, kind, op_index):
     return None
 
 
-def _resolve_cuts(row, source, calibration_ops=(), flash_base=0):
+def _attach_call_chain(target, pc, call_context, source, driver_functions=()):
+    if not pc and not call_context:
+        return
+    chain, caller = source.resolve_call_chain(
+        pc,
+        call_context=call_context,
+        driver_functions=driver_functions,
+    )
+    if not pc and chain:
+        pc = chain[0].get("pc")
+    if pc:
+        target["pc"] = str(pc)
+    if chain:
+        target["call_chain"] = chain
+    target["source"] = caller
+
+
+def _resolve_cuts(row, source, calibration_ops=(), flash_base=0, driver_functions=()):
     cuts_out = []
     search = row.get("recovery_state_search") or {}
     chain = (search.get("chain") or {}).get("cuts")
@@ -246,15 +273,26 @@ def _resolve_cuts(row, source, calibration_ops=(), flash_base=0):
             if raw_cut.get("address"):
                 entry["address"] = str(raw_cut["address"])
             pc = raw_cut.get("pc")
-            if not pc and idx == 0:
+            call_ctx = raw_cut.get("call_context") or raw_cut.get("call_chain")
+            if (not pc or not call_ctx) and idx == 0:
                 cal_op = _lookup_op_in_list(calibration_ops, op_kind, op_index)
-                if cal_op and cal_op.get("pc"):
-                    pc = cal_op["pc"]
-            if not pc and idx == len(chain) - 1 and row.get("fault_pc"):
-                pc = row["fault_pc"]
-            if pc:
-                entry["pc"] = str(pc)
-                entry["source"] = source.resolve_pc(pc)
+                if cal_op:
+                    if not pc and cal_op.get("pc"):
+                        pc = cal_op["pc"]
+                    if not call_ctx and (cal_op.get("call_context") or cal_op.get("call_chain")):
+                        call_ctx = cal_op.get("call_context") or cal_op.get("call_chain")
+            if idx == len(chain) - 1:
+                if not pc and row.get("fault_pc"):
+                    pc = row["fault_pc"]
+                if not call_ctx and row.get("fault_call_context"):
+                    call_ctx = row["fault_call_context"]
+            _attach_call_chain(entry, pc, call_ctx, source, driver_functions=driver_functions)
+            if isinstance(raw_cut, dict):
+                raw_cut.pop("call_context", None)
+                if "call_chain" in entry:
+                    raw_cut["call_chain"] = entry["call_chain"]
+                if "source" in entry:
+                    raw_cut["source"] = entry["source"]
             cuts_out.append(entry)
         return cuts_out
 
@@ -270,16 +308,16 @@ def _resolve_cuts(row, source, calibration_ops=(), flash_base=0):
         if p2.get("p1_fault_address"):
             p1_entry["address"] = str(p2["p1_fault_address"])
         p1_pc = p2.get("p1_fault_pc")
-        if not p1_pc:
-            cal_op = _lookup_op_in_list(calibration_ops, p1_kind, p1_idx)
-            if cal_op:
-                if cal_op.get("pc"):
-                    p1_pc = cal_op["pc"]
-                if not p1_entry.get("address") and cal_op.get("address"):
-                    p1_entry["address"] = cal_op["address"]
-        if p1_pc:
-            p1_entry["pc"] = str(p1_pc)
-            p1_entry["source"] = source.resolve_pc(p1_pc)
+        p1_ctx = p2.get("p1_fault_call_context")
+        cal_op = _lookup_op_in_list(calibration_ops, p1_kind, p1_idx)
+        if cal_op:
+            if not p1_pc and cal_op.get("pc"):
+                p1_pc = cal_op["pc"]
+            if not p1_ctx and (cal_op.get("call_context") or cal_op.get("call_chain")):
+                p1_ctx = cal_op.get("call_context") or cal_op.get("call_chain")
+            if not p1_entry.get("address") and cal_op.get("address"):
+                p1_entry["address"] = cal_op["address"]
+        _attach_call_chain(p1_entry, p1_pc, p1_ctx, source, driver_functions=driver_functions)
         cuts_out.append(p1_entry)
 
         p2_kind = "erase" if str(p2.get("p2_fault_type")) in ("e", "a", "interrupted_erase") else "write"
@@ -294,9 +332,12 @@ def _resolve_cuts(row, source, calibration_ops=(), flash_base=0):
         p2_ops = _p2_merged_operations(p2)
         p2_trace_op = _lookup_op_in_list(p2_ops, p2_kind, p2_idx)
         p2_pc = p2.get("p2_fault_pc") or (p2_trace_op.get("pc") if p2_trace_op else None) or row.get("fault_pc")
-        if p2_pc:
-            p2_entry["pc"] = str(p2_pc)
-            p2_entry["source"] = source.resolve_pc(p2_pc)
+        p2_ctx = (
+            p2.get("p2_fault_call_context")
+            or (p2_trace_op.get("call_context") if p2_trace_op else None)
+            or row.get("fault_call_context")
+        )
+        _attach_call_chain(p2_entry, p2_pc, p2_ctx, source, driver_functions=driver_functions)
         cuts_out.append(p2_entry)
         return cuts_out
 
@@ -313,13 +354,21 @@ def _resolve_cuts(row, source, calibration_ops=(), flash_base=0):
             if cut_rec.get("fault_address"):
                 entry["address"] = str(cut_rec["fault_address"])
             pc = cut_rec.get("fault_pc")
-            if not pc and idx == 0:
+            call_ctx = cut_rec.get("fault_call_context") or cut_rec.get("call_chain")
+            if (not pc or not call_ctx) and idx == 0:
                 cal_op = _lookup_op_in_list(calibration_ops, op_kind, op_index)
-                if cal_op and cal_op.get("pc"):
-                    pc = cal_op["pc"]
-            if pc:
-                entry["pc"] = str(pc)
-                entry["source"] = source.resolve_pc(pc)
+                if cal_op:
+                    if not pc and cal_op.get("pc"):
+                        pc = cal_op["pc"]
+                    if not call_ctx and (cal_op.get("call_context") or cal_op.get("call_chain")):
+                        call_ctx = cal_op.get("call_context") or cal_op.get("call_chain")
+            _attach_call_chain(entry, pc, call_ctx, source, driver_functions=driver_functions)
+            if isinstance(cut_rec, dict):
+                cut_rec.pop("fault_call_context", None)
+                if "call_chain" in entry:
+                    cut_rec["call_chain"] = entry["call_chain"]
+                if "source" in entry:
+                    cut_rec["source"] = entry["source"]
             cuts_out.append(entry)
         return cuts_out
 
@@ -336,15 +385,21 @@ def _resolve_cuts(row, source, calibration_ops=(), flash_base=0):
         if idx == len(paths[0]) - 1 and row.get("fault_address"):
             entry["address"] = str(row["fault_address"])
         pc = row.get("fault_pc") if idx == len(paths[0]) - 1 else None
-        if not pc:
+        call_ctx = row.get("fault_call_context") if idx == len(paths[0]) - 1 else None
+        if not pc or not call_ctx:
             mram_ev = row.get("mram_fault_evidence") or {}
-            if mram_ev.get("fault_pc"):
+            if not pc and mram_ev.get("fault_pc"):
                 pc = mram_ev["fault_pc"]
-            else:
+            if not call_ctx and mram_ev.get("fault_call_context"):
+                call_ctx = mram_ev["fault_call_context"]
+            if not pc or not call_ctx:
                 mram_op = _lookup_op_in_list(mram_ev.get("write_trace") or (), op_kind, op_index)
-                if mram_op and mram_op.get("pc"):
-                    pc = mram_op["pc"]
-        if not pc:
+                if mram_op:
+                    if not pc and mram_op.get("pc"):
+                        pc = mram_op["pc"]
+                    if not call_ctx and (mram_op.get("call_context") or mram_op.get("call_chain")):
+                        call_ctx = mram_op.get("call_context") or mram_op.get("call_chain")
+        if not pc or not call_ctx:
             fw = row.get("fault_window") or {}
             fw_ops = list(fw.get("operations") or ())
             for key in ("before", "at", "after"):
@@ -352,27 +407,29 @@ def _resolve_cuts(row, source, calibration_ops=(), flash_base=0):
                     fw_ops.append(fw[key])
             fw_op = _lookup_op_in_list(fw_ops, op_kind, op_index)
             if fw_op:
-                if fw_op.get("pc"):
+                if not pc and fw_op.get("pc"):
                     pc = fw_op["pc"]
+                if not call_ctx and (fw_op.get("call_context") or fw_op.get("call_chain")):
+                    call_ctx = fw_op.get("call_context") or fw_op.get("call_chain")
                 if not entry.get("address") and fw_op.get("address"):
                     entry["address"] = fw_op["address"]
-        if not pc and idx == 0:
+        if (not pc or not call_ctx) and idx == 0:
             cal_op = _lookup_op_in_list(calibration_ops, op_kind, op_index)
             if cal_op:
-                if cal_op.get("pc"):
+                if not pc and cal_op.get("pc"):
                     pc = cal_op["pc"]
+                if not call_ctx and (cal_op.get("call_context") or cal_op.get("call_chain")):
+                    call_ctx = cal_op.get("call_context") or cal_op.get("call_chain")
                 if not entry.get("address") and cal_op.get("address"):
                     entry["address"] = cal_op["address"]
                 elif not entry.get("address") and "offset" in cal_op:
                     entry["address"] = f"0x{(int(flash_base) + int(cal_op['offset'])) & 0xFFFFFFFF:08X}"
-        if pc:
-            entry["pc"] = str(pc)
-            entry["source"] = source.resolve_pc(pc)
+        _attach_call_chain(entry, pc, call_ctx, source, driver_functions=driver_functions)
         cuts_out.append(entry)
     return cuts_out
 
 
-def _attribute_comparison_ranges(row, other, comparison, source, calibration_ops=(), flash_base=0):
+def _attribute_comparison_ranges(row, other, comparison, source, calibration_ops=(), flash_base=0, driver_functions=()):
     ranges = comparison.get("ranges") or []
     if not ranges:
         return
@@ -443,8 +500,276 @@ def _attribute_comparison_ranges(row, other, comparison, source, calibration_ops
 
     for span in ranges:
         op = span.get("operation")
-        if isinstance(op, dict) and op.get("pc") and "source" not in op:
-            op["source"] = source.resolve_pc(op["pc"])
+        if isinstance(op, dict):
+            call_ctx = op.pop("call_context", None) or op.get("call_chain")
+            if op.get("pc") or call_ctx:
+                _attach_call_chain(op, op.get("pc"), call_ctx, source, driver_functions=driver_functions)
+
+
+def _annotate_row_operation_traces(row, source, driver_functions=()):
+    if not isinstance(row, dict):
+        return
+    row.pop("fault_call_context", None)
+    p2 = row.get("phase2_fault")
+    if isinstance(p2, dict):
+        p2.pop("p1_fault_call_context", None)
+        p2.pop("p2_fault_call_context", None)
+        for key in ("p2_write_trace", "p2_erase_trace"):
+            for item in p2.get(key) or ():
+                if isinstance(item, dict):
+                    call_ctx = item.pop("call_context", None) or item.get("call_chain")
+                    if item.get("pc") or call_ctx:
+                        _attach_call_chain(item, item.get("pc"), call_ctx, source, driver_functions=driver_functions)
+    mram_ev = row.get("mram_fault_evidence")
+    if isinstance(mram_ev, dict):
+        mram_ev.pop("fault_call_context", None)
+        for item in mram_ev.get("write_trace") or ():
+            if isinstance(item, dict):
+                call_ctx = item.pop("call_context", None) or item.get("call_chain")
+                if item.get("pc") or call_ctx:
+                    _attach_call_chain(item, item.get("pc"), call_ctx, source, driver_functions=driver_functions)
+    fw = row.get("fault_window")
+    if isinstance(fw, dict):
+        for item in fw.get("operations") or ():
+            if isinstance(item, dict):
+                call_ctx = item.pop("call_context", None) or item.get("call_chain")
+                if item.get("pc") or call_ctx:
+                    _attach_call_chain(item, item.get("pc"), call_ctx, source, driver_functions=driver_functions)
+        for key in ("before", "at", "after"):
+            item = fw.get(key)
+            if isinstance(item, dict):
+                call_ctx = item.pop("call_context", None) or item.get("call_chain")
+                if item.get("pc") or call_ctx:
+                    _attach_call_chain(item, item.get("pc"), call_ctx, source, driver_functions=driver_functions)
+
+
+_PROBE_MODULE_CACHE = {}
+
+_TARGET_PROBE_SCRIPTS = {
+    "mcuboot": "targets/mcuboot/probe.py",
+    "tf_m_bl2": "targets/tf_m_bl2/probe.py",
+    "tfm": "targets/tf_m_bl2/probe.py",
+    "nxboot": "targets/nxboot/probe.py",
+    "nuttx_nxboot": "targets/nuttx_nxboot/probe.py",
+    "rustboot": "targets/rustboot/probe.py",
+    "esp_idf": "targets/esp_idf/probe.py",
+}
+
+
+def _load_probe_module(script_path):
+    if not script_path:
+        return None
+    resolved = str(Path(script_path).resolve())
+    if resolved in _PROBE_MODULE_CACHE:
+        return _PROBE_MODULE_CACHE[resolved]
+    if not os.path.isfile(resolved):
+        _PROBE_MODULE_CACHE[resolved] = None
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("_tardigrade_state_probe", resolved)
+        if spec is None or spec.loader is None:
+            _PROBE_MODULE_CACHE[resolved] = None
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _PROBE_MODULE_CACHE[resolved] = module
+        return module
+    except Exception:
+        _PROBE_MODULE_CACHE[resolved] = None
+        return None
+
+
+def _infer_target_probe_script(row, other, source, elf, root):
+    repo_root = Path(root) if root else Path(__file__).resolve().parents[1]
+    for candidate_row in (row, other):
+        if not isinstance(candidate_row, dict):
+            continue
+        for key in ("fault_semantic_state", "semantic_state"):
+            sem = candidate_row.get(key)
+            if isinstance(sem, dict) and sem.get("target"):
+                target_name = str(sem["target"]).strip().lower().replace("-", "_")
+                rel = _TARGET_PROBE_SCRIPTS.get(target_name)
+                if rel:
+                    candidate = repo_root / rel
+                    if candidate.is_file():
+                        return str(candidate)
+    elf_str = str(elf or "").lower()
+    if "mcuboot" in elf_str:
+        return str(repo_root / _TARGET_PROBE_SCRIPTS["mcuboot"])
+    if "tf_m" in elf_str or "tfm" in elf_str or "bl2" in elf_str:
+        return str(repo_root / _TARGET_PROBE_SCRIPTS["tf_m_bl2"])
+    if "nuttx_nxboot" in elf_str:
+        return str(repo_root / _TARGET_PROBE_SCRIPTS["nuttx_nxboot"])
+    if "nxboot" in elf_str:
+        return str(repo_root / _TARGET_PROBE_SCRIPTS["nxboot"])
+    if "rustboot" in elf_str:
+        return str(repo_root / _TARGET_PROBE_SCRIPTS["rustboot"])
+    if "esp_idf" in elf_str or "espidf" in elf_str:
+        return str(repo_root / _TARGET_PROBE_SCRIPTS["esp_idf"])
+    if source is not None and getattr(source, "index", None) is not None:
+        sym_names = {name for _, _, name in getattr(source.index, "symbols", ())}
+        if any(
+            name.startswith(("boot_write_magic", "boot_write_trailer", "boot_swap_", "bootutil_"))
+            for name in sym_names
+        ):
+            return str(repo_root / _TARGET_PROBE_SCRIPTS["mcuboot"])
+        if any(name.startswith("nxboot_") for name in sym_names):
+            return str(repo_root / _TARGET_PROBE_SCRIPTS["nxboot"])
+    return None
+
+
+def _collect_effective_slots(row, other, comparison, slots):
+    out = {}
+    if isinstance(slots, dict):
+        for name, cfg in slots.items():
+            if isinstance(cfg, dict) and "base" in cfg and "size" in cfg:
+                try:
+                    out[str(name)] = {
+                        "base": int(str(cfg["base"]), 0),
+                        "size": int(str(cfg["size"]), 0),
+                    }
+                except Exception:
+                    pass
+            elif hasattr(cfg, "base") and hasattr(cfg, "size"):
+                out[str(name)] = {"base": int(cfg.base), "size": int(cfg.size)}
+    for candidate_row in (row, other):
+        if not isinstance(candidate_row, dict):
+            continue
+        for key in ("fault_semantic_state", "semantic_state"):
+            sem = candidate_row.get(key)
+            sem_slots = sem.get("slots") if isinstance(sem, dict) else None
+            if isinstance(sem_slots, dict):
+                for name, cfg in sem_slots.items():
+                    if name not in out and isinstance(cfg, dict) and "base" in cfg and "size" in cfg:
+                        try:
+                            out[str(name)] = {
+                                "base": int(str(cfg["base"]), 0),
+                                "size": int(str(cfg["size"]), 0),
+                            }
+                        except Exception:
+                            pass
+    if not out and isinstance(comparison, dict) and comparison.get("base") and comparison.get("size"):
+        try:
+            out["exec"] = {
+                "base": int(str(comparison["base"]), 0),
+                "size": int(str(comparison["size"]), 0),
+            }
+        except Exception:
+            pass
+    return out
+
+
+def _resolve_probe_ranges(row, other, comparison, source, elf, root, state_probe=None, slots=None, page_size=4096, trailer_align=8):
+    effective_slots = _collect_effective_slots(row, other, comparison, slots)
+    align = trailer_align
+    for candidate_row in (row, other):
+        if isinstance(candidate_row, dict):
+            for key in ("fault_semantic_state", "semantic_state"):
+                sem = candidate_row.get(key)
+                if isinstance(sem, dict) and sem.get("trailer_align"):
+                    try:
+                        align = int(str(sem["trailer_align"]), 0)
+                    except Exception:
+                        pass
+    context = {
+        "slots": effective_slots,
+        "slot_geometry": effective_slots,
+        "page_size": page_size,
+        "trailer_align": align,
+    }
+    raw_ranges = None
+    if isinstance(state_probe, (list, tuple)):
+        raw_ranges = state_probe
+    elif callable(state_probe):
+        try:
+            raw_ranges = state_probe(context)
+        except TypeError:
+            raw_ranges = state_probe()
+    elif hasattr(state_probe, "describe_ranges") and callable(state_probe.describe_ranges):
+        raw_ranges = state_probe.describe_ranges(context)
+    else:
+        script_path = None
+        if isinstance(state_probe, dict):
+            if isinstance(state_probe.get("ranges"), (list, tuple)):
+                raw_ranges = state_probe["ranges"]
+            elif state_probe.get("script"):
+                script_path = state_probe["script"]
+        elif hasattr(state_probe, "script") and getattr(state_probe, "script"):
+            script_path = state_probe.script
+        elif isinstance(state_probe, (str, Path)) and str(state_probe).strip():
+            script_path = str(state_probe).strip()
+        if script_path and root and not os.path.isabs(str(script_path)):
+            candidate = Path(root) / str(script_path)
+            if candidate.is_file():
+                script_path = str(candidate)
+        if not script_path and raw_ranges is None:
+            script_path = _infer_target_probe_script(row, other, source, elf, root)
+        if script_path and raw_ranges is None:
+            module = _load_probe_module(script_path)
+            if module is not None and hasattr(module, "describe_ranges"):
+                try:
+                    raw_ranges = module.describe_ranges(context)
+                except Exception:
+                    raw_ranges = None
+    normalized = []
+    for item in raw_ranges or ():
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        try:
+            start = int(str(item["start"]), 0)
+            if "end" in item and item["end"] is not None:
+                end = int(str(item["end"]), 0)
+            else:
+                end = start + int(str(item.get("size", 0)), 0)
+        except Exception:
+            continue
+        if end > start:
+            entry = {"start": start, "end": end, "name": str(item["name"])}
+            if item.get("slot"):
+                entry["slot"] = str(item["slot"])
+            normalized.append(entry)
+    return normalized
+
+
+def _match_probe_range(start, end, probe_ranges):
+    span_size = max(1, end - start)
+    containing = [
+        item for item in probe_ranges
+        if item["start"] <= start and end <= item["end"]
+    ]
+    if containing:
+        return min(containing, key=lambda item: (item["end"] - item["start"], item["start"]))
+    best = None
+    best_key = None
+    for item in probe_ranges:
+        ov_start = max(start, item["start"])
+        ov_end = min(end, item["end"])
+        overlap = ov_end - ov_start
+        if overlap <= 0 or overlap * 2 < span_size:
+            continue
+        key = (overlap, 1 if item["start"] <= start < item["end"] else 0, -(item["end"] - item["start"]))
+        if best_key is None or key > best_key:
+            best_key = key
+            best = item
+    return best
+
+
+def _annotate_comparison_probe_fields(comparison, probe_ranges):
+    if not isinstance(comparison, dict) or not probe_ranges:
+        return
+    for span in comparison.get("ranges") or ():
+        if not isinstance(span, dict) or not span.get("address"):
+            continue
+        try:
+            start = int(str(span["address"]), 0)
+        except Exception:
+            continue
+        size = max(1, len(span.get("failing_hex") or "") // 2)
+        matched = _match_probe_range(start, start + size, probe_ranges)
+        if matched is not None:
+            span["field"] = matched["name"]
+            if matched.get("slot") and "slot" not in span:
+                span["slot"] = matched["slot"]
 
 
 def _format_cut_source(location, fallback_cut=None):
@@ -483,10 +808,15 @@ def _format_range_label(span):
     try:
         start = int(addr_str, 0)
         if size > 1:
-            return f"0x{start:08X}..0x{(start + size - 1) & 0xFFFFFFFF:08X} ({size} bytes)"
-        return f"0x{start:08X} (1 byte)"
+            addr_label = f"0x{start:08X}..0x{(start + size - 1) & 0xFFFFFFFF:08X} ({size} bytes)"
+        else:
+            addr_label = f"0x{start:08X} (1 byte)"
     except Exception:
-        return f"{addr_str} ({size} bytes)"
+        addr_label = f"{addr_str} ({size} bytes)"
+    field = span.get("field")
+    if field:
+        return f"{field} {addr_label}"
+    return addr_label
 
 
 def _message(endpoint, comparison, cuts=()):
@@ -575,6 +905,10 @@ def explain_recovery_failures(
     page_size=4096,
     write_granularity=4,
     trace_address_map=None,
+    driver_functions=(),
+    state_probe=None,
+    slots=None,
+    trailer_align=8,
 ):
     source = SourceLocations(elf, root)
     records = []
@@ -639,6 +973,8 @@ def explain_recovery_failures(
                             }
                             if prog.get("pc"):
                                 entry["pc"] = prog["pc"]
+                            if prog.get("call_context"):
+                                entry["call_context"] = prog["call_context"]
                             write_entries.append(entry)
                     erase_entries = (
                         load_clean_erase_trace(erase_trace_file, page_size=page_size)
@@ -682,9 +1018,35 @@ def explain_recovery_failures(
             else:
                 comparison = compare_snapshots(row.get("fault_snapshot"), other.get("fault_snapshot"))
             _attribute_comparison_ranges(
-                row, other, comparison, source, calibration_ops=cal_ops, flash_base=flash_base,
+                row,
+                other,
+                comparison,
+                source,
+                calibration_ops=cal_ops,
+                flash_base=flash_base,
+                driver_functions=driver_functions,
             )
-        cuts = _resolve_cuts(row, source, calibration_ops=cal_ops, flash_base=flash_base)
+            probe_ranges = _resolve_probe_ranges(
+                row,
+                other,
+                comparison,
+                source,
+                elf,
+                root,
+                state_probe=state_probe,
+                slots=slots,
+                page_size=page_size,
+                trailer_align=trailer_align,
+            )
+            _annotate_comparison_probe_fields(comparison, probe_ranges)
+        cuts = _resolve_cuts(
+            row,
+            source,
+            calibration_ops=cal_ops,
+            flash_base=flash_base,
+            driver_functions=driver_functions,
+        )
+        _annotate_row_operation_traces(row, source, driver_functions=driver_functions)
         endpoint = _endpoint(row, expected, source)
         row["failure_explanation"] = {
             "message": _message(endpoint, comparison, cuts),

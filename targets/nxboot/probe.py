@@ -218,6 +218,37 @@ def _compute_roles_and_flags(primary, secondary, tertiary):
     return roles, flags
 
 
+def describe_ranges(context=None):
+    """Return named persistent address ranges for nxboot slot headers."""
+    context = context or {}
+    geometry = context.get("slot_geometry") or context.get("slots") or {}
+    ranges = []
+    for slot_name, slot_info in sorted(geometry.items()):
+        if not isinstance(slot_info, dict):
+            continue
+        base = _as_int(slot_info.get("base"), -1)
+        size = _as_int(slot_info.get("size"), 0)
+        if base < 0 or size < 40:
+            continue
+        for start_off, end_off, label, field in (
+            (0, 4, "nxboot header magic", "magic"),
+            (4, 8, "nxboot header_size", "header_size"),
+            (8, 12, "nxboot image_crc", "image_crc"),
+            (12, 16, "nxboot image_size", "image_size"),
+            (16, 24, "nxboot identifier", "identifier"),
+            (24, 28, "nxboot header_fields", "header_fields"),
+            (28, 40, "nxboot image version", "version"),
+        ):
+            ranges.append({
+                "start": base + start_off,
+                "end": base + end_off,
+                "name": label,
+                "slot": slot_name,
+                "field": field,
+            })
+    return ranges
+
+
 def collect_state(bus=None, monitor=None, context=None, target_name="nxboot_style"):
     """Collect nxboot-style semantic state from emulated memory.
 
