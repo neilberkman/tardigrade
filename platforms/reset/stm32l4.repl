@@ -1,0 +1,6 @@
+rtc: Timers.STM32F4_RTC @ sysbus 0x40002800
+
+powerDomain: Miscellaneous.PowerResetDomain @ sysbus
+    family: ResetFamily.STM32L4
+    init:
+        Initialize

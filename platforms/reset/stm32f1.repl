@@ -1,0 +1,4 @@
+powerDomain: Miscellaneous.PowerResetDomain @ sysbus
+    family: ResetFamily.STM32F1
+    init:
+        Initialize

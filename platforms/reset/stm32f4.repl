@@ -1,0 +1,9 @@
+rtc: Timers.STM32F4_RTC @ sysbus 0x40002800
+
+backupSram: Memory.MappedMemory @ sysbus 0x40024000
+    size: 0x1000
+
+powerDomain: Miscellaneous.PowerResetDomain @ sysbus
+    family: ResetFamily.STM32F4
+    init:
+        Initialize

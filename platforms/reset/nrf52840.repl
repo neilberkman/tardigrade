@@ -1,0 +1,4 @@
+powerDomain: Miscellaneous.PowerResetDomain @ sysbus
+    family: ResetFamily.NRF52840
+    init:
+        Initialize
