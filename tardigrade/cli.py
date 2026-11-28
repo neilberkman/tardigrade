@@ -151,11 +151,68 @@ def main(argv=None):
     debug.add_argument("--timeout", type=int, default=300)
     debug.add_argument("--output", type=Path)
     debug.add_argument("--ex", dest="gdb_ex", action="append")
+    export_repro = commands.add_parser(
+        "export-repro",
+        help="export a failing point or state as a standalone reproducer bundle",
+    )
+    export_repro.add_argument("positional", nargs="*", help="<report> <point or state id> [output]")
+    export_repro.add_argument("--report", "--input", "--sarif", dest="report", type=Path)
+    export_repro.add_argument("--point")
+    export_repro.add_argument("--state")
+    export_repro.add_argument("--reproduction")
+    export_repro.add_argument("--profile", type=Path)
+    export_repro.add_argument("--elf", type=Path)
+    export_repro.add_argument("--output", "-o", type=Path)
+    export_repro.add_argument("--archive", action="store_true")
+    export_repro.add_argument("--renode-test", default=runner)
+    export_repro.add_argument("--renode-version")
+    export_repro.add_argument("--timeout", type=int, default=300)
     args, unknown = parser.parse_known_args(argv)
     if unknown and args.command != "audit":
         parser.error(f"unrecognized arguments: {' '.join(unknown)}")
     if args.command == "doctor":
         return doctor(args)
+    if args.command == "export-repro":
+        sys.path.insert(0, str(RUNTIME / "scripts"))
+        import export_repro as export_repro_mod
+
+        pos = list(args.positional or ())
+        if pos and args.report is None and args.reproduction is None:
+            args.report = Path(pos.pop(0))
+        if pos and args.point is None and args.state is None:
+            args.point = str(pos.pop(0))
+        if pos and args.output is None:
+            args.output = Path(pos.pop(0))
+
+        export_argv = [
+            "--renode-test",
+            _resolve_runner_arg(args.renode_test),
+            "--timeout",
+            str(args.timeout),
+            "--repo-root",
+            str(RUNTIME),
+        ]
+        if args.report is not None:
+            export_argv.extend(["--report", str(args.report.expanduser().resolve())])
+        if args.point is not None:
+            export_argv.extend(["--point", str(args.point)])
+        if args.state is not None:
+            export_argv.extend(["--state", str(args.state)])
+        if args.reproduction is not None:
+            export_argv.extend(["--reproduction", str(args.reproduction)])
+        if args.profile is not None:
+            export_argv.extend(["--profile", str(args.profile.expanduser().resolve())])
+        if args.elf is not None:
+            export_argv.extend(["--elf", str(args.elf.expanduser().resolve())])
+        if args.output is not None:
+            export_argv.extend(["--output", str(args.output.expanduser().resolve())])
+        if args.archive:
+            export_argv.append("--archive")
+        if args.renode_version is not None:
+            export_argv.extend(["--renode-version", str(args.renode_version)])
+        for extra_pos in pos:
+            export_argv.append(str(extra_pos))
+        return export_repro_mod.main(export_argv, prog="tardigrade export-repro")
     if args.command == "debug":
         sys.path.insert(0, str(RUNTIME / "scripts"))
         import debug_point

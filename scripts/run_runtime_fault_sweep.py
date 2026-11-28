@@ -23490,17 +23490,65 @@ def run_debug_session(fault_at, fault_type='w'):
     initial_lr = as_int(cpu_ref.GetRegisterUnsafe(14))
     initial_vtor = as_int(bus.ReadDoubleWord(0xE000ED08))
 
-    monitor.Parse('machine StartGdbServer {} true'.format(int(debug_gdb_port)))
-    try:
-        monitor.Machine.IsGdbConnectedToServer(int(debug_gdb_port))
-    except Exception as exc:
-        _debug_write_ready_payload({
-            'ready': False,
-            'error': 'failed to start Renode GDB server on port {}: {}'.format(
-                int(debug_gdb_port), exc
-            ),
-        })
-        raise
+    export_state_file = (
+        str(expected_payload.get('export_state_file') or '').strip()
+        if isinstance(expected_payload, dict)
+        else ''
+    )
+    export_no_gdb = bool(
+        isinstance(expected_payload, dict) and expected_payload.get('no_gdb')
+    )
+    if (
+        export_state_file
+        and isinstance(previous_snapshot, dict)
+        and previous_snapshot.get('flash') is not None
+    ):
+        raw_export_bytes = bytes(bytearray(to_py_bytes(previous_snapshot['flash'])))
+        export_bin_path = export_state_file + '.bin'
+        with open(export_bin_path, 'wb') as ef_bin:
+            ef_bin.write(raw_export_bytes)
+        flash_base_val, _flash_size_val, _ps_val, _ef_val = _replay_storage_geometry()
+        pv_export = {}
+        for pv_name, pv_val in (previous_snapshot.get('persistent_values') or {}).items():
+            pv_export[str(pv_name)] = base64.b64encode(
+                bytes(bytearray(to_py_bytes(pv_val)))
+            ).decode('ascii')
+        renode_ver_str = ''
+        try:
+            from System.Reflection import Assembly, AssemblyInformationalVersionAttribute
+            _asm = Assembly.GetEntryAssembly()
+            _vers = _asm.GetCustomAttributes(AssemblyInformationalVersionAttribute, False)
+            renode_ver_str = str(
+                _vers[0].InformationalVersion if _vers.Length else _asm.GetName().Version
+            )
+        except Exception:
+            renode_ver_str = ''
+        export_meta = {
+            'binary_file': export_bin_path,
+            'base_address': fmt_u32(flash_base_val),
+            'size': len(raw_export_bytes),
+            'sha256': hashlib.sha256(raw_export_bytes).hexdigest().lower(),
+            'state_identity': actual_state_id,
+            'backend_kind': str(backend.get('kind', 'fast')),
+            'flash_backend': str(backend.get('backend_sysbus_name') or 'sysbus.faultFlash'),
+            'uncorrectable_offsets': [
+                int(x) for x in (previous_snapshot.get('uncorrectable_offsets') or ())
+            ],
+            'uncorrectable_words': [
+                str(x) for x in (previous_snapshot.get('uncorrectable_addresses') or ())
+            ],
+            'mram_torn_word': str(mram_torn_word),
+            'torn_word': str(torn_word),
+            'persistent_values': pv_export,
+            'initial_pc': fmt_u32(initial_pc),
+            'initial_sp': fmt_u32(initial_sp),
+            'initial_lr': fmt_u32(initial_lr),
+            'initial_vtor': fmt_u32(initial_vtor),
+            'renode_version': renode_ver_str,
+        }
+        with open(export_state_file, 'w') as ef_json:
+            ef_json.write(_json_dump_text(export_meta))
+
     ready_payload = {
         'ready': True,
         'port': int(debug_gdb_port),
@@ -23515,155 +23563,174 @@ def run_debug_session(fault_at, fault_type='w'):
     }
     if first_fault_reason is not None:
         ready_payload['first_fault_reason'] = first_fault_reason
-    _debug_write_ready_payload(ready_payload)
-    log(
-        'debug: GDB server listening on port {} (stop_at={} pc={} sp={} state={})'.format(
-            debug_gdb_port,
-            debug_stop_at,
-            fmt_u32(initial_pc),
-            fmt_u32(initial_sp),
-            actual_state_id,
-        )
-    )
+    if export_state_file:
+        ready_payload['export_state_file'] = export_state_file
 
     m_ref = monitor.Machine
-    deadline = _time.time() + max(1.0, float(debug_timeout_s))
     gdb_ever_connected = False
     gdb_terminal_reason = None
-    boot_start_virtual_s = _debug_read_machine_virtual_s(m_ref)
-    last_progress_virtual_s = boot_start_virtual_s
-    last_progress_wall_s = _time.time()
-    last_progress_key = None
-    vtor_captured_virtual_s = None
-    vtor_captured_polls = 0
-    settle_virtual_s = max(0.005, float(_copy_on_boot_vtor_settle_iters()) * 0.02)
-    last_running_pc = None
-    last_running_insns = None
-    terminal_loop_hits = 0
-    pc_handoff_slot = success_pc_slot if success_pc_slot in slot_ranges else None
     timed_out = False
 
-    try:
-        while _time.time() < deadline:
-            connected = False
-            try:
-                connected = bool(m_ref.IsGdbConnectedToServer(int(debug_gdb_port)))
-            except Exception:
-                connected = False
-            if connected:
-                gdb_ever_connected = True
-            elif gdb_ever_connected:
-                break
-
-            is_continuing = False
-            if connected:
-                try:
-                    exec_mode = str(getattr(cpu_ref, 'ExecutionMode', ''))
-                    is_continuing = (exec_mode == 'Continuous')
-                except Exception:
-                    is_continuing = not bool(getattr(m_ref, 'IsPaused', True))
-
-            if is_continuing:
-                now_virtual_s = _debug_read_machine_virtual_s(m_ref)
-                now_wall_s = _time.time()
-                pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
-                try:
-                    cur_insns = as_int(cpu_ref.ExecutedInstructions)
-                except Exception:
-                    cur_insns = None
-                vtor_now = as_int(bus.ReadDoubleWord(0xE000ED08))
-                if vtor_now != 0:
-                    for sn, (s_lo, s_hi) in slot_ranges.items():
-                        if s_lo <= vtor_now < s_hi:
-                            sticky_vtor['value'] = vtor_now
-                            sticky_vtor['slot'] = sn
-                            sticky_vtor['captured'] = True
-                            break
-                capture_sticky_pc(pc_now)
-                cur_w = get_total_writes()
-                cur_e = get_total_erases()
-                p_key = (cur_w, cur_e, bool(sticky_vtor['captured']), pc_now & ~1, cur_insns)
-                if last_progress_key is None or p_key != last_progress_key:
-                    last_progress_key = p_key
-                    last_progress_virtual_s = now_virtual_s
-                    last_progress_wall_s = now_wall_s
-
-                if sticky_vtor['captured']:
-                    vtor_captured_polls += 1
-                    if vtor_captured_virtual_s is None:
-                        vtor_captured_virtual_s = now_virtual_s
-                    elif (
-                        (now_virtual_s - vtor_captured_virtual_s) >= settle_virtual_s
-                        or vtor_captured_polls >= 2
-                    ):
-                        gdb_terminal_reason = 'vtor_captured'
-                        vtor_captured_polls = 0
-                        _debug_pause_for_gdb(m_ref, cpu_ref)
-                elif (
-                    pc_handoff_slot is not None
-                    and sticky_pc['captured']
-                    and sticky_pc.get('slot') == pc_handoff_slot
-                ):
-                    gdb_terminal_reason = 'pc_captured'
-                    _debug_pause_for_gdb(m_ref, cpu_ref)
-                elif check_console_fatal():
-                    gdb_terminal_reason = 'console_fatal'
-                    _debug_pause_for_gdb(m_ref, cpu_ref)
-                elif (
-                    bool(getattr(cpu_ref, 'IsLockedUp', False))
-                    or (pc_now & ~1) == 0xEFFFFFFE
-                ):
-                    gdb_terminal_reason = 'cpu_lockup'
-                    _debug_pause_for_gdb(m_ref, cpu_ref)
-                else:
-                    is_halt_pc = _debug_is_terminal_halt_pc(cpu_ref, pc_now)
-                    insns_stalled = (
-                        cur_insns is not None
-                        and last_running_insns is not None
-                        and cur_insns == last_running_insns
-                    )
-                    if last_running_pc == (pc_now & ~1) and (is_halt_pc or insns_stalled):
-                        terminal_loop_hits += 1
-                    else:
-                        terminal_loop_hits = 0
-                    last_running_pc = pc_now & ~1
-                    last_running_insns = cur_insns
-                    if terminal_loop_hits >= 2:
-                        gdb_terminal_reason = 'no_boot_terminal_loop'
-                        terminal_loop_hits = 0
-                        _debug_pause_for_gdb(m_ref, cpu_ref)
-                    elif (
-                        progress_stall_timeout_s > 0
-                        and (
-                            (now_virtual_s - last_progress_virtual_s)
-                            >= max(0.1, float(progress_stall_timeout_s))
-                            or (now_wall_s - last_progress_wall_s)
-                            >= max(1.5, float(progress_stall_timeout_s) * 5.0)
-                        )
-                    ):
-                        gdb_terminal_reason = 'no_boot_stall'
-                        last_progress_wall_s = now_wall_s
-                        _debug_pause_for_gdb(m_ref, cpu_ref)
-                    elif (now_virtual_s - boot_start_virtual_s) >= max(
-                        2.0, parse_duration_seconds(default=2.0)
-                    ):
-                        gdb_terminal_reason = 'budget'
-                        _debug_pause_for_gdb(m_ref, cpu_ref)
-            _time.sleep(0.02)
-        else:
-            timed_out = True
-    finally:
+    if export_no_gdb:
         disarm_vtor_watchpoint()
-        _debug_restore_continuous_execution(cpu_ref)
+        _debug_write_ready_payload(ready_payload)
+    else:
+        monitor.Parse('machine StartGdbServer {} true'.format(int(debug_gdb_port)))
         try:
-            monitor.Parse('machine Pause')
-        except Exception:
-            pass
+            monitor.Machine.IsGdbConnectedToServer(int(debug_gdb_port))
+        except Exception as exc:
+            _debug_write_ready_payload({
+                'ready': False,
+                'error': 'failed to start Renode GDB server on port {}: {}'.format(
+                    int(debug_gdb_port), exc
+                ),
+            })
+            raise
+        _debug_write_ready_payload(ready_payload)
+        log(
+            'debug: GDB server listening on port {} (stop_at={} pc={} sp={} state={})'.format(
+                debug_gdb_port,
+                debug_stop_at,
+                fmt_u32(initial_pc),
+                fmt_u32(initial_sp),
+                actual_state_id,
+            )
+        )
+
+        deadline = _time.time() + max(1.0, float(debug_timeout_s))
+        boot_start_virtual_s = _debug_read_machine_virtual_s(m_ref)
+        last_progress_virtual_s = boot_start_virtual_s
+        last_progress_wall_s = _time.time()
+        last_progress_key = None
+        vtor_captured_virtual_s = None
+        vtor_captured_polls = 0
+        settle_virtual_s = max(0.005, float(_copy_on_boot_vtor_settle_iters()) * 0.02)
+        last_running_pc = None
+        last_running_insns = None
+        terminal_loop_hits = 0
+        pc_handoff_slot = success_pc_slot if success_pc_slot in slot_ranges else None
+
         try:
-            monitor.Parse('machine StopGdbServer {}'.format(int(debug_gdb_port)))
-        except Exception:
-            pass
-        _debug_restore_continuous_execution(cpu_ref)
+            while _time.time() < deadline:
+                connected = False
+                try:
+                    connected = bool(m_ref.IsGdbConnectedToServer(int(debug_gdb_port)))
+                except Exception:
+                    connected = False
+                if connected:
+                    gdb_ever_connected = True
+                elif gdb_ever_connected:
+                    break
+
+                is_continuing = False
+                if connected:
+                    try:
+                        exec_mode = str(getattr(cpu_ref, 'ExecutionMode', ''))
+                        is_continuing = (exec_mode == 'Continuous')
+                    except Exception:
+                        is_continuing = not bool(getattr(m_ref, 'IsPaused', True))
+
+                if is_continuing:
+                    now_virtual_s = _debug_read_machine_virtual_s(m_ref)
+                    now_wall_s = _time.time()
+                    pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
+                    try:
+                        cur_insns = as_int(cpu_ref.ExecutedInstructions)
+                    except Exception:
+                        cur_insns = None
+                    vtor_now = as_int(bus.ReadDoubleWord(0xE000ED08))
+                    if vtor_now != 0:
+                        for sn, (s_lo, s_hi) in slot_ranges.items():
+                            if s_lo <= vtor_now < s_hi:
+                                sticky_vtor['value'] = vtor_now
+                                sticky_vtor['slot'] = sn
+                                sticky_vtor['captured'] = True
+                                break
+                    capture_sticky_pc(pc_now)
+                    cur_w = get_total_writes()
+                    cur_e = get_total_erases()
+                    p_key = (cur_w, cur_e, bool(sticky_vtor['captured']), pc_now & ~1, cur_insns)
+                    if last_progress_key is None or p_key != last_progress_key:
+                        last_progress_key = p_key
+                        last_progress_virtual_s = now_virtual_s
+                        last_progress_wall_s = now_wall_s
+
+                    if sticky_vtor['captured']:
+                        vtor_captured_polls += 1
+                        if vtor_captured_virtual_s is None:
+                            vtor_captured_virtual_s = now_virtual_s
+                        elif (
+                            (now_virtual_s - vtor_captured_virtual_s) >= settle_virtual_s
+                            or vtor_captured_polls >= 2
+                        ):
+                            gdb_terminal_reason = 'vtor_captured'
+                            vtor_captured_polls = 0
+                            _debug_pause_for_gdb(m_ref, cpu_ref)
+                    elif (
+                        pc_handoff_slot is not None
+                        and sticky_pc['captured']
+                        and sticky_pc.get('slot') == pc_handoff_slot
+                    ):
+                        gdb_terminal_reason = 'pc_captured'
+                        _debug_pause_for_gdb(m_ref, cpu_ref)
+                    elif check_console_fatal():
+                        gdb_terminal_reason = 'console_fatal'
+                        _debug_pause_for_gdb(m_ref, cpu_ref)
+                    elif (
+                        bool(getattr(cpu_ref, 'IsLockedUp', False))
+                        or (pc_now & ~1) == 0xEFFFFFFE
+                    ):
+                        gdb_terminal_reason = 'cpu_lockup'
+                        _debug_pause_for_gdb(m_ref, cpu_ref)
+                    else:
+                        is_halt_pc = _debug_is_terminal_halt_pc(cpu_ref, pc_now)
+                        insns_stalled = (
+                            cur_insns is not None
+                            and last_running_insns is not None
+                            and cur_insns == last_running_insns
+                        )
+                        if last_running_pc == (pc_now & ~1) and (is_halt_pc or insns_stalled):
+                            terminal_loop_hits += 1
+                        else:
+                            terminal_loop_hits = 0
+                        last_running_pc = pc_now & ~1
+                        last_running_insns = cur_insns
+                        if terminal_loop_hits >= 2:
+                            gdb_terminal_reason = 'no_boot_terminal_loop'
+                            terminal_loop_hits = 0
+                            _debug_pause_for_gdb(m_ref, cpu_ref)
+                        elif (
+                            progress_stall_timeout_s > 0
+                            and (
+                                (now_virtual_s - last_progress_virtual_s)
+                                >= max(0.1, float(progress_stall_timeout_s))
+                                or (now_wall_s - last_progress_wall_s)
+                                >= max(1.5, float(progress_stall_timeout_s) * 5.0)
+                            )
+                        ):
+                            gdb_terminal_reason = 'no_boot_stall'
+                            last_progress_wall_s = now_wall_s
+                            _debug_pause_for_gdb(m_ref, cpu_ref)
+                        elif (now_virtual_s - boot_start_virtual_s) >= max(
+                            2.0, parse_duration_seconds(default=2.0)
+                        ):
+                            gdb_terminal_reason = 'budget'
+                            _debug_pause_for_gdb(m_ref, cpu_ref)
+                _time.sleep(0.02)
+            else:
+                timed_out = True
+        finally:
+            disarm_vtor_watchpoint()
+            _debug_restore_continuous_execution(cpu_ref)
+            try:
+                monitor.Parse('machine Pause')
+            except Exception:
+                pass
+            try:
+                monitor.Parse('machine StopGdbServer {}'.format(int(debug_gdb_port)))
+            except Exception:
+                pass
+            _debug_restore_continuous_execution(cpu_ref)
 
     if timed_out:
         raise RuntimeError(
