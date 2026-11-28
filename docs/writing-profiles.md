@@ -525,7 +525,73 @@ success_criteria:
       op: ge                 # popcount >= 5
 ```
 
-Supported `op` values: `eq` (default), `ne`, `ge`, `le`, `nonzero`. An optional `mask` field (default `0xFFFFFFFF`) is ANDed with the read value before comparison.
+Supported `op` values are `eq` (default), `ne`, `ge`, `le`, and `nonzero`.
+`width` selects a 1-, 2-, or 4-byte read and defaults to 4 bytes. An optional
+`mask` selects the bits to compare in the read value and `expected_value`.
+By default the comparison uses all bits in the selected width.
+
+#### Image-specific addresses and symbols
+
+Add `image` to a memory or config check when its address or expected value
+belongs to one build, or use `symbol` instead of `address` to resolve the
+address from the `.symtab` of the sibling `.elf` for each image in
+`allowed_images`. The digest of the booted slot selects the matched image, and
+Tardigrade evaluates only that image's checks alongside any unscoped fixed-address
+checks.
+
+```yaml
+success_criteria:
+  pc_in_slot: exec
+  image_hash: true
+  image_hash_slot: exec
+  allowed_images: [exec, staging]
+  memory_checks:
+    - {address: 0x20000040, expected_value: 1}
+    - {image: exec, address: 0x20000200, expected_value: 1}
+    - {image: staging, address: 0x20000300, width: 1, expected_value: 2}
+    # Or resolve one symbol across every allowed image's sibling .elf:
+    # - {symbol: alive, op: nonzero}
+```
+
+Which form to prefer:
+
+- **Prefer `symbol` without `image`** (`- {symbol: alive, op: nonzero}`) when
+  all allowed images define the same symbol with the same pass condition and
+  keep an unstripped `.elf` next to the binary (`old.elf` alongside `old.bin`),
+  so one line covers both builds and survives relinking.
+- **Prefer per-image `image` checks** (`image` with `address` or `symbol`) when
+  the expected value, width, mask, or operator differs per build (for example,
+  version `1` in `exec` vs version `2` in `staging`), when only one build
+  defines the variable, or when no `.elf` symbol table is available.
+- **Prefer an unscoped `address` check** only for a fixed register or a fixed
+  shared-RAM ABI address that is identical in every allowed build.
+
+Scoping and symbol resolution require execute mode and distinct digests for the
+allowed images. Declare scoped or symbol checks in `success_criteria` or in an
+update phase's `success_criteria`. A fault-type override must keep image hashing
+enabled. If a boot lacks an allowed digest match, the image-specific checks are
+skipped and the boot cannot pass the content criteria.
+
+With scoped checks, observing slot execution starts polling the applicable
+memory checks within the boot budget. `terminal_after_reset` also requires
+reset evidence before a terminal sample. Reports record the digest match in
+`signals.matched_allowed_image` and the observed checks in
+`signals.success_checks`. A `memory_checks_unmet` outcome includes the image
+name and the failed reads in `signals.failed_memory_checks`.
+
+The per-image example links the same application at two different liveness
+addresses. Build it and run the erase sweep with the commands below.
+[Example profile](../examples/per_image_success/profile.yaml)
+
+```sh
+make -C examples/per_image_success
+python3 scripts/audit_bootloader.py --profile examples/per_image_success/profile.yaml
+```
+
+The unfaulted control finishes the update and matches `staging`. The first
+erase cut preserves the old image byte for byte and matches `exec`. Run
+`examples/per_image_success/profile_old_liveness_unmet.yaml` to observe a
+valid old image that never sets its liveness flag.
 
 ### Image hash
 

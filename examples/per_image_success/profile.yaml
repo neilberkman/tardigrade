@@ -1,0 +1,54 @@
+schema_version: 1
+name: per_image_success
+description: An untouched erase cut preserves the old image with its original RAM layout.
+platform: examples/per_image_success/platform.repl
+bootloader:
+  elf: examples/per_image_success/boot.elf
+  entry: 0
+bootloader_region: {base: 0, size: 0x1000}
+memory:
+  sram: {start: 0x20000000, end: 0x20002000}
+  volatile_regions:
+    - {base: 0x20000000, size: 0x2000}
+  write_granularity: 4
+  page_size: 0x100
+  erase_fill: 0xFF
+  trace_address_map:
+    - {offset_start: 0, offset_end: 0x3000, address_addend: 0x10100000}
+  slots:
+    exec: {base: 0x10100000, size: 0x1000}
+    staging: {base: 0x10101000, size: 0x1000}
+images:
+  exec: examples/per_image_success/old.bin
+  staging: examples/per_image_success/update.bin
+flash_backend: tracker
+pre_boot_state:
+  - {address: 0x10102000, u32: 1}
+  - {address: 0x10102004, u32: 0}
+success_criteria:
+  pc_in_slot: exec
+  image_hash: true
+  image_hash_slot: exec
+  allowed_images: [exec, staging]
+  terminal_after_reset: true
+  memory_checks:
+    - {address: 0x20000040, expected_value: 1}
+    - {image: exec, address: 0x20000200, expected_value: 1}
+    - {image: staging, address: 0x20000300, width: 1, expected_value: 2}
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  fault_types: [interrupted_erase]
+  include_erase_fault_points: true
+  mram_torn_word: untouched
+  max_writes: auto
+  max_writes_cap: 128
+  sweep_strategy: exhaustive
+  run_duration: "0.1"
+  calibration_time_slice: "0.002"
+  phase1_time_slice: "0.002"
+  phase2_time_slice: "0.002"
+  calibration_stop:
+    success_criteria: true
+expect:
+  should_find_issues: false
