@@ -35,6 +35,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     public class STM32H7FastFlash : BasicDoubleWordPeripheral, IKnownSize, ITardigradeFaultInjectable
     {
         private FlashTiming timing;
+        public FlashTimingCalibration TimingCalibration { get; } = new FlashTimingCalibration();
         public FlashTiming OperationTiming
         {
             get => timing;
@@ -176,7 +177,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             public BankState(STM32H7FastFlash parent)
             {
-                Timing = new H7BankTiming(parent);
+                Timing = new H7BankTiming(parent, parent.TimingCalibration);
             }
 
             public readonly H7BankTiming Timing;

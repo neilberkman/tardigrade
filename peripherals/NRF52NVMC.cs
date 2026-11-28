@@ -94,6 +94,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         private FlashTiming timing;
+        public FlashTimingCalibration TimingCalibration => operation.Calibration;
         private readonly FlashOperationTimer operation;
         private readonly FlashProgramBuffer programBuffer = new FlashProgramBuffer();
         private Action bufferedProgram;

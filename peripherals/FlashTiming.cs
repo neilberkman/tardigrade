@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals;
@@ -19,13 +20,34 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         Maximum
     }
 
+    // A separate clean boot counts the physical commands selected by the model.
+    // A one-tick busy interval preserves asynchronous completion and unit chaining.
+    public sealed class FlashTimingCalibration
+    {
+        public bool Enabled { get; set; }
+        public Dictionary<ulong, ulong> Counts { get; } = new Dictionary<ulong, ulong>();
+
+        public ulong Interval(ulong microseconds)
+        {
+            if(!Enabled || microseconds == 0)
+            {
+                return microseconds;
+            }
+            Counts.TryGetValue(microseconds, out var count);
+            Counts[microseconds] = checked(count + 1);
+            return 1;
+        }
+    }
+
     public sealed class FlashOperationTimer
     {
-        public FlashOperationTimer(IPeripheral owner)
+        public FlashOperationTimer(IPeripheral owner, FlashTimingCalibration calibration = null)
         {
             this.owner = owner;
+            Calibration = calibration ?? new FlashTimingCalibration();
         }
 
+        public FlashTimingCalibration Calibration { get; }
         public bool Busy => completion != null;
 
         public void Start(ulong microseconds, Action complete)
@@ -47,6 +69,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 timer.LimitReached += Finish;
             }
             completion = complete;
+            microseconds = Calibration.Interval(microseconds);
             timer.Limit = microseconds;
             timer.Value = microseconds;
             timer.Enabled = true;
@@ -138,10 +161,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // One operation engine per bank allows independent bank deadlines.
     public sealed class H7BankTiming
     {
-        public H7BankTiming(ITardigradeFaultInjectable controller)
+        public H7BankTiming(ITardigradeFaultInjectable controller, FlashTimingCalibration calibration)
         {
             this.controller = controller;
-            timer = new FlashOperationTimer((IPeripheral)controller);
+            timer = new FlashOperationTimer((IPeripheral)controller, calibration);
         }
 
         public bool Busy => timer.Busy;

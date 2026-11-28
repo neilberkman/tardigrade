@@ -208,6 +208,76 @@ def merge_robot_vars(base: List[str], overlay: List[str]) -> List[str]:
     return ["{}:{}".format(k, v) for k, v in merged.items()]
 
 
+def flash_timing_budget(counts: Dict[str, int], probe_seconds: float, variables: Dict[str, str]) -> Dict[str, Any]:
+    """Bound a complete boot including time to repeat an interrupted operation."""
+    busy_us = sum(int(delay) * int(count) for delay, count in counts.items())
+    duration = max(4, float(variables.get("RUN_DURATION") or 0),
+                   math.ceil(2 * (probe_seconds + busy_us / 1_000_000)))
+    wall = math.ceil(max(300, 120 * duration,
+                         float(variables.get("PHASE1_WALL_TIMEOUT_S") or 0),
+                         float(variables.get("PHASE2_WALL_TIMEOUT_S") or 0)))
+    return {
+        "counts_by_duration_us": counts,
+        "busy_us": busy_us,
+        "probe_emulated_s": probe_seconds,
+        "run_duration_s": duration,
+        "phase_wall_s": wall,
+    }
+
+
+def calibrate_flash_timing(*, robot_vars, profile, repo_root, renode_test, robot_suite,
+                           work_dir, renode_remote_server_dir, keep_run_artifacts):
+    variables = dict(var.split(":", 1) for var in robot_vars)
+    if variables.get("FLASH_TIMING", "").lower() in ("", "off"):
+        return robot_vars, None
+    # A separate process prevents the short probe pulses, counters and memory
+    # from leaking into the control, planner trace or recovery boots.
+    # Before the histogram exists, size the outer guard from the emulated
+    # control floor. The default single-point Robot limit can expire first.
+    probe_wall = flash_timing_budget({}, 0.0, variables)["phase_wall_s"]
+    probe_vars = merge_robot_vars(robot_vars, [
+        f"FLASH_TIMING_PHASE_WALL_S:{probe_wall}", f"PHASE2_WALL_TIMEOUT_S:{probe_wall}",
+        "FLASH_TIMING_PROBE:true", "HASH_BYPASS_SYMBOLS:", "HASH_BYPASS_ADDRS:",
+    ])
+    data = run_single_point(
+        repo_root=repo_root, renode_test=renode_test, robot_suite=robot_suite,
+        profile=profile, fault_at=-1, robot_vars=probe_vars,
+        work_dir=work_dir / "flash_timing_probe", is_control=True,
+        renode_remote_server_dir=renode_remote_server_dir,
+        keep_run_artifacts=keep_run_artifacts,
+    )
+    signals = data.get("signals", {})
+    reason = str(signals.get("phase1_stop_reason", "unknown"))
+    if (data.get("boot_outcome") != profile.expect.control_outcome
+            or not calibration_completed(reason, profile.expect.control_outcome)
+            or "flash_timing_counts" not in signals):
+        raise RuntimeError(
+            "Cannot size flash timing: clean sizing boot stopped with {} ({}). "
+            "Check fault_sweep.run_duration, max_step_limit, phase-one wall timeout and the clean control."
+            .format(reason, data.get("boot_outcome"))
+        )
+    budget = flash_timing_budget(signals["flash_timing_counts"],
+                                 signals["phase1_emulated_s"], variables)
+    _progress("Flash timing budget " + json.dumps(budget, sort_keys=True))
+    duration = budget["run_duration_s"]
+    wall = budget["phase_wall_s"]
+    stall = float(variables.get("PROGRESS_STALL_TIMEOUT_S") or 0)
+    return merge_robot_vars(robot_vars, [
+        "FLASH_TIMING_PROBE:false", f"RUN_DURATION:{duration}", f"FLASH_TIMING_PHASE_WALL_S:{wall}",
+        f"PHASE1_WALL_TIMEOUT_S:{wall}", f"PHASE2_WALL_TIMEOUT_S:{wall}",
+        f"PROGRESS_STALL_TIMEOUT_S:{max(stall, duration) if stall else 0}",
+    ]), budget
+
+
+def timed_suite_minutes(robot_vars: List[str], boots: int) -> int:
+    # Each phase has a wall bound. Leave room outside RunFor for Robot startup,
+    # flash restore and evidence export.
+    for var in robot_vars:
+        if var.startswith("FLASH_TIMING_PHASE_WALL_S:"):
+            return math.ceil((120 + boots * int(var.split(":", 1)[1])) / 60)
+    return 0
+
+
 def parse_renode_point_timeout(env: Dict[str, str]) -> Optional[float]:
     """Read per-run renode-test timeout from environment.
 
@@ -865,6 +935,8 @@ def run_single_point(
     single_point_timeout_m = 15 if calibration else 2
     env = prepare_run_environment(os.environ.copy(), bundle_dir, temp_root)
     profile_timeout_m = profile_robot_timeout_minutes(profile)
+    phase_count = 2 if calibration else 1 + int(getattr(getattr(profile, "fault_sweep", None), "boot_cycles", 1) or 1)
+    profile_timeout_m = max(profile_timeout_m or 0, timed_suite_minutes(robot_vars, phase_count)) or None
     if profile_timeout_m is not None:
         single_point_timeout_m = max(single_point_timeout_m, profile_timeout_m)
     robot_timeout_override_m = parse_renode_robot_timeout_minutes(env)
@@ -1320,6 +1392,8 @@ def run_batch(
     # point.  Keep the outer suite timeout at least as long as the profile's
     # configured execute budget (the same floor used by run_single_point()).
     profile_timeout_m = profile_robot_timeout_minutes(profile)
+    phase_count = len(fault_points) * (2 + int(getattr(getattr(profile, "fault_sweep", None), "boot_cycles", 1) or 1))
+    profile_timeout_m = max(profile_timeout_m or 0, timed_suite_minutes(robot_vars, phase_count)) or None
     if fault_types_list == ["rs"]:
         for variable in robot_vars:
             if variable.startswith("PHASE2_STATE_SEARCH_B64:"):

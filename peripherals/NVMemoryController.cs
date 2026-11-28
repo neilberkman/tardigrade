@@ -970,6 +970,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         public Action<long, int, Action> ProgramScheduler { get; set; }
         public bool EraseInProgress => AliasTarget != null ? AliasTarget.EraseInProgress : eraseInProgress;
         private bool eraseInProgress;
+        public FlashTimingCalibration TimingCalibration => operationTimer.Calibration;
         private readonly FlashOperationTimer operationTimer;
 
         public bool WriteInProgress { get; private set; }

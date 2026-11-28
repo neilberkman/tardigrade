@@ -106,3 +106,32 @@ def test_stm32f1_and_stm32l4_flash_models_and_docs_define_datasheet_timing():
     # Documentation cites RM0008 / DS5319 Table 28 and RM0351 / DS10198 Table 63
     assert "RM0008" in docs and "DS5319" in docs and "Table 28" in docs
     assert "RM0351" in docs and "DS10198" in docs and "Table 63" in docs
+
+
+def test_physical_programs_and_sector_erases_fund_both_phases():
+    from renode_runner import flash_timing_budget, timed_suite_minutes
+
+    budget = flash_timing_budget({"100": 393263, "4000000": 6}, 2.0, {"RUN_DURATION": "3.3"})
+    assert budget["busy_us"] == 63_326_300
+    assert budget["run_duration_s"] == 131
+    assert budget["phase_wall_s"] == 15_720
+    assert timed_suite_minutes(["FLASH_TIMING_PHASE_WALL_S:15720"], 4) == 1050
+
+
+def test_partial_sizing_boot_cannot_supply_a_budget(tmp_path, monkeypatch):
+    import renode_runner
+
+    def partial(**kwargs):
+        assert kwargs["is_control"]
+        assert "FLASH_TIMING_PROBE:true" in kwargs["robot_vars"]
+        assert "FLASH_TIMING_PHASE_WALL_S:480" in kwargs["robot_vars"]
+        return {"boot_outcome": "timeout", "signals": {"phase1_stop_reason": "budget"}}
+
+    monkeypatch.setattr(renode_runner, "run_single_point", partial)
+    profile = config(tmp_path, "maximum")
+    with pytest.raises(RuntimeError, match="budget.*run_duration"):
+        renode_runner.calibrate_flash_timing(
+            robot_vars=profile.robot_vars(ROOT), profile=profile, repo_root=ROOT,
+            renode_test="renode-test", robot_suite="tests/ota_fault_point.robot",
+            work_dir=tmp_path, renode_remote_server_dir="", keep_run_artifacts=False,
+        )

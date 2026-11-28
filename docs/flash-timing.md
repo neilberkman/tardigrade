@@ -81,3 +81,34 @@ CFI query fields 0x1F and 0x23 encode a word-program timeout and its maximum mul
 
 - **Unarmed reset (`Reset()`)**: cancels any active operation timer and discards uncommitted program or erase data while preserving all prior operations whose timers have already expired.
 - **Armed power-loss / write / erase cut (`FaultAtWordWrite` or `FaultAtPageErase`)**: all operations prior to the armed index run with their full configured duration and commit on timer expiry. When the armed target operation starts, the cut interrupts that in-progress operation immediately, applies the configured torn-program, interrupted-erase, or uncorrectable-ECC outcome to backing storage and `FaultFlashSnapshot`, latches power loss, and suppresses the completion timer so the interrupted operation never silently finishes after the cut.
+
+## Runtime audit budgets
+
+A clean sizing boot runs before a timed audit, including a control-only audit.
+The selected controller counts each nonzero duration it requests from its
+operation timer. During this boot only, each request completes after one
+microsecond of virtual time. This keeps status polling and chained program
+units active. The histogram includes programming bytes that already hold the
+requested value, erases of different sizes, and the parallelism selected by
+firmware. An individual write-trace entry can represent a change to flash
+contents, so its count alone cannot determine the busy time.
+
+Let `B = sum(count * duration_us) / 1_000_000` seconds and let `C` be the
+emulated time to the clean sizing boot's terminal observation. The audit uses
+`D = max(4, configured run_duration, ceil(2 * (C + B)))` emulated seconds.
+The factor of two allows a recovery boot to repeat a copy or erase. Both
+phases receive this budget. The instruction ceiling scales with the CPU's
+configured MIPS and `D`, with the harness's existing twofold instruction
+headroom. The timed coarse and fine calibration passes each have at least
+`D` seconds available. The phase wall budget is the largest of the requested
+phase wall limits, 300 seconds, and 120 wall seconds per budgeted emulated
+second. This allows for MMIO polling and host contention. The outer Robot and
+process limits include the phase allowances for the batch plus startup time.
+
+Before operation counts exist, the sizing pass uses the same wall rule with
+`D = max(4, configured run_duration)`. A sizing boot that exhausts its control budget or misses the expected
+outcome stops the audit before any point verdicts. Its diagnostic identifies
+the stop reason and the control limits to check. Only the sizing process uses
+one-microsecond pulses. Calibration, the independent clean control and recovery
+boots use the full selected durations. The audit log records the histogram,
+summed busy time and effective budgets. Timing `off` skips the sizing pass.

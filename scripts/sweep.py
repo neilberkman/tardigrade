@@ -57,6 +57,7 @@ from partial_staging import (
 from point_counts import merge_point_counts
 from profile_loader import ProfileConfig, load_profile
 from renode_runner import (
+    calibrate_flash_timing,
     RenodeTimeoutError,
     _group_fault_plan_by_type,
     _progress,
@@ -2188,6 +2189,13 @@ def run_multi_component_sweep(
                     comp_profile.expect.control_outcome
                 ),
             ],
+        )
+
+        comp_robot_vars, _ = calibrate_flash_timing(
+            robot_vars=comp_robot_vars, profile=comp_profile, repo_root=repo_root,
+            renode_test=renode_test, robot_suite=robot_suite, work_dir=comp_dir,
+            renode_remote_server_dir=renode_remote_server_dir,
+            keep_run_artifacts=keep_run_artifacts,
         )
 
         # Calibrate this component.

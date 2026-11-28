@@ -1325,6 +1325,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly IMachine machine;
         private readonly DoubleWordRegisterCollection registers;
         private readonly FaultTracker tracker = new FaultTracker();
+        public FlashTimingCalibration TimingCalibration => operation.Calibration;
         private readonly FlashOperationTimer operation;
         private FlashTiming timing;
 

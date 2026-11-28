@@ -121,6 +121,8 @@ ${EXTRA_PERIPHERALS}           ${EMPTY}
 ${WATCHDOG_FREQUENCY}          ${EMPTY}
 ${FLASH_BACKEND}               ${EMPTY}
 ${FLASH_TIMING}                ${EMPTY}
+${FLASH_TIMING_PROBE}          false
+${FLASH_TIMING_PHASE_WALL_S}   0
 ${NVM_CONTROLLER}              ${EMPTY}
 ${BOOT_REGISTER_PRE_WRITES}    ${EMPTY}
 ${BOOT_REGISTERS}              ${EMPTY}
@@ -272,6 +274,8 @@ Run Runtime Fault Point
     Execute Command    $boundary_acceptance="${BOUNDARY_ACCEPTANCE}"
     Execute Command    $flash_backend="${FLASH_BACKEND}"
     Execute Command    $flash_timing="${FLASH_TIMING}"
+    Execute Command    $flash_timing_probe="${FLASH_TIMING_PROBE}"
+    Execute Command    $flash_timing_phase_wall_s="${FLASH_TIMING_PHASE_WALL_S}"
     Run Keyword If    '${NVM_CONTROLLER}' != ''    Execute Command    $nvm_controller="${NVM_CONTROLLER}"
     Execute Command    $enable_machine_snapshots="${ENABLE_MACHINE_SNAPSHOTS}"
     Execute Command    $success_vtor_slot="${SUCCESS_VTOR_SLOT}"

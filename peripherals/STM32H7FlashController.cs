@@ -37,6 +37,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     public class STM32H7FlashController : STM32_FlashController, IKnownSize, ITardigradeFaultInjectable
     {
         private FlashTiming timing;
+        public FlashTimingCalibration TimingCalibration { get; } = new FlashTimingCalibration();
         public FlashTiming OperationTiming
         {
             get => timing;
@@ -868,7 +869,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             public Bank(STM32H7FlashController parent, int id, MappedMemory memory, long combinedBaseOffset)
             {
-                Timing = new H7BankTiming(parent);
+                Timing = new H7BankTiming(parent, parent.TimingCalibration);
                 this.parent = parent;
                 this.Id = id;
                 this.memory = memory;

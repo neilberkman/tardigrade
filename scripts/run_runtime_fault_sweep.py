@@ -394,7 +394,9 @@ def resolve_runtime_step_limit(configured_value, duration_value, cpu_ref):
     derived = int(
         (budget_s * performance_mips * 1000000.0 * 2.0) + 0.999999
     )
-    derived = max(1, min(2000000000, derived))
+    if active_timing in ('', 'off'):
+        derived = min(2000000000, derived)
+    derived = max(1, derived)
     if configured > 0:
         effective = max(configured, derived)
         return {
@@ -1454,6 +1456,11 @@ if evaluation_mode not in ('execute', 'state'):
     evaluation_mode = 'state'
 if recovery_tracking_start_address is not None and evaluation_mode != 'execute':
     raise ValueError('recovery_tracking_start_address requires execute evaluation mode')
+flash_timing_probe = get_optional_var('flash_timing_probe', 'false').lower() == 'true'
+if (get_optional_var('flash_timing', '').lower() not in ('', 'off')
+        and not flash_timing_probe
+        and int(get_optional_var('flash_timing_phase_wall_s', '0')) <= 0):
+    raise ValueError('run_duration and phase2_wall_timeout_s require a calibrated flash timing budget')
 run_duration = str(monitor.GetVariable('run_duration'))
 max_step_limit_configured = int(monitor.GetVariable('max_step_limit'))
 max_step_limit_resolution = resolve_runtime_step_limit(
@@ -16903,6 +16910,15 @@ def run_execute_fault(
             else None
         )
         phase1_status = None
+        probe = None
+        if globals().get('flash_timing_probe', False):
+            device = backend['data']
+            # Named-part controllers own their timer. A generic controller
+            # delegates operations to its storage.
+            storage = device if hasattr(device, 'OperationTiming') else getattr(device, 'Nvm', device)
+            probe = storage.TimingCalibration
+            probe.Counts.Clear()
+            probe.Enabled = True
         try:
             phase1_status = run_control_phase1(
                 cpu_ref,
@@ -16910,6 +16926,8 @@ def run_execute_fault(
                 vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
             )
         finally:
+            if probe is not None:
+                probe.Enabled = False
             if callable(_stop_cov_fn):
                 _stop_cov_fn(
                     cpu_ref, _control_cov_session, stop_status=phase1_status
@@ -16953,6 +16971,10 @@ def run_execute_fault(
         if phase1_status is not None:
             merge_stop_status_signals(signals, 'phase1', phase1_status)
             signals['zero_point_execute_control'] = zero_point_execute_control
+            if probe is not None:
+                signals['flash_timing_counts'] = dict(
+                    (str(int(key)), int(probe.Counts[key])) for key in probe.Counts.Keys
+                )
 
         if (boundary_setup_env and boundary_durable_state_file and not calibration_mode
                 and boundary_phase.strip().lower() != 'follow_up'):
@@ -25382,6 +25404,9 @@ if calibration_mode:
             int(coarse_budget_s / max(0.001, coarse_slice_s)) + 1,
         )
         coarse_wall_timeout = max(300, int(coarse_budget_s * 60))
+        timing_wall = int(get_optional_var('flash_timing_phase_wall_s', '0'))
+        if timing_wall:
+            coarse_wall_timeout = timing_wall
         cal_settle = _copy_on_boot_vtor_settle_iters()
         log('calibration phase 1: coarse detection (slice={}s, max_iters={})'.format(
             coarse_slice_s, coarse_max_iters))
@@ -25422,8 +25447,10 @@ if calibration_mode:
             # Phase 2: Reset and re-run with fine slices, bounded by phase 1 time.
             fine_margin_s = max(1.0, phase1_emulated_s * 0.2)
             fine_budget_s = phase1_emulated_s + fine_margin_s
+            if timing_wall:
+                fine_budget_s = max(coarse_budget_s, fine_budget_s)
             fine_max_iters = max(200, int(fine_budget_s / float(calibration_time_slice)) + 1)
-            fine_wall_timeout = max(600, int(fine_budget_s * 300))
+            fine_wall_timeout = timing_wall or max(600, int(fine_budget_s * 300))
             log('calibration phase 2: fine trace (slice={}s, budget={}s, max_iters={})'.format(
                 calibration_time_slice, fine_budget_s, fine_max_iters))
             _reset_trial_boot_history('power_on')

@@ -70,6 +70,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
         private readonly FlashProgramBuffer programBuffer = new FlashProgramBuffer();
+        public FlashTimingCalibration TimingCalibration => operation.Calibration;
         private readonly FlashOperationTimer operation;
 
         private void ProgramStore(long offset, int width, ulong value, bool nativeStore)

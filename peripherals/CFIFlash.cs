@@ -48,6 +48,7 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
 
         private byte Status => timer.Busy ? (byte)0 : (byte)0x80;
 
+        public FlashTimingCalibration TimingCalibration => timer.Calibration;
         private readonly FlashOperationTimer timer;
 
         // --- Tardigrade write tracking ---

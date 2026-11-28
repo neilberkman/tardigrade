@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from trace_utils import flash_base_for_profile, summarize_calibration_coverage
 from renode_runner import (
+    calibrate_flash_timing,
     CalibrationResult,
     calibration_completed,
     run_single_point,
@@ -1714,6 +1715,12 @@ def discover_update_trigger(
 
         robot_vars = robot_vars_factory(candidate)
         try:
+            robot_vars, _ = calibrate_flash_timing(
+                robot_vars=robot_vars, profile=candidate, repo_root=repo_root,
+                renode_test=renode_test, robot_suite=robot_suite, work_dir=work_dir,
+                renode_remote_server_dir=renode_remote_server_dir,
+                keep_run_artifacts=keep_run_artifacts,
+            )
             data = run_single_point(
                 repo_root=repo_root,
                 renode_test=renode_test,

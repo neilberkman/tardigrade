@@ -78,6 +78,7 @@ from state_fuzz import (
 )
 from fuzz_corpus import convert_corpus
 from renode_runner import (
+    calibrate_flash_timing,
     CalibrationResult,
     _progress,
     ensure_tool,
@@ -2276,6 +2277,7 @@ def _main_single() -> int:
             work_dir = Path(temp_ctx.name)
             report_artifacts_dir = "temporary"
 
+        timing_budget = None
         discovery: Optional[TriggerDiscoveryResult] = None
         geometry_preflight: Optional[Dict[str, Any]] = None
         max_writes = profile.fault_sweep.max_writes
@@ -2336,6 +2338,13 @@ def _main_single() -> int:
                     geometry=geometry_preflight,
                 )
                 return 0 if args.no_assert_verdict else EXIT_ASSERTION_FAILURE
+
+            robot_vars, timing_budget = calibrate_flash_timing(
+                robot_vars=robot_vars, profile=profile, repo_root=repo_root,
+                renode_test=renode_test, robot_suite=robot_suite, work_dir=work_dir,
+                renode_remote_server_dir=args.renode_remote_server_dir,
+                keep_run_artifacts=args.keep_run_artifacts,
+            )
 
         # -------------------------------------------------------------------
         # Calibration
@@ -3416,6 +3425,8 @@ def _main_single() -> int:
             "program_trace_file": program_trace_file,
             "barrier_audit": cal.barrier_audit if cal is not None else None,
         }
+        if timing_budget is not None:
+            payload["calibration"]["flash_timing_budget"] = timing_budget
         payload["calibration"]["stop"] = _calibration_stop_summary(
             profile, cal
         )
