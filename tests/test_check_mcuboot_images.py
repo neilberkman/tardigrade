@@ -203,14 +203,14 @@ class CheckMcubootImagesTests(unittest.TestCase):
 
     def test_profile_vector_crosscheck_identifies_expected_mismatches(self) -> None:
         profiles = img_check.discover_mcuboot_profiles(ROOT)
-        self.assertEqual(len(profiles), 103)
+        self.assertEqual(len(profiles), 114)
 
         results = img_check.check_all_profile_vectors(profiles, repo_root=ROOT)
-        self.assertEqual(len(results), 103)
+        self.assertEqual(len(results), 114)
 
         ok_profiles = {r.profile_path.name: r for r in results if r.ok}
         mismatch_map = {r.profile_path.name: r for r in results if not r.ok}
-        self.assertEqual(len(ok_profiles), 103)
+        self.assertEqual(len(ok_profiles), 114)
         self.assertEqual(set(mismatch_map.keys()), set())
 
         for name in (
@@ -243,7 +243,26 @@ class CheckMcubootImagesTests(unittest.TestCase):
             rc_report = img_check.main(["--check-profiles", "--report-only"])
         self.assertEqual(rc_report, 0)
         self.assertEqual(stderr_report.getvalue(), "")
-        self.assertEqual(len(stdout_report.getvalue().strip().splitlines()), 103)
+        self.assertEqual(len(stdout_report.getvalue().strip().splitlines()), 114)
+
+    def test_mcuboot_head_state_search_profiles_load_strict(self) -> None:
+        from profile_loader import load_profile
+
+        state_search_profiles = sorted(
+            (ROOT / "profiles").glob("mcuboot_head_*_state_search.yaml")
+        )
+        self.assertEqual(len(state_search_profiles), 11)
+        for path in state_search_profiles:
+            with self.subTest(profile=path.name):
+                loaded = load_profile(path, strict=True)
+                self.assertTrue(loaded.fault_sweep.include_erase_fault_points)
+                self.assertTrue(loaded.fault_sweep.torn_word_explicit)
+                self.assertEqual(loaded.fault_sweep.torn_word_seed, 20261127)
+                self.assertTrue(loaded.fault_sweep.phase2_fault.state_search.enabled)
+                expected_issues = (
+                    path.name == "mcuboot_head_offset_stm32f4_upgrade_state_search.yaml"
+                )
+                self.assertEqual(loaded.expect.should_find_issues, expected_issues)
 
 
 if __name__ == "__main__":
