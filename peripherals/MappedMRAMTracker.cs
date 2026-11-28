@@ -446,26 +446,32 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         public ulong LastFaultWriteIndex => lastFaultWriteIndex;
+        public ulong LastFaultEraseIndex => lastFaultEraseIndex;
         public ulong LastFaultProgramAddress => lastFaultProgramAddress;
         public long LastFaultOffset => lastFaultOffset;
         public int LastFaultProgramWidth => lastFaultProgramWidth;
+        public int LastFaultEraseSize => lastFaultProgramWidth;
         public byte[] LastFaultIntendedBytes => CloneBytes(lastFaultIntendedBytes);
         public byte[] LastFaultPreProgramBytes => CloneBytes(lastFaultPreProgramBytes);
+        public byte[] LastFaultPreEraseBytes => CloneBytes(lastFaultPreProgramBytes);
         public byte[] LastFaultPostFaultBytes => CloneBytes(lastFaultPostFaultBytes);
+        public byte[] LastFaultPostEraseBytes => CloneBytes(lastFaultPostFaultBytes);
         public byte[] FaultMemorySnapshot => CloneBytes(faultMemorySnapshot);
         public int FaultMemorySnapshotSize => faultMemorySnapshot != null ? faultMemorySnapshot.Length : 0;
         public bool FaultEvidenceExact =>
-            lastFaultWriteIndex != 0
+            ((lastFaultWriteIndex != 0 && lastFaultProgramWidth == ProgramUnitSize)
+             || (lastFaultEraseIndex != 0 && lastFaultProgramWidth > 0))
             && lastFaultOffset >= 0
-            && lastFaultProgramWidth == ProgramUnitSize
             && lastFaultIntendedBytes != null
-            && lastFaultIntendedBytes.Length == ProgramUnitSize
+            && lastFaultIntendedBytes.Length == lastFaultProgramWidth
             && lastFaultPreProgramBytes != null
-            && lastFaultPreProgramBytes.Length == ProgramUnitSize
+            && lastFaultPreProgramBytes.Length == lastFaultProgramWidth
             && lastFaultPostFaultBytes != null
-            && lastFaultPostFaultBytes.Length == ProgramUnitSize
+            && lastFaultPostFaultBytes.Length == lastFaultProgramWidth
             && faultMemorySnapshot != null
             && faultMemorySnapshot.Length == Size;
+        public bool EraseFaultEvidenceExact =>
+            lastFaultEraseIndex != 0 && FaultEvidenceExact;
 
         public ulong TrackingStartAddress
         {
@@ -652,7 +658,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var eraseCtx = CaptureCpuCallContext(erasePc);
             var eraseIndex = TotalPageErases + 1;
             TotalPageErases = eraseIndex;
-            if(EraseTraceEnabled)
+            if(EraseTraceEnabled || (!PassthroughMode && faultAtPageErase != ulong.MaxValue))
             {
                 TraceTimes.Record(true, eraseIndex);
                 eraseTrace.Add(new EraseTraceEntry(
@@ -674,14 +680,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     Array.Copy(postErase, 0, flashShadow, checked((int)offset), postErase.Length);
                 }
+                var intendedErase = new byte[spanSize];
+                if(EraseFill != 0)
+                {
+                    for(var i = 0; i < intendedErase.Length; i++)
+                    {
+                        intendedErase[i] = EraseFill;
+                    }
+                }
                 EraseFaultFired = true;
                 LastFaultInjected = true;
                 LastFaultAddress = checked((uint)(ProgramAddressBase + (ulong)offset));
                 LastFaultPC = erasePc;
                 LastFaultCallContext = eraseCtx;
+                lastFaultWriteIndex = 0;
+                lastFaultEraseIndex = eraseIndex;
                 lastFaultOffset = offset;
                 lastFaultProgramAddress = ProgramAddressBase + (ulong)offset;
                 lastFaultProgramWidth = spanSize;
+                lastFaultIntendedBytes = intendedErase;
+                lastFaultPreProgramBytes = CloneBytes(preErase);
+                lastFaultPostFaultBytes = CloneBytes(postErase);
                 faultMemorySnapshot = BackingMemory.ReadBytes(0, checked((int)Size));
                 faultUncorrectableWords.Clear();
                 faultUncorrectableWords.AddRange(uncorrectableWords);
@@ -1215,6 +1234,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                           byte[] preProgram, byte[] postFault)
         {
             lastFaultWriteIndex = index;
+            lastFaultEraseIndex = 0;
             lastFaultOffset = offset;
             lastFaultProgramAddress = ProgramAddressBase + (ulong)offset;
             lastFaultProgramWidth = ProgramUnitSize;
@@ -1262,6 +1282,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private void ClearFaultEvidence()
         {
             lastFaultWriteIndex = 0;
+            lastFaultEraseIndex = 0;
             lastFaultProgramAddress = 0;
             lastFaultOffset = -1;
             lastFaultProgramWidth = 0;
@@ -1464,6 +1485,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private ulong trackingStopErases;
         private bool stopHookInstalled;
         private ulong lastFaultWriteIndex;
+        private ulong lastFaultEraseIndex;
         private ulong lastFaultProgramAddress;
         private long lastFaultOffset = -1;
         private int lastFaultProgramWidth;

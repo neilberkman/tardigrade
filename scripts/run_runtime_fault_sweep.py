@@ -7267,9 +7267,270 @@ def parse_mram_program_trace(trace_text, memory_size, bus_base, call_context_tex
     return events
 
 
-def collect_mram_fault_evidence(selected_write_index, expected_backend_index):
+def collect_mram_fault_evidence(selected_write_index, expected_backend_index, operation_kind=None):
     """Return validated MRAM evidence plus the peripheral's immediate snapshot."""
     data = backend['data']
+    if getattr(data, 'Nvm', None) is not None:
+        data = data.Nvm
+    if operation_kind is None:
+        is_erase = bool(getattr(data, 'EraseFaultFired', False)) or (
+            int(getattr(data, 'LastFaultEraseIndex', 0) or 0) != 0
+            and int(getattr(data, 'LastFaultWriteIndex', 0) or 0) == 0
+        )
+        op_kind = 'erase' if is_erase else 'program'
+    else:
+        raw_kind = str(operation_kind).strip().lower()
+        op_kind = (
+            'erase'
+            if raw_kind in ('erase', 'e', 'a', 'interrupted_erase', 'multi_sector_atomicity')
+            else 'program'
+        )
+    if op_kind == 'erase':
+        evidence = {
+            'contract_version': 1,
+            'operation_kind': 'erase',
+            'selected_erase_index': int(selected_write_index),
+            'exact': False,
+        }
+        missing = []
+        if not hasattr(data, 'FaultEvidenceExact') and not hasattr(data, 'EraseFaultEvidenceExact'):
+            missing.append('FaultEvidenceExact')
+        if not hasattr(data, 'LastFaultProgramAddress') and not hasattr(data, 'LastFaultAddress'):
+            missing.append('LastFaultProgramAddress')
+        if not hasattr(data, 'LastFaultOffset'):
+            missing.append('LastFaultOffset')
+        if not hasattr(data, 'LastFaultProgramWidth') and not hasattr(data, 'LastFaultEraseSize'):
+            missing.append('LastFaultProgramWidth')
+        if not hasattr(data, 'LastFaultPreProgramBytes') and not hasattr(data, 'LastFaultPreEraseBytes'):
+            missing.append('LastFaultPreProgramBytes')
+        if not hasattr(data, 'LastFaultPostFaultBytes') and not hasattr(data, 'LastFaultPostEraseBytes') and not hasattr(data, 'FaultMemorySnapshot') and not hasattr(data, 'FaultFlashSnapshot'):
+            missing.append('LastFaultPostFaultBytes')
+        if not hasattr(data, 'FaultMemorySnapshot') and not hasattr(data, 'FaultFlashSnapshot'):
+            missing.append('FaultMemorySnapshot')
+        if missing:
+            evidence['capability_error'] = (
+                'MRAM backend lacks exact fault evidence capability: {}'.format(
+                    ', '.join(missing)
+                )
+            )
+            return evidence, None, None
+        if backend.get('bus_base') is None:
+            evidence['capability_error'] = (
+                'MRAM backend bus base is unknown; absolute fault address cannot be proven'
+            )
+            return evidence, None, None
+        try:
+            exact_flag = getattr(
+                data,
+                'EraseFaultEvidenceExact',
+                getattr(data, 'FaultEvidenceExact', False),
+            )
+            if not bool(exact_flag):
+                raise ValueError('backend marked its fault evidence inexact')
+            memory_size = int(getattr(data, 'Size', getattr(data, 'FlashSize', 0)) or 0)
+            bus_base = int(backend['bus_base'])
+            erase_index = int(
+                getattr(data, 'LastFaultEraseIndex', 0)
+                or getattr(data, 'TotalPageErases', 0)
+                or 0
+            )
+            offset = int(data.LastFaultOffset)
+            width = int(
+                getattr(data, 'LastFaultEraseSize', getattr(data, 'LastFaultProgramWidth', 0))
+                or 0
+            )
+            erase_address = int(
+                getattr(data, 'LastFaultProgramAddress', getattr(data, 'LastFaultAddress', 0))
+                or 0
+            )
+            if erase_index != int(expected_backend_index):
+                raise ValueError(
+                    'fault erase index {} does not match armed index {}'.format(
+                        erase_index, expected_backend_index
+                    )
+                )
+            if width <= 0:
+                raise ValueError('erase size is not positive')
+            if offset < 0 or offset > memory_size - width:
+                raise ValueError('fault erase range is outside MRAM')
+            expected_address = bus_base + offset
+            if erase_address != expected_address:
+                raise ValueError(
+                    'fault address {} does not equal bus base plus offset {}'.format(
+                        fmt_u32(erase_address), fmt_u32(expected_address)
+                    )
+                )
+            raw_snapshot = getattr(
+                data, 'FaultMemorySnapshot', getattr(data, 'FaultFlashSnapshot', None)
+            )
+            snapshot = to_py_bytes(raw_snapshot)
+            if snapshot is None or len(snapshot) != memory_size:
+                raise ValueError('immediate fault snapshot length does not equal MRAM size')
+            pre_raw = getattr(
+                data,
+                'LastFaultPreEraseBytes',
+                getattr(data, 'LastFaultPreProgramBytes', None),
+            )
+            pre_erase = to_py_bytes(pre_raw)
+            if pre_erase is None or len(pre_erase) != width:
+                raise ValueError(
+                    'pre-erase bytes length does not equal erase size {}'.format(width)
+                )
+            post_raw = getattr(
+                data,
+                'LastFaultPostEraseBytes',
+                getattr(data, 'LastFaultPostFaultBytes', None),
+            )
+            post_fault = to_py_bytes(post_raw) if post_raw is not None else snapshot[offset:offset + width]
+            if post_fault is None or len(post_fault) != width:
+                raise ValueError(
+                    'post-fault bytes length does not equal erase size {}'.format(width)
+                )
+            intended_raw = getattr(data, 'LastFaultIntendedBytes', None)
+            if intended_raw is not None:
+                intended = to_py_bytes(intended_raw)
+            else:
+                erase_fill = int(getattr(data, 'EraseFill', 0) or 0) & 0xFF
+                intended = bytearray([erase_fill] * width)
+            if intended is None or len(intended) != width:
+                raise ValueError(
+                    'intended bytes length does not equal erase size {}'.format(width)
+                )
+            erase_trace = []
+            if hasattr(data, 'EraseTraceToString'):
+                raw_erase_trace = str(data.EraseTraceToString() or '')
+                erase_ctx_map = {}
+                if hasattr(data, 'EraseCallContextToString'):
+                    try:
+                        _ctx_fn = globals().get('parse_call_context_map')
+                        if callable(_ctx_fn):
+                            erase_ctx_map = _ctx_fn(data.EraseCallContextToString())
+                    except Exception:
+                        erase_ctx_map = {}
+                for line in raw_erase_trace.splitlines():
+                    text = line.strip()
+                    if not text:
+                        continue
+                    fields = text.split(':')
+                    if len(fields) < 4:
+                        raise ValueError('erase trace record has fewer than four fields')
+                    e_idx = int(fields[0])
+                    e_off = int(fields[1])
+                    e_writes_at = int(fields[2])
+                    e_sz = int(fields[3])
+                    is_faulted = (e_idx == erase_index)
+                    item = {
+                        'erase_index': e_idx,
+                        'erase_address': fmt_u32(bus_base + e_off),
+                        'program_address': fmt_u32(bus_base + e_off),
+                        'offset': e_off,
+                        'writes_at_this_point': e_writes_at,
+                        'erase_size': e_sz,
+                        'program_width': e_sz,
+                        'faulted': is_faulted,
+                    }
+                    if is_faulted:
+                        item['intended_bytes'] = _program_bytes_hex(intended)
+                        item['pre_erase_bytes'] = _program_bytes_hex(pre_erase)
+                        item['post_erase_bytes'] = _program_bytes_hex(post_fault)
+                    if len(fields) >= 5 and fields[4].strip():
+                        pc_val = int(fields[4].strip(), 0)
+                        if pc_val > 0:
+                            item['pc'] = fmt_u32(pc_val)
+                    if e_idx in erase_ctx_map:
+                        item['call_context'] = erase_ctx_map[e_idx]
+                    erase_trace.append(item)
+                if hasattr(data, 'EraseTraceCount') and erase_trace:
+                    if len(erase_trace) != int(data.EraseTraceCount):
+                        raise ValueError('erase trace count does not match exported trace')
+                if erase_trace:
+                    fault_events = [ev for ev in erase_trace if ev.get('faulted')]
+                    if len(fault_events) != 1:
+                        raise ValueError(
+                            'erase trace contains {} faulted events; expected exactly one'.format(
+                                len(fault_events)
+                            )
+                        )
+                    fault_event = fault_events[0]
+                    if (
+                        int(fault_event['erase_index']) != erase_index
+                        or int(fault_event['offset']) != offset
+                        or int(fault_event['erase_size']) != width
+                    ):
+                        raise ValueError('faulted erase trace event disagrees with fault evidence')
+                else:
+                    fault_event = {}
+            else:
+                fault_event = {}
+            evidence.update({
+                'backend_erase_index': erase_index,
+                'erase_address': fmt_u32(erase_address),
+                'program_address': fmt_u32(erase_address),
+                'offset': offset,
+                'erase_size': width,
+                'program_width': width,
+                'intended_bytes': _program_bytes_hex(intended),
+                'pre_erase_bytes': _program_bytes_hex(pre_erase),
+                'pre_program_bytes': _program_bytes_hex(pre_erase),
+                'post_fault_bytes': _program_bytes_hex(post_fault),
+                'post_erase_bytes': _program_bytes_hex(post_fault),
+                'erase_trace': erase_trace,
+                'exact': True,
+            })
+            fault_pc_val = int(getattr(data, 'LastFaultPC', 0) or 0)
+            if fault_event.get('pc'):
+                evidence['fault_pc'] = fault_event['pc']
+            elif fault_pc_val > 0:
+                evidence['fault_pc'] = fmt_u32(fault_pc_val)
+            fault_ctx_val = getattr(data, 'LastFaultCallContext', None)
+            if fault_event.get('call_context'):
+                evidence['fault_call_context'] = fault_event['call_context']
+            elif fault_ctx_val:
+                evidence['fault_call_context'] = str(fault_ctx_val)
+            uncorr_addrs = []
+            for method_name in ('FaultUncorrectableWordsToString', 'UncorrectableWordsToString'):
+                if hasattr(data, method_name):
+                    try:
+                        raw_table = str(getattr(data, method_name)() or '')
+                    except Exception:
+                        raw_table = ''
+                    for u_line in raw_table.splitlines():
+                        u_parts = u_line.strip().split(':')
+                        if len(u_parts) >= 2 and u_parts[1].strip():
+                            uncorr_addrs.append(fmt_u32(int(u_parts[1].strip(), 0)))
+                    if uncorr_addrs:
+                        break
+            if not uncorr_addrs and hasattr(data, 'FaultUncorrectableWords'):
+                raw_uncorr_list = getattr(data, 'FaultUncorrectableWords', None)
+                if isinstance(raw_uncorr_list, (list, tuple)):
+                    for u_val in raw_uncorr_list:
+                        uncorr_addrs.append(fmt_u32(int(str(u_val), 0) if isinstance(u_val, str) else int(u_val)))
+            if (
+                bool(getattr(data, 'LastFaultMarkedUncorrectable', False))
+                or bool(getattr(data, 'LastFaultWordMarkedUncorrectable', False))
+                or uncorr_addrs
+            ):
+                if not uncorr_addrs:
+                    unit_size = int(
+                        getattr(data, 'ProgramUnitSize', getattr(data, 'WordSize', width))
+                        or width
+                    )
+                    if unit_size <= 0:
+                        unit_size = width
+                    first_unit = (offset // unit_size) * unit_size
+                    last_unit = ((offset + width - 1) // unit_size) * unit_size
+                    uncorr_addrs = [
+                        fmt_u32(bus_base + u)
+                        for u in range(first_unit, last_unit + 1, unit_size)
+                    ]
+                evidence['word_marked_uncorrectable'] = True
+                evidence['uncorrectable_word_address'] = uncorr_addrs[0]
+                evidence['uncorrectable_words'] = list(uncorr_addrs)
+            return evidence, snapshot, raw_snapshot
+        except Exception as exc:
+            evidence['capability_error'] = 'MRAM exact fault evidence rejected: {}'.format(exc)
+            return evidence, None, None
+
     required = (
         'FaultEvidenceExact', 'LastFaultWriteIndex', 'LastFaultProgramAddress',
         'LastFaultOffset', 'LastFaultProgramWidth', 'LastFaultIntendedBytes',
@@ -7279,6 +7540,7 @@ def collect_mram_fault_evidence(selected_write_index, expected_backend_index):
     missing = [name for name in required if not hasattr(data, name)]
     evidence = {
         'contract_version': 1,
+        'operation_kind': 'program',
         'selected_write_index': int(selected_write_index),
         'exact': False,
     }
@@ -7391,6 +7653,15 @@ def collect_mram_fault_evidence(selected_write_index, expected_backend_index):
     except Exception as exc:
         evidence['capability_error'] = 'MRAM exact fault evidence rejected: {}'.format(exc)
         return evidence, None, None
+
+
+def collect_mram_erase_fault_evidence(selected_erase_index, expected_backend_index):
+    """Return validated MRAM erase-cut evidence plus the immediate snapshot."""
+    return collect_mram_fault_evidence(
+        selected_erase_index,
+        expected_backend_index,
+        operation_kind='erase',
+    )
 
 def get_last_command_address():
     ctrl = backend['controller']
@@ -7826,8 +8097,12 @@ def reset_nvmc_for_sweep(tracking_start=None):
         b['data'].Nvm.TotalWordWrites = 0
         if hasattr(b['data'].Nvm, 'TotalPageErases'):
             b['data'].Nvm.TotalPageErases = 0
+        if hasattr(b['data'].Nvm, 'WriteTraceClear'):
+            b['data'].Nvm.WriteTraceClear()
         if hasattr(b['data'].Nvm, 'EraseTraceClear'):
             b['data'].Nvm.EraseTraceClear()
+        if hasattr(b['data'].Nvm, 'ProgramTraceClear'):
+            b['data'].Nvm.ProgramTraceClear()
         b['data'].Nvm.FaultEverFired = False
         if hasattr(b['data'].Nvm, 'EraseFaultFired'):
             b['data'].Nvm.EraseFaultFired = False
@@ -7922,8 +8197,12 @@ def reset_nvmc_for_recovery(tracking_start=0):
         b['data'].Nvm.TotalWordWrites = 0
         if hasattr(b['data'].Nvm, 'TotalPageErases'):
             b['data'].Nvm.TotalPageErases = 0
+        if hasattr(b['data'].Nvm, 'WriteTraceClear'):
+            b['data'].Nvm.WriteTraceClear()
         if hasattr(b['data'].Nvm, 'EraseTraceClear'):
             b['data'].Nvm.EraseTraceClear()
+        if hasattr(b['data'].Nvm, 'ProgramTraceClear'):
+            b['data'].Nvm.ProgramTraceClear()
         b['data'].Nvm.FaultEverFired = False
         if hasattr(b['data'].Nvm, 'EraseFaultFired'):
             b['data'].Nvm.EraseFaultFired = False
@@ -11074,6 +11353,9 @@ def run_state_fault(fault_at):
         'final_reset_kind': _state_reset_kinds[-1],
         'signals': signals,
     }
+    if int(fault_at) >= 0:
+        result['operation_kind'] = 'program'
+        signals['operation_kind'] = 'program'
     if signals.get('matched_image') is not None:
         result['matched_image'] = signals.get('matched_image')
     if isinstance(signals.get('approved_image_running'), dict):
@@ -16147,6 +16429,7 @@ def run_execute_fault(
         erase_mode = 1 if fault_type == 'a' else 0
         base_erases = get_total_erases()
         arm_at = base_erases + fault_at + 1
+        expected_backend_fault_index = arm_at
         log('fp={} phase1_step erase_arm_at={} mode={}'.format(fault_at, arm_at, erase_mode))
         arm_erase_fault(arm_at, erase_fault_mode=erase_mode)
         disarm_write_fault()
@@ -16242,17 +16525,42 @@ def run_execute_fault(
     _fault_ctx_fn = globals().get('get_last_fault_call_context')
     fault_call_context = None if (is_command_fault or not callable(_fault_ctx_fn)) else _fault_ctx_fn()
     if (
-        backend['kind'] == 'mram'
-        and fault_injected
-        and not (is_erase_fault or is_command_fault or is_i2c_fault or is_otp_fault)
-    ):
-        mram_fault_evidence, fault_snapshot_bytes, mram_fault_snapshot_raw = (
-            collect_mram_fault_evidence(
-                fault_at,
-                expected_backend_fault_index,
+        (
+            backend['kind'] == 'mram'
+            or (
+                backend['kind'] == 'slow'
+                and (is_erase_fault or include_erase_fault_points)
             )
         )
-        if mram_fault_evidence.get('program_address'):
+        and fault_injected
+        and not (is_command_fault or is_i2c_fault or is_otp_fault)
+    ):
+        if is_erase_fault:
+            _erase_ev_fn = globals().get('collect_mram_erase_fault_evidence')
+            if callable(_erase_ev_fn):
+                mram_fault_evidence, fault_snapshot_bytes, mram_fault_snapshot_raw = (
+                    _erase_ev_fn(
+                        fault_at,
+                        expected_backend_fault_index,
+                    )
+                )
+            else:
+                mram_fault_evidence, fault_snapshot_bytes, mram_fault_snapshot_raw = (
+                    collect_mram_fault_evidence(
+                        fault_at,
+                        expected_backend_fault_index,
+                    )
+                )
+        else:
+            mram_fault_evidence, fault_snapshot_bytes, mram_fault_snapshot_raw = (
+                collect_mram_fault_evidence(
+                    fault_at,
+                    expected_backend_fault_index,
+                )
+            )
+        if mram_fault_evidence.get('erase_address'):
+            fault_address = int(mram_fault_evidence['erase_address'], 0)
+        elif mram_fault_evidence.get('program_address'):
             fault_address = int(mram_fault_evidence['program_address'], 0)
         if mram_fault_evidence.get('fault_pc') and not fault_pc:
             fault_pc = int(str(mram_fault_evidence['fault_pc']), 0)
@@ -16697,7 +17005,7 @@ def run_execute_fault(
         metadata_delta_pre_snapshot=md_pre_snapshot,
         fault_semantic_state=fault_semantic_state,
         persist_snapshot=bool(
-            backend['kind'] == 'mram'
+            (backend['kind'] == 'mram' or mram_fault_evidence is not None)
             and fault_injected
             and fault_snapshot_bytes is not None
         ),
@@ -19269,6 +19577,7 @@ def _deferred_mram_replay_fault_evidence(
         trace.append(trace_item)
     evidence = {
         'contract_version': 1,
+        'operation_kind': 'program',
         'selected_write_index': int(selected_write_index),
         'backend_write_index': backend_index,
         'program_address': fmt_u32(bus_base + int(event['offset'])),

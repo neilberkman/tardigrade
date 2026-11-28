@@ -285,15 +285,20 @@ namespace Antmicro.Renode.Peripherals.Memory
         }
 
         public ulong LastFaultWriteIndex => Nvm != null ? Nvm.LastFaultWriteIndex : 0UL;
+        public ulong LastFaultEraseIndex => Nvm != null ? Nvm.LastFaultEraseIndex : 0UL;
         public ulong LastFaultProgramAddress => Nvm != null ? Nvm.LastFaultProgramAddress : 0UL;
         public long LastFaultOffset => Nvm != null ? Nvm.LastFaultOffset : -1L;
         public int LastFaultProgramWidth => Nvm != null ? Nvm.LastFaultProgramWidth : 0;
+        public int LastFaultEraseSize => Nvm != null ? Nvm.LastFaultEraseSize : 0;
         public byte[] LastFaultIntendedBytes => Nvm != null ? Nvm.LastFaultIntendedBytes : null;
         public byte[] LastFaultPreProgramBytes => Nvm != null ? Nvm.LastFaultPreProgramBytes : null;
+        public byte[] LastFaultPreEraseBytes => Nvm != null ? Nvm.LastFaultPreEraseBytes : null;
         public byte[] LastFaultPostFaultBytes => Nvm != null ? Nvm.LastFaultPostFaultBytes : null;
+        public byte[] LastFaultPostEraseBytes => Nvm != null ? Nvm.LastFaultPostEraseBytes : null;
         public byte[] FaultMemorySnapshot => Nvm != null ? Nvm.FaultMemorySnapshot : null;
         public int FaultMemorySnapshotSize => Nvm != null ? Nvm.FaultMemorySnapshotSize : 0;
         public bool FaultEvidenceExact => Nvm != null && Nvm.FaultEvidenceExact;
+        public bool EraseFaultEvidenceExact => Nvm != null && Nvm.EraseFaultEvidenceExact;
         public int ProgramTraceCount => Nvm != null ? Nvm.ProgramTraceCount : 0;
         public string ProgramTraceToString() { return Nvm != null ? Nvm.ProgramTraceToString() : string.Empty; }
         public void ProgramTraceClear() { Nvm?.ProgramTraceClear(); }
