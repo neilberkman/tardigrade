@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "LICENSES/*.txt"]
 dependencies = [
-    "PyYAML==6.0.3", "pyelftools==0.32", "capstone==5.0.7", "devicetree==0.0.2",
+    "PyYAML==6.0.3", "fastjsonschema==2.21.2", "pyelftools==0.32", "capstone==5.0.7", "devicetree==0.0.2",
     "robotframework==6.1", "robotframework-retryfailed==0.2.0", "psutil==7.2.2",
     "telnetlib3==2.0.8",
 ]
@@ -29,6 +29,8 @@ include-package-data = false
     "peripherals/*.cs",
     "scripts/*.py",
     "scripts/*.resc",
+    "scripts/clause_maps/*.json",
+    "scripts/clause_maps/*.yaml",
     "tests/ota_fault_point.robot",
     "targets/*/*.py",
     "profiles/naive_bare_copy.yaml",

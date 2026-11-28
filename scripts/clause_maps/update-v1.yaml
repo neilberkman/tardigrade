@@ -1,0 +1,31 @@
+# Each selector counts distinct evaluated fault points with a named observation.
+# Both point verdict classes (observation and finding) are always included.
+# Requested, returned and omitted points, skips and infrastructure errors retain
+# their campaign scope. A clean control never contributes a clause observation.
+schema_version: 1
+mapping_version: 1
+clauses:
+  - regulation: UN Regulation No. 156
+    paragraph: "7.2.2.1.1"
+    citation: https://eur-lex.europa.eu/eli/reg/2021/388/oj/eng
+    paraphrase: After an OTA update fails or stops early, the vehicle must support returning to the earlier software or entering a safe state.
+    campaigns: [runtime_sweep]
+    fault_scope: interruption
+    criteria: [boot_handoff, running_image]
+    limit: A boot handoff describes one component. Establishing the previous vehicle software configuration or vehicle-level safety requires additional evidence.
+  - regulation: UN Regulation No. 156
+    paragraph: "7.2.1.1"
+    citation: https://eur-lex.europa.eu/eli/reg/2021/388/oj/eng
+    paraphrase: Update safeguards must protect origin and contents against compromise and guard against invalid updates.
+    campaigns: [runtime_sweep, multi_fault_runtime_sweep]
+    fault_scope: any_injection
+    criteria: [image_digest, verification_probe]
+    limit: An image digest identifies bytes against local references. Probe observations describe only the instrumented checks. Signer trust and update delivery require independent evidence.
+  - regulation: Regulation (EU) 2024/2847
+    paragraph: Annex I, Part I, point (2)(f)
+    citation: https://eur-lex.europa.eu/eli/reg/2024/2847/oj/eng
+    paraphrase: Where applicable under the product risk assessment, protect data, commands, programs and configuration against unauthorised changes and report corruption.
+    campaigns: [runtime_sweep, multi_fault_runtime_sweep]
+    fault_scope: any_injection
+    criteria: [image_digest]
+    limit: This observation covers only the sampled program image. User authorisation, product corruption reporting and the remaining data and configuration need separate evidence.
