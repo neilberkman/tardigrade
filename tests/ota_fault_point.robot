@@ -206,12 +206,18 @@ Load Runtime Scenario
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${PLATFORM_REPL}
     Run Keyword If    '${WATCHDOG_FREQUENCY}' != ''    Execute Command    watchdogNs ClockFrequency ${WATCHDOG_FREQUENCY}
-    ${load_cmds}=    Set Variable    bus=monitor.Machine.SystemBus; bus.LoadELF(r'${BOOTLOADER_ELF}')
-    Run Keyword If    '${IMAGE_EXEC}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_EXEC}', ${IMAGE_EXEC_LOAD_ADDR})"
-    Run Keyword If    '${IMAGE_STAGING}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_STAGING}', ${IMAGE_STAGING_LOAD_ADDR})"
-    Run Keyword If    '${IMAGE_TERTIARY}' != '' and '${IMAGE_TERTIARY_LOAD_ADDR}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_TERTIARY}', ${IMAGE_TERTIARY_LOAD_ADDR})"
-    Run Keyword If    '${IMAGE_RECOVERY}' != '' and '${IMAGE_RECOVERY_LOAD_ADDR}' != ''    Execute Command    python "bus=monitor.Machine.SystemBus; bus.LoadBinary(r'${IMAGE_RECOVERY}', ${IMAGE_RECOVERY_LOAD_ADDR})"
-    Execute Command    python "${load_cmds}"
+    Execute Command    python "bus=monitor.Machine.SystemBus; observed_image_loads=set()"
+    Load Slot Image    exec       ${IMAGE_EXEC}        ${IMAGE_EXEC_LOAD_ADDR}
+    Load Slot Image    staging    ${IMAGE_STAGING}     ${IMAGE_STAGING_LOAD_ADDR}
+    Load Slot Image    tertiary   ${IMAGE_TERTIARY}    ${IMAGE_TERTIARY_LOAD_ADDR}
+    Load Slot Image    recovery   ${IMAGE_RECOVERY}    ${IMAGE_RECOVERY_LOAD_ADDR}
+    Execute Command    python "bus.LoadELF(r'${BOOTLOADER_ELF}'); observed_image_loads.add(('bootloader', r'${BOOTLOADER_ELF}', None))"
+
+Load Slot Image
+    [Arguments]    ${slot}    ${path}    ${address}
+    IF    $path != '' and $address != ''
+        Execute Command    python "bus.LoadBinary(r'${path}', ${address}); observed_image_loads.add(('${slot}', r'${path}', ${address}))"
+    END
 
 Load Extra Peripherals
     [Documentation]    Compile additional C# peripherals specified as comma-separated paths.

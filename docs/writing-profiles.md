@@ -229,6 +229,12 @@ images:
   staging: path/to/update.bin
 ```
 
+Omit a slot from `images` to leave it at the backend's erase fill. An explicit
+bootloader segment, setup script, or pre-boot write can still supply bytes there.
+Each image needs a slot in `memory.slots` and a non-empty file path. The audit
+report lists the file loads observed during the sweep in `image_loads`, with the
+slot, path, raw file SHA-256 and, for binaries, the load address.
+
 For upgrade scenarios, `exec` has the old image and `staging` has the new one. For revert scenarios, swap them (the "new" image is in exec, "old" is in staging, and the bootloader should swap back).
 
 If your bootloader reads image headers from the binary, include them. If it reads metadata from a separate trailer region, use `pre_boot_state` or `update_trigger` instead.

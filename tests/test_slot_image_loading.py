@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A slot declaration supplies geometry. Only an image declaration supplies bytes."""
 
+import hashlib
 import os
 import shutil
 import sys
@@ -70,7 +71,7 @@ def test_undeclared_staging_reads_as_erased(tmp_path, path, fill):
         # A caller supplying just geometry must also get safe suite defaults.
         variables = [var for var in variables if not var.startswith("IMAGE_") or not var.endswith(":")]
     try:
-        run_single_point(
+        result = run_single_point(
             ROOT, renode, str(ROOT / "tests/ota_fault_point.robot"), profile,
             -1, variables, tmp_path, "", is_control=True,
         )
@@ -79,3 +80,14 @@ def test_undeclared_staging_reads_as_erased(tmp_path, path, fill):
             if var.startswith("PRE_BOOT_STATE_BIN:"):
                 Path(var.split(":", 1)[1]).unlink(missing_ok=True)
     assert dump.read_bytes() == bytes([fill]) * slot.size
+
+    loads = {entry["slot"]: entry for entry in result["image_loads"]}
+    assert set(loads) == {"bootloader", *profile.images}
+    assert loads["bootloader"]["path"] == profile.bootloader_elf
+    for name, image in profile.images.items():
+        assert loads[name] == {
+            "slot": name,
+            "path": image,
+            "address": f"0x{profile.memory.slots[name].base:08X}",
+            "sha256": hashlib.sha256((ROOT / image).read_bytes()).hexdigest(),
+        }

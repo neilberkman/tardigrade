@@ -142,6 +142,9 @@ def _json_dump_text(value):
     return json.dumps(_json_safe(value), sort_keys=True)
 
 bus = monitor.Machine.SystemBus
+# The Robot scenario records successful initial loads in this monitor session.
+# A direct monitor invocation starts collecting at its first runtime reload.
+observed_image_loads = globals().get('observed_image_loads', set())
 _pre_boot_state_debug = []
 _recovery_zero_vector_guard = False
 _recovery_erased_vector_lockup = None
@@ -223,6 +226,7 @@ def _bus_load_elf(path):
         _write_segment(_p_vaddr, _seg)
         if _p_paddr != _p_vaddr:
             _write_segment(_p_paddr, _seg)
+    observed_image_loads.add(('bootloader', str(path), None))
 
 
 def _to_byte_list(data):
@@ -282,12 +286,31 @@ def _verify_loaded_binary_samples(path, addr):
             )
 
 
-def _bus_load_binary(path, addr):
+def _bus_load_binary(path, addr, slot):
     """Load binary via inline python and verify sampled bytes landed in memory."""
     _p = str(path).replace("'", "\\'").replace('\\', '/')
     _a = int(addr)
     monitor.Parse("python \"bus=monitor.Machine.SystemBus; bus.LoadBinary(r'{}', {})\"".format(_p, _a))
     _verify_loaded_binary_samples(path, _a)
+    observed_image_loads.add((slot, str(path), _a))
+
+
+def image_load_provenance():
+    """Describe distinct file loads observed during this Renode session."""
+    entries = []
+    for slot, path, address in sorted(observed_image_loads):
+        with open(path, 'rb') as stream:
+            digest = hashlib.sha256(stream.read()).hexdigest()
+        try:
+            report_path = os.path.relpath(path, repo_root)
+        except ValueError:
+            # A file on a different drive has no relative path.
+            report_path = path
+        entry = {'slot': slot, 'path': report_path, 'sha256': digest}
+        if address is not None:
+            entry['address'] = fmt_u32(address)
+        entries.append(entry)
+    return entries
 
 
 # Sentinel value used to disarm fault injection (max uint64).
@@ -8504,7 +8527,7 @@ def _load_images_mapping(images_map):
         base_addr = slot_load_addresses.get(str(slot_name))
         if base_addr is None:
             raise RuntimeError('unknown slot in update_sequence images: {}'.format(slot_name))
-        _bus_load_binary(str(image_path), int(base_addr))
+        _bus_load_binary(str(image_path), int(base_addr), str(slot_name))
 
 
 def reload_images_from_map(images_map):
@@ -8621,8 +8644,8 @@ def _apply_residual_image():
 
     if residual_image_prior:
         # Mode 2: load prior image first, then actual on top.
-        _bus_load_binary(residual_image_prior, target_base)
-        _bus_load_binary(actual_image_path, target_base)
+        _bus_load_binary(residual_image_prior, target_base, residual_image_slot)
+        _bus_load_binary(actual_image_path, target_base, residual_image_slot)
         # If fill_pattern is set, fill the residual tail between the actual
         # image end and the prior image end.
         if residual_image_fill is not None:
@@ -8642,7 +8665,7 @@ def _apply_residual_image():
         if slot_cfg:
             s_lo, s_hi = slot_cfg
             _fill_slot_region(s_lo, s_hi - s_lo, residual_image_fill)
-        _bus_load_binary(actual_image_path, target_base)
+        _bus_load_binary(actual_image_path, target_base, residual_image_slot)
         log('residual_image: filled slot {} (0x{:08X}) with 0x{:02X}, then loaded actual'.format(
             residual_image_slot, target_base, residual_image_fill))
 
@@ -16851,9 +16874,9 @@ def run_execute_fault(
         _verify_recovery_marker_cleared()
         _bus_load_elf(bootloader_elf)
         if image_exec_path:
-            _bus_load_binary(image_exec_path, slot_load_addresses.get('exec', slot_exec_base))
+            _bus_load_binary(image_exec_path, slot_load_addresses.get('exec', slot_exec_base), 'exec')
         if image_staging_path:
-            _bus_load_binary(image_staging_path, slot_load_addresses.get('staging', slot_staging_base))
+            _bus_load_binary(image_staging_path, slot_load_addresses.get('staging', slot_staging_base), 'staging')
         if is_erase_fault and saved_flash is not None:
             restore_raw = getattr(backend['data'].Nvm, 'RestoreSnapshotRaw', None)
             if restore_raw is not None:
@@ -22729,13 +22752,11 @@ def _debug_prepare_recovery_boot(snapshot):
         _bus_load_elf(bootloader_elf)
         if image_exec_path:
             _bus_load_binary(
-                image_exec_path,
-                slot_load_addresses.get('exec', slot_exec_base),
+                image_exec_path, slot_load_addresses.get('exec', slot_exec_base), 'exec',
             )
         if image_staging_path:
             _bus_load_binary(
-                image_staging_path,
-                slot_load_addresses.get('staging', slot_staging_base),
+                image_staging_path, slot_load_addresses.get('staging', slot_staging_base), 'staging',
             )
         if snapshot.get('flash') is not None:
             restore_raw = getattr(backend['data'].Nvm, 'RestoreSnapshotRaw', None)
@@ -24853,6 +24874,7 @@ if calibration_mode:
             log('calibration: exec slot hash = {}'.format(cal_exec_hash[:16]))
     result = annotate_boot_span_result(result)
     result['calibration_boot_outcome'] = result.get('final_boot_outcome') or result.get('boot_outcome')
+    result['image_loads'] = image_load_provenance()
     with open(result_file, 'w') as f:
         f.write(_json_dump_text(result))
     log('calibration done: total_writes={}'.format(result.get('total_writes', '?')))
@@ -24872,6 +24894,7 @@ elif debug_mode:
     )
     _record_point_mram_torn_word(result, point_torn_word)
     _record_point_torn_word(result, point_flash_torn_word)
+    result['image_loads'] = image_load_provenance()
     with open(result_file, 'w') as f:
         f.write(_json_dump_text(result))
     log('debug session done: outcome={} class={}'.format(
@@ -25005,7 +25028,9 @@ else:
     except Exception as _sidecar_exc:
         log('WARNING: could not write read-fault sidecar: {}'.format(_sidecar_exc))
 
-    # Write results.
+    # Record session-wide provenance once per batch.
+    if results:
+        results[0]['image_loads'] = image_load_provenance()
     if batch_mode:
         with open(result_file, 'w') as f:
             f.write(_json_dump_text(results))

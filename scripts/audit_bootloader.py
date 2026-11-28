@@ -944,6 +944,15 @@ def _profile_requests_zero_fault_points(max_writes: object) -> bool:
         return False
 
 
+def _observed_image_loads(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    loads: List[Dict[str, Any]] = []
+    for row in rows:
+        for entry in row.pop("image_loads", []):
+            if entry not in loads:
+                loads.append(entry)
+    return loads
+
+
 def _report_provenance(profile: ProfileConfig, repo_root: Path) -> Dict[str, Any]:
     """Return report provenance, including only explicitly declared target data.
 
@@ -2193,6 +2202,10 @@ def _main_single() -> int:
                 "profile_path": str(profile.profile_path) if profile.profile_path else None,
                 "schema_version": profile.schema_version,
                 "multi_component": True,
+                "image_loads_by_component": {
+                    name: _observed_image_loads(data.get("results", []))
+                    for name, data in mc_result["per_component"].items()
+                },
                 "verdict": mc_verdict,
                 "summary": {
                     "combined": combined_summary,
@@ -3272,6 +3285,7 @@ def _main_single() -> int:
                 "toctou_protection": profile.security_policy.toctou_protection,
             },
             "authorization_review_analysis": authorization_review_analysis,
+            "image_loads": _observed_image_loads(sweep_results),
             "runtime_sweep_results": sweep_results,
             "execution": {
                 "run_utc": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
@@ -3768,6 +3782,9 @@ def _run_initial_state_matrix(
                 "profile": child_payload.get("profile"),
                 "_child_payload": child_payload,
             }
+            for key in ("image_loads", "image_loads_by_component"):
+                if key in child_payload:
+                    entry[key] = child_payload[key]
             # Preserve canonical multi-component point evidence in the
             # wrapper; the validator cannot verify a child's aggregate after
             # the private payload is discarded below without these fields.
