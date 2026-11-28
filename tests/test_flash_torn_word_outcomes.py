@@ -153,6 +153,45 @@ def test_profile_load_rejects_backend_without_outcome_support(tmp_path: Path) ->
         )
 
 
+def test_profile_load_follows_using_includes_for_torn_word_backend(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "base.repl").write_text(
+        "faultFlash: Miscellaneous.STM32H7FlashController @ sysbus 0x52002000\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "derived.repl").write_text(
+        'using "./base.repl"\n',
+        encoding="utf-8",
+    )
+    path = tmp_path / "profile.yaml"
+    path.write_text(
+        textwrap.dedent(
+            """
+            schema_version: 1
+            name: flash_torn_derived_repl
+            platform: derived.repl
+            bootloader: { elf: firmware.elf, entry: 0x08000000 }
+            memory:
+              sram: { start: 0x20000000, end: 0x20001000 }
+              slots:
+                exec: { base: 0x08000000, size: 0x1000 }
+                staging: { base: 0x08001000, size: 0x1000 }
+            images: { staging: firmware.bin }
+            flash_backend: faultFlash
+            success_criteria: { vtor_in_slot: exec }
+            fault_sweep:
+              torn_word: [fixed, untouched, programmed, {partial_bits: 3}]
+              torn_word_seed: 20261127
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    loaded = load_profile(path, strict=True)
+    assert loaded.fault_sweep.torn_word_explicit is True
+    assert loaded.fault_sweep.torn_word_seed == 20261127
+
+
 def test_cfi_flash_exposes_the_runtime_fault_backend_contract() -> None:
     source = (ROOT / "peripherals" / "CFIFlash.cs").read_text(encoding="utf-8")
     for declaration in (

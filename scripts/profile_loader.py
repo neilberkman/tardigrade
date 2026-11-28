@@ -298,6 +298,31 @@ def _parse_torn_word(value: Any) -> Tuple[str, Tuple[Tuple[str, int], ...]]:
     return choices[0][0], tuple(choices)
 
 
+def _read_repl_tree_text(path: Path, _seen: Optional[set[Path]] = None) -> str:
+    if _seen is None:
+        _seen = set()
+    resolved = path.resolve()
+    if resolved in _seen or not resolved.is_file():
+        return ""
+    _seen.add(resolved)
+    text = resolved.read_text(encoding="utf-8", errors="ignore")
+    chunks = [text]
+    for raw_line in text.splitlines():
+        line = raw_line.split("//", 1)[0].strip()
+        m_using = re.match(r'^using\s+"([^"]+)"', line, re.IGNORECASE)
+        if not m_using:
+            continue
+        include_rel = m_using.group(1).strip()
+        include_path = (
+            Path(include_rel)
+            if Path(include_rel).is_absolute()
+            else (resolved.parent / include_rel)
+        )
+        if include_path.is_file():
+            chunks.append(_read_repl_tree_text(include_path, _seen))
+    return "\n".join(chunks)
+
+
 def _validate_torn_word_backend(
     fs: Optional["FaultSweepConfig"],
     platform: Optional[str],
@@ -343,7 +368,7 @@ def _validate_torn_word_backend(
         try:
             if not candidate.is_file():
                 continue
-            platform_text = candidate.read_text(encoding="utf-8", errors="ignore")
+            platform_text = _read_repl_tree_text(candidate)
             if not any(type_name in platform_text for type_name in supported_types):
                 raise ProfileError(
                     "fault_sweep.torn_word is not supported by the flash "
