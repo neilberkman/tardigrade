@@ -1,0 +1,14 @@
+{
+  "licenses": {
+    "Apache-2.0": {"decision": "allow"},
+    "BSD-2-Clause": {"decision": "allow"},
+    "BSD-3-Clause": {"decision": "allow"},
+    "ISC": {"decision": "allow"},
+    "MIT": {"decision": "allow"},
+    "MPL-2.0": {"decision": "prohibit"},
+    "LGPL-3.0-only": {"decision": "prohibit"},
+    "GPL-3.0-only": {"decision": "prohibit"},
+    "GPL-3.0-only WITH GCC-exception-3.1": {"decision": "prohibit"},
+    "PSF-2.0": {"decision": "allow"}
+  }
+}

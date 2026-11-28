@@ -17,6 +17,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
+from export_repro_licenses import detect_gpl_license_marker
+
 
 SCHEMA_VERSION = 2
 KINDS = frozenset({"build-only", "runtime", "linked", "distributed"})
@@ -70,32 +72,6 @@ SNAPSHOT_FIELDS = frozenset({"path", "sha256", "artifact_sha256"})
 LINK_REF_FIELDS = frozenset({"path", "sha256"})
 LINK_FILE_FIELDS = frozenset({"schema_version", "inputs", "verification_status", "notes"})
 LINK_INPUT_FIELDS = frozenset({"artifact_id", "path", "sha256"})
-# The reference texts already shipped under LICENSES/ contain full grant notices.
-# Pin their contents so added source in that directory is checked as well.
-REFERENCE_NOTICE_DIGESTS = {
-    "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
-    "73879138376be7ab8ccdb4eb116f11d215ff70210ca2ab5183b2b6a7276e52a5",
-}
-GPL_SPDX_HEADER_RE = re.compile(
-    r"^\s*(?:#|//+|/\*+|\*+|;+|--+|\.\.|<!--|REM\b)?\s*"
-    r"SPDX-License-Identifier\s*:\s*([^\r\n]+)",
-    re.IGNORECASE | re.MULTILINE,
-)
-GPL_SPDX_TOKEN_RE = re.compile(
-    r"\b(?:A|L)?GPL(?:-[0-9.]+(?:-(?:only|or-later)|\+)?)?\b",
-    re.IGNORECASE,
-)
-GPL_GRANT_NOTICE_RE = re.compile(
-    r"redistribute(?:\s|\*)+it(?:\s|\*)+and/or(?:\s|\*)+modify(?:\s|\*)+it"
-    r"(?:\s|\*)+under(?:\s|\*)+the(?:\s|\*)+terms(?:\s|\*)+of(?:\s|\*)+the"
-    r"(?:\s|\*)+GNU(?:\s|\*)+(?:(?:Affero|Lesser|Library)(?:\s|\*)+)?"
-    r"General(?:\s|\*)+Public(?:\s|\*)+License",
-    re.IGNORECASE,
-)
-GPL_LICENSE_TITLE_RE = re.compile(
-    r"^\s*GNU\s+(?:(?:AFFERO|LESSER|LIBRARY)\s+)?GENERAL\s+PUBLIC\s+LICENSE\s*$",
-    re.IGNORECASE | re.MULTILINE,
-)
 
 
 class CertificationInputError(ValueError):
@@ -438,27 +414,6 @@ def _git_tracked_files(root: Path) -> List[Path]:
     return sorted(paths, key=lambda item: item.as_posix())
 
 
-def _detect_gpl_license_marker(root: Path, relative: Path) -> str | None:
-    try:
-        data = (root / relative).read_bytes()
-    except OSError as exc:
-        raise CertificationInputError(f"Could not inspect tracked file {relative}") from exc
-    if relative.parent == Path("LICENSES") and hashlib.sha256(data).hexdigest() in REFERENCE_NOTICE_DIGESTS:
-        return None
-    text = data.decode("utf-8", errors="ignore")
-    for match in GPL_SPDX_HEADER_RE.finditer(text):
-        raw_expr = match.group(1).strip()
-        spdx_expr = re.sub(r"\s*(?:\*/+|-->)\s*$", "", raw_expr).strip()
-        if not GPL_SPDX_TOKEN_RE.search(spdx_expr):
-            continue
-        return f"SPDX-License-Identifier: {spdx_expr}"
-    if GPL_GRANT_NOTICE_RE.search(text):
-        return "GNU General Public License grant notice"
-    if GPL_LICENSE_TITLE_RE.search(text):
-        return "GNU General Public License text"
-    return None
-
-
 def _certify_source_release(
     raw: Any,
     root: Path,
@@ -521,7 +476,10 @@ def _certify_source_release(
             candidate = root / relative
             if candidate.is_symlink() or not candidate.is_file():
                 continue
-            marker = _detect_gpl_license_marker(root, relative)
+            try:
+                marker = detect_gpl_license_marker(root, relative)
+            except ValueError as exc:
+                raise CertificationInputError(str(exc)) from exc
             if marker is not None:
                 findings.append(
                     _finding(

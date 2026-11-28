@@ -42,7 +42,7 @@ from debug_point import (  # noqa: E402
     build_debug_robot_vars,
     resolve_debug_target,
 )
-from license_certify import _detect_gpl_license_marker  # noqa: E402
+from export_repro_licenses import detect_gpl_license_marker, load_license_policy  # noqa: E402
 from profile_loader import load_profile_raw  # noqa: E402
 from recovery_checkpoint import restore_snapshots  # noqa: E402
 from recovery_search import first_persistent_difference  # noqa: E402
@@ -64,19 +64,6 @@ RENODE_RELEASE_ARCHIVES: dict[str, dict[str, str]] = {
         "url": "https://github.com/renode/renode/releases/download/v1.16.1/renode-1.16.1.linux-portable-dotnet.tar.gz",
         "sha256": "00e113cdbd0f5354cf2f64bbe3f5a070d8958409542fca66e45ac97d982938c0",
     },
-}
-
-DEFAULT_LICENSE_DECISIONS: dict[str, str] = {
-    "Apache-2.0": "allow",
-    "BSD-2-Clause": "allow",
-    "BSD-3-Clause": "allow",
-    "ISC": "allow",
-    "MIT": "allow",
-    "PSF-2.0": "allow",
-    "MPL-2.0": "prohibit",
-    "LGPL-3.0-only": "prohibit",
-    "GPL-3.0-only": "prohibit",
-    "GPL-3.0-only WITH GCC-exception-3.1": "prohibit",
 }
 
 PROHIBITED_LICENSE_TOKEN_RE = re.compile(
@@ -386,20 +373,6 @@ def resolve_export_target(
     return target
 
 
-def _load_license_policy(repo_root: Path) -> dict[str, str]:
-    decisions = dict(DEFAULT_LICENSE_DECISIONS)
-    policy_path = repo_root / "docs" / "license-certification-policy.json"
-    if policy_path.is_file():
-        try:
-            data = json.loads(policy_path.read_text(encoding="utf-8"))
-            for spdx, rule in (data.get("licenses") or {}).items():
-                if isinstance(rule, dict) and isinstance(rule.get("decision"), str):
-                    decisions[str(spdx)] = str(rule["decision"]).strip().lower()
-        except Exception:
-            pass
-    return decisions
-
-
 def _is_license_allowed(spdx_expr: str, policy_decisions: dict[str, str]) -> bool:
     expr = str(spdx_expr or "").strip()
     if not expr:
@@ -680,7 +653,7 @@ def classify_target_license(
     raw_profile: dict[str, Any] | None,
     repo_root: Path,
 ) -> LicenseDecision:
-    policy_decisions = _load_license_policy(repo_root)
+    policy_decisions = load_license_policy(repo_root)
     provenance = resolve_upstream_provenance(target, report_data, raw_profile, repo_root)
 
     declared_licenses: list[str] = []
@@ -847,7 +820,11 @@ def resolve_platform_and_peripherals(
         if resolved in seen_repls or not resolved.is_file():
             return
         seen_repls.add(resolved)
-        marker = _detect_gpl_license_marker(repo_root, resolved.relative_to(repo_root)) if _is_under(resolved, repo_root) else _detect_file_gpl_or_prohibited(resolved)
+        marker = (
+            detect_gpl_license_marker(repo_root, resolved.relative_to(repo_root))
+            if _is_under(resolved, repo_root)
+            else _detect_file_gpl_or_prohibited(resolved)
+        )
         if marker:
             raise ExportReproError(
                 f"cannot bundle platform description {resolved.name}: prohibited license ({marker})"
@@ -918,7 +895,7 @@ def resolve_platform_and_peripherals(
 
     for cs_path in ordered_cs_paths:
         marker = (
-            _detect_gpl_license_marker(repo_root, cs_path.relative_to(repo_root))
+            detect_gpl_license_marker(repo_root, cs_path.relative_to(repo_root))
             if _is_under(cs_path, repo_root)
             else _detect_file_gpl_or_prohibited(cs_path)
         )
