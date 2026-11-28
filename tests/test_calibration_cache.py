@@ -487,6 +487,310 @@ class TestSaveLoadCalibration(unittest.TestCase):
         with open(loaded.trace_file, "rb") as stream:
             self.assertEqual(stream.read(), trace_data)
 
+    def test_all_runtime_write_headers_round_trip(self):
+        binary = struct.pack("<IIIIII", 1, 0x1000, 7, 2, 0x1004, 8)
+        for columns, first, second in (
+            ("", "", ""),
+            (",width", ",4", ",4"),
+            (",pc", ",0xffffffff", ","),
+            (",width,pc", ",4,0xffffffff", ",4,"),
+        ):
+            with self.subTest(columns=columns):
+                trace = (
+                    f"write_index,flash_offset,value{columns}\n"
+                    f"1,4096,7{first}\n2,4100,8{second}\n"
+                ).encode()
+                cal = self._make_cal(
+                    total_writes=2, trace_data=trace, trace_bin_data=binary
+                )
+                save_calibration(self.cache_path, cal, "runtime-write-trace")
+                loaded = load_calibration(
+                    self.cache_path,
+                    "runtime-write-trace",
+                    self.work_dir,
+                    allow_unsigned=True,
+                )
+                self.assertIsNotNone(loaded)
+                self.assertEqual(Path(loaded.trace_file).read_bytes(), trace)
+                self.assertEqual(Path(loaded.trace_file_bin).read_bytes(), binary)
+
+    def test_all_runtime_erase_headers_round_trip(self):
+        binary = struct.pack("<IIIIII", 0, 0x1000, 4096, 2, 0x2000, 4096)
+        for columns, first, second in (
+            ("", "", ""),
+            (",pc", ",0x08000100", ","),
+        ):
+            with self.subTest(columns=columns):
+                erase_trace = (
+                    f"erase_index,flash_offset,writes_at_this_point,erase_size{columns}\n"
+                    f"1,0x1000,0,4096{first}\n2,0x2000,2,4096{second}\n"
+                ).encode()
+                erase_csv_path = os.path.join(self.td, "erase.csv")
+                erase_bin_path = os.path.join(self.td, "erase.bin")
+                Path(erase_csv_path).write_bytes(erase_trace)
+                Path(erase_bin_path).write_bytes(binary)
+                cal = self._make_cal(total_writes=2)
+                cal.total_erases = 2
+                cal.erase_trace_file = erase_csv_path
+                cal.erase_trace_file_bin = erase_bin_path
+                save_calibration(self.cache_path, cal, "runtime-erase-trace")
+                loaded = load_calibration(
+                    self.cache_path,
+                    "runtime-erase-trace",
+                    self.work_dir,
+                    allow_unsigned=True,
+                )
+                self.assertIsNotNone(loaded)
+                self.assertEqual(
+                    Path(loaded.erase_trace_file).read_bytes(), erase_trace
+                )
+                self.assertEqual(
+                    Path(loaded.erase_trace_file_bin).read_bytes(), binary
+                )
+
+    def test_all_runtime_exact_program_headers_round_trip_and_reject_extra_columns(self):
+        for columns, first, second in (
+            ("", "", ""),
+            (",pc", ",0x10000100", ","),
+        ):
+            with self.subTest(columns=columns):
+                program_data = (
+                    "write_index,program_address,offset,width,intended_hex,"
+                    f"pre_program_hex,post_program_hex,faulted{columns}\n"
+                    f"1,0x10001000,4096,4,11223344,ffffffff,11223344,false{first}\n"
+                    f"2,0x10001004,4100,4,55667788,ffffffff,55667788,false{second}\n"
+                ).encode()
+                program_trace = os.path.join(self.td, "program_trace.csv")
+                Path(program_trace).write_bytes(program_data)
+                cal = self._make_cal(total_writes=2)
+                cal.program_trace_file = program_trace
+                save_calibration(self.cache_path, cal, "runtime-program-trace")
+                loaded = load_calibration(
+                    self.cache_path,
+                    "runtime-program-trace",
+                    self.work_dir,
+                    allow_unsigned=True,
+                )
+                self.assertIsNotNone(loaded)
+                self.assertEqual(
+                    Path(loaded.program_trace_file).read_bytes(), program_data
+                )
+
+        non_runtime = (
+            b"write_index,program_address,offset,width,intended_hex,"
+            b"pre_program_hex,post_program_hex,faulted,call_context\n"
+            b"1,0x10001000,4096,4,11223344,ffffffff,11223344,false,main\n"
+        )
+        program_trace = os.path.join(self.td, "program_trace.csv")
+        Path(program_trace).write_bytes(non_runtime)
+        cal = self._make_cal(total_writes=1)
+        cal.program_trace_file = program_trace
+        with self.assertRaisesRegex(ValueError, "unexpected header"):
+            save_calibration(self.cache_path, cal, "non-runtime-program-trace")
+
+    def test_pc_bearing_traces_enforce_strict_validation_rules(self):
+        # 1. Binary companion requires width == 4 even when pc column is present.
+        bad_width_bin_csv = (
+            b"write_index,flash_offset,value,width,pc\n"
+            b"1,0x1000,0xBEEF,2,0x08000100\n"
+        )
+        bad_width_bin = struct.pack("<III", 1, 0x1000, 0xBEEF)
+        cal = self._make_cal(
+            total_writes=1,
+            trace_data=bad_width_bin_csv,
+            trace_bin_data=bad_width_bin,
+        )
+        with self.assertRaisesRegex(ValueError, "binary companion"):
+            save_calibration(self.cache_path, cal, "pc-width-bin-reject")
+
+        # 2. 8-byte CSV-only value round-trips with width,pc header, while value
+        # exceeding width or uint32 (without width) is rejected.
+        wide_pc_csv = (
+            b"write_index,flash_offset,value,width,pc\n"
+            b"1,0x1000,0x1000000000000001,8,0x08000100\n"
+        )
+        wide_file = os.path.join(self.td, "wide-pc.csv")
+        Path(wide_file).write_bytes(wide_pc_csv)
+        cal = CalibrationResult(
+            total_writes=1,
+            total_erases=0,
+            trace_file=wide_file,
+            erase_trace_file=None,
+            trace_file_bin=None,
+            erase_trace_file_bin=None,
+        )
+        save_calibration(self.cache_path, cal, "wide-pc-ok")
+        loaded = load_calibration(
+            self.cache_path, "wide-pc-ok", self.work_dir, allow_unsigned=True
+        )
+        self.assertEqual(Path(loaded.trace_file).read_bytes(), wide_pc_csv)
+
+        overflow_width_pc_csv = (
+            b"write_index,flash_offset,value,width,pc\n"
+            b"1,0x1000,0x10000,2,0x08000100\n"
+        )
+        Path(wide_file).write_bytes(overflow_width_pc_csv)
+        with self.assertRaisesRegex(ValueError, "value exceeds width"):
+            save_calibration(self.cache_path, cal, "wide-pc-overflow")
+
+        overflow_legacy_pc_csv = (
+            b"write_index,flash_offset,value,pc\n"
+            b"1,0x1000,0x100000000,0x08000100\n"
+        )
+        Path(wide_file).write_bytes(overflow_legacy_pc_csv)
+        with self.assertRaisesRegex(ValueError, "uint32"):
+            save_calibration(self.cache_path, cal, "legacy-pc-overflow")
+
+        # 3. Invalid pc values (0, negative, > 0xFFFFFFFF, non-numeric) are rejected
+        # across write, erase, and exact program traces.
+        for bad_pc in ("0", "0x0", "-1", "0x100000000", "not_a_pc"):
+            with self.subTest(kind="write", bad_pc=bad_pc):
+                Path(wide_file).write_bytes(
+                    f"write_index,flash_offset,value,pc\n1,0x1000,7,{bad_pc}\n".encode()
+                )
+                with self.assertRaises(ValueError):
+                    save_calibration(self.cache_path, cal, "bad-write-pc")
+
+            with self.subTest(kind="erase", bad_pc=bad_pc):
+                erase_file = os.path.join(self.td, "bad-erase-pc.csv")
+                Path(erase_file).write_bytes(
+                    "erase_index,flash_offset,writes_at_this_point,erase_size,pc\n"
+                    f"1,0x1000,0,4096,{bad_pc}\n".encode()
+                )
+                erase_cal = self._make_cal(total_writes=1)
+                erase_cal.total_erases = 1
+                erase_cal.erase_trace_file = erase_file
+                with self.assertRaises(ValueError):
+                    save_calibration(self.cache_path, erase_cal, "bad-erase-pc")
+
+            with self.subTest(kind="program", bad_pc=bad_pc):
+                prog_file = os.path.join(self.td, "bad-prog-pc.csv")
+                Path(prog_file).write_bytes(
+                    "write_index,program_address,offset,width,intended_hex,"
+                    "pre_program_hex,post_program_hex,faulted,pc\n"
+                    f"1,0x10001000,4096,4,11223344,ffffffff,11223344,false,{bad_pc}\n".encode()
+                )
+                prog_cal = self._make_cal(total_writes=1)
+                prog_cal.program_trace_file = prog_file
+                with self.assertRaises(ValueError):
+                    save_calibration(self.cache_path, prog_cal, "bad-prog-pc")
+
+        # 4. Coexisting write trace (with pc or width,pc) and exact program trace
+        # validate width and pc agreement.
+        write_pc_file = os.path.join(self.td, "coexist-write.csv")
+        prog_pc_file = os.path.join(self.td, "coexist-prog.csv")
+        Path(write_pc_file).write_bytes(
+            b"write_index,flash_offset,value,pc\n1,4096,0x44332211,0x10000100\n"
+        )
+        Path(prog_pc_file).write_bytes(
+            b"write_index,program_address,offset,width,intended_hex,"
+            b"pre_program_hex,post_program_hex,faulted,pc\n"
+            b"1,0x10001000,4096,16,"
+            + b"11" * 16 + b"," + b"ff" * 16 + b"," + b"11" * 16
+            + b",false,0x10000100\n"
+        )
+        coexist_cal = CalibrationResult(
+            total_writes=1,
+            total_erases=0,
+            trace_file=write_pc_file,
+            erase_trace_file=None,
+            trace_file_bin=None,
+            erase_trace_file_bin=None,
+            program_trace_file=prog_pc_file,
+        )
+        save_calibration(self.cache_path, coexist_cal, "coexist-pc-ok")
+
+        Path(write_pc_file).write_bytes(
+            b"write_index,flash_offset,value,width,pc\n1,4096,0x44332211,4,0x10000100\n"
+        )
+        with self.assertRaisesRegex(ValueError, "contradicts exact MRAM program width"):
+            save_calibration(self.cache_path, coexist_cal, "coexist-width-mismatch")
+
+        Path(write_pc_file).write_bytes(
+            b"write_index,flash_offset,value,pc\n1,4096,0x44332211,0x10000200\n"
+        )
+        with self.assertRaisesRegex(ValueError, "contradicts exact MRAM program pc"):
+            save_calibration(self.cache_path, coexist_cal, "coexist-pc-mismatch")
+
+    def test_writer_and_cache_share_single_trace_header_definition(self):
+        import ast
+        import calibration_cache
+        import trace_utils
+        import writeback_reconstruction
+
+        self.assertIs(
+            calibration_cache.WRITE_TRACE_CSV_HEADERS,
+            writeback_reconstruction.WRITE_TRACE_CSV_HEADERS,
+        )
+        self.assertIs(
+            calibration_cache.ERASE_TRACE_CSV_HEADERS,
+            writeback_reconstruction.ERASE_TRACE_CSV_HEADERS,
+        )
+        self.assertIs(
+            trace_utils.EXACT_PROGRAM_TRACE_CSV_HEADERS,
+            writeback_reconstruction.EXACT_PROGRAM_TRACE_CSV_HEADERS,
+        )
+        self.assertEqual(
+            writeback_reconstruction.WRITE_TRACE_CSV_HEADERS,
+            tuple(
+                tuple(
+                    writeback_reconstruction.write_trace_csv_header(
+                        has_width=has_width, has_pc=has_pc
+                    ).split(",")
+                )
+                for has_width, has_pc in (
+                    (False, False),
+                    (True, False),
+                    (False, True),
+                    (True, True),
+                )
+            ),
+        )
+        self.assertEqual(
+            writeback_reconstruction.ERASE_TRACE_CSV_HEADERS,
+            tuple(
+                tuple(
+                    writeback_reconstruction.erase_trace_csv_header(
+                        has_pc=has_pc
+                    ).split(",")
+                )
+                for has_pc in (False, True)
+            ),
+        )
+        self.assertEqual(
+            writeback_reconstruction.EXACT_PROGRAM_TRACE_CSV_HEADERS,
+            tuple(
+                tuple(
+                    writeback_reconstruction.exact_program_trace_csv_header(
+                        has_pc=has_pc
+                    ).split(",")
+                )
+                for has_pc in (False, True)
+            ),
+        )
+
+        runtime_path = SCRIPTS_DIR / "run_runtime_fault_sweep.py"
+        runtime_source = runtime_path.read_text(encoding="utf-8")
+        tree = ast.parse(runtime_source, filename=str(runtime_path))
+        called_functions = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertTrue(
+            {
+                "write_trace_csv_header",
+                "erase_trace_csv_header",
+                "exact_program_trace_csv_header",
+            }.issubset(called_functions)
+        )
+        for literal_header in (
+            "write_index,flash_offset,value",
+            "erase_index,flash_offset,writes_at_this_point,erase_size",
+            "write_index,program_address,offset,width,intended_hex",
+        ):
+            self.assertNotIn(literal_header, runtime_source)
+
     def test_width_bearing_binary_rejects_non_four_byte_width(self):
         trace_data = (
             b"write_index,flash_offset,value,width\n"

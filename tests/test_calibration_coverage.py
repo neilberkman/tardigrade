@@ -637,6 +637,195 @@ def test_clean_trace_annotation_reports_to_stderr_without_runtime_error(
     assert metadata["writes"] == 1
 
 
+def test_trace_utils_enforces_pc_uint32_bounds_and_row_width(
+    tmp_path: Path,
+) -> None:
+    write_trace = tmp_path / "write_pc.csv"
+    write_trace.write_text(
+        "write_index,flash_offset,value,width,pc\n"
+        "1,0,7,4,0x08000100\n"
+        "2,4,8,4,\n",
+        encoding="utf-8",
+    )
+    write_entries = load_clean_write_trace(str(write_trace))
+    assert write_entries[0]["pc"] == "0x08000100"
+    assert "pc" not in write_entries[1]
+
+    erase_trace = tmp_path / "erase_pc.csv"
+    erase_trace.write_text(
+        "erase_index,flash_offset,writes_at_this_point,erase_size,pc\n"
+        "1,0,0,4096,0x08000200\n"
+        "2,4096,2,4096,\n",
+        encoding="utf-8",
+    )
+    erase_entries = load_clean_erase_trace(str(erase_trace))
+    assert erase_entries[0]["pc"] == "0x08000200"
+    assert "pc" not in erase_entries[1]
+
+    program_trace = tmp_path / "program_pc.csv"
+    program_trace.write_text(
+        "write_index,program_address,offset,width,intended_hex,"
+        "pre_program_hex,post_program_hex,faulted,pc\n"
+        "1,0x10001000,4096,4,11223344,ffffffff,11223344,false,0x10000300\n"
+        "2,0x10001004,4100,4,55667788,ffffffff,55667788,false,\n",
+        encoding="utf-8",
+    )
+    program_entries = load_exact_program_trace(str(program_trace))
+    assert program_entries[0]["pc"] == "0x10000300"
+    assert "pc" not in program_entries[1]
+
+    for bad_pc in ("0", "0x0", "-1", "0x100000000", "bogus"):
+        write_trace.write_text(
+            f"write_index,flash_offset,value,pc\n1,0,7,{bad_pc}\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError):
+            load_clean_write_trace(str(write_trace))
+
+        erase_trace.write_text(
+            "erase_index,flash_offset,writes_at_this_point,erase_size,pc\n"
+            f"1,0,0,4096,{bad_pc}\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError):
+            load_clean_erase_trace(str(erase_trace))
+
+        program_trace.write_text(
+            "write_index,program_address,offset,width,intended_hex,"
+            "pre_program_hex,post_program_hex,faulted,pc\n"
+            f"1,0x10001000,4096,4,11223344,ffffffff,11223344,false,{bad_pc}\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError):
+            load_exact_program_trace(str(program_trace))
+
+    # Row missing the trailing pc separator (wrong column count) must fail closed.
+    write_trace.write_text(
+        "write_index,flash_offset,value,pc\n1,0,7\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        load_clean_write_trace(str(write_trace))
+
+    erase_trace.write_text(
+        "erase_index,flash_offset,writes_at_this_point,erase_size,pc\n1,0,0,4096\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        load_clean_erase_trace(str(erase_trace))
+
+    program_trace.write_text(
+        "write_index,program_address,offset,width,intended_hex,"
+        "pre_program_hex,post_program_hex,faulted,pc\n"
+        "1,0x10001000,4096,4,11223344,ffffffff,11223344,false\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        load_exact_program_trace(str(program_trace))
+
+
+def test_other_trace_readers_enforce_pc_bounds_and_row_width(
+    tmp_path: Path,
+) -> None:
+    import ast
+    from first_cut_states import load_calibration_operations_for_profile
+    from profile_loader import ProfileError
+    from trigger_discovery import _validate_trace_artifacts
+    from write_trace_heuristic import load_trace
+
+    runtime_path = SCRIPTS / "run_runtime_fault_sweep.py"
+    tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
+    wanted = {
+        "_decode_exact_program_bytes",
+        "_little_endian_trace_value",
+        "load_trace_data",
+        "load_erase_trace_data",
+        "load_mram_program_trace_data",
+    }
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
+    ]
+    namespace: dict[str, object] = {
+        "_validated_erase_trace": lambda entries: entries,
+        "fmt_u32": lambda val: f"0x{int(val) & 0xFFFFFFFF:08X}",
+    }
+    exec(
+        compile(ast.Module(body=nodes, type_ignores=[]), str(runtime_path), "exec"),
+        namespace,
+    )
+    load_trace_data = namespace["load_trace_data"]
+    load_erase_trace_data = namespace["load_erase_trace_data"]
+    load_mram_program_trace_data = namespace["load_mram_program_trace_data"]
+
+    write_csv = tmp_path / "write.csv"
+    erase_csv = tmp_path / "erase.csv"
+    prog_csv = tmp_path / "prog.csv"
+
+    # Valid pc and 16-byte width accepted by runtime loaders and heuristic loader.
+    write_csv.write_text(
+        "write_index,flash_offset,value,width,pc\n"
+        "1,0x100,0x1234,16,0x08000100\n"
+        "2,0x110,0x5678,16,\n",
+        encoding="utf-8",
+    )
+    assert load_trace_data(str(write_csv)) == [
+        (1, 0x100, 0x1234, 16),
+        (2, 0x110, 0x5678, 16),
+    ]
+    assert load_trace(str(write_csv)) == [(1, 0x100), (2, 0x110)]
+
+    # Invalid pc rejected by runtime loaders, first_cut_states, and trigger_discovery.
+    write_csv.write_text(
+        "write_index,flash_offset,value,width,pc\n1,0,7,4,0x100000000\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        load_trace_data(str(write_csv))
+
+    profile_stub = SimpleNamespace(
+        platform="platforms/stm32f4_fast.repl",
+        flash_backend="faultFlash",
+        extra_peripherals=[],
+        resolve_path=lambda root, rel: str(Path(root) / rel),
+    )
+    with pytest.raises(ProfileError):
+        load_calibration_operations_for_profile(
+            profile_stub,
+            total_writes=1,
+            total_erases=0,
+            trace_file=str(write_csv),
+            erase_trace_file=None,
+            repo_root=ROOT,
+        )
+
+    erase_csv.write_text(
+        "erase_index,flash_offset,writes_at_this_point,erase_size,pc\n"
+        "1,0,0,4096,0x100000000\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        load_erase_trace_data(str(erase_csv), require_replay_metadata=True)
+
+    prog_csv.write_text(
+        "write_index,program_address,offset,width,intended_hex,"
+        "pre_program_hex,post_program_hex,faulted,pc\n"
+        "1,0x10001000,4096,4,11223344,ffffffff,11223344,false,0x100000000\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        load_mram_program_trace_data(str(prog_csv))
+
+    write_csv.write_text(
+        "write_index,flash_offset,value,pc\n1,0,7,not_an_int\n",
+        encoding="utf-8",
+    )
+    assert "non-integer pc" in (
+        _validate_trace_artifacts({"trace_file": str(write_csv)}) or ""
+    )
+
+
 def test_compute_verdict_fails_clean_profile_when_calibration_only_touches_metadata() -> None:
     summary = _base_summary()
     summary["calibration_coverage"] = {

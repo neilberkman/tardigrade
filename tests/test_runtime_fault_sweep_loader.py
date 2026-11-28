@@ -1361,7 +1361,11 @@ class RuntimeFaultSweepLoaderTests(unittest.TestCase):
         )
         self.assertIn("parse_write_trace_record(line)", text)
         self.assertIn("if len(parts) >= 4 and parts[3] != '':", helper_text)
-        self.assertIn("tf.write('write_index,flash_offset,value,width\\n')", text)
+        self.assertIn("write_trace_csv_header(", text)
+        self.assertIn(
+            'WRITE_TRACE_BASE_FIELDS = ("write_index", "flash_offset", "value")',
+            helper_text,
+        )
         self.assertIn("width_field = '' if width is None else str(width)", text)
         self.assertIn("native_trace_safe = bool(parsed_trace) and all(", text)
         self.assertIn("calibration: mixed-width trace; native binary replay disabled", text)
