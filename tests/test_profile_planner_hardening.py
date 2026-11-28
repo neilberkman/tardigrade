@@ -839,7 +839,7 @@ success_criteria:
         runtime = (SCRIPTS / "run_runtime_fault_sweep.py").read_text(encoding="utf-8")
         self.assertIn("frozenset(('op', 'os', 'od', 'oo', 'on'))", runtime)
         self.assertIn("'op', 'os', 'od', 'oo', 'on'", runtime)
-        self.assertIn("def evaluate_structured_success_checks():", runtime)
+        self.assertIn("def evaluate_structured_success_checks(matched_image=None):", runtime)
         self.assertIn("result['criteria_observations']", runtime)
         robot = (ROOT / "tests/ota_fault_point.robot").read_text(encoding="utf-8")
         self.assertIn("${SUCCESS_CHECKS_B64}", robot)

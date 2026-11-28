@@ -3043,9 +3043,12 @@ def annotate_boot_span_result(result):
                 result[field] = mba[field]
     signals = result.get('signals')
     if isinstance(signals, dict):
+        if signals.get('matched_allowed_image') is not None:
+            result['matched_allowed_image'] = signals['matched_allowed_image']
         observations = signals.get('success_checks')
         if isinstance(observations, dict):
             result['criteria_observations'] = observations
+            result['success_checks'] = observations
             result['config_values'] = dict(
                 observations.get('config_values', {}) or {}
             )
@@ -8779,10 +8782,16 @@ def _run_clean_update_phase(phase, phase_index):
 
     # Defensive final content check after follow-up cycles so an unexpected
     # rollback inside a clean update_sequence phase cannot slip past.
-    if final_outcome == 'success' and success_image_hash and expected_exec_sha256:
+    if final_outcome == 'success' and success_image_hash and (allowed_image_hashes or expected_exec_sha256):
+        from success_checks import match_allowed_image
+
         hash_slot = success_image_hash_slot if success_image_hash_slot not in ('', 'any') else final_slot
         actual_hash = compute_slot_hash(hash_slot)
-        if actual_hash != expected_exec_sha256:
+        if allowed_image_hashes:
+            final_hash_ok = match_allowed_image(actual_hash, allowed_image_hashes) is not None
+        else:
+            final_hash_ok = actual_hash == expected_exec_sha256
+        if not final_hash_ok:
             log('update_phase {}: content verification FAILED after followup cycles '
                 '(expected={}, actual={})'.format(phase_name, expected_exec_sha256[:16], actual_hash[:16]))
             final_outcome = 'wrong_image'
@@ -9299,194 +9308,16 @@ def analyze_fault_snapshot(snapshot_bytes, boot_slot=None, uncorrectable_words=N
     return analysis
 
 
-def evaluate_structured_success_checks():
-    """Read and evaluate configured memory/config/integrity observations."""
+def evaluate_structured_success_checks(matched_image=None):
+    """Read structured checks for the current boot sample."""
+    from success_checks import evaluate_success_checks
+
     config = success_checks_config if isinstance(success_checks_config, dict) else {}
-    memory_specs = config.get('memory_checks', [])
-    config_specs = config.get('config_checks', [])
-    integrity_enabled = bool(config.get('bootloader_integrity', False))
-    requested = bool(
-        memory_specs
-        or config_specs
-        or integrity_enabled
-        or success_checks_parse_error
+    return evaluate_success_checks(
+        config, bus, as_int, fmt_u32, matched_image,
+        sram_start, sram_end, success_checks_parse_error,
+        globals().get('_mram_address_is_uncorrectable'),
     )
-    observations = {
-        'contract_version': 1,
-        'requested': requested,
-        'all_ok': True,
-        'memory_checks_ok': True,
-        'config_checks_ok': True,
-        'bootloader_integrity_ok': True,
-        'memory_checks': [],
-        'config_checks': [],
-        'config_values': {},
-    }
-    if success_checks_parse_error:
-        observations['transport_error'] = success_checks_parse_error
-        observations['all_ok'] = False
-
-    if not isinstance(memory_specs, list):
-        observations['memory_checks_error'] = 'memory_checks is not a list'
-        observations['memory_checks_ok'] = False
-        memory_specs = []
-    for index, spec in enumerate(memory_specs):
-        detail = {'index': index, 'ok': False}
-        try:
-            if not isinstance(spec, dict):
-                raise ValueError('check is not a mapping')
-            address = int(spec['address'])
-            mask = int(spec.get('mask', 0xFFFFFFFF)) & 0xFFFFFFFF
-            op = str(spec.get('op', 'eq')).strip().lower()
-            actual = as_int(bus.ReadDoubleWord(address)) & 0xFFFFFFFF
-            masked_actual = actual & mask
-            expected = spec.get('expected_value')
-            if op == 'nonzero':
-                ok = masked_actual != 0
-            else:
-                if expected is None:
-                    raise ValueError('expected_value is missing for op {}'.format(op))
-                masked_expected = int(expected) & mask & 0xFFFFFFFF
-                if op == 'eq':
-                    ok = masked_actual == masked_expected
-                elif op == 'ne':
-                    ok = masked_actual != masked_expected
-                elif op == 'ge':
-                    ok = masked_actual >= masked_expected
-                elif op == 'le':
-                    ok = masked_actual <= masked_expected
-                else:
-                    raise ValueError('unsupported op {}'.format(op))
-                detail['expected'] = int(expected) & 0xFFFFFFFF
-                detail['expected_masked'] = masked_expected
-            detail.update({
-                'address': '0x{:X}'.format(address),
-                'actual': actual,
-                'actual_hex': fmt_u32(actual),
-                'actual_masked': masked_actual,
-                'mask': mask,
-                'op': op,
-                'ok': bool(ok),
-            })
-            _addr_uncorr_fn = globals().get('_mram_address_is_uncorrectable')
-            marked_word_addr = (
-                _addr_uncorr_fn(address) if _addr_uncorr_fn is not None else None
-            )
-            if marked_word_addr is not None:
-                detail['uncorrectable'] = True
-                detail['uncorrectable_word_address'] = marked_word_addr
-        except Exception as exc:
-            detail['error'] = str(exc)
-            ok = False
-        if not ok:
-            observations['memory_checks_ok'] = False
-        observations['memory_checks'].append(detail)
-
-    if not isinstance(config_specs, list):
-        observations['config_checks_error'] = 'config_checks is not a list'
-        observations['config_checks_ok'] = False
-        config_specs = []
-    for index, spec in enumerate(config_specs):
-        detail = {'index': index, 'ok': False}
-        try:
-            if not isinstance(spec, dict):
-                raise ValueError('check is not a mapping')
-            address = int(spec['address'])
-            actual = as_int(bus.ReadDoubleWord(address)) & 0xFFFFFFFF
-            ok = True
-            failures = []
-            expected = spec.get('expected')
-            if expected is not None and actual != (int(expected) & 0xFFFFFFFF):
-                ok = False
-                failures.append('expected')
-            if bool(spec.get('nonzero', False)) and actual == 0:
-                ok = False
-                failures.append('nonzero')
-            range_min = spec.get('range_min')
-            range_max = spec.get('range_max')
-            if range_min is not None and actual < int(range_min):
-                ok = False
-                failures.append('range_min')
-            if range_max is not None and actual > int(range_max):
-                ok = False
-                failures.append('range_max')
-            mask = spec.get('mask')
-            expected_masked = spec.get('expected_masked')
-            if mask is not None or expected_masked is not None:
-                if mask is None or expected_masked is None:
-                    raise ValueError('mask and expected_masked must be configured together')
-                if (actual & int(mask)) != (int(expected_masked) & int(mask)):
-                    ok = False
-                    failures.append('expected_masked')
-            address_key = '0x{:X}'.format(address)
-            observations['config_values'][address_key] = actual
-            detail.update({
-                'address': address_key,
-                'actual': actual,
-                'actual_hex': fmt_u32(actual),
-                'expected': expected,
-                'nonzero': bool(spec.get('nonzero', False)),
-                'range_min': range_min,
-                'range_max': range_max,
-                'mask': mask,
-                'expected_masked': expected_masked,
-                'failed_constraints': failures,
-                'ok': bool(ok),
-            })
-        except Exception as exc:
-            detail['error'] = str(exc)
-            ok = False
-        if not ok:
-            observations['config_checks_ok'] = False
-        observations['config_checks'].append(detail)
-
-    if integrity_enabled:
-        integrity = {'enabled': True, 'ok': False}
-        try:
-            region = config.get('bootloader_region')
-            if not isinstance(region, dict):
-                raise ValueError('bootloader_region is missing')
-            base = int(region['base'])
-            size = int(region['size'])
-            if size < 8:
-                raise ValueError('bootloader_region is smaller than 8 bytes')
-            initial_sp = as_int(bus.ReadDoubleWord(base)) & 0xFFFFFFFF
-            reset_vector = as_int(bus.ReadDoubleWord(base + 4)) & 0xFFFFFFFF
-            reset_pc = reset_vector & ~1
-            sp_ok = sram_start <= initial_sp <= sram_end
-            reset_thumb_ok = (reset_vector & 1) == 1
-            reset_ok = reset_thumb_ok and base <= reset_pc < (base + size)
-            integrity.update({
-                'region_base': '0x{:X}'.format(base),
-                'region_size': size,
-                'initial_sp': initial_sp,
-                'initial_sp_hex': fmt_u32(initial_sp),
-                'initial_sp_ok': sp_ok,
-                'reset_vector': reset_vector,
-                'reset_vector_hex': fmt_u32(reset_vector),
-                'reset_pc': reset_pc,
-                'reset_pc_hex': fmt_u32(reset_pc),
-                'reset_thumb_ok': reset_thumb_ok,
-                'reset_vector_ok': reset_ok,
-                'ok': bool(sp_ok and reset_ok),
-                'reason': (
-                    'ok'
-                    if sp_ok and reset_ok
-                    else 'invalid initial SP or reset vector'
-                ),
-            })
-        except Exception as exc:
-            integrity['error'] = str(exc)
-        observations['bootloader_integrity'] = integrity
-        observations['bootloader_integrity_ok'] = bool(integrity.get('ok'))
-
-    observations['all_ok'] = bool(
-        observations['all_ok']
-        and observations['memory_checks_ok']
-        and observations['config_checks_ok']
-        and observations['bootloader_integrity_ok']
-    )
-    return observations
 
 
 def _match_configured_image_hash(actual_hash):
@@ -10255,6 +10086,10 @@ def evaluate_boot_outcome(
 ):
     # Shared boot outcome evaluation for all execution modes.
     # When effective_criteria is provided, use its values instead of globals.
+    from success_checks import has_image_scoped_checks, match_allowed_image
+
+    check_config = globals().get('success_checks_config') or {}
+    image_scoped_checks = has_image_scoped_checks(check_config)
     followup_cycle = bool(followup_cycle)
     followup_skipped_criteria = []
     _hook_configured = bool(str(globals().get('boot_cycle_hook', '') or '').strip())
@@ -10473,6 +10308,7 @@ def evaluate_boot_outcome(
     marker_ok = True
     hash_result = None
     matched_image = None
+    matched_allowed_image = None
     actual_marker_val = 0
     actual_hash = None
     image_hash_uncorrectable_words = []
@@ -10481,6 +10317,8 @@ def evaluate_boot_outcome(
             enforce_hash = True
             if eff_image_hash_slot and eff_image_hash_slot != 'any':
                 enforce_hash = (boot_slot == eff_image_hash_slot)
+            elif image_scoped_checks:
+                enforce_hash = boot_slot in slot_ranges
             if enforce_hash:
                 hash_slot = eff_image_hash_slot if eff_image_hash_slot not in ('', 'any') else boot_slot
                 actual_hash = compute_slot_hash(hash_slot)
@@ -10488,7 +10326,8 @@ def evaluate_boot_outcome(
                 if _range_uncorr_fn is not None and hash_slot in slot_ranges:
                     _hs_lo, _hs_hi = slot_ranges[hash_slot]
                     image_hash_uncorrectable_words = _range_uncorr_fn(_hs_lo, _hs_hi)
-                matched_image = _match_configured_image_hash(actual_hash)
+                matched_allowed_image = match_allowed_image(actual_hash, allowed_image_hashes)
+                matched_image = matched_allowed_image or _match_configured_image_hash(actual_hash)
                 if matched_image == 'exec':
                     hash_result = 'exec_image'
                 elif matched_image == 'staging':
@@ -10498,10 +10337,7 @@ def evaluate_boot_outcome(
                 else:
                     hash_result = 'unknown'
                 if allowed_image_hashes:
-                    marker_ok = any(
-                        actual_hash == str(entry.get('sha256', '')).strip().lower()
-                        for entry in allowed_image_hashes
-                    )
+                    marker_ok = matched_allowed_image is not None
                 elif expected_exec_sha256:
                     # On an unconfirmed multi-boot upgrade (no boot_cycle_hook,
                     # no anti-rollback, not inside update_sequence) whose
@@ -10624,6 +10460,8 @@ def evaluate_boot_outcome(
         signals['image_hash_uncorrectable_words'] = list(image_hash_uncorrectable_words)
     if matched_image is not None:
         signals['matched_image'] = matched_image
+    if image_scoped_checks and matched_allowed_image is not None:
+        signals['matched_allowed_image'] = matched_allowed_image
     if allowed_image_hashes:
         signals['allowed_images'] = [
             str(entry.get('name', '')) for entry in allowed_image_hashes
@@ -10640,7 +10478,10 @@ def evaluate_boot_outcome(
     non_memory_structured_ok = True
     failed_memory_checks = []
     if enforce_content_criteria:
-        structured_observations = evaluate_structured_success_checks()
+        structured_observations = (
+            evaluate_structured_success_checks(matched_allowed_image)
+            if image_scoped_checks else evaluate_structured_success_checks()
+        )
         if structured_observations.get('requested'):
             signals['success_checks'] = structured_observations
             signals['memory_checks_ok'] = structured_observations.get('memory_checks_ok')
@@ -10718,8 +10559,16 @@ def evaluate_boot_outcome(
                         }
                         if 'expected' in check:
                             entry['expected'] = check.get('expected')
+                        if check.get('symbol') is not None:
+                            entry['symbol'] = check.get('symbol')
                         if check.get('error'):
                             entry['error'] = check.get('error')
+                        check_image = check.get('image') or matched_allowed_image
+                        if check_image is not None:
+                            entry['image'] = check_image
+                            entry['summary'] = 'image {}: {}'.format(
+                                check_image, summary
+                            )
                         failed_memory_checks.append(entry)
                 if not failed_memory_checks:
                     failed_memory_checks.append({
@@ -10738,6 +10587,10 @@ def evaluate_boot_outcome(
                     )
                 else:
                     signals['failure_reason'] = memory_checks_failure_reason
+        if image_scoped_checks and matched_allowed_image is None:
+            non_memory_structured_ok = False
+            if not signals.get('failure_reason'):
+                signals['failure_reason'] = 'image-scoped checks require an allowed image digest match'
 
     otadata_expect_ok = True
     otadata_mismatches = []
@@ -10997,8 +10850,7 @@ def evaluate_boot_outcome(
     )
     budget_exhausted_with_unmet_checks = bool(
         post_reset_checks_unmet_ready
-        and terminal_after_reset_active
-        and reset_observed_for_status
+        and (reset_observed_for_status if terminal_after_reset_active else image_scoped_checks)
         and primary_execution_failure == 'timeout'
         and not str(p2_reason).lower().startswith('wall_timeout')
     )
@@ -11381,6 +11233,10 @@ def run_state_fault(fault_at):
         signals['operation_kind'] = 'program'
     if signals.get('matched_image') is not None:
         result['matched_image'] = signals.get('matched_image')
+    if signals.get('matched_allowed_image') is not None:
+        result['matched_allowed_image'] = signals.get('matched_allowed_image')
+    if isinstance(signals.get('success_checks'), dict):
+        result['success_checks'] = signals.get('success_checks')
     if isinstance(signals.get('approved_image_running'), dict):
         result['approved_image_running'] = dict(signals['approved_image_running'])
     if isinstance(signals.get('function_return_probes'), dict):
@@ -11601,10 +11457,8 @@ def _reset_gated_success_stop_observation(
     fault_injected=False,
     followup_cycle=False,
 ):
-    if (
-        not success_terminal_after_reset
-        or not reset_observation.get('observed')
-    ):
+    """Sample terminal boot checks once any required reset has occurred."""
+    if success_terminal_after_reset and not reset_observation.get('observed'):
         return None
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
     pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
@@ -11838,9 +11692,18 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
     #   6. (no_boot profiles) no writes + no VTOR for N slices/min emulated time
     #   7. (no_boot profiles) writes settled (>0 but unchanged) + no VTOR
     #   8. Iteration, instruction, or wall-clock limit exhausted
+    from success_checks import DEFAULT_BOOT_OBSERVATION_SLICES, has_image_scoped_checks
+
+    if max_iters is None:
+        max_iters = DEFAULT_BOOT_OBSERVATION_SLICES
     terminal_after_reset = bool(
         globals().get('success_terminal_after_reset', False)
     )
+    image_scoped_checks = bool(
+        enforce_content_criteria
+        and has_image_scoped_checks(globals().get('success_checks_config') or {})
+    )
+    poll_success_checks = terminal_after_reset or image_scoped_checks
     runfor_guard = globals().get('_run_for_with_watchdog')
     runfor_watchdog_s = globals().get('runfor_watchdog_timeout_s', 300.0)
     configured_test_runfor_error_label = str(
@@ -12270,7 +12133,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 except Exception:
                     return False
             struct_cfg = globals().get('success_checks_config')
-            if isinstance(struct_cfg, dict) and (
+            if not image_scoped_checks and isinstance(struct_cfg, dict) and (
                 struct_cfg.get('memory_checks')
                 or struct_cfg.get('config_checks')
                 or struct_cfg.get('bootloader_integrity')
@@ -13202,7 +13065,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                             break
                         approved_dwell_state['completed'] = True
                         approved_dwell_state['ok'] = True
-                        if not terminal_after_reset:
+                        if not poll_success_checks:
                             reason = (
                                 'vtor_captured'
                                 if sticky_vtor['captured']
@@ -13235,7 +13098,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 reason = 'calibration_stop_success_criteria'
                 break
             success_terminal_observation = None
-            if terminal_after_reset:
+            if poll_success_checks:
                 if _accepts_kwarg(_reset_gated_success_stop_observation, 'followup_cycle'):
                     success_terminal_observation = (
                         _reset_gated_success_stop_observation(
@@ -13268,13 +13131,12 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 )
                 if terminal_outcome == 'success':
                     record_checks_held(iters, emulated_s)
-                    reason = 'success_terminal_after_reset'
+                    reason = 'success_terminal_after_reset' if terminal_after_reset else 'success_terminal'
                 else:
-                    reason = 'outcome_terminal_after_reset({})'.format(
-                        terminal_outcome
-                    )
+                    terminal_reason = 'outcome_terminal_after_reset' if terminal_after_reset else 'outcome_terminal'
+                    reason = '{}({})'.format(terminal_reason, terminal_outcome)
                 break
-            if sticky_vtor['captured'] and not terminal_after_reset and (
+            if sticky_vtor['captured'] and not poll_success_checks and (
                 approved_dwell_state is None or not approved_dwell_state.get('started')
             ):
                 if vtor_settle_remaining < 0:
@@ -13354,7 +13216,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                         reason = 'vtor_captured'
                     break
             if (
-                not terminal_after_reset
+                not poll_success_checks
                 and (approved_dwell_state is None or not approved_dwell_state.get('started'))
                 and
                 pc_handoff_slot is not None
@@ -13500,6 +13362,7 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 zero_writes_is_brick
                 and cur_writes == 0
                 and not expect_writes
+                and not (image_scoped_checks and reset_observation.get('post_reset_checks_pending'))
                 and not (
                     approved_dwell_state is not None
                     and approved_dwell_state.get('started')
@@ -13718,7 +13581,8 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
                 'peripheral'
             ]
     if success_terminal_observation is not None:
-        status['reset_gated_terminal'] = success_terminal_observation
+        if terminal_after_reset:
+            status['reset_gated_terminal'] = success_terminal_observation
         if success_terminal_observation.get('boot_outcome') == 'success':
             status['success_terminal'] = success_terminal_observation
     if lockup_state.get('detected'):
@@ -15431,6 +15295,10 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         signals['operation_kind'] = _op_kind
     if signals.get('matched_image') is not None:
         result['matched_image'] = signals.get('matched_image')
+    if signals.get('matched_allowed_image') is not None:
+        result['matched_allowed_image'] = signals.get('matched_allowed_image')
+    if isinstance(signals.get('success_checks'), dict):
+        result['success_checks'] = signals.get('success_checks')
     if isinstance(signals.get('approved_image_running'), dict):
         result['approved_image_running'] = dict(signals['approved_image_running'])
     if isinstance(signals.get('function_return_probes'), dict):
@@ -17817,6 +17685,9 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None, diagnostic=None):
             wall_timeout=phase2_wall_timeout_s,
             stop_on_fault=False,
             time_slice=phase2_time_slice,
+            reset_already_observed=True,
+            effective_criteria=eff_criteria,
+            fault_injected=True,
         )
     finally:
         disarm_vtor_watchpoint()
@@ -18107,8 +17978,18 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         observation = _state_search_begin_live_trace(diagnostic)
         if diagnostic.get('preflight'):
             disarm_fault()
-            status = run_until_done(cpu_ref, label='preflight_live_recovery',
-                                    time_slice=phase2_time_slice, wall_timeout=60)
+            status = run_until_done(
+                cpu_ref,
+                label='preflight_live_recovery',
+                expect_writes=False,
+                zero_writes_is_brick=False,
+                stop_on_fault=False,
+                time_slice=phase2_time_slice,
+                wall_timeout=60,
+                reset_already_observed=True,
+                effective_criteria=eff_criteria,
+                fault_injected=True,
+            )
             if status.get('infrastructure_error') or str(status['reason']).startswith(
                     ('wall_timeout', 'instruction_limit', 'budget')):
                 raise RuntimeError('incomplete live determinism preflight: {}'.format(
@@ -18286,6 +18167,9 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
             wall_timeout=phase2_wall_timeout_s,
             stop_on_fault=False,
             time_slice=phase2_time_slice,
+            reset_already_observed=True,
+            effective_criteria=eff_criteria,
+            fault_injected=True,
         )
         disarm_vtor_watchpoint()
         phase3_ms = int((_time.time() - phase3_t0) * 1000)
@@ -18837,6 +18721,9 @@ def run_multi_fault_sequence(fault_sequence, stage_codes=None):
         wall_timeout=phase2_wall_timeout_s,
         stop_on_fault=False,
         time_slice=phase2_time_slice,
+        reset_already_observed=True,
+        effective_criteria=get_effective_criteria('w'),
+        fault_injected=True,
     )
     disarm_vtor_watchpoint()
     recovery_ms = int((_time.time() - recovery_t0) * 1000)
@@ -23647,6 +23534,8 @@ def _debug_read_machine_virtual_s(m_ref):
 
 
 def run_debug_session(fault_at, fault_type='w'):
+    from success_checks import DEFAULT_BOOT_OBSERVATION_SLICES, has_image_scoped_checks
+
     started = _time.time()
     ft = str(fault_type or 'w').strip()
     is_control = int(fault_at) < 0 or ft == 'control'
@@ -23956,6 +23845,9 @@ def run_debug_session(fault_at, fault_type='w'):
         last_running_insns = None
         terminal_loop_hits = 0
         pc_handoff_slot = success_pc_slot if success_pc_slot in slot_ranges else None
+        poll_image_checks = recovery_boot_active and has_image_scoped_checks(success_checks_config)
+        if poll_image_checks:
+            check_budget_s = DEFAULT_BOOT_OBSERVATION_SLICES * max(0.001, float(phase2_time_slice))
 
         try:
             while _time.time() < deadline:
@@ -24002,7 +23894,22 @@ def run_debug_session(fault_at, fault_type='w'):
                         last_progress_virtual_s = now_virtual_s
                         last_progress_wall_s = now_wall_s
 
-                    if sticky_vtor['captured']:
+                    if poll_image_checks and (sticky_vtor['captured'] or sticky_pc['captured']):
+                        outcome, _slot, _signals = evaluate_boot_outcome(
+                            vtor_now, pc_now,
+                            fault_injected=(not is_control),
+                            effective_criteria=eff_criteria,
+                            p2_status={'reason': 'success_terminal_poll'},
+                        )
+                        if outcome not in ('no_boot', 'memory_checks_unmet'):
+                            gdb_terminal_reason = 'outcome_terminal({})'.format(outcome)
+                            _debug_pause_for_gdb(m_ref, cpu_ref)
+                        elif now_virtual_s - boot_start_virtual_s >= check_budget_s:
+                            gdb_terminal_reason = (
+                                'post_reset_checks_unmet' if outcome == 'memory_checks_unmet' else 'budget'
+                            )
+                            _debug_pause_for_gdb(m_ref, cpu_ref)
+                    elif sticky_vtor['captured']:
                         vtor_captured_polls += 1
                         if vtor_captured_virtual_s is None:
                             vtor_captured_virtual_s = now_virtual_s
@@ -24127,7 +24034,7 @@ def run_debug_session(fault_at, fault_type='w'):
                 wall_timeout=phase2_wall_timeout_s,
                 stop_on_fault=False,
                 time_slice=phase2_time_slice,
-                reset_already_observed=True,
+                reset_already_observed=(not is_control),
                 effective_criteria=eff_criteria,
                 fault_injected=(not is_control),
             )

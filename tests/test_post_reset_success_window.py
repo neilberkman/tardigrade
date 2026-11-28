@@ -702,3 +702,141 @@ def test_delayed_fixture_profile_and_symbols() -> None:
         }
         assert profile.fault_sweep.tracking_start_address == syms["copy_update"]
         assert profile.fault_sweep.calibration_stop.address == syms["request_reset"]
+
+
+@pytest.mark.parametrize(
+    ("image", "digest", "address", "value"),
+    [("exec", UNKNOWN_HASH, 0x20000200, 1), ("staging", ALLOWED_HASH, 0x20000300, 2)],
+)
+def test_selected_image_and_global_checks_stop_on_first_passing_sample(
+    image, digest, address, value,
+):
+    common = 0x20000040
+    memory = {common: 1}
+
+    def step(state, _machine, _cpu, mem, _hash_ref):
+        state["virtual_time"].seconds += 0.1
+        state["instructions"] += 100_000
+        if state["run_calls"] == 3:
+            mem[address] = value
+
+    ns, _state, _machine, cpu = _build_integrated_harness(
+        memory_specs=[
+            {"address": common, "expected_value": 1},
+            {"image": "exec", "address": 0x20000200, "expected_value": 1},
+            {"image": "staging", "address": 0x20000300, "expected_value": 2},
+        ],
+        mem_values=memory,
+        image_hash_ref={"digest": digest},
+        step_fn=step,
+    )
+    ns["allowed_image_hashes"].append({"name": "exec", "sha256": UNKNOWN_HASH})
+    ns["success_terminal_after_reset"] = False
+
+    status = ns["run_until_done"](cpu, time_slice="0.1", max_iters=8)
+    assert status["reason"] == "success_terminal"
+    assert status["iters"] == 3
+    signals = status["success_terminal"]["signals"]
+    assert signals["matched_image"] == image
+    assert signals["matched_allowed_image"] == image
+    assert [int(check["address"], 16) for check in signals["success_checks"]["memory_checks"]] == [
+        common, address,
+    ]
+
+
+def test_only_the_matched_images_failed_checks_are_reported():
+    ns, _state, _machine, _cpu = _build_integrated_harness(
+        memory_specs=[
+            {"image": "exec", "address": 0x20000200, "expected_value": 1},
+            {"image": "staging", "address": 0x20000300, "expected_value": 1},
+        ],
+        mem_values={},
+        image_hash_ref={"digest": ALLOWED_HASH},
+        step_fn=lambda *_: None,
+    )
+    outcome, slot, signals = ns["evaluate_boot_outcome"](0, 0x10100050)
+    assert (outcome, slot) == ("memory_checks_unmet", "exec")
+    failed, = signals["failed_memory_checks"]
+    assert (failed["index"], failed["image"], failed["address"]) == (1, "staging", "0x20000300")
+    assert "staging" in signals["memory_checks_failure_reason"]
+
+
+@pytest.mark.parametrize("hash_slot", ["exec", "staging"])
+def test_scoped_reads_require_an_allowed_digest_in_the_booted_slot(hash_slot):
+    # A known digest outside the allowed set and a skipped hash are both
+    # insufficient to identify the image. Global checks still apply.
+    digest = UNKNOWN_HASH if hash_slot == "exec" else ALLOWED_HASH
+    ns, _state, _machine, _cpu = _build_integrated_harness(
+        memory_specs=[
+            {"address": 0x20000040, "op": "nonzero"},
+            {"image": "staging", "address": 0x20000300, "op": "nonzero"},
+        ],
+        mem_values={0x20000040: 1},
+        image_hash_ref={"digest": digest},
+        step_fn=lambda *_: None,
+    )
+    ns["success_image_hash_slot"] = hash_slot
+    ns["slot_ranges"]["staging"] = (0x10101000, 0x10102000)
+    ns["_match_configured_image_hash"] = lambda _: "exec"
+    ns["success_checks_config"]["config_checks"] = [
+        {"image": "staging", "address": 0x20000304, "nonzero": True},
+    ]
+    addresses = []
+    read = ns["bus"].ReadDoubleWord
+
+    def record_read(address):
+        addresses.append(address)
+        return read(address)
+
+    ns["bus"].ReadDoubleWord = record_read
+    outcome, slot, signals = ns["evaluate_boot_outcome"](0, 0x10100050)
+    assert (outcome, slot) == ("wrong_image", "exec")
+    assert "matched_allowed_image" not in signals
+    assert 0x20000040 in addresses
+    assert 0x20000300 not in addresses
+    assert 0x20000304 not in addresses
+
+
+def test_scoped_checks_wait_for_a_boot_slot_before_hashing():
+    ns, _state, _machine, _cpu = _build_integrated_harness(
+        memory_specs=[{"image": "staging", "address": 0x20000300, "op": "nonzero"}],
+        mem_values={},
+        image_hash_ref={"digest": ALLOWED_HASH},
+        step_fn=lambda *_: None,
+    )
+    ns["success_image_hash_slot"] = "any"
+    hashed_slots = []
+    ns["compute_slot_hash"] = lambda slot: hashed_slots.append(slot) or ALLOWED_HASH
+
+    outcome, slot, signals = ns["evaluate_boot_outcome"](0, 0x10200010)
+    assert (outcome, slot) == ("no_boot", None)
+    assert hashed_slots == []
+    assert signals["success_checks"]["memory_checks"] == []
+
+
+def test_symbol_scoped_memory_check_reports_matched_image_and_symbol_on_unmet():
+    ns, _state, _machine, _cpu = _build_integrated_harness(
+        memory_specs=[
+            {
+                "symbol": "alive",
+                "addresses": {"exec": 0x20000200, "staging": 0x20000300},
+                "op": "nonzero",
+            }
+        ],
+        mem_values={0x20000300: 1},
+        image_hash_ref={"digest": UNKNOWN_HASH},
+        step_fn=lambda *_: None,
+    )
+    ns["allowed_image_hashes"].append({"name": "exec", "sha256": UNKNOWN_HASH})
+    outcome, slot, signals = ns["evaluate_boot_outcome"](0, 0x10100050)
+    assert (outcome, slot) == ("memory_checks_unmet", "exec")
+    assert signals["matched_allowed_image"] == "exec"
+    assert signals["success_checks"]["matched_image"] == "exec"
+    failed, = signals["failed_memory_checks"]
+    assert (failed["index"], failed["image"], failed["symbol"], failed["address"]) == (
+        0,
+        "exec",
+        "alive",
+        "0x20000200",
+    )
+    assert "image exec:" in signals["memory_checks_failure_reason"]

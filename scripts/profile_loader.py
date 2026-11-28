@@ -948,16 +948,29 @@ class ResidualImageConfig:
 class MemoryCheck:
     """Post-execution memory assertion."""
 
-    __slots__ = ("address", "expected_value", "mask", "op")
+    __slots__ = (
+        "address",
+        "expected_value",
+        "mask",
+        "op",
+        "image",
+        "width",
+        "symbol",
+        "image_addresses",
+    )
 
     def __init__(
         self,
-        address: int,
+        address: Optional[int] = None,
         expected_value: Optional[int] = None,
         mask: int = 0xFFFFFFFF,
         op: str = "eq",
+        image: Optional[str] = None,
+        width: int = 4,
+        symbol: Optional[str] = None,
+        image_addresses: Optional[Dict[str, int]] = None,
     ) -> None:
-        self.address = int(address)
+        self.address = int(address) if address is not None else None
         self.expected_value = int(expected_value) if expected_value is not None else None
         self.mask = int(mask)
         if op not in ("eq", "ne", "ge", "le", "nonzero"):
@@ -965,6 +978,27 @@ class MemoryCheck:
                 "memory_check: op must be one of eq, ne, ge, le, nonzero; got '{}'".format(op)
             )
         self.op = op
+        self.image = image
+        self.width = width
+        self.symbol = symbol
+        self.image_addresses = dict(image_addresses) if image_addresses else None
+
+    @property
+    def is_image_scoped(self) -> bool:
+        return (
+            self.image is not None
+            or self.symbol is not None
+            or bool(self.image_addresses)
+        )
+
+    def address_for_image(self, matched_image: Optional[str]) -> Optional[int]:
+        if self.image is not None and self.image != matched_image:
+            return None
+        if self.image_addresses:
+            if matched_image not in self.image_addresses:
+                return None
+            return int(self.image_addresses[matched_image])
+        return self.address
 
 
 class ApprovedImageRunning:
@@ -1060,6 +1094,13 @@ class SuccessCriteria:
         self.terminal_after_reset = bool(terminal_after_reset)
         self.allow_fault_after_success = bool(allow_fault_after_success)
         self.approved_image_running = approved_image_running
+
+    @property
+    def has_image_scoped_checks(self) -> bool:
+        return any(
+            check.is_image_scoped
+            for check in (*self.memory_checks, *self.config_checks)
+        )
 
 
 
@@ -1958,17 +1999,50 @@ class NvsRegionConfig:
 
 class ConfigCheck:
     """A single post-boot config check: verify memory at an address."""
-    __slots__ = ("address", "expected", "nonzero", "range_min", "range_max", "mask", "expected_masked")
-    def __init__(self, address: int, expected: Optional[int] = None, nonzero: bool = False,
+    __slots__ = (
+        "address",
+        "expected",
+        "nonzero",
+        "range_min",
+        "range_max",
+        "mask",
+        "expected_masked",
+        "image",
+        "symbol",
+        "image_addresses",
+    )
+    def __init__(self, address: Optional[int] = None, expected: Optional[int] = None, nonzero: bool = False,
                  range_min: Optional[int] = None, range_max: Optional[int] = None,
-                 mask: Optional[int] = None, expected_masked: Optional[int] = None) -> None:
-        self.address = address
+                 mask: Optional[int] = None, expected_masked: Optional[int] = None,
+                 image: Optional[str] = None, symbol: Optional[str] = None,
+                 image_addresses: Optional[Dict[str, int]] = None) -> None:
+        self.address = int(address) if address is not None else None
         self.expected = expected
         self.nonzero = nonzero
         self.range_min = range_min
         self.range_max = range_max
         self.mask = mask
         self.expected_masked = expected_masked
+        self.image = image
+        self.symbol = symbol
+        self.image_addresses = dict(image_addresses) if image_addresses else None
+
+    @property
+    def is_image_scoped(self) -> bool:
+        return (
+            self.image is not None
+            or self.symbol is not None
+            or bool(self.image_addresses)
+        )
+
+    def address_for_image(self, matched_image: Optional[str]) -> Optional[int]:
+        if self.image is not None and self.image != matched_image:
+            return None
+        if self.image_addresses:
+            if matched_image not in self.image_addresses:
+                return None
+            return int(self.image_addresses[matched_image])
+        return self.address
 
     def evaluate(self, actual_value: int) -> bool:
         """Evaluate this check against an actual memory value."""
@@ -3144,6 +3218,114 @@ def resolve_image_header_vector_offset(
     criteria.vector_table_offset = int(struct.unpack_from("<H", blob, start + 8)[0])
 
 
+def _resolve_elf_symbol_address(
+    elf_path: Path,
+    symbol_name: str,
+    *,
+    ctx: str,
+) -> int:
+    if ELFFile is None:
+        raise ProfileError(
+            "{}: symbol resolution requires pyelftools. "
+            "Install it with: pip install -r requirements.txt".format(ctx)
+        )
+    try:
+        with elf_path.open("rb") as handle:
+            elf = ELFFile(handle)
+            symtab = elf.get_section_by_name(".symtab")
+            if symtab is None:
+                raise ProfileError(
+                    "{}: ELF '{}' has no .symtab".format(ctx, elf_path)
+                )
+            addresses = sorted(
+                {
+                    (
+                        int(symbol["st_value"]) & ~1
+                        if symbol["st_info"]["type"] == "STT_FUNC"
+                        else int(symbol["st_value"])
+                    )
+                    for symbol in symtab.iter_symbols()
+                    if symbol.name == symbol_name
+                    and symbol["st_shndx"] != "SHN_UNDEF"
+                    and symbol["st_info"]["type"] not in ("STT_SECTION", "STT_FILE")
+                }
+            )
+    except ProfileError:
+        raise
+    except Exception as exc:
+        raise ProfileError(
+            "{}: failed to read symbols from '{}': {}".format(ctx, elf_path, exc)
+        ) from exc
+
+    if not addresses:
+        raise ProfileError(
+            "{}: symbol {!r} not found in '{}'".format(ctx, symbol_name, elf_path)
+        )
+    if len(addresses) > 1:
+        raise ProfileError(
+            "{}: symbol {!r} is ambiguous in '{}' ({})".format(
+                ctx,
+                symbol_name,
+                elf_path,
+                ", ".join("0x{:X}".format(addr) for addr in addresses),
+            )
+        )
+    return addresses[0]
+
+
+def resolve_image_check_symbols(
+    criteria: SuccessCriteria,
+    images: Dict[str, str],
+    *,
+    profile_path: Optional[Path],
+    ctx: str,
+) -> None:
+    """Resolve symbol-based memory_checks and config_checks against each allowed image's ELF."""
+    for kind, checks in (
+        ("memory_checks", criteria.memory_checks),
+        ("config_checks", criteria.config_checks),
+    ):
+        for index, check in enumerate(checks):
+            if check.symbol is None:
+                continue
+            field = "{}.{}[{}].symbol".format(ctx, kind, index)
+            target_images = (
+                [check.image]
+                if check.image is not None
+                else list(criteria.allowed_images)
+            )
+            resolved_by_image: Dict[str, int] = {}
+            for img_name in target_images:
+                if img_name not in images:
+                    raise ProfileError(
+                        "{}: image {!r} is not present in the effective images mapping".format(
+                            field, img_name
+                        )
+                    )
+                img_rel = images[img_name]
+                candidate = _resolve_profile_input_path(
+                    img_rel,
+                    profile_path=profile_path,
+                )
+                if candidate.is_file() and candidate.read_bytes()[:4] == b"\x7fELF":
+                    elf_path = candidate
+                else:
+                    elf_rel = str(Path(img_rel).with_suffix(".elf"))
+                    elf_path = _resolve_existing_profile_path(
+                        elf_rel,
+                        profile_path=profile_path,
+                        ctx="{} ({})".format(field, img_name),
+                    )
+                resolved_by_image[img_name] = _resolve_elf_symbol_address(
+                    elf_path,
+                    check.symbol,
+                    ctx="{} ({})".format(field, img_name),
+                )
+            check.image_addresses = resolved_by_image
+            if check.image is not None:
+                check.address = resolved_by_image[check.image]
+
+
 def mcuboot_validated_image_extent(blob: bytes, slot_size: int = 0) -> Optional[int]:
     """Return the byte extent validated by MCUboot's bootutil_img_validate, or None."""
     if not blob or len(blob) < 32:
@@ -4106,22 +4288,29 @@ class ProfileConfig:
             "contract_version": 1,
             "memory_checks": [
                 {
-                    "address": check.address,
+                    **({"address": check.address} if check.address is not None else {}),
+                    **({"addresses": dict(check.image_addresses)} if check.image_addresses else {}),
+                    **({"symbol": check.symbol} if check.symbol is not None else {}),
                     "expected_value": check.expected_value,
                     "mask": check.mask,
                     "op": check.op,
+                    **({"width": check.width} if check.width != 4 else {}),
+                    **({"image": check.image} if check.image is not None else {}),
                 }
                 for check in criteria.memory_checks
             ],
             "config_checks": [
                 {
-                    "address": check.address,
+                    **({"address": check.address} if check.address is not None else {}),
+                    **({"addresses": dict(check.image_addresses)} if check.image_addresses else {}),
+                    **({"symbol": check.symbol} if check.symbol is not None else {}),
                     "expected": check.expected,
                     "nonzero": check.nonzero,
                     "range_min": check.range_min,
                     "range_max": check.range_max,
                     "mask": check.mask,
                     "expected_masked": check.expected_masked,
+                    **({"image": check.image} if check.image is not None else {}),
                 }
                 for check in criteria.config_checks
             ],
@@ -4983,7 +5172,14 @@ class ProfileConfig:
         if sc.config_checks:
             check_parts: List[str] = []
             for chk in sc.config_checks:
-                parts: List[str] = ["addr=0x{:X}".format(chk.address)]
+                addr_val = chk.address
+                if addr_val is None and chk.image_addresses:
+                    addr_val = next(iter(chk.image_addresses.values()))
+                parts: List[str] = (
+                    ["addr=0x{:X}".format(addr_val)]
+                    if addr_val is not None
+                    else ["symbol={}".format(chk.symbol or "")]
+                )
                 if chk.expected is not None:
                     parts.append("expected=0x{:08X}".format(chk.expected))
                 if chk.nonzero:
@@ -5470,6 +5666,20 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
         raise ProfileError(
             "success_criteria.allowed_images requires success_criteria.image_hash: true"
         )
+    memory_checks = _parse_memory_checks(raw.get("memory_checks"))
+    config_checks = _parse_config_checks(raw.get("config_checks"))
+    for kind, checks in (("memory_checks", memory_checks), ("config_checks", config_checks)):
+        for index, check in enumerate(checks):
+            if check.image is not None and check.image not in allowed_images:
+                raise ProfileError(
+                    "success_criteria.{}[{}].image={!r} must name a member of "
+                    "success_criteria.allowed_images".format(kind, index, check.image)
+                )
+            if check.symbol is not None and not allowed_images:
+                raise ProfileError(
+                    "success_criteria.{}[{}].symbol={!r} requires "
+                    "success_criteria.allowed_images".format(kind, index, check.symbol)
+                )
     return SuccessCriteria(
         vtor_in_slot=raw.get("vtor_in_slot"),
         vector_table_offset=(
@@ -5495,13 +5705,13 @@ def _parse_success_criteria(raw: Optional[Dict[str, Any]]) -> SuccessCriteria:
             raw.get("bootloader_integrity", False),
             "success_criteria.bootloader_integrity",
         ),
-        config_checks=_parse_config_checks(raw.get("config_checks")),
+        config_checks=config_checks,
         boot_register_values=_parse_boot_register_values(raw.get("boot_register_values")),
         max_reset_vector_offset=(
             _parse_int(raw["max_reset_vector_offset"], "success_criteria.max_reset_vector_offset")
             if "max_reset_vector_offset" in raw else None
         ),
-        memory_checks=_parse_memory_checks(raw.get("memory_checks")),
+        memory_checks=memory_checks,
         terminal_after_reset=_parse_bool(
             raw.get("terminal_after_reset", False),
             "success_criteria.terminal_after_reset",
@@ -5558,12 +5768,56 @@ def _validate_approved_image_running_slot(
         )
 
 
+def _validate_image_scoped_checks(
+    criteria: SuccessCriteria,
+    slots: Dict[str, SlotConfig],
+    fault_sweep: FaultSweepConfig,
+    overrides: Dict[str, Dict[str, Any]],
+    context: str,
+) -> None:
+    if not criteria.has_image_scoped_checks:
+        return
+    if str(fault_sweep.evaluation_mode or "state").strip().lower() != "execute":
+        raise ProfileError(
+            "{}: image-scoped checks require fault_sweep.evaluation_mode: execute".format(context)
+        )
+    for override_name, override in [("", {}), *overrides.items()]:
+        check_context = (
+            "success_criteria_overrides." + override_name if override_name else context
+        )
+        if not _parse_bool(override.get("image_hash", True), check_context + ".image_hash"):
+            raise ProfileError("{}: image-scoped checks require image_hash".format(check_context))
+        slot = override.get("image_hash_slot", criteria.image_hash_slot)
+        if slot and slot != "any" and (not isinstance(slot, str) or slot not in slots):
+            raise ProfileError("{}.image_hash_slot={!r} is not present in memory.slots".format(
+                check_context, slot
+            ))
+
+
 def _parse_terminal_error_paths(raw: Optional[Any]) -> List[TerminalErrorPathConfig]:
     """Parse binary-driven terminal-error escape declarations."""
     try:
         return parse_terminal_error_paths(raw)
     except (TypeError, ValueError, KeyError) as exc:
         raise ProfileError(str(exc)) from exc
+
+
+def _parse_check_image(entry: Dict[str, Any], context: str) -> Optional[str]:
+    if "image" not in entry:
+        return None
+    image = entry["image"]
+    if not isinstance(image, str) or not image.strip():
+        raise ProfileError("{}.image: expected a non-empty image name".format(context))
+    return image.strip()
+
+
+def _parse_check_symbol(entry: Dict[str, Any], context: str) -> Optional[str]:
+    if "symbol" not in entry:
+        return None
+    symbol = entry["symbol"]
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise ProfileError("{}.symbol: expected a non-empty symbol name".format(context))
+    return symbol.strip()
 
 
 def _parse_memory_checks(raw: Optional[list]) -> List[MemoryCheck]:
@@ -5575,12 +5829,26 @@ def _parse_memory_checks(raw: Optional[list]) -> List[MemoryCheck]:
         return []
     checks = []
     for i, entry in enumerate(raw):
+        context = "memory_checks[{}]".format(i)
         if not isinstance(entry, dict):
             raise ProfileError(
                 "memory_checks[{}]: expected mapping".format(i)
             )
-        if "address" not in entry:
+        has_address = "address" in entry
+        has_symbol = "symbol" in entry
+        if has_address and has_symbol:
+            raise ProfileError("{}: use either address or symbol, not both".format(context))
+        if not has_address and not has_symbol:
             raise ProfileError("memory_checks[{}]: missing 'address'".format(i))
+        symbol = _parse_check_symbol(entry, context)
+        address = (
+            _parse_int(entry["address"], "memory_checks[{}].address".format(i))
+            if has_address
+            else None
+        )
+        width = _parse_int(entry.get("width", 4), context + ".width")
+        if width not in (1, 2, 4):
+            raise ProfileError("{}.width: expected 1, 2 or 4 bytes".format(context))
         op = str(entry.get("op", "eq")).strip().lower()
         if op not in {"eq", "ne", "ge", "le", "nonzero"}:
             raise ProfileError(
@@ -5594,13 +5862,16 @@ def _parse_memory_checks(raw: Optional[list]) -> List[MemoryCheck]:
                 )
             )
         checks.append(MemoryCheck(
-            address=_parse_int(entry["address"], "memory_checks[{}].address".format(i)),
+            address=address,
             expected_value=(
                 _parse_int(entry["expected_value"], "memory_checks[{}].expected_value".format(i))
                 if "expected_value" in entry else None
             ),
             mask=_parse_int(entry.get("mask", 0xFFFFFFFF), "memory_checks[{}].mask".format(i)),
             op=op,
+            image=_parse_check_image(entry, context),
+            width=width,
+            symbol=symbol,
         ))
     return checks
 
@@ -5638,6 +5909,16 @@ def _parse_success_criteria_overrides(
                     fault_type_name, type(overrides).__name__
                 )
             )
+        for kind in ("memory_checks", "config_checks"):
+            checks = overrides.get(kind)
+            if isinstance(checks, list) and any(
+                isinstance(check, dict) and ("image" in check or "symbol" in check)
+                for check in checks
+            ):
+                raise ProfileError(
+                    "success_criteria_overrides.{}.{}: declare image-scoped checks "
+                    "in success_criteria".format(fault_type_name, kind)
+                )
         result[fault_type_name] = dict(overrides)
     return result
 
@@ -7796,8 +8077,15 @@ def _parse_config_checks(raw: Optional[List[Any]]) -> List[ConfigCheck]:
         ctx = "success_criteria.config_checks[{}]".format(i)
         if not isinstance(entry, dict):
             raise ProfileError("{}: expected mapping".format(ctx))
-        address = _parse_int(
-            _require(entry, "address", ctx), "{}.address".format(ctx)
+        has_address = "address" in entry
+        has_symbol = "symbol" in entry
+        if has_address and has_symbol:
+            raise ProfileError("{}: use either address or symbol, not both".format(ctx))
+        symbol = _parse_check_symbol(entry, ctx)
+        address = (
+            _parse_int(_require(entry, "address", ctx), "{}.address".format(ctx))
+            if not has_symbol
+            else None
         )
         expected: Optional[int] = None
         if "expected" in entry:
@@ -7844,6 +8132,8 @@ def _parse_config_checks(raw: Optional[List[Any]]) -> List[ConfigCheck]:
             expected_masked=expected_masked,
             range_min=range_min,
             range_max=range_max,
+            image=_parse_check_image(entry, ctx),
+            symbol=symbol,
         ))
     return checks
 
@@ -9894,10 +10184,10 @@ def _validate_strict_success_criteria(
         )
 
     for check_name, allowed in (
-        ("memory_checks", {"address", "expected_value", "mask", "op"}),
+        ("memory_checks", {"address", "symbol", "expected_value", "mask", "op", "image", "width"}),
         (
             "config_checks",
-            {"address", "expected", "nonzero", "range", "mask", "expected_masked"},
+            {"address", "symbol", "expected", "nonzero", "range", "mask", "expected_masked", "image"},
         ),
     ):
         checks = raw.get(check_name) or []
@@ -10928,6 +11218,24 @@ def _load_profile(
         fault_sweep=fault_sweep,
         profile_path=path,
     )
+    _validate_image_scoped_checks(
+        success_criteria, memory.slots, fault_sweep, success_criteria_overrides,
+        "success_criteria",
+    )
+    resolve_image_check_symbols(
+        success_criteria, images, profile_path=path, ctx="success_criteria"
+    )
+    for index, phase in enumerate(update_sequence):
+        _validate_image_scoped_checks(
+            phase.success_criteria, memory.slots, fault_sweep, success_criteria_overrides,
+            "update_sequence[{}].success_criteria".format(index),
+        )
+        resolve_image_check_symbols(
+            phase.success_criteria,
+            phase.start_images,
+            profile_path=path,
+            ctx="update_sequence[{}].success_criteria".format(index),
+        )
     if (
         any(
             phase.success_criteria.approved_image_running is not None
@@ -11078,6 +11386,19 @@ def _load_profile(
         data.get("multi_component"),
         profile_path=path,
     )
+    if multi_component is not None:
+        for component in multi_component.components:
+            _validate_image_scoped_checks(
+                component.success_criteria, component.memory.slots,
+                component.fault_sweep or fault_sweep, success_criteria_overrides,
+                "multi_component.{}.success_criteria".format(component.name),
+            )
+            resolve_image_check_symbols(
+                component.success_criteria,
+                component.images,
+                profile_path=path,
+                ctx="multi_component.{}.success_criteria".format(component.name),
+            )
     if boundary_campaigns and multi_component is not None:
         raise ProfileError(
             "boundary_campaigns cannot be combined with multi_component profiles"

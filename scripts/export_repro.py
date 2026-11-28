@@ -2189,6 +2189,15 @@ def _build_recovery_config_dict(
     mem = prof.memory
     sc = prof.success_criteria
     fs = prof.fault_sweep
+    check_images = prof.images
+    faulted_phase = prof.faulted_update_phase
+    if faulted_phase is not None and faulted_phase.success_criteria.has_image_scoped_checks:
+        sc = faulted_phase.success_criteria
+        check_images = faulted_phase.start_images
+    overrides = (
+        prof.success_criteria_overrides.get(CODE_TO_FAULT_NAME.get(target.fault_type_code), {})
+        if sc.has_image_scoped_checks else {}
+    )
 
     elf_rel = f"firmware/{target.elf_path.name}"
     load_addrs = prof.effective_image_load_addresses()
@@ -2205,9 +2214,10 @@ def _build_recovery_config_dict(
     # Pre-compute slot image digests matching ProfileConfig._compute_image_digests / approved_image_running
     slot_image_digests: dict[str, str] = {}
     try:
-        slot_image_digests = prof._compute_image_digests(repo_root, prof.images)
+        slot_image_digests = prof._compute_image_digests(repo_root, check_images)
     except Exception:
-        pass
+        if sc.has_image_scoped_checks:
+            raise
 
     approved_running_dict = None
     try:
@@ -2276,6 +2286,11 @@ def _build_recovery_config_dict(
         for name in (sc.allowed_images or ())
         if name in slot_image_digests
     ]
+    if sc.has_image_scoped_checks and (
+        len(allowed_hashes) != len(sc.allowed_images)
+        or len({entry["sha256"] for entry in allowed_hashes}) != len(allowed_hashes)
+    ):
+        raise DebugError("image-scoped checks require distinct digests for all allowed images")
 
     recovery_cfg: dict[str, Any] = {
         "bootloader_elf": elf_rel,
@@ -2312,7 +2327,9 @@ def _build_recovery_config_dict(
         "tracking_start_address": f"0x{int(fs.tracking_start_address or 0):08X}",
         "recovery_tracking_start_address": f"0x{rec_tracking_start:08X}",
         "run_duration_s": float(fs.run_duration or 1.0),
-        "phase2_time_slice_s": float(fs.phase2_time_slice or 0.02),
+        "phase2_time_slice_s": float(
+            fs.phase2_time_slice or (0.05 if sc.has_image_scoped_checks else 0.02)
+        ),
         "phase2_wall_timeout_s": float(fs.phase2_wall_timeout_s or 30.0),
         "progress_stall_timeout_s": float(getattr(fs, "progress_stall_timeout_s", 5.0) or 5.0),
         "vtor_settle_iters": int(fs.vtor_settle_iters or 0),
@@ -2328,7 +2345,7 @@ def _build_recovery_config_dict(
         },
         "images": images_meta,
         "success_criteria": {
-            "vtor_in_slot": sc.vtor_in_slot or "",
+            "vtor_in_slot": overrides.get("vtor_in_slot", sc.vtor_in_slot) or "",
             "vector_table_offset": f"0x{int(sc.vector_table_offset or 0):08X}",
             "pc_in_slot": sc.pc_in_slot or "",
             "terminal_after_reset": bool(sc.terminal_after_reset),
@@ -2336,7 +2353,7 @@ def _build_recovery_config_dict(
             "marker_address": f"0x{int(sc.marker_address):08X}" if sc.marker_address is not None else "0x00000000",
             "marker_value": f"0x{int(sc.marker_value):08X}" if sc.marker_value is not None else "0x00000000",
             "image_hash": bool(sc.image_hash),
-            "image_hash_slot": sc.image_hash_slot or "",
+            "image_hash_slot": overrides.get("image_hash_slot", sc.image_hash_slot) or "",
             "image_digests": slot_image_digests,
             "expected_exec_sha256": expected_exec_sha,
             "allowed_image_hashes": allowed_hashes,
@@ -2344,6 +2361,7 @@ def _build_recovery_config_dict(
             "memory_checks": success_checks.get("memory_checks") or [],
             "config_checks": success_checks.get("config_checks") or [],
             "bootloader_integrity": bool(success_checks.get("bootloader_integrity")),
+            "bootloader_region": success_checks.get("bootloader_region"),
         },
     }
     return recovery_cfg, bytes(final_bytes), scrubbed_regions
@@ -2414,8 +2432,9 @@ def _render_reproduce_resc(
 
 def _render_reproduce_recovery_py() -> str:
     """Return IronPython 2.7 / Renode 1.16.1 & 1.17.0 compatible recovery boot & outcome script."""
-    return '''# Copyright (c) 2026 Neil Berkman
-# SPDX-License-Identifier: Apache-2.0
+    shared_checks = (SCRIPT_DIR / "success_checks.py").read_text(encoding="utf-8")
+    return shared_checks + '''
+
 # Standalone Renode recovery boot and outcome evaluator (IronPython 2.7 compatible).
 
 import base64
@@ -2556,50 +2575,6 @@ def _resolve_slot_hash_extent(bus, backend_dev, backend_kind, nvm_base, slot_bas
         if page_size and 0 < int(page_size) < slot_size:
             return slot_size - int(page_size)
     return slot_size - 4096 if slot_size > 4096 else slot_size
-
-
-def _evaluate_memory_checks(bus, checks):
-    all_ok = True
-    failed = []
-    for chk in checks or ():
-        addr = int(str(chk.get('address', '0')), 0)
-        width = int(chk.get('width', 4) or 4)
-        op = str(chk.get('op') or 'eq').strip().lower()
-        mask = chk.get('mask')
-        exp = chk.get('expected')
-        if width == 1:
-            actual = _as_int(bus.ReadByte(addr)) & 0xFF
-        elif width == 2:
-            actual = _as_int(bus.ReadWord(addr)) & 0xFFFF
-        else:
-            actual = _as_int(bus.ReadDoubleWord(addr)) & 0xFFFFFFFF
-        eff_val = (actual & int(str(mask), 0)) if mask is not None else actual
-        exp_val = int(str(exp), 0) if exp is not None else 0
-        if op in ('eq', '=='):
-            ok = (eff_val == exp_val)
-        elif op in ('ne', '!='):
-            ok = (eff_val != exp_val)
-        elif op == 'nonzero':
-            ok = (eff_val != 0)
-        elif op in ('gt', '>'):
-            ok = (eff_val > exp_val)
-        elif op in ('ge', '>='):
-            ok = (eff_val >= exp_val)
-        elif op in ('lt', '<'):
-            ok = (eff_val < exp_val)
-        elif op in ('le', '<='):
-            ok = (eff_val <= exp_val)
-        else:
-            ok = (eff_val == exp_val)
-        if not ok:
-            all_ok = False
-            failed.append({
-                'address': _fmt_u32(addr),
-                'op': op,
-                'actual': _fmt_u32(actual),
-                'expected': _fmt_u32(exp_val) if exp is not None else 'nonzero',
-            })
-    return all_ok, failed
 
 
 def run_standalone_reproducer():
@@ -2823,17 +2798,59 @@ def run_standalone_reproducer():
                 break
 
     # Run recovery boot loop
-    time_slice_s = max(0.002, min(0.05, float(rcfg.get('phase2_time_slice_s', 0.02) or 0.02)))
+    image_scoped_checks = has_image_scoped_checks(sc)
+    time_slice_s = float(rcfg.get('phase2_time_slice_s', 0.02) or 0.02)
+    if image_scoped_checks:
+        time_slice_s = max(0.001, time_slice_s)
+    else:
+        time_slice_s = max(0.002, min(0.05, time_slice_s))
     slice_str = '{:.3f}'.format(time_slice_s)
-    run_duration_s = max(0.1, float(rcfg.get('run_duration_s', 2.0) or 2.0))
+    run_duration_s = float(rcfg.get('run_duration_s', 2.0) or 2.0)
     wall_timeout_s = max(10.0, float(rcfg.get('phase2_wall_timeout_s', 30.0) or 30.0))
     stall_timeout_s = float(rcfg.get('progress_stall_timeout_s', 5.0) or 5.0)
     settle_iters = int(rcfg.get('vtor_settle_iters', 0) or 0)
-    max_iters = max(20, int(run_duration_s / time_slice_s) + 10)
 
     eff_vtor_slot = str(sc.get('vtor_in_slot') or '').strip()
     eff_pc_slot = str(sc.get('pc_in_slot') or '').strip()
     vec_offset = int(str(sc.get('vector_table_offset', '0')), 0)
+
+    page_size = int(rcfg.get('page_size', 4096) or 4096)
+    erase_regions = rcfg.get('erase_regions') or []
+    poll_address_checks = bool(sc.get('memory_checks') or image_scoped_checks)
+    if image_scoped_checks:
+        max_iters = DEFAULT_BOOT_OBSERVATION_SLICES
+    else:
+        max_iters = max(20, int(max(0.1, run_duration_s) / time_slice_s) + 10)
+
+    def evaluate_boot_checks(boot_slot):
+        hash_ok = True
+        matched_image = None
+        if sc.get('image_hash'):
+            hash_slot = str(sc.get('image_hash_slot') or '').strip()
+            if not hash_slot or hash_slot == 'any':
+                hash_slot = boot_slot
+            if hash_slot == boot_slot and hash_slot in slot_ranges:
+                hs_lo, hs_hi = slot_ranges[hash_slot]
+                extent = _resolve_slot_hash_extent(
+                    bus, backend_dev, backend_kind, nvm_base,
+                    hs_lo, hs_hi - hs_lo, erase_regions, page_size,
+                )
+                contents = _read_nvm_bytes(bus, backend_dev, backend_kind, nvm_base, hs_lo, extent)
+                digest = hashlib.sha256(contents).hexdigest()
+                allowed_hashes = sc.get('allowed_image_hashes') or []
+                matched_image = match_allowed_image(digest, allowed_hashes)
+                if allowed_hashes:
+                    hash_ok = matched_image is not None
+                elif sc.get('expected_exec_sha256'):
+                    hash_ok = digest == sc['expected_exec_sha256'].lower()
+        if image_scoped_checks and matched_image is None:
+            hash_ok = False
+        checks = evaluate_success_checks(
+            sc, bus, _as_int, _fmt_u32, matched_image,
+            int(str(rcfg.get('sram_start', '0')), 0),
+            int(str(rcfg.get('sram_end', '0')), 0),
+        )
+        return hash_ok, matched_image, checks
 
     started_wall = _time.time()
     start_virt = _read_machine_virtual_s(m_ref)
@@ -2870,23 +2887,42 @@ def run_standalone_reproducer():
         except Exception:
             pass
 
-        if sticky_vtor['captured']:
-            if vtor_settle_remaining > 0:
-                vtor_settle_remaining -= 1
-            else:
-                stop_reason = 'vtor_captured'
+        pending_checks = False
+        if poll_address_checks:
+            if lockup_observed or exception_active in (3, 4, 5, 6):
+                stop_reason = 'fault_exception'
+                break
+            sample_slot = sticky_vtor['slot'] or sticky_pc['slot']
+            if sample_slot:
+                if sticky_vtor['captured'] and vtor_settle_remaining > 0:
+                    vtor_settle_remaining -= 1
+                else:
+                    hash_ok, _matched_image, checks = evaluate_boot_checks(sample_slot)
+                    if not hash_ok or not checks['config_checks_ok'] or not checks['bootloader_integrity_ok']:
+                        stop_reason = 'content_mismatch'
+                        break
+                    if checks['memory_checks_ok']:
+                        stop_reason = 'success_checks_held'
+                        break
+                pending_checks = True
+        else:
+            if sticky_vtor['captured']:
+                if vtor_settle_remaining > 0:
+                    vtor_settle_remaining -= 1
+                else:
+                    stop_reason = 'vtor_captured'
+                    break
+
+            if eff_pc_slot and sticky_pc['captured'] and sticky_pc['slot'] == eff_pc_slot:
+                stop_reason = 'pc_captured'
                 break
 
-        if eff_pc_slot and sticky_pc['captured'] and sticky_pc['slot'] == eff_pc_slot:
-            stop_reason = 'pc_captured'
-            break
-
-        if lockup_observed or exception_active in (3, 4, 5, 6):
-            stop_reason = 'fault_exception'
-            break
+            if lockup_observed or exception_active in (3, 4, 5, 6):
+                stop_reason = 'fault_exception'
+                break
 
         pc_norm = pc_now & ~1
-        if last_pc_norm == pc_norm and _is_terminal_halt_pc(bus, pc_now):
+        if not pending_checks and last_pc_norm == pc_norm and _is_terminal_halt_pc(bus, pc_now):
             halt_hits += 1
             if halt_hits >= 2:
                 stop_reason = 'no_boot_terminal_loop'
@@ -2902,7 +2938,7 @@ def run_standalone_reproducer():
         w_cnt = int(getattr(backend_dev, 'TotalWordWrites', 0) or 0) if backend_dev is not None else 0
         e_cnt = int(getattr(backend_dev, 'TotalPageErases', 0) or 0) if backend_dev is not None else 0
         cur_key = (w_cnt, e_cnt, sticky_vtor['captured'], sticky_pc['captured'], pc_norm)
-        if last_key is None or cur_key != last_key:
+        if pending_checks or last_key is None or cur_key != last_key:
             last_key = cur_key
             last_progress_virt = now_virt
             last_progress_wall = now_wall
@@ -2965,28 +3001,7 @@ def run_standalone_reproducer():
         actual_marker = _as_int(bus.ReadDoubleWord(marker_addr))
         marker_ok = (actual_marker == marker_value)
 
-    page_size = int(rcfg.get('page_size', 4096) or 4096)
-    erase_regions = rcfg.get('erase_regions') or []
-    if sc.get('image_hash'):
-        hash_slot = str(sc.get('image_hash_slot') or '').strip()
-        if not hash_slot or hash_slot == 'any':
-            hash_slot = boot_slot or 'exec'
-        if hash_slot in slot_ranges:
-            hs_lo, hs_hi = slot_ranges[hash_slot]
-            ext = _resolve_slot_hash_extent(
-                bus, backend_dev, backend_kind, nvm_base, hs_lo, hs_hi - hs_lo, erase_regions, page_size
-            )
-            slot_data = _read_nvm_bytes(bus, backend_dev, backend_kind, nvm_base, hs_lo, ext)
-            actual_hash = hashlib.sha256(slot_data).hexdigest().lower()
-            allowed_list = sc.get('allowed_image_hashes') or []
-            exp_sha = str(sc.get('expected_exec_sha256') or '').strip().lower()
-            if allowed_list:
-                marker_ok = marker_ok and any(
-                    actual_hash == str(item.get('sha256') or '').strip().lower()
-                    for item in allowed_list
-                )
-            elif exp_sha:
-                marker_ok = marker_ok and (actual_hash == exp_sha)
+    hash_ok, matched_image, check_results = evaluate_boot_checks(boot_slot)
 
     approved_cfg = sc.get('approved_image_running')
     approved_failed_part = None
@@ -3009,7 +3024,32 @@ def run_standalone_reproducer():
                 approved_failed_part = 'digest'
                 marker_ok = False
 
-    mem_checks_ok, failed_mem_checks = _evaluate_memory_checks(bus, sc.get('memory_checks'))
+    failed_mem_checks = []
+    unmet_mem_checks = []
+    for check in check_results['memory_checks']:
+        if not check['ok']:
+            failure = dict(check)
+            idx = check.get('index')
+            addr_str = check.get('address') or 'unknown'
+            op_str = str(check.get('op') or 'eq')
+            if check.get('error'):
+                summary = 'memory_check[{}] @ {}: {}'.format(idx, addr_str, check.get('error'))
+            elif op_str == 'nonzero':
+                summary = 'memory_check[{}] @ {}: actual {} ({}) is zero (expected nonzero)'.format(
+                    idx, addr_str, check.get('actual_hex', check.get('actual')), check.get('actual')
+                )
+            else:
+                summary = 'memory_check[{}] @ {}: actual {} ({}) does not satisfy {} {}'.format(
+                    idx, addr_str, check.get('actual_hex', check.get('actual')), check.get('actual'),
+                    op_str, check.get('expected')
+                )
+            check_image = check.get('image') or matched_image
+            if check_image is not None:
+                failure['image'] = check_image
+                summary = 'image {}: {}'.format(check_image, summary)
+            failure['summary'] = summary
+            failed_mem_checks.append(failure)
+            unmet_mem_checks.append(summary)
 
     if approved_failed_part == 'digest':
         observed_outcome = 'wrong_image'
@@ -3025,9 +3065,10 @@ def run_standalone_reproducer():
         observed_outcome = 'misaligned_vtor'
     elif not pc_ok:
         observed_outcome = 'wrong_pc'
-    elif not vtor_ok or not marker_ok:
+    elif (not vtor_ok or not marker_ok or not hash_ok
+          or not check_results['config_checks_ok'] or not check_results['bootloader_integrity_ok']):
         observed_outcome = 'wrong_image'
-    elif not mem_checks_ok:
+    elif not check_results['memory_checks_ok']:
         observed_outcome = 'memory_checks_unmet'
     else:
         observed_outcome = 'success'
@@ -3044,6 +3085,7 @@ def run_standalone_reproducer():
         'matches_report': (observed_outcome == report_outcome),
         'boot_slot': boot_slot,
         'stop_reason': stop_reason,
+        'emulated_s': round(max(0.0, _read_machine_virtual_s(m_ref) - start_virt), 6),
         'vtor': _fmt_u32(actual_vtor),
         'pc': _fmt_u32(final_pc),
         'marker_actual': _fmt_u32(actual_marker) if marker_addr != 0 else None,
@@ -3052,7 +3094,12 @@ def run_standalone_reproducer():
         'specified_bytes_verified': specified_bytes_verified,
         'unspecified_bytes': unspecified_bytes_count,
         'uncorrectable_words': pstate.get('uncorrectable_words') or [],
+        'matched_image': matched_image,
+        'matched_allowed_image': matched_image,
+        'success_checks': check_results,
         'failed_memory_checks': failed_mem_checks,
+        'unmet_memory_checks': unmet_mem_checks,
+        'memory_checks_failure_reason': '; '.join(unmet_mem_checks) if unmet_mem_checks else None,
     }
     res_path = os.path.join(cwd, 'result.json')
     with open(res_path, 'w') as rf:

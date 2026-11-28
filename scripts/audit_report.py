@@ -351,6 +351,10 @@ def categorize_failure(
             payload["uncorrectable_read"] = signals.get("uncorrectable_read")
         if signals.get("matched_image") is not None:
             payload["matched_image"] = signals.get("matched_image")
+        if signals.get("matched_allowed_image") is not None:
+            payload["matched_allowed_image"] = signals["matched_allowed_image"]
+        if isinstance(signals.get("success_checks"), dict):
+            payload["success_checks"] = signals["success_checks"]
         if signals.get("unmet_memory_checks"):
             payload["unmet_memory_checks"] = signals.get("unmet_memory_checks")
         if signals.get("failed_memory_checks"):
@@ -1253,6 +1257,8 @@ def summarize_runtime_sweep(
                 "anti_rollback_ok",
                 "reset_vector_offset_ok",
                 "matched_image",
+                "matched_allowed_image",
+                "success_checks",
                 "image_hash_actual",
                 "approved_image_running",
             )

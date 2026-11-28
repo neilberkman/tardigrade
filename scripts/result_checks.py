@@ -562,6 +562,11 @@ def annotate_result_checks(
         signals = result.get("signals")
         if isinstance(signals, dict) and signals.get("matched_image") is not None:
             result["matched_image"] = signals.get("matched_image")
+        if isinstance(signals, dict) and signals.get("matched_allowed_image") is not None:
+            result["matched_allowed_image"] = signals.get("matched_allowed_image")
+        if isinstance(signals, dict) and isinstance(signals.get("success_checks"), dict):
+            result.setdefault("criteria_observations", signals["success_checks"])
+            result["success_checks"] = signals["success_checks"]
         if isinstance(signals, dict) and isinstance(
             signals.get("approved_image_running"), dict
         ):

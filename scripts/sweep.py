@@ -1777,8 +1777,23 @@ def evaluate_config_checks(result: Dict[str, Any], profile: "ProfileConfig") -> 
     config_values = result.get("config_values", {})
     if not isinstance(config_values, dict):
         return None
+    signals = result.get("signals") if isinstance(result.get("signals"), dict) else {}
+    matched_image = (
+        result.get("matched_allowed_image")
+        or signals.get("matched_allowed_image")
+        or result.get("matched_image")
+        or signals.get("matched_image")
+    )
     for check in config_checks:
-        addr_key = "0x{:X}".format(check.address)
+        if getattr(check, "is_image_scoped", False):
+            if matched_image is None:
+                return "config_lost"
+            address = check.address_for_image(matched_image)
+            if address is None:
+                continue
+        else:
+            address = check.address
+        addr_key = "0x{:X}".format(address)
         if addr_key not in config_values:
             return "config_lost"
         actual = config_values[addr_key]
