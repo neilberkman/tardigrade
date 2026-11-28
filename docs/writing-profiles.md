@@ -123,6 +123,90 @@ original update. After one cut the computed source boot is boot two, the
 same boot that arms cut two in the live chain. Use timing relative to that
 boot, independently of search traversal order or host wall time.
 
+### Boot role and recovery boot invocation sequence
+
+Tardigrade exposes the active boot's role (`boot_role`) to `setup_script`,
+`boot_cycle_hook`, and `state_probe` (`collect_state`, `probe`, and
+`describe_ranges`) on every boot:
+
+| Field | Python global / `context` key | Renode monitor variable | Values |
+| --- | --- | --- | --- |
+| `boot_role["phase"]` | `boot_phase`, `context["boot_phase"]` | `$boot_phase` | `"first_operation"` or `"recovery"` |
+| `boot_role["generation"]` | `boot_generation`, `context["boot_generation"]` | `$boot_generation` | `0` on `first_operation`; `1`, `2`, … on recovery after cut `1`, `2`, … |
+| `boot_role["source"]` | `boot_source`, `context["boot_source"]` | `$boot_source` | `"computed_source"` (`state_search`, trace replay) or `"live_injection"` (live execute, `phase2_fault`, `phase2_fault_chain`, `multi_fault`, `tardigrade debug`) |
+| `boot_role["is_computed_source"]` | `is_computed_source`, `context["is_computed_source"]` | `$boot_is_computed_source` (`"true"` / `"false"`) | `True` for `"computed_source"`, `False` for `"live_injection"` |
+| `boot_role["is_live_injection"]` | `is_live_injection`, `context["is_live_injection"]` | `$boot_is_live_injection` (`"true"` / `"false"`) | `True` for `"live_injection"`, `False` for `"computed_source"` |
+| `boot_role["preceding_cut"]` | `preceding_cut`, `cut`, `context["preceding_cut"]` | `$boot_preceding_cut_json`, `$boot_cut_operation`, `$boot_cut_index`, `$boot_cut_address`, `$boot_cut_fault_type` | `None` on `first_operation`; normalized dict `{cut, operation, operation_index, fault_type, address, pc, call_context, torn_word_mode}` on `recovery` |
+| `boot_role["preceding_cuts"]` | `preceding_cuts`, `context["preceding_cuts"]` | `$boot_preceding_cuts_json` | `[]` on `first_operation`; ordered list of normalized cut dicts leading to this recovery boot |
+| `boot_role["reset_kind"]` | `boot_reset_kind`, `reset_kind`, `context["reset_kind"]` | `$boot_reset_kind` | `"power_on"`, `"power_loss"`, or `"warm"` |
+| `boot_role["cycle"]` | `boot_cycle`, `context["cycle"]` | `$boot_cycle` | `0` on the initial boot of a generation; `1..boot_cycles-1` on follow-up cycles |
+
+In `setup_script` (`.resc`), both Renode monitor variables (`$boot_phase`,
+`$boot_generation`, `$boot_source`, `$boot_reset_kind`, `$boot_cut_index`,
+etc.) and IronPython globals (`boot_role`, `get_boot_role()`, `boot_phase`,
+`boot_generation`, `boot_source`, `is_computed_source`, `is_live_injection`,
+`preceding_cut`, `preceding_cuts`, `boot_reset_kind`, `boot_cycle`) are updated
+before `include @<setup_script>` runs. This lets a single `setup_script`
+branch on `boot_phase == "first_operation"` vs `boot_phase == "recovery"` (or
+`boot_generation`) to seed an initial request on boot one and deliver a host
+recovery message on recovery boots.
+
+Wherever the engine controls execution, a computed-source recovery boot
+(`state_search` and trace replay) and a live recovery boot (`run_execute_fault`,
+`run_phase2_fault`, and `run_phase2_fault_chain`) execute the identical
+sequence of reset, state restoration, script, and hook invocations:
+
+1. **Bind `boot_role`**: Set `phase="recovery"`, `generation=k`,
+   `source="computed_source"` (or `"live_injection"`), `preceding_cut`,
+   `preceding_cuts`, `reset_kind="power_loss"` (or `"warm"` for non-power
+   faults), and `cycle=0`.
+2. **Reset machine and re-enable CPU time handles**: Run `_machine_reset()`
+   (`powerDomain.PowerLost` → `machine Reset` → `powerDomain.PowerRestored`
+   when `PowerResetDomain` is active) and pause (`machine Pause`). Both
+   `PowerResetDomain` (`PowerRestored`, `Reset`, `WarmReset`) and the Python
+   reset handler re-enable `cpu.TimeHandle.Enabled = true` on every unhalted
+   CPU so that every released CPU runs from the exact reset instant without a
+   1-quantum lag, even when the preceding run halted the CPU mid-quantum from a
+   memory hook, watchpoint, interrupt-begin hook, or peripheral fault.
+3. **Clear volatile state**: Zero `memory.sram` and declared
+   `memory.volatile_regions` (preserving `memory.retained_regions`), verify
+   that any volatile `success_criteria.marker_address` was cleared, reload the
+   bootloader ELF segments, and restore platform hardware-init registers.
+4. **Restore persistent snapshot and uncorrectable marks**: Write the faulted
+   or computed persistent NVM bytes (`saved_flash`), restore any separate OTP
+   snapshot, and restore MRAM uncorrectable-word marks (`uncorrectable_offsets`).
+5. **Run `setup_script`**: Export `boot_role` to Python globals and Renode
+   monitor variables and execute `include @<setup_script>` (or the active
+   `update_sequence` phase's `setup_script`). Declarative `pre_boot_state` /
+   `update_trigger` writes run only on `first_operation` (`generation == 0`),
+   never on `recovery`, so they never clobber the cut's persistent state.
+6. **Prime CPU entry**: Run `prime_bootloader_entry()` to load `SP` and `PC`
+   from the vector table at `bootloader.entry` in the restored image, set
+   `cpu.IsHalted = False`, and re-verify `cpu.TimeHandle.Enabled = True` on all
+   released CPUs.
+7. **Probe `fault_snapshot` state**: Invoke `state_probe` (`collect_state` or
+   `probe`) with `context["stage"] == "fault_snapshot"` and
+   `context["boot_role"]`.
+8. **Prepare counters and run cycle 0**: Reset peripheral counters for recovery
+   (`reset_nvmc_for_recovery`), re-affirm MRAM uncorrectable-word marks, clear
+   the uncorrectable-read log, and run CPU emulation (`run_until_done`).
+9. **Evaluate cycle 0 and probe `boot_cycle` (`cycle=0`)**: Evaluate
+   `evaluate_boot_outcome`; when `boot_cycles > 1`, invoke `state_probe` with
+   `context["stage"] == "boot_cycle"`, `context["cycle"] == 0`, and
+   `context["boot_role"]`.
+10. **Run follow-up boot cycles (`1..boot_cycles-1`)**: For each follow-up
+    cycle `c`, update `boot_role` to `cycle=c` and `reset_kind="warm"`, invoke
+    `boot_cycle_hook` (passing `boot_role` via `context` and globals), snapshot
+    current persistent NVM and uncorrectable marks, repeat steps 2–6 with
+    `reset_kind="warm"` (including `setup_script` and
+    `prime_bootloader_entry()`), run CPU emulation for cycle `c`, and invoke
+    `state_probe` with `context["stage"] == "boot_cycle"`,
+    `context["cycle"] == c`, and `context["boot_role"]`.
+11. **Probe `post_boot` state and explain failures**: Restore `boot_role` to
+    `cycle=0` and invoke `state_probe` with `context["stage"] == "post_boot"`
+    and `context["boot_role"]`. During post-run failure explanation,
+    `state_probe.describe_ranges(context)` also receives `context["boot_role"]`.
+
 ## Profile inheritance
 
 A profile can extend a base profile with `base_profile`. The child profile deep-merges on top of the base: dicts merge recursively, lists and scalars in the child replace the base value. The base path is resolved relative to the child profile's directory.
@@ -1580,7 +1664,7 @@ fault_sweep:
 
 `boot_cycles` runs the recovery boot N times. Between each boot, `boot_cycle_hook` runs a Python script that can write to NVM (simulating app confirmation). `expected_rollback_at_cycle` tells the `successful_rollback` invariant when rollback should complete.
 
-A hook script is a Python file with a `run(monitor)` function:
+A hook script is a Python file with a `run(monitor)` function (or raw top-level statements executed in the hook namespace). Both `context["boot_role"]` (and top-level `boot_role`, `boot_phase`, `boot_generation`, `boot_source`, `is_computed_source`, `is_live_injection`, `preceding_cut`, `preceding_cuts`, `boot_reset_kind`, `boot_cycle`) and the Renode monitor variables (`$boot_phase`, `$boot_generation`, `$boot_source`, `$boot_reset_kind`, `$boot_cycle`, etc.) are populated before the hook executes:
 
 ```python
 def run(monitor):
@@ -1624,7 +1708,7 @@ state_probe:
   script: targets/nxboot/probe.py
 ```
 
-The probe script must define `probe(monitor) -> dict` that reads memory via `monitor.Parse()` and returns a dict. The returned state is available to assertions and invariants as `nvm_state`.
+The probe script must define `collect_state(bus, context) -> dict` or `probe(monitor) -> dict` (and optionally `describe_ranges(context) -> list[dict]` for failure explanations). At every probe stage (`"fault_snapshot"`, `"boot_cycle"`, `"post_boot"`, `"update_phase_post_boot"`, and offline `describe_ranges`), `context["boot_role"]` (along with `context["boot_phase"]`, `context["boot_generation"]`, `context["boot_source"]`, `context["is_computed_source"]`, `context["is_live_injection"]`, `context["preceding_cut"]`, `context["preceding_cuts"]`, and `context["reset_kind"]`, plus the matching probe module globals) describes the active boot's role. The returned state is available to assertions and invariants as `nvm_state`.
 
 ### Semantic assertions
 
