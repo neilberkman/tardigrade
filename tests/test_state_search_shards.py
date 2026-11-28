@@ -24,7 +24,7 @@ def operations(values):
 
 
 def model(index=None, limit=100, expire_after=None, sample=1, *, count=4,
-          explorer_only=False, plan_only=False):
+          explorer_only=False, plan_only=False, order="breadth_first"):
     boots = []
     def boot(state, chain, generation):
         value = state.materialize()["nvm"][0]
@@ -49,6 +49,7 @@ def model(index=None, limit=100, expire_after=None, sample=1, *, count=4,
         boot_state=boot, backend_kind="mram", torn_word_mode="programmed",
         address_ranges=[{"start": 0, "end": 0}], cross_check_every=sample,
         cross_check=lambda *_: {"matched": True},
+        order=order,
     )
     if index is None:
         explorer = RecoveryStateExplorer(**options)
@@ -280,3 +281,42 @@ def test_shard_plan_predicts_owned_second_generation(index):
         assert {key: plan_row[key] for key in full_row} == full_row
     assert [r["owned_generation_two_candidates"] for r in traces] == counts
     assert plan["generation_two_candidates"] == sum(counts)
+
+
+@pytest.mark.parametrize("sample", [0, 1, 2, 3])
+def test_best_first_unlimited_shard_merge_matches_single_and_breadth_first_outcomes(sample):
+    from merge_state_search import merge_reports
+
+    reports = [model(i, limit=100, sample=sample, order="best_first") for i in reversed(range(4))]
+    merged = merge_reports(reports)
+    rows, summary = model(limit=100, sample=sample, order="best_first")
+    assert merged["runtime_sweep_results"] == rows
+    assert merged["summary"]["runtime_sweep"]["recovery_state_search"] == summary
+    assert merged["summary"]["runtime_sweep"]["campaign_complete"] is True
+    bfs_rows, _bfs_summary = model(limit=100, sample=sample, order="breadth_first")
+    assert {
+        r["recovery_state_search"]["state_identity"]: r["boot_outcome"] for r in rows
+    } == {
+        r["recovery_state_search"]["state_identity"]: r["boot_outcome"] for r in bfs_rows
+    }
+
+
+@pytest.mark.parametrize("limit", [1, 3, 6])
+@pytest.mark.parametrize("index", range(4))
+def test_best_first_shard_resume_preserves_evidence_and_counts(index, limit):
+    first = model(index, limit, explorer_only=True, order="best_first")
+    first.run()
+    checkpoint = json.loads(json.dumps(first.checkpoint({})))
+    expected = model(index, explorer_only=True, order="best_first")
+    rows, summary = expected.run()
+    if checkpoint is None:
+        assert len(first.results) == len(rows)
+        return
+    resumed = model(index, 100 - limit, explorer_only=True, order="best_first")
+    resumed.restore(checkpoint, {})
+    actual, resumed_summary = resumed.run()
+    for row in actual:
+        row["recovery_state_search"].pop("resume_origin")
+    assert actual == rows
+    assert resumed_summary == summary
+    assert resumed.partition == expected.partition

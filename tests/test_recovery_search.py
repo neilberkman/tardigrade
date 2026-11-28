@@ -1541,3 +1541,454 @@ def test_guided_boot_preserves_trace_context_and_sibling_comparison():
     comparison = bad["_sibling_snapshot_comparison"]
     assert comparison["sibling"] == good["recovery_state_search"]["state_identity"]
     assert comparison["comparison"]["ranges"]
+
+
+def _make_best_first_tiered_fixture(with_coverage=False):
+    # Slot layout: exec slot [0x0000, 0x4000) with page_size=0x1000 (4096).
+    # - Boundary region: [0x0000, 0x2000)
+    # - Bulk region:     [0x2000, 0x3000)
+    # - Trailer region:  [0x3000, 0x4000), trailer tail [0x3FC0, 0x4000)
+    # - Declared metadata_regions: [0x3800, 0x3900)
+    baseline = PersistentState.from_bytes(
+        b"\xff" * 0x4000,
+        name="nvm",
+        base_address=0,
+    )
+    calibration_writes = [
+        # 8 bulk writes in [0x2000, 0x2020)
+        _write(1, 0x2000, 0x11111111),
+        _write(2, 0x2004, 0x22222222),
+        _write(3, 0x2008, 0x33333333),
+        _write(4, 0x200C, 0x44444444),
+        _write(5, 0x2010, 0x55555555),
+        _write(6, 0x2014, 0x66666666),
+        # 1 boundary write in [0x0100, 0x0104)
+        _write(7, 0x0100, 0x77777777),
+        # 2 declared metadata writes in [0x3800, 0x3808)
+        _write(8, 0x3800, 0x88888888),
+        _write(9, 0x3804, 0x99999999),
+        # 1 trailer tail write at 0x3FF0
+        _write(10, 0x3FF0, 0xAAAAAAAA),
+    ]
+    calibration = merge_operation_traces(calibration_writes, [])
+
+    def boot_state(state, chain, generation):
+        first_op = int(chain[0]["operation_index"])
+        last_op = int(chain[-1]["operation_index"])
+        outcome = "success"
+        if generation == 2 and first_op == 9 and last_op == 2:
+            outcome = "no_boot"
+        result = {
+            "boot_outcome": outcome,
+            "boot_slot": "exec",
+            "fault_injected": True,
+            "signals": {},
+        }
+        if with_coverage:
+            if generation == 1:
+                if first_op in (7, 8):
+                    pcs = [0x1000, 0x1004]
+                elif first_op == 9:
+                    pcs = [0x1000, 0x2000, 0x2004]
+                else:
+                    pcs = [0x1000]
+            else:
+                pcs = [0x1000, 0x3000 + 4 * first_op + last_op]
+            result["recovery_coverage"] = {"executed_pcs": pcs}
+
+        if generation >= 2:
+            return result, ()
+
+        # Each Generation-1 state produces a recovery trace with 2 bulk writes
+        # and 1 trailer-tail write (index 2).
+        rec_writes = [
+            _write(1, 0x2100 + first_op * 0x10, 0xA0000001 + first_op),
+            _write(2, 0x2104 + first_op * 0x10, 0xB0000002 + first_op),
+            _write(3, 0x3FC0 + first_op * 4, 0xC0000003 + first_op),
+        ]
+        return result, merge_operation_traces(rec_writes, [])
+
+    return baseline, calibration, boot_state
+
+
+def test_best_first_without_coverage_orders_metadata_and_recovery_cuts_before_bulk():
+    baseline, calibration, boot_state = _make_best_first_tiered_fixture(
+        with_coverage=False
+    )
+    explorer = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=tuple(range(10)),
+        max_cuts=2,
+        max_new_states=7,
+        max_wall_time_s=30,
+        clock=lambda: 0.0,
+        boot_state=boot_state,
+        order="best_first",
+        page_size=0x1000,
+        slot_ranges=[{"start": 0x0000, "end": 0x4000}],
+        metadata_regions=[{"start": 0x3800, "end": 0x3900}],
+        starvation_guard_interval=0,
+    )
+    rows, summary = explorer.run()
+    assert summary["order"] == "best_first"
+    assert summary["stopped_reason"] == "max_new_states"
+    # Metadata first cuts (indices 7, 8, 9) and their metadata recovery cuts
+    # (generation 2 at index 2) are evaluated ahead of bulk first cuts (0..5).
+    chains = [
+        tuple(
+            cut["operation_index"]
+            for cut in r["recovery_state_search"]["chain"]["cuts"]
+        )
+        for r in rows
+    ]
+    assert (7,) in chains
+    assert (8,) in chains
+    assert (9,) in chains
+    assert (9, 2) in chains
+    assert any(r["boot_outcome"] == "no_boot" for r in rows)
+    # Generation-2 metadata cuts were interleaved before all Generation-1 cuts finished.
+    generations = [r["recovery_state_search"]["generation"] for r in rows]
+    assert 2 in generations
+    assert summary["evaluated_states_by_generation"]["2"] >= 1
+    assert summary["evaluated_states_by_tier"]["metadata"] >= 4
+
+
+def test_best_first_with_coverage_prioritizes_novel_signature_parents_across_generations():
+    baseline, calibration, boot_state = _make_best_first_tiered_fixture(
+        with_coverage=True
+    )
+    explorer = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=tuple(range(10)),
+        max_cuts=2,
+        max_new_states=6,
+        max_wall_time_s=30,
+        clock=lambda: 0.0,
+        boot_state=boot_state,
+        order="best_first",
+        page_size=0x1000,
+        slot_ranges=[{"start": 0x0000, "end": 0x4000}],
+        metadata_regions=[{"start": 0x3800, "end": 0x3900}],
+        starvation_guard_interval=0,
+    )
+    rows, summary = explorer.run()
+    chains = [
+        tuple(
+            cut["operation_index"]
+            for cut in r["recovery_state_search"]["chain"]["cuts"]
+        )
+        for r in rows
+    ]
+    # Cut 8 shares cut 7's coverage signature [0x1000, 0x1004], so after cut 7 is
+    # probed, cut 8 is not expanded ahead of cut 9; cut 9 reaches novel signature
+    # [0x1000, 0x2000, 0x2004] and its recovery cut (9, 2) is immediately expanded
+    # ahead of (8, 2).
+    assert (9, 2) in chains
+    assert (8, 2) not in chains
+    assert any(r["boot_outcome"] == "no_boot" for r in rows)
+    assert summary["evaluated_states_by_generation"]["2"] >= 2
+
+
+def test_best_first_starvation_guard_evaluates_generation_one_in_trace_order():
+    baseline, calibration, boot_state = _make_best_first_tiered_fixture(
+        with_coverage=True
+    )
+    explorer = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=tuple(range(10)),
+        max_cuts=2,
+        max_new_states=8,
+        max_wall_time_s=30,
+        clock=lambda: 0.0,
+        boot_state=boot_state,
+        order="best_first",
+        page_size=0x1000,
+        slot_ranges=[{"start": 0x0000, "end": 0x4000}],
+        metadata_regions=[{"start": 0x3800, "end": 0x3900}],
+        starvation_guard_interval=3,
+    )
+    rows, _summary = explorer.run()
+    chains = [
+        tuple(
+            cut["operation_index"]
+            for cut in r["recovery_state_search"]["chain"]["cuts"]
+        )
+        for r in rows
+    ]
+    # Despite bulk first cuts (0, 1, ...) having tier_rank=2, the starvation
+    # guard periodically schedules Generation-1 cuts in trace order (0, then 1).
+    assert (0,) in chains
+    assert (1,) in chains
+    assert chains.index((0,)) < chains.index((1,))
+
+
+def test_best_first_determinism_across_repeated_runs():
+    baseline, calibration, boot_state = _make_best_first_tiered_fixture(
+        with_coverage=True
+    )
+    runs = []
+    for _ in range(3):
+        explorer = RecoveryStateExplorer(
+            baseline,
+            calibration,
+            first_cuts=tuple(range(10)),
+            max_cuts=2,
+            max_new_states=15,
+            max_wall_time_s=30,
+            clock=lambda: 0.0,
+            boot_state=boot_state,
+            order="best_first",
+            page_size=0x1000,
+            slot_ranges=[{"start": 0x0000, "end": 0x4000}],
+            metadata_regions=[{"start": 0x3800, "end": 0x3900}],
+        )
+        runs.append(explorer.run())
+    first_rows, first_summary = runs[0]
+    for rows, summary in runs[1:]:
+        assert rows == first_rows
+        assert summary == first_summary
+
+
+def test_best_first_unlimited_equals_breadth_first_and_limited_reports_tier_generation_counts():
+    baseline, calibration, boot_state = _make_best_first_tiered_fixture(
+        with_coverage=True
+    )
+    common_kwargs = dict(
+        first_cuts=tuple(range(10)),
+        max_cuts=2,
+        max_wall_time_s=30,
+        clock=lambda: 0.0,
+        boot_state=boot_state,
+        page_size=0x1000,
+        slot_ranges=[{"start": 0x0000, "end": 0x4000}],
+        metadata_regions=[{"start": 0x3800, "end": 0x3900}],
+    )
+    bfs_rows, bfs_summary = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        max_new_states=200,
+        order="breadth_first",
+        **common_kwargs,
+    ).run()
+    bf_rows, bf_summary = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        max_new_states=200,
+        order="best_first",
+        **common_kwargs,
+    ).run()
+    assert bfs_summary["complete"] is True
+    assert bf_summary["complete"] is True
+    assert bf_summary["states_booted"] == bfs_summary["states_booted"]
+    bfs_outcomes = {
+        r["recovery_state_search"]["state_identity"]: r["boot_outcome"]
+        for r in bfs_rows
+    }
+    bf_outcomes = {
+        r["recovery_state_search"]["state_identity"]: r["boot_outcome"]
+        for r in bf_rows
+    }
+    assert bf_outcomes == bfs_outcomes
+    assert bf_summary["unexpanded_states_by_generation"] == {}
+    assert bf_summary["unexpanded_states_by_tier"] == {
+        "metadata": 0,
+        "boundary": 0,
+        "bulk": 0,
+    }
+
+    # Under a limit, per-generation and per-tier counts of evaluated and
+    # unexpanded states are reported in summary.
+    lim_rows, lim_summary = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        max_new_states=8,
+        order="best_first",
+        **common_kwargs,
+    ).run()
+    assert lim_summary["complete"] is False
+    assert lim_summary["stopped_reason"] == "max_new_states"
+    assert sum(lim_summary["evaluated_states_by_generation"].values()) == len(
+        lim_rows
+    )
+    assert sum(lim_summary["evaluated_states_by_tier"].values()) == len(
+        lim_rows
+    )
+    assert sum(lim_summary["unexpanded_states_by_generation"].values()) > 0
+    assert (
+        sum(lim_summary["unexpanded_states_by_tier"].values())
+        == sum(lim_summary["unexpanded_states_by_generation"].values())
+    )
+
+
+@pytest.mark.parametrize("with_coverage", [False, True])
+@pytest.mark.parametrize("split_at", [3, 7, 12])
+def test_best_first_checkpoint_resume_and_plan_only_sizing(
+    with_coverage, split_at
+):
+    import json
+
+    baseline, calibration, boot_state = _make_best_first_tiered_fixture(
+        with_coverage=with_coverage
+    )
+    common_kwargs = dict(
+        first_cuts=tuple(range(10)),
+        max_cuts=2,
+        max_wall_time_s=30,
+        clock=lambda: 0.0,
+        boot_state=boot_state,
+        order="best_first",
+        page_size=0x1000,
+        slot_ranges=[{"start": 0x0000, "end": 0x4000}],
+        metadata_regions=[{"start": 0x3800, "end": 0x3900}],
+    )
+    full_rows, full_summary = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        max_new_states=100,
+        **common_kwargs,
+    ).run()
+
+    part1 = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        max_new_states=split_at,
+        **common_kwargs,
+    )
+    part1.run()
+    ckpt = json.loads(json.dumps(part1.checkpoint({})))
+    assert ckpt is not None
+
+    part2 = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        max_new_states=100 - split_at,
+        **common_kwargs,
+    )
+    part2.restore(ckpt, {})
+    resumed_rows, resumed_summary = part2.run()
+    for row in resumed_rows:
+        row["recovery_state_search"].pop("resume_origin", None)
+    assert resumed_rows == full_rows
+    assert resumed_summary == full_summary
+
+    # Plan-only sizing under order="best_first" matches breadth_first sizing.
+    plan_bf = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        max_new_states=100,
+        plan_only=True,
+        **common_kwargs,
+    )
+    _, plan_bf_summary = plan_bf.run()
+    plan_bfs = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=tuple(range(10)),
+        max_cuts=2,
+        max_new_states=100,
+        max_wall_time_s=30,
+        clock=lambda: 0.0,
+        boot_state=boot_state,
+        order="breadth_first",
+        plan_only=True,
+        page_size=0x1000,
+        slot_ranges=[{"start": 0x0000, "end": 0x4000}],
+        metadata_regions=[{"start": 0x3800, "end": 0x3900}],
+    )
+    _, plan_bfs_summary = plan_bfs.run()
+    assert (
+        plan_bf_summary["generation_two_plan"]
+        == plan_bfs_summary["generation_two_plan"]
+    )
+
+
+def test_best_first_sharded_merge_matches_unsharded():
+    from audit_report import summarize_runtime_sweep
+    from merge_state_search import merge_reports
+    from recovery_search_shard import ShardedRecoveryStateExplorer
+
+    baseline, calibration, boot_state = _make_best_first_tiered_fixture(
+        with_coverage=True
+    )
+    slots = {"exec": {"base": 0x0000, "size": 0x4000}}
+    metadata_regions = [{"start": 0x3800, "end": 0x3900}]
+    expect = {
+        "control_outcome": "success",
+        "should_find_issues": True,
+        "mode": "regression",
+    }
+    shard_reports = []
+    for shard_idx in range(3):
+        explorer = ShardedRecoveryStateExplorer(
+            baseline,
+            calibration,
+            first_cuts=tuple(range(10)),
+            max_cuts=2,
+            max_new_states=100,
+            max_wall_time_s=30,
+            clock=lambda: 0.0,
+            boot_state=boot_state,
+            order="best_first",
+            page_size=0x1000,
+            slots=slots,
+            metadata_regions=metadata_regions,
+            shard_count=3,
+            shard_index=shard_idx,
+        )
+        rows, _summary = explorer.run()
+        runtime = summarize_runtime_sweep(
+            rows, expected_fault_points=1, expected_control_points=0
+        )
+        shard_reports.append(
+            {
+                "state_search_shard": {
+                    **explorer.partition,
+                    "firmware_sha256": "1" * 64,
+                    "profile_sha256": "2" * 64,
+                    "tardigrade_revision": "3" * 40,
+                    "renode_version": "1.17.0",
+                    "report_context": {
+                        "expect": expect,
+                        "page_size": 0x1000,
+                        "slots": slots,
+                        "metadata_regions": metadata_regions,
+                        "planned_fault_types": ["rs"],
+                        "total_writes": 10,
+                        "calibration_point_coverage": {},
+                    },
+                },
+                "summary": {"runtime_sweep": runtime},
+                "runtime_sweep_results": rows,
+                "expect": expect,
+                "profile": "bf_sharded",
+                "calibrated_writes": 10,
+                "fault_points_tested": 1,
+            }
+        )
+
+    merged = merge_reports(shard_reports)
+    single_rows, single_summary = RecoveryStateExplorer(
+        baseline,
+        calibration,
+        first_cuts=tuple(range(10)),
+        max_cuts=2,
+        max_new_states=100,
+        max_wall_time_s=30,
+        clock=lambda: 0.0,
+        boot_state=boot_state,
+        order="best_first",
+        page_size=0x1000,
+        slots=slots,
+        metadata_regions=metadata_regions,
+    ).run()
+    summarize_runtime_sweep(
+        single_rows, expected_fault_points=1, expected_control_points=0
+    )
+    assert merged["runtime_sweep_results"] == single_rows
+    assert (
+        merged["summary"]["runtime_sweep"]["recovery_state_search"]
+        == single_summary
+    )
