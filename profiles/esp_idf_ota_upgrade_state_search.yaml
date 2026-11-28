@@ -1,0 +1,80 @@
+schema_version: 1
+name: esp_idf_ota_upgrade_state_search
+description: >
+  ESP-IDF OTA bootloader model — upgrade scenario with recovery-state search
+  across write and erase cuts with mixed torn-word outcomes and live
+  cross-checks.
+
+platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
+bootloader:
+  elf: examples/esp_idf_ota/esp_idf_ota.elf
+  entry: 0x00000000
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  slots:
+    exec: { base: 0x0000C000, size: 0x74000 }
+    staging: { base: 0x00080000, size: 0x74000 }
+images:
+  exec: examples/esp_idf_ota/slot0.bin
+  staging: examples/esp_idf_ota/slot1.bin
+
+metadata_fault_regions:
+  - { name: otadata0, start: 0x000F8000, end: 0x000F9000 }
+  - { name: otadata1, start: 0x000F9000, end: 0x000FA000 }
+
+pre_boot_state:
+  # Entry 0 (sector 0 at 0xF8000): ota_seq=1, VALID
+  - { address: 0x000F8000, u32: 0x00000001 }
+  - { address: 0x000F8018, u32: 0x00000002 }
+  - { address: 0x000F801C, u32: 0x4743989A }
+  # Entry 1 (sector 1 at 0xF9000): ota_seq=2, NEW
+  - { address: 0x000F9000, u32: 0x00000002 }
+  - { address: 0x000F9018, u32: 0x00000000 }
+  - { address: 0x000F901C, u32: 0x55F63774 }
+  # Trigger one-shot copy-on-boot update path (staging -> exec).
+  - { address: 0x000FC040, u32: 0x55445021 }
+
+success_criteria:
+  vtor_in_slot: any
+
+invariant_providers:
+  - targets/esp_idf/invariants.py
+invariants:
+  - esp_idf_otadata_crc_integrity
+  - esp_idf_pending_verify_gets_aborted
+  - esp_idf_seq_not_zero
+
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  include_erase_fault_points: true
+  torn_word: [fixed, untouched, programmed, { partial_bits: 3 }]
+  torn_word_seed: 20261127
+  max_writes: auto
+  max_writes_cap: 200000
+  run_duration: "2.0"
+  max_step_limit: 20000000
+  fault_types: [power_loss]
+  phase2_fault:
+    enabled: true
+    first_fault_types: [power_loss, interrupted_erase]
+    fault_types: [power_loss, interrupted_erase]
+    state_search:
+      enabled: true
+      first_cuts:
+        mode: ranges
+        ranges:
+          - { start: 0, end: 7 }
+          - { start: 2048, end: 2051 }
+      max_cuts: 3
+      max_new_states: 64
+      max_wall_time_s: 300
+      address_ranges:
+        - { start: 0x0000C000, end: 0x0000C01F }
+        - { start: 0x000F8000, end: 0x000FCFFF }
+      cross_check_every: 4
+skip_self_test: true
+expect:
+  should_find_issues: false

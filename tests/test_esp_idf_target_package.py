@@ -329,6 +329,21 @@ class TestInvariants(unittest.TestCase):
         # Should not raise
         check_esp_idf_seq_not_zero(self._result(state))
 
+    def test_esp_idf_state_search_profiles_load_strict(self) -> None:
+        from profile_loader import load_profile
+
+        for name in (
+            "esp_idf_ota_rollback_state_search.yaml",
+            "esp_idf_ota_upgrade_state_search.yaml",
+        ):
+            with self.subTest(profile=name):
+                loaded = load_profile(ROOT / "profiles" / name, strict=True)
+                self.assertTrue(loaded.fault_sweep.include_erase_fault_points)
+                self.assertTrue(loaded.fault_sweep.torn_word_explicit)
+                self.assertEqual(loaded.fault_sweep.torn_word_seed, 20261127)
+                self.assertTrue(loaded.fault_sweep.phase2_fault.state_search.enabled)
+                self.assertFalse(loaded.expect.should_find_issues)
+
 
 if __name__ == "__main__":
     unittest.main()
