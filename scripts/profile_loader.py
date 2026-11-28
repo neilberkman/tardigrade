@@ -4548,9 +4548,10 @@ class ProfileConfig:
                 "IMAGE_{}_LOAD_ADDR:0x{:08X}".format(slot_name.upper(), int(load_addr))
             )
 
-        # Images (robot variables for Load Runtime Scenario + paths for batch reload).
-        for img_name, img_path in self.images.items():
-            resolved = self.resolve_path(repo_root, img_path)
+        # Set both the initial load and reload paths, including empty slots.
+        for img_name in mem.slots:
+            img_path = self.images.get(img_name)
+            resolved = self.resolve_path(repo_root, img_path) if img_path else ""
             vars_list.append("IMAGE_{}:{}".format(img_name.upper(), resolved))
             vars_list.append("IMAGE_{}_PATH:{}".format(img_name.upper(), resolved))
 
@@ -5148,6 +5149,25 @@ def _require(data: Dict[str, Any], key: str, context: str = "") -> Any:
         where = " in {}".format(context) if context else ""
         raise ProfileError("missing required field '{}'{}.".format(key, where))
     return data[key]
+
+
+def _image_path(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ProfileError("{}: expected a non-empty image path".format(field))
+    return value
+
+
+def _parse_images(raw: Any, field: str, slots: Dict[str, SlotConfig]) -> Dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ProfileError("{}: expected mapping".format(field))
+    images: Dict[str, str] = {}
+    for slot, path in raw.items():
+        if slot not in slots:
+            raise ProfileError("{}.{}: no such slot in memory.slots".format(field, slot))
+        images[slot] = _image_path(path, "{}.{}".format(field, slot))
+    return images
 
 
 def _parse_slots(raw: Dict[str, Any]) -> Dict[str, SlotConfig]:
@@ -8668,12 +8688,7 @@ def _parse_update_sequence(
             raise ProfileError("update_sequence: duplicate phase name '{}'".format(name))
         seen_names.add(name)
 
-        raw_images = entry.get("images", {})
-        if raw_images is None:
-            raw_images = {}
-        if not isinstance(raw_images, dict):
-            raise ProfileError("{}.images: expected mapping".format(ctx))
-        phase_images = {str(k): str(v) for k, v in raw_images.items()}
+        phase_images = _parse_images(entry.get("images"), "{}.images".format(ctx), slots)
 
         phase_success = (
             _parse_success_criteria(entry.get("success_criteria"))
@@ -9018,7 +9033,9 @@ def _parse_component(
     platform = str(_require(raw, "platform", ctx))
 
     bootloader = _require(raw, "bootloader", ctx)
-    bootloader_elf = str(_require(bootloader, "elf", "{}.bootloader".format(ctx)))
+    bootloader_elf = _image_path(
+        _require(bootloader, "elf", "{}.bootloader".format(ctx)), "{}.bootloader.elf".format(ctx)
+    )
     bootloader_entry = _parse_int(
         _require(bootloader, "entry", "{}.bootloader".format(ctx)),
         "{}.bootloader.entry".format(ctx),
@@ -9034,10 +9051,7 @@ def _parse_component(
 
     memory = _parse_memory(_require(raw, "memory", ctx))
 
-    images: Dict[str, str] = {}
-    raw_images = raw.get("images", {})
-    if isinstance(raw_images, dict):
-        images = {str(k): str(v) for k, v in raw_images.items()}
+    images = _parse_images(raw.get("images"), "{}.images".format(ctx), memory.slots)
 
     pre_boot_state = _parse_pre_boot_state(raw.get("pre_boot_state"))
     setup_script = raw.get("setup_script")
@@ -10674,7 +10688,7 @@ def _load_profile(
     platform = str(_require(data, "platform"))
 
     bootloader = _require(data, "bootloader")
-    bootloader_elf = str(_require(bootloader, "elf", "bootloader"))
+    bootloader_elf = _image_path(_require(bootloader, "elf", "bootloader"), "bootloader.elf")
     bootloader_entry = _parse_int(
         _require(bootloader, "entry", "bootloader"), "bootloader.entry"
     )
@@ -10763,10 +10777,7 @@ def _load_profile(
         raise ProfileError(str(exc)) from exc
     terminal_error_paths = _parse_terminal_error_paths(data.get("terminal_error_paths"))
     target_source = _parse_target_source(data.get("target_source"))
-    images = {}
-    raw_images = data.get("images", {})
-    if isinstance(raw_images, dict):
-        images = {str(k): str(v) for k, v in raw_images.items()}
+    images = _parse_images(data.get("images"), "images", memory.slots)
 
     pre_boot_state = _parse_pre_boot_state(data.get("pre_boot_state"))
     update_trigger, auto_update_trigger = _parse_update_trigger_config(

@@ -9,7 +9,7 @@ ${PLATFORM_REPL}               ${ROOT}/platforms/cortex_m0_nvm.repl
 ${RUNTIME_MODE}                true
 ${CALIBRATION_MODE}            false
 ${EVALUATION_MODE}             execute
-${BOOTLOADER_ELF}              ${ROOT}/examples/vulnerable_ota/firmware.elf
+${BOOTLOADER_ELF}              ${EMPTY}
 ${BOOTLOADER_ENTRY}            0x10000000
 ${SRAM_START}                  0x20000000
 ${SRAM_END}                    0x20020000
@@ -26,7 +26,7 @@ ${SLOT_TERTIARY_SIZE}          ${EMPTY}
 ${SLOT_RECOVERY_BASE}          ${EMPTY}
 ${SLOT_RECOVERY_SIZE}          ${EMPTY}
 ${IMAGE_EXEC}                  ${EMPTY}
-${IMAGE_STAGING}               ${ROOT}/examples/vulnerable_ota/firmware.bin
+${IMAGE_STAGING}               ${EMPTY}
 ${IMAGE_TERTIARY}              ${EMPTY}
 ${IMAGE_RECOVERY}              ${EMPTY}
 ${IMAGE_EXEC_LOAD_ADDR}        ${SLOT_EXEC_BASE}
@@ -47,7 +47,7 @@ ${SUCCESS_PC_SLOT}             ${EMPTY}
 ${SUCCESS_MARKER_ADDR}         0
 ${SUCCESS_MARKER_VALUE}        0
 ${FAULT_POINTS_CSV}            ${EMPTY}
-${IMAGE_STAGING_PATH}          ${ROOT}/examples/vulnerable_ota/firmware.bin
+${IMAGE_STAGING_PATH}          ${EMPTY}
 ${IMAGE_EXEC_PATH}             ${EMPTY}
 ${IMAGE_TERTIARY_PATH}         ${EMPTY}
 ${IMAGE_RECOVERY_PATH}         ${EMPTY}
@@ -172,6 +172,7 @@ ${TEST_TIMEOUT}                2 minutes
 *** Keywords ***
 Load Runtime Scenario
     [Documentation]    Profile-driven runtime scenario: load peripheral, platform, ELF, and seed images.
+    Should Not Be Empty    ${BOOTLOADER_ELF}    BOOTLOADER_ELF is required
     Execute Command    include "${ROOT}/peripherals/ITardigradeFaultInjectable.cs"
     Execute Command    include "${ROOT}/peripherals/NVMemoryController.cs"
     Execute Command    include "${ROOT}/peripherals/GenericNvmController.cs"
