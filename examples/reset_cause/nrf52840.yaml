@@ -1,0 +1,34 @@
+schema_version: 1
+name: reset_cause_nrf52840
+description: Observe the reset-cause register and retained bytes over three boots.
+platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
+bootloader:
+  elf: examples/reset_cause/nrf52840.elf
+  entry: 0x00000000
+memory:
+  sram: {start: 0x20000000, end: 0x20001000}
+  retained_regions:
+    - {name: boot_flag, base: 0x20000200, size: 4, fill: 0xa5}
+  trace_address_map:
+    - {offset_start: 0x00000, offset_end: 0xf4000, address_addend: 0x0000c000}
+  slots:
+    exec: {base: 0x0000c000, size: 0x2000}
+    staging: {base: 0x00010000, size: 0x2000}
+pre_boot_state:
+  - {address: 0x0000c000, u32: 0x20001000}
+  - {address: 0x0000c004, u32: 0x0000c021}
+  - {address: 0x00010000, u32: 0x53574550}
+success_criteria:
+  vtor_in_slot: exec
+  marker_address: 0x2000010c
+  marker_value: 0xdeadbeef
+state_probe: examples/reset_cause/probe.py
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: 1
+  duration_s: 0.1
+expect:
+  should_find_issues: false
+  control_outcome: success
