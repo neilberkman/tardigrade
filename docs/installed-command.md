@@ -220,3 +220,36 @@ tardigrade debug \
   --ex "x/4wx 0x00024ff0" \
   --ex "continue"
 ```
+
+## Export a finding as a standalone reproducer
+
+`tardigrade export-repro <report> <point or state id>` (or
+`python3 scripts/export_repro.py` in a checkout) exports a failing audit point or
+state-search state into a self-contained directory or `.tar.gz` archive that
+runs on a machine with only Docker (or only Renode of the recorded version) and
+no `tardigrade` installation:
+
+```sh
+tardigrade export-repro results/pr3011_move_broken.json "3,0" --output repro-pr3011
+cd repro-pr3011
+./run.sh
+```
+
+Each bundle contains:
+
+- `platforms/*.repl` and only the `peripherals/*.cs` files referenced by the
+  platform.
+- `firmware/` containing the bootloader ELF and slot images when their license
+  permits redistribution, or `fetch_and_build.sh` that clones and builds from
+  pinned upstream sources when the target's license (such as GPL-3.0 `wolfBoot`)
+  forbids binary redistribution.
+- `state/persistent_state.bin` and `state/persistent_state.json` containing the
+  reconstructed persistent memory image and any uncorrectable ECC or torn-word
+  marks.
+- `reproduce.resc` and `reproduce_recovery.py` to load the platform, ELF, and
+  reconstructed persistent state and boot the recovery in Renode.
+- `run.sh` and `Dockerfile` so `./run.sh` (or `./run.sh --native`) runs the
+  recovery and prints `Observed outcome: <outcome>` and
+  `Expected outcome: <outcome>`.
+- `README.md` with the report's failure explanation, cut chain, upstream commit,
+  and exact Renode version.
