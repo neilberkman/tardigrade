@@ -135,6 +135,44 @@ def test_dispatch_debug_forwards_resolved_paths_and_flags(cli, tmp_path, monkeyp
     )]
 
 
+def test_dispatch_export_repro_forwards_positional_and_flag_arguments(cli, tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(cli.RUNTIME / "scripts"))
+    import export_repro
+
+    calls = []
+    monkeypatch.setattr(
+        export_repro,
+        "main",
+        lambda argv=None, *, prog=None: calls.append((argv, prog)) or 0,
+    )
+    monkeypatch.chdir(tmp_path)
+    report = tmp_path / "audit.json"
+    report.write_text("{}")
+    profile = ROOT / "profiles/mcuboot_pr3011_move_broken.yaml"
+    output = tmp_path / "repro_bundle"
+    assert cli.main([
+        "export-repro",
+        str(report),
+        "3,0",
+        "--profile", str(profile),
+        "--output", str(output),
+        "--renode-test", "my-renode",
+        "--timeout", "90",
+    ]) == 0
+    assert calls == [(
+        [
+            "--renode-test", "my-renode",
+            "--timeout", "90",
+            "--repo-root", str(cli.RUNTIME),
+            "--report", str(report.resolve()),
+            "--point", "3,0",
+            "--profile", str(profile.resolve()),
+            "--output", str(output.resolve()),
+        ],
+        "tardigrade export-repro",
+    )]
+
+
 def test_doctor_checks_server_and_version(cli, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(shutil, "which", lambda cmd: str(tmp_path / cmd))
     monkeypatch.setattr(cli, "probe", lambda cmd: "Renode v1.17.0.123" if cmd[-1] == "--version" else "")
@@ -253,6 +291,7 @@ for resource in [
     'scripts/profile_loader.py',
     'scripts/audit_bootloader.py',
     'scripts/debug_point.py',
+    'scripts/export_repro.py',
     'scripts/run_runtime_fault_sweep.py',
     'scripts/run_runtime_fault_sweep.resc',
     'scripts/run_demo.py',
