@@ -2,7 +2,11 @@
 
 Tardigrade tests whether firmware survives losing power in the middle of an update. It runs your real bootloader binary in the [Renode](https://renode.io/) emulator, cuts power at individual flash writes and erases, boots the device again, and checks that it still boots the right image.
 
-It was built for Cortex-M bootloaders: MCUboot, NuttX nxboot, TF-M BL2 and wolfBoot. It also tests storage code such as Zephyr NVS, and besides power loss it can inject bit corruption, failed writes, skipped instructions, and I2C and OTP faults.
+A device can lose power again while it is recovering, so tardigrade also follows each recovery boot and cuts that, up to eight cuts deep.
+
+It works on your own bootloader and on the open-source ones. You describe a bootloader in a short profile: where the slots are, which images go in them, and what a successful boot looks like. That covers any Cortex-M firmware that writes to flash, whether it is a bootloader, an updater inside the application or a storage layer. The repository has ready-made profiles and build scripts for MCUboot, NuttX nxboot, TF-M BL2 and wolfBoot. A campaign against nxboot found a power-loss bug that is now fixed upstream, and the MCUboot profiles reproduce bugs its developers found and fixed ([Results](#results)).
+
+Besides power loss it can inject bit corruption, failed writes, skipped instructions, and I2C and OTP faults.
 
 ## Try it
 
@@ -26,7 +30,52 @@ pip install .
 tardigrade doctor
 ```
 
-A profile describes one test. It is a YAML file with the memory layout, the firmware images, and what counts as a successful boot. For MCUboot built with Zephyr, and for NuttX nxboot, `tardigrade init` writes a starter profile from your build output and boots one clean update to check it:
+A profile describes one test: the platform, the memory layout, the firmware images, and what counts as a successful boot. This one is complete for a bootloader with two slots:
+
+```yaml
+schema_version: 1
+name: my_bootloader_upgrade
+description: "Power loss during a firmware upgrade"
+
+platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
+
+bootloader:
+  elf: build/bootloader.elf
+  entry: 0x00000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  page_size: 0x1000
+  slots:
+    exec: { base: 0x0000C000, size: 0x76000 }
+    staging: { base: 0x00082000, size: 0x76000 }
+
+images:
+  exec: build/current.bin
+  staging: build/update.bin
+
+success_criteria:
+  vtor_in_slot: exec
+
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+
+expect:
+  should_find_issues: false
+```
+
+```bash
+tardigrade audit --profile my_bootloader.yaml --output report.json
+tardigrade report --input report.json --output report.html
+```
+
+Pick the platform that matches your chip from [Choosing a platform](docs/writing-profiles.md#choosing-a-platform). If your chip is not listed, point `platform` at your own Renode description and use one of the generic memory models. [Writing profiles](docs/writing-profiles.md) documents every field, and `profiles/` has about 190 working profiles to copy from.
+
+If your bootloader is MCUboot built with Zephyr, or NuttX nxboot, `tardigrade init` writes the profile from your build output and boots one clean update to check it:
 
 ```bash
 tardigrade init --bootloader build/zephyr/zephyr.elf \
@@ -34,14 +83,7 @@ tardigrade init --bootloader build/zephyr/zephyr.elf \
   --build-dir build --output starter.yaml --control
 ```
 
-The starter runs no fault points (`fault_sweep.max_writes: 0`). Set that to `auto` to turn on the power-loss sweep, then run the audit and render the report:
-
-```bash
-tardigrade audit --profile starter.yaml --output report.json
-tardigrade report --input report.json --output report.html
-```
-
-For other bootloaders, and for boards `init` does not recognise, you write the profile by hand. [Writing profiles](docs/writing-profiles.md) documents every field, and `profiles/` has about 190 to copy from.
+The starter runs no fault points (`fault_sweep.max_writes: 0`). Set that to `auto` to turn on the power-loss sweep.
 
 ### In CI
 
@@ -86,6 +128,8 @@ MCUboot and Zephyr developers reported and fixed each of these. The repository k
 | MCUboot [#3010](https://github.com/mcu-tools/mcuboot/issues/3010), swap-offset | After repeated power loss the device asserts on every boot |
 | Zephyr NVS, commit `c200ff1e` | A torn metadata entry at the end of a sector makes the mount fail |
 
+Two open Zephyr FCB issues reported by others, [#121749](https://github.com/zephyrproject-rtos/zephyr/issues/121749) and [#122446](https://github.com/zephyrproject-rtos/zephyr/issues/122446), also reproduce, at Zephyr v3.7.0 and at its current head ([details](docs/zephyr-fcb-settings.md)).
+
 The recovery-state search finds #3009 without anyone choosing the pair of cuts by hand. The pairs for #2100, #2206, #2214 and #3009 run in CI. [Findings and validation history](docs/findings.md) has the point counts, the commits, and two candidate pairs that were examined and dropped.
 
 ## What a pass means
@@ -96,17 +140,29 @@ The recovery-state search finds #3009 without anyone choosing the pair of cuts b
 
 ## What it covers
 
+### Power loss during recovery
+
+Some bugs need two power losses: MCUboot #3009 and #3010 above only appear when the recovery from one cut is cut again. The [recovery-state search](docs/writing-profiles.md#recovery-state-search) boots the state each cut leaves behind, records what the recovery writes, and cuts that too, in chains of up to eight cuts.
+
+- It boots each distinct flash state once, however many cut sequences lead to it.
+- It can order the search by coverage, expanding first the states whose recovery ran code no earlier boot had run, and stop when new boots stop reaching new code.
+- It can also search best-first: cuts in bootloader metadata come before cuts in bulk image copy, and second cuts are tried without waiting for every first cut to finish.
+- A search can be sized before it runs, stopped and resumed from a checkpoint, and split across machines.
+
+### Faults, models and targets
+
 | | |
 | --- | --- |
 | Power loss | Cuts before any flash program or erase. The profile picks what the interrupted operation leaves behind: the old bytes, the new bytes, a subset of the bits, a half-finished erase, or a word that fails ECC on read (STM32L4 and MRAM). |
-| Repeated power loss | More cuts during the recovery boots. The [recovery-state search](docs/writing-profiles.md#recovery-state-search) follows each recovery and cuts it again, skips flash states it has already booted, and can be sized in advance, resumed, and split across machines. |
-| Other faults | 28 fault types in all, among them bit corruption, silent write failure, write rejection, write disturb, driver errors, instruction skip, and I2C and OTP faults. |
+| Other faults | 28 fault types in all, among them bit corruption, silent write failure, write rejection, write disturb, driver errors, instruction skip (a glitch model), and I2C and OTP faults. Faults can also land during the recovery writes and during the confirm step between boots. |
 | Buffered storage | A write-back mode for storage stacks that hold writes in RAM until a flush. A power cut discards whatever was not yet committed. |
 | Resets | Power loss, software reset and watchdog reset are modelled separately, with reset-cause registers, backup registers and retained RAM on nRF52840, STM32F1, STM32F4 and STM32H7. |
 | Memory models | nRF52840 NVMC; STM32F1, F4, L4 and H7 flash; MRAM; SPI NOR; I2C EEPROM; CFI flash; OTP fuses; a generic command-register controller. |
-| Targets | MCUboot (swap-move, swap-scratch and swap-offset, on nRF52840 and STM32), NuttX nxboot, TF-M BL2, wolfBoot, and Zephyr storage on SPI NOR and EEPROM. See [supported targets](docs/targets.md). |
+| Open-source targets | Ready-made profiles and build scripts for MCUboot (swap-move, swap-scratch and swap-offset; upgrade and revert; nRF52840 and STM32; about 100 profiles), NuttX nxboot, TF-M BL2, wolfBoot and Zephyr storage (NVS, FCB and settings on internal flash, SPI NOR and EEPROM), plus a model of ESP-IDF OTA slot selection. See [supported targets](docs/targets.md). |
 | Verdicts | Which slot booted, whether its bytes match an approved image, and whether the CPU is executing inside it. State probes and invariants check trailer state, rollback counters and other persistent fields. |
 | Reports | JSON, JUnit XML, SARIF and HTML. Each report also lists its evidence against paragraphs of UN R156 and the EU Cyber Resilience Act, without making a legal determination ([details](docs/software-update-clause-evidence.md)). |
+
+A weekly workflow builds MCUboot's current `main` and sweeps it, and scheduled canaries run NuttX nxboot.
 
 ### When a point fails
 
