@@ -579,6 +579,25 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             set => tracker.LastFaultAddress = value;
         }
 
+        public ulong LastFaultPC
+        {
+            get => tracker.LastFaultPC;
+            set => tracker.LastFaultPC = value;
+        }
+
+        private ulong GetCurrentCpuPC()
+        {
+            if(machine != null && machine.GetSystemBus(this).TryGetCurrentCPU(out var currentCpu))
+            {
+                return currentCpu.PC.RawValue;
+            }
+            foreach(var cpu in machine.GetSystemBus(this).GetCPUs().OfType<ICPUWithHooks>())
+            {
+                return cpu.PC.RawValue;
+            }
+            return 0;
+        }
+
         public bool AnyFaultFired => tracker.AnyFaultFired || ReadFaultFired;
         public bool FaultRequiresImmediateStop => tracker.FaultRequiresImmediateStop;
 
@@ -935,7 +954,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
-            var shouldFault = tracker.RecordEraseAndCheckFault(regionBase, regionLength);
+            var shouldFault = tracker.RecordEraseAndCheckFault(regionBase, regionLength, GetCurrentCpuPC());
             var eraseIndex = tracker.TotalPageErases;
 
             if(!passthroughMode && shouldFault)
@@ -1154,6 +1173,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             if(fstpgEnabled)
             {
+                tracker.PendingPC = pc != 0 ? pc : GetCurrentCpuPC();
                 HandleFastRowWrite(offset, width, value);
                 return;
             }
@@ -1168,10 +1188,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     UpdateInterrupts();
                     return;
                 }
+                tracker.PendingPC = pc != 0 ? pc : GetCurrentCpuPC();
                 CommitDoubleWordProgram(offset, value, isFastRow: false);
                 return;
             }
 
+            tracker.PendingPC = pc != 0 ? pc : GetCurrentCpuPC();
             HandleStandardWordWrite(offset, (uint)value, isFastRow: false);
         }
 

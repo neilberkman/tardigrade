@@ -159,6 +159,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             tracker.EraseFaultFired = false;
             tracker.DriverErrorFired = false;
             tracker.LastFaultAddress = 0;
+            tracker.LastFaultPC = 0;
             tracker.FaultFlashSnapshot = null;
             tracker.WriteTraceClear();
             tracker.EraseTraceClear();
@@ -366,6 +367,25 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             get => tracker.LastFaultAddress;
             set => tracker.LastFaultAddress = value;
+        }
+
+        public ulong LastFaultPC
+        {
+            get => tracker.LastFaultPC;
+            set => tracker.LastFaultPC = value;
+        }
+
+        private ulong GetCurrentCpuPC()
+        {
+            if(machine != null && machine.GetSystemBus(this).TryGetCurrentCPU(out var currentCpu))
+            {
+                return currentCpu.PC.RawValue;
+            }
+            foreach(var cpu in machine.GetSystemBus(this).GetCPUs().OfType<ICPUWithHooks>())
+            {
+                return cpu.PC.RawValue;
+            }
+            return 0;
         }
 
         public bool AnyFaultFired => tracker.AnyFaultFired || ReadFaultFired;
@@ -631,7 +651,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
-            var shouldFault = tracker.RecordEraseAndCheckFault(pageBase, eraseLen);
+            var shouldFault = tracker.RecordEraseAndCheckFault(pageBase, eraseLen, GetCurrentCpuPC());
             var eraseIndex = tracker.TotalPageErases;
 
             if(!passthroughMode && shouldFault)
@@ -664,7 +684,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
-            var shouldFault = tracker.RecordEraseAndCheckFault(0, totalLen);
+            var shouldFault = tracker.RecordEraseAndCheckFault(0, totalLen, GetCurrentCpuPC());
             var eraseIndex = tracker.TotalPageErases;
 
             if(!passthroughMode && shouldFault)
@@ -779,6 +799,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             if(width == 2 && (offset & 1) == 0)
             {
+                tracker.PendingPC = pc != 0 ? pc : GetCurrentCpuPC();
                 ProcessHalfWordProgram(offset, (ushort)(value & 0xFFFF));
                 return;
             }

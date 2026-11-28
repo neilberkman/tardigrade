@@ -77,6 +77,7 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
         public bool AnyFaultFired => FaultEverFired;
         public bool FaultRequiresImmediateStop => EraseFaultFired || (FaultFired && WriteFaultMode == 0);
         public uint LastFaultAddress { get; set; }
+        public ulong LastFaultPC { get; set; }
         public byte[] FaultFlashSnapshot { get; set; }
         public IMemory Flash => this;
         public long FlashBaseAddress { get; set; }
@@ -266,6 +267,7 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             DriverErrorFired = false;
             FaultEverFired = false;
             LastFaultAddress = 0;
+            LastFaultPC = 0;
             FaultFlashSnapshot = null;
             writeTrace.Clear();
             eraseTrace.Clear();

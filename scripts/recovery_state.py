@@ -473,6 +473,12 @@ def _normalize_operation(raw, kind=None, sequence=None):
                 "writes_at_this_point": writes_at,
             }
         )
+    if operation.get("address") not in (None, ""):
+        normalized["address"] = str(operation["address"])
+    if operation.get("pc") not in (None, "", 0, "0", "0x0", "0x00000000"):
+        pc_value = _coerce_integer(operation["pc"]) & 0xFFFFFFFF
+        if pc_value != 0:
+            normalized["pc"] = "0x{:08X}".format(pc_value)
     return normalized
 
 

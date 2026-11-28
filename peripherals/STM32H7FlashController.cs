@@ -121,6 +121,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
 
+        public ulong LastFaultPC { get => tracker.LastFaultPC; set => tracker.LastFaultPC = value; }
+
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
 
         public int DiffLookahead { get; set; } = 32;
@@ -288,7 +290,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
-        private void OnMemoryProgramWrite(ulong _, MemoryOperation operation, ulong __, ulong physicalAddress, uint width, ulong value)
+        private ulong CurrentCpuPc()
+        {
+            if(!machine.IsRegistered(this))
+            {
+                return 0UL;
+            }
+            ICPU cpu;
+            var bus = machine.GetSystemBus(this);
+            if(bus != null && bus.TryGetCurrentCPU(out cpu) && cpu != null)
+            {
+                return cpu.PC.RawValue;
+            }
+            return 0UL;
+        }
+
+        private void OnMemoryProgramWrite(ulong pc, MemoryOperation operation, ulong __, ulong physicalAddress, uint width, ulong value)
         {
             if(operation != MemoryOperation.MemoryWrite)
             {
@@ -308,7 +325,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 return;
             }
-            bank.HandleMemoryProgramWrite(localOffset, width, value);
+            bank.HandleMemoryProgramWrite(localOffset, width, value, pc);
         }
 
         private void UpdateMemoryProgramHooks(bool enabled)
@@ -331,8 +348,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             memoryProgramHooksInstalled = enabled;
         }
 
-        private ulong HandleTrackedWrite(Bank bank, long localOffset, uint width, ulong value)
+        private ulong HandleTrackedWrite(Bank bank, long localOffset, uint width, ulong value, ulong pc = 0)
         {
+            var writePc = pc != 0 ? pc : CurrentCpuPc();
             if(PassthroughMode)
             {
                 if(AnyFaultFired || width == 0)
@@ -349,7 +367,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     var alignedOffset = chunkOffset & ~3L;
                     var inWordOffset = (int)(chunkOffset - alignedOffset);
                     var bytesInWord = Math.Min(4 - inWordOffset, passthroughByteCount - passthroughCursor);
-                    tracker.IncrementWriteCount();
+                    tracker.IncrementWriteCount(writePc);
                     passthroughCursor += bytesInWord;
                 }
                 return value;
@@ -389,7 +407,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var traceValue = newWord;
                 var traceWidth = 4;
 
-                if(tracker.RecordWriteAndCheckFault(traceOffset, traceValue, traceWidth))
+                if(tracker.RecordWriteAndCheckFault(traceOffset, traceValue, traceWidth, writePc))
                 {
                     FaultFired = true;
                     LastFaultAddress = (uint)(FlashBaseAddress + alignedOffset);
@@ -466,7 +484,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             EnsureShadow();
 
-            if(tracker.RecordEraseAndCheckFault(bank.CombinedBaseOffset + sectorOffset, eraseSize))
+            if(tracker.RecordEraseAndCheckFault(bank.CombinedBaseOffset + sectorOffset, eraseSize, CurrentCpuPc()))
             {
                 EraseFaultFired = true;
                 LastFaultAddress = (uint)(FlashBaseAddress + bank.CombinedBaseOffset + sectorOffset);
@@ -838,7 +856,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 parent.UpdateInterrupts();
             }
 
-            public ulong HandleMemoryProgramWrite(long localOffset, uint width, ulong value)
+            public ulong HandleMemoryProgramWrite(long localOffset, uint width, ulong value, ulong pc = 0)
             {
                 if(!bankWriteEnabled.Value || bankInconsistencyErrorStatus.Value)
                 {
@@ -858,7 +876,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     return parent.ReadCurrentValue(this, localOffset, width);
                 }
 
-                var filteredValue = parent.HandleTrackedWrite(this, localOffset, width, value);
+                var filteredValue = parent.HandleTrackedWrite(this, localOffset, width, value, pc);
 
                 bankWriteBufferCounter += (int)width;
                 if(bankWriteBufferCounter >= WriteBufferSize)

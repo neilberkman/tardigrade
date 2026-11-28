@@ -6680,6 +6680,25 @@ def get_last_write_address():
     return int(b['data'].Nvm.LastWriteAddress)
 
 
+def get_last_fault_pc():
+    b = backend
+    if b['kind'] in ('mram', 'fast'):
+        try:
+            return int(getattr(b['data'], 'LastFaultPC', 0) or 0)
+        except Exception:
+            return 0
+    try:
+        pc = int(getattr(b['data'], 'LastFaultPC', 0) or 0)
+        if pc != 0:
+            return pc
+    except Exception:
+        pass
+    try:
+        return int(getattr(b['data'].Nvm, 'LastFaultPC', 0) or 0)
+    except Exception:
+        return 0
+
+
 def _decode_exact_program_bytes(value, width, field_name):
     text = str(value or '').strip()
     if len(text) != int(width) * 2:
@@ -6709,7 +6728,7 @@ def parse_mram_program_trace(trace_text, memory_size, bus_base):
         if not line:
             continue
         fields = line.split(':')
-        if len(fields) != 7:
+        if len(fields) not in (7, 8):
             raise ValueError(
                 'program trace line {} has {} fields; expected 7'.format(
                     line_number, len(fields)
@@ -6733,7 +6752,7 @@ def parse_mram_program_trace(trace_text, memory_size, bus_base):
         post_program = _decode_exact_program_bytes(fields[5], width, 'post-program bytes')
         if fields[6] not in ('0', '1'):
             raise ValueError('program trace fault marker is not 0 or 1 at line {}'.format(line_number))
-        events.append({
+        event = {
             'write_index': index,
             'program_address': fmt_u32(int(bus_base) + offset),
             'offset': offset,
@@ -6742,7 +6761,12 @@ def parse_mram_program_trace(trace_text, memory_size, bus_base):
             'pre_program_bytes': _program_bytes_hex(pre_program),
             'post_program_bytes': _program_bytes_hex(post_program),
             'faulted': fields[6] == '1',
-        })
+        }
+        if len(fields) == 8 and fields[7].strip():
+            pc_val = int(fields[7].strip(), 0)
+            if pc_val > 0:
+                event['pc'] = fmt_u32(pc_val)
+        events.append(event)
         previous_index = index
     return events
 
@@ -6851,6 +6875,8 @@ def collect_mram_fault_evidence(selected_write_index, expected_backend_index):
             'write_trace': trace,
             'exact': True,
         })
+        if fault_event.get('pc'):
+            evidence['fault_pc'] = fault_event['pc']
         if bool(getattr(data, 'LastFaultMarkedUncorrectable', False)):
             evidence['word_marked_uncorrectable'] = True
             evidence['uncorrectable_word_address'] = fmt_u32(program_address)
@@ -7252,6 +7278,8 @@ def reset_nvmc_for_sweep(tracking_start=None):
         b['data'].DriverErrorFired = False
         if hasattr(b['data'], 'LastFaultAddress'):
             b['data'].LastFaultAddress = 0
+        if hasattr(b['data'], 'LastFaultPC'):
+            b['data'].LastFaultPC = 0
         if hasattr(b['data'], 'PassthroughMode'):
             b['data'].PassthroughMode = False
     elif b['kind'] == 'fast':
@@ -7266,6 +7294,8 @@ def reset_nvmc_for_sweep(tracking_start=None):
         b['data'].DriverErrorFired = False
         b['data'].EraseFaultFired = False
         b['data'].LastFaultAddress = 0
+        if hasattr(b['data'], 'LastFaultPC'):
+            b['data'].LastFaultPC = 0
         b['data'].FaultFlashSnapshot = None
         # Shadow scanning: enable for NRF52-style controllers (WEN batches
         # multiple writes, needs diff to count them).  Skip for STM32F4-style
@@ -7291,6 +7321,10 @@ def reset_nvmc_for_sweep(tracking_start=None):
             b['data'].Nvm.EraseFaultMode = 0
         if hasattr(b['data'].Nvm, 'LastFaultAddress'):
             b['data'].Nvm.LastFaultAddress = 0
+        if hasattr(b['data'].Nvm, 'LastFaultPC'):
+            b['data'].Nvm.LastFaultPC = 0
+        if hasattr(b['data'], 'LastFaultPC'):
+            b['data'].LastFaultPC = 0
         b['data'].Nvm.DriverErrorFired = False
     _set_preserve_counters_across_reset(True)
     # Reset controller fault state on all backends — command_drop can be
@@ -7333,6 +7367,8 @@ def reset_nvmc_for_recovery(tracking_start=0):
         b['data'].DriverErrorFired = False
         if hasattr(b['data'], 'LastFaultAddress'):
             b['data'].LastFaultAddress = 0
+        if hasattr(b['data'], 'LastFaultPC'):
+            b['data'].LastFaultPC = 0
         if hasattr(b['data'], 'PassthroughMode'):
             b['data'].PassthroughMode = False
         _set_preserve_counters_across_reset(True)
@@ -7348,6 +7384,8 @@ def reset_nvmc_for_recovery(tracking_start=0):
         b['data'].DriverErrorFired = False
         b['data'].EraseFaultFired = False
         b['data'].LastFaultAddress = 0
+        if hasattr(b['data'], 'LastFaultPC'):
+            b['data'].LastFaultPC = 0
         # Skip shadow scanning during recovery boot — just count PG transitions
         # for progress tracking. Avoids O(flash_size) ReadBytes per write.
         b['data'].SkipShadowScan = True
@@ -7367,6 +7405,10 @@ def reset_nvmc_for_recovery(tracking_start=0):
             b['data'].Nvm.EraseFaultMode = 0
         if hasattr(b['data'].Nvm, 'LastFaultAddress'):
             b['data'].Nvm.LastFaultAddress = 0
+        if hasattr(b['data'].Nvm, 'LastFaultPC'):
+            b['data'].Nvm.LastFaultPC = 0
+        if hasattr(b['data'], 'LastFaultPC'):
+            b['data'].LastFaultPC = 0
         b['data'].Nvm.DriverErrorFired = False
         disarm_fault()
     _set_preserve_counters_across_reset(True)
@@ -13362,7 +13404,34 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
 
     if extra_fields:
         result.update(extra_fields)
+    _encode_pre_fn = globals().get('_encode_pre_recovery_state')
+    if callable(_encode_pre_fn) and fault_snapshot_bytes is not None and int(fault_at) >= 0:
+        _encoded_pre_state = _encode_pre_fn(
+            fault_snapshot_bytes, fault_uncorrectable_words
+        )
+        if _encoded_pre_state is not None:
+            result['_pre_recovery_state'] = _encoded_pre_state
     return result
+
+
+def _encode_pre_recovery_state(snapshot_bytes, uncorrectable_words=None):
+    if not snapshot_bytes:
+        return None
+    try:
+        import base64 as _b64
+        import zlib as _zlib
+        flash_base_addr, _ = flash_geometry()
+        raw = bytes(bytearray(snapshot_bytes))
+        payload = {
+            'base_address': fmt_u32(flash_base_addr),
+            'size': len(raw),
+            'zlib_b64': _b64.b64encode(_zlib.compress(raw, 1)).decode('ascii'),
+        }
+        if uncorrectable_words:
+            payload['uncorrectable_words'] = list(uncorrectable_words)
+        return payload
+    except Exception:
+        return None
 
 
 def parse_write_trace_map(trace_text):
@@ -13401,6 +13470,8 @@ def parse_write_trace_map(trace_text):
                 raise ValueError('write trace map width spans outside flash')
             if meta['width'] == 8:
                 meta['value'] = '0x{:016X}'.format(value & 0xFFFFFFFFFFFFFFFF)
+        if len(event) >= 5 and int(event[4]) > 0:
+            meta['pc'] = fmt_u32(int(event[4]))
         mapping[write_idx] = meta
     return mapping
 
@@ -13418,12 +13489,17 @@ def parse_erase_trace_map(trace_text):
         flash_off = int(parts[1])
         writes_at = int(parts[2]) if len(parts) >= 3 else 0
         erase_size = int(parts[3]) if len(parts) >= 4 else 0
-        mapping[erase_idx] = {
+        entry = {
             'flash_offset': flash_off,
             'address': fmt_u32(flash_base + flash_off),
             'writes_at_this_point': writes_at,
             'erase_size': erase_size,
         }
+        if len(parts) >= 5 and parts[4].strip():
+            pc_val = int(parts[4].strip(), 0)
+            if pc_val > 0:
+                entry['pc'] = fmt_u32(pc_val)
+        mapping[erase_idx] = entry
     return mapping
 
 def run_resume_trace_from_snapshot(snapshot_flash, fault_at, fault_type):
@@ -14211,6 +14287,8 @@ def run_execute_fault(
     else:
         fault_injected = was_fault_injected()
     fault_address = get_last_command_address() if is_command_fault else get_last_write_address()
+    _fault_pc_fn = globals().get('get_last_fault_pc')
+    fault_pc = 0 if (is_command_fault or not callable(_fault_pc_fn)) else _fault_pc_fn()
     if (
         backend['kind'] == 'mram'
         and fault_injected
@@ -14224,6 +14302,8 @@ def run_execute_fault(
         )
         if mram_fault_evidence.get('program_address'):
             fault_address = int(mram_fault_evidence['program_address'], 0)
+        if mram_fault_evidence.get('fault_pc') and not fault_pc:
+            fault_pc = int(str(mram_fault_evidence['fault_pc']), 0)
     if fault_injected and is_power_loss_fault:
         fault_uncorrectable_offsets = _snapshot_mram_fault_uncorrectable_offsets()
         fault_uncorrectable_addresses = _snapshot_mram_fault_uncorrectable_addresses()
@@ -14629,6 +14709,14 @@ def run_execute_fault(
     extras = {}
     if not fault_injected and int(fault_at) >= 0:
         extras['skip_reason'] = 'fault_index_beyond_total'
+    if fault_injected:
+        if fault_pc > 0:
+            extras['fault_pc'] = fmt_u32(fault_pc)
+        else:
+            _cal_pc_fn = globals().get('_get_calibration_op_pc')
+            cal_pc = _cal_pc_fn(fault_type, fault_at) if callable(_cal_pc_fn) else None
+            if cal_pc:
+                extras['fault_pc'] = cal_pc
     if backend['kind'] != 'slow' and fault_injected and is_power_loss_fault:
         if debug_trailer is not None:
             extras['debug_trailer'] = debug_trailer
@@ -15093,7 +15181,6 @@ def _phase2_chain_evaluated_result(
         'fault_requested': cuts[0][0],
         'fault_type': 'pc',
         # The returned evidence is for the injected prefix. The separate
-        # first_unreached_cut field records why the requested suffix did not run.
         'fault_injected': bool(records),
         'fault_address': records[-1]['fault_address'],
         'boot_outcome': boot_outcome,
@@ -15103,6 +15190,16 @@ def _phase2_chain_evaluated_result(
         'signals': signals,
         'phase2_fault_chain': chain_metadata,
     }
+    if records[-1].get('fault_pc'):
+        result['fault_pc'] = records[-1]['fault_pc']
+    _encode_pre_fn = globals().get('_encode_pre_recovery_state')
+    if callable(_encode_pre_fn) and snapshot and snapshot.get('flash') is not None:
+        _chain_pre_state = _encode_pre_fn(
+            to_py_bytes(snapshot['flash']),
+            snapshot.get('uncorrectable_addresses'),
+        )
+        if _chain_pre_state is not None:
+            result['_pre_recovery_state'] = _chain_pre_state
     if records[0].get('mram_torn_word') is not None:
         result['mram_torn_word'] = records[0]['mram_torn_word']
     if records[0].get('torn_word') is not None:
@@ -15255,6 +15352,8 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None):
         injected = was_fault_injected()
         total_ops = get_total_erases() if cut_type == 'e' else get_total_writes()
         fault_address = get_last_write_address()
+        _fault_pc_fn = globals().get('get_last_fault_pc')
+        fault_pc = _fault_pc_fn() if callable(_fault_pc_fn) else 0
         recovery_signals = {}
         if cut_index > 0:
             _attach_uncorrectable_read_signals(
@@ -15281,6 +15380,8 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None):
         }
         if recovery_tracking_start_address is not None:
             record['tracking_start_address'] = fmt_u32(tracking_start)
+        if fault_pc > 0:
+            record['fault_pc'] = fmt_u32(fault_pc)
         if drawn_mram is not None:
             record['mram_torn_word'] = drawn_mram
         if drawn_flash is not None:
@@ -15444,6 +15545,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     p2_status = None
     p1_fault_address = 0
     p2_fault_address = 0
+    p1_fault_pc = 0
+    p2_fault_pc = 0
     p2_write_trace = []
     p2_erase_trace = []
     p1_uncorrectable_offsets = []
@@ -15509,6 +15612,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         p1_injected = was_fault_injected()
         p1_ops = get_total_erases()
         p1_fault_address = get_last_write_address()
+        _fault_pc_fn = globals().get('get_last_fault_pc')
+        p1_fault_pc = _fault_pc_fn() if callable(_fault_pc_fn) else 0
     else:
         write_mode = _WRITE_FAULT_MODE.get(p1_fault_type, 0)
         base_writes = get_total_writes()
@@ -15531,6 +15636,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         p1_injected = was_fault_injected()
         p1_ops = get_total_writes()
         p1_fault_address = get_last_write_address()
+        _fault_pc_fn = globals().get('get_last_fault_pc')
+        p1_fault_pc = _fault_pc_fn() if callable(_fault_pc_fn) else 0
 
     phase1_ms = int((_time.time() - fp_t0) * 1000)
 
@@ -15709,6 +15816,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         p2_injected = was_fault_injected()
         p2_ops = get_total_erases()
         p2_fault_address = get_last_write_address()
+        _fault_pc_fn = globals().get('get_last_fault_pc')
+        p2_fault_pc = _fault_pc_fn() if callable(_fault_pc_fn) else 0
     else:
         write_mode = _WRITE_FAULT_MODE.get(p2_fault_type, 0)
         base_writes = get_total_writes()
@@ -15729,6 +15838,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         p2_injected = was_fault_injected()
         p2_ops = get_total_writes()
         p2_fault_address = get_last_write_address()
+        _fault_pc_fn = globals().get('get_last_fault_pc')
+        p2_fault_pc = _fault_pc_fn() if callable(_fault_pc_fn) else 0
 
     if p2_trace_enabled:
         backend['data'].WriteTraceEnabled = False
@@ -15957,6 +16068,25 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     }
     if recovery_tracking_start_address is not None:
         result['phase2_fault']['recovery_tracking_start_address'] = fmt_u32(recovery_start)
+    if p1_fault_pc > 0:
+        result['phase2_fault']['p1_fault_pc'] = fmt_u32(p1_fault_pc)
+    else:
+        _cal_pc_fn = globals().get('_get_calibration_op_pc')
+        cal_p1_pc = _cal_pc_fn(p1_fault_type, p1_fault_at) if callable(_cal_pc_fn) else None
+        if cal_p1_pc:
+            result['phase2_fault']['p1_fault_pc'] = cal_p1_pc
+    if p2_fault_pc > 0:
+        result['phase2_fault']['p2_fault_pc'] = fmt_u32(p2_fault_pc)
+        result['fault_pc'] = fmt_u32(p2_fault_pc)
+    _p2_pre_snap = saved_flash_p2 if p2_injected else saved_flash_p1
+    _encode_pre_fn = globals().get('_encode_pre_recovery_state')
+    if callable(_encode_pre_fn) and _p2_pre_snap is not None:
+        _p2_pre_state = _encode_pre_fn(
+            to_py_bytes(_p2_pre_snap),
+            p2_uncorrectable_addresses if p2_injected else p1_uncorrectable_addresses,
+        )
+        if _p2_pre_state is not None:
+            result['_pre_recovery_state'] = _p2_pre_state
     if runfor_error_status is not None:
         result['infrastructure_error'] = True
         result['error_kind'] = runfor_error_status.get(
@@ -16732,7 +16862,7 @@ def load_trace_data(path):
         fieldnames = list(reader.fieldnames or ())
         allowed_fields = frozenset((
             'write_index', 'flash_offset', 'value',
-            'width', 'write_width', 'length',
+            'width', 'write_width', 'length', 'pc',
         ))
         if not fieldnames:
             raise ValueError('write trace CSV has no header')
@@ -16788,6 +16918,82 @@ def load_trace_data(path):
     return entries
 
 
+_calibration_write_pc_cache = None
+_calibration_erase_pc_cache = None
+
+
+def load_trace_pc_map(path):
+    import csv as _csv
+    pc_map = {}
+    if not path or not os.path.exists(path):
+        return pc_map
+    try:
+        with open(path, 'r') as f:
+            reader = _csv.DictReader(f)
+            if 'pc' not in (reader.fieldnames or ()):
+                return pc_map
+            for row in reader:
+                pc_text = str(row.get('pc') or '').strip()
+                if not pc_text:
+                    continue
+                idx = int(str(row['write_index']).strip(), 0)
+                pc_val = int(pc_text, 0)
+                if pc_val > 0:
+                    pc_map[idx] = fmt_u32(pc_val)
+    except Exception:
+        return {}
+    return pc_map
+
+
+def load_erase_trace_pc_map(path):
+    import csv as _csv
+    pc_map = {}
+    if not path or not os.path.exists(path):
+        return pc_map
+    try:
+        with open(path, 'r') as f:
+            reader = _csv.DictReader(f)
+            if 'pc' not in (reader.fieldnames or ()):
+                return pc_map
+            for row_number, row in enumerate(reader, start=1):
+                pc_text = str(row.get('pc') or '').strip()
+                if not pc_text:
+                    continue
+                idx_text = str(row.get('erase_index') or '').strip()
+                idx = int(idx_text, 0) if idx_text else row_number
+                pc_val = int(pc_text, 0)
+                if pc_val > 0:
+                    pc_map[idx] = fmt_u32(pc_val)
+    except Exception:
+        return {}
+    return pc_map
+
+
+def _get_calibration_op_pc(fault_type, fault_at):
+    global _calibration_write_pc_cache, _calibration_erase_pc_cache
+    try:
+        idx = int(fault_at) + 1
+    except Exception:
+        return None
+    if idx <= 0:
+        return None
+    fault_base = _base_fault_type_code(fault_type)
+    if fault_base in ('e', 'a'):
+        if _calibration_erase_pc_cache is None:
+            _calibration_erase_pc_cache = load_erase_trace_pc_map(erase_trace_file_path)
+        return _calibration_erase_pc_cache.get(idx)
+    if _calibration_write_pc_cache is None:
+        _calibration_write_pc_cache = load_trace_pc_map(trace_file_path)
+        if not _calibration_write_pc_cache and program_trace_file_path and os.path.exists(program_trace_file_path):
+            try:
+                for ev in load_mram_program_trace_data(program_trace_file_path):
+                    if ev.get('pc'):
+                        _calibration_write_pc_cache[int(ev['write_index'])] = ev['pc']
+            except Exception:
+                pass
+    return _calibration_write_pc_cache.get(idx)
+
+
 def load_mram_program_trace_data(path):
     """Load exact, whole-unit MRAM programs from calibration CSV."""
     import csv as _csv
@@ -16800,7 +17006,8 @@ def load_mram_program_trace_data(path):
     previous_index = 0
     with open(path, 'r') as program_file:
         reader = _csv.DictReader(program_file)
-        if tuple(reader.fieldnames or ()) != expected_fields:
+        header_fields = tuple(reader.fieldnames or ())
+        if header_fields not in (expected_fields, expected_fields + ('pc',)):
             raise ValueError(
                 'MRAM program trace has an unexpected header'
             )
@@ -16857,7 +17064,7 @@ def load_mram_program_trace_data(path):
                 decoded[field] = _decode_exact_program_bytes(
                     row[field], width, field.replace('_', ' ')
                 )
-            events.append({
+            entry = {
                 'write_index': write_index,
                 'offset': offset,
                 'width': width,
@@ -16868,7 +17075,13 @@ def load_mram_program_trace_data(path):
                 'completed_value': _little_endian_trace_value(
                     decoded['post_program_hex']
                 ),
-            })
+            }
+            pc_text = str(row.get('pc') or '').strip()
+            if pc_text:
+                pc_val = int(pc_text, 0)
+                if pc_val > 0:
+                    entry['pc'] = fmt_u32(pc_val)
+            events.append(entry)
             previous_index = write_index
     return events
 
@@ -16942,7 +17155,7 @@ def _deferred_mram_replay_fault_evidence(
         if trace_index > backend_index:
             break
         is_fault = trace_index == backend_index
-        trace.append({
+        trace_item = {
             'write_index': trace_index,
             'program_address': fmt_u32(
                 bus_base + int(trace_event['offset'])
@@ -16959,7 +17172,10 @@ def _deferred_mram_replay_fault_evidence(
                 else trace_event['completed_value']
             ),
             'faulted': is_fault,
-        })
+        }
+        if trace_event.get('pc'):
+            trace_item['pc'] = trace_event['pc']
+        trace.append(trace_item)
     evidence = {
         'contract_version': 1,
         'selected_write_index': int(selected_write_index),
@@ -16973,6 +17189,8 @@ def _deferred_mram_replay_fault_evidence(
         'write_trace': trace,
         'exact': True,
     }
+    if event.get('pc'):
+        evidence['fault_pc'] = event['pc']
     if marked_uncorrectable:
         evidence['word_marked_uncorrectable'] = True
         evidence['uncorrectable_word_address'] = evidence['program_address']
@@ -16985,7 +17203,7 @@ def load_erase_trace_data(path, require_replay_metadata=False):
         reader = _csv.DictReader(f)
         fieldnames = list(reader.fieldnames or ())
         allowed_fields = frozenset((
-            'erase_index', 'flash_offset', 'writes_at_this_point', 'erase_size',
+            'erase_index', 'flash_offset', 'writes_at_this_point', 'erase_size', 'pc',
         ))
         if not fieldnames:
             raise ValueError('erase trace CSV has no header')
@@ -17885,13 +18103,19 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
             fault_at, writes_applied, reload_ms, replay_ms, reset_ms, setup_ms,
             emulation_ms, p2_status.get('iters'), total_ms, boot_outcome))
 
+    native_extra_fields = {'recovery_writes': recovery_writes}
+    if fault_injected:
+        _cal_pc_fn = globals().get('_get_calibration_op_pc')
+        cal_pc = _cal_pc_fn(fault_type, fault_at) if callable(_cal_pc_fn) else None
+        if cal_pc:
+            native_extra_fields['fault_pc'] = cal_pc
     result = _build_fault_result(
         fault_at, fault_type, fault_injected, fault_address,
         actual_writes, signals, boot_outcome=boot_outcome,
         boot_slot=boot_slot, eff_criteria=eff_criteria, p2_status=p2_status,
         followup_label='fp{}_native_followup'.format(fault_at),
         saved_flash=faulted_flash, fault_snapshot_bytes=fault_snapshot_bytes,
-        extra_fields={'recovery_writes': recovery_writes},
+        extra_fields=native_extra_fields,
         metadata_delta_pre_snapshot=md_pre_snapshot,
         fault_semantic_state=fault_semantic_state,
     )
@@ -18328,6 +18552,13 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     extra_fields = {'recovery_writes': recovery_writes}
     if mram_fault_evidence is not None:
         extra_fields['mram_fault_evidence'] = mram_fault_evidence
+        if mram_fault_evidence.get('fault_pc'):
+            extra_fields['fault_pc'] = mram_fault_evidence['fault_pc']
+    if fault_injected and 'fault_pc' not in extra_fields:
+        _cal_pc_fn = globals().get('_get_calibration_op_pc')
+        cal_pc = _cal_pc_fn(fault_type, fault_at) if callable(_cal_pc_fn) else None
+        if cal_pc:
+            extra_fields['fault_pc'] = cal_pc
     result = _build_fault_result(
         fault_at, fault_type, fault_injected, fault_address,
         actual_writes, signals, boot_outcome=boot_outcome,
@@ -18462,12 +18693,15 @@ def _state_search_operations_from_maps(write_map, erase_map):
             raise RuntimeError(
                 'recovery state search requires contiguous width-explicit write records'
             )
-        writes.append({
+        write_item = {
             'write_index': int(write_index),
             'offset': int(meta['flash_offset']),
             'value': meta['value'],
             'width': int(meta['width']),
-        })
+        }
+        if meta.get('pc'):
+            write_item['pc'] = meta['pc']
+        writes.append(write_item)
     erases = []
     for expected_index, erase_index in enumerate(sorted(erase_map), start=1):
         meta = erase_map[erase_index]
@@ -18476,12 +18710,15 @@ def _state_search_operations_from_maps(write_map, erase_map):
             raise RuntimeError(
                 'recovery state search requires contiguous erase indices and explicit sizes'
             )
-        erases.append({
+        erase_item = {
             'erase_index': int(erase_index),
             'offset': int(meta['flash_offset']),
             'writes_at_this_point': int(meta.get('writes_at_this_point', 0)),
             'erase_size': erase_size,
-        })
+        }
+        if meta.get('pc'):
+            erase_item['pc'] = meta['pc']
+        erases.append(erase_item)
     return merge_operation_traces(writes, erases)
 
 
@@ -18511,6 +18748,7 @@ def _state_search_load_calibration_operations():
             erases = load_erase_trace_data(
                 erase_trace_file_path, require_replay_metadata=True
             )
+            erase_pcs = load_erase_trace_pc_map(erase_trace_file_path)
             for position, (flash_offset, writes_at, erase_size) in enumerate(
                 erases, start=1
             ):
@@ -18518,6 +18756,7 @@ def _state_search_load_calibration_operations():
                     'flash_offset': int(flash_offset),
                     'writes_at_this_point': int(writes_at),
                     'erase_size': int(erase_size),
+                    'pc': erase_pcs.get(position),
                 }
         operations = merge_operation_traces(program_events, [
             {
@@ -18527,6 +18766,7 @@ def _state_search_load_calibration_operations():
                     meta.get('writes_at_this_point', 0)
                 ),
                 'erase_size': int(meta['erase_size']),
+                'pc': meta.get('pc'),
             }
             for index, meta in sorted(erase_map.items())
         ])
@@ -18538,6 +18778,7 @@ def _state_search_load_calibration_operations():
     if any(len(event) < 4 for event in raw_writes):
         raise RuntimeError('recovery state search calibration trace has an ambiguous write width')
     writes = _validated_writeback_trace(raw_writes)
+    write_pcs = load_trace_pc_map(trace_file_path)
     write_map = {}
     for write_index, flash_offset, value, width in writes:
         if int(write_index) <= 0:
@@ -18546,12 +18787,14 @@ def _state_search_load_calibration_operations():
             'flash_offset': int(flash_offset),
             'value': int(value),
             'width': int(width),
+            'pc': write_pcs.get(int(write_index)),
         }
     erase_map = {}
     if erase_trace_file_path and os.path.exists(erase_trace_file_path):
         erases = load_erase_trace_data(
             erase_trace_file_path, require_replay_metadata=True
         )
+        erase_pcs = load_erase_trace_pc_map(erase_trace_file_path)
         for position, (flash_offset, writes_at, erase_size) in enumerate(
             erases, start=1
         ):
@@ -18559,6 +18802,7 @@ def _state_search_load_calibration_operations():
                 'flash_offset': int(flash_offset),
                 'writes_at_this_point': int(writes_at),
                 'erase_size': int(erase_size),
+                'pc': erase_pcs.get(position),
             }
     return (
         _state_search_operations_from_maps(write_map, erase_map),
@@ -18599,7 +18843,7 @@ def _state_search_capture_trace():
                     'recovery state search requires contiguous clean whole-unit '
                     'MRAM program records'
                 )
-            writes.append({
+            write_item = {
                 'write_index': expected_index,
                 'offset': int(event['offset']),
                 'width': width,
@@ -18618,7 +18862,10 @@ def _state_search_capture_trace():
                         event['post_program_bytes'], width, 'post-program bytes'
                     )
                 ),
-            })
+            }
+            if event.get('pc'):
+                write_item['pc'] = event['pc']
+            writes.append(write_item)
         erases = [
             {
                 'erase_index': int(index),
@@ -18627,6 +18874,7 @@ def _state_search_capture_trace():
                     meta.get('writes_at_this_point', 0)
                 ),
                 'erase_size': int(meta['erase_size']),
+                'pc': meta.get('pc'),
             }
             for index, meta in sorted(erase_map.items())
         ]
@@ -18857,6 +19105,8 @@ def _state_search_boot_state(state, chain, generation):
     state_search_extra_fields = {'recovery_writes': recovery_writes}
     if recovery_tracking_start_address is not None:
         state_search_extra_fields['recovery_tracking_start_address'] = fmt_u32(recovery_start)
+    if chain and chain[-1].get('pc'):
+        state_search_extra_fields['fault_pc'] = chain[-1]['pc']
     if recovery_tracking_start_address is not None and capture_recovery_trace:
         recovery_tracking_gate = recovery_trace_size(
             recovery_operations, recovery_start, state.region('nvm').base_address, phase2_state_search
@@ -19566,6 +19816,7 @@ if calibration_mode:
                 trace_data = calibration_trace_target.WriteTraceToString()
                 parsed_trace = []
                 trace_has_width = False
+                trace_has_pc = False
                 for line in trace_data.strip().split('\n'):
                     if not line.strip():
                         continue
@@ -19585,13 +19836,16 @@ if calibration_mode:
                     # events must not be truncated to the legacy word mask.
                     value = int(event[2])
                     width = int(event[3]) if len(event) >= 4 else None
+                    pc = int(event[4]) if len(event) >= 5 and int(event[4]) > 0 else None
                     if not _calibration_event_within_stop(
                         write_index=write_idx
                     ):
                         continue
                     if width is not None:
                         trace_has_width = True
-                    parsed_trace.append((write_idx, flash_off, value, width))
+                    if pc is not None:
+                        trace_has_pc = True
+                    parsed_trace.append((write_idx, flash_off, value, width, pc))
 
                 # The native replay format has no width field.  Emit it only
                 # when every event is demonstrably a four-byte write; a
@@ -19600,22 +19854,34 @@ if calibration_mode:
                 legacy_trace_width = _writeback_legacy_trace_width()
                 native_trace_safe = bool(parsed_trace) and all(
                     width == 4 or (width is None and legacy_trace_width == 4)
-                    for _write_idx, _flash_off, _value, width in parsed_trace
+                    for _write_idx, _flash_off, _value, width, _pc in parsed_trace
                 )
                 if native_trace_safe:
                     trace_file_bin = result_file.replace('.json', '_trace.bin')
 
                 with open(trace_file, 'w') as tf:
-                    if trace_has_width:
+                    if trace_has_width and trace_has_pc:
+                        tf.write('write_index,flash_offset,value,width,pc\n')
+                    elif trace_has_width:
                         tf.write('write_index,flash_offset,value,width\n')
+                    elif trace_has_pc:
+                        tf.write('write_index,flash_offset,value,pc\n')
                     else:
                         tf.write('write_index,flash_offset,value\n')
-                    for write_idx, flash_off, value, width in parsed_trace:
-                        if trace_has_width:
+                    for write_idx, flash_off, value, width, pc in parsed_trace:
+                        pc_field = '' if pc is None else fmt_u32(pc)
+                        if trace_has_width and trace_has_pc:
+                            width_field = '' if width is None else str(width)
+                            tf.write('{},{},{},{},{}\n'.format(
+                                write_idx, flash_off, value, width_field, pc_field
+                            ))
+                        elif trace_has_width:
                             width_field = '' if width is None else str(width)
                             tf.write('{},{},{},{}\n'.format(
                                 write_idx, flash_off, value, width_field
                             ))
+                        elif trace_has_pc:
+                            tf.write('{},{},{},{}\n'.format(write_idx, flash_off, value, pc_field))
                         else:
                             tf.write('{},{},{}\n'.format(write_idx, flash_off, value))
                 log('calibration: wrote {} trace entries to {}'.format(
@@ -19623,7 +19889,7 @@ if calibration_mode:
                 ))
                 if trace_file_bin:
                     with open(trace_file_bin, 'wb') as tfb:
-                        for write_idx, flash_off, value, _width in parsed_trace:
+                        for write_idx, flash_off, value, _width, _pc in parsed_trace:
                             tfb.write(struct.pack(
                                 '<III', write_idx, flash_off, value & 0xFFFFFFFF
                             ))
@@ -19658,24 +19924,46 @@ if calibration_mode:
             program_trace_file = result_file.replace(
                 '.json', '_program_trace.csv'
             )
+            program_trace_has_pc = any(bool(event.get('pc')) for event in program_trace)
             with open(program_trace_file, 'w') as program_file:
-                program_file.write(
-                    'write_index,program_address,offset,width,intended_hex,'
-                    'pre_program_hex,post_program_hex,faulted\n'
-                )
-                for event in program_trace:
+                if program_trace_has_pc:
                     program_file.write(
-                        '{},{},{},{},{},{},{},{}\n'.format(
-                            event['write_index'],
-                            event['program_address'],
-                            event['offset'],
-                            event['program_width'],
-                            event['intended_bytes'],
-                            event['pre_program_bytes'],
-                            event['post_program_bytes'],
-                            'true' if event['faulted'] else 'false',
-                        )
+                        'write_index,program_address,offset,width,intended_hex,'
+                        'pre_program_hex,post_program_hex,faulted,pc\n'
                     )
+                else:
+                    program_file.write(
+                        'write_index,program_address,offset,width,intended_hex,'
+                        'pre_program_hex,post_program_hex,faulted\n'
+                    )
+                for event in program_trace:
+                    if program_trace_has_pc:
+                        program_file.write(
+                            '{},{},{},{},{},{},{},{},{}\n'.format(
+                                event['write_index'],
+                                event['program_address'],
+                                event['offset'],
+                                event['program_width'],
+                                event['intended_bytes'],
+                                event['pre_program_bytes'],
+                                event['post_program_bytes'],
+                                'true' if event['faulted'] else 'false',
+                                event.get('pc') or '',
+                            )
+                        )
+                    else:
+                        program_file.write(
+                            '{},{},{},{},{},{},{},{}\n'.format(
+                                event['write_index'],
+                                event['program_address'],
+                                event['offset'],
+                                event['program_width'],
+                                event['intended_bytes'],
+                                event['pre_program_bytes'],
+                                event['post_program_bytes'],
+                                'true' if event['faulted'] else 'false',
+                            )
+                        )
             log('calibration: wrote {} exact MRAM program entries to {}'.format(
                 len(program_trace), program_trace_file
             ))
@@ -19706,39 +19994,51 @@ if calibration_mode:
                 erase_trace_file = result_file.replace('.json', '_erase_trace.csv')
                 erase_trace_file_bin = result_file.replace('.json', '_erase_trace.bin')
                 erase_data = calibration_trace_target.EraseTraceToString()
+                parsed_erases = []
+                erase_has_pc = False
+                for line in erase_data.strip().split('\n'):
+                    parts = line.split(':')
+                    if len(parts) >= 4:
+                        erase_idx = int(parts[0]) & 0xFFFFFFFF
+                        flash_off = int(parts[1]) & 0xFFFFFFFF
+                        writes_at = int(parts[2]) & 0xFFFFFFFF
+                        erase_sz = int(parts[3]) & 0xFFFFFFFF
+                        erase_pc = int(parts[4], 0) if len(parts) >= 5 and parts[4].strip() else 0
+                        if not _calibration_event_within_stop(
+                            write_index=writes_at,
+                            erase_index=erase_idx,
+                        ):
+                            continue
+                        if erase_pc > 0:
+                            erase_has_pc = True
+                        parsed_erases.append((erase_idx, flash_off, writes_at, erase_sz, erase_pc))
+                    elif len(parts) >= 3:
+                        # Legacy format without erase_size — use PageSize.
+                        erase_idx = int(parts[0]) & 0xFFFFFFFF
+                        flash_off = int(parts[1]) & 0xFFFFFFFF
+                        writes_at = int(parts[2]) & 0xFFFFFFFF
+                        fallback_sz = int(getattr(calibration_trace_target, 'PageSize', 0) or effective_page_size()) & 0xFFFFFFFF
+                        if not _calibration_event_within_stop(
+                            write_index=writes_at,
+                            erase_index=erase_idx,
+                        ):
+                            continue
+                        parsed_erases.append((erase_idx, flash_off, writes_at, fallback_sz, 0))
                 with open(erase_trace_file, 'w') as ef:
-                    ef.write('erase_index,flash_offset,writes_at_this_point,erase_size\n')
+                    if erase_has_pc:
+                        ef.write('erase_index,flash_offset,writes_at_this_point,erase_size,pc\n')
+                    else:
+                        ef.write('erase_index,flash_offset,writes_at_this_point,erase_size\n')
                     with open(erase_trace_file_bin, 'wb') as efb:
                         erase_bin_count = 0
-                        for line in erase_data.strip().split('\n'):
-                            parts = line.split(':')
-                            if len(parts) >= 4:
-                                erase_idx = int(parts[0]) & 0xFFFFFFFF
-                                flash_off = int(parts[1]) & 0xFFFFFFFF
-                                writes_at = int(parts[2]) & 0xFFFFFFFF
-                                erase_sz = int(parts[3]) & 0xFFFFFFFF
-                                if not _calibration_event_within_stop(
-                                    write_index=writes_at,
-                                    erase_index=erase_idx,
-                                ):
-                                    continue
+                        for erase_idx, flash_off, writes_at, erase_sz, erase_pc in parsed_erases:
+                            if erase_has_pc:
+                                pc_str = fmt_u32(erase_pc) if erase_pc > 0 else ''
+                                ef.write('{},{},{},{},{}\n'.format(erase_idx, flash_off, writes_at, erase_sz, pc_str))
+                            else:
                                 ef.write('{},{},{},{}\n'.format(erase_idx, flash_off, writes_at, erase_sz))
-                                efb.write(struct.pack('<III', writes_at, flash_off, erase_sz))
-                                erase_bin_count += 1
-                            elif len(parts) >= 3:
-                                # Legacy format without erase_size — use PageSize.
-                                erase_idx = int(parts[0]) & 0xFFFFFFFF
-                                flash_off = int(parts[1]) & 0xFFFFFFFF
-                                writes_at = int(parts[2]) & 0xFFFFFFFF
-                                fallback_sz = int(getattr(calibration_trace_target, 'PageSize', 0) or effective_page_size()) & 0xFFFFFFFF
-                                if not _calibration_event_within_stop(
-                                    write_index=writes_at,
-                                    erase_index=erase_idx,
-                                ):
-                                    continue
-                                ef.write('{},{},{},{}\n'.format(erase_idx, flash_off, writes_at, fallback_sz))
-                                efb.write(struct.pack('<III', writes_at, flash_off, fallback_sz))
-                                erase_bin_count += 1
+                            efb.write(struct.pack('<III', writes_at, flash_off, erase_sz))
+                            erase_bin_count += 1
                 log('calibration: wrote {} erase trace entries to {}'.format(erase_count, erase_trace_file))
                 log('calibration: wrote {} binary erase entries to {}'.format(erase_bin_count, erase_trace_file_bin))
                 log('calibration: {} total erases'.format(total_erases))

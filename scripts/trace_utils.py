@@ -139,7 +139,7 @@ def load_clean_write_trace(
             raise ValueError(
                 "write trace CSV is missing columns: {}".format(",".join(sorted(missing)))
             )
-        allowed = required | {"width", "write_width", "length"}
+        allowed = required | {"width", "write_width", "length", "pc"}
         unexpected = set(fields) - allowed
         if unexpected:
             raise ValueError(
@@ -205,6 +205,14 @@ def load_clean_write_trace(
                             )
                         )
                     entry["width"] = width
+            if "pc" in fields:
+                raw_pc = str(row.get("pc", "") or "").strip()
+                if raw_pc:
+                    pc_value = _parse_optional_int(raw_pc)
+                    if pc_value is None or pc_value < 0:
+                        raise ValueError("malformed write trace pc")
+                    if pc_value != 0:
+                        entry["pc"] = _fmt_u32(pc_value)
             entries.append(entry)
     return entries
 
@@ -242,7 +250,10 @@ def parse_exact_program_trace_csv(
     """Parse and validate an exact, width-aware MRAM calibration trace."""
     reader = csv.DictReader(text.splitlines(), strict=True)
     fields = tuple(reader.fieldnames or ())
-    if fields != EXACT_PROGRAM_TRACE_FIELDS:
+    if fields not in (
+        EXACT_PROGRAM_TRACE_FIELDS,
+        EXACT_PROGRAM_TRACE_FIELDS + ("pc",),
+    ):
         raise ValueError("{} has an unexpected header".format(source))
 
     entries: List[Dict[str, Any]] = []
@@ -341,18 +352,27 @@ def parse_exact_program_trace_csv(
                 )
             )
 
-        entries.append(
-            {
-                "write_index": write_index,
-                "program_address": program_address,
-                "offset": offset,
-                "program_width": width,
-                "intended_bytes": exact_bytes["intended_hex"],
-                "pre_program_bytes": exact_bytes["pre_program_hex"],
-                "post_program_bytes": exact_bytes["post_program_hex"],
-                "faulted": False,
-            }
-        )
+        entry_record: Dict[str, Any] = {
+            "write_index": write_index,
+            "program_address": program_address,
+            "offset": offset,
+            "program_width": width,
+            "intended_bytes": exact_bytes["intended_hex"],
+            "pre_program_bytes": exact_bytes["pre_program_hex"],
+            "post_program_bytes": exact_bytes["post_program_hex"],
+            "faulted": False,
+        }
+        if "pc" in fields:
+            raw_pc = str(row.get("pc", "") or "").strip()
+            if raw_pc:
+                pc_value = _parse_optional_int(raw_pc)
+                if pc_value is None or pc_value < 0:
+                    raise ValueError(
+                        "{} row {} has a malformed pc".format(source, line_number)
+                    )
+                if pc_value != 0:
+                    entry_record["pc"] = _fmt_u32(pc_value)
+        entries.append(entry_record)
         previous_index = write_index
     return entries
 
@@ -541,6 +561,7 @@ def load_clean_erase_trace(
             "write_index",
             "write_count_at_erase",
             "erase_size",
+            "pc",
         }
         unexpected = set(fields) - allowed
         if unexpected:
@@ -631,15 +652,22 @@ def load_clean_erase_trace(
                         flash_offset, flash_offset + effective_size, capacity
                     )
                 )
-            entries.append(
-                {
-                    "erase_index": erase_index,
-                    "flash_offset": flash_offset,
-                    "writes_at_this_point": writes_at,
-                    "erase_size": erase_size,
-                    "source_order": idx,
-                }
-            )
+            erase_entry: Dict[str, Any] = {
+                "erase_index": erase_index,
+                "flash_offset": flash_offset,
+                "writes_at_this_point": writes_at,
+                "erase_size": erase_size,
+                "source_order": idx,
+            }
+            if "pc" in fields:
+                raw_pc = str(row.get("pc", "") or "").strip()
+                if raw_pc:
+                    pc_value = _parse_optional_int(raw_pc)
+                    if pc_value is None or pc_value < 0:
+                        raise ValueError("erase trace pc is malformed")
+                    if pc_value != 0:
+                        erase_entry["pc"] = _fmt_u32(pc_value)
+            entries.append(erase_entry)
     entries.sort(
         key=lambda e: (
             e["writes_at_this_point"] is None,
@@ -846,6 +874,8 @@ def build_clean_operation_trace(
             }
         if "width" in w and w.get("width") is not None:
             op["width"] = int(w["width"])
+        if w.get("pc"):
+            op["pc"] = str(w["pc"])
         ops.append(op)
     for e in erase_entries:
         erase_idx = int(e["erase_index"])
@@ -861,19 +891,22 @@ def build_clean_operation_trace(
             writes_at = int(writes_at_raw)
             writes_at_known = True
         off = int(e["flash_offset"])
-        ops.append(
-            {
-                "_sort_key": (writes_at + 1, 0, erase_idx),
-                "kind": "erase",
-                "erase_index": erase_idx,
-                "writes_at_this_point": writes_at_raw,
-                "writes_at_known": writes_at_known,
-                "flash_offset": off,
-                "address": _fmt_u32(
-                    _trace_absolute_address(off, flash_base, trace_address_map)
-                ),
-            }
-        )
+        erase_op: Dict[str, Any] = {
+            "_sort_key": (writes_at + 1, 0, erase_idx),
+            "kind": "erase",
+            "erase_index": erase_idx,
+            "writes_at_this_point": writes_at_raw,
+            "writes_at_known": writes_at_known,
+            "flash_offset": off,
+            "address": _fmt_u32(
+                _trace_absolute_address(off, flash_base, trace_address_map)
+            ),
+        }
+        if e.get("erase_size") is not None:
+            erase_op["erase_size"] = int(e["erase_size"])
+        if e.get("pc"):
+            erase_op["pc"] = str(e["pc"])
+        ops.append(erase_op)
     ops.sort(key=lambda o: o["_sort_key"])
     for i, op in enumerate(ops, start=1):
         op["sequence"] = i
@@ -901,6 +934,10 @@ def _compact_operation(op: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
         if writes_at is not None:
             base["writes_at_this_point"] = int(writes_at)
         base["writes_at_known"] = bool(op.get("writes_at_known", True))
+        if op.get("erase_size") is not None:
+            base["erase_size"] = int(op["erase_size"])
+    if op.get("pc"):
+        base["pc"] = str(op["pc"])
     return base
 
 

@@ -76,6 +76,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             wenSnapshot = null;
             operationTraceShadow = null;
             wenWriteOffsets.Clear();
+            wenWritePcs.Clear();
             OperationTraceFastMode = false;
             memoryAccessHookInstalled = false;
             UpdateMemoryAccessHook(false);
@@ -91,6 +92,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public ulong FaultAtWordWrite { get => tracker.FaultAtWordWrite; set => tracker.FaultAtWordWrite = value; }
         public bool FaultFired { get => tracker.FaultFired; set => tracker.FaultFired = value; }
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
+        public ulong LastFaultPC { get => tracker.LastFaultPC; set => tracker.LastFaultPC = value; }
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
         public bool DriverErrorFired { get => tracker.DriverErrorFired; set => tracker.DriverErrorFired = value; }
         public bool DriverErrorRequiresReturnHook => true;
@@ -186,7 +188,33 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private byte[] wenSnapshot;
         private readonly List<int> wenWriteOffsets = new List<int>();
+        private readonly Dictionary<int, ulong> wenWritePcs = new Dictionary<int, ulong>();
         private bool memoryAccessHookInstalled;
+
+        private ulong CurrentCpuPc()
+        {
+            if(!machine.IsRegistered(this))
+            {
+                return 0UL;
+            }
+            ICPU cpu;
+            var bus = machine.GetSystemBus(this);
+            if(bus != null && bus.TryGetCurrentCPU(out cpu) && cpu != null)
+            {
+                return cpu.PC.RawValue;
+            }
+            return 0UL;
+        }
+
+        private ulong ResolveWritePc(int offset, ulong fallbackPc)
+        {
+            ulong hookPc;
+            if(wenWritePcs.TryGetValue(offset, out hookPc) && hookPc != 0)
+            {
+                return hookPc;
+            }
+            return fallbackPc;
+        }
 
         private void UpdateMemoryAccessHook(bool enabled)
         {
@@ -232,6 +260,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         "operation trace fast mode requires aligned 4-byte flash writes");
                 }
                 int off = (int)rel;
+                wenWritePcs[off] = pc;
                 if(wenWriteOffsets.Count == 0 || wenWriteOffsets[wenWriteOffsets.Count - 1] != off)
                 {
                     wenWriteOffsets.Add(off);
@@ -244,6 +273,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 if(off >= 0 && off <= FlashSize - 4)
                 {
+                    wenWritePcs[off] = pc;
                     if(wenWriteOffsets.Count == 0 || wenWriteOffsets[wenWriteOffsets.Count - 1] != off)
                     {
                         wenWriteOffsets.Add(off);
@@ -415,7 +445,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         // No MappedMemory — fall back to simple counting.
                         if(oldConfig == 1 && val == 0 && !AnyFaultFired)
                         {
-                            if(tracker.IncrementWriteCount())
+                            if(tracker.IncrementWriteCount(CurrentCpuPc()))
                             {
                                 FaultFired = true;
                             }
@@ -442,6 +472,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     if(val == 1 && oldConfig != 1)
                     {
                         wenWriteOffsets.Clear();
+                        wenWritePcs.Clear();
                         bool wantSnap = needDiff || (!PassthroughMode && WriteFaultMode != 0 && !AnyFaultFired);
                         if(wantSnap)
                         {
@@ -468,6 +499,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     // Exiting WEN → REN.
                     if(oldConfig == 1 && val == 0)
                     {
+                        var configWritePc = CurrentCpuPc();
                         if(wenSnapshot != null && !AnyFaultFired)
                         {
                             // Word-level diff mode: count each changed 4-byte word.
@@ -497,6 +529,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                         | (current[off + 2] << 16)
                                         | (current[off + 3] << 24));
 
+                                    tracker.PendingPC = ResolveWritePc(off, configWritePc);
                                     if(tracker.RecordWriteAndCheckFault(off, val32, 4))
                                     {
                                         FaultFired = true;
@@ -546,6 +579,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                         | (current[off + 2] << 16)
                                         | (current[off + 3] << 24));
 
+                                    tracker.PendingPC = ResolveWritePc(off, configWritePc);
                                     if(tracker.RecordWriteAndCheckFault(off, val32, 4))
                                     {
                                         FaultFired = true;
@@ -617,6 +651,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                     | (currentWord[1] << 8)
                                     | (currentWord[2] << 16)
                                     | (currentWord[3] << 24));
+                                tracker.PendingPC = ResolveWritePc(off, configWritePc);
                                 tracker.RecordWriteAndCheckFault(off, val32, 4);
                                 operationTraceShadow[off] = currentWord[0];
                                 operationTraceShadow[off + 1] = currentWord[1];
@@ -631,7 +666,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                             // because the WEN entry guard captures wenSnapshot for
                             // all non-power-loss modes, routing them through the
                             // slow diff path above which calls ApplyWriteFaultAtOffset.
-                            if(tracker.IncrementWriteCount())
+                            if(tracker.IncrementWriteCount(configWritePc))
                             {
                                 FaultFired = true;
                                 LastFaultAddress = 0;
@@ -640,6 +675,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         }
 
                         wenWriteOffsets.Clear();
+                        wenWritePcs.Clear();
                         wenSnapshot = null;
                     }
                 }, valueProviderCallback: _ => configValue, name: "WEN");
@@ -665,12 +701,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         return;
                     }
 
+                    var erasePc = CurrentCpuPc();
                     if(Nvm != null)
                     {
                         var offset = pageAddr - NvmBaseAddress;
                         if(offset >= 0 && offset + PageSize <= Nvm.Size)
                         {
-                            if(tracker.RecordEraseAndCheckFault(offset, PageSize))
+                            if(tracker.RecordEraseAndCheckFault(offset, PageSize, erasePc))
                             {
                                 EraseFaultFired = true;
                                 LastFaultAddress = (uint)pageAddr;
@@ -731,7 +768,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         var offset = pageAddr - FlashBaseAddress;
                         if(offset >= 0 && offset + PageSize <= FlashSize)
                         {
-                            if(tracker.RecordEraseAndCheckFault(offset, PageSize))
+                            if(tracker.RecordEraseAndCheckFault(offset, PageSize, erasePc))
                             {
                                 EraseFaultFired = true;
                                 LastFaultAddress = (uint)pageAddr;

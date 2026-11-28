@@ -24,6 +24,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool EraseFaultFired;
 
         public uint LastFaultAddress;
+        public ulong LastFaultPC;
+        public ulong PendingPC;
         public byte[] FaultFlashSnapshot;
 
         public int WriteFaultMode;
@@ -56,25 +58,50 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // Returns true if TotalWordWrites == FaultAtWordWrite.
         public bool RecordWriteAndCheckFault(int byteOffset, ulong eventValue, int width)
         {
+            var pc = PendingPC;
+            PendingPC = 0;
+            return RecordWriteAndCheckFault(byteOffset, eventValue, width, pc);
+        }
+
+        public bool RecordWriteAndCheckFault(int byteOffset, ulong eventValue, int width, ulong pc)
+        {
             if(width != 1 && width != 2 && width != 4 && width != 8)
             {
                 throw new ArgumentOutOfRangeException(nameof(width),
                     "Write trace width must be 1, 2, 4, or 8 bytes");
             }
+            var effectivePc = pc != 0 ? pc : PendingPC;
+            PendingPC = 0;
             TotalWordWrites++;
             if(WriteTraceEnabled)
             {
                 writeTrace.Add(Tuple.Create(TotalWordWrites, byteOffset, eventValue, width));
+                if(effectivePc != 0)
+                {
+                    writeTracePcs[TotalWordWrites] = effectivePc;
+                }
             }
-            return TotalWordWrites == FaultAtWordWrite;
+            var faultHit = TotalWordWrites == FaultAtWordWrite;
+            if(faultHit)
+            {
+                LastFaultPC = effectivePc;
+            }
+            return faultHit;
         }
 
         // Counter-only increment (NRF52 fast path outside diff window).
         // No trace entry emitted.  Returns true if fault arm hit.
-        public bool IncrementWriteCount()
+        public bool IncrementWriteCount(ulong pc = 0)
         {
+            var effectivePc = pc != 0 ? pc : PendingPC;
+            PendingPC = 0;
             TotalWordWrites++;
-            return TotalWordWrites == FaultAtWordWrite;
+            var faultHit = TotalWordWrites == FaultAtWordWrite;
+            if(faultHit)
+            {
+                LastFaultPC = effectivePc;
+            }
+            return faultHit;
         }
 
         // --- Erase counting ---
@@ -82,14 +109,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // Increment erase counter, add trace entry if enabled, check fault arm.
         // Returns true if TotalPageErases == FaultAtPageErase.
         // Caller is responsible for ALL erase application (partial or full).
-        public bool RecordEraseAndCheckFault(long offset, int eraseSize)
+        public bool RecordEraseAndCheckFault(long offset, int eraseSize, ulong pc = 0)
         {
+            var effectivePc = pc != 0 ? pc : PendingPC;
+            PendingPC = 0;
             TotalPageErases++;
             if(EraseTraceEnabled)
             {
-                eraseTrace.Add(Tuple.Create(TotalPageErases, offset, TotalWordWrites, eraseSize));
+                eraseTrace.Add(Tuple.Create(TotalPageErases, offset, TotalWordWrites, eraseSize, effectivePc));
             }
-            return TotalPageErases == FaultAtPageErase;
+            var faultHit = TotalPageErases == FaultAtPageErase;
+            if(faultHit)
+            {
+                LastFaultPC = effectivePc;
+            }
+            return faultHit;
         }
 
         // --- Trace access ---
@@ -98,7 +132,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public string WriteTraceToString()
         {
-            var sb = new StringBuilder(writeTrace.Count * 32);
+            var sb = new StringBuilder(writeTrace.Count * 40);
             foreach(var entry in writeTrace)
             {
                 sb.Append(entry.Item1);
@@ -108,6 +142,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 sb.Append(entry.Item3);
                 sb.Append(':');
                 sb.Append(entry.Item4);
+                ulong tracePc;
+                if(writeTracePcs.TryGetValue(entry.Item1, out tracePc) && tracePc != 0)
+                {
+                    sb.Append(":0x");
+                    sb.Append(tracePc.ToString("X8"));
+                }
                 sb.Append('\n');
             }
             return sb.ToString();
@@ -116,13 +156,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public void WriteTraceClear()
         {
             writeTrace.Clear();
+            writeTracePcs.Clear();
         }
 
         public int EraseTraceCount => eraseTrace.Count;
 
         public string EraseTraceToString()
         {
-            var sb = new StringBuilder(eraseTrace.Count * 32);
+            var sb = new StringBuilder(eraseTrace.Count * 40);
             foreach(var entry in eraseTrace)
             {
                 sb.Append(entry.Item1);
@@ -132,6 +173,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 sb.Append(entry.Item3);
                 sb.Append(':');
                 sb.Append(entry.Item4);
+                if(entry.Item5 != 0)
+                {
+                    sb.Append(":0x");
+                    sb.Append(entry.Item5.ToString("X8"));
+                }
                 sb.Append('\n');
             }
             return sb.ToString();
@@ -154,8 +200,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 DriverErrorFired = false;
                 EraseFaultFired = false;
                 LastFaultAddress = 0;
+                LastFaultPC = 0;
+                PendingPC = 0;
                 FaultFlashSnapshot = null;
                 writeTrace.Clear();
+                writeTracePcs.Clear();
                 eraseTrace.Clear();
             }
             if(WritebackDomains != null)
@@ -403,7 +452,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         // --- Private trace storage ---
         private readonly List<Tuple<ulong, int, ulong, int>> writeTrace = new List<Tuple<ulong, int, ulong, int>>();
-        private readonly List<Tuple<ulong, long, ulong, int>> eraseTrace = new List<Tuple<ulong, long, ulong, int>>();
+        private readonly Dictionary<ulong, ulong> writeTracePcs = new Dictionary<ulong, ulong>();
+        private readonly List<Tuple<ulong, long, ulong, int, ulong>> eraseTrace = new List<Tuple<ulong, long, ulong, int, ulong>>();
     }
 
     public class WritebackDomain

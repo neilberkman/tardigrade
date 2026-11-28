@@ -521,7 +521,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         public string WriteTraceToString()
         {
             if(AliasTarget != null) return AliasTarget.WriteTraceToString();
-            var result = new StringBuilder(writeTrace.Count * 32);
+            var result = new StringBuilder(writeTrace.Count * 40);
             foreach(var entry in writeTrace)
             {
                 result.Append(entry.Index);
@@ -531,6 +531,11 @@ namespace Antmicro.Renode.Peripherals.Memory
                 result.Append(entry.Value);
                 result.Append(':');
                 result.Append(entry.Width);
+                if(entry.PC != 0)
+                {
+                    result.Append(":0x");
+                    result.Append(entry.PC.ToString("X8"));
+                }
                 result.Append('\n');
             }
             return result.ToString();
@@ -631,7 +636,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         public string ProgramTraceToString()
         {
             if(AliasTarget != null) return AliasTarget.ProgramTraceToString();
-            var result = new StringBuilder(programTrace.Count * 128);
+            var result = new StringBuilder(programTrace.Count * 140);
             foreach(var entry in programTrace)
             {
                 result.Append(entry.Index);
@@ -647,6 +652,11 @@ namespace Antmicro.Renode.Peripherals.Memory
                 AppendHex(result, entry.PostProgram);
                 result.Append(':');
                 result.Append(entry.Faulted ? '1' : '0');
+                if(entry.PC != 0)
+                {
+                    result.Append(":0x");
+                    result.Append(entry.PC.ToString("X8"));
+                }
                 result.Append('\n');
             }
             return result.ToString();
@@ -982,7 +992,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             {
                 return string.Empty;
             }
-            var result = new StringBuilder(eraseTrace.Count * 32);
+            var result = new StringBuilder(eraseTrace.Count * 40);
             foreach(var entry in eraseTrace)
             {
                 result.Append(entry.Index);
@@ -992,6 +1002,11 @@ namespace Antmicro.Renode.Peripherals.Memory
                 result.Append(entry.WritesAt);
                 result.Append(':');
                 result.Append(entry.EraseSize);
+                if(entry.PC != 0)
+                {
+                    result.Append(":0x");
+                    result.Append(entry.PC.ToString("X8"));
+                }
                 result.Append('\n');
             }
             return result.ToString();
@@ -1010,6 +1025,16 @@ namespace Antmicro.Renode.Peripherals.Memory
             {
                 if(AliasTarget != null) AliasTarget.LastFaultAddress = value;
                 else lastFaultAddress = value;
+            }
+        }
+
+        public ulong LastFaultPC
+        {
+            get { return AliasTarget != null ? AliasTarget.LastFaultPC : lastFaultPC; }
+            set
+            {
+                if(AliasTarget != null) AliasTarget.LastFaultPC = value;
+                else lastFaultPC = value;
             }
         }
 
@@ -1174,12 +1199,13 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return;
             }
 
+            var erasePc = CurrentCpuPc();
             var currentEraseIndex = totalPageErases + 1;
             totalPageErases = currentEraseIndex;
             if(eraseTraceEnabled)
             {
                 eraseTrace.Add(new EraseTraceEntry(
-                    currentEraseIndex, offset, TotalWordWrites, spanSize));
+                    currentEraseIndex, offset, TotalWordWrites, spanSize, erasePc));
             }
 
             if(currentEraseIndex == faultAtPageErase)
@@ -1194,6 +1220,7 @@ namespace Antmicro.Renode.Peripherals.Memory
                 LastFaultInjected = true;
                 LastFaultPattern = EraseFill;
                 lastFaultAddress = unchecked((uint)(programAddressBase + (ulong)offset));
+                lastFaultPC = erasePc;
                 lastFaultOffset = offset;
                 lastFaultProgramAddress = programAddressBase + (ulong)offset;
                 lastFaultProgramWidth = spanSize;
@@ -1383,6 +1410,8 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return;
             }
 
+            var writePc = CurrentCpuPc();
+
             if(!EnforceWordWriteSemantics)
             {
                 // Fast path: commit one word at a time.  A simulated power
@@ -1488,15 +1517,15 @@ namespace Antmicro.Renode.Peripherals.Memory
                         LastFaultPattern = (byte)(WriteFaultMode == 1 ? 0xCC : EraseFill);
                         TotalWordWrites++;
                         LastWriteAddress = wordStart;
-                        RecordWriteTrace(wordStart);
+                        RecordWriteTrace(wordStart, writePc);
                         var postFaultWord = ReadStorageWord(wordStart);
                         RecordProgramTrace(
                             currentWriteIndex, wordStart, intendedWord,
-                            previousWord, postFaultWord, true
+                            previousWord, postFaultWord, true, writePc
                         );
                         CaptureFaultEvidence(
                             currentWriteIndex, wordStart, intendedWord,
-                            previousWord, postFaultWord
+                            previousWord, postFaultWord, writePc
                         );
                         return;
                     }
@@ -1504,10 +1533,10 @@ namespace Antmicro.Renode.Peripherals.Memory
                     ClearUncorrectableWordInternal(wordStart);
                     RecordProgramTrace(
                         currentWriteIndex, wordStart, intendedWord,
-                        previousWord, ReadStorageWord(wordStart), false
+                        previousWord, ReadStorageWord(wordStart), false, writePc
                     );
                     TotalWordWrites++;
-                    RecordWriteTrace(wordStart);
+                    RecordWriteTrace(wordStart, writePc);
                 }
 
                 return;
@@ -1633,15 +1662,15 @@ namespace Antmicro.Renode.Peripherals.Memory
                         LastFaultPattern = (byte)(WriteFaultMode == 1 ? 0xCC : EraseFill);
                         TotalWordWrites++;
                         writeLog.Add(wordStart);
-                        RecordWriteTrace(wordStart);
+                        RecordWriteTrace(wordStart, writePc);
                         var postFaultWord = ReadStorageWord(wordStart);
                         RecordProgramTrace(
                             currentWriteIndex, wordStart, mergedWord,
-                            previousWord, postFaultWord, true
+                            previousWord, postFaultWord, true, writePc
                         );
                         CaptureFaultEvidence(
                             currentWriteIndex, wordStart, mergedWord,
-                            previousWord, postFaultWord
+                            previousWord, postFaultWord, writePc
                         );
                         break;
                     }
@@ -1650,7 +1679,7 @@ namespace Antmicro.Renode.Peripherals.Memory
                     ClearUncorrectableWordInternal(wordStart);
                     RecordProgramTrace(
                         currentWriteIndex, wordStart, mergedWord,
-                        previousWord, ReadStorageWord(wordStart), false
+                        previousWord, ReadStorageWord(wordStart), false, writePc
                     );
                     TotalWordWrites++;
                     writeLog.Add(wordStart);
@@ -1752,7 +1781,33 @@ namespace Antmicro.Renode.Peripherals.Memory
             }
         }
 
+        private ulong CurrentCpuPc()
+        {
+            if(machine == null)
+            {
+                return 0UL;
+            }
+            try
+            {
+                var bus = machine.GetSystemBus(this);
+                ICPU cpu;
+                if(bus != null && bus.TryGetCurrentCPU(out cpu) && cpu != null)
+                {
+                    return cpu.PC.RawValue;
+                }
+            }
+            catch
+            {
+            }
+            return 0UL;
+        }
+
         private void RecordWriteTrace(long wordStart)
+        {
+            RecordWriteTrace(wordStart, CurrentCpuPc());
+        }
+
+        private void RecordWriteTrace(long wordStart, ulong pc)
         {
             if(!WriteTraceEnabled)
             {
@@ -1768,26 +1823,28 @@ namespace Antmicro.Renode.Peripherals.Memory
             // explicit width remains authoritative. Full program bytes live
             // in ProgramTraceToString and are never truncated there.
             writeTrace.Add(new WriteTraceEntry(
-                TotalWordWrites, wordStart, value, checked((int)WordSize)
+                TotalWordWrites, wordStart, value, checked((int)WordSize), pc
             ));
         }
 
         private void RecordProgramTrace(ulong index, long offset, byte[] intended,
-                                        byte[] preProgram, byte[] postProgram, bool faulted)
+                                        byte[] preProgram, byte[] postProgram, bool faulted, ulong pc = 0)
         {
             programTrace.Add(new ProgramTraceEntry(
                 index, offset, (int)WordSize,
                 CloneBytes(intended), CloneBytes(preProgram), CloneBytes(postProgram),
-                faulted
+                faulted, pc
             ));
         }
 
         private void CaptureFaultEvidence(ulong index, long offset, byte[] intended,
-                                          byte[] preProgram, byte[] postFault)
+                                          byte[] preProgram, byte[] postFault, ulong pc = 0)
         {
             lastFaultWriteIndex = index;
             lastFaultOffset = offset;
             lastFaultProgramAddress = programAddressBase + (ulong)offset;
+            lastFaultAddress = unchecked((uint)lastFaultProgramAddress);
+            lastFaultPC = pc;
             lastFaultProgramWidth = (int)WordSize;
             lastFaultIntendedBytes = CloneBytes(intended);
             lastFaultPreProgramBytes = CloneBytes(preProgram);
@@ -2029,6 +2086,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             FaultEverFired = false;
             eraseFaultFired = false;
             lastFaultAddress = 0;
+            lastFaultPC = 0;
             DriverErrorFired = false;
         }
 
@@ -2094,6 +2152,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         private bool eraseFaultFired;
         private int eraseFaultMode;
         private uint lastFaultAddress;
+        private ulong lastFaultPC;
         private ulong trackingStartAddress;
         private ulong configuredTrackingStartAddress;
         private bool trackingStarted = true;
@@ -2138,41 +2197,45 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         private sealed class WriteTraceEntry
         {
-            public WriteTraceEntry(ulong index, long offset, ulong value, int width)
+            public WriteTraceEntry(ulong index, long offset, ulong value, int width, ulong pc = 0)
             {
                 Index = index;
                 Offset = offset;
                 Value = value;
                 Width = width;
+                PC = pc;
             }
 
             public readonly ulong Index;
             public readonly long Offset;
             public readonly ulong Value;
             public readonly int Width;
+            public readonly ulong PC;
         }
 
         private sealed class EraseTraceEntry
         {
-            public EraseTraceEntry(ulong index, long offset, ulong writesAt, int eraseSize)
+            public EraseTraceEntry(ulong index, long offset, ulong writesAt, int eraseSize, ulong pc = 0)
             {
                 Index = index;
                 Offset = offset;
                 WritesAt = writesAt;
                 EraseSize = eraseSize;
+                PC = pc;
             }
 
             public readonly ulong Index;
             public readonly long Offset;
             public readonly ulong WritesAt;
             public readonly int EraseSize;
+            public readonly ulong PC;
         }
 
         private sealed class ProgramTraceEntry
         {
             public ProgramTraceEntry(ulong index, long offset, int width,
                                      byte[] intended, byte[] preProgram,
-                                     byte[] postProgram, bool faulted)
+                                     byte[] postProgram, bool faulted, ulong pc = 0)
             {
                 Index = index;
                 Offset = offset;
@@ -2181,6 +2244,7 @@ namespace Antmicro.Renode.Peripherals.Memory
                 PreProgram = preProgram;
                 PostProgram = postProgram;
                 Faulted = faulted;
+                PC = pc;
             }
 
             public readonly ulong Index;
@@ -2190,6 +2254,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             public readonly byte[] PreProgram;
             public readonly byte[] PostProgram;
             public readonly bool Faulted;
+            public readonly ulong PC;
         }
 
         private const long DefaultSize = 0x80000;
@@ -2471,6 +2536,12 @@ namespace Antmicro.Renode.Peripherals
         {
             get { return Nvm != null ? Nvm.LastFaultAddress : 0U; }
             set { if(Nvm != null) { Nvm.LastFaultAddress = value; } }
+        }
+
+        public ulong LastFaultPC
+        {
+            get { return Nvm != null ? Nvm.LastFaultPC : 0UL; }
+            set { if(Nvm != null) { Nvm.LastFaultPC = value; } }
         }
 
         public byte[] FaultFlashSnapshot

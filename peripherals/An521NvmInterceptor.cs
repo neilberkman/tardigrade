@@ -64,6 +64,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool AnyFaultFired => tracker.AnyFaultFired;
         public bool FaultRequiresImmediateStop => tracker.FaultRequiresImmediateStop;
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
+        public ulong LastFaultPC { get => tracker.LastFaultPC; set => tracker.LastFaultPC = value; }
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
         public int WriteFaultMode
         {
@@ -172,6 +173,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             EraseSpan(offset, sectorSize);
         }
 
+        private ulong CurrentCpuPc()
+        {
+            if(!machine.IsRegistered(this))
+            {
+                return 0UL;
+            }
+            ICPU cpu;
+            var bus = machine.GetSystemBus(this);
+            if(bus != null && bus.TryGetCurrentCPU(out cpu) && cpu != null)
+            {
+                return cpu.PC.RawValue;
+            }
+            return 0UL;
+        }
+
         private void EraseSpan(long offset, int spanSize)
         {
             if(!trackingStarted)
@@ -180,10 +196,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
+            var erasePc = CurrentCpuPc();
+
             if(PassthroughMode)
             {
                 WriteErasedSpanRaw(offset, spanSize);
-                tracker.RecordEraseAndCheckFault(offset, spanSize);
+                tracker.RecordEraseAndCheckFault(offset, spanSize, erasePc);
                 return;
             }
 
@@ -194,7 +212,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
 
             EnsureShadow();
-            if(tracker.RecordEraseAndCheckFault(offset, spanSize))
+            if(tracker.RecordEraseAndCheckFault(offset, spanSize, erasePc))
             {
                 EraseFaultFired = true;
                 LastFaultAddress = (uint)(FlashBaseAddress + offset);
@@ -401,7 +419,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // coherent so a later campaign cannot compare against stale
                 // recovery data.
                 WriteResult(aligned, offset, width, result);
-                tracker.IncrementWriteCount();
+                tracker.IncrementWriteCount(CurrentCpuPc());
                 WriteShadowWord(aligned, result);
                 return;
             }
@@ -414,6 +432,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var traceOffset = (int)aligned;
             var traceValue = (ulong)result;
             var traceWidth = 4;
+            tracker.PendingPC = CurrentCpuPc();
             var faultArmed = tracker.RecordWriteAndCheckFault(
                 traceOffset, traceValue, traceWidth);
             if(faultArmed)
@@ -480,7 +499,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // Count recovery writes for diagnostics, but do not snapshot or
                 // fault them; only mirror them into an existing shadow used by a
                 // later campaign.
-                MirrorShadowWrite(offset, width, value);
+                MirrorShadowWrite(offset, width, value, virtualPC);
                 return;
             }
 
@@ -518,7 +537,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var traceValue = (ulong)newWord;
                 var traceWidth = 4;
 
-                if(tracker.RecordWriteAndCheckFault(traceOffset, traceValue, traceWidth))
+                if(tracker.RecordWriteAndCheckFault(traceOffset, traceValue, traceWidth, virtualPC))
                 {
                     FaultFired = true;
                     LastFaultAddress = (uint)(FlashBaseAddress + aligned);
@@ -656,7 +675,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return result;
         }
 
-        private void MirrorShadowWrite(long offset, uint width, ulong value)
+        private void MirrorShadowWrite(long offset, uint width, ulong value, ulong pc = 0)
         {
             if(width == 0)
             {
@@ -670,7 +689,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var aligned = chunkOffset & ~3L;
                 var inWord = (int)(chunkOffset - aligned);
                 var bytes = Math.Min(4 - inWord, byteCount - cursor);
-                tracker.IncrementWriteCount();
+                tracker.IncrementWriteCount(pc);
                 if(flashShadow != null)
                 {
                     var oldWord = ReadShadowWord(aligned);

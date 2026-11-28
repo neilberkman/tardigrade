@@ -24,6 +24,7 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Memory;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
@@ -52,6 +53,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public ulong FaultAtWordWrite { get => tracker.FaultAtWordWrite; set => tracker.FaultAtWordWrite = value; }
         public bool FaultFired { get => tracker.FaultFired; set => tracker.FaultFired = value; }
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
+        public ulong LastFaultPC { get => tracker.LastFaultPC; set => tracker.LastFaultPC = value; }
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
         public bool DriverErrorFired { get => tracker.DriverErrorFired; set => tracker.DriverErrorFired = value; }
         public bool DriverErrorRequiresReturnHook => true;
@@ -354,6 +356,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
+            var writePc = CurrentCpuPc();
+
             if(preFaultSnapshot != null)
             {
                 // We have a pre-write snapshot — diff to find the changed word.
@@ -377,6 +381,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     uint wordValue = FaultTracker.ReadU32(current, changedOffset);
 
+                    tracker.PendingPC = writePc;
                     if(tracker.RecordWriteAndCheckFault(changedOffset, wordValue, 4))
                     {
                         FaultFired = true;
@@ -410,7 +415,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 else
                 {
                     // No change found — still count the PG transition.
-                    if(tracker.IncrementWriteCount())
+                    if(tracker.IncrementWriteCount(writePc))
                     {
                         FaultFired = true;
                         if(WriteFaultMode == 6)
@@ -427,7 +432,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             else
             {
                 // Fast path: no snapshot, just count.
-                if(tracker.IncrementWriteCount())
+                if(tracker.IncrementWriteCount(writePc))
                 {
                     FaultFired = true;
                     if(WriteFaultMode == 6)
@@ -572,7 +577,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
-            if(tracker.RecordEraseAndCheckFault(sector.Offset, sector.Size))
+            if(tracker.RecordEraseAndCheckFault(sector.Offset, sector.Size, CurrentCpuPc()))
             {
                 EraseFaultFired = true;
                 LastFaultAddress = (uint)(FlashBaseAddress + sector.Offset);
@@ -639,6 +644,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // ---------------------------------------------------------------
         // Helpers.
         // ---------------------------------------------------------------
+
+        private ulong CurrentCpuPc()
+        {
+            if(!machine.IsRegistered(this))
+            {
+                return 0UL;
+            }
+            ICPU cpu;
+            var bus = machine.GetSystemBus(this);
+            if(bus != null && bus.TryGetCurrentCPU(out cpu) && cpu != null)
+            {
+                return cpu.PC.RawValue;
+            }
+            return 0UL;
+        }
 
         private void EraseWithFill(IMemory flash, long offset, int size)
         {

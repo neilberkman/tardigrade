@@ -26,6 +26,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         bool FaultRequiresImmediateStop { get; }
         bool DriverErrorFired { get; set; }
         uint LastFaultAddress { get; set; }
+        ulong LastFaultPC { get; set; }
         byte[] FaultFlashSnapshot { get; set; }
 
         int WriteFaultMode { get; set; }

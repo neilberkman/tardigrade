@@ -351,6 +351,12 @@ namespace Antmicro.Renode.Peripherals.Memory
             set { if(Nvm != null) { Nvm.LastFaultAddress = value; } }
         }
 
+        public ulong LastFaultPC
+        {
+            get { return Nvm != null ? Nvm.LastFaultPC : 0UL; }
+            set { if(Nvm != null) { Nvm.LastFaultPC = value; } }
+        }
+
         public byte[] FaultFlashSnapshot
         {
             get { return Nvm != null ? Nvm.FaultFlashSnapshot : null; }

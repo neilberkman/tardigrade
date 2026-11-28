@@ -73,6 +73,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool FaultFired { get => tracker.FaultFired; set => tracker.FaultFired = value; }
         public bool DriverErrorFired { get => tracker.DriverErrorFired; set => tracker.DriverErrorFired = value; }
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
+        public ulong LastFaultPC { get => tracker.LastFaultPC; set => tracker.LastFaultPC = value; }
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
 
         // Kept for backward compatibility with .resc scripts (no-op).
@@ -175,6 +176,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // byte/halfword write is not promoted to a merged aligned word:
             // callers need the byte offset, raw little-endian value, and
             // width to replay the same mutation.
+            tracker.PendingPC = CurrentCpuPc();
             if(tracker.RecordWriteAndCheckFault(checked((int)offset), value, width))
             {
                 FaultFired = true;
@@ -282,7 +284,28 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // already-erased byte (where no byte differs from flashShadow).
         private int pgWriteMinOffset = int.MaxValue;
         private int pgWriteMaxOffset = -1;
+        private ulong pgLastWritePc;
         private bool memoryAccessHookInstalled;
+
+        private ulong CurrentCpuPc()
+        {
+            if(!machine.IsRegistered(this))
+            {
+                return 0UL;
+            }
+            ICPU cpu;
+            var bus = machine.GetSystemBus(this);
+            if(bus != null && bus.TryGetCurrentCPU(out cpu) && cpu != null)
+            {
+                return cpu.PC.RawValue;
+            }
+            return 0UL;
+        }
+
+        private ulong EffectiveWritePc()
+        {
+            return pgLastWritePc != 0 ? pgLastWritePc : CurrentCpuPc();
+        }
 
         // FLASH_CR bit definitions.
         private const uint PG_BIT    = 1U << 0;
@@ -458,6 +481,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             preFaultSnapshot = null;
             pgWriteMinOffset = int.MaxValue;
             pgWriteMaxOffset = -1;
+            pgLastWritePc = 0;
             memoryAccessHookInstalled = false;
             UpdateMemoryAccessHook(false);
             Array.Clear(localityCache, 0, LocalityCacheSize);
@@ -498,6 +522,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             if(off >= 0)
             {
+                pgLastWritePc = pc;
                 if(off < pgWriteMinOffset)
                 {
                     pgWriteMinOffset = off;
@@ -580,6 +605,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 hadDirectWrite = false;
                 pgWriteMinOffset = int.MaxValue;
                 pgWriteMaxOffset = -1;
+                pgLastWritePc = 0;
                 bool faultTargetWrite = SkipShadowScan && !AnyFaultFired
                     && Flash != null && FlashSize > 0
                     && TotalWordWrites + 1 == FaultAtWordWrite;
@@ -664,9 +690,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             // Fast path: just count PG transitions without scanning flash.
             // Each PG deactivation is one program operation on STM32F4.
+            var writePc = EffectiveWritePc();
             if(SkipShadowScan && !WriteTraceEnabled)
             {
-                if(tracker.IncrementWriteCount())
+                if(tracker.IncrementWriteCount(writePc))
                 {
                     FaultFired = true;
                     HandleSkipScanFault();
@@ -705,6 +732,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 flashShadow[aligned + i] = wordBytes[i];
             }
 
+            tracker.PendingPC = writePc;
             if(tracker.RecordWriteAndCheckFault(aligned, wordValue, 4))
             {
                 FaultFired = true;
@@ -926,7 +954,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
-            if(tracker.RecordEraseAndCheckFault(sector.Offset, sector.Size))
+            if(tracker.RecordEraseAndCheckFault(sector.Offset, sector.Size, CurrentCpuPc()))
             {
                 EraseFaultFired = true;
                 LastFaultAddress = (uint)(FlashBaseAddress + sector.Offset);

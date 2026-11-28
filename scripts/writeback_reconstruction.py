@@ -188,7 +188,7 @@ def parse_write_trace_record(line):
         raise AmbiguousWriteEvent(
             "write trace record has fewer than two fields: {!r}".format(text)
         )
-    if len(parts) > 4:
+    if len(parts) > 5:
         raise AmbiguousWriteEvent(
             "write trace record has more than four fields: {!r}".format(text)
         )
@@ -199,6 +199,17 @@ def parse_write_trace_record(line):
         values.append(0)
     if len(parts) >= 4 and parts[3] != '':
         values.append(_parse_trace_int(parts[3]))
+    if len(parts) == 5 and parts[4] != '':
+        if len(values) < 4:
+            raise AmbiguousWriteEvent(
+                "write trace record has PC without width: {!r}".format(text)
+            )
+        try:
+            values.append(_parse_trace_int(parts[4]))
+        except ValueError:
+            raise AmbiguousWriteEvent(
+                "write trace record has more than four fields: {!r}".format(text)
+            )
     return tuple(values)
 
 
