@@ -654,6 +654,9 @@ class RecoveryStateExplorer(object):
             self._computed_frontier.pop(key, None)
         return parent, index, candidate
 
+    def _needs_boot(self, parent, state):
+        return state.identity_hex() not in self._seen
+
     def checkpoint(self, inputs):
         if self.plan_only or (not self._pending and not self._frames):
             return None
@@ -677,6 +680,10 @@ class RecoveryStateExplorer(object):
     def restore(self, checkpoint, inputs):
         if self.plan_only:
             raise RecoverySearchError("plan_only cannot resume a state search checkpoint")
+        partition = checkpoint.get("shard", {})
+        for field, default in (("shard_index", 0), ("shard_count", 1)):
+            if partition.get(field, default) != getattr(self, field, default):
+                raise RecoverySearchError("state search checkpoint mismatch: " + field)
         validate_checkpoint(checkpoint, inputs)
         snapshots = restore_snapshots(checkpoint)
         self.results = checkpoint["results"]
@@ -724,6 +731,7 @@ class RecoveryStateExplorer(object):
         new_states = 0
         for parent, row in enumerate(rows):
             children = set()
+            candidates_before = self.summary["recovery_operations_considered"]
             while self._frames and self._frames[0][0] == parent:
                 self._check_plan_time()
                 visit = self._expand(self._frames, selected, self.summary)
@@ -731,7 +739,8 @@ class RecoveryStateExplorer(object):
                     children.add(visit[2].identity_hex())
             new = sum(1 for key in children if key not in self._seen and key not in identities)
             identities.update(children)
-            reused = row["generation_two_candidates"] - new
+            candidates = self.summary["recovery_operations_considered"] - candidates_before
+            reused = candidates - new
             new_states += new
             row.update({
                 "distinct_candidate_states": len(children),
@@ -773,7 +782,7 @@ class RecoveryStateExplorer(object):
                 break
             if self._pending:
                 parent, index, state = self._pending[0]
-                if self.budget.boot_limit_reached() and state.identity_hex() not in self._seen:
+                if self.budget.boot_limit_reached() and self._needs_boot(parent, state):
                     reason = "max_new_states"
                     break
                 self._pending.popleft()

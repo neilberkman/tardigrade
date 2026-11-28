@@ -903,6 +903,8 @@ class RecoveryStateSearchConfig:
         "max_wall_time_s",
         "address_ranges",
         "cross_check_every",
+        "shard_count",
+        "shard_index",
     )
 
     def __init__(
@@ -916,6 +918,8 @@ class RecoveryStateSearchConfig:
         address_ranges: Optional[List[Tuple[int, int]]] = None,
         cross_check_every: int = 100,
         plan_only: bool = False,
+        shard_count: int = 1,
+        shard_index: int = 0,
     ) -> None:
         self.enabled = bool(enabled)
         self.plan_only = bool(plan_only)
@@ -962,6 +966,12 @@ class RecoveryStateSearchConfig:
                 "fault_sweep.phase2_fault.state_search.max_wall_time_s: "
                 "expected a positive number no greater than 86400"
             )
+        if type(shard_count) is not int or shard_count < 1:
+            raise ProfileError("state_search.shard_count must be a positive integer")
+        if type(shard_index) is not int or not 0 <= shard_index < shard_count:
+            raise ProfileError("state_search.shard_index must be an integer in [0, shard_count)")
+        self.shard_count = shard_count
+        self.shard_index = shard_index
         self.address_ranges = list(address_ranges or [])
         self.cross_check_every = int(cross_check_every)
         if self.cross_check_every < 0 or self.cross_check_every > MAX_PROFILE_FAULT_POINTS:
@@ -991,6 +1001,8 @@ class RecoveryStateSearchConfig:
                 for start, end in self.address_ranges
             ],
             "cross_check_every": self.cross_check_every,
+            **({"shard_count": self.shard_count, "shard_index": self.shard_index}
+               if self.shard_count > 1 else {}),
         }
 
 
@@ -5574,6 +5586,8 @@ def _parse_recovery_state_search(raw: Optional[Dict[str, Any]]) -> RecoveryState
         max_wall_time_s=max_wall_time_s,
         address_ranges=address_ranges,
         cross_check_every=int(raw.get("cross_check_every", 100)),
+        shard_count=raw.get("shard_count", 1),
+        shard_index=raw.get("shard_index", 0),
     )
 
 
@@ -8784,6 +8798,7 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
                     {
                         "enabled", "plan_only", "first_cuts", "max_cuts", "max_new_states",
                         "max_wall_time_s", "address_ranges", "cross_check_every",
+                        "shard_count", "shard_index",
                     }
                 ),
                 "fault_sweep.phase2_fault.state_search",

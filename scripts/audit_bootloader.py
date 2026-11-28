@@ -102,6 +102,7 @@ from sweep import (
     validate_runtime_fault_mode_compat,
 )
 from profile_loader import (
+    ExpectConfig,
     HeuristicConfig,
     PreBootWrite,
     ProfileConfig,
@@ -1416,12 +1417,7 @@ def _checkpoint_header(path: Optional[Path]) -> Optional[Dict[str, Any]]:
     return {key: saved[key] for key in ("version", "inputs", "limits", "elapsed_s")}
 
 
-def _state_search_inputs(profile: ProfileConfig, repo_root: Path) -> Dict[str, Any]:
-    raw = load_profile_raw(profile.profile_path)
-    for scope in [raw] + raw.get("multi_component", {}).get("components", []):
-        search = (scope.get("fault_sweep") or {}).get("phase2_fault", {}).get("state_search", {})
-        for key in ("max_new_states", "max_wall_time_s"):
-            search.pop(key, None)
+def _state_search_artifacts(profile: ProfileConfig, repo_root: Path) -> Dict[str, str]:
     images = _resolved_image_files(profile, repo_root)
     firmware = {
         "images": {name: _sha256_path(Path(path)) for name, path in images.items()},
@@ -1441,10 +1437,43 @@ def _state_search_inputs(profile: ProfileConfig, repo_root: Path) -> Dict[str, A
         })
     return {
         "firmware_sha256": json_digest(firmware),
-        "profile_sha256": json_digest(raw),
         "tardigrade_revision": revision,
+    }
+
+
+def _state_search_inputs(profile: ProfileConfig, repo_root: Path) -> Dict[str, Any]:
+    raw = load_profile_raw(profile.profile_path)
+    for scope in [raw] + raw.get("multi_component", {}).get("components", []):
+        search = (scope.get("fault_sweep") or {}).get("phase2_fault", {}).get("state_search", {})
+        for key in ("max_new_states", "max_wall_time_s"):
+            search.pop(key, None)
+    config = profile.fault_sweep.phase2_fault.state_search
+    return {
+        **_state_search_artifacts(profile, repo_root),
+        "profile_sha256": json_digest(raw),
+        "shard_index": config.shard_index,
+        "shard_count": config.shard_count,
         "initial_state": profile.resolved_initial_state_name,
         "search_profile": profile.name,
+    }
+
+
+def _state_search_shard_inputs(profile, repo_root, robot_overrides=(), no_hash_bypass=False,
+                               previous=None):
+    raw = load_profile_raw(profile.profile_path)
+    search = raw["fault_sweep"]["phase2_fault"]["state_search"]
+    search.pop("shard_count", None)
+    search.pop("shard_index", None)
+    config = profile.fault_sweep.phase2_fault.state_search
+    for key in ("max_new_states", "max_wall_time_s"):
+        search[key] = getattr(config, key) + (previous["limits"][key] if previous else 0)
+    overrides = {item["key"]: item.get("file_sha256", item["value"])
+                 for item in _cache_robot_var_material(robot_overrides)}
+    return {
+        **_state_search_artifacts(profile, repo_root),
+        "profile_sha256": json_digest([raw, profile.resolved_initial_state_name,
+                                      profile.boundary_value, profile.boundary_previous_value,
+                                      overrides, no_hash_bypass]),
     }
 
 
@@ -2594,7 +2623,13 @@ def _main_single() -> int:
         import time as _time_mod
         sweep_wall_t0 = _time_mod.time()
 
-        if profile.fault_sweep.phase2_fault.state_search.enabled:
+        search_config = profile.fault_sweep.phase2_fault.state_search
+        shard_inputs = None
+        if search_config.enabled and search_config.shard_count > 1:
+            shard_inputs = _state_search_shard_inputs(
+                profile, repo_root, extra_robot_vars, effective_no_hash_bypass, previous,
+            )
+        if search_config.enabled:
             robot_vars = _state_search_checkpoint_vars(profile, repo_root, args, robot_vars, previous)
         sweep_results = run_runtime_sweep(
             repo_root=repo_root,
@@ -3069,6 +3104,23 @@ def _main_single() -> int:
             },
             **_report_provenance(profile, repo_root),
         }
+        if shard_inputs:
+            for row in sweep_results:
+                if "state_search_shard" in row:
+                    payload["state_search_shard"] = row.pop("state_search_shard")
+                    payload["state_search_shard"].update(shard_inputs)
+                    # Reporting context travels with the shard so merging
+                    # does not require the profile or firmware on disk.
+                    payload["state_search_shard"]["report_context"] = {
+                        "expect": {k: getattr(profile.expect, k) for k in ExpectConfig.__slots__},
+                        "page_size": profile.memory.page_size,
+                        "slots": {name: {"base": slot.base, "size": slot.size}
+                                  for name, slot in profile.memory.slots.items()},
+                        "planned_fault_types": planned_fault_types,
+                        "calibration_point_coverage": calibration_point_coverage,
+                        "total_writes": max_writes,
+                    }
+                    break
         dist = profile.fault_sweep.fault_distribution
         if dist is not None and dist.mode != "uniform":
             payload["fault_distribution"] = {

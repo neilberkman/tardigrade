@@ -18981,7 +18981,15 @@ def run_recovery_state_search():
             active_seed,
         )
 
-    explorer = RecoveryStateExplorer(
+    explorer_class = RecoveryStateExplorer
+    shard_options = {}
+    if phase2_state_search.get('shard_count', 1) > 1:
+        from recovery_search_shard import ShardedRecoveryStateExplorer
+        explorer_class = ShardedRecoveryStateExplorer
+        shard_options = dict((key, phase2_state_search[key])
+                            for key in ('shard_count', 'shard_index'))
+
+    explorer = explorer_class(
         initial_state,
         calibration_operations,
         first_cuts=selected,
@@ -19012,10 +19020,11 @@ def run_recovery_state_search():
         cross_check_every=int(phase2_state_search.get('cross_check_every', 100)),
         cross_check=_state_search_live_cross_check,
         plan_only=phase2_state_search.get('plan_only', False),
+        **shard_options
     )
     checkpoint_path = get_optional_var('state_search_checkpoint', '').strip()
     resume_path = get_optional_var('state_search_resume', '').strip()
-    if checkpoint_path:
+    if checkpoint_path and not explorer.plan_only:
         from System.Reflection import Assembly, AssemblyInformationalVersionAttribute
         inputs = dict(phase2_state_search['checkpoint_inputs'])
         assembly = Assembly.GetEntryAssembly()
@@ -19084,6 +19093,18 @@ def run_recovery_state_search():
             1 for result in results
             if result.get('recovery_tracking_gate', {}).get('reached') is False
         )
+    if shard_options:
+        from System.Reflection import Assembly, AssemblyInformationalVersionAttribute
+        version = Assembly.GetEntryAssembly().GetCustomAttributes(
+            AssemblyInformationalVersionAttribute, False
+        )[0].InformationalVersion
+        explorer.partition['renode_version'] = str(version)
+        if not results:
+            # Carry the limit evidence through the dynamic batch protocol.
+            results.append({'fault_type': 'rs', 'fault_requested': 0, 'fault_at': 0,
+                            'fault_injected': False, 'boot_outcome': 'skipped',
+                            'skip_reason': summary['stopped_reason']})
+        results[0]['state_search_shard'] = explorer.partition
     if results:
         results[0]['recovery_state_search_summary'] = dict(summary)
     log(
