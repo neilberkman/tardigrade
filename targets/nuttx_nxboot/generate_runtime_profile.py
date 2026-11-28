@@ -7,6 +7,7 @@ import argparse
 from pathlib import Path
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SLOT_EXEC_BASE = 0x08040000
 SLOT_STAGING_BASE = 0x080C0000
 SLOT_TERTIARY_BASE = 0x08140000
@@ -69,6 +70,47 @@ CAMPAIGNS = {
         "writeback_buffer_capacity": "auto",
         "writeback_erase_flushes_domain": False,
     },
+    "state_search": {
+        "image_suffix": "",
+        "default_fault_types": "power_loss",
+        "default_boot_cycles": 3,
+        "description": (
+            "recovery-state search campaign across write and erase cuts with "
+            "mixed torn-word outcomes and live cross-checks"
+        ),
+        "include_erase_fault_points": True,
+        "torn_word": "[fixed, untouched, programmed, { partial_bits: 3 }]",
+        "torn_word_seed": 20261127,
+        "state_search": {
+            "first_fault_types": ["power_loss", "interrupted_erase"],
+            "fault_types": ["power_loss", "interrupted_erase"],
+            "max_cuts": 3,
+            "max_new_states": 384,
+            "max_wall_time_s": 3600,
+            "cross_check_every": 16,
+        },
+    },
+    "state_search_sector_boundary": {
+        "image_suffix": "-sector-boundary",
+        "default_fault_types": "power_loss",
+        "default_boot_cycles": 3,
+        "description": (
+            "recovery-state search campaign with sector-boundary update image "
+            "across write and erase cuts, mixed torn-word outcomes, and live "
+            "cross-checks"
+        ),
+        "include_erase_fault_points": True,
+        "torn_word": "[fixed, untouched, programmed, { partial_bits: 3 }]",
+        "torn_word_seed": 20261127,
+        "state_search": {
+            "first_fault_types": ["power_loss", "interrupted_erase"],
+            "fault_types": ["power_loss", "interrupted_erase"],
+            "max_cuts": 3,
+            "max_new_states": 384,
+            "max_wall_time_s": 3600,
+            "cross_check_every": 16,
+        },
+    },
 }
 
 
@@ -85,6 +127,10 @@ def render_runtime_profile(
     name: str = "nuttx_nxboot_real_update",
     fault_types: str = "",
     campaign: str = "baseline",
+    state_search_max_cuts: int | None = None,
+    state_search_max_new_states: int | None = None,
+    state_search_max_wall_time_s: float | None = None,
+    state_search_cross_check_every: int | None = None,
 ) -> str:
     try:
         campaign_config = CAMPAIGNS[campaign]
@@ -143,6 +189,86 @@ def render_runtime_profile(
                 str(campaign_config.get("writeback_erase_flushes_domain", False)).lower(),
             )
         )
+    if campaign_config.get("include_erase_fault_points"):
+        writeback_block += "\n  include_erase_fault_points: true"
+    if campaign_config.get("torn_word"):
+        writeback_block += "\n  torn_word: {}".format(campaign_config["torn_word"])
+        if campaign_config.get("torn_word_seed") is not None:
+            writeback_block += "\n  torn_word_seed: {}".format(
+                int(campaign_config["torn_word_seed"])
+            )
+    state_search_cfg = campaign_config.get("state_search")
+    if isinstance(state_search_cfg, dict):
+        ss_first = ", ".join(state_search_cfg.get("first_fault_types", ["power_loss"]))
+        ss_deeper = ", ".join(state_search_cfg.get("fault_types", ["power_loss"]))
+        ss_max_cuts = (
+            int(state_search_max_cuts)
+            if state_search_max_cuts is not None
+            else int(state_search_cfg.get("max_cuts", 2))
+        )
+        ss_max_states = (
+            int(state_search_max_new_states)
+            if state_search_max_new_states is not None
+            else int(state_search_cfg.get("max_new_states", 384))
+        )
+        ss_max_wall = (
+            float(state_search_max_wall_time_s)
+            if state_search_max_wall_time_s is not None
+            else float(state_search_cfg.get("max_wall_time_s", 3600))
+        )
+        ss_cross_check = (
+            int(state_search_cross_check_every)
+            if state_search_cross_check_every is not None
+            else int(state_search_cfg.get("cross_check_every", 16))
+        )
+        addr_range_lines = []
+        for slot_base in (SLOT_EXEC_BASE, SLOT_STAGING_BASE, SLOT_TERTIARY_BASE):
+            slot_end = slot_base + SLOT_SIZE
+            addr_range_lines.append(
+                "        - {{ start: 0x{:08X}, end: 0x{:08X} }}".format(
+                    slot_base, slot_base + int(header_size)
+                )
+            )
+            addr_range_lines.append(
+                "        - {{ start: 0x{:08X}, end: 0x{:08X} }}".format(
+                    slot_end - 0x1000, slot_end
+                )
+            )
+        writeback_block += (
+            "\n  phase2_fault:"
+            "\n    enabled: true"
+            "\n    first_fault_types: [{}]"
+            "\n    fault_types: [{}]"
+            "\n    state_search:"
+            "\n      enabled: true"
+            "\n      max_cuts: {}"
+            "\n      max_new_states: {}"
+            "\n      max_wall_time_s: {}"
+            "\n      address_ranges:"
+            "\n{}"
+            "\n      cross_check_every: {}".format(
+                ss_first,
+                ss_deeper,
+                ss_max_cuts,
+                ss_max_states,
+                ss_max_wall,
+                "\n".join(addr_range_lines),
+                ss_cross_check,
+            )
+        )
+
+    def _rel_or_abs(path: Path) -> str:
+        resolved = path.resolve()
+        try:
+            return resolved.relative_to(REPO_ROOT).as_posix()
+        except ValueError:
+            pass
+        if "instruction_skip" not in selected_fault_types:
+            try:
+                return resolved.relative_to(build_dir).as_posix()
+            except ValueError:
+                pass
+        return resolved.as_posix()
 
     return """schema_version: 1
 name: {name}
@@ -235,9 +361,9 @@ expect:
         ),
         writeback_block=writeback_block,
         name=name,
-        loader_elf=loader_elf,
-        primary_img=primary_img,
-        update_img=update_img,
+        loader_elf=_rel_or_abs(loader_elf),
+        primary_img=_rel_or_abs(primary_img),
+        update_img=_rel_or_abs(update_img),
         bootloader_entry=BOOTLOADER_ENTRY,
         sram_start=SRAM_START,
         sram_end=SRAM_END,
@@ -308,6 +434,30 @@ def main() -> int:
         default="",
         help="Comma-separated fault types (e.g. 'power_loss, bit_corruption')",
     )
+    parser.add_argument(
+        "--state-search-max-cuts",
+        type=int,
+        default=None,
+        help="Override state_search.max_cuts for state_search campaigns",
+    )
+    parser.add_argument(
+        "--state-search-max-new-states",
+        type=int,
+        default=None,
+        help="Override state_search.max_new_states for state_search campaigns",
+    )
+    parser.add_argument(
+        "--state-search-max-wall-time-s",
+        type=float,
+        default=None,
+        help="Override state_search.max_wall_time_s for state_search campaigns",
+    )
+    parser.add_argument(
+        "--state-search-cross-check-every",
+        type=int,
+        default=None,
+        help="Override state_search.cross_check_every for state_search campaigns",
+    )
     args = parser.parse_args()
 
     rendered = render_runtime_profile(
@@ -322,6 +472,10 @@ def main() -> int:
         name=args.name,
         fault_types=args.fault_types,
         campaign=args.campaign,
+        state_search_max_cuts=args.state_search_max_cuts,
+        state_search_max_new_states=args.state_search_max_new_states,
+        state_search_max_wall_time_s=args.state_search_max_wall_time_s,
+        state_search_cross_check_every=args.state_search_cross_check_every,
     )
     args.output_profile.parent.mkdir(parents=True, exist_ok=True)
     args.output_profile.write_text(rendered)

@@ -453,6 +453,60 @@ class NuttxNxbootBuildScaffoldTest(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir)
 
+    def test_render_state_search_campaigns(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_nxboot_state_search_"))
+        try:
+            build_dir = temp_dir / "build"
+            images_dir = build_dir / "images"
+            images_dir.mkdir(parents=True)
+            (build_dir / "nxboot-loader.elf").write_bytes(b"ELF")
+            for suffix in ("", "-sector-boundary"):
+                for image in ("nxboot-primary-v1-h400", "nxboot-update-v2-h400"):
+                    (images_dir / f"{image}{suffix}.img").write_bytes(b"I")
+
+            for campaign, expect_sb in (
+                ("state_search", False),
+                ("state_search_sector_boundary", True),
+            ):
+                with self.subTest(campaign=campaign):
+                    profile_path = temp_dir / f"{campaign}.yaml"
+                    profile_path.write_text(
+                        render_runtime_profile(
+                            build_dir,
+                            campaign=campaign,
+                            name=f"nuttx_nxboot_{campaign}",
+                            state_search_max_cuts=4,
+                            state_search_max_new_states=512,
+                            state_search_cross_check_every=8,
+                        )
+                    )
+                    profile = load_profile(profile_path, strict=True)
+                    self.assertTrue(profile.fault_sweep.include_erase_fault_points)
+                    self.assertTrue(profile.fault_sweep.torn_word_explicit)
+                    self.assertEqual(profile.fault_sweep.torn_word_seed, 20261127)
+                    self.assertTrue(profile.fault_sweep.phase2_fault.enabled)
+                    self.assertEqual(
+                        profile.fault_sweep.phase2_fault.first_fault_types,
+                        ["power_loss", "interrupted_erase"],
+                    )
+                    self.assertEqual(
+                        profile.fault_sweep.phase2_fault.fault_types,
+                        ["power_loss", "interrupted_erase"],
+                    )
+                    ss = profile.fault_sweep.phase2_fault.state_search
+                    self.assertTrue(ss.enabled)
+                    self.assertEqual(ss.max_cuts, 4)
+                    self.assertEqual(ss.max_new_states, 512)
+                    self.assertEqual(ss.cross_check_every, 8)
+                    self.assertEqual(len(ss.address_ranges), 6)
+                    self.assertFalse(profile.expect.should_find_issues)
+                    self.assertEqual(
+                        "sector-boundary" in profile.images["staging"],
+                        expect_sb,
+                    )
+        finally:
+            shutil.rmtree(temp_dir)
+
     def test_verify_nxboot_support_passes_on_upstream(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="nuttx_upstream_"))
         try:
