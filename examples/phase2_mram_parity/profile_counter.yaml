@@ -1,0 +1,14 @@
+base_profile: profile_state_search.yaml
+name: recovery_counter_cross_check
+description: The recovery boot samples a counter that continues across resets.
+platform: examples/phase2_mram_parity/counter.repl
+bootloader:
+  elf: examples/phase2_mram_parity/counter.elf
+fault_sweep:
+  mram_torn_word: half
+  phase2_fault:
+    state_search:
+      first_cuts:
+        mode: ranges
+        ranges: [{start: 0, end: 0}]
+      address_ranges: [{start: 0x10100120, end: 0x10100127}]

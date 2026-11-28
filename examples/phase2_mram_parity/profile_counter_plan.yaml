@@ -1,0 +1,6 @@
+base_profile: profile_counter.yaml
+name: recovery_counter_plan
+fault_sweep:
+  phase2_fault:
+    state_search:
+      plan_only: true

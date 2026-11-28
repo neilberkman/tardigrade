@@ -40,3 +40,9 @@ python3 scripts/audit_bootloader.py \
   --renode-test "$RENODE_TEST" \
   --workers 1 --no-assert-verdict --output /tmp/deferred-gate-not-reached.json
 ```
+
+The counter example reads a free-running microsecond counter during recovery
+and persists it before writing a completion word. Build with
+`make -C examples/phase2_mram_parity counter.elf`. Use `profile_counter.yaml`
+for the sampled cross-check and `profile_counter_plan.yaml` for the plan.
+Both produce an infrastructure error naming the counter write.

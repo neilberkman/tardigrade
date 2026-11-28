@@ -1,0 +1,5 @@
+using "../../platforms/cortex_m0_mram_tracked.repl"
+
+counter: Python.PythonPeripheral @ sysbus 0x40010000
+    size: 4
+    script: "if request.IsRead: request.Value = int(self.GetMachine().LocalTimeSource.ElapsedVirtualTime.TotalMicroseconds) & 0xffffffff"

@@ -50,4 +50,7 @@ slot.bin: slot.elf
 
 clean:
 	rm -f firmware.elf firmware_two_unit.elf firmware_deferred.elf \
-		firmware_deferred_early_success.elf slot.elf slot.bin
+		firmware_deferred_early_success.elf counter.elf slot.elf slot.bin
+
+counter.elf: counter.c linker.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ counter.c
