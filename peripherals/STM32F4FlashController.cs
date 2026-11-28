@@ -52,6 +52,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public STM32F4FlashController(IMachine machine) : base(machine)
         {
+            tracker.Bind(machine, this);
             DefineRegisters();
         }
 
@@ -74,6 +75,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool DriverErrorFired { get => tracker.DriverErrorFired; set => tracker.DriverErrorFired = value; }
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
         public ulong LastFaultPC { get => tracker.LastFaultPC; set => tracker.LastFaultPC = value; }
+        public string LastFaultCallContext { get => tracker.LastFaultCallContext; set => tracker.LastFaultCallContext = value; }
+        public string WriteCallContextToString() => tracker.WriteCallContextToString();
+        public string EraseCallContextToString() => tracker.EraseCallContextToString();
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
 
         // Kept for backward compatibility with .resc scripts (no-op).
@@ -285,6 +289,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private int pgWriteMinOffset = int.MaxValue;
         private int pgWriteMaxOffset = -1;
         private ulong pgLastWritePc;
+        private string pgLastWriteContext;
         private bool memoryAccessHookInstalled;
 
         private ulong CurrentCpuPc()
@@ -482,6 +487,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             pgWriteMinOffset = int.MaxValue;
             pgWriteMaxOffset = -1;
             pgLastWritePc = 0;
+            pgLastWriteContext = null;
             memoryAccessHookInstalled = false;
             UpdateMemoryAccessHook(false);
             Array.Clear(localityCache, 0, LocalityCacheSize);
@@ -523,6 +529,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(off >= 0)
             {
                 pgLastWritePc = pc;
+                pgLastWriteContext = tracker.CaptureCallContext(pc);
                 if(off < pgWriteMinOffset)
                 {
                     pgWriteMinOffset = off;
@@ -606,6 +613,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 pgWriteMinOffset = int.MaxValue;
                 pgWriteMaxOffset = -1;
                 pgLastWritePc = 0;
+                pgLastWriteContext = null;
                 bool faultTargetWrite = SkipShadowScan && !AnyFaultFired
                     && Flash != null && FlashSize > 0
                     && TotalWordWrites + 1 == FaultAtWordWrite;
@@ -691,6 +699,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // Fast path: just count PG transitions without scanning flash.
             // Each PG deactivation is one program operation on STM32F4.
             var writePc = EffectiveWritePc();
+            tracker.PendingCallContext = pgLastWriteContext;
             if(SkipShadowScan && !WriteTraceEnabled)
             {
                 if(tracker.IncrementWriteCount(writePc))

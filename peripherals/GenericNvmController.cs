@@ -357,6 +357,22 @@ namespace Antmicro.Renode.Peripherals.Memory
             set { if(Nvm != null) { Nvm.LastFaultPC = value; } }
         }
 
+        public string LastFaultCallContext
+        {
+            get { return Nvm != null ? Nvm.LastFaultCallContext : null; }
+            set { if(Nvm != null) { Nvm.LastFaultCallContext = value; } }
+        }
+
+        public string WriteCallContextToString()
+        {
+            return Nvm != null ? Nvm.WriteCallContextToString() : string.Empty;
+        }
+
+        public string EraseCallContextToString()
+        {
+            return Nvm != null ? Nvm.EraseCallContextToString() : string.Empty;
+        }
+
         public byte[] FaultFlashSnapshot
         {
             get { return Nvm != null ? Nvm.FaultFlashSnapshot : null; }

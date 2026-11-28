@@ -37,6 +37,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public STM32H7FastFlash(IMachine machine) : base(machine)
         {
+            tracker.Bind(machine, this);
             bank1State = new BankState();
             bank2State = new BankState();
         }
@@ -74,6 +75,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool FaultFired { get => tracker.FaultFired; set => tracker.FaultFired = value; }
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
         public ulong LastFaultPC { get => tracker.LastFaultPC; set => tracker.LastFaultPC = value; }
+        public string LastFaultCallContext { get => tracker.LastFaultCallContext; set => tracker.LastFaultCallContext = value; }
+        public string WriteCallContextToString() => tracker.WriteCallContextToString();
+        public string EraseCallContextToString() => tracker.EraseCallContextToString();
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
         public bool DriverErrorFired { get => tracker.DriverErrorFired; set => tracker.DriverErrorFired = value; }
 

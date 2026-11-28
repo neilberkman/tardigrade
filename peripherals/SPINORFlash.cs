@@ -162,6 +162,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                     $"SPINORFlash size must be a positive multiple of {SectorEraseSize} bytes (got {size})");
             }
             this.machine = machine;
+            tracker.Bind(machine, this);
             DeviceSize = size;
             FlashBaseAddress = flashBaseAddress;
             FlashSize = size;
@@ -319,6 +320,10 @@ namespace Antmicro.Renode.Peripherals.SPI
         public ulong FaultAtWordWrite { get => tracker.FaultAtWordWrite; set => tracker.FaultAtWordWrite = value; }
         public bool FaultFired { get => tracker.FaultFired; set => tracker.FaultFired = value; }
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
+        public ulong LastFaultPC { get => tracker.LastFaultPC; set => tracker.LastFaultPC = value; }
+        public string LastFaultCallContext { get => tracker.LastFaultCallContext; set => tracker.LastFaultCallContext = value; }
+        public string WriteCallContextToString() => tracker.WriteCallContextToString();
+        public string EraseCallContextToString() => tracker.EraseCallContextToString();
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
         public bool DriverErrorFired { get => tracker.DriverErrorFired; set => tracker.DriverErrorFired = value; }
         public bool DriverErrorRequiresReturnHook => true;

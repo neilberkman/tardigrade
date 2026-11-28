@@ -34,6 +34,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                       bool dualBank = true)
         {
             this.machine = machine;
+            tracker.Bind(machine, this);
             this.flash = flash;
             this.flashBaseAddress = flashBaseAddress;
             this.flashSize = flashSize;
@@ -584,6 +585,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             get => tracker.LastFaultPC;
             set => tracker.LastFaultPC = value;
         }
+
+        public string LastFaultCallContext
+        {
+            get => tracker.LastFaultCallContext;
+            set => tracker.LastFaultCallContext = value;
+        }
+
+        public string WriteCallContextToString() => tracker.WriteCallContextToString();
+        public string EraseCallContextToString() => tracker.EraseCallContextToString();
 
         private ulong GetCurrentCpuPC()
         {

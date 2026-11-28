@@ -87,6 +87,51 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool FaultRequiresImmediateStop => EraseFaultFired || (FaultEverFired && WriteFaultMode == 0);
         public uint LastFaultAddress { get; set; }
         public ulong LastFaultPC { get; set; }
+        public string LastFaultCallContext { get; set; }
+        private ulong cachedStackStart;
+        private ulong cachedStackEnd;
+        private readonly Dictionary<ulong, string> writeCallContexts = new Dictionary<ulong, string>();
+        private readonly Dictionary<ulong, string> eraseCallContexts = new Dictionary<ulong, string>();
+
+        private string CaptureCpuCallContext(ulong overridePc = 0)
+        {
+            return FaultTracker.CaptureCpuCallContext(
+                machine, this, ref cachedStackStart, ref cachedStackEnd, overridePc);
+        }
+
+        public string WriteCallContextToString()
+        {
+            if(writeCallContexts.Count == 0)
+            {
+                return string.Empty;
+            }
+            var sb = new StringBuilder(writeCallContexts.Count * 128);
+            foreach(var kv in writeCallContexts.OrderBy(k => k.Key))
+            {
+                if(!string.IsNullOrEmpty(kv.Value))
+                {
+                    sb.Append(kv.Key).Append(':').Append(kv.Value).Append('\n');
+                }
+            }
+            return sb.ToString();
+        }
+
+        public string EraseCallContextToString()
+        {
+            if(eraseCallContexts.Count == 0)
+            {
+                return string.Empty;
+            }
+            var sb = new StringBuilder(eraseCallContexts.Count * 128);
+            foreach(var kv in eraseCallContexts.OrderBy(k => k.Key))
+            {
+                if(!string.IsNullOrEmpty(kv.Value))
+                {
+                    sb.Append(kv.Key).Append(':').Append(kv.Value).Append('\n');
+                }
+            }
+            return sb.ToString();
+        }
         public byte[] FaultFlashSnapshot
         {
             get { return CloneBytes(faultMemorySnapshot); }
@@ -297,6 +342,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public void EraseTraceClear()
         {
             eraseTrace.Clear();
+            eraseCallContexts.Clear();
         }
 
         // Optional MMIO erase trigger registers (disabled by default at -1 so
@@ -377,6 +423,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public void ProgramTraceClear()
         {
             programTrace.Clear();
+            writeCallContexts.Clear();
             ClearFaultEvidence();
         }
 
@@ -600,12 +647,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
 
             var erasePc = CurrentCpuPc();
+            var eraseCtx = CaptureCpuCallContext(erasePc);
             var eraseIndex = TotalPageErases + 1;
             TotalPageErases = eraseIndex;
             if(EraseTraceEnabled)
             {
                 eraseTrace.Add(new EraseTraceEntry(
                     eraseIndex, offset, TotalWordWrites, spanSize, erasePc));
+                if(!string.IsNullOrEmpty(eraseCtx))
+                {
+                    eraseCallContexts[eraseIndex] = eraseCtx;
+                }
             }
 
             if(!PassthroughMode && eraseIndex == faultAtPageErase)
@@ -623,6 +675,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 LastFaultInjected = true;
                 LastFaultAddress = checked((uint)(ProgramAddressBase + (ulong)offset));
                 LastFaultPC = erasePc;
+                LastFaultCallContext = eraseCtx;
                 lastFaultOffset = offset;
                 lastFaultProgramAddress = ProgramAddressBase + (ulong)offset;
                 lastFaultProgramWidth = spanSize;
@@ -901,6 +954,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
                 var writeIndex = TotalWordWrites + 1;
                 TotalWordWrites = writeIndex;
+                var writeCtx = CaptureCpuCallContext(virtualPC);
+                if(!string.IsNullOrEmpty(writeCtx))
+                {
+                    writeCallContexts[writeIndex] = writeCtx;
+                }
                 if(WriteTraceEnabled)
                 {
                     writeTrace.Add(new WriteTraceEntry(
@@ -927,6 +985,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     FaultFired = true;
                     LastFaultAddress = checked((uint)(ProgramAddressBase + (ulong)unitOffset));
                     LastFaultPC = virtualPC;
+                    LastFaultCallContext = writeCtx;
                     WriteBackingUnit(unitOffset, postProgram);
                     CaptureFaultEvidence(
                         writeIndex, unitOffset, intended, preProgram, postProgram);
@@ -1174,8 +1233,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             DriverErrorFired = false;
             LastFaultAddress = 0;
             LastFaultPC = 0;
+            LastFaultCallContext = null;
             writeTrace.Clear();
+            writeCallContexts.Clear();
             eraseTrace.Clear();
+            eraseCallContexts.Clear();
             programTrace.Clear();
             ClearFaultEvidence();
             flashShadow = null;

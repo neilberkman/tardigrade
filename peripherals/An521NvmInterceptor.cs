@@ -25,6 +25,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public An521NvmInterceptor(IMachine machine)
         {
             this.machine = machine;
+            tracker.Bind(machine, this);
             trackingStarted = true;
         }
 
@@ -65,6 +66,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool FaultRequiresImmediateStop => tracker.FaultRequiresImmediateStop;
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
         public ulong LastFaultPC { get => tracker.LastFaultPC; set => tracker.LastFaultPC = value; }
+        public string LastFaultCallContext { get => tracker.LastFaultCallContext; set => tracker.LastFaultCallContext = value; }
+        public string WriteCallContextToString() => tracker.WriteCallContextToString();
+        public string EraseCallContextToString() => tracker.EraseCallContextToString();
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
         public int WriteFaultMode
         {

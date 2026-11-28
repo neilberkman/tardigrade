@@ -57,12 +57,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 if(value != null)
                 {
                     tracker = value;
+                    if(tracker.Machine == null)
+                    {
+                        tracker.Bind(machine, this);
+                    }
                 }
             }
         }
 
         public NRF52NVMC(IMachine machine) : base(machine)
         {
+            tracker.Bind(machine, this);
             DefineRegisters();
         }
 
@@ -77,6 +82,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             operationTraceShadow = null;
             wenWriteOffsets.Clear();
             wenWritePcs.Clear();
+            wenWriteContexts.Clear();
             OperationTraceFastMode = false;
             memoryAccessHookInstalled = false;
             UpdateMemoryAccessHook(false);
@@ -93,6 +99,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool FaultFired { get => tracker.FaultFired; set => tracker.FaultFired = value; }
         public uint LastFaultAddress { get => tracker.LastFaultAddress; set => tracker.LastFaultAddress = value; }
         public ulong LastFaultPC { get => tracker.LastFaultPC; set => tracker.LastFaultPC = value; }
+        public string LastFaultCallContext { get => tracker.LastFaultCallContext; set => tracker.LastFaultCallContext = value; }
         public byte[] FaultFlashSnapshot { get => tracker.FaultFlashSnapshot; set => tracker.FaultFlashSnapshot = value; }
         public bool DriverErrorFired { get => tracker.DriverErrorFired; set => tracker.DriverErrorFired = value; }
         public bool DriverErrorRequiresReturnHook => true;
@@ -104,6 +111,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool EraseTraceEnabled { get => tracker.EraseTraceEnabled; set => tracker.EraseTraceEnabled = value; }
         public int EraseTraceCount => tracker.EraseTraceCount;
         public string EraseTraceToString() => tracker.EraseTraceToString();
+        public string EraseCallContextToString() => tracker.EraseCallContextToString();
         public void EraseTraceClear() => tracker.EraseTraceClear();
 
         public int DiffLookahead { get; set; } = 32;
@@ -131,6 +139,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool WriteTraceEnabled { get => tracker.WriteTraceEnabled; set => tracker.WriteTraceEnabled = value; }
         public int WriteTraceCount => tracker.WriteTraceCount;
         public string WriteTraceToString() => tracker.WriteTraceToString();
+        public string WriteCallContextToString() => tracker.WriteCallContextToString();
         public void WriteTraceClear() => tracker.WriteTraceClear();
         // WEN diffing reconstructs aligned four-byte word writes, so every
         // trace row has an explicit, replay-safe width.
@@ -189,6 +198,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private byte[] wenSnapshot;
         private readonly List<int> wenWriteOffsets = new List<int>();
         private readonly Dictionary<int, ulong> wenWritePcs = new Dictionary<int, ulong>();
+        private readonly Dictionary<int, string> wenWriteContexts = new Dictionary<int, string>();
         private bool memoryAccessHookInstalled;
 
         private ulong CurrentCpuPc()
@@ -214,6 +224,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return hookPc;
             }
             return fallbackPc;
+        }
+
+        private string ResolveWriteContext(int offset)
+        {
+            string hookCtx;
+            if(wenWriteContexts.TryGetValue(offset, out hookCtx) && !string.IsNullOrEmpty(hookCtx))
+            {
+                return hookCtx;
+            }
+            return null;
         }
 
         private void UpdateMemoryAccessHook(bool enabled)
@@ -261,6 +281,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 int off = (int)rel;
                 wenWritePcs[off] = pc;
+                var fastCtx = tracker.CaptureCallContext(pc);
+                if(!string.IsNullOrEmpty(fastCtx))
+                {
+                    wenWriteContexts[off] = fastCtx;
+                }
                 if(wenWriteOffsets.Count == 0 || wenWriteOffsets[wenWriteOffsets.Count - 1] != off)
                 {
                     wenWriteOffsets.Add(off);
@@ -269,11 +294,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             int startAligned = (int)(rel & ~3L);
             int endAligned = (int)((rel + Math.Max(1U, width) - 1) & ~3L);
+            var hookCtx = tracker.CaptureCallContext(pc);
             for(int off = startAligned; off <= endAligned; off += 4)
             {
                 if(off >= 0 && off <= FlashSize - 4)
                 {
                     wenWritePcs[off] = pc;
+                    if(!string.IsNullOrEmpty(hookCtx))
+                    {
+                        wenWriteContexts[off] = hookCtx;
+                    }
                     if(wenWriteOffsets.Count == 0 || wenWriteOffsets[wenWriteOffsets.Count - 1] != off)
                     {
                         wenWriteOffsets.Add(off);
@@ -473,6 +503,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     {
                         wenWriteOffsets.Clear();
                         wenWritePcs.Clear();
+                        wenWriteContexts.Clear();
                         bool wantSnap = needDiff || (!PassthroughMode && WriteFaultMode != 0 && !AnyFaultFired);
                         if(wantSnap)
                         {
@@ -530,6 +561,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                         | (current[off + 3] << 24));
 
                                     tracker.PendingPC = ResolveWritePc(off, configWritePc);
+                                    tracker.PendingCallContext = ResolveWriteContext(off);
                                     if(tracker.RecordWriteAndCheckFault(off, val32, 4))
                                     {
                                         FaultFired = true;
@@ -580,6 +612,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                         | (current[off + 3] << 24));
 
                                     tracker.PendingPC = ResolveWritePc(off, configWritePc);
+                                    tracker.PendingCallContext = ResolveWriteContext(off);
                                     if(tracker.RecordWriteAndCheckFault(off, val32, 4))
                                     {
                                         FaultFired = true;
@@ -652,6 +685,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                     | (currentWord[2] << 16)
                                     | (currentWord[3] << 24));
                                 tracker.PendingPC = ResolveWritePc(off, configWritePc);
+                                tracker.PendingCallContext = ResolveWriteContext(off);
                                 tracker.RecordWriteAndCheckFault(off, val32, 4);
                                 operationTraceShadow[off] = currentWord[0];
                                 operationTraceShadow[off + 1] = currentWord[1];
@@ -676,6 +710,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
                         wenWriteOffsets.Clear();
                         wenWritePcs.Clear();
+                        wenWriteContexts.Clear();
                         wenSnapshot = null;
                     }
                 }, valueProviderCallback: _ => configValue, name: "WEN");

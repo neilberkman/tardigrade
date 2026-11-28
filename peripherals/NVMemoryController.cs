@@ -544,7 +544,26 @@ namespace Antmicro.Renode.Peripherals.Memory
         public void WriteTraceClear()
         {
             if(AliasTarget != null) AliasTarget.WriteTraceClear();
-            else writeTrace.Clear();
+            else
+            {
+                writeTrace.Clear();
+                writeCallContexts.Clear();
+            }
+        }
+
+        public string WriteCallContextToString()
+        {
+            if(AliasTarget != null) return AliasTarget.WriteCallContextToString();
+            if(writeCallContexts.Count == 0) return string.Empty;
+            var sb = new StringBuilder(writeCallContexts.Count * 128);
+            foreach(var kv in writeCallContexts.OrderBy(k => k.Key))
+            {
+                if(!string.IsNullOrEmpty(kv.Value))
+                {
+                    sb.Append(kv.Key).Append(':').Append(kv.Value).Append('\n');
+                }
+            }
+            return sb.ToString();
         }
 
         // Exact program evidence is separate from the legacy integer trace.
@@ -1015,7 +1034,26 @@ namespace Antmicro.Renode.Peripherals.Memory
         public void EraseTraceClear()
         {
             if(AliasTarget != null) AliasTarget.EraseTraceClear();
-            else eraseTrace.Clear();
+            else
+            {
+                eraseTrace.Clear();
+                eraseCallContexts.Clear();
+            }
+        }
+
+        public string EraseCallContextToString()
+        {
+            if(AliasTarget != null) return AliasTarget.EraseCallContextToString();
+            if(eraseCallContexts.Count == 0) return string.Empty;
+            var sb = new StringBuilder(eraseCallContexts.Count * 128);
+            foreach(var kv in eraseCallContexts.OrderBy(k => k.Key))
+            {
+                if(!string.IsNullOrEmpty(kv.Value))
+                {
+                    sb.Append(kv.Key).Append(':').Append(kv.Value).Append('\n');
+                }
+            }
+            return sb.ToString();
         }
 
         public uint LastFaultAddress
@@ -1035,6 +1073,16 @@ namespace Antmicro.Renode.Peripherals.Memory
             {
                 if(AliasTarget != null) AliasTarget.LastFaultPC = value;
                 else lastFaultPC = value;
+            }
+        }
+
+        public string LastFaultCallContext
+        {
+            get { return AliasTarget != null ? AliasTarget.LastFaultCallContext : lastFaultCallContext; }
+            set
+            {
+                if(AliasTarget != null) AliasTarget.LastFaultCallContext = value;
+                else lastFaultCallContext = value;
             }
         }
 
@@ -1200,12 +1248,17 @@ namespace Antmicro.Renode.Peripherals.Memory
             }
 
             var erasePc = CurrentCpuPc();
+            var eraseCtx = CaptureCpuCallContext(erasePc);
             var currentEraseIndex = totalPageErases + 1;
             totalPageErases = currentEraseIndex;
             if(eraseTraceEnabled)
             {
                 eraseTrace.Add(new EraseTraceEntry(
                     currentEraseIndex, offset, TotalWordWrites, spanSize, erasePc));
+                if(!string.IsNullOrEmpty(eraseCtx))
+                {
+                    eraseCallContexts[currentEraseIndex] = eraseCtx;
+                }
             }
 
             if(currentEraseIndex == faultAtPageErase)
@@ -1221,6 +1274,7 @@ namespace Antmicro.Renode.Peripherals.Memory
                 LastFaultPattern = EraseFill;
                 lastFaultAddress = unchecked((uint)(programAddressBase + (ulong)offset));
                 lastFaultPC = erasePc;
+                lastFaultCallContext = eraseCtx;
                 lastFaultOffset = offset;
                 lastFaultProgramAddress = programAddressBase + (ulong)offset;
                 lastFaultProgramWidth = spanSize;
@@ -1830,6 +1884,11 @@ namespace Antmicro.Renode.Peripherals.Memory
         private void RecordProgramTrace(ulong index, long offset, byte[] intended,
                                         byte[] preProgram, byte[] postProgram, bool faulted, ulong pc = 0)
         {
+            var ctx = CaptureCpuCallContext(pc);
+            if(!string.IsNullOrEmpty(ctx))
+            {
+                writeCallContexts[index] = ctx;
+            }
             programTrace.Add(new ProgramTraceEntry(
                 index, offset, (int)WordSize,
                 CloneBytes(intended), CloneBytes(preProgram), CloneBytes(postProgram),
@@ -1845,6 +1904,8 @@ namespace Antmicro.Renode.Peripherals.Memory
             lastFaultProgramAddress = programAddressBase + (ulong)offset;
             lastFaultAddress = unchecked((uint)lastFaultProgramAddress);
             lastFaultPC = pc;
+            string ctx;
+            lastFaultCallContext = writeCallContexts.TryGetValue(index, out ctx) ? ctx : CaptureCpuCallContext(pc);
             lastFaultProgramWidth = (int)WordSize;
             lastFaultIntendedBytes = CloneBytes(intended);
             lastFaultPreProgramBytes = CloneBytes(preProgram);
@@ -2079,7 +2140,9 @@ namespace Antmicro.Renode.Peripherals.Memory
             totalPageErases = 0;
             writeLog.Clear();
             writeTrace.Clear();
+            writeCallContexts.Clear();
             eraseTrace.Clear();
+            eraseCallContexts.Clear();
             programTrace.Clear();
             ClearFaultEvidence();
             LastFaultInjected = false;
@@ -2087,7 +2150,112 @@ namespace Antmicro.Renode.Peripherals.Memory
             eraseFaultFired = false;
             lastFaultAddress = 0;
             lastFaultPC = 0;
+            lastFaultCallContext = null;
             DriverErrorFired = false;
+        }
+
+        private ulong cachedStackStart;
+        private ulong cachedStackEnd;
+        private readonly Dictionary<ulong, string> writeCallContexts = new Dictionary<ulong, string>();
+        private readonly Dictionary<ulong, string> eraseCallContexts = new Dictionary<ulong, string>();
+
+        private string CaptureCpuCallContext(ulong overridePc = 0)
+        {
+            if(machine == null)
+            {
+                return null;
+            }
+            try
+            {
+                var bus = machine.GetSystemBus(this);
+                ICPU cpu;
+                if(bus == null || !bus.TryGetCurrentCPU(out cpu) || cpu == null)
+                {
+                    return null;
+                }
+                var pc = overridePc != 0 ? overridePc : cpu.PC.RawValue;
+                if(pc == 0)
+                {
+                    return null;
+                }
+                ulong lr = 0;
+                ulong sp = 0;
+                ulong r7 = 0;
+                ulong r11 = 0;
+                var tcpu = cpu as TranslationCPU;
+                if(tcpu != null)
+                {
+                    try { lr = tcpu.GetRegisterUnsafe(14).RawValue; } catch { }
+                    try { sp = tcpu.GetRegisterUnsafe(13).RawValue; } catch { }
+                    try { r7 = tcpu.GetRegisterUnsafe(7).RawValue; } catch { }
+                    try { r11 = tcpu.GetRegisterUnsafe(11).RawValue; } catch { }
+                }
+                var stackHex = string.Empty;
+                var alignedSp = sp & ~3UL;
+                if(alignedSp != 0)
+                {
+                    try
+                    {
+                        const int maxStackBytes = 256;
+                        int readableLen = 0;
+                        if(alignedSp >= cachedStackStart && (alignedSp + (ulong)maxStackBytes) <= cachedStackEnd)
+                        {
+                            readableLen = maxStackBytes;
+                        }
+                        else
+                        {
+                            var reg = bus.WhatIsAt(alignedSp, cpu);
+                            if(reg != null && reg.Peripheral is IMemory)
+                            {
+                                var pageBase = alignedSp & ~0xFFFUL;
+                                var endAddr = pageBase + 0x1000UL;
+                                var regEnd = bus.WhatIsAt(endAddr - 4, cpu);
+                                if(regEnd != null && regEnd.Peripheral == reg.Peripheral)
+                                {
+                                    var regNext = bus.WhatIsAt(endAddr, cpu);
+                                    if(regNext != null && regNext.Peripheral == reg.Peripheral)
+                                    {
+                                        endAddr += 0x1000UL;
+                                    }
+                                    cachedStackStart = pageBase;
+                                    cachedStackEnd = endAddr;
+                                }
+                                if(alignedSp >= cachedStackStart && alignedSp < cachedStackEnd)
+                                {
+                                    var avail = cachedStackEnd - alignedSp;
+                                    readableLen = (int)(avail >= (ulong)maxStackBytes ? (ulong)maxStackBytes : (avail & ~3UL));
+                                }
+                                else
+                                {
+                                    readableLen = 64;
+                                }
+                            }
+                        }
+                        if(readableLen > 0)
+                        {
+                            var bytes = bus.ReadBytes(alignedSp, readableLen, true, cpu);
+                            if(bytes != null && bytes.Length > 0)
+                            {
+                                var sb = new StringBuilder(bytes.Length * 2);
+                                for(var i = 0; i < bytes.Length; i++)
+                                {
+                                    sb.Append(bytes[i].ToString("x2"));
+                                }
+                                stackHex = sb.ToString();
+                            }
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+                return string.Format("0x{0:X8}@0x{1:X8}@0x{2:X8}@0x{3:X8}@0x{4:X8}@{5}",
+                    pc, lr, alignedSp, r7, r11, stackHex);
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private void CaptureTrackingBaseState()
@@ -2153,6 +2321,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         private int eraseFaultMode;
         private uint lastFaultAddress;
         private ulong lastFaultPC;
+        private string lastFaultCallContext;
         private ulong trackingStartAddress;
         private ulong configuredTrackingStartAddress;
         private bool trackingStarted = true;
@@ -2542,6 +2711,22 @@ namespace Antmicro.Renode.Peripherals
         {
             get { return Nvm != null ? Nvm.LastFaultPC : 0UL; }
             set { if(Nvm != null) { Nvm.LastFaultPC = value; } }
+        }
+
+        public string LastFaultCallContext
+        {
+            get { return Nvm != null ? Nvm.LastFaultCallContext : null; }
+            set { if(Nvm != null) { Nvm.LastFaultCallContext = value; } }
+        }
+
+        public string WriteCallContextToString()
+        {
+            return Nvm != null ? Nvm.WriteCallContextToString() : string.Empty;
+        }
+
+        public string EraseCallContextToString()
+        {
+            return Nvm != null ? Nvm.EraseCallContextToString() : string.Empty;
         }
 
         public byte[] FaultFlashSnapshot
