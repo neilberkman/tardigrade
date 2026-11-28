@@ -2,6 +2,8 @@
 
 BOUNDARY_RESERVED_VARIABLES = frozenset((
     "VOLATILE_REGIONS_B64",
+    "RETAINED_REGIONS_B64",
+    "VBAT_PRESENT",
     # Every variable declared by the shared Robot suite or consumed by the
     # runtime RESC.  This list is intentionally broader than the boundary
     # transport variables: a profile setup hook must not be able to overwrite

@@ -808,7 +808,7 @@ class MemoryRegionConfig:
     coupling evidence collection to a particular bootloader.
     """
 
-    __slots__ = ("name", "base", "size", "sector_size", "parent")
+    __slots__ = ("name", "base", "size", "sector_size", "parent", "power_loss_fill")
 
     def __init__(
         self,
@@ -817,12 +817,14 @@ class MemoryRegionConfig:
         sector_size: Optional[int] = None,
         name: Optional[str] = None,
         parent: Optional[str] = None,
+        power_loss_fill: int = 0,
     ) -> None:
         self.name = str(name) if name is not None else None
         self.base = int(base)
         self.size = int(size)
         self.sector_size = int(sector_size) if sector_size is not None else None
         self.parent = str(parent) if parent is not None else None
+        self.power_loss_fill = power_loss_fill
 
 
 def _parse_erase_fill_byte(value: Any, field: str = "memory.erase_fill") -> int:
@@ -852,6 +854,8 @@ class MemoryConfig:
         "erase_regions",
         "postmortem_partitions",
         "volatile_regions",
+        "retained_regions",
+        "vbat_present",
     )
 
     def __init__(
@@ -868,6 +872,8 @@ class MemoryConfig:
         volatile_regions: Optional[List[MemoryRegionConfig]] = None,
         page_size_explicit: Optional[bool] = None,
         erase_fill: Optional[int] = None,
+        retained_regions: Optional[List[MemoryRegionConfig]] = None,
+        vbat_present: Optional[bool] = None,
     ) -> None:
         self.sram_start = sram_start
         self.sram_end = sram_end
@@ -892,6 +898,8 @@ class MemoryConfig:
         self.erase_regions = erase_regions or []
         self.postmortem_partitions = postmortem_partitions or []
         self.volatile_regions = volatile_regions or []
+        self.retained_regions = retained_regions or []
+        self.vbat_present = vbat_present
 
 
 class ResidualImageConfig:
@@ -4049,6 +4057,17 @@ class ProfileConfig:
     def robot_vars(self, repo_root: Path) -> List[str]:
         """Generate Robot Framework --variable arguments for this profile."""
         mem = self.memory
+        if mem.vbat_present:
+            platform_stem = Path(self.platform).stem.lower()
+            if not (platform_stem.startswith("stm32") or "h753" in platform_stem or "h743" in platform_stem):
+                raise ProfileError("memory.vbat_present requires a platform with a backup domain")
+        if mem.retained_regions:
+            for region in mem.retained_regions:
+                if any(
+                    region.base < slot.base + slot.size and slot.base < region.base + region.size
+                    for slot in mem.slots.values()
+                ):
+                    raise ProfileError("reset RAM overlaps a persistent slot")
         sc = self.success_criteria
         fs = self.fault_sweep
 
@@ -4140,6 +4159,26 @@ class ProfileConfig:
                 ).encode("utf-8")
             ).decode("ascii")
             vars_list.append("VOLATILE_REGIONS_B64:{}".format(encoded_volatile))
+        if mem.retained_regions:
+            retained_payload = [
+                {
+                    "name": region.name or "retained_{}".format(index),
+                    "base": region.base,
+                    "size": region.size,
+                    "fill": region.power_loss_fill,
+                }
+                for index, region in enumerate(mem.retained_regions)
+            ]
+            encoded_retained = base64.b64encode(
+                json.dumps(
+                    retained_payload, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).decode("ascii")
+            vars_list.append("RETAINED_REGIONS_B64:{}".format(encoded_retained))
+        if mem.vbat_present is not None:
+            vars_list.append(
+                "VBAT_PRESENT:{}".format("true" if mem.vbat_present else "false")
+            )
         if fs.calibration_stop.address is not None:
             vars_list.append(
                 "CALIBRATION_STOP_ADDRESS:0x{:08X}".format(
@@ -4948,6 +4987,10 @@ def _parse_memory_regions(
                 raise ProfileError(
                     "{}.parent must be a non-empty ownership id".format(path)
                 )
+        fill = 0
+        if field == "memory.retained_regions":
+            _reject_unknown_keys(entry, frozenset({"name", "base", "size", "fill"}), path)
+            fill = _parse_erase_fill_byte(entry.get("fill", 0), path + ".fill")
         regions.append(
             MemoryRegionConfig(
                 base=base,
@@ -4955,6 +4998,7 @@ def _parse_memory_regions(
                 sector_size=sector_size,
                 name=name,
                 parent=parent,
+                power_loss_fill=fill,
             )
         )
     regions.sort(key=lambda region: (region.base, region.size))
@@ -5058,6 +5102,8 @@ def _parse_memory(raw: Dict[str, Any]) -> MemoryConfig:
         erase_regions=erase_regions,
         postmortem_partitions=postmortem_partitions,
         volatile_regions=volatile_regions,
+        retained_regions=_parse_memory_regions(raw.get("retained_regions"), "memory.retained_regions"),
+        vbat_present=_parse_bool(raw["vbat_present"], "memory.vbat_present") if "vbat_present" in raw else None,
         page_size_explicit=("page_size" in raw),
         erase_fill=erase_fill,
     )
@@ -9197,7 +9243,7 @@ def _validate_strict_memory(raw: Any, context: str) -> None:
             {
                 "sram", "write_granularity", "page_size", "erase_fill", "slots",
                 "bootloader_region", "trace_address_map", "erase_regions",
-                "postmortem_partitions", "volatile_regions",
+                "postmortem_partitions", "volatile_regions", "retained_regions", "vbat_present",
             }
         ),
         context,
@@ -9216,7 +9262,7 @@ def _validate_strict_memory(raw: Any, context: str) -> None:
             frozenset({"base", "size", "compiled_offset"}),
             "{}.slots.{}".format(context, slot_name),
         )
-    for field_name in ("erase_regions", "postmortem_partitions", "volatile_regions"):
+    for field_name in ("erase_regions", "postmortem_partitions", "volatile_regions", "retained_regions"):
         regions = raw.get(field_name)
         if regions is None:
             continue
@@ -9224,7 +9270,9 @@ def _validate_strict_memory(raw: Any, context: str) -> None:
             raise ProfileError("{}.{}: expected list".format(context, field_name))
         for index, region in enumerate(regions):
             region_keys = {"base", "size", "name"}
-            if field_name != "volatile_regions":
+            if field_name == "retained_regions":
+                region_keys.add("fill")
+            if field_name in ("erase_regions", "postmortem_partitions"):
                 region_keys.update({"sector_size", "erase_size"})
             if field_name == "postmortem_partitions":
                 region_keys.add("parent")

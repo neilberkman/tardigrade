@@ -435,6 +435,73 @@ Markers outside the declared volatile ranges, such as flash metadata fields,
 are not subject to this precondition. Recovery also probes both ends of every
 declared range before clearing so an unmapped or non-writable range fails closed.
 
+### Power loss in a live reset check
+
+A loaded machine can model a full loss of supply, a firmware software reset,
+and a watchdog timeout. Generate its monitor setup from a profile and include
+the resulting file once, after loading the base platform and before booting.
+
+```sh
+python3 scripts/reset_domain.py examples/reset_cause/stm32f4.yaml reset.resc
+```
+
+```renode
+include @reset.resc
+powerDomain PowerCycle
+```
+
+```yaml
+memory:
+  sram: {start: 0x20000000, end: 0x20010000}
+  volatile_regions:
+    - {name: second_bank, base: 0x21000000, size: 0x1000}
+  retained_regions:
+    - {name: noinit, base: 0x20000081, size: 7, fill: 0xa5}
+  vbat_present: true
+```
+
+On a cut, the live reset domain fills main SRAM and additional volatile banks
+with zero. A retained range overrides the fill on the exact bytes it covers.
+A separate retained bank is also valid. The optional fill is one byte and
+defaults to zero, a reproducible representative of lost RAM contents. Ordinary
+machine resets retain bytes in these memory mappings. Retained ranges must be
+disjoint and each span must fit one memory-backed mapping. Declare RAM
+addresses only. VBAT controls the RTC backup registers and, on F4 and H7,
+the dedicated 4 KiB backup SRAM. This option assumes the backup supply and
+regulator are available throughout the cut.
+
+The register overlays cover the following reset sources and retention domains.
+
+| Platform | Register behavior | Reference |
+| --- | --- | --- |
+| nRF52840 | Sticky, write-one-to-clear RESETREAS. The two eight-bit GPREGRET registers survive software reset and clear on pin reset, watchdog reset and power loss. | nRF52840 Product Specification, POWER, “Reset behavior”, “RESETREAS”, “GPREGRET”, “GPREGRET2” |
+| STM32F103 | RCC_CSR flags and BKP_DR1 through BKP_DR10 on the medium-density device. | RM0008, “Control/status register (RCC_CSR)” and “Backup data register x (BKP_DRx)” |
+| STM32F4 | RCC_CSR flags, RTC_BKP0R through RTC_BKP19R and backup SRAM. | RM0090, RCC “Clock control & status register”, PWR “Battery backup domain”, RTC “Backup registers” |
+| STM32H743/753 | RCC_RSR and its C1 alias, RTC_BKP0R through RTC_BKP31R and backup SRAM. | RM0433 §§8.4.4, 8.7.39 and RTC “Backup registers” |
+| STM32L476 | RCC_CSR flags and RTC_BKP0R through RTC_BKP31R. | RM0351, RCC “Control/status register”, PWR “VBAT operation”, RTC “Backup registers” |
+
+A peripheral can implement `IPowerLossAware`. The domain pauses the machine,
+calls `PowerLost(vbatPresent)` on registered listeners, resets the machine once,
+and calls `PowerRestored()` before resuming. Untagged resets take the warm
+path. `powerDomain ResetFromPin` models a pin reset. The built-in watchdog
+timeout and Cortex-M AIRCR software request supply their own causes.
+`powerDomain BootResetKinds` lists the initial power-on and every subsequent
+reset in order. The register overlays own the bus read/write hooks on their
+POWER/CLOCK, RCC and extended RTC register blocks.
+
+The fault sweep automatically loads the matching reset-domain overlay on
+supported platforms, drives `IPowerLossAware` (`PowerLost` before `machine
+Reset`, `PowerRestored` after) on every power-loss cut while keeping in-run
+software/watchdog resets and follow-up boot cycles on the warm reset path,
+applies `retained_regions` and `vbat_present`, and records `reset_kind` and
+`boot_reset_kinds` on every sweep result and boot cycle. When a profile
+declares `retained_regions` or `vbat_present`, trace replay is disabled so
+Phase 1 CPU execution populates SRAM and backup/retention registers before each
+cut. To exercise both the standalone monitor check and the full fault sweep on
+`examples/reset_cause`, build `examples/reset_cause` with `make` and run
+`renode-test tests/power_reset.robot` or `python3 scripts/audit_bootloader.py
+--profile examples/reset_cause/nrf52840.yaml`.
+
 ### Memory checks
 
 Verify multiple memory locations after execution. Useful for firmware-level harnesses that report results through SRAM:
