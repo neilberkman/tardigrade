@@ -1601,6 +1601,7 @@ invariants:
   - state_relations # cross-component compatibility rules
   - success_implies_effect # successful API return has its durable effect
   - persistent_state_fail_closed # failed state reads cannot write or accept
+  - zephyr_fcb_durability # Zephyr FCB and settings-on-FCB power-loss durability oracle
 ```
 
 Use `invariants: [strict]` to enable all built-in invariants. Contracts that
@@ -3305,3 +3306,11 @@ Guard profiles (e.g., `esp_idf_ota_crc_guard.yaml`) test that the correct implem
 | `profiles/esp_idf_ota_upgrade.yaml`              | ESP-IDF upgrade with state probe and otadata invariants                 |
 | `profiles/esp_idf_ota_rollback.yaml`             | ESP-IDF rollback with semantic assertions on otadata state              |
 | `profiles/esp_idf_ota_upgrade_confirm_hook.yaml` | Boot-cycle hook for confirm-or-rollback                                 |
+| `profiles/zephyr_fcb_raw_internal_rotation_sweep.yaml` | Zephyr FCB sector rotation reproducing known upstream issue #121749 |
+| `profiles/zephyr_settings_fcb_spi_nor_compaction_sweep.yaml` | Zephyr settings-on-FCB compaction reproducing known upstream issues #121749 and #122446 |
+
+See [zephyr-fcb-settings.md](zephyr-fcb-settings.md) for the Zephyr FCB and
+settings-on-FCB targets (pinned at both `36940db938a8` / `v3.7.0` and current
+upstream head `06b50e7c66d2`), the `zephyr_fcb_durability` oracle with
+kind-qualified `ack_write_boundaries` (`"w[N]"`), and the mapping to upstream
+Zephyr issues `#121749` (referencing `#121748`) and `#122446`.

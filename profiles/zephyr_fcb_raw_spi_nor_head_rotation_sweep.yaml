@@ -1,0 +1,96 @@
+schema_version: 1
+name: zephyr_fcb_raw_spi_nor_head_rotation_sweep
+description: >
+  Exhaustive single-cut power-loss and interrupted-erase sweep for pinned
+  upstream Zephyr Flash Circular Buffer (FCB, subsys/fs/fcb, current upstream
+  head commit 06b50e7c66d2) on external JEDEC SPI NOR flash (Winbond W25Q16JV on
+  nRF52840 spi2) across a close-to-full workload crossing sector initialization
+  (fcb_sector_hdr_init), compaction, and sector rotation (fcb_rotate).
+  Reproduces known open upstream Zephyr issue #121749 (referencing #121748) at
+  w[17] (0x60002004), where a torn sector header (fd_magic written, fd_id =
+  0xFFFF erased) causes fcb_init() to treat the new sector as f_oldest and fail
+  subsequent appends with -ENOSPC.
+
+platform: platforms/nrf52840_external_nvm.repl
+flash_backend: spiNor
+target_source:
+  name: zephyr
+  repository: https://github.com/zephyrproject-rtos/zephyr
+  commit: 06b50e7c66d27d519826a49e3c524ed762873cb6
+
+bootloader:
+  elf: targets/zephyr_fcb_settings/build/zephyr_fcb_raw_spi_nor_head.elf
+  entry: 0x00000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  trace_address_map:
+    - { offset_start: 0x0, offset_end: 0x200000, address_addend: 0x60000000 }
+  slots:
+    exec: { base: 0x00000382, size: 0x00000012 }
+    staging: { base: 0x60000000, size: 0x00003000 }
+
+images:
+  staging: targets/zephyr_fcb_settings/build/fcb_raw_spi_nor_rotation_seed.bin
+
+invariants:
+  - zephyr_fcb_durability
+
+invariant_config:
+  zephyr_fcb_durability:
+    ack_write_boundaries:
+      "21": "w[8]"
+      "22": "w[16]"
+      "23": "w[28]"
+      "24": "w[52]"
+
+success_criteria:
+  pc_in_slot: exec
+  marker_address: 0x2003F000
+  marker_value: 0x4643424F
+  memory_checks:
+    - { address: 0x2003F000, expected_value: 0x4643424F, op: eq }
+    - { address: 0x2003F004, expected_value: 0x00000001, op: eq }
+    - { address: 0x2003F008, expected_value: 0x00000001, op: eq }
+    - { address: 0x2003F00C, expected_value: 0x00000001, op: eq }
+    - { address: 0x2003F010, expected_value: 0x00000001, op: eq }
+    - { address: 0x2003F014, expected_value: 0x00000001, op: eq }
+    - { address: 0x2003F018, expected_value: 0x0000001B, op: ge }
+    - { address: 0x2003F01C, expected_value: 0x00000000, op: eq }
+    - { address: 0x2003F020, expected_value: 0x00000001, op: eq }
+    - { address: 0x2003F024, expected_value: 0x0000000A, op: eq }
+    - { address: 0x2003F028, expected_value: 0x00000000, op: eq }
+    - { address: 0x2003F02C, expected_value: 0x00000004, op: ge }
+    - { address: 0x2003F030, expected_value: 0x0000000C, op: ge }
+    - { address: 0x2003F034, expected_value: 0x0000000D, op: le }
+    - { address: 0x2003F038, expected_value: 0x0000001E, op: le }
+    - { address: 0x2003F03C, expected_value: 0x0000005B, op: eq }
+    - { address: 0x2003F040, expected_value: 0x00000000, op: eq }
+    - { address: 0x2003F044, expected_value: 0x00000001, op: eq }
+    - { address: 0x2003F048, expected_value: 0x0000000A, op: eq }
+    - { address: 0x2003F04C, expected_value: 0x00000000, op: eq }
+    - { address: 0x2003F050, expected_value: 0x00000018, op: eq }
+    - { address: 0x2003F054, expected_value: 0x00000015, op: eq }
+    - { address: 0x2003F058, expected_value: 0x00000000, op: eq }
+    - { address: 0x2003F05C, expected_value: 0x00000017, op: ge }
+    - { address: 0x2003F060, expected_value: 0x00000018, op: ge }
+    - { address: 0x2003F064, expected_value: 0x00000001, op: ge }
+    - { address: 0x2003F068, expected_value: 0x00000000, op: eq }
+
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  sweep_strategy: full
+  max_writes: auto
+  max_writes_cap: 10000
+  run_duration: "0.5"
+  max_step_limit: 50000000
+  calibration_stop:
+    success_criteria: true
+  include_erase_fault_points: true
+  fault_types: [power_loss, interrupted_erase]
+
+expect:
+  control_outcome: success
+  should_find_issues: true

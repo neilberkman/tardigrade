@@ -1,0 +1,99 @@
+schema_version: 1
+name: zephyr_settings_fcb_internal_state_search
+description: >
+  Two-cut recovery-state search (state_search) with live cross-checks on pinned
+  upstream Zephyr settings subsystem on the FCB backend
+  (subsys/settings/src/settings_fcb.c, commit 36940db938a8 / v3.7.0) on nRF52840
+  internal NVMC flash0 across the close-to-full settings compaction workload.
+  Reproduces known open upstream Zephyr issue #121749 (referencing #121748)
+  across 1-cut and 2-cut recovery paths where settings_fcb_src() erases active
+  sector S1 after a torn scratch sector header.
+
+platform: platforms/cortex_m4_flash_fast.repl
+flash_backend: faultFlash
+target_source:
+  name: zephyr
+  repository: https://github.com/zephyrproject-rtos/zephyr
+  commit: 36940db938a8f4a1e919496793ed439850a221c2
+
+bootloader:
+  elf: targets/zephyr_fcb_settings/build/zephyr_settings_fcb_internal.elf
+  entry: 0x00000000
+
+memory:
+  sram: { start: 0x20000000, end: 0x20040000 }
+  write_granularity: 4
+  trace_address_map:
+    - { offset_start: 0x0, offset_end: 0x0F4000, address_addend: 0x0000C000 }
+  slots:
+    exec: { base: 0x0000038A, size: 0x00000012 }
+    staging: { base: 0x0000C000, size: 0x00003000 }
+
+images:
+  staging: targets/zephyr_fcb_settings/build/settings_fcb_internal_compaction_seed.bin
+
+invariants:
+  - zephyr_fcb_durability
+
+success_criteria:
+  pc_in_slot: exec
+  marker_address: 0x2003F000
+  marker_value: 0x53464342
+  memory_checks:
+    - { address: 0x2003F000, expected_value: 0x53464342, op: eq }
+    - { address: 0x2003F004, expected_value: 0x00000001, op: eq }
+    - { address: 0x2003F008, expected_value: 0x00000001, op: eq }
+    - { address: 0x2003F00C, expected_value: 0x00000001, op: eq }
+    - { address: 0x2003F010, expected_value: 0x00000001, op: eq }
+    - { address: 0x2003F014, expected_value: 0x00000001, op: eq }
+    - { address: 0x2003F018, expected_value: 0x0000001B, op: ge }
+    - { address: 0x2003F01C, expected_value: 0x00000000, op: eq }
+    - { address: 0x2003F020, expected_value: 0x00000001, op: eq }
+    - { address: 0x2003F024, expected_value: 0x0000000A, op: eq }
+    - { address: 0x2003F028, expected_value: 0x00000000, op: eq }
+    - { address: 0x2003F02C, expected_value: 0x00000004, op: ge }
+    - { address: 0x2003F030, expected_value: 0x0000000C, op: ge }
+    - { address: 0x2003F034, expected_value: 0x0000000D, op: le }
+    - { address: 0x2003F038, expected_value: 0x0000001E, op: le }
+    - { address: 0x2003F03C, expected_value: 0x0000005B, op: eq }
+    - { address: 0x2003F040, expected_value: 0x00000000, op: eq }
+    - { address: 0x2003F044, expected_value: 0x00000001, op: eq }
+    - { address: 0x2003F048, expected_value: 0x0000000A, op: eq }
+    - { address: 0x2003F04C, expected_value: 0x00000000, op: eq }
+    - { address: 0x2003F050, expected_value: 0x00000018, op: eq }
+    - { address: 0x2003F054, expected_value: 0x00000015, op: eq }
+    - { address: 0x2003F058, expected_value: 0x00000000, op: eq }
+    - { address: 0x2003F05C, expected_value: 0x00000017, op: ge }
+    - { address: 0x2003F060, expected_value: 0x00000018, op: ge }
+    - { address: 0x2003F064, expected_value: 0x00000001, op: ge }
+    - { address: 0x2003F068, expected_value: 0x00000000, op: eq }
+
+fault_sweep:
+  mode: runtime
+  evaluation_mode: execute
+  max_writes: auto
+  max_writes_cap: 10000
+  run_duration: "0.2"
+  max_step_limit: 25000000
+  calibration_stop:
+    success_criteria: true
+  phase2_fault:
+    enabled: true
+    fault_types: [power_loss, interrupted_erase]
+    state_search:
+      enabled: true
+      first_cuts:
+        mode: ranges
+        ranges:
+          - { start: 13, end: 16 }
+      max_cuts: 2
+      max_new_states: 64
+      max_wall_time_s: 600
+      address_ranges:
+        - { start: 0x0000E000, end: 0x0000E00C }
+      cross_check_every: 1
+
+skip_self_test: true
+expect:
+  control_outcome: success
+  should_find_issues: true
