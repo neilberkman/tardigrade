@@ -26,6 +26,7 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
 
         public CFIFlash(int size)
         {
+            timer = new FlashOperationTimer(this);
             this.size = (long)size;
             flash = new byte[size];
             // Initialize to erased state (all 0xFF)
@@ -42,6 +43,12 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
         }
 
         public long Size => size;
+
+        public FlashTiming OperationTiming { get; set; }
+
+        private byte Status => timer.Busy ? (byte)0 : (byte)0x80;
+
+        private readonly FlashOperationTimer timer;
 
         // --- Tardigrade write tracking ---
         public int TotalWrites => totalWrites;
@@ -173,8 +180,8 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             if (mode == FlashMode.ReadStatus)
             {
                 if (DebugTrace)
-                    this.Log(LogLevel.Warning, "CFIFlash: READ_STATUS off=0x{0:X} => 0x80", offset);
-                return 0x80;
+                    this.Log(LogLevel.Warning, "CFIFlash: READ_STATUS off=0x{0:X} => 0x{1:X2}", offset, Status);
+                return Status;
             }
             if (mode == FlashMode.ReadID)
             {
@@ -210,8 +217,8 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             if (mode == FlashMode.ReadStatus)
             {
                 if (DebugTrace)
-                    this.Log(LogLevel.Warning, "CFIFlash: READBYTE_STATUS off=0x{0:X} => 0x80", offset);
-                return 0x80;
+                    this.Log(LogLevel.Warning, "CFIFlash: READBYTE_STATUS off=0x{0:X} => 0x{1:X2}", offset, Status);
+                return Status;
             }
             if (mode == FlashMode.ReadID)
             {
@@ -239,7 +246,7 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             }
             if (mode == FlashMode.ReadStatus)
             {
-                return 0x0080;
+                return Status;
             }
             if (mode == FlashMode.ReadID)
             {
@@ -259,6 +266,7 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
 
         public void Reset()
         {
+            timer.Reset();
             mode = FlashMode.ReadArray;
             totalWrites = 0;
             totalErases = 0;
@@ -281,13 +289,34 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
                 this.Log(LogLevel.Warning, "CFIFlash: WRITE off=0x{0:X} val=0x{1:X8} mode={2}", offset, value, mode);
             }
 
+            if(AnyFaultFired && FaultRequiresImmediateStop)
+            {
+                return;
+            }
+
+            // A status read is always available while the write state machine runs.
+            if(timer.Busy)
+            {
+                mode = FlashMode.ReadStatus;
+                return;
+            }
+
             // In WordProgram mode, the next write is DATA, not a command.
             // Must handle before the command switch or data bytes that
             // coincidentally match command codes (0xFF, 0x40, 0x20, etc.)
             // get misinterpreted as commands.
             if (mode == FlashMode.WordProgram)
             {
-                ProgramWord(offset, value);
+                if(OperationTiming == FlashTiming.Off
+                    || (FaultAtWrite >= 0 && totalWrites == FaultAtWrite && !FaultEverFired && WriteFaultMode == 0))
+                {
+                    ProgramWord(offset, value);
+                }
+                else
+                {
+                    timer.Start(OperationTiming == FlashTiming.Maximum ? 630UL : 210UL,
+                        () => { ProgramWord(offset, value); });
+                }
                 mode = FlashMode.ReadStatus;
                 return;
             }
@@ -378,6 +407,22 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
 
         public void EraseSector(long offset)
         {
+            if(timer.Busy || (AnyFaultFired && FaultRequiresImmediateStop))
+            {
+                return;
+            }
+            if(OperationTiming == FlashTiming.Off
+                || ((ulong)(totalErases + 1) == FaultAtPageErase && !FaultEverFired))
+            {
+                CompleteErase(offset);
+                return;
+            }
+            timer.Start(OperationTiming == FlashTiming.Maximum ? 5000000UL : 1000000UL,
+                () => { CompleteErase(offset); });
+        }
+
+        private void CompleteErase(long offset)
+        {
             long sectorStart = (offset / sectorSize) * sectorSize;
 
             // Check erase fault injection
@@ -446,7 +491,13 @@ namespace Antmicro.Renode.Peripherals.Tardigrade
             // But some implementations use byte addressing
             long queryIndex = offset / 2;
             if (queryIndex >= 0 && queryIndex < cfiTable.Length)
+            {
+                // Word program takes 210/630 us. Round the typical time up
+                // to a power of two and allow four times that for the deadline.
+                if(OperationTiming != FlashTiming.Off && queryIndex == 0x1F) return 8;
+                if(OperationTiming != FlashTiming.Off && queryIndex == 0x23) return 2;
                 return cfiTable[queryIndex];
+            }
             return 0;
         }
 

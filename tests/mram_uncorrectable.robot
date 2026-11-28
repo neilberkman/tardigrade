@@ -7,6 +7,7 @@ ${ROOT}    ${CURDIR}/..
 *** Keywords ***
 Load MRAM Peripherals
     Execute Command    include "${ROOT}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${ROOT}/peripherals/FlashTiming.cs"
     Execute Command    include "${ROOT}/peripherals/FaultTracker.cs"
     Execute Command    include "${ROOT}/peripherals/NVMemoryController.cs"
     Execute Command    include "${ROOT}/peripherals/MappedMRAMTracker.cs"

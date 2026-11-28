@@ -100,6 +100,7 @@ Run Audit Point
     # Load platform + firmware.
     Execute Command    include "${ROOT}/peripherals/ITardigradeFaultInjectable.cs"
     Execute Command    include "${ROOT}/peripherals/FaultTracker.cs"
+    Execute Command    include "${ROOT}/peripherals/FlashTiming.cs"
     Execute Command    include "${ROOT}/peripherals/NVMemoryController.cs"
     Execute Command    include "${ROOT}/peripherals/GenericNvmController.cs"
     Execute Command    include "${ROOT}/peripherals/NRF52NVMC.cs"

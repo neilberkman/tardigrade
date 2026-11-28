@@ -9,6 +9,7 @@ ${STM32_PERIPHERALS_LOADED}    ${FALSE}
 Ensure STM32 Flash Peripherals Loaded
     IF    not ${STM32_PERIPHERALS_LOADED}
         Execute Command    include "${ROOT}/peripherals/ITardigradeFaultInjectable.cs"
+        Execute Command    include "${ROOT}/peripherals/FlashTiming.cs"
         Execute Command    include "${ROOT}/peripherals/FaultTracker.cs"
         Execute Command    include "${ROOT}/peripherals/TraceReplayEngine.cs"
         Execute Command    include "${ROOT}/peripherals/STM32F1FlashController.cs"

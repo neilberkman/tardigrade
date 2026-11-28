@@ -4,7 +4,7 @@ ${ROOT}    ${CURDIR}/..
 *** Keywords ***
 Load H7 Platform
     [Arguments]    ${platform}
-    FOR    ${model}    IN    ITardigradeFaultInjectable    FaultTracker    TraceReplayEngine
+    FOR    ${model}    IN    ITardigradeFaultInjectable    FlashTiming    FaultTracker    TraceReplayEngine
     ...    STM32H7FlashController    STM32H7FastFlash    STM32H7PWRStub    STM32H7RCCStub
         Execute Command    include "${ROOT}/peripherals/${model}.cs"
     END

@@ -5,7 +5,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
-using System.Threading;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
@@ -28,6 +27,7 @@ namespace Antmicro.Renode.Peripherals.Memory
                 throw new ArgumentException("NVM size must be between 1 and Int32.MaxValue");
             }
 
+            operationTimer = new FlashOperationTimer(this);
             this.machine = machine;
             this.size = size;
             WordSize = wordSize;
@@ -43,6 +43,8 @@ namespace Antmicro.Renode.Peripherals.Memory
         public void Reset()
         {
             // Intentionally do NOT clear storage: this models non-volatile memory.
+            operationTimer.Reset();
+            eraseInProgress = false;
             WriteInProgress = false;
             if(FaultEverFired || EraseFaultFired)
             {
@@ -312,7 +314,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             {
                 return AliasTarget.IsWriteInProgress();
             }
-            return WriteInProgress;
+            return WriteInProgress || operationTimer.Busy;
         }
 
         public long Size
@@ -963,6 +965,12 @@ namespace Antmicro.Renode.Peripherals.Memory
         }
 
         public uint WriteLatencyMicros { get; set; }
+        public uint EraseLatencyMicros { get; set; }
+        // An attached NVMC can own the program clock and one-word write buffer.
+        public Action<long, int, Action> ProgramScheduler { get; set; }
+        public bool EraseInProgress => AliasTarget != null ? AliasTarget.EraseInProgress : eraseInProgress;
+        private bool eraseInProgress;
+        private readonly FlashOperationTimer operationTimer;
 
         public bool WriteInProgress { get; private set; }
 
@@ -1264,6 +1272,26 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         private void EraseSpanInternal(long offset, int spanSize)
         {
+            if(operationTimer.Busy)
+            {
+                return;
+            }
+            if(EraseLatencyMicros == 0
+                || (TrackingStarted && !eraseFaultFired && totalPageErases + 1 == faultAtPageErase))
+            {
+                CompleteEraseSpan(offset, spanSize);
+                return;
+            }
+            eraseInProgress = true;
+            operationTimer.Start(EraseLatencyMicros, () =>
+            {
+                eraseInProgress = false;
+                CompleteEraseSpan(offset, spanSize);
+            });
+        }
+
+        private void CompleteEraseSpan(long offset, int spanSize)
+        {
             if(!TrackingStarted)
             {
                 EraseSectorRaw(offset, spanSize);
@@ -1495,6 +1523,51 @@ namespace Antmicro.Renode.Peripherals.Memory
                 LogOutOfRangeWrite(offset, data.Length);
                 return;
             }
+            if(operationTimer.Busy)
+            {
+                return;
+            }
+            if(ProgramScheduler != null)
+            {
+                ProgramScheduler(offset, data.Length, () => CompleteProgram(offset, data));
+                return;
+            }
+            if(WriteLatencyMicros != 0)
+            {
+                StartProgramUnit(offset, data, 0, WriteLatencyMicros);
+                return;
+            }
+            CompleteProgram(offset, data);
+        }
+
+        private void StartProgramUnit(long offset, byte[] data, int cursor, uint delay)
+        {
+            var address = offset + cursor;
+            int count = (int)Math.Min(data.Length - cursor, WordSize - address % WordSize);
+            if(TrackingStarted && !eraseFaultFired && !(FaultEverFired && WriteFaultMode == 0)
+                && FaultAtWordWrite != ulong.MaxValue
+                && TotalWordWrites + 1 == FaultAtWordWrite
+                && WriteFaultMode == 0)
+            {
+                var immediateSlice = new byte[count];
+                Array.Copy(data, cursor, immediateSlice, 0, count);
+                CompleteProgram(address, immediateSlice);
+                return;
+            }
+            operationTimer.Start(delay, () =>
+            {
+                var slice = new byte[count];
+                Array.Copy(data, cursor, slice, 0, count);
+                CompleteProgram(address, slice);
+                if(cursor + count < data.Length && !(FaultEverFired && WriteFaultMode == 0) && !eraseFaultFired)
+                {
+                    StartProgramUnit(offset, data, cursor + count, delay);
+                }
+            });
+        }
+
+        private void CompleteProgram(long offset, byte[] data)
+        {
             LastWriteAddress = offset;
 
             if(!TrackingStarted)
@@ -1784,11 +1857,6 @@ namespace Antmicro.Renode.Peripherals.Memory
                     writeLog.Add(wordStart);
                     RecordWriteTrace(wordStart);
 
-                    if(WriteLatencyMicros > 0)
-                    {
-                        var milliseconds = (int)Math.Max(1, WriteLatencyMicros / 1000);
-                        Thread.Sleep(milliseconds);
-                    }
                 }
             }
             finally
@@ -1868,10 +1936,6 @@ namespace Antmicro.Renode.Peripherals.Memory
                     EraseWordStorage(wordStart);
                     ProgramWord(wordStart, mergedWord);
                     ClearUncorrectableWordInternal(wordStart);
-                    if(WriteLatencyMicros > 0)
-                    {
-                        Thread.Sleep((int)Math.Max(1, WriteLatencyMicros / 1000));
-                    }
                 }
             }
             finally
@@ -3027,8 +3091,7 @@ namespace Antmicro.Renode.Peripherals
 
             if(Nvm != null && Nvm.IsWriteInProgress())
             {
-                status |= (1U << 9);  // PROG_ACTIVE
-                status |= (1U << 10); // ERASE_ACTIVE
+                status |= Nvm.EraseInProgress ? (1U << 10) : (1U << 9);
             }
 
             if(illegalOperation)
@@ -3043,9 +3106,11 @@ namespace Antmicro.Renode.Peripherals
         {
             var ctrl = nvmCtrlWriteableBits;
 
-            // Model immediate readiness in the simplified timing model.
-            ctrl |= (1U << 8); // RDY_FOR_ERASE
-            ctrl |= (1U << 9); // RDY_FOR_PROG
+            if(Nvm == null || !Nvm.IsWriteInProgress())
+            {
+                ctrl |= (1U << 8); // RDY_FOR_ERASE
+                ctrl |= (1U << 9); // RDY_FOR_PROG
+            }
 
             return ctrl;
         }

@@ -4,6 +4,7 @@
 Create STM32F4 Fast Machine
     ${root}=    Set Variable    ${CURDIR}/..
     Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${root}/peripherals/FlashTiming.cs"
     Execute Command    include "${root}/peripherals/FaultTracker.cs"
     Execute Command    include "${root}/peripherals/STM32F4FastFlash.cs"
     Execute Command    include "${root}/peripherals/STM32F4RCCStub.cs"
@@ -14,6 +15,7 @@ Create STM32F4 Fast Machine
 Create STM32F4 Controller Machine
     ${root}=    Set Variable    ${CURDIR}/..
     Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${root}/peripherals/FlashTiming.cs"
     Execute Command    include "${root}/peripherals/FaultTracker.cs"
     Execute Command    include "${root}/peripherals/STM32F4FlashController.cs"
     Execute Command    include "${root}/peripherals/STM32DummyUSART.cs"
@@ -23,6 +25,7 @@ Create STM32F4 Controller Machine
 Create STM32H7 Fast Machine
     ${root}=    Set Variable    ${CURDIR}/..
     Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${root}/peripherals/FlashTiming.cs"
     Execute Command    include "${root}/peripherals/FaultTracker.cs"
     Execute Command    include "${root}/peripherals/TraceReplayEngine.cs"
     Execute Command    include "${root}/peripherals/STM32H7FastFlash.cs"
@@ -32,6 +35,7 @@ Create STM32H7 Fast Machine
 Create STM32F1 Machine
     ${root}=    Set Variable    ${CURDIR}/..
     Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${root}/peripherals/FlashTiming.cs"
     Execute Command    include "${root}/peripherals/FaultTracker.cs"
     Execute Command    include "${root}/peripherals/TraceReplayEngine.cs"
     Execute Command    include "${root}/peripherals/STM32F1FlashController.cs"
@@ -41,6 +45,7 @@ Create STM32F1 Machine
 Create STM32L4 Machine
     ${root}=    Set Variable    ${CURDIR}/..
     Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${root}/peripherals/FlashTiming.cs"
     Execute Command    include "${root}/peripherals/FaultTracker.cs"
     Execute Command    include "${root}/peripherals/TraceReplayEngine.cs"
     Execute Command    include "${root}/peripherals/STM32L4FlashController.cs"
@@ -50,6 +55,7 @@ Create STM32L4 Machine
 Create NRF52 Fast Machine
     ${root}=    Set Variable    ${CURDIR}/..
     Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${root}/peripherals/FlashTiming.cs"
     Execute Command    include "${root}/peripherals/NVMemoryController.cs"
     Execute Command    include "${root}/peripherals/FaultTracker.cs"
     Execute Command    include "${root}/peripherals/NRF52NVMC.cs"
@@ -63,6 +69,7 @@ Create NRF52 Fast Machine
 Create AN521 Machine
     ${root}=    Set Variable    ${CURDIR}/..
     Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${root}/peripherals/FlashTiming.cs"
     Execute Command    include "${root}/peripherals/NVMemoryController.cs"
     Execute Command    include "${root}/peripherals/GenericNvmController.cs"
     Execute Command    include "${root}/peripherals/FaultTracker.cs"
@@ -276,6 +283,7 @@ SPINORFlash And I2CEEPROM Emit Explicit Chunk Widths In Write Trace
     ${root}=    Set Variable    ${CURDIR}/..
     Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
     Execute Command    include "${root}/peripherals/FaultTracker.cs"
+    Execute Command    include "${root}/peripherals/FlashTiming.cs"
     Execute Command    include "${root}/peripherals/NRF52NVMC.cs"
     Execute Command    include "${root}/peripherals/NRF52UARTE.cs"
     Execute Command    include "${root}/peripherals/TraceReplayEngine.cs"

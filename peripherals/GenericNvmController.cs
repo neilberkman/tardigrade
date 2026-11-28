@@ -58,7 +58,7 @@ namespace Antmicro.Renode.Peripherals.Memory
 
             if(offset == StatusRegisterOffset)
             {
-                return statusRegisterValue;
+                return WriteInProgress ? 0U : statusRegisterValue;
             }
 
             if(offset == AddressRegisterOffset)
@@ -515,6 +515,10 @@ namespace Antmicro.Renode.Peripherals.Memory
                 return;
             }
 
+            if(WriteInProgress)
+            {
+                return;
+            }
             commandExecutions++;
             statusRegisterValue = 0U;
             registers[StatusRegisterOffset] = statusRegisterValue;

@@ -3,6 +3,7 @@
 Create AN521 Watchdog Machine
     ${root}=    Set Variable    ${CURDIR}/..
     Execute Command    include "${root}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${root}/peripherals/FlashTiming.cs"
     Execute Command    include "${root}/peripherals/NVMemoryController.cs"
     Execute Command    include "${root}/peripherals/GenericNvmController.cs"
     Execute Command    include "${root}/peripherals/FaultTracker.cs"

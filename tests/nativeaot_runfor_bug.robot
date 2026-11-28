@@ -28,6 +28,7 @@ RunFor Completes With Dynamically Compiled Peripheral On Fetch Path
     ...    0xeffffffe. The test passes only once the CPU is spinning in the loop.
     [Timeout]    30s
     Execute Command    include "${ROOT}/peripherals/ITardigradeFaultInjectable.cs"
+    Execute Command    include "${ROOT}/peripherals/FlashTiming.cs"
     Execute Command    include "${ROOT}/peripherals/NVMemoryController.cs"
     Execute Command    include "${ROOT}/peripherals/GenericNvmController.cs"
     Execute Command    mach create

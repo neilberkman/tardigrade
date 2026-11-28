@@ -117,13 +117,15 @@ def load_dts_template() -> str:
 
 
 def render_resc(platform_path: Path, fw_cfg_cs_path: Path, dtb_path: Path, elf_path: Path, pty_link: Path) -> str:
-    cfi_cs_path = repo_root() / "peripherals" / "CFIFlash.cs"
-    pl061_cs_path = repo_root() / "peripherals" / "PL061Stub.cs"
+    peripherals = repo_root() / "peripherals"
     return textwrap.dedent(
         f"""\
-        include @{cfi_cs_path}
+        include @{peripherals}/ITardigradeFaultInjectable.cs
+        include @{peripherals}/FlashTiming.cs
+        include @{peripherals}/FaultTracker.cs
+        include @{peripherals}/CFIFlash.cs
         include @{fw_cfg_cs_path}
-        include @{pl061_cs_path}
+        include @{peripherals}/PL061Stub.cs
 
         mach create
         machine LoadPlatformDescription @{platform_path}

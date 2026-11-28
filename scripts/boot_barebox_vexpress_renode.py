@@ -54,6 +54,9 @@ def resolve_image(explicit: str | None) -> Path:
 def render_resc(image_path: Path, pty_link: Path) -> str:
     root = repo_root()
     includes = [
+        root / "peripherals" / "ITardigradeFaultInjectable.cs",
+        root / "peripherals" / "FlashTiming.cs",
+        root / "peripherals" / "FaultTracker.cs",
         root / "peripherals" / "CFIFlash.cs",
         root / "peripherals" / "ARM_SP804PrimeCellTimer.cs",
     ]

@@ -293,6 +293,9 @@ def render_resc(
 ) -> str:
     root = repo_root()
     includes = [
+        root / "peripherals" / "ITardigradeFaultInjectable.cs",
+        root / "peripherals" / "FlashTiming.cs",
+        root / "peripherals" / "FaultTracker.cs",
         root / "peripherals" / "CFIFlash.cs",
         root / "peripherals" / "ARM_SP804PrimeCellTimer.cs",
         root / "peripherals" / "QEMUFwCfg.cs",
