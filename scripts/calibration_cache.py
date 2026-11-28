@@ -24,7 +24,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from renode_runner import CalibrationResult, validate_barrier_audit
-from trace_utils import parse_exact_program_trace_csv
+from trace_utils import (
+    SUPPORTED_WRITE_TRACE_WIDTHS,
+    parse_exact_program_trace_csv,
+)
+from writeback_reconstruction import (
+    ERASE_TRACE_CSV_HEADERS,
+    EXACT_PROGRAM_TRACE_CSV_HEADERS,
+    WRITE_TRACE_CSV_HEADERS,
+)
 
 
 CACHE_VERSION = 6
@@ -187,8 +195,8 @@ def _parse_trace_csv(
     data: bytes,
     *,
     name: str,
-    header: list[str],
-) -> list[tuple[int, ...]]:
+    header: Optional[list[str]] = None,
+) -> list[tuple[Optional[int], ...]]:
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -198,42 +206,85 @@ def _parse_trace_csv(
         actual_header = next(reader)
     except StopIteration as exc:
         raise ValueError("{} is empty".format(name)) from exc
-    if actual_header != header:
+    allowed_headers = (
+        ERASE_TRACE_CSV_HEADERS
+        if name == "erase trace"
+        else WRITE_TRACE_CSV_HEADERS
+    )
+    if (
+        (header is not None and actual_header != list(header))
+        or tuple(actual_header) not in allowed_headers
+    ):
         raise ValueError("{} has an unexpected header".format(name))
-    rows: list[tuple[int, ...]] = []
+    header = actual_header
+    has_width = "width" in header
+    has_pc = "pc" in header
+    width_index = header.index("width") if has_width else None
+    pc_index = header.index("pc") if has_pc else None
+    rows: list[tuple[Optional[int], ...]] = []
     previous_index = 0
     for line_number, row in enumerate(reader, start=2):
         if len(row) != len(header):
             raise ValueError("{} row {} has wrong column count".format(name, line_number))
-        try:
-            values = tuple(int(value.strip(), 0) for value in row)
-        except ValueError as exc:
-            raise ValueError("{} row {} is not numeric".format(name, line_number)) from exc
+        parsed_values: list[Optional[int]] = []
+        for col_index, cell in enumerate(row):
+            text_cell = cell.strip()
+            if col_index == pc_index and not text_cell:
+                parsed_values.append(None)
+                continue
+            try:
+                parsed_values.append(int(text_cell, 0))
+            except ValueError as exc:
+                raise ValueError(
+                    "{} row {} is not numeric".format(name, line_number)
+                ) from exc
+        values = tuple(parsed_values)
+        index_value = values[0]
+        offset_value = values[1]
         # Trace indices, offsets, and erase metadata are uint32. Write values
         # may be wider when the CSV exporter records a write width explicitly.
-        if any(value < 0 or value > 0xFFFFFFFF for value in values[:1]):
+        if index_value is None or not (0 <= index_value <= 0xFFFFFFFF):
             raise ValueError("{} row {} exceeds uint32 range".format(name, line_number))
-        if len(values) > 1 and not (0 <= values[1] <= 0xFFFFFFFF):
+        if offset_value is None or not (0 <= offset_value <= 0xFFFFFFFF):
             raise ValueError("{} row {} exceeds uint32 range".format(name, line_number))
-        if header == ["write_index", "flash_offset", "value", "width"]:
-            width = values[3]
-            if width not in (1, 2, 4, 8, 16):
+        if has_pc:
+            pc_value = values[pc_index]
+            if pc_value is not None and not (1 <= pc_value <= 0xFFFFFFFF):
+                raise ValueError(
+                    "{} row {} pc exceeds uint32 range".format(name, line_number)
+                )
+        if name == "erase trace":
+            if any(
+                val is None or val < 0 or val > 0xFFFFFFFF
+                for val in values[2:4]
+            ):
+                raise ValueError(
+                    "{} row {} exceeds uint32 range".format(name, line_number)
+                )
+        elif has_width:
+            width = values[width_index]
+            if width not in SUPPORTED_WRITE_TRACE_WIDTHS:
                 raise ValueError(
                     "{} row {} has unsupported write width {}".format(
                         name, line_number, width
                     )
                 )
-            if values[2] < 0 or values[2] > (1 << (width * 8)) - 1:
+            value = values[2]
+            if value is None or value < 0 or value > (1 << (width * 8)) - 1:
                 raise ValueError(
                     "{} row {} value exceeds width {}".format(
                         name, line_number, width
                     )
                 )
-        elif any(value < 0 or value > 0xFFFFFFFF for value in values[2:]):
-            raise ValueError("{} row {} exceeds uint32 range".format(name, line_number))
-        if values[0] <= previous_index:
+        else:
+            value = values[2]
+            if value is None or value < 0 or value > 0xFFFFFFFF:
+                raise ValueError(
+                    "{} row {} exceeds uint32 range".format(name, line_number)
+                )
+        if index_value <= previous_index:
             raise ValueError("{} indices must be positive and increasing".format(name))
-        previous_index = values[0]
+        previous_index = index_value
         rows.append(values)
     return rows
 
@@ -252,29 +303,25 @@ def _validate_trace_pair(
         raise ValueError("{} binary artifact requires a CSV artifact".format(name))
     if csv_data is None:
         return 0
-    if erase:
-        header = [
-            "erase_index",
-            "flash_offset",
-            "writes_at_this_point",
-            "erase_size",
-        ]
-    else:
-        try:
-            decoded = csv.reader(io.StringIO(csv_data.decode("utf-8"), newline=""))
-            actual_header = next(decoded)
-        except (UnicodeDecodeError, StopIteration) as exc:
-            raise ValueError("write trace has an invalid header") from exc
-        legacy_header = ["write_index", "flash_offset", "value"]
-        width_header = legacy_header + ["width"]
-        if actual_header not in (legacy_header, width_header):
-            raise ValueError("write trace has an unexpected header")
-        header = actual_header
+    allowed_headers = (
+        ERASE_TRACE_CSV_HEADERS if erase else WRITE_TRACE_CSV_HEADERS
+    )
+    try:
+        decoded = csv.reader(io.StringIO(csv_data.decode("utf-8"), newline=""))
+        actual_header = next(decoded)
+    except UnicodeDecodeError as exc:
+        raise ValueError("{} must be UTF-8 CSV".format(name)) from exc
+    except StopIteration as exc:
+        raise ValueError("{} is empty".format(name)) from exc
+    if tuple(actual_header) not in allowed_headers:
+        raise ValueError("{} has an unexpected header".format(name))
+    header = actual_header
     rows = _parse_trace_csv(csv_data, name=name, header=header)
     if bin_data is None:
         return len(rows)
-    if not erase and header == ["write_index", "flash_offset", "value", "width"]:
-        if any(row[3] != 4 for row in rows):
+    if not erase and "width" in header:
+        width_index = header.index("width")
+        if any(row[width_index] != 4 for row in rows):
             raise ValueError(
                 "write trace binary companion requires every width to be 4"
             )
@@ -411,15 +458,39 @@ def _validate_cache_payload(payload: Any) -> Dict[str, Any]:
             raise ValueError(
                 "legacy write trace contradicts exact MRAM program trace count"
             )
+        width_index = (
+            write_header.index("width") if "width" in write_header else None
+        )
+        pc_index = write_header.index("pc") if "pc" in write_header else None
+        program_header = tuple(
+            next(
+                csv.reader(
+                    io.StringIO(program_csv.decode("utf-8"), newline="")
+                )
+            )
+        )
+        program_has_pc = "pc" in program_header
         for legacy, exact in zip(legacy_rows, program_entries):
             if legacy[0] != exact["write_index"] or legacy[1] != exact["offset"]:
                 raise ValueError(
                     "legacy write trace contradicts exact MRAM program provenance"
                 )
-            if len(legacy) == 4 and legacy[3] != exact["program_width"]:
+            if (
+                width_index is not None
+                and legacy[width_index] != exact["program_width"]
+            ):
                 raise ValueError(
                     "legacy write trace contradicts exact MRAM program width"
                 )
+            if pc_index is not None and program_has_pc:
+                legacy_pc = legacy[pc_index]
+                exact_pc = (
+                    int(str(exact["pc"]), 16) if exact.get("pc") else None
+                )
+                if legacy_pc != exact_pc:
+                    raise ValueError(
+                        "legacy write trace contradicts exact MRAM program pc"
+                    )
     if erase_rows and erase_rows != total_erases:
         raise ValueError("erase trace record count does not match total_erases")
     return payload

@@ -913,6 +913,15 @@ def load_calibration_operations_for_profile(
                     "'width' column in calibration write trace '{}'".format(trace_file)
                 )
             for expected_idx, row in enumerate(reader, start=1):
+                if (None in row and row[None]) or any(
+                    row.get(field) is None for field in fieldnames
+                ):
+                    raise ProfileError(
+                        "fault_sweep.sweep_strategy: distinct_states requires valid "
+                        "width-explicit write trace rows in '{}': wrong column count".format(
+                            trace_file
+                        )
+                    )
                 try:
                     write_idx = int(str(row.get("write_index", "")).strip(), 0)
                     offset = int(str(row.get("flash_offset", "")).strip(), 0)
@@ -921,6 +930,12 @@ def load_calibration_operations_for_profile(
                     if not width_text:
                         raise ValueError("missing width")
                     width = int(width_text, 0)
+                    if "pc" in fieldnames:
+                        pc_text = str(row.get("pc", "") or "").strip()
+                        if pc_text:
+                            pc_val = int(pc_text, 0)
+                            if pc_val <= 0 or pc_val > 0xFFFFFFFF:
+                                raise ValueError("pc out of uint32 range")
                 except (TypeError, ValueError) as exc:
                     raise ProfileError(
                         "fault_sweep.sweep_strategy: distinct_states requires valid "
@@ -969,11 +984,26 @@ def load_calibration_operations_for_profile(
                     )
                 )
             for expected_idx, row in enumerate(reader, start=1):
+                if (None in row and row[None]) or any(
+                    row.get(field) is None for field in fieldnames
+                ):
+                    raise ProfileError(
+                        "fault_sweep.sweep_strategy: distinct_states requires valid "
+                        "erase trace rows in '{}': wrong column count".format(
+                            erase_trace_file
+                        )
+                    )
                 try:
                     erase_idx = int(str(row.get("erase_index", "")).strip(), 0)
                     offset = int(str(row.get("flash_offset", "")).strip(), 0)
                     writes_at = int(str(row.get("writes_at_this_point", "0")).strip(), 0)
                     erase_size = int(str(row.get("erase_size", "")).strip(), 0)
+                    if "pc" in fieldnames:
+                        pc_text = str(row.get("pc", "") or "").strip()
+                        if pc_text:
+                            pc_val = int(pc_text, 0)
+                            if pc_val <= 0 or pc_val > 0xFFFFFFFF:
+                                raise ValueError("pc out of uint32 range")
                 except (TypeError, ValueError) as exc:
                     raise ProfileError(
                         "fault_sweep.sweep_strategy: distinct_states requires valid "

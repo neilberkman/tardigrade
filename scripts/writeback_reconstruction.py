@@ -10,6 +10,72 @@ class AmbiguousWriteEvent(ValueError):
 
 
 SUPPORTED_WRITE_WIDTHS = (1, 2, 4, 8)
+WRITE_TRACE_BASE_FIELDS = ("write_index", "flash_offset", "value")
+ERASE_TRACE_BASE_FIELDS = (
+    "erase_index",
+    "flash_offset",
+    "writes_at_this_point",
+    "erase_size",
+)
+EXACT_PROGRAM_TRACE_BASE_FIELDS = (
+    "write_index",
+    "program_address",
+    "offset",
+    "width",
+    "intended_hex",
+    "pre_program_hex",
+    "post_program_hex",
+    "faulted",
+)
+
+
+def write_trace_csv_fields(has_width=False, has_pc=False):
+    fields = WRITE_TRACE_BASE_FIELDS
+    if has_width:
+        fields = fields + ("width",)
+    if has_pc:
+        fields = fields + ("pc",)
+    return fields
+
+
+def write_trace_csv_header(has_width=False, has_pc=False):
+    return ",".join(write_trace_csv_fields(has_width=has_width, has_pc=has_pc))
+
+
+def erase_trace_csv_fields(has_pc=False):
+    if has_pc:
+        return ERASE_TRACE_BASE_FIELDS + ("pc",)
+    return ERASE_TRACE_BASE_FIELDS
+
+
+def erase_trace_csv_header(has_pc=False):
+    return ",".join(erase_trace_csv_fields(has_pc=has_pc))
+
+
+def exact_program_trace_csv_fields(has_pc=False):
+    if has_pc:
+        return EXACT_PROGRAM_TRACE_BASE_FIELDS + ("pc",)
+    return EXACT_PROGRAM_TRACE_BASE_FIELDS
+
+
+def exact_program_trace_csv_header(has_pc=False):
+    return ",".join(exact_program_trace_csv_fields(has_pc=has_pc))
+
+
+WRITE_TRACE_CSV_HEADERS = (
+    write_trace_csv_fields(has_width=False, has_pc=False),
+    write_trace_csv_fields(has_width=True, has_pc=False),
+    write_trace_csv_fields(has_width=False, has_pc=True),
+    write_trace_csv_fields(has_width=True, has_pc=True),
+)
+ERASE_TRACE_CSV_HEADERS = (
+    erase_trace_csv_fields(has_pc=False),
+    erase_trace_csv_fields(has_pc=True),
+)
+EXACT_PROGRAM_TRACE_CSV_HEADERS = (
+    exact_program_trace_csv_fields(has_pc=False),
+    exact_program_trace_csv_fields(has_pc=True),
+)
 UNSUPPORTED_LIFECYCLE_PREFIXES = (
     "m:", "h:", "cc:", "p2:", "pc:", "mf:", "c:"
 )

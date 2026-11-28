@@ -1220,8 +1220,25 @@ def _validate_trace_artifacts(data: Dict[str, Any]) -> Optional[str]:
                             return "{} has a non-integer {} at row {}".format(
                                 field_name, column, row_number
                             )
-                    if field_name == "erase_trace_file":
-                        for optional_column in ("writes_at_this_point", "writes_at", "write_index", "write_count_at_erase", "erase_size"):
+                    if field_name == "trace_file":
+                        for optional_column in ("width", "pc"):
+                            if optional_column in row and str(row[optional_column]).strip():
+                                try:
+                                    int(str(row[optional_column]).strip(), 0)
+                                except (TypeError, ValueError):
+                                    return "{} has a non-integer {} at row {}".format(
+                                        field_name, optional_column, row_number
+                                    )
+                    elif field_name == "program_trace_file":
+                        if "pc" in row and str(row["pc"]).strip():
+                            try:
+                                int(str(row["pc"]).strip(), 0)
+                            except (TypeError, ValueError):
+                                return "{} has a non-integer pc at row {}".format(
+                                    field_name, row_number
+                                )
+                    elif field_name == "erase_trace_file":
+                        for optional_column in ("writes_at_this_point", "writes_at", "write_index", "write_count_at_erase", "erase_size", "pc"):
                             if optional_column in row and str(row[optional_column]).strip():
                                 try:
                                     int(str(row[optional_column]).strip(), 0)

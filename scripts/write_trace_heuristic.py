@@ -42,7 +42,12 @@ def load_trace(trace_path: str) -> List[Tuple[int, int]]:
     with open(trace_path, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            entries.append((int(row["write_index"]), int(row["flash_offset"])))
+            entries.append(
+                (
+                    int(str(row["write_index"]).strip(), 0),
+                    int(str(row["flash_offset"]).strip(), 0),
+                )
+            )
     return entries
 
 

@@ -32,11 +32,17 @@ from boundary_reserved import BOUNDARY_RESERVED_VARIABLES
 from boot_outcomes import boot_outcome_after_stop, count_followup_boot_cycles
 from writeback_reconstruction import (
     AmbiguousWriteEvent,
+    ERASE_TRACE_CSV_HEADERS,
+    EXACT_PROGRAM_TRACE_CSV_HEADERS,
+    WRITE_TRACE_CSV_HEADERS,
+    erase_trace_csv_header,
+    exact_program_trace_csv_header,
     normalise_write_event,
     parse_write_trace_record,
     reconstruct_committed_snapshot,
     validate_erase_trace_data,
     validate_write_trace_width,
+    write_trace_csv_header,
     is_known_writeback_fault_type,
     is_unsupported_writeback_fault_type,
 )
@@ -20066,9 +20072,20 @@ def load_trace_data(path):
                     width_value = trace_integer(str(width).strip(), 0)
                 except (TypeError, ValueError) as exc:
                     raise ValueError('malformed write width: {}'.format(exc))
-                if width_value not in (1, 2, 4, 8):
+                if width_value not in (1, 2, 4, 8, 16):
                     raise ValueError('unsupported write width {}'.format(width_value))
                 event = event + (width_value,)
+            if 'pc' in fieldnames:
+                if row.get('pc') is None:
+                    raise ValueError('write trace CSV row is missing pc field')
+                pc_text = str(row.get('pc') or '').strip()
+                if pc_text:
+                    try:
+                        pc_value = trace_integer(pc_text, 0)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError('malformed write trace pc: {}'.format(exc))
+                    if pc_value <= 0 or pc_value > 0xFFFFFFFF:
+                        raise ValueError('write trace pc is out of uint32 range')
             entries.append(event)
     return entries
 
@@ -20128,7 +20145,7 @@ def load_trace_pc_map(path):
                     continue
                 idx = int(str(row['write_index']).strip(), 0)
                 pc_val = int(pc_text, 0)
-                if pc_val > 0:
+                if 0 < pc_val <= 0xFFFFFFFF:
                     pc_map[idx] = fmt_u32(pc_val)
     except Exception:
         return {}
@@ -20152,7 +20169,7 @@ def load_erase_trace_pc_map(path):
                 idx_text = str(row.get('erase_index') or '').strip()
                 idx = int(idx_text, 0) if idx_text else row_number
                 pc_val = int(pc_text, 0)
-                if pc_val > 0:
+                if 0 < pc_val <= 0xFFFFFFFF:
                     pc_map[idx] = fmt_u32(pc_val)
     except Exception:
         return {}
@@ -20187,17 +20204,20 @@ def _get_calibration_op_pc(fault_type, fault_at):
 def load_mram_program_trace_data(path):
     """Load exact, whole-unit MRAM programs from calibration CSV."""
     import csv as _csv
-    expected_fields = (
-        'write_index', 'program_address', 'offset', 'width',
-        'intended_hex', 'pre_program_hex', 'post_program_hex', 'faulted',
-    )
+    allowed_headers = globals().get('EXACT_PROGRAM_TRACE_CSV_HEADERS')
+    if allowed_headers is None:
+        expected_fields = (
+            'write_index', 'program_address', 'offset', 'width',
+            'intended_hex', 'pre_program_hex', 'post_program_hex', 'faulted',
+        )
+        allowed_headers = (expected_fields, expected_fields + ('pc',))
     events = []
     address_base = None
     previous_index = 0
     with open(path, 'r') as program_file:
         reader = _csv.DictReader(program_file)
         header_fields = tuple(reader.fieldnames or ())
-        if header_fields not in (expected_fields, expected_fields + ('pc',)):
+        if header_fields not in allowed_headers:
             raise ValueError(
                 'MRAM program trace has an unexpected header'
             )
@@ -20266,10 +20286,29 @@ def load_mram_program_trace_data(path):
                     decoded['post_program_hex']
                 ),
             }
-            pc_text = str(row.get('pc') or '').strip()
-            if pc_text:
-                pc_val = int(pc_text, 0)
-                if pc_val > 0:
+            if 'pc' in header_fields:
+                if row.get('pc') is None:
+                    raise ValueError(
+                        'MRAM program trace row {} is missing pc field'.format(
+                            line_number
+                        )
+                    )
+                pc_text = str(row.get('pc') or '').strip()
+                if pc_text:
+                    try:
+                        pc_val = int(pc_text, 0)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            'malformed MRAM program trace row {} pc: {}'.format(
+                                line_number, exc
+                            )
+                        )
+                    if pc_val <= 0 or pc_val > 0xFFFFFFFF:
+                        raise ValueError(
+                            'MRAM program trace row {} pc is out of uint32 range'.format(
+                                line_number
+                            )
+                        )
                     entry['pc'] = fmt_u32(pc_val)
             events.append(entry)
             previous_index = write_index
@@ -20455,6 +20494,17 @@ def load_erase_trace_data(path, require_replay_metadata=False):
                 )
             if previous_writes_at is not None and writes_at < previous_writes_at:
                 raise ValueError('erase trace writes_at_this_point is out of order')
+            if 'pc' in fieldnames:
+                if row.get('pc') is None:
+                    raise ValueError('erase trace CSV row is missing pc field')
+                pc_text = str(row.get('pc') or '').strip()
+                if pc_text:
+                    try:
+                        pc_val = int(pc_text, 0)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError('malformed erase trace pc: {}'.format(exc))
+                    if pc_val <= 0 or pc_val > 0xFFFFFFFF:
+                        raise ValueError('erase trace pc is out of uint32 range')
             previous_erase_index = erase_index
             previous_writes_at = writes_at
             entries.append((flash_offset, writes_at, erase_size))
@@ -25432,14 +25482,12 @@ if calibration_mode:
                     trace_file_bin = result_file.replace('.json', '_trace.bin')
 
                 with open(trace_file, 'w') as tf:
-                    if trace_has_width and trace_has_pc:
-                        tf.write('write_index,flash_offset,value,width,pc\n')
-                    elif trace_has_width:
-                        tf.write('write_index,flash_offset,value,width\n')
-                    elif trace_has_pc:
-                        tf.write('write_index,flash_offset,value,pc\n')
-                    else:
-                        tf.write('write_index,flash_offset,value\n')
+                    tf.write(
+                        write_trace_csv_header(
+                            has_width=trace_has_width,
+                            has_pc=trace_has_pc,
+                        ) + '\n'
+                    )
                     for write_idx, flash_off, value, width, pc in parsed_trace:
                         pc_field = '' if pc is None else fmt_u32(pc)
                         if trace_has_width and trace_has_pc:
@@ -25507,16 +25555,11 @@ if calibration_mode:
             )
             program_trace_has_pc = any(bool(event.get('pc')) for event in program_trace)
             with open(program_trace_file, 'w') as program_file:
-                if program_trace_has_pc:
-                    program_file.write(
-                        'write_index,program_address,offset,width,intended_hex,'
-                        'pre_program_hex,post_program_hex,faulted,pc\n'
-                    )
-                else:
-                    program_file.write(
-                        'write_index,program_address,offset,width,intended_hex,'
-                        'pre_program_hex,post_program_hex,faulted\n'
-                    )
+                program_file.write(
+                    exact_program_trace_csv_header(
+                        has_pc=program_trace_has_pc
+                    ) + '\n'
+                )
                 for event in program_trace:
                     if program_trace_has_pc:
                         program_file.write(
@@ -25615,10 +25658,9 @@ if calibration_mode:
                             continue
                         parsed_erases.append((erase_idx, flash_off, writes_at, fallback_sz, 0))
                 with open(erase_trace_file, 'w') as ef:
-                    if erase_has_pc:
-                        ef.write('erase_index,flash_offset,writes_at_this_point,erase_size,pc\n')
-                    else:
-                        ef.write('erase_index,flash_offset,writes_at_this_point,erase_size\n')
+                    ef.write(
+                        erase_trace_csv_header(has_pc=erase_has_pc) + '\n'
+                    )
                     with open(erase_trace_file_bin, 'wb') as efb:
                         erase_bin_count = 0
                         for erase_idx, flash_off, writes_at, erase_sz, erase_pc in parsed_erases:

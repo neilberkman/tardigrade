@@ -12,18 +12,17 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from fault_inject import MetadataFaultRegion
-
-
-EXACT_PROGRAM_TRACE_FIELDS = (
-    "write_index",
-    "program_address",
-    "offset",
-    "width",
-    "intended_hex",
-    "pre_program_hex",
-    "post_program_hex",
-    "faulted",
+from writeback_reconstruction import (
+    ERASE_TRACE_BASE_FIELDS,
+    ERASE_TRACE_CSV_HEADERS,
+    EXACT_PROGRAM_TRACE_BASE_FIELDS,
+    EXACT_PROGRAM_TRACE_CSV_HEADERS,
+    WRITE_TRACE_BASE_FIELDS,
+    WRITE_TRACE_CSV_HEADERS,
 )
+
+
+EXACT_PROGRAM_TRACE_FIELDS = EXACT_PROGRAM_TRACE_BASE_FIELDS
 MAX_EXACT_PROGRAM_WIDTH = 1 << 20
 SUPPORTED_WRITE_TRACE_WIDTHS = (1, 2, 4, 8, 16)
 
@@ -188,6 +187,8 @@ def load_clean_write_trace(
         for row in reader:
             if None in row and row[None]:
                 raise ValueError("write trace CSV row has extra fields")
+            if any(row.get(field) is None for field in fields):
+                raise ValueError("write trace CSV row has missing fields")
             try:
                 write_index = int(str(row.get("write_index", "")).strip(), 0)
                 flash_offset = int(str(row.get("flash_offset", "")).strip(), 0)
@@ -238,10 +239,9 @@ def load_clean_write_trace(
                 raw_pc = str(row.get("pc", "") or "").strip()
                 if raw_pc:
                     pc_value = _parse_optional_int(raw_pc)
-                    if pc_value is None or pc_value < 0:
+                    if pc_value is None or pc_value <= 0 or pc_value > 0xFFFFFFFF:
                         raise ValueError("malformed write trace pc")
-                    if pc_value != 0:
-                        entry["pc"] = _fmt_u32(pc_value)
+                    entry["pc"] = _fmt_u32(pc_value)
             if "call_context" in fields:
                 raw_ctx = str(row.get("call_context", "") or "").strip()
                 if raw_ctx:
@@ -289,12 +289,7 @@ def parse_exact_program_trace_csv(
     """Parse and validate an exact, width-aware MRAM calibration trace."""
     reader = csv.DictReader(text.splitlines(), strict=True)
     fields = tuple(reader.fieldnames or ())
-    if fields not in (
-        EXACT_PROGRAM_TRACE_FIELDS,
-        EXACT_PROGRAM_TRACE_FIELDS + ("pc",),
-        EXACT_PROGRAM_TRACE_FIELDS + ("pc", "call_context"),
-        EXACT_PROGRAM_TRACE_FIELDS + ("call_context",),
-    ):
+    if fields not in EXACT_PROGRAM_TRACE_CSV_HEADERS:
         raise ValueError("{} has an unexpected header".format(source))
 
     entries: List[Dict[str, Any]] = []
@@ -305,8 +300,8 @@ def parse_exact_program_trace_csv(
             raise ValueError(
                 "{} row {} has extra fields".format(source, line_number)
             )
-        if any(
-            row.get(field) is None or not str(row[field]).strip()
+        if any(row.get(field) is None for field in fields) or any(
+            not str(row[field]).strip()
             for field in EXACT_PROGRAM_TRACE_FIELDS
         ):
             raise ValueError(
@@ -407,16 +402,11 @@ def parse_exact_program_trace_csv(
             raw_pc = str(row.get("pc", "") or "").strip()
             if raw_pc:
                 pc_value = _parse_optional_int(raw_pc)
-                if pc_value is None or pc_value < 0:
+                if pc_value is None or pc_value <= 0 or pc_value > 0xFFFFFFFF:
                     raise ValueError(
                         "{} row {} has a malformed pc".format(source, line_number)
                     )
-                if pc_value != 0:
-                    entry_record["pc"] = _fmt_u32(pc_value)
-        if "call_context" in fields:
-            raw_ctx = str(row.get("call_context", "") or "").strip()
-            if raw_ctx:
-                entry_record["call_context"] = raw_ctx
+                entry_record["pc"] = _fmt_u32(pc_value)
         entries.append(entry_record)
         previous_index = write_index
     return entries
@@ -472,6 +462,14 @@ def _validate_coexisting_write_traces(
         ):
             raise ValueError(
                 "legacy write trace contradicts exact MRAM program width"
+            )
+        if (
+            "pc" in legacy
+            and "pc" in exact
+            and str(legacy["pc"]).lower() != str(exact["pc"]).lower()
+        ):
+            raise ValueError(
+                "legacy write trace contradicts exact MRAM program pc"
             )
 
 
@@ -652,6 +650,8 @@ def load_clean_erase_trace(
         for idx, row in enumerate(reader, start=1):
             if None in row and row[None]:
                 raise ValueError("erase trace CSV row has extra fields")
+            if any(row.get(field) is None for field in fields):
+                raise ValueError("erase trace CSV row has missing fields")
             try:
                 erase_index_raw = row.get("erase_index", str(idx))
                 erase_index = int(str(erase_index_raw).strip() or str(idx), 0)
@@ -716,10 +716,9 @@ def load_clean_erase_trace(
                 raw_pc = str(row.get("pc", "") or "").strip()
                 if raw_pc:
                     pc_value = _parse_optional_int(raw_pc)
-                    if pc_value is None or pc_value < 0:
+                    if pc_value is None or pc_value <= 0 or pc_value > 0xFFFFFFFF:
                         raise ValueError("erase trace pc is malformed")
-                    if pc_value != 0:
-                        erase_entry["pc"] = _fmt_u32(pc_value)
+                    erase_entry["pc"] = _fmt_u32(pc_value)
             if "call_context" in fields:
                 raw_ctx = str(row.get("call_context", "") or "").strip()
                 if raw_ctx:
