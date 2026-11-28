@@ -48,8 +48,7 @@ tardigrade/
 │   ├── cbmc_to_profile.py            # CBMC counterexample converter
 │   ├── fuzz_crash_to_profile.py      # Fuzzer crash-to-profile converter
 │   ├── fuzz_to_profile.py            # Legacy fuzzer bridge
-│   ├── run_oss_validation.py         # OSS validation runner
-│   └── license_certify.py            # Strict source-release license gate
+│   └── run_oss_validation.py         # OSS validation runner
 ├── targets/
 │   ├── esp_idf/                      # ESP-IDF model probe + invariants
 │   ├── mcuboot/                      # MCUboot probe, invariants, state fuzzer
@@ -82,7 +81,6 @@ tardigrade/
     ├── writing-profiles.md           # Profile-writing guide + result interpretation
     ├── authenticated-equivalence.md  # Authenticated-content campaign guide
     ├── preauth-bounds-oracle.md      # Synthetic pre-auth bounds guide
-    ├── license-certification.md      # Strict source-package license boundary
     ├── rustboot-target.md            # rustBoot adapter reference
     ├── i2c-fault-model.md            # I2C fault injection model
     └── otp-backend.md                # OTP fuse-blow backend

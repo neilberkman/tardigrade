@@ -143,6 +143,6 @@ The repository also has analyzers that run without the emulator: an update-proto
 
 [Repository layout and CI workflows](docs/repository-layout.md) says where things live.
 
-Apache 2.0. See [`LICENSE`](LICENSE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). [License certification](docs/license-certification.md) describes the source-package boundary that the license check covers.
+Apache 2.0. See [`LICENSE`](LICENSE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 The name: tardigrades survive vacuum, radiation and temperature extremes.

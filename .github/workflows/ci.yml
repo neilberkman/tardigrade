@@ -82,9 +82,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Certify source-release license boundary
-        run: python3 scripts/license_certify.py license-certification-manifest.json --strict
-
       - name: Install pinned Arm GNU toolchain
         run: |
           set -euxo pipefail

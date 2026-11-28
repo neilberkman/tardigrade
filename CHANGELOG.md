@@ -100,6 +100,7 @@ The format follows [common-changelog](https://common-changelog.org/).
 
 ### Changed
 
+- Remove the license-certification CI check and its per-file source inventory.
 - The weekly MCUboot HEAD bypass canary for swap-move revert on nRF52 no
   longer runs the payload-corrupting non-power types `bit_corruption`,
   `silent_write_failure`, `write_disturb`, `wear_leveling_corruption`, and
