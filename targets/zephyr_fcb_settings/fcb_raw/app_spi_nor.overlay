@@ -1,0 +1,65 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Devicetree overlay for Zephyr FCB / settings-on-FCB on external JEDEC
+ * SPI NOR flash (Winbond W25Q16JV) attached to spi2 (0x40023000, CS# P0.22).
+ */
+
+&qspi {
+    status = "disabled";
+};
+
+&mx25r64 {
+    status = "disabled";
+};
+
+&flash0 {
+    /delete-node/ partitions;
+
+    partitions {
+        compatible = "fixed-partitions";
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        boot_partition: partition@0 {
+            label = "mcuboot";
+            reg = <0x00000000 0x0000C000>;
+        };
+        slot0_partition: partition@c000 {
+            label = "image-0";
+            reg = <0x0000C000 0x00020000>;
+        };
+    };
+};
+
+&spi2 {
+    compatible = "nordic,nrf-spi";
+    status = "okay";
+    cs-gpios = <&gpio0 22 GPIO_ACTIVE_LOW>;
+
+    spi_nor0: w25q16jv@0 {
+        compatible = "jedec,spi-nor";
+        reg = <0>;
+        spi-max-frequency = <8000000>;
+        jedec-id = [ef 40 15];
+        size = <0x1000000>;
+
+        partitions {
+            compatible = "fixed-partitions";
+            #address-cells = <1>;
+            #size-cells = <1>;
+
+            fcb_storage: partition@0 {
+                label = "fcb_storage";
+                reg = <0x00000000 0x00003000>;
+            };
+        };
+    };
+};
+
+/ {
+    chosen {
+        zephyr,code-partition = &boot_partition;
+        zephyr,settings-partition = &fcb_storage;
+    };
+};

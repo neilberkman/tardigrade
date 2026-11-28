@@ -1,0 +1,27 @@
+manifest:
+  group-filter:
+  - -babblesim
+  - -optional
+  - -testing
+  projects:
+  - name: cmsis
+    url: https://github.com/zephyrproject-rtos/cmsis
+    revision: 512cc7e895e8491696b61f7ba8066b4a182569b8
+    path: modules/hal/cmsis
+    groups:
+    - hal
+  - name: cmsis_6
+    url: https://github.com/zephyrproject-rtos/CMSIS_6
+    revision: 1c1840af7a7e757d6e2fec3ddb0e5ce0dfcc93c8
+    path: modules/hal/cmsis_6
+    groups:
+    - hal
+  - name: hal_nordic
+    url: https://github.com/zephyrproject-rtos/hal_nordic
+    revision: ab12c8b987bc0d4f28c14338891c1657490c24cb
+    path: modules/hal/nordic
+    groups:
+    - hal
+  self:
+    path: zephyr
+    west-commands: scripts/west-commands.yml

@@ -1,0 +1,145 @@
+{
+  "board": "nrf52840dk/nrf52840",
+  "sources": {
+    "zephyr_base": {
+      "repository": "https://github.com/zephyrproject-rtos/zephyr",
+      "commit": "36940db938a8f4a1e919496793ed439850a221c2",
+      "version": "v3.7.0"
+    },
+    "zephyr_head": {
+      "repository": "https://github.com/zephyrproject-rtos/zephyr",
+      "commit": "06b50e7c66d27d519826a49e3c524ed762873cb6",
+      "version": "v4.5.99"
+    }
+  },
+  "upstream_issues": {
+    "#121749": {
+      "url": "https://github.com/zephyrproject-rtos/zephyr/issues/121749",
+      "references": [
+        "#121748"
+      ],
+      "summary": "Power cut during fcb_sector_hdr_init() after fd_magic is written leaves fd_ver and fd_id erased (fd_id = 0xFFFF); fcb_sector_hdr_read() validates only fd_magic, FCB_ID_GT treats 0xFFFF (-1) as f_oldest, fcb_free_sector_cnt() becomes 0 (-ENOSPC in raw FCB), and settings_fcb_src() erases f_active (the active data sector) instead of the scratch sector."
+    },
+    "#122446": {
+      "url": "https://github.com/zephyrproject-rtos/zephyr/issues/122446",
+      "summary": "Power cut during entry payload write before fcb_append_finish() leaves the trailing CRC-8 byte erased (0xFF); when crc8_ccitt(0xFF, length_header || partial_payload || remaining_0xFF_bytes) == 0xFF, fcb_elem_crc8() accepts the torn uncommitted entry as valid."
+    },
+    "#121748": {
+      "url": "https://github.com/zephyrproject-rtos/zephyr/issues/121748",
+      "summary": "Referenced by #121749: power cut after the first byte of a 2-byte entry length header (entries >= 128 bytes) causes fcb_get_len() to decode an oversized length and fcb_init() to fail permanently with -EIO. Not exercised by these 24-byte/32-byte record profiles."
+    }
+  },
+  "api_differences_at_head": [
+    "No application source changes were required between 36940db938a8 (v3.7.0) and 06b50e7c66d2 (v4.5.99 head); both fcb_raw/src/main.c and settings_fcb/src/main.c compile unchanged.",
+    "In include/zephyr/fs/fcb.h, struct fcb field f_sector_cnt widened from uint8_t to uint16_t.",
+    "In subsys/fs/fcb/fcb.c, commit f15889378791 (issue #111886) changed fcb_sector_hdr_init() to write a 16-byte WRITE_ALIGNMENT_BUFFER_SIZE union padded with f_erase_value (0xFF) instead of an 8-byte struct fcb_disk_area, adding two 4-byte 0xFFFFFFFF padding writes (+0x008 and +0x00C) per sector header initialization."
+  ],
+  "west_manifest": {
+    "file": "west-manifest.freeze.yml",
+    "sha256": "07ea9bab064384b0d39b7080e4320021e8beb6c90e4cfdaca5257e46f2f8bb6b"
+  },
+  "head_west_manifest": {
+    "file": "west-manifest-head.freeze.yml",
+    "sha256": "cccdea168c1a58972fab02b5ca5794b4c7e36d2e1c5dd598a966b8c72b3456b8"
+  },
+  "artifacts": {
+    "zephyr_fcb_raw_internal.elf": {
+      "size": 72932,
+      "sha256": "d8232aa00d6d7432612cbc523891137b23ad01191c6dce4dd07f54890542f7dd",
+      "zephyr_commit": "36940db938a8f4a1e919496793ed439850a221c2",
+      "reproduces_upstream_issues": [
+        "#121749"
+      ]
+    },
+    "zephyr_fcb_raw_spi_nor.elf": {
+      "size": 89044,
+      "sha256": "806a7a496ffc1ba535a0f168aa6ac744eb10fd4494766e0e5a173d4bd9a49322",
+      "zephyr_commit": "36940db938a8f4a1e919496793ed439850a221c2",
+      "reproduces_upstream_issues": [
+        "#121749"
+      ]
+    },
+    "zephyr_settings_fcb_internal.elf": {
+      "size": 79004,
+      "sha256": "8c94b28f626342d82b99afd437c3b5b359214cc5305ec39cb581d91c17d47669",
+      "zephyr_commit": "36940db938a8f4a1e919496793ed439850a221c2",
+      "reproduces_upstream_issues": [
+        "#121749"
+      ]
+    },
+    "zephyr_settings_fcb_spi_nor.elf": {
+      "size": 95112,
+      "sha256": "b3e17f3bdde3e9ee9983c901d468d812f89a6bed909e6e7642d667cdc4df76cc",
+      "zephyr_commit": "36940db938a8f4a1e919496793ed439850a221c2",
+      "reproduces_upstream_issues": [
+        "#121749",
+        "#122446"
+      ]
+    },
+    "zephyr_fcb_raw_internal_head.elf": {
+      "size": 95420,
+      "sha256": "18d20ce89bb218888d57929f849f98525b3e8e5916d5add74f1a2c5b06849a09",
+      "zephyr_commit": "06b50e7c66d27d519826a49e3c524ed762873cb6",
+      "reproduces_upstream_issues": [
+        "#121749"
+      ]
+    },
+    "zephyr_fcb_raw_spi_nor_head.elf": {
+      "size": 113192,
+      "sha256": "6f626a142df12f73b172ec6cf8c6886bd147547177970473274c71cbdeaa3e59",
+      "zephyr_commit": "06b50e7c66d27d519826a49e3c524ed762873cb6",
+      "reproduces_upstream_issues": [
+        "#121749"
+      ]
+    },
+    "zephyr_settings_fcb_internal_head.elf": {
+      "size": 101752,
+      "sha256": "d099394eff74b17de9fcf07f7803177ab11bbd09f994f24ddf68e7fef764dbbd",
+      "zephyr_commit": "06b50e7c66d27d519826a49e3c524ed762873cb6",
+      "reproduces_upstream_issues": [
+        "#121749"
+      ]
+    },
+    "zephyr_settings_fcb_spi_nor_head.elf": {
+      "size": 119524,
+      "sha256": "dc13cf3abbb2d47657130c3629d4b4374a71d54aaf1933c2349bdfc3dac70587",
+      "zephyr_commit": "06b50e7c66d27d519826a49e3c524ed762873cb6",
+      "reproduces_upstream_issues": [
+        "#121749",
+        "#122446"
+      ]
+    },
+    "fcb_raw_internal_ordinary_seed.bin": {
+      "size": 12288,
+      "sha256": "52acb55ddaeda17c0b45da706cd0eff3748b5509226f84a8e9a918186fd0c0fa"
+    },
+    "fcb_raw_internal_rotation_seed.bin": {
+      "size": 12288,
+      "sha256": "73a5d52299fc070839aaf313dfe73a727593c45fe2b19d26a4038cee06d3ef80"
+    },
+    "fcb_raw_spi_nor_ordinary_seed.bin": {
+      "size": 12288,
+      "sha256": "96ea3812a498cbf033a7728400dc4a3bfc1485fe30148c2a5e2cea64ada5634f"
+    },
+    "fcb_raw_spi_nor_rotation_seed.bin": {
+      "size": 12288,
+      "sha256": "fc9f36f27efc8ebd68f5428b45a261ed216473223e314a13e59130551fa50996"
+    },
+    "settings_fcb_internal_ordinary_seed.bin": {
+      "size": 12288,
+      "sha256": "72f49e20b8f35114f2ed6cb62764a35e876d7d913186cc20a54b79f69590b735"
+    },
+    "settings_fcb_internal_compaction_seed.bin": {
+      "size": 12288,
+      "sha256": "d7ae3dc4a63fd7f89d2a171667b33dcf65b007af49e3e5a3ffbacae7b6a03151"
+    },
+    "settings_fcb_spi_nor_ordinary_seed.bin": {
+      "size": 12288,
+      "sha256": "33c36113f5414970e5a789b52c2468b7cf25a0db6e84de4f52cb8934c80f014c"
+    },
+    "settings_fcb_spi_nor_compaction_seed.bin": {
+      "size": 12288,
+      "sha256": "52ee21c30bc08913ef4c7ab44a546f8b2c27e7bb1e33b577cdab0c3ee45ec1af"
+    }
+  }
+}
