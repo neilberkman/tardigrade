@@ -702,6 +702,16 @@ def attach_search_metadata(result, chain, state, generation, reused=False):
     if chain:
         target["fault_at"] = int(chain[0]["operation_index"])
         target["fault_address"] = chain[-1]["address"]
+        first_op = str(chain[0].get("operation") or "").strip().lower()
+        first_ft = str(chain[0].get("fault_type") or "").strip().lower()
+        target["operation_kind"] = (
+            "erase"
+            if (
+                first_op == "erase"
+                or first_ft in ("e", "a", "interrupted_erase", "multi_sector_atomicity")
+            )
+            else "program"
+        )
     return target
 
 

@@ -20,10 +20,39 @@ def junit_report(runs):
         properties = ET.SubElement(suite, "properties")
         ET.SubElement(properties, "property", name="point_counts", value=json.dumps(run.counts, sort_keys=True))
         ET.SubElement(properties, "property", name="verdict", value=str(run.data.get("verdict", "")))
+        summary = run.data.get("summary") or {}
+        sweep = summary.get("runtime_sweep") if isinstance(summary.get("runtime_sweep"), dict) else summary
+        if isinstance(sweep, dict) and sweep.get("fault_evidence"):
+            ET.SubElement(
+                properties,
+                "property",
+                name="fault_evidence",
+                value=json.dumps(sweep["fault_evidence"], sort_keys=True),
+            )
         counters = dict(tests=0, failures=0, errors=0, skipped=0)
         case_times = []
         for point in run.points():
             case = ET.SubElement(suite, "testcase", classname=f"{run.name}.{point.kind}", name=point.name)
+            row = point.row if isinstance(point.row, dict) else {}
+            if "fault_at" in row and not row.get("is_control") and row.get("fault_type") != "control":
+                case.set("fault_at", str(row.get("fault_at")))
+                raw_op = str(row.get("operation_kind") or "").strip().lower()
+                ft = str(row.get("fault_type") or ("e" if raw_op == "erase" else "w"))
+                ft_base = ft.split(":", 1)[0].strip().lower()
+                op_kind = str(
+                    row.get("operation_kind")
+                    or (
+                        "erase"
+                        if ft_base in ("e", "a", "interrupted_erase", "multi_sector_atomicity")
+                        else "program"
+                    )
+                )
+                case.set("fault_type", ft)
+                case.set("operation_kind", op_kind)
+            if isinstance(row.get("mram_fault_evidence"), dict):
+                case.set("fault_evidence", json.dumps(row["mram_fault_evidence"], sort_keys=True))
+            if isinstance(row.get("fault_snapshot"), dict):
+                case.set("fault_snapshot", json.dumps(row["fault_snapshot"], sort_keys=True))
             elapsed = point_time(point.row)
             if elapsed is not None:
                 case.set("time", f"{elapsed:.3f}")

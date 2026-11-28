@@ -38,14 +38,35 @@ def sarif_run(run, root):
     results = []
     for (rule, _, (uri, line), component), entries in sorted(groups.items()):
         message = entries[0][1].message
-        points = [{"name": point.name, "kind": point.kind, "reproduction": point.selector or reproduction(point.row)}
-                  for point, _ in entries]
+        points = []
         explanations = {}
-        for record, (point, _) in zip(points, entries):
-            explanation = point.row.get("failure_explanation")
+        for point, _ in entries:
+            row = point.row if isinstance(point.row, dict) else {}
+            record = {
+                "name": point.name,
+                "kind": point.kind,
+                "reproduction": point.selector or reproduction(row),
+            }
+            if "fault_at" in row and not row.get("is_control") and row.get("fault_type") != "control":
+                record["fault_at"] = row.get("fault_at")
+                raw_op = str(row.get("operation_kind") or "").strip().lower()
+                ft = row.get("fault_type") or ("e" if raw_op == "erase" else "w")
+                record["fault_type"] = ft
+                ft_base = str(ft).split(":", 1)[0].strip().lower()
+                record["operation_kind"] = row.get("operation_kind") or (
+                    "erase"
+                    if ft_base in ("e", "a", "interrupted_erase", "multi_sector_atomicity")
+                    else "program"
+                )
+            if isinstance(row.get("mram_fault_evidence"), dict):
+                record["mram_fault_evidence"] = row["mram_fault_evidence"]
+            if isinstance(row.get("fault_snapshot"), dict):
+                record["fault_snapshot"] = row["fault_snapshot"]
+            explanation = row.get("failure_explanation")
             if explanation:
                 record["failure_explanation"] = explanation
                 explanations[explanation["message"]] = None
+            points.append(record)
         if explanations:
             message += "\n" + "\n".join(explanations)
         properties = {"profile": run.name, "points": points}
@@ -67,8 +88,15 @@ def sarif_run(run, root):
     report = {"tool": {"driver": {"name": "Tardigrade", "rules": rules}},
               "automationDetails": {"id": f"{run.name}/"}, "invocations": [invocation], "results": results}
     first_cuts = run.counts.get("first_cut_states") or {}
+    summary = run.data.get("summary") or {}
+    sweep = summary.get("runtime_sweep") if isinstance(summary.get("runtime_sweep"), dict) else summary
+    run_props = {}
     if first_cuts.get("available"):
-        report["properties"] = {"first_cut_states": first_cuts}
+        run_props["first_cut_states"] = first_cuts
+    if isinstance(sweep, dict) and sweep.get("fault_evidence"):
+        run_props["fault_evidence"] = sweep["fault_evidence"]
+    if run_props:
+        report["properties"] = run_props
     return report
 
 

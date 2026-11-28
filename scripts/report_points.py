@@ -25,7 +25,10 @@ CAMPAIGNS = ("runtime_sweep_results", "multi_fault_results", "terminal_error_res
 
 
 def wire_point(row):
-    code = str(row.get("fault_requested_type") or row.get("fault_type") or "w")
+    raw_op = str(row.get("operation_kind") or "").strip().lower()
+    default_code = "e" if raw_op == "erase" else "w"
+    raw_code = str(row.get("fault_requested_type") or row.get("fault_type") or default_code)
+    code = FAULT_TYPE_NAME_TO_CODE.get(raw_code, raw_code)
     if code == "mf" and row.get("fault_sequence"):
         code = encode_multi_fault_sequence(row["fault_sequence"], row.get("fault_stage_codes"))
     if code == "cascade" and row.get("cascade"):

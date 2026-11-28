@@ -59,6 +59,13 @@ class InvariantViolation(Exception):
         fault_seq = getattr(result, "fault_sequence", None)
         if fault_seq is not None and "fault_sequence" not in self.details:
             self.details["fault_sequence"] = fault_seq
+        if "fault_at" in self.details and not getattr(result, "is_control", False):
+            from fault_types import operation_kind_for_fault_type
+            op_kind = operation_kind_for_fault_type(getattr(result, "fault_type", None))
+            if op_kind is None and self.details.get("fault_at") is not None:
+                op_kind = "program"
+            if op_kind is not None and "operation_kind" not in self.details:
+                self.details["operation_kind"] = op_kind
         super().__init__(f"{invariant_name}: {description}")
 
 

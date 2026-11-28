@@ -93,13 +93,25 @@ def compare_results(
     exhaustive_results = normalize_results(exhaustive_results)
     heuristic_results = normalize_results(heuristic_results)
 
+    has_fault_type = any(
+        "fault_type" in r or "operation_kind" in r
+        for r in list(exhaustive_results) + list(heuristic_results)
+    )
+
+    def _point_key(r: Dict[str, Any]) -> Any:
+        if has_fault_type:
+            kind = r.get("fault_type") or r.get("operation_kind") or "w"
+            return (str(kind), int(r["fault_point"]))
+        return int(r["fault_point"])
+
+    heuristic_keys: Set[Any] = {_point_key(r) for r in heuristic_results}
     heuristic_fps: Set[int] = {r["fault_point"] for r in heuristic_results}
 
     # Identify issue points in exhaustive.
-    exhaustive_issue_fps: Dict[int, Dict[str, Any]] = {}
+    exhaustive_issue_by_key: Dict[Any, Dict[str, Any]] = {}
     for r in exhaustive_results:
         if r["outcome"] not in SUCCESS_OUTCOMES:
-            exhaustive_issue_fps[r["fault_point"]] = r
+            exhaustive_issue_by_key[_point_key(r)] = r
 
     # Identify issue points in heuristic.
     heuristic_issue_count = sum(
@@ -108,16 +120,19 @@ def compare_results(
 
     # Recall: fraction of exhaustive issue fault points that appear in
     # the heuristic fault point set (regardless of outcome).
-    missed_fps: List[int] = sorted(
-        fp for fp in exhaustive_issue_fps if fp not in heuristic_fps
+    missed_keys: List[Any] = sorted(
+        k for k in exhaustive_issue_by_key if k not in heuristic_keys
     )
-    covered = len(exhaustive_issue_fps) - len(missed_fps)
+    missed_fps: List[int] = sorted(
+        {int(exhaustive_issue_by_key[k]["fault_point"]) for k in missed_keys}
+    )
+    covered = len(exhaustive_issue_by_key) - len(missed_keys)
     issue_recall = (
-        covered / len(exhaustive_issue_fps) if exhaustive_issue_fps else 1.0
+        covered / len(exhaustive_issue_by_key) if exhaustive_issue_by_key else 1.0
     )
 
     missed_outcomes: Set[str] = {
-        exhaustive_issue_fps[fp]["outcome"] for fp in missed_fps
+        exhaustive_issue_by_key[k]["outcome"] for k in missed_keys
     }
 
     # Per-fault_type recall (if fault_type present in results).
@@ -126,20 +141,20 @@ def compare_results(
         "fault_type" in r for r in exhaustive_results
     )
     if exhaustive_has_fault_type:
-        by_type: Dict[str, List[int]] = defaultdict(list)
-        for fp, r in exhaustive_issue_fps.items():
+        by_type: Dict[str, List[Any]] = defaultdict(list)
+        for k, r in exhaustive_issue_by_key.items():
             ft = r.get("fault_type", "unknown")
-            by_type[ft].append(fp)
-        for ft, fps in sorted(by_type.items()):
-            type_covered = sum(1 for fp in fps if fp in heuristic_fps)
+            by_type[ft].append(k)
+        for ft, keys in sorted(by_type.items()):
+            type_covered = sum(1 for k in keys if k in heuristic_keys)
             recall_by_fault_type[ft] = (
-                type_covered / len(fps) if fps else 1.0
+                type_covered / len(keys) if keys else 1.0
             )
 
     result: Dict[str, Any] = {
         "total_exhaustive_points": len(exhaustive_results),
         "total_heuristic_points": len(heuristic_results),
-        "exhaustive_issue_count": len(exhaustive_issue_fps),
+        "exhaustive_issue_count": len(exhaustive_issue_by_key),
         "heuristic_issue_count": heuristic_issue_count,
         "issue_recall": round(issue_recall, 4),
         "missed_issue_points": missed_fps,

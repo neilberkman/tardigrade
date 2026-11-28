@@ -254,12 +254,27 @@ def render_fault_grid(results: List[Dict[str, Any]], expected_outcome: str = "su
     if not points:
         return "<p class='empty-state'>No runtime sweep results found.</p>"
 
-    points.sort(key=lambda r: (str(r.get("fault_type", "w")), int(r.get("fault_requested", r.get("fault_at", 0)))))
+    points.sort(
+        key=lambda r: (
+            str(
+                r.get("fault_type")
+                or ("e" if str(r.get("operation_kind") or "").strip().lower() == "erase" else "w")
+            ),
+            int(r.get("fault_requested", r.get("fault_at", 0))),
+        )
+    )
 
     cells = []
     explanations = []
     for p in points:
-        ftype = str(p.get("fault_type", "w"))
+        raw_op = str(p.get("operation_kind") or "").strip().lower()
+        ftype = str(p.get("fault_type") or ("e" if raw_op == "erase" else "w"))
+        ft_base = ftype.split(":", 1)[0].strip().lower()
+        op_kind = p.get("operation_kind") or (
+            "erase"
+            if ft_base in ("e", "a", "interrupted_erase", "multi_sector_atomicity")
+            else "program"
+        )
         label = FAULT_LABELS.get(ftype, ftype)
         if ftype.startswith("w:ss:"):
             label = "security_state_erase"
@@ -270,17 +285,19 @@ def render_fault_grid(results: List[Dict[str, Any]], expected_outcome: str = "su
         issue = not disposition and result_has_issues(p, expected_outcome)
         state = "idle" if disposition else ("alert" if issue else "safe")
         color = {"idle": "#52606d", "alert": "#ff4d6d", "safe": "#37f6a0"}[state]
+        pt_lbl = point_label(p)
         if initial_outcome == final_outcome:
-            title = f"type={label} fp={at} outcome={final_outcome} injected={injected}"
+            title = (
+                f"point={pt_lbl} kind={op_kind} type={label} fp={at} "
+                f"outcome={final_outcome} injected={injected}"
+            )
         else:
             title = (
-                f"type={label} fp={at} initial={initial_outcome} "
-                f"final={final_outcome} injected={injected}"
+                f"point={pt_lbl} kind={op_kind} type={label} fp={at} "
+                f"initial={initial_outcome} final={final_outcome} injected={injected}"
             )
         if reason:
             title += " " + reason
-        if p.get("recovery_state_search") or p.get("phase2_fault_chain") or p.get("phase2_fault"):
-            title += " " + point_label(p)
         explanation = p.get("failure_explanation")
         if explanation:
             text = explanation["message"]
@@ -335,6 +352,15 @@ def render_success_effect_panel(results: List[Dict[str, Any]]) -> str:
             raw_values = probe.get("raw_values") or []
             return_value = details.get("return_value_text") or ("0x{:08X}".format(_as_int(raw_values[-1])) if raw_values else "—")
             condition = (details.get("conditions") or [{}])[0]
+            point_desc = (
+                f"{point_label(result)} ({result['fault_address']})"
+                if result.get("fault_address") and not result.get("is_control") and "fault_at" in result
+                else (
+                    point_label(result)
+                    if not result.get("is_control") and "fault_at" in result
+                    else str(result.get("fault_address") or result.get("fault_at") or "control")
+                )
+            )
             rows.append(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
                     html.escape(str(details.get("contract") or "—")),
@@ -342,7 +368,7 @@ def render_success_effect_panel(results: List[Dict[str, Any]]) -> str:
                     html.escape(str(return_value)),
                     html.escape(str(condition.get("pre_value", "—"))),
                     html.escape(str(condition.get("post_value", "—"))),
-                    html.escape(str(result.get("fault_address") or result.get("fault_at") or "control")),
+                    html.escape(point_desc),
                 )
             )
     if not rows:
@@ -461,6 +487,9 @@ def _format_first_reached_cell(entry: Any) -> str:
         or entry.get("state_identity")
         or ""
     ).strip()
+    if not label and entry.get("fault_at") is not None:
+        kind_tag = entry.get("fault_type") or entry.get("operation_kind") or "w"
+        label = f"{kind_tag}@{entry.get('fault_at')}"
     boot_index = entry.get("boot_index")
     if not label and boot_index is not None:
         label = f"boot {boot_index}"
@@ -622,8 +651,11 @@ def render_recovery_coverage_panel(payload: Dict[str, Any]) -> str:
     for boot in cov.get("coverage_by_boot") or []:
         if not isinstance(boot, dict):
             continue
-        point_label = str(
-            boot.get("label") or boot.get("chain") or f"point {boot.get('fault_at', '?')}"
+        fallback_kind = boot.get("fault_type") or boot.get("operation_kind") or "point"
+        point_label_text = str(
+            boot.get("label")
+            or boot.get("chain")
+            or f"{fallback_kind}@{boot.get('fault_at', '?')}"
         )
         cum_lines_cell = (
             f"<td>{_as_int(boot.get('cumulative_lines'))}</td>"
@@ -633,7 +665,7 @@ def render_recovery_coverage_panel(payload: Dict[str, Any]) -> str:
         boot_rows.append(
             "<tr>"
             f"<td>{_as_int(boot.get('boot_index'))}</td>"
-            f"<td><code>{html.escape(point_label)}</code></td>"
+            f"<td><code>{html.escape(point_label_text)}</code></td>"
             f"<td>{_as_int(boot.get('boot_basic_blocks'))}</td>"
             f"<td>{_as_int(boot.get('new_basic_blocks'))}</td>"
             f"<td>{_as_int(boot.get('cumulative_basic_blocks'))}</td>"
@@ -677,7 +709,9 @@ def render_point_counts_panel(payload: Dict[str, Any]) -> str:
         skip_reasons = ", ".join(
             "{}={}".format(reason, count)
             for reason, count in sorted((row.get("skip_reasons") or {}).items())
-        ) or "—"
+        )
+        if not skip_reasons:
+            skip_reasons = "zero planned points" if row.get("zero_planned_points") else "—"
         rows.append(
             "<tr>"
             f"<td>{html.escape(str(row['label']))}</td>"
@@ -787,6 +821,125 @@ def render_point_counts_panel(payload: Dict[str, Any]) -> str:
     )
 
 
+def render_fault_evidence_panel(payload: Dict[str, Any]) -> str:
+    """Render per-point fault evidence keeping program and erase cuts distinct."""
+    sweep = (payload.get("summary") or {}).get("runtime_sweep") or {}
+    summary_items = sweep.get("fault_evidence")
+    rows_out: List[str] = []
+    results = [
+        r for r in (payload.get("runtime_sweep_results") or [])
+        if isinstance(r, dict) and not r.get("is_control")
+    ]
+    if results and any(
+        isinstance(r.get("mram_fault_evidence"), dict) or isinstance(r.get("fault_snapshot"), dict)
+        for r in results
+    ):
+        for r in results:
+            ev = r.get("mram_fault_evidence") if isinstance(r.get("mram_fault_evidence"), dict) else {}
+            snap = r.get("fault_snapshot") if isinstance(r.get("fault_snapshot"), dict) else {}
+            if not ev and not snap:
+                continue
+            raw_op = str(r.get("operation_kind") or ev.get("operation_kind") or "").strip().lower()
+            ft = str(r.get("fault_type") or ("e" if raw_op == "erase" else "w"))
+            ft_base = ft.split(":", 1)[0].strip().lower()
+            op_kind = (
+                r.get("operation_kind")
+                or ev.get("operation_kind")
+                or (
+                    "erase"
+                    if ft_base in ("e", "a", "interrupted_erase", "multi_sector_atomicity")
+                    else "program"
+                )
+            )
+            addr = (
+                ev.get("erase_address")
+                or ev.get("program_address")
+                or r.get("fault_address")
+                or "—"
+            )
+            width = (
+                ev.get("erase_size")
+                if ev.get("erase_size") is not None
+                else ev.get("program_width")
+            )
+            pre_hex = (
+                ev.get("pre_erase_bytes")
+                if ev.get("pre_erase_bytes") is not None
+                else ev.get("pre_program_bytes")
+            )
+            post_hex = (
+                ev.get("post_fault_bytes")
+                if ev.get("post_fault_bytes") is not None
+                else ev.get("post_erase_bytes")
+            )
+            uncorr = (
+                ", ".join(str(u) for u in (ev.get("uncorrectable_words") or snap.get("uncorrectable_words") or []))
+                or str(ev.get("uncorrectable_word_address") or "")
+                or ("yes" if ev.get("word_marked_uncorrectable") else "—")
+            )
+            sha = str(snap.get("sha256") or "—")
+            _, final_outcome = _boot_span_outcomes(r)
+            rows_out.append(
+                "<tr>"
+                f"<td><code>{html.escape(point_label(r))}</code></td>"
+                f"<td><code>{html.escape(str(op_kind))}</code></td>"
+                f"<td>{html.escape(str(r.get('fault_at', '—')))}</td>"
+                f"<td><code>{html.escape(str(addr))}</code></td>"
+                f"<td>{html.escape(str(width if width is not None else '—'))}</td>"
+                f"<td><code>{html.escape(str(pre_hex or '—'))}</code></td>"
+                f"<td><code>{html.escape(str(post_hex or '—'))}</code></td>"
+                f"<td><code>{html.escape(uncorr)}</code></td>"
+                f"<td><code>{html.escape(sha)}</code></td>"
+                f"<td><code>{html.escape(str(final_outcome))}</code></td>"
+                "</tr>"
+            )
+    elif isinstance(summary_items, list) and summary_items:
+        for item in summary_items:
+            if not isinstance(item, dict):
+                continue
+            op_kind = str(item.get("operation_kind") or "program")
+            code = "e" if op_kind == "erase" else "w"
+            pt = f"{code}[{item.get('fault_at')}]"
+            addr = item.get("erase_address") or item.get("fault_address") or "—"
+            width = (
+                item.get("erase_size")
+                if item.get("erase_size") is not None
+                else item.get("program_width")
+            )
+            pre_hex = item.get("pre_erase_bytes") or item.get("pre_program_bytes") or "—"
+            post_hex = item.get("post_fault_bytes") or "—"
+            uncorr = (
+                ", ".join(str(u) for u in (item.get("uncorrectable_words") or []))
+                or str(item.get("uncorrectable_word_address") or "")
+                or ("yes" if item.get("word_marked_uncorrectable") else "—")
+            )
+            sha = str(item.get("snapshot_sha256") or "—")
+            rows_out.append(
+                "<tr>"
+                f"<td><code>{html.escape(pt)}</code></td>"
+                f"<td><code>{html.escape(op_kind)}</code></td>"
+                f"<td>{html.escape(str(item.get('fault_at', '—')))}</td>"
+                f"<td><code>{html.escape(str(addr))}</code></td>"
+                f"<td>{html.escape(str(width if width is not None else '—'))}</td>"
+                f"<td><code>{html.escape(str(pre_hex))}</code></td>"
+                f"<td><code>{html.escape(str(post_hex))}</code></td>"
+                f"<td><code>{html.escape(uncorr)}</code></td>"
+                f"<td><code>{html.escape(sha)}</code></td>"
+                f"<td><code>{html.escape(str(item.get('boot_outcome') or '—'))}</code></td>"
+                "</tr>"
+            )
+    if not rows_out:
+        return ""
+    return (
+        "<div class='telemetry-heading'><span>fault evidence</span>"
+        "<code>per-point unit / before / after / snapshot</code></div>"
+        "<div class='table-wrap'><table><thead><tr>"
+        "<th>Point</th><th>Kind</th><th>Index</th><th>Address</th><th>Width / Size</th>"
+        "<th>Before</th><th>After</th><th>Uncorrectable</th><th>Snapshot SHA-256</th><th>Outcome</th>"
+        "</tr></thead><tbody>" + "".join(rows_out) + "</tbody></table></div>"
+    )
+
+
 def render_audit_card(path: Path, payload: Dict[str, Any], mapping=None) -> Tuple[str, Dict[str, Any]]:
     sweep = payload.get("summary", {}).get("runtime_sweep", {})
     profile = str(payload.get("profile", path.stem))
@@ -877,6 +1030,7 @@ def render_audit_card(path: Path, payload: Dict[str, Any], mapping=None) -> Tupl
         f"{render_multi_component_panel(payload)}"
         f"{render_terminal_error_panel(payload)}"
         f"{render_recovery_coverage_panel(payload)}"
+        f"{render_fault_evidence_panel(payload)}"
         f"{grid}"
         "</section>"
     )

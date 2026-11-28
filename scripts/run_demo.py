@@ -88,10 +88,16 @@ def result_from_report(
             except (TypeError, ValueError):
                 operation = None
             address = _format_address(first.get("fault_address"))
+            first_op_kind = first.get("operation_kind")
+            first_fault_type = first.get("fault_type")
             for row in payload.get("runtime_sweep_results") or []:
                 if not isinstance(row, Mapping) or row.get("is_control"):
                     continue
                 if _integer(row.get("fault_at"), -1) != operation:
+                    continue
+                if first_op_kind and row.get("operation_kind") and str(row.get("operation_kind")) != str(first_op_kind):
+                    continue
+                if first_fault_type and row.get("fault_type") and str(row.get("fault_type")) != str(first_fault_type):
                     continue
                 boot_outcome = str(
                     row.get("initial_boot_outcome")

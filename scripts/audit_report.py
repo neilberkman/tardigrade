@@ -247,6 +247,13 @@ def categorize_failure(
     op_kind = result.get("operation_kind") or operation_kind_for_fault_type(
         result.get("fault_type")
     )
+    if (
+        op_kind is None
+        and not result.get("is_control")
+        and fp is not None
+        and (not isinstance(fp, int) or fp >= 0)
+    ):
+        op_kind = "program"
     if op_kind is not None:
         payload["operation_kind"] = op_kind
     if result.get("mram_torn_word") is not None:
@@ -304,16 +311,24 @@ def categorize_failure(
         payload["mram_fault_evidence"] = {
             key: mram_evidence.get(key)
             for key in (
+                "operation_kind",
                 "selected_write_index",
                 "backend_write_index",
+                "selected_erase_index",
+                "backend_erase_index",
                 "program_address",
+                "erase_address",
                 "offset",
                 "program_width",
+                "erase_size",
                 "intended_bytes",
                 "pre_program_bytes",
+                "pre_erase_bytes",
                 "post_fault_bytes",
+                "post_erase_bytes",
                 "word_marked_uncorrectable",
                 "uncorrectable_word_address",
+                "uncorrectable_words",
                 "exact",
                 "capability_error",
             )
@@ -322,6 +337,9 @@ def categorize_failure(
         trace = mram_evidence.get("write_trace")
         if isinstance(trace, list):
             payload["mram_fault_evidence"]["write_trace_events"] = len(trace)
+        erase_trace = mram_evidence.get("erase_trace")
+        if isinstance(erase_trace, list):
+            payload["mram_fault_evidence"]["erase_trace_events"] = len(erase_trace)
     snapshot = result.get("fault_snapshot")
     if isinstance(snapshot, dict):
         payload["fault_snapshot"] = snapshot
@@ -389,6 +407,8 @@ def categorize_failure(
             if k in ("confirm_incomplete", "rollback_not_ratcheted",
                       "metadata_inconsistent_after_confirm", "assertion_results")
         }
+    if isinstance(result.get("failure_explanation"), dict):
+        payload["failure_explanation"] = result["failure_explanation"]
     return payload
 
 
@@ -978,8 +998,15 @@ def summarize_runtime_sweep(
         if not isinstance(evidence, dict) and not isinstance(snapshot, dict):
             continue
         effective_outcome, _ = _effective_boot_result(result)
+        ev_op_kind = (
+            result.get("operation_kind")
+            or (evidence.get("operation_kind") if isinstance(evidence, dict) else None)
+            or operation_kind_for_fault_type(result.get("fault_type"))
+            or "program"
+        )
         item: Dict[str, Any] = {
             "fault_at": result.get("fault_at"),
+            "operation_kind": str(ev_op_kind),
             "fault_address": result.get("fault_address"),
             "boot_outcome": effective_outcome,
         }
@@ -989,12 +1016,43 @@ def summarize_runtime_sweep(
             item["torn_word"] = result["torn_word"]
         if isinstance(evidence, dict):
             item["exact"] = evidence.get("exact") is True
-            item["program_width"] = evidence.get("program_width")
+            item["program_width"] = (
+                evidence.get("program_width")
+                if evidence.get("program_width") is not None
+                else evidence.get("erase_size")
+            )
+            if str(ev_op_kind) == "erase":
+                if evidence.get("erase_address"):
+                    item["erase_address"] = evidence.get("erase_address")
+                if evidence.get("erase_size") is not None:
+                    item["erase_size"] = evidence.get("erase_size")
+                elif evidence.get("program_width") is not None:
+                    item["erase_size"] = evidence.get("program_width")
+                pre_erase = (
+                    evidence.get("pre_erase_bytes")
+                    if evidence.get("pre_erase_bytes") is not None
+                    else evidence.get("pre_program_bytes")
+                )
+                if pre_erase is not None:
+                    item["pre_erase_bytes"] = pre_erase
+                post_erase = (
+                    evidence.get("post_fault_bytes")
+                    if evidence.get("post_fault_bytes") is not None
+                    else evidence.get("post_erase_bytes")
+                )
+                if post_erase is not None:
+                    item["post_fault_bytes"] = post_erase
+                if evidence.get("intended_bytes") is not None:
+                    item["intended_bytes"] = evidence.get("intended_bytes")
             if evidence.get("word_marked_uncorrectable") is True:
                 item["word_marked_uncorrectable"] = True
             if evidence.get("uncorrectable_word_address"):
                 item["uncorrectable_word_address"] = evidence.get(
                     "uncorrectable_word_address"
+                )
+            if evidence.get("uncorrectable_words"):
+                item["uncorrectable_words"] = list(
+                    evidence.get("uncorrectable_words")
                 )
             if evidence.get("capability_error"):
                 item["capability_error"] = evidence.get("capability_error")
@@ -1044,8 +1102,15 @@ def summarize_runtime_sweep(
             else:
                 uncorr_other_failed_points += 1
             effective_outcome, _ = _effective_boot_result(result)
+            obs_op_kind = (
+                result.get("operation_kind")
+                or evidence.get("operation_kind")
+                or operation_kind_for_fault_type(result.get("fault_type"))
+                or "program"
+            )
             obs_item: Dict[str, Any] = {
                 "fault_at": result.get("fault_at"),
+                "operation_kind": str(obs_op_kind),
                 "word_address": uncorr_read.get("word_address"),
                 "word_addresses": list(uncorr_read.get("word_addresses") or []),
                 "read_count": int(uncorr_read.get("read_count") or 0),
@@ -1274,6 +1339,34 @@ def summarize_runtime_sweep(
         issue_predicate=_point_has_issue,
         calibration=calibration_point_coverage,
     )
+    zero_point_kinds = list(summary["point_counts"].get("zero_point_kinds") or [])
+    if zero_point_kinds:
+        summary["zero_point_fault_kinds"] = zero_point_kinds
+        summary["zero_point_fault_kind_statuses"] = {
+            kind: {
+                "requested": 0,
+                "planned_points": 0,
+                "zero_planned_points": True,
+                "status": "zero_planned_points",
+                "note": "requested fault kind yielded zero planned points",
+            }
+            for kind in zero_point_kinds
+        }
+        if bool(
+            getattr(
+                getattr(profile, "fault_sweep", None),
+                "require_planned_points_per_kind",
+                False,
+            )
+        ):
+            summary["zero_point_fault_kind_error"] = (
+                "requested fault kind(s) yielded zero planned points: {}".format(
+                    ", ".join(zero_point_kinds)
+                )
+            )
+            summary["campaign_complete"] = False
+            summary["campaign_integrity"]["complete"] = False
+            summary["campaign_integrity"]["zero_point_fault_kinds"] = zero_point_kinds
 
     resolved_cov_scope = recovery_coverage_scope
     if resolved_cov_scope is None and profile is not None:
@@ -1401,6 +1494,10 @@ def _campaign_integrity_gate_reason(
     integrity = sweep_summary.get("campaign_integrity")
     if not isinstance(integrity, dict):
         return None
+
+    zero_kind_error = sweep_summary.get("zero_point_fault_kind_error")
+    if isinstance(zero_kind_error, str) and zero_kind_error.strip():
+        return zero_kind_error.strip()
 
     requested = int(integrity.get("requested", 0) or 0)
     returned = int(integrity.get("returned", requested) or 0)

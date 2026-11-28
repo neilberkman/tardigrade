@@ -1119,6 +1119,18 @@ def _format_point_descriptor(result, boot_index=None):
         chain_text = chain.get("text") or "state:{}".format(
             rss.get("state_identity", "")
         )
+        cuts = list(chain.get("cuts") or [])
+        first_op = None
+        if cuts and isinstance(cuts[0], dict):
+            first_op = cuts[0].get("operation") or cuts[0].get("fault_type")
+        raw_op = str(
+            result.get("operation_kind") or first_op or ""
+        ).strip().lower()
+        op_kind = (
+            "erase"
+            if raw_op in ("erase", "e", "a", "interrupted_erase", "multi_sector_atomicity")
+            else "program"
+        )
         return {
             "kind": "state",
             "boot_index": int(boot_index) if boot_index is not None else None,
@@ -1126,16 +1138,24 @@ def _format_point_descriptor(result, boot_index=None):
             "state_identity": rss.get("state_identity"),
             "generation": int(rss.get("generation", 1)),
             "chain": str(chain_text),
-            "cuts": copy.deepcopy(chain.get("cuts") or []),
+            "cuts": copy.deepcopy(cuts),
             "fault_type": str(result.get("fault_type") or "rs"),
             "fault_at": int(result.get("fault_at", 0) or 0),
+            "operation_kind": op_kind,
         }
 
     p2_chain = result.get("phase2_fault_chain")
     if isinstance(p2_chain, dict) and p2_chain.get("cuts"):
+        cuts = p2_chain["cuts"]
         label = " -> ".join(
             "{}[{}]".format(cut.get("fault_type", "w"), cut.get("fault_at", 0))
-            for cut in p2_chain["cuts"]
+            for cut in cuts
+        )
+        first_ft = str(cuts[0].get("fault_type") or cuts[0].get("operation") or "w").strip().lower()
+        op_kind = (
+            "erase"
+            if first_ft in ("erase", "e", "a", "interrupted_erase", "multi_sector_atomicity")
+            else "program"
         )
         return {
             "kind": "point",
@@ -1143,16 +1163,25 @@ def _format_point_descriptor(result, boot_index=None):
             "label": label,
             "fault_type": str(result.get("fault_type") or "pc"),
             "fault_at": int(result.get("fault_at", 0) or 0),
+            "operation_kind": op_kind,
             "fault_address": result.get("fault_address"),
         }
 
     p2 = result.get("phase2_fault")
     if isinstance(p2, dict) and "p1_fault_at" in p2 and "p2_fault_at" in p2:
+        p1_ft = str(p2.get("p1_fault_type", "w"))
+        p2_ft = str(p2.get("p2_fault_type", "w"))
         label = "p2:{}:{}:{}:{}".format(
             p2.get("p1_fault_at", 0),
             p2.get("p2_fault_at", 0),
-            p2.get("p1_fault_type", "w"),
-            p2.get("p2_fault_type", "w"),
+            p1_ft,
+            p2_ft,
+        )
+        p1_base = p1_ft.split(":", 1)[0].strip().lower()
+        op_kind = (
+            "erase"
+            if p1_base in ("erase", "e", "a", "interrupted_erase", "multi_sector_atomicity")
+            else "program"
         )
         return {
             "kind": "point",
@@ -1160,10 +1189,25 @@ def _format_point_descriptor(result, boot_index=None):
             "label": label,
             "fault_type": str(result.get("fault_type") or "p2"),
             "fault_at": int(result.get("fault_at", 0) or 0),
+            "operation_kind": op_kind,
             "fault_address": result.get("fault_address"),
         }
 
-    ft = str(result.get("fault_type") or "w")
+    raw_op_kind = str(result.get("operation_kind") or "").strip().lower()
+    raw_ft = result.get("fault_type")
+    if raw_ft:
+        ft = str(raw_ft)
+    elif raw_op_kind in ("erase", "e", "a", "interrupted_erase", "multi_sector_atomicity"):
+        ft = "e"
+    else:
+        ft = "w"
+    ft_base = ft.split(":", 1)[0].strip().lower()
+    if raw_op_kind in ("erase", "program"):
+        op_kind = raw_op_kind
+    elif ft_base in ("e", "a", "interrupted_erase", "multi_sector_atomicity"):
+        op_kind = "erase"
+    else:
+        op_kind = "program"
     fp = int(result.get("fault_at", 0) or 0)
     return {
         "kind": "point",
@@ -1171,6 +1215,7 @@ def _format_point_descriptor(result, boot_index=None):
         "label": "{}@{}".format(ft, fp),
         "fault_type": ft,
         "fault_at": fp,
+        "operation_kind": op_kind,
         "fault_address": result.get("fault_address"),
     }
 
@@ -1327,6 +1372,9 @@ def summarize_recovery_coverage(results, scope, state_search_summary=None):
             "boot_index": boot_index,
             "label": descriptor["label"],
             "kind": descriptor["kind"],
+            "fault_at": descriptor.get("fault_at"),
+            "fault_type": descriptor.get("fault_type"),
+            "operation_kind": descriptor.get("operation_kind"),
             "boot_executed_units": len(boot_pcs),
             "new_units": len(new_pcs),
             "cumulative_units": len(all_cut_pcs),

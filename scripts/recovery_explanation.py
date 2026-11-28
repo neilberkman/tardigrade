@@ -30,7 +30,17 @@ def _cut_paths(row):
     """Canonical and equivalent power-cut paths within this runtime campaign."""
     cuts = point_cuts(row)
     if not cuts:
-        kind = {"w": "power_loss", "e": "interrupted_erase"}.get(row.get("fault_type"))
+        raw_ft = row.get("fault_type")
+        op_kind = str(row.get("operation_kind") or "").strip().lower()
+        kind = {
+            "w": "power_loss",
+            "power_loss": "power_loss",
+            "e": "interrupted_erase",
+            "a": "interrupted_erase",
+            "interrupted_erase": "interrupted_erase",
+        }.get(raw_ft)
+        if not kind and op_kind in ("erase", "program", "write"):
+            kind = "interrupted_erase" if op_kind == "erase" else "power_loss"
         if not kind:
             return
         cuts = [(row.get("fault_requested", row.get("fault_at")), kind)]
@@ -399,7 +409,10 @@ def _resolve_cuts(row, source, calibration_ops=(), flash_base=0, driver_function
             if not call_ctx and mram_ev.get("fault_call_context"):
                 call_ctx = mram_ev["fault_call_context"]
             if not pc or not call_ctx:
-                mram_op = _lookup_op_in_list(mram_ev.get("write_trace") or (), op_kind, op_index)
+                mram_trace_ops = list(mram_ev.get("write_trace") or ()) + list(
+                    mram_ev.get("erase_trace") or ()
+                )
+                mram_op = _lookup_op_in_list(mram_trace_ops, op_kind, op_index)
                 if mram_op:
                     if not pc and mram_op.get("pc"):
                         pc = mram_op["pc"]
@@ -489,6 +502,8 @@ def _attribute_comparison_ranges(row, other, comparison, source, calibration_ops
             mram_ev = candidate_row.get("mram_fault_evidence") or {}
             if mram_ev.get("write_trace"):
                 candidate_ops.extend(mram_ev["write_trace"])
+            if mram_ev.get("erase_trace"):
+                candidate_ops.extend(mram_ev["erase_trace"])
             fw = candidate_row.get("fault_window") or {}
             if fw.get("operations"):
                 candidate_ops.extend(fw["operations"])
@@ -529,11 +544,12 @@ def _annotate_row_operation_traces(row, source, driver_functions=()):
     mram_ev = row.get("mram_fault_evidence")
     if isinstance(mram_ev, dict):
         mram_ev.pop("fault_call_context", None)
-        for item in mram_ev.get("write_trace") or ():
-            if isinstance(item, dict):
-                call_ctx = item.pop("call_context", None) or item.get("call_chain")
-                if item.get("pc") or call_ctx:
-                    _attach_call_chain(item, item.get("pc"), call_ctx, source, driver_functions=driver_functions)
+        for key in ("write_trace", "erase_trace"):
+            for item in mram_ev.get(key) or ():
+                if isinstance(item, dict):
+                    call_ctx = item.pop("call_context", None) or item.get("call_chain")
+                    if item.get("pc") or call_ctx:
+                        _attach_call_chain(item, item.get("pc"), call_ctx, source, driver_functions=driver_functions)
     fw = row.get("fault_window")
     if isinstance(fw, dict):
         for item in fw.get("operations") or ():
