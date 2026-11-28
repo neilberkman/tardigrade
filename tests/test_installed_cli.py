@@ -89,6 +89,52 @@ def test_dispatch_audit_uses_existing_audit_runtime_and_forwards_flags(cli, tmp_
     assert recorded["env"]["OTA_RENODE_POINT_TIMEOUT_S"] == "180"
 
 
+def test_dispatch_debug_forwards_resolved_paths_and_flags(cli, tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(cli.RUNTIME / "scripts"))
+    import debug_point
+
+    calls = []
+    monkeypatch.setattr(
+        debug_point,
+        "main",
+        lambda argv=None, *, prog=None: calls.append((argv, prog)) or 0,
+    )
+    monkeypatch.chdir(tmp_path)
+    report = tmp_path / "audit.json"
+    report.write_text("{}")
+    profile = ROOT / "profiles/mcuboot_pr3011_move_broken.yaml"
+    output = tmp_path / "debug_out.json"
+    assert cli.main([
+        "debug",
+        "--report", str(report),
+        "--point", "3,0",
+        "--profile", str(profile),
+        "--stop-at", "recovery-reset",
+        "--port", "4444",
+        "--gdb", "arm-none-eabi-gdb",
+        "--renode-test", "my-renode",
+        "--timeout", "120",
+        "--output", str(output),
+        "--ex", "info registers",
+    ]) == 0
+    assert calls == [(
+        [
+            "--stop-at", "recovery-reset",
+            "--port", "4444",
+            "--renode-test", "my-renode",
+            "--timeout", "120",
+            "--repo-root", str(cli.RUNTIME),
+            "--report", str(report.resolve()),
+            "--point", "3,0",
+            "--profile", str(profile.resolve()),
+            "--gdb", "arm-none-eabi-gdb",
+            "--output", str(output.resolve()),
+            "--ex", "info registers",
+        ],
+        "tardigrade debug",
+    )]
+
+
 def test_doctor_checks_server_and_version(cli, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(shutil, "which", lambda cmd: str(tmp_path / cmd))
     monkeypatch.setattr(cli, "probe", lambda cmd: "Renode v1.17.0.123" if cmd[-1] == "--version" else "")
@@ -206,6 +252,7 @@ for resource in [
     'platforms/stm32f4_fast.repl',
     'scripts/profile_loader.py',
     'scripts/audit_bootloader.py',
+    'scripts/debug_point.py',
     'scripts/run_runtime_fault_sweep.py',
     'scripts/run_runtime_fault_sweep.resc',
     'scripts/run_demo.py',
