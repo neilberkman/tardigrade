@@ -494,6 +494,30 @@ def test_profile_loader_recovery_coverage_and_state_search_options(tmp_path: Pat
         load_profile(missing_cov_path)
 
 
+def test_recovery_coverage_requires_effective_execute_mode(tmp_path: Path) -> None:
+    from profile_loader import load_profile
+    from sweep import validate_runtime_fault_mode_compat
+
+    profile_path = tmp_path / "coverage.yaml"
+    base_profile = ROOT / "examples/phase2_mram_parity/profile_state_search.yaml"
+    profile_path.write_text(
+        f"base_profile: {base_profile}\n"
+        "fault_sweep:\n"
+        "  recovery_coverage:\n"
+        "    functions: [Reset_Handler]\n",
+        encoding="utf-8",
+    )
+    profile = load_profile(profile_path)
+
+    assert profile.fault_sweep.recovery_coverage.enabled is True
+    assert profile.fault_sweep.recovery_coverage.mechanism == "oneshot_address_hooks"
+    assert profile.fault_sweep.phase2_fault.state_search.order == "breadth_first"
+    assert profile.fault_sweep.phase2_fault.state_search.max_boots_without_new_coverage is None
+    validate_runtime_fault_mode_compat(profile, "execute")
+    with pytest.raises(RuntimeError, match="recovery_coverage.*requires.*execute"):
+        validate_runtime_fault_mode_compat(profile, "state")
+
+
 def test_runtime_recovery_coverage_hook_recording_and_merging() -> None:
     import ast
     from recovery_coverage import resolve_executed_probe_pcs

@@ -1809,6 +1809,14 @@ def evaluate_config_checks(result: Dict[str, Any], profile: "ProfileConfig") -> 
 
 def validate_runtime_fault_mode_compat(profile: "ProfileConfig", eval_mode: str) -> None:
     """Fail fast on profile/mode combinations the runtime runner cannot support."""
+    recovery_coverage = getattr(profile.fault_sweep, "recovery_coverage", None)
+    if (
+        getattr(recovery_coverage, "enabled", False)
+        and str(eval_mode or "").strip().lower() != "execute"
+    ):
+        raise RuntimeError(
+            "fault_sweep.recovery_coverage requires evaluation_mode 'execute'."
+        )
     if (
         str(getattr(profile.fault_sweep, "durability_model", "direct")).strip().lower()
         == "writeback"
